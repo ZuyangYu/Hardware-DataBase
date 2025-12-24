@@ -243,7 +243,7 @@ def main():
                 /* 使用 :has 选择器精确定位头部容器 */
                 div[data-testid="stVerticalBlock"] > div:has(div.fixed-header-marker) {
                     position: sticky;
-                    top: 0.7rem; /* 预留出 Streamlit 顶部工具栏的高度 */
+                    top: 0.2rem; /* 预留出 Streamlit 顶部工具栏的高度 */
                     background-color: white;
                     z-index: 999;
                     padding-top: 1rem; /* 在容器内部补偿视觉间距 */
@@ -256,7 +256,7 @@ def main():
 
         col_header, col_status = st.columns([4, 1])
         with col_header:
-            st.title("😺 HardWare RAG")
+            st.markdown('<h1 style="font-size: 35px; margin-top: 10px; margin-bottom: 0px;">😺 HardWare RAG</h1>', unsafe_allow_html=True)
             st.markdown(f"**正在使用知识库:** `{st.session_state.current_kb}`")
         with col_status:
             status = resource_manager.get_status()
@@ -273,13 +273,13 @@ def main():
 
         selected_tab = st.radio("**🚩 功能切换:**", ["💬 智能对话", "📚 知识库管理"], label_visibility="collapsed")
         st.divider()
-        st.markdown(f"**📍 当前知识库:**")
+        st.markdown(f"**📍 当前对话挂载知识库:**")
         if st.session_state.current_kb not in st.session_state.kb_list:
             st.session_state.current_kb = DEFAULT_KB_NAME
             if DEFAULT_KB_NAME not in st.session_state.kb_list:
                 st.session_state.kb_list.append(DEFAULT_KB_NAME)
 
-        selected_kb = st.selectbox("选择知识库", options=st.session_state.kb_list, key="kb_selector")
+        selected_kb = st.selectbox("切换知识库", options=st.session_state.kb_list, key="kb_selector")
         if selected_kb != st.session_state.current_kb:
             st.session_state.current_kb = selected_kb
             st.session_state.messages = []
@@ -354,17 +354,30 @@ def render_chat_tab(pipeline):
                     if content.startswith("Error:") or content == "Empty response.":
                         st.error(content)
                     else:
+                        # ==================== 核心修复开始 ====================
                         separator = "**🔍 检索到的上下文:**"
+
+                        main_text = content
+
                         if separator in content:
                             try:
-                                main_text, source_text = content.split(separator, 1)
-                                st.markdown(main_text.strip())
-                                with st.expander("📚 参考来源"):
-                                    st.markdown(source_text.strip())
+                                parts = content.split(separator, 1)
+                                if len(parts) == 2:
+                                    main_text = parts[0]
+                                    source_text = parts[1]
+
+                                    st.markdown(main_text.strip())
+                                    with st.expander("📚 参考来源"):
+                                        st.markdown(source_text.strip())
+                                else:
+                                    st.markdown(content)
                             except ValueError:
                                 st.markdown(content)
                         else:
                             st.markdown(content)
+
+                        with st.expander("📋 复制完整回复内容", expanded=False):
+                            st.code(main_text.strip(), language=None)
 
     # 2. 检查并处理新的流式响应
     if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
