@@ -17,8 +17,7 @@ import json
 
 class GenericOpenAILLM(CustomLLM):
     """
-    通用 OpenAI 兼容 API 封装（支持 OpenRouter、DeepSeek 等）
-    已修复装饰器错误并移除冗余代码
+    General OpenAI compatible API wrapper (supporting OpenRouter, DeepSeek, etc.)
     """
     model: str = Field(description="模型名称")
     api_key: str = Field(description="API 密钥")
@@ -141,10 +140,10 @@ class GenericOpenAILLM(CustomLLM):
             for line in response.iter_lines():
                 if line:
                     line_str = line.decode('utf-8')
-                    if line_str.startswith('data: '):
-                        line_str = line_str[6:]
-                    if line_str == '[DONE]':
-                        break
+                    if line_str.startswith('data:'):
+                        line_str = line_str[len('data:'):].strip()
+                    if line_str == '[DONE]' or not line_str:
+                        continue
                     try:
                         data = json.loads(line_str)
                         if "choices" in data and len(data["choices"]) > 0:

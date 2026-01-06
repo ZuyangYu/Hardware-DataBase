@@ -11,7 +11,6 @@ from src.core.logger import log, error
 class BM25Cache:
     """
     BM25 索引缓存管理器
-
     特性:
     - 分库存储: 每个知识库独立存储为 .pkl 文件，避免单点故障
     - 按需加载: 只有在查询特定知识库时才加载其索引

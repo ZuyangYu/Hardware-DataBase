@@ -120,7 +120,7 @@ pip install -r requirements.txt
 
 ### **启动应用** :
 ```bash
-streamlit run src/streamlit_app.py
+streamlit run streamlit_app.py
 ```
 ## ⚙️ 配置说明
 

@@ -72,3 +72,11 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 os.makedirs(CHROMA_PATH, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(RERANKER_CACHE, exist_ok=True)
+
+
+def get_kb_storage_path(kb_name: str) -> str:
+    """获取知识库索引元数据(docstore.json等)的持久化路径"""
+    # 将元数据存放在 storage/index_stores/知识库名/ 下
+    path = os.path.join(STORAGE_DIR, "index_stores", kb_name)
+    os.makedirs(path, exist_ok=True)
+    return path
