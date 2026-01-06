@@ -35,6 +35,7 @@ class CustomRAGChat:
             return self._context_cache[query_hash]
 
         retrieved_nodes = hybrid_retrieve(query, self.index, self.kb_name, top_k)
+
         if not retrieved_nodes:
             return "", ""
 

@@ -7,7 +7,7 @@ from src.core.rag_pipeline import RAGPipeline
 from src.core.resource_manager import resource_manager
 from config.settings import DEFAULT_KB_NAME
 
-# ==================== 页面配置 ====================
+# ==================== 页面配置 ========================
 st.set_page_config(
     page_title="HardWare RAG",
     page_icon="😺",
@@ -15,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ==================== CSS 样式配置 ====================
+# ==================== CSS 样式配置 =====================
 st.markdown("""
 <style>
     /* ========== 1. 全局与容器调整 ========== */
@@ -138,7 +138,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ==================== 初始化逻辑 ====================
+# ==================== 初始化逻辑 ========================
 @st.cache_resource
 def init_pipeline():
     """初始化 RAG Pipeline"""
@@ -170,7 +170,7 @@ def init_session_state():
         st.session_state.error_msg = None
 
 
-# ==================== 逻辑处理回调函数 ====================
+# ==================== 逻辑处理回调函数 ===================
 def create_kb_callback(pipeline):
     """创建知识库回调"""
     name = st.session_state.get("new_kb_name_input", "").strip()
@@ -394,8 +394,6 @@ def render_chat_tab(pipeline):
                 user_msg = None
 
         with st.chat_message("assistant", avatar="😻"):
-            # 初始化变量
-            full_response = ""
             first_chunk = None
             error_occured = None
 
@@ -446,7 +444,7 @@ def render_kb_management_tab(pipeline):
     with st.container(border=True):
         st.markdown("##### 📤 当前知识库上传文档")
         files = st.file_uploader("拖拽文件到此处", accept_multiple_files=True,
-                                 type=["pdf", "txt", "md", "docx", "html", "csv"])
+                                 type=["pdf", "txt", "md", "docx", "html", "csv", "xlsx"])
         if files and st.button("开始上传", type="primary"):
             with st.status("处理中...", expanded=True) as status:
                 st.write("保存临时文件...")

@@ -2,17 +2,16 @@
 import os
 from llama_index.core import SimpleDirectoryReader
 from src.core.logger import log, error
+from config.settings import DATA_ROOT
 
 
 def get_kb_path(kb_name: str) -> str:
     """获取知识库的文件路径"""
-    from config.settings import DATA_ROOT
     return os.path.join(DATA_ROOT, kb_name)
 
 
 def list_knowledge_bases() -> list[str]:
     """列出所有知识库"""
-    from config.settings import DATA_ROOT
     os.makedirs(DATA_ROOT, exist_ok=True)
     try:
         return [
