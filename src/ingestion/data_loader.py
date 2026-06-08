@@ -1,22 +1,22 @@
 # src/ingestion/data_loader.py
 import os
 from llama_index.core import SimpleDirectoryReader
+import config.settings
 from src.core.logger import log, error
-from config.settings import DATA_ROOT
 
 
 def get_kb_path(kb_name: str) -> str:
     """获取知识库的文件路径"""
-    return os.path.join(DATA_ROOT, kb_name)
+    return os.path.join(config.settings.DATA_ROOT, kb_name)
 
 
 def list_knowledge_bases() -> list[str]:
     """列出所有知识库"""
-    os.makedirs(DATA_ROOT, exist_ok=True)
+    os.makedirs(config.settings.DATA_ROOT, exist_ok=True)
     try:
         return [
-            d for d in os.listdir(DATA_ROOT)
-            if os.path.isdir(os.path.join(DATA_ROOT, d))
+            d for d in os.listdir(config.settings.DATA_ROOT)
+            if os.path.isdir(os.path.join(config.settings.DATA_ROOT, d))
         ]
     except Exception as e:
         error(f"列出知识库失败: {e}")

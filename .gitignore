@@ -18,3 +18,7 @@ data/**
 !data/.gitkeep
 
 .idea/
+
+# Streamlit logs
+streamlit.log
+streamlit.err.log

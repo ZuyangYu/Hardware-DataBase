@@ -61,7 +61,7 @@ Hardware-RAG/
 
 ## 🛠️ 环境准备
 
-- **Python**: >= 3.10
+- **Python**: >= 3.12
 - **Ollama** : 如果计划使用本地模型，请先安装并启动 [Ollama](https://ollama.com/)。
 
 ---
@@ -124,6 +124,21 @@ streamlit run streamlit_app.py
 ```
 ## ⚙️ 配置说明
 
+支持两种配置方式：**页面配置**（推荐）和 **.env 文件配置**。
+
+### 方式一：页面配置（推荐）
+
+启动应用后，点击侧边栏的 **「⚙️ 系统配置」** 即可在页面上直接修改所有配置项，点击「应用配置」立即生效，无需手动编辑文件或重启。
+
+可配置项包括：
+- **模型配置**：Provider、API Key、模型名称、Context Window 等
+- **Embedding 配置**：独立的 API Key / Base URL / 模型（支持与 LLM 使用不同提供商）
+- **RAG 检索参数**：Chunk Size、Top-K、RRF K 等
+- **Reranker 配置**：类型（none / local / api）、模型、API
+- **系统提示词**：自定义 AI 助手人设和行为规则
+
+### 方式二：.env 文件配置
+
 在项目根目录下创建一个 .env 文件（可参考 .env.example）。
 ```
 # ==================== 模式选择 ====================
@@ -141,20 +156,28 @@ CUSTOM_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
 CUSTOM_BASE_URL=https://openrouter.ai/api/v1
 CUSTOM_LLM_MODEL=deepseek/deepseek-chat
 
+# ==================== Embedding 配置（独立） ====================
+# Embedding 可使用与 LLM 不同的 API 提供商
+CUSTOM_EMBEDDING_API_KEY=
+CUSTOM_EMBEDDING_BASE_URL=
+CUSTOM_EMBEDDING_MODEL=
+
 # [可选] 混合模式开关
 # 设置为 true 表示：使用云端 LLM 回答，但使用本地 Ollama 做向量化 (省钱且快)
 USE_OLLAMA_EMBEDDING=false
 
 # ==================== RAG 检索参数 ====================
 CHUNK_SIZE=512
+CHUNK_OVERLAP=50
 VECTOR_TOP_K=20
 BM25_TOP_K=20
-# 最终展示给大模型的片段数
 FINAL_TOP_K=5
+RRF_K=60
 
 # ==================== 重排序 (Reranker) ====================
-# 类型: none, local, ollama, api
+# 类型: none, local, api
 RERANKER_TYPE=none
+RERANKER_MODEL=BAAI/bge-reranker-v2-gemma
 ```
 ## ❓ 常见问题
 

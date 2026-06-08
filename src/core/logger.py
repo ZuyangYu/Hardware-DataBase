@@ -2,11 +2,11 @@
 import logging
 import os
 from datetime import datetime
-from config.settings import LOG_DIR
+import config.settings
 
-os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(config.settings.LOG_DIR, exist_ok=True)
 
-LOG_FILE = os.path.join(LOG_DIR, f"rag_{datetime.now().strftime('%Y-%m-%d')}.log")
+LOG_FILE = os.path.join(config.settings.LOG_DIR, f"rag_{datetime.now().strftime('%Y-%m-%d')}.log")
 
 logger = logging.getLogger("RAG")
 logger.setLevel(logging.INFO)

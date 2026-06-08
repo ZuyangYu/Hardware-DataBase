@@ -6,7 +6,7 @@ import time
 import atexit
 from typing import Optional
 from collections import defaultdict
-from config.settings import CHROMA_PATH
+import config.settings
 from src.core.model_factory import init_global_models
 from src.core.logger import log, error, warn
 
@@ -83,8 +83,15 @@ class ResourceManager:
 
     def initialize(self, force: bool = False) -> bool:
         if self._is_shutdown:
-            warn("资源管理器已关闭，无法重新初始化")
-            return False
+            warn("资源管理器已关闭，尝试重新初始化...")
+            self._is_shutdown = False
+            self._chroma_client = None
+            self._models_initialized = False
+            self._health_status = {
+                "chroma": False,
+                "models": False,
+                "last_check": None
+            }
 
         if not force and self._models_initialized and self._chroma_client is not None:
             log("资源已初始化，跳过")
@@ -136,11 +143,11 @@ class ResourceManager:
                 else:
                     self._chroma_client = None
 
-            log(f"连接 ChromaDB: {CHROMA_PATH}")
+            log(f"连接 ChromaDB: {config.settings.CHROMA_PATH}")
             for attempt in range(1, self.MAX_RETRIES + 1):
                 try:
                     self._chroma_client = chromadb.PersistentClient(
-                        path=CHROMA_PATH,
+                        path=config.settings.CHROMA_PATH,
                         settings=chromadb.Settings(allow_reset=False, anonymized_telemetry=False, is_persistent=True)
                     )
                     if self._test_chroma_connection():
@@ -169,7 +176,7 @@ class ResourceManager:
         with self._chroma_lock:
             if self._chroma_client is None or not self._test_chroma_connection():
                 if not self._initialize_chroma(force=True):
-                    raise RuntimeError(f"无法连接到 ChromaDB: {CHROMA_PATH}")
+                    raise RuntimeError(f"无法连接到 ChromaDB: {config.settings.CHROMA_PATH}")
             return self._chroma_client
 
     def health_check(self) -> dict:
@@ -189,7 +196,7 @@ class ResourceManager:
             "chroma_connected": self._chroma_client is not None,
             "is_shutdown": self._is_shutdown,
             "health_status": self._health_status.copy(),
-            "chroma_path": CHROMA_PATH
+            "chroma_path": config.settings.CHROMA_PATH
         }
 
     def shutdown(self):

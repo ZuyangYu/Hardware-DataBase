@@ -4,7 +4,7 @@ import pickle
 import threading
 import glob
 from typing import Optional, List
-from config.settings import STORAGE_DIR
+import config.settings
 from src.core.logger import log, error
 
 
@@ -33,7 +33,7 @@ class BM25Cache:
     def _initialize(self):
         """初始化"""
         # 创建专属的缓存目录
-        self.cache_dir = os.path.join(STORAGE_DIR, "bm25_indexes")
+        self.cache_dir = os.path.join(config.settings.STORAGE_DIR, "bm25_indexes")
         os.makedirs(self.cache_dir, exist_ok=True)
 
         self.rw_lock = threading.RLock()
@@ -73,7 +73,7 @@ class BM25Cache:
                 # 文件损坏则移除
                 try:
                     os.rename(file_path, file_path + ".corrupt")
-                except:
+                except OSError:
                     pass
                 return None
 

@@ -1,13 +1,21 @@
 from typing import List, Optional, Tuple
+import traceback
 import jieba
-import hashlib
 from rank_bm25 import BM25Okapi
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.schema import NodeWithScore, QueryBundle, TextNode
 from llama_index.vector_stores.chroma import ChromaVectorStore
-from config.settings import VECTOR_TOP_K, BM25_TOP_K, RRF_K, FINAL_TOP_K
+import config.settings
 from src.core.bm25_cache import BM25Cache
 from src.core.logger import log, error, warn
+
+
+def _get_chroma_collection(index: VectorStoreIndex):
+    """安全获取 ChromaDB collection 对象，收敛私有属性访问"""
+    vector_store = index._vector_store
+    if not isinstance(vector_store, ChromaVectorStore):
+        return None
+    return vector_store._collection
 
 
 def aggressive_tokenize(text: str) -> List[str]:
@@ -17,88 +25,55 @@ def aggressive_tokenize(text: str) -> List[str]:
     return [t for t in tokens if t.strip()]
 
 
-def _compute_content_hash(texts: List[str]) -> str:
-    """
-    计算文档内容的哈希值，用于检测内容是否变化
-
-    Args:
-        texts: 文档文本列表
-
-    Returns:
-        MD5 哈希值
-    """
-    combined = "".join(sorted(texts))  # 排序后拼接，确保顺序无关
-    return hashlib.md5(combined.encode('utf-8')).hexdigest()
-
-
 def build_bm25_index(kb_name: str, index: VectorStoreIndex, force_rebuild: bool = False) -> Optional[
     Tuple[BM25Okapi, List[str]]]:
     """
-    直接从 Chroma 构建 BM25 索引
-
-    修复要点：
-    1. 使用内容哈希检测变化，而非仅数量
-    2. 缓存数据结构：(bm25, ids, content_hash)
+    从 Chroma 构建 BM25 索引，带轻量级缓存校验
+    缓存格式：(bm25, ids, doc_count)
+    校验策略：数量比对 + 抽样 ID 验证（避免全量拉取文档计算哈希）
     """
     cache = BM25Cache()
-    vector_store = index._vector_store
-
-    if not isinstance(vector_store, ChromaVectorStore):
+    collection = _get_chroma_collection(index)
+    if collection is None:
         return None
-
-    collection = vector_store._collection
     current_doc_count = collection.count()
 
     if current_doc_count == 0:
         return None
 
-    # === 1. 缓存校验（使用内容哈希） ===
+    # === 1. 缓存校验（数量 + ID 集合比对） ===
     if not force_rebuild:
         cached_data = cache.get(kb_name)
-        if cached_data is not None:
-            # 新的缓存格式：(bm25, cached_ids, content_hash)
-            if len(cached_data) == 3:
-                bm25, cached_ids, cached_hash = cached_data
+        if cached_data is not None and len(cached_data) == 3:
+            bm25, cached_ids, cached_count = cached_data
 
-                # 快速检查：数量不同直接重建
-                if len(cached_ids) != current_doc_count:
-                    log(f"文档数量变更 (缓存:{len(cached_ids)} vs DB:{current_doc_count}) -> 触发重建")
-                else:
-                    # ✅ 内容哈希校验
-                    log(f"检查 BM25 缓存完整性: {kb_name}")
-                    results = collection.get(limit=None, include=["documents"])
-                    current_hash = _compute_content_hash(results.get("documents", []))
-
-                    if current_hash == cached_hash:
-                        try:
-                            sample_ids = cached_ids[:min(10, len(cached_ids))]
-                            collection.get(ids=sample_ids)
-                            log(f"⚡ BM25 缓存有效")
-                            return bm25, cached_ids
-                        except Exception as e:
-                            warn(f"缓存 ID 验证失败: {e}，触发重建")
-                    else:
-                        log(f"内容已变更 (哈希不匹配) -> 触发重建")
+            if cached_count != current_doc_count:
+                log(f"文档数量变更 (缓存:{cached_count} vs DB:{current_doc_count}) -> 触发重建")
             else:
-                # 旧格式缓存，直接重建
-                log(f"检测到旧版缓存格式，触发重建")
+                # 比对缓存 ID 集合与数据库实际 ID 集合
+                try:
+                    results = collection.get(limit=None, include=[])
+                    current_ids = set(results.get("ids", []))
+                    if set(cached_ids) == current_ids:
+                        log(f"⚡ BM25 缓存有效")
+                        return bm25, cached_ids
+                    else:
+                        log(f"文档 ID 集合变更 -> 触发重建")
+                except Exception as e:
+                    warn(f"缓存校验失败: {e}，触发重建")
+        elif cached_data is not None:
+            log(f"检测到旧版缓存格式，触发重建")
 
-    # === 2. 构建索引（直接从 Chroma 拉取） ===
+    # === 2. 构建索引 ===
     try:
         log(f"构建 BM25 索引: {kb_name} (Total: {current_doc_count} docs)")
         valid_docs_tokens = []
         valid_ids = []
 
-        # 拉取全量数据
-        results = collection.get(
-            limit=None,
-            include=["documents"]
-        )
-
+        results = collection.get(limit=None, include=["documents"])
         docs_text = results.get("documents", [])
         ids = results.get("ids", [])
 
-        # 分词处理
         for i, text in enumerate(docs_text):
             try:
                 tokens = aggressive_tokenize(text)
@@ -107,29 +82,19 @@ def build_bm25_index(kb_name: str, index: VectorStoreIndex, force_rebuild: bool 
                     valid_ids.append(ids[i])
             except Exception as e:
                 warn(f"分词失败 (跳过): {e}")
-                continue
 
         if not valid_ids:
             warn(f"知识库 {kb_name} 未能构建有效索引")
             return None
 
-        # 构建 BM25
         bm25 = BM25Okapi(valid_docs_tokens)
-
-        # ✅ 计算内容哈希
-        content_hash = _compute_content_hash(docs_text)
-
-        # 保存缓存（新格式）
-        cache.set(kb_name, (bm25, valid_ids, content_hash))
+        cache.set(kb_name, (bm25, valid_ids, current_doc_count))
 
         log(f"✅ BM25 索引构建完成，有效文档数: {len(valid_ids)}")
-        log(f"   内容哈希: {content_hash[:8]}...")
-
         return bm25, valid_ids
 
     except Exception as e:
         error(f"❌ 构建 BM25 索引失败: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
@@ -147,7 +112,7 @@ def hybrid_retrieve(
     # 1. 向量检索
     log(f"向量检索: {query[:20]}...")
     try:
-        vector_retriever = index.as_retriever(similarity_top_k=VECTOR_TOP_K)
+        vector_retriever = index.as_retriever(similarity_top_k=config.settings.VECTOR_TOP_K)
         vector_nodes = vector_retriever.retrieve(query)
         log(f"   └─ 向量检索返回: {len(vector_nodes)} 个结果")
     except Exception as e:
@@ -159,23 +124,19 @@ def hybrid_retrieve(
     bm25_data = build_bm25_index(kb_name, index)
 
     if bm25_data:
-        # ✅ 适配新的返回格式
-        if len(bm25_data) == 3:
-            bm25, node_ids, _ = bm25_data
-        else:
-            bm25, node_ids = bm25_data
+        bm25, node_ids = bm25_data[0], bm25_data[1]
 
         try:
             query_tokens = aggressive_tokenize(query)
             if query_tokens:
                 bm25_scores = bm25.get_scores(query_tokens)
-                top_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:BM25_TOP_K]
+                top_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:config.settings.BM25_TOP_K]
 
                 # 批量获取需要的节点内容
                 target_ids = [node_ids[i] for i in top_indices if bm25_scores[i] > 0.0]
 
                 if target_ids:
-                    collection = index._vector_store._collection
+                    collection = _get_chroma_collection(index)
                     try:
                         results = collection.get(ids=target_ids, include=["documents", "metadatas"])
                     except Exception as get_err:
@@ -186,7 +147,7 @@ def hybrid_retrieve(
                             try:
                                 collection.get(ids=[tid])
                                 valid_ids.append(tid)
-                            except:
+                            except Exception:
                                 pass
 
                         if not valid_ids:
@@ -216,7 +177,6 @@ def hybrid_retrieve(
                 log(f"   └─ BM25 检索返回: {len(bm25_nodes)} 个结果")
         except Exception as e:
             error(f"BM25 计算出错: {e}")
-            import traceback
             traceback.print_exc()
 
     # 3. RRF 融合
@@ -235,12 +195,14 @@ def hybrid_retrieve(
             return reranked_nodes
         except Exception as e:
             error(f"Reranker 失败: {e}")
-            return fused_nodes[:FINAL_TOP_K]
+            return fused_nodes[:config.settings.FINAL_TOP_K]
 
-    return fused_nodes[:FINAL_TOP_K]
+    return fused_nodes[:config.settings.FINAL_TOP_K]
 
 
-def rrf_fusion(vector_nodes, bm25_nodes, top_k, k=RRF_K, vector_weight=0.5, bm25_weight=0.5):
+def rrf_fusion(vector_nodes, bm25_nodes, top_k, k=None, vector_weight=0.5, bm25_weight=0.5):
+    if k is None:
+        k = config.settings.RRF_K
     scores = {}
     node_map = {}
 

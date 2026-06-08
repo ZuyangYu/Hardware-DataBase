@@ -2,11 +2,12 @@
 import os
 import shutil
 import time
+import traceback
 from typing import List, Tuple, Generator
-from llama_index.core import SimpleDirectoryReader, Settings
-from config.settings import DEFAULT_KB_NAME, DATA_ROOT, get_kb_storage_path
+import config.settings
 from src.ingestion.index_builder import get_or_build_index, invalidate_index_cache
 from src.ingestion.data_loader import get_kb_path, list_knowledge_bases
+from src.ingestion.docling_parser import parse_file
 from src.core.hybrid_retriever import invalidate_bm25_cache
 from src.core.logger import log, error, warn
 from src.core.custom_rag_chat import CustomRAGChat
@@ -26,7 +27,7 @@ class RAGPipeline:
         except Exception as e:
             error(f"❌ RAGPipeline 初始化异常: {e}")
             raise
-        os.makedirs(DATA_ROOT, exist_ok=True)
+        os.makedirs(config.settings.DATA_ROOT, exist_ok=True)
 
     def get_index(self, kb_name: str):
         """获取索引实例，内部处理了双轨持久化加载逻辑"""
@@ -56,7 +57,6 @@ class RAGPipeline:
 
         except Exception as e:
             error(f"查询出错: {e}")
-            import traceback
             traceback.print_exc()
             yield f"❌ 系统错误: {str(e)}"
 
@@ -69,9 +69,9 @@ class RAGPipeline:
         for file in files:
             file_path = file if isinstance(file, str) else file.name
             try:
-                result = self.add_document(file_path, target_kb)
-                results.append(result)
-                if "✅" in result:
+                success, msg = self.add_document(file_path, target_kb)
+                results.append(msg)
+                if success:
                     success_count += 1
             except Exception as e:
                 error(f"上传文件失败 {file_path}: {e}")
@@ -79,18 +79,20 @@ class RAGPipeline:
 
         return f"✅ 成功处理 {success_count}/{len(files)} 个文件\n" + "\n".join(results)
 
-    def add_document(self, temp_file_path: str, kb_name: str) -> str:
+    def add_document(self, temp_file_path: str, kb_name: str) -> Tuple[bool, str]:
         """
         单文件索引逻辑：
         1. 物理存盘
         2. 统一 doc_id 为文件名并入库
         3. 同步持久化 Docstore
+        Returns:
+            Tuple[bool, str]: (是否成功, 描述信息)
         """
         lock = resource_manager.get_kb_lock(kb_name)
         with lock:
             try:
                 if not os.path.exists(temp_file_path):
-                    return "❌ 临时文件不存在"
+                    return False, "❌ 临时文件不存在"
 
                 filename = os.path.basename(temp_file_path)
                 target_dir = get_kb_path(kb_name)
@@ -107,21 +109,11 @@ class RAGPipeline:
 
                 log(f"开始解析文件: {filename}")
 
-                # 加载文档
-                new_docs = SimpleDirectoryReader(input_files=[target_path])
-                documents = new_docs.load_data()
-
-                # 删除时只需要删除这个 ID，关联的所有向量和元数据都会被清理。显式注入元数据
-                for doc in documents:
-                    doc.metadata["file_name"] = filename
-                    doc.metadata["kb_name"] = kb_name
-
                 # 获取索引实例
                 index = self.get_index(kb_name)
 
-                # 使用 Index 关联的节点解析器生成 Nodes
-                # 这样做可以确保分片逻辑与索引配置完全一致
-                nodes = Settings.node_parser.get_nodes_from_documents(documents)
+                # 使用 Docling 进行布局感知解析和语义分块
+                nodes = parse_file(target_path, filename, kb_name)
 
                 if not nodes:
                     raise ValueError("文件解析后未生成任何有效节点")
@@ -134,7 +126,7 @@ class RAGPipeline:
                 # 写入向量库(Chroma)
                 index.insert_nodes(nodes)
 
-                persist_dir = get_kb_storage_path(kb_name)  # 获取路径,持久化的是文档
+                persist_dir = config.settings.get_kb_storage_path(kb_name)  # 获取路径,持久化的是文档
                 index.storage_context.persist(persist_dir=persist_dir)  # 文档持久化
 
                 # 清理相关缓存
@@ -142,7 +134,7 @@ class RAGPipeline:
                 invalidate_index_cache(kb_name)
 
                 log(f"✅ 索引及同步持久化成功: {filename} (KB: {kb_name})")
-                return f"✅ 索引成功: {filename}"
+                return True, f"✅ 索引成功: {filename}"
             except Exception as e:
                 error(f"❌ 上传文档处理失败: {e}")
                 if 'target_path' in locals() and os.path.exists(target_path):
@@ -188,7 +180,7 @@ class RAGPipeline:
                     log(f"从索引中删除 ref_doc_id: {ref_doc_id}")
 
                 # 持久化变更
-                persist_dir = get_kb_storage_path(kb_name)
+                persist_dir = config.settings.get_kb_storage_path(kb_name)
                 index.storage_context.persist(persist_dir=persist_dir)
 
                 # 删除物理文件
@@ -205,7 +197,6 @@ class RAGPipeline:
 
             except Exception as e:
                 error(f"❌ 删除文档失败: {e}")
-                import traceback
                 traceback.print_exc()
                 return f"❌ 删除失败: {str(e)}"
 
@@ -234,7 +225,7 @@ class RAGPipeline:
         彻底删除知识库（含物理文件、向量库、元数据、缓存）
         修复要点：增加完整性校验
         """
-        if kb_name == DEFAULT_KB_NAME:
+        if kb_name == config.settings.DEFAULT_KB_NAME:
             return False, "❌ 不可删除默认知识库"
 
         lock = resource_manager.get_kb_lock(kb_name)
@@ -260,7 +251,7 @@ class RAGPipeline:
                         errors.append(f"源文件: {e}")
 
                 # === 3. 删除持久化元数据目录 ===
-                persist_dir = get_kb_storage_path(kb_name)
+                persist_dir = config.settings.get_kb_storage_path(kb_name)
                 if os.path.exists(persist_dir):
                     try:
                         shutil.rmtree(persist_dir)

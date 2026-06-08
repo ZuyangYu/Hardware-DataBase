@@ -7,7 +7,7 @@ from llama_index.core.schema import TextNode
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from src.core.logger import log, error, warn
 from src.core.resource_manager import resource_manager
-from config.settings import get_kb_storage_path
+import config.settings
 from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.core.storage.index_store import SimpleIndexStore
 
@@ -111,7 +111,7 @@ def get_or_build_index(kb_name: str, chroma_client, use_cache: bool = True) -> V
                 return cached_index
 
         try:
-            persist_dir = get_kb_storage_path(kb_name)
+            persist_dir = config.settings.get_kb_storage_path(kb_name)
             coll_name = f"kb_{kb_name}"
             collection = chroma_client.get_or_create_collection(coll_name)
             vector_store = ChromaVectorStore(chroma_collection=collection)
@@ -200,3 +200,9 @@ def get_or_build_index(kb_name: str, chroma_client, use_cache: bool = True) -> V
 def invalidate_index_cache(kb_name: str):
     """清除索引缓存"""
     _index_cache.invalidate(kb_name)
+
+
+def clear_all_index_cache():
+    """清除所有索引缓存（配置变更时调用）"""
+    with _index_cache._lock:
+        _index_cache._cache.clear()
