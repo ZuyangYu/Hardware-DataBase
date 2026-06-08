@@ -3,13 +3,13 @@ import os
 import threading
 from typing import Optional, Dict
 from llama_index.core import VectorStoreIndex, StorageContext, load_index_from_storage
+from llama_index.core.schema import TextNode
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from src.core.logger import log, error, warn
+from src.core.resource_manager import resource_manager
+import config.settings
 from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.core.storage.index_store import SimpleIndexStore
-from llama_index.core.schema import TextNode, Document
-from src.core.logger import log, error, warn
-from config.settings import STORAGE_DIR
-
 
 class _IndexCache:
     def __init__(self):
@@ -33,220 +33,176 @@ class _IndexCache:
 _index_cache = _IndexCache()
 
 
+def _rebuild_docstore_from_chroma(collection, vector_store) -> VectorStoreIndex:
+    """
+    从 Chroma 重建 Docstore
+
+    这是一个独立的辅助函数，只在 docstore 损坏/丢失且 Chroma 有数据时调用
+
+    Args:
+        collection: Chroma collection 对象
+        vector_store: ChromaVectorStore 实例
+
+    Returns:
+        重建后的索引
+    """
+    chroma_count = collection.count()
+
+    # 1. 批量拉取所有数据
+    results = collection.get(limit=None, include=["documents", "metadatas", "embeddings"])
+    # 2. 重建节点
+    nodes = []
+
+    for i, (doc_id, text, meta, embedding) in enumerate(zip(
+            results["ids"],
+            results["documents"],
+            results["metadatas"],
+            results.get("embeddings", [None] * len(results["ids"]))
+    )):
+        node = TextNode(
+            text=text,
+            id_=doc_id,
+            metadata=meta or {},
+            embedding=embedding  # 保留嵌入信息
+        )
+        nodes.append(node)
+
+        if (i + 1) % 100 == 0:
+            log(f"   进度: {i + 1}/{chroma_count} 个节点")
+
+    # 3. 创建索引（会正确初始化 docstore）
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    # 1. 创建空索引（连接到现有的 vector_store）
+    index = VectorStoreIndex.from_vector_store(
+        vector_store=vector_store,
+        storage_context=storage_context
+    )
+
+    # 2. 手动填充 docstore（不插入向量，因为 Chroma 已有）
+    for node in nodes:
+        index.docstore.add_documents([node], allow_update=True)
+
+    log(f"✅ Docstore 重建完成: {len(index.docstore.docs)} 个节点")
+
+    return index
+
+
 def get_or_build_index(kb_name: str, chroma_client, use_cache: bool = True) -> VectorStoreIndex:
-    # 1. 缓存层
+    """
+    获取或构建索引：支持 Chroma + Docstore 双轨持久化
+
+    修复要点：
+    1. 当 docstore 丢失时，从 Chroma 完整重建
+    2. 确保 docstore 和向量库的强一致性
+    3. 空库使用标准构造函数，避免 docstore 初始化不完整
+    """
     if use_cache:
         cached_index = _index_cache.get(kb_name)
         if cached_index is not None:
             return cached_index
 
-    try:
-        coll_name = f"kb_{kb_name}"
-        collection = chroma_client.get_or_create_collection(coll_name)
-        vector_store = ChromaVectorStore(chroma_collection=collection)
+    lock = resource_manager.get_kb_lock(kb_name)
+    with lock:
+        # 双重检查
+        if use_cache:
+            cached_index = _index_cache.get(kb_name)
+            if cached_index is not None:
+                return cached_index
 
-        # 持久化目录
-        kb_persist_dir = os.path.join(STORAGE_DIR, f"docstore_{kb_name}")
-        os.makedirs(kb_persist_dir, exist_ok=True)
-
-        vector_count = collection.count()
-
-        # 尝试从磁盘恢复 StorageContext
         try:
-            storage_context = StorageContext.from_defaults(
-                vector_store=vector_store,
-                persist_dir=kb_persist_dir
-            )
+            persist_dir = config.settings.get_kb_storage_path(kb_name)
+            coll_name = f"kb_{kb_name}"
+            collection = chroma_client.get_or_create_collection(coll_name)
+            vector_store = ChromaVectorStore(chroma_collection=collection)
 
-            if vector_count > 0:
-                log(f"从磁盘加载完整索引: {kb_name}")
-                index = load_index_from_storage(storage_context, vector_store=vector_store)
+            docstore_path = os.path.join(persist_dir, "docstore.json")
 
-                # ✅ 验证 DocStore 完整性
-                if _validate_docstore(index, collection):
-                    log(f"✅ DocStore 验证通过: {kb_name}")
-                else:
-                    # DocStore 不完整，需要重建
-                    warn(f"检测到 DocStore 与 ChromaDB 不一致,正在修复...")
-                    index = _rebuild_docstore_from_chroma(vector_store, kb_persist_dir, collection)
-            else:
-                # Chroma 空，初始化空索引
-                index = VectorStoreIndex.from_documents([], storage_context=storage_context)
+            # === 场景1: Docstore 存在 - 直接加载 ===
+            if os.path.exists(docstore_path):
+                try:
+                    log(f"📂 加载已有索引: {kb_name}")
+                    storage_context = StorageContext.from_defaults(
+                        vector_store=vector_store,
+                        persist_dir=persist_dir
+                    )
+                    index = load_index_from_storage(storage_context)
 
-        except Exception as e:
-            warn(f"DocStore 加载失败 ({e})，正在重建...")
+                    # ✅ 校验一致性
+                    docstore_count = len(index.docstore.docs)
+                    chroma_count = collection.count()
 
-            if vector_count > 0:
-                # 从 ChromaDB 重建
-                index = _rebuild_docstore_from_chroma(vector_store, kb_persist_dir, collection)
-            else:
-                # 初始化空索引
-                docstore = SimpleDocumentStore()
-                index_store = SimpleIndexStore()
+                    if docstore_count == chroma_count:
+                        log(f"✅ 索引加载成功，共 {docstore_count} 个节点")
+                        if use_cache:
+                            _index_cache.set(kb_name, index)
+                        return index
+                    else:
+                        # 数据不一致，需要重建
+                        warn(f"数据不一致! Docstore:{docstore_count} vs Chroma:{chroma_count}")
+                        warn(f"触发完整重建...")
+                        raise ValueError("数据不一致")
+
+                except Exception as e:
+                    error(f"❌ 加载索引失败: {e}")
+                    # 继续执行下面的重建逻辑
+                    pass
+
+            # === 场景2: Docstore 不存在 - 根据 Chroma 状态决定策略 ===
+            chroma_count = collection.count()
+            if chroma_count == 0:
+                # ✅ 情况A: 空库 - 直接创建标准空索引
+                log(f"✨ 创建新知识库索引: {kb_name}")
+
+                # 关键：使用 VectorStoreIndex
+                # 构建索引
                 storage_context = StorageContext.from_defaults(
                     vector_store=vector_store,
-                    docstore=docstore,
-                    index_store=index_store
+                    docstore=SimpleDocumentStore(),
+                    index_store=SimpleIndexStore()
                 )
-                log(f"🆕 初始化空索引: {kb_name}")
-                index = VectorStoreIndex.from_documents([], storage_context=storage_context)
-                index.storage_context.persist(persist_dir=kb_persist_dir)
 
-        # 3. 缓存
-        if use_cache:
-            _index_cache.set(kb_name, index)
-        return index
+                # 使用标准构造函数，传入空列表 [] 而不是 from_vector_store
+                index = VectorStoreIndex(
+                    nodes=[],
+                    storage_context=storage_context
+                )
 
-    except Exception as e:
-        error(f"❌ 索引构建严重失败: {kb_name} - {e}")
-        raise
+                # 立即执行一次持久化，强制生成非空的初始 JSON 结构
+                index.storage_context.persist(persist_dir=persist_dir)
 
+                log(f"✅ 空索引创建完成")
+                log(f"   └─ Docstore 初始化: {len(index.docstore.docs)} 个节点")
+            else:
+                # ✅ 情况B: Chroma 有数据但 docstore 丢失 - 重建
+                log(f"🔧 检测到 Chroma 有 {chroma_count} 个节点，但 docstore 丢失")
+                log(f"开始从 Chroma 重建...")
+                index = _rebuild_docstore_from_chroma(collection, vector_store)
+                log(f"✅ Docstore 重建完成")
 
-def _validate_docstore(index: VectorStoreIndex, collection) -> bool:
-    """验证 DocStore 是否完整"""
-    try:
-        docstore = index.docstore
-        chroma_count = collection.count()
-
-        # 获取几个 ID 测试
-        results = collection.get(limit=min(10, chroma_count), include=["metadatas"])
-        test_ids = results.get("ids", [])
-
-        missing_count = 0
-        for node_id in test_ids:
+            # === 持久化到磁盘 ===
             try:
-                docstore.get_node(node_id)
-            except:
-                missing_count += 1
-
-        if missing_count > 0:
-            warn(f"DocStore 缺失率过高: {missing_count}/{len(test_ids)}")
-            return False
-
-        return True
-
-    except Exception as e:
-        warn(f"验证 DocStore 失败: {e}")
-        return False
-
-
-def _rebuild_docstore_from_chroma(
-        vector_store: ChromaVectorStore,
-        kb_persist_dir: str,
-        collection
-) -> VectorStoreIndex:
-    """
-    从 ChromaDB 重建 DocStore
-    正确创建 TextNode，不直接设置 ref_doc_id
-    """
-    log("从 ChromaDB 重建 DocStore...")
-
-    # 创建新的存储组件
-    docstore = SimpleDocumentStore()
-    index_store = SimpleIndexStore()
-
-    storage_context = StorageContext.from_defaults(
-        vector_store=vector_store,
-        docstore=docstore,
-        index_store=index_store
-    )
-
-    try:
-        # 获取所有数据
-        results = collection.get(include=["documents", "metadatas", "embeddings"])
-
-        node_count = len(results["ids"])
-        log(f"从 ChromaDB 获取到 {node_count} 个节点")
-
-        success_count = 0
-
-        # ✅ 关键修复：正确创建节点
-        for idx, node_id in enumerate(results["ids"]):
-            try:
-                text = results["documents"][idx]
-                metadata = results["metadatas"][idx]
-
-                # 方案1: 如果有 doc_id，创建 Document
-                doc_id = metadata.get("doc_id") or metadata.get("ref_doc_id")
-
-                if doc_id:
-                    # 创建 Document（会自动设置 doc_id）
-                    doc = Document(
-                        text=text,
-                        id_=doc_id,
-                        metadata=metadata,
-                        excluded_embed_metadata_keys=["file_name", "file_path"],
-                        excluded_llm_metadata_keys=["file_name", "file_path"]
-                    )
-                    docstore.add_documents([doc])
-
-                    # 再创建对应的 TextNode
-                    node = TextNode(
-                        text=text,
-                        id_=node_id,
-                        metadata=metadata,
-                        excluded_embed_metadata_keys=["file_name", "file_path"],
-                        excluded_llm_metadata_keys=["file_name", "file_path"]
-                    )
-                    # ✅ 通过 relationships 关联 Document
-                    from llama_index.core.schema import NodeRelationship, RelatedNodeInfo
-                    node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                        node_id=doc_id,
-                        metadata={}
-                    )
-                    docstore.add_documents([node])
-                else:
-                    # 如果没有 doc_id，直接创建独立 TextNode
-                    node = TextNode(
-                        text=text,
-                        id_=node_id,
-                        metadata=metadata,
-                        excluded_embed_metadata_keys=["file_name", "file_path"],
-                        excluded_llm_metadata_keys=["file_name", "file_path"]
-                    )
-                    docstore.add_documents([node])
-
-                success_count += 1
-
+                index.storage_context.persist(persist_dir=persist_dir)
+                log(f"💾 索引已持久化: {persist_dir}")
             except Exception as e:
-                warn(f"重建节点失败 {node_id}: {e}")
-                continue
+                error(f"❌ 持久化失败: {e}")
+                # 不抛出异常，允许继续使用内存中的索引
 
-        log(f"✅ DocStore 重建完成,成功 {success_count}/{node_count} 个节点")
+            if use_cache:
+                _index_cache.set(kb_name, index)
+            return index
 
-        # 验证重建结果
-        if success_count == 0:
-            error("❌ DocStore 验证失败: 没有节点被正确保存!")
-            log(f"DocStore 内容: {len(docstore.docs)} 个文档")
-
-        # 持久化
-        log("💾 正在持久化 DocStore...")
-        storage_context.persist(persist_dir=kb_persist_dir)
-
-        # 验证文件大小
-        docstore_path = os.path.join(kb_persist_dir, "docstore.json")
-        if os.path.exists(docstore_path):
-            size = os.path.getsize(docstore_path)
-            if size < 100:  # 小于 100 字节说明基本是空的
-                warn(f"DocStore 文件过小: {size} bytes")
-
-        log("已保存重建的 DocStore")
-
-        # 从重建的 storage_context 创建索引
-        index = VectorStoreIndex.from_vector_store(
-            vector_store=vector_store,
-            storage_context=storage_context
-        )
-
-        return index
-
-    except Exception as e:
-        error(f"❌ 重建 DocStore 失败: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+        except Exception as e:
+            error(f"❌ 索引加载失败: {kb_name} - {e}")
+            raise
 
 
 def invalidate_index_cache(kb_name: str):
     """清除索引缓存"""
     _index_cache.invalidate(kb_name)
+
+
+def clear_all_index_cache():
+    """清除所有索引缓存（配置变更时调用）"""
+    with _index_cache._lock:
+        _index_cache._cache.clear()

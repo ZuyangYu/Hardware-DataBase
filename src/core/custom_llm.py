@@ -1,8 +1,9 @@
 # src/core/custom_llm.py
-from typing import Any, Sequence, List
+from typing import Any, Sequence, List, Generator
 from llama_index.core.llms import (
     CustomLLM,
     ChatResponse,
+    ChatResponseGen,
     CompletionResponse,
     CompletionResponseGen,
     LLMMetadata,
@@ -11,12 +12,12 @@ from llama_index.core.base.llms.types import ChatMessage, MessageRole
 from llama_index.core.llms.callbacks import llm_completion_callback, llm_chat_callback
 from pydantic import Field
 import requests
+import json
 
 
 class GenericOpenAILLM(CustomLLM):
     """
-    通用 OpenAI 兼容 API 封装（支持 OpenRouter、DeepSeek 等）
-    已修复装饰器错误并移除冗余代码
+    General OpenAI compatible API wrapper (supporting OpenRouter, DeepSeek, etc.)
     """
     model: str = Field(description="模型名称")
     api_key: str = Field(description="API 密钥")
@@ -35,7 +36,6 @@ class GenericOpenAILLM(CustomLLM):
             is_chat_model=True,
         )
 
-    # ✅ complete 返回 CompletionResponse -> 使用 llm_completion_callback
     @llm_completion_callback()
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
         messages = [{"role": "user", "content": prompt}]
@@ -44,55 +44,66 @@ class GenericOpenAILLM(CustomLLM):
 
     @llm_completion_callback()
     def stream_complete(self, prompt: str, **kwargs: Any) -> CompletionResponseGen:
-        raise NotImplementedError("流式补全暂不支持")
+        messages = [{"role": "user", "content": prompt}]
 
-    # ✅ chat 返回 ChatResponse -> 必须使用 llm_chat_callback
+        def gen() -> CompletionResponseGen:
+            text = ""
+            for chunk in self._stream_api_call(messages, **kwargs):
+                text += chunk
+                yield CompletionResponse(delta=chunk, text=text)
+
+        return gen()
+
     @llm_chat_callback()
     def chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
-        # 将 LlamaIndex 消息对象转为 API 字典
+        api_messages = [
+            {"role": msg.role.value if hasattr(msg.role, 'value') else str(msg.role),
+             "content": msg.content}
+            for msg in messages
+        ]
+        response_text = self._call_api(api_messages, **kwargs)
+        return ChatResponse(
+            message=ChatMessage(role=MessageRole.ASSISTANT, content=response_text),
+            raw={"model": self.model, "usage": {}}
+        )
+
+    @llm_chat_callback()
+    def stream_chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponseGen:
         api_messages = [
             {"role": msg.role.value if hasattr(msg.role, 'value') else str(msg.role),
              "content": msg.content}
             for msg in messages
         ]
 
-        response_text = self._call_api(api_messages, **kwargs)
+        def gen() -> ChatResponseGen:
+            content = ""
+            for chunk in self._stream_api_call(api_messages, **kwargs):
+                content += chunk
+                yield ChatResponse(
+                    message=ChatMessage(role=MessageRole.ASSISTANT, content=content),
+                    delta=chunk,
+                )
 
-        return ChatResponse(
-            message=ChatMessage(role=MessageRole.ASSISTANT, content=response_text),
-            raw={"model": self.model, "usage": {}}
-        )
-
-    # ✅ stream_chat 也应该对应 chat callback (虽然这里未实现)
-    @llm_chat_callback()
-    def stream_chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> CompletionResponseGen:
-        raise NotImplementedError("流式聊天暂不支持")
+        return gen()
 
     def _call_api(self, messages: List[dict], **kwargs) -> str:
         url = f"{self.api_base.rstrip('/')}/chat/completions"
-
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
         }
-
         if "extra_headers" in kwargs:
             headers.update(kwargs["extra_headers"])
-
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": kwargs.get("temperature", self.temperature),
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
         }
-
         try:
-            response = requests.post(
-                url, headers=headers, json=payload, timeout=self.timeout
-            )
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
-
             if "choices" in data and len(data["choices"]) > 0:
                 content = data["choices"][0]["message"]["content"]
                 if not content or not content.strip():
@@ -100,7 +111,6 @@ class GenericOpenAILLM(CustomLLM):
                 return content
             else:
                 raise ValueError(f"API 响应格式错误: {data}")
-
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
                 raise RuntimeError("API 请求频率过高 (429)，请稍后重试。")
@@ -108,3 +118,46 @@ class GenericOpenAILLM(CustomLLM):
                 raise RuntimeError(f"API 调用失败: {e}")
         except Exception as e:
             raise RuntimeError(f"请求异常: {e}")
+
+    def _stream_api_call(self, messages: List[dict], **kwargs) -> Generator[str, None, None]:
+        url = f"{self.api_base.rstrip('/')}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        if "extra_headers" in kwargs:
+            headers.update(kwargs["extra_headers"])
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": kwargs.get("temperature", self.temperature),
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+            "stream": True,
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout, stream=True)
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    line_str = line.decode('utf-8')
+                    if line_str.startswith('data:'):
+                        line_str = line_str[len('data:'):].strip()
+                    if line_str == '[DONE]' or not line_str:
+                        continue
+                    try:
+                        data = json.loads(line_str)
+                        if "choices" in data and len(data["choices"]) > 0:
+                            delta = data["choices"][0].get("delta", {})
+                            content = delta.get("content")
+                            if content:
+                                yield content
+                    except json.JSONDecodeError:
+                        continue
+        except requests.exceptions.HTTPError as e:
+            error_body = e.response.text
+            if e.response.status_code == 429:
+                raise RuntimeError("API 请求频率过高 (429)，请稍后重试。")
+            else:
+                raise RuntimeError(f"API 调用失败: {e}. Body: {error_body}")
+        except Exception as e:
+            raise RuntimeError(f"流式请求异常: {e}")

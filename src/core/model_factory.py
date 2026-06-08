@@ -1,19 +1,14 @@
 # src/core/model_factory.py
-"""
-模型工厂 - 统一的模型初始化模块
-支持两种模式：
-1. ollama: 本地 Ollama 服务
-2. custom: 所有第三方 API（OpenAI、OpenRouter、DeepSeek 等）
-"""
+import os
+import config.settings
 from llama_index.core import Settings
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
 from src.core.custom_embedding import OpenRouterEmbedding
 from llama_index.core.postprocessor import SentenceTransformerRerank
-from config.settings import *
 from llama_index.core.node_parser import SentenceSplitter
 from src.core.logger import log, error, warn
-from src.core.custom_reranker import OllamaReranker, APIReranker, NoReranker
+from src.core.custom_reranker import APIReranker, NoReranker
 from src.core.custom_llm import GenericOpenAILLM
 
 
@@ -27,7 +22,7 @@ def init_global_models():
     """
     try:
         log("=" * 60)
-        log(f"初始化模型 Provider: {PROVIDER.name.upper()}")
+        log(f"初始化模型 Provider: {config.settings.PROVIDER.name.upper()}")
         log("=" * 60)
 
         # 1. 初始化 LLM
@@ -38,15 +33,16 @@ def init_global_models():
 
         # 3. 初始化 Reranker
         _init_reranker()
+
         # 4. 初始化 分词器
         text_splitter = SentenceSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP
+            chunk_size=config.settings.CHUNK_SIZE,
+            chunk_overlap=config.settings.CHUNK_OVERLAP
         )
 
         Settings.text_splitter = text_splitter
         Settings.node_parser = text_splitter
-        log(f"全局分词器已配置: Size={CHUNK_SIZE}, Overlap={CHUNK_OVERLAP}")
+        log(f"全局分词器已配置: Size={config.settings.CHUNK_SIZE}, Overlap={config.settings.CHUNK_OVERLAP}")
 
         log("=" * 60)
         log("✅ 全局模型初始化完成")
@@ -65,21 +61,21 @@ def _init_llm():
     - custom: 第三方 API 服务
     """
     try:
-        if PROVIDER == Provider.OLLAMA:
+        if config.settings.PROVIDER == config.settings.Provider.OLLAMA:
             # ==================== Ollama 本地模型 ====================
             Settings.llm = Ollama(
-                model=OLLAMA_LLM_MODEL,
-                base_url=OLLAMA_BASE_URL,
+                model=config.settings.OLLAMA_LLM_MODEL,
+                base_url=config.settings.OLLAMA_BASE_URL,
                 request_timeout=360
             )
             log(f"LLM: Ollama")
-            log(f"   ├─ 模型: {OLLAMA_LLM_MODEL}")
-            log(f"   └─ 地址: {OLLAMA_BASE_URL}")
+            log(f"   ├─ 模型: {config.settings.OLLAMA_LLM_MODEL}")
+            log(f"   └─ 地址: {config.settings.OLLAMA_BASE_URL}")
 
-        elif PROVIDER == Provider.CUSTOM:
+        elif config.settings.PROVIDER == config.settings.Provider.CUSTOM:
             # ==================== 自定义 API =========================
             # 验证必要参数
-            if not CUSTOM_API_KEY or not CUSTOM_BASE_URL or not CUSTOM_LLM_MODEL:
+            if not config.settings.CUSTOM_API_KEY or not config.settings.CUSTOM_BASE_URL or not config.settings.CUSTOM_LLM_MODEL:
                 error("❌ CUSTOM 模式需要设置以下参数:")
                 error("   - CUSTOM_API_KEY")
                 error("   - CUSTOM_BASE_URL")
@@ -88,21 +84,21 @@ def _init_llm():
 
             # 使用自定义LLM封装
             Settings.llm = GenericOpenAILLM(
-                model=CUSTOM_LLM_MODEL,
-                api_key=CUSTOM_API_KEY,
-                api_base=CUSTOM_BASE_URL,
-                context_window=CUSTOM_CONTEXT_WINDOW,
-                max_tokens=CUSTOM_MAX_TOKENS
+                model=config.settings.CUSTOM_LLM_MODEL,
+                api_key=config.settings.CUSTOM_API_KEY,
+                api_base=config.settings.CUSTOM_BASE_URL,
+                context_window=config.settings.CUSTOM_CONTEXT_WINDOW,
+                max_tokens=config.settings.CUSTOM_MAX_TOKENS
             )
 
             log(f"LLM: 自定义 API")
-            log(f"   ├─ 模型: {CUSTOM_LLM_MODEL}")
-            log(f"   ├─ 地址: {CUSTOM_BASE_URL}")
-            log(f"   ├─ 上下文: {CUSTOM_CONTEXT_WINDOW}")
-            log(f"   └─ 最大Token: {CUSTOM_MAX_TOKENS}")
+            log(f"   ├─ 模型: {config.settings.CUSTOM_LLM_MODEL}")
+            log(f"   ├─ 地址: {config.settings.CUSTOM_BASE_URL}")
+            log(f"   ├─ 上下文: {config.settings.CUSTOM_CONTEXT_WINDOW}")
+            log(f"   └─ 最大Token: {config.settings.CUSTOM_MAX_TOKENS}")
 
         else:
-            raise ValueError(f"❌ 未知的 Provider: {PROVIDER}")
+            raise ValueError(f"❌ 未知的 Provider: {config.settings.PROVIDER}")
 
     except Exception as e:
         error(f"❌ LLM 初始化失败: {e}")
@@ -119,49 +115,46 @@ def _init_embedding():
     注意：很多第三方 API 不支持 Embedding，推荐使用本地 Ollama
     """
     try:
-        if PROVIDER == Provider.OLLAMA or USE_OLLAMA_EMBEDDING:
+        if config.settings.PROVIDER == config.settings.Provider.OLLAMA or config.settings.USE_OLLAMA_EMBEDDING:
             # ==================== Ollama Embedding ====================
             # 两种情况会使用 Ollama：
             # 1. Provider 本身就是 ollama
             # 2. 强制设置 USE_OLLAMA_EMBEDDING=true（混合模式）
 
             Settings.embed_model = OllamaEmbedding(
-                model_name=OLLAMA_EMBEDDING_MODEL,
-                base_url=OLLAMA_BASE_URL
+                model_name=config.settings.OLLAMA_EMBEDDING_MODEL,
+                base_url=config.settings.OLLAMA_BASE_URL
             )
 
-            if USE_OLLAMA_EMBEDDING and PROVIDER == Provider.CUSTOM: # 判断是不是混合模式
+            if config.settings.USE_OLLAMA_EMBEDDING and config.settings.PROVIDER == config.settings.Provider.CUSTOM: # 判断是不是混合模式
                 log(f"Embedding: Ollama（混合模式）")
                 log(f"LLM 用第三方 API，Embedding 用本地 Ollama")
             else:
                 log(f"Embedding: Ollama")
 
-            log(f"   ├─ 模型: {OLLAMA_EMBEDDING_MODEL}")
-            log(f"   └─ 地址: {OLLAMA_BASE_URL}")
+            log(f"   ├─ 模型: {config.settings.OLLAMA_EMBEDDING_MODEL}")
+            log(f"   └─ 地址: {config.settings.OLLAMA_BASE_URL}")
 
-        elif PROVIDER == Provider.CUSTOM:
+        elif config.settings.PROVIDER == config.settings.Provider.CUSTOM:
             # ==================== 第三方 API Embedding ====================
-            # 只在明确不使用 Ollama 时才会走到这里
-            if not CUSTOM_EMBEDDING_MODEL:
-                warn("未设置 CUSTOM_EMBEDDING_MODEL")
+            if not config.settings.CUSTOM_EMBEDDING_MODEL:
+                warn("未设置 CUSTOM_EMBEDDING_MODEL，请设置 USE_OLLAMA_EMBEDDING=true 使用本地 Ollama")
                 Settings.embed_model = None
             else:
-                embedding_model = CUSTOM_EMBEDDING_MODEL
-
-            warn("注意：很多第三方 API 不支持 Embedding")
-            warn("如遇到错误，请设置 USE_OLLAMA_EMBEDDING=true")
-
-            Settings.embed_model = OpenRouterEmbedding(
-                model=CUSTOM_EMBEDDING_MODEL,
-                api_key=CUSTOM_API_KEY,
-                api_base=CUSTOM_BASE_URL
-            )
-            log(f"Embedding: 自定义 API")
-            log(f"   ├─ 模型: {embedding_model}")
-            log(f"   └─ 地址: {CUSTOM_BASE_URL}")
+                # 优先使用 Embedding 专用 API，未设置则回退到 LLM 的 API
+                emb_api_key = config.settings.CUSTOM_EMBEDDING_API_KEY or config.settings.CUSTOM_API_KEY
+                emb_api_base = config.settings.CUSTOM_EMBEDDING_BASE_URL or config.settings.CUSTOM_BASE_URL
+                Settings.embed_model = OpenRouterEmbedding(
+                    model=config.settings.CUSTOM_EMBEDDING_MODEL,
+                    api_key=emb_api_key,
+                    api_base=emb_api_base
+                )
+                log(f"Embedding: 自定义 API")
+                log(f"   ├─ 模型: {config.settings.CUSTOM_EMBEDDING_MODEL}")
+                log(f"   └─ 地址: {emb_api_base}")
 
         else:
-            raise ValueError(f"❌ 未知的 Provider: {PROVIDER}")
+            raise ValueError(f"❌ 未知的 Provider: {config.settings.PROVIDER}")
 
     except Exception as e:
         error(f"❌ Embedding 初始化失败: {e}")
@@ -174,76 +167,62 @@ def _init_reranker():
 
     Reranker 用于对检索结果进行二次排序，提高精度
 
-    支持四种模式：
+    支持三种模式：
     - none: 不使用 Reranker（最快，精度一般）
     - local: 本地 Sentence Transformer 模型（精度高，需要下载模型）
-    - ollama: 使用 Ollama 模拟 Reranker（兼容性好）
     - api: 使用 API 服务（需要付费）
     """
     try:
-        if RERANKER_TYPE == RerankerType.NONE:
+        if config.settings.RERANKER_TYPE == config.settings.RerankerType.NONE:
             # ==================== 不使用 Reranker ====================
-            Settings.node_postprocessors = [NoReranker(top_n=FINAL_TOP_K)]
-            log(f"Reranker: 不使用（直接返回 Top {FINAL_TOP_K}）")
+            Settings.node_postprocessors = [NoReranker(top_n=config.settings.FINAL_TOP_K)]
+            log(f"Reranker: 不使用（直接返回 Top {config.settings.FINAL_TOP_K}）")
 
-        elif RERANKER_TYPE == RerankerType.LOCAL:
+        elif config.settings.RERANKER_TYPE == config.settings.RerankerType.LOCAL:
             # ==================== 本地 Reranker ====================
-            # 设置模型缓存目录
-            os.environ['SENTENCE_TRANSFORMERS_HOME'] = RERANKER_CACHE
+            # 设置模型缓存目录, SentenceTransformer 会自动检查此目录
+            # 如果模型已存在,则直接加载,否则会自动下载
+            os.environ['SENTENCE_TRANSFORMERS_HOME'] = config.settings.RERANKER_CACHE
 
             Settings.node_postprocessors = [
                 SentenceTransformerRerank(
-                    top_n=FINAL_TOP_K,
-                    model=RERANKER_MODEL
+                    top_n=config.settings.FINAL_TOP_K,
+                    model=config.settings.RERANKER_MODEL
                 )
             ]
             log(f"Reranker: 本地模型")
-            log(f"   ├─ 模型: {RERANKER_MODEL}")
-            log(f"   ├─ Top-N: {FINAL_TOP_K}")
-            log(f"   └─ 缓存: {RERANKER_CACHE}")
+            log(f"   ├─ 模型: {config.settings.RERANKER_MODEL}")
+            log(f"   ├─ Top-N: {config.settings.FINAL_TOP_K}")
+            log(f"   └─ 缓存/本地路径: {config.settings.RERANKER_CACHE}")
 
-        elif RERANKER_TYPE == RerankerType.OLLAMA:
-            # ==================== Ollama Reranker ====================
-            Settings.node_postprocessors = [
-                OllamaReranker(
-                    model=OLLAMA_RERANKER_MODEL,
-                    base_url=OLLAMA_BASE_URL,
-                    top_n=FINAL_TOP_K
-                )
-            ]
-            log(f"Reranker: Ollama")
-            log(f"   ├─ 模型: {OLLAMA_RERANKER_MODEL}")
-            log(f"   ├─ 地址: {OLLAMA_BASE_URL}")
-            log(f"   └─ Top-N: {FINAL_TOP_K}")
-
-        elif RERANKER_TYPE == RerankerType.API:
+        elif config.settings.RERANKER_TYPE == config.settings.RerankerType.API:
             # ==================== API Reranker ====================
-            api_key = RERANKER_API_KEY or CUSTOM_API_KEY
+            api_key = config.settings.RERANKER_API_KEY or config.settings.CUSTOM_API_KEY
 
             if not api_key:
                 warn("Reranker API Key 未设置")
 
             Settings.node_postprocessors = [
                 APIReranker(
-                    model=RERANKER_MODEL,
+                    model=config.settings.RERANKER_MODEL,
                     api_key=api_key,
-                    api_base=RERANKER_API_BASE,
-                    top_n=FINAL_TOP_K
+                    api_base=config.settings.RERANKER_API_BASE,
+                    top_n=config.settings.FINAL_TOP_K
                 )
             ]
             log(f"Reranker: API")
-            log(f"   ├─ 模型: {RERANKER_MODEL}")
-            log(f"   ├─ 地址: {RERANKER_API_BASE}")
-            log(f"   └─ Top-N: {FINAL_TOP_K}")
+            log(f"   ├─ 模型: {config.settings.RERANKER_MODEL}")
+            log(f"   ├─ 地址: {config.settings.RERANKER_API_BASE}")
+            log(f"   └─ Top-N: {config.settings.FINAL_TOP_K}")
 
         else:
-            warn(f"未知的 Reranker 类型: {RERANKER_TYPE}")
-            Settings.node_postprocessors = [NoReranker(top_n=FINAL_TOP_K)]
+            warn(f"未知的 Reranker 类型: {config.settings.RERANKER_TYPE}")
+            Settings.node_postprocessors = [NoReranker(top_n=config.settings.FINAL_TOP_K)]
 
     except Exception as e:
         error(f"❌ Reranker 初始化失败: {e}")
         warn("降级到不使用 Reranker")
-        Settings.node_postprocessors = [NoReranker(top_n=FINAL_TOP_K)]
+        Settings.node_postprocessors = [NoReranker(top_n=config.settings.FINAL_TOP_K)]
 
 
 def get_current_config() -> dict:
@@ -254,16 +233,16 @@ def get_current_config() -> dict:
         dict: 当前配置的字典
     """
     config = {
-        "provider": PROVIDER.name,
-        "llm_model": OLLAMA_LLM_MODEL if PROVIDER == Provider.OLLAMA else CUSTOM_LLM_MODEL,
-        "embedding_model": OLLAMA_EMBEDDING_MODEL if (
-                PROVIDER == Provider.OLLAMA or USE_OLLAMA_EMBEDDING) else CUSTOM_EMBEDDING_MODEL,
-        "use_ollama_embedding": USE_OLLAMA_EMBEDDING,
-        "reranker_type": RERANKER_TYPE.name,
-        "reranker_model": RERANKER_MODEL if RERANKER_TYPE != RerankerType.NONE else None,
-        "final_top_k": FINAL_TOP_K,
-        "chunk_size": CHUNK_SIZE,
-        "chunk_overlap": CHUNK_OVERLAP,
+        "provider": config.settings.PROVIDER.name,
+        "llm_model": config.settings.OLLAMA_LLM_MODEL if config.settings.PROVIDER == config.settings.Provider.OLLAMA else config.settings.CUSTOM_LLM_MODEL,
+        "embedding_model": config.settings.OLLAMA_EMBEDDING_MODEL if (
+                config.settings.PROVIDER == config.settings.Provider.OLLAMA or config.settings.USE_OLLAMA_EMBEDDING) else config.settings.CUSTOM_EMBEDDING_MODEL,
+        "use_ollama_embedding": config.settings.USE_OLLAMA_EMBEDDING,
+        "reranker_type": config.settings.RERANKER_TYPE.name,
+        "reranker_model": config.settings.RERANKER_MODEL if config.settings.RERANKER_TYPE != config.settings.RerankerType.NONE else None,
+        "final_top_k": config.settings.FINAL_TOP_K,
+        "chunk_size": config.settings.CHUNK_SIZE,
+        "chunk_overlap": config.settings.CHUNK_OVERLAP,
     }
     return config
 
@@ -271,7 +250,6 @@ def get_current_config() -> dict:
 def print_config():
     """
     打印当前配置（用于调试）
-
     在启动时调用此函数可以查看完整的配置信息
     """
     config = get_current_config()
@@ -293,24 +271,24 @@ def validate_config() -> tuple[bool, list[str]]:
     errors = []
 
     # 验证 Provider
-    if PROVIDER == Provider.CUSTOM:
-        if not CUSTOM_API_KEY:
+    if config.settings.PROVIDER == config.settings.Provider.CUSTOM:
+        if not config.settings.CUSTOM_API_KEY:
             errors.append("缺少 CUSTOM_API_KEY")
-        if not CUSTOM_BASE_URL:
+        if not config.settings.CUSTOM_BASE_URL:
             errors.append("缺少 CUSTOM_BASE_URL")
-        if not CUSTOM_LLM_MODEL:
+        if not config.settings.CUSTOM_LLM_MODEL:
             errors.append("缺少 CUSTOM_LLM_MODEL")
 
         # 如果不使用 Ollama Embedding，检查 Embedding 配置
-        if not USE_OLLAMA_EMBEDDING and not CUSTOM_EMBEDDING_MODEL:
+        if not config.settings.USE_OLLAMA_EMBEDDING and not config.settings.CUSTOM_EMBEDDING_MODEL:
             errors.append("缺少 CUSTOM_EMBEDDING_MODEL（或设置 USE_OLLAMA_EMBEDDING=true）")
 
-    elif PROVIDER == Provider.OLLAMA:
-        if not OLLAMA_BASE_URL:
+    elif config.settings.PROVIDER == config.settings.Provider.OLLAMA:
+        if not config.settings.OLLAMA_BASE_URL:
             errors.append("缺少 OLLAMA_BASE_URL")
-        if not OLLAMA_LLM_MODEL:
+        if not config.settings.OLLAMA_LLM_MODEL:
             errors.append("缺少 OLLAMA_LLM_MODEL")
-        if not OLLAMA_EMBEDDING_MODEL:
+        if not config.settings.OLLAMA_EMBEDDING_MODEL:
             errors.append("缺少 OLLAMA_EMBEDDING_MODEL")
 
     return len(errors) == 0, errors
