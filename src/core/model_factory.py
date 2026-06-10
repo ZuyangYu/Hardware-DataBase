@@ -232,7 +232,7 @@ def get_current_config() -> dict:
     Returns:
         dict: 当前配置的字典
     """
-    config = {
+    current_config = {
         "provider": config.settings.PROVIDER.name,
         "llm_model": config.settings.OLLAMA_LLM_MODEL if config.settings.PROVIDER == config.settings.Provider.OLLAMA else config.settings.CUSTOM_LLM_MODEL,
         "embedding_model": config.settings.OLLAMA_EMBEDDING_MODEL if (
@@ -244,7 +244,7 @@ def get_current_config() -> dict:
         "chunk_size": config.settings.CHUNK_SIZE,
         "chunk_overlap": config.settings.CHUNK_OVERLAP,
     }
-    return config
+    return current_config
 
 
 def print_config():
@@ -252,11 +252,11 @@ def print_config():
     打印当前配置（用于调试）
     在启动时调用此函数可以查看完整的配置信息
     """
-    config = get_current_config()
+    current_config = get_current_config()
     log("\n" + "=" * 60)
     log("当前配置")
     log("=" * 60)
-    for key, value in config.items():
+    for key, value in current_config.items():
         log(f"   {key}: {value}")
     log("=" * 60 + "\n")
 

@@ -5,7 +5,7 @@ import re
 import traceback
 from llama_index.core import Settings
 from llama_index.core.llms import ChatMessage, MessageRole
-from src.core.hybrid_retriever import hybrid_retrieve
+from src.core.routed_retriever import routed_retrieve
 from src.core.logger import log, error
 import config.settings
 
@@ -33,12 +33,12 @@ class CustomRAGChat:
         Returns:
             Tuple[str, str]: (用于Prompt的纯文本上下文, 用于UI显示的带格式上下文)
         """
-        query_hash = _get_query_hash(query)
-        if query_hash in _context_cache:
+        cache_key = f"{self.kb_name}:{_get_query_hash(query)}"
+        if cache_key in _context_cache:
             log(f"⚡ 使用缓存的上下文: {query[:30]}...")
-            return _context_cache[query_hash]
+            return _context_cache[cache_key]
 
-        retrieved_nodes = hybrid_retrieve(query, self.index, self.kb_name, top_k)
+        retrieved_nodes = routed_retrieve(query, self.index, self.kb_name, top_k)
 
         if not retrieved_nodes:
             return "", ""
@@ -59,7 +59,7 @@ class CustomRAGChat:
         log("=" * 50)
 
         result = (context, display_context)
-        _context_cache[query_hash] = result
+        _context_cache[cache_key] = result
         if len(_context_cache) > _CONTEXT_CACHE_LIMIT:
             oldest_key = next(iter(_context_cache))
             del _context_cache[oldest_key]

@@ -13,6 +13,12 @@ CHROMA_PATH = os.path.join(STORAGE_DIR, "chroma_db")
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
 RERANKER_CACHE = os.path.join(STORAGE_DIR, "reranker_cache")
 DEFAULT_KB_NAME = "source_documents"
+RAG_BACKEND = os.getenv("RAG_BACKEND", "local").lower()
+AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
+AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
+AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
+AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "admin123")
+AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
 
 
 class Provider(Enum):
@@ -98,6 +104,12 @@ os.makedirs(RERANKER_CACHE, exist_ok=True)
 
 # ==================== 默认值字典 ====================
 DEFAULT_VALUES = {
+    "RAG_BACKEND": "local",
+    "AUTH_ENABLED": "true",
+    "AUTH_DB_PATH": os.path.join(STORAGE_DIR, "auth.db"),
+    "AUTH_DEFAULT_ADMIN_USERNAME": "admin",
+    "AUTH_DEFAULT_ADMIN_PASSWORD": "admin123",
+    "AUTH_SESSION_TTL_HOURS": "24",
     "PROVIDER": "ollama",
     "OLLAMA_BASE_URL": "http://localhost:11434",
     "OLLAMA_LLM_MODEL": "qwen2.5:32b",
@@ -145,6 +157,8 @@ def reload_settings():
     重新读取 .env 文件并更新所有模块级全局变量。
     用于 Streamlit 设置页面 "应用配置" 后动态刷新。
     """
+    global RAG_BACKEND, AUTH_ENABLED, AUTH_DB_PATH
+    global AUTH_DEFAULT_ADMIN_USERNAME, AUTH_DEFAULT_ADMIN_PASSWORD, AUTH_SESSION_TTL_HOURS
     global PROVIDER, OLLAMA_BASE_URL, OLLAMA_LLM_MODEL, OLLAMA_EMBEDDING_MODEL
     global CUSTOM_API_KEY, CUSTOM_BASE_URL, CUSTOM_LLM_MODEL, CUSTOM_EMBEDDING_MODEL
     global CUSTOM_EMBEDDING_API_KEY, CUSTOM_EMBEDDING_BASE_URL
@@ -155,6 +169,12 @@ def reload_settings():
 
     load_dotenv(override=True)
 
+    RAG_BACKEND = os.getenv("RAG_BACKEND", "local").lower()
+    AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
+    AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
+    AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
+    AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "admin123")
+    AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
     PROVIDER = Provider(os.getenv("PROVIDER", "ollama").lower())
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     OLLAMA_LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "qwen2.5:32b")

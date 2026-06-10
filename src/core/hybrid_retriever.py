@@ -70,13 +70,16 @@ def build_bm25_index(kb_name: str, index: VectorStoreIndex, force_rebuild: bool 
         valid_docs_tokens = []
         valid_ids = []
 
-        results = collection.get(limit=None, include=["documents"])
+        results = collection.get(limit=None, include=["documents", "metadatas"])
         docs_text = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
         ids = results.get("ids", [])
 
         for i, text in enumerate(docs_text):
             try:
-                tokens = aggressive_tokenize(text)
+                metadata = metadatas[i] if i < len(metadatas) and metadatas[i] else {}
+                searchable_text = f"{text}\n{metadata.get('source_group', '')}\n{metadata.get('file_name', '')}"
+                tokens = aggressive_tokenize(searchable_text)
                 if tokens:
                     valid_docs_tokens.append(tokens)
                     valid_ids.append(ids[i])
@@ -181,7 +184,13 @@ def hybrid_retrieve(
 
     # 3. RRF 融合
     if bm25_nodes:
-        fused_nodes = rrf_fusion(vector_nodes, bm25_nodes, top_k, vector_weight, bm25_weight)
+        fused_nodes = rrf_fusion(
+            vector_nodes,
+            bm25_nodes,
+            top_k,
+            vector_weight=vector_weight,
+            bm25_weight=bm25_weight,
+        )
     else:
         fused_nodes = vector_nodes[:top_k]
 
@@ -195,9 +204,9 @@ def hybrid_retrieve(
             return reranked_nodes
         except Exception as e:
             error(f"Reranker 失败: {e}")
-            return fused_nodes[:config.settings.FINAL_TOP_K]
+            return fused_nodes[:top_k]
 
-    return fused_nodes[:config.settings.FINAL_TOP_K]
+    return fused_nodes[:top_k]
 
 
 def rrf_fusion(vector_nodes, bm25_nodes, top_k, k=None, vector_weight=0.5, bm25_weight=0.5):
