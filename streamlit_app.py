@@ -10,6 +10,7 @@ from src.core.resource_manager import resource_manager
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER, build_request_context, ensure_session_id
 from src.core.app_logs import AppLogService
 from src.core.conversation import ConversationService
+from src.ingestion.source_groups import SOURCE_GROUP_DESCRIPTIONS, USER_SELECTABLE_SOURCE_GROUPS
 import config.settings
 
 AUTH_QUERY_PARAM = "hd_session"
@@ -1789,6 +1790,12 @@ def render_kb_management_tab(pipeline):
 
     with st.container(border=True):
         st.markdown("##### 📤 当前知识库上传文档")
+        source_group = st.selectbox(
+            "文件类型",
+            USER_SELECTABLE_SOURCE_GROUPS,
+            format_func=lambda group: f"{group}（{SOURCE_GROUP_DESCRIPTIONS.get(group, '')}）",
+            key="upload_source_group",
+        )
         files = st.file_uploader("拖拽文件到此处", accept_multiple_files=True,
                                  type=["pdf", "txt", "md", "docx", "html", "csv", "xlsx"])
         if files and st.button("开始上传", type="primary"):
@@ -1803,7 +1810,12 @@ def render_kb_management_tab(pipeline):
                     temp_paths.append(path)
                 st.write("创建后台解析任务...")
                 ctx = build_request_context(st.session_state)
-                res = pipeline.upload_files(temp_paths, st.session_state.current_kb, ctx=ctx)
+                res = pipeline.upload_files(
+                    temp_paths,
+                    st.session_state.current_kb,
+                    ctx=ctx,
+                    source_group=source_group,
+                )
                 upload_ok = res.startswith("✅")
                 record_audit(
                     "upload_document",
@@ -1812,7 +1824,11 @@ def render_kb_management_tab(pipeline):
                     kb_name=st.session_state.current_kb,
                     success=upload_ok,
                     error_message="" if upload_ok else res,
-                    metadata={"file_count": len(files), "result": res.split("\n")[0]},
+                    metadata={
+                        "file_count": len(files),
+                        "source_group": source_group,
+                        "result": res.split("\n")[0],
+                    },
                 )
                 for p in temp_paths:
                     try:

@@ -5,9 +5,45 @@ from dataclasses import dataclass
 
 DOCS_GROUP = "文档资料"
 MATERIAL_GROUP = "物料数据"
+DESIGN_GROUP = "设计数据"
+TEST_GROUP = "测试数据"
+PROJECT_GROUP = "项目管理数据"
+EXTERNAL_GROUP = "外部数据"
+PEOPLE_GROUP = "人员与组织数据"
 UNKNOWN_GROUP = "未分类"
 
-SOURCE_GROUPS = (DOCS_GROUP, MATERIAL_GROUP, UNKNOWN_GROUP)
+SOURCE_GROUPS = (
+    DESIGN_GROUP,
+    MATERIAL_GROUP,
+    DOCS_GROUP,
+    TEST_GROUP,
+    PROJECT_GROUP,
+    EXTERNAL_GROUP,
+    PEOPLE_GROUP,
+    UNKNOWN_GROUP,
+)
+
+USER_SELECTABLE_SOURCE_GROUPS = (
+    DESIGN_GROUP,
+    MATERIAL_GROUP,
+    DOCS_GROUP,
+    TEST_GROUP,
+    PROJECT_GROUP,
+    EXTERNAL_GROUP,
+    PEOPLE_GROUP,
+)
+
+SOURCE_GROUP_DESCRIPTIONS = {
+    DESIGN_GROUP: "原理图、PCB、BOM、网表、约束、仿真文件",
+    MATERIAL_GROUP: "器件参数、封装、供应商、生命周期、替代料信息",
+    DOCS_GROUP: "规格书、设计文档、手册标准规范、参考资料",
+    TEST_GROUP: "测试报告、测试记录、验证数据",
+    PROJECT_GROUP: "计划、进度、任务、评审与会议资料",
+    EXTERNAL_GROUP: "第三方资料、外部接口、客户或供应链输入",
+    PEOPLE_GROUP: "人员、团队、角色、组织结构资料",
+}
+
+IMPLEMENTED_PARSE_GROUPS = {DOCS_GROUP, MATERIAL_GROUP}
 
 
 @dataclass(frozen=True)

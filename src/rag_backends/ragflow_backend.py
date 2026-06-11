@@ -12,7 +12,13 @@ class RAGFlowBackend(RAGBackend):
     def _not_configured(self):
         raise NotImplementedError("RAGFlowBackend 尚未接入，请先使用 RAG_BACKEND=local")
 
-    def ingest(self, kb_name: str, files: list[str], ctx: RequestContext | None = None) -> IngestResult:
+    def ingest(
+        self,
+        kb_name: str,
+        files: list[str],
+        ctx: RequestContext | None = None,
+        source_group: str | None = None,
+    ) -> IngestResult:
         self._not_configured()
 
     def retrieve(self, kb_name: str, query: str, top_k: int | None = None, ctx: RequestContext | None = None) -> list[Evidence]:
