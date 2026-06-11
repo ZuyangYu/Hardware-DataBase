@@ -59,13 +59,24 @@ class RAGPipeline:
             traceback.print_exc()
             yield f"❌ 系统错误: {str(e)}"
 
-    def upload_files(self, files, target_kb: str, ctx: RequestContext | None = None) -> str:
-        """批量上传并索引文件"""
-        if not files: return "未选择文件"
-        if not target_kb: return "❌ 未选择目标知识库"
+    def upload_files(
+        self,
+        files,
+        target_kb: str,
+        ctx: RequestContext | None = None,
+        source_group: str | None = None,
+    ) -> str:
+        """批量上传并自动提交后台解析任务"""
+        if not files:
+            return "未选择文件"
+        if not target_kb:
+            return "❌ 未选择目标知识库"
 
         file_paths = [file if isinstance(file, str) else file.name for file in files]
-        return self.backend.ingest(target_kb, file_paths, ctx=ctx).to_message()
+        if hasattr(self.backend, "submit_parse_tasks"):
+            tasks = self.backend.submit_parse_tasks(target_kb, file_paths, source_group=source_group, ctx=ctx)
+            return f"✅ 已创建 {len(tasks)} 个解析任务，系统将自动开始解析"
+        return self.backend.ingest(target_kb, file_paths, ctx=ctx, source_group=source_group).to_message()
 
     def add_document(self, temp_file_path: str, kb_name: str) -> Tuple[bool, str]:
         """
@@ -167,3 +178,30 @@ class RAGPipeline:
     def list_files(self, kb_name: str, ctx: RequestContext | None = None) -> List[str]:
         """列出知识库内的源文件"""
         return [doc.name for doc in self.backend.list_documents(kb_name, ctx=ctx)]
+
+    def list_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
+        if hasattr(self.backend, "list_parse_tasks"):
+            return self.backend.list_parse_tasks(kb_name, ctx=ctx)
+        return []
+
+    def pause_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
+        if hasattr(self.backend, "pause_parse_task"):
+            return self.backend.pause_parse_task(task_id, ctx=ctx).message
+        return "当前后端不支持暂停解析任务"
+
+    def resume_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
+        if hasattr(self.backend, "resume_parse_task"):
+            return self.backend.resume_parse_task(task_id, ctx=ctx).message
+        return "当前后端不支持启动解析任务"
+
+    def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
+        if hasattr(self.backend, "delete_parse_task"):
+            return self.backend.delete_parse_task(task_id, ctx=ctx).message
+        return "当前后端不支持删除解析任务"
+
+    def clear_finished_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
+        if hasattr(self.backend, "clear_finished_parse_tasks"):
+            self.backend.clear_finished_parse_tasks(kb_name, ctx=ctx)
+
+    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None):
+        return self.backend.get_parse_result(kb_name, document_id, ctx=ctx)

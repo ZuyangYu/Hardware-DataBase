@@ -25,3 +25,4 @@ data/**
 # Streamlit logs
 streamlit.log
 streamlit.err.log
+streamlit.out.log

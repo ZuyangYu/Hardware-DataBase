@@ -463,6 +463,82 @@ def invalidate_file_cache(kb_name: str):
     st.session_state.file_cache.pop(f"{ctx.user_id}:{kb_name}", None)
 
 
+def render_parse_result_viewer(pipeline, kb_name: str, files: list[str], key_prefix: str):
+    if not files:
+        return
+    selected_file = st.selectbox("查看解析结果", files, key=f"{key_prefix}_parse_result_file")
+    if not selected_file:
+        return
+    ctx = build_request_context(st.session_state)
+    result = pipeline.get_parse_result(kb_name, selected_file, ctx=ctx)
+    if not result:
+        st.caption("该文件尚未生成解析结果，或索引中没有找到对应分块。")
+        return
+    st.caption(f"共 {result.chunk_count} 个解析分块")
+    for chunk in result.chunks:
+        title = f"分块 {chunk.index + 1}"
+        source_group = chunk.metadata.get("source_group")
+        if source_group:
+            title = f"{title} · {source_group}"
+        with st.expander(title):
+            st.write(chunk.content)
+
+
+def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
+    ctx = build_request_context(st.session_state)
+    tasks = pipeline.list_parse_tasks(kb_name, ctx=ctx)
+    if any(task.status == "completed" for task in tasks):
+        invalidate_file_cache(kb_name)
+
+    with st.container(border=True):
+        c_title, c_refresh, c_clear = st.columns([0.68, 0.16, 0.16])
+        with c_title:
+            st.markdown("##### 🧩 解析任务")
+        with c_refresh:
+            if st.button("刷新", key=f"{key_prefix}_refresh_tasks", use_container_width=True):
+                st.rerun()
+        with c_clear:
+            if st.button("清理完成", key=f"{key_prefix}_clear_tasks", use_container_width=True):
+                pipeline.clear_finished_parse_tasks(kb_name, ctx=ctx)
+                st.rerun()
+
+        if not tasks:
+            st.caption("当前知识库暂无解析任务")
+            return
+
+        status_labels = {
+            "queued": "排队中",
+            "running": "解析中",
+            "paused": "已暂停",
+            "completed": "已完成",
+            "failed": "失败",
+            "cancelled": "已取消",
+        }
+        for task in tasks:
+            st.divider()
+            c_info, c_actions = st.columns([0.72, 0.28])
+            with c_info:
+                status_label = status_labels.get(task.status, task.status)
+                st.markdown(f"**{task.original_name}** · {status_label}")
+                st.progress(task.progress, text=f"{task.progress}% · {task.stage}")
+                if task.message:
+                    st.caption(task.message)
+            with c_actions:
+                if task.status in {"queued", "running"}:
+                    if st.button("暂停", key=f"{key_prefix}_pause_{task.id}", use_container_width=True):
+                        st.session_state.toast_msg = pipeline.pause_parse_task(task.id, ctx=ctx)
+                        st.rerun()
+                elif task.status == "paused":
+                    if st.button("启动", key=f"{key_prefix}_resume_{task.id}", use_container_width=True):
+                        st.session_state.toast_msg = pipeline.resume_parse_task(task.id, ctx=ctx)
+                        st.rerun()
+                else:
+                    st.button("暂停", key=f"{key_prefix}_noop_{task.id}", disabled=True, use_container_width=True)
+                if st.button("删除任务", key=f"{key_prefix}_delete_{task.id}", use_container_width=True):
+                    st.session_state.toast_msg = pipeline.delete_parse_task(task.id, ctx=ctx)
+                    st.rerun()
+
+
 def render_login_page():
     """渲染登录页。"""
     auth_service = init_auth_service()
@@ -1233,6 +1309,13 @@ def main():
                 with st.expander("📚 查看库内文档"):
                     for f in kb_files:
                         st.markdown(f"- 📄 {f}")
+                    st.divider()
+                    render_parse_result_viewer(
+                        pipeline,
+                        st.session_state.current_kb,
+                        kb_files,
+                        key_prefix="sidebar",
+                    )
 
             if selected_tab == "💬 智能对话":
                 ensure_current_chat_session()
@@ -1718,7 +1801,7 @@ def render_kb_management_tab(pipeline):
                     with open(path, "wb") as wb:
                         wb.write(f.getbuffer())
                     temp_paths.append(path)
-                st.write("正在建立索引...")
+                st.write("创建后台解析任务...")
                 ctx = build_request_context(st.session_state)
                 res = pipeline.upload_files(temp_paths, st.session_state.current_kb, ctx=ctx)
                 upload_ok = res.startswith("✅")
@@ -1736,11 +1819,13 @@ def render_kb_management_tab(pipeline):
                         os.remove(p)
                     except OSError:
                         pass
-                status.update(label="✅ 完成", state="complete", expanded=False)
-            invalidate_file_cache(st.session_state.current_kb)
+                status.update(label="✅ 已提交解析任务", state="complete", expanded=False)
             st.success(res.split('\n')[0])
             time.sleep(1)
             st.rerun()
+    st.divider()
+
+    render_parse_task_panel(pipeline, st.session_state.current_kb, key_prefix="kb_mgmt")
     st.divider()
 
     st.markdown("##### 📁 知识库列表")
@@ -1850,6 +1935,8 @@ def render_kb_management_tab(pipeline):
                                 if st.button("🗑️", key=f"del_f_{kb}_{f}", help="删除文件"):
                                     st.session_state.confirm_delete_file = (kb, f)
                                     st.rerun()
+                st.divider()
+                render_parse_result_viewer(pipeline, kb, files, key_prefix=f"mgmt_{kb}")
             else:
                 st.caption("暂无文件")
 
