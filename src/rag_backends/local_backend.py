@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import time
@@ -17,6 +18,28 @@ from src.ingestion.parse_tasks import ParseTaskManager
 from src.ingestion.source_groups import SourceGroupClassification, classify_source_group, safe_source_group
 from src.rag_backends.base import RAGBackend
 from src.rag_backends.schemas import BackendHealth, BackendResult, DocumentInfo, Evidence, IngestResult, ParsedChunk, ParseResult, RequestContext
+
+
+_MAX_METADATA_VALUE_LENGTH = 2000
+
+
+def _sanitize_chroma_metadata(metadata: dict | None) -> tuple[dict, list[str]]:
+    clean = {}
+    converted_keys = []
+    for key, value in (metadata or {}).items():
+        if isinstance(value, bool):
+            clean[key] = int(value)
+            continue
+        if isinstance(value, (str, int, float)) or value is None:
+            clean[key] = value
+            continue
+
+        converted_keys.append(key)
+        serialized = json.dumps(value, ensure_ascii=False, default=str)
+        if len(serialized) > _MAX_METADATA_VALUE_LENGTH:
+            serialized = f"{serialized[:_MAX_METADATA_VALUE_LENGTH]}..."
+        clean[key] = serialized
+    return clean, converted_keys
 
 
 class LocalRAGBackend(RAGBackend):
@@ -133,6 +156,15 @@ class LocalRAGBackend(RAGBackend):
                     node.metadata["source_group_confidence"] = classification.confidence
                     node.metadata["source_group_reason"] = classification.reason
                     node.metadata["chunk_index"] = chunk_index
+                    clean_metadata, converted_keys = _sanitize_chroma_metadata(node.metadata)
+                    node.metadata = clean_metadata
+                    if converted_keys:
+                        node.excluded_embed_metadata_keys = sorted(
+                            set(getattr(node, "excluded_embed_metadata_keys", []) or []) | set(converted_keys)
+                        )
+                        node.excluded_llm_metadata_keys = sorted(
+                            set(getattr(node, "excluded_llm_metadata_keys", []) or []) | set(converted_keys)
+                        )
 
                 index.docstore.add_documents(nodes)
                 index.insert_nodes(nodes)
