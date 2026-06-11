@@ -19,6 +19,9 @@ data/**
 
 .idea/
 
+# Ruff cache
+.ruff_cache/
+
 # Streamlit logs
 streamlit.log
 streamlit.err.log
