@@ -1,14 +1,14 @@
 # src/ingestion/docling_parser.py
 from llama_index.readers.docling import DoclingReader
 from llama_index.node_parser.docling import DoclingNodeParser
-from src.core.logger import log, error
+from src.core.logger import log
 
 
 _reader = DoclingReader(export_type=DoclingReader.ExportType.JSON)
 _node_parser = DoclingNodeParser()
 
 
-def parse_file(file_path: str, filename: str, kb_name: str):
+def parse_file(file_path: str, filename: str, kb_name: str, source_group: str | None = None):
     """
     使用 Docling 解析文档，返回 LlamaIndex Node 列表。
     DoclingReader 以 JSON 格式读取文档（保留布局、表格等结构），
@@ -21,6 +21,8 @@ def parse_file(file_path: str, filename: str, kb_name: str):
     for doc in documents:
         doc.metadata["file_name"] = filename
         doc.metadata["kb_name"] = kb_name
+        if source_group:
+            doc.metadata["source_group"] = source_group
 
     nodes = _node_parser.get_nodes_from_documents(documents)
 

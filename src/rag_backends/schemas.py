@@ -65,6 +65,22 @@ class DocumentInfo:
 
 
 @dataclass
+class ParsedChunk:
+    index: int
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ParseResult:
+    document_id: str
+    file_name: str
+    chunk_count: int
+    chunks: list[ParsedChunk] = field(default_factory=list)
+    backend: str = "local"
+
+
+@dataclass
 class BackendHealth:
     ok: bool
     message: str = ""
