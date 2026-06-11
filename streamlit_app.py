@@ -1204,33 +1204,64 @@ def main():
 
     # ------------------ 顶部栏 (应用更稳健的 CSS Sticky 效果) ------------------
     with st.container():
-        st.markdown("""
-            <div class="fixed-header-marker"></div>
+        status = resource_manager.get_status()
+        st.markdown(f"""
             <style>
-                /* 使用 :has 选择器精确定位头部容器 */
-                div[data-testid="stVerticalBlock"] > div:has(div.fixed-header-marker) {
+                div[data-testid="stVerticalBlock"] > div:has(.app-header-shell) {{
                     position: sticky;
-                    top: 0.2rem;
+                    top: 2.75rem;
+                    z-index: 50;
                     background-color: white;
-                    z-index: 999;
-                    padding-top: 1rem;
-                    padding-bottom: 10px;
                     border-bottom: 1px solid #f0f2f6;
-                    margin-top: -2rem;
-                }
+                }}
+                .app-header-shell {{
+                    background-color: white;
+                    padding: 0.75rem 0 0.65rem;
+                    overflow: visible;
+                }}
+                .app-header-row {{
+                    display: flex;
+                    align-items: flex-start;
+                    justify-content: space-between;
+                    gap: 24px;
+                    width: 100%;
+                }}
+                .app-header-title {{
+                    font-size: 35px;
+                    margin-top: 0;
+                    margin-bottom: 0;
+                    line-height: 1.2;
+                }}
+                .app-header-status {{
+                    flex: 0 0 auto;
+                    min-width: 96px;
+                    padding-top: 4px;
+                    text-align: right;
+                    white-space: nowrap;
+                    line-height: 1.7;
+                }}
+                @media (max-width: 640px) {{
+                    .app-header-row {{
+                        align-items: flex-start;
+                        flex-direction: column;
+                        gap: 4px;
+                    }}
+                    .app-header-status {{
+                        padding-top: 0;
+                        text-align: left;
+                    }}
+                }}
             </style>
+            <div class="app-header-shell">
+                <div class="app-header-row">
+                    <h1 class="app-header-title">😺 Hardware DataBase</h1>
+                    <div class="app-header-status">
+                        <span class="status-indicator {'status-ok' if status.get('models_initialized') else 'status-error'}"></span> AI模型<br>
+                        <span class="status-indicator {'status-ok' if status.get('chroma_connected') else 'status-error'}"></span> 向量库
+                    </div>
+                </div>
+            </div>
         """, unsafe_allow_html=True)
-
-        col_header, col_status = st.columns([4, 1])
-        with col_header:
-            st.markdown('<h1 style="font-size: 35px; margin-top: 10px; margin-bottom: 0px;">😺 Hardware DataBase</h1>', unsafe_allow_html=True)
-        with col_status:
-            status = resource_manager.get_status()
-            st.markdown(f"""
-                <div style="text-align:right; padding-top:22px;">
-                    <span class="status-indicator {'status-ok' if status.get('models_initialized') else 'status-error'}"></span> AI模型<br>
-                    <span class="status-indicator {'status-ok' if status.get('chroma_connected') else 'status-error'}"></span> 向量库</div>
-            """, unsafe_allow_html=True)
 
     # ------------------ 侧边栏 ------------------
     with st.sidebar:
@@ -1518,9 +1549,21 @@ def render_chat_tab(pipeline):
                 st.error(f"❌ 处理请求时发生错误: {error_occured}")
                 full_response = f"Error: {error_occured}"
             else:
-                with st.status("正在检索相关文档...", expanded=False) as status:
-                    full_response = st.write_stream(gen)
-                    status.update(label="回答生成完毕", state="complete", expanded=False)
+                status = st.status("正在检索相关文档...", expanded=False)
+                has_started_answer = False
+
+                def stream_with_status():
+                    nonlocal has_started_answer
+                    for chunk in gen:
+                        if not has_started_answer:
+                            status.update(label="正在生成回答...", state="running", expanded=False)
+                            has_started_answer = True
+                        yield chunk
+
+                full_response = st.write_stream(stream_with_status())
+                status.update(label="回答生成完毕", state="complete", expanded=False)
+                if isinstance(full_response, list):
+                    full_response = "".join(str(item) for item in full_response)
                 if not full_response or not full_response.strip():
                     st.warning("⚠️ AI 未生成任何内容。")
                     full_response = "Empty response."
