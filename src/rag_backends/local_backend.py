@@ -11,10 +11,10 @@ from src.core.hybrid_retriever import invalidate_bm25_cache
 from src.core.logger import error, log, warn
 from src.core.resource_manager import resource_manager
 from src.ingestion.data_loader import get_kb_path
-from src.ingestion.docling_parser import parse_file
 from src.ingestion.index_builder import get_or_build_index, invalidate_index_cache
+from src.ingestion.parse_strategies import parse_by_source_group
 from src.ingestion.parse_tasks import ParseTaskManager
-from src.ingestion.source_groups import classify_source_group, safe_source_group
+from src.ingestion.source_groups import SourceGroupClassification, classify_source_group, safe_source_group
 from src.rag_backends.base import RAGBackend
 from src.rag_backends.schemas import BackendHealth, BackendResult, DocumentInfo, Evidence, IngestResult, ParsedChunk, ParseResult, RequestContext
 
@@ -87,8 +87,16 @@ class LocalRAGBackend(RAGBackend):
                     return BackendResult(ok=False, message="❌ 临时文件不存在", backend=self.name)
 
                 original_filename = os.path.basename(temp_file_path)
-                classification = classify_source_group(original_filename)
-                source_group = safe_source_group(source_group) if source_group else safe_source_group(classification.group)
+                if source_group:
+                    source_group = safe_source_group(source_group)
+                    classification = SourceGroupClassification(
+                        source_group,
+                        1.0,
+                        "user-selected upload type",
+                    )
+                else:
+                    classification = classify_source_group(original_filename)
+                    source_group = safe_source_group(classification.group)
                 filename = original_filename
                 target_dir = os.path.join(get_kb_path(kb_name), source_group)
                 os.makedirs(target_dir, exist_ok=True)
@@ -108,7 +116,7 @@ class LocalRAGBackend(RAGBackend):
                 index = self.get_index(kb_name)
                 check()
                 report(40, "解析文档内容")
-                nodes = parse_file(target_path, filename, kb_name, source_group=source_group)
+                nodes = parse_by_source_group(target_path, filename, kb_name, source_group=source_group)
 
                 if not nodes:
                     raise ValueError("文件解析后未生成任何有效节点")
