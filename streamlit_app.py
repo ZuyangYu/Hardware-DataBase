@@ -525,7 +525,7 @@ def render_login_page():
         with st.form("login_form"):
             username = st.text_input("用户名", placeholder="admin")
             password = st.text_input("密码", type="password", placeholder="请输入密码")
-            submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
+            submitted = st.form_submit_button("登录", width="stretch", type="primary")
         if submitted:
             session = auth_service.authenticate(username.strip(), password)
             if session:
@@ -773,7 +773,7 @@ def render_settings_tab():
     st.caption("修改后点击应用配置生效。")
     _, col_apply, _ = st.columns([2, 1, 2])
     with col_apply:
-        if st.button("应用配置", type="primary", use_container_width=True):
+        if st.button("应用配置", type="primary", width="stretch"):
             _apply_settings()
 
 
@@ -1003,7 +1003,7 @@ def render_log_center_tab():
                     }
                     for event in audit_events
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1043,7 +1043,7 @@ def render_log_center_tab():
                     }
                     for trace in traces
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1088,7 +1088,7 @@ def render_log_center_tab():
                             }
                             for item in evidence
                         ],
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
                 else:
@@ -1161,7 +1161,7 @@ def main():
         user_label = st.session_state.username or "anonymous"
         role_label = st.session_state.role or "anonymous"
         st.caption(f"当前用户: {user_label} / {role_label}")
-        if config.settings.AUTH_ENABLED and st.button("退出登录", use_container_width=True):
+        if config.settings.AUTH_ENABLED and st.button("退出登录", width="stretch"):
             logout()
         st.divider()
 
@@ -1236,7 +1236,7 @@ def main():
 
             if selected_tab == "💬 智能对话":
                 ensure_current_chat_session()
-                if st.button("➕ 新建对话", use_container_width=True, type="secondary"):
+                if st.button("➕ 新建对话", width="stretch", type="secondary"):
                     start_new_chat_session()
                     st.rerun()
 
@@ -1263,7 +1263,7 @@ def main():
                             load_chat_session(selected_session_id)
                             st.rerun()
 
-                if st.button("🗑️ 清空当前对话", use_container_width=True, type="secondary"):
+                if st.button("🗑️ 清空当前对话", width="stretch", type="secondary"):
                     clear_current_chat_session()
                     st.rerun()
         elif selected_tab in {"👥 部门管理", "📊 日志中心"}:
@@ -1498,7 +1498,7 @@ def render_department_management_tab():
                 with c3:
                     next_active = not user.is_active
                     button_label = "启用" if next_active else "停用"
-                    if st.button(button_label, key=f"dept_user_toggle_{user.id}", use_container_width=True):
+                    if st.button(button_label, key=f"dept_user_toggle_{user.id}", width="stretch"):
                         try:
                             auth_service.set_user_active(user.id, next_active)
                             record_audit(
@@ -1525,7 +1525,7 @@ def render_department_management_tab():
             st.markdown("##### 创建普通用户")
             new_username = st.text_input("用户名", key="dept_auth_new_username")
             new_password = st.text_input("密码", type="password", key="dept_auth_new_password")
-            if st.form_submit_button("创建用户", use_container_width=True):
+            if st.form_submit_button("创建用户", width="stretch"):
                 try:
                     auth_service.create_user(
                         new_username,
@@ -1583,11 +1583,11 @@ def render_system_department_management():
                         st.caption("启用" if user.is_active else "停用")
                     with c4:
                         if user.id == st.session_state.get("user_id"):
-                            st.button("当前账号", key=f"user_self_{user.id}", disabled=True, use_container_width=True)
+                            st.button("当前账号", key=f"user_self_{user.id}", disabled=True, width="stretch")
                         else:
                             next_active = not user.is_active
                             button_label = "启用" if next_active else "停用"
-                            if st.button(button_label, key=f"user_toggle_{user.id}", use_container_width=True):
+                            if st.button(button_label, key=f"user_toggle_{user.id}", width="stretch"):
                                 try:
                                     auth_service.set_user_active(user.id, next_active)
                                     record_audit(
@@ -1619,9 +1619,9 @@ def render_system_department_management():
                 st.markdown(f"`{dept.name}`")
             with c3:
                 if dept.name == "system":
-                    st.button("受保护", key=f"dept_system_{dept.id}", disabled=True, use_container_width=True)
+                    st.button("受保护", key=f"dept_system_{dept.id}", disabled=True, width="stretch")
                 else:
-                    if st.button("删除", key=f"dept_delete_{dept.id}", use_container_width=True):
+                    if st.button("删除", key=f"dept_delete_{dept.id}", width="stretch"):
                         try:
                             auth_service.delete_department(dept.id)
                             record_audit(
@@ -1647,7 +1647,7 @@ def render_system_department_management():
             with st.form("create_department_form"):
                 st.markdown("###### 创建部门")
                 new_department_name = st.text_input("新部门名称", key="auth_new_department_name")
-                if st.form_submit_button("创建部门", use_container_width=True):
+                if st.form_submit_button("创建部门", width="stretch"):
                     try:
                         auth_service.create_department(new_department_name)
                         record_audit(
@@ -1675,7 +1675,7 @@ def render_system_department_management():
                 new_role = st.selectbox("角色", [ROLE_USER, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN], key="auth_new_role")
                 department_names = [dept.name for dept in departments]
                 selected_department = st.selectbox("部门", department_names, key="auth_new_department")
-                if st.form_submit_button("创建用户", use_container_width=True):
+                if st.form_submit_button("创建用户", width="stretch"):
                     try:
                         department_id = next((dept.id for dept in departments if dept.name == selected_department), None)
                         auth_service.create_user(new_username, new_password, new_role, department_id=department_id)
