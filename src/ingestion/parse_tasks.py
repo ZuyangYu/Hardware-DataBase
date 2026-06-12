@@ -48,6 +48,8 @@ class ParseTask:
 class ParseTaskManager:
     """Small in-process parser task runner with JSON persistence for Streamlit."""
 
+    _file_lock = threading.RLock()
+
     def __init__(self, worker: Callable[[str, str, str, Callable[[int, str], None], Callable[[], None]], str]):
         self.worker = worker
         self.task_dir = os.path.join(config.settings.STORAGE_DIR, "parse_tasks")
@@ -72,12 +74,37 @@ class ParseTaskManager:
             return {}
 
     def _save_tasks(self):
-        os.makedirs(self.task_dir, exist_ok=True)
-        data = [asdict(task) for task in sorted(self._tasks.values(), key=lambda t: t.created_at, reverse=True)]
-        tmp_path = f"{self.task_file}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self.task_file)
+        with self._file_lock:
+            os.makedirs(self.task_dir, exist_ok=True)
+            data = [asdict(task) for task in sorted(self._tasks.values(), key=lambda t: t.created_at, reverse=True)]
+            tmp_path = f"{self.task_file}.{uuid.uuid4().hex}.tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                self._replace_task_file(tmp_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+    def _replace_task_file(self, tmp_path: str):
+        last_exc: OSError | None = None
+        for attempt in range(8):
+            try:
+                os.replace(tmp_path, self.task_file)
+                return
+            except PermissionError as exc:
+                last_exc = exc
+            except OSError as exc:
+                if getattr(exc, "winerror", None) not in {5, 32}:
+                    raise
+                last_exc = exc
+            time.sleep(0.05 * (attempt + 1))
+        raise last_exc or PermissionError(f"无法替换解析任务状态文件: {self.task_file}")
 
     def _recover_interrupted_tasks(self):
         changed = False

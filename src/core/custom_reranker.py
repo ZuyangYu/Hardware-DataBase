@@ -10,12 +10,18 @@ from pydantic import Field
 class APIReranker(BaseNodePostprocessor):
     """API Reranker(OpenAI 兼容格式)"""
 
+    model: str = Field(description="Reranker 模型名称")
+    api_key: str = Field(default="", description="Reranker API Key")
+    api_base: str = Field(description="Reranker API Base URL")
+    top_n: int = Field(default=5, description="返回的节点数量")
+
     def __init__(self, model: str, api_key: str, api_base: str, top_n: int = 5):
-        super().__init__()
-        self.model = model
-        self.api_key = api_key
-        self.api_base = api_base.rstrip("/")
-        self.top_n = top_n
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            api_base=api_base.rstrip("/"),
+            top_n=top_n,
+        )
 
     def _postprocess_nodes(
             self,

@@ -203,11 +203,39 @@ def reload_settings():
 
 
 def _format_env_value(value: str) -> str:
-    """格式化 .env 值，包含 # 或空格时用引号包裹"""
+    """格式化 .env 值，换行写成转义序列，避免破坏 KEY=VALUE 结构。"""
+    value = str(value)
     if '#' in value or '"' in value or ' ' in value or '\n' in value:
-        escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+        escaped = (
+            value
+            .replace('\\', '\\\\')
+            .replace('\r\n', '\n')
+            .replace('\r', '\n')
+            .replace('\n', '\\n')
+            .replace('"', '\\"')
+        )
         return f'"{escaped}"'
     return value
+
+
+def _env_value_quote_closed(value: str) -> bool:
+    """判断 .env 的引号值是否在当前物理行闭合。"""
+    value = value.lstrip()
+    if not value or value[0] not in ('"', "'"):
+        return True
+
+    quote = value[0]
+    escaped = False
+    for char in value[1:]:
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and char == '\\':
+            escaped = True
+            continue
+        if char == quote:
+            return True
+    return False
 
 
 def save_settings_to_env(settings_dict: dict, env_path: str = None):
@@ -225,20 +253,34 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
 
     updated_keys = set()
     new_lines = []
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         stripped = line.strip()
         # 跳过注释和空行
         if not stripped or stripped.startswith("#"):
             new_lines.append(line)
+            i += 1
             continue
+
         # 解析 KEY=VALUE（忽略行内注释）
         if "=" in stripped:
             key = stripped.split("=", 1)[0].strip()
             if key in settings_dict:
                 new_lines.append(f"{key}={_format_env_value(settings_dict[key])}\n")
                 updated_keys.add(key)
+                value = stripped.split("=", 1)[1]
+                i += 1
+                while i < len(lines) and not _env_value_quote_closed(value):
+                    value += "\n" + lines[i].rstrip("\n")
+                    i += 1
                 continue
-        new_lines.append(line)
+            new_lines.append(line)
+            i += 1
+            continue
+
+        # .env 只支持 KEY=VALUE / 注释 / 空行。丢弃历史多行值残留，避免 dotenv 反复报警。
+        i += 1
 
     # 追加文件中没有的新 key
     for key, value in settings_dict.items():

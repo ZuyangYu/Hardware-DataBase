@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import time
 import traceback
@@ -21,6 +22,25 @@ from src.rag_backends.schemas import BackendHealth, BackendResult, DocumentInfo,
 
 
 _MAX_METADATA_VALUE_LENGTH = 2000
+_TEMP_UPLOAD_PREFIX_RE = re.compile(r"^(?:[0-9a-f]{32}_)+", re.IGNORECASE)
+_INSERT_NODES_BATCH_SIZE = 32
+
+
+def _display_filename(path_or_name: str) -> str:
+    name = os.path.basename(str(path_or_name).replace("\\", os.sep).replace("/", os.sep))
+    return _TEMP_UPLOAD_PREFIX_RE.sub("", name)
+
+
+def _normalize_document_key(path_or_name: str | None) -> str:
+    if not path_or_name:
+        return ""
+    return _display_filename(path_or_name).casefold()
+
+
+def _normalize_relative_path(path_or_name: str | None) -> str:
+    if not path_or_name:
+        return ""
+    return str(path_or_name).replace("\\", "/").casefold()
 
 
 def _sanitize_chroma_metadata(metadata: dict | None) -> tuple[dict, list[str]]:
@@ -40,6 +60,25 @@ def _sanitize_chroma_metadata(metadata: dict | None) -> tuple[dict, list[str]]:
             serialized = f"{serialized[:_MAX_METADATA_VALUE_LENGTH]}..."
         clean[key] = serialized
     return clean, converted_keys
+
+
+def _delete_node_ids_from_index(index, node_ids: set[str]) -> int:
+    """Delete nodes from both Chroma and the persisted docstore."""
+    if not node_ids:
+        return 0
+
+    ordered_node_ids = sorted(node_ids)
+    index.vector_store.delete_nodes(ordered_node_ids)
+
+    for node_id in ordered_node_ids:
+        try:
+            index.index_struct.delete(node_id)
+        except KeyError:
+            pass
+        index.docstore.delete_document(node_id, raise_error=False)
+
+    index.storage_context.index_store.add_index_struct(index.index_struct)
+    return len(ordered_node_ids)
 
 
 class LocalRAGBackend(RAGBackend):
@@ -109,7 +148,8 @@ class LocalRAGBackend(RAGBackend):
                 if not os.path.exists(temp_file_path):
                     return BackendResult(ok=False, message="❌ 临时文件不存在", backend=self.name)
 
-                original_filename = os.path.basename(temp_file_path)
+                staged_filename = os.path.basename(temp_file_path)
+                original_filename = _display_filename(staged_filename)
                 if source_group:
                     source_group = safe_source_group(source_group)
                     classification = SourceGroupClassification(
@@ -139,7 +179,13 @@ class LocalRAGBackend(RAGBackend):
                 index = self.get_index(kb_name)
                 check()
                 report(40, "解析文档内容")
-                nodes = parse_by_source_group(target_path, filename, kb_name, source_group=source_group)
+                nodes = parse_by_source_group(
+                    target_path,
+                    filename,
+                    kb_name,
+                    source_group=source_group,
+                    progress_callback=report,
+                )
 
                 if not nodes:
                     raise ValueError("文件解析后未生成任何有效节点")
@@ -151,6 +197,7 @@ class LocalRAGBackend(RAGBackend):
                 for chunk_index, node in enumerate(nodes):
                     node.metadata["file_name"] = filename
                     node.metadata["original_file_name"] = original_filename
+                    node.metadata["staged_file_name"] = staged_filename
                     node.metadata["relative_path"] = relative_path
                     node.metadata["source_group"] = source_group
                     node.metadata["source_group_confidence"] = classification.confidence
@@ -167,7 +214,18 @@ class LocalRAGBackend(RAGBackend):
                         )
 
                 index.docstore.add_documents(nodes)
-                index.insert_nodes(nodes)
+                total_nodes = len(nodes)
+                for start in range(0, total_nodes, _INSERT_NODES_BATCH_SIZE):
+                    end = min(start + _INSERT_NODES_BATCH_SIZE, total_nodes)
+                    report(
+                        70 + int((start / total_nodes) * 18),
+                        f"生成向量并写入索引（{start + 1}-{end}/{total_nodes} 个分块）",
+                    )
+                    index.insert_nodes(nodes[start:end])
+                    report(
+                        70 + int((end / total_nodes) * 18),
+                        f"已写入向量索引（{end}/{total_nodes} 个分块）",
+                    )
 
                 report(90, "持久化索引")
                 persist_dir = config.settings.get_kb_storage_path(kb_name)
@@ -298,19 +356,29 @@ class LocalRAGBackend(RAGBackend):
             try:
                 index = self.get_index(kb_name)
                 all_nodes = list(index.docstore.docs.values())
-                requested_name = os.path.basename(document_id)
+                requested_key = _normalize_document_key(document_id)
+                requested_relative_path = _normalize_relative_path(document_id)
                 target_ref_doc_ids = set()
+                target_node_ids = set()
                 for node in all_nodes:
-                    node_file_name = node.metadata.get("file_name")
-                    node_relative_path = node.metadata.get("relative_path")
-                    if (
-                        document_id in {node_file_name, node_relative_path}
-                        or requested_name == node_file_name
-                    ) and node.ref_doc_id:
-                        target_ref_doc_ids.add(node.ref_doc_id)
+                    node_file_name = node.metadata.get("file_name", "")
+                    node_original_file_name = node.metadata.get("original_file_name", "")
+                    node_staged_file_name = node.metadata.get("staged_file_name", "")
+                    node_relative_path = node.metadata.get("relative_path", "")
+                    node_keys = {
+                        _normalize_document_key(node_file_name),
+                        _normalize_document_key(node_original_file_name),
+                        _normalize_document_key(node_staged_file_name),
+                        _normalize_document_key(node_relative_path),
+                    }
+                    matched = requested_relative_path == _normalize_relative_path(node_relative_path) or requested_key in node_keys
+                    if matched:
+                        target_node_ids.add(node.node_id)
+                        if node.ref_doc_id:
+                            target_ref_doc_ids.add(node.ref_doc_id)
 
                 file_path = os.path.join(get_kb_path(kb_name), document_id)
-                if not target_ref_doc_ids:
+                if not target_ref_doc_ids and not target_node_ids:
                     warn(f"在索引中未找到与文件 '{document_id}' 关联的文档。可能已被删除或从未索引。")
                     if os.path.exists(file_path):
                         os.remove(file_path)
@@ -318,8 +386,12 @@ class LocalRAGBackend(RAGBackend):
                     return BackendResult(ok=False, message="索引和物理路径中均未找到该文件。", backend=self.name)
 
                 for ref_doc_id in target_ref_doc_ids:
-                    index.delete_ref_doc(ref_doc_id, delete_from_store=True)
-                    log(f"从索引中删除 ref_doc_id: {ref_doc_id}")
+                    ref_doc_info = index.docstore.get_ref_doc_info(ref_doc_id)
+                    if ref_doc_info is not None:
+                        target_node_ids.update(ref_doc_info.node_ids)
+
+                deleted_node_count = _delete_node_ids_from_index(index, target_node_ids)
+                log(f"从索引中删除 {deleted_node_count} 个节点")
 
                 persist_dir = config.settings.get_kb_storage_path(kb_name)
                 index.storage_context.persist(persist_dir=persist_dir)
@@ -365,14 +437,23 @@ class LocalRAGBackend(RAGBackend):
         if not document_id:
             return None
         index = self.get_index(kb_name)
-        requested_name = os.path.basename(document_id)
+        requested_key = _normalize_document_key(document_id)
+        requested_relative_path = _normalize_relative_path(document_id)
         chunks = []
         file_name = document_id
         for node in index.docstore.docs.values():
             metadata = dict(node.metadata or {})
             node_file_name = metadata.get("file_name", "")
+            node_original_file_name = metadata.get("original_file_name", "")
+            node_staged_file_name = metadata.get("staged_file_name", "")
             node_relative_path = metadata.get("relative_path", "")
-            if document_id in {node_file_name, node_relative_path} or requested_name == node_file_name:
+            node_keys = {
+                _normalize_document_key(node_file_name),
+                _normalize_document_key(node_original_file_name),
+                _normalize_document_key(node_staged_file_name),
+                _normalize_document_key(node_relative_path),
+            }
+            if requested_relative_path == _normalize_relative_path(node_relative_path) or requested_key in node_keys:
                 file_name = node_relative_path or node_file_name or file_name
                 try:
                     chunk_index = int(metadata.get("chunk_index", len(chunks)))

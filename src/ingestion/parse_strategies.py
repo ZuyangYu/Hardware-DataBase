@@ -1,3 +1,5 @@
+from typing import Callable
+
 from llama_index.core.schema import BaseNode
 
 from src.ingestion.docling_parser import parse_file
@@ -13,11 +15,12 @@ def parse_by_source_group(
     filename: str,
     kb_name: str,
     source_group: str | None = None,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> list[BaseNode]:
     group = safe_source_group(source_group)
 
     if group in {DOCS_GROUP, MATERIAL_GROUP}:
-        return parse_file(file_path, filename, kb_name, source_group=group)
+        return parse_file(file_path, filename, kb_name, source_group=group, progress_callback=progress_callback)
 
     implemented = "、".join(sorted(IMPLEMENTED_PARSE_GROUPS))
     raise ParseStrategyNotImplemented(
