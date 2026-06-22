@@ -53,6 +53,11 @@ def init_global_models():
         raise
 
 
+def init_generation_model():
+    """Initialize only the LLM used to generate answers."""
+    _init_llm()
+
+
 def _init_llm():
     """
     初始化 LLM 模型

@@ -3,11 +3,12 @@ import os
 from llama_index.core import SimpleDirectoryReader
 import config.settings
 from src.core.logger import log, error
+from src.ingestion.kb_paths import get_kb_data_path
 
 
 def get_kb_path(kb_name: str) -> str:
     """获取知识库的文件路径"""
-    return os.path.join(config.settings.DATA_ROOT, kb_name)
+    return get_kb_data_path(kb_name)
 
 
 def list_knowledge_bases() -> list[str]:

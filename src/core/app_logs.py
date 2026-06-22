@@ -303,7 +303,10 @@ class AppLogService:
         """
         with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [row_to_query_trace(row) for row in rows]
+        traces = [row_to_query_trace(row) for row in rows]
+        if viewer.role == ROLE_SYSTEM_ADMIN:
+            return [redact_query_trace(trace) for trace in traces]
+        return traces
 
     def list_evidence(self, viewer: AuthUser, trace_id: int) -> list[RetrievedEvidence]:
         with closing(self._connect()) as conn:
@@ -319,7 +322,10 @@ class AppLogService:
                 """,
                 (trace_id,),
             ).fetchall()
-        return [row_to_evidence(row) for row in rows]
+        evidence = [row_to_evidence(row) for row in rows]
+        if viewer.role == ROLE_SYSTEM_ADMIN:
+            return [redact_evidence(item) for item in evidence]
+        return evidence
 
 
 def scoped_where(viewer: AuthUser, user_column: str = "actor_user_id") -> tuple[list[str], list[Any]]:
@@ -380,6 +386,30 @@ def row_to_query_trace(row) -> QueryTrace:
     )
 
 
+def redact_query_trace(trace: QueryTrace) -> QueryTrace:
+    return QueryTrace(
+        id=trace.id,
+        user_id=trace.user_id,
+        username=trace.username,
+        department_id=trace.department_id,
+        chat_session_id=trace.chat_session_id,
+        user_message_id=trace.user_message_id,
+        assistant_message_id=trace.assistant_message_id,
+        kb_name=trace.kb_name,
+        original_query="[redacted]",
+        rewritten_query="[redacted]" if trace.rewritten_query else "",
+        backend=trace.backend,
+        retriever_type=trace.retriever_type,
+        vector_top_k=trace.vector_top_k,
+        bm25_top_k=trace.bm25_top_k,
+        final_top_k=trace.final_top_k,
+        latency_ms=trace.latency_ms,
+        status=trace.status,
+        error_message=trace.error_message,
+        created_at=trace.created_at,
+    )
+
+
 def row_to_evidence(row) -> RetrievedEvidence:
     return RetrievedEvidence(
         id=int(row["id"]),
@@ -395,6 +425,24 @@ def row_to_evidence(row) -> RetrievedEvidence:
         text_preview=row["text_preview"],
         metadata_json=row["metadata_json"],
         created_at=row["created_at"],
+    )
+
+
+def redact_evidence(item: RetrievedEvidence) -> RetrievedEvidence:
+    return RetrievedEvidence(
+        id=item.id,
+        trace_id=item.trace_id,
+        rank=item.rank,
+        file_name=item.file_name,
+        document_id=item.document_id,
+        chunk_id=item.chunk_id,
+        vector_score=item.vector_score,
+        bm25_score=item.bm25_score,
+        rrf_score=item.rrf_score,
+        rerank_score=item.rerank_score,
+        text_preview="[redacted]",
+        metadata_json=item.metadata_json,
+        created_at=item.created_at,
     )
 
 

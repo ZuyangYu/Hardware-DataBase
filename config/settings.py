@@ -1,10 +1,13 @@
 # config/settings.py
 import os
+import re
 from enum import Enum
 from dotenv import load_dotenv
 
+ENV_FILE_ENCODING = "utf-8-sig"
+
 # 加载 .env 文件
-load_dotenv()
+load_dotenv(encoding=ENV_FILE_ENCODING)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 根目录
 DATA_ROOT = os.path.join(BASE_DIR, "data")
@@ -12,12 +15,18 @@ STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 CHROMA_PATH = os.path.join(STORAGE_DIR, "chroma_db")
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
 RERANKER_CACHE = os.path.join(STORAGE_DIR, "reranker_cache")
-DEFAULT_KB_NAME = "source_documents"
-RAG_BACKEND = os.getenv("RAG_BACKEND", "local").lower()
+RAG_BACKEND = os.getenv("RAG_BACKEND", "ragflow").lower()
+RAGFLOW_BASE_URL = os.getenv("RAGFLOW_BASE_URL", "http://localhost:9380")
+RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
+RAGFLOW_GOVERNANCE_DATASET_NAME = os.getenv("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")
+RAGFLOW_DESIGN_DATASET_NAME = os.getenv("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")
+RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
+RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
+RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
 AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
 AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
-AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "admin123")
+AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
 AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
 
 
@@ -104,11 +113,18 @@ os.makedirs(RERANKER_CACHE, exist_ok=True)
 
 # ==================== 默认值字典 ====================
 DEFAULT_VALUES = {
-    "RAG_BACKEND": "local",
+    "RAG_BACKEND": "ragflow",
+    "RAGFLOW_BASE_URL": "http://localhost:9380",
+    "RAGFLOW_API_KEY": "",
+    "RAGFLOW_GOVERNANCE_DATASET_NAME": "department_governance",
+    "RAGFLOW_DESIGN_DATASET_NAME": "project_design_assets",
+    "RAGFLOW_TIMEOUT_SECONDS": "120",
+    "RAGFLOW_SIMILARITY_THRESHOLD": "0.25",
+    "RAGFLOW_VECTOR_WEIGHT": "0.4",
     "AUTH_ENABLED": "true",
     "AUTH_DB_PATH": os.path.join(STORAGE_DIR, "auth.db"),
     "AUTH_DEFAULT_ADMIN_USERNAME": "admin",
-    "AUTH_DEFAULT_ADMIN_PASSWORD": "admin123",
+    "AUTH_DEFAULT_ADMIN_PASSWORD": "",
     "AUTH_SESSION_TTL_HOURS": "24",
     "PROVIDER": "ollama",
     "OLLAMA_BASE_URL": "http://localhost:11434",
@@ -147,7 +163,13 @@ DEFAULT_VALUES = {
 def get_kb_storage_path(kb_name: str) -> str:
     """获取知识库索引元数据(docstore.json等)的持久化路径"""
     # 将元数据存放在 storage/index_stores/知识库名/ 下
-    path = os.path.join(STORAGE_DIR, "index_stores", kb_name)
+    name = str(kb_name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name) or ".." in name:
+        raise ValueError("Invalid knowledge base name")
+    root = os.path.abspath(os.path.join(STORAGE_DIR, "index_stores"))
+    path = os.path.abspath(os.path.join(root, name))
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError("Knowledge base storage path escapes storage root")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -157,7 +179,10 @@ def reload_settings():
     重新读取 .env 文件并更新所有模块级全局变量。
     用于 Streamlit 设置页面 "应用配置" 后动态刷新。
     """
-    global RAG_BACKEND, AUTH_ENABLED, AUTH_DB_PATH
+    global RAG_BACKEND, RAGFLOW_BASE_URL, RAGFLOW_API_KEY
+    global RAGFLOW_GOVERNANCE_DATASET_NAME, RAGFLOW_DESIGN_DATASET_NAME
+    global RAGFLOW_TIMEOUT_SECONDS, RAGFLOW_SIMILARITY_THRESHOLD, RAGFLOW_VECTOR_WEIGHT
+    global AUTH_ENABLED, AUTH_DB_PATH
     global AUTH_DEFAULT_ADMIN_USERNAME, AUTH_DEFAULT_ADMIN_PASSWORD, AUTH_SESSION_TTL_HOURS
     global PROVIDER, OLLAMA_BASE_URL, OLLAMA_LLM_MODEL, OLLAMA_EMBEDDING_MODEL
     global CUSTOM_API_KEY, CUSTOM_BASE_URL, CUSTOM_LLM_MODEL, CUSTOM_EMBEDDING_MODEL
@@ -167,13 +192,20 @@ def reload_settings():
     global RERANKER_TYPE, RERANKER_MODEL, RERANKER_API_KEY, RERANKER_API_BASE
     global SYSTEM_PROMPT, NO_CONTEXT_PROMPT
 
-    load_dotenv(override=True)
+    load_dotenv(override=True, encoding=ENV_FILE_ENCODING)
 
-    RAG_BACKEND = os.getenv("RAG_BACKEND", "local").lower()
+    RAG_BACKEND = os.getenv("RAG_BACKEND", "ragflow").lower()
+    RAGFLOW_BASE_URL = os.getenv("RAGFLOW_BASE_URL", "http://localhost:9380")
+    RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
+    RAGFLOW_GOVERNANCE_DATASET_NAME = os.getenv("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")
+    RAGFLOW_DESIGN_DATASET_NAME = os.getenv("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")
+    RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
+    RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
+    RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
     AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
     AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
     AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
-    AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "admin123")
+    AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
     AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
     PROVIDER = Provider(os.getenv("PROVIDER", "ollama").lower())
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -248,7 +280,7 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
 
     lines = []
     if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
+        with open(env_path, "r", encoding=ENV_FILE_ENCODING) as f:
             lines = f.readlines()
 
     updated_keys = set()
@@ -287,5 +319,5 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
         if key not in updated_keys:
             new_lines.append(f"{key}={_format_env_value(value)}\n")
 
-    with open(env_path, "w", encoding="utf-8") as f:
+    with open(env_path, "w", encoding=ENV_FILE_ENCODING) as f:
         f.writelines(new_lines)

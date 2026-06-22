@@ -1,12 +1,18 @@
 from dataclasses import dataclass
 
-from src.ingestion.source_groups import DOCS_GROUP, MATERIAL_GROUP, UNKNOWN_GROUP
+from src.ingestion.source_groups import DESIGN_GROUP, DOCS_GROUP, MATERIAL_GROUP, PROJECT_GROUP, TEST_GROUP, UNKNOWN_GROUP
 
 
 @dataclass(frozen=True)
 class SourceGroupRoute:
     weights: dict[str, float]
     reason: str
+    source_groups: tuple[str, ...] = ()
+    confidence: float = 0.0
+
+    @property
+    def should_filter(self) -> bool:
+        return bool(self.source_groups) and self.confidence >= 0.7
 
 
 _MATERIAL_QUERY_KEYWORDS = [
@@ -53,25 +59,101 @@ _DOC_QUERY_KEYWORDS = [
     "参数",
 ]
 
+_DESIGN_QUERY_KEYWORDS = [
+    "schematic",
+    "pcb",
+    "netlist",
+    "layout",
+    "constraint",
+    "simulation",
+    "原理图",
+    "网表",
+    "约束",
+    "仿真",
+    "布局",
+    "布线",
+]
+
+_TEST_QUERY_KEYWORDS = [
+    "test",
+    "report",
+    "validation",
+    "verify",
+    "emi",
+    "emc",
+    "pass",
+    "fail",
+    "测试",
+    "报告",
+    "验证",
+    "超标",
+    "通过",
+    "失败",
+]
+
+_PROJECT_QUERY_KEYWORDS = [
+    "meeting",
+    "review",
+    "schedule",
+    "milestone",
+    "task",
+    "owner",
+    "deadline",
+    "会议",
+    "评审",
+    "计划",
+    "进度",
+    "任务",
+    "负责人",
+    "截止",
+    "里程碑",
+]
+
+_GROUP_KEYWORDS = {
+    DOCS_GROUP: _DOC_QUERY_KEYWORDS,
+    MATERIAL_GROUP: _MATERIAL_QUERY_KEYWORDS,
+    DESIGN_GROUP: _DESIGN_QUERY_KEYWORDS,
+    TEST_GROUP: _TEST_QUERY_KEYWORDS,
+    PROJECT_GROUP: _PROJECT_QUERY_KEYWORDS,
+}
+
 
 def route_source_groups(query: str) -> SourceGroupRoute:
     text = query.lower()
-    material_hits = sum(1 for keyword in _MATERIAL_QUERY_KEYWORDS if keyword.lower() in text)
-    docs_hits = sum(1 for keyword in _DOC_QUERY_KEYWORDS if keyword.lower() in text)
+    hits = {
+        group: sum(1 for keyword in keywords if keyword.lower() in text)
+        for group, keywords in _GROUP_KEYWORDS.items()
+    }
+    best_group, best_hits = max(hits.items(), key=lambda item: item[1])
+    sorted_hits = sorted(hits.values(), reverse=True)
+    second_hits = sorted_hits[1] if len(sorted_hits) > 1 else 0
 
-    if material_hits > docs_hits:
+    if best_hits >= 2 and best_hits > second_hits:
+        weights = {group: 0.65 for group in _GROUP_KEYWORDS}
+        weights[best_group] = 1.3
+        weights[UNKNOWN_GROUP] = 0.5
         return SourceGroupRoute(
-            weights={MATERIAL_GROUP: 1.25, DOCS_GROUP: 0.8, UNKNOWN_GROUP: 0.65},
-            reason="material-oriented query",
+            weights=weights,
+            reason=f"{best_group} high-confidence route",
+            source_groups=(best_group,),
+            confidence=0.85,
         )
 
-    if docs_hits > material_hits:
+    if best_hits == 1 and best_hits > second_hits:
+        weights = {group: 0.85 for group in _GROUP_KEYWORDS}
+        weights[best_group] = 1.15
+        weights[UNKNOWN_GROUP] = 0.65
         return SourceGroupRoute(
-            weights={DOCS_GROUP: 1.2, MATERIAL_GROUP: 0.85, UNKNOWN_GROUP: 0.65},
-            reason="document-oriented query",
+            weights=weights,
+            reason=f"{best_group} low-confidence route",
+            source_groups=(best_group,),
+            confidence=0.55,
         )
 
+    balanced_weights = {group: 1.0 for group in _GROUP_KEYWORDS}
+    balanced_weights[UNKNOWN_GROUP] = 0.75
     return SourceGroupRoute(
-        weights={DOCS_GROUP: 1.0, MATERIAL_GROUP: 1.0, UNKNOWN_GROUP: 0.75},
+        weights=balanced_weights,
         reason="balanced query",
+        confidence=0.0,
     )

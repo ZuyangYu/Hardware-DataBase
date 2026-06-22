@@ -1,10 +1,11 @@
-# src/streamlit_app.py
+﻿# src/streamlit_app.py
 import os
 import tempfile
 import html
 import streamlit as st
 import streamlit.components.v1 as components
 import time
+import requests
 from src.core.rag_pipeline import RAGPipeline
 from src.core.resource_manager import resource_manager
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER, build_request_context, ensure_session_id
@@ -152,7 +153,6 @@ def init_pipeline():
     """初始化 RAG Pipeline"""
     try:
         pipeline = RAGPipeline()
-        pipeline.create_kb(config.settings.DEFAULT_KB_NAME)
         return pipeline, None
     except Exception as e:
         return None, str(e)
@@ -176,7 +176,7 @@ def init_session_state():
     """初始化会话状态"""
     ensure_session_id(st.session_state)
     if "authenticated" not in st.session_state:
-        st.session_state.authenticated = not config.settings.AUTH_ENABLED
+        st.session_state.authenticated = False
     if "username" not in st.session_state:
         st.session_state.username = None
     if "role" not in st.session_state:
@@ -198,7 +198,7 @@ def init_session_state():
     if "pending_user_message_id" not in st.session_state:
         st.session_state.pending_user_message_id = None
     if "current_kb" not in st.session_state:
-        st.session_state.current_kb = config.settings.DEFAULT_KB_NAME
+        st.session_state.current_kb = None
     if "kb_list" not in st.session_state:
         st.session_state.kb_list = []
     if "show_create_kb" not in st.session_state:
@@ -224,7 +224,6 @@ def read_auth_token_from_url() -> str | None:
 
 def persist_auth_token(token: str):
     st.session_state.auth_token = token
-    st.query_params.update({AUTH_QUERY_PARAM: token})
     time.sleep(0.2)
 
 
@@ -235,26 +234,11 @@ def clear_persisted_auth_token():
 
 
 def render_auth_restore_script():
-    if read_auth_token_from_url():
-        return
-    components.html(f"""
-        <script>
-        const token = window.parent.localStorage.getItem("{AUTH_QUERY_PARAM}");
-        const params = new URLSearchParams(window.parent.location.search);
-        if (token && !params.has("{AUTH_QUERY_PARAM}")) {{
-            params.set("{AUTH_QUERY_PARAM}", token);
-            window.parent.location.search = params.toString();
-        }}
-        </script>
-    """, height=0)
+    return
 
 
 def render_auth_store_script(token: str):
-    components.html(f"""
-        <script>
-        window.parent.localStorage.setItem("{AUTH_QUERY_PARAM}", "{token}");
-        </script>
-    """, height=0)
+    return
 
 
 def render_auth_clear_script():
@@ -266,15 +250,13 @@ def render_auth_clear_script():
 
 
 def refresh_auth_state():
-    if not config.settings.AUTH_ENABLED:
-        st.session_state.authenticated = True
-        return
-
     token = st.session_state.get("auth_token") or read_auth_token_from_url()
     if not token:
         st.session_state.authenticated = False
         return
     st.session_state.auth_token = token
+    if AUTH_QUERY_PARAM in st.query_params:
+        del st.query_params[AUTH_QUERY_PARAM]
 
     user = init_auth_service().get_user_by_token(token)
     if user is None:
@@ -325,7 +307,7 @@ def load_chat_session(session_id: int):
 def ensure_current_chat_session():
     user_id = st.session_state.get("user_id")
     kb_name = st.session_state.get("current_kb")
-    if not config.settings.AUTH_ENABLED or not user_id or not kb_name:
+    if not user_id or not kb_name:
         return None
 
     conversation_service = init_conversation_service()
@@ -357,7 +339,7 @@ def start_new_chat_session():
 
 def persist_chat_message(role: str, content: str):
     user_id = st.session_state.get("user_id")
-    if not config.settings.AUTH_ENABLED or not user_id:
+    if not user_id:
         return None
     session = ensure_current_chat_session()
     if session:
@@ -368,7 +350,7 @@ def persist_chat_message(role: str, content: str):
 def clear_current_chat_session():
     user_id = st.session_state.get("user_id")
     session_id = st.session_state.get("chat_session_id")
-    if config.settings.AUTH_ENABLED and user_id and session_id:
+    if user_id and session_id:
         init_conversation_service().clear_session(user_id, session_id)
     st.session_state.messages = []
 
@@ -414,7 +396,8 @@ def create_kb_callback(pipeline):
 
 def delete_kb_confirmed(pipeline, kb_name):
     """执行已确认的知识库删除"""
-    ok, msg = pipeline.delete_knowledge_base(kb_name)
+    ctx = build_request_context(st.session_state)
+    ok, msg = pipeline.delete_knowledge_base(kb_name, ctx=ctx)
     record_audit(
         "delete_kb",
         target_type="knowledge_base",
@@ -425,12 +408,15 @@ def delete_kb_confirmed(pipeline, kb_name):
     )
     if ok:
         invalidate_file_cache(kb_name)
-        if st.session_state.current_kb == kb_name:
-            st.session_state.current_kb = config.settings.DEFAULT_KB_NAME
-            st.session_state.kb_selector = config.settings.DEFAULT_KB_NAME
-            reset_chat_state()
         ctx = build_request_context(st.session_state)
         st.session_state.kb_list = pipeline.list_knowledge_bases(ctx=ctx)
+        if st.session_state.current_kb == kb_name:
+            st.session_state.current_kb = st.session_state.kb_list[0] if st.session_state.kb_list else None
+            if st.session_state.current_kb:
+                st.session_state.kb_selector = st.session_state.current_kb
+            elif "kb_selector" in st.session_state:
+                del st.session_state["kb_selector"]
+            reset_chat_state()
         st.session_state.toast_msg = msg
     else:
         st.session_state.error_msg = msg
@@ -451,6 +437,30 @@ def refresh_kb_list(pipeline):
     st.session_state.kb_list = pipeline.list_knowledge_bases(ctx=ctx)
 
 
+def list_physical_knowledge_bases() -> list[str]:
+    try:
+        if not os.path.isdir(config.settings.DATA_ROOT):
+            return []
+        return sorted(
+            name for name in os.listdir(config.settings.DATA_ROOT)
+            if os.path.isdir(os.path.join(config.settings.DATA_ROOT, name))
+        )
+    except Exception:
+        return []
+
+
+def get_manageable_kbs(pipeline) -> list[str]:
+    ctx = build_request_context(st.session_state)
+    if ctx.is_system_admin() and hasattr(pipeline, "list_all_knowledge_bases_for_admin"):
+        return pipeline.list_all_knowledge_bases_for_admin(ctx=ctx)
+    return st.session_state.kb_list
+
+
+def has_current_kb_permission(required: str = "read") -> bool:
+    kb_name = st.session_state.get("current_kb")
+    return bool(kb_name and build_request_context(st.session_state).has_kb_permission(kb_name, required))
+
+
 def get_cached_files(pipeline, kb_name: str) -> list[str]:
     ctx = build_request_context(st.session_state)
     cache_key = f"{ctx.user_id}:{kb_name}"
@@ -459,27 +469,40 @@ def get_cached_files(pipeline, kb_name: str) -> list[str]:
     return st.session_state.file_cache[cache_key]
 
 
+def get_cached_file_infos(pipeline, kb_name: str):
+    ctx = build_request_context(st.session_state)
+    cache_key = f"{ctx.user_id}:{kb_name}:infos"
+    if cache_key not in st.session_state.file_cache:
+        if hasattr(pipeline, "list_file_infos"):
+            st.session_state.file_cache[cache_key] = pipeline.list_file_infos(kb_name, ctx=ctx)
+        else:
+            st.session_state.file_cache[cache_key] = []
+    return st.session_state.file_cache[cache_key]
+
+
 def invalidate_file_cache(kb_name: str):
     ctx = build_request_context(st.session_state)
     st.session_state.file_cache.pop(f"{ctx.user_id}:{kb_name}", None)
+    st.session_state.file_cache.pop(f"{ctx.user_id}:{kb_name}:infos", None)
 
 
 def _selected_parse_result_key(key_prefix: str) -> str:
     return f"{key_prefix}_selected_parse_result_file"
 
 
-def toggle_parse_result_file(key_prefix: str, file_name: str):
+def toggle_parse_result_file(key_prefix: str, document_id: str):
     state_key = _selected_parse_result_key(key_prefix)
-    st.session_state[state_key] = None if st.session_state.get(state_key) == file_name else file_name
+    st.session_state[state_key] = None if st.session_state.get(state_key) == document_id else document_id
 
 
-def render_parse_result_detail(pipeline, kb_name: str, selected_file: str | None):
-    if not selected_file:
+def render_parse_result_detail(pipeline, kb_name: str, selected_document_id: str | None, display_name: str | None = None):
+    if not selected_document_id:
         return
     ctx = build_request_context(st.session_state)
-    result = pipeline.get_parse_result(kb_name, selected_file, ctx=ctx)
+    result = pipeline.get_parse_result(kb_name, selected_document_id, ctx=ctx)
+    title_name = display_name or selected_document_id
     with st.container(border=True):
-        st.markdown(f"###### 解析分块 · {selected_file}")
+        st.markdown(f"###### 解析分块 · {title_name}")
         if not result:
             st.caption("该文件尚未生成解析结果，或索引中没有找到对应分块。")
             return
@@ -510,6 +533,7 @@ def format_task_time(timestamp: float | None) -> str:
 def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
     ctx = build_request_context(st.session_state)
     tasks = pipeline.list_parse_tasks(kb_name, ctx=ctx)
+    is_ragflow = config.settings.RAG_BACKEND == "ragflow"
     if any(task.status == "completed" for task in tasks):
         invalidate_file_cache(kb_name)
 
@@ -521,7 +545,7 @@ def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
             if st.button("刷新", key=f"{key_prefix}_refresh_tasks", use_container_width=True):
                 st.rerun()
         with c_clear:
-            if st.button("清理完成", key=f"{key_prefix}_clear_tasks", use_container_width=True):
+            if st.button("清理完成", key=f"{key_prefix}_clear_tasks", use_container_width=True, disabled=is_ragflow):
                 pipeline.clear_finished_parse_tasks(kb_name, ctx=ctx)
                 st.rerun()
 
@@ -546,9 +570,14 @@ def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
                 st.progress(task.progress, text=f"{task.progress}% · {task.stage}")
                 st.caption(f"最后更新: {format_task_time(task.updated_at)}")
                 if task.message:
-                    st.caption(task.message)
+                    if task.status == "failed":
+                        st.error(task.message)
+                    else:
+                        st.caption(task.message)
             with c_actions:
-                if task.status in {"queued", "running"}:
+                if is_ragflow:
+                    st.button("远端任务", key=f"{key_prefix}_remote_{task.id}", disabled=True, use_container_width=True)
+                elif task.status in {"queued", "running"}:
                     if st.button("暂停", key=f"{key_prefix}_pause_{task.id}", use_container_width=True):
                         st.session_state.toast_msg = pipeline.pause_parse_task(task.id, ctx=ctx)
                         st.rerun()
@@ -692,13 +721,51 @@ def render_settings_tab():
         """读取当前配置值，不存在则返回默认值"""
         return getattr(config.settings, key, config.settings.DEFAULT_VALUES.get(key, default))
 
+    def _check_ragflow_connection():
+        base_url = str(st.session_state.get("cfg_ragflow_base_url", "")).rstrip("/")
+        api_key = str(st.session_state.get("cfg_ragflow_api_key", ""))
+        dataset_names = [
+            str(st.session_state.get("cfg_ragflow_governance_dataset", "")),
+            str(st.session_state.get("cfg_ragflow_design_dataset", "")),
+        ]
+        timeout = int(st.session_state.get("cfg_ragflow_timeout", 120))
+        if not base_url or not api_key:
+            st.error("请先填写 RAGFlow Base URL 和 API Key")
+            return
+        try:
+            response = requests.get(
+                f"{base_url}/api/v1/datasets",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("code") not in {None, 0}:
+                st.error(f"RAGFlow API 返回错误: {payload}")
+                return
+            datasets = payload.get("data", []) if isinstance(payload, dict) else []
+            existing_names = {item.get("name") for item in datasets if isinstance(item, dict)}
+            missing = [name for name in dataset_names if name and name not in existing_names]
+            if missing:
+                st.warning(f"RAGFlow 可连接，但以下 Dataset 暂未找到: {', '.join(missing)}")
+            else:
+                st.success(f"RAGFlow 连接正常，已找到 {len(dataset_names)} 个配置 Dataset")
+        except Exception as exc:
+            st.error(f"RAGFlow 连接检查失败: {exc}")
+
+    rag_backend_options = ["ragflow", "local"]
+    backend_labels = {
+        "ragflow": "RAGFlow（推荐/生产）",
+        "local": "Local（本地兜底/调试）",
+    }
+    current_backend = str(_val("RAG_BACKEND", "ragflow")).lower()
+    if current_backend not in rag_backend_options:
+        current_backend = "ragflow"
+    selected_backend = st.session_state.get("cfg_rag_backend", current_backend)
+    is_local_backend = selected_backend == "local"
+
     with st.expander("🔐 登录与会话"):
-        st.checkbox(
-            "启用登录",
-            value=bool(_val("AUTH_ENABLED", False)),
-            key="cfg_auth_enabled",
-            help="开启后进入应用必须先登录。"
-        )
+        st.info("登录权限已固定开启。")
         st.text_input(
             "认证数据库路径",
             value=str(_val("AUTH_DB_PATH", "storage/auth.db")),
@@ -713,7 +780,7 @@ def render_settings_tab():
         )
         st.text_input(
             "默认管理员密码",
-            value=str(_val("AUTH_DEFAULT_ADMIN_PASSWORD", "admin123")),
+            value=str(_val("AUTH_DEFAULT_ADMIN_PASSWORD", "")),
             key="cfg_auth_admin_password",
             type="password",
             help="仅首次创建默认管理员时使用。创建后请通过数据库管理或后续用户管理功能修改。"
@@ -745,8 +812,6 @@ def render_settings_tab():
             st.text_input("Ollama Base URL", value=_val("OLLAMA_BASE_URL"), key="cfg_ollama_base_url")
             st.text_input("Ollama LLM 模型", value=_val("OLLAMA_LLM_MODEL"), key="cfg_ollama_llm_model",
                           help="例: qwen2.5:32b")
-            st.text_input("Ollama Embedding 模型", value=_val("OLLAMA_EMBEDDING_MODEL"), key="cfg_ollama_emb_model",
-                          help="例: nomic-embed-text:latest")
         else:
             st.text_input("API Key", value=_val("CUSTOM_API_KEY"), key="cfg_custom_api_key", type="password")
             st.text_input("Base URL", value=_val("CUSTOM_BASE_URL"), key="cfg_custom_base_url",
@@ -763,86 +828,157 @@ def render_settings_tab():
                                 value=int(_val("CUSTOM_MAX_TOKENS", "4096")),
                                 step=256, key="cfg_custom_max_tokens")
 
-            use_ollama_emb = st.checkbox(
-                "使用 Ollama 提供 Embedding（推荐，免费）",
-                value=_val("USE_OLLAMA_EMBEDDING", False) == True or _val("USE_OLLAMA_EMBEDDING", "false") == True,
-                key="cfg_use_ollama_emb",
-                help="很多第三方 API 不支持 Embedding，建议开启"
-            )
-            if use_ollama_emb:
-                st.text_input("Ollama Base URL", value=_val("OLLAMA_BASE_URL"), key="cfg_ollama_base_url")
-                st.text_input("Ollama Embedding 模型", value=_val("OLLAMA_EMBEDDING_MODEL"), key="cfg_ollama_emb_model")
-            else:
-                st.text_input("Embedding API Key", value=_val("CUSTOM_EMBEDDING_API_KEY"),
-                              key="cfg_custom_emb_api_key", type="password")
-                st.text_input("Embedding Base URL", value=_val("CUSTOM_EMBEDDING_BASE_URL"),
-                              key="cfg_custom_emb_base_url", help="例: https://api.siliconflow.cn/v1")
-                st.text_input("Embedding 模型", value=_val("CUSTOM_EMBEDDING_MODEL"), key="cfg_custom_emb_model",
-                              help="例: text-embedding-3-small")
-
     # ==================== 🔍 RAG 参数 ====================
-    with st.expander("🔎 RAG 检索参数"):
-        rag_backend_options = ["local", "ragflow"]
-        current_backend = str(_val("RAG_BACKEND", "local")).lower()
-        if current_backend not in rag_backend_options:
-            current_backend = "local"
+    with st.expander("🔎 RAG 配置", expanded=True):
         st.selectbox(
             "RAG 后端",
             options=rag_backend_options,
             index=rag_backend_options.index(current_backend),
+            format_func=lambda backend: backend_labels.get(backend, backend),
             key="cfg_rag_backend",
-            help="local = 当前内置检索；ragflow = 预留接口，后续接入 RAGFlow API"
+            help="RAGFlow 是正式解析/索引/检索主线；Local 仅用于本地兜底、离线调试和对比验证。"
         )
-        st.divider()
-        c1, c2 = st.columns(2)
-        with c1:
-            st.number_input("Chunk Size（分块大小）", min_value=64, max_value=4096,
-                            value=int(_val("CHUNK_SIZE", "512")), step=64, key="cfg_chunk_size",
-                            help="文档分块的大小（token 数）")
-        with c2:
-            st.number_input("Chunk Overlap（分块重叠）", min_value=0, max_value=2048,
-                            value=int(_val("CHUNK_OVERLAP", "50")), step=10, key="cfg_chunk_overlap",
-                            help="相邻分块的重叠量")
+        is_local_backend = st.session_state.get("cfg_rag_backend", current_backend) == "local"
 
-        st.divider()
-        c3, c4, c5 = st.columns(3)
-        with c3:
-            st.number_input("Vector Top-K", min_value=1, max_value=100,
-                            value=int(_val("VECTOR_TOP_K", "20")), key="cfg_vector_top_k",
-                            help="向量检索返回数量")
-        with c4:
-            st.number_input("BM25 Top-K", min_value=1, max_value=100,
-                            value=int(_val("BM25_TOP_K", "20")), key="cfg_bm25_top_k",
-                            help="BM25 检索返回数量")
-        with c5:
-            st.number_input("Final Top-K", min_value=1, max_value=50,
-                            value=int(_val("FINAL_TOP_K", "5")), key="cfg_final_top_k",
-                            help="最终返回给 LLM 的文档数")
-        st.number_input("RRF K（倒数排名融合参数）", min_value=1, max_value=200,
-                        value=int(_val("RRF_K", "60")), key="cfg_rrf_k",
-                        help="控制排名融合的平滑度，通常 60 效果好")
+        if is_local_backend:
+            st.warning("Local 后端仅建议用于本地调试或 RAGFlow 不可用时的临时兜底。")
+            st.markdown("###### Embedding")
+            provider_for_rag = st.session_state.get("cfg_provider", current_provider)
+            if provider_for_rag == "ollama":
+                st.text_input(
+                    "Ollama Embedding 模型",
+                    value=_val("OLLAMA_EMBEDDING_MODEL"),
+                    key="cfg_ollama_emb_model",
+                    help="例: nomic-embed-text:latest",
+                )
+            else:
+                use_ollama_emb = st.checkbox(
+                    "使用 Ollama 提供 Embedding（推荐，免费）",
+                    value=_val("USE_OLLAMA_EMBEDDING", False) == True or _val("USE_OLLAMA_EMBEDDING", "false") == True,
+                    key="cfg_use_ollama_emb",
+                    help="很多第三方 API 不支持 Embedding，建议开启"
+                )
+                if use_ollama_emb:
+                    st.text_input("Ollama Base URL", value=_val("OLLAMA_BASE_URL"), key="cfg_ollama_emb_base_url")
+                    st.text_input("Ollama Embedding 模型", value=_val("OLLAMA_EMBEDDING_MODEL"), key="cfg_ollama_emb_model")
+                else:
+                    st.text_input("Embedding API Key", value=_val("CUSTOM_EMBEDDING_API_KEY"),
+                                  key="cfg_custom_emb_api_key", type="password")
+                    st.text_input("Embedding Base URL", value=_val("CUSTOM_EMBEDDING_BASE_URL"),
+                                  key="cfg_custom_emb_base_url", help="例: https://api.siliconflow.cn/v1")
+                    st.text_input("Embedding 模型", value=_val("CUSTOM_EMBEDDING_MODEL"), key="cfg_custom_emb_model",
+                                  help="例: text-embedding-3-small")
 
-    # ==================== 🔄 Reranker 配置 ====================
-    with st.expander("🔄 Reranker 配置"):
-        reranker_options = ["none", "local", "api"]
-        current_reranker = _val("RERANKER_TYPE", "none")
-        if isinstance(current_reranker, config.settings.RerankerType):
-            current_reranker = current_reranker.value
+            st.divider()
+            st.markdown("###### 分块与检索")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.number_input("Chunk Size（分块大小）", min_value=64, max_value=4096,
+                                value=int(_val("CHUNK_SIZE", "512")), step=64, key="cfg_chunk_size",
+                                help="文档分块的大小（token 数）")
+            with c2:
+                st.number_input("Chunk Overlap（分块重叠）", min_value=0, max_value=2048,
+                                value=int(_val("CHUNK_OVERLAP", "50")), step=10, key="cfg_chunk_overlap",
+                                help="相邻分块的重叠量")
 
-        reranker_type = st.selectbox(
-            "Reranker 类型",
-            options=reranker_options,
-            index=reranker_options.index(current_reranker),
-            key="cfg_reranker_type",
-            help="none = 不使用 | local = 本地模型（需下载）| api = API 服务"
-        )
-        if reranker_type != "none":
-            st.text_input("Reranker 模型", value=_val("RERANKER_MODEL"), key="cfg_reranker_model",
-                          help="例: BAAI/bge-reranker-v2-m3")
-        if reranker_type == "api":
-            st.text_input("Reranker API Key", value=_val("RERANKER_API_KEY"), key="cfg_reranker_api_key", type="password")
-            st.text_input("Reranker API Base", value=_val("RERANKER_API_BASE"), key="cfg_reranker_api_base")
+            st.divider()
+            c3, c4, c5 = st.columns(3)
+            with c3:
+                st.number_input("Vector Top-K", min_value=1, max_value=100,
+                                value=int(_val("VECTOR_TOP_K", "20")), key="cfg_vector_top_k",
+                                help="向量检索返回数量")
+            with c4:
+                st.number_input("BM25 Top-K", min_value=1, max_value=100,
+                                value=int(_val("BM25_TOP_K", "20")), key="cfg_bm25_top_k",
+                                help="BM25 检索返回数量")
+            with c5:
+                st.number_input("Final Top-K", min_value=1, max_value=50,
+                                value=int(_val("FINAL_TOP_K", "5")), key="cfg_final_top_k",
+                                help="最终融合后返回给 LLM 的文档数")
+            st.number_input("RRF K（倒数排名融合参数）", min_value=1, max_value=200,
+                            value=int(_val("RRF_K", "60")), key="cfg_rrf_k",
+                            help="控制排名融合的平滑度，通常 60 效果好")
 
+            st.divider()
+            st.markdown("###### Reranker")
+            reranker_options = ["none", "local", "api"]
+            current_reranker = _val("RERANKER_TYPE", "none")
+            if isinstance(current_reranker, config.settings.RerankerType):
+                current_reranker = current_reranker.value
+
+            reranker_type = st.selectbox(
+                "Reranker 类型",
+                options=reranker_options,
+                index=reranker_options.index(current_reranker),
+                key="cfg_reranker_type",
+                help="none = 不使用 | local = 本地模型（需下载）| api = API 服务",
+            )
+            if reranker_type != "none":
+                st.text_input("Reranker 模型", value=_val("RERANKER_MODEL"), key="cfg_reranker_model",
+                              help="例: BAAI/bge-reranker-v2-m3")
+            if reranker_type == "api":
+                st.text_input("Reranker API Key", value=_val("RERANKER_API_KEY"), key="cfg_reranker_api_key", type="password")
+                st.text_input("Reranker API Base", value=_val("RERANKER_API_BASE"), key="cfg_reranker_api_base")
+
+        else:
+            st.markdown("###### RAGFlow 连接")
+            st.text_input(
+                "RAGFlow Base URL",
+                value=str(_val("RAGFLOW_BASE_URL", "http://localhost:9380")),
+                key="cfg_ragflow_base_url",
+                help="例如 http://localhost:9380 或你的 RAGFlow 网关地址",
+            )
+            st.text_input(
+                "RAGFlow API Key",
+                value=str(_val("RAGFLOW_API_KEY", "")),
+                key="cfg_ragflow_api_key",
+                type="password",
+            )
+            d1, d2 = st.columns(2)
+            with d1:
+                st.text_input(
+                    "部门治理 Dataset",
+                    value=str(_val("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")),
+                    key="cfg_ragflow_governance_dataset",
+                )
+            with d2:
+                st.text_input(
+                    "设计资料 Dataset",
+                    value=str(_val("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")),
+                    key="cfg_ragflow_design_dataset",
+                )
+            if st.button("检查 RAGFlow 连接", key="cfg_check_ragflow_connection"):
+                _check_ragflow_connection()
+
+            st.divider()
+            st.markdown("###### RAGFlow 检索")
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                st.number_input(
+                    "超时秒数",
+                    min_value=10,
+                    max_value=600,
+                    value=int(_val("RAGFLOW_TIMEOUT_SECONDS", "120")),
+                    key="cfg_ragflow_timeout",
+                )
+            with p2:
+                st.number_input(
+                    "相似度阈值",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(_val("RAGFLOW_SIMILARITY_THRESHOLD", "0.25")),
+                    step=0.05,
+                    key="cfg_ragflow_similarity",
+                )
+            with p3:
+                st.number_input(
+                    "向量权重",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(_val("RAGFLOW_VECTOR_WEIGHT", "0.4")),
+                    step=0.05,
+                    key="cfg_ragflow_vector_weight",
+                )
     # ==================== 💬 系统提示词 ====================
     with st.expander("💬 系统提示词"):
         default_system_prompt = config.settings.DEFAULT_VALUES.get("SYSTEM_PROMPT", "")
@@ -881,13 +1017,14 @@ def _validate_settings(new_settings: dict) -> list[str]:
     """验证配置值"""
     errors = []
     provider = new_settings.get("PROVIDER", "ollama")
+    is_local_backend = new_settings.get("RAG_BACKEND", "local") == "local"
 
     if provider == "ollama":
         if not new_settings.get("OLLAMA_BASE_URL"):
             errors.append("Ollama Base URL 不能为空")
         if not new_settings.get("OLLAMA_LLM_MODEL"):
             errors.append("Ollama LLM 模型名不能为空")
-        if not new_settings.get("OLLAMA_EMBEDDING_MODEL"):
+        if is_local_backend and not new_settings.get("OLLAMA_EMBEDDING_MODEL"):
             errors.append("Ollama Embedding 模型名不能为空")
     elif provider == "custom":
         if not new_settings.get("CUSTOM_API_KEY"):
@@ -897,11 +1034,21 @@ def _validate_settings(new_settings: dict) -> list[str]:
         if not new_settings.get("CUSTOM_LLM_MODEL"):
             errors.append("LLM 模型名不能为空")
         use_ollama = new_settings.get("USE_OLLAMA_EMBEDDING", "false") == "true"
-        if not use_ollama and not new_settings.get("CUSTOM_EMBEDDING_MODEL"):
+        if is_local_backend and not use_ollama and not new_settings.get("CUSTOM_EMBEDDING_MODEL"):
             errors.append("未使用 Ollama Embedding 时，必须填写 Custom Embedding 模型名")
 
-    for key in ["CHUNK_SIZE", "CHUNK_OVERLAP", "VECTOR_TOP_K", "BM25_TOP_K", "FINAL_TOP_K", "RRF_K",
-                "CUSTOM_CONTEXT_WINDOW", "CUSTOM_MAX_TOKENS"]:
+    if not is_local_backend:
+        if not new_settings.get("RAGFLOW_BASE_URL"):
+            errors.append("RAGFlow Base URL 不能为空")
+        if not new_settings.get("RAGFLOW_API_KEY"):
+            errors.append("RAGFlow API Key 不能为空")
+
+    int_keys = ["CUSTOM_CONTEXT_WINDOW", "CUSTOM_MAX_TOKENS"]
+    if is_local_backend:
+        int_keys.extend(["CHUNK_SIZE", "CHUNK_OVERLAP", "VECTOR_TOP_K", "BM25_TOP_K", "FINAL_TOP_K", "RRF_K"])
+    else:
+        int_keys.extend(["RAGFLOW_TIMEOUT_SECONDS"])
+    for key in int_keys:
         val = new_settings.get(key, "")
         if val:
             try:
@@ -920,8 +1067,10 @@ def _apply_settings():
     from src.core.custom_rag_chat import _context_cache
 
     new_settings = {}
-    new_settings["RAG_BACKEND"] = st.session_state.get("cfg_rag_backend", "local")
-    new_settings["AUTH_ENABLED"] = "true" if st.session_state.get("cfg_auth_enabled", False) else "false"
+    rag_backend = st.session_state.get("cfg_rag_backend", "local")
+    is_local_backend = rag_backend == "local"
+    new_settings["RAG_BACKEND"] = rag_backend
+    new_settings["AUTH_ENABLED"] = "true"
     new_settings["AUTH_DB_PATH"] = st.session_state.get("cfg_auth_db_path", "")
     new_settings["AUTH_DEFAULT_ADMIN_USERNAME"] = st.session_state.get("cfg_auth_admin_username", "")
     new_settings["AUTH_DEFAULT_ADMIN_PASSWORD"] = st.session_state.get("cfg_auth_admin_password", "")
@@ -934,39 +1083,57 @@ def _apply_settings():
     if provider == "ollama":
         new_settings["OLLAMA_BASE_URL"] = st.session_state.get("cfg_ollama_base_url", "")
         new_settings["OLLAMA_LLM_MODEL"] = st.session_state.get("cfg_ollama_llm_model", "")
-        new_settings["OLLAMA_EMBEDDING_MODEL"] = st.session_state.get("cfg_ollama_emb_model", "")
+        if is_local_backend:
+            new_settings["OLLAMA_EMBEDDING_MODEL"] = st.session_state.get("cfg_ollama_emb_model", "")
     else:
         new_settings["CUSTOM_API_KEY"] = st.session_state.get("cfg_custom_api_key", "")
         new_settings["CUSTOM_BASE_URL"] = st.session_state.get("cfg_custom_base_url", "")
         new_settings["CUSTOM_LLM_MODEL"] = st.session_state.get("cfg_custom_llm_model", "")
         new_settings["CUSTOM_CONTEXT_WINDOW"] = str(st.session_state.get("cfg_custom_ctx_window", 128000))
         new_settings["CUSTOM_MAX_TOKENS"] = str(st.session_state.get("cfg_custom_max_tokens", 4096))
-        use_ollama_emb = st.session_state.get("cfg_use_ollama_emb", False)
-        new_settings["USE_OLLAMA_EMBEDDING"] = "true" if use_ollama_emb else "false"
-        if use_ollama_emb:
-            new_settings["OLLAMA_BASE_URL"] = st.session_state.get("cfg_ollama_base_url", "")
-            new_settings["OLLAMA_EMBEDDING_MODEL"] = st.session_state.get("cfg_ollama_emb_model", "")
-        else:
-            new_settings["CUSTOM_EMBEDDING_API_KEY"] = st.session_state.get("cfg_custom_emb_api_key", "")
-            new_settings["CUSTOM_EMBEDDING_BASE_URL"] = st.session_state.get("cfg_custom_emb_base_url", "")
-            new_settings["CUSTOM_EMBEDDING_MODEL"] = st.session_state.get("cfg_custom_emb_model", "")
+        if is_local_backend:
+            use_ollama_emb = st.session_state.get("cfg_use_ollama_emb", False)
+            new_settings["USE_OLLAMA_EMBEDDING"] = "true" if use_ollama_emb else "false"
+            if use_ollama_emb:
+                new_settings["OLLAMA_BASE_URL"] = st.session_state.get("cfg_ollama_emb_base_url", "")
+                new_settings["OLLAMA_EMBEDDING_MODEL"] = st.session_state.get("cfg_ollama_emb_model", "")
+            else:
+                new_settings["CUSTOM_EMBEDDING_API_KEY"] = st.session_state.get("cfg_custom_emb_api_key", "")
+                new_settings["CUSTOM_EMBEDDING_BASE_URL"] = st.session_state.get("cfg_custom_emb_base_url", "")
+                new_settings["CUSTOM_EMBEDDING_MODEL"] = st.session_state.get("cfg_custom_emb_model", "")
 
     # ---- RAG 参数 ----
-    new_settings["CHUNK_SIZE"] = str(st.session_state.get("cfg_chunk_size", 512))
-    new_settings["CHUNK_OVERLAP"] = str(st.session_state.get("cfg_chunk_overlap", 50))
-    new_settings["VECTOR_TOP_K"] = str(st.session_state.get("cfg_vector_top_k", 20))
-    new_settings["BM25_TOP_K"] = str(st.session_state.get("cfg_bm25_top_k", 20))
-    new_settings["FINAL_TOP_K"] = str(st.session_state.get("cfg_final_top_k", 5))
-    new_settings["RRF_K"] = str(st.session_state.get("cfg_rrf_k", 60))
+    if is_local_backend:
+        new_settings["CHUNK_SIZE"] = str(st.session_state.get("cfg_chunk_size", 512))
+        new_settings["CHUNK_OVERLAP"] = str(st.session_state.get("cfg_chunk_overlap", 50))
+        new_settings["VECTOR_TOP_K"] = str(st.session_state.get("cfg_vector_top_k", 20))
+        new_settings["BM25_TOP_K"] = str(st.session_state.get("cfg_bm25_top_k", 20))
+        new_settings["FINAL_TOP_K"] = str(st.session_state.get("cfg_final_top_k", 5))
+        new_settings["RRF_K"] = str(st.session_state.get("cfg_rrf_k", 60))
+    else:
+        new_settings["RAGFLOW_BASE_URL"] = st.session_state.get("cfg_ragflow_base_url", "")
+        new_settings["RAGFLOW_API_KEY"] = st.session_state.get("cfg_ragflow_api_key", "")
+        new_settings["RAGFLOW_GOVERNANCE_DATASET_NAME"] = st.session_state.get(
+            "cfg_ragflow_governance_dataset",
+            "department_governance",
+        )
+        new_settings["RAGFLOW_DESIGN_DATASET_NAME"] = st.session_state.get(
+            "cfg_ragflow_design_dataset",
+            "project_design_assets",
+        )
+        new_settings["RAGFLOW_TIMEOUT_SECONDS"] = str(st.session_state.get("cfg_ragflow_timeout", 120))
+        new_settings["RAGFLOW_SIMILARITY_THRESHOLD"] = str(st.session_state.get("cfg_ragflow_similarity", 0.25))
+        new_settings["RAGFLOW_VECTOR_WEIGHT"] = str(st.session_state.get("cfg_ragflow_vector_weight", 0.4))
 
     # ---- Reranker ----
-    reranker_type = st.session_state.get("cfg_reranker_type", "none")
-    new_settings["RERANKER_TYPE"] = reranker_type
-    if reranker_type != "none":
-        new_settings["RERANKER_MODEL"] = st.session_state.get("cfg_reranker_model", "")
-    if reranker_type == "api":
-        new_settings["RERANKER_API_KEY"] = st.session_state.get("cfg_reranker_api_key", "")
-        new_settings["RERANKER_API_BASE"] = st.session_state.get("cfg_reranker_api_base", "")
+    if is_local_backend:
+        reranker_type = st.session_state.get("cfg_reranker_type", "none")
+        new_settings["RERANKER_TYPE"] = reranker_type
+        if reranker_type != "none":
+            new_settings["RERANKER_MODEL"] = st.session_state.get("cfg_reranker_model", "")
+        if reranker_type == "api":
+            new_settings["RERANKER_API_KEY"] = st.session_state.get("cfg_reranker_api_key", "")
+            new_settings["RERANKER_API_BASE"] = st.session_state.get("cfg_reranker_api_base", "")
 
     # ---- 系统提示词 ----
     system_prompt = st.session_state.get("cfg_system_prompt", "")
@@ -991,11 +1158,12 @@ def _apply_settings():
         # 2. 刷新模块变量
         config.settings.reload_settings()
 
-        # 3. 强制重新初始化模型
-        resource_manager.initialize(force=True)
+        if is_local_backend:
+            # 3. local 后端才需要重新初始化模型、Embedding、Reranker 和 Chroma。
+            resource_manager.initialize(force=True)
 
-        # 4. 清除索引缓存（embedding 可能变了）
-        clear_all_index_cache()
+            # 4. local 后端的 embedding/chunk 参数可能变化，需要清除索引缓存。
+            clear_all_index_cache()
 
         # 5. 清除上下文缓存
         _context_cache.clear()
@@ -1035,9 +1203,10 @@ def render_log_center_tab():
         st.stop()
 
     if viewer.role == ROLE_SYSTEM_ADMIN:
-        st.caption("系统管理员视图：可查看全局审计日志和查询日志。")
+        st.caption("系统管理员视图：可查看全局审计日志和查询状态，查询原文已隐藏。")
     else:
         st.caption("部门管理员视图：仅显示本部门相关日志。")
+    show_query_content = viewer.role != ROLE_SYSTEM_ADMIN
 
     log_service = init_log_service()
     tab_audit, tab_query = st.tabs(["审计日志", "查询日志"])
@@ -1058,6 +1227,10 @@ def render_log_center_tab():
                 "delete_kb",
                 "upload_document",
                 "delete_document",
+                "ragflow_upload_submitted",
+                "ragflow_upload_failed",
+                "ragflow_delete_document",
+                "ragflow_permission_denied",
                 "grant_kb_permission",
                 "change_settings",
             ]
@@ -1115,13 +1288,19 @@ def render_log_center_tab():
             status = st.selectbox("状态", ["全部", "success", "failed"], key="query_status_filter")
         with c3:
             query_limit = st.number_input("条数", min_value=20, max_value=1000, value=200, step=20, key="query_limit")
-        query_keyword = st.text_input("关键词", placeholder="用户名、问题、错误信息", key="query_keyword")
+        query_keyword = st.text_input(
+            "关键词",
+            placeholder="用户名、问题、错误信息" if show_query_content else "用户名、错误信息",
+            key="query_keyword",
+            disabled=not show_query_content,
+        )
+        query_keyword_filter = (query_keyword.strip() or None) if show_query_content else None
 
         traces = log_service.list_query_traces(
             viewer=viewer,
             kb_name=None if query_kb == "全部" else query_kb,
             status=None if status == "全部" else status,
-            keyword=query_keyword.strip() or None,
+            keyword=query_keyword_filter,
             limit=int(query_limit),
         )
         if not traces:
@@ -1134,7 +1313,7 @@ def render_log_center_tab():
                         "用户": trace.username,
                         "部门ID": trace.department_id,
                         "知识库": trace.kb_name,
-                        "问题": trace.original_query[:120],
+                        "问题": trace.original_query[:120] if show_query_content else "已隐藏",
                         "后端": trace.backend,
                         "检索": trace.retriever_type,
                         "耗时ms": trace.latency_ms,
@@ -1152,7 +1331,8 @@ def render_log_center_tab():
                 [trace.id for trace in traces],
                 format_func=lambda trace_id: next(
                     (
-                        f"#{trace.id} {trace.created_at} {trace.username}: {trace.original_query[:40]}"
+                        f"#{trace.id} {trace.created_at} {trace.username}: "
+                        f"{trace.original_query[:40] if show_query_content else '已隐藏'}"
                         for trace in traces
                         if trace.id == trace_id
                     ),
@@ -1163,7 +1343,7 @@ def render_log_center_tab():
             selected_trace = next((trace for trace in traces if trace.id == selected_trace_id), None)
             if selected_trace:
                 with st.expander("查询详情", expanded=True):
-                    st.markdown(f"**原始问题:** {selected_trace.original_query}")
+                    st.markdown(f"**原始问题:** {selected_trace.original_query if show_query_content else '已隐藏'}")
                     st.markdown(f"**知识库:** `{selected_trace.kb_name}`")
                     st.markdown(
                         f"**参数:** vector_top_k={selected_trace.vector_top_k}, "
@@ -1200,7 +1380,7 @@ def main():
     init_session_state()
     refresh_auth_state()
 
-    if config.settings.AUTH_ENABLED and not st.session_state.authenticated:
+    if not st.session_state.authenticated:
         render_login_page()
         return
 
@@ -1220,10 +1400,10 @@ def main():
     elif pipeline:
         ctx = build_request_context(st.session_state)
         st.session_state.kb_list = pipeline.list_knowledge_bases(ctx=ctx)
-        if not st.session_state.kb_list and st.session_state.role == ROLE_SYSTEM_ADMIN:
-            st.session_state.kb_list = [config.settings.DEFAULT_KB_NAME]
         if st.session_state.kb_list and st.session_state.current_kb not in st.session_state.kb_list:
             st.session_state.current_kb = st.session_state.kb_list[0]
+        elif not st.session_state.kb_list:
+            st.session_state.current_kb = None
 
     # ------------------ 顶部栏 (应用更稳健的 CSS Sticky 效果) ------------------
     with st.container():
@@ -1292,18 +1472,17 @@ def main():
         user_label = st.session_state.username or "anonymous"
         role_label = st.session_state.role or "anonymous"
         st.caption(f"当前用户: {user_label} / {role_label}")
-        if config.settings.AUTH_ENABLED and st.button("退出登录", width="stretch"):
+        if st.button("退出登录", width="stretch"):
             logout()
         st.divider()
 
         role = st.session_state.get("role")
-        tab_options = ["💬 智能对话"]
-        if role in {ROLE_SYSTEM_ADMIN, ROLE_DEPT_ADMIN}:
-            tab_options.append("👥 部门管理")
-            tab_options.append("📚 知识库管理")
-            tab_options.append("📊 日志中心")
         if role == ROLE_SYSTEM_ADMIN:
-            tab_options.append("⚙️ 系统配置")
+            tab_options = ["🧭 知识库治理", "👥 部门管理", "📊 日志中心", "⚙️ 系统配置"]
+        elif role == ROLE_DEPT_ADMIN:
+            tab_options = ["💬 智能对话", "👥 部门管理", "📚 知识库管理", "📊 日志中心"]
+        else:
+            tab_options = ["💬 智能对话"]
 
         selected_tab = st.radio("**🚩 功能切换:**", tab_options, label_visibility="collapsed")
         st.divider()
@@ -1319,26 +1498,34 @@ def main():
 
             if _provider == "ollama":
                 st.markdown(f"- **LLM:** `{config.settings.OLLAMA_LLM_MODEL}`")
-                st.markdown(f"- **Embedding:** `{config.settings.OLLAMA_EMBEDDING_MODEL}`")
             else:
                 st.markdown(f"- **LLM:** `{config.settings.CUSTOM_LLM_MODEL}`")
                 st.markdown(f"- **Base URL:** `{config.settings.CUSTOM_BASE_URL}`")
-                if config.settings.USE_OLLAMA_EMBEDDING:
+
+            st.divider()
+            st.markdown("**📍 当前 RAG 后端:**")
+            st.markdown(f"- **Backend:** `{config.settings.RAG_BACKEND}`")
+            if config.settings.RAG_BACKEND == "local":
+                st.caption("Local 仅作为本地兜底/调试后端。")
+                if _provider == "ollama" or config.settings.USE_OLLAMA_EMBEDDING:
                     st.markdown(f"- **Embedding:** Ollama (`{config.settings.OLLAMA_EMBEDDING_MODEL}`)")
                 else:
                     st.markdown(f"- **Embedding:** `{config.settings.CUSTOM_EMBEDDING_MODEL}`")
-
-            _reranker = config.settings.RERANKER_TYPE.value if isinstance(config.settings.RERANKER_TYPE, config.settings.RerankerType) else str(config.settings.RERANKER_TYPE)
-            st.markdown(f"- **Reranker:** `{_reranker}`")
-
-            st.divider()
-            st.markdown("**📍 当前 RAG 参数:**")
-            st.markdown(f"- **Chunk Size:** {config.settings.CHUNK_SIZE}")
-            st.markdown(f"- **Chunk Overlap:** {config.settings.CHUNK_OVERLAP}")
-            st.markdown(f"- **Vector Top-K:** {config.settings.VECTOR_TOP_K}")
-            st.markdown(f"- **BM25 Top-K:** {config.settings.BM25_TOP_K}")
-            st.markdown(f"- **Final Top-K:** {config.settings.FINAL_TOP_K}")
-            st.markdown(f"- **RRF K:** {config.settings.RRF_K}")
+                _reranker = config.settings.RERANKER_TYPE.value if isinstance(config.settings.RERANKER_TYPE, config.settings.RerankerType) else str(config.settings.RERANKER_TYPE)
+                st.markdown(f"- **Reranker:** `{_reranker}`")
+                st.markdown(f"- **Chunk Size:** {config.settings.CHUNK_SIZE}")
+                st.markdown(f"- **Chunk Overlap:** {config.settings.CHUNK_OVERLAP}")
+                st.markdown(f"- **Vector Top-K:** {config.settings.VECTOR_TOP_K}")
+                st.markdown(f"- **BM25 Top-K:** {config.settings.BM25_TOP_K}")
+                st.markdown(f"- **Final Top-K:** {config.settings.FINAL_TOP_K}")
+                st.markdown(f"- **RRF K:** {config.settings.RRF_K}")
+            else:
+                st.caption("RAGFlow 是正式解析、索引、检索主线。")
+                st.markdown(f"- **Base URL:** `{config.settings.RAGFLOW_BASE_URL}`")
+                st.markdown(f"- **Governance Dataset:** `{config.settings.RAGFLOW_GOVERNANCE_DATASET_NAME}`")
+                st.markdown(f"- **Design Dataset:** `{config.settings.RAGFLOW_DESIGN_DATASET_NAME}`")
+                st.markdown(f"- **Similarity:** {config.settings.RAGFLOW_SIMILARITY_THRESHOLD}")
+                st.markdown(f"- **Vector Weight:** {config.settings.RAGFLOW_VECTOR_WEIGHT}")
         elif selected_tab in {"💬 智能对话", "📚 知识库管理"}:
             # 其他页面需要 pipeline
             if not pipeline:
@@ -1346,31 +1533,37 @@ def main():
                 st.stop()
 
             st.markdown(f"**📍 当前对话挂载知识库:**")
-            if st.session_state.current_kb not in st.session_state.kb_list:
-                st.session_state.current_kb = config.settings.DEFAULT_KB_NAME
-                if config.settings.DEFAULT_KB_NAME not in st.session_state.kb_list:
-                    st.session_state.kb_list.append(config.settings.DEFAULT_KB_NAME)
-
-            selected_kb = st.selectbox("切换知识库", options=st.session_state.kb_list, key="kb_selector")
-            if selected_kb != st.session_state.current_kb:
-                st.session_state.current_kb = selected_kb
-                reset_chat_state()
-                st.session_state.confirm_delete_file = None
-                st.rerun()
-
-            kb_files = get_cached_files(pipeline, st.session_state.current_kb)
-            st.info(f"当前库包含 {len(kb_files)} 个文件")
-            if kb_files:
-                with st.expander("📚 查看库内文档"):
-                    render_compact_document_list(kb_files)
-
-            if selected_tab == "💬 智能对话":
-                ensure_current_chat_session()
-                if st.button("➕ 新建对话", width="stretch", type="secondary"):
-                    start_new_chat_session()
+            if not st.session_state.kb_list:
+                st.session_state.current_kb = None
+                if "kb_selector" in st.session_state:
+                    del st.session_state["kb_selector"]
+                st.info("暂无可用知识库，请先创建知识库或联系管理员授权。")
+            else:
+                if st.session_state.current_kb not in st.session_state.kb_list:
+                    st.session_state.current_kb = st.session_state.kb_list[0]
+                selected_kb = st.selectbox("切换知识库", options=st.session_state.kb_list, key="kb_selector")
+                if selected_kb != st.session_state.current_kb:
+                    st.session_state.current_kb = selected_kb
+                    reset_chat_state()
+                    st.session_state.confirm_delete_file = None
                     st.rerun()
 
-                if config.settings.AUTH_ENABLED and st.session_state.get("user_id"):
+                kb_files = get_cached_files(pipeline, st.session_state.current_kb)
+                st.info(f"当前库包含 {len(kb_files)} 个文件")
+                if kb_files:
+                    with st.expander("📚 查看库内文档"):
+                        render_compact_document_list(kb_files)
+
+            if selected_tab == "💬 智能对话":
+                if not has_current_kb_permission("read"):
+                    st.info("当前账号只有系统管理权限，没有该知识库的内容检索权限。")
+                else:
+                    ensure_current_chat_session()
+                    if st.button("➕ 新建对话", width="stretch", type="secondary"):
+                        start_new_chat_session()
+                        st.rerun()
+
+                if has_current_kb_permission("read") and st.session_state.get("user_id"):
                     sessions = init_conversation_service().list_sessions(
                         st.session_state.user_id,
                         st.session_state.current_kb,
@@ -1396,7 +1589,7 @@ def main():
                 if st.button("🗑️ 清空当前对话", width="stretch", type="secondary"):
                     clear_current_chat_session()
                     st.rerun()
-        elif selected_tab in {"👥 部门管理", "📊 日志中心"}:
+        elif selected_tab == "📊 日志中心":
             if not pipeline:
                 st.warning("⚠️ 系统未初始化，请先在 ⚙️ 系统配置 中检查并修复配置")
                 st.stop()
@@ -1429,8 +1622,14 @@ def main():
             - **删除**: 删除操作**不可恢复**。
 
             **3. 数据安全:**
-            - 默认库 `source_documents` 不可被删除。
             - 删除文件会同时移除索引和物理文件。
+            """)
+        elif selected_tab == "🧭 知识库治理":
+            st.warning("""
+            **知识库治理:**
+            - 查看全局知识库资产、归属、授权和解析状态。
+            - 不进入知识库对话，不展示文档正文或分块正文。
+            - 需要测试内容效果时，请创建测试部门和测试部门管理员。
             """)
         elif selected_tab == "👥 部门管理":
             st.warning("""
@@ -1461,9 +1660,17 @@ def main():
 
     # ------------------ 页面内容分发 ------------------
     if selected_tab == "💬 智能对话":
+        if st.session_state.get("role") == ROLE_SYSTEM_ADMIN:
+            st.error("系统管理员不使用知识库对话，请使用测试部门管理员账号进行功能测试。")
+            st.stop()
         render_chat_tab(pipeline)
+    elif selected_tab == "🧭 知识库治理":
+        if st.session_state.get("role") != ROLE_SYSTEM_ADMIN:
+            st.error("当前账号无权访问知识库治理")
+            st.stop()
+        render_kb_governance_tab(pipeline)
     elif selected_tab == "📚 知识库管理":
-        if st.session_state.get("role") not in {ROLE_SYSTEM_ADMIN, ROLE_DEPT_ADMIN}:
+        if st.session_state.get("role") != ROLE_DEPT_ADMIN:
             st.error("当前账号无权访问知识库管理")
             st.stop()
         render_kb_management_tab(pipeline)
@@ -1487,6 +1694,9 @@ def main():
 # ==================== Tab 1: 对话界面 ====================
 def render_chat_tab(pipeline):
     st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
+    if not st.session_state.current_kb:
+        st.info("暂无可用知识库，请先创建知识库或联系管理员授权。")
+        return
     ensure_current_chat_session()
 
     # 1. 渲染历史消息
@@ -1669,7 +1879,8 @@ def render_department_management_tab():
             new_password = st.text_input("密码", type="password", key="dept_auth_new_password")
             if st.form_submit_button("创建用户", width="stretch"):
                 try:
-                    auth_service.create_user(
+                    auth_service.create_user_as(
+                        current_user,
                         new_username,
                         new_password,
                         ROLE_USER,
@@ -1696,10 +1907,10 @@ def render_department_management_tab():
         return
 
     if current_user.role == ROLE_SYSTEM_ADMIN:
-        render_system_department_management()
+        render_system_department_management(current_user)
 
 
-def render_system_department_management():
+def render_system_department_management(current_user):
     auth_service = init_auth_service()
     users = auth_service.list_users()
     departments = auth_service.list_departments()
@@ -1814,13 +2025,19 @@ def render_system_department_management():
                 st.markdown("###### 创建用户")
                 new_username = st.text_input("新用户名", key="auth_new_username")
                 new_password = st.text_input("新用户密码", type="password", key="auth_new_password")
-                new_role = st.selectbox("角色", [ROLE_USER, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN], key="auth_new_role")
+                new_role = st.selectbox("角色", [ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN], key="auth_new_role")
                 department_names = [dept.name for dept in departments]
                 selected_department = st.selectbox("部门", department_names, key="auth_new_department")
                 if st.form_submit_button("创建用户", width="stretch"):
                     try:
                         department_id = next((dept.id for dept in departments if dept.name == selected_department), None)
-                        auth_service.create_user(new_username, new_password, new_role, department_id=department_id)
+                        auth_service.create_user_as(
+                            current_user,
+                            new_username,
+                            new_password,
+                            new_role,
+                            department_id=department_id,
+                        )
                         record_audit(
                             "create_user",
                             target_type="user",
@@ -1841,73 +2058,300 @@ def render_system_department_management():
                         st.error(f"创建用户失败: {e}")
 
 
+def _count_local_kb_files(kb_name: str) -> int:
+    from src.ingestion.kb_paths import get_kb_data_path
+
+    path = get_kb_data_path(kb_name)
+    if not os.path.exists(path):
+        return 0
+    total = 0
+    for _, _, files in os.walk(path):
+        total += len(files)
+    return total
+
+
+def _ragflow_governance_stats() -> dict[str, dict[str, int]]:
+    if config.settings.RAG_BACKEND != "ragflow":
+        return {}
+    try:
+        from src.rag_backends.ragflow_store import RAGFlowStore
+
+        store = RAGFlowStore()
+        stats = {}
+        with store._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    kb_name,
+                    COUNT(*) AS files,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN status = 'parsing' THEN 1 ELSE 0 END) AS parsing
+                FROM ragflow_documents
+                GROUP BY kb_name
+                """
+            ).fetchall()
+        for row in rows:
+            stats[row["kb_name"]] = {
+                "files": int(row["files"] or 0),
+                "failed": int(row["failed"] or 0),
+                "parsing": int(row["parsing"] or 0),
+            }
+        return stats
+    except Exception as exc:
+        st.caption(f"RAGFlow 台账读取失败: {exc}")
+        return {}
+
+
+def render_kb_governance_tab(pipeline):
+    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
+    st.subheader("🧭 知识库治理")
+    st.caption("系统管理员用于查看全局资产、归属、授权和异常状态；不展示文档正文，不提供对话入口。")
+
+    auth_service = init_auth_service()
+    current_user = current_auth_user()
+    if pipeline:
+        existing_kbs = pipeline.list_all_knowledge_bases_for_admin(ctx=build_request_context(st.session_state))
+    else:
+        existing_kbs = list_physical_knowledge_bases()
+        st.warning("RAG 后端未初始化，当前仅展示本地目录和权限数据库中的治理信息。")
+    summaries = auth_service.list_knowledge_base_summaries(existing_kbs)
+    ragflow_stats = _ragflow_governance_stats()
+
+    rows = []
+    issue_count = 0
+    for item in summaries:
+        local_files = _count_local_kb_files(item.name)
+        backend_stats = ragflow_stats.get(item.name, {})
+        file_count = backend_stats.get("files", local_files)
+        failed_count = backend_stats.get("failed", 0)
+        parsing_count = backend_stats.get("parsing", 0)
+        issues = []
+        if not item.registered:
+            issues.append("未登记")
+        if not item.physical_exists:
+            issues.append("目录缺失")
+        if not item.department_id:
+            issues.append("未分配部门")
+        if item.department_id and item.dept_admin_count == 0:
+            issues.append("无部门管理员")
+        if failed_count:
+            issues.append(f"解析失败 {failed_count}")
+        if item.permission_count == 0:
+            issues.append("未授权")
+        if issues:
+            issue_count += 1
+        rows.append(
+            {
+                "知识库": item.name,
+                "部门": item.department_name or "未分配",
+                "负责人": item.owner_username or "-",
+                "文件数": file_count,
+                "解析中": parsing_count,
+                "失败数": failed_count,
+                "授权人数": item.permission_count,
+                "登记": "是" if item.registered else "否",
+                "状态": "；".join(issues) if issues else "正常",
+            }
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("知识库总数", len(summaries))
+    c2.metric("异常知识库", issue_count)
+    c3.metric("未分配部门", sum(1 for item in summaries if not item.department_id))
+    c4.metric("解析失败文件", sum(row["失败数"] for row in rows))
+
+    st.markdown("##### 全局知识库台账")
+    if not rows:
+        st.info("当前没有知识库。")
+    else:
+        st.dataframe(rows, width="stretch", hide_index=True)
+
+    st.divider()
+    st.markdown("##### 知识库归属与授权")
+    if not summaries:
+        return
+
+    selected_kb = st.selectbox("选择知识库", [item.name for item in summaries], key="governance_kb_select")
+    selected_summary = next(item for item in summaries if item.name == selected_kb)
+    departments = [dept for dept in auth_service.list_departments() if dept.name != "system"]
+    dept_admins = [user for user in auth_service.list_users() if user.role == ROLE_DEPT_ADMIN and user.is_active]
+    permissions = auth_service.list_knowledge_base_permissions(selected_kb)
+
+    detail_col, assign_col = st.columns([1.2, 1])
+    with detail_col:
+        st.markdown("###### 当前状态")
+        st.write(f"部门: `{selected_summary.department_name or '未分配'}`")
+        st.write(f"负责人: `{selected_summary.owner_username or '-'}`")
+        st.write(f"授权人数: `{selected_summary.permission_count}`")
+        if permissions:
+            st.dataframe(
+                [
+                    {
+                        "用户": item.username,
+                        "角色": item.role,
+                        "部门": item.department_name or "-",
+                        "权限": item.permission,
+                    }
+                    for item in permissions
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.caption("暂无内容访问授权。")
+
+    with assign_col:
+        st.markdown("###### 分配归属")
+        if not departments:
+            st.info("请先在部门管理中创建业务部门。")
+        else:
+            current_dept_index = next(
+                (idx for idx, dept in enumerate(departments) if dept.id == selected_summary.department_id),
+                0,
+            )
+            department = st.selectbox(
+                "所属部门",
+                departments,
+                index=current_dept_index,
+                format_func=lambda dept: dept.name,
+                key="governance_department_select",
+            )
+            owner_options = [user for user in dept_admins if user.department_id == department.id]
+            owner = None
+            if owner_options:
+                current_owner_index = next(
+                    (idx for idx, user in enumerate(owner_options) if user.id == selected_summary.owner_user_id),
+                    0,
+                )
+                owner = st.selectbox(
+                    "部门负责人",
+                    owner_options,
+                    index=current_owner_index,
+                    format_func=lambda user: user.username,
+                    key="governance_owner_select",
+                )
+            else:
+                st.warning("该部门还没有启用的部门管理员。")
+
+            if st.button("保存归属", type="primary", width="stretch", disabled=owner is None):
+                try:
+                    auth_service.assign_knowledge_base_as(current_user, selected_kb, department.id, owner.id if owner else None)
+                    record_audit(
+                        "assign_knowledge_base",
+                        target_type="knowledge_base",
+                        target_id=selected_kb,
+                        kb_name=selected_kb,
+                        metadata={"department": department.name, "owner": owner.username if owner else ""},
+                    )
+                    st.success("知识库归属已更新。")
+                    st.rerun()
+                except Exception as exc:
+                    record_audit(
+                        "assign_knowledge_base",
+                        target_type="knowledge_base",
+                        target_id=selected_kb,
+                        kb_name=selected_kb,
+                        success=False,
+                        error_message=str(exc),
+                    )
+                    st.error(f"保存失败: {exc}")
+
+
 # ==================== Tab 2: 管理界面 ====================
 def render_kb_management_tab(pipeline):
     st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
     st.subheader("📚 知识库管理")
+    manageable_kbs = get_manageable_kbs(pipeline)
+    can_create_kb = st.session_state.get("role") == ROLE_DEPT_ADMIN
+    upload_types = ["pdf", "txt", "md", "docx", "html", "csv", "xlsx"]
 
-    with st.container(border=True):
-        st.markdown("##### 📤 当前知识库上传文档")
-        source_group = st.selectbox(
-            "文件类型",
-            USER_SELECTABLE_SOURCE_GROUPS,
-            format_func=lambda group: f"{group}（{SOURCE_GROUP_DESCRIPTIONS.get(group, '')}）",
-            key="upload_source_group",
-        )
-        files = st.file_uploader("拖拽文件到此处", accept_multiple_files=True,
-                                 type=["pdf", "txt", "md", "docx", "html", "csv", "xlsx"])
-        if files and st.button("开始上传", type="primary"):
-            with st.status("处理中...", expanded=True) as status:
-                st.write("保存临时文件...")
-                temp_paths = []
-                temp_dir = tempfile.gettempdir()
-                for f in files:
-                    path = os.path.join(temp_dir, f.name)
-                    with open(path, "wb") as wb:
-                        wb.write(f.getbuffer())
-                    temp_paths.append(path)
-                st.write("创建后台解析任务...")
-                ctx = build_request_context(st.session_state)
-                res = pipeline.upload_files(
-                    temp_paths,
-                    st.session_state.current_kb,
-                    ctx=ctx,
-                    source_group=source_group,
-                )
-                upload_ok = res.startswith("✅")
-                record_audit(
-                    "upload_document",
-                    target_type="document",
-                    target_id=", ".join(f.name for f in files),
-                    kb_name=st.session_state.current_kb,
-                    success=upload_ok,
-                    error_message="" if upload_ok else res,
-                    metadata={
-                        "file_count": len(files),
-                        "source_group": source_group,
-                        "result": res.split("\n")[0],
-                    },
-                )
-                for p in temp_paths:
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
-                status.update(label="✅ 已提交解析任务", state="complete", expanded=False)
-            st.success(res.split('\n')[0])
-            time.sleep(1)
-            st.rerun()
-    st.divider()
+    if not st.session_state.current_kb and not manageable_kbs:
+        st.info("暂无可用知识库，请联系本部门管理员创建或授权。")
+        st.markdown("##### 📁 知识库列表")
+        if can_create_kb and st.button("➕ 新建"):
+            st.session_state.show_create_kb = True
+        if st.session_state.show_create_kb:
+            with st.container(border=True):
+                st.markdown("###### 新建知识库")
+                with st.form("new_kb_form_empty"):
+                    st.text_input("输入新知识库名称", placeholder="例如: project_alpha", key="new_kb_name_input")
+                    st.form_submit_button("确认创建", on_click=create_kb_callback, args=(pipeline,))
+                if st.button("取消", key="cancel_create_kb_empty"):
+                    st.session_state.show_create_kb = False
+                    st.rerun()
+        return
 
-    render_parse_task_panel(pipeline, st.session_state.current_kb, key_prefix="kb_mgmt")
-    st.divider()
+    if has_current_kb_permission("write"):
+        with st.container(border=True):
+            st.markdown("##### 📤 当前知识库上传文档")
+            source_group = st.selectbox(
+                "文件类型",
+                USER_SELECTABLE_SOURCE_GROUPS,
+                format_func=lambda group: f"{group}（{SOURCE_GROUP_DESCRIPTIONS.get(group, '')}）",
+                key="upload_source_group",
+            )
+            files = st.file_uploader("拖拽文件到此处", accept_multiple_files=True, type=upload_types)
+            if files and st.button("开始上传", type="primary"):
+                with st.status("处理中...", expanded=True) as status:
+                    st.write("保存临时文件...")
+                    temp_paths = []
+                    temp_dir = tempfile.gettempdir()
+                    for f in files:
+                        path = os.path.join(temp_dir, f.name)
+                        with open(path, "wb") as wb:
+                            wb.write(f.getbuffer())
+                        temp_paths.append(path)
+                    st.write("创建后台解析任务...")
+                    ctx = build_request_context(st.session_state)
+                    res = pipeline.upload_files(
+                        temp_paths,
+                        st.session_state.current_kb,
+                        ctx=ctx,
+                        source_group=source_group,
+                    )
+                    upload_ok = (
+                        res.startswith("✅")
+                        or "Submitted to RAGFlow" in res
+                        or "成功" in res
+                        or "已创建" in res
+                    )
+                    record_audit(
+                        "upload_document",
+                        target_type="document",
+                        target_id=", ".join(f.name for f in files),
+                        kb_name=st.session_state.current_kb,
+                        success=upload_ok,
+                        error_message="" if upload_ok else res,
+                        metadata={
+                            "file_count": len(files),
+                            "source_group": source_group,
+                            "result": res.split("\n")[0],
+                        },
+                    )
+                    for p in temp_paths:
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                    invalidate_file_cache(st.session_state.current_kb)
+                    status.update(label="✅ 已提交解析任务", state="complete", expanded=False)
+                st.success(res.split('\n')[0])
+                time.sleep(1)
+                st.rerun()
+        st.divider()
+
+        render_parse_task_panel(pipeline, st.session_state.current_kb, key_prefix="kb_mgmt")
+        st.divider()
+    elif st.session_state.current_kb:
+        st.info("当前账号没有该知识库的内容上传权限。")
+        st.divider()
 
     st.markdown("##### 📁 知识库列表")
     col_kbs, col_new = st.columns([9, 1])
     with col_kbs:
-        st.caption(f"共有 {len(st.session_state.kb_list)} 个知识库")
+        st.caption(f"共有 {len(manageable_kbs)} 个知识库")
     with col_new:
-        if st.button("➕ 新建"):
+        if can_create_kb and st.button("➕ 新建"):
             st.session_state.show_create_kb = True
 
     if st.session_state.show_create_kb:
@@ -1920,79 +2364,123 @@ def render_kb_management_tab(pipeline):
                 st.session_state.show_create_kb = False
                 st.rerun()
 
-    if st.session_state.get("role") in {ROLE_SYSTEM_ADMIN, ROLE_DEPT_ADMIN} and st.session_state.kb_list:
+    if st.session_state.get("role") == ROLE_DEPT_ADMIN and manageable_kbs:
         with st.expander("🔑 知识库访问授权"):
             auth_service = init_auth_service()
             manager = auth_service.get_user_by_username(st.session_state.get("username"))
             users = auth_service.list_users_for_manager(manager) if manager else []
+            users = [user for user in users if user.role != ROLE_SYSTEM_ADMIN]
             if st.session_state.get("role") == ROLE_DEPT_ADMIN:
                 users = [user for user in users if user.role == ROLE_USER]
             if not users:
                 st.info("暂无可授权用户")
             else:
                 with st.form("grant_kb_permission_form"):
-                    grant_kb = st.selectbox("知识库", st.session_state.kb_list, key="grant_kb_name")
+                    grant_kb = st.selectbox("知识库", manageable_kbs, key="grant_kb_name")
                     user_labels = [f"{user.username} ({user.role})" for user in users]
-                    selected_user_label = st.selectbox("用户", user_labels, key="grant_user_label")
+                    selected_user_labels = st.multiselect("用户", user_labels, key="grant_user_labels")
                     permission = st.selectbox("权限", ["read", "write", "admin"], key="grant_permission")
                     if st.form_submit_button("授权"):
-                        selected_index = user_labels.index(selected_user_label)
-                        target_user = users[selected_index]
-                        try:
-                            auth_service.grant_kb_permission(grant_kb, target_user.id, permission)
-                            record_audit(
-                                "grant_kb_permission",
-                                target_type="kb_permission",
-                                target_id=target_user.username,
-                                kb_name=grant_kb,
-                                metadata={"permission": permission, "target_user_id": target_user.id},
-                            )
-                            st.success(f"已授权 {target_user.username} 访问 {grant_kb}: {permission}")
-                            st.rerun()
-                        except Exception as e:
-                            record_audit(
-                                "grant_kb_permission",
-                                target_type="kb_permission",
-                                target_id=target_user.username,
-                                kb_name=grant_kb,
-                                success=False,
-                                error_message=str(e),
-                                metadata={"permission": permission, "target_user_id": target_user.id},
-                            )
-                            st.error(f"授权失败: {e}")
+                        if not selected_user_labels:
+                            st.warning("请至少选择一个用户。")
+                        else:
+                            selected_users = [
+                                users[user_labels.index(label)]
+                                for label in selected_user_labels
+                            ]
+                            success_users = []
+                            failed_messages = []
+                            for target_user in selected_users:
+                                try:
+                                    auth_service.grant_kb_permission_as(manager, grant_kb, target_user.id, permission)
+                                    record_audit(
+                                        "grant_kb_permission",
+                                        target_type="kb_permission",
+                                        target_id=target_user.username,
+                                        kb_name=grant_kb,
+                                        metadata={"permission": permission, "target_user_id": target_user.id},
+                                    )
+                                    success_users.append(target_user.username)
+                                except Exception as e:
+                                    record_audit(
+                                        "grant_kb_permission",
+                                        target_type="kb_permission",
+                                        target_id=target_user.username,
+                                        kb_name=grant_kb,
+                                        success=False,
+                                        error_message=str(e),
+                                        metadata={"permission": permission, "target_user_id": target_user.id},
+                                    )
+                                    failed_messages.append(f"{target_user.username}: {e}")
+                            if success_users:
+                                st.success(f"已授权 {len(success_users)} 个用户访问 {grant_kb}: {permission}")
+                            if failed_messages:
+                                st.error("授权失败: " + "；".join(failed_messages))
+                            if success_users and not failed_messages:
+                                st.rerun()
 
-    for kb in st.session_state.kb_list:
-        files = get_cached_files(pipeline, kb)
+    for kb in manageable_kbs:
+        ctx = build_request_context(st.session_state)
+        can_read_kb = ctx.has_kb_permission(kb, "read")
+        can_write_kb = ctx.has_kb_permission(kb, "write")
+        can_admin_kb = ctx.has_kb_permission(kb, "admin")
+        file_infos = get_cached_file_infos(pipeline, kb) if can_read_kb else []
+        files = ([info.name for info in file_infos] or get_cached_files(pipeline, kb)) if can_read_kb else []
+        file_info_by_id = {info.id: info for info in file_infos}
         is_current = (kb == st.session_state.current_kb)
         with st.expander(f"{'🟢' if is_current else '⚪'} {kb} ({len(files)} 文件)", expanded=is_current):
-            if files:
+            if not can_read_kb:
+                st.caption("仅系统管理可见；当前账号没有内容读取权限。")
+            elif files:
                 st.markdown("**📄 文件列表:**")
                 container_kwargs = {"border": True}
                 if len(files) > 5:
                     container_kwargs["height"] = 300
-                selected_file = st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}"))
-                if selected_file not in files:
-                    selected_file = None
+                selected_doc_id = st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}"))
+                if selected_doc_id not in file_info_by_id and file_info_by_id:
+                    selected_doc_id = None
                 with st.container(**container_kwargs):
-                    for file_index, f in enumerate(files):
+                    rows = file_infos if file_infos else files
+                    for file_index, item in enumerate(rows):
+                        if hasattr(item, "id"):
+                            doc_id = item.id
+                            f = item.name
+                            info = item
+                        else:
+                            doc_id = item
+                            f = item
+                            info = None
                         c1, c2, c3 = st.columns([0.68, 0.16, 0.16])
                         with c1:
-                            st.markdown(f"📄 {f}")
+                            if info and info.metadata.get("ragflow_document_id"):
+                                status = info.metadata.get("status", "unknown")
+                                dataset_kind = info.metadata.get("dataset_kind", "")
+                                local_path = info.metadata.get("local_path", "")
+                                ragflow_error = info.metadata.get("ragflow_error", "")
+                                st.markdown(f"📄 {f}  \n`RAGFlow: {status}` `{dataset_kind}`")
+                                if local_path:
+                                    st.caption(f"本地归档: {local_path}")
+                                if ragflow_error:
+                                    st.caption(f"RAGFlow 错误: {ragflow_error}")
+                            else:
+                                st.markdown(f"📄 {f}")
                         with c2:
-                            chunk_label = "收起" if selected_file == f else "分块"
+                            chunk_label = "收起" if selected_doc_id == doc_id else "分块"
                             if st.button(chunk_label, key=f"chunks_f_{kb}_{file_index}", use_container_width=True):
-                                toggle_parse_result_file(f"mgmt_{kb}", f)
+                                toggle_parse_result_file(f"mgmt_{kb}", doc_id)
                                 st.rerun()
                         with c3:
                             current_confirm = st.session_state.confirm_delete_file
-                            is_confirming = (current_confirm == (kb, f))
-                            if is_confirming:
+                            is_confirming = (current_confirm == (kb, doc_id))
+                            if not can_write_kb:
+                                st.button("🗑️", key=f"del_f_{kb}_{file_index}", help="无删除权限", disabled=True)
+                            elif is_confirming:
                                 sub_c1, sub_c2 = st.columns([1, 1])
                                 with sub_c1:
-                                    if st.button("✓", key=f"yes_f_{kb}_{f}", help="确认删除"):
+                                    if st.button("✓", key=f"yes_f_{kb}_{file_index}", help="确认删除"):
                                         with st.spinner("删除中..."):
                                             ctx = build_request_context(st.session_state)
-                                            res = pipeline.delete_document(f, kb, ctx=ctx)
+                                            res = pipeline.delete_document(doc_id, kb, ctx=ctx)
                                             delete_ok = "✅" in res
                                             record_audit(
                                                 "delete_document",
@@ -2004,7 +2492,7 @@ def render_kb_management_tab(pipeline):
                                             )
                                             invalidate_file_cache(kb)
                                             st.session_state.confirm_delete_file = None
-                                            if st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}")) == f:
+                                            if st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}")) == doc_id:
                                                 st.session_state[_selected_parse_result_key(f"mgmt_{kb}")] = None
                                             if "✅" in res:
                                                 st.session_state.toast_msg = f"已删除: {f}"
@@ -2012,41 +2500,50 @@ def render_kb_management_tab(pipeline):
                                                 st.session_state.error_msg = res
                                             st.rerun()
                                 with sub_c2:
-                                    if st.button("✗", key=f"no_f_{kb}_{f}", help="取消"):
+                                    if st.button("✗", key=f"no_f_{kb}_{file_index}", help="取消"):
                                         st.session_state.confirm_delete_file = None
                                         st.rerun()
                             else:
-                                if st.button("🗑️", key=f"del_f_{kb}_{f}", help="删除文件"):
-                                    st.session_state.confirm_delete_file = (kb, f)
+                                if st.button("🗑️", key=f"del_f_{kb}_{file_index}", help="删除文件"):
+                                    st.session_state.confirm_delete_file = (kb, doc_id)
                                     st.rerun()
-                if selected_file:
+                if selected_doc_id:
                     st.divider()
-                    render_parse_result_detail(pipeline, kb, selected_file)
+                    selected_info = file_info_by_id.get(selected_doc_id)
+                    render_parse_result_detail(
+                        pipeline,
+                        kb,
+                        selected_doc_id,
+                        selected_info.name if selected_info else selected_doc_id,
+                    )
             else:
                 st.caption("暂无文件")
 
             st.divider()
             col_switch, col_del = st.columns([1, 1])
             with col_switch:
-                if not is_current:
+                if not can_read_kb:
+                    st.button("🔄 切换到此知识库", disabled=True, key=f"btn_no_read_{kb}", help="无内容检索权限")
+                elif not is_current:
                     st.button("🔄 切换到此知识库", key=f"btn_switch_{kb}", on_click=switch_kb_callback, args=(kb,))
                 else:
                     st.button("✅ 当前使用中", disabled=True, key=f"btn_cur_{kb}")
             with col_del:
-                if kb != config.settings.DEFAULT_KB_NAME:
-                    if st.session_state.confirm_delete_kb == kb:
-                        st.markdown("**确认删除?**")
-                        sub_c1, sub_c2 = st.columns([1, 1])
-                        with sub_c1:
-                            st.button("✅ 是", key=f"yes_kb_{kb}", on_click=delete_kb_confirmed, args=(pipeline, kb))
-                        with sub_c2:
-                            if st.button("❌ 否", key=f"no_kb_{kb}"):
-                                st.session_state.confirm_delete_kb = None
-                                st.rerun()
-                    else:
-                        if st.button("🗑️ 删除整个库", key=f"del_kb_{kb}"):
-                            st.session_state.confirm_delete_kb = kb
+                if not can_admin_kb:
+                    st.button("🗑️ 删除整个库", disabled=True, key=f"del_kb_disabled_{kb}", help="无知识库 admin 权限")
+                elif st.session_state.confirm_delete_kb == kb:
+                    st.markdown("**确认删除?**")
+                    sub_c1, sub_c2 = st.columns([1, 1])
+                    with sub_c1:
+                        st.button("✅ 是", key=f"yes_kb_{kb}", on_click=delete_kb_confirmed, args=(pipeline, kb))
+                    with sub_c2:
+                        if st.button("❌ 否", key=f"no_kb_{kb}"):
+                            st.session_state.confirm_delete_kb = None
                             st.rerun()
+                else:
+                    if st.button("🗑️ 删除整个库", key=f"del_kb_{kb}"):
+                        st.session_state.confirm_delete_kb = kb
+                        st.rerun()
 
 
 if __name__ == "__main__":
