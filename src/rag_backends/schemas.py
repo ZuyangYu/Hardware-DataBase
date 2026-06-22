@@ -8,10 +8,24 @@ class RequestContext:
     session_id: str = ""
     roles: list[str] = field(default_factory=list)
     allowed_kbs: list[str] = field(default_factory=list)
+    kb_permissions: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def is_system_admin(self) -> bool:
+        return "system_admin" in self.roles
+
     def can_access_kb(self, kb_name: str) -> bool:
-        return not self.allowed_kbs or kb_name in self.allowed_kbs
+        return self.has_kb_permission(kb_name, "read")
+
+    def has_kb_permission(self, kb_name: str, required: str = "read") -> bool:
+        if self.is_system_admin():
+            return False
+        levels = {"read": 1, "write": 2, "admin": 3}
+        required_level = levels.get(required, 1)
+        permission = self.kb_permissions.get(kb_name)
+        if permission is None and kb_name in self.allowed_kbs:
+            permission = "read"
+        return levels.get(permission or "", 0) >= required_level
 
 
 @dataclass

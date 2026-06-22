@@ -26,3 +26,8 @@ data/**
 streamlit.log
 streamlit.err.log
 streamlit.out.log
+
+# Local verification scratch dirs
+.tmp_ragflow*/
+.tmp_pycache/
+ragflow_store_*/
