@@ -54,13 +54,26 @@ class IngestResult:
     total_count: int
     messages: list[str] = field(default_factory=list)
     backend: str = "local"
+    failed_count: int = 0
+    skipped_count: int = 0
 
     @property
     def ok(self) -> bool:
-        return self.success_count == self.total_count
+        return self.total_count > 0 and self.success_count == self.total_count and self.failed_count == 0 and self.skipped_count == 0
 
     def to_message(self) -> str:
-        return f"✅ 成功处理 {self.success_count}/{self.total_count} 个文件\n" + "\n".join(self.messages)
+        if self.ok:
+            prefix = "全部处理成功"
+        elif self.success_count > 0:
+            prefix = "部分处理完成"
+        else:
+            prefix = "未处理成功"
+        summary = (
+            f"{prefix}: 成功 {self.success_count}, "
+            f"失败 {self.failed_count}, 跳过 {self.skipped_count}, 总计 {self.total_count}"
+        )
+        details = "\n".join(self.messages)
+        return f"{summary}\n{details}" if details else summary
 
 
 @dataclass
