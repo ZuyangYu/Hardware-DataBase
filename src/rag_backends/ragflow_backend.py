@@ -13,6 +13,7 @@ from src.core.app_logs import AppLogService
 from src.core.logger import error, log
 from src.core.source_group_router import route_source_groups
 from src.ingestion.kb_paths import get_kb_data_path, safe_child_path, validate_kb_name
+from src.ingestion.container_inspector import inspect_container_file
 from src.ingestion.source_groups import (
     DESIGN_GROUP,
     DOCS_GROUP,
@@ -85,6 +86,7 @@ SOURCE_GROUP_DATASET_KIND = {
 }
 
 RAGFLOW_INFO_ID_PREFIX = "ragflow:"
+RAGFLOW_DOCUMENT_EXTENSIONS = {".doc", ".docx", ".pdf"}
 SPREADSHEET_EXTENSIONS = {".xls", ".xlsx"}
 
 
@@ -146,6 +148,18 @@ def _file_sha256(file_path: str) -> str:
 
 def _is_spreadsheet_file(file_path: str) -> bool:
     return os.path.splitext(file_path.lower())[1] in SPREADSHEET_EXTENSIONS
+
+
+def _is_ragflow_document_file(file_path: str) -> bool:
+    return os.path.splitext(file_path.lower())[1] in RAGFLOW_DOCUMENT_EXTENSIONS
+
+
+def _supported_pipeline_for_file(file_path: str) -> str | None:
+    if _is_spreadsheet_file(file_path):
+        return PROCESSOR_KIND_SPREADSHEET
+    if _is_ragflow_document_file(file_path):
+        return PROCESSOR_KIND_RAGFLOW
+    return None
 
 
 def _normalize_ragflow_status(raw_status: object) -> str:
@@ -516,6 +530,12 @@ class RAGFlowBackend(RAGBackend):
     def _local_archive_exists(self, record) -> bool:
         return os.path.exists(self._resolve_archive_path(record))
 
+    def _inspect_record_archive(self, record) -> dict:
+        path = self._resolve_archive_path(record)
+        if not os.path.exists(path):
+            return {}
+        return inspect_container_file(path).to_metadata()
+
     def _remote_document_exists(self, record) -> bool:
         try:
             return bool(self.client.list_documents(record.dataset_id, record.document_id))
@@ -546,6 +566,8 @@ class RAGFlowBackend(RAGBackend):
 
         messages = []
         success_count = 0
+        failed_count = 0
+        skipped_count = 0
         dataset_kind = self._dataset_kind_for_group(source_group)
         dataset_id = self._dataset_ids[dataset_kind]
         department_id = _require_upload_department(ctx)
@@ -557,8 +579,35 @@ class RAGFlowBackend(RAGBackend):
             document_id = ""
             uploaded_to_ragflow = False
             try:
+                pipeline_kind = _supported_pipeline_for_file(file_path)
+                if pipeline_kind is None:
+                    extension = os.path.splitext(filename)[1].lower() or "(no extension)"
+                    message = f"[skipped] {filename}: unsupported file type {extension}; no pipeline is configured yet."
+                    messages.append(message)
+                    skipped_count += 1
+                    self._audit(
+                        "upload_unsupported_file",
+                        ctx,
+                        kb_name=kb_name,
+                        target_type="document",
+                        target_id=filename,
+                        success=False,
+                        error_message=message,
+                        metadata={
+                            "extension": extension,
+                            "source_group": source_group,
+                            "configured_pipelines": {
+                                PROCESSOR_KIND_RAGFLOW: sorted(RAGFLOW_DOCUMENT_EXTENSIONS),
+                                PROCESSOR_KIND_SPREADSHEET: sorted(SPREADSHEET_EXTENSIONS),
+                            },
+                        },
+                    )
+                    if progress_callback:
+                        progress_callback(0, f"{filename}: 暂未接入处理管道，已跳过")
+                    continue
+
                 content_hash = _file_sha256(file_path)
-                is_spreadsheet = _is_spreadsheet_file(file_path)
+                is_spreadsheet = pipeline_kind == PROCESSOR_KIND_SPREADSHEET
                 record_dataset_kind = DATASET_TABLE if is_spreadsheet else dataset_kind
                 existing = self.store.find_by_hash(kb_name, record_dataset_kind, content_hash, department_id)
                 if existing and existing.status not in {RAGFLOW_STATUS_FAILED, RAGFLOW_STATUS_DELETED}:
@@ -566,9 +615,9 @@ class RAGFlowBackend(RAGBackend):
                         existing.processor_kind != PROCESSOR_KIND_RAGFLOW or self._remote_document_exists(existing)
                     ):
                         messages.append(
-                            f"Already archived for spreadsheet pipeline: {existing.document_name}"
+                            f"[success] Already archived for spreadsheet pipeline: {existing.document_name}"
                             if is_spreadsheet
-                            else f"Already submitted to RAGFlow: {existing.document_name}"
+                            else f"[success] Already submitted to RAGFlow: {existing.document_name}"
                         )
                         success_count += 1
                         continue
@@ -581,6 +630,8 @@ class RAGFlowBackend(RAGBackend):
                 archived_path, filename, archived_group = self._archive_source_file(kb_name, file_path, source_group)
                 relative_local_path = os.path.relpath(archived_path, self._archive_kb_path(kb_name))
                 file_size = os.path.getsize(archived_path)
+                container_inspection = inspect_container_file(archived_path)
+                container_warning = container_inspection.to_warning_message()
                 if is_spreadsheet:
                     document_id = f"table:{content_hash[:16]}"
                     self.store.upsert_document(
@@ -616,11 +667,14 @@ class RAGFlowBackend(RAGBackend):
                             "source_group": archived_group,
                             "local_path": relative_local_path,
                             "content_hash": content_hash,
+                            "container_inspection": container_inspection.to_metadata(),
                         },
                     )
                     if progress_callback:
                         progress_callback(100, f"{filename}: 已归档到 Excel 独立管道，未上传 RAGFlow")
-                    messages.append(f"Archived for spreadsheet pipeline: {filename}")
+                    messages.append(f"[success] Archived for spreadsheet pipeline: {filename}")
+                    if container_warning:
+                        messages.append(f"[warning] {container_warning}")
                     success_count += 1
                     continue
 
@@ -679,11 +733,15 @@ class RAGFlowBackend(RAGBackend):
                         "source_group": archived_group,
                         "local_path": relative_local_path,
                         "content_hash": content_hash,
+                        "container_inspection": container_inspection.to_metadata(),
                     },
                 )
-                messages.append(f"Submitted to RAGFlow: {filename}")
+                messages.append(f"[success] Submitted to RAGFlow: {filename}")
+                if container_warning:
+                    messages.append(f"[warning] {container_warning}")
                 success_count += 1
             except Exception as exc:
+                failed_count += 1
                 if uploaded_to_ragflow and document_id:
                     self._cleanup_remote_document(dataset_id, document_id)
                     self.store.delete_document_by_remote_id(dataset_id, document_id)
@@ -710,9 +768,16 @@ class RAGFlowBackend(RAGBackend):
                         "content_kind": CONTENT_KIND_SPREADSHEET if _is_spreadsheet_file(file_path) else CONTENT_KIND_DOCUMENT,
                     },
                 )
-                messages.append(f"Failed {filename}: {exc}")
+                messages.append(f"[failed] {filename}: {exc}")
 
-        return IngestResult(success_count=success_count, total_count=len(files), messages=messages, backend=self.name)
+        return IngestResult(
+            success_count=success_count,
+            total_count=len(files),
+            messages=messages,
+            backend=self.name,
+            failed_count=failed_count,
+            skipped_count=skipped_count,
+        )
 
     def _wait_parse_progress(
         self,
@@ -1148,6 +1213,7 @@ class RAGFlowBackend(RAGBackend):
                         "file_size": record.file_size,
                         "content_hash": record.content_hash,
                         "ragflow_error": error_message,
+                        "container_inspection": self._inspect_record_archive(record),
                     },
                     backend=self.name,
                 )

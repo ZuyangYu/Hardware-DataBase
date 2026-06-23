@@ -412,6 +412,24 @@ def format_query_trace_params(trace) -> str:
     )
 
 
+def format_container_inspection_warning(metadata: dict | None) -> str:
+    if not metadata:
+        return ""
+    inspection = metadata.get("container_inspection") or {}
+    if not isinstance(inspection, dict):
+        return ""
+    embedded_count = int(inspection.get("embedded_object_count") or 0)
+    media_count = int(inspection.get("media_object_count") or 0)
+    if embedded_count <= 0 and media_count <= 0:
+        return ""
+    parts = []
+    if embedded_count:
+        parts.append(f"{embedded_count} 个内嵌对象")
+    if media_count:
+        parts.append(f"{media_count} 个媒体对象")
+    return f"检测到 {', '.join(parts)}，当前仅提示，尚未展开到子管道处理。"
+
+
 # ==================== 逻辑处理回调函数 ===================
 def create_kb_callback(pipeline):
     """创建知识库回调"""
@@ -2483,7 +2501,7 @@ def render_kb_management_tab(pipeline):
     st.subheader("📚 知识库管理")
     manageable_kbs = get_manageable_kbs(pipeline)
     can_create_kb = st.session_state.get("role") == ROLE_DEPT_ADMIN
-    upload_types = ["pdf", "txt", "md", "docx", "html", "csv", "xlsx"]
+    upload_types = ["pdf", "doc", "docx", "xls", "xlsx"]
 
     if not st.session_state.current_kb and not manageable_kbs:
         st.info("暂无可用知识库，请联系本部门管理员创建或授权。")
@@ -2524,14 +2542,14 @@ def render_kb_management_tab(pipeline):
                         with open(path, "wb") as wb:
                             wb.write(f.getbuffer())
                         temp_paths.append(path)
-                    progress_bar = st.progress(0, text="等待 RAGFlow 返回解析进度")
+                    progress_bar = st.progress(0, text="等待文件处理进度")
 
                     def update_upload_progress(progress: int, stage: str):
                         safe_progress = max(0, min(100, int(progress)))
-                        progress_bar.progress(safe_progress, text=stage or f"RAGFlow 解析进度 {safe_progress}%")
-                        status.update(label=f"RAGFlow 解析中 {safe_progress}%", state="running", expanded=True)
+                        progress_bar.progress(safe_progress, text=stage or f"文件处理进度 {safe_progress}%")
+                        status.update(label=f"文件处理中 {safe_progress}%", state="running", expanded=True)
 
-                    st.write("上传到 RAGFlow 并等待解析进度...")
+                    st.write("按文件类型分发到对应处理管道...")
                     ctx = build_request_context(st.session_state)
                     res = pipeline.upload_files(
                         temp_paths,
@@ -2540,23 +2558,21 @@ def render_kb_management_tab(pipeline):
                         source_group=source_group,
                         progress_callback=update_upload_progress,
                     )
-                    upload_ok = (
-                        res.startswith("✅")
-                        or "Submitted to RAGFlow" in res
-                        or "成功" in res
-                        or "已创建" in res
-                    )
+                    result_summary = res.split("\n")[0] if res else ""
+                    upload_ok = result_summary.startswith("全部处理成功")
+                    upload_partial = result_summary.startswith("部分处理完成")
                     record_audit(
                         "upload_document",
                         target_type="document",
                         target_id=", ".join(f.name for f in files),
                         kb_name=st.session_state.current_kb,
-                        success=upload_ok,
-                        error_message="" if upload_ok else res,
+                        success=upload_ok or upload_partial,
+                        error_message="" if upload_ok or upload_partial else res,
                         metadata={
                             "file_count": len(files),
                             "source_group": source_group,
-                            "result": res.split("\n")[0],
+                            "result": result_summary,
+                            "full_result": res,
                         },
                     )
                     for p in temp_paths:
@@ -2565,9 +2581,22 @@ def render_kb_management_tab(pipeline):
                         except OSError:
                             pass
                     invalidate_file_cache(st.session_state.current_kb)
-                    progress_bar.progress(100, text="RAGFlow 解析流程完成")
-                    status.update(label="✅ RAGFlow 解析流程完成", state="complete", expanded=False)
-                st.success(res.split('\n')[0])
+                    progress_bar.progress(100, text="文件处理流程完成")
+                    if upload_ok:
+                        status.update(label="✅ 文件处理流程完成", state="complete", expanded=False)
+                    elif upload_partial:
+                        status.update(label="⚠️ 文件部分处理完成", state="complete", expanded=True)
+                    else:
+                        status.update(label="❌ 文件未处理成功", state="error", expanded=True)
+                if upload_ok:
+                    st.success(result_summary)
+                elif upload_partial:
+                    st.warning(result_summary)
+                    st.text(res)
+                else:
+                    st.error(result_summary or "文件处理失败")
+                    if res:
+                        st.text(res)
                 time.sleep(1)
                 st.rerun()
         st.divider()
@@ -2693,6 +2722,9 @@ def render_kb_management_tab(pipeline):
                                 st.markdown(f"📊 {f}  \n`Excel 管道: 已归档` `待结构化解析`")
                                 if local_path:
                                     st.caption(f"本地归档: {local_path}")
+                                container_warning = format_container_inspection_warning(info.metadata)
+                                if container_warning:
+                                    st.caption(container_warning)
                             elif info and info.metadata.get("ragflow_document_id"):
                                 status = str(info.metadata.get("status", "unknown")).lower()
                                 status_label, searchability_label = format_ragflow_document_status(status)
@@ -2706,6 +2738,9 @@ def render_kb_management_tab(pipeline):
                                     st.caption("解析已停止，当前不会进入检索结果。可删除后重新上传解析。")
                                 if ragflow_error:
                                     st.caption(f"RAGFlow 错误: {ragflow_error}")
+                                container_warning = format_container_inspection_warning(info.metadata)
+                                if container_warning:
+                                    st.caption(container_warning)
                             else:
                                 st.markdown(f"📄 {f}")
                         with c2:
