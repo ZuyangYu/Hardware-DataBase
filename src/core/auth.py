@@ -104,12 +104,14 @@ class AuthService:
                     role TEXT NOT NULL DEFAULT 'user',
                     department_id INTEGER,
                     is_active INTEGER NOT NULL DEFAULT 1,
+                    managed_by_env INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(department_id) REFERENCES departments(id)
                 )
             """)
             self._ensure_column(conn, "users", "department_id", "INTEGER")
+            self._ensure_column(conn, "users", "managed_by_env", "INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 "UPDATE users SET role = ? WHERE role = 'admin'",
                 (ROLE_SYSTEM_ADMIN,),
@@ -169,19 +171,27 @@ class AuthService:
         with closing(self._connect()) as conn:
             dept = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchone()
             department_id = dept["id"] if dept else None
-            row = conn.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,)).fetchone()
+            row = conn.execute(
+                "SELECT id, password_hash, role, managed_by_env FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
             if row is not None:
-                if verify_password("admin123", row["password_hash"]):
+                should_sync_password = (
+                    row["role"] == ROLE_SYSTEM_ADMIN
+                    and (row["managed_by_env"] or verify_password("admin123", row["password_hash"]))
+                    and not verify_password(password, row["password_hash"])
+                )
+                if should_sync_password:
                     conn.execute(
-                        "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                        "UPDATE users SET password_hash = ?, managed_by_env = 1, updated_at = ? WHERE id = ?",
                         (hash_password(password), utc_now(), row["id"]),
                     )
                 return
             now = utc_now()
             conn.execute(
                 """
-                INSERT INTO users (username, password_hash, role, department_id, is_active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 1, ?, ?)
+                INSERT INTO users (username, password_hash, role, department_id, is_active, managed_by_env, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, 1, ?, ?)
                 """,
                 (username, hash_password(password), ROLE_SYSTEM_ADMIN, department_id, now, now),
             )
@@ -200,6 +210,11 @@ class AuthService:
         if actor.role == ROLE_SYSTEM_ADMIN:
             if role == ROLE_USER:
                 raise PermissionError("系统管理员不能创建普通用户，请由部门管理员创建。")
+            system_department_id = self._system_department_id()
+            if role == ROLE_SYSTEM_ADMIN:
+                department_id = system_department_id
+            elif role == ROLE_DEPT_ADMIN and (department_id is None or department_id == system_department_id):
+                raise ValueError("部门管理员必须归属到业务部门，不能归属 system 部门")
         elif actor.role == ROLE_DEPT_ADMIN:
             if role != ROLE_USER:
                 raise PermissionError("部门管理员只能创建普通用户。")
@@ -212,6 +227,11 @@ class AuthService:
             raise PermissionError("无权创建用户。")
 
         return self._create_user_record(username, password, role, department_id)
+
+    def _system_department_id(self) -> int | None:
+        with closing(self._connect()) as conn:
+            dept = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchone()
+        return dept["id"] if dept else None
 
     def _create_user_record(self, username: str, password: str, role: str = "user", department_id: int | None = None) -> AuthUser:
         username = username.strip()
@@ -340,6 +360,40 @@ class AuthService:
                     (utc_now(), user_id),
                 )
 
+    def reset_user_password_as(self, actor: AuthUser, user_id: int, new_password: str):
+        if not new_password:
+            raise ValueError("密码不能为空")
+        if len(new_password) < 8:
+            raise ValueError("密码长度不能少于 8 位")
+
+        with closing(self._connect()) as conn:
+            target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            if target is None:
+                raise ValueError("目标用户不存在")
+            if actor.id == user_id:
+                raise PermissionError("不能在这里重置当前登录账号密码")
+
+            if actor.role == ROLE_SYSTEM_ADMIN:
+                pass
+            elif actor.role == ROLE_DEPT_ADMIN:
+                if target["role"] != ROLE_USER or target["department_id"] != actor.department_id:
+                    raise PermissionError("部门管理员只能重置本部门普通用户密码")
+            else:
+                raise PermissionError("无权重置用户密码")
+
+            conn.execute(
+                """
+                UPDATE users
+                SET password_hash = ?, managed_by_env = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (hash_password(new_password), utc_now(), user_id),
+            )
+            conn.execute(
+                "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+                (utc_now(), user_id),
+            )
+
     def create_department(self, name: str) -> Department:
         name = name.strip()
         if not name:
@@ -391,6 +445,11 @@ class AuthService:
         with closing(self._connect()) as conn:
             conn.execute("DELETE FROM kb_permissions WHERE kb_name = ?", (kb_name,))
             conn.execute("DELETE FROM knowledge_bases WHERE name = ?", (kb_name,))
+
+    def list_registered_knowledge_bases(self) -> list[str]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT name FROM knowledge_bases ORDER BY name").fetchall()
+        return [row["name"] for row in rows]
 
     def list_knowledge_base_summaries(self, existing_kbs: list[str]) -> list[KnowledgeBaseSummary]:
         existing = set(existing_kbs)

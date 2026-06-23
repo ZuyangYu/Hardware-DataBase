@@ -21,7 +21,8 @@ class RAGPipeline:
 
     def __init__(self):
         try:
-            os.makedirs(config.settings.DATA_ROOT, exist_ok=True)
+            if config.settings.RAG_BACKEND == "local":
+                os.makedirs(config.settings.DATA_ROOT, exist_ok=True)
             self.backend = create_rag_backend()
         except Exception as e:
             error(f"RAGPipeline 初始化异常: {e}")
@@ -29,22 +30,30 @@ class RAGPipeline:
 
     def get_index(self, kb_name: str):
         """获取索引实例，内部处理双轨持久化加载逻辑。"""
+        if config.settings.RAG_BACKEND != "local":
+            raise RuntimeError("当前 RAG 后端不使用本地索引。")
         return get_or_build_index(kb_name, resource_manager.chroma_client, use_cache=True)
 
     def list_knowledge_bases(self, ctx: RequestContext | None = None) -> List[str]:
         """列出当前用户可访问的知识库名称。"""
-        kbs = list_knowledge_bases()
+        auth_service = AuthService()
+        if config.settings.RAG_BACKEND == "ragflow":
+            kbs = auth_service.list_registered_knowledge_bases()
+        else:
+            kbs = list_knowledge_bases()
         if ctx is None:
             return kbs
-        user = AuthService().get_user_by_username(ctx.user_id)
+        user = auth_service.get_user_by_username(ctx.user_id)
         if user is None:
             return []
-        return AuthService().list_accessible_kbs(user, kbs)
+        return auth_service.list_accessible_kbs(user, kbs)
 
     def list_all_knowledge_bases_for_admin(self, ctx: RequestContext | None = None) -> List[str]:
         """列出全部知识库，仅用于系统级管理界面，不授予内容读写权限。"""
         if ctx is None or not ctx.is_system_admin():
             return []
+        if config.settings.RAG_BACKEND == "ragflow":
+            return AuthService().list_registered_knowledge_bases()
         return list_knowledge_bases()
 
     def query(
@@ -114,16 +123,23 @@ class RAGPipeline:
                 return False, "权限不足：请先登录再创建知识库。"
             if ctx is not None and ctx.is_system_admin():
                 return False, "系统管理员不能创建内容知识库，请由部门管理员创建。"
-            path = get_kb_path(name)
-            if os.path.exists(path):
+            auth_service = AuthService()
+            if name in auth_service.list_registered_knowledge_bases():
                 return False, "知识库已存在"
 
-            os.makedirs(path, exist_ok=True)
+            if config.settings.RAG_BACKEND != "ragflow":
+                path = get_kb_path(name)
+                if os.path.exists(path):
+                    return False, "知识库已存在"
+                os.makedirs(path, exist_ok=True)
+
             if ctx and ctx.user_id:
-                auth_service = AuthService()
                 owner = auth_service.get_user_by_username(ctx.user_id)
                 auth_service.register_knowledge_base(name, owner=owner)
-            log(f"知识库 '{name}' 创建成功，索引将在首次查询时自动初始化")
+            if config.settings.RAG_BACKEND == "local":
+                log(f"知识库 '{name}' 创建成功，索引将在首次查询时自动初始化")
+            else:
+                log(f"RAGFlow 逻辑知识库 '{name}' 创建成功")
             return True, f"知识库 '{name}' 创建成功"
         except Exception as e:
             error(f"创建知识库失败: {e}")
@@ -145,6 +161,25 @@ class RAGPipeline:
             errors = []
 
             try:
+                if hasattr(self.backend, "delete_knowledge_base"):
+                    result = self.backend.delete_knowledge_base(kb_name, ctx=ctx)
+                    if not result.ok:
+                        return False, result.message
+
+                    archive_path = os.path.join(config.settings.RAGFLOW_FILE_ROOT, kb_name)
+                    if os.path.exists(archive_path):
+                        try:
+                            shutil.rmtree(archive_path)
+                            log("已删除 RAGFlow 本地归档目录")
+                        except Exception as e:
+                            errors.append(f"RAGFlow 归档: {e}")
+
+                    AuthService().delete_knowledge_base_record(kb_name)
+                    if errors:
+                        warn(f"删除过程中出现部分错误: {'; '.join(errors)}")
+                        return True, f"知识库 '{kb_name}' 已删除，部分本地清理失败。"
+                    return True, f"知识库 '{kb_name}' 已被彻底删除"
+
                 try:
                     resource_manager.chroma_client.delete_collection(name=f"kb_{kb_name}")
                     log("已删除 Chroma Collection")

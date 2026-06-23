@@ -12,7 +12,7 @@ from src.core.auth import AuthService
 from src.core.app_logs import AppLogService
 from src.core.logger import error, log
 from src.core.source_group_router import route_source_groups
-from src.ingestion.kb_paths import get_kb_data_path, validate_kb_name
+from src.ingestion.kb_paths import get_kb_data_path, safe_child_path, validate_kb_name
 from src.ingestion.source_groups import (
     DESIGN_GROUP,
     DOCS_GROUP,
@@ -41,6 +41,11 @@ from src.rag_backends.schemas import (
 
 DATASET_GOVERNANCE = "governance"
 DATASET_DESIGN = "design"
+DATASET_TABLE = "table"
+CONTENT_KIND_DOCUMENT = "document_text"
+CONTENT_KIND_SPREADSHEET = "spreadsheet_table"
+PROCESSOR_KIND_RAGFLOW = "ragflow"
+PROCESSOR_KIND_SPREADSHEET = "spreadsheet_table"
 
 RAGFLOW_STATUS_UPLOADED = "uploaded"
 RAGFLOW_STATUS_PARSING = "parsing"
@@ -49,10 +54,12 @@ RAGFLOW_STATUS_FAILED = "failed"
 RAGFLOW_STATUS_DELETED = "deleted"
 RAGFLOW_STATUS_CANCELLED = "cancelled"
 RAGFLOW_STATUS_UNKNOWN = "unknown"
+TABLE_STATUS_ARCHIVED = "archived"
 RAGFLOW_HIDDEN_TASK_STATUSES = {
     RAGFLOW_STATUS_PARSED,
     RAGFLOW_STATUS_DELETED,
     RAGFLOW_STATUS_CANCELLED,
+    TABLE_STATUS_ARCHIVED,
     "completed",
     "complete",
     "done",
@@ -67,17 +74,18 @@ RAGFLOW_PARSE_PROGRESS_TIMEOUT_SECONDS = 1800.0
 RAGFLOW_PARSE_PROGRESS_POLL_SECONDS = 2.0
 
 SOURCE_GROUP_DATASET_KIND = {
-    DOCS_GROUP: DATASET_GOVERNANCE,
+    DOCS_GROUP: DATASET_DESIGN,
     PROJECT_GROUP: DATASET_GOVERNANCE,
-    EXTERNAL_GROUP: DATASET_GOVERNANCE,
+    EXTERNAL_GROUP: DATASET_DESIGN,
     PEOPLE_GROUP: DATASET_GOVERNANCE,
     DESIGN_GROUP: DATASET_DESIGN,
     MATERIAL_GROUP: DATASET_DESIGN,
     TEST_GROUP: DATASET_DESIGN,
-    UNKNOWN_GROUP: DATASET_GOVERNANCE,
+    UNKNOWN_GROUP: DATASET_DESIGN,
 }
 
 RAGFLOW_INFO_ID_PREFIX = "ragflow:"
+SPREADSHEET_EXTENSIONS = {".xls", ".xlsx"}
 
 
 class RAGFlowAPIError(RuntimeError):
@@ -134,6 +142,10 @@ def _file_sha256(file_path: str) -> str:
         for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_spreadsheet_file(file_path: str) -> bool:
+    return os.path.splitext(file_path.lower())[1] in SPREADSHEET_EXTENSIONS
 
 
 def _normalize_ragflow_status(raw_status: object) -> str:
@@ -451,10 +463,28 @@ class RAGFlowBackend(RAGBackend):
             "original_file_name": filename,
         }
 
+    def _archive_root(self, create: bool = False) -> str:
+        root = os.path.abspath(config.settings.RAGFLOW_FILE_ROOT)
+        if create:
+            os.makedirs(root, exist_ok=True)
+        return root
+
+    def _archive_kb_path(self, kb_name: str, create: bool = False) -> str:
+        return safe_child_path(self._archive_root(create=True), validate_kb_name(kb_name), create=create)
+
+    def _resolve_archive_path(self, record) -> str:
+        path = record.local_path or os.path.join(record.source_group, record.document_name)
+        if os.path.isabs(path):
+            return path
+        archive_path = os.path.join(self._archive_kb_path(record.kb_name), path)
+        if os.path.exists(archive_path):
+            return archive_path
+        return os.path.join(get_kb_data_path(record.kb_name), path)
+
     def _archive_source_file(self, kb_name: str, file_path: str, source_group: str | None) -> tuple[str, str, str]:
         source_group = safe_source_group(source_group)
         filename = os.path.basename(file_path)
-        kb_path = get_kb_data_path(kb_name, create=True)
+        kb_path = self._archive_kb_path(kb_name, create=True)
         target_dir = os.path.join(kb_path, source_group)
         os.makedirs(target_dir, exist_ok=True)
         target_path = os.path.join(target_dir, filename)
@@ -468,9 +498,7 @@ class RAGFlowBackend(RAGBackend):
         return target_path, filename, source_group
 
     def _remove_local_archive(self, record):
-        path = record.local_path or os.path.join(record.source_group, record.document_name)
-        if not os.path.isabs(path):
-            path = os.path.join(get_kb_data_path(record.kb_name), path)
+        path = self._resolve_archive_path(record)
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -486,10 +514,7 @@ class RAGFlowBackend(RAGBackend):
             log(f"RAGFlow remote cleanup failed for {document_id}: {cleanup_error}")
 
     def _local_archive_exists(self, record) -> bool:
-        path = record.local_path or os.path.join(record.source_group, record.document_name)
-        if not os.path.isabs(path):
-            path = os.path.join(get_kb_data_path(record.kb_name), path)
-        return os.path.exists(path)
+        return os.path.exists(self._resolve_archive_path(record))
 
     def _remote_document_exists(self, record) -> bool:
         try:
@@ -530,23 +555,77 @@ class RAGFlowBackend(RAGBackend):
             filename = os.path.basename(file_path)
             archived_path = ""
             document_id = ""
+            uploaded_to_ragflow = False
             try:
                 content_hash = _file_sha256(file_path)
-                existing = self.store.find_by_hash(kb_name, dataset_kind, content_hash, department_id)
+                is_spreadsheet = _is_spreadsheet_file(file_path)
+                record_dataset_kind = DATASET_TABLE if is_spreadsheet else dataset_kind
+                existing = self.store.find_by_hash(kb_name, record_dataset_kind, content_hash, department_id)
                 if existing and existing.status not in {RAGFLOW_STATUS_FAILED, RAGFLOW_STATUS_DELETED}:
-                    if self._local_archive_exists(existing) and self._remote_document_exists(existing):
-                        messages.append(f"Already submitted to RAGFlow: {existing.document_name}")
+                    if self._local_archive_exists(existing) and (
+                        existing.processor_kind != PROCESSOR_KIND_RAGFLOW or self._remote_document_exists(existing)
+                    ):
+                        messages.append(
+                            f"Already archived for spreadsheet pipeline: {existing.document_name}"
+                            if is_spreadsheet
+                            else f"Already submitted to RAGFlow: {existing.document_name}"
+                        )
                         success_count += 1
                         continue
-                    log(f"RAGFlow mapping for {existing.document_name} is stale; re-uploading.")
-                    self._cleanup_remote_document(existing.dataset_id, existing.document_id)
+                    log(f"Mapping for {existing.document_name} is stale; re-processing.")
+                    if existing.processor_kind == PROCESSOR_KIND_RAGFLOW:
+                        self._cleanup_remote_document(existing.dataset_id, existing.document_id)
                     self._remove_local_archive(existing)
                     self.store.delete_document_by_id(existing.id)
 
                 archived_path, filename, archived_group = self._archive_source_file(kb_name, file_path, source_group)
-                relative_local_path = os.path.relpath(archived_path, get_kb_data_path(kb_name))
+                relative_local_path = os.path.relpath(archived_path, self._archive_kb_path(kb_name))
                 file_size = os.path.getsize(archived_path)
+                if is_spreadsheet:
+                    document_id = f"table:{content_hash[:16]}"
+                    self.store.upsert_document(
+                        kb_name=kb_name,
+                        document_name=filename,
+                        dataset_kind=DATASET_TABLE,
+                        dataset_id="",
+                        document_id=document_id,
+                        source_group=archived_group,
+                        department_id=department_id,
+                        uploaded_by=uploaded_by,
+                        status=TABLE_STATUS_ARCHIVED,
+                        original_file_name=os.path.basename(file_path),
+                        local_path=relative_local_path,
+                        file_size=file_size,
+                        content_hash=content_hash,
+                        upload_status=TABLE_STATUS_ARCHIVED,
+                        content_kind=CONTENT_KIND_SPREADSHEET,
+                        processor_kind=PROCESSOR_KIND_SPREADSHEET,
+                    )
+                    record = self.store.get_document(kb_name, filename, DATASET_TABLE)
+                    self._audit(
+                        "spreadsheet_upload_archived",
+                        ctx,
+                        kb_name=kb_name,
+                        target_type="document",
+                        target_id=filename,
+                        metadata={
+                            "store_id": record.id if record else None,
+                            "dataset_kind": DATASET_TABLE,
+                            "content_kind": CONTENT_KIND_SPREADSHEET,
+                            "processor_kind": PROCESSOR_KIND_SPREADSHEET,
+                            "source_group": archived_group,
+                            "local_path": relative_local_path,
+                            "content_hash": content_hash,
+                        },
+                    )
+                    if progress_callback:
+                        progress_callback(100, f"{filename}: 已归档到 Excel 独立管道，未上传 RAGFlow")
+                    messages.append(f"Archived for spreadsheet pipeline: {filename}")
+                    success_count += 1
+                    continue
+
                 document_id = self.client.upload_document(dataset_id, archived_path)
+                uploaded_to_ragflow = True
                 metadata = self._metadata(kb_name, filename, archived_group, ctx)
                 try:
                     self.client.update_document_metadata(dataset_id, document_id, metadata)
@@ -573,6 +652,8 @@ class RAGFlowBackend(RAGBackend):
                     file_size=file_size,
                     content_hash=content_hash,
                     upload_status=RAGFLOW_STATUS_PARSING,
+                    content_kind=CONTENT_KIND_DOCUMENT,
+                    processor_kind=PROCESSOR_KIND_RAGFLOW,
                 )
                 status, message = self._wait_parse_progress(
                     dataset_id,
@@ -583,6 +664,7 @@ class RAGFlowBackend(RAGBackend):
                 self.store.update_document_status(dataset_id, document_id, status, message)
                 if status == RAGFLOW_STATUS_FAILED:
                     raise RuntimeError(message or f"RAGFlow parsing failed for {filename}")
+                record = self.store.get_document(kb_name, filename, dataset_kind)
                 self._audit(
                     "ragflow_upload_submitted",
                     ctx,
@@ -590,6 +672,7 @@ class RAGFlowBackend(RAGBackend):
                     target_type="document",
                     target_id=filename,
                     metadata={
+                        "store_id": record.id if record else None,
                         "dataset_kind": dataset_kind,
                         "dataset_id": dataset_id,
                         "ragflow_document_id": document_id,
@@ -601,7 +684,7 @@ class RAGFlowBackend(RAGBackend):
                 messages.append(f"Submitted to RAGFlow: {filename}")
                 success_count += 1
             except Exception as exc:
-                if document_id:
+                if uploaded_to_ragflow and document_id:
                     self._cleanup_remote_document(dataset_id, document_id)
                     self.store.delete_document_by_remote_id(dataset_id, document_id)
                 if archived_path and os.path.exists(archived_path):
@@ -618,7 +701,14 @@ class RAGFlowBackend(RAGBackend):
                     target_id=filename,
                     success=False,
                     error_message=str(exc),
-                    metadata={"dataset_kind": dataset_kind},
+                    metadata={
+                        "dataset_kind": dataset_kind,
+                        "dataset_id": dataset_id,
+                        "ragflow_document_id": document_id,
+                        "source_group": source_group,
+                        "local_path": archived_path,
+                        "content_kind": CONTENT_KIND_SPREADSHEET if _is_spreadsheet_file(file_path) else CONTENT_KIND_DOCUMENT,
+                    },
                 )
                 messages.append(f"Failed {filename}: {exc}")
 
@@ -732,8 +822,7 @@ class RAGFlowBackend(RAGBackend):
             from llama_index.core.base.llms.types import ChatMessage, MessageRole
             from src.core.model_factory import init_generation_model
 
-            if Settings.llm is None:
-                init_generation_model()
+            init_generation_model()
 
             if not _is_small_talk(query):
                 evidences = self.retrieve(kb_name, query, config.settings.FINAL_TOP_K, ctx=ctx)
@@ -789,11 +878,12 @@ class RAGFlowBackend(RAGBackend):
             )
             return BackendResult(ok=False, message=str(exc), backend=self.name)
         try:
-            self.client.delete_documents(record.dataset_id, [record.document_id])
+            if record.processor_kind == PROCESSOR_KIND_RAGFLOW:
+                self.client.delete_documents(record.dataset_id, [record.document_id])
             self._remove_local_archive(record)
             self.store.delete_document_by_id(record.id)
             self._audit(
-                "ragflow_delete_document",
+                "ragflow_delete_document" if record.processor_kind == PROCESSOR_KIND_RAGFLOW else "spreadsheet_delete_document",
                 ctx,
                 kb_name=kb_name,
                 target_type="document",
@@ -803,6 +893,8 @@ class RAGFlowBackend(RAGBackend):
                     "ragflow_document_id": record.document_id,
                     "dataset_id": record.dataset_id,
                     "dataset_kind": record.dataset_kind,
+                    "content_kind": record.content_kind,
+                    "processor_kind": record.processor_kind,
                     "local_path": record.local_path,
                 },
             )
@@ -846,6 +938,43 @@ class RAGFlowBackend(RAGBackend):
                 },
             )
             return BackendResult(ok=False, message=f"Delete failed: {exc}", backend=self.name)
+
+    def delete_knowledge_base(self, kb_name: str, ctx: RequestContext | None = None) -> BackendResult:
+        self._check_kb_access(kb_name, ctx, "admin")
+        records = self.store.list_documents(kb_name)
+        errors = []
+        for record in records:
+            try:
+                _check_record_department(record, ctx)
+            except PermissionError as exc:
+                errors.append(f"{record.document_name}: {exc}")
+                continue
+            try:
+                self.client.delete_documents(record.dataset_id, [record.document_id])
+            except Exception as exc:
+                if not _is_ragflow_not_owner_error(exc):
+                    errors.append(f"{record.document_name}: {exc}")
+                    continue
+                log(f"RAGFlow remote document is not readable while deleting kb {kb_name}: {record.document_id}, {exc}")
+            self._remove_local_archive(record)
+
+        if errors:
+            return BackendResult(
+                ok=False,
+                message=f"RAGFlow 知识库删除失败，部分文档未清理: {'; '.join(errors)}",
+                backend=self.name,
+            )
+
+        self.store.delete_documents_by_kb(kb_name)
+        self._audit(
+            "ragflow_delete_knowledge_base",
+            ctx,
+            kb_name=kb_name,
+            target_type="knowledge_base",
+            target_id=kb_name,
+            metadata={"document_count": len(records)},
+        )
+        return BackendResult(ok=True, message=f"RAGFlow 知识库 '{kb_name}' 已删除", backend=self.name)
 
     def list_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None) -> list[ParseTask]:
         if kb_name:
@@ -921,6 +1050,11 @@ class RAGFlowBackend(RAGBackend):
         except PermissionError as exc:
             return BackendResult(ok=False, message=str(exc), backend=self.name)
 
+        if record.processor_kind != PROCESSOR_KIND_RAGFLOW:
+            self._remove_local_archive(record)
+            self.store.delete_document_by_id(record.id)
+            return BackendResult(ok=True, message=f"Removed archived spreadsheet: {record.document_name}", backend=self.name)
+
         try:
             self.client.stop_parse_documents(record.dataset_id, [record.document_id])
         except Exception as exc:
@@ -979,19 +1113,20 @@ class RAGFlowBackend(RAGBackend):
         for record in self.store.list_documents(kb_name, department_id=department_id):
             status = record.status
             error_message = record.ragflow_error
-            try:
-                remote_docs = self.client.list_documents(record.dataset_id, record.document_id)
-                if remote_docs:
-                    remote_doc = remote_docs[0]
-                    status = _normalize_ragflow_status(remote_doc.get("run") or remote_doc.get("status") or status)
-                    error_message = _extract_ragflow_error(remote_doc)
-                    self.store.update_document_status(record.dataset_id, record.document_id, status, error_message)
-            except Exception as status_error:
-                if _is_ragflow_not_owner_error(status_error):
-                    error_message = _ragflow_status_unavailable_message(record.document_name)
-                    log(f"RAGFlow document status is not readable for {record.document_id}: {status_error}")
-                else:
-                    log(f"RAGFlow status refresh failed for {record.document_name}: {status_error}")
+            if record.processor_kind == PROCESSOR_KIND_RAGFLOW:
+                try:
+                    remote_docs = self.client.list_documents(record.dataset_id, record.document_id)
+                    if remote_docs:
+                        remote_doc = remote_docs[0]
+                        status = _normalize_ragflow_status(remote_doc.get("run") or remote_doc.get("status") or status)
+                        error_message = _extract_ragflow_error(remote_doc)
+                        self.store.update_document_status(record.dataset_id, record.document_id, status, error_message)
+                except Exception as status_error:
+                    if _is_ragflow_not_owner_error(status_error):
+                        error_message = _ragflow_status_unavailable_message(record.document_name)
+                        log(f"RAGFlow document status is not readable for {record.document_id}: {status_error}")
+                    else:
+                        log(f"RAGFlow status refresh failed for {record.document_name}: {status_error}")
 
             documents.append(
                 DocumentInfo(
@@ -1001,11 +1136,14 @@ class RAGFlowBackend(RAGBackend):
                         "store_id": record.id,
                         "dataset_kind": record.dataset_kind,
                         "dataset_id": record.dataset_id,
-                        "ragflow_document_id": record.document_id,
+                        "ragflow_document_id": record.document_id if record.processor_kind == PROCESSOR_KIND_RAGFLOW else "",
+                        "table_document_id": record.document_id if record.processor_kind == PROCESSOR_KIND_SPREADSHEET else "",
                         "original_file_name": record.original_file_name,
                         "source_group": record.source_group,
                         "department_id": record.department_id,
                         "status": status,
+                        "content_kind": record.content_kind,
+                        "processor_kind": record.processor_kind,
                         "local_path": record.local_path,
                         "file_size": record.file_size,
                         "content_hash": record.content_hash,
@@ -1022,6 +1160,8 @@ class RAGFlowBackend(RAGBackend):
         if not record:
             return None
         _check_record_department(record, ctx)
+        if record.processor_kind != PROCESSOR_KIND_RAGFLOW:
+            return None
         try:
             raw_chunks = self.client.list_chunks(record.dataset_id, record.document_id)
         except Exception as exc:

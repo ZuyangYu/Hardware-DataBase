@@ -19,6 +19,8 @@ class RAGFlowDocumentRecord:
     department_id: str
     uploaded_by: str
     status: str
+    content_kind: str = "document_text"
+    processor_kind: str = "ragflow"
     local_path: str = ""
     file_size: int = 0
     content_hash: str = ""
@@ -65,6 +67,8 @@ class RAGFlowStore:
                     department_id TEXT NOT NULL DEFAULT '',
                     uploaded_by TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'uploaded',
+                    content_kind TEXT NOT NULL DEFAULT 'document_text',
+                    processor_kind TEXT NOT NULL DEFAULT 'ragflow',
                     local_path TEXT NOT NULL DEFAULT '',
                     file_size INTEGER NOT NULL DEFAULT 0,
                     content_hash TEXT NOT NULL DEFAULT '',
@@ -93,6 +97,8 @@ class RAGFlowStore:
             "last_status_checked_at": "ALTER TABLE ragflow_documents ADD COLUMN last_status_checked_at TEXT NOT NULL DEFAULT ''",
             "parse_started_at": "ALTER TABLE ragflow_documents ADD COLUMN parse_started_at TEXT NOT NULL DEFAULT ''",
             "parse_completed_at": "ALTER TABLE ragflow_documents ADD COLUMN parse_completed_at TEXT NOT NULL DEFAULT ''",
+            "content_kind": "ALTER TABLE ragflow_documents ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'document_text'",
+            "processor_kind": "ALTER TABLE ragflow_documents ADD COLUMN processor_kind TEXT NOT NULL DEFAULT 'ragflow'",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -120,6 +126,8 @@ class RAGFlowStore:
                 department_id TEXT NOT NULL DEFAULT '',
                 uploaded_by TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'uploaded',
+                content_kind TEXT NOT NULL DEFAULT 'document_text',
+                processor_kind TEXT NOT NULL DEFAULT 'ragflow',
                 local_path TEXT NOT NULL DEFAULT '',
                 file_size INTEGER NOT NULL DEFAULT 0,
                 content_hash TEXT NOT NULL DEFAULT '',
@@ -137,14 +145,14 @@ class RAGFlowStore:
             INSERT OR IGNORE INTO ragflow_documents (
                 id, kb_name, document_name, original_file_name, dataset_kind,
                 dataset_id, document_id, source_group, department_id, uploaded_by,
-                status, local_path, file_size, content_hash, upload_status,
+                status, content_kind, processor_kind, local_path, file_size, content_hash, upload_status,
                 ragflow_error, last_status_checked_at, parse_started_at,
                 parse_completed_at, created_at, updated_at
             )
             SELECT
                 id, kb_name, document_name, original_file_name, dataset_kind,
                 dataset_id, document_id, source_group, department_id, uploaded_by,
-                status, local_path, file_size, content_hash, upload_status,
+                status, 'document_text', 'ragflow', local_path, file_size, content_hash, upload_status,
                 ragflow_error, last_status_checked_at, parse_started_at,
                 parse_completed_at, created_at, updated_at
             FROM ragflow_documents_old
@@ -187,16 +195,18 @@ class RAGFlowStore:
         content_hash: str = "",
         upload_status: str = "",
         ragflow_error: str = "",
+        content_kind: str = "document_text",
+        processor_kind: str = "ragflow",
     ):
         with closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO ragflow_documents (
                     kb_name, document_name, original_file_name, dataset_kind, dataset_id, document_id,
-                    source_group, department_id, uploaded_by, status, local_path, file_size,
+                    source_group, department_id, uploaded_by, status, content_kind, processor_kind, local_path, file_size,
                     content_hash, upload_status, ragflow_error, parse_started_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(kb_name, department_id, document_name, dataset_kind) DO UPDATE SET
                     department_id = excluded.department_id,
                     original_file_name = excluded.original_file_name,
@@ -205,6 +215,8 @@ class RAGFlowStore:
                     source_group = excluded.source_group,
                     uploaded_by = excluded.uploaded_by,
                     status = excluded.status,
+                    content_kind = excluded.content_kind,
+                    processor_kind = excluded.processor_kind,
                     local_path = excluded.local_path,
                     file_size = excluded.file_size,
                     content_hash = excluded.content_hash,
@@ -224,6 +236,8 @@ class RAGFlowStore:
                     department_id,
                     uploaded_by,
                     status,
+                    content_kind,
+                    processor_kind,
                     local_path,
                     file_size,
                     content_hash,
@@ -339,6 +353,10 @@ class RAGFlowStore:
                 "DELETE FROM ragflow_documents WHERE dataset_id = ? AND document_id = ?",
                 (dataset_id, document_id),
             )
+
+    def delete_documents_by_kb(self, kb_name: str):
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM ragflow_documents WHERE kb_name = ?", (kb_name,))
 
     def update_document_status(self, dataset_id: str, document_id: str, status: str, error_message: str = ""):
         completed_expr = "CURRENT_TIMESTAMP" if status in {"parsed", "failed", "deleted"} else "parse_completed_at"

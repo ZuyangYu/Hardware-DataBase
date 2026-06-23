@@ -12,6 +12,7 @@ load_dotenv(encoding=ENV_FILE_ENCODING)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 根目录
 DATA_ROOT = os.path.join(BASE_DIR, "data")
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
+RAGFLOW_FILE_ROOT = os.path.join(STORAGE_DIR, "ragflow_files")
 CHROMA_PATH = os.path.join(STORAGE_DIR, "chroma_db")
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
 RERANKER_CACHE = os.path.join(STORAGE_DIR, "reranker_cache")
@@ -23,7 +24,6 @@ RAGFLOW_DESIGN_DATASET_NAME = os.getenv("RAGFLOW_DESIGN_DATASET_NAME", "project_
 RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
 RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
 RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
-AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
 AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
 AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
 AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
@@ -104,12 +104,20 @@ NO_CONTEXT_PROMPT = os.getenv("NO_CONTEXT_PROMPT", (
     "（知识库中没有找到相关上下文，请基于你自己的知识回答，并告知用户知识库中无相关信息）"
 ))
 
+def ensure_runtime_dirs():
+    """Ensure only the directories required by the active backend exist."""
+    os.makedirs(STORAGE_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(RERANKER_CACHE, exist_ok=True)
+    if RAG_BACKEND == "ragflow":
+        os.makedirs(RAGFLOW_FILE_ROOT, exist_ok=True)
+    if RAG_BACKEND == "local":
+        os.makedirs(DATA_ROOT, exist_ok=True)
+        os.makedirs(CHROMA_PATH, exist_ok=True)
+
+
 # 确保目录存在
-os.makedirs(DATA_ROOT, exist_ok=True)
-os.makedirs(STORAGE_DIR, exist_ok=True)
-os.makedirs(CHROMA_PATH, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(RERANKER_CACHE, exist_ok=True)
+ensure_runtime_dirs()
 
 # ==================== 默认值字典 ====================
 DEFAULT_VALUES = {
@@ -121,7 +129,6 @@ DEFAULT_VALUES = {
     "RAGFLOW_TIMEOUT_SECONDS": "120",
     "RAGFLOW_SIMILARITY_THRESHOLD": "0.25",
     "RAGFLOW_VECTOR_WEIGHT": "0.4",
-    "AUTH_ENABLED": "true",
     "AUTH_DB_PATH": os.path.join(STORAGE_DIR, "auth.db"),
     "AUTH_DEFAULT_ADMIN_USERNAME": "admin",
     "AUTH_DEFAULT_ADMIN_PASSWORD": "",
@@ -182,7 +189,7 @@ def reload_settings():
     global RAG_BACKEND, RAGFLOW_BASE_URL, RAGFLOW_API_KEY
     global RAGFLOW_GOVERNANCE_DATASET_NAME, RAGFLOW_DESIGN_DATASET_NAME
     global RAGFLOW_TIMEOUT_SECONDS, RAGFLOW_SIMILARITY_THRESHOLD, RAGFLOW_VECTOR_WEIGHT
-    global AUTH_ENABLED, AUTH_DB_PATH
+    global AUTH_DB_PATH
     global AUTH_DEFAULT_ADMIN_USERNAME, AUTH_DEFAULT_ADMIN_PASSWORD, AUTH_SESSION_TTL_HOURS
     global PROVIDER, OLLAMA_BASE_URL, OLLAMA_LLM_MODEL, OLLAMA_EMBEDDING_MODEL
     global CUSTOM_API_KEY, CUSTOM_BASE_URL, CUSTOM_LLM_MODEL, CUSTOM_EMBEDDING_MODEL
@@ -202,7 +209,6 @@ def reload_settings():
     RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
     RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
     RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
-    AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
     AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
     AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
     AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
@@ -232,6 +238,7 @@ def reload_settings():
     RERANKER_API_BASE = os.getenv("RERANKER_API_BASE", "https://api.openai.com/v1")
     SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_VALUES["SYSTEM_PROMPT"])
     NO_CONTEXT_PROMPT = os.getenv("NO_CONTEXT_PROMPT", DEFAULT_VALUES["NO_CONTEXT_PROMPT"])
+    ensure_runtime_dirs()
 
 
 def _format_env_value(value: str) -> str:
