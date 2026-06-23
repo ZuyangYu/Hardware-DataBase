@@ -12,6 +12,26 @@ from src.core.custom_reranker import APIReranker, NoReranker
 from src.core.custom_llm import GenericOpenAILLM
 
 
+_generation_model_signature = None
+
+
+def _current_generation_model_signature() -> tuple:
+    if config.settings.PROVIDER == config.settings.Provider.OLLAMA:
+        return (
+            "ollama",
+            config.settings.OLLAMA_BASE_URL,
+            config.settings.OLLAMA_LLM_MODEL,
+        )
+    return (
+        "custom",
+        config.settings.CUSTOM_BASE_URL,
+        config.settings.CUSTOM_LLM_MODEL,
+        config.settings.CUSTOM_API_KEY,
+        config.settings.CUSTOM_CONTEXT_WINDOW,
+        config.settings.CUSTOM_MAX_TOKENS,
+    )
+
+
 def init_global_models():
     """
     初始化全局模型配置
@@ -26,7 +46,7 @@ def init_global_models():
         log("=" * 60)
 
         # 1. 初始化 LLM
-        _init_llm()
+        init_generation_model(force=True)
 
         # 2. 初始化 Embedding
         _init_embedding()
@@ -53,9 +73,14 @@ def init_global_models():
         raise
 
 
-def init_generation_model():
+def init_generation_model(force: bool = False):
     """Initialize only the LLM used to generate answers."""
+    global _generation_model_signature
+    signature = _current_generation_model_signature()
+    if not force and Settings.llm is not None and _generation_model_signature == signature:
+        return
     _init_llm()
+    _generation_model_signature = signature
 
 
 def _init_llm():

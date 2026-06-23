@@ -47,6 +47,7 @@ class QueryTrace:
     latency_ms: int | None
     status: str
     error_message: str
+    metadata_json: str
     created_at: str
 
 
@@ -120,6 +121,7 @@ class AppLogService:
                     latency_ms INTEGER,
                     status TEXT NOT NULL DEFAULT 'success',
                     error_message TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 )
             """)
@@ -148,6 +150,12 @@ class AppLogService:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_query_traces_user ON query_traces(user_id, department_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_query_traces_kb ON query_traces(kb_name, status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_retrieved_evidence_trace ON retrieved_evidence(trace_id, rank)")
+            self._ensure_columns(conn)
+
+    def _ensure_columns(self, conn):
+        query_columns = {row["name"] for row in conn.execute("PRAGMA table_info(query_traces)").fetchall()}
+        if "metadata_json" not in query_columns:
+            conn.execute("ALTER TABLE query_traces ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
 
     def record_audit(
         self,
@@ -197,11 +205,25 @@ class AppLogService:
         assistant_message_id: int | None = None,
         rewritten_query: str = "",
         backend: str = "",
-        retriever_type: str = "hybrid",
+        retriever_type: str = "",
         latency_ms: int | None = None,
         status: str = "success",
         error_message: str = "",
+        metadata: dict[str, Any] | None = None,
     ) -> int:
+        effective_backend = backend or config.settings.RAG_BACKEND
+        effective_retriever_type = retriever_type or (
+            "ragflow_retrieval" if effective_backend == "ragflow" else "hybrid"
+        )
+        if effective_backend == "local":
+            vector_top_k = config.settings.VECTOR_TOP_K
+            bm25_top_k = config.settings.BM25_TOP_K
+            final_top_k = config.settings.FINAL_TOP_K
+        else:
+            vector_top_k = None
+            bm25_top_k = None
+            final_top_k = None
+
         with closing(self._connect()) as conn:
             cursor = conn.execute(
                 """
@@ -210,9 +232,9 @@ class AppLogService:
                     user_message_id, assistant_message_id, kb_name,
                     original_query, rewritten_query, backend, retriever_type,
                     vector_top_k, bm25_top_k, final_top_k, latency_ms,
-                    status, error_message, created_at
+                    status, error_message, metadata_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user.id if user else None,
@@ -224,14 +246,15 @@ class AppLogService:
                     kb_name or "",
                     original_query or "",
                     rewritten_query or "",
-                    backend or config.settings.RAG_BACKEND,
-                    retriever_type or "",
-                    config.settings.VECTOR_TOP_K,
-                    config.settings.BM25_TOP_K,
-                    config.settings.FINAL_TOP_K,
+                    effective_backend,
+                    effective_retriever_type,
+                    vector_top_k,
+                    bm25_top_k,
+                    final_top_k,
                     latency_ms,
                     status,
                     error_message or "",
+                    json.dumps(metadata or {}, ensure_ascii=False),
                     utc_now(),
                 ),
             )
@@ -289,9 +312,9 @@ class AppLogService:
             where.append("status = ?")
             params.append(status)
         if keyword:
-            where.append("(username LIKE ? OR original_query LIKE ? OR error_message LIKE ?)")
+            where.append("(username LIKE ? OR original_query LIKE ? OR error_message LIKE ? OR metadata_json LIKE ?)")
             like = f"%{keyword}%"
-            params.extend([like, like, like])
+            params.extend([like, like, like, like])
 
         params.append(max(1, min(limit, 1000)))
         sql = f"""
@@ -382,6 +405,7 @@ def row_to_query_trace(row) -> QueryTrace:
         latency_ms=row["latency_ms"],
         status=row["status"],
         error_message=row["error_message"],
+        metadata_json=row["metadata_json"],
         created_at=row["created_at"],
     )
 
@@ -406,6 +430,7 @@ def redact_query_trace(trace: QueryTrace) -> QueryTrace:
         latency_ms=trace.latency_ms,
         status=trace.status,
         error_message=trace.error_message,
+        metadata_json=trace.metadata_json,
         created_at=trace.created_at,
     )
 

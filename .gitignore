@@ -31,3 +31,6 @@ streamlit.out.log
 .tmp_ragflow*/
 .tmp_pycache/
 ragflow_store_*/
+
+
+.agents/

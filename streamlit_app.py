@@ -2,6 +2,7 @@
 import os
 import tempfile
 import html
+import json
 import streamlit as st
 import streamlit.components.v1 as components
 import time
@@ -11,6 +12,7 @@ from src.core.resource_manager import resource_manager
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER, build_request_context, ensure_session_id
 from src.core.app_logs import AppLogService
 from src.core.conversation import ConversationService
+from src.ingestion.kb_paths import InvalidKnowledgeBaseName, validate_kb_name
 from src.ingestion.source_groups import SOURCE_GROUP_DESCRIPTIONS, USER_SELECTABLE_SOURCE_GROUPS, display_source_group
 import config.settings
 
@@ -203,6 +205,8 @@ def init_session_state():
         st.session_state.kb_list = []
     if "show_create_kb" not in st.session_state:
         st.session_state.show_create_kb = False
+    if "create_kb_error" not in st.session_state:
+        st.session_state.create_kb_error = None
     if "confirm_delete_file" not in st.session_state:
         st.session_state.confirm_delete_file = None
     if "confirm_delete_kb" not in st.session_state:
@@ -367,13 +371,61 @@ def record_audit(action: str, **kwargs):
         print(f"audit log failed: {exc}")
 
 
+def build_query_log_metadata() -> dict:
+    if config.settings.RAG_BACKEND == "ragflow":
+        return {
+            "ragflow_similarity_threshold": config.settings.RAGFLOW_SIMILARITY_THRESHOLD,
+            "ragflow_vector_weight": config.settings.RAGFLOW_VECTOR_WEIGHT,
+            "ragflow_top_k": config.settings.FINAL_TOP_K,
+            "ragflow_governance_dataset": config.settings.RAGFLOW_GOVERNANCE_DATASET_NAME,
+            "ragflow_design_dataset": config.settings.RAGFLOW_DESIGN_DATASET_NAME,
+        }
+    return {
+        "vector_top_k": config.settings.VECTOR_TOP_K,
+        "bm25_top_k": config.settings.BM25_TOP_K,
+        "final_top_k": config.settings.FINAL_TOP_K,
+        "retriever_type": "hybrid",
+    }
+
+
+def format_query_trace_params(trace) -> str:
+    try:
+        metadata = json.loads(trace.metadata_json or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
+
+    if trace.backend == "ragflow":
+        parts = [
+            f"similarity={metadata.get('ragflow_similarity_threshold', '-')}",
+            f"vector_weight={metadata.get('ragflow_vector_weight', '-')}",
+            f"top_k={metadata.get('ragflow_top_k', '-')}",
+        ]
+        governance_dataset = metadata.get("ragflow_governance_dataset")
+        design_dataset = metadata.get("ragflow_design_dataset")
+        if governance_dataset or design_dataset:
+            parts.append(f"datasets={governance_dataset or '-'} / {design_dataset or '-'}")
+        return ", ".join(parts)
+
+    return (
+        f"vector_top_k={trace.vector_top_k}, "
+        f"bm25_top_k={trace.bm25_top_k}, final_top_k={trace.final_top_k}"
+    )
+
+
 # ==================== 逻辑处理回调函数 ===================
 def create_kb_callback(pipeline):
     """创建知识库回调"""
-    name = st.session_state.get("new_kb_name_input", "").strip()
-    if not name:
-        st.session_state.error_msg = "❌ 名称不能为空"
+    raw_name = st.session_state.get("new_kb_name_input", "").strip()
+    st.session_state.create_kb_error = None
+    if not raw_name:
+        st.session_state.create_kb_error = "名称不能为空"
         return
+    try:
+        name = validate_kb_name(raw_name.replace(" ", "_"))
+    except InvalidKnowledgeBaseName as exc:
+        st.session_state.create_kb_error = format_create_kb_error(str(exc))
+        return
+
     ctx = build_request_context(st.session_state)
     ok, msg = pipeline.create_kb(name, ctx=ctx)
     record_audit(
@@ -391,7 +443,17 @@ def create_kb_callback(pipeline):
         st.session_state.show_create_kb = False
         st.session_state.toast_msg = msg
     else:
-        st.session_state.error_msg = msg
+        st.session_state.create_kb_error = format_create_kb_error(msg)
+
+
+def format_create_kb_error(message: str) -> str:
+    if "may only contain letters" in message:
+        return "知识库名称只能使用英文字母、数字、下划线、短横线和点号，并且必须以字母或数字开头。"
+    if "cannot be empty" in message:
+        return "名称不能为空。"
+    if "consecutive dots" in message:
+        return "知识库名称不能包含连续的点号。"
+    return message
 
 
 def delete_kb_confirmed(pipeline, kb_name):
@@ -787,7 +849,6 @@ def render_settings_tab():
     is_local_backend = selected_backend == "local"
 
     with st.expander("🔐 登录与会话"):
-        st.info("登录权限已固定开启。")
         st.text_input(
             "认证数据库路径",
             value=str(_val("AUTH_DB_PATH", "storage/auth.db")),
@@ -1087,12 +1148,12 @@ def _apply_settings():
     """应用配置：收集 → 验证 → 保存 .env → 刷新 → 重新初始化"""
     from src.ingestion.index_builder import clear_all_index_cache
     from src.core.custom_rag_chat import _context_cache
+    from src.core.model_factory import init_generation_model
 
     new_settings = {}
     rag_backend = st.session_state.get("cfg_rag_backend", "local")
     is_local_backend = rag_backend == "local"
     new_settings["RAG_BACKEND"] = rag_backend
-    new_settings["AUTH_ENABLED"] = "true"
     new_settings["AUTH_DB_PATH"] = st.session_state.get("cfg_auth_db_path", "")
     new_settings["AUTH_DEFAULT_ADMIN_USERNAME"] = st.session_state.get("cfg_auth_admin_username", "")
     new_settings["AUTH_DEFAULT_ADMIN_PASSWORD"] = st.session_state.get("cfg_auth_admin_password", "")
@@ -1186,6 +1247,9 @@ def _apply_settings():
 
             # 4. local 后端的 embedding/chunk 参数可能变化，需要清除索引缓存。
             clear_all_index_cache()
+        else:
+            # RAGFlow 后端只需要刷新答案生成模型，不初始化本地 Chroma/Embedding。
+            init_generation_model(force=True)
 
         # 5. 清除上下文缓存
         _context_cache.clear()
@@ -1203,7 +1267,6 @@ def _apply_settings():
             metadata={
                 "provider": new_settings.get("PROVIDER"),
                 "rag_backend": new_settings.get("RAG_BACKEND"),
-                "auth_enabled": new_settings.get("AUTH_ENABLED"),
                 "reranker_type": new_settings.get("RERANKER_TYPE"),
             },
         )
@@ -1249,6 +1312,8 @@ def render_log_center_tab():
                 "delete_kb",
                 "upload_document",
                 "delete_document",
+                "spreadsheet_upload_archived",
+                "spreadsheet_delete_document",
                 "ragflow_upload_submitted",
                 "ragflow_upload_failed",
                 "ragflow_delete_document",
@@ -1285,6 +1350,7 @@ def render_log_center_tab():
             st.dataframe(
                 [
                     {
+                        "ID": event.id,
                         "时间": event.created_at,
                         "用户": event.actor_username,
                         "角色": event.actor_role,
@@ -1300,7 +1366,54 @@ def render_log_center_tab():
                 ],
                 width="stretch",
                 hide_index=True,
+                column_config={
+                    "ID": st.column_config.NumberColumn(width="small"),
+                    "时间": st.column_config.TextColumn(width="medium"),
+                    "用户": st.column_config.TextColumn(width="small"),
+                    "角色": st.column_config.TextColumn(width="small"),
+                    "部门ID": st.column_config.NumberColumn(width="small"),
+                    "操作": st.column_config.TextColumn(width="medium"),
+                    "对象类型": st.column_config.TextColumn(width="small"),
+                    "对象": st.column_config.TextColumn(width="large"),
+                    "知识库": st.column_config.TextColumn(width="medium"),
+                    "结果": st.column_config.TextColumn(width="small"),
+                    "错误": st.column_config.TextColumn(width="large"),
+                },
             )
+            selected_audit_id = st.selectbox(
+                "查看审计详情",
+                [event.id for event in audit_events],
+                format_func=lambda event_id: next(
+                    (
+                        f"#{event.id} {event.created_at} {event.action}: {event.target_id}"
+                        for event in audit_events
+                        if event.id == event_id
+                    ),
+                    str(event_id),
+                ),
+                key="audit_detail_select",
+            )
+            selected_event = next((event for event in audit_events if event.id == selected_audit_id), None)
+            if selected_event:
+                with st.expander("审计详情", expanded=True):
+                    st.markdown(f"**操作:** `{selected_event.action}`")
+                    st.markdown(f"**对象:** `{selected_event.target_type}` / `{selected_event.target_id}`")
+                    st.markdown(f"**知识库:** `{selected_event.kb_name}`")
+                    st.markdown(f"**结果:** {'成功' if selected_event.success else '失败'}")
+                    if selected_event.error_message:
+                        st.text_area(
+                            "完整错误信息",
+                            value=selected_event.error_message,
+                            height=140,
+                            disabled=True,
+                            key=f"audit_error_{selected_event.id}",
+                        )
+                    try:
+                        metadata = json.loads(selected_event.metadata_json or "{}")
+                    except json.JSONDecodeError:
+                        metadata = selected_event.metadata_json
+                    if metadata:
+                        st.json(metadata)
 
     with tab_query:
         c1, c2, c3 = st.columns([1.2, 1.1, 0.8])
@@ -1346,6 +1459,18 @@ def render_log_center_tab():
                 ],
                 width="stretch",
                 hide_index=True,
+                column_config={
+                    "时间": st.column_config.TextColumn(width="medium"),
+                    "用户": st.column_config.TextColumn(width="small"),
+                    "部门ID": st.column_config.NumberColumn(width="small"),
+                    "知识库": st.column_config.TextColumn(width="medium"),
+                    "问题": st.column_config.TextColumn(width="large"),
+                    "后端": st.column_config.TextColumn(width="small"),
+                    "检索": st.column_config.TextColumn(width="medium"),
+                    "耗时ms": st.column_config.NumberColumn(width="small"),
+                    "状态": st.column_config.TextColumn(width="small"),
+                    "错误": st.column_config.TextColumn(width="large"),
+                },
             )
 
             selected_trace_id = st.selectbox(
@@ -1367,10 +1492,7 @@ def render_log_center_tab():
                 with st.expander("查询详情", expanded=True):
                     st.markdown(f"**原始问题:** {selected_trace.original_query if show_query_content else '已隐藏'}")
                     st.markdown(f"**知识库:** `{selected_trace.kb_name}`")
-                    st.markdown(
-                        f"**参数:** vector_top_k={selected_trace.vector_top_k}, "
-                        f"bm25_top_k={selected_trace.bm25_top_k}, final_top_k={selected_trace.final_top_k}"
-                    )
+                    st.markdown(f"**参数:** {format_query_trace_params(selected_trace)}")
                     st.markdown(f"**耗时:** {selected_trace.latency_ms} ms")
                     if selected_trace.error_message:
                         st.error(selected_trace.error_message)
@@ -1429,7 +1551,15 @@ def main():
 
     # ------------------ 顶部栏 (应用更稳健的 CSS Sticky 效果) ------------------
     with st.container():
-        status = resource_manager.get_status()
+        if config.settings.RAG_BACKEND == "local":
+            status = resource_manager.get_status()
+            model_ok = status.get("models_initialized")
+            backend_ok = status.get("chroma_connected")
+            backend_label = "向量库"
+        else:
+            model_ok = True
+            backend_ok = pipeline is not None
+            backend_label = "RAGFlow"
         st.markdown(f"""
             <style>
                 div[data-testid="stVerticalBlock"] > div:has(.app-header-shell) {{
@@ -1481,8 +1611,8 @@ def main():
                 <div class="app-header-row">
                     <h1 class="app-header-title">😺 Hardware DataBase</h1>
                     <div class="app-header-status">
-                        <span class="status-indicator {'status-ok' if status.get('models_initialized') else 'status-error'}"></span> AI模型<br>
-                        <span class="status-indicator {'status-ok' if status.get('chroma_connected') else 'status-error'}"></span> 向量库
+                        <span class="status-indicator {'status-ok' if model_ok else 'status-error'}"></span> AI模型<br>
+                        <span class="status-indicator {'status-ok' if backend_ok else 'status-error'}"></span> {backend_label}
                     </div>
                 </div>
             </div>
@@ -1563,6 +1693,8 @@ def main():
             else:
                 if st.session_state.current_kb not in st.session_state.kb_list:
                     st.session_state.current_kb = st.session_state.kb_list[0]
+                if st.session_state.get("kb_selector") not in st.session_state.kb_list:
+                    st.session_state.kb_selector = st.session_state.current_kb
                 selected_kb = st.selectbox("切换知识库", options=st.session_state.kb_list, key="kb_selector")
                 if selected_kb != st.session_state.current_kb:
                     st.session_state.current_kb = selected_kb
@@ -1830,6 +1962,7 @@ def render_chat_tab(pipeline):
             latency_ms=latency_ms,
             status="failed" if full_response.startswith("Error:") else "success",
             error_message=full_response if full_response.startswith("Error:") else "",
+            metadata=build_query_log_metadata(),
         )
         st.session_state.pending_user_message_id = None
         st.rerun()
@@ -1864,7 +1997,7 @@ def render_department_management_tab():
             st.info("本部门暂无普通用户")
         else:
             for user in users:
-                c1, c2, c3 = st.columns([2, 1, 1])
+                c1, c2, c3, c4 = st.columns([1.6, 0.8, 0.8, 1.2])
                 with c1:
                     st.markdown(f"`{user.username}`")
                 with c2:
@@ -1893,6 +2026,34 @@ def render_department_management_tab():
                                 metadata={"is_active": next_active, "scope": "department"},
                             )
                             st.error(f"操作失败: {e}")
+                with c4:
+                    with st.popover("重置密码", use_container_width=True):
+                        new_password = st.text_input(
+                            "新密码",
+                            type="password",
+                            key=f"dept_reset_pwd_{user.id}",
+                        )
+                        if st.button("确认重置", key=f"dept_reset_pwd_btn_{user.id}", use_container_width=True):
+                            try:
+                                auth_service.reset_user_password_as(current_user, user.id, new_password)
+                                record_audit(
+                                    "reset_user_password",
+                                    target_type="user",
+                                    target_id=user.username,
+                                    metadata={"scope": "department"},
+                                )
+                                st.success(f"已重置密码: {user.username}")
+                                st.rerun()
+                            except Exception as e:
+                                record_audit(
+                                    "reset_user_password",
+                                    target_type="user",
+                                    target_id=user.username,
+                                    success=False,
+                                    error_message=str(e),
+                                    metadata={"scope": "department"},
+                                )
+                                st.error(f"重置失败: {e}")
 
         st.divider()
         with st.form("dept_create_user_form"):
@@ -1949,7 +2110,7 @@ def render_system_department_management(current_user):
             active_count = sum(1 for user in dept_users if user.is_active)
             with st.expander(f"{dept_name} · {len(dept_users)} 人 · 启用 {active_count}", expanded=False):
                 for user in dept_users:
-                    c1, c2, c3, c4 = st.columns([1.6, 1.2, 0.8, 0.9])
+                    c1, c2, c3, c4, c5 = st.columns([1.4, 1.0, 0.7, 0.8, 1.1])
                     with c1:
                         st.markdown(f"`{user.username}`")
                     with c2:
@@ -1981,8 +2142,39 @@ def render_system_department_management(current_user):
                                         success=False,
                                         error_message=str(e),
                                         metadata={"is_active": next_active},
-                                    )
+                                )
                                     st.error(f"操作失败: {e}")
+                    with c5:
+                        if user.id == st.session_state.get("user_id"):
+                            st.button("重置密码", key=f"reset_self_{user.id}", disabled=True, width="stretch")
+                        else:
+                            with st.popover("重置密码", use_container_width=True):
+                                new_password = st.text_input(
+                                    "新密码",
+                                    type="password",
+                                    key=f"sys_reset_pwd_{user.id}",
+                                )
+                                if st.button("确认重置", key=f"sys_reset_pwd_btn_{user.id}", use_container_width=True):
+                                    try:
+                                        auth_service.reset_user_password_as(current_user, user.id, new_password)
+                                        record_audit(
+                                            "reset_user_password",
+                                            target_type="user",
+                                            target_id=user.username,
+                                            metadata={"role": user.role},
+                                        )
+                                        st.success(f"已重置密码: {user.username}")
+                                        st.rerun()
+                                    except Exception as e:
+                                        record_audit(
+                                            "reset_user_password",
+                                            target_type="user",
+                                            target_id=user.username,
+                                            success=False,
+                                            error_message=str(e),
+                                            metadata={"role": user.role},
+                                        )
+                                        st.error(f"重置失败: {e}")
 
     with dept_tab:
         st.caption(f"当前部门数: {len(departments)}")
@@ -2048,11 +2240,17 @@ def render_system_department_management(current_user):
                 new_username = st.text_input("新用户名", key="auth_new_username")
                 new_password = st.text_input("新用户密码", type="password", key="auth_new_password")
                 new_role = st.selectbox("角色", [ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN], key="auth_new_role")
-                department_names = [dept.name for dept in departments]
-                selected_department = st.selectbox("部门", department_names, key="auth_new_department")
+                business_departments = [dept for dept in departments if dept.name != "system"]
+                selected_department = "system"
+                if new_role == ROLE_SYSTEM_ADMIN:
+                    st.caption("系统管理员固定归属 system 部门，不挂载业务部门。")
+                    department_id = next((dept.id for dept in departments if dept.name == "system"), None)
+                else:
+                    department_names = [dept.name for dept in business_departments]
+                    selected_department = st.selectbox("部门", department_names, key="auth_new_department")
+                    department_id = next((dept.id for dept in business_departments if dept.name == selected_department), None)
                 if st.form_submit_button("创建用户", width="stretch"):
                     try:
-                        department_id = next((dept.id for dept in departments if dept.name == selected_department), None)
                         auth_service.create_user_as(
                             current_user,
                             new_username,
@@ -2142,7 +2340,7 @@ def render_kb_governance_tab(pipeline):
     rows = []
     issue_count = 0
     for item in summaries:
-        local_files = _count_local_kb_files(item.name)
+        local_files = 0 if config.settings.RAG_BACKEND == "ragflow" else _count_local_kb_files(item.name)
         backend_stats = ragflow_stats.get(item.name, {})
         file_count = backend_stats.get("files", local_files)
         failed_count = backend_stats.get("failed", 0)
@@ -2150,7 +2348,7 @@ def render_kb_governance_tab(pipeline):
         issues = []
         if not item.registered:
             issues.append("未登记")
-        if not item.physical_exists:
+        if config.settings.RAG_BACKEND != "ragflow" and not item.physical_exists:
             issues.append("目录缺失")
         if not item.department_id:
             issues.append("未分配部门")
@@ -2298,8 +2496,11 @@ def render_kb_management_tab(pipeline):
                 with st.form("new_kb_form_empty"):
                     st.text_input("输入新知识库名称", placeholder="例如: project_alpha", key="new_kb_name_input")
                     st.form_submit_button("确认创建", on_click=create_kb_callback, args=(pipeline,))
+                if st.session_state.get("create_kb_error"):
+                    st.error(st.session_state.create_kb_error)
                 if st.button("取消", key="cancel_create_kb_empty"):
                     st.session_state.show_create_kb = False
+                    st.session_state.create_kb_error = None
                     st.rerun()
         return
 
@@ -2391,8 +2592,11 @@ def render_kb_management_tab(pipeline):
             with st.form("new_kb_form"):
                 st.text_input("输入新知识库名称", placeholder="例如: project_alpha", key="new_kb_name_input")
                 st.form_submit_button("确认创建", on_click=create_kb_callback, args=(pipeline,))
+            if st.session_state.get("create_kb_error"):
+                st.error(st.session_state.create_kb_error)
             if st.button("取消", key="cancel_create_kb"):
                 st.session_state.show_create_kb = False
+                st.session_state.create_kb_error = None
                 st.rerun()
 
     if st.session_state.get("role") == ROLE_DEPT_ADMIN and manageable_kbs:
@@ -2483,7 +2687,13 @@ def render_kb_management_tab(pipeline):
                             info = None
                         c1, c2, c3 = st.columns([0.68, 0.16, 0.16])
                         with c1:
-                            if info and info.metadata.get("ragflow_document_id"):
+                            processor_kind = info.metadata.get("processor_kind", "") if info else ""
+                            if processor_kind == "spreadsheet_table":
+                                local_path = info.metadata.get("local_path", "")
+                                st.markdown(f"📊 {f}  \n`Excel 管道: 已归档` `待结构化解析`")
+                                if local_path:
+                                    st.caption(f"本地归档: {local_path}")
+                            elif info and info.metadata.get("ragflow_document_id"):
                                 status = str(info.metadata.get("status", "unknown")).lower()
                                 status_label, searchability_label = format_ragflow_document_status(status)
                                 dataset_kind = info.metadata.get("dataset_kind", "")
@@ -2501,8 +2711,9 @@ def render_kb_management_tab(pipeline):
                         with c2:
                             chunk_label = "收起" if selected_doc_id == doc_id else "分块"
                             info_status = str(info.metadata.get("status", "")).lower() if info else ""
-                            chunk_disabled = bool(info_status in {"cancelled", "failed", "uploaded", "parsing"})
-                            chunk_help = "当前文档尚不可检索，没有可展示分块" if chunk_disabled else None
+                            info_processor = info.metadata.get("processor_kind", "") if info else ""
+                            chunk_disabled = bool(info_processor == "spreadsheet_table" or info_status in {"cancelled", "failed", "uploaded", "parsing"})
+                            chunk_help = "Excel 文件已进入独立表格管道，当前不展示 RAG 分块" if info_processor == "spreadsheet_table" else ("当前文档尚不可检索，没有可展示分块" if chunk_disabled else None)
                             if st.button(chunk_label, key=f"chunks_f_{kb}_{file_index}", use_container_width=True, disabled=chunk_disabled, help=chunk_help):
                                 toggle_parse_result_file(f"mgmt_{kb}", doc_id)
                                 st.rerun()
