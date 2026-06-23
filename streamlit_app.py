@@ -11,7 +11,7 @@ from src.core.resource_manager import resource_manager
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER, build_request_context, ensure_session_id
 from src.core.app_logs import AppLogService
 from src.core.conversation import ConversationService
-from src.ingestion.source_groups import SOURCE_GROUP_DESCRIPTIONS, USER_SELECTABLE_SOURCE_GROUPS
+from src.ingestion.source_groups import SOURCE_GROUP_DESCRIPTIONS, USER_SELECTABLE_SOURCE_GROUPS, display_source_group
 import config.settings
 
 AUTH_QUERY_PARAM = "hd_session"
@@ -509,7 +509,7 @@ def render_parse_result_detail(pipeline, kb_name: str, selected_document_id: str
         st.caption(f"共 {result.chunk_count} 个解析分块")
         for chunk in result.chunks:
             title = f"分块 {chunk.index + 1}"
-            source_group = chunk.metadata.get("source_group")
+            source_group = display_source_group(chunk.metadata.get("source_group"))
             page_label = chunk.metadata.get("page_label")
             details = [value for value in [source_group, f"第 {page_label} 页" if page_label else None] if value]
             if details:
@@ -529,11 +529,14 @@ def format_task_time(timestamp: float | None) -> str:
     return time.strftime("%H:%M:%S", time.localtime(timestamp))
 
 
-@st.fragment(run_every="2s")
+@st.fragment
 def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
     ctx = build_request_context(st.session_state)
     tasks = pipeline.list_parse_tasks(kb_name, ctx=ctx)
     is_ragflow = config.settings.RAG_BACKEND == "ragflow"
+    if is_ragflow:
+        hidden_task_statuses = {"completed", "complete", "done", "finish", "finished", "success", "parsed", "deleted", "cancelled", "已完成"}
+        tasks = [task for task in tasks if str(task.status).lower() not in hidden_task_statuses and task.status not in hidden_task_statuses]
     if any(task.status == "completed" for task in tasks):
         invalidate_file_cache(kb_name)
 
@@ -576,7 +579,12 @@ def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
                         st.caption(task.message)
             with c_actions:
                 if is_ragflow:
-                    st.button("远端任务", key=f"{key_prefix}_remote_{task.id}", disabled=True, use_container_width=True)
+                    if task.status in {"queued", "running"}:
+                        if st.button("停止", key=f"{key_prefix}_stop_{task.id}", use_container_width=True):
+                            st.session_state.toast_msg = pipeline.delete_parse_task(task.id, ctx=ctx)
+                            st.rerun()
+                    else:
+                        st.button("停止", key=f"{key_prefix}_stop_noop_{task.id}", disabled=True, use_container_width=True)
                 elif task.status in {"queued", "running"}:
                     if st.button("暂停", key=f"{key_prefix}_pause_{task.id}", use_container_width=True):
                         st.session_state.toast_msg = pipeline.pause_parse_task(task.id, ctx=ctx)
@@ -587,9 +595,23 @@ def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
                         st.rerun()
                 else:
                     st.button("暂停", key=f"{key_prefix}_noop_{task.id}", disabled=True, use_container_width=True)
-                if st.button("删除任务", key=f"{key_prefix}_delete_{task.id}", use_container_width=True):
+                if not is_ragflow and st.button("删除任务", key=f"{key_prefix}_delete_{task.id}", use_container_width=True):
                     st.session_state.toast_msg = pipeline.delete_parse_task(task.id, ctx=ctx)
                     st.rerun()
+
+
+def format_ragflow_document_status(status: str) -> tuple[str, str]:
+    normalized = str(status or "unknown").lower()
+    labels = {
+        "parsed": ("已解析", "可检索"),
+        "parsing": ("解析中", "暂不可检索"),
+        "uploaded": ("已上传", "等待解析"),
+        "failed": ("解析失败", "不可检索"),
+        "cancelled": ("已停止", "不可检索"),
+        "deleted": ("已删除", "不可检索"),
+        "unknown": ("状态未知", "不可检索"),
+    }
+    return labels.get(normalized, (normalized, "状态待确认"))
 
 
 def render_login_page():
@@ -2287,7 +2309,7 @@ def render_kb_management_tab(pipeline):
             source_group = st.selectbox(
                 "文件类型",
                 USER_SELECTABLE_SOURCE_GROUPS,
-                format_func=lambda group: f"{group}（{SOURCE_GROUP_DESCRIPTIONS.get(group, '')}）",
+                format_func=lambda group: f"{display_source_group(group)}（{SOURCE_GROUP_DESCRIPTIONS.get(group, '')}）",
                 key="upload_source_group",
             )
             files = st.file_uploader("拖拽文件到此处", accept_multiple_files=True, type=upload_types)
@@ -2301,13 +2323,21 @@ def render_kb_management_tab(pipeline):
                         with open(path, "wb") as wb:
                             wb.write(f.getbuffer())
                         temp_paths.append(path)
-                    st.write("创建后台解析任务...")
+                    progress_bar = st.progress(0, text="等待 RAGFlow 返回解析进度")
+
+                    def update_upload_progress(progress: int, stage: str):
+                        safe_progress = max(0, min(100, int(progress)))
+                        progress_bar.progress(safe_progress, text=stage or f"RAGFlow 解析进度 {safe_progress}%")
+                        status.update(label=f"RAGFlow 解析中 {safe_progress}%", state="running", expanded=True)
+
+                    st.write("上传到 RAGFlow 并等待解析进度...")
                     ctx = build_request_context(st.session_state)
                     res = pipeline.upload_files(
                         temp_paths,
                         st.session_state.current_kb,
                         ctx=ctx,
                         source_group=source_group,
+                        progress_callback=update_upload_progress,
                     )
                     upload_ok = (
                         res.startswith("✅")
@@ -2334,7 +2364,8 @@ def render_kb_management_tab(pipeline):
                         except OSError:
                             pass
                     invalidate_file_cache(st.session_state.current_kb)
-                    status.update(label="✅ 已提交解析任务", state="complete", expanded=False)
+                    progress_bar.progress(100, text="RAGFlow 解析流程完成")
+                    status.update(label="✅ RAGFlow 解析流程完成", state="complete", expanded=False)
                 st.success(res.split('\n')[0])
                 time.sleep(1)
                 st.rerun()
@@ -2453,20 +2484,26 @@ def render_kb_management_tab(pipeline):
                         c1, c2, c3 = st.columns([0.68, 0.16, 0.16])
                         with c1:
                             if info and info.metadata.get("ragflow_document_id"):
-                                status = info.metadata.get("status", "unknown")
+                                status = str(info.metadata.get("status", "unknown")).lower()
+                                status_label, searchability_label = format_ragflow_document_status(status)
                                 dataset_kind = info.metadata.get("dataset_kind", "")
                                 local_path = info.metadata.get("local_path", "")
                                 ragflow_error = info.metadata.get("ragflow_error", "")
-                                st.markdown(f"📄 {f}  \n`RAGFlow: {status}` `{dataset_kind}`")
+                                st.markdown(f"📄 {f}  \n`RAGFlow: {status_label}` `{searchability_label}` `{dataset_kind}`")
                                 if local_path:
                                     st.caption(f"本地归档: {local_path}")
+                                if status == "cancelled":
+                                    st.caption("解析已停止，当前不会进入检索结果。可删除后重新上传解析。")
                                 if ragflow_error:
                                     st.caption(f"RAGFlow 错误: {ragflow_error}")
                             else:
                                 st.markdown(f"📄 {f}")
                         with c2:
                             chunk_label = "收起" if selected_doc_id == doc_id else "分块"
-                            if st.button(chunk_label, key=f"chunks_f_{kb}_{file_index}", use_container_width=True):
+                            info_status = str(info.metadata.get("status", "")).lower() if info else ""
+                            chunk_disabled = bool(info_status in {"cancelled", "failed", "uploaded", "parsing"})
+                            chunk_help = "当前文档尚不可检索，没有可展示分块" if chunk_disabled else None
+                            if st.button(chunk_label, key=f"chunks_f_{kb}_{file_index}", use_container_width=True, disabled=chunk_disabled, help=chunk_help):
                                 toggle_parse_result_file(f"mgmt_{kb}", doc_id)
                                 st.rerun()
                         with c3:

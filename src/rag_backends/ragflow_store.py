@@ -333,6 +333,13 @@ class RAGFlowStore:
         with closing(self._connect()) as conn:
             conn.execute("DELETE FROM ragflow_documents WHERE id = ?", (record_id,))
 
+    def delete_document_by_remote_id(self, dataset_id: str, document_id: str):
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "DELETE FROM ragflow_documents WHERE dataset_id = ? AND document_id = ?",
+                (dataset_id, document_id),
+            )
+
     def update_document_status(self, dataset_id: str, document_id: str, status: str, error_message: str = ""):
         completed_expr = "CURRENT_TIMESTAMP" if status in {"parsed", "failed", "deleted"} else "parse_completed_at"
         with closing(self._connect()) as conn:

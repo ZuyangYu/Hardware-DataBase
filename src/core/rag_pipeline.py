@@ -2,7 +2,7 @@
 import os
 import shutil
 import traceback
-from typing import Generator, List, Tuple
+from typing import Callable, Generator, List, Tuple
 
 import config.settings
 from src.core.auth import AuthService
@@ -74,6 +74,7 @@ class RAGPipeline:
         target_kb: str,
         ctx: RequestContext | None = None,
         source_group: str | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> str:
         """批量上传并自动提交后台解析任务。"""
         if not files:
@@ -85,7 +86,13 @@ class RAGPipeline:
         if hasattr(self.backend, "submit_parse_tasks"):
             tasks = self.backend.submit_parse_tasks(target_kb, file_paths, source_group=source_group, ctx=ctx)
             return f"已创建 {len(tasks)} 个解析任务，系统将自动开始解析"
-        return self.backend.ingest(target_kb, file_paths, ctx=ctx, source_group=source_group).to_message()
+        return self.backend.ingest(
+            target_kb,
+            file_paths,
+            ctx=ctx,
+            source_group=source_group,
+            progress_callback=progress_callback,
+        ).to_message()
 
     def add_document(self, temp_file_path: str, kb_name: str) -> Tuple[bool, str]:
         """单文件索引逻辑，返回是否成功和描述信息。"""

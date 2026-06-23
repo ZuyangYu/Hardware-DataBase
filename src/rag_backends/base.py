@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Generator
+from typing import Callable, Generator
 
 from src.rag_backends.schemas import BackendHealth, BackendResult, DocumentInfo, Evidence, IngestResult, ParseResult, RequestContext
 
@@ -14,6 +14,7 @@ class RAGBackend(ABC):
         files: list[str],
         ctx: RequestContext | None = None,
         source_group: str | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> IngestResult:
         """Ingest and index files into a knowledge base."""
 
