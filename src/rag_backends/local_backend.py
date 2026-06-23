@@ -119,6 +119,7 @@ class LocalRAGBackend(RAGBackend):
         files: list[str],
         ctx: RequestContext | None = None,
         source_group: str | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> IngestResult:
         self._check_kb_access(kb_name, ctx, "write")
         if not files:

@@ -36,11 +36,15 @@ USER_SELECTABLE_SOURCE_GROUPS = (
 SOURCE_GROUP_DESCRIPTIONS = {
     DESIGN_GROUP: "原理图、PCB、BOM、网表、约束、仿真文件",
     MATERIAL_GROUP: "器件参数、封装、供应商、生命周期、替代料信息",
-    DOCS_GROUP: "规格书、设计文档、手册标准规范、参考资料",
+    DOCS_GROUP: "Datasheet、规格书、手册、标准规范、应用笔记、参考资料",
     TEST_GROUP: "测试报告、测试记录、验证数据",
     PROJECT_GROUP: "计划、进度、任务、评审与会议资料",
     EXTERNAL_GROUP: "第三方资料、外部接口、客户或供应链输入",
     PEOPLE_GROUP: "人员、团队、角色、组织结构资料",
+}
+
+SOURCE_GROUP_DISPLAY_NAMES = {
+    DOCS_GROUP: "规范手册资料",
 }
 
 IMPLEMENTED_PARSE_GROUPS = {DOCS_GROUP, MATERIAL_GROUP}
@@ -117,3 +121,8 @@ def classify_source_group(filename: str) -> SourceGroupClassification:
 
 def safe_source_group(group: str | None) -> str:
     return group if group in SOURCE_GROUPS else UNKNOWN_GROUP
+
+
+def display_source_group(group: str | None) -> str:
+    safe_group = safe_source_group(group)
+    return SOURCE_GROUP_DISPLAY_NAMES.get(safe_group, safe_group)

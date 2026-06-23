@@ -3,7 +3,7 @@ import json
 import os
 import shutil
 import time
-from typing import Generator
+from typing import Callable, Generator
 
 import requests
 
@@ -47,9 +47,24 @@ RAGFLOW_STATUS_PARSING = "parsing"
 RAGFLOW_STATUS_PARSED = "parsed"
 RAGFLOW_STATUS_FAILED = "failed"
 RAGFLOW_STATUS_DELETED = "deleted"
+RAGFLOW_STATUS_CANCELLED = "cancelled"
 RAGFLOW_STATUS_UNKNOWN = "unknown"
+RAGFLOW_HIDDEN_TASK_STATUSES = {
+    RAGFLOW_STATUS_PARSED,
+    RAGFLOW_STATUS_DELETED,
+    RAGFLOW_STATUS_CANCELLED,
+    "completed",
+    "complete",
+    "done",
+    "finish",
+    "finished",
+    "success",
+    "已完成",
+}
 RAGFLOW_PARSE_START_DELAY_SECONDS = 2.0
 RAGFLOW_DOCUMENT_READY_TIMEOUT_SECONDS = 10.0
+RAGFLOW_PARSE_PROGRESS_TIMEOUT_SECONDS = 1800.0
+RAGFLOW_PARSE_PROGRESS_POLL_SECONDS = 2.0
 
 SOURCE_GROUP_DATASET_KIND = {
     DOCS_GROUP: DATASET_GOVERNANCE,
@@ -75,6 +90,10 @@ class RAGFlowAPIError(RuntimeError):
 
 def _is_ragflow_not_owner_error(exc: Exception) -> bool:
     return isinstance(exc, RAGFlowAPIError) and exc.code == 102
+
+
+def _ragflow_status_unavailable_message(document_name: str) -> str:
+    return f"{document_name}: RAGFlow parse submitted; realtime progress is not readable by the current API key."
 
 
 def _ctx_department_id(ctx: RequestContext | None) -> str:
@@ -131,7 +150,48 @@ def _normalize_ragflow_status(raw_status: object) -> str:
         return RAGFLOW_STATUS_FAILED
     if status in {"deleted", "removed"}:
         return RAGFLOW_STATUS_DELETED
+    if status in {"cancel", "cancelled", "canceled", "stopped", "stop"}:
+        return RAGFLOW_STATUS_CANCELLED
     return status
+
+
+def _coerce_progress_percent(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("%"):
+            text = text[:-1].strip()
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+
+    if 0 <= number <= 1:
+        number *= 100
+    return max(0, min(100, int(round(number))))
+
+
+def _extract_ragflow_progress(document: dict) -> int | None:
+    return _coerce_progress_percent(document.get("progress"))
+
+
+def _extract_ragflow_progress_message(document: dict) -> str:
+    value = document.get("progress_msg")
+    if isinstance(value, list):
+        messages = [str(item).strip() for item in value if str(item).strip()]
+        return messages[-1] if messages else ""
+    if value:
+        lines = [line.strip() for line in str(value).splitlines() if line.strip()]
+        return lines[-1] if lines else str(value)
+    return ""
 
 
 def _extract_ragflow_error(document: dict) -> str:
@@ -151,13 +211,11 @@ def _extract_ragflow_error(document: dict) -> str:
         if value:
             return str(value)
 
-    for key in ("progress_msg", "status_msg", "parse_msg"):
-        value = document.get(key)
-        if value:
-            return str(value)
-
     run_value = document.get("run")
     if _normalize_ragflow_status(run_value) == RAGFLOW_STATUS_FAILED:
+        progress_message = _extract_ragflow_progress_message(document)
+        if progress_message:
+            return progress_message
         summary = {
             key: document.get(key)
             for key in ("id", "name", "run", "status", "type", "parser_id")
@@ -259,6 +317,9 @@ class RAGFlowClient:
 
     def parse_documents(self, dataset_id: str, document_ids: list[str]):
         self.request("POST", f"/api/v1/datasets/{dataset_id}/chunks", json={"document_ids": document_ids})
+
+    def stop_parse_documents(self, dataset_id: str, document_ids: list[str]):
+        self.request("DELETE", f"/api/v1/datasets/{dataset_id}/chunks", json={"document_ids": document_ids})
 
     def wait_document_ready(self, dataset_id: str, document_id: str, timeout_seconds: float = RAGFLOW_DOCUMENT_READY_TIMEOUT_SECONDS) -> dict:
         deadline = time.monotonic() + timeout_seconds
@@ -452,6 +513,7 @@ class RAGFlowBackend(RAGBackend):
         files: list[str],
         ctx: RequestContext | None = None,
         source_group: str | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> IngestResult:
         self._check_kb_access(kb_name, ctx, "write")
         if not files:
@@ -494,6 +556,8 @@ class RAGFlowBackend(RAGBackend):
                 self.client.wait_document_ready(dataset_id, document_id)
                 time.sleep(RAGFLOW_PARSE_START_DELAY_SECONDS)
                 self.client.parse_documents(dataset_id, [document_id])
+                if progress_callback:
+                    progress_callback(5, f"{filename}: 已提交到 RAGFlow，等待解析进度")
                 self.store.upsert_document(
                     kb_name=kb_name,
                     document_name=filename,
@@ -510,6 +574,15 @@ class RAGFlowBackend(RAGBackend):
                     content_hash=content_hash,
                     upload_status=RAGFLOW_STATUS_PARSING,
                 )
+                status, message = self._wait_parse_progress(
+                    dataset_id,
+                    document_id,
+                    filename,
+                    progress_callback=progress_callback,
+                )
+                self.store.update_document_status(dataset_id, document_id, status, message)
+                if status == RAGFLOW_STATUS_FAILED:
+                    raise RuntimeError(message or f"RAGFlow parsing failed for {filename}")
                 self._audit(
                     "ragflow_upload_submitted",
                     ctx,
@@ -530,6 +603,7 @@ class RAGFlowBackend(RAGBackend):
             except Exception as exc:
                 if document_id:
                     self._cleanup_remote_document(dataset_id, document_id)
+                    self.store.delete_document_by_remote_id(dataset_id, document_id)
                 if archived_path and os.path.exists(archived_path):
                     try:
                         os.remove(archived_path)
@@ -549,6 +623,48 @@ class RAGFlowBackend(RAGBackend):
                 messages.append(f"Failed {filename}: {exc}")
 
         return IngestResult(success_count=success_count, total_count=len(files), messages=messages, backend=self.name)
+
+    def _wait_parse_progress(
+        self,
+        dataset_id: str,
+        document_id: str,
+        filename: str,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> tuple[str, str]:
+        deadline = time.monotonic() + RAGFLOW_PARSE_PROGRESS_TIMEOUT_SECONDS
+        last_status = RAGFLOW_STATUS_PARSING
+        last_message = ""
+        last_progress = None
+
+        while time.monotonic() < deadline:
+            try:
+                remote_docs = self.client.list_documents(dataset_id, document_id)
+            except Exception as progress_error:
+                last_message = _ragflow_status_unavailable_message(filename)
+                log(f"RAGFlow progress polling failed for {document_id}: {progress_error}")
+                if progress_callback:
+                    progress_callback(last_progress if last_progress is not None else 5, last_message)
+                return RAGFLOW_STATUS_PARSING, last_message
+            if not remote_docs:
+                last_message = f"{filename}: RAGFlow 暂未返回文档状态"
+            else:
+                remote_doc = remote_docs[0]
+                last_status = _normalize_ragflow_status(remote_doc.get("run"))
+                last_message = _extract_ragflow_error(remote_doc) or _extract_ragflow_progress_message(remote_doc)
+                remote_progress = _extract_ragflow_progress(remote_doc)
+                if remote_progress is not None:
+                    last_progress = remote_progress
+
+                if progress_callback and last_progress is not None:
+                    stage = last_message or f"{filename}: RAGFlow 解析中"
+                    progress_callback(last_progress, stage)
+
+                if last_status in {RAGFLOW_STATUS_PARSED, RAGFLOW_STATUS_FAILED, RAGFLOW_STATUS_DELETED}:
+                    return last_status, last_message
+
+            time.sleep(RAGFLOW_PARSE_PROGRESS_POLL_SECONDS)
+
+        return last_status, last_message or f"{filename}: RAGFlow parsing progress timed out"
 
     def retrieve(self, kb_name: str, query: str, top_k: int | None = None, ctx: RequestContext | None = None) -> list[Evidence]:
         self._check_kb_access(kb_name, ctx, "read")
@@ -609,6 +725,8 @@ class RAGFlowBackend(RAGBackend):
         history: list[tuple[str, str]],
         ctx: RequestContext | None = None,
     ) -> Generator[str, None, None]:
+        evidences = []
+        context = ""
         try:
             from llama_index.core import Settings
             from llama_index.core.base.llms.types import ChatMessage, MessageRole
@@ -617,8 +735,6 @@ class RAGFlowBackend(RAGBackend):
             if Settings.llm is None:
                 init_generation_model()
 
-            evidences = []
-            context = ""
             if not _is_small_talk(query):
                 evidences = self.retrieve(kb_name, query, config.settings.FINAL_TOP_K, ctx=ctx)
                 context = "\n\n".join(
@@ -649,7 +765,10 @@ class RAGFlowBackend(RAGBackend):
                 yield f"\n\n---\n\nReferences:\n{sources}"
         except Exception as exc:
             error(f"RAGFlow answer generation failed: {exc}")
-            yield f"RAGFlow retrieved relevant context, but answer generation failed: {exc}\n\n{context}"
+            if context:
+                yield f"RAGFlow retrieved relevant context, but answer generation failed: {exc}\n\n{context}"
+            else:
+                yield f"系统错误: {exc}"
 
     def delete_document(self, kb_name: str, document_id: str, ctx: RequestContext | None = None) -> BackendResult:
         self._check_kb_access(kb_name, ctx, "write")
@@ -735,24 +854,35 @@ class RAGFlowBackend(RAGBackend):
         records = self.store.list_documents(kb_name, department_id=department_id) if kb_name else []
         tasks = []
         for record in records:
+            if record.status in RAGFLOW_HIDDEN_TASK_STATUSES:
+                continue
             status = record.status
             message = record.ragflow_error
+            remote_progress = None
+            remote_stage = ""
             try:
                 remote_docs = self.client.list_documents(record.dataset_id, record.document_id)
                 if remote_docs:
                     remote_doc = remote_docs[0]
                     status = _normalize_ragflow_status(remote_doc.get("run") or remote_doc.get("status") or status)
                     message = _extract_ragflow_error(remote_doc)
+                    remote_progress = _extract_ragflow_progress(remote_doc)
+                    remote_stage = _extract_ragflow_progress_message(remote_doc)
                     self.store.update_document_status(record.dataset_id, record.document_id, status, message)
+                    if status in RAGFLOW_HIDDEN_TASK_STATUSES:
+                        continue
             except Exception as status_error:
                 if _is_ragflow_not_owner_error(status_error):
-                    status = RAGFLOW_STATUS_FAILED
-                    message = str(status_error)
-                    self.store.update_document_status(record.dataset_id, record.document_id, status, message)
+                    message = _ragflow_status_unavailable_message(record.document_name)
+                    log(f"RAGFlow task status is not readable for {record.document_id}: {status_error}")
                 else:
                     message = str(status_error)
 
-            task_status, progress, stage = self._parse_task_state_from_ragflow_status(status)
+            task_status, progress, stage = self._parse_task_state_from_ragflow_status(
+                status,
+                remote_progress=remote_progress,
+                remote_stage=remote_stage,
+            )
             tasks.append(
                 ParseTask(
                     id=f"ragflow-{record.id}",
@@ -773,16 +903,66 @@ class RAGFlowBackend(RAGBackend):
             )
         return sorted(tasks, key=lambda task: task.updated_at, reverse=True)
 
-    def _parse_task_state_from_ragflow_status(self, status: str) -> tuple[str, int, str]:
+    def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> BackendResult:
+        if not task_id.startswith("ragflow-"):
+            return BackendResult(ok=False, message="Invalid RAGFlow parse task id.", backend=self.name)
+
+        raw_record_id = task_id.removeprefix("ragflow-")
+        if not raw_record_id.isdigit():
+            return BackendResult(ok=False, message="Invalid RAGFlow parse task id.", backend=self.name)
+
+        record = self.store.get_document_by_id(int(raw_record_id))
+        if not record:
+            return BackendResult(ok=True, message="RAGFlow parse task is already gone.", backend=self.name)
+
+        try:
+            self._check_kb_access(record.kb_name, ctx, "write")
+            _check_record_department(record, ctx)
+        except PermissionError as exc:
+            return BackendResult(ok=False, message=str(exc), backend=self.name)
+
+        try:
+            self.client.stop_parse_documents(record.dataset_id, [record.document_id])
+        except Exception as exc:
+            if not _is_ragflow_not_owner_error(exc):
+                return BackendResult(ok=False, message=f"Stop RAGFlow parsing failed: {exc}", backend=self.name)
+            log(f"RAGFlow stop parsing is not readable for {record.document_id}: {exc}")
+
+        self._cleanup_remote_document(record.dataset_id, record.document_id)
+        self._remove_local_archive(record)
+        self.store.delete_document_by_id(record.id)
+        self._audit(
+            "ragflow_stop_parse_task",
+            ctx,
+            kb_name=record.kb_name,
+            target_type="document",
+            target_id=record.document_name,
+            metadata={
+                "store_id": record.id,
+                "ragflow_document_id": record.document_id,
+                "dataset_id": record.dataset_id,
+                "dataset_kind": record.dataset_kind,
+            },
+        )
+        return BackendResult(ok=True, message=f"已停止并移除未完成文档: {record.document_name}", backend=self.name)
+
+    def _parse_task_state_from_ragflow_status(
+        self,
+        status: str,
+        remote_progress: int | None = None,
+        remote_stage: str = "",
+    ) -> tuple[str, int, str]:
         if status == RAGFLOW_STATUS_PARSED:
-            return "completed", 100, "解析完成"
+            return "completed", 100, remote_stage or "解析完成"
         if status == RAGFLOW_STATUS_FAILED:
-            return "failed", 100, "解析失败"
+            return "failed", remote_progress if remote_progress is not None else 100, remote_stage or "解析失败"
+        if status == RAGFLOW_STATUS_CANCELLED:
+            return "cancelled", remote_progress if remote_progress is not None else 100, remote_stage or "已停止解析"
         if status == RAGFLOW_STATUS_PARSING:
-            return "running", 65, "RAGFlow 解析中"
+            return "running", remote_progress if remote_progress is not None else 65, remote_stage or "RAGFlow 解析中"
         if status == RAGFLOW_STATUS_UPLOADED:
-            return "queued", 20, "已上传，等待解析"
-        return "running", 40, f"RAGFlow 状态: {status or RAGFLOW_STATUS_UNKNOWN}"
+            return "queued", remote_progress if remote_progress is not None else 20, remote_stage or "已上传，等待解析"
+        return "running", remote_progress if remote_progress is not None else 40, remote_stage or f"RAGFlow 状态: {status or RAGFLOW_STATUS_UNKNOWN}"
 
     def _parse_timestamp(self, value: str) -> float:
         if not value:
@@ -808,9 +988,8 @@ class RAGFlowBackend(RAGBackend):
                     self.store.update_document_status(record.dataset_id, record.document_id, status, error_message)
             except Exception as status_error:
                 if _is_ragflow_not_owner_error(status_error):
-                    status = RAGFLOW_STATUS_FAILED
-                    error_message = str(status_error)
-                    self.store.update_document_status(record.dataset_id, record.document_id, status, error_message)
+                    error_message = _ragflow_status_unavailable_message(record.document_name)
+                    log(f"RAGFlow document status is not readable for {record.document_id}: {status_error}")
                 else:
                     log(f"RAGFlow status refresh failed for {record.document_name}: {status_error}")
 
