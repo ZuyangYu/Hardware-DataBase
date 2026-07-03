@@ -1,19 +1,23 @@
 ﻿# src/streamlit_app.py
-import os
-import tempfile
 import html
 import json
 import streamlit as st
 import streamlit.components.v1 as components
 import time
-import requests
-from src.core.rag_pipeline import RAGPipeline
-from src.core.resource_manager import resource_manager
+from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER, build_request_context, ensure_session_id
-from src.core.app_logs import AppLogService
+from src.core.app_logs import AppLogService, format_local_time, query_trace_status
 from src.core.conversation import ConversationService
 from src.ingestion.kb_paths import InvalidKnowledgeBaseName, validate_kb_name
 from src.ingestion.source_groups import SOURCE_GROUP_DESCRIPTIONS, USER_SELECTABLE_SOURCE_GROUPS, display_source_group
+from src.pipelines.document_rag.schemas import (
+    TASK_STATUS_CANCELLED,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_PAUSED,
+    TASK_STATUS_QUEUED,
+    TASK_STATUS_RUNNING,
+    parse_status_view,
+)
 import config.settings
 
 AUTH_QUERY_PARAM = "hd_session"
@@ -30,7 +34,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     /* ========== 1. 全局与容器调整 ========== */
-    /* 核心修复：消除顶部默认内边距，防止滚动时的回弹计算误差 */
+    /* 消除顶部默认内边距，避免滚动时出现额外空白。 */
     .block-container {
         padding-top: 0rem !important;
         padding-bottom: 5rem !important; /* 底部留白给输入框 */
@@ -38,7 +42,7 @@ st.markdown("""
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
 
-    /* ========== 2. 侧边栏样式========== */
+    /* ========== 2. 侧边栏样式 ========== */
     .sidebar-main-title {
         font-size: 24px !important;
         font-weight: 700 !important;
@@ -51,7 +55,7 @@ st.markdown("""
         line-height: 1.8 !important;
     }
 
-    /* --- 增大选项字体 & 对齐圆点 --- */
+    /* --- 增大选项字体并对齐圆点 --- */
     [data-testid="stRadio"] label {
         display: flex !important;
         align-items: center !important; /* 垂直对齐圆点和文字 */
@@ -84,7 +88,7 @@ st.markdown("""
     .status-ok { background-color: #4caf50; }
 
 
-    /* ========== 4. 聊天界面样式  ========== */
+    /* ========== 4. 聊天界面样式 ========== */
     [data-testid="stChatMessageContent"] {
         background-color: #f0f2f6;
         border-radius: 10px;
@@ -152,14 +156,15 @@ st.markdown("""
 # ==================== 初始化逻辑 ========================
 @st.cache_resource
 def init_pipeline():
-    """初始化 RAG Pipeline"""
+    """初始化应用编排 Pipeline。"""
     try:
-        pipeline = RAGPipeline()
+        pipeline = AppPipeline()
         return pipeline, None
     except Exception as e:
         return None, str(e)
 
 
+@st.cache_resource
 def init_auth_service():
     return AuthService()
 
@@ -170,12 +175,13 @@ def init_conversation_service():
 
 
 @st.cache_resource
+@st.cache_resource
 def init_log_service():
     return AppLogService()
 
 
 def init_session_state():
-    """初始化会话状态"""
+    """Initialize session state."""
     ensure_session_id(st.session_state)
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -201,6 +207,16 @@ def init_session_state():
         st.session_state.pending_user_message_id = None
     if "current_kb" not in st.session_state:
         st.session_state.current_kb = None
+    if "current_kb_id" not in st.session_state:
+        st.session_state.current_kb_id = None
+    if "current_kb_department_id" not in st.session_state:
+        st.session_state.current_kb_department_id = None
+    if "current_kb_identity" not in st.session_state:
+        st.session_state.current_kb_identity = None
+    if "kb_identity_map" not in st.session_state:
+        st.session_state.kb_identity_map = {}
+    if "kb_identity_by_name" not in st.session_state:
+        st.session_state.kb_identity_by_name = {}
     if "kb_list" not in st.session_state:
         st.session_state.kb_list = []
     if "show_create_kb" not in st.session_state:
@@ -285,6 +301,9 @@ def reset_chat_state():
     st.session_state.chat_session_id = None
     st.session_state.loaded_chat_session_id = None
     st.session_state.chat_session_kb = None
+    # Drop the session-selector widget state so it does not carry a stale
+    # session id (possibly from another KB) into the next render.
+    st.session_state.pop("chat_session_selector", None)
 
 
 def load_chat_session(session_id: int):
@@ -339,6 +358,11 @@ def start_new_chat_session():
     st.session_state.chat_session_kb = kb_name
     st.session_state.loaded_chat_session_id = session.id
     st.session_state.messages = []
+    # Clear the session-selector widget state so the selectbox picks up the new
+    # session id via its index on rerun. Without this, Streamlit reuses the
+    # widget's previous value (an older session), which triggers load_chat_session
+    # on that older session and makes the new chat appear to "jump away".
+    st.session_state.pop("chat_session_selector", None)
 
 
 def persist_chat_message(role: str, content: str):
@@ -349,6 +373,29 @@ def persist_chat_message(role: str, content: str):
     if session:
         return init_conversation_service().add_message(user_id, session.id, role, content)
     return None
+
+
+def strip_agent_observation(content: str) -> str:
+    text = str(content or "")
+    marker = "\n---\n"
+    if marker in text:
+        answer, tail = text.split(marker, 1)
+        tail = tail.strip()
+        if tail.startswith(("**概览**", "**执行时间线**", "**路由说明**")) or "Agent 观测" in tail:
+            return answer.strip()
+    return text
+
+
+def split_agent_observation(content: str) -> tuple[str, str]:
+    text = str(content or "")
+    marker = "\n---\n"
+    if marker not in text:
+        return text, ""
+    answer, tail = text.split(marker, 1)
+    tail = tail.strip()
+    if tail.startswith(("**概览**", "**执行时间线**", "**路由说明**")) or "Agent 观测" in tail:
+        return answer.strip(), tail
+    return text, ""
 
 
 def clear_current_chat_session():
@@ -372,19 +419,12 @@ def record_audit(action: str, **kwargs):
 
 
 def build_query_log_metadata() -> dict:
-    if config.settings.RAG_BACKEND == "ragflow":
-        return {
-            "ragflow_similarity_threshold": config.settings.RAGFLOW_SIMILARITY_THRESHOLD,
-            "ragflow_vector_weight": config.settings.RAGFLOW_VECTOR_WEIGHT,
-            "ragflow_top_k": config.settings.FINAL_TOP_K,
-            "ragflow_governance_dataset": config.settings.RAGFLOW_GOVERNANCE_DATASET_NAME,
-            "ragflow_design_dataset": config.settings.RAGFLOW_DESIGN_DATASET_NAME,
-        }
     return {
-        "vector_top_k": config.settings.VECTOR_TOP_K,
-        "bm25_top_k": config.settings.BM25_TOP_K,
-        "final_top_k": config.settings.FINAL_TOP_K,
-        "retriever_type": "hybrid",
+        "ragflow_similarity_threshold": config.settings.RAGFLOW_SIMILARITY_THRESHOLD,
+        "ragflow_vector_weight": config.settings.RAGFLOW_VECTOR_WEIGHT,
+        "ragflow_top_k": config.settings.FINAL_TOP_K,
+        "ragflow_governance_dataset": config.settings.RAGFLOW_GOVERNANCE_DATASET_NAME,
+        "ragflow_design_dataset": config.settings.RAGFLOW_DESIGN_DATASET_NAME,
     }
 
 
@@ -394,22 +434,92 @@ def format_query_trace_params(trace) -> str:
     except json.JSONDecodeError:
         metadata = {}
 
-    if trace.backend == "ragflow":
-        parts = [
-            f"similarity={metadata.get('ragflow_similarity_threshold', '-')}",
-            f"vector_weight={metadata.get('ragflow_vector_weight', '-')}",
-            f"top_k={metadata.get('ragflow_top_k', '-')}",
-        ]
-        governance_dataset = metadata.get("ragflow_governance_dataset")
-        design_dataset = metadata.get("ragflow_design_dataset")
-        if governance_dataset or design_dataset:
-            parts.append(f"datasets={governance_dataset or '-'} / {design_dataset or '-'}")
-        return ", ".join(parts)
+    parts = [
+        f"similarity={metadata.get('ragflow_similarity_threshold', '-')}",
+        f"vector_weight={metadata.get('ragflow_vector_weight', '-')}",
+        f"top_k={metadata.get('ragflow_top_k', '-')}",
+        f"final_top_k={trace.final_top_k if trace.final_top_k is not None else '-'}",
+    ]
+    governance_dataset = metadata.get("ragflow_governance_dataset")
+    design_dataset = metadata.get("ragflow_design_dataset")
+    if governance_dataset or design_dataset:
+        parts.append(f"datasets={governance_dataset or '-'} / {design_dataset or '-'}")
+    return ", ".join(parts)
 
-    return (
-        f"vector_top_k={trace.vector_top_k}, "
-        f"bm25_top_k={trace.bm25_top_k}, final_top_k={trace.final_top_k}"
+
+def _parse_log_metadata(raw: str) -> dict:
+    try:
+        parsed = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def render_audit_event_detail(event) -> None:
+    """审计日志行级详情：展示 dataframe 里放不下的完整 metadata / 目标 / 错误信息。"""
+    st.markdown(
+        f"**操作者**：{event.actor_username or '-'}"
+        f"（角色 {event.actor_role or '-'}，ID {event.actor_user_id or '-'}）"
     )
+    st.markdown(f"**部门 ID**：{event.department_id if event.department_id is not None else '-'}")
+    st.markdown(f"**时间**：{format_local_time(event.created_at)}")
+    st.markdown(f"**目标**：{event.target_type or '-'} / {event.target_id or '-'}")
+    st.markdown(f"**知识库**：{event.kb_name or '-'}")
+    st.markdown(f"**结果**：{'✅ 成功' if event.success else '❌ 失败'}")
+    if event.error_message:
+        st.markdown("**错误信息**：")
+        st.code(event.error_message)
+    metadata = _parse_log_metadata(event.metadata_json)
+    st.markdown("**元数据**：")
+    if metadata:
+        st.json(metadata)
+    else:
+        st.caption("（无）")
+
+
+def render_query_trace_detail(trace, viewer, log_service) -> None:
+    """查询日志行级详情：展示改写问题、会话定位、检索参数、完整错误、命中证据等。
+
+    脱敏在数据层完成（list_query_traces / list_evidence 对非 owner 返回 redacted），
+    这里直接渲染字段即可，无需再判断角色。
+    """
+    st.markdown("**原问题**：")
+    st.code(trace.original_query or "")
+    if trace.rewritten_query:
+        st.markdown("**改写后问题**：")
+        st.code(trace.rewritten_query)
+    st.markdown(
+        f"**会话定位**：session={trace.chat_session_id or '-'}，"
+        f"user_msg={trace.user_message_id or '-'}，"
+        f"assistant_msg={trace.assistant_message_id or '-'}"
+    )
+    st.markdown(f"**后端 / 检索器**：{trace.backend or '-'} / {trace.retriever_type or '-'}")
+    st.markdown(f"**耗时**：{trace.latency_ms if trace.latency_ms is not None else '-'} ms")
+    st.markdown(f"**状态**：{trace.status or '-'}")
+    if trace.error_message:
+        st.markdown("**错误信息**：")
+        st.code(trace.error_message)
+    st.markdown(f"**时间**：{format_local_time(trace.created_at)}")
+    st.markdown(f"**检索参数**：{format_query_trace_params(trace)}")
+    metadata = _parse_log_metadata(trace.metadata_json)
+    st.markdown("**元数据**：")
+    if metadata:
+        st.json(metadata)
+    else:
+        st.caption("（无）")
+
+    try:
+        evidence = log_service.list_evidence(viewer, trace.id)
+    except Exception as exc:
+        st.caption(f"证据读取失败：{exc}")
+        evidence = []
+    if evidence:
+        with st.expander(f"命中证据（{len(evidence)} 条）", expanded=False):
+            for item in evidence:
+                score = item.rerank_score if item.rerank_score is not None else "-"
+                st.markdown(f"**#{item.rank} · {item.file_name or '-'}**（score={score}）")
+                if item.text_preview:
+                    st.code(item.text_preview)
 
 
 def format_container_inspection_warning(metadata: dict | None) -> str:
@@ -427,12 +537,25 @@ def format_container_inspection_warning(metadata: dict | None) -> str:
         parts.append(f"{embedded_count} 个内嵌对象")
     if media_count:
         parts.append(f"{media_count} 个媒体对象")
-    return f"检测到 {', '.join(parts)}，当前仅提示，尚未展开到子管道处理。"
+    return "检测到 " + ", ".join(parts) + "，当前仅提示，尚未展开到子管道处理。"
+
+
+def format_ragflow_document_status(status: str) -> tuple[str, str]:
+    view = parse_status_view(status)
+    if view.is_success:
+        return view.label, "可检索"
+    if view.is_failed:
+        return view.label, "不可检索"
+    if view.normalized in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_PAUSED}:
+        return view.label, "解析中"
+    if view.normalized == TASK_STATUS_CANCELLED:
+        return view.label, "已停止"
+    return view.label, view.searchability
 
 
 # ==================== 逻辑处理回调函数 ===================
 def create_kb_callback(pipeline):
-    """创建知识库回调"""
+    """Create knowledge base callback."""
     raw_name = st.session_state.get("new_kb_name_input", "").strip()
     st.session_state.create_kb_error = None
     if not raw_name:
@@ -456,8 +579,8 @@ def create_kb_callback(pipeline):
     )
     if ok:
         st.session_state.kb_list = pipeline.list_knowledge_bases(ctx=ctx)
-        st.session_state.current_kb = name
-        st.session_state.kb_selector = name
+        refresh_kb_identity_map(st.session_state.kb_list)
+        set_current_kb(name)
         st.session_state.show_create_kb = False
         st.session_state.toast_msg = msg
     else:
@@ -475,7 +598,7 @@ def format_create_kb_error(message: str) -> str:
 
 
 def delete_kb_confirmed(pipeline, kb_name):
-    """执行已确认的知识库删除"""
+    """Delete a confirmed knowledge base."""
     ctx = build_request_context(st.session_state)
     ok, msg = pipeline.delete_knowledge_base(kb_name, ctx=ctx)
     record_audit(
@@ -490,12 +613,9 @@ def delete_kb_confirmed(pipeline, kb_name):
         invalidate_file_cache(kb_name)
         ctx = build_request_context(st.session_state)
         st.session_state.kb_list = pipeline.list_knowledge_bases(ctx=ctx)
+        refresh_kb_identity_map(st.session_state.kb_list)
         if st.session_state.current_kb == kb_name:
-            st.session_state.current_kb = st.session_state.kb_list[0] if st.session_state.kb_list else None
-            if st.session_state.current_kb:
-                st.session_state.kb_selector = st.session_state.current_kb
-            elif "kb_selector" in st.session_state:
-                del st.session_state["kb_selector"]
+            set_current_kb(st.session_state.kb_list[0] if st.session_state.kb_list else None)
             reset_chat_state()
         st.session_state.toast_msg = msg
     else:
@@ -504,9 +624,8 @@ def delete_kb_confirmed(pipeline, kb_name):
 
 
 def switch_kb_callback(kb_name):
-    """切换知识库回调"""
-    st.session_state.current_kb = kb_name
-    st.session_state.kb_selector = kb_name
+    """Switch the active knowledge base."""
+    set_current_kb(kb_name)
     reset_chat_state()
     st.session_state.confirm_delete_file = None
     st.session_state.confirm_delete_kb = None
@@ -515,18 +634,91 @@ def switch_kb_callback(kb_name):
 def refresh_kb_list(pipeline):
     ctx = build_request_context(st.session_state)
     st.session_state.kb_list = pipeline.list_knowledge_bases(ctx=ctx)
+    refresh_kb_identity_map(st.session_state.kb_list)
 
 
-def list_physical_knowledge_bases() -> list[str]:
+def _kb_identity_stats_key(kb_id: int | str | None, department_id: int | str | None, kb_name: str) -> str:
+    kb_id_value = int(kb_id or 0) if str(kb_id or "").isdigit() else 0
+    if kb_id_value:
+        return f"kb_id:{kb_id_value}"
+    return f"department:{department_id or ''}:kb:{kb_name or ''}"
+
+
+def _pipeline_governance_stats(ctx) -> dict:
+    return AppPipeline.governance_stats(ctx)
+
+
+def refresh_kb_identity_map(kb_names: list[str] | None = None):
     try:
-        if not os.path.isdir(config.settings.DATA_ROOT):
-            return []
-        return sorted(
-            name for name in os.listdir(config.settings.DATA_ROOT)
-            if os.path.isdir(os.path.join(config.settings.DATA_ROOT, name))
-        )
+        auth_service = init_auth_service()
+        existing = kb_names or []
+        summaries = auth_service.list_knowledge_base_summaries(existing)
     except Exception:
-        return []
+        st.session_state.kb_identity_map = {}
+        return
+
+    identity_map = {}
+    identity_by_name = {}
+    actor_department_id = st.session_state.get("department_id")
+    for item in summaries:
+        if kb_names and item.name not in kb_names:
+            continue
+        identity_key = _kb_identity_stats_key(item.kb_id, item.department_id, item.name)
+        identity_map[identity_key] = {
+            "name": item.name,
+            "kb_id": item.kb_id,
+            "department_id": item.department_id,
+            "department_name": item.department_name,
+            "label": f"{item.name} ({item.department_name})" if item.department_name else item.name,
+        }
+        existing_key = identity_by_name.get(item.name)
+        existing = identity_map.get(existing_key) if existing_key else None
+        prefer_item = (
+            existing is None
+            or item.department_id == actor_department_id
+            or (existing.get("department_id") in (None, "") and item.department_id not in (None, ""))
+        )
+        if prefer_item:
+            identity_by_name[item.name] = identity_key
+    st.session_state.kb_identity_map = identity_map
+    st.session_state.kb_identity_by_name = identity_by_name
+
+
+def set_current_kb(kb_name: str | None = None, identity_key: str | None = None):
+    if identity_key is None and kb_name:
+        identity_key = st.session_state.get("kb_identity_by_name", {}).get(kb_name)
+    identity = st.session_state.get("kb_identity_map", {}).get(identity_key or "", {})
+    selected_name = identity.get("name") or kb_name
+    st.session_state.current_kb = selected_name
+    if selected_name:
+        st.session_state.current_kb_identity = identity_key
+        st.session_state.current_kb_id = identity.get("kb_id")
+        st.session_state.current_kb_department_id = identity.get("department_id")
+        st.session_state.kb_selector = identity_key or selected_name
+    else:
+        st.session_state.current_kb_identity = None
+        st.session_state.current_kb_id = None
+        st.session_state.current_kb_department_id = None
+        if "kb_selector" in st.session_state:
+            del st.session_state["kb_selector"]
+
+
+def kb_selector_options() -> list[str]:
+    options = [
+        identity
+        for name in st.session_state.get("kb_list", [])
+        if (identity := st.session_state.get("kb_identity_by_name", {}).get(name))
+    ]
+    if options:
+        return options
+    return list(st.session_state.get("kb_list", []))
+
+
+def format_kb_selector(identity_key: str) -> str:
+    info = st.session_state.get("kb_identity_map", {}).get(identity_key)
+    if info:
+        return info.get("label") or info.get("name") or identity_key
+    return identity_key
 
 
 def get_manageable_kbs(pipeline) -> list[str]:
@@ -543,25 +735,39 @@ def has_current_kb_permission(required: str = "read") -> bool:
 
 def get_cached_files(pipeline, kb_name: str) -> list[str]:
     ctx = build_request_context(st.session_state)
-    cache_key = f"{ctx.user_id}:{kb_name}"
-    if cache_key not in st.session_state.file_cache:
-        st.session_state.file_cache[cache_key] = pipeline.list_files(kb_name, ctx=ctx)
-    return st.session_state.file_cache[cache_key]
+    kb_identity = st.session_state.get("current_kb_identity") or kb_name
+    cache_key = f"{ctx.user_id}:{kb_identity}:{kb_name}"
+    cached = st.session_state.file_cache.get(cache_key)
+    now = time.time()
+    # Cache with TTL so RAGFlow parse status/progress refreshes instead of
+    # freezing at the upload-time state ("parsing") for the whole session.
+    if not cached or now - cached.get("timestamp", 0) >= BACKEND_TASK_CACHE_TTL_SECONDS:
+        cached = {"timestamp": now, "data": pipeline.list_files(kb_name, ctx=ctx)}
+        st.session_state.file_cache[cache_key] = cached
+    return cached["data"]
 
 
-def get_cached_file_infos(pipeline, kb_name: str):
-    ctx = build_request_context(st.session_state)
-    cache_key = f"{ctx.user_id}:{kb_name}:infos"
-    if cache_key not in st.session_state.file_cache:
+def get_cached_file_infos(pipeline, kb_name: str, ctx=None):
+    ctx = ctx or build_request_context(st.session_state)
+    kb_identity = st.session_state.get("current_kb_identity") or kb_name
+    cache_key = f"{ctx.user_id}:{kb_identity}:{kb_name}:infos"
+    cached = st.session_state.file_cache.get(cache_key)
+    now = time.time()
+    # Same TTL as parse-task cache: parsed/failed states surface within seconds.
+    if not cached or now - cached.get("timestamp", 0) >= BACKEND_TASK_CACHE_TTL_SECONDS:
         if hasattr(pipeline, "list_file_infos"):
-            st.session_state.file_cache[cache_key] = pipeline.list_file_infos(kb_name, ctx=ctx)
+            cached = {"timestamp": now, "data": pipeline.list_file_infos(kb_name, ctx=ctx)}
         else:
-            st.session_state.file_cache[cache_key] = []
-    return st.session_state.file_cache[cache_key]
+            cached = {"timestamp": now, "data": []}
+        st.session_state.file_cache[cache_key] = cached
+    return cached["data"]
 
 
 def invalidate_file_cache(kb_name: str):
     ctx = build_request_context(st.session_state)
+    kb_identity = st.session_state.get("current_kb_identity") or kb_name
+    st.session_state.file_cache.pop(f"{ctx.user_id}:{kb_identity}:{kb_name}", None)
+    st.session_state.file_cache.pop(f"{ctx.user_id}:{kb_identity}:{kb_name}:infos", None)
     st.session_state.file_cache.pop(f"{ctx.user_id}:{kb_name}", None)
     st.session_state.file_cache.pop(f"{ctx.user_id}:{kb_name}:infos", None)
 
@@ -609,89 +815,293 @@ def format_task_time(timestamp: float | None) -> str:
     return time.strftime("%H:%M:%S", time.localtime(timestamp))
 
 
+BACKEND_TASK_CACHE_TTL_SECONDS = 5
+
+
+def _parse_task_context_key(key_prefix: str, kb_name: str, ctx, suffix: str) -> str:
+    resource_department_id = str(ctx.metadata.get("resource_department_id") or ctx.metadata.get("department_id") or "")
+    kb_identity = st.session_state.get("current_kb_identity") or kb_name
+    return f"{key_prefix}:{ctx.user_id}:{resource_department_id}:{kb_identity}:{kb_name}:{suffix}"
+
+
+def _backend_task_cache_key(key_prefix: str, kb_name: str, ctx) -> str:
+    return _parse_task_context_key(key_prefix, kb_name, ctx, "backend_parse_tasks")
+
+
+def _clear_backend_task_cache(key_prefix: str, kb_name: str, ctx):
+    st.session_state.pop(_backend_task_cache_key(key_prefix, kb_name, ctx), None)
+
+
+def _get_parse_tasks_for_panel(pipeline, kb_name: str, ctx, key_prefix: str, uses_backend_tasks: bool):
+    if not uses_backend_tasks:
+        return pipeline.list_parse_tasks(kb_name, ctx=ctx)
+
+    cache_key = _backend_task_cache_key(key_prefix, kb_name, ctx)
+    cached = st.session_state.get(cache_key)
+    now = time.time()
+    if cached and now - cached.get("timestamp", 0) < BACKEND_TASK_CACHE_TTL_SECONDS:
+        return cached.get("tasks", [])
+
+    tasks = pipeline.list_parse_tasks(kb_name, ctx=ctx)
+    st.session_state[cache_key] = {"timestamp": now, "tasks": tasks}
+    return tasks
+
+
+def _should_show_parse_task(task, uses_backend_tasks: bool) -> bool:
+    if not uses_backend_tasks:
+        return True
+    status = parse_status_view(task.status)
+    return not status.is_success and status.normalized != TASK_STATUS_CANCELLED
+
+
+def _safe_task_progress(progress) -> int:
+    try:
+        value = int(progress or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return max(0, min(100, value))
+
+
+def _track_parse_task_file_cache(kb_name: str, key_prefix: str, ctx, all_tasks: list, visible_tasks: list, uses_backend_tasks: bool):
+    if uses_backend_tasks:
+        visible_key = _parse_task_context_key(key_prefix, kb_name, ctx, "backend_visible_task_ids")
+        current_visible_ids = {task.id for task in visible_tasks}
+        previous_visible_ids = set(st.session_state.get(visible_key, []))
+        if previous_visible_ids and previous_visible_ids - current_visible_ids:
+            invalidate_file_cache(kb_name)
+        st.session_state[visible_key] = list(current_visible_ids)
+        return
+
+    completed_key = _parse_task_context_key(key_prefix, kb_name, ctx, "local_completed_task_ids")
+    completed_ids = {task.id for task in all_tasks if parse_status_view(task.status).is_success}
+    previous_completed_ids = set(st.session_state.get(completed_key, []))
+    if completed_ids - previous_completed_ids:
+        invalidate_file_cache(kb_name)
+    st.session_state[completed_key] = list(completed_ids)
+
+
+def _render_parse_task_summary(tasks: list, uses_backend_tasks: bool):
+    counts = {
+        TASK_STATUS_QUEUED: 0,
+        TASK_STATUS_RUNNING: 0,
+        TASK_STATUS_PAUSED: 0,
+        TASK_STATUS_FAILED: 0,
+    }
+    for task in tasks:
+        normalized = parse_status_view(task.status).normalized
+        if normalized in counts:
+            counts[normalized] += 1
+
+    parts = [
+        f"当前显示 {len(tasks)} 个任务",
+        f"解析中 {counts[TASK_STATUS_RUNNING]}",
+        f"排队 {counts[TASK_STATUS_QUEUED]}",
+        f"失败 {counts[TASK_STATUS_FAILED]}",
+    ]
+    if uses_backend_tasks:
+        parts.append("已完成文档会进入文件列表")
+    st.caption(" - ".join(parts))
+
+
 @st.fragment
 def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
     ctx = build_request_context(st.session_state)
-    tasks = pipeline.list_parse_tasks(kb_name, ctx=ctx)
-    is_ragflow = config.settings.RAG_BACKEND == "ragflow"
-    if is_ragflow:
-        hidden_task_statuses = {"completed", "complete", "done", "finish", "finished", "success", "parsed", "deleted", "cancelled", "已完成"}
-        tasks = [task for task in tasks if str(task.status).lower() not in hidden_task_statuses and task.status not in hidden_task_statuses]
-    if any(task.status == "completed" for task in tasks):
-        invalidate_file_cache(kb_name)
+    uses_backend_tasks = True
 
     with st.container(border=True):
         c_title, c_refresh, c_clear = st.columns([0.68, 0.16, 0.16])
         with c_title:
-            st.markdown("##### 🧩 解析任务")
+            st.markdown("##### 解析 / 索引任务")
         with c_refresh:
             if st.button("刷新", key=f"{key_prefix}_refresh_tasks", use_container_width=True):
+                _clear_backend_task_cache(key_prefix, kb_name, ctx)
+                invalidate_file_cache(kb_name)
                 st.rerun()
         with c_clear:
-            if st.button("清理完成", key=f"{key_prefix}_clear_tasks", use_container_width=True, disabled=is_ragflow):
-                pipeline.clear_finished_parse_tasks(kb_name, ctx=ctx)
-                st.rerun()
+            st.button(
+                "清理完成",
+                key=f"{key_prefix}_clear_tasks",
+                use_container_width=True,
+                disabled=True,
+                help="RAGFlow 完成文档会进入文件列表，此处不清理远端记录。",
+            )
+
+        st.caption("显示 RAGFlow 文档解析与结构化索引任务；完成后会进入文件列表。")
+
+        try:
+            all_tasks = _get_parse_tasks_for_panel(pipeline, kb_name, ctx, key_prefix, uses_backend_tasks)
+        except Exception as exc:
+            st.warning(f"解析任务读取失败: {exc}")
+            return
+
+        tasks = [task for task in all_tasks if _should_show_parse_task(task, uses_backend_tasks)]
+        _track_parse_task_file_cache(kb_name, key_prefix, ctx, all_tasks, tasks, uses_backend_tasks)
 
         if not tasks:
             st.caption("当前知识库暂无解析任务")
             return
 
-        status_labels = {
-            "queued": "排队中",
-            "running": "解析中",
-            "paused": "已暂停",
-            "completed": "已完成",
-            "failed": "失败",
-            "cancelled": "已取消",
-        }
+        _render_parse_task_summary(tasks, uses_backend_tasks)
+
         for task in tasks:
+            task_status = parse_status_view(task.status)
+            progress = _safe_task_progress(task.progress)
+            stage = task.stage or task_status.label
+            source_group = display_source_group(task.source_group) if task.source_group else ""
+            details = [task_status.label, task_status.searchability, source_group]
+            detail_text = " - ".join(value for value in details if value)
             st.divider()
             c_info, c_actions = st.columns([0.72, 0.28])
             with c_info:
-                status_label = status_labels.get(task.status, task.status)
-                st.markdown(f"**{task.original_name}** · {status_label}")
-                st.progress(task.progress, text=f"{task.progress}% · {task.stage}")
-                st.caption(f"最后更新: {format_task_time(task.updated_at)}")
+                st.markdown(f"**{task.original_name}** - {detail_text}")
+                st.progress(progress, text=f"{progress}% - {stage}")
+                st.caption(f"最后更新 {format_task_time(task.updated_at)}")
                 if task.message:
-                    if task.status == "failed":
+                    if task_status.is_failed:
                         st.error(task.message)
                     else:
                         st.caption(task.message)
             with c_actions:
-                if is_ragflow:
-                    if task.status in {"queued", "running"}:
-                        if st.button("停止", key=f"{key_prefix}_stop_{task.id}", use_container_width=True):
-                            st.session_state.toast_msg = pipeline.delete_parse_task(task.id, ctx=ctx)
-                            st.rerun()
-                    else:
-                        st.button("停止", key=f"{key_prefix}_stop_noop_{task.id}", disabled=True, use_container_width=True)
-                elif task.status in {"queued", "running"}:
-                    if st.button("暂停", key=f"{key_prefix}_pause_{task.id}", use_container_width=True):
-                        st.session_state.toast_msg = pipeline.pause_parse_task(task.id, ctx=ctx)
-                        st.rerun()
-                elif task.status == "paused":
-                    if st.button("启动", key=f"{key_prefix}_resume_{task.id}", use_container_width=True):
-                        st.session_state.toast_msg = pipeline.resume_parse_task(task.id, ctx=ctx)
+                stop_help = "停止并移除该未完成解析/索引任务。"
+                if task_status.can_cancel:
+                    if st.button("停止任务", key=f"{key_prefix}_stop_{task.id}", use_container_width=True, help=stop_help):
+                        st.session_state.toast_msg = pipeline.delete_parse_task(task.id, ctx=ctx)
+                        _clear_backend_task_cache(key_prefix, kb_name, ctx)
+                        invalidate_file_cache(kb_name)
                         st.rerun()
                 else:
-                    st.button("暂停", key=f"{key_prefix}_noop_{task.id}", disabled=True, use_container_width=True)
-                if not is_ragflow and st.button("删除任务", key=f"{key_prefix}_delete_{task.id}", use_container_width=True):
-                    st.session_state.toast_msg = pipeline.delete_parse_task(task.id, ctx=ctx)
-                    st.rerun()
+                    st.button("停止任务", key=f"{key_prefix}_stop_noop_{task.id}", disabled=True, use_container_width=True, help=stop_help)
 
 
-def format_ragflow_document_status(status: str) -> tuple[str, str]:
-    normalized = str(status or "unknown").lower()
-    labels = {
-        "parsed": ("已解析", "可检索"),
-        "parsing": ("解析中", "暂不可检索"),
-        "uploaded": ("已上传", "等待解析"),
-        "failed": ("解析失败", "不可检索"),
-        "cancelled": ("已停止", "不可检索"),
-        "deleted": ("已删除", "不可检索"),
-        "unknown": ("状态未知", "不可检索"),
+def spreadsheet_profile_summary(metadata: dict | None) -> dict:
+    profile = (metadata or {}).get("spreadsheet_profile") or {}
+    status = str((metadata or {}).get("status") or "").lower()
+    status_view = parse_status_view(status, "spreadsheet_table")
+
+    sheets = profile.get("sheets") or []
+    row_count = sum(int(sheet.get("non_empty_row_count") or 0) for sheet in sheets)
+    cell_count = sum(int(sheet.get("non_empty_cell_count") or 0) for sheet in sheets)
+    block_count = int(profile.get("text_block_count") or 0)
+    semantic_row_count = int(profile.get("semantic_row_count") or 0)
+    object_count = sum(
+        int(profile.get(key) or 0)
+        for key in ("embedded_object_count", "media_object_count", "drawing_object_count")
+    )
+    return {
+        "profile": profile,
+        "status_view": status_view,
+        "sheet_count": len(sheets),
+        "row_count": row_count,
+        "cell_count": cell_count,
+        "block_count": block_count,
+        "semantic_row_count": semantic_row_count,
+        "object_count": object_count,
+        "warnings": profile.get("warnings") or [],
     }
-    return labels.get(normalized, (normalized, "状态待确认"))
+
+
+def format_spreadsheet_profile(metadata: dict | None) -> tuple[str, str, str]:
+    summary = spreadsheet_profile_summary(metadata)
+    status_view = summary["status_view"]
+    if not status_view.is_success:
+        return "待处理", status_view.searchability, "Excel 文件已保存，但尚未完成解析。"
+    detail = (
+        f"{summary['sheet_count']} 个工作表，"
+        f"{summary['row_count']} 行有效数据，"
+        f"{summary['block_count']} 个行块，"
+        f"{summary['semantic_row_count']} 个语义行"
+    )
+    if summary["object_count"]:
+        detail += f"，检测到 {summary['object_count']} 个嵌入/媒体/绘图对象"
+    return "原貌结构", "结构化解析", detail
+
+
+def render_excel_ledger_panel(file_infos: list, key_prefix: str):
+    spreadsheet_infos = [
+        info for info in file_infos
+        if getattr(info, "processor_kind", "") == "spreadsheet_table"
+    ]
+    if not spreadsheet_infos:
+        return
+
+    rows = []
+    for info in spreadsheet_infos:
+        metadata = info.metadata or {}
+        summary = spreadsheet_profile_summary(metadata)
+        profile = summary["profile"]
+        status_view = summary["status_view"]
+        rows.append(
+            {
+                "文件": info.name,
+                "状态": status_view.label,
+                "结构": "已解析" if status_view.is_success else status_view.searchability,
+                "工作表": summary["sheet_count"],
+                "有效行": summary["row_count"],
+                "单元格": summary["cell_count"],
+                "语义行": summary["semantic_row_count"],
+                "块": summary["block_count"],
+                "对象": summary["object_count"],
+                "record_id": metadata.get("store_id", ""),
+                "kb_id": profile.get("kb_id", ""),
+                "归档路径": info.local_path or metadata.get("local_path", ""),
+            }
+        )
+
+    with st.expander("Excel 结构化台账", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Excel 文件", len(spreadsheet_infos))
+        c2.metric("工作表", sum(row["工作表"] for row in rows))
+        c3.metric("语义行", sum(row["语义行"] for row in rows))
+        c4.metric("待处理", sum(1 for row in rows if row["结构"] != "已解析"))
+
+        st.dataframe(
+            rows,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "文件": st.column_config.TextColumn(width="large"),
+                "状态": st.column_config.TextColumn(width="small"),
+                "结构": st.column_config.TextColumn(width="small"),
+                "工作表": st.column_config.NumberColumn(width="small"),
+                "有效行": st.column_config.NumberColumn(width="small"),
+                "单元格": st.column_config.NumberColumn(width="small"),
+                "语义行": st.column_config.NumberColumn(width="small"),
+                "块": st.column_config.NumberColumn(width="small"),
+                "对象": st.column_config.NumberColumn(width="small"),
+                "record_id": st.column_config.TextColumn(width="small"),
+                "kb_id": st.column_config.TextColumn(width="small"),
+                "归档路径": st.column_config.TextColumn(width="large"),
+            },
+        )
+
+        selected = st.selectbox(
+            "查看工作表结果",
+            spreadsheet_infos,
+            format_func=lambda item: item.name,
+            key=f"{key_prefix}_excel_ledger_select",
+        )
+        profile = ((selected.metadata or {}).get("spreadsheet_profile") or {})
+        sheets = profile.get("sheets") or []
+        if sheets:
+            st.dataframe(
+                [
+                    {
+                        "sheet": sheet.get("sheet_name", ""),
+                        "行数": sheet.get("row_count", 0),
+                        "列数": sheet.get("column_count", 0),
+                        "有效行": sheet.get("non_empty_row_count", 0),
+                        "单元格": sheet.get("non_empty_cell_count", 0),
+                        "表头行": str(sheet.get("header_row_index") or "-"),
+                        "语义行": sheet.get("semantic_row_count", 0),
+                        "文本块": sheet.get("text_block_count", 0),
+                    }
+                    for sheet in sheets
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.caption("该 Excel 尚未生成 sheet 结构明细。")
 
 
 def render_login_page():
@@ -818,9 +1228,8 @@ def render_settings_tab():
     st.subheader("⚙️ 系统配置")
     st.caption("修改配置后点击「🔄 应用配置」生效。配置会保存到 .env 文件。")
 
-    # ---- 辅助：从 config.settings 读取当前值，用于预填充 ----
     def _val(key, default=""):
-        """读取当前配置值，不存在则返回默认值"""
+        """Read current config value with DEFAULT_VALUES fallback."""
         return getattr(config.settings, key, config.settings.DEFAULT_VALUES.get(key, default))
 
     def _check_ragflow_connection():
@@ -831,60 +1240,33 @@ def render_settings_tab():
             str(st.session_state.get("cfg_ragflow_design_dataset", "")),
         ]
         timeout = int(st.session_state.get("cfg_ragflow_timeout", 120))
-        if not base_url or not api_key:
-            st.error("请先填写 RAGFlow Base URL 和 API Key")
-            return
-        try:
-            response = requests.get(
-                f"{base_url}/api/v1/datasets",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if isinstance(payload, dict) and payload.get("code") not in {None, 0}:
-                st.error(f"RAGFlow API 返回错误: {payload}")
-                return
-            datasets = payload.get("data", []) if isinstance(payload, dict) else []
-            existing_names = {item.get("name") for item in datasets if isinstance(item, dict)}
-            missing = [name for name in dataset_names if name and name not in existing_names]
-            if missing:
-                st.warning(f"RAGFlow 可连接，但以下 Dataset 暂未找到: {', '.join(missing)}")
-            else:
-                st.success(f"RAGFlow 连接正常，已找到 {len(dataset_names)} 个配置 Dataset")
-        except Exception as exc:
-            st.error(f"RAGFlow 连接检查失败: {exc}")
+        ok, message, missing = AppPipeline.check_ragflow_connection(base_url, api_key, dataset_names, timeout)
+        if not ok:
+            st.error(message)
+        elif missing:
+            st.warning(message)
+        else:
+            st.success(message)
 
-    rag_backend_options = ["ragflow", "local"]
-    backend_labels = {
-        "ragflow": "RAGFlow（推荐/生产）",
-        "local": "Local（本地兜底/调试）",
-    }
-    current_backend = str(_val("RAG_BACKEND", "ragflow")).lower()
-    if current_backend not in rag_backend_options:
-        current_backend = "ragflow"
-    selected_backend = st.session_state.get("cfg_rag_backend", current_backend)
-    is_local_backend = selected_backend == "local"
-
-    with st.expander("🔐 登录与会话"):
+    with st.expander("登录与会话"):
         st.text_input(
             "认证数据库路径",
             value=str(_val("AUTH_DB_PATH", "storage/auth.db")),
             key="cfg_auth_db_path",
-            help="SQLite 用户与会话数据库路径。"
+            help="SQLite 用户与会话数据库路径。",
         )
         st.text_input(
             "默认管理员用户名",
             value=str(_val("AUTH_DEFAULT_ADMIN_USERNAME", "admin")),
             key="cfg_auth_admin_username",
-            help="仅在认证数据库中不存在该用户时自动创建。"
+            help="仅在认证数据库中不存在该用户时自动创建。",
         )
         st.text_input(
             "默认管理员密码",
             value=str(_val("AUTH_DEFAULT_ADMIN_PASSWORD", "")),
             key="cfg_auth_admin_password",
             type="password",
-            help="仅首次创建默认管理员时使用。创建后请通过数据库管理或后续用户管理功能修改。"
+            help="仅首次创建默认管理员时使用。",
         )
         st.number_input(
             "会话有效期（小时）",
@@ -893,201 +1275,127 @@ def render_settings_tab():
             value=int(_val("AUTH_SESSION_TTL_HOURS", "24")),
             key="cfg_auth_session_ttl",
         )
-    # ==================== 🤖 模型配置 ====================
-    with st.expander("🧠 模型配置", expanded=True):
+
+    with st.expander("模型配置", expanded=True):
         provider_options = ["ollama", "custom"]
-        current_provider = _val("PROVIDER", "ollama")
+        current_provider = _val("AGENT_LLM_PROVIDER", "ollama")
         if isinstance(current_provider, config.settings.Provider):
             current_provider = current_provider.value
 
         provider = st.radio(
-            "Provider（模型提供商）",
+            "Agent LLM Provider",
             options=provider_options,
             index=provider_options.index(current_provider),
             horizontal=True,
             key="cfg_provider",
-            help="ollama = 本地模型 | custom = 第三方 API (OpenAI/OpenRouter/DeepSeek/...)"
+            help="只影响 Agent 最终答案生成。",
         )
 
         if provider == "ollama":
-            st.text_input("Ollama Base URL", value=_val("OLLAMA_BASE_URL"), key="cfg_ollama_base_url")
-            st.text_input("Ollama LLM 模型", value=_val("OLLAMA_LLM_MODEL"), key="cfg_ollama_llm_model",
-                          help="例: qwen2.5:32b")
+            st.text_input("Agent Ollama Base URL", value=_val("AGENT_OLLAMA_BASE_URL", "http://localhost:11434"), key="cfg_ollama_base_url")
+            st.text_input(
+                "Agent Ollama 模型",
+                value=_val("AGENT_OLLAMA_MODEL", "qwen2.5:32b"),
+                key="cfg_agent_ollama_model",
+                help="例如 qwen2.5:32b",
+            )
         else:
-            st.text_input("API Key", value=_val("CUSTOM_API_KEY"), key="cfg_custom_api_key", type="password")
-            st.text_input("Base URL", value=_val("CUSTOM_BASE_URL"), key="cfg_custom_base_url",
-                          help="例: https://api.openai.com/v1")
-            st.text_input("LLM 模型", value=_val("CUSTOM_LLM_MODEL"), key="cfg_custom_llm_model",
-                          help="例: gpt-4o, deepseek-chat")
+            st.text_input("Agent API Key", value=_val("AGENT_CUSTOM_API_KEY", ""), key="cfg_custom_api_key", type="password")
+            st.text_input(
+                "Agent Base URL",
+                value=_val("AGENT_CUSTOM_BASE_URL", ""),
+                key="cfg_custom_base_url",
+                help="例如 https://api.openai.com/v1",
+            )
+            st.text_input(
+                "Agent LLM 模型",
+                value=_val("AGENT_CUSTOM_MODEL", ""),
+                key="cfg_agent_custom_model",
+                help="例如 gpt-4o, deepseek-chat",
+            )
             c1, c2 = st.columns(2)
             with c1:
-                st.number_input("Context Window", min_value=1024, max_value=512000,
-                                value=int(_val("CUSTOM_CONTEXT_WINDOW", "128000")),
-                                step=1000, key="cfg_custom_ctx_window")
+                st.number_input("Temperature", min_value=0.0, max_value=2.0, value=float(_val("AGENT_TEMPERATURE", "0.2")), step=0.1, key="cfg_agent_temperature")
             with c2:
-                st.number_input("Max Tokens", min_value=256, max_value=65536,
-                                value=int(_val("CUSTOM_MAX_TOKENS", "4096")),
-                                step=256, key="cfg_custom_max_tokens")
+                st.number_input("Max Tokens", min_value=256, max_value=65536, value=int(_val("AGENT_CUSTOM_MAX_TOKENS", "4096")), step=256, key="cfg_custom_max_tokens")
+            st.number_input("Timeout Seconds", min_value=10, max_value=600, value=int(_val("AGENT_TIMEOUT_SECONDS", "120")), step=10, key="cfg_agent_timeout")
 
-    # ==================== 🔍 RAG 参数 ====================
-    with st.expander("🔎 RAG 配置", expanded=True):
-        st.selectbox(
-            "RAG 后端",
-            options=rag_backend_options,
-            index=rag_backend_options.index(current_backend),
-            format_func=lambda backend: backend_labels.get(backend, backend),
-            key="cfg_rag_backend",
-            help="RAGFlow 是正式解析/索引/检索主线；Local 仅用于本地兜底、离线调试和对比验证。"
+    # ==================== RAG config ====================
+    with st.expander("RAG 配置", expanded=True):
+        st.caption("RAG 后端固定为 RAGFlow，本地向量知识库链路已移除。")
+        st.text_input(
+            "RAGFlow Base URL",
+            value=str(_val("RAGFLOW_BASE_URL", "http://localhost:9380")),
+            key="cfg_ragflow_base_url",
+            help="例如 http://localhost:9380 或你的 RAGFlow 网关地址",
         )
-        is_local_backend = st.session_state.get("cfg_rag_backend", current_backend) == "local"
-
-        if is_local_backend:
-            st.warning("Local 后端仅建议用于本地调试或 RAGFlow 不可用时的临时兜底。")
-            st.markdown("###### Embedding")
-            provider_for_rag = st.session_state.get("cfg_provider", current_provider)
-            if provider_for_rag == "ollama":
-                st.text_input(
-                    "Ollama Embedding 模型",
-                    value=_val("OLLAMA_EMBEDDING_MODEL"),
-                    key="cfg_ollama_emb_model",
-                    help="例: nomic-embed-text:latest",
-                )
-            else:
-                use_ollama_emb = st.checkbox(
-                    "使用 Ollama 提供 Embedding（推荐，免费）",
-                    value=_val("USE_OLLAMA_EMBEDDING", False) == True or _val("USE_OLLAMA_EMBEDDING", "false") == True,
-                    key="cfg_use_ollama_emb",
-                    help="很多第三方 API 不支持 Embedding，建议开启"
-                )
-                if use_ollama_emb:
-                    st.text_input("Ollama Base URL", value=_val("OLLAMA_BASE_URL"), key="cfg_ollama_emb_base_url")
-                    st.text_input("Ollama Embedding 模型", value=_val("OLLAMA_EMBEDDING_MODEL"), key="cfg_ollama_emb_model")
-                else:
-                    st.text_input("Embedding API Key", value=_val("CUSTOM_EMBEDDING_API_KEY"),
-                                  key="cfg_custom_emb_api_key", type="password")
-                    st.text_input("Embedding Base URL", value=_val("CUSTOM_EMBEDDING_BASE_URL"),
-                                  key="cfg_custom_emb_base_url", help="例: https://api.siliconflow.cn/v1")
-                    st.text_input("Embedding 模型", value=_val("CUSTOM_EMBEDDING_MODEL"), key="cfg_custom_emb_model",
-                                  help="例: text-embedding-3-small")
-
-            st.divider()
-            st.markdown("###### 分块与检索")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.number_input("Chunk Size（分块大小）", min_value=64, max_value=4096,
-                                value=int(_val("CHUNK_SIZE", "512")), step=64, key="cfg_chunk_size",
-                                help="文档分块的大小（token 数）")
-            with c2:
-                st.number_input("Chunk Overlap（分块重叠）", min_value=0, max_value=2048,
-                                value=int(_val("CHUNK_OVERLAP", "50")), step=10, key="cfg_chunk_overlap",
-                                help="相邻分块的重叠量")
-
-            st.divider()
-            c3, c4, c5 = st.columns(3)
-            with c3:
-                st.number_input("Vector Top-K", min_value=1, max_value=100,
-                                value=int(_val("VECTOR_TOP_K", "20")), key="cfg_vector_top_k",
-                                help="向量检索返回数量")
-            with c4:
-                st.number_input("BM25 Top-K", min_value=1, max_value=100,
-                                value=int(_val("BM25_TOP_K", "20")), key="cfg_bm25_top_k",
-                                help="BM25 检索返回数量")
-            with c5:
-                st.number_input("Final Top-K", min_value=1, max_value=50,
-                                value=int(_val("FINAL_TOP_K", "5")), key="cfg_final_top_k",
-                                help="最终融合后返回给 LLM 的文档数")
-            st.number_input("RRF K（倒数排名融合参数）", min_value=1, max_value=200,
-                            value=int(_val("RRF_K", "60")), key="cfg_rrf_k",
-                            help="控制排名融合的平滑度，通常 60 效果好")
-
-            st.divider()
-            st.markdown("###### Reranker")
-            reranker_options = ["none", "local", "api"]
-            current_reranker = _val("RERANKER_TYPE", "none")
-            if isinstance(current_reranker, config.settings.RerankerType):
-                current_reranker = current_reranker.value
-
-            reranker_type = st.selectbox(
-                "Reranker 类型",
-                options=reranker_options,
-                index=reranker_options.index(current_reranker),
-                key="cfg_reranker_type",
-                help="none = 不使用 | local = 本地模型（需下载）| api = API 服务",
-            )
-            if reranker_type != "none":
-                st.text_input("Reranker 模型", value=_val("RERANKER_MODEL"), key="cfg_reranker_model",
-                              help="例: BAAI/bge-reranker-v2-m3")
-            if reranker_type == "api":
-                st.text_input("Reranker API Key", value=_val("RERANKER_API_KEY"), key="cfg_reranker_api_key", type="password")
-                st.text_input("Reranker API Base", value=_val("RERANKER_API_BASE"), key="cfg_reranker_api_base")
-
-        else:
-            st.markdown("###### RAGFlow 连接")
+        st.text_input(
+            "RAGFlow API Key",
+            value=str(_val("RAGFLOW_API_KEY", "")),
+            key="cfg_ragflow_api_key",
+            type="password",
+        )
+        d1, d2 = st.columns(2)
+        with d1:
             st.text_input(
-                "RAGFlow Base URL",
-                value=str(_val("RAGFLOW_BASE_URL", "http://localhost:9380")),
-                key="cfg_ragflow_base_url",
-                help="例如 http://localhost:9380 或你的 RAGFlow 网关地址",
+                "部门治理 Dataset",
+                value=str(_val("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")),
+                key="cfg_ragflow_governance_dataset",
             )
+        with d2:
             st.text_input(
-                "RAGFlow API Key",
-                value=str(_val("RAGFLOW_API_KEY", "")),
-                key="cfg_ragflow_api_key",
-                type="password",
+                "设计资料 Dataset",
+                value=str(_val("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")),
+                key="cfg_ragflow_design_dataset",
             )
-            d1, d2 = st.columns(2)
-            with d1:
-                st.text_input(
-                    "部门治理 Dataset",
-                    value=str(_val("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")),
-                    key="cfg_ragflow_governance_dataset",
-                )
-            with d2:
-                st.text_input(
-                    "设计资料 Dataset",
-                    value=str(_val("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")),
-                    key="cfg_ragflow_design_dataset",
-                )
-            if st.button("检查 RAGFlow 连接", key="cfg_check_ragflow_connection"):
-                _check_ragflow_connection()
+        if st.button("检查 RAGFlow 连接", key="cfg_check_ragflow_connection"):
+            _check_ragflow_connection()
 
-            st.divider()
-            st.markdown("###### RAGFlow 检索")
-            p1, p2, p3 = st.columns(3)
-            with p1:
-                st.number_input(
-                    "超时秒数",
-                    min_value=10,
-                    max_value=600,
-                    value=int(_val("RAGFLOW_TIMEOUT_SECONDS", "120")),
-                    key="cfg_ragflow_timeout",
-                )
-            with p2:
-                st.number_input(
-                    "相似度阈值",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(_val("RAGFLOW_SIMILARITY_THRESHOLD", "0.25")),
-                    step=0.05,
-                    key="cfg_ragflow_similarity",
-                )
-            with p3:
-                st.number_input(
-                    "向量权重",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(_val("RAGFLOW_VECTOR_WEIGHT", "0.4")),
-                    step=0.05,
-                    key="cfg_ragflow_vector_weight",
-                )
-    # ==================== 💬 系统提示词 ====================
-    with st.expander("💬 系统提示词"):
+        st.divider()
+        st.markdown("###### RAGFlow 检索")
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            st.number_input(
+                "超时秒数",
+                min_value=10,
+                max_value=600,
+                value=int(_val("RAGFLOW_TIMEOUT_SECONDS", "120")),
+                key="cfg_ragflow_timeout",
+            )
+        with p2:
+            st.number_input(
+                "相似度阈值",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(_val("RAGFLOW_SIMILARITY_THRESHOLD", "0.25")),
+                step=0.05,
+                key="cfg_ragflow_similarity",
+            )
+        with p3:
+            st.number_input(
+                "向量权重",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(_val("RAGFLOW_VECTOR_WEIGHT", "0.4")),
+                step=0.05,
+                key="cfg_ragflow_vector_weight",
+            )
+        with p4:
+            st.number_input(
+                "Final Top-K",
+                min_value=1,
+                max_value=50,
+                value=int(_val("FINAL_TOP_K", "5")),
+                key="cfg_final_top_k",
+            )
+    # ==================== System prompts ====================
+    with st.expander("系统提示词"):
         default_system_prompt = config.settings.DEFAULT_VALUES.get("SYSTEM_PROMPT", "")
         current_system_prompt = _val("SYSTEM_PROMPT", default_system_prompt)
         if isinstance(current_system_prompt, bool):
             current_system_prompt = default_system_prompt
         st.text_area(
-            "System Prompt（系统提示词）",
+            "System Prompt",
             value=str(current_system_prompt),
             height=150,
             key="cfg_system_prompt",
@@ -1105,7 +1413,7 @@ def render_settings_tab():
             help="知识库未检索到内容时使用的提示词"
         )
 
-    # ==================== 操作按钮 ====================
+    # ==================== Actions ====================
     st.divider()
     st.caption("修改后点击应用配置生效。")
     _, col_apply, _ = st.columns([2, 1, 2])
@@ -1115,128 +1423,78 @@ def render_settings_tab():
 
 
 def _validate_settings(new_settings: dict) -> list[str]:
-    """验证配置值"""
+    """Validate settings collected from the Streamlit settings page."""
     errors = []
-    provider = new_settings.get("PROVIDER", "ollama")
-    is_local_backend = new_settings.get("RAG_BACKEND", "local") == "local"
+    provider = new_settings.get("AGENT_LLM_PROVIDER", "ollama")
 
     if provider == "ollama":
-        if not new_settings.get("OLLAMA_BASE_URL"):
-            errors.append("Ollama Base URL 不能为空")
-        if not new_settings.get("OLLAMA_LLM_MODEL"):
-            errors.append("Ollama LLM 模型名不能为空")
-        if is_local_backend and not new_settings.get("OLLAMA_EMBEDDING_MODEL"):
-            errors.append("Ollama Embedding 模型名不能为空")
+        if not new_settings.get("AGENT_OLLAMA_BASE_URL"):
+            errors.append("Agent Ollama Base URL 不能为空")
+        if not new_settings.get("AGENT_OLLAMA_MODEL"):
+            errors.append("Agent Ollama 模型名不能为空")
     elif provider == "custom":
-        if not new_settings.get("CUSTOM_API_KEY"):
-            errors.append("API Key 不能为空")
-        if not new_settings.get("CUSTOM_BASE_URL"):
-            errors.append("Base URL 不能为空")
-        if not new_settings.get("CUSTOM_LLM_MODEL"):
-            errors.append("LLM 模型名不能为空")
-        use_ollama = new_settings.get("USE_OLLAMA_EMBEDDING", "false") == "true"
-        if is_local_backend and not use_ollama and not new_settings.get("CUSTOM_EMBEDDING_MODEL"):
-            errors.append("未使用 Ollama Embedding 时，必须填写 Custom Embedding 模型名")
+        if not new_settings.get("AGENT_CUSTOM_API_KEY"):
+            errors.append("Agent API Key 不能为空")
+        if not new_settings.get("AGENT_CUSTOM_BASE_URL"):
+            errors.append("Agent Base URL 不能为空")
+        if not new_settings.get("AGENT_CUSTOM_MODEL"):
+            errors.append("Agent LLM 模型名不能为空")
 
-    if not is_local_backend:
-        if not new_settings.get("RAGFLOW_BASE_URL"):
-            errors.append("RAGFlow Base URL 不能为空")
-        if not new_settings.get("RAGFLOW_API_KEY"):
-            errors.append("RAGFlow API Key 不能为空")
+    if not new_settings.get("RAGFLOW_BASE_URL"):
+        errors.append("RAGFlow Base URL 不能为空")
+    if not new_settings.get("RAGFLOW_API_KEY"):
+        errors.append("RAGFlow API Key 不能为空")
 
-    int_keys = ["CUSTOM_CONTEXT_WINDOW", "CUSTOM_MAX_TOKENS"]
-    if is_local_backend:
-        int_keys.extend(["CHUNK_SIZE", "CHUNK_OVERLAP", "VECTOR_TOP_K", "BM25_TOP_K", "FINAL_TOP_K", "RRF_K"])
-    else:
-        int_keys.extend(["RAGFLOW_TIMEOUT_SECONDS"])
-    for key in int_keys:
+    for key in ["AGENT_CUSTOM_MAX_TOKENS", "AGENT_TIMEOUT_SECONDS", "RAGFLOW_TIMEOUT_SECONDS", "FINAL_TOP_K"]:
         val = new_settings.get(key, "")
         if val:
             try:
-                v = int(val)
-                if v <= 0:
+                if int(val) <= 0:
                     errors.append(f"{key} 必须为正整数")
             except ValueError:
-                errors.append(f"{key} 不是有效的整数: {val}")
+                errors.append(f"{key} 不是有效整数: {val}")
 
     return errors
 
 
 def _apply_settings():
-    """应用配置：收集 → 验证 → 保存 .env → 刷新 → 重新初始化"""
-    from src.ingestion.index_builder import clear_all_index_cache
-    from src.core.custom_rag_chat import _context_cache
-    from src.core.model_factory import init_generation_model
+    """Collect, validate, persist and reload settings."""
+    new_settings = {
+        "AUTH_DB_PATH": st.session_state.get("cfg_auth_db_path", ""),
+        "AUTH_DEFAULT_ADMIN_USERNAME": st.session_state.get("cfg_auth_admin_username", ""),
+        "AUTH_DEFAULT_ADMIN_PASSWORD": st.session_state.get("cfg_auth_admin_password", ""),
+        "AUTH_SESSION_TTL_HOURS": str(st.session_state.get("cfg_auth_session_ttl", 24)),
+    }
 
-    new_settings = {}
-    rag_backend = st.session_state.get("cfg_rag_backend", "local")
-    is_local_backend = rag_backend == "local"
-    new_settings["RAG_BACKEND"] = rag_backend
-    new_settings["AUTH_DB_PATH"] = st.session_state.get("cfg_auth_db_path", "")
-    new_settings["AUTH_DEFAULT_ADMIN_USERNAME"] = st.session_state.get("cfg_auth_admin_username", "")
-    new_settings["AUTH_DEFAULT_ADMIN_PASSWORD"] = st.session_state.get("cfg_auth_admin_password", "")
-    new_settings["AUTH_SESSION_TTL_HOURS"] = str(st.session_state.get("cfg_auth_session_ttl", 24))
-
-    # ---- Provider & Model ----
     provider = st.session_state.get("cfg_provider", "ollama")
-    new_settings["PROVIDER"] = provider
+    new_settings["AGENT_LLM_PROVIDER"] = provider
 
     if provider == "ollama":
-        new_settings["OLLAMA_BASE_URL"] = st.session_state.get("cfg_ollama_base_url", "")
-        new_settings["OLLAMA_LLM_MODEL"] = st.session_state.get("cfg_ollama_llm_model", "")
-        if is_local_backend:
-            new_settings["OLLAMA_EMBEDDING_MODEL"] = st.session_state.get("cfg_ollama_emb_model", "")
+        new_settings["AGENT_OLLAMA_BASE_URL"] = st.session_state.get("cfg_ollama_base_url", "")
+        new_settings["AGENT_OLLAMA_MODEL"] = st.session_state.get("cfg_agent_ollama_model", "")
     else:
-        new_settings["CUSTOM_API_KEY"] = st.session_state.get("cfg_custom_api_key", "")
-        new_settings["CUSTOM_BASE_URL"] = st.session_state.get("cfg_custom_base_url", "")
-        new_settings["CUSTOM_LLM_MODEL"] = st.session_state.get("cfg_custom_llm_model", "")
-        new_settings["CUSTOM_CONTEXT_WINDOW"] = str(st.session_state.get("cfg_custom_ctx_window", 128000))
-        new_settings["CUSTOM_MAX_TOKENS"] = str(st.session_state.get("cfg_custom_max_tokens", 4096))
-        if is_local_backend:
-            use_ollama_emb = st.session_state.get("cfg_use_ollama_emb", False)
-            new_settings["USE_OLLAMA_EMBEDDING"] = "true" if use_ollama_emb else "false"
-            if use_ollama_emb:
-                new_settings["OLLAMA_BASE_URL"] = st.session_state.get("cfg_ollama_emb_base_url", "")
-                new_settings["OLLAMA_EMBEDDING_MODEL"] = st.session_state.get("cfg_ollama_emb_model", "")
-            else:
-                new_settings["CUSTOM_EMBEDDING_API_KEY"] = st.session_state.get("cfg_custom_emb_api_key", "")
-                new_settings["CUSTOM_EMBEDDING_BASE_URL"] = st.session_state.get("cfg_custom_emb_base_url", "")
-                new_settings["CUSTOM_EMBEDDING_MODEL"] = st.session_state.get("cfg_custom_emb_model", "")
+        new_settings["AGENT_CUSTOM_API_KEY"] = st.session_state.get("cfg_custom_api_key", "")
+        new_settings["AGENT_CUSTOM_BASE_URL"] = st.session_state.get("cfg_custom_base_url", "")
+        new_settings["AGENT_CUSTOM_MODEL"] = st.session_state.get("cfg_agent_custom_model", "")
+        new_settings["AGENT_CUSTOM_MAX_TOKENS"] = str(st.session_state.get("cfg_custom_max_tokens", 4096))
+        new_settings["AGENT_TEMPERATURE"] = str(st.session_state.get("cfg_agent_temperature", 0.2))
+        new_settings["AGENT_TIMEOUT_SECONDS"] = str(st.session_state.get("cfg_agent_timeout", 120))
 
-    # ---- RAG 参数 ----
-    if is_local_backend:
-        new_settings["CHUNK_SIZE"] = str(st.session_state.get("cfg_chunk_size", 512))
-        new_settings["CHUNK_OVERLAP"] = str(st.session_state.get("cfg_chunk_overlap", 50))
-        new_settings["VECTOR_TOP_K"] = str(st.session_state.get("cfg_vector_top_k", 20))
-        new_settings["BM25_TOP_K"] = str(st.session_state.get("cfg_bm25_top_k", 20))
-        new_settings["FINAL_TOP_K"] = str(st.session_state.get("cfg_final_top_k", 5))
-        new_settings["RRF_K"] = str(st.session_state.get("cfg_rrf_k", 60))
-    else:
-        new_settings["RAGFLOW_BASE_URL"] = st.session_state.get("cfg_ragflow_base_url", "")
-        new_settings["RAGFLOW_API_KEY"] = st.session_state.get("cfg_ragflow_api_key", "")
-        new_settings["RAGFLOW_GOVERNANCE_DATASET_NAME"] = st.session_state.get(
-            "cfg_ragflow_governance_dataset",
-            "department_governance",
-        )
-        new_settings["RAGFLOW_DESIGN_DATASET_NAME"] = st.session_state.get(
-            "cfg_ragflow_design_dataset",
-            "project_design_assets",
-        )
-        new_settings["RAGFLOW_TIMEOUT_SECONDS"] = str(st.session_state.get("cfg_ragflow_timeout", 120))
-        new_settings["RAGFLOW_SIMILARITY_THRESHOLD"] = str(st.session_state.get("cfg_ragflow_similarity", 0.25))
-        new_settings["RAGFLOW_VECTOR_WEIGHT"] = str(st.session_state.get("cfg_ragflow_vector_weight", 0.4))
+    new_settings["RAGFLOW_BASE_URL"] = st.session_state.get("cfg_ragflow_base_url", "")
+    new_settings["RAGFLOW_API_KEY"] = st.session_state.get("cfg_ragflow_api_key", "")
+    new_settings["RAGFLOW_GOVERNANCE_DATASET_NAME"] = st.session_state.get(
+        "cfg_ragflow_governance_dataset",
+        "department_governance",
+    )
+    new_settings["RAGFLOW_DESIGN_DATASET_NAME"] = st.session_state.get(
+        "cfg_ragflow_design_dataset",
+        "project_design_assets",
+    )
+    new_settings["RAGFLOW_TIMEOUT_SECONDS"] = str(st.session_state.get("cfg_ragflow_timeout", 120))
+    new_settings["RAGFLOW_SIMILARITY_THRESHOLD"] = str(st.session_state.get("cfg_ragflow_similarity", 0.25))
+    new_settings["RAGFLOW_VECTOR_WEIGHT"] = str(st.session_state.get("cfg_ragflow_vector_weight", 0.4))
+    new_settings["FINAL_TOP_K"] = str(st.session_state.get("cfg_final_top_k", 5))
 
-    # ---- Reranker ----
-    if is_local_backend:
-        reranker_type = st.session_state.get("cfg_reranker_type", "none")
-        new_settings["RERANKER_TYPE"] = reranker_type
-        if reranker_type != "none":
-            new_settings["RERANKER_MODEL"] = st.session_state.get("cfg_reranker_model", "")
-        if reranker_type == "api":
-            new_settings["RERANKER_API_KEY"] = st.session_state.get("cfg_reranker_api_key", "")
-            new_settings["RERANKER_API_BASE"] = st.session_state.get("cfg_reranker_api_base", "")
-
-    # ---- 系统提示词 ----
     system_prompt = st.session_state.get("cfg_system_prompt", "")
     no_context_prompt = st.session_state.get("cfg_no_context_prompt", "")
     if system_prompt:
@@ -1244,61 +1502,107 @@ def _apply_settings():
     if no_context_prompt:
         new_settings["NO_CONTEXT_PROMPT"] = no_context_prompt
 
-    # ---- 验证 ----
     errors = _validate_settings(new_settings)
     if errors:
         for e in errors:
             st.error(e)
         return
 
-    # ---- 保存并重新加载 ----
     try:
-        # 1. 写入 .env
-        config.settings.save_settings_to_env(new_settings)
-
-        # 2. 刷新模块变量
-        config.settings.reload_settings()
-
-        if is_local_backend:
-            # 3. local 后端才需要重新初始化模型、Embedding、Reranker 和 Chroma。
-            resource_manager.initialize(force=True)
-
-            # 4. local 后端的 embedding/chunk 参数可能变化，需要清除索引缓存。
-            clear_all_index_cache()
-        else:
-            # RAGFlow 后端只需要刷新答案生成模型，不初始化本地 Chroma/Embedding。
-            init_generation_model(force=True)
-
-        # 5. 清除上下文缓存
-        _context_cache.clear()
-
-        # 6. 清除 Streamlit 缓存的 pipeline
+        AppPipeline.apply_settings(new_settings)
         init_pipeline.clear()
-
-        # 7. 清空当前 UI 对话状态（模型已变，旧上下文无效）
+        init_auth_service.clear()
         reset_chat_state()
-
         record_audit(
             "change_settings",
             target_type="system_settings",
             target_id="env",
             metadata={
-                "provider": new_settings.get("PROVIDER"),
-                "rag_backend": new_settings.get("RAG_BACKEND"),
-                "reranker_type": new_settings.get("RERANKER_TYPE"),
+                "agent_llm_provider": new_settings.get("AGENT_LLM_PROVIDER"),
+                "rag_backend": "ragflow",
             },
         )
-        st.session_state.toast_msg = "✅ 配置已更新并生效"
+        st.session_state.toast_msg = "配置已更新并生效"
         st.rerun()
-
     except Exception as e:
-        st.error(f"❌ 应用配置失败: {e}")
-        st.warning("配置已保存到 .env，但模型初始化失败。请检查配置后点击「应用配置」重试。")
+        st.error(f"应用配置失败: {e}")
+        st.warning("配置已保存到 .env，但重新初始化失败。请检查配置后重试。")
+
+
+AUDIT_ACTION_LABELS = {
+    "login_success": "登录成功",
+    "login_failed": "登录失败",
+    "logout": "登出",
+    "create_kb": "创建知识库",
+    "delete_kb": "删除知识库",
+    "upload_document": "上传文档",
+    "delete_document": "删除文档",
+    "grant_kb_permission": "授权知识库",
+    "change_settings": "修改配置",
+    "create_user": "创建用户",
+    "set_user_active": "启停用户",
+    "reset_user_password": "重置密码",
+    "create_department": "创建部门",
+    "delete_department": "删除部门",
+}
+
+
+def _audit_action_label(action: str) -> str:
+    return AUDIT_ACTION_LABELS.get(action, action)
+
+
+def build_audit_rows(events) -> list[dict]:
+    """审计日志表格行：列与 events 同序，便于按 dataframe 选中行索引回查事件。"""
+    return [
+        {
+            "ID": e.id,
+            "时间": format_local_time(e.created_at),
+            "操作者": e.actor_username or "-",
+            "角色": e.actor_role or "-",
+            "动作": _audit_action_label(e.action),
+            "目标": f"{e.target_type or '-'} / {e.target_id or '-'}",
+            "知识库": e.kb_name or "-",
+            "结果": "✅" if e.success else "❌",
+        }
+        for e in events
+    ]
+
+
+def build_query_rows(traces, show_query_content: bool) -> list[dict]:
+    """查询日志表格行。系统管理员看他人查询时原文脱敏为「已隐藏」。"""
+    rows = []
+    for t in traces:
+        if not show_query_content:
+            summary = "已隐藏"
+        else:
+            summary = (t.original_query or "")[:60] or "(空)"
+        rows.append(
+            {
+                "ID": t.id,
+                "时间": format_local_time(t.created_at),
+                "用户": t.username or "-",
+                "知识库": t.kb_name or "-",
+                "问题摘要": summary,
+                "耗时(ms)": t.latency_ms if t.latency_ms is not None else "-",
+                "状态": "✅" if t.status == "success" else "❌",
+            }
+        )
+    return rows
+
+
+def _selected_row_index(key: str) -> int | None:
+    """读取 st.dataframe 单行选中的首条行索引，未选中返回 None。"""
+    sel = st.session_state.get(key)
+    if not sel:
+        return None
+    rows = getattr(sel, "selection", None)
+    rows = getattr(rows, "rows", None) if rows is not None else None
+    return rows[0] if rows else None
 
 
 def render_log_center_tab():
     st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
-    st.subheader("📊 日志中心")
+    st.subheader("日志中心")
 
     viewer = current_auth_user()
     if viewer is None or viewer.role not in {ROLE_SYSTEM_ADMIN, ROLE_DEPT_ADMIN}:
@@ -1306,238 +1610,1018 @@ def render_log_center_tab():
         st.stop()
 
     if viewer.role == ROLE_SYSTEM_ADMIN:
-        st.caption("系统管理员视图：可查看全局审计日志和查询状态，查询原文已隐藏。")
+        st.caption("全局视图：可查看全部部门审计与查询日志，他人查询原文已脱敏。")
     else:
-        st.caption("部门管理员视图：仅显示本部门相关日志。")
-    show_query_content = viewer.role != ROLE_SYSTEM_ADMIN
+        st.caption("本部门视图：仅显示本部门日志，他人查询原文已脱敏。")
 
     log_service = init_log_service()
     tab_audit, tab_query = st.tabs(["审计日志", "查询日志"])
 
+    # -------------------- 审计日志 --------------------
     with tab_audit:
-        c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 0.8])
+        c1, c2, c3, c4 = st.columns([0.22, 0.22, 0.22, 0.34])
         with c1:
-            action_options = [
-                "全部",
-                "login_success",
-                "login_failed",
-                "logout",
-                "create_user",
-                "set_user_active",
-                "create_department",
-                "delete_department",
-                "create_kb",
-                "delete_kb",
-                "upload_document",
-                "delete_document",
-                "spreadsheet_upload_archived",
-                "spreadsheet_delete_document",
-                "ragflow_upload_submitted",
-                "ragflow_upload_failed",
-                "ragflow_delete_document",
-                "ragflow_permission_denied",
-                "grant_kb_permission",
-                "change_settings",
-            ]
-            action = st.selectbox("操作类型", action_options, key="audit_action_filter")
+            audit_action_options = [""] + log_service.list_audit_actions(viewer)
+            audit_action = st.selectbox(
+                "动作",
+                audit_action_options,
+                format_func=lambda value: "全部" if not value else _audit_action_label(value),
+                key="audit_action_filter",
+            )
         with c2:
-            audit_kb = st.selectbox("知识库", ["全部"] + st.session_state.get("kb_list", []), key="audit_kb_filter")
+            audit_success = st.selectbox(
+                "结果",
+                [None, True, False],
+                format_func=lambda value: "全部" if value is None else ("成功" if value else "失败"),
+                key="audit_success_filter",
+            )
         with c3:
-            success_label = st.selectbox("结果", ["全部", "成功", "失败"], key="audit_success_filter")
+            audit_kb = st.text_input("知识库", key="audit_kb_filter")
         with c4:
-            audit_limit = st.number_input("条数", min_value=20, max_value=1000, value=200, step=20, key="audit_limit")
-        audit_keyword = st.text_input("关键词", placeholder="用户名、对象、错误信息", key="audit_keyword")
+            audit_keyword = st.text_input("关键词", placeholder="用户名、对象、错误信息", key="audit_keyword")
 
-        success_filter = None
-        if success_label == "成功":
-            success_filter = True
-        elif success_label == "失败":
-            success_filter = False
+        audit_kb_v = audit_kb.strip() or None
+        audit_kw_v = audit_keyword.strip() or None
+        audit_total = log_service.count_audit_events(
+            viewer, action=audit_action or None, kb_name=audit_kb_v, success=audit_success, keyword=audit_kw_v
+        )
+        audit_bk = log_service.audit_breakdown(
+            viewer, action=audit_action or None, kb_name=audit_kb_v, success=audit_success, keyword=audit_kw_v
+        )
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("审计事件总数", audit_total)
+        m2.metric("成功", audit_bk["success"])
+        m3.metric("失败", audit_bk["failed"])
+
+        with st.expander("近 7 日趋势 / 动作分布", expanded=False):
+            daily = log_service.audit_recent_daily(viewer, days=7)
+            if daily:
+                st.dataframe(
+                    [{"日期": d, "审计事件数": n} for d, n in daily],
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.caption("近 7 日无审计事件")
+            action_bd = log_service.audit_action_breakdown(
+                viewer, kb_name=audit_kb_v, success=audit_success, keyword=audit_kw_v
+            )
+            if action_bd:
+                top3 = "、".join(f"{_audit_action_label(a)} {n}" for a, n in action_bd[:3])
+                st.caption(f"动作分布 Top3：{top3}")
+            else:
+                st.caption("暂无动作分布数据")
 
         audit_events = log_service.list_audit_events(
-            viewer=viewer,
-            action=None if action == "全部" else action,
-            kb_name=None if audit_kb == "全部" else audit_kb,
-            success=success_filter,
-            keyword=audit_keyword.strip() or None,
-            limit=int(audit_limit),
+            viewer,
+            action=audit_action or None,
+            kb_name=audit_kb_v,
+            success=audit_success,
+            keyword=audit_kw_v,
+            limit=300,
         )
         if not audit_events:
             st.info("暂无审计日志")
         else:
+            st.caption(f"共 {audit_total} 条，展示 {len(audit_events)} 条，点击表格行查看详情")
+            audit_rows = build_audit_rows(audit_events)
             st.dataframe(
-                [
-                    {
-                        "ID": event.id,
-                        "时间": event.created_at,
-                        "用户": event.actor_username,
-                        "角色": event.actor_role,
-                        "部门ID": event.department_id,
-                        "操作": event.action,
-                        "对象类型": event.target_type,
-                        "对象": event.target_id,
-                        "知识库": event.kb_name,
-                        "结果": "成功" if event.success else "失败",
-                        "错误": event.error_message,
-                    }
-                    for event in audit_events
-                ],
+                audit_rows,
                 width="stretch",
                 hide_index=True,
-                column_config={
-                    "ID": st.column_config.NumberColumn(width="small"),
-                    "时间": st.column_config.TextColumn(width="medium"),
-                    "用户": st.column_config.TextColumn(width="small"),
-                    "角色": st.column_config.TextColumn(width="small"),
-                    "部门ID": st.column_config.NumberColumn(width="small"),
-                    "操作": st.column_config.TextColumn(width="medium"),
-                    "对象类型": st.column_config.TextColumn(width="small"),
-                    "对象": st.column_config.TextColumn(width="large"),
-                    "知识库": st.column_config.TextColumn(width="medium"),
-                    "结果": st.column_config.TextColumn(width="small"),
-                    "错误": st.column_config.TextColumn(width="large"),
-                },
+                on_select="rerun",
+                selection_mode="single-row",
+                key="audit_table_select",
             )
-            selected_audit_id = st.selectbox(
-                "查看审计详情",
-                [event.id for event in audit_events],
-                format_func=lambda event_id: next(
-                    (
-                        f"#{event.id} {event.created_at} {event.action}: {event.target_id}"
-                        for event in audit_events
-                        if event.id == event_id
-                    ),
-                    str(event_id),
-                ),
-                key="audit_detail_select",
-            )
-            selected_event = next((event for event in audit_events if event.id == selected_audit_id), None)
-            if selected_event:
-                with st.expander("审计详情", expanded=True):
-                    st.markdown(f"**操作:** `{selected_event.action}`")
-                    st.markdown(f"**对象:** `{selected_event.target_type}` / `{selected_event.target_id}`")
-                    st.markdown(f"**知识库:** `{selected_event.kb_name}`")
-                    st.markdown(f"**结果:** {'成功' if selected_event.success else '失败'}")
-                    if selected_event.error_message:
-                        st.text_area(
-                            "完整错误信息",
-                            value=selected_event.error_message,
-                            height=140,
-                            disabled=True,
-                            key=f"audit_error_{selected_event.id}",
-                        )
-                    try:
-                        metadata = json.loads(selected_event.metadata_json or "{}")
-                    except json.JSONDecodeError:
-                        metadata = selected_event.metadata_json
-                    if metadata:
-                        st.json(metadata)
+            sel_idx = _selected_row_index("audit_table_select")
+            if sel_idx is not None and 0 <= sel_idx < len(audit_events):
+                event = audit_events[sel_idx]
+                st.markdown(f"#### 详情 #{event.id}")
+                render_audit_event_detail(event)
+            else:
+                st.info("点击表格任意一行查看详情")
 
+    # -------------------- 查询日志 --------------------
     with tab_query:
-        c1, c2, c3 = st.columns([1.2, 1.1, 0.8])
+        c1, c2, c3 = st.columns([0.25, 0.25, 0.5])
         with c1:
-            query_kb = st.selectbox("知识库", ["全部"] + st.session_state.get("kb_list", []), key="query_kb_filter")
+            query_status = st.selectbox(
+                "状态",
+                ["", "success", "failed", "partial", "no_evidence"],
+                format_func=lambda value: "全部" if not value else value,
+                key="query_status_filter",
+            )
         with c2:
-            status = st.selectbox("状态", ["全部", "success", "failed"], key="query_status_filter")
+            query_kb = st.text_input("知识库", key="query_kb_filter")
         with c3:
-            query_limit = st.number_input("条数", min_value=20, max_value=1000, value=200, step=20, key="query_limit")
-        query_keyword = st.text_input(
-            "关键词",
-            placeholder="用户名、问题、错误信息" if show_query_content else "用户名、错误信息",
-            key="query_keyword",
-            disabled=not show_query_content,
+            show_query_content = viewer.role != ROLE_SYSTEM_ADMIN
+            query_keyword = st.text_input(
+                "关键词",
+                placeholder="用户名、问题、错误信息" if show_query_content else "用户名、错误信息",
+                key="query_keyword",
+            )
+
+        query_kb_v = query_kb.strip() or None
+        query_kw_v = query_keyword.strip() or None
+        query_total = log_service.count_query_traces(
+            viewer, kb_name=query_kb_v, status=query_status or None, keyword=query_kw_v
         )
-        query_keyword_filter = (query_keyword.strip() or None) if show_query_content else None
+        q_bk = log_service.query_status_breakdown(
+            viewer, kb_name=query_kb_v, status=query_status or None, keyword=query_kw_v
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("查询日志总数", query_total)
+        m2.metric("成功", q_bk["success"])
+        m3.metric("失败", q_bk["failed"])
+        m4.metric("部分/无证据", q_bk["partial"] + q_bk["no_evidence"])
+
+        with st.expander("失败原因 Top 5", expanded=False):
+            failures = log_service.query_failure_top(viewer, kb_name=query_kb_v, keyword=query_kw_v, limit=5)
+            if failures:
+                st.dataframe(
+                    [{"失败原因": r, "次数": n} for r, n in failures],
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.caption("暂无失败查询")
 
         traces = log_service.list_query_traces(
-            viewer=viewer,
-            kb_name=None if query_kb == "全部" else query_kb,
-            status=None if status == "全部" else status,
-            keyword=query_keyword_filter,
-            limit=int(query_limit),
+            viewer,
+            kb_name=query_kb_v,
+            status=query_status or None,
+            keyword=query_kw_v,
+            limit=300,
         )
         if not traces:
             st.info("暂无查询日志")
         else:
+            st.caption(f"共 {query_total} 条，展示 {len(traces)} 条，点击表格行查看详情")
+            query_rows = build_query_rows(traces, show_query_content)
             st.dataframe(
-                [
-                    {
-                        "时间": trace.created_at,
-                        "用户": trace.username,
-                        "部门ID": trace.department_id,
-                        "知识库": trace.kb_name,
-                        "问题": trace.original_query[:120] if show_query_content else "已隐藏",
-                        "后端": trace.backend,
-                        "检索": trace.retriever_type,
-                        "耗时ms": trace.latency_ms,
-                        "状态": trace.status,
-                        "错误": trace.error_message,
-                    }
-                    for trace in traces
-                ],
+                query_rows,
                 width="stretch",
                 hide_index=True,
-                column_config={
-                    "时间": st.column_config.TextColumn(width="medium"),
-                    "用户": st.column_config.TextColumn(width="small"),
-                    "部门ID": st.column_config.NumberColumn(width="small"),
-                    "知识库": st.column_config.TextColumn(width="medium"),
-                    "问题": st.column_config.TextColumn(width="large"),
-                    "后端": st.column_config.TextColumn(width="small"),
-                    "检索": st.column_config.TextColumn(width="medium"),
-                    "耗时ms": st.column_config.NumberColumn(width="small"),
-                    "状态": st.column_config.TextColumn(width="small"),
-                    "错误": st.column_config.TextColumn(width="large"),
-                },
+                on_select="rerun",
+                selection_mode="single-row",
+                key="query_table_select",
             )
+            sel_idx = _selected_row_index("query_table_select")
+            if sel_idx is not None and 0 <= sel_idx < len(traces):
+                trace = traces[sel_idx]
+                st.markdown(f"#### 详情 #{trace.id}")
+                render_query_trace_detail(trace, viewer, log_service)
+            else:
+                st.info("点击表格任意一行查看详情")
 
-            selected_trace_id = st.selectbox(
-                "查看查询详情",
-                [trace.id for trace in traces],
-                format_func=lambda trace_id: next(
-                    (
-                        f"#{trace.id} {trace.created_at} {trace.username}: "
-                        f"{trace.original_query[:40] if show_query_content else '已隐藏'}"
-                        for trace in traces
-                        if trace.id == trace_id
-                    ),
-                    str(trace_id),
-                ),
-                key="trace_detail_select",
-            )
-            selected_trace = next((trace for trace in traces if trace.id == selected_trace_id), None)
-            if selected_trace:
-                with st.expander("查询详情", expanded=True):
-                    st.markdown(f"**原始问题:** {selected_trace.original_query if show_query_content else '已隐藏'}")
-                    st.markdown(f"**知识库:** `{selected_trace.kb_name}`")
-                    st.markdown(f"**参数:** {format_query_trace_params(selected_trace)}")
-                    st.markdown(f"**耗时:** {selected_trace.latency_ms} ms")
-                    if selected_trace.error_message:
-                        st.error(selected_trace.error_message)
 
-                evidence = log_service.list_evidence(viewer, selected_trace.id)
-                if evidence:
-                    st.markdown("##### 检索证据")
-                    st.dataframe(
-                        [
-                            {
-                                "排名": item.rank,
-                                "文件": item.file_name,
-                                "chunk": item.chunk_id,
-                                "预览": item.text_preview,
-                                "rerank": item.rerank_score,
-                                "rrf": item.rrf_score,
-                            }
-                            for item in evidence
-                        ],
-                        width="stretch",
-                        hide_index=True,
+def _agent_thread_id_for_current_kb() -> str:
+    return f"{st.session_state.get('chat_session_id') or st.session_state.get('session_id')}:{st.session_state.current_kb}"
+
+
+def render_chat_tab(pipeline):
+    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
+    if not st.session_state.current_kb:
+        st.info("暂无可用知识库，请先创建知识库或联系管理员授权。")
+        return
+    ensure_current_chat_session()
+
+    if not st.session_state.messages:
+        st.markdown("""
+            <div style='text-align:center; color:#888; padding-top:180px;'>
+                <h3 style="margin-top:100px;">🙌 硬件数据检索助手</h3>
+                <p>请问有什么可以帮您？</p>
+            </div>
+        """, unsafe_allow_html=True)
+    else:
+        for msg in st.session_state.messages:
+            role = msg["role"]
+            content = msg["content"]
+            if role == "user":
+                safe_content = html.escape(content).replace("\n", "<br>")
+                st.markdown(f"""
+                    <div class="user-chat-container">
+                        <div class="user-bubble">{safe_content}</div>
+                        <div class="user-avatar">🧑</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            else:
+                with st.chat_message("assistant", avatar="😽"):
+                    if content.startswith("Error:") or content == "Empty response.":
+                        st.error(content)
+                    else:
+                        separator = "**🔍 检索到的上下文:**"
+                        fallback_separator = "**检索到的上下文:**"
+                        active_separator = separator if separator in content else fallback_separator
+                        if active_separator in content:
+                            parts = content.split(active_separator, 1)
+                            st.markdown(parts[0].strip())
+                            with st.expander("📚 参考来源"):
+                                st.markdown(parts[1].strip())
+                        else:
+                            answer_body, observation = split_agent_observation(content)
+                            st.markdown(answer_body)
+                            if observation:
+                                with st.expander("Agent 观测", expanded=False):
+                                    st.markdown(observation)
+
+    should_process_user_message = st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
+    if should_process_user_message:
+        user_input_to_process = st.session_state.messages[-1]["content"]
+        query_started_at = time.perf_counter()
+        agent_thread_id = _agent_thread_id_for_current_kb()
+        agent_query = user_input_to_process
+
+        chat_history = []
+        messages_for_history = st.session_state.messages[:-1]
+        user_msg = None
+        for msg in messages_for_history:
+            if msg["role"] == "user":
+                user_msg = msg["content"]
+            elif msg["role"] == "assistant" and user_msg is not None:
+                chat_history.append((user_msg, strip_agent_observation(msg["content"])))
+                user_msg = None
+
+        with st.chat_message("assistant", avatar="😽"):
+            error_occured = None
+            agent_footer = ""
+            try:
+                ctx = build_request_context(st.session_state)
+                gen = pipeline.query(
+                    agent_query,
+                    st.session_state.current_kb,
+                    chat_history[-5:],
+                    ctx=ctx,
+                    agent_thread_id=agent_thread_id,
+                )
+            except Exception as e:
+                error_occured = str(e)
+
+            if error_occured:
+                st.error(f"❌ 处理请求时发生错误: {error_occured}")
+                full_response = f"Error: {error_occured}"
+            else:
+                status = st.status("正在处理您的请求...", expanded=False)
+                has_started_answer = False
+
+                def stream_with_status():
+                    nonlocal has_started_answer
+                    for chunk in gen:
+                        if not has_started_answer:
+                            status.update(label="正在生成回答...", state="running", expanded=False)
+                            has_started_answer = True
+                        yield chunk
+
+                full_response = st.write_stream(stream_with_status())
+                status.update(label="回答生成完毕", state="complete", expanded=False)
+                if isinstance(full_response, list):
+                    full_response = "".join(str(item) for item in full_response)
+                if not full_response or not full_response.strip():
+                    st.warning("⚠️ AI 未生成任何内容。")
+                    full_response = "Empty response."
+                # Agent observability footer (trace / route note / retrieval
+                # diagnostics) is rendered collapsed, separate from the answer.
+                agent_footer = pipeline.get_last_agent_footer() if hasattr(pipeline, "get_last_agent_footer") else ""
+                if agent_footer:
+                    with st.expander("Agent 观测", expanded=False):
+                        st.markdown(agent_footer)
+
+        persisted_response = full_response
+        if agent_footer:
+            persisted_response = f"{full_response.rstrip()}\n---\n{agent_footer.strip()}"
+
+        st.session_state.messages.append({"role": "assistant", "content": persisted_response})
+        assistant_message = persist_chat_message("assistant", persisted_response)
+        latency_ms = int((time.perf_counter() - query_started_at) * 1000)
+        query_status, query_error_message = query_trace_status(full_response)
+        retrieval_summary = (
+            pipeline.get_last_retrieval_summary()
+            if hasattr(pipeline, "get_last_retrieval_summary")
+            else {}
+        )
+        rewritten_queries = retrieval_summary.get("rewritten_queries") or []
+        rewritten_query = " | ".join(rewritten_queries)[:500] if rewritten_queries else ""
+        log_service = init_log_service()
+        trace_id = log_service.record_query_trace(
+            user=current_auth_user(),
+            kb_name=st.session_state.current_kb,
+            original_query=agent_query,
+            chat_session_id=st.session_state.get("chat_session_id"),
+            user_message_id=st.session_state.get("pending_user_message_id"),
+            assistant_message_id=assistant_message.id if assistant_message else None,
+            rewritten_query=rewritten_query,
+            backend="ragflow",
+            retriever_type=retrieval_summary.get("retriever_type") or "",
+            final_top_k=retrieval_summary.get("final_top_k"),
+            latency_ms=latency_ms,
+            status=query_status,
+            error_message=query_error_message,
+            metadata=build_query_log_metadata(),
+        )
+        try:
+            log_service.record_retrieved_evidence(trace_id, retrieval_summary.get("evidence") or [])
+        except Exception as evidence_error:
+            # 证据落库失败不应影响主流程与已写入的 trace。
+            from src.core.logger import log as _log
+            _log(f"retrieved_evidence logging failed for trace {trace_id}: {evidence_error}")
+        st.session_state.pending_user_message_id = None
+        st.rerun()
+
+    prompt = st.chat_input("请输入问题...")
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        user_message = persist_chat_message("user", prompt)
+        st.session_state.pending_user_message_id = user_message.id if user_message else None
+        st.rerun()
+def render_department_management_tab():
+    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
+    st.subheader("👥 部门管理")
+    current_user = current_auth_user()
+    if current_user is None:
+        st.error("无法获取当前用户")
+        return
+
+    auth_service = init_auth_service()
+    if current_user.role == ROLE_DEPT_ADMIN:
+        users = [
+            user for user in auth_service.list_users_for_manager(current_user)
+            if user.role == ROLE_USER
+        ]
+        st.caption(f"当前部门: {current_user.department_name or '-'}")
+        st.markdown("##### 本部门用户")
+        if not users:
+            st.info("本部门暂无普通用户")
+        else:
+            for user in users:
+                c1, c2, c3, c4 = st.columns([1.6, 0.8, 0.8, 1.2])
+                with c1:
+                    st.markdown(f"`{user.username}`")
+                with c2:
+                    st.caption("启用" if user.is_active else "停用")
+                with c3:
+                    next_active = not user.is_active
+                    button_label = "启用" if next_active else "停用"
+                    if st.button(button_label, key=f"dept_user_toggle_{user.id}", width="stretch"):
+                        try:
+                            auth_service.set_user_active_as(current_user, user.id, next_active)
+                            record_audit(
+                                "set_user_active",
+                                target_type="user",
+                                target_id=user.username,
+                                metadata={"is_active": next_active, "scope": "department"},
+                            )
+                            st.success(f"已{button_label}: {user.username}")
+                            st.rerun()
+                        except Exception as e:
+                            record_audit(
+                                "set_user_active",
+                                target_type="user",
+                                target_id=user.username,
+                                success=False,
+                                error_message=str(e),
+                                metadata={"is_active": next_active, "scope": "department"},
+                            )
+                            st.error(f"操作失败: {e}")
+                with c4:
+                    with st.popover("重置密码", use_container_width=True):
+                        new_password = st.text_input(
+                            "新密码",
+                            type="password",
+                            key=f"dept_reset_pwd_{user.id}",
+                        )
+                        if st.button("确认重置", key=f"dept_reset_pwd_btn_{user.id}", use_container_width=True):
+                            try:
+                                auth_service.reset_user_password_as(current_user, user.id, new_password)
+                                record_audit(
+                                    "reset_user_password",
+                                    target_type="user",
+                                    target_id=user.username,
+                                    metadata={"scope": "department"},
+                                )
+                                st.success(f"已重置密码: {user.username}")
+                                st.rerun()
+                            except Exception as e:
+                                record_audit(
+                                    "reset_user_password",
+                                    target_type="user",
+                                    target_id=user.username,
+                                    success=False,
+                                    error_message=str(e),
+                                    metadata={"scope": "department"},
+                                )
+                                st.error(f"重置失败: {e}")
+
+        st.divider()
+        with st.form("dept_create_user_form"):
+            st.markdown("##### 创建普通用户")
+            new_username = st.text_input("用户名", key="dept_auth_new_username")
+            new_password = st.text_input("密码", type="password", key="dept_auth_new_password")
+            if st.form_submit_button("创建用户", width="stretch"):
+                try:
+                    auth_service.create_user_as(
+                        current_user,
+                        new_username,
+                        new_password,
+                        ROLE_USER,
+                        department_id=current_user.department_id,
                     )
+                    record_audit(
+                        "create_user",
+                        target_type="user",
+                        target_id=new_username,
+                        metadata={"role": ROLE_USER, "scope": "department"},
+                    )
+                    st.success(f"已创建普通用户: {new_username}")
+                    st.rerun()
+                except Exception as e:
+                    record_audit(
+                        "create_user",
+                        target_type="user",
+                        target_id=new_username,
+                        success=False,
+                        error_message=str(e),
+                        metadata={"role": ROLE_USER, "scope": "department"},
+                    )
+                    st.error(f"创建用户失败: {e}")
+        return
+
+    if current_user.role == ROLE_SYSTEM_ADMIN:
+        render_system_department_management(current_user)
+    else:
+        st.error("当前账号无权访问部门管理")
+
+
+def render_system_department_management(current_user):
+    auth_service = init_auth_service()
+    users = auth_service.list_users()
+    departments = auth_service.list_departments()
+
+    user_tab, dept_tab, create_tab = st.tabs(["用户列表", "部门列表", "创建"])
+    with user_tab:
+        st.caption(f"当前用户数: {len(users)}")
+        grouped_users = {}
+        for user in users:
+            dept_name = user.department_name or "未分配"
+            grouped_users.setdefault(dept_name, []).append(user)
+
+        for dept_name, dept_users in grouped_users.items():
+            active_count = sum(1 for user in dept_users if user.is_active)
+            with st.expander(f"{dept_name} · {len(dept_users)} 人 · 启用 {active_count}", expanded=False):
+                for user in dept_users:
+                    c1, c2, c3, c4, c5 = st.columns([1.4, 1.0, 0.7, 0.8, 1.1])
+                    with c1:
+                        st.markdown(f"`{user.username}`")
+                    with c2:
+                        st.caption(user.role)
+                    with c3:
+                        st.caption("启用" if user.is_active else "停用")
+                    with c4:
+                        if user.id == st.session_state.get("user_id"):
+                            st.button("当前账号", key=f"user_self_{user.id}", disabled=True, width="stretch")
+                        else:
+                            next_active = not user.is_active
+                            button_label = "启用" if next_active else "停用"
+                            if st.button(button_label, key=f"user_toggle_{user.id}", width="stretch"):
+                                try:
+                                    auth_service.set_user_active_as(current_user, user.id, next_active)
+                                    record_audit(
+                                        "set_user_active",
+                                        target_type="user",
+                                        target_id=user.username,
+                                        metadata={"is_active": next_active},
+                                    )
+                                    st.success(f"已{button_label}: {user.username}")
+                                    st.rerun()
+                                except Exception as e:
+                                    record_audit(
+                                        "set_user_active",
+                                        target_type="user",
+                                        target_id=user.username,
+                                        success=False,
+                                        error_message=str(e),
+                                        metadata={"is_active": next_active},
+                                    )
+                                    st.error(f"操作失败: {e}")
+                    with c5:
+                        if user.id == st.session_state.get("user_id"):
+                            st.button("重置密码", key=f"reset_self_{user.id}", disabled=True, width="stretch")
+                        else:
+                            with st.popover("重置密码", use_container_width=True):
+                                new_password = st.text_input(
+                                    "新密码",
+                                    type="password",
+                                    key=f"sys_reset_pwd_{user.id}",
+                                )
+                                if st.button("确认重置", key=f"sys_reset_pwd_btn_{user.id}", use_container_width=True):
+                                    try:
+                                        auth_service.reset_user_password_as(current_user, user.id, new_password)
+                                        record_audit(
+                                            "reset_user_password",
+                                            target_type="user",
+                                            target_id=user.username,
+                                            metadata={"role": user.role},
+                                        )
+                                        st.success(f"已重置密码: {user.username}")
+                                        st.rerun()
+                                    except Exception as e:
+                                        record_audit(
+                                            "reset_user_password",
+                                            target_type="user",
+                                            target_id=user.username,
+                                            success=False,
+                                            error_message=str(e),
+                                            metadata={"role": user.role},
+                                        )
+                                        st.error(f"重置失败: {e}")
+
+    with dept_tab:
+        st.caption(f"当前部门数: {len(departments)}")
+        for dept in departments:
+            c1, c2, c3 = st.columns([0.8, 2.4, 0.9])
+            with c1:
+                st.caption(str(dept.id))
+            with c2:
+                st.markdown(f"`{dept.name}`")
+            with c3:
+                if dept.name == "system":
+                    st.button("受保护", key=f"dept_system_{dept.id}", disabled=True, width="stretch")
                 else:
-                    st.caption("当前版本已预留检索证据表；完整证据落库需要继续改造检索链路。")
+                    if st.button("删除", key=f"dept_delete_{dept.id}", width="stretch"):
+                        try:
+                            auth_service.delete_department_as(current_user, dept.id)
+                            record_audit(
+                                "delete_department",
+                                target_type="department",
+                                target_id=dept.name,
+                            )
+                            st.success(f"已删除部门: {dept.name}")
+                            st.rerun()
+                        except Exception as e:
+                            record_audit(
+                                "delete_department",
+                                target_type="department",
+                                target_id=dept.name,
+                                success=False,
+                                error_message=str(e),
+                            )
+                            st.error(f"删除部门失败: {e}")
+
+    with create_tab:
+        col_dept, col_user = st.columns(2)
+        with col_dept:
+            with st.form("create_department_form"):
+                st.markdown("###### 创建部门")
+                new_department_name = st.text_input("新部门名称", key="auth_new_department_name")
+                if st.form_submit_button("创建部门", width="stretch"):
+                    try:
+                        auth_service.create_department_as(current_user, new_department_name)
+                        record_audit(
+                            "create_department",
+                            target_type="department",
+                            target_id=new_department_name,
+                        )
+                        st.success(f"已创建部门: {new_department_name}")
+                        st.rerun()
+                    except Exception as e:
+                        record_audit(
+                            "create_department",
+                            target_type="department",
+                            target_id=new_department_name,
+                            success=False,
+                            error_message=str(e),
+                        )
+                        st.error(f"创建部门失败: {e}")
+
+        with col_user:
+            with st.form("create_user_form"):
+                st.markdown("###### 创建用户")
+                new_username = st.text_input("新用户名", key="auth_new_username")
+                new_password = st.text_input("新用户密码", type="password", key="auth_new_password")
+                new_role = st.selectbox("角色", [ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN], key="auth_new_role")
+                business_departments = [dept for dept in departments if dept.name != "system"]
+                selected_department = "system"
+                if new_role == ROLE_SYSTEM_ADMIN:
+                    st.caption("系统管理员固定归属 system 部门，不挂载业务部门。")
+                    department_id = next((dept.id for dept in departments if dept.name == "system"), None)
+                else:
+                    department_names = [dept.name for dept in business_departments]
+                    selected_department = st.selectbox("部门", department_names, key="auth_new_department")
+                    department_id = next((dept.id for dept in business_departments if dept.name == selected_department), None)
+                if st.form_submit_button("创建用户", width="stretch"):
+                    try:
+                        auth_service.create_user_as(
+                            current_user,
+                            new_username,
+                            new_password,
+                            new_role,
+                            department_id=department_id,
+                        )
+                        record_audit(
+                            "create_user",
+                            target_type="user",
+                            target_id=new_username,
+                            metadata={"role": new_role, "department": selected_department},
+                        )
+                        st.success(f"已创建用户: {new_username}")
+                        st.rerun()
+                    except Exception as e:
+                        record_audit(
+                            "create_user",
+                            target_type="user",
+                            target_id=new_username,
+                            success=False,
+                            error_message=str(e),
+                            metadata={"role": new_role, "department": selected_department},
+                        )
+                        st.error(f"创建用户失败: {e}")
+def render_kb_governance_tab(pipeline):
+    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
+    st.subheader("知识库治理")
+    st.caption("系统管理员用于查看全局资产、归属、授权和异常状态；不展示文档正文。")
+
+    auth_service = init_auth_service()
+    existing_kbs = pipeline.list_all_knowledge_bases_for_admin(ctx=build_request_context(st.session_state)) if pipeline else []
+    if not pipeline:
+        st.warning("RAGFlow 后端未初始化，当前无法读取知识库治理信息。")
+    summaries = auth_service.list_knowledge_base_summaries(existing_kbs)
+    ctx = build_request_context(st.session_state)
+    pipeline_stats = _pipeline_governance_stats(ctx)
+
+    rows = []
+    issue_count = 0
+    for item in summaries:
+        backend_stats = pipeline_stats.get(_kb_identity_stats_key(item.kb_id, item.department_id, item.name))
+        if backend_stats is None:
+            backend_stats = pipeline_stats.get(item.name, {})
+        file_count = backend_stats.get("files", 0)
+        failed_count = backend_stats.get("failed", 0)
+        parsing_count = backend_stats.get("parsing", 0)
+        issues = []
+        if not item.registered:
+            issues.append("未登记")
+        if not item.department_id:
+            issues.append("未分配部门")
+        if item.department_id and item.dept_admin_count == 0:
+            issues.append("无部门管理员")
+        if failed_count:
+            issues.append(f"解析失败 {failed_count}")
+        if item.permission_count == 0:
+            issues.append("未授权")
+        if issues:
+            issue_count += 1
+        rows.append(
+            {
+                "知识库": item.name,
+                "部门": item.department_name or "未分配",
+                "负责人": item.owner_username or "-",
+                "文件数": file_count,
+                "解析中": parsing_count,
+                "失败": failed_count,
+                "授权数": item.permission_count,
+                "登记": "是" if item.registered else "否",
+                "问题": "；".join(issues) if issues else "-",
+            }
+        )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("知识库", len(summaries))
+    c2.metric("异常", issue_count)
+    c3.metric("未分配部门", sum(1 for item in summaries if not item.department_id))
+
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
+    else:
+        st.info("暂无知识库治理数据")
+def render_kb_management_tab(pipeline):
+    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
+    st.subheader("📚 知识库管理")
+    manageable_kbs = get_manageable_kbs(pipeline)
+    can_create_kb = st.session_state.get("role") == ROLE_DEPT_ADMIN
+    upload_types = ["pdf", "doc", "docx", "xls", "xlsx"]
+
+    if not st.session_state.current_kb and not manageable_kbs:
+        st.info("暂无可用知识库，请联系本部门管理员创建或授权。")
+        st.markdown("##### 📁 知识库列表")
+        if can_create_kb and st.button("➕ 新建"):
+            st.session_state.show_create_kb = True
+        if st.session_state.show_create_kb:
+            with st.container(border=True):
+                st.markdown("###### 新建知识库")
+                with st.form("new_kb_form_empty"):
+                    st.text_input("输入新知识库名称", placeholder="例如: project_alpha", key="new_kb_name_input")
+                    st.form_submit_button("确认创建", on_click=create_kb_callback, args=(pipeline,))
+                if st.session_state.get("create_kb_error"):
+                    st.error(st.session_state.create_kb_error)
+                if st.button("取消", key="cancel_create_kb_empty"):
+                    st.session_state.show_create_kb = False
+                    st.session_state.create_kb_error = None
+                    st.rerun()
+        return
+
+    if has_current_kb_permission("write"):
+        with st.container(border=True):
+            st.markdown("##### 📤 当前知识库上传文档")
+            source_group = st.selectbox(
+                "文件类型",
+                USER_SELECTABLE_SOURCE_GROUPS,
+                format_func=lambda group: f"{display_source_group(group)}（{SOURCE_GROUP_DESCRIPTIONS.get(group, '')}）",
+                key="upload_source_group",
+            )
+            files = st.file_uploader("拖拽文件到此处", accept_multiple_files=True, type=upload_types)
+            if files and st.button("开始上传", type="primary"):
+                with st.status("处理中...", expanded=True) as status:
+                    st.write("保存临时文件...")
+                    progress_bar = st.progress(0, text="等待文件处理进度")
+
+                    def update_upload_progress(progress: int, stage: str):
+                        safe_progress = max(0, min(100, int(progress)))
+                        progress_bar.progress(safe_progress, text=stage or f"文件处理进度 {safe_progress}%")
+                        status.update(label=f"文件处理中 {safe_progress}%", state="running", expanded=True)
+
+                    st.write("按文件类型分发到对应处理管道...")
+                    ctx = build_request_context(st.session_state)
+                    result = pipeline.upload_files(
+                        files,
+                        st.session_state.current_kb,
+                        ctx=ctx,
+                        source_group=source_group,
+                        progress_callback=update_upload_progress,
+                    )
+                    result_message = result.to_message()
+                    result_summary = result_message.split("\n")[0] if result_message else ""
+                    upload_ok = result.ok
+                    upload_partial = result.partial
+                    record_audit(
+                        "upload_document",
+                        target_type="document",
+                        target_id=", ".join(f.name for f in files),
+                        kb_name=st.session_state.current_kb,
+                        success=upload_ok or upload_partial,
+                        error_message="" if upload_ok or upload_partial else result_message,
+                        metadata={
+                            "file_count": len(files),
+                            "source_group": source_group,
+                            "result": result_summary,
+                            "full_result": result_message,
+                            "backend": result.backend,
+                        },
+                    )
+                    invalidate_file_cache(st.session_state.current_kb)
+                    _clear_backend_task_cache("kb_mgmt", st.session_state.current_kb, ctx)
+                    progress_bar.progress(100, text="文件处理流程完成")
+                    if upload_ok:
+                        status.update(label="✅ 文件处理流程完成", state="complete", expanded=False)
+                    elif upload_partial:
+                        status.update(label="⚠️ 文件部分处理完成", state="complete", expanded=True)
+                    else:
+                        status.update(label="❌ 文件未处理成功", state="error", expanded=True)
+                if upload_ok:
+                    st.success(result_summary)
+                elif upload_partial:
+                    st.warning(result_summary)
+                    st.text(result_message)
+                else:
+                    st.error(result_summary or "文件处理失败")
+                    if result_message:
+                        st.text(result_message)
+                time.sleep(1)
+                st.rerun()
+        st.divider()
+
+        render_parse_task_panel(pipeline, st.session_state.current_kb, key_prefix="kb_mgmt")
+        st.divider()
+    elif st.session_state.current_kb:
+        st.info("当前账号没有该知识库的内容上传权限。")
+        st.divider()
+
+    st.markdown("##### 📁 知识库列表")
+    col_kbs, col_new = st.columns([9, 1])
+    with col_kbs:
+        st.caption(f"共有 {len(manageable_kbs)} 个知识库")
+    with col_new:
+        if can_create_kb and st.button("➕ 新建"):
+            st.session_state.show_create_kb = True
+
+    if st.session_state.show_create_kb:
+        with st.container(border=True):
+            st.markdown("###### 新建知识库")
+            with st.form("new_kb_form"):
+                st.text_input("输入新知识库名称", placeholder="例如: project_alpha", key="new_kb_name_input")
+                st.form_submit_button("确认创建", on_click=create_kb_callback, args=(pipeline,))
+            if st.session_state.get("create_kb_error"):
+                st.error(st.session_state.create_kb_error)
+            if st.button("取消", key="cancel_create_kb"):
+                st.session_state.show_create_kb = False
+                st.session_state.create_kb_error = None
+                st.rerun()
+
+    if st.session_state.get("role") == ROLE_DEPT_ADMIN and manageable_kbs:
+        with st.expander("🔑 知识库访问授权"):
+            auth_service = init_auth_service()
+            manager = auth_service.get_user_by_username(st.session_state.get("username"))
+            users = auth_service.list_users_for_manager(manager) if manager else []
+            users = [user for user in users if user.role != ROLE_SYSTEM_ADMIN]
+            if st.session_state.get("role") == ROLE_DEPT_ADMIN:
+                users = [user for user in users if user.role == ROLE_USER]
+            if not users:
+                st.info("暂无可授权用户")
+            else:
+                with st.form("grant_kb_permission_form"):
+                    grant_kb = st.selectbox("知识库", manageable_kbs, key="grant_kb_name")
+                    user_labels = [f"{user.username} ({user.role})" for user in users]
+                    selected_user_labels = st.multiselect("用户", user_labels, key="grant_user_labels")
+                    permission = st.selectbox("权限", ["read", "write", "admin"], key="grant_permission")
+                    if st.form_submit_button("授权"):
+                        if not selected_user_labels:
+                            st.warning("请至少选择一个用户。")
+                        else:
+                            selected_users = [
+                                users[user_labels.index(label)]
+                                for label in selected_user_labels
+                            ]
+                            success_users = []
+                            failed_messages = []
+                            for target_user in selected_users:
+                                try:
+                                    auth_service.grant_kb_permission_as(manager, grant_kb, target_user.id, permission)
+                                    record_audit(
+                                        "grant_kb_permission",
+                                        target_type="kb_permission",
+                                        target_id=target_user.username,
+                                        kb_name=grant_kb,
+                                        metadata={"permission": permission, "target_user_id": target_user.id},
+                                    )
+                                    success_users.append(target_user.username)
+                                except Exception as e:
+                                    record_audit(
+                                        "grant_kb_permission",
+                                        target_type="kb_permission",
+                                        target_id=target_user.username,
+                                        kb_name=grant_kb,
+                                        success=False,
+                                        error_message=str(e),
+                                        metadata={"permission": permission, "target_user_id": target_user.id},
+                                    )
+                                    failed_messages.append(f"{target_user.username}: {e}")
+                            if success_users:
+                                st.success(f"已授权 {len(success_users)} 个用户访问 {grant_kb}: {permission}")
+                            if failed_messages:
+                                st.error("授权失败: " + "；".join(failed_messages))
+                            if success_users and not failed_messages:
+                                st.rerun()
+
+    for kb in manageable_kbs:
+        ctx = build_request_context(st.session_state)
+        can_read_kb = ctx.has_kb_permission(kb, "read")
+        can_write_kb = ctx.has_kb_permission(kb, "write")
+        can_admin_kb = ctx.has_kb_permission(kb, "admin")
+        file_infos = get_cached_file_infos(pipeline, kb, ctx) if can_read_kb else []
+        files = ([info.name for info in file_infos] or get_cached_files(pipeline, kb)) if can_read_kb else []
+        file_info_by_id = {info.id: info for info in file_infos}
+        is_current = (kb == st.session_state.current_kb)
+        with st.expander(f"{'🟢' if is_current else '⚪'} {kb} ({len(files)} 文件)", expanded=is_current):
+            if not can_read_kb:
+                st.caption("仅系统管理可见；当前账号没有内容读取权限。")
+            elif files:
+                render_excel_ledger_panel(file_infos, f"mgmt_{kb}")
+                st.markdown("**📄 文件列表:**")
+                container_kwargs = {"border": True}
+                if len(files) > 5:
+                    container_kwargs["height"] = 300
+                selected_doc_id = st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}"))
+                if selected_doc_id not in file_info_by_id and file_info_by_id:
+                    selected_doc_id = None
+                with st.container(**container_kwargs):
+                    rows = file_infos if file_infos else files
+                    for file_index, item in enumerate(rows):
+                        if hasattr(item, "id"):
+                            doc_id = item.id
+                            f = item.name
+                            info = item
+                        else:
+                            doc_id = item
+                            f = item
+                            info = None
+                        c1, c2, c3 = st.columns([0.68, 0.16, 0.16])
+                        with c1:
+                            processor_kind = info.metadata.get("processor_kind", "") if info else ""
+                            if processor_kind == "spreadsheet_table":
+                                local_path = info.metadata.get("local_path", "")
+                                st.markdown(f"📊 {f}  \n`Excel 管道: 已归档` `待结构化解析`")
+                                if local_path:
+                                    st.caption(f"本地归档: {local_path}")
+                                container_warning = format_container_inspection_warning(info.metadata)
+                                if container_warning:
+                                    st.caption(container_warning)
+                            elif info and info.metadata.get("ragflow_document_id"):
+                                status = str(info.metadata.get("status", "unknown")).lower()
+                                status_label, searchability_label = format_ragflow_document_status(status)
+                                dataset_kind = info.metadata.get("dataset_kind", "")
+                                local_path = info.metadata.get("local_path", "")
+                                ragflow_error = info.metadata.get("ragflow_error", "")
+                                ragflow_status_note = info.metadata.get("ragflow_status_note", "")
+                                st.markdown(f"📄 {f}  \n`RAGFlow: {status_label}` `{searchability_label}` `{dataset_kind}`")
+                                if local_path:
+                                    st.caption(f"本地归档: {local_path}")
+                                if status == "cancelled":
+                                    st.caption("解析已停止，当前不会进入检索结果。可删除后重新上传解析。")
+                                if ragflow_error:
+                                    st.caption(f"RAGFlow 错误: {ragflow_error}")
+                                elif ragflow_status_note:
+                                    st.caption("RAGFlow 状态暂不可读，解析任务已提交。")
+                                container_warning = format_container_inspection_warning(info.metadata)
+                                if container_warning:
+                                    st.caption(container_warning)
+                            else:
+                                st.markdown(f"📄 {f}")
+                        with c2:
+                            chunk_label = "收起" if selected_doc_id == doc_id else "分块"
+                            info_status = str(info.metadata.get("status", "")).lower() if info else ""
+                            info_processor = info.metadata.get("processor_kind", "") if info else ""
+                            chunk_disabled = bool(info_processor == "spreadsheet_table" or info_status in {"cancelled", "failed", "uploaded", "parsing"})
+                            chunk_help = "Excel 文件已进入独立表格管道，当前不展示 RAG 分块" if info_processor == "spreadsheet_table" else ("当前文档尚不可检索，没有可展示分块" if chunk_disabled else None)
+                            if st.button(chunk_label, key=f"chunks_f_{kb}_{file_index}", width="stretch", disabled=chunk_disabled, help=chunk_help):
+                                toggle_parse_result_file(f"mgmt_{kb}", doc_id)
+                                st.rerun()
+                        with c3:
+                            current_confirm = st.session_state.confirm_delete_file
+                            is_confirming = (current_confirm == (kb, doc_id))
+                            if not can_write_kb:
+                                st.button("🗑️", key=f"del_f_{kb}_{file_index}", help="无删除权限", disabled=True)
+                            elif is_confirming:
+                                sub_c1, sub_c2 = st.columns([1, 1])
+                                with sub_c1:
+                                    if st.button("✓", key=f"yes_f_{kb}_{file_index}", help="确认删除"):
+                                        with st.spinner("删除中..."):
+                                            ctx = build_request_context(st.session_state)
+                                            res = pipeline.delete_document(doc_id, kb, ctx=ctx)
+                                            delete_ok = not str(res).startswith(("Error:", "系统错误:", "删除失败"))
+                                            record_audit(
+                                                "delete_document",
+                                                target_type="document",
+                                                target_id=f,
+                                                kb_name=kb,
+                                                success=delete_ok,
+                                                error_message="" if delete_ok else str(res),
+                                            )
+                                            invalidate_file_cache(kb)
+                                            st.session_state.confirm_delete_file = None
+                                            if st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}")) == doc_id:
+                                                st.session_state[_selected_parse_result_key(f"mgmt_{kb}")] = None
+                                            if delete_ok:
+                                                st.session_state.toast_msg = f"已删除: {f}"
+                                            else:
+                                                st.session_state.error_msg = str(res)
+                                            st.rerun()
+                                with sub_c2:
+                                    if st.button("✗", key=f"no_f_{kb}_{file_index}", help="取消"):
+                                        st.session_state.confirm_delete_file = None
+                                        st.rerun()
+                            else:
+                                if st.button("🗑️", key=f"del_f_{kb}_{file_index}", help="删除文件"):
+                                    st.session_state.confirm_delete_file = (kb, doc_id)
+                                    st.rerun()
+                if selected_doc_id:
+                    st.divider()
+                    selected_info = file_info_by_id.get(selected_doc_id)
+                    render_parse_result_detail(
+                        pipeline,
+                        kb,
+                        selected_doc_id,
+                        selected_info.name if selected_info else selected_doc_id,
+                    )
+            else:
+                st.caption("暂无文件")
+
+            st.divider()
+            col_switch, col_del = st.columns([1, 1])
+            with col_switch:
+                if not can_read_kb:
+                    st.button("🔄 切换到此知识库", disabled=True, key=f"btn_no_read_{kb}", help="无内容检索权限")
+                elif not is_current:
+                    st.button("🔄 切换到此知识库", key=f"btn_switch_{kb}", on_click=switch_kb_callback, args=(kb,))
+                else:
+                    st.button("✅ 当前使用中", disabled=True, key=f"btn_cur_{kb}")
+            with col_del:
+                if not can_admin_kb:
+                    st.button("🗑️ 删除整个库", disabled=True, key=f"del_kb_disabled_{kb}", help="无知识库 admin 权限")
+                elif st.session_state.confirm_delete_kb == kb:
+                    st.markdown("**确认删除?**")
+                    sub_c1, sub_c2 = st.columns([1, 1])
+                    with sub_c1:
+                        st.button("✅ 是", key=f"yes_kb_{kb}", on_click=delete_kb_confirmed, args=(pipeline, kb))
+                    with sub_c2:
+                        if st.button("❌ 否", key=f"no_kb_{kb}"):
+                            st.session_state.confirm_delete_kb = None
+                            st.rerun()
+                else:
+                    if st.button("🗑️ 删除整个库", key=f"del_kb_{kb}"):
+                        st.session_state.confirm_delete_kb = kb
+                        st.rerun()
 
 
-# ==================== 主界面 ====================
 def main():
     init_session_state()
     refresh_auth_state()
@@ -1546,7 +2630,7 @@ def main():
         render_login_page()
         return
 
-    pipeline, error = init_pipeline()
+    pipeline, pipeline_error = init_pipeline()
 
     if st.session_state.toast_msg:
         st.toast(st.session_state.toast_msg)
@@ -1557,27 +2641,21 @@ def main():
         st.error(st.session_state.error_msg)
         st.session_state.error_msg = None
 
-    if error:
-        st.error(f"❌ 系统初始化失败: {error}")
+    if pipeline_error:
+        st.error(f"❌ 系统初始化失败: {pipeline_error}")
     elif pipeline:
         ctx = build_request_context(st.session_state)
-        st.session_state.kb_list = pipeline.list_knowledge_bases(ctx=ctx)
+        refresh_kb_list(pipeline)
         if st.session_state.kb_list and st.session_state.current_kb not in st.session_state.kb_list:
-            st.session_state.current_kb = st.session_state.kb_list[0]
+            set_current_kb(st.session_state.kb_list[0])
         elif not st.session_state.kb_list:
-            st.session_state.current_kb = None
+            set_current_kb(None)
 
     # ------------------ 顶部栏 (应用更稳健的 CSS Sticky 效果) ------------------
     with st.container():
-        if config.settings.RAG_BACKEND == "local":
-            status = resource_manager.get_status()
-            model_ok = status.get("models_initialized")
-            backend_ok = status.get("chroma_connected")
-            backend_label = "向量库"
-        else:
-            model_ok = True
-            backend_ok = pipeline is not None
-            backend_label = "RAGFlow"
+        model_ok = True
+        backend_ok = pipeline is not None
+        backend_label = "RAGFlow"
         st.markdown(f"""
             <style>
                 div[data-testid="stVerticalBlock"] > div:has(.app-header-shell) {{
@@ -1662,60 +2740,47 @@ def main():
             if role != ROLE_SYSTEM_ADMIN:
                 st.error("当前账号无权访问系统配置")
                 st.stop()
-            _provider = config.settings.PROVIDER.value if isinstance(config.settings.PROVIDER, config.settings.Provider) else str(config.settings.PROVIDER)
+            provider_value = (
+                config.settings.AGENT_LLM_PROVIDER.value
+                if isinstance(config.settings.AGENT_LLM_PROVIDER, config.settings.Provider)
+                else str(config.settings.AGENT_LLM_PROVIDER)
+            )
             st.markdown("**📍 当前模型配置:**")
-            st.markdown(f"- **Provider:** `{_provider}`")
-
-            if _provider == "ollama":
-                st.markdown(f"- **LLM:** `{config.settings.OLLAMA_LLM_MODEL}`")
+            st.markdown(f"- **Provider:** `{provider_value}`")
+            if provider_value == "ollama":
+                st.markdown(f"- **LLM:** `{config.settings.AGENT_OLLAMA_MODEL}`")
             else:
-                st.markdown(f"- **LLM:** `{config.settings.CUSTOM_LLM_MODEL}`")
-                st.markdown(f"- **Base URL:** `{config.settings.CUSTOM_BASE_URL}`")
+                st.markdown(f"- **LLM:** `{config.settings.AGENT_CUSTOM_MODEL}`")
+                st.markdown(f"- **Base URL:** `{config.settings.AGENT_CUSTOM_BASE_URL}`")
 
             st.divider()
             st.markdown("**📍 当前 RAG 后端:**")
-            st.markdown(f"- **Backend:** `{config.settings.RAG_BACKEND}`")
-            if config.settings.RAG_BACKEND == "local":
-                st.caption("Local 仅作为本地兜底/调试后端。")
-                if _provider == "ollama" or config.settings.USE_OLLAMA_EMBEDDING:
-                    st.markdown(f"- **Embedding:** Ollama (`{config.settings.OLLAMA_EMBEDDING_MODEL}`)")
-                else:
-                    st.markdown(f"- **Embedding:** `{config.settings.CUSTOM_EMBEDDING_MODEL}`")
-                _reranker = config.settings.RERANKER_TYPE.value if isinstance(config.settings.RERANKER_TYPE, config.settings.RerankerType) else str(config.settings.RERANKER_TYPE)
-                st.markdown(f"- **Reranker:** `{_reranker}`")
-                st.markdown(f"- **Chunk Size:** {config.settings.CHUNK_SIZE}")
-                st.markdown(f"- **Chunk Overlap:** {config.settings.CHUNK_OVERLAP}")
-                st.markdown(f"- **Vector Top-K:** {config.settings.VECTOR_TOP_K}")
-                st.markdown(f"- **BM25 Top-K:** {config.settings.BM25_TOP_K}")
-                st.markdown(f"- **Final Top-K:** {config.settings.FINAL_TOP_K}")
-                st.markdown(f"- **RRF K:** {config.settings.RRF_K}")
-            else:
-                st.caption("RAGFlow 是正式解析、索引、检索主线。")
-                st.markdown(f"- **Base URL:** `{config.settings.RAGFLOW_BASE_URL}`")
-                st.markdown(f"- **Governance Dataset:** `{config.settings.RAGFLOW_GOVERNANCE_DATASET_NAME}`")
-                st.markdown(f"- **Design Dataset:** `{config.settings.RAGFLOW_DESIGN_DATASET_NAME}`")
-                st.markdown(f"- **Similarity:** {config.settings.RAGFLOW_SIMILARITY_THRESHOLD}")
-                st.markdown(f"- **Vector Weight:** {config.settings.RAGFLOW_VECTOR_WEIGHT}")
+            st.markdown("- **Backend:** `ragflow`")
+            st.caption("RAGFlow 是正式解析、索引、检索主线。")
+            st.markdown(f"- **Base URL:** `{config.settings.RAGFLOW_BASE_URL}`")
+            st.markdown(f"- **Governance Dataset:** `{config.settings.RAGFLOW_GOVERNANCE_DATASET_NAME}`")
+            st.markdown(f"- **Design Dataset:** `{config.settings.RAGFLOW_DESIGN_DATASET_NAME}`")
+            st.markdown(f"- **Similarity:** {config.settings.RAGFLOW_SIMILARITY_THRESHOLD}")
+            st.markdown(f"- **Vector Weight:** {config.settings.RAGFLOW_VECTOR_WEIGHT}")
         elif selected_tab in {"💬 智能对话", "📚 知识库管理"}:
-            # 其他页面需要 pipeline
-            if not pipeline:
+            if pipeline is None:
                 st.warning("⚠️ 系统未初始化，请先在 ⚙️ 系统配置 中检查并修复配置")
                 st.stop()
 
             st.markdown(f"**📍 当前对话挂载知识库:**")
             if not st.session_state.kb_list:
-                st.session_state.current_kb = None
+                set_current_kb(None)
                 if "kb_selector" in st.session_state:
                     del st.session_state["kb_selector"]
                 st.info("暂无可用知识库，请先创建知识库或联系管理员授权。")
             else:
                 if st.session_state.current_kb not in st.session_state.kb_list:
-                    st.session_state.current_kb = st.session_state.kb_list[0]
+                    set_current_kb(st.session_state.kb_list[0])
                 if st.session_state.get("kb_selector") not in st.session_state.kb_list:
                     st.session_state.kb_selector = st.session_state.current_kb
                 selected_kb = st.selectbox("切换知识库", options=st.session_state.kb_list, key="kb_selector")
                 if selected_kb != st.session_state.current_kb:
-                    st.session_state.current_kb = selected_kb
+                    set_current_kb(selected_kb)
                     reset_chat_state()
                     st.session_state.confirm_delete_file = None
                     st.rerun()
@@ -1728,7 +2793,7 @@ def main():
 
             if selected_tab == "💬 智能对话":
                 if not has_current_kb_permission("read"):
-                    st.info("当前账号只有系统管理权限，没有该知识库的内容检索权限。")
+                    st.info("当前账号没有该知识库的内容检索权限。")
                 else:
                     ensure_current_chat_session()
                     if st.button("➕ 新建对话", width="stretch", type="secondary"):
@@ -1831,6 +2896,11 @@ def main():
         st.caption("© 2025 Hardware DataBase Assistant")
 
     # ------------------ 页面内容分发 ------------------
+    if pipeline is None:
+        st.error(f"应用后端未初始化: {pipeline_error}")
+        st.info("请先进入系统配置检查 RAGFlow 与 Agent 模型配置。")
+        return
+
     if selected_tab == "💬 智能对话":
         if st.session_state.get("role") == ROLE_SYSTEM_ADMIN:
             st.error("系统管理员不使用知识库对话，请使用测试部门管理员账号进行功能测试。")
@@ -1861,972 +2931,6 @@ def main():
             st.error("当前账号无权访问系统配置")
             st.stop()
         render_settings_tab()
-
-
-# ==================== Tab 1: 对话界面 ====================
-def render_chat_tab(pipeline):
-    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
-    if not st.session_state.current_kb:
-        st.info("暂无可用知识库，请先创建知识库或联系管理员授权。")
-        return
-    ensure_current_chat_session()
-
-    # 1. 渲染历史消息
-    if not st.session_state.messages:
-        st.markdown("""
-            <div style='text-align:center; color:#888; padding-top:180px;'>
-                <h3 style="margin-top:100px;">🙌 硬件数据检索助手</h3>
-                <p>请问有什么可以帮您？</p>
-            </div>
-        """, unsafe_allow_html=True)
-    else:
-        for msg in st.session_state.messages:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "user":
-                safe_content = html.escape(content).replace("\n", "<br>")
-                st.markdown(f"""
-                    <div class="user-chat-container">
-                        <div class="user-bubble">{safe_content}</div>
-                        <div class="user-avatar">🧑</div>
-                    </div>
-                """, unsafe_allow_html=True)
-            else:
-                with st.chat_message("assistant", avatar="😽"):
-                    # 检查是否是错误消息
-                    if content.startswith("Error:") or content == "Empty response.":
-                        st.error(content)
-                    else:
-                        # ==================== 核心修复开始 ====================
-                        separator = "**🔍 检索到的上下文:**"
-
-                        main_text = content
-
-                        if separator in content:
-                            try:
-                                parts = content.split(separator, 1)
-                                if len(parts) == 2:
-                                    main_text = parts[0]
-                                    source_text = parts[1]
-
-                                    st.markdown(main_text.strip())
-                                    with st.expander("📚 参考来源"):
-                                        st.markdown(source_text.strip())
-                                else:
-                                    st.markdown(content)
-                            except ValueError:
-                                st.markdown(content)
-                        else:
-                            st.markdown(content)
-
-    # 2. 检查并处理新的流式响应
-    if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-        user_input_to_process = st.session_state.messages[-1]["content"]
-        query_started_at = time.perf_counter()
-
-        chat_history = []
-        messages_for_history = st.session_state.messages[:-1]
-        user_msg = None
-        for msg in messages_for_history:
-            if msg["role"] == "user":
-                user_msg = msg["content"]
-            elif msg["role"] == "assistant" and user_msg is not None:
-                chat_history.append((user_msg, msg["content"]))
-                user_msg = None
-
-        with st.chat_message("assistant", avatar="😽"):
-            error_occured = None
-            try:
-                ctx = build_request_context(st.session_state)
-                gen = pipeline.query(user_input_to_process, st.session_state.current_kb, chat_history[-5:], ctx=ctx)
-            except Exception as e:
-                error_occured = str(e)
-
-            if error_occured:
-                st.error(f"❌ 处理请求时发生错误: {error_occured}")
-                full_response = f"Error: {error_occured}"
-            else:
-                status = st.status("正在检索相关文档...", expanded=False)
-                has_started_answer = False
-
-                def stream_with_status():
-                    nonlocal has_started_answer
-                    for chunk in gen:
-                        if not has_started_answer:
-                            status.update(label="正在生成回答...", state="running", expanded=False)
-                            has_started_answer = True
-                        yield chunk
-
-                full_response = st.write_stream(stream_with_status())
-                status.update(label="回答生成完毕", state="complete", expanded=False)
-                if isinstance(full_response, list):
-                    full_response = "".join(str(item) for item in full_response)
-                if not full_response or not full_response.strip():
-                    st.warning("⚠️ AI 未生成任何内容。")
-                    full_response = "Empty response."
-
-        # 将最终结果存入历史记录并刷新
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
-        assistant_message = persist_chat_message("assistant", full_response)
-        latency_ms = int((time.perf_counter() - query_started_at) * 1000)
-        init_log_service().record_query_trace(
-            user=current_auth_user(),
-            kb_name=st.session_state.current_kb,
-            original_query=user_input_to_process,
-            chat_session_id=st.session_state.get("chat_session_id"),
-            user_message_id=st.session_state.get("pending_user_message_id"),
-            assistant_message_id=assistant_message.id if assistant_message else None,
-            backend=config.settings.RAG_BACKEND,
-            latency_ms=latency_ms,
-            status="failed" if full_response.startswith("Error:") else "success",
-            error_message=full_response if full_response.startswith("Error:") else "",
-            metadata=build_query_log_metadata(),
-        )
-        st.session_state.pending_user_message_id = None
-        st.rerun()
-
-    # --- 原生聊天输入框 ---
-    if prompt := st.chat_input("请输入问题..."):
-        ensure_current_chat_session()
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        user_message = persist_chat_message("user", prompt)
-        st.session_state.pending_user_message_id = user_message.id if user_message else None
-        st.rerun()
-
-
-def render_department_management_tab():
-    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
-    st.subheader("👥 部门管理")
-
-    auth_service = init_auth_service()
-    current_user = current_auth_user()
-    if current_user is None:
-        st.error("无法获取当前用户")
-        return
-
-    if current_user.role == ROLE_DEPT_ADMIN:
-        users = [
-            user for user in auth_service.list_users_for_manager(current_user)
-            if user.role == ROLE_USER
-        ]
-        st.caption(f"当前部门: {current_user.department_name or '-'}")
-        st.markdown("##### 本部门用户")
-        if not users:
-            st.info("本部门暂无普通用户")
-        else:
-            for user in users:
-                c1, c2, c3, c4 = st.columns([1.6, 0.8, 0.8, 1.2])
-                with c1:
-                    st.markdown(f"`{user.username}`")
-                with c2:
-                    st.caption("启用" if user.is_active else "停用")
-                with c3:
-                    next_active = not user.is_active
-                    button_label = "启用" if next_active else "停用"
-                    if st.button(button_label, key=f"dept_user_toggle_{user.id}", width="stretch"):
-                        try:
-                            auth_service.set_user_active(user.id, next_active)
-                            record_audit(
-                                "set_user_active",
-                                target_type="user",
-                                target_id=user.username,
-                                metadata={"is_active": next_active, "scope": "department"},
-                            )
-                            st.success(f"已{button_label}: {user.username}")
-                            st.rerun()
-                        except Exception as e:
-                            record_audit(
-                                "set_user_active",
-                                target_type="user",
-                                target_id=user.username,
-                                success=False,
-                                error_message=str(e),
-                                metadata={"is_active": next_active, "scope": "department"},
-                            )
-                            st.error(f"操作失败: {e}")
-                with c4:
-                    with st.popover("重置密码", use_container_width=True):
-                        new_password = st.text_input(
-                            "新密码",
-                            type="password",
-                            key=f"dept_reset_pwd_{user.id}",
-                        )
-                        if st.button("确认重置", key=f"dept_reset_pwd_btn_{user.id}", use_container_width=True):
-                            try:
-                                auth_service.reset_user_password_as(current_user, user.id, new_password)
-                                record_audit(
-                                    "reset_user_password",
-                                    target_type="user",
-                                    target_id=user.username,
-                                    metadata={"scope": "department"},
-                                )
-                                st.success(f"已重置密码: {user.username}")
-                                st.rerun()
-                            except Exception as e:
-                                record_audit(
-                                    "reset_user_password",
-                                    target_type="user",
-                                    target_id=user.username,
-                                    success=False,
-                                    error_message=str(e),
-                                    metadata={"scope": "department"},
-                                )
-                                st.error(f"重置失败: {e}")
-
-        st.divider()
-        with st.form("dept_create_user_form"):
-            st.markdown("##### 创建普通用户")
-            new_username = st.text_input("用户名", key="dept_auth_new_username")
-            new_password = st.text_input("密码", type="password", key="dept_auth_new_password")
-            if st.form_submit_button("创建用户", width="stretch"):
-                try:
-                    auth_service.create_user_as(
-                        current_user,
-                        new_username,
-                        new_password,
-                        ROLE_USER,
-                        department_id=current_user.department_id,
-                    )
-                    record_audit(
-                        "create_user",
-                        target_type="user",
-                        target_id=new_username,
-                        metadata={"role": ROLE_USER, "scope": "department"},
-                    )
-                    st.success(f"已创建普通用户: {new_username}")
-                    st.rerun()
-                except Exception as e:
-                    record_audit(
-                        "create_user",
-                        target_type="user",
-                        target_id=new_username,
-                        success=False,
-                        error_message=str(e),
-                        metadata={"role": ROLE_USER, "scope": "department"},
-                    )
-                    st.error(f"创建用户失败: {e}")
-        return
-
-    if current_user.role == ROLE_SYSTEM_ADMIN:
-        render_system_department_management(current_user)
-
-
-def render_system_department_management(current_user):
-    auth_service = init_auth_service()
-    users = auth_service.list_users()
-    departments = auth_service.list_departments()
-
-    user_tab, dept_tab, create_tab = st.tabs(["用户列表", "部门列表", "创建"])
-    with user_tab:
-        st.caption(f"当前用户数: {len(users)}")
-        grouped_users = {}
-        for user in users:
-            dept_name = user.department_name or "未分配"
-            grouped_users.setdefault(dept_name, []).append(user)
-
-        for dept_name, dept_users in grouped_users.items():
-            active_count = sum(1 for user in dept_users if user.is_active)
-            with st.expander(f"{dept_name} · {len(dept_users)} 人 · 启用 {active_count}", expanded=False):
-                for user in dept_users:
-                    c1, c2, c3, c4, c5 = st.columns([1.4, 1.0, 0.7, 0.8, 1.1])
-                    with c1:
-                        st.markdown(f"`{user.username}`")
-                    with c2:
-                        st.caption(user.role)
-                    with c3:
-                        st.caption("启用" if user.is_active else "停用")
-                    with c4:
-                        if user.id == st.session_state.get("user_id"):
-                            st.button("当前账号", key=f"user_self_{user.id}", disabled=True, width="stretch")
-                        else:
-                            next_active = not user.is_active
-                            button_label = "启用" if next_active else "停用"
-                            if st.button(button_label, key=f"user_toggle_{user.id}", width="stretch"):
-                                try:
-                                    auth_service.set_user_active(user.id, next_active)
-                                    record_audit(
-                                        "set_user_active",
-                                        target_type="user",
-                                        target_id=user.username,
-                                        metadata={"is_active": next_active},
-                                    )
-                                    st.success(f"已{button_label}: {user.username}")
-                                    st.rerun()
-                                except Exception as e:
-                                    record_audit(
-                                        "set_user_active",
-                                        target_type="user",
-                                        target_id=user.username,
-                                        success=False,
-                                        error_message=str(e),
-                                        metadata={"is_active": next_active},
-                                )
-                                    st.error(f"操作失败: {e}")
-                    with c5:
-                        if user.id == st.session_state.get("user_id"):
-                            st.button("重置密码", key=f"reset_self_{user.id}", disabled=True, width="stretch")
-                        else:
-                            with st.popover("重置密码", use_container_width=True):
-                                new_password = st.text_input(
-                                    "新密码",
-                                    type="password",
-                                    key=f"sys_reset_pwd_{user.id}",
-                                )
-                                if st.button("确认重置", key=f"sys_reset_pwd_btn_{user.id}", use_container_width=True):
-                                    try:
-                                        auth_service.reset_user_password_as(current_user, user.id, new_password)
-                                        record_audit(
-                                            "reset_user_password",
-                                            target_type="user",
-                                            target_id=user.username,
-                                            metadata={"role": user.role},
-                                        )
-                                        st.success(f"已重置密码: {user.username}")
-                                        st.rerun()
-                                    except Exception as e:
-                                        record_audit(
-                                            "reset_user_password",
-                                            target_type="user",
-                                            target_id=user.username,
-                                            success=False,
-                                            error_message=str(e),
-                                            metadata={"role": user.role},
-                                        )
-                                        st.error(f"重置失败: {e}")
-
-    with dept_tab:
-        st.caption(f"当前部门数: {len(departments)}")
-        for dept in departments:
-            c1, c2, c3 = st.columns([0.8, 2.4, 0.9])
-            with c1:
-                st.caption(str(dept.id))
-            with c2:
-                st.markdown(f"`{dept.name}`")
-            with c3:
-                if dept.name == "system":
-                    st.button("受保护", key=f"dept_system_{dept.id}", disabled=True, width="stretch")
-                else:
-                    if st.button("删除", key=f"dept_delete_{dept.id}", width="stretch"):
-                        try:
-                            auth_service.delete_department(dept.id)
-                            record_audit(
-                                "delete_department",
-                                target_type="department",
-                                target_id=dept.name,
-                            )
-                            st.success(f"已删除部门: {dept.name}")
-                            st.rerun()
-                        except Exception as e:
-                            record_audit(
-                                "delete_department",
-                                target_type="department",
-                                target_id=dept.name,
-                                success=False,
-                                error_message=str(e),
-                            )
-                            st.error(f"删除部门失败: {e}")
-
-    with create_tab:
-        col_dept, col_user = st.columns(2)
-        with col_dept:
-            with st.form("create_department_form"):
-                st.markdown("###### 创建部门")
-                new_department_name = st.text_input("新部门名称", key="auth_new_department_name")
-                if st.form_submit_button("创建部门", width="stretch"):
-                    try:
-                        auth_service.create_department(new_department_name)
-                        record_audit(
-                            "create_department",
-                            target_type="department",
-                            target_id=new_department_name,
-                        )
-                        st.success(f"已创建部门: {new_department_name}")
-                        st.rerun()
-                    except Exception as e:
-                        record_audit(
-                            "create_department",
-                            target_type="department",
-                            target_id=new_department_name,
-                            success=False,
-                            error_message=str(e),
-                        )
-                        st.error(f"创建部门失败: {e}")
-
-        with col_user:
-            with st.form("create_user_form"):
-                st.markdown("###### 创建用户")
-                new_username = st.text_input("新用户名", key="auth_new_username")
-                new_password = st.text_input("新用户密码", type="password", key="auth_new_password")
-                new_role = st.selectbox("角色", [ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN], key="auth_new_role")
-                business_departments = [dept for dept in departments if dept.name != "system"]
-                selected_department = "system"
-                if new_role == ROLE_SYSTEM_ADMIN:
-                    st.caption("系统管理员固定归属 system 部门，不挂载业务部门。")
-                    department_id = next((dept.id for dept in departments if dept.name == "system"), None)
-                else:
-                    department_names = [dept.name for dept in business_departments]
-                    selected_department = st.selectbox("部门", department_names, key="auth_new_department")
-                    department_id = next((dept.id for dept in business_departments if dept.name == selected_department), None)
-                if st.form_submit_button("创建用户", width="stretch"):
-                    try:
-                        auth_service.create_user_as(
-                            current_user,
-                            new_username,
-                            new_password,
-                            new_role,
-                            department_id=department_id,
-                        )
-                        record_audit(
-                            "create_user",
-                            target_type="user",
-                            target_id=new_username,
-                            metadata={"role": new_role, "department": selected_department},
-                        )
-                        st.success(f"已创建用户: {new_username}")
-                        st.rerun()
-                    except Exception as e:
-                        record_audit(
-                            "create_user",
-                            target_type="user",
-                            target_id=new_username,
-                            success=False,
-                            error_message=str(e),
-                            metadata={"role": new_role, "department": selected_department},
-                        )
-                        st.error(f"创建用户失败: {e}")
-
-
-def _count_local_kb_files(kb_name: str) -> int:
-    from src.ingestion.kb_paths import get_kb_data_path
-
-    path = get_kb_data_path(kb_name)
-    if not os.path.exists(path):
-        return 0
-    total = 0
-    for _, _, files in os.walk(path):
-        total += len(files)
-    return total
-
-
-def _ragflow_governance_stats() -> dict[str, dict[str, int]]:
-    if config.settings.RAG_BACKEND != "ragflow":
-        return {}
-    try:
-        from src.rag_backends.ragflow_store import RAGFlowStore
-
-        store = RAGFlowStore()
-        stats = {}
-        with store._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                    kb_name,
-                    COUNT(*) AS files,
-                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN status = 'parsing' THEN 1 ELSE 0 END) AS parsing
-                FROM ragflow_documents
-                GROUP BY kb_name
-                """
-            ).fetchall()
-        for row in rows:
-            stats[row["kb_name"]] = {
-                "files": int(row["files"] or 0),
-                "failed": int(row["failed"] or 0),
-                "parsing": int(row["parsing"] or 0),
-            }
-        return stats
-    except Exception as exc:
-        st.caption(f"RAGFlow 台账读取失败: {exc}")
-        return {}
-
-
-def render_kb_governance_tab(pipeline):
-    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
-    st.subheader("🧭 知识库治理")
-    st.caption("系统管理员用于查看全局资产、归属、授权和异常状态；不展示文档正文，不提供对话入口。")
-
-    auth_service = init_auth_service()
-    current_user = current_auth_user()
-    if pipeline:
-        existing_kbs = pipeline.list_all_knowledge_bases_for_admin(ctx=build_request_context(st.session_state))
-    else:
-        existing_kbs = list_physical_knowledge_bases()
-        st.warning("RAG 后端未初始化，当前仅展示本地目录和权限数据库中的治理信息。")
-    summaries = auth_service.list_knowledge_base_summaries(existing_kbs)
-    ragflow_stats = _ragflow_governance_stats()
-
-    rows = []
-    issue_count = 0
-    for item in summaries:
-        local_files = 0 if config.settings.RAG_BACKEND == "ragflow" else _count_local_kb_files(item.name)
-        backend_stats = ragflow_stats.get(item.name, {})
-        file_count = backend_stats.get("files", local_files)
-        failed_count = backend_stats.get("failed", 0)
-        parsing_count = backend_stats.get("parsing", 0)
-        issues = []
-        if not item.registered:
-            issues.append("未登记")
-        if config.settings.RAG_BACKEND != "ragflow" and not item.physical_exists:
-            issues.append("目录缺失")
-        if not item.department_id:
-            issues.append("未分配部门")
-        if item.department_id and item.dept_admin_count == 0:
-            issues.append("无部门管理员")
-        if failed_count:
-            issues.append(f"解析失败 {failed_count}")
-        if item.permission_count == 0:
-            issues.append("未授权")
-        if issues:
-            issue_count += 1
-        rows.append(
-            {
-                "知识库": item.name,
-                "部门": item.department_name or "未分配",
-                "负责人": item.owner_username or "-",
-                "文件数": file_count,
-                "解析中": parsing_count,
-                "失败数": failed_count,
-                "授权人数": item.permission_count,
-                "登记": "是" if item.registered else "否",
-                "状态": "；".join(issues) if issues else "正常",
-            }
-        )
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("知识库总数", len(summaries))
-    c2.metric("异常知识库", issue_count)
-    c3.metric("未分配部门", sum(1 for item in summaries if not item.department_id))
-    c4.metric("解析失败文件", sum(row["失败数"] for row in rows))
-
-    st.markdown("##### 全局知识库台账")
-    if not rows:
-        st.info("当前没有知识库。")
-    else:
-        st.dataframe(rows, width="stretch", hide_index=True)
-
-    st.divider()
-    st.markdown("##### 知识库归属与授权")
-    if not summaries:
-        return
-
-    selected_kb = st.selectbox("选择知识库", [item.name for item in summaries], key="governance_kb_select")
-    selected_summary = next(item for item in summaries if item.name == selected_kb)
-    departments = [dept for dept in auth_service.list_departments() if dept.name != "system"]
-    dept_admins = [user for user in auth_service.list_users() if user.role == ROLE_DEPT_ADMIN and user.is_active]
-    permissions = auth_service.list_knowledge_base_permissions(selected_kb)
-
-    detail_col, assign_col = st.columns([1.2, 1])
-    with detail_col:
-        st.markdown("###### 当前状态")
-        st.write(f"部门: `{selected_summary.department_name or '未分配'}`")
-        st.write(f"负责人: `{selected_summary.owner_username or '-'}`")
-        st.write(f"授权人数: `{selected_summary.permission_count}`")
-        if permissions:
-            st.dataframe(
-                [
-                    {
-                        "用户": item.username,
-                        "角色": item.role,
-                        "部门": item.department_name or "-",
-                        "权限": item.permission,
-                    }
-                    for item in permissions
-                ],
-                width="stretch",
-                hide_index=True,
-            )
-        else:
-            st.caption("暂无内容访问授权。")
-
-    with assign_col:
-        st.markdown("###### 分配归属")
-        if not departments:
-            st.info("请先在部门管理中创建业务部门。")
-        else:
-            current_dept_index = next(
-                (idx for idx, dept in enumerate(departments) if dept.id == selected_summary.department_id),
-                0,
-            )
-            department = st.selectbox(
-                "所属部门",
-                departments,
-                index=current_dept_index,
-                format_func=lambda dept: dept.name,
-                key="governance_department_select",
-            )
-            owner_options = [user for user in dept_admins if user.department_id == department.id]
-            owner = None
-            if owner_options:
-                current_owner_index = next(
-                    (idx for idx, user in enumerate(owner_options) if user.id == selected_summary.owner_user_id),
-                    0,
-                )
-                owner = st.selectbox(
-                    "部门负责人",
-                    owner_options,
-                    index=current_owner_index,
-                    format_func=lambda user: user.username,
-                    key="governance_owner_select",
-                )
-            else:
-                st.warning("该部门还没有启用的部门管理员。")
-
-            if st.button("保存归属", type="primary", width="stretch", disabled=owner is None):
-                try:
-                    auth_service.assign_knowledge_base_as(current_user, selected_kb, department.id, owner.id if owner else None)
-                    record_audit(
-                        "assign_knowledge_base",
-                        target_type="knowledge_base",
-                        target_id=selected_kb,
-                        kb_name=selected_kb,
-                        metadata={"department": department.name, "owner": owner.username if owner else ""},
-                    )
-                    st.success("知识库归属已更新。")
-                    st.rerun()
-                except Exception as exc:
-                    record_audit(
-                        "assign_knowledge_base",
-                        target_type="knowledge_base",
-                        target_id=selected_kb,
-                        kb_name=selected_kb,
-                        success=False,
-                        error_message=str(exc),
-                    )
-                    st.error(f"保存失败: {exc}")
-
-
-# ==================== Tab 2: 管理界面 ====================
-def render_kb_management_tab(pipeline):
-    st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
-    st.subheader("📚 知识库管理")
-    manageable_kbs = get_manageable_kbs(pipeline)
-    can_create_kb = st.session_state.get("role") == ROLE_DEPT_ADMIN
-    upload_types = ["pdf", "doc", "docx", "xls", "xlsx"]
-
-    if not st.session_state.current_kb and not manageable_kbs:
-        st.info("暂无可用知识库，请联系本部门管理员创建或授权。")
-        st.markdown("##### 📁 知识库列表")
-        if can_create_kb and st.button("➕ 新建"):
-            st.session_state.show_create_kb = True
-        if st.session_state.show_create_kb:
-            with st.container(border=True):
-                st.markdown("###### 新建知识库")
-                with st.form("new_kb_form_empty"):
-                    st.text_input("输入新知识库名称", placeholder="例如: project_alpha", key="new_kb_name_input")
-                    st.form_submit_button("确认创建", on_click=create_kb_callback, args=(pipeline,))
-                if st.session_state.get("create_kb_error"):
-                    st.error(st.session_state.create_kb_error)
-                if st.button("取消", key="cancel_create_kb_empty"):
-                    st.session_state.show_create_kb = False
-                    st.session_state.create_kb_error = None
-                    st.rerun()
-        return
-
-    if has_current_kb_permission("write"):
-        with st.container(border=True):
-            st.markdown("##### 📤 当前知识库上传文档")
-            source_group = st.selectbox(
-                "文件类型",
-                USER_SELECTABLE_SOURCE_GROUPS,
-                format_func=lambda group: f"{display_source_group(group)}（{SOURCE_GROUP_DESCRIPTIONS.get(group, '')}）",
-                key="upload_source_group",
-            )
-            files = st.file_uploader("拖拽文件到此处", accept_multiple_files=True, type=upload_types)
-            if files and st.button("开始上传", type="primary"):
-                with st.status("处理中...", expanded=True) as status:
-                    st.write("保存临时文件...")
-                    temp_paths = []
-                    temp_dir = tempfile.gettempdir()
-                    for f in files:
-                        path = os.path.join(temp_dir, f.name)
-                        with open(path, "wb") as wb:
-                            wb.write(f.getbuffer())
-                        temp_paths.append(path)
-                    progress_bar = st.progress(0, text="等待文件处理进度")
-
-                    def update_upload_progress(progress: int, stage: str):
-                        safe_progress = max(0, min(100, int(progress)))
-                        progress_bar.progress(safe_progress, text=stage or f"文件处理进度 {safe_progress}%")
-                        status.update(label=f"文件处理中 {safe_progress}%", state="running", expanded=True)
-
-                    st.write("按文件类型分发到对应处理管道...")
-                    ctx = build_request_context(st.session_state)
-                    res = pipeline.upload_files(
-                        temp_paths,
-                        st.session_state.current_kb,
-                        ctx=ctx,
-                        source_group=source_group,
-                        progress_callback=update_upload_progress,
-                    )
-                    result_summary = res.split("\n")[0] if res else ""
-                    upload_ok = result_summary.startswith("全部处理成功")
-                    upload_partial = result_summary.startswith("部分处理完成")
-                    record_audit(
-                        "upload_document",
-                        target_type="document",
-                        target_id=", ".join(f.name for f in files),
-                        kb_name=st.session_state.current_kb,
-                        success=upload_ok or upload_partial,
-                        error_message="" if upload_ok or upload_partial else res,
-                        metadata={
-                            "file_count": len(files),
-                            "source_group": source_group,
-                            "result": result_summary,
-                            "full_result": res,
-                        },
-                    )
-                    for p in temp_paths:
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
-                    invalidate_file_cache(st.session_state.current_kb)
-                    progress_bar.progress(100, text="文件处理流程完成")
-                    if upload_ok:
-                        status.update(label="✅ 文件处理流程完成", state="complete", expanded=False)
-                    elif upload_partial:
-                        status.update(label="⚠️ 文件部分处理完成", state="complete", expanded=True)
-                    else:
-                        status.update(label="❌ 文件未处理成功", state="error", expanded=True)
-                if upload_ok:
-                    st.success(result_summary)
-                elif upload_partial:
-                    st.warning(result_summary)
-                    st.text(res)
-                else:
-                    st.error(result_summary or "文件处理失败")
-                    if res:
-                        st.text(res)
-                time.sleep(1)
-                st.rerun()
-        st.divider()
-
-        render_parse_task_panel(pipeline, st.session_state.current_kb, key_prefix="kb_mgmt")
-        st.divider()
-    elif st.session_state.current_kb:
-        st.info("当前账号没有该知识库的内容上传权限。")
-        st.divider()
-
-    st.markdown("##### 📁 知识库列表")
-    col_kbs, col_new = st.columns([9, 1])
-    with col_kbs:
-        st.caption(f"共有 {len(manageable_kbs)} 个知识库")
-    with col_new:
-        if can_create_kb and st.button("➕ 新建"):
-            st.session_state.show_create_kb = True
-
-    if st.session_state.show_create_kb:
-        with st.container(border=True):
-            st.markdown("###### 新建知识库")
-            with st.form("new_kb_form"):
-                st.text_input("输入新知识库名称", placeholder="例如: project_alpha", key="new_kb_name_input")
-                st.form_submit_button("确认创建", on_click=create_kb_callback, args=(pipeline,))
-            if st.session_state.get("create_kb_error"):
-                st.error(st.session_state.create_kb_error)
-            if st.button("取消", key="cancel_create_kb"):
-                st.session_state.show_create_kb = False
-                st.session_state.create_kb_error = None
-                st.rerun()
-
-    if st.session_state.get("role") == ROLE_DEPT_ADMIN and manageable_kbs:
-        with st.expander("🔑 知识库访问授权"):
-            auth_service = init_auth_service()
-            manager = auth_service.get_user_by_username(st.session_state.get("username"))
-            users = auth_service.list_users_for_manager(manager) if manager else []
-            users = [user for user in users if user.role != ROLE_SYSTEM_ADMIN]
-            if st.session_state.get("role") == ROLE_DEPT_ADMIN:
-                users = [user for user in users if user.role == ROLE_USER]
-            if not users:
-                st.info("暂无可授权用户")
-            else:
-                with st.form("grant_kb_permission_form"):
-                    grant_kb = st.selectbox("知识库", manageable_kbs, key="grant_kb_name")
-                    user_labels = [f"{user.username} ({user.role})" for user in users]
-                    selected_user_labels = st.multiselect("用户", user_labels, key="grant_user_labels")
-                    permission = st.selectbox("权限", ["read", "write", "admin"], key="grant_permission")
-                    if st.form_submit_button("授权"):
-                        if not selected_user_labels:
-                            st.warning("请至少选择一个用户。")
-                        else:
-                            selected_users = [
-                                users[user_labels.index(label)]
-                                for label in selected_user_labels
-                            ]
-                            success_users = []
-                            failed_messages = []
-                            for target_user in selected_users:
-                                try:
-                                    auth_service.grant_kb_permission_as(manager, grant_kb, target_user.id, permission)
-                                    record_audit(
-                                        "grant_kb_permission",
-                                        target_type="kb_permission",
-                                        target_id=target_user.username,
-                                        kb_name=grant_kb,
-                                        metadata={"permission": permission, "target_user_id": target_user.id},
-                                    )
-                                    success_users.append(target_user.username)
-                                except Exception as e:
-                                    record_audit(
-                                        "grant_kb_permission",
-                                        target_type="kb_permission",
-                                        target_id=target_user.username,
-                                        kb_name=grant_kb,
-                                        success=False,
-                                        error_message=str(e),
-                                        metadata={"permission": permission, "target_user_id": target_user.id},
-                                    )
-                                    failed_messages.append(f"{target_user.username}: {e}")
-                            if success_users:
-                                st.success(f"已授权 {len(success_users)} 个用户访问 {grant_kb}: {permission}")
-                            if failed_messages:
-                                st.error("授权失败: " + "；".join(failed_messages))
-                            if success_users and not failed_messages:
-                                st.rerun()
-
-    for kb in manageable_kbs:
-        ctx = build_request_context(st.session_state)
-        can_read_kb = ctx.has_kb_permission(kb, "read")
-        can_write_kb = ctx.has_kb_permission(kb, "write")
-        can_admin_kb = ctx.has_kb_permission(kb, "admin")
-        file_infos = get_cached_file_infos(pipeline, kb) if can_read_kb else []
-        files = ([info.name for info in file_infos] or get_cached_files(pipeline, kb)) if can_read_kb else []
-        file_info_by_id = {info.id: info for info in file_infos}
-        is_current = (kb == st.session_state.current_kb)
-        with st.expander(f"{'🟢' if is_current else '⚪'} {kb} ({len(files)} 文件)", expanded=is_current):
-            if not can_read_kb:
-                st.caption("仅系统管理可见；当前账号没有内容读取权限。")
-            elif files:
-                st.markdown("**📄 文件列表:**")
-                container_kwargs = {"border": True}
-                if len(files) > 5:
-                    container_kwargs["height"] = 300
-                selected_doc_id = st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}"))
-                if selected_doc_id not in file_info_by_id and file_info_by_id:
-                    selected_doc_id = None
-                with st.container(**container_kwargs):
-                    rows = file_infos if file_infos else files
-                    for file_index, item in enumerate(rows):
-                        if hasattr(item, "id"):
-                            doc_id = item.id
-                            f = item.name
-                            info = item
-                        else:
-                            doc_id = item
-                            f = item
-                            info = None
-                        c1, c2, c3 = st.columns([0.68, 0.16, 0.16])
-                        with c1:
-                            processor_kind = info.metadata.get("processor_kind", "") if info else ""
-                            if processor_kind == "spreadsheet_table":
-                                local_path = info.metadata.get("local_path", "")
-                                st.markdown(f"📊 {f}  \n`Excel 管道: 已归档` `待结构化解析`")
-                                if local_path:
-                                    st.caption(f"本地归档: {local_path}")
-                                container_warning = format_container_inspection_warning(info.metadata)
-                                if container_warning:
-                                    st.caption(container_warning)
-                            elif info and info.metadata.get("ragflow_document_id"):
-                                status = str(info.metadata.get("status", "unknown")).lower()
-                                status_label, searchability_label = format_ragflow_document_status(status)
-                                dataset_kind = info.metadata.get("dataset_kind", "")
-                                local_path = info.metadata.get("local_path", "")
-                                ragflow_error = info.metadata.get("ragflow_error", "")
-                                st.markdown(f"📄 {f}  \n`RAGFlow: {status_label}` `{searchability_label}` `{dataset_kind}`")
-                                if local_path:
-                                    st.caption(f"本地归档: {local_path}")
-                                if status == "cancelled":
-                                    st.caption("解析已停止，当前不会进入检索结果。可删除后重新上传解析。")
-                                if ragflow_error:
-                                    st.caption(f"RAGFlow 错误: {ragflow_error}")
-                                container_warning = format_container_inspection_warning(info.metadata)
-                                if container_warning:
-                                    st.caption(container_warning)
-                            else:
-                                st.markdown(f"📄 {f}")
-                        with c2:
-                            chunk_label = "收起" if selected_doc_id == doc_id else "分块"
-                            info_status = str(info.metadata.get("status", "")).lower() if info else ""
-                            info_processor = info.metadata.get("processor_kind", "") if info else ""
-                            chunk_disabled = bool(info_processor == "spreadsheet_table" or info_status in {"cancelled", "failed", "uploaded", "parsing"})
-                            chunk_help = "Excel 文件已进入独立表格管道，当前不展示 RAG 分块" if info_processor == "spreadsheet_table" else ("当前文档尚不可检索，没有可展示分块" if chunk_disabled else None)
-                            if st.button(chunk_label, key=f"chunks_f_{kb}_{file_index}", use_container_width=True, disabled=chunk_disabled, help=chunk_help):
-                                toggle_parse_result_file(f"mgmt_{kb}", doc_id)
-                                st.rerun()
-                        with c3:
-                            current_confirm = st.session_state.confirm_delete_file
-                            is_confirming = (current_confirm == (kb, doc_id))
-                            if not can_write_kb:
-                                st.button("🗑️", key=f"del_f_{kb}_{file_index}", help="无删除权限", disabled=True)
-                            elif is_confirming:
-                                sub_c1, sub_c2 = st.columns([1, 1])
-                                with sub_c1:
-                                    if st.button("✓", key=f"yes_f_{kb}_{file_index}", help="确认删除"):
-                                        with st.spinner("删除中..."):
-                                            ctx = build_request_context(st.session_state)
-                                            res = pipeline.delete_document(doc_id, kb, ctx=ctx)
-                                            delete_ok = "✅" in res
-                                            record_audit(
-                                                "delete_document",
-                                                target_type="document",
-                                                target_id=f,
-                                                kb_name=kb,
-                                                success=delete_ok,
-                                                error_message="" if delete_ok else res,
-                                            )
-                                            invalidate_file_cache(kb)
-                                            st.session_state.confirm_delete_file = None
-                                            if st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}")) == doc_id:
-                                                st.session_state[_selected_parse_result_key(f"mgmt_{kb}")] = None
-                                            if "✅" in res:
-                                                st.session_state.toast_msg = f"已删除: {f}"
-                                            else:
-                                                st.session_state.error_msg = res
-                                            st.rerun()
-                                with sub_c2:
-                                    if st.button("✗", key=f"no_f_{kb}_{file_index}", help="取消"):
-                                        st.session_state.confirm_delete_file = None
-                                        st.rerun()
-                            else:
-                                if st.button("🗑️", key=f"del_f_{kb}_{file_index}", help="删除文件"):
-                                    st.session_state.confirm_delete_file = (kb, doc_id)
-                                    st.rerun()
-                if selected_doc_id:
-                    st.divider()
-                    selected_info = file_info_by_id.get(selected_doc_id)
-                    render_parse_result_detail(
-                        pipeline,
-                        kb,
-                        selected_doc_id,
-                        selected_info.name if selected_info else selected_doc_id,
-                    )
-            else:
-                st.caption("暂无文件")
-
-            st.divider()
-            col_switch, col_del = st.columns([1, 1])
-            with col_switch:
-                if not can_read_kb:
-                    st.button("🔄 切换到此知识库", disabled=True, key=f"btn_no_read_{kb}", help="无内容检索权限")
-                elif not is_current:
-                    st.button("🔄 切换到此知识库", key=f"btn_switch_{kb}", on_click=switch_kb_callback, args=(kb,))
-                else:
-                    st.button("✅ 当前使用中", disabled=True, key=f"btn_cur_{kb}")
-            with col_del:
-                if not can_admin_kb:
-                    st.button("🗑️ 删除整个库", disabled=True, key=f"del_kb_disabled_{kb}", help="无知识库 admin 权限")
-                elif st.session_state.confirm_delete_kb == kb:
-                    st.markdown("**确认删除?**")
-                    sub_c1, sub_c2 = st.columns([1, 1])
-                    with sub_c1:
-                        st.button("✅ 是", key=f"yes_kb_{kb}", on_click=delete_kb_confirmed, args=(pipeline, kb))
-                    with sub_c2:
-                        if st.button("❌ 否", key=f"no_kb_{kb}"):
-                            st.session_state.confirm_delete_kb = None
-                            st.rerun()
-                else:
-                    if st.button("🗑️ 删除整个库", key=f"del_kb_{kb}"):
-                        st.session_state.confirm_delete_kb = kb
-                        st.rerun()
 
 
 if __name__ == "__main__":

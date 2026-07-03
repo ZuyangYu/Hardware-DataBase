@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import config.settings
-from src.rag_backends.schemas import RequestContext
+from src.pipelines.document_rag.schemas import RequestContext, kb_scope_key
 
 
 PBKDF2_ITERATIONS = 260_000
@@ -46,6 +46,7 @@ class KnowledgeBaseAccess:
 @dataclass
 class KnowledgeBaseSummary:
     name: str
+    kb_id: int | None = None
     department_id: int | None = None
     department_name: str | None = None
     owner_user_id: int | None = None
@@ -130,10 +131,11 @@ class AuthService:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge_bases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
                     department_id INTEGER,
                     owner_user_id INTEGER,
                     created_at TEXT NOT NULL,
+                    UNIQUE(department_id, name),
                     FOREIGN KEY(department_id) REFERENCES departments(id),
                     FOREIGN KEY(owner_user_id) REFERENCES users(id)
                 )
@@ -141,15 +143,18 @@ class AuthService:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS kb_permissions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kb_id INTEGER NOT NULL,
                     kb_name TEXT NOT NULL,
                     user_id INTEGER NOT NULL,
                     permission TEXT NOT NULL DEFAULT 'read',
                     created_at TEXT NOT NULL,
-                    UNIQUE(kb_name, user_id),
+                    UNIQUE(kb_id, user_id),
+                    FOREIGN KEY(kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 )
             """)
             self._ensure_default_department(conn)
+            self._migrate_kb_scope_schema(conn)
 
     def _ensure_column(self, conn, table: str, column: str, ddl: str):
         columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -162,6 +167,92 @@ class AuthService:
             "INSERT OR IGNORE INTO departments (name, created_at) VALUES ('system', ?)",
             (now,),
         )
+
+    def _migrate_kb_scope_schema(self, conn):
+        kb_columns = {row["name"] for row in conn.execute("PRAGMA table_info(knowledge_bases)").fetchall()}
+        kb_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_bases'"
+        ).fetchone()
+        kb_sql = kb_sql_row["sql"] if kb_sql_row else ""
+        needs_kb_rebuild = "UNIQUE(department_id, name)" not in kb_sql
+
+        permission_columns = {row["name"] for row in conn.execute("PRAGMA table_info(kb_permissions)").fetchall()}
+        permission_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'kb_permissions'"
+        ).fetchone()
+        permission_sql = permission_sql_row["sql"] if permission_sql_row else ""
+        needs_permission_rebuild = (
+            "kb_id" not in permission_columns
+            or "UNIQUE(kb_id, user_id)" not in permission_sql
+            or "kb_id INTEGER NOT NULL" not in permission_sql
+        )
+
+        if not needs_kb_rebuild and not needs_permission_rebuild:
+            return
+
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            if needs_kb_rebuild:
+                conn.execute("ALTER TABLE knowledge_bases RENAME TO knowledge_bases_old")
+                conn.execute("""
+                    CREATE TABLE knowledge_bases (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        department_id INTEGER,
+                        owner_user_id INTEGER,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(department_id, name),
+                        FOREIGN KEY(department_id) REFERENCES departments(id),
+                        FOREIGN KEY(owner_user_id) REFERENCES users(id)
+                    )
+                """)
+                select_columns = [
+                    "id",
+                    "name",
+                    "department_id" if "department_id" in kb_columns else "NULL AS department_id",
+                    "owner_user_id" if "owner_user_id" in kb_columns else "NULL AS owner_user_id",
+                    "created_at" if "created_at" in kb_columns else "'' AS created_at",
+                ]
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO knowledge_bases (id, name, department_id, owner_user_id, created_at)
+                    SELECT {', '.join(select_columns)}
+                    FROM knowledge_bases_old
+                """)
+                conn.execute("DROP TABLE knowledge_bases_old")
+
+            if needs_permission_rebuild:
+                conn.execute("ALTER TABLE kb_permissions RENAME TO kb_permissions_old")
+                conn.execute("""
+                    CREATE TABLE kb_permissions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        kb_id INTEGER NOT NULL,
+                        kb_name TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        permission TEXT NOT NULL DEFAULT 'read',
+                        created_at TEXT NOT NULL,
+                        UNIQUE(kb_id, user_id),
+                        FOREIGN KEY(kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+                        FOREIGN KEY(user_id) REFERENCES users(id)
+                    )
+                """)
+                created_expr = "p.created_at" if "created_at" in permission_columns else "''"
+                permission_expr = "p.permission" if "permission" in permission_columns else "'read'"
+                kb_id_expr = "p.kb_id" if "kb_id" in permission_columns else "NULL"
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO kb_permissions (kb_id, kb_name, user_id, permission, created_at)
+                    SELECT kb.id, kb.name, p.user_id, {permission_expr}, {created_expr}
+                    FROM kb_permissions_old p
+                    JOIN users u ON u.id = p.user_id
+                    JOIN knowledge_bases kb
+                      ON kb.name = p.kb_name
+                     AND (
+                         ({kb_id_expr} IS NOT NULL AND kb.id = {kb_id_expr})
+                         OR ({kb_id_expr} IS NULL AND kb.department_id = u.department_id)
+                     )
+                """)
+                conn.execute("DROP TABLE kb_permissions_old")
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
 
     def _ensure_default_admin(self):
         username = config.settings.AUTH_DEFAULT_ADMIN_USERNAME
@@ -340,6 +431,13 @@ class AuthService:
             return [row_to_user(row) for row in rows]
         return []
 
+    def list_users_as(self, actor: AuthUser) -> list[AuthUser]:
+        if actor.role == ROLE_SYSTEM_ADMIN:
+            return self.list_users()
+        if actor.role == ROLE_DEPT_ADMIN:
+            return self.list_users_for_manager(actor)
+        raise PermissionError("User listing requires an administrator role.")
+
     def list_departments(self) -> list[Department]:
         with closing(self._connect()) as conn:
             rows = conn.execute("SELECT * FROM departments ORDER BY id").fetchall()
@@ -359,6 +457,22 @@ class AuthService:
                     "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
                     (utc_now(), user_id),
                 )
+
+    def set_user_active_as(self, actor: AuthUser, user_id: int, is_active: bool):
+        with closing(self._connect()) as conn:
+            target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            if target is None:
+                raise ValueError("User does not exist")
+            if actor.id == user_id:
+                raise PermissionError("Cannot change the active state of the current account here.")
+            if actor.role == ROLE_SYSTEM_ADMIN:
+                pass
+            elif actor.role == ROLE_DEPT_ADMIN:
+                if target["role"] != ROLE_USER or target["department_id"] != actor.department_id:
+                    raise PermissionError("Department administrators can only manage users in their department.")
+            else:
+                raise PermissionError("User activation requires an administrator role.")
+        self.set_user_active(user_id, is_active)
 
     def reset_user_password_as(self, actor: AuthUser, user_id: int, new_password: str):
         if not new_password:
@@ -406,6 +520,11 @@ class AuthService:
             row = conn.execute("SELECT * FROM departments WHERE name = ?", (name,)).fetchone()
         return Department(id=int(row["id"]), name=row["name"])
 
+    def create_department_as(self, actor: AuthUser, name: str) -> Department:
+        if actor.role != ROLE_SYSTEM_ADMIN:
+            raise PermissionError("Department creation requires a system administrator role.")
+        return self.create_department(name)
+
     def delete_department(self, department_id: int):
         with closing(self._connect()) as conn:
             dept = conn.execute("SELECT * FROM departments WHERE id = ?", (department_id,)).fetchone()
@@ -427,7 +546,35 @@ class AuthService:
                 raise ValueError("该部门下仍有关联知识库，不能删除")
             conn.execute("DELETE FROM departments WHERE id = ?", (department_id,))
 
+    def delete_department_as(self, actor: AuthUser, department_id: int):
+        if actor.role != ROLE_SYSTEM_ADMIN:
+            raise PermissionError("Department deletion requires a system administrator role.")
+        self.delete_department(department_id)
+
+    def _get_kb_row(
+        self,
+        conn,
+        kb_name: str | None = None,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ):
+        if kb_id is not None:
+            return conn.execute("SELECT * FROM knowledge_bases WHERE id = ?", (kb_id,)).fetchone()
+        if kb_name is None:
+            return None
+        kb_name = kb_name.strip()
+        if department_id not in (None, ""):
+            return conn.execute(
+                "SELECT * FROM knowledge_bases WHERE name = ? AND department_id = ?",
+                (kb_name, int(department_id)),
+            ).fetchone()
+        rows = conn.execute("SELECT * FROM knowledge_bases WHERE name = ?", (kb_name,)).fetchall()
+        if len(rows) > 1:
+            raise ValueError(f"Ambiguous knowledge base name without department scope: {kb_name}")
+        return rows[0] if rows else None
+
     def register_knowledge_base(self, kb_name: str, owner: AuthUser | None = None):
+        kb_name = kb_name.strip()
         department_id = owner.department_id if owner else None
         owner_id = owner.id if owner else None
         with closing(self._connect()) as conn:
@@ -438,13 +585,40 @@ class AuthService:
                 """,
                 (kb_name, department_id, owner_id, utc_now()),
             )
+            kb = self._get_kb_row(conn, kb_name, department_id)
             if owner_id:
-                self.grant_kb_permission(kb_name, owner_id, "admin", conn=conn)
+                self.grant_kb_permission(kb_name, owner_id, "admin", conn=conn, department_id=department_id, kb_id=kb["id"])
 
-    def delete_knowledge_base_record(self, kb_name: str):
+    def knowledge_base_exists(
+        self,
+        kb_name: str,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ) -> bool:
         with closing(self._connect()) as conn:
-            conn.execute("DELETE FROM kb_permissions WHERE kb_name = ?", (kb_name,))
-            conn.execute("DELETE FROM knowledge_bases WHERE name = ?", (kb_name,))
+            return self._get_kb_row(conn, kb_name, department_id, kb_id) is not None
+
+    def get_knowledge_base_id(
+        self,
+        kb_name: str,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ) -> int | None:
+        with closing(self._connect()) as conn:
+            row = self._get_kb_row(conn, kb_name, department_id, kb_id)
+        return int(row["id"]) if row else None
+
+    def delete_knowledge_base_record(
+        self,
+        kb_name: str,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ):
+        with closing(self._connect()) as conn:
+            kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
+            if kb is None:
+                return
+            conn.execute("DELETE FROM knowledge_bases WHERE id = ?", (kb["id"],))
 
     def list_registered_knowledge_bases(self) -> list[str]:
         with closing(self._connect()) as conn:
@@ -470,6 +644,7 @@ class AuthService:
             rows = conn.execute(
                 """
                 SELECT
+                    kb.id,
                     kb.name,
                     kb.department_id,
                     d.name AS department_name,
@@ -480,18 +655,20 @@ class AuthService:
                 FROM knowledge_bases kb
                 LEFT JOIN departments d ON d.id = kb.department_id
                 LEFT JOIN users owner ON owner.id = kb.owner_user_id
-                LEFT JOIN kb_permissions p ON p.kb_name = kb.name
+                LEFT JOIN kb_permissions p ON p.kb_id = kb.id
                 GROUP BY
-                    kb.name, kb.department_id, d.name,
+                    kb.id, kb.name, kb.department_id, d.name,
                     kb.owner_user_id, owner.username, kb.created_at
-                ORDER BY kb.name
+                ORDER BY d.name, kb.name
                 """
             ).fetchall()
 
         for row in rows:
             department_id = row["department_id"]
-            summaries[row["name"]] = KnowledgeBaseSummary(
+            summary_key = f"{department_id or 'none'}:{row['name']}"
+            summaries[summary_key] = KnowledgeBaseSummary(
                 name=row["name"],
+                kb_id=int(row["id"]),
                 department_id=department_id,
                 department_name=row["department_name"],
                 owner_user_id=row["owner_user_id"],
@@ -503,27 +680,36 @@ class AuthService:
                 created_at=row["created_at"] or "",
             )
 
-        for kb_name in sorted(existing - set(summaries)):
+        registered_names = {row["name"] for row in rows}
+        for kb_name in sorted(existing - registered_names):
             summaries[kb_name] = KnowledgeBaseSummary(
                 name=kb_name,
                 registered=False,
                 physical_exists=True,
             )
 
-        return [summaries[name] for name in sorted(summaries)]
+        return sorted(summaries.values(), key=lambda item: (item.department_name or "", item.name))
 
-    def list_knowledge_base_permissions(self, kb_name: str) -> list[KnowledgeBasePermission]:
+    def list_knowledge_base_permissions(
+        self,
+        kb_name: str,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ) -> list[KnowledgeBasePermission]:
         with closing(self._connect()) as conn:
+            kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
+            if kb is None:
+                return []
             rows = conn.execute(
                 """
                 SELECT u.username, u.role, d.name AS department_name, p.permission
                 FROM kb_permissions p
                 JOIN users u ON u.id = p.user_id
                 LEFT JOIN departments d ON d.id = u.department_id
-                WHERE p.kb_name = ?
+                WHERE p.kb_id = ?
                 ORDER BY d.name, u.username
                 """,
-                (kb_name,),
+                (kb["id"],),
             ).fetchall()
         return [
             KnowledgeBasePermission(
@@ -566,46 +752,75 @@ class AuthService:
                 """
                 INSERT INTO knowledge_bases (name, department_id, owner_user_id, created_at)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
+                ON CONFLICT(department_id, name) DO UPDATE SET
                     department_id = excluded.department_id,
                     owner_user_id = excluded.owner_user_id
                 """,
                 (kb_name, department_id, owner_user_id, utc_now()),
             )
+            kb = self._get_kb_row(conn, kb_name, department_id)
             conn.execute(
                 """
                 DELETE FROM kb_permissions
-                WHERE kb_name = ?
+                WHERE kb_id = ?
                   AND user_id IN (
                       SELECT id
                       FROM users
                       WHERE department_id IS NULL OR department_id != ?
                   )
                 """,
-                (kb_name, department_id),
+                (kb["id"], department_id),
             )
             if owner_user_id is not None:
-                self.grant_kb_permission(kb_name, owner_user_id, "admin", conn=conn)
+                self.grant_kb_permission(
+                    kb_name,
+                    owner_user_id,
+                    "admin",
+                    conn=conn,
+                    department_id=department_id,
+                    kb_id=kb["id"],
+                )
 
-    def grant_kb_permission(self, kb_name: str, user_id: int, permission: str = "read", conn=None):
+    def grant_kb_permission(
+        self,
+        kb_name: str,
+        user_id: int,
+        permission: str = "read",
+        conn=None,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ):
         if permission not in {"read", "write", "admin"}:
             raise ValueError("权限必须为 read、write 或 admin")
         target_conn = conn or self._connect()
         should_close = conn is None
         try:
+            kb = self._get_kb_row(target_conn, kb_name, department_id, kb_id)
+            if kb is None:
+                raise ValueError("Knowledge base does not exist")
             target_conn.execute(
                 """
-                INSERT INTO kb_permissions (kb_name, user_id, permission, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(kb_name, user_id) DO UPDATE SET permission = excluded.permission
+                INSERT INTO kb_permissions (kb_id, kb_name, user_id, permission, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(kb_id, user_id) DO UPDATE SET
+                    kb_name = excluded.kb_name,
+                    permission = excluded.permission
                 """,
-                (kb_name, user_id, permission, utc_now()),
+                (kb["id"], kb["name"], user_id, permission, utc_now()),
             )
         finally:
             if should_close:
                 target_conn.close()
 
-    def grant_kb_permission_as(self, actor: AuthUser, kb_name: str, user_id: int, permission: str = "read"):
+    def grant_kb_permission_as(
+        self,
+        actor: AuthUser,
+        kb_name: str,
+        user_id: int,
+        permission: str = "read",
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ):
         if permission not in {"read", "write", "admin"}:
             raise ValueError("权限必须为 read、write 或 admin")
         with closing(self._connect()) as conn:
@@ -615,7 +830,9 @@ class AuthService:
             if target["role"] == ROLE_SYSTEM_ADMIN:
                 raise ValueError("不能授予系统管理员知识库内容权限")
 
-            kb = conn.execute("SELECT * FROM knowledge_bases WHERE name = ?", (kb_name,)).fetchone()
+            if actor.role == ROLE_DEPT_ADMIN and department_id in (None, "") and kb_id is None:
+                department_id = actor.department_id
+            kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
             if kb is None:
                 raise ValueError("知识库不存在")
 
@@ -629,7 +846,14 @@ class AuthService:
             else:
                 raise PermissionError("无权授权知识库")
 
-            self.grant_kb_permission(kb_name, user_id, permission, conn=conn)
+            self.grant_kb_permission(
+                kb_name,
+                user_id,
+                permission,
+                conn=conn,
+                department_id=kb["department_id"],
+                kb_id=kb["id"],
+            )
 
     def list_accessible_kbs(self, user: AuthUser, existing_kbs: list[str]) -> list[str]:
         if user.role == ROLE_SYSTEM_ADMIN:
@@ -643,20 +867,22 @@ class AuthService:
                     FROM knowledge_bases kb
                     WHERE kb.department_id = ?
                     UNION
-                    SELECT p.kb_name
+                    SELECT kb.name
                     FROM kb_permissions p
-                    WHERE p.user_id = ?
+                    JOIN knowledge_bases kb ON kb.id = p.kb_id
+                    WHERE p.user_id = ? AND kb.department_id = ?
                     """,
-                    (user.department_id, user.id),
+                    (user.department_id, user.id, user.department_id),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     """
-                    SELECT p.kb_name
+                    SELECT kb.name
                     FROM kb_permissions p
-                    WHERE p.user_id = ?
+                    JOIN knowledge_bases kb ON kb.id = p.kb_id
+                    WHERE p.user_id = ? AND kb.department_id = ?
                     """,
-                    (user.id,),
+                    (user.id, user.department_id),
                 ).fetchall()
         allowed = {row[0] for row in rows}
         return [kb for kb in existing_kbs if kb in allowed]
@@ -673,28 +899,35 @@ class AuthService:
         permissions: dict[str, str] = {}
         levels = {"read": 1, "write": 2, "admin": 3}
 
-        def add_permission(kb_name: str, permission: str):
+        def add_permission(kb_name: str, permission: str, department_id: int | str | None = None):
             if existing_filter is not None and kb_name not in existing_filter:
                 return
-            current = permissions.get(kb_name)
+            effective_department_id = department_id if department_id not in (None, "") else user.department_id
+            key = kb_scope_key(kb_name, effective_department_id)
+            current = permissions.get(key)
             if current is None or levels.get(permission, 0) > levels.get(current, 0):
-                permissions[kb_name] = permission
+                permissions[key] = permission
 
         with closing(self._connect()) as conn:
             if user.role == ROLE_DEPT_ADMIN:
                 rows = conn.execute(
-                    "SELECT name FROM knowledge_bases WHERE department_id = ?",
+                    "SELECT name, department_id FROM knowledge_bases WHERE department_id = ?",
                     (user.department_id,),
                 ).fetchall()
                 for row in rows:
-                    add_permission(row["name"], "admin")
+                    add_permission(row["name"], "admin", row["department_id"])
 
             rows = conn.execute(
-                "SELECT kb_name, permission FROM kb_permissions WHERE user_id = ?",
-                (user.id,),
+                """
+                SELECT kb.name AS kb_name, kb.department_id, p.permission
+                FROM kb_permissions p
+                JOIN knowledge_bases kb ON kb.id = p.kb_id
+                WHERE p.user_id = ? AND kb.department_id = ?
+                """,
+                (user.id, user.department_id),
             ).fetchall()
             for row in rows:
-                add_permission(row["kb_name"], row["permission"])
+                add_permission(row["kb_name"], row["permission"], row["department_id"])
 
         return permissions
 
@@ -775,6 +1008,10 @@ def build_request_context(session_state) -> RequestContext:
     username = session_state.get("username")
     role = session_state.get("role")
     department_id = session_state.get("department_id")
+    kb_id = session_state.get("current_kb_id")
+    resource_department_id = session_state.get("current_kb_department_id")
+    if resource_department_id in (None, ""):
+        resource_department_id = department_id
     if username:
         auth_service = AuthService()
         user = auth_service.get_user_by_username(username)
@@ -783,9 +1020,14 @@ def build_request_context(session_state) -> RequestContext:
             user_id=username,
             session_id=session_id,
             roles=[role or "user"],
-            allowed_kbs=sorted(kb_permissions.keys()),
+            allowed_kbs=sorted(key for key in kb_permissions if ":" not in key),
             kb_permissions=kb_permissions,
-            metadata={"department_id": department_id},
+            metadata={
+                "actor_department_id": department_id,
+                "resource_department_id": resource_department_id,
+                "department_id": resource_department_id,
+                "kb_id": kb_id,
+            },
         )
     return RequestContext(
         user_id=anonymous_user_id(session_id),

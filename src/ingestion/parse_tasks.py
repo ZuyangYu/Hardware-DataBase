@@ -9,14 +9,14 @@ from typing import Callable
 
 import config.settings
 from src.core.logger import error, log
-
-
-TASK_STATUS_QUEUED = "queued"
-TASK_STATUS_RUNNING = "running"
-TASK_STATUS_PAUSED = "paused"
-TASK_STATUS_COMPLETED = "completed"
-TASK_STATUS_FAILED = "failed"
-TASK_STATUS_CANCELLED = "cancelled"
+from src.pipelines.document_rag.schemas import (
+    TASK_STATUS_CANCELLED,
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_PAUSED,
+    TASK_STATUS_QUEUED,
+    TASK_STATUS_RUNNING,
+)
 
 TERMINAL_STATUSES = {TASK_STATUS_COMPLETED, TASK_STATUS_FAILED, TASK_STATUS_CANCELLED}
 

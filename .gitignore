@@ -34,3 +34,5 @@ ragflow_store_*/
 
 
 .agents/
+
+.tests/
