@@ -36,3 +36,6 @@ ragflow_store_*/
 .agents/
 
 .tests/
+
+# Claude Code local settings
+.claude/settings.local.json
