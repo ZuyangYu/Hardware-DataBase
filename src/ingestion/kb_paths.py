@@ -1,8 +1,6 @@
 import os
 import re
 
-import config.settings
-
 
 _KB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
@@ -34,9 +32,3 @@ def safe_child_path(root: str, *parts: str, create: bool = False) -> str:
     return path_abs
 
 
-def get_kb_data_path(kb_name: str, create: bool = False) -> str:
-    return safe_child_path(config.settings.DATA_ROOT, validate_kb_name(kb_name), create=create)
-
-
-def get_kb_index_storage_path(kb_name: str, create: bool = True) -> str:
-    return safe_child_path(config.settings.STORAGE_DIR, "index_stores", validate_kb_name(kb_name), create=create)

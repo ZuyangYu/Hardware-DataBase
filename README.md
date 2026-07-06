@@ -1,203 +1,190 @@
-# 😺 Hardware DataBase
+# Hardware DataBase
 
-Hardware DataBase 是一个面向硬件数据与技术文档的智能数据基座, 能够通过克隆仓库到本地, pip或uv快速启动问答系统, 实现小团队的知识库搭建、权限管理、数据检索和问答。
-它基于 LlamaIndex 和 Streamlit 构建，使用混合检索（Hybrid Retrieval） 策略，支持多知识库管理、文档增量更新以及灵活的模型配置（支持本地 Ollama 和云端 OpenAI 兼容 API）。
----
-# 🐱 部署示例
-## 📚知识库管理
-![知识库管理示例](assets/kap_example.png)
+Hardware DataBase 是一个面向硬件设计资料、项目文档和结构化表格的智能数据基座。
 
-## 🤖检索聊天
-![检索聊天机器人](assets/chat_example.png)
+## 核心特性
 
----
-## ✨ 核心特性
+- **Agentic 查询流程**：问题拆解确认、文件扫描、检索范围确认、多源检索、证据覆盖度判断、自动补检索、最终 grounded answer。
+- **多源 pipeline**：普通文档进入 RAGFlow 检索链路；Excel 进入结构化表格索引，并由 agent 统一调度。
+- **RAGFlow 后端固定化**：文档上传、解析任务、检索、删除和知识库治理都通过 RAGFlow 后端适配层完成。
+- **权限与治理**：支持部门、用户、知识库权限、审计日志、查询 trace 和文件处理状态。
+- **独立模型配置**：Agent 最终答案生成使用项目自有 `LLMClient`，支持 Ollama 或 OpenAI-compatible API，不再复用旧 RAG 框架模型封装。
 
-- **高级混合检索架构** :
-  - **语义检索** : 基于 Embedding 的向量相似度搜索。
-  - **关键词检索** : 基于 BM25 的关键词匹配，弥补语义丢失。
-  - **RRF 融合** : 使用 Reciprocal Rank Fusion 算法合并双路检索结果。
-  - **Reranker 重排序** : 引入 Cross-Encoder 模型对结果进行二次精排，大幅提升回答准确度。
+## 项目结构
 
-- **知识库管理** :
-  - **多库隔离** : 支持创建多个独立的知识库（Project），一键切换。
-  - **增量更新** : 随时上传新文档，自动建立索引，无需重建整个库。
-  - **精细删除** : 支持删除知识库中的单个文件及其对应的向量数据。
-
-- **灵活的模型支持** :
-  - **纯本地模式** : 支持通过 Ollama 运行 LLM 和 Embedding，数据不出域。
-  - **混合模式** : 本地 Embedding (免费/快) + 云端 LLM (智能/强)。
-  - **高可用** : 内置 API 重试与降级机制，应对网络波动和限流。
-
-## 📂 项目结构
-
-```
-Hardware-DataBase/
-├── assets/                  # 应用示例图片
+```text
+Hardware-RAG/
+├── assets/                     # 应用示例图片
 ├── config/
-│   └── settings.py          # 全局配置与环境变量加载
-├── data/                    # (自动生成) 原始文档存储路径
-├── docs/
-│   └── architecture_doc.md  # 系统架构说明文档
-├── storage/                 # (自动生成) 向量数据库与缓存
+│   └── settings.py             # 全局配置与 .env 加载
+├── data/                       # (自动生成) 原始文档存储
+├── docs/                       # 架构与设计文档
+│   ├── architecture_doc.md
+│   ├── langgraph_agentic_query_design.md
+│   └── pipeline_contract.md
 ├── src/
-│   ├── core/
-│   │   ├── custom_embedding.py # 自定义 Embedding
-│   │   ├── custom_llm.py       # 自定义 LLM 封装
-│   │   ├── custom_rag_chat.py  # 聊天核心逻辑
-│   │   ├── hybrid_retriever.py # 混合检索实现
-│   │   ├── rag_pipeline.py     # RAG 业务流程控制
-│   │   └── resource_manager.py # 资源与连接池管理
-│   └── ingestion/
-│       └── index_builder.py    # 索引构建器
-│   
-├── .env                     # 环境变量配置文件
-├── uv.lock                  # 依赖锁定文件
-├── pyproject.toml           # uv 项目配置文件
-├── requirements.txt         # 项目依赖
-├── streamlit_app.py        # 前端启动入口
-└── README.md                # 说明文档
+│   ├── agents/                 # LangGraph Agent 编排
+│   │   ├── graph.py
+│   │   ├── runner.py
+│   │   ├── prompts.py
+│   │   ├── state.py
+│   │   ├── query_tokens.py
+│   │   └── tools/              # 检索工具适配
+│   ├── core/                   # 应用管线、鉴权、LLM 客户端
+│   │   ├── app_pipeline.py
+│   │   ├── auth.py
+│   │   ├── llm_client.py
+│   │   ├── conversation.py
+│   │   ├── source_group_router.py
+│   │   ├── app_logs.py
+│   │   └── logger.py
+│   ├── ingestion/              # 容器检查、路径与解析任务
+│   ├── pipelines/              # 多源 pipeline
+│   │   ├── document_rag/       # RAGFlow 文档检索
+│   │   └── spreadsheet/        # Excel 结构化表格索引
+│   └── services/               # 文档治理、路由与资产清理
+├── storage/                    # (自动生成) 归档、索引、日志与鉴权库
+├── tests/                      # 单元与集成测试
+├── streamlit_app.py            # 前端启动入口
+├── pyproject.toml
+├── requirements.txt
+└── README.md
 ```
 
-## 🛠️ 环境准备
+## 环境要求
 
-- **Python**: >= 3.12
-- **Ollama** : 如果计划使用本地模型，请先安装并启动 [Ollama](https://ollama.com/)。
+- **Python**：>= 3.12
+- **RAGFlow**：需准备一个可访问的 RAGFlow 实例作为文档检索后端，并获取其 API Key。
+- **Ollama**：当 `AGENT_LLM_PROVIDER=ollama`（默认）时需要本地 [Ollama](https://ollama.com/) 服务并拉取对应模型；若改用 OpenAI-compatible API 则无需 Ollama。
 
----
+## 安装
 
-## 🚀 安装部署
-
-本项目支持使用新一代包管理工具 **uv** 进行部署，也支持传统的 `requirements.txt` 方式。
-
-### 方式一：使用 uv (推荐)
+### 方式一：使用 uv（推荐）
 
 [uv](https://github.com/astral-sh/uv) 是一个极速的 Python 包管理器。
 
-### **安装 uv** (如果尚未安装):
+安装 uv（如尚未安装）：
 
-**MacOS / Linux:**
 ```bash
+# macOS / Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-**Windows (PowerShell):**
-```bash
+# Windows (PowerShell)
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
-### **一键同步环境**
 
-在项目根目录下运行以下命令。这将读取 uv.lock 并自动创建虚拟环境、安装所有精确版本的依赖。
+同步环境并启动（`uv run` 会自动加载虚拟环境，无需手动 activate）：
+
 ```bash
 uv sync
-```
-
-### **启动应用**
-
-使用 uv run 启动，它会自动加载虚拟环境，无需手动 activate。
-```bash
 uv run streamlit run streamlit_app.py
 ```
 
-### 方式二：使用 pip 部署 (🐢 传统方式)
-如果你无法使用 uv，可以使用传统的 requirements.txt 进行部署。
+### 方式二：使用 pip
 
-### **创建虚拟环境** :
 ```bash
-# 创建环境
 python -m venv venv
-
-# 激活环境
-# Windows:
+# Windows
 venv\Scripts\activate
-# macOS/Linux:
+# macOS / Linux
 source venv/bin/activate
-```
-### **安装依赖** :
 
-```bash
 pip install -r requirements.txt
-```
-
-### **启动应用** :
-```bash
 streamlit run streamlit_app.py
 ```
-## ⚙️ 配置说明
 
-支持两种配置方式：**页面配置**（推荐）和 **.env 文件配置**。
+## 配置说明
+
+支持两种配置方式：**页面配置**（推荐）和 **`.env` 文件配置**。
+
+> 注意：仓库根目录的 `.env.example` 为旧架构模板，其中的 `RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE` 等变量在当前版本已失效，请以下方变量为准。
 
 ### 方式一：页面配置（推荐）
 
-启动应用后，点击侧边栏的 **「⚙️ 系统配置」** 即可在页面上直接修改所有配置项，点击「应用配置」立即生效，无需手动编辑文件或重启。
+启动应用后，进入侧边栏的 **「⚙️ 系统配置」**，可在页面上直接修改模型、RAGFlow、检索等配置，点击「🔄 应用配置」立即生效，配置会持久化保存到 `.env` 文件。
 
-可配置项包括：
-- **模型配置**：Provider、API Key、模型名称、Context Window 等
-- **Embedding 配置**：独立的 API Key / Base URL / 模型（支持与 LLM 使用不同提供商）
-- **RAG 检索参数**：Chunk Size、Top-K、RRF K 等
-- **Reranker 配置**：类型（none / local / api）、模型、API
-- **系统提示词**：自定义 AI 助手人设和行为规则
+### 方式二：`.env` 文件配置
 
-### 方式二：.env 文件配置
+在项目根目录创建 `.env`，按需填写（以下为 `config/settings.py` 实际读取的变量及默认值）：
 
-在项目根目录下创建一个 .env 文件（可参考 .env.example）。
-```
-# ==================== 模式选择 ====================
-# ollama: 全本地模式 | custom: 调用第三方 API
-PROVIDER=ollama
+```env
+# ==================== RAGFlow 后端 ====================
+RAGFLOW_BASE_URL=http://localhost:9380
+RAGFLOW_API_KEY=
+RAGFLOW_GOVERNANCE_DATASET_NAME=department_governance
+RAGFLOW_DESIGN_DATASET_NAME=project_design_assets
+RAGFLOW_TIMEOUT_SECONDS=120
+RAGFLOW_SIMILARITY_THRESHOLD=0.25
+RAGFLOW_VECTOR_WEIGHT=0.4
 
-# ==================== 本地模式配置 (Ollama) ====================
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_LLM_MODEL=qwen2.5:32b
-OLLAMA_EMBEDDING_MODEL=nomic-embed-text:latest
+# ==================== Agent LLM ====================
+# provider: ollama | custom
+AGENT_LLM_PROVIDER=ollama
+AGENT_OLLAMA_BASE_URL=http://localhost:11434
+AGENT_OLLAMA_MODEL=qwen2.5:32b
+AGENT_TEMPERATURE=0.2
+AGENT_TIMEOUT_SECONDS=120
 
-# ==================== 云端 API 配置 (OpenRouter/DeepSeek) ====================
-# 仅当 PROVIDER=custom 时生效
-CUSTOM_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
-CUSTOM_BASE_URL=https://openrouter.ai/api/v1
-CUSTOM_LLM_MODEL=deepseek/deepseek-chat
+# 或使用 OpenAI-compatible API（provider=custom 时生效）
+AGENT_CUSTOM_API_KEY=
+AGENT_CUSTOM_BASE_URL=https://api.openai.com/v1
+AGENT_CUSTOM_MODEL=
+AGENT_CUSTOM_MAX_TOKENS=4096
 
-# ==================== Embedding 配置（独立） ====================
-# Embedding 可使用与 LLM 不同的 API 提供商
-CUSTOM_EMBEDDING_API_KEY=
-CUSTOM_EMBEDDING_BASE_URL=
-CUSTOM_EMBEDDING_MODEL=
-
-# [可选] 混合模式开关
-# 设置为 true 表示：使用云端 LLM 回答，但使用本地 Ollama 做向量化 (省钱且快)
-USE_OLLAMA_EMBEDDING=false
-
-# ==================== RAG 检索参数 ====================
-CHUNK_SIZE=512
-CHUNK_OVERLAP=50
-VECTOR_TOP_K=20
-BM25_TOP_K=20
+# ==================== 检索与 Agent 行为 ====================
 FINAL_TOP_K=5
-RRF_K=60
+AGENT_MAX_RETRIEVAL_ROUNDS=3
 
-# ==================== 重排序 (Reranker) ====================
-# 类型: none, local, api
-RERANKER_TYPE=none
-RERANKER_MODEL=BAAI/bge-reranker-v2-gemma
+# ==================== 鉴权（通常无需修改）====================
+AUTH_DB_PATH=storage/auth.db
+AUTH_DEFAULT_ADMIN_USERNAME=admin
+AUTH_DEFAULT_ADMIN_PASSWORD=
+AUTH_SESSION_TTL_HOURS=24
+
+# ==================== 存储路径（通常无需修改）====================
+PIPELINE_ARCHIVE_ROOT=storage/pipeline_archives
+RAGFLOW_FILE_ROOT=storage/pipeline_archives
+
+# ==================== 提示词（可选）====================
+SYSTEM_PROMPT=
+NO_CONTEXT_PROMPT=
 ```
-## ❓ 常见问题
 
-Q: 运行 uv sync 时提示 lock file is not up to date?
+## 查询流程
 
-A: 这通常发生在手动修改了 pyproject.toml 后。请运行 uv lock 更新锁定文件，然后再运行 uv sync。
+```text
+Streamlit
+  -> AppPipeline
+  -> MultiSourceAgentRunner
+  -> LangGraph
+  -> Tool adapters
+     - RAGFlow document retrieval
+     - Spreadsheet semantic/cell/profile search
+  -> LLMClient 生成最终答案
+```
 
-Q: 启动时提示 ModuleNotFoundError?
+## 常见问题
 
-A: 如果使用 uv，必须使用 uv run ... 启动命令，或者手动 source .venv/bin/activate 后再运行。
+**Q: 运行 `uv sync` 时提示 lock file is not up to date？**
+A: 通常发生在手动修改了 `pyproject.toml` 之后。运行 `uv lock` 更新锁定文件，再执行 `uv sync`。
 
-Q: 上传文件后搜索不到内容？
+**Q: 启动时提示 `ModuleNotFoundError`？**
+A: 使用 uv 时必须用 `uv run streamlit run streamlit_app.py` 启动，或先 `source .venv/bin/activate` 再运行；使用 pip 时请确认已激活虚拟环境并安装依赖。
 
-A:
+**Q: 上传文件后在问答中搜不到内容？**
+A: 当前检索后端为 RAGFlow，请按顺序排查：1) RAGFlow 服务是否可达、`RAGFLOW_API_KEY` 是否正确；2) `RAGFLOW_GOVERNANCE_DATASET_NAME` / `RAGFLOW_DESIGN_DATASET_NAME` 对应的 dataset 是否存在；3) 在「📊 日志中心」或文件处理状态中确认 RAGFlow 解析任务是否完成。
 
-1. 检查控制台日志，确认文件是否索引成功。
+**Q: Agent 响应很慢或超时？**
+A: 可适当调大 `AGENT_TIMEOUT_SECONDS`；检查 `AGENT_MAX_RETRIEVAL_ROUNDS` 是否过大导致多轮补检索；确认 LLM 模型（Ollama 或 custom API）的响应速度。
 
-2. 确保 .env 中的 Embedding 模型配置正确。
+**Q: 首次启动后无法使用问答？**
+A: 请先进入「⚙️ 系统配置」检查并补全 RAGFlow 与 Agent 模型配置，点击「应用配置」生效。
 
-3. 如果是中文文档，BM25 依赖 Jieba 分词，系统会自动处理，但请确保文档编码为 UTF-8。
+## 说明
 
-## 📜 License
+- “知识库”现在是业务隔离与权限治理单元，不代表本地向量库。
+- 检索后端固定为 RAGFlow，项目内不再维护本地向量索引。
+- Excel 等结构化数据不走本地 RAG，而是由 spreadsheet pipeline 建立结构化索引后交给 agent 调度。
+
+## License
+
 MIT License

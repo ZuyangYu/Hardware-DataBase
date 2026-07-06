@@ -1,2 +1,0 @@
-"""RAG backend abstraction package."""
-
