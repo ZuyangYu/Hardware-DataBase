@@ -866,6 +866,13 @@ class RAGFlowBackend(RAGBackend):
                 f"source_names={source_names}"
             )
 
+        # Local re-filter is defense-in-depth on top of the remote
+        # metadata_condition: if RAGFlow ever echoes a cross-scope chunk, drop it
+        # here. Each check passes the chunk through when the scoping field is
+        # absent — RAGFlow stores kb_name/department_id/source_group as
+        # document-level meta_fields and does not always echo them on each
+        # retrieved chunk, so treating a missing field as a mismatch would
+        # silently drop every hit (the department check in particular).
         evidences = []
         skipped_counts = {
             "kb": 0,
@@ -880,14 +887,24 @@ class RAGFlowBackend(RAGBackend):
                 skipped_counts["kb"] += 1
                 continue
             chunk_department = str(metadata.get("department_id") or "")
-            if chunk_department != scope.department_id:
+            if chunk_department and chunk_department != scope.department_id:
+                # Only drop chunks that explicitly carry a different department.
+                # A chunk with no department_id is trusted to the remote filter;
+                # dropping it would empty the result set when RAGFlow does not
+                # echo document-level meta_fields on retrieved chunks.
                 skipped_counts["department"] += 1
                 continue
             chunk_source_group = safe_source_group(metadata.get("source_group"))
             if routed_source_groups and chunk_source_group not in routed_source_groups:
                 skipped_counts["source_group"] += 1
                 continue
-            if source_names:
+            if source_names and not source_name_fallback:
+                # On the fallback path we already re-retrieved WITHOUT the
+                # original_file_name condition because the scoped retrieve
+                # returned 0; re-applying the source_name filter here would drop
+                # the broader hits (often from other files) and defeat the
+                # fallback. The non-fallback path keeps the check as
+                # defense-in-depth on top of the remote condition.
                 chunk_source_name = str(chunk.get("document_name") or metadata.get("original_file_name") or "")
                 if chunk_source_name not in source_names:
                     skipped_counts["source_name"] += 1

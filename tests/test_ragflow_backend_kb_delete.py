@@ -248,6 +248,32 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
             metadata_condition["conditions"],
         )
 
+    def test_retrieve_passes_through_chunks_without_department_metadata(self):
+        # RAGFlow does not always echo document-level meta_fields (department_id)
+        # on retrieved chunks. Such chunks must pass through to the caller instead
+        # of being dropped by the defense-in-depth department check — otherwise
+        # every hit is silently filtered out and the answer comes back empty.
+        backend = _retrieve_backend([
+            {
+                "id": "chunk-nodept",
+                "content": "content without department metadata",
+                "similarity": 0.9,
+                "metadata": {
+                    "kb_name": "kb",
+                    "source_group": "docs",
+                    "original_file_name": "c.pdf",
+                },
+            },
+        ])
+        ctx = RequestContext(metadata={"department_id": "dept_a"})
+
+        evidences = backend.retrieve("kb", "query", top_k=5, ctx=ctx)
+
+        self.assertEqual(
+            [item.content for item in evidences],
+            ["content without department metadata"],
+        )
+
     def test_retrieve_retries_scoped_source_name_without_remote_filename_filter(self):
         chunk = {
             "id": "chunk-hsi",
@@ -285,6 +311,37 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
             {"name": "original_file_name", "comparison_operator": "=", "value": "600608964_ADAS_HSI.docx"},
             second_condition["conditions"],
         )
+
+    def test_retrieve_fallback_passes_through_chunks_with_other_filenames(self):
+        # Fallback fires because the scoped (by source_name) retrieve returned 0.
+        # The broader retrieve typically returns chunks from OTHER files; those
+        # must pass through instead of being dropped by the local source_name
+        # filter, otherwise the fallback is pointless.
+        chunk = {
+            "id": "chunk-other",
+            "document_name": "other.pdf",
+            "content": "evidence from a different file",
+            "similarity": 0.8,
+            "metadata": {
+                "kb_name": "kb",
+                "department_id": "dept_a",
+                "source_group": "design",
+            },
+        }
+        backend = _retrieve_backend([])
+        backend.client = _SequentialRetrieveClient([[], [chunk]])
+        ctx = RequestContext(metadata={"department_id": "dept_a"})
+
+        evidences = backend.retrieve(
+            "kb",
+            "HSI interface",
+            top_k=5,
+            ctx=ctx,
+            filters={"source_name": "target.pdf"},
+        )
+
+        self.assertEqual([item.id for item in evidences], ["chunk-other"])
+        self.assertTrue(evidences[0].metadata["ragflow_source_name_fallback"])
 
     def test_kb_delete_dispatches_to_pipeline_handlers(self):
         rag_handler = _Handler(PROCESSOR_KIND_RAGFLOW)
