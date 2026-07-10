@@ -106,6 +106,22 @@ SOURCE_GROUP_DATASET_KIND = {
 
 RAGFLOW_INFO_ID_PREFIX = "ragflow:"
 
+_LEGACY_SOURCE_GROUP_ALIASES = {
+    "docs": DOCS_GROUP,
+    "document": DOCS_GROUP,
+    "design": DESIGN_GROUP,
+    "material": MATERIAL_GROUP,
+    "test": TEST_GROUP,
+    "project": PROJECT_GROUP,
+    "external": EXTERNAL_GROUP,
+    "people": PEOPLE_GROUP,
+}
+
+
+def _normalize_chunk_source_group(value: object) -> str:
+    raw = str(value or "").strip()
+    return _LEGACY_SOURCE_GROUP_ALIASES.get(raw.casefold(), safe_source_group(raw))
+
 
 @dataclass
 class ProcessingResult:
@@ -533,6 +549,7 @@ class RAGFlowBackend(RAGBackend):
         ).build()
         self.store = runtime_bundle.store
         self.spreadsheet_indexes = runtime_bundle.spreadsheet_indexes
+        self.circuit_indexes = runtime_bundle.circuit_indexes
         self.archive = runtime_bundle.archive
         self.ingestion = runtime_bundle.ingestion
         self.runtime = runtime_bundle.runtime
@@ -894,7 +911,7 @@ class RAGFlowBackend(RAGBackend):
                 # echo document-level meta_fields on retrieved chunks.
                 skipped_counts["department"] += 1
                 continue
-            chunk_source_group = safe_source_group(metadata.get("source_group"))
+            chunk_source_group = _normalize_chunk_source_group(metadata.get("source_group"))
             if routed_source_groups and chunk_source_group not in routed_source_groups:
                 skipped_counts["source_group"] += 1
                 continue
@@ -1421,5 +1438,3 @@ class RAGFlowBackend(RAGBackend):
             return BackendHealth(ok=True, details=details, backend=self.name)
         except Exception as exc:
             return BackendHealth(ok=False, message=str(exc), backend=self.name)
-
-

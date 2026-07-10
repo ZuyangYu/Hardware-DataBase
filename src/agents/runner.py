@@ -16,10 +16,12 @@ from src.agents.graph import (
     scan_kb_catalog,
 )
 from src.agents.prompts import ANSWER_SYSTEM_PROMPT
+from src.agents.tools.circuit_tools import CircuitQueryTool
 from src.agents.tools.document_rag_tool import DocumentRAGTool
 from src.agents.tools.pipeline_catalog_tool import PipelineCatalogTool
 from src.agents.tools.spreadsheet_tools import SpreadsheetCellTool, SpreadsheetProfileTool, SpreadsheetSemanticTool
 from src.core.llm_client import LLMClient
+from src.circuit.index_service import CircuitIndexService
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
@@ -46,11 +48,13 @@ class MultiSourceAgentRunner:
         rag_backend: RAGBackend,
         document_store: PipelineDocumentStore | None = None,
         spreadsheet_service: SpreadsheetIndexService | None = None,
+        circuit_service: CircuitIndexService | None = None,
         llm_client: LLMClient | None = None,
     ):
         self.rag_backend = rag_backend
         self.document_store = document_store or PipelineDocumentStore()
         self.spreadsheet_service = spreadsheet_service or SpreadsheetIndexService()
+        self.circuit_service = circuit_service or CircuitIndexService()
         self.llm_client = llm_client or LLMClient()
         # Footer (observability/trace) from the most recent stream; exposed
         # separately from final_response so the frontend can collapse it.
@@ -67,6 +71,7 @@ class MultiSourceAgentRunner:
         )
         self.tools = {
             "document_rag": DocumentRAGTool(rag_backend, self.document_store),
+            "circuit_query": CircuitQueryTool(self.circuit_service),
             "spreadsheet_semantic": SpreadsheetSemanticTool(self.spreadsheet_service),
             "spreadsheet_cell": SpreadsheetCellTool(self.spreadsheet_service),
             "spreadsheet_profile": SpreadsheetProfileTool(self.spreadsheet_service),

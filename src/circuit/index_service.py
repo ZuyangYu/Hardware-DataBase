@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.agents.state import Evidence
+from src.circuit.evidence_mapper import CircuitEvidenceMapper
 from src.circuit.models import CircuitDesign, CircuitStatus, DesignFile
 from src.circuit.parsers.edf_parser import EdfParser
+from src.circuit.query_engine import CircuitQueryEngine
 from src.circuit.store import CircuitStore, make_design_id
 from src.pipelines.document_rag.schemas import RequestContext
 
@@ -34,9 +36,12 @@ class CircuitIndexService:
         store: CircuitStore | None = None,
         storage_root: str | None = None,
         parser_factory: Callable[..., Any] | None = None,
+        query_engine: CircuitQueryEngine | None = None,
     ):
         self.store = store or CircuitStore(root=storage_root)
         self.parser_factory = parser_factory or EdfParser
+        self.query_engine = query_engine or CircuitQueryEngine(self.store)
+        self.evidence_mapper = CircuitEvidenceMapper()
 
     def index_file(
         self,
@@ -112,18 +117,66 @@ class CircuitIndexService:
         top_k = max(1, int(top_k or 5))
         needles = _query_terms(query)
         department_id = _ctx_department_id(ctx)
-        hits: list[Evidence] = []
+        allowed_designs: dict[str, tuple[dict[str, Any], str]] = {}
         for design in self.store.list_designs(kb_name):
             meta = self._read_metadata(kb_name, design.design_id)
-            if department_id and meta.get("department_id") and meta.get("department_id") != department_id:
+            if department_id and str(meta.get("department_id") or "") != department_id:
                 continue
             source_name = str(meta.get("original_name") or (design.files[0].file_name if design.files else design.design_id))
             if not _matches_filters(filters, source_name, meta):
                 continue
+            meta = {**meta, "kb_name": design.kb_name}
+            allowed_designs[design.design_id] = (meta, source_name)
+
+        if not allowed_designs:
+            return []
+
+        hits = self._structured_evidence(kb_name, query, allowed_designs, top_k)
+        if hits:
+            return hits[:top_k]
+
+        hits = []
+        for design in self.store.list_designs(kb_name):
+            allowed = allowed_designs.get(design.design_id)
+            if allowed is None:
+                continue
+            meta, source_name = allowed
             hits.extend(self._net_evidence(design, meta, source_name, needles))
             hits.extend(self._instance_evidence(design, meta, source_name, needles))
         hits.sort(key=lambda item: item.score, reverse=True)
         return hits[:top_k]
+
+    def _structured_evidence(
+        self,
+        kb_name: str,
+        query: str,
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+        top_k: int,
+    ) -> list[Evidence]:
+        candidates = [
+            ("net", 0.96, self.query_engine.search_net_connections(kb_name, query, limit=top_k * 3)),
+            ("instance", 0.92, self.query_engine.search_instances(kb_name, query, limit=top_k * 3)),
+            ("module", 0.80, self.query_engine.search_modules(kb_name, query, limit=top_k * 2)),
+            ("module_connection", 0.84, self.query_engine.search_module_connections(kb_name, query, limit=top_k * 2)),
+            ("module_power", 0.82, self.query_engine.search_module_power_nets(kb_name, query, limit=top_k * 2)),
+        ]
+        evidence_by_id: dict[str, Evidence] = {}
+        for kind, score, rows in candidates:
+            for row in rows:
+                design_id = str(row.get("design_id") or row.get("circuit_id") or "")
+                context = allowed_designs.get(design_id)
+                if context is None:
+                    continue
+                metadata, source_name = context
+                evidence = self.evidence_mapper.build(
+                    kind=kind,
+                    row=row,
+                    metadata=metadata,
+                    source_name=source_name,
+                    score=score,
+                )
+                evidence_by_id.setdefault(evidence.id, evidence)
+        return sorted(evidence_by_id.values(), key=lambda item: (-item.score, item.id))
 
     def delete_record(self, record: Any) -> None:
         kb_name = getattr(record, "kb_name", "")

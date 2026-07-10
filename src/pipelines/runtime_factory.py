@@ -2,12 +2,19 @@ from dataclasses import dataclass
 
 from src.pipelines.document_store import PipelineDocumentStore
 from src.pipelines.ingestion import (
+    CircuitPipelineHandler,
     IngestionOrchestrator,
     RAGFlowDocumentHandler,
     SpreadsheetPipelineHandler,
 )
-from src.pipelines.registry import PIPELINE_REGISTRY, PROCESSOR_KIND_RAGFLOW, PROCESSOR_KIND_SPREADSHEET
+from src.pipelines.registry import (
+    PIPELINE_REGISTRY,
+    PROCESSOR_KIND_CIRCUIT,
+    PROCESSOR_KIND_RAGFLOW,
+    PROCESSOR_KIND_SPREADSHEET,
+)
 from src.pipelines.runtime import PipelineRuntime
+from src.circuit.index_service import CircuitIndexService
 from src.services.document_archive import DocumentArchiveManager
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
 
@@ -17,6 +24,7 @@ class PipelineRuntimeBundle:
     store: PipelineDocumentStore
     archive: DocumentArchiveManager
     spreadsheet_indexes: SpreadsheetIndexService
+    circuit_indexes: CircuitIndexService
     ingestion: IngestionOrchestrator
     runtime: PipelineRuntime
 
@@ -36,6 +44,7 @@ class PipelineRuntimeFactory:
         store: PipelineDocumentStore | None = None,
         archive: DocumentArchiveManager | None = None,
         spreadsheet_indexes: SpreadsheetIndexService | None = None,
+        circuit_indexes: CircuitIndexService | None = None,
     ):
         self.backend_name = backend_name
         self.submit_remote = submit_remote_callback
@@ -48,11 +57,13 @@ class PipelineRuntimeFactory:
         self.store = store or PipelineDocumentStore()
         self.archive = archive or DocumentArchiveManager()
         self.spreadsheet_indexes = spreadsheet_indexes or SpreadsheetIndexService()
+        self.circuit_indexes = circuit_indexes or CircuitIndexService()
 
     def build(self) -> PipelineRuntimeBundle:
         rag_spec = PIPELINE_REGISTRY.by_processor_kind(PROCESSOR_KIND_RAGFLOW)
         spreadsheet_spec = PIPELINE_REGISTRY.by_processor_kind(PROCESSOR_KIND_SPREADSHEET)
-        if rag_spec is None or spreadsheet_spec is None:
+        circuit_spec = PIPELINE_REGISTRY.by_processor_kind(PROCESSOR_KIND_CIRCUIT)
+        if rag_spec is None or spreadsheet_spec is None or circuit_spec is None:
             raise RuntimeError("Required ingestion pipeline specs are not registered.")
 
         runtime_ref: dict[str, PipelineRuntime] = {}
@@ -79,6 +90,11 @@ class PipelineRuntimeFactory:
                     parse_index_callback=self.spreadsheet_indexes.parse_and_index,
                     delete_index_callback=self.spreadsheet_indexes.delete_record,
                 ),
+                PROCESSOR_KIND_CIRCUIT: CircuitPipelineHandler(
+                    spec=circuit_spec,
+                    store=self.store,
+                    circuit_index=self.circuit_indexes,
+                ),
             },
             audit_callback=self.audit,
             content_hash_callback=self.content_hash,
@@ -96,6 +112,7 @@ class PipelineRuntimeFactory:
             store=self.store,
             archive=self.archive,
             spreadsheet_indexes=self.spreadsheet_indexes,
+            circuit_indexes=self.circuit_indexes,
             ingestion=ingestion,
             runtime=runtime,
         )

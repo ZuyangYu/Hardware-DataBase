@@ -47,7 +47,12 @@ class AppPipeline:
         try:
             self.backend = create_rag_backend()
             self.documents = DocumentManager(self.backend)
-            self.agent = MultiSourceAgentRunner(rag_backend=self.backend)
+            self.agent = MultiSourceAgentRunner(
+                rag_backend=self.backend,
+                document_store=getattr(self.backend, "store", None),
+                spreadsheet_service=getattr(self.backend, "spreadsheet_indexes", None),
+                circuit_service=getattr(self.backend, "circuit_indexes", None),
+            )
         except Exception as exc:
             error(f"AppPipeline 初始化失败: {exc}")
             raise

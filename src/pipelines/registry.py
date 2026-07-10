@@ -4,10 +4,13 @@ from typing import Iterable
 
 
 DATASET_TABLE = "table"
+DATASET_CIRCUIT = "circuit"
 CONTENT_KIND_DOCUMENT = "document_text"
 CONTENT_KIND_SPREADSHEET = "spreadsheet_table"
+CONTENT_KIND_CIRCUIT = "circuit_design"
 PROCESSOR_KIND_RAGFLOW = "ragflow"
 PROCESSOR_KIND_SPREADSHEET = "spreadsheet_table"
+PROCESSOR_KIND_CIRCUIT = "circuit_design"
 
 PIPELINE_STAGE_RETRIEVAL = "retrieval"
 PIPELINE_STAGE_STRUCTURED = "structured"
@@ -134,6 +137,16 @@ PIPELINE_REGISTRY = PipelineRegistry([
         stage=PIPELINE_STAGE_STRUCTURED,
         dataset_kind=DATASET_TABLE,
         description="Excel workbooks parsed into department-scoped table indexes.",
+    ),
+    PipelineSpec(
+        key="circuit_design",
+        label="Circuit Design",
+        processor_kind=PROCESSOR_KIND_CIRCUIT,
+        content_kind=CONTENT_KIND_CIRCUIT,
+        supported_extensions=frozenset({".edf", ".edif"}),
+        stage=PIPELINE_STAGE_STRUCTURED,
+        dataset_kind=DATASET_CIRCUIT,
+        description="Circuit design netlists archived into the scoped circuit pipeline.",
     ),
 ])
 

@@ -1,9 +1,9 @@
 import unittest
-from pathlib import Path
 
+from src.agents.runner import MultiSourceAgentRunner
 from src.agents.state import Evidence
 from src.agents.tools.circuit_tools import CircuitQueryTool
-from src.pipelines.document_rag.schemas import RequestContext
+from src.pipelines.document_rag.schemas import BackendHealth, BackendResult, IngestResult, RequestContext
 
 
 class _CircuitIndex:
@@ -14,6 +14,38 @@ class _CircuitIndex:
     def query(self, **kwargs):
         self.calls.append(kwargs)
         return self.hits
+
+
+class _FakeRAGBackend:
+    name = "fake_ragflow"
+
+    def list_knowledge_bases(self):
+        return ["kb_hw"]
+
+    def upload_files(self, kb_name, files, ctx=None, source_group=None, progress_callback=None):
+        return IngestResult(success_count=len(files), total_count=len(files), backend=self.name)
+
+    def retrieve(self, kb_name, query, top_k=None, ctx=None, filters=None):
+        return []
+
+    def delete_document(self, kb_name, document_id, ctx=None):
+        return BackendResult(ok=True, message="deleted", backend=self.name)
+
+    def list_documents(self, kb_name, ctx=None):
+        return []
+
+    def health_check(self):
+        return BackendHealth(ok=True, backend=self.name)
+
+
+class _FakeDocumentStore:
+    def list_documents(self, kb_name, department_id=None):
+        return []
+
+
+class _FakeSpreadsheetService:
+    def get_document_profile(self, record):
+        return {}
 
 
 class CircuitAgentToolTests(unittest.TestCase):
@@ -52,10 +84,17 @@ class CircuitAgentToolTests(unittest.TestCase):
         hits = tool.run("U1200 CAN connection", "kb_hw", RequestContext(user_id="alice"), top_k=3)
         self.assertEqual(hits, [])
 
-    def test_runner_registers_circuit_query_tool(self):
-        runner_source = Path("src/agents/runner.py").read_text(encoding="utf-8")
-        self.assertIn("CircuitQueryTool", runner_source)
-        self.assertIn('"circuit_query": CircuitQueryTool()', runner_source)
+    def test_runner_uses_injected_circuit_service(self):
+        circuit_index = _CircuitIndex()
+
+        runner = MultiSourceAgentRunner(
+            rag_backend=_FakeRAGBackend(),
+            document_store=_FakeDocumentStore(),
+            spreadsheet_service=_FakeSpreadsheetService(),
+            circuit_service=circuit_index,
+        )
+
+        self.assertIs(runner.tools["circuit_query"].index_service, circuit_index)
 
 
 if __name__ == "__main__":

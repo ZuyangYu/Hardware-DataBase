@@ -73,7 +73,7 @@ def _write_stream_event(event: dict[str, Any]) -> None:
 
 
 def _normalize_expected_evidence(values: Any) -> list[str]:
-    allowed = {"document_text", "spreadsheet_table"}
+    allowed = {"document_text", "spreadsheet_table", "circuit_design"}
     if isinstance(values, str):
         values = [values]
     result = []
@@ -81,7 +81,7 @@ def _normalize_expected_evidence(values: Any) -> list[str]:
         text = str(value or "").strip()
         if text in allowed and text not in result:
             result.append(text)
-    return result or ["document_text", "spreadsheet_table"]
+    return result or ["document_text", "spreadsheet_table", "circuit_design"]
 
 
 def _as_unique_strings(values: Any, limit: int = 20) -> list[str]:
@@ -116,6 +116,37 @@ def _keyword_entities(query: str) -> list[str]:
 def _expected_evidence(question: str) -> list[str]:
     lower = question.lower()
     expected = []
+    has_refdes = bool(re.search(r"\b[A-Za-z]{1,4}\d{1,}\b", question or ""))
+    has_net_identifier = bool(re.search(r"\b[A-Z][A-Z0-9_]{2,}\b", question or ""))
+    has_circuit_context = any(word in lower for word in [
+        "connection",
+        "pin",
+        "net",
+        "topology",
+        "module",
+        "power",
+        "连接",
+        "引脚",
+        "网络",
+        "拓扑",
+        "模块",
+        "电源",
+    ])
+    if any(word in lower for word in [
+        "edf",
+        "edif",
+        "netlist",
+        "schematic",
+        "pin",
+        "net ",
+        "原理图",
+        "网表",
+        "引脚",
+        "网络",
+        "连接",
+        "拓扑",
+    ]) or has_refdes or (has_net_identifier and has_circuit_context):
+        expected.append("circuit_design")
     if any(word in lower for word in [
         "bom",
         "mpn",
@@ -143,7 +174,7 @@ def _expected_evidence(question: str) -> list[str]:
         "原理图",
     ]):
         expected.append("document_text")
-    return expected or ["document_text", "spreadsheet_table"]
+    return expected or ["document_text", "spreadsheet_table", "circuit_design"]
 
 
 _SMALL_TALK_PATTERNS = (
@@ -352,7 +383,7 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
         '  "reasoning_summary": "Brief visible rationale, not hidden chain-of-thought",\n'
         '  "entities": ["part numbers, document names, hardware terms"],\n'
         '  "sub_questions": [\n'
-        '    {"id": "sq_1", "question": "...", "expected_evidence": ["document_text", "spreadsheet_table"]}\n'
+        '    {"id": "sq_1", "question": "...", "expected_evidence": ["document_text", "spreadsheet_table", "circuit_design"]}\n'
         "  ],\n"
         '  "multi_hop": true|false\n'
         "}\n\n"
@@ -441,6 +472,11 @@ def _source_matches_analysis(source: dict[str, Any], analysis: dict[str, Any]) -
     expected = {item for sq in sub_questions for item in sq.get("expected_evidence", [])}
     if processor == "spreadsheet_table" and "spreadsheet_table" in expected:
         return True, "该文件是结构化 Excel，适合查询 BOM、用量、替代料、参数或测试矩阵等表格事实。"
+    if processor == "circuit_design":
+        if str(source.get("status") or "") != "indexed":
+            return False, "电路文件尚未索引成功，跳过结构化电路检索。"
+        if "circuit_design" in expected:
+            return True, "该文件是结构化电路设计数据，适合查询网表、引脚、网络连接和拓扑事实。"
     if content_kind == "document_text" and "document_text" in expected:
         return True, "该文件是文本文档，适合查询设计说明、测试报告、规格说明和上下文解释。"
     entity_hit = any(str(entity).casefold() in name.casefold() for entity in analysis.get("entities", []))
@@ -520,6 +556,16 @@ def plan_source_selection(state: AgentState) -> AgentState:
                     filters=compact_filters,
                 )
             )
+        elif processor == "circuit_design":
+            calls.append(
+                ToolCallPlan(
+                    tool_name="circuit_query",
+                    query=query,
+                    reason="查询结构化电路数据，覆盖网表、引脚、网络连接和拓扑事实。",
+                    top_k=8,
+                    filters=compact_filters,
+                )
+            )
         else:
             calls.append(
                 ToolCallPlan(
@@ -580,6 +626,7 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         "- document_rag: use for document_text / ragflow sources\n"
         "- spreadsheet_semantic: use for spreadsheet_table row-level facts\n"
         "- spreadsheet_cell: use for spreadsheet_table exact cells, part numbers, quantities, parameters\n\n"
+        "- circuit_query: use for circuit_design netlist/schematic connection facts\n\n"
         "Planning requirements:\n"
         "- Build search fanout from the sub_questions, not a single best source.\n"
         "- If different sub_questions need different evidence types or corpora, select multiple sources and tool calls.\n"
@@ -590,7 +637,7 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         "{\n"
         '  "source_plan": [\n'
         '    {"source_name": "must exactly match catalog document_name", "reason": "visible reason", '
-        '"tool_calls": [{"tool_name": "document_rag|spreadsheet_semantic|spreadsheet_cell", '
+        '"tool_calls": [{"tool_name": "document_rag|spreadsheet_semantic|spreadsheet_cell|circuit_query", '
         '"query": "rewritten retrieval query", "reason": "visible reason", "top_k": 8}]}\n'
         "  ],\n"
         '  "skipped_sources": [{"source_name": "...", "reason": "..."}]\n'
@@ -621,6 +668,8 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
             allowed_tools = (
                 {"spreadsheet_semantic", "spreadsheet_cell"}
                 if processor == "spreadsheet_table"
+                else {"circuit_query"}
+                if processor == "circuit_design"
                 else {"document_rag"}
             )
             filters = {
@@ -712,6 +761,16 @@ def _default_tool_calls_for_source(source: dict[str, Any], query: str, filters: 
                 filters=filters,
             ),
         ]
+    if source.get("processor_kind") == "circuit_design":
+        return [
+            ToolCallPlan(
+                tool_name="circuit_query",
+                query=query,
+                reason="Fallback circuit-design retrieval.",
+                top_k=8,
+                filters=filters,
+            )
+        ]
     return [
         ToolCallPlan(
             tool_name="document_rag",
@@ -721,6 +780,14 @@ def _default_tool_calls_for_source(source: dict[str, Any], query: str, filters: 
             filters=filters,
         )
     ]
+
+
+def _allowed_tools_for_processor(processor_kind: str) -> set[str]:
+    if processor_kind == "spreadsheet_table":
+        return {"spreadsheet_semantic", "spreadsheet_cell"}
+    if processor_kind == "circuit_design":
+        return {"circuit_query"}
+    return {"document_rag"}
 
 
 def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool: Any) -> AgentState:
@@ -827,13 +894,15 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
                 continue
             q = str(call.get("query") or "").strip()
             tool_name = str(call.get("tool_name") or "").strip()
-            if not q or tool_name not in {"document_rag", "spreadsheet_semantic", "spreadsheet_cell"}:
+            if not q or tool_name not in {"document_rag", "spreadsheet_semantic", "spreadsheet_cell", "circuit_query"}:
                 continue
             source_name = str(call.get("source_name") or "").strip()
             filters: dict[str, Any] = {}
             # 指定了 source_name 且在 catalog 中 → 跨语料精准检索；否则广搜（filters 空）。
             src = source_by_name.get(source_name) or _resolve_catalog_source(sources, source_name)
             if src:
+                if tool_name not in _allowed_tools_for_processor(str(src.get("processor_kind") or "")):
+                    continue
                 source_name = str(src.get("document_name") or source_name)
                 filters = {"source_name": source_name, "record_id": src.get("record_id")}
                 filters = {k: v for k, v in filters.items() if v}
@@ -1060,7 +1129,12 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
         else:
             status = "missing"
             for evidence_type in expected or ["document_text"]:
-                tool_name = "spreadsheet_semantic" if evidence_type == "spreadsheet_table" else "document_rag"
+                if evidence_type == "spreadsheet_table":
+                    tool_name = "spreadsheet_semantic"
+                elif evidence_type == "circuit_design":
+                    tool_name = "circuit_query"
+                else:
+                    tool_name = "document_rag"
                 followups.append(
                     ToolCallPlan(
                         tool_name=tool_name,
@@ -1069,7 +1143,7 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
                         top_k=8,
                     ).model_dump()
                 )
-        expected_types = list(expected or {"document_text", "spreadsheet_table"})
+        expected_types = list(expected or {"document_text", "spreadsheet_table", "circuit_design"})
         missing_types = [kind for kind in expected_types if kind not in covered_types]
         relevant_sources = _relevant_sources_for_subquestion(sources, sq, analysis)
         searched_sources = sorted(
@@ -1150,14 +1224,16 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
 
 
 def _searched_scope_by_kind(diagnostics: list[dict[str, Any]]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    sources_by_kind: dict[str, set[str]] = {"document_text": set(), "spreadsheet_table": set()}
-    tools_by_kind: dict[str, set[str]] = {"document_text": set(), "spreadsheet_table": set()}
+    sources_by_kind: dict[str, set[str]] = {"document_text": set(), "spreadsheet_table": set(), "circuit_design": set()}
+    tools_by_kind: dict[str, set[str]] = {"document_text": set(), "spreadsheet_table": set(), "circuit_design": set()}
     for item in diagnostics:
         tool_name = str(item.get("tool_name") or "")
         if tool_name == "document_rag":
             kind = "document_text"
         elif tool_name in {"spreadsheet_semantic", "spreadsheet_cell"}:
             kind = "spreadsheet_table"
+        elif tool_name == "circuit_query":
+            kind = "circuit_design"
         else:
             continue
         tools_by_kind.setdefault(kind, set()).add(tool_name)
@@ -1180,6 +1256,9 @@ def _relevant_sources_for_subquestion(
         content_kind = str(source.get("content_kind") or "")
         processor = str(source.get("processor_kind") or "")
         if "spreadsheet_table" in expected and processor == "spreadsheet_table":
+            result.append(source)
+            continue
+        if "circuit_design" in expected and processor == "circuit_design":
             result.append(source)
             continue
         if "document_text" in expected and content_kind == "document_text":
