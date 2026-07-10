@@ -24,6 +24,7 @@ from src.agents.state import (
     ToolCallPlan,
 )
 from src.agents.query_tokens import _HARDWARE_TERMS
+from src.circuit.question_analysis import analyze_question as analyze_circuit_question
 from src.agents.prompts import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
     PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT,
@@ -929,6 +930,49 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
         return _empty("重规划 LLM 失败，终止迭代。", error=str(exc)[:300])
 
 
+_CAPABILITY_TERMS = (
+    "short circuit", "short-to-ground", "short-to-battery", "overcurrent", "current limit", "thermal shutdown", "ocp", "scp",
+    "短路保护", "短地", "短电源", "过流保护", "限流", "热关断",
+)
+
+
+def _is_matching_datasheet_capability(source_name: str, content: str, part_number: str) -> bool:
+    """Require both the discovered MPN and an explicit protection term."""
+    part = str(part_number or "").strip().casefold()
+    searchable = f"{source_name or ''}\n{content or ''}".casefold()
+    return bool(part and part in searchable and any(term in searchable for term in _CAPABILITY_TERMS))
+
+
+def _derived_datasheet_calls(question: str, circuit_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build bounded manual lookups from part numbers discovered in EDF facts."""
+    if not analyze_circuit_question(question).requires_datasheet:
+        return []
+    part_numbers: list[str] = []
+    for hit in circuit_hits:
+        metadata = hit.get("metadata") or {}
+        if metadata.get("evidence_kind") != "derived_topology" or not metadata.get("capability_candidate"):
+            continue
+        for raw in metadata.get("part_numbers") or []:
+            part = str(raw or "").strip()
+            if part and part.casefold() not in {item.casefold() for item in part_numbers}:
+                part_numbers.append(part)
+            if len(part_numbers) >= 4:
+                break
+        if len(part_numbers) >= 4:
+            break
+    return [
+        {
+            "tool_name": "document_rag",
+            "query": f"{part} datasheet short circuit protection OCP SCP short-to-ground short-to-battery thermal shutdown",
+            "reason": f"Verify protection capability claimed for circuit-discovered part {part}.",
+            "top_k": 4,
+            "filters": {},
+            "part_number": part,
+        }
+        for part in part_numbers
+    ]
+
+
 def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
     evidence = list(state.get("evidence") or [])
     round_no = int(state.get("retrieval_round") or 0) + 1
@@ -942,6 +986,7 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
             calls.extend(item.get("tool_calls", []))
 
     bounded_calls = list(calls[:8])
+    circuit_hits: list[dict[str, Any]] = []
 
     def _run_call(call: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
         tool = tools.get(call.get("tool_name"))
@@ -1004,6 +1049,8 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                 diagnostic, hits, failure = future.result()
                 diagnostics.append(diagnostic)
                 evidence.extend(hits)
+                if diagnostic.get("tool_name") == "circuit_query":
+                    circuit_hits.extend(hits)
                 _write_stream_event(
                     {
                         "type": "tool_result",
@@ -1020,6 +1067,50 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                         f"Tool failed: {failure.get('tool')}",
                         {"error": str(failure.get("error") or "")[:300]},
                     )
+
+    if round_no == 1:
+        for call in _derived_datasheet_calls(state.get("user_query", ""), circuit_hits):
+            tool = tools.get("document_rag")
+            if tool is None:
+                break
+            try:
+                hits = tool.run(call["query"], state["kb_name"], state.get("_ctx_obj"), top_k=call["top_k"], filters={})
+                for hit in hits:
+                    payload = hit.model_dump()
+                    evidence_kind = "datasheet_claim" if _is_matching_datasheet_capability(
+                        hit.source_name, hit.content, call["part_number"]
+                    ) else "datasheet_reference"
+                    payload["metadata"] = {
+                        **(payload.get("metadata") or {}),
+                        "evidence_kind": evidence_kind,
+                        "derived_from": "circuit_part_number",
+                        "part_number": call["part_number"],
+                    }
+                    evidence.append(payload)
+                diagnostics.append(
+                    {
+                        "tool_name": "document_rag",
+                        "query": call["query"],
+                        "filters": {},
+                        "top_k": call["top_k"],
+                        "hit_count": len(hits),
+                        "status": "ok",
+                        "derived_from": "circuit_part_number",
+                    }
+                )
+            except Exception as exc:
+                diagnostics.append(
+                    {
+                        "tool_name": "document_rag",
+                        "query": call["query"],
+                        "filters": {},
+                        "top_k": call["top_k"],
+                        "hit_count": 0,
+                        "status": "failed",
+                        "derived_from": "circuit_part_number",
+                        "error": str(exc),
+                    }
+                )
 
     trace_tool_calls = [
         {

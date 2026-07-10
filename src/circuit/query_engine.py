@@ -678,6 +678,144 @@ class CircuitQueryEngine:
                     return results
         return results
 
+    def search_bias_topologies(self, kb_name: str, limit: int = 20) -> list[dict]:
+        """Return grounded external pull-up and pull-down resistor facts.
+
+        This intentionally recognises only a two-pin, non-zero resistor whose
+        endpoints are one signal net and one classified power/ground net.
+        Dividers, feedbacks and links are therefore not relabelled as bias.
+        """
+        rows: list[dict] = []
+        for design in self.store.list_designs(kb_name):
+            for inst in design.instances:
+                descriptor = " ".join(str(value or "") for value in (inst.library_cell, inst.part_number, inst.value))
+                if not inst.refdes.upper().startswith("R") and "RES" not in descriptor.upper():
+                    continue
+                if self._is_zero_ohm_resistor(inst.value):
+                    continue
+                pins = [pin for pin in inst.pins if pin.net]
+                if len(pins) != 2:
+                    continue
+                left, right = pins
+                left_role = classify_net_name(left.net)
+                right_role = classify_net_name(right.net)
+                if left_role == "signal" and right_role in {"power", "ground"}:
+                    signal, rail, rail_role = left, right, right_role
+                elif right_role == "signal" and left_role in {"power", "ground"}:
+                    signal, rail, rail_role = right, left, left_role
+                else:
+                    continue
+                topology = "pull_up" if rail_role == "power" else "pull_down"
+                rows.append(
+                    {
+                        "design_id": design.design_id,
+                        "circuit_id": design.design_id,
+                        "topology": topology,
+                        "refdes": inst.refdes,
+                        "library_cell": inst.library_cell,
+                        "part_number": inst.part_number,
+                        "value": inst.value,
+                        "signal_net": signal.net,
+                        "signal_pin": signal.name,
+                        "rail_net": rail.net,
+                        "rail_pin": rail.name,
+                        "certainty": "direct",
+                        "confidence": 1.0,
+                    }
+                )
+                if len(rows) >= limit:
+                    return rows
+        return rows
+
+    def search_protection_topologies(self, kb_name: str, limit: int = 20) -> list[dict]:
+        """Find directly connected protection-component candidates.
+
+        A returned row proves a component-to-net topology only.  Its presence
+        must not be interpreted as an IC short-circuit capability.
+        """
+        rows: list[dict] = []
+        for design in self.store.list_designs(kb_name):
+            for inst in design.instances:
+                descriptor = " ".join(str(value or "") for value in (inst.library_cell, inst.part_number, inst.value)).upper()
+                refdes = inst.refdes.upper()
+                if "TVS" in descriptor or "ESD" in descriptor:
+                    kind = "protection_tvs"
+                elif refdes.startswith("F") or "FUSE" in descriptor or "PTC" in descriptor:
+                    kind = "protection_fuse"
+                else:
+                    continue
+                pins = [pin for pin in inst.pins if pin.net]
+                if len(pins) < 2:
+                    continue
+                ground_pins = [pin for pin in pins if classify_net_name(pin.net) == "ground"]
+                signal_pins = [pin for pin in pins if classify_net_name(pin.net) == "signal"]
+                rows.append(
+                    {
+                        "design_id": design.design_id,
+                        "circuit_id": design.design_id,
+                        "topology": kind,
+                        "refdes": inst.refdes,
+                        "library_cell": inst.library_cell,
+                        "part_number": inst.part_number,
+                        "value": inst.value,
+                        "pins": [{"name": pin.name, "net": pin.net} for pin in pins],
+                        "protected_nets": [pin.net for pin in signal_pins],
+                        "ground_nets": [pin.net for pin in ground_pins],
+                        "certainty": "direct",
+                        "confidence": 1.0,
+                    }
+                )
+                if len(rows) >= limit:
+                    return rows
+        return rows
+
+    def search_power_protection_candidates(self, kb_name: str, limit: int = 20) -> list[dict]:
+        """Find power-control ICs on a concrete input-to-output rail path.
+
+        These rows nominate a part number for datasheet lookup; they do not
+        establish that the component implements any particular protection.
+        """
+        rows: list[dict] = []
+        for design in self.store.list_designs(kb_name):
+            rail_names = {
+                net.name
+                for net in design.nets
+                if net.net_type in {"power", "ground"} or classify_net_name(net.name) in {"power", "ground"}
+            }
+            for inst in design.instances:
+                candidate = self._power_converter_candidate(inst, {}, rail_names)
+                if candidate is None or candidate["is_incomplete"]:
+                    continue
+                if candidate["type"] in {"fuse", "ferrite_bead", "series_passive"}:
+                    continue
+                if not str(inst.refdes).upper().startswith("U"):
+                    continue
+                rows.append(
+                    {
+                        "design_id": design.design_id,
+                        "circuit_id": design.design_id,
+                        "topology": "power_control_candidate",
+                        "refdes": inst.refdes,
+                        "library_cell": inst.library_cell,
+                        "part_number": inst.part_number,
+                        "value": inst.value,
+                        "input_nets": candidate["input_nets"],
+                        "protected_nets": candidate["output_nets"],
+                        "ground_nets": [item["net"] for item in candidate["pins"]["grounds"]],
+                        "certainty": "direct",
+                        "confidence": candidate["confidence"],
+                        "capability_candidate": True,
+                    }
+                )
+                if len(rows) >= limit:
+                    return rows
+        return rows
+
+    @staticmethod
+    def _is_zero_ohm_resistor(value: str | None) -> bool:
+        normalized = re.sub(r"\s+", "", str(value or "").upper())
+        return normalized in {"0", "0R", "0OHM", "0Ω", "0R,5%%"}
+
     def search_modules(
         self,
         kb_name: str,

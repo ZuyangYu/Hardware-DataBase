@@ -212,6 +212,9 @@ class MultiSourceAgentRunner:
                 "请输出中文答案，按子问题组织，包含来源说明，并列出缺失信息。"
                 "如果检索账本中某个子问题 status 不是 covered，必须明确说明缺口，不要把弱证据写成确定结论。"
                 "如果 coverage_matrix.conflicts 非空，必须单独列出证据冲突，不能把冲突值合并成确定结论。"
+                "对 evidence_kind=derived_topology 的内容只能说明已观察到的连接/拓扑；"
+                "只有同一 part_number 的 evidence_kind=datasheet_claim 才能确认器件保护能力。"
+                "若存在多个 power-control candidate，必须逐个按输入/输出网络列示，不能将其归纳为某一个未指定输出的能力。"
             )
             try:
                 messages = [

@@ -11,6 +11,7 @@ from src.agents.state import Evidence
 from src.circuit.evidence_mapper import CircuitEvidenceMapper
 from src.circuit.models import CircuitDesign, CircuitStatus, DesignFile
 from src.circuit.parsers.edf_parser import EdfParser
+from src.circuit.question_analysis import analyze_question
 from src.circuit.query_engine import CircuitQueryEngine
 from src.circuit.store import CircuitStore, make_design_id
 from src.pipelines.document_rag.schemas import RequestContext
@@ -153,6 +154,7 @@ class CircuitIndexService:
         allowed_designs: dict[str, tuple[dict[str, Any], str]],
         top_k: int,
     ) -> list[Evidence]:
+        plan = analyze_question(query)
         candidates = [
             ("net", 0.96, self.query_engine.search_net_connections(kb_name, query, limit=top_k * 3)),
             ("instance", 0.92, self.query_engine.search_instances(kb_name, query, limit=top_k * 3)),
@@ -160,6 +162,18 @@ class CircuitIndexService:
             ("module_connection", 0.84, self.query_engine.search_module_connections(kb_name, query, limit=top_k * 2)),
             ("module_power", 0.82, self.query_engine.search_module_power_nets(kb_name, query, limit=top_k * 2)),
         ]
+        if "bias" in plan.operations:
+            bias_rows = self.query_engine.search_bias_topologies(kb_name, limit=top_k * 3)
+            lowered = query.casefold()
+            if "上拉" in lowered or "pull-up" in lowered or "pullup" in lowered:
+                bias_rows = [row for row in bias_rows if row.get("topology") == "pull_up"]
+            elif "下拉" in lowered or "pull-down" in lowered or "pulldown" in lowered:
+                bias_rows = [row for row in bias_rows if row.get("topology") == "pull_down"]
+            candidates.append(("topology", 0.94, bias_rows))
+        if "protection" in plan.operations:
+            candidates.append(("topology", 0.90, self.query_engine.search_protection_topologies(kb_name, limit=top_k * 3)))
+        if "power_path" in plan.operations and "protection" in plan.operations:
+            candidates.append(("topology", 0.91, self.query_engine.search_power_protection_candidates(kb_name, limit=top_k * 3)))
         evidence_by_id: dict[str, Evidence] = {}
         for kind, score, rows in candidates:
             for row in rows:

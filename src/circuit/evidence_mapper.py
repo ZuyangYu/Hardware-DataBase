@@ -37,6 +37,10 @@ class CircuitEvidenceMapper:
                 "kb_name": metadata.get("kb_name", ""),
                 "department_id": metadata.get("department_id", ""),
                 "source_group": "circuit_design",
+                "evidence_kind": "derived_topology" if kind == "topology" else "circuit_fact",
+                "part_numbers": [str(row["part_number"])] if row.get("part_number") else [],
+                "certainty": row.get("certainty", "direct"),
+                "capability_candidate": bool(row.get("capability_candidate")),
             },
         )
 
@@ -86,5 +90,30 @@ class CircuitEvidenceMapper:
             if ground:
                 facts.append(f"ground nets {ground}")
             return module_id, f"Module {name} has {'; '.join(facts)}." if facts else f"Module {name} has no classified power nets."
+
+        if kind == "topology":
+            topology = str(row.get("topology") or "topology")
+            refdes = str(row.get("refdes") or "component")
+            entity_id = f"{topology}:{refdes}"
+            if topology in {"pull_up", "pull_down"}:
+                content = (
+                    f"Observed {topology.replace('_', '-')} resistor {refdes} ({row.get('value') or 'value unknown'}) "
+                    f"connects signal net {row.get('signal_net')} to {row.get('rail_net')}."
+                )
+            elif topology == "power_control_candidate":
+                inputs = ", ".join(str(item) for item in row.get("input_nets") or []) or "no input power net classified"
+                outputs = ", ".join(str(item) for item in row.get("protected_nets") or []) or "no output power net classified"
+                content = (
+                    f"Observed power-control candidate {refdes} connects input power nets {inputs} to output power nets {outputs}; "
+                    "a matching datasheet capability clause is required before claiming protection."
+                )
+            else:
+                protected = ", ".join(str(item) for item in row.get("protected_nets") or []) or "no signal net classified"
+                ground = ", ".join(str(item) for item in row.get("ground_nets") or []) or "no ground net classified"
+                content = (
+                    f"Observed {topology.replace('_', ' ')} component {refdes} connects protected nets {protected} "
+                    f"and ground nets {ground}; this topology does not confirm short-circuit protection capability."
+                )
+            return entity_id, content
 
         raise ValueError(f"Unsupported circuit evidence kind: {kind}")
