@@ -186,6 +186,24 @@ class ConversationService:
                 (now, session_id, user_id),
             )
 
+    def delete_session(self, user_id: int, session_id: int) -> bool:
+        """Hard-delete a chat session (messages cascade via FK).
+
+        Returned bool tells the caller whether the row actually existed —
+        used by the UI's "clear current chat" path so we don't carry the
+        orphaned id around in session_state.
+        """
+        if not self.get_session(user_id, session_id):
+            return False
+        with closing(self._connect()) as conn:
+            # `chat_messages.session_id` has ON DELETE CASCADE, so deleting the
+            # session row drops its messages atomically.
+            conn.execute(
+                "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+        return True
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import logging
 import re
 import sys
@@ -86,16 +87,31 @@ def _patch_spydrnet_edif_parser() -> None:
     _SPYDRNET_PATCHED = True
 
 
+def _repo_spydrnet_path() -> Path:
+    return Path(__file__).resolve().parents[4] / "spydrnet"
+
+
 def _load_spydrnet():
-    try:
-        import spydrnet as sdn  # type: ignore
-    except ImportError:
-        repo_spydrnet = Path(__file__).resolve().parents[4] / "spydrnet"
-        if repo_spydrnet.exists():
-            sys.path.insert(0, str(repo_spydrnet))
-            import spydrnet as sdn  # type: ignore
-        else:
-            raise
+    """Load the workspace SpyDrNet checkout before any installed package."""
+    repo_spydrnet = _repo_spydrnet_path()
+    repo_package = repo_spydrnet / "spydrnet" / "__init__.py"
+    if repo_package.is_file():
+        repo_path = str(repo_spydrnet)
+        sys.path[:] = [entry for entry in sys.path if entry != repo_path]
+        sys.path.insert(0, repo_path)
+        importlib.invalidate_caches()
+
+        # An earlier import may have selected site-packages before the parser
+        # runs. Drop only SpyDrNet modules so this parser consistently uses the
+        # workspace checkout selected above.
+        loaded = sys.modules.get("spydrnet")
+        loaded_file = str(getattr(loaded, "__file__", "")) if loaded else ""
+        if loaded_file and not loaded_file.startswith(repo_path):
+            for module_name in tuple(sys.modules):
+                if module_name == "spydrnet" or module_name.startswith("spydrnet."):
+                    sys.modules.pop(module_name, None)
+
+    sdn = importlib.import_module("spydrnet")  # type: ignore
     _patch_spydrnet_edif_parser()
     return sdn
 

@@ -196,6 +196,9 @@ class LLMClient:
             stream=True,
         )
         response.raise_for_status()
+        # `text/event-stream` without a charset defaults to ISO-8859-1 in
+        # requests, corrupting UTF-8 model deltas before JSON parsing.
+        response.encoding = "utf-8"
         parts: list[str] = []
         for line in response.iter_lines(decode_unicode=True):
             if not line:
@@ -270,6 +273,9 @@ class LLMClient:
             stream=True,
         )
         response.raise_for_status()
+        # OpenAI-compatible SSE responses are UTF-8 even when their
+        # Content-Type header omits an explicit charset.
+        response.encoding = "utf-8"
         parts: list[str] = []
         for event_data in _iter_sse_data_events(response.iter_lines(decode_unicode=True)):
             if event_data == "[DONE]":

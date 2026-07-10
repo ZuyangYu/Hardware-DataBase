@@ -890,60 +890,79 @@ class RAGFlowBackend(RAGBackend):
         # document-level meta_fields and does not always echo them on each
         # retrieved chunk, so treating a missing field as a mismatch would
         # silently drop every hit (the department check in particular).
-        evidences = []
-        skipped_counts = {
-            "kb": 0,
-            "department": 0,
-            "source_group": 0,
-            "source_name": 0,
-        }
-        for chunk in chunks:
-            metadata = chunk.get("metadata") or chunk.get("meta_fields") or {}
-            chunk_kb = metadata.get("kb_name") or metadata.get("logical_kb_id")
-            if chunk_kb and chunk_kb != kb_name:
-                skipped_counts["kb"] += 1
-                continue
-            chunk_department = str(metadata.get("department_id") or "")
-            if chunk_department and chunk_department != scope.department_id:
-                # Only drop chunks that explicitly carry a different department.
-                # A chunk with no department_id is trusted to the remote filter;
-                # dropping it would empty the result set when RAGFlow does not
-                # echo document-level meta_fields on retrieved chunks.
-                skipped_counts["department"] += 1
-                continue
-            chunk_source_group = _normalize_chunk_source_group(metadata.get("source_group"))
-            if routed_source_groups and chunk_source_group not in routed_source_groups:
-                skipped_counts["source_group"] += 1
-                continue
-            if source_names and not source_name_fallback:
-                # On the fallback path we already re-retrieved WITHOUT the
-                # original_file_name condition because the scoped retrieve
-                # returned 0; re-applying the source_name filter here would drop
-                # the broader hits (often from other files) and defeat the
-                # fallback. The non-fallback path keeps the check as
-                # defense-in-depth on top of the remote condition.
-                chunk_source_name = str(chunk.get("document_name") or metadata.get("original_file_name") or "")
-                if chunk_source_name not in source_names:
-                    skipped_counts["source_name"] += 1
+        def _filter_chunks(apply_source_name_filter: bool) -> tuple[list[Evidence], dict[str, int]]:
+            evidences = []
+            skipped_counts = {
+                "kb": 0,
+                "department": 0,
+                "source_group": 0,
+                "source_name": 0,
+            }
+            for chunk in chunks:
+                metadata = chunk.get("metadata") or chunk.get("meta_fields") or {}
+                chunk_kb = metadata.get("kb_name") or metadata.get("logical_kb_id")
+                if chunk_kb and chunk_kb != kb_name:
+                    skipped_counts["kb"] += 1
                     continue
-            content = chunk.get("content") or chunk.get("text") or ""
-            score = chunk.get("similarity") or chunk.get("score") or chunk.get("vector_similarity") or 0.0
-            evidences.append(
-                Evidence(
-                    id=str(chunk.get("id") or chunk.get("chunk_id") or ""),
-                    content=content,
-                    source_name=chunk.get("document_name") or metadata.get("original_file_name", ""),
-                    score=float(score or 0.0),
-                    metadata={
-                        **metadata,
-                        "query_route_reason": route.reason,
-                        "query_route_confidence": route.confidence,
-                        "query_route_source_groups": list(routed_source_groups),
-                        "ragflow_source_name_fallback": source_name_fallback,
-                    },
-                    backend=self.name,
-                    retriever="ragflow_retrieval",
+                chunk_department = str(metadata.get("department_id") or "")
+                if chunk_department and chunk_department != scope.department_id:
+                    # Only drop chunks that explicitly carry a different department.
+                    # A chunk with no department_id is trusted to the remote filter;
+                    # dropping it would empty the result set when RAGFlow does not
+                    # echo document-level meta_fields on retrieved chunks.
+                    skipped_counts["department"] += 1
+                    continue
+                chunk_source_group = _normalize_chunk_source_group(metadata.get("source_group"))
+                if routed_source_groups and chunk_source_group not in routed_source_groups:
+                    skipped_counts["source_group"] += 1
+                    continue
+                if source_names and apply_source_name_filter:
+                    chunk_source_name = str(chunk.get("document_name") or metadata.get("original_file_name") or "")
+                    if chunk_source_name not in source_names:
+                        skipped_counts["source_name"] += 1
+                        continue
+                content = chunk.get("content") or chunk.get("text") or ""
+                score = chunk.get("similarity") or chunk.get("score") or chunk.get("vector_similarity") or 0.0
+                evidences.append(
+                    Evidence(
+                        id=str(chunk.get("id") or chunk.get("chunk_id") or ""),
+                        content=content,
+                        source_name=chunk.get("document_name") or metadata.get("original_file_name", ""),
+                        score=float(score or 0.0),
+                        metadata={
+                            **metadata,
+                            "query_route_reason": route.reason,
+                            "query_route_confidence": route.confidence,
+                            "query_route_source_groups": list(routed_source_groups),
+                            "ragflow_source_name_fallback": source_name_fallback,
+                        },
+                        backend=self.name,
+                        retriever="ragflow_retrieval",
+                    )
                 )
+            return evidences, skipped_counts
+
+        evidences, skipped_counts = _filter_chunks(apply_source_name_filter=not source_name_fallback)
+        if not evidences and source_names and not source_name_fallback and skipped_counts["source_name"]:
+            fallback_condition = _metadata_condition(
+                kb_name,
+                ctx,
+                routed_source_groups,
+                filters=filters,
+                include_source_names=False,
+            )
+            chunks = self._client().retrieve(
+                query,
+                dataset_ids=dataset_ids,
+                top_k=top_k,
+                metadata_condition=fallback_condition,
+            )
+            source_name_fallback = True
+            evidences, skipped_counts = _filter_chunks(apply_source_name_filter=False)
+            log(
+                "RAGFlow scoped source-name retrieve was emptied by local filename validation; "
+                "retried without original_file_name condition and received "
+                f"{len(chunks)} raw chunks. source_names={source_names}"
             )
         if not evidences:
             log(

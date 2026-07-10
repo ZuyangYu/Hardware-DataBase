@@ -2299,7 +2299,7 @@ def render_kb_management_tab(pipeline):
     st.subheader("📚 知识库管理")
     manageable_kbs = get_manageable_kbs(pipeline)
     can_create_kb = st.session_state.get("role") == ROLE_DEPT_ADMIN
-    upload_types = ["pdf", "doc", "docx", "xls", "xlsx"]
+    upload_types = ["pdf", "doc", "docx", "xls", "xlsx", "edf", "edif"]
 
     if not st.session_state.current_kb and not manageable_kbs:
         st.info("暂无可用知识库，请联系本部门管理员创建或授权。")
