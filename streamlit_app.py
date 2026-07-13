@@ -375,27 +375,114 @@ def persist_chat_message(role: str, content: str):
     return None
 
 
-def strip_agent_observation(content: str) -> str:
-    text = str(content or "")
-    marker = "\n---\n"
-    if marker in text:
-        answer, tail = text.split(marker, 1)
-        tail = tail.strip()
-        if tail.startswith(("**概览**", "**执行时间线**", "**路由说明**")) or "Agent 观测" in tail:
-            return answer.strip()
-    return text
+TOKEN_USAGE_HEADING = "**Token 使用量**"
 
 
-def split_agent_observation(content: str) -> tuple[str, str]:
+def _is_agent_observation_footer(text: str) -> bool:
+    return text.startswith(("**概览**", "**执行时间线**", "**路由说明**")) or "Agent 观测" in text
+
+
+def _is_token_usage_footer(text: str) -> bool:
+    return text.startswith(TOKEN_USAGE_HEADING)
+
+
+def split_assistant_diagnostics(content: str) -> tuple[str, str, str]:
     text = str(content or "")
     marker = "\n---\n"
     if marker not in text:
-        return text, ""
-    answer, tail = text.split(marker, 1)
-    tail = tail.strip()
-    if tail.startswith(("**概览**", "**执行时间线**", "**路由说明**")) or "Agent 观测" in tail:
-        return answer.strip(), tail
-    return text, ""
+        return text, "", ""
+    parts = text.split(marker)
+    answer_parts = [parts[0].strip()]
+    observation_parts = []
+    token_parts = []
+    for raw_part in parts[1:]:
+        part = raw_part.strip()
+        if not part:
+            continue
+        if _is_token_usage_footer(part):
+            token_parts.append(part)
+        elif _is_agent_observation_footer(part):
+            observation_parts.append(part)
+        else:
+            answer_parts.append(part)
+    return (
+        marker.join(part for part in answer_parts if part).strip(),
+        marker.join(observation_parts).strip(),
+        marker.join(token_parts).strip(),
+    )
+
+
+def strip_agent_observation(content: str) -> str:
+    answer, _, _ = split_assistant_diagnostics(content)
+    return answer
+
+
+def split_agent_observation(content: str) -> tuple[str, str]:
+    answer, observation, _ = split_assistant_diagnostics(content)
+    return answer, observation
+
+
+def format_token_usage_summary(summary) -> str:
+    if not summary or _usage_attr(summary, "call_count") <= 0:
+        return ""
+    usage_returned = _usage_attr(summary, "usage_returned_count")
+    call_count = _usage_attr(summary, "call_count")
+    has_total_usage = usage_returned > 0
+    lines = [
+        TOKEN_USAGE_HEADING,
+        "",
+        (
+            f"- 总计：输入 {_format_token_value(_usage_attr(summary, 'prompt_tokens'), has_total_usage)} / "
+            f"输出 {_format_token_value(_usage_attr(summary, 'completion_tokens'), has_total_usage)} / "
+            f"合计 {_format_token_value(_usage_attr(summary, 'total_tokens'), has_total_usage)} tokens"
+        ),
+        f"- 模型：{_usage_attr(summary, 'provider', '-')} / {_usage_attr(summary, 'model', '-')}",
+        f"- 调用：{call_count} 次；返回 usage：{usage_returned} 次",
+        "",
+        "| 阶段 | 输入 | 输出 | 合计 | 调用 | usage |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    by_stage = _usage_attr(summary, "by_stage", {}) or {}
+    for stage, stage_summary in sorted(by_stage.items()):
+        stage_usage_returned = _usage_attr(stage_summary, "usage_returned_count")
+        stage_has_usage = stage_usage_returned > 0
+        lines.append(
+            "| "
+            f"{_token_stage_label(stage)} | "
+            f"{_format_token_value(_usage_attr(stage_summary, 'prompt_tokens'), stage_has_usage)} | "
+            f"{_format_token_value(_usage_attr(stage_summary, 'completion_tokens'), stage_has_usage)} | "
+            f"{_format_token_value(_usage_attr(stage_summary, 'total_tokens'), stage_has_usage)} | "
+            f"{_usage_attr(stage_summary, 'call_count')} | "
+            f"{stage_usage_returned} |"
+        )
+    if usage_returned < call_count:
+        lines.extend(["", "> 部分模型调用未返回 usage，未对缺失部分做估算。"])
+    return "\n".join(lines)
+
+
+def _usage_attr(value, name: str, default=0):
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _format_token_value(value, has_usage: bool) -> str:
+    return str(int(value or 0)) if has_usage else "未返回"
+
+
+def _token_stage_label(stage: str) -> str:
+    labels = {
+        "query_router": "路由判断",
+        "direct_answer": "直接回答",
+        "question_analysis": "问题分析",
+        "source_planning": "检索规划",
+        "intermediate_draft": "中间草稿",
+        "sufficiency_judge": "充分性判断",
+        "next_retrieval_planning": "补检索规划",
+        "final_answer": "最终生成",
+        "unknown": "未标记",
+    }
+    return labels.get(str(stage or "unknown"), str(stage or "unknown"))
 
 
 def clear_current_chat_session():
@@ -1812,20 +1899,23 @@ def render_chat_tab(pipeline):
                     if content.startswith("Error:") or content == "Empty response.":
                         st.error(content)
                     else:
+                        display_content, observation, token_footer = split_assistant_diagnostics(content)
                         separator = "**🔍 检索到的上下文:**"
                         fallback_separator = "**检索到的上下文:**"
-                        active_separator = separator if separator in content else fallback_separator
-                        if active_separator in content:
-                            parts = content.split(active_separator, 1)
+                        active_separator = separator if separator in display_content else fallback_separator
+                        if active_separator in display_content:
+                            parts = display_content.split(active_separator, 1)
                             st.markdown(parts[0].strip())
                             with st.expander("📚 参考来源"):
                                 st.markdown(parts[1].strip())
                         else:
-                            answer_body, observation = split_agent_observation(content)
-                            st.markdown(answer_body)
-                            if observation:
-                                with st.expander("Agent 观测", expanded=False):
-                                    st.markdown(observation)
+                            st.markdown(display_content)
+                        if observation:
+                            with st.expander("Agent 观测", expanded=False):
+                                st.markdown(observation)
+                        if token_footer:
+                            with st.expander("Token 使用量", expanded=False):
+                                st.markdown(token_footer)
 
     should_process_user_message = st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
     if should_process_user_message:
@@ -1847,6 +1937,7 @@ def render_chat_tab(pipeline):
         with st.chat_message("assistant", avatar="😽"):
             error_occured = None
             agent_footer = ""
+            token_usage_footer = ""
             try:
                 ctx = build_request_context(st.session_state)
                 gen = pipeline.query(
@@ -1887,10 +1978,20 @@ def render_chat_tab(pipeline):
                 if agent_footer:
                     with st.expander("Agent 观测", expanded=False):
                         st.markdown(agent_footer)
+                token_usage_summary = (
+                    pipeline.get_last_token_usage_summary()
+                    if hasattr(pipeline, "get_last_token_usage_summary")
+                    else None
+                )
+                token_usage_footer = format_token_usage_summary(token_usage_summary)
+                if token_usage_footer:
+                    with st.expander("Token 使用量", expanded=False):
+                        st.markdown(token_usage_footer)
 
         persisted_response = full_response
-        if agent_footer:
-            persisted_response = f"{full_response.rstrip()}\n---\n{agent_footer.strip()}"
+        footer_sections = [section.strip() for section in (agent_footer, token_usage_footer) if section and section.strip()]
+        if footer_sections:
+            persisted_response = "\n---\n".join([full_response.rstrip(), *footer_sections])
 
         st.session_state.messages.append({"role": "assistant", "content": persisted_response})
         assistant_message = persist_chat_message("assistant", persisted_response)

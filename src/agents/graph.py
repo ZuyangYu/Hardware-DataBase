@@ -73,6 +73,24 @@ def _write_stream_event(event: dict[str, Any]) -> None:
         return
 
 
+def _chat_with_usage_stage(llm_client: Any, messages: list[dict[str, str]], stage: str) -> str:
+    try:
+        return llm_client.chat(messages, usage_stage=stage)
+    except TypeError as exc:
+        if "usage_stage" not in str(exc):
+            raise
+        return llm_client.chat(messages)
+
+
+def _stream_chat_with_usage_stage(llm_client: Any, messages: list[dict[str, str]], stage: str):
+    try:
+        yield from llm_client.stream_chat(messages, usage_stage=stage)
+    except TypeError as exc:
+        if "usage_stage" not in str(exc):
+            raise
+        yield from llm_client.stream_chat(messages)
+
+
 def _normalize_expected_evidence(values: Any) -> list[str]:
     allowed = {"document_text", "spreadsheet_table", "circuit_design"}
     if isinstance(values, str):
@@ -265,11 +283,13 @@ def route_query(state: AgentState, llm_client: Any | None = None) -> AgentState:
             f"Recent chat history:\n{_json_for_prompt(state.get('history') or [], limit=2000)}"
         )
         try:
-            raw = llm_client.chat(
+            raw = _chat_with_usage_stage(
+                llm_client,
                 [
                     {"role": "system", "content": QUERY_ROUTER_SYSTEM_PROMPT + "\n" + system_prompt},
                     {"role": "user", "content": user_prompt},
-                ]
+                ],
+                "query_router",
             )
             payload = _extract_json_object(raw)
             category = str(payload.get("category") or fallback["category"]).strip()
@@ -319,11 +339,13 @@ def compose_direct_answer(state: AgentState, llm_client: Any | None = None) -> A
             f"用户问题：{query}\n\n请用中文回答。"
         )
         try:
-            answer = llm_client.chat(
+            answer = _chat_with_usage_stage(
+                llm_client,
                 [
                     {"role": "system", "content": DIRECT_ANSWER_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
-                ]
+                ],
+                "direct_answer",
             )
         except Exception as exc:
             answer = (
@@ -395,11 +417,13 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
         f"Recent chat history:\n{_json_for_prompt(history[-6:], limit=4000)}"
     )
     try:
-        raw = llm_client.chat(
+        raw = _chat_with_usage_stage(
+            llm_client,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            "question_analysis",
         )
         payload = _extract_json_object(raw)
         sub_questions = []
@@ -648,11 +672,13 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         f"Catalog:\n{_json_for_prompt(compact_sources, limit=14000)}"
     )
     try:
-        raw = llm_client.chat(
+        raw = _chat_with_usage_stage(
+            llm_client,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            "source_planning",
         )
         payload = _extract_json_object(raw)
         plan_items = []
@@ -882,11 +908,13 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
         "只有当同一来源确有新查询价值时才继续查同一来源。"
     )
     try:
-        raw = llm_client.chat(
+        raw = _chat_with_usage_stage(
+            llm_client,
             [
                 {"role": "system", "content": PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            "next_retrieval_planning",
         )
         payload = _extract_json_object(raw)
         calls = []
@@ -1514,11 +1542,13 @@ def judge_sufficiency(state: AgentState, llm_client: Any | None = None) -> Agent
         "按 system prompt 的 JSON schema 返回。"
     )
     try:
-        raw = llm_client.chat(
+        raw = _chat_with_usage_stage(
+            llm_client,
             [
                 {"role": "system", "content": SUFFICIENCY_JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            "sufficiency_judge",
         )
         payload = _extract_json_object(raw)
         status = str(payload.get("status") or "").strip()

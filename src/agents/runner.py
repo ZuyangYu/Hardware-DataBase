@@ -4,6 +4,8 @@ import json
 from typing import Generator
 
 from src.agents.graph import (
+    _chat_with_usage_stage,
+    _stream_chat_with_usage_stage,
     _write_stream_event,
     analyze_question_with_llm,
     build_multi_source_graph,
@@ -64,6 +66,7 @@ class MultiSourceAgentRunner:
         # Consumed by the log layer to populate query_traces + retrieved_evidence
         # after the answer finishes streaming. Reset on every stream() entry.
         self._last_retrieval_summary: dict = {}
+        self._last_token_usage_summary = None
         self.catalog_tool = PipelineCatalogTool(
             document_store=self.document_store,
             spreadsheet_service=self.spreadsheet_service,
@@ -104,6 +107,8 @@ class MultiSourceAgentRunner:
         """Run the compiled LangGraph agent and stream answer deltas."""
         self._last_footer = ""
         self._last_retrieval_summary = {}
+        self._last_token_usage_summary = None
+        self._reset_llm_usage()
 
         state = {
             "thread_id": thread_id or f"{ctx.session_id if ctx else 'anonymous'}:{kb_name}",
@@ -136,6 +141,7 @@ class MultiSourceAgentRunner:
             if int(final_state.get("retrieval_round") or 0) > 0
             else {}
         )
+        self._last_token_usage_summary = self._get_llm_usage_summary()
         if not yielded:
             yield final_state.get("final_response") or final_state.get("answer") or "未生成回答。"
         return
@@ -163,11 +169,13 @@ class MultiSourceAgentRunner:
                 "对缺失或冲突的信息明确标注“缺失”或“冲突”。"
             )
             try:
-                draft = self.llm_client.chat(
+                draft = _chat_with_usage_stage(
+                    self.llm_client,
                     [
                         {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                         {"role": "user", "content": prompt},
-                    ]
+                    ],
+                    "intermediate_draft",
                 )
             except Exception as exc:
                 draft = f"中间草稿生成失败：{exc}"
@@ -222,7 +230,7 @@ class MultiSourceAgentRunner:
                     {"role": "user", "content": user_prompt},
                 ]
                 parts = []
-                for delta in self.llm_client.stream_chat(messages):
+                for delta in _stream_chat_with_usage_stage(self.llm_client, messages, "final_answer"):
                     parts.append(delta)
                     _write_stream_event({"type": "answer_delta", "delta": delta})
                 answer = "".join(parts).strip()
@@ -293,7 +301,7 @@ class MultiSourceAgentRunner:
                 {"role": "user", "content": f"对话历史：\n{history}\n\n用户问题：{query}"},
             ]
             parts = []
-            for delta in self.llm_client.stream_chat(messages):
+            for delta in _stream_chat_with_usage_stage(self.llm_client, messages, "direct_answer"):
                 parts.append(delta)
                 _write_stream_event({"type": "answer_delta", "delta": delta})
             state = {
@@ -460,6 +468,23 @@ class MultiSourceAgentRunner:
         rewritten_query and the retrieved_evidence rows.
         """
         return self._last_retrieval_summary or {}
+
+    def get_last_token_usage_summary(self):
+        return self._last_token_usage_summary
+
+    def clear_last_token_usage_summary(self) -> None:
+        self._last_token_usage_summary = None
+
+    def _reset_llm_usage(self) -> None:
+        reset_usage = getattr(self.llm_client, "reset_usage", None)
+        if callable(reset_usage):
+            reset_usage()
+
+    def _get_llm_usage_summary(self):
+        get_usage_summary = getattr(self.llm_client, "get_usage_summary", None)
+        if callable(get_usage_summary):
+            return get_usage_summary()
+        return None
 
     def _build_retrieval_summary(self, state: dict) -> dict:
         source_plan = (state.get("source_plan") or {}).get("source_plan") or []
