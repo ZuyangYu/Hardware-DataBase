@@ -40,16 +40,16 @@ suggested_queries 规则（多跳的核心）：
 - 只有 status=insufficient_need_more 时才需要给。
 - 每条 query 必须基于**当前证据里已发现的具体实体**（料号、型号、ID、文档名等）、用户问题中的实体，或中间草稿暴露出的明确缺失信息，不能凭空编造。
 - 如果账本中某个未覆盖子问题存在 unsearched_relevant_sources，优先把 source_name 指向这些未查来源之一，并说明对应 gap_feedback。
-- 如果账本中某个未覆盖子问题存在 missing_evidence_types，tool_name 必须匹配缺失证据类型：document_text 用 document_rag；spreadsheet_table 用 spreadsheet_semantic 或 spreadsheet_cell。
+- 如果账本中某个未覆盖子问题存在 missing_evidence_types，tool_name 必须匹配缺失证据类型：document_text 用 document_rag；spreadsheet_table 用 spreadsheet_semantic 或 spreadsheet_cell；circuit_design 用 circuit_query。
 - 如果缺失项可通过换 query、换 source/corpus 或换工具补上，不要降级 partial_but_answerable；应给出可执行 suggested_queries。
 - 若证据里没有可二次检索的实体、用户问题也没有可用实体、或缺失信息无法通过检索补上，才判 partial_but_answerable，且 suggested_queries 留空。
-- tool_name 从 document_rag / spreadsheet_semantic / spreadsheet_cell 中选；source_name 可选（跨语料时指定新源，不指定则广搜）。
+- tool_name 从 document_rag / spreadsheet_semantic / spreadsheet_cell / circuit_query 中选；source_name 可选（跨语料时指定新源，不指定则广搜）。
 
 返回 JSON：
 {"status": "sufficient|partial_but_answerable|insufficient_need_more",
  "reason": "简短中文理由",
  "missing": ["具体缺失信息，如'server S-123 的规格'"],
- "suggested_queries": [{"query": "基于已发现实体的新检索句", "tool_name": "document_rag|spreadsheet_semantic|spreadsheet_cell", "source_name": "可选", "reason": "为什么这条查询能补上缺口"}]}
+ "suggested_queries": [{"query": "基于已发现实体的新检索句", "tool_name": "document_rag|spreadsheet_semantic|spreadsheet_cell|circuit_query", "source_name": "可选", "reason": "为什么这条查询能补上缺口"}]}
 """
 
 PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT = """你是企业硬件 Agentic RAG 系统的多跳重规划器。
@@ -62,7 +62,7 @@ PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT = """你是企业硬件 Agentic RAG 系统的�
 - 若未指定 source_name，按 tool_name 在 catalog 全量源上构建调用（filters 留空，广搜，权限由后端按部门/KB 收紧，安全）。
 - 若检索账本显示某缺口有 unsearched_relevant_sources，优先选择这些未查来源，不要继续只查已有支持证据的同一来源。
 - 若历史诊断显示某来源/工具多次 0 命中，除非 suggested_query 明确要求，否则应换 query、换 tool 或换 source。
-- tool_name 必须与源类型匹配：spreadsheet 类源只能用 spreadsheet_semantic/spreadsheet_cell；文档类源用 document_rag。
+- tool_name 必须与源类型匹配：spreadsheet 类源只能用 spreadsheet_semantic/spreadsheet_cell；文档类源用 document_rag；电路类源用 circuit_query。
 - 不要编造 catalog 里不存在的 source_name。
 
 返回 JSON：

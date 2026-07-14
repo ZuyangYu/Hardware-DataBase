@@ -4,6 +4,8 @@ import json
 from typing import Generator
 
 from src.agents.graph import (
+    _chat_with_usage_stage,
+    _stream_chat_with_usage_stage,
     _write_stream_event,
     analyze_question_with_llm,
     build_multi_source_graph,
@@ -16,10 +18,12 @@ from src.agents.graph import (
     scan_kb_catalog,
 )
 from src.agents.prompts import ANSWER_SYSTEM_PROMPT
+from src.agents.tools.circuit_tools import CircuitQueryTool
 from src.agents.tools.document_rag_tool import DocumentRAGTool
 from src.agents.tools.pipeline_catalog_tool import PipelineCatalogTool
 from src.agents.tools.spreadsheet_tools import SpreadsheetCellTool, SpreadsheetProfileTool, SpreadsheetSemanticTool
 from src.core.llm_client import LLMClient
+from src.circuit.index_service import CircuitIndexService
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
@@ -46,11 +50,13 @@ class MultiSourceAgentRunner:
         rag_backend: RAGBackend,
         document_store: PipelineDocumentStore | None = None,
         spreadsheet_service: SpreadsheetIndexService | None = None,
+        circuit_service: CircuitIndexService | None = None,
         llm_client: LLMClient | None = None,
     ):
         self.rag_backend = rag_backend
         self.document_store = document_store or PipelineDocumentStore()
         self.spreadsheet_service = spreadsheet_service or SpreadsheetIndexService()
+        self.circuit_service = circuit_service or CircuitIndexService()
         self.llm_client = llm_client or LLMClient()
         # Footer (observability/trace) from the most recent stream; exposed
         # separately from final_response so the frontend can collapse it.
@@ -60,6 +66,7 @@ class MultiSourceAgentRunner:
         # Consumed by the log layer to populate query_traces + retrieved_evidence
         # after the answer finishes streaming. Reset on every stream() entry.
         self._last_retrieval_summary: dict = {}
+        self._last_token_usage_summary = None
         self.catalog_tool = PipelineCatalogTool(
             document_store=self.document_store,
             spreadsheet_service=self.spreadsheet_service,
@@ -67,6 +74,7 @@ class MultiSourceAgentRunner:
         )
         self.tools = {
             "document_rag": DocumentRAGTool(rag_backend, self.document_store),
+            "circuit_query": CircuitQueryTool(self.circuit_service),
             "spreadsheet_semantic": SpreadsheetSemanticTool(self.spreadsheet_service),
             "spreadsheet_cell": SpreadsheetCellTool(self.spreadsheet_service),
             "spreadsheet_profile": SpreadsheetProfileTool(self.spreadsheet_service),
@@ -99,6 +107,8 @@ class MultiSourceAgentRunner:
         """Run the compiled LangGraph agent and stream answer deltas."""
         self._last_footer = ""
         self._last_retrieval_summary = {}
+        self._last_token_usage_summary = None
+        self._reset_llm_usage()
 
         state = {
             "thread_id": thread_id or f"{ctx.session_id if ctx else 'anonymous'}:{kb_name}",
@@ -131,6 +141,7 @@ class MultiSourceAgentRunner:
             if int(final_state.get("retrieval_round") or 0) > 0
             else {}
         )
+        self._last_token_usage_summary = self._get_llm_usage_summary()
         if not yielded:
             yield final_state.get("final_response") or final_state.get("answer") or "未生成回答。"
         return
@@ -158,11 +169,13 @@ class MultiSourceAgentRunner:
                 "对缺失或冲突的信息明确标注“缺失”或“冲突”。"
             )
             try:
-                draft = self.llm_client.chat(
+                draft = _chat_with_usage_stage(
+                    self.llm_client,
                     [
                         {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                         {"role": "user", "content": prompt},
-                    ]
+                    ],
+                    "intermediate_draft",
                 )
             except Exception as exc:
                 draft = f"中间草稿生成失败：{exc}"
@@ -207,6 +220,9 @@ class MultiSourceAgentRunner:
                 "请输出中文答案，按子问题组织，包含来源说明，并列出缺失信息。"
                 "如果检索账本中某个子问题 status 不是 covered，必须明确说明缺口，不要把弱证据写成确定结论。"
                 "如果 coverage_matrix.conflicts 非空，必须单独列出证据冲突，不能把冲突值合并成确定结论。"
+                "对 evidence_kind=derived_topology 的内容只能说明已观察到的连接/拓扑；"
+                "只有同一 part_number 的 evidence_kind=datasheet_claim 才能确认器件保护能力。"
+                "若存在多个 power-control candidate，必须逐个按输入/输出网络列示，不能将其归纳为某一个未指定输出的能力。"
             )
             try:
                 messages = [
@@ -214,7 +230,7 @@ class MultiSourceAgentRunner:
                     {"role": "user", "content": user_prompt},
                 ]
                 parts = []
-                for delta in self.llm_client.stream_chat(messages):
+                for delta in _stream_chat_with_usage_stage(self.llm_client, messages, "final_answer"):
                     parts.append(delta)
                     _write_stream_event({"type": "answer_delta", "delta": delta})
                 answer = "".join(parts).strip()
@@ -285,7 +301,7 @@ class MultiSourceAgentRunner:
                 {"role": "user", "content": f"对话历史：\n{history}\n\n用户问题：{query}"},
             ]
             parts = []
-            for delta in self.llm_client.stream_chat(messages):
+            for delta in _stream_chat_with_usage_stage(self.llm_client, messages, "direct_answer"):
                 parts.append(delta)
                 _write_stream_event({"type": "answer_delta", "delta": delta})
             state = {
@@ -452,6 +468,23 @@ class MultiSourceAgentRunner:
         rewritten_query and the retrieved_evidence rows.
         """
         return self._last_retrieval_summary or {}
+
+    def get_last_token_usage_summary(self):
+        return self._last_token_usage_summary
+
+    def clear_last_token_usage_summary(self) -> None:
+        self._last_token_usage_summary = None
+
+    def _reset_llm_usage(self) -> None:
+        reset_usage = getattr(self.llm_client, "reset_usage", None)
+        if callable(reset_usage):
+            reset_usage()
+
+    def _get_llm_usage_summary(self):
+        get_usage_summary = getattr(self.llm_client, "get_usage_summary", None)
+        if callable(get_usage_summary):
+            return get_usage_summary()
+        return None
 
     def _build_retrieval_summary(self, state: dict) -> dict:
         source_plan = (state.get("source_plan") or {}).get("source_plan") or []

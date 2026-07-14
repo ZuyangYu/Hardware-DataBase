@@ -24,6 +24,7 @@ from src.agents.state import (
     ToolCallPlan,
 )
 from src.agents.query_tokens import _HARDWARE_TERMS
+from src.circuit.question_analysis import analyze_question as analyze_circuit_question
 from src.agents.prompts import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
     PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT,
@@ -72,8 +73,26 @@ def _write_stream_event(event: dict[str, Any]) -> None:
         return
 
 
+def _chat_with_usage_stage(llm_client: Any, messages: list[dict[str, str]], stage: str) -> str:
+    try:
+        return llm_client.chat(messages, usage_stage=stage)
+    except TypeError as exc:
+        if "usage_stage" not in str(exc):
+            raise
+        return llm_client.chat(messages)
+
+
+def _stream_chat_with_usage_stage(llm_client: Any, messages: list[dict[str, str]], stage: str):
+    try:
+        yield from llm_client.stream_chat(messages, usage_stage=stage)
+    except TypeError as exc:
+        if "usage_stage" not in str(exc):
+            raise
+        yield from llm_client.stream_chat(messages)
+
+
 def _normalize_expected_evidence(values: Any) -> list[str]:
-    allowed = {"document_text", "spreadsheet_table"}
+    allowed = {"document_text", "spreadsheet_table", "circuit_design"}
     if isinstance(values, str):
         values = [values]
     result = []
@@ -81,7 +100,7 @@ def _normalize_expected_evidence(values: Any) -> list[str]:
         text = str(value or "").strip()
         if text in allowed and text not in result:
             result.append(text)
-    return result or ["document_text", "spreadsheet_table"]
+    return result or ["document_text", "spreadsheet_table", "circuit_design"]
 
 
 def _as_unique_strings(values: Any, limit: int = 20) -> list[str]:
@@ -116,6 +135,37 @@ def _keyword_entities(query: str) -> list[str]:
 def _expected_evidence(question: str) -> list[str]:
     lower = question.lower()
     expected = []
+    has_refdes = bool(re.search(r"\b[A-Za-z]{1,4}\d{1,}\b", question or ""))
+    has_net_identifier = bool(re.search(r"\b[A-Z][A-Z0-9_]{2,}\b", question or ""))
+    has_circuit_context = any(word in lower for word in [
+        "connection",
+        "pin",
+        "net",
+        "topology",
+        "module",
+        "power",
+        "连接",
+        "引脚",
+        "网络",
+        "拓扑",
+        "模块",
+        "电源",
+    ])
+    if any(word in lower for word in [
+        "edf",
+        "edif",
+        "netlist",
+        "schematic",
+        "pin",
+        "net ",
+        "原理图",
+        "网表",
+        "引脚",
+        "网络",
+        "连接",
+        "拓扑",
+    ]) or has_refdes or (has_net_identifier and has_circuit_context):
+        expected.append("circuit_design")
     if any(word in lower for word in [
         "bom",
         "mpn",
@@ -143,7 +193,7 @@ def _expected_evidence(question: str) -> list[str]:
         "原理图",
     ]):
         expected.append("document_text")
-    return expected or ["document_text", "spreadsheet_table"]
+    return expected or ["document_text", "spreadsheet_table", "circuit_design"]
 
 
 _SMALL_TALK_PATTERNS = (
@@ -233,11 +283,13 @@ def route_query(state: AgentState, llm_client: Any | None = None) -> AgentState:
             f"Recent chat history:\n{_json_for_prompt(state.get('history') or [], limit=2000)}"
         )
         try:
-            raw = llm_client.chat(
+            raw = _chat_with_usage_stage(
+                llm_client,
                 [
                     {"role": "system", "content": QUERY_ROUTER_SYSTEM_PROMPT + "\n" + system_prompt},
                     {"role": "user", "content": user_prompt},
-                ]
+                ],
+                "query_router",
             )
             payload = _extract_json_object(raw)
             category = str(payload.get("category") or fallback["category"]).strip()
@@ -287,11 +339,13 @@ def compose_direct_answer(state: AgentState, llm_client: Any | None = None) -> A
             f"用户问题：{query}\n\n请用中文回答。"
         )
         try:
-            answer = llm_client.chat(
+            answer = _chat_with_usage_stage(
+                llm_client,
                 [
                     {"role": "system", "content": DIRECT_ANSWER_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
-                ]
+                ],
+                "direct_answer",
             )
         except Exception as exc:
             answer = (
@@ -352,7 +406,7 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
         '  "reasoning_summary": "Brief visible rationale, not hidden chain-of-thought",\n'
         '  "entities": ["part numbers, document names, hardware terms"],\n'
         '  "sub_questions": [\n'
-        '    {"id": "sq_1", "question": "...", "expected_evidence": ["document_text", "spreadsheet_table"]}\n'
+        '    {"id": "sq_1", "question": "...", "expected_evidence": ["document_text", "spreadsheet_table", "circuit_design"]}\n'
         "  ],\n"
         '  "multi_hop": true|false\n'
         "}\n\n"
@@ -363,11 +417,13 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
         f"Recent chat history:\n{_json_for_prompt(history[-6:], limit=4000)}"
     )
     try:
-        raw = llm_client.chat(
+        raw = _chat_with_usage_stage(
+            llm_client,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            "question_analysis",
         )
         payload = _extract_json_object(raw)
         sub_questions = []
@@ -441,6 +497,11 @@ def _source_matches_analysis(source: dict[str, Any], analysis: dict[str, Any]) -
     expected = {item for sq in sub_questions for item in sq.get("expected_evidence", [])}
     if processor == "spreadsheet_table" and "spreadsheet_table" in expected:
         return True, "该文件是结构化 Excel，适合查询 BOM、用量、替代料、参数或测试矩阵等表格事实。"
+    if processor == "circuit_design":
+        if str(source.get("status") or "") != "indexed":
+            return False, "电路文件尚未索引成功，跳过结构化电路检索。"
+        if "circuit_design" in expected:
+            return True, "该文件是结构化电路设计数据，适合查询网表、引脚、网络连接和拓扑事实。"
     if content_kind == "document_text" and "document_text" in expected:
         return True, "该文件是文本文档，适合查询设计说明、测试报告、规格说明和上下文解释。"
     entity_hit = any(str(entity).casefold() in name.casefold() for entity in analysis.get("entities", []))
@@ -520,6 +581,16 @@ def plan_source_selection(state: AgentState) -> AgentState:
                     filters=compact_filters,
                 )
             )
+        elif processor == "circuit_design":
+            calls.append(
+                ToolCallPlan(
+                    tool_name="circuit_query",
+                    query=query,
+                    reason="查询结构化电路数据，覆盖网表、引脚、网络连接和拓扑事实。",
+                    top_k=8,
+                    filters=compact_filters,
+                )
+            )
         else:
             calls.append(
                 ToolCallPlan(
@@ -580,6 +651,7 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         "- document_rag: use for document_text / ragflow sources\n"
         "- spreadsheet_semantic: use for spreadsheet_table row-level facts\n"
         "- spreadsheet_cell: use for spreadsheet_table exact cells, part numbers, quantities, parameters\n\n"
+        "- circuit_query: use for circuit_design netlist/schematic connection facts\n\n"
         "Planning requirements:\n"
         "- Build search fanout from the sub_questions, not a single best source.\n"
         "- If different sub_questions need different evidence types or corpora, select multiple sources and tool calls.\n"
@@ -590,7 +662,7 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         "{\n"
         '  "source_plan": [\n'
         '    {"source_name": "must exactly match catalog document_name", "reason": "visible reason", '
-        '"tool_calls": [{"tool_name": "document_rag|spreadsheet_semantic|spreadsheet_cell", '
+        '"tool_calls": [{"tool_name": "document_rag|spreadsheet_semantic|spreadsheet_cell|circuit_query", '
         '"query": "rewritten retrieval query", "reason": "visible reason", "top_k": 8}]}\n'
         "  ],\n"
         '  "skipped_sources": [{"source_name": "...", "reason": "..."}]\n'
@@ -600,11 +672,13 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         f"Catalog:\n{_json_for_prompt(compact_sources, limit=14000)}"
     )
     try:
-        raw = llm_client.chat(
+        raw = _chat_with_usage_stage(
+            llm_client,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            "source_planning",
         )
         payload = _extract_json_object(raw)
         plan_items = []
@@ -621,6 +695,8 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
             allowed_tools = (
                 {"spreadsheet_semantic", "spreadsheet_cell"}
                 if processor == "spreadsheet_table"
+                else {"circuit_query"}
+                if processor == "circuit_design"
                 else {"document_rag"}
             )
             filters = {
@@ -712,6 +788,16 @@ def _default_tool_calls_for_source(source: dict[str, Any], query: str, filters: 
                 filters=filters,
             ),
         ]
+    if source.get("processor_kind") == "circuit_design":
+        return [
+            ToolCallPlan(
+                tool_name="circuit_query",
+                query=query,
+                reason="Fallback circuit-design retrieval.",
+                top_k=8,
+                filters=filters,
+            )
+        ]
     return [
         ToolCallPlan(
             tool_name="document_rag",
@@ -721,6 +807,14 @@ def _default_tool_calls_for_source(source: dict[str, Any], query: str, filters: 
             filters=filters,
         )
     ]
+
+
+def _allowed_tools_for_processor(processor_kind: str) -> set[str]:
+    if processor_kind == "spreadsheet_table":
+        return {"spreadsheet_semantic", "spreadsheet_cell"}
+    if processor_kind == "circuit_design":
+        return {"circuit_query"}
+    return {"document_rag"}
 
 
 def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool: Any) -> AgentState:
@@ -814,11 +908,13 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
         "只有当同一来源确有新查询价值时才继续查同一来源。"
     )
     try:
-        raw = llm_client.chat(
+        raw = _chat_with_usage_stage(
+            llm_client,
             [
                 {"role": "system", "content": PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            "next_retrieval_planning",
         )
         payload = _extract_json_object(raw)
         calls = []
@@ -827,13 +923,15 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
                 continue
             q = str(call.get("query") or "").strip()
             tool_name = str(call.get("tool_name") or "").strip()
-            if not q or tool_name not in {"document_rag", "spreadsheet_semantic", "spreadsheet_cell"}:
+            if not q or tool_name not in {"document_rag", "spreadsheet_semantic", "spreadsheet_cell", "circuit_query"}:
                 continue
             source_name = str(call.get("source_name") or "").strip()
             filters: dict[str, Any] = {}
             # 指定了 source_name 且在 catalog 中 → 跨语料精准检索；否则广搜（filters 空）。
             src = source_by_name.get(source_name) or _resolve_catalog_source(sources, source_name)
             if src:
+                if tool_name not in _allowed_tools_for_processor(str(src.get("processor_kind") or "")):
+                    continue
                 source_name = str(src.get("document_name") or source_name)
                 filters = {"source_name": source_name, "record_id": src.get("record_id")}
                 filters = {k: v for k, v in filters.items() if v}
@@ -860,6 +958,49 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
         return _empty("重规划 LLM 失败，终止迭代。", error=str(exc)[:300])
 
 
+_CAPABILITY_TERMS = (
+    "short circuit", "short-to-ground", "short-to-battery", "overcurrent", "current limit", "thermal shutdown", "ocp", "scp",
+    "短路保护", "短地", "短电源", "过流保护", "限流", "热关断",
+)
+
+
+def _is_matching_datasheet_capability(source_name: str, content: str, part_number: str) -> bool:
+    """Require both the discovered MPN and an explicit protection term."""
+    part = str(part_number or "").strip().casefold()
+    searchable = f"{source_name or ''}\n{content or ''}".casefold()
+    return bool(part and part in searchable and any(term in searchable for term in _CAPABILITY_TERMS))
+
+
+def _derived_datasheet_calls(question: str, circuit_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build bounded manual lookups from part numbers discovered in EDF facts."""
+    if not analyze_circuit_question(question).requires_datasheet:
+        return []
+    part_numbers: list[str] = []
+    for hit in circuit_hits:
+        metadata = hit.get("metadata") or {}
+        if metadata.get("evidence_kind") != "derived_topology" or not metadata.get("capability_candidate"):
+            continue
+        for raw in metadata.get("part_numbers") or []:
+            part = str(raw or "").strip()
+            if part and part.casefold() not in {item.casefold() for item in part_numbers}:
+                part_numbers.append(part)
+            if len(part_numbers) >= 4:
+                break
+        if len(part_numbers) >= 4:
+            break
+    return [
+        {
+            "tool_name": "document_rag",
+            "query": f"{part} datasheet short circuit protection OCP SCP short-to-ground short-to-battery thermal shutdown",
+            "reason": f"Verify protection capability claimed for circuit-discovered part {part}.",
+            "top_k": 4,
+            "filters": {},
+            "part_number": part,
+        }
+        for part in part_numbers
+    ]
+
+
 def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
     evidence = list(state.get("evidence") or [])
     round_no = int(state.get("retrieval_round") or 0) + 1
@@ -873,6 +1014,7 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
             calls.extend(item.get("tool_calls", []))
 
     bounded_calls = list(calls[:8])
+    circuit_hits: list[dict[str, Any]] = []
 
     def _run_call(call: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
         tool = tools.get(call.get("tool_name"))
@@ -935,6 +1077,8 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                 diagnostic, hits, failure = future.result()
                 diagnostics.append(diagnostic)
                 evidence.extend(hits)
+                if diagnostic.get("tool_name") == "circuit_query":
+                    circuit_hits.extend(hits)
                 _write_stream_event(
                     {
                         "type": "tool_result",
@@ -951,6 +1095,50 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                         f"Tool failed: {failure.get('tool')}",
                         {"error": str(failure.get("error") or "")[:300]},
                     )
+
+    if round_no == 1:
+        for call in _derived_datasheet_calls(state.get("user_query", ""), circuit_hits):
+            tool = tools.get("document_rag")
+            if tool is None:
+                break
+            try:
+                hits = tool.run(call["query"], state["kb_name"], state.get("_ctx_obj"), top_k=call["top_k"], filters={})
+                for hit in hits:
+                    payload = hit.model_dump()
+                    evidence_kind = "datasheet_claim" if _is_matching_datasheet_capability(
+                        hit.source_name, hit.content, call["part_number"]
+                    ) else "datasheet_reference"
+                    payload["metadata"] = {
+                        **(payload.get("metadata") or {}),
+                        "evidence_kind": evidence_kind,
+                        "derived_from": "circuit_part_number",
+                        "part_number": call["part_number"],
+                    }
+                    evidence.append(payload)
+                diagnostics.append(
+                    {
+                        "tool_name": "document_rag",
+                        "query": call["query"],
+                        "filters": {},
+                        "top_k": call["top_k"],
+                        "hit_count": len(hits),
+                        "status": "ok",
+                        "derived_from": "circuit_part_number",
+                    }
+                )
+            except Exception as exc:
+                diagnostics.append(
+                    {
+                        "tool_name": "document_rag",
+                        "query": call["query"],
+                        "filters": {},
+                        "top_k": call["top_k"],
+                        "hit_count": 0,
+                        "status": "failed",
+                        "derived_from": "circuit_part_number",
+                        "error": str(exc),
+                    }
+                )
 
     trace_tool_calls = [
         {
@@ -1060,7 +1248,12 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
         else:
             status = "missing"
             for evidence_type in expected or ["document_text"]:
-                tool_name = "spreadsheet_semantic" if evidence_type == "spreadsheet_table" else "document_rag"
+                if evidence_type == "spreadsheet_table":
+                    tool_name = "spreadsheet_semantic"
+                elif evidence_type == "circuit_design":
+                    tool_name = "circuit_query"
+                else:
+                    tool_name = "document_rag"
                 followups.append(
                     ToolCallPlan(
                         tool_name=tool_name,
@@ -1069,7 +1262,7 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
                         top_k=8,
                     ).model_dump()
                 )
-        expected_types = list(expected or {"document_text", "spreadsheet_table"})
+        expected_types = list(expected or {"document_text", "spreadsheet_table", "circuit_design"})
         missing_types = [kind for kind in expected_types if kind not in covered_types]
         relevant_sources = _relevant_sources_for_subquestion(sources, sq, analysis)
         searched_sources = sorted(
@@ -1150,14 +1343,16 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
 
 
 def _searched_scope_by_kind(diagnostics: list[dict[str, Any]]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    sources_by_kind: dict[str, set[str]] = {"document_text": set(), "spreadsheet_table": set()}
-    tools_by_kind: dict[str, set[str]] = {"document_text": set(), "spreadsheet_table": set()}
+    sources_by_kind: dict[str, set[str]] = {"document_text": set(), "spreadsheet_table": set(), "circuit_design": set()}
+    tools_by_kind: dict[str, set[str]] = {"document_text": set(), "spreadsheet_table": set(), "circuit_design": set()}
     for item in diagnostics:
         tool_name = str(item.get("tool_name") or "")
         if tool_name == "document_rag":
             kind = "document_text"
         elif tool_name in {"spreadsheet_semantic", "spreadsheet_cell"}:
             kind = "spreadsheet_table"
+        elif tool_name == "circuit_query":
+            kind = "circuit_design"
         else:
             continue
         tools_by_kind.setdefault(kind, set()).add(tool_name)
@@ -1180,6 +1375,9 @@ def _relevant_sources_for_subquestion(
         content_kind = str(source.get("content_kind") or "")
         processor = str(source.get("processor_kind") or "")
         if "spreadsheet_table" in expected and processor == "spreadsheet_table":
+            result.append(source)
+            continue
+        if "circuit_design" in expected and processor == "circuit_design":
             result.append(source)
             continue
         if "document_text" in expected and content_kind == "document_text":
@@ -1344,11 +1542,13 @@ def judge_sufficiency(state: AgentState, llm_client: Any | None = None) -> Agent
         "按 system prompt 的 JSON schema 返回。"
     )
     try:
-        raw = llm_client.chat(
+        raw = _chat_with_usage_stage(
+            llm_client,
             [
                 {"role": "system", "content": SUFFICIENCY_JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            "sufficiency_judge",
         )
         payload = _extract_json_object(raw)
         status = str(payload.get("status") or "").strip()

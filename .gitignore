@@ -9,11 +9,11 @@ wheels/
 # Virtual environments
 .venv
 .env
-# 忽略 storage/ 下所有内容，但保留 .gitkeep
+# Ignore all storage/ contents, but keep .gitkeep
 storage/**
 !storage/.gitkeep
 
-# 忽略 data/ 下所有内容，但保留 .gitkeep
+# Ignore all data/ contents, but keep .gitkeep
 data/**
 !data/.gitkeep
 
@@ -21,6 +21,9 @@ data/**
 
 # Ruff cache
 .ruff_cache/
+
+# Pytest cache
+.pytest_cache/
 
 # Streamlit logs
 streamlit.log
@@ -39,3 +42,14 @@ ragflow_store_*/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Local diagnostic scripts and output (may contain secrets)
+/_diag_auth.py
+/_diag_out.txt
+/_verify.txt
+
+# macOS Finder metadata
+.DS_Store
+
+# Local development plans / specs (not version-controlled)
+docs/superpowers/

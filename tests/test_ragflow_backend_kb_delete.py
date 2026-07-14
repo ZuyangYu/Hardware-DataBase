@@ -343,6 +343,53 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
         self.assertEqual([item.id for item in evidences], ["chunk-other"])
         self.assertTrue(evidences[0].metadata["ragflow_source_name_fallback"])
 
+    def test_retrieve_retries_when_local_filename_validation_empties_remote_hits(self):
+        mismatched_chunk = {
+            "id": "chunk-mismatched-name",
+            "document_name": "ragflow-internal-name.docx",
+            "content": "candidate returned with an internal name",
+            "similarity": 0.9,
+            "metadata": {
+                "kb_name": "kb",
+                "department_id": "dept_a",
+                "source_group": "design",
+            },
+        }
+        fallback_chunk = {
+            "id": "chunk-fallback",
+            "document_name": "600608964_ADAS_HSI_0506_1952_shoulin.wang.docx",
+            "content": "HSI interface evidence",
+            "similarity": 0.91,
+            "metadata": {
+                "kb_name": "kb",
+                "department_id": "dept_a",
+                "source_group": "design",
+            },
+        }
+        backend = _retrieve_backend([])
+        backend.client = _SequentialRetrieveClient([[mismatched_chunk], [fallback_chunk]])
+        ctx = RequestContext(metadata={"department_id": "dept_a"})
+
+        evidences = backend.retrieve(
+            "kb",
+            "HSI interface",
+            top_k=5,
+            ctx=ctx,
+            filters={"source_name": "600608964_ADAS_HSI_0506_1952_shoulin.wang.docx"},
+        )
+
+        self.assertEqual([item.id for item in evidences], ["chunk-fallback"])
+        self.assertTrue(evidences[0].metadata["ragflow_source_name_fallback"])
+        self.assertEqual(len(backend.client.retrieve_calls), 2)
+        self.assertNotIn(
+            {
+                "name": "original_file_name",
+                "comparison_operator": "=",
+                "value": "600608964_ADAS_HSI_0506_1952_shoulin.wang.docx",
+            },
+            backend.client.retrieve_calls[1][3]["conditions"],
+        )
+
     def test_kb_delete_dispatches_to_pipeline_handlers(self):
         rag_handler = _Handler(PROCESSOR_KIND_RAGFLOW)
         spreadsheet_handler = _Handler(PROCESSOR_KIND_SPREADSHEET)

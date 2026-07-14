@@ -65,6 +65,19 @@ class _Auth:
         self.registered.append((kb_name, owner.department_id if owner else None))
 
 
+class _AgentWithTokenSummary:
+    def __init__(self):
+        self.summary = object()
+        self.clear_calls = 0
+
+    def clear_last_token_usage_summary(self):
+        self.clear_calls += 1
+        self.summary = None
+
+    def get_last_token_usage_summary(self):
+        return self.summary
+
+
 class AppPipelineScopeTests(unittest.TestCase):
     def _pipeline(self):
         pipeline = object.__new__(AppPipeline)
@@ -109,6 +122,16 @@ class AppPipelineScopeTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(auth.exists_calls, [("new_kb", "dept_a", None)])
         self.assertEqual(pipeline.backend.created, ["new_kb"])
+
+    def test_query_early_return_clears_previous_token_usage_summary(self):
+        pipeline = self._pipeline()
+        pipeline.agent = _AgentWithTokenSummary()
+
+        response = "".join(pipeline.query("", "kb", []))
+
+        self.assertTrue(response)
+        self.assertIsNone(pipeline.get_last_token_usage_summary())
+        self.assertEqual(pipeline.agent.clear_calls, 1)
 
 
 if __name__ == "__main__":

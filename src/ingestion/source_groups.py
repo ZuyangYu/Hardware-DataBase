@@ -6,6 +6,8 @@ from dataclasses import dataclass
 DOCS_GROUP = "文档资料"
 MATERIAL_GROUP = "物料数据"
 DESIGN_GROUP = "设计数据"
+NETLIST_GROUP = "网表数据"
+SCHEMATIC_GROUP = "原理图数据"
 TEST_GROUP = "测试数据"
 PROJECT_GROUP = "项目管理数据"
 EXTERNAL_GROUP = "外部数据"
@@ -13,6 +15,8 @@ PEOPLE_GROUP = "人员与组织数据"
 UNKNOWN_GROUP = "未分类"
 
 SOURCE_GROUPS = (
+    NETLIST_GROUP,
+    SCHEMATIC_GROUP,
     DESIGN_GROUP,
     MATERIAL_GROUP,
     DOCS_GROUP,
@@ -34,7 +38,9 @@ USER_SELECTABLE_SOURCE_GROUPS = (
 )
 
 SOURCE_GROUP_DESCRIPTIONS = {
-    DESIGN_GROUP: "原理图、PCB、BOM、网表、约束、仿真文件",
+    NETLIST_GROUP: "EDF/EDIF 网表文件，包含元件、引脚、网络和层次结构",
+    SCHEMATIC_GROUP: "PDF 原理图文件，包含页面文本、标签和图纸区域信息",
+    DESIGN_GROUP: "原理图(PDF)、网表(EDF/EDIF)、PCB、约束、仿真等设计数据；系统按扩展名自动分流",
     MATERIAL_GROUP: "器件参数、封装、供应商、生命周期、替代料信息",
     DOCS_GROUP: "Datasheet、规格书、手册、标准规范、应用笔记、参考资料",
     TEST_GROUP: "测试报告、测试记录、验证数据",
@@ -43,11 +49,19 @@ SOURCE_GROUP_DESCRIPTIONS = {
     PEOPLE_GROUP: "人员、团队、角色、组织结构资料",
 }
 
+# EDF 网表和 PDF 原理图都归属"设计数据"伞下；
+# 系统内部仍按子组（NETLIST/SCHEMATIC）路由解析器，但对用户统一展示为"设计数据"。
 SOURCE_GROUP_DISPLAY_NAMES = {
+    NETLIST_GROUP: "设计数据",
+    SCHEMATIC_GROUP: "设计数据",
+    DESIGN_GROUP: "设计数据",
     DOCS_GROUP: "规范手册资料",
 }
 
-IMPLEMENTED_PARSE_GROUPS = {DOCS_GROUP, MATERIAL_GROUP}
+# 用户层归属：DESIGN_GROUP 是 NETLIST/SCHEMATIC 的伞类。
+DESIGN_UMBRELLA_SUBGROUPS = (NETLIST_GROUP, SCHEMATIC_GROUP)
+
+IMPLEMENTED_PARSE_GROUPS = {DOCS_GROUP, MATERIAL_GROUP, NETLIST_GROUP, SCHEMATIC_GROUP, TEST_GROUP}
 
 
 @dataclass(frozen=True)
@@ -91,8 +105,24 @@ _DOC_PATTERNS = [
     r"应用笔记",
 ]
 
+_NETLIST_PATTERNS = [
+    r"\bedf\b",
+    r"\bedif\b",
+    r"net[-_\s]?list",
+    r"netlist",
+    r"网表",
+]
+
+_SCHEMATIC_PATTERNS = [
+    r"schematic",
+    r"\bsch\b",
+    r"circuit[-_\s]?diagram",
+    r"原理图",
+]
+
 _MATERIAL_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 _DOC_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".html", ".htm"}
+_NETLIST_EXTENSIONS = {".edf", ".edif"}
 
 
 def _matches_any(text: str, patterns: list[str]) -> bool:
@@ -103,6 +133,12 @@ def classify_source_group(filename: str) -> SourceGroupClassification:
     """Classify an uploaded file into the first two supported project data domains."""
     lowered = filename.lower()
     _, ext = os.path.splitext(lowered)
+
+    if ext in _NETLIST_EXTENSIONS or _matches_any(lowered, _NETLIST_PATTERNS):
+        return SourceGroupClassification(NETLIST_GROUP, 0.95, "filename matched EDF/EDIF netlist rules")
+
+    if ext == ".pdf" and _matches_any(lowered, _SCHEMATIC_PATTERNS):
+        return SourceGroupClassification(SCHEMATIC_GROUP, 0.85, "PDF filename matched schematic keywords")
 
     if _matches_any(lowered, _MATERIAL_PATTERNS):
         return SourceGroupClassification(MATERIAL_GROUP, 0.9, "filename matched material/BOM keywords")
@@ -121,6 +157,43 @@ def classify_source_group(filename: str) -> SourceGroupClassification:
 
 def safe_source_group(group: str | None) -> str:
     return group if group in SOURCE_GROUPS else UNKNOWN_GROUP
+
+
+def resolve_design_subgroup(filename: str) -> str:
+    """Map a file under the DESIGN umbrella to its concrete sub-group.
+
+    Strict routing — only files we can identify with high confidence get a
+    specialised parser:
+      - ``.edf`` / ``.edif`` → NETLIST_GROUP (handled by SpyDrNet)
+      - PDF whose name carries schematic hints (``schematic``/``原理图``/...)
+        → SCHEMATIC_GROUP
+    Everything else (including plain ``.pdf`` files that may be datasheets,
+    PCBs, reports, …) stays on DESIGN_GROUP and goes through the generic
+    fallback parser. PDFs are intentionally NOT routed to the schematic
+    parser by extension alone — that's the user's job via the doc-type
+    selector when the file isn't actually a schematic.
+    """
+    lowered = filename.lower()
+    _, ext = os.path.splitext(lowered)
+    if ext in _NETLIST_EXTENSIONS:
+        return NETLIST_GROUP
+    if ext == ".pdf" and _matches_any(lowered, _SCHEMATIC_PATTERNS):
+        return SCHEMATIC_GROUP
+    if _matches_any(lowered, _NETLIST_PATTERNS):
+        return NETLIST_GROUP
+    return DESIGN_GROUP
+
+
+def expand_source_group_for_file(source_group: str | None, filename: str) -> str:
+    """Resolve the user-facing source group into the concrete internal group.
+
+    Users only see the DESIGN umbrella when uploading; internally we still
+    route EDF/PDF schematics through their specialised parsers via the
+    NETLIST/SCHEMATIC sub-groups.
+    """
+    if source_group == DESIGN_GROUP:
+        return resolve_design_subgroup(filename)
+    return safe_source_group(source_group) if source_group else source_group
 
 
 def display_source_group(group: str | None) -> str:

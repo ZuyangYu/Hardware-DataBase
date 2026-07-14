@@ -8,6 +8,7 @@ from src.agents.graph import judge_sufficiency, plan_next_retrieval, plan_source
 from src.agents.query_tokens import tokenize_hardware_query
 from src.agents.runner import MultiSourceAgentRunner
 from src.agents.tools.document_rag_tool import DocumentRAGTool
+from src.core.llm_client import LLMUsageRecord, LLMUsageSummary
 from src.pipelines.document_store_sqlite import PipelineDocumentRecord
 from src.pipelines.document_rag.schemas import (
     BackendHealth,
@@ -205,6 +206,74 @@ class _FakeLLM:
         yield self.chat(messages)
 
 
+class _UsageTrackingLLM(_FakeLLM):
+    def __init__(self):
+        super().__init__(first_sufficient=True)
+        self.records = []
+
+    def reset_usage(self):
+        self.records = []
+
+    def chat(self, messages, **kwargs):
+        stage = kwargs.get("usage_stage", "missing")
+        self.records.append(
+            LLMUsageRecord(
+                stage=stage,
+                provider="fake",
+                model="fake-model",
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+                usage_returned=True,
+            )
+        )
+        return super().chat(messages)
+
+    def stream_chat(self, messages, **kwargs):
+        stage = kwargs.get("usage_stage", "missing")
+        self.records.append(
+            LLMUsageRecord(
+                stage=stage,
+                provider="fake",
+                model="fake-model",
+                prompt_tokens=20,
+                completion_tokens=8,
+                total_tokens=28,
+                usage_returned=True,
+            )
+        )
+        yield super().chat(messages)
+
+    def get_usage_summary(self):
+        by_stage = {}
+        for record in self.records:
+            current = by_stage.get(record.stage, LLMUsageSummary())
+            by_stage[record.stage] = LLMUsageSummary(
+                provider=record.provider,
+                model=record.model,
+                prompt_tokens=current.prompt_tokens + record.prompt_tokens,
+                completion_tokens=current.completion_tokens + record.completion_tokens,
+                total_tokens=current.total_tokens + record.total_tokens,
+                call_count=current.call_count + 1,
+                usage_returned_count=current.usage_returned_count + 1,
+            )
+        return LLMUsageSummary(
+            provider="fake",
+            model="fake-model",
+            prompt_tokens=sum(record.prompt_tokens for record in self.records),
+            completion_tokens=sum(record.completion_tokens for record in self.records),
+            total_tokens=sum(record.total_tokens for record in self.records),
+            call_count=len(self.records),
+            usage_returned_count=len(self.records),
+            by_stage=by_stage,
+        )
+
+
+class _NoKwargStreamLLM(_FakeLLM):
+    def stream_chat(self, messages):
+        yield "streamed-no-kwargs"
+
+
 import json
 
 
@@ -379,6 +448,27 @@ class AgenticRunnerTests(unittest.TestCase):
         self.assertIn("trace", summary)
         self.assertIn("tool_diagnostics", summary)
         self.assertEqual(summary.get("sufficiency_status"), "sufficient")
+
+    def test_runner_exposes_token_usage_summary_by_stage(self):
+        llm = _UsageTrackingLLM()
+        runner, backend = self._runner(llm)
+        "".join(runner.stream(query="check design_report part number", kb_name="kb", history=[], ctx=self._ctx()))
+
+        summary = runner.get_last_token_usage_summary()
+
+        self.assertGreater(summary.total_tokens, 0)
+        self.assertIn("query_router", summary.by_stage)
+        self.assertIn("question_analysis", summary.by_stage)
+        self.assertIn("source_planning", summary.by_stage)
+        self.assertIn("final_answer", summary.by_stage)
+
+    def test_runner_keeps_streaming_with_llm_client_that_rejects_usage_stage_kwarg(self):
+        runner, backend = self._runner(_NoKwargStreamLLM(first_sufficient=True))
+
+        out = "".join(runner.stream(query="check design_report part number", kb_name="kb", history=[], ctx=self._ctx()))
+
+        self.assertIn("streamed-no-kwargs", out)
+        self.assertNotIn("调用失败", out)
 
     def test_planner_search_fanout_can_cover_document_and_spreadsheet_sources(self):
         runner, backend = self._runner(_FakeLLM(first_sufficient=True, planner_fanout=True))

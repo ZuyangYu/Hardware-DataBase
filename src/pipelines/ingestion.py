@@ -16,9 +16,12 @@ from src.pipelines.document_rag.schemas import (
     normalize_parse_status,
 )
 from src.pipelines.registry import (
+    CONTENT_KIND_CIRCUIT,
     CONTENT_KIND_DOCUMENT,
     CONTENT_KIND_SPREADSHEET,
+    DATASET_CIRCUIT,
     PIPELINE_REGISTRY,
+    PROCESSOR_KIND_CIRCUIT,
     PROCESSOR_KIND_RAGFLOW,
     PROCESSOR_KIND_SPREADSHEET,
     PipelineRoute,
@@ -103,6 +106,7 @@ class HandlerResult:
     warnings: list[str] = field(default_factory=list)
     audit_action: str = ""
     audit_metadata: dict = field(default_factory=dict)
+    preserve_failed_record: bool = False
 
 
 @dataclass
@@ -286,7 +290,8 @@ class IngestionOrchestrator:
                     messages.extend(f"[warning] {warning}" for warning in handler_result.warnings)
                     success_count += 1
                 else:
-                    self._cleanup_failed_submission(handler, handler_result, scope, archived)
+                    if not handler_result.preserve_failed_record:
+                        self._cleanup_failed_submission(handler, handler_result, scope, archived)
                     failed_count += 1
                     messages.append(handler_result.message)
             except Exception as exc:
@@ -534,6 +539,165 @@ class RAGFlowDocumentHandler(PipelineHandler):
             audit_action="ragflow_delete_document",
         )
 
+
+class CircuitPipelineHandler(PipelineHandler):
+    def __init__(self, *, spec: PipelineSpec, store: PipelineDocumentStore, circuit_index=None):
+        self.spec = spec
+        self.store = store
+        if circuit_index is None:
+            from src.circuit.index_service import CircuitIndexService
+
+            circuit_index = CircuitIndexService()
+        self.circuit_index = circuit_index
+
+    def existing_record_dataset_kind(self, default_dataset_kind: str) -> str:
+        return self.spec.dataset_kind or DATASET_CIRCUIT
+
+    def reuse_message(self, record: PipelineDocumentRecord) -> str:
+        return f"[success] Circuit design already archived: {record.document_name}"
+
+    def submit(
+        self,
+        scope: IngestionScope,
+        archived: ArchivedFile,
+        default_dataset_kind: str,
+        default_dataset_id: str,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> HandlerResult:
+        dataset_kind = self.spec.dataset_kind or DATASET_CIRCUIT
+        document_id = f"circuit:{archived.content_hash[:16]}"
+        self.store.upsert_document(
+            kb_name=scope.kb_name,
+            document_name=archived.filename,
+            dataset_kind=dataset_kind,
+            dataset_id="",
+            document_id=document_id,
+            source_group=archived.source_group,
+            department_id=scope.department_id,
+            uploaded_by=scope.uploaded_by,
+            kb_id=scope.kb_id,
+            status=TABLE_STATUS_ARCHIVED,
+            original_file_name=os.path.basename(archived.original_path),
+            local_path=archived.relative_local_path,
+            file_size=archived.file_size,
+            content_hash=archived.content_hash,
+            upload_status=TABLE_STATUS_ARCHIVED,
+            content_kind=CONTENT_KIND_CIRCUIT,
+            processor_kind=PROCESSOR_KIND_CIRCUIT,
+            parse_progress=5,
+            parse_stage="Archived; waiting for circuit indexing",
+        )
+        record = self.store.get_document(
+            scope.kb_name,
+            archived.filename,
+            dataset_kind,
+            department_id=scope.department_id,
+        )
+        record_id = record.id if record else None
+        warnings: list[str] = []
+        warning = archived.inspection.to_warning_message()
+        if warning:
+            warnings.append(warning)
+        try:
+            index_result = self.circuit_index.index_file(
+                kb_name=scope.kb_name,
+                record_id=record_id,
+                file_path=archived.archived_path,
+                original_name=archived.filename,
+                department_id=scope.department_id,
+                uploaded_by=scope.uploaded_by,
+            )
+            warnings.extend(getattr(index_result, "warnings", []) or [])
+            if record_id:
+                self.store.update_document_progress_by_id(
+                    record_id,
+                    100,
+                    getattr(index_result, "message", "") or "Circuit design indexed",
+                    status=TABLE_STATUS_INDEXED,
+                    error_message="",
+                )
+            if progress_callback:
+                progress_callback(100, f"{archived.filename}: circuit design indexed")
+            return HandlerResult(
+                success=True,
+                message=f"[success] Indexed circuit design file: {archived.filename}",
+                document_id=document_id,
+                record_id=record_id,
+                status=TABLE_STATUS_INDEXED,
+                warnings=warnings,
+                audit_action="circuit_upload_indexed",
+                audit_metadata={
+                    "store_id": record_id,
+                    "kb_id": scope.kb_id,
+                    "dataset_kind": dataset_kind,
+                    "content_kind": CONTENT_KIND_CIRCUIT,
+                    "processor_kind": PROCESSOR_KIND_CIRCUIT,
+                    "source_group": archived.source_group,
+                    "local_path": archived.relative_local_path,
+                    "content_hash": archived.content_hash,
+                    "status": TABLE_STATUS_INDEXED,
+                    "container_inspection": archived.inspection.to_metadata(),
+                    "circuit_stats": getattr(index_result, "stats", {}),
+                    "circuit_design_id": getattr(index_result, "design_id", ""),
+                },
+            )
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            if record_id:
+                self.store.update_document_progress_by_id(
+                    record_id,
+                    100,
+                    "Circuit design indexing failed",
+                    status=RAGFLOW_STATUS_FAILED,
+                    error_message=error_message,
+                )
+            if progress_callback:
+                progress_callback(100, f"{archived.filename}: circuit design indexing failed")
+            return HandlerResult(
+                success=False,
+                message=f"[failed] Circuit design indexing failed: {archived.filename}: {exc}",
+                document_id=document_id,
+                record_id=record_id,
+                status=RAGFLOW_STATUS_FAILED,
+                warnings=warnings,
+                audit_action="circuit_upload_failed",
+                audit_metadata={
+                    "store_id": record_id,
+                    "kb_id": scope.kb_id,
+                    "dataset_kind": dataset_kind,
+                    "content_kind": CONTENT_KIND_CIRCUIT,
+                    "processor_kind": PROCESSOR_KIND_CIRCUIT,
+                    "source_group": archived.source_group,
+                    "local_path": archived.relative_local_path,
+                    "content_hash": archived.content_hash,
+                    "status": RAGFLOW_STATUS_FAILED,
+                    "error_message": error_message,
+                    "container_inspection": archived.inspection.to_metadata(),
+                },
+                preserve_failed_record=True,
+            )
+
+    def rollback(self, result: HandlerResult, scope: IngestionScope):
+        if result.record_id:
+            self.store.delete_document_by_id(result.record_id)
+
+    def delete_record(self, record: PipelineDocumentRecord, archive: DocumentArchiveManager) -> HandlerDeleteResult:
+        try:
+            self.circuit_index.delete_record(record)
+        except Exception as exc:
+            return HandlerDeleteResult(
+                ok=False,
+                message=f"Circuit index cleanup failed for {record.document_name}: {exc}",
+                errors=[f"circuit index: {exc}"],
+                audit_action="circuit_delete_document_failed",
+            )
+        archive.remove_record_archive(record)
+        self.store.delete_document_by_id(record.id)
+        return HandlerDeleteResult(
+            ok=True,
+            message=f"Deleted circuit design archive: {record.document_name}",
+            audit_action="circuit_delete_document",
+        )
 
 class SpreadsheetPipelineHandler(PipelineHandler):
     def __init__(

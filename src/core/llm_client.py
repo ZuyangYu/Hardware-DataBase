@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from collections.abc import Iterable
 from typing import Any, Generator
@@ -82,6 +82,33 @@ class LLMClientConfig:
     temperature: float = 0.2
 
 
+@dataclass(frozen=True)
+class LLMUsageRecord:
+    stage: str
+    provider: str
+    model: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    usage_returned: bool = False
+
+
+@dataclass(frozen=True)
+class LLMUsageSummary:
+    provider: str = ""
+    model: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    call_count: int = 0
+    usage_returned_count: int = 0
+    by_stage: dict[str, "LLMUsageSummary"] = field(default_factory=dict)
+
+    @property
+    def has_usage(self) -> bool:
+        return self.usage_returned_count > 0
+
+
 class LLMClient:
     """Project-owned chat client for agent answer generation.
 
@@ -91,6 +118,16 @@ class LLMClient:
 
     def __init__(self, config: LLMClientConfig | None = None):
         self.config = config
+        self._usage_records: list[LLMUsageRecord] = []
+
+    def reset_usage(self) -> None:
+        self._usage_records = []
+
+    def get_usage_records(self) -> tuple[LLMUsageRecord, ...]:
+        return tuple(self._usage_records)
+
+    def get_usage_summary(self) -> LLMUsageSummary:
+        return _summarize_usage(self._usage_records)
 
     def chat(self, messages: list[ChatPayload], **kwargs: Any) -> str:
         config = self.config or self._from_runtime_settings()
@@ -165,6 +202,7 @@ class LLMClient:
         )
         response.raise_for_status()
         data = response.json()
+        self._record_usage(config, kwargs.get("usage_stage"), _extract_ollama_usage(data))
         content = ((data.get("message") or {}).get("content") or "").strip()
         if not content:
             raise RuntimeError(f"Ollama returned an empty response: {data}")
@@ -196,17 +234,24 @@ class LLMClient:
             stream=True,
         )
         response.raise_for_status()
+        # `text/event-stream` without a charset defaults to ISO-8859-1 in
+        # requests, corrupting UTF-8 model deltas before JSON parsing.
+        response.encoding = "utf-8"
         parts: list[str] = []
+        usage: dict[str, int] | None = None
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
             data = json.loads(line)
+            if data.get("done"):
+                usage = _extract_ollama_usage(data)
             delta = ((data.get("message") or {}).get("content") or "")
             if delta:
                 parts.append(delta)
                 yield delta
             if data.get("done"):
                 break
+        self._record_usage(config, kwargs.get("usage_stage"), usage)
         content = "".join(parts).strip()
         if not content:
             raise RuntimeError("Ollama returned an empty streamed response")
@@ -234,6 +279,7 @@ class LLMClient:
         )
         response.raise_for_status()
         data = response.json()
+        self._record_usage(config, kwargs.get("usage_stage"), _extract_openai_usage(data.get("usage")))
         choices = data.get("choices") or []
         if not choices:
             raise RuntimeError(f"Chat API returned no choices: {data}")
@@ -261,6 +307,7 @@ class LLMClient:
             "temperature": kwargs.get("temperature", config.temperature),
             "max_tokens": kwargs.get("max_tokens", config.max_tokens),
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         response = requests.post(
             f"{config.base_url.rstrip('/')}/chat/completions",
@@ -269,12 +316,32 @@ class LLMClient:
             timeout=kwargs.get("timeout", config.timeout),
             stream=True,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            if not _should_retry_without_stream_options(response):
+                raise
+            retry_payload = dict(payload)
+            retry_payload.pop("stream_options", None)
+            response = requests.post(
+                f"{config.base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=retry_payload,
+                timeout=kwargs.get("timeout", config.timeout),
+                stream=True,
+            )
+            response.raise_for_status()
+        # OpenAI-compatible SSE responses are UTF-8 even when their
+        # Content-Type header omits an explicit charset.
+        response.encoding = "utf-8"
         parts: list[str] = []
+        usage: dict[str, int] | None = None
         for event_data in _iter_sse_data_events(response.iter_lines(decode_unicode=True)):
             if event_data == "[DONE]":
                 break
             data = json.loads(event_data)
+            if data.get("usage"):
+                usage = _extract_openai_usage(data.get("usage"))
             choices = data.get("choices") or []
             if not choices:
                 continue
@@ -282,7 +349,101 @@ class LLMClient:
             if delta:
                 parts.append(delta)
                 yield delta
+        self._record_usage(config, kwargs.get("usage_stage"), usage)
         content = "".join(parts).strip()
         if not content:
             raise RuntimeError("Chat API returned an empty streamed response")
         return content
+
+    def _record_usage(self, config: LLMClientConfig, stage: Any, usage: dict[str, int] | None) -> None:
+        prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
+        completion_tokens = int((usage or {}).get("completion_tokens") or 0)
+        total_tokens = int((usage or {}).get("total_tokens") or 0)
+        if usage and total_tokens <= 0:
+            total_tokens = prompt_tokens + completion_tokens
+        self._usage_records.append(
+            LLMUsageRecord(
+                stage=str(stage or "unknown"),
+                provider=str(config.provider.value if hasattr(config.provider, "value") else config.provider),
+                model=config.model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                usage_returned=usage is not None,
+            )
+        )
+
+
+def _extract_openai_usage(usage: Any) -> dict[str, int] | None:
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = _int_usage_value(usage.get("prompt_tokens", usage.get("input_tokens")))
+    completion_tokens = _int_usage_value(usage.get("completion_tokens", usage.get("output_tokens")))
+    total_tokens = _int_usage_value(usage.get("total_tokens"))
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _extract_ollama_usage(data: Any) -> dict[str, int] | None:
+    if not isinstance(data, dict):
+        return None
+    if "prompt_eval_count" not in data and "eval_count" not in data:
+        return None
+    prompt_tokens = _int_usage_value(data.get("prompt_eval_count"))
+    completion_tokens = _int_usage_value(data.get("eval_count"))
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _int_usage_value(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _should_retry_without_stream_options(response: Any) -> bool:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    body = str(getattr(response, "text", "") or "").lower()
+    return status_code in {400, 422} and "stream_options" in body
+
+
+def _summarize_usage(records: Iterable[LLMUsageRecord]) -> LLMUsageSummary:
+    record_list = list(records)
+    by_stage: dict[str, LLMUsageSummary] = {}
+    for stage in sorted({record.stage for record in record_list}):
+        stage_records = [record for record in record_list if record.stage == stage]
+        by_stage[stage] = _summarize_usage_flat(stage_records)
+    summary = _summarize_usage_flat(record_list)
+    return LLMUsageSummary(
+        provider=summary.provider,
+        model=summary.model,
+        prompt_tokens=summary.prompt_tokens,
+        completion_tokens=summary.completion_tokens,
+        total_tokens=summary.total_tokens,
+        call_count=summary.call_count,
+        usage_returned_count=summary.usage_returned_count,
+        by_stage=by_stage,
+    )
+
+
+def _summarize_usage_flat(records: list[LLMUsageRecord]) -> LLMUsageSummary:
+    providers = {record.provider for record in records if record.provider}
+    models = {record.model for record in records if record.model}
+    return LLMUsageSummary(
+        provider=next(iter(providers)) if len(providers) == 1 else ("mixed" if providers else ""),
+        model=next(iter(models)) if len(models) == 1 else ("mixed" if models else ""),
+        prompt_tokens=sum(record.prompt_tokens for record in records),
+        completion_tokens=sum(record.completion_tokens for record in records),
+        total_tokens=sum(record.total_tokens for record in records),
+        call_count=len(records),
+        usage_returned_count=sum(1 for record in records if record.usage_returned),
+    )

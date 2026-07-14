@@ -47,7 +47,12 @@ class AppPipeline:
         try:
             self.backend = create_rag_backend()
             self.documents = DocumentManager(self.backend)
-            self.agent = MultiSourceAgentRunner(rag_backend=self.backend)
+            self.agent = MultiSourceAgentRunner(
+                rag_backend=self.backend,
+                document_store=getattr(self.backend, "store", None),
+                spreadsheet_service=getattr(self.backend, "spreadsheet_indexes", None),
+                circuit_service=getattr(self.backend, "circuit_indexes", None),
+            )
         except Exception as exc:
             error(f"AppPipeline 初始化失败: {exc}")
             raise
@@ -75,6 +80,7 @@ class AppPipeline:
         ctx: RequestContext | None = None,
         agent_thread_id: str = "",
     ) -> Generator[str, None, None]:
+        self.clear_last_token_usage_summary()
         if not msg.strip():
             yield "请输入有效问题"
             return
@@ -99,6 +105,14 @@ class AppPipeline:
 
     def get_last_retrieval_summary(self) -> dict:
         return self.agent.get_last_retrieval_summary()
+
+    def get_last_token_usage_summary(self):
+        return self.agent.get_last_token_usage_summary()
+
+    def clear_last_token_usage_summary(self) -> None:
+        clear = getattr(self.agent, "clear_last_token_usage_summary", None)
+        if callable(clear):
+            clear()
 
     def upload_files(
         self,
