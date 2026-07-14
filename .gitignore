@@ -50,3 +50,6 @@ ragflow_store_*/
 
 # macOS Finder metadata
 .DS_Store
+
+# Local development plans / specs (not version-controlled)
+docs/superpowers/
