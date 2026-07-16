@@ -6,10 +6,10 @@ from dotenv import load_dotenv
 
 
 ENV_FILE_ENCODING = "utf-8-sig"
-
-load_dotenv(encoding=ENV_FILE_ENCODING)
-
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
+
+load_dotenv(dotenv_path=ENV_FILE_PATH, encoding=ENV_FILE_ENCODING)
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
@@ -121,7 +121,7 @@ def reload_settings():
     global FINAL_TOP_K, AGENT_MAX_RETRIEVAL_ROUNDS
     global SYSTEM_PROMPT, NO_CONTEXT_PROMPT
 
-    load_dotenv(override=True, encoding=ENV_FILE_ENCODING)
+    load_dotenv(dotenv_path=ENV_FILE_PATH, override=True, encoding=ENV_FILE_ENCODING)
 
     RAGFLOW_BASE_URL = os.getenv("RAGFLOW_BASE_URL", "http://localhost:9380")
     RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")

@@ -13,8 +13,30 @@ dependencies = [
     "pymupdf>=1.26.0",
     "python-dotenv>=1.2.1,<2",
     "requests>=2.32.3,<3",
-    "spydrnet>=1.13.0",
     "streamlit>=1.52.1,<2",
+]
+
+[project.scripts]
+hardware-rag-eval = "src.evaluation.cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*", "config*"]
+exclude = [
+    "src.circuit.vendor.spydrnet.docs*",
+    "src.circuit.vendor.spydrnet.examples*",
+    "src.circuit.vendor.spydrnet.example_netlists*",
+    "src.circuit.vendor.spydrnet.tests*",
+    "src.circuit.vendor.spydrnet.spydrnet_extension*.tests*",
+]
+
+[tool.setuptools.package-data]
+"src.circuit.vendor.spydrnet.spydrnet.support_files" = [
+    "*.tcl",
+    "architecture_libraries/*.zip",
 ]
 
 [tool.uv]
@@ -22,5 +44,14 @@ python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-st
 
 [dependency-groups]
 dev = [
+    "pytest>=8.0,<10",
     "ruff>=0.14.5",
 ]
+eval = [
+    "langchain-community>=0.3.31,<0.4",
+    "openai>=1.0,<3",
+    "ragas>=0.4,<0.5",
+]
+
+[tool.pytest.ini_options]
+norecursedirs = ["build", "src/circuit/vendor/spydrnet"]

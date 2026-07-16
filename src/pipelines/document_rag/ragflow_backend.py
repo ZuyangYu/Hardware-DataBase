@@ -582,17 +582,21 @@ class RAGFlowBackend(RAGBackend):
         if not isinstance(dataset_ids, dict):
             dataset_ids = {}
             self._dataset_ids = dataset_ids
-        if all(dataset_ids.get(kind) for kind in dataset_specs):
-            return
         store = getattr(self, "store", None)
+        get_dataset = getattr(store, "get_dataset", None)
         for kind, name in dataset_specs.items():
-            dataset_id = dataset_ids.get(kind)
-            if not dataset_id and store is not None:
-                dataset_id = store.get_dataset_id(kind)
-            if not dataset_id:
-                dataset_id = self._client().ensure_dataset(name)
-                if store is not None:
-                    store.save_dataset(kind, dataset_id, name)
+            saved_mapping = get_dataset(kind) if callable(get_dataset) else None
+            saved_id, saved_name = saved_mapping or ("", "")
+            if saved_id and saved_name == name:
+                dataset_ids[kind] = saved_id
+                continue
+
+            if not callable(get_dataset) and dataset_ids.get(kind):
+                continue
+
+            dataset_id = self._client().ensure_dataset(name)
+            if store is not None:
+                store.save_dataset(kind, dataset_id, name)
             dataset_ids[kind] = dataset_id
 
     def _audit(
@@ -844,6 +848,14 @@ class RAGFlowBackend(RAGBackend):
     ) -> list[Evidence]:
         self._check_kb_access(kb_name, ctx, "read")
         scope = _scope_for_kb(kb_name, ctx).require_department("retrieve from")
+        scoped_records = self.store.list_documents(kb_name, department_id=scope.department_id)
+        records_by_remote_id = {
+            str(record.document_id): record
+            for record in scoped_records
+            if record.processor_kind == PROCESSOR_KIND_RAGFLOW
+            and record.document_id
+            and normalize_parse_status(record.status, record.processor_kind) == TASK_STATUS_COMPLETED
+        }
         top_k = top_k or config.settings.FINAL_TOP_K
         route = route_source_groups(query)
         routed_source_groups = route.source_groups if route.should_filter else ()
@@ -883,51 +895,70 @@ class RAGFlowBackend(RAGBackend):
                 f"source_names={source_names}"
             )
 
-        # Local re-filter is defense-in-depth on top of the remote
-        # metadata_condition: if RAGFlow ever echoes a cross-scope chunk, drop it
-        # here. Each check passes the chunk through when the scoping field is
-        # absent — RAGFlow stores kb_name/department_id/source_group as
-        # document-level meta_fields and does not always echo them on each
-        # retrieved chunk, so treating a missing field as a mismatch would
-        # silently drop every hit (the department check in particular).
-        def _filter_chunks(apply_source_name_filter: bool) -> tuple[list[Evidence], dict[str, int]]:
+        # RAGFlow retrieval chunks may omit document-level metadata. Resolve
+        # their scope through our local, department-scoped document mapping so
+        # missing fields do not drop valid chunks and untracked remote chunks
+        # cannot bypass the application's access controls.
+        def _filter_chunks() -> tuple[list[Evidence], dict[str, int]]:
             evidences = []
             skipped_counts = {
+                "document": 0,
                 "kb": 0,
                 "department": 0,
                 "source_group": 0,
                 "source_name": 0,
             }
             for chunk in chunks:
-                metadata = chunk.get("metadata") or chunk.get("meta_fields") or {}
-                chunk_kb = metadata.get("kb_name") or metadata.get("logical_kb_id")
-                if chunk_kb and chunk_kb != kb_name:
+                metadata = dict(chunk.get("metadata") or chunk.get("meta_fields") or {})
+                remote_document_id = str(chunk.get("document_id") or "").strip()
+                record = records_by_remote_id.get(remote_document_id)
+                if record is None:
+                    skipped_counts["document"] += 1
+                    continue
+
+                chunk_kb = str(metadata.get("kb_name") or metadata.get("logical_kb_id") or "")
+                if chunk_kb and chunk_kb != record.kb_name:
                     skipped_counts["kb"] += 1
                     continue
                 chunk_department = str(metadata.get("department_id") or "")
-                if chunk_department and chunk_department != scope.department_id:
-                    # Only drop chunks that explicitly carry a different department.
-                    # A chunk with no department_id is trusted to the remote filter;
-                    # dropping it would empty the result set when RAGFlow does not
-                    # echo document-level meta_fields on retrieved chunks.
+                if chunk_department and chunk_department != record.department_id:
                     skipped_counts["department"] += 1
                     continue
-                chunk_source_group = _normalize_chunk_source_group(metadata.get("source_group"))
-                if routed_source_groups and chunk_source_group not in routed_source_groups:
+                record_source_group = _normalize_chunk_source_group(record.source_group)
+                chunk_source_group = str(metadata.get("source_group") or "").strip()
+                if chunk_source_group and _normalize_chunk_source_group(chunk_source_group) != record_source_group:
                     skipped_counts["source_group"] += 1
                     continue
-                if source_names and apply_source_name_filter:
-                    chunk_source_name = str(chunk.get("document_name") or metadata.get("original_file_name") or "")
-                    if chunk_source_name not in source_names:
-                        skipped_counts["source_name"] += 1
-                        continue
+                if routed_source_groups and record_source_group not in routed_source_groups:
+                    skipped_counts["source_group"] += 1
+                    continue
+
+                canonical_source_name = str(
+                    record.original_file_name
+                    or record.document_name
+                    or chunk.get("document_keyword")
+                    or chunk.get("document_name")
+                    or metadata.get("original_file_name")
+                    or ""
+                )
+                if source_names and canonical_source_name not in source_names:
+                    skipped_counts["source_name"] += 1
+                    continue
+
+                metadata.update({
+                    "kb_name": record.kb_name,
+                    "department_id": record.department_id,
+                    "source_group": record_source_group,
+                    "original_file_name": canonical_source_name,
+                    "ragflow_document_id": remote_document_id,
+                })
                 content = chunk.get("content") or chunk.get("text") or ""
                 score = chunk.get("similarity") or chunk.get("score") or chunk.get("vector_similarity") or 0.0
                 evidences.append(
                     Evidence(
                         id=str(chunk.get("id") or chunk.get("chunk_id") or ""),
                         content=content,
-                        source_name=chunk.get("document_name") or metadata.get("original_file_name", ""),
+                        source_name=canonical_source_name,
                         score=float(score or 0.0),
                         metadata={
                             **metadata,
@@ -942,7 +973,7 @@ class RAGFlowBackend(RAGBackend):
                 )
             return evidences, skipped_counts
 
-        evidences, skipped_counts = _filter_chunks(apply_source_name_filter=not source_name_fallback)
+        evidences, skipped_counts = _filter_chunks()
         if not evidences and source_names and not source_name_fallback and skipped_counts["source_name"]:
             fallback_condition = _metadata_condition(
                 kb_name,
@@ -958,7 +989,7 @@ class RAGFlowBackend(RAGBackend):
                 metadata_condition=fallback_condition,
             )
             source_name_fallback = True
-            evidences, skipped_counts = _filter_chunks(apply_source_name_filter=False)
+            evidences, skipped_counts = _filter_chunks()
             log(
                 "RAGFlow scoped source-name retrieve was emptied by local filename validation; "
                 "retried without original_file_name condition and received "

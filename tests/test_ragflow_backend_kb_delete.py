@@ -168,10 +168,11 @@ def _backend(records, handlers):
     return backend
 
 
-def _retrieve_backend(chunks):
+def _retrieve_backend(chunks, records=None):
     backend = object.__new__(RAGFlowBackend)
     backend.name = "ragflow"
     backend.client = _RetrieveClient(chunks)
+    backend.store = _Store(records or [])
     backend._dataset_ids = {"governance": "dataset-g", "design": "dataset-d"}
     backend._check_kb_access = lambda kb_name, ctx, required="read": None
     return backend
@@ -213,9 +214,12 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
         self.assertEqual(backend.client.retrieve_calls, [])
 
     def test_retrieve_filters_by_department_scope(self):
+        dept_a_record = _record(1, "a.pdf", PROCESSOR_KIND_RAGFLOW, department_id="dept_a")
+        dept_b_record = _record(2, "b.pdf", PROCESSOR_KIND_RAGFLOW, department_id="dept_b")
         backend = _retrieve_backend([
             {
                 "id": "chunk-a",
+                "document_id": dept_a_record.document_id,
                 "content": "dept a content",
                 "similarity": 0.9,
                 "metadata": {
@@ -227,6 +231,7 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
             },
             {
                 "id": "chunk-b",
+                "document_id": dept_b_record.document_id,
                 "content": "dept b content",
                 "similarity": 0.8,
                 "metadata": {
@@ -236,7 +241,7 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
                     "original_file_name": "b.pdf",
                 },
             },
-        ])
+        ], [dept_a_record, dept_b_record])
         ctx = RequestContext(metadata={"department_id": "dept_a"})
 
         evidences = backend.retrieve("kb", "query", top_k=5, ctx=ctx)
@@ -253,9 +258,11 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
         # on retrieved chunks. Such chunks must pass through to the caller instead
         # of being dropped by the defense-in-depth department check — otherwise
         # every hit is silently filtered out and the answer comes back empty.
+        record = _record(3, "c.pdf", PROCESSOR_KIND_RAGFLOW)
         backend = _retrieve_backend([
             {
                 "id": "chunk-nodept",
+                "document_id": record.document_id,
                 "content": "content without department metadata",
                 "similarity": 0.9,
                 "metadata": {
@@ -264,7 +271,7 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
                     "original_file_name": "c.pdf",
                 },
             },
-        ])
+        ], [record])
         ctx = RequestContext(metadata={"department_id": "dept_a"})
 
         evidences = backend.retrieve("kb", "query", top_k=5, ctx=ctx)
@@ -275,8 +282,11 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
         )
 
     def test_retrieve_retries_scoped_source_name_without_remote_filename_filter(self):
+        record = _record(4, "600608964_ADAS_HSI.docx", PROCESSOR_KIND_RAGFLOW)
+        record.source_group = "design"
         chunk = {
             "id": "chunk-hsi",
+            "document_id": record.document_id,
             "document_name": "600608964_ADAS_HSI.docx",
             "content": "HSI interface evidence",
             "similarity": 0.91,
@@ -286,7 +296,7 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
                 "source_group": "design",
             },
         }
-        backend = _retrieve_backend([])
+        backend = _retrieve_backend([], [record])
         backend.client = _SequentialRetrieveClient([[], [chunk]])
         ctx = RequestContext(metadata={"department_id": "dept_a"})
 
@@ -312,24 +322,26 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
             second_condition["conditions"],
         )
 
-    def test_retrieve_fallback_passes_through_chunks_with_other_filenames(self):
-        # Fallback fires because the scoped (by source_name) retrieve returned 0.
-        # The broader retrieve typically returns chunks from OTHER files; those
-        # must pass through instead of being dropped by the local source_name
-        # filter, otherwise the fallback is pointless.
-        chunk = {
-            "id": "chunk-other",
-            "document_name": "other.pdf",
-            "content": "evidence from a different file",
-            "similarity": 0.8,
-            "metadata": {
-                "kb_name": "kb",
-                "department_id": "dept_a",
-                "source_group": "design",
-            },
+    def test_retrieve_fallback_keeps_only_requested_local_document(self):
+        target = _record(5, "target.pdf", PROCESSOR_KIND_RAGFLOW)
+        other = _record(6, "other.pdf", PROCESSOR_KIND_RAGFLOW)
+        target.source_group = other.source_group = "design"
+        target_chunk = {
+            "id": "chunk-target",
+            "document_id": target.document_id,
+            "document_keyword": "target(1).pdf",
+            "content": "target evidence",
+            "similarity": 0.91,
         }
-        backend = _retrieve_backend([])
-        backend.client = _SequentialRetrieveClient([[], [chunk]])
+        other_chunk = {
+            "id": "chunk-other",
+            "document_id": other.document_id,
+            "document_keyword": "other.pdf",
+            "content": "other evidence",
+            "similarity": 0.9,
+        }
+        backend = _retrieve_backend([], [target, other])
+        backend.client = _SequentialRetrieveClient([[], [other_chunk, target_chunk]])
         ctx = RequestContext(metadata={"department_id": "dept_a"})
 
         evidences = backend.retrieve(
@@ -340,12 +352,16 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
             filters={"source_name": "target.pdf"},
         )
 
-        self.assertEqual([item.id for item in evidences], ["chunk-other"])
+        self.assertEqual([item.id for item in evidences], ["chunk-target"])
         self.assertTrue(evidences[0].metadata["ragflow_source_name_fallback"])
 
     def test_retrieve_retries_when_local_filename_validation_empties_remote_hits(self):
+        target = _record(7, "600608964_ADAS_HSI_0506_1952_shoulin.wang.docx", PROCESSOR_KIND_RAGFLOW)
+        other = _record(8, "other.docx", PROCESSOR_KIND_RAGFLOW)
+        target.source_group = other.source_group = "design"
         mismatched_chunk = {
             "id": "chunk-mismatched-name",
+            "document_id": other.document_id,
             "document_name": "ragflow-internal-name.docx",
             "content": "candidate returned with an internal name",
             "similarity": 0.9,
@@ -357,6 +373,7 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
         }
         fallback_chunk = {
             "id": "chunk-fallback",
+            "document_id": target.document_id,
             "document_name": "600608964_ADAS_HSI_0506_1952_shoulin.wang.docx",
             "content": "HSI interface evidence",
             "similarity": 0.91,
@@ -366,7 +383,7 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
                 "source_group": "design",
             },
         }
-        backend = _retrieve_backend([])
+        backend = _retrieve_backend([], [target, other])
         backend.client = _SequentialRetrieveClient([[mismatched_chunk], [fallback_chunk]])
         ctx = RequestContext(metadata={"department_id": "dept_a"})
 
@@ -389,6 +406,59 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
             },
             backend.client.retrieve_calls[1][3]["conditions"],
         )
+
+    def test_retrieve_enriches_metadata_free_chunk_from_scoped_local_record(self):
+        record = _record(9, "600608964_ADAS_HSI.docx", PROCESSOR_KIND_RAGFLOW)
+        chunk = {
+            "id": "chunk-hsi",
+            "document_id": record.document_id,
+            "document_keyword": "600608964_ADAS_HSI(1).docx",
+            "content": "HSI interface evidence",
+            "similarity": 0.91,
+        }
+        backend = _retrieve_backend([chunk], [record])
+        ctx = RequestContext(metadata={"department_id": "dept_a"})
+
+        evidences = backend.retrieve("kb", "balanced query", top_k=5, ctx=ctx)
+
+        self.assertEqual([item.id for item in evidences], ["chunk-hsi"])
+        self.assertEqual(evidences[0].source_name, "600608964_ADAS_HSI.docx")
+        self.assertEqual(evidences[0].metadata["kb_name"], "kb")
+        self.assertEqual(evidences[0].metadata["department_id"], "dept_a")
+        self.assertEqual(evidences[0].metadata["source_group"], "文档资料")
+        self.assertEqual(evidences[0].metadata["original_file_name"], "600608964_ADAS_HSI.docx")
+
+    def test_retrieve_rejects_chunk_without_scoped_local_document(self):
+        allowed = _record(10, "allowed.docx", PROCESSOR_KIND_RAGFLOW)
+        chunk = {
+            "id": "chunk-stale",
+            "document_id": "remote-stale",
+            "document_keyword": "stale.docx",
+            "content": "unscoped content",
+            "similarity": 0.9,
+        }
+        backend = _retrieve_backend([chunk], [allowed])
+        ctx = RequestContext(metadata={"department_id": "dept_a"})
+
+        self.assertEqual(backend.retrieve("kb", "balanced query", ctx=ctx), [])
+
+    def test_retrieve_rejects_explicit_metadata_conflicting_with_local_record(self):
+        record = _record(11, "allowed.docx", PROCESSOR_KIND_RAGFLOW)
+        chunk = {
+            "id": "chunk-conflict",
+            "document_id": record.document_id,
+            "content": "wrong department content",
+            "similarity": 0.9,
+            "metadata": {
+                "kb_name": "kb",
+                "department_id": "dept_b",
+                "source_group": "docs",
+            },
+        }
+        backend = _retrieve_backend([chunk], [record])
+        ctx = RequestContext(metadata={"department_id": "dept_a"})
+
+        self.assertEqual(backend.retrieve("kb", "balanced query", ctx=ctx), [])
 
     def test_kb_delete_dispatches_to_pipeline_handlers(self):
         rag_handler = _Handler(PROCESSOR_KIND_RAGFLOW)

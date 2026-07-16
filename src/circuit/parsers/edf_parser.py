@@ -88,7 +88,7 @@ def _patch_spydrnet_edif_parser() -> None:
 
 
 def _repo_spydrnet_path() -> Path:
-    return Path(__file__).resolve().parents[4] / "spydrnet"
+    return Path(__file__).resolve().parents[1] / "vendor" / "spydrnet"
 
 
 def _load_spydrnet():
@@ -101,9 +101,6 @@ def _load_spydrnet():
         sys.path.insert(0, repo_path)
         importlib.invalidate_caches()
 
-        # An earlier import may have selected site-packages before the parser
-        # runs. Drop only SpyDrNet modules so this parser consistently uses the
-        # workspace checkout selected above.
         loaded = sys.modules.get("spydrnet")
         loaded_file = str(getattr(loaded, "__file__", "")) if loaded else ""
         if loaded_file and not loaded_file.startswith(repo_path):

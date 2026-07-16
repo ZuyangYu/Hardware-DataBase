@@ -53,3 +53,19 @@ ragflow_store_*/
 
 # Local development plans / specs (not version-controlled)
 docs/superpowers/
+
+# Generated evaluation artifacts
+evaluation/reports/
+evaluation/results/
+evaluation/snapshots/
+evaluation/.cache/
+storage/evaluations/
+
+# Local test and coverage artifacts
+.coverage
+htmlcov/
+*.log
+
+# Generated parser tables in the vendored SpyDrNet source
+/src/circuit/vendor/spydrnet/**/parser.out
+/src/circuit/vendor/spydrnet/**/parsetab.py

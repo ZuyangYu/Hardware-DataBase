@@ -211,6 +211,16 @@ class PipelineDocumentStore:
         """)
         conn.execute("DROP TABLE pipeline_documents_old")
 
+    def get_dataset(self, kind: str) -> tuple[str, str] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT dataset_id, dataset_name FROM pipeline_datasets WHERE kind = ?",
+                (kind,),
+            ).fetchone()
+        if not row:
+            return None
+        return row["dataset_id"], row["dataset_name"]
+
     def get_dataset_id(self, kind: str) -> str | None:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT dataset_id FROM pipeline_datasets WHERE kind = ?", (kind,)).fetchone()
@@ -730,6 +740,5 @@ class PipelineDocumentStore:
             error_message=message,
         )
         self.release_parse_claim(record_id)
-
 
 

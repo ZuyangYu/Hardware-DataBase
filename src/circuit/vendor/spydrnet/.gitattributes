@@ -1,0 +1,27 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Explicitly declare text files for LF normalization
+*.py text eol=lf
+*.rst text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.cfg text eol=lf
+*.bat text eol=lf
+*.pyi text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+Makefile text eol=lf
+.gitignore text eol=lf
+.pylintrc text eol=lf
+LICENSE text eol=lf
+*.out text eol=lf
+
+# Binary files
+*.svg binary

@@ -179,6 +179,35 @@ A: 可适当调大 `AGENT_TIMEOUT_SECONDS`；检查 `AGENT_MAX_RETRIEVAL_ROUNDS`
 **Q: 首次启动后无法使用问答？**
 A: 请先进入「⚙️ 系统配置」检查并补全 RAGFlow 与 Agent 模型配置，点击「应用配置」生效。
 
+## RAGAS 回答质量评估
+
+项目提供独立的 RAGAS 评估子系统，可在线调用真实问答管线，也可对保存的回答快照离线重评。内置数据集 `evaluation/datasets/hardware_qa_v1.jsonl` 包含 25 条电路、文档、联合检索、多跳、缺失证据、冲突、权限和直答用例。
+
+安装评估依赖并校验数据集：
+
+```powershell
+uv sync --group eval
+uv run hardware-rag-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
+```
+
+运行端到端评估或重评已有快照：
+
+```powershell
+uv run hardware-rag-eval run --dataset evaluation/datasets/hardware_qa_v1.jsonl --output storage/evaluations
+uv run hardware-rag-eval score --dataset evaluation/datasets/hardware_qa_v1.jsonl --snapshot storage/evaluations/<run_id>/snapshot.jsonl --output storage/evaluations
+```
+
+默认只生成 JSON、CSV 和 HTML 报告。需要在 CI 中启用阈值门禁时添加 `--fail-on-threshold`。可用 `--tag`、`--sample-id`、`--metric` 和 `--threshold faithfulness=0.8` 过滤或覆盖评分设置。
+
+裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。Streamlit 中仅系统管理员可见“RAGAS 评估”页面。
+
+- 评估数据集格式与扩展方式：`evaluation/README.md`
+- 运行产物：`storage/evaluations/<run_id>/`
+
+- `snapshot.jsonl` 保存回答和检索上下文，可更换裁判模型重复评分。
+- `summary.json` 是自动化消费的权威汇总，`summary.csv` 用于表格分析，`report.html` 用于人工查看。
+- 单题或单指标失败不会终止整批；`not_applicable` 不计入指标均值。
+
 ## 说明
 
 - “知识库”现在是业务隔离与权限治理单元，不代表本地向量库。
