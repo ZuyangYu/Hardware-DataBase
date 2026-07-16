@@ -1168,7 +1168,43 @@ class RAGFlowBackend(RAGBackend):
 
             if record.status in RAGFLOW_HIDDEN_TASK_STATUSES:
                 continue
-            if _ragflow_parse_timed_out(record):
+            # 先用远端真实状态刷新本地,再判定超时:避免本地 status 停在 parsing
+            # 但远端其实已解析完成时,被超时误判并删除远端文档(数据丢失)。
+            status = record.status
+            message = record.ragflow_error
+            remote_progress = None
+            remote_stage = ""
+            refreshed = False
+            try:
+                remote_docs = self._client().list_documents(record.dataset_id, record.document_id)
+                if remote_docs:
+                    remote_doc = remote_docs[0]
+                    status = _normalize_ragflow_status(remote_doc.get("run") or remote_doc.get("status") or status)
+                    message = _extract_ragflow_error(remote_doc)
+                    remote_progress = _extract_ragflow_progress(remote_doc)
+                    remote_stage = _extract_ragflow_progress_message(remote_doc)
+                    self.store.update_document_status(record.dataset_id, record.document_id, status, message)
+                    if remote_progress is not None or remote_stage:
+                        self.store.update_document_progress_by_id(
+                            record.id,
+                            remote_progress if remote_progress is not None else record.parse_progress,
+                            remote_stage or record.parse_stage,
+                        )
+                    refreshed = True
+                    if status in RAGFLOW_HIDDEN_TASK_STATUSES:
+                        continue
+            except Exception as status_error:
+                if _is_ragflow_not_owner_error(status_error):
+                    message = _ragflow_status_unavailable_message(record.document_name)
+                    log(f"RAGFlow task status is not readable for {record.document_id}: {status_error}")
+                else:
+                    message = str(status_error)
+            # 仅当远端确认仍在解析、且确实超过阈值时才标记超时;远端不可达/状态不明时不删远端。
+            if (
+                refreshed
+                and normalize_parse_status(status) == TASK_STATUS_RUNNING
+                and _ragflow_parse_timed_out(record)
+            ):
                 timeout_msg = self._mark_ragflow_parse_timed_out(record)
                 tasks.append(
                     ParseTask(
@@ -1189,33 +1225,6 @@ class RAGFlowBackend(RAGBackend):
                     )
                 )
                 continue
-            status = record.status
-            message = record.ragflow_error
-            remote_progress = None
-            remote_stage = ""
-            try:
-                remote_docs = self._client().list_documents(record.dataset_id, record.document_id)
-                if remote_docs:
-                    remote_doc = remote_docs[0]
-                    status = _normalize_ragflow_status(remote_doc.get("run") or remote_doc.get("status") or status)
-                    message = _extract_ragflow_error(remote_doc)
-                    remote_progress = _extract_ragflow_progress(remote_doc)
-                    remote_stage = _extract_ragflow_progress_message(remote_doc)
-                    self.store.update_document_status(record.dataset_id, record.document_id, status, message)
-                    if remote_progress is not None or remote_stage:
-                        self.store.update_document_progress_by_id(
-                            record.id,
-                            remote_progress if remote_progress is not None else record.parse_progress,
-                            remote_stage or record.parse_stage,
-                        )
-                    if status in RAGFLOW_HIDDEN_TASK_STATUSES:
-                        continue
-            except Exception as status_error:
-                if _is_ragflow_not_owner_error(status_error):
-                    message = _ragflow_status_unavailable_message(record.document_name)
-                    log(f"RAGFlow task status is not readable for {record.document_id}: {status_error}")
-                else:
-                    message = str(status_error)
 
             task_status, progress, stage = self._parse_task_state_from_ragflow_status(
                 status,
@@ -1346,23 +1355,31 @@ class RAGFlowBackend(RAGBackend):
                 else raw_error_message
             )
             if record.processor_kind == PROCESSOR_KIND_RAGFLOW:
-                if _ragflow_parse_timed_out(record):
+                # 先用远端真实状态刷新本地,再判定超时:避免本地 status 停在 parsing
+                # 但远端其实已解析完成时,被超时误判并删除远端文档(数据丢失)。
+                refreshed_status: str | None = None
+                try:
+                    remote_docs = self._client().list_documents(record.dataset_id, record.document_id)
+                    if remote_docs:
+                        remote_doc = remote_docs[0]
+                        refreshed_status = _normalize_ragflow_status(remote_doc.get("run") or remote_doc.get("status") or status)
+                        error_message = _extract_ragflow_error(remote_doc)
+                        status = refreshed_status
+                        self.store.update_document_status(record.dataset_id, record.document_id, status, error_message)
+                except Exception as status_error:
+                    if _is_ragflow_not_owner_error(status_error):
+                        status_note = _ragflow_status_unavailable_message(record.document_name)
+                        log(f"RAGFlow document status is not readable for {record.document_id}: {status_error}")
+                    else:
+                        log(f"RAGFlow status refresh failed for {record.document_name}: {status_error}")
+                # 仅当远端确认仍在解析、且确实超过阈值时才标记超时;远端不可达/状态不明时不删远端。
+                if (
+                    refreshed_status is not None
+                    and normalize_parse_status(refreshed_status) == TASK_STATUS_RUNNING
+                    and _ragflow_parse_timed_out(record)
+                ):
                     error_message = self._mark_ragflow_parse_timed_out(record)
                     status = RAGFLOW_STATUS_FAILED
-                else:
-                    try:
-                        remote_docs = self._client().list_documents(record.dataset_id, record.document_id)
-                        if remote_docs:
-                            remote_doc = remote_docs[0]
-                            status = _normalize_ragflow_status(remote_doc.get("run") or remote_doc.get("status") or status)
-                            error_message = _extract_ragflow_error(remote_doc)
-                            self.store.update_document_status(record.dataset_id, record.document_id, status, error_message)
-                    except Exception as status_error:
-                        if _is_ragflow_not_owner_error(status_error):
-                            status_note = _ragflow_status_unavailable_message(record.document_name)
-                            log(f"RAGFlow document status is not readable for {record.document_id}: {status_error}")
-                        else:
-                            log(f"RAGFlow status refresh failed for {record.document_name}: {status_error}")
 
             container_inspection = self.archive.inspect_record_archive(record)
             spreadsheet_profile = (

@@ -83,7 +83,7 @@ class AuthService:
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=MEMORY")
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
@@ -1006,7 +1006,6 @@ def anonymous_user_id(session_id: str) -> str:
 def build_request_context(session_state) -> RequestContext:
     session_id = ensure_session_id(session_state)
     username = session_state.get("username")
-    role = session_state.get("role")
     department_id = session_state.get("department_id")
     kb_id = session_state.get("current_kb_id")
     resource_department_id = session_state.get("current_kb_department_id")
@@ -1015,11 +1014,19 @@ def build_request_context(session_state) -> RequestContext:
     if username:
         auth_service = AuthService()
         user = auth_service.get_user_by_username(username)
-        kb_permissions = auth_service.get_kb_permissions_for_user(user) if user else {}
+        # 用 DB 里的实时角色/状态,而非 session_state 快照:降级或停用的账号
+        # 不能凭旧会话继续以原角色操作。
+        if user is None or not user.is_active:
+            return RequestContext(
+                user_id=anonymous_user_id(session_id),
+                session_id=session_id,
+                roles=["anonymous"],
+            )
+        kb_permissions = auth_service.get_kb_permissions_for_user(user)
         return RequestContext(
             user_id=username,
             session_id=session_id,
-            roles=[role or "user"],
+            roles=[user.role],
             allowed_kbs=sorted(key for key in kb_permissions if ":" not in key),
             kb_permissions=kb_permissions,
             metadata={
