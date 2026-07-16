@@ -1,4 +1,4 @@
-import tempfile
+import json
 import unittest
 import ast
 from dataclasses import dataclass, field
@@ -274,9 +274,6 @@ class _NoKwargStreamLLM(_FakeLLM):
         yield "streamed-no-kwargs"
 
 
-import json
-
-
 class _BadLLM:
     """LLM 全程返回非 JSON → 验证降级不挂。"""
 
@@ -365,6 +362,83 @@ class _PromptCaptureLLM:
 
 
 class AgenticRunnerTests(unittest.TestCase):
+    def test_retrieval_does_not_truncate_required_circuit_sources(self):
+        calls = []
+
+        class _Tool:
+            def run(self, query, kb_name, ctx, top_k=5, filters=None):
+                calls.append((query, (filters or {}).get("source_name", "")))
+                return []
+
+        circuit_calls = [
+            {
+                "tool_name": "circuit_query",
+                "query": f"U{i}",
+                "filters": {"source_name": f"board_{i}.edf"},
+                "top_k": 8,
+            }
+            for i in range(9)
+        ]
+        state = {
+            "kb_name": "kb",
+            "user_query": "U1800是什么器件？",
+            "source_plan": {
+                "source_plan": [
+                    {
+                        "tool_calls": [
+                            {
+                                "tool_name": "document_rag",
+                                "query": "U1800功能",
+                                "filters": {},
+                                "top_k": 8,
+                            },
+                            *circuit_calls,
+                        ]
+                    }
+                ]
+            },
+            "retrieval_round": 0,
+            "evidence": [],
+            "trace": [],
+        }
+
+        retrieve_evidence(state, {"document_rag": _Tool(), "circuit_query": _Tool()})
+
+        self.assertEqual({source for _, source in calls if source}, {f"board_{i}.edf" for i in range(9)})
+
+    def test_generic_document_text_does_not_cover_a_different_refdes(self):
+        state = {
+            "question_analysis": {
+                "entities": ["U1800"],
+                "sub_questions": [
+                    {
+                        "id": "sq_1",
+                        "question": "U1800是什么器件，有什么功能？",
+                        "expected_evidence": ["document_text"],
+                    }
+                ],
+            },
+            "catalog": {"sources": []},
+            "merged_evidence": [
+                {
+                    "id": "doc-u1700",
+                    "source_name": "manual.pdf",
+                    "content": "U1700是什么器件，有什么功能？",
+                    "content_kind": "document_text",
+                    "processor_kind": "ragflow",
+                    "score": 0.9,
+                }
+            ],
+            "retrieval_diagnostics": [],
+            "source_plan": {"source_plan": []},
+            "trace": [],
+        }
+
+        result = score_and_compare_evidence(state)
+
+        self.assertEqual(result["retrieval_ledger"][0]["status"], "missing")
+        self.assertIn("document_text", result["retrieval_ledger"][0]["missing_evidence_types"])
+
     def test_runner_uses_compiled_langgraph_without_legacy_manual_pipeline(self):
         runner_path = Path(__file__).resolve().parents[1] / "src" / "agents" / "runner.py"
         tree = ast.parse(runner_path.read_text(encoding="utf-8"))
@@ -422,7 +496,7 @@ class AgenticRunnerTests(unittest.TestCase):
 
     def test_multi_hop_dynamic_requery(self):
         runner, backend = self._runner(_FakeLLM(first_sufficient=False, multi_hop_query="R-123 用量"))
-        out = "".join(runner.stream(query="查 design_report 料号及 BOM 用量", kb_name="kb", history=[], ctx=self._ctx()))
+        "".join(runner.stream(query="查 design_report 料号及 BOM 用量", kb_name="kb", history=[], ctx=self._ctx()))
         # 第二轮基于第一轮发现实体 R-123 产出了新查询；rewritten_queries 汇总所有轮次查询。
         summary = runner.get_last_retrieval_summary()
         rewritten = summary.get("rewritten_queries") or []
@@ -503,7 +577,7 @@ class AgenticRunnerTests(unittest.TestCase):
 
     def test_smalltalk_routes_to_direct_answer(self):
         runner, backend = self._runner(_FakeLLM())
-        out = "".join(runner.stream(query="你好", kb_name="kb", history=[], ctx=self._ctx()))
+        "".join(runner.stream(query="你好", kb_name="kb", history=[], ctx=self._ctx()))
         self.assertIn("直接回答（未检索知识库）", runner.get_last_footer())
         self.assertFalse(backend.retrieve_calls)
 
@@ -516,7 +590,7 @@ class AgenticRunnerTests(unittest.TestCase):
     def test_router_deterministic_fallback(self):
         # llm_client=None → route_query 走确定性路径。
         runner, backend = self._runner(None)
-        out = "".join(runner.stream(query="你好", kb_name="kb", history=[], ctx=self._ctx()))
+        "".join(runner.stream(query="你好", kb_name="kb", history=[], ctx=self._ctx()))
         self.assertIn("直接回答（未检索知识库）", runner.get_last_footer())
         self.assertFalse(backend.retrieve_calls)
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import random
+import time
 from collections.abc import Iterable
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 import requests
 
@@ -80,6 +82,10 @@ class LLMClientConfig:
     max_tokens: int = 4096
     timeout: int = 120
     temperature: float = 0.2
+    rate_limit_max_retries: int = 4
+    rate_limit_initial_delay_seconds: float = 1.0
+    rate_limit_max_delay_seconds: float = 16.0
+    fallback_model: str = "deepseek-ai/DeepSeek-V4-Pro"
 
 
 @dataclass(frozen=True)
@@ -167,6 +173,10 @@ class LLMClient:
             max_tokens=settings.AGENT_CUSTOM_MAX_TOKENS,
             timeout=settings.AGENT_TIMEOUT_SECONDS,
             temperature=settings.AGENT_TEMPERATURE,
+            rate_limit_max_retries=settings.AGENT_RATE_LIMIT_MAX_RETRIES,
+            rate_limit_initial_delay_seconds=settings.AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS,
+            rate_limit_max_delay_seconds=settings.AGENT_RATE_LIMIT_MAX_DELAY_SECONDS,
+            fallback_model=settings.AGENT_FALLBACK_MODEL,
         )
 
     @staticmethod
@@ -266,18 +276,19 @@ class LLMClient:
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
         payload = {
-            "model": config.model,
             "messages": messages,
             "temperature": kwargs.get("temperature", config.temperature),
             "max_tokens": kwargs.get("max_tokens", config.max_tokens),
         }
-        response = requests.post(
-            f"{config.base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=kwargs.get("timeout", config.timeout),
+        response = self._request_openai_compatible_with_rate_limit_fallback(
+            config,
+            lambda model: requests.post(
+                f"{config.base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json={"model": model, **payload},
+                timeout=kwargs.get("timeout", config.timeout),
+            ),
         )
-        response.raise_for_status()
         data = response.json()
         self._record_usage(config, kwargs.get("usage_stage"), _extract_openai_usage(data.get("usage")))
         choices = data.get("choices") or []
@@ -302,35 +313,34 @@ class LLMClient:
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
         payload = {
-            "model": config.model,
             "messages": messages,
             "temperature": kwargs.get("temperature", config.temperature),
             "max_tokens": kwargs.get("max_tokens", config.max_tokens),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        response = requests.post(
-            f"{config.base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=kwargs.get("timeout", config.timeout),
-            stream=True,
-        )
-        try:
-            response.raise_for_status()
-        except requests.HTTPError:
-            if not _should_retry_without_stream_options(response):
-                raise
-            retry_payload = dict(payload)
-            retry_payload.pop("stream_options", None)
+        def request_stream(model: str) -> Any:
+            model_payload = {"model": model, **payload}
             response = requests.post(
+                f"{config.base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=model_payload,
+                timeout=kwargs.get("timeout", config.timeout),
+                stream=True,
+            )
+            if not _should_retry_without_stream_options(response):
+                return response
+            retry_payload = dict(model_payload)
+            retry_payload.pop("stream_options", None)
+            return requests.post(
                 f"{config.base_url.rstrip('/')}/chat/completions",
                 headers=headers,
                 json=retry_payload,
                 timeout=kwargs.get("timeout", config.timeout),
                 stream=True,
             )
-            response.raise_for_status()
+
+        response = self._request_openai_compatible_with_rate_limit_fallback(config, request_stream)
         # OpenAI-compatible SSE responses are UTF-8 even when their
         # Content-Type header omits an explicit charset.
         response.encoding = "utf-8"
@@ -354,6 +364,31 @@ class LLMClient:
         if not content:
             raise RuntimeError("Chat API returned an empty streamed response")
         return content
+
+    def _request_openai_compatible_with_rate_limit_fallback(
+        self,
+        config: LLMClientConfig,
+        request_for_model: Callable[[str], Any],
+    ) -> Any:
+        last_rate_limit_error: requests.HTTPError | None = None
+        retries = max(0, int(config.rate_limit_max_retries))
+        for model in _model_attempt_order(config):
+            for attempt in range(retries + 1):
+                response = request_for_model(model)
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as exc:
+                    if not _is_rate_limited(response):
+                        raise
+                    last_rate_limit_error = exc
+                    if attempt < retries:
+                        time.sleep(_rate_limit_delay_seconds(config, attempt, response))
+                        continue
+                    break
+                return response
+        if last_rate_limit_error is not None:
+            raise last_rate_limit_error
+        raise RuntimeError("OpenAI-compatible request did not select a model")
 
     def _record_usage(self, config: LLMClientConfig, stage: Any, usage: dict[str, int] | None) -> None:
         prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
@@ -414,6 +449,38 @@ def _should_retry_without_stream_options(response: Any) -> bool:
     status_code = int(getattr(response, "status_code", 0) or 0)
     body = str(getattr(response, "text", "") or "").lower()
     return status_code in {400, 422} and "stream_options" in body
+
+
+def _is_rate_limited(response: Any) -> bool:
+    return int(getattr(response, "status_code", 0) or 0) == 429
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", {}) or {}
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _rate_limit_delay_seconds(config: LLMClientConfig, attempt: int, response: Any) -> float:
+    retry_after = _retry_after_seconds(response)
+    if retry_after is not None:
+        return retry_after
+    initial_delay = max(0.0, float(config.rate_limit_initial_delay_seconds))
+    max_delay = max(0.0, float(config.rate_limit_max_delay_seconds))
+    delay = min(max_delay, initial_delay * (2 ** max(0, attempt)))
+    return min(max_delay, delay + (random.random() * delay * 0.25))
+
+
+def _model_attempt_order(config: LLMClientConfig) -> tuple[str, ...]:
+    primary = str(config.model or "").strip()
+    fallback = str(config.fallback_model or "").strip()
+    if fallback and fallback != primary:
+        return primary, fallback
+    return (primary,)
 
 
 def _summarize_usage(records: Iterable[LLMUsageRecord]) -> LLMUsageSummary:

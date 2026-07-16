@@ -89,9 +89,10 @@ retrieval can filter by group; consumed by `routed_retriever.py` and the RAGFlow
 Parses EDF netlists and schematic PDFs into a structured, cross-referenced circuit model.
 - `CircuitOrchestrator` incrementally merges EDF (`apply_edf_parse`) and PDF
   (`apply_pdf_parse`) results per KB, fusing them when both sources are present.
-- Parsers in `parsers/`: `edf_parser.py` wraps the **sibling `spydrnet` repo** for EDIF
-  (it inserts `../spydrnet` onto `sys.path` and monkey-patches spydrnet's EDIF parser),
-  with `edif_lite_parser.py` as a fallback; `pdf_schematic_parser.py` uses pdfplumber/PyMuPDF.
+- Parsers in `parsers/`: `edf_parser.py` wraps the vendored `src/circuit/vendor/spydrnet`
+  checkout for EDIF (it prioritizes that path on `sys.path` and monkey-patches SpyDrNet's
+  EDIF parser), with `edif_lite_parser.py` as a fallback; `pdf_schematic_parser.py` uses
+  pdfplumber/PyMuPDF.
 - `CircuitStore` persists to `storage/circuits/{kb}/{design_id}/` (circuit_state.json,
   connectivity_graph.gpickle, module_screenshots/, pdf_cache/) plus a global
   `storage/circuits/index.json`. Old flat layouts auto-migrate on next save.
@@ -137,10 +138,10 @@ are test scratch space.
   than passing ad-hoc dicts across boundaries.
 - User-facing strings and answers are Chinese; keep that for prompts and UI text.
 
-## Sibling repo: `spydrnet/`
+## Vendored dependency: `src/circuit/vendor/spydrnet/`
 
-`../spydrnet` is a vendored copy of the SpyDrNet netlist framework. The circuit EDF parser
-depends on it being a sibling of `Hardware-DataBase/` (resolved relative to the parser file).
-`spydrnet/sch_parse/` and `spydrnet/spydrnet_extension/` hold project-specific additions on
-top of upstream SpyDrNet. It is also pulled in as the `spydrnet>=1.13.0` PyPI dependency, so
-the local path injection is an override of the installed package.
+The circuit EDF parser loads its SpyDrNet checkout from `src/circuit/vendor/spydrnet`, so the
+project does not require a sibling repository or the PyPI `spydrnet` package at runtime.
+`sch_parse/` and `spydrnet_extension/` contain project-specific additions on top of upstream
+SpyDrNet. A sibling `../spydrnet` checkout may be retained as a human-maintained backup, but it
+is not part of the application import path or dependency resolution.

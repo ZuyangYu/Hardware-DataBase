@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import requests
 
-from src.core.llm_client import LLMClient, LLMClientConfig, _iter_sse_data_events
+from src.core.llm_client import LLMClient, LLMClientConfig, _iter_sse_data_events, _rate_limit_delay_seconds
 import config.settings as settings
 
 
@@ -35,6 +35,18 @@ class _FakeJsonResponse:
         return self.payload
 
 
+class _RateLimitedResponse:
+    status_code = 429
+    text = "rate limit exceeded"
+    encoding = None
+
+    def __init__(self, retry_after="0"):
+        self.headers = {"Retry-After": retry_after}
+
+    def raise_for_status(self):
+        raise requests.HTTPError("429 Client Error")
+
+
 class _RejectStreamOptionsResponse:
     status_code = 400
     text = "unknown field stream_options"
@@ -45,6 +57,83 @@ class _RejectStreamOptionsResponse:
 
 
 class LLMClientStreamTests(unittest.TestCase):
+    def test_rate_limit_delay_does_not_exceed_configured_maximum(self):
+        config = LLMClientConfig(
+            provider=settings.Provider.CUSTOM,
+            base_url="https://example.test/v1",
+            model="primary-model",
+            rate_limit_initial_delay_seconds=16,
+            rate_limit_max_delay_seconds=16,
+        )
+
+        with patch("src.core.llm_client.random.random", return_value=1.0):
+            delay = _rate_limit_delay_seconds(config, 0, _RateLimitedResponse(retry_after="invalid"))
+
+        self.assertEqual(delay, 16.0)
+
+    def test_openai_compatible_chat_retries_429_using_retry_after(self):
+        config = LLMClientConfig(
+            provider=settings.Provider.CUSTOM,
+            base_url="https://example.test/v1",
+            model="primary-model",
+            rate_limit_max_retries=1,
+            fallback_model="",
+        )
+        success = _FakeJsonResponse({"choices": [{"message": {"content": "answer"}}]})
+
+        with patch(
+            "src.core.llm_client.requests.post",
+            side_effect=[_RateLimitedResponse(), success],
+        ) as post:
+            answer = LLMClient(config).chat([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(answer, "answer")
+        self.assertEqual(post.call_count, 2)
+
+    def test_openai_compatible_chat_uses_fallback_after_primary_429(self):
+        config = LLMClientConfig(
+            provider=settings.Provider.CUSTOM,
+            base_url="https://example.test/v1",
+            model="primary-model",
+            rate_limit_max_retries=0,
+            fallback_model="deepseek-ai/DeepSeek-V4-Pro",
+        )
+        success = _FakeJsonResponse({"choices": [{"message": {"content": "fallback answer"}}]})
+
+        with patch(
+            "src.core.llm_client.requests.post",
+            side_effect=[_RateLimitedResponse(), success],
+        ) as post:
+            answer = LLMClient(config).chat([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(answer, "fallback answer")
+        self.assertEqual(post.call_args_list[1].kwargs["json"]["model"], "deepseek-ai/DeepSeek-V4-Pro")
+
+    def test_openai_compatible_stream_uses_fallback_after_pre_stream_429(self):
+        config = LLMClientConfig(
+            provider=settings.Provider.CUSTOM,
+            base_url="https://example.test/v1",
+            model="primary-model",
+            rate_limit_max_retries=0,
+            fallback_model="deepseek-ai/DeepSeek-V4-Pro",
+        )
+        success = _FakeStreamResponse(
+            [
+                'data: {"choices":[{"delta":{"content":"ok"}}]}',
+                "",
+                "data: [DONE]",
+            ]
+        )
+
+        with patch(
+            "src.core.llm_client.requests.post",
+            side_effect=[_RateLimitedResponse(), success],
+        ) as post:
+            chunks = list(LLMClient(config).stream_chat([{"role": "user", "content": "hi"}]))
+
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(post.call_args_list[1].kwargs["json"]["model"], "deepseek-ai/DeepSeek-V4-Pro")
+
     def test_sse_parser_buffers_json_split_inside_chinese_string(self):
         events = list(
             _iter_sse_data_events(
