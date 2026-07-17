@@ -19,3 +19,11 @@
 ```powershell
 uv run hardware-rag-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
 ```
+
+## Streamlit 运行控制
+
+系统管理员可在“RAGAS 评估”页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”都是协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效。“取消”不会删除已保存的 `snapshot.jsonl`；选择“继续”后，系统会使用原始数据集和筛选条件恢复运行，并跳过已成功的样本。
+
+在线运行可取消勾选“执行 RAGAS 评分”。此时系统只采集回答和检索证据，不需要安装 `eval` 依赖，也不需要配置裁判 LLM 或 Embedding。离线评分和勾选评分的在线运行仍需先执行 `uv sync --group eval`，并完成评估模型配置。
+
+运行目录位于 `storage/evaluations/<run_id>/`，并始终包含 `run_state.json`。在线运行在至少持久化一条采集结果后，才会在该目录生成 `snapshot.jsonl`；离线运行则引用所提供的快照路径，该路径可能位于运行目录之外。仅在评分完整结束后，系统才会生成 `summary.json`、`results.jsonl`、`summary.csv` 和 `report.html`。这使暂停或取消的运行可以安全恢复，同时避免将不完整结果当作最终报告使用。

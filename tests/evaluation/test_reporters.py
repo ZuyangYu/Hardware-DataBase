@@ -28,7 +28,17 @@ class ReporterTests(unittest.TestCase):
                 question="问题",
                 reference_answer="参考答案",
                 response="<script>alert(1)</script>",
+                scored_response="正文回答",
                 retrieved_contexts=["检索上下文"],
+                metadata={
+                    "ragas_scoring": {
+                        "original_context_count": 3,
+                        "original_context_characters": 120,
+                        "scored_context_count": 2,
+                        "scored_context_characters": 80,
+                        "contexts_truncated": True,
+                    }
+                },
                 metrics=[
                     MetricResult(
                         sample_id="q1",
@@ -43,13 +53,23 @@ class ReporterTests(unittest.TestCase):
 
         loaded = json.loads(paths.summary_json.read_text(encoding="utf-8"))
         self.assertEqual(loaded["metric_scores"]["faithfulness"], 0.8)
+        result_json = json.loads(paths.results_jsonl.read_text(encoding="utf-8"))
+        self.assertEqual(result_json["metadata"]["ragas_scoring"]["scored_context_count"], 2)
+        self.assertEqual(result_json["scored_response"], "正文回答")
         with paths.summary_csv.open(encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual(rows[0]["faithfulness"], "0.8")
+        self.assertIn("ragas_scoring", rows[0])
+        self.assertEqual(rows[0]["scored_response"], "正文回答")
+        self.assertIn('"scored_context_count": 2', rows[0]["ragas_scoring"])
         html = paths.report_html.read_text(encoding="utf-8")
+        self.assertIn("评分上下文", html)
+        self.assertIn("2/3", html)
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
         self.assertIn("参考答案", html)
+        self.assertIn("评分正文", html)
+        self.assertIn("正文回答", html)
         self.assertIn("检索上下文", html)
 
     def test_report_write_leaves_no_temp_files(self):

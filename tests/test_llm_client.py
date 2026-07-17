@@ -109,6 +109,26 @@ class LLMClientStreamTests(unittest.TestCase):
         self.assertEqual(answer, "fallback answer")
         self.assertEqual(post.call_args_list[1].kwargs["json"]["model"], "deepseek-ai/DeepSeek-V4-Pro")
 
+    def test_openai_compatible_chat_retries_transient_connection_error(self):
+        config = LLMClientConfig(
+            provider=settings.Provider.CUSTOM,
+            base_url="https://example.test/v1",
+            model="primary-model",
+            rate_limit_max_retries=1,
+            fallback_model="",
+        )
+        success = _FakeJsonResponse({"choices": [{"message": {"content": "answer"}}]})
+
+        with patch(
+            "src.core.llm_client.requests.post",
+            side_effect=[requests.ConnectionError("connection reset"), success],
+        ) as post, patch("src.core.llm_client.time.sleep") as sleep:
+            answer = LLMClient(config).chat([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(answer, "answer")
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once()
+
     def test_openai_compatible_stream_uses_fallback_after_pre_stream_429(self):
         config = LLMClientConfig(
             provider=settings.Provider.CUSTOM,

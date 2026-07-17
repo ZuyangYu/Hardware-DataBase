@@ -201,10 +201,13 @@ uv run hardware-rag-eval score --dataset evaluation/datasets/hardware_qa_v1.json
 
 裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。Streamlit 中仅系统管理员可见“RAGAS 评估”页面。
 
+管理员可在该页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”均为协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效；“取消”不会删除 `snapshot.jsonl`；“继续”会跳过其中已成功的样本。未勾选“执行 RAGAS 评分”时，系统只采集回答和检索证据，无需安装 `eval` 依赖或配置裁判 Embedding。
+
 - 评估数据集格式与扩展方式：`evaluation/README.md`
 - 运行产物：`storage/evaluations/<run_id>/`
 
 - `snapshot.jsonl` 保存回答和检索上下文，可更换裁判模型重复评分。
+- 每个运行目录都会保存 `run_state.json`。在线运行在至少持久化一条采集结果后，才会在该目录生成 `snapshot.jsonl`；离线运行则引用所提供的快照路径，该路径可能位于运行目录之外。只有完成评分的运行才会生成 `summary.json`、`results.jsonl`、`summary.csv` 和 `report.html`。
 - `summary.json` 是自动化消费的权威汇总，`summary.csv` 用于表格分析，`report.html` 用于人工查看。
 - 单题或单指标失败不会终止整批；`not_applicable` 不计入指标均值。
 

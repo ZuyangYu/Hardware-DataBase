@@ -371,10 +371,18 @@ class LLMClient:
         request_for_model: Callable[[str], Any],
     ) -> Any:
         last_rate_limit_error: requests.HTTPError | None = None
+        last_connection_error: requests.RequestException | None = None
         retries = max(0, int(config.rate_limit_max_retries))
         for model in _model_attempt_order(config):
             for attempt in range(retries + 1):
-                response = request_for_model(model)
+                try:
+                    response = request_for_model(model)
+                except requests.RequestException as exc:
+                    last_connection_error = exc
+                    if attempt < retries:
+                        time.sleep(_rate_limit_delay_seconds(config, attempt, None))
+                        continue
+                    break
                 try:
                     response.raise_for_status()
                 except requests.HTTPError as exc:
@@ -388,6 +396,8 @@ class LLMClient:
                 return response
         if last_rate_limit_error is not None:
             raise last_rate_limit_error
+        if last_connection_error is not None:
+            raise last_connection_error
         raise RuntimeError("OpenAI-compatible request did not select a model")
 
     def _record_usage(self, config: LLMClientConfig, stage: Any, usage: dict[str, int] | None) -> None:

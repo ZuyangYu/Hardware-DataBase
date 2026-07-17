@@ -14,6 +14,7 @@ from .config import EvaluationConfig
 from .dataset_loader import load_dataset, validate_dataset
 from .gates import DEFAULT_THRESHOLDS, evaluate_gate
 from .hardware_metrics import score_hardware_rules
+from .preflight import EvaluationPreflight
 from .ragas_adapter import RagasAdapter
 from .schemas import (
     AnswerSnapshot,
@@ -48,6 +49,7 @@ class EvaluationService:
     ):
         self.config = config
         self.ragas_adapter = ragas_adapter
+        self._pipeline_factory = pipeline_factory
         self.answer_runner = AnswerRunner(pipeline_factory)
 
     @staticmethod
@@ -60,14 +62,27 @@ class EvaluationService:
         snapshot_path: str | Path,
         *,
         resume: bool = True,
+        before_sample: Callable[[EvaluationSample, int, int], bool] | None = None,
+        after_sample: Callable[[AnswerSnapshot, int, int], None] | None = None,
     ) -> list[AnswerSnapshot]:
         store = SnapshotStore(snapshot_path)
-        completed = store.completed_ids() if resume else set()
+        completed_ids = store.completed_ids() if resume else set()
+        completed_count = len(completed_ids)
+        total = len(samples)
         for sample in samples:
-            if sample.id in completed:
+            if sample.id in completed_ids:
                 continue
-            store.append(self.answer_runner.collect(sample))
+            if before_sample is not None and not before_sample(sample, completed_count, total):
+                break
+            snapshot = self.answer_runner.collect(sample)
+            store.append(snapshot)
+            completed_count += 1
+            if after_sample is not None:
+                after_sample(snapshot, completed_count, total)
         return store.load_all()
+
+    def preflight_online(self, samples: list[EvaluationSample]) -> list[str]:
+        return EvaluationPreflight(self._pipeline_factory).validate(samples)
 
     def score(
         self,
@@ -91,18 +106,41 @@ class EvaluationService:
                 question=sample.question,
                 reference_answer=sample.reference_answer,
                 response=snapshot.response if snapshot is not None else "",
+                scored_response=(snapshot.scored_response or snapshot.response) if snapshot is not None else "",
                 retrieved_contexts=snapshot.retrieved_contexts if snapshot is not None else [],
                 critical=sample.critical,
                 snapshot_status=status,
                 metrics=metrics,
             )
+            if snapshot is not None and snapshot.retrieval_summary:
+                sample_results[sample.id].metadata["retrieval_summary"] = (
+                    snapshot.retrieval_summary
+                )
+            if snapshot is not None and snapshot.metadata.get("scored_response_filter"):
+                sample_results[sample.id].metadata["scored_response_filter"] = (
+                    snapshot.metadata["scored_response_filter"]
+                )
 
         if metric_names:
             adapter = self.ragas_adapter
             if adapter is None:
                 config = self.config or EvaluationConfig.from_environment()
                 adapter = RagasAdapter(config)
-            for metric in adapter.score(samples, snapshots, metric_names):
+            scoring_snapshots = snapshots
+            if isinstance(adapter, RagasAdapter):
+                scoring_snapshots, diagnostics = adapter.prepare_snapshots_for_scoring(snapshots)
+                for sample_id, diagnostic in diagnostics.items():
+                    if sample_id in sample_results:
+                        sample_results[sample_id].metadata["ragas_scoring"] = diagnostic
+                metrics = adapter.score(
+                    samples,
+                    scoring_snapshots,
+                    metric_names,
+                    snapshots_prepared=True,
+                )
+            else:
+                metrics = adapter.score(samples, snapshots, metric_names)
+            for metric in metrics:
                 sample_results[metric.sample_id].metrics.append(metric)
 
         ordered_results = [sample_results[sample.id] for sample in samples]

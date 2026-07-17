@@ -169,19 +169,6 @@ class CircuitStore:
 
         self._update_index(design)
 
-        # Stage 2: keep the per-KB circuit vector index in sync. Fail-soft —
-        # vector indexing is an enhancement, not a precondition for save().
-        # Import locally to avoid a hard dependency on the embedding stack
-        # for tests that only exercise the file layout.
-        try:
-            from src.circuit.vector_index import default_circuit_vector_index
-
-            default_circuit_vector_index.reindex_design(design)
-        except Exception:
-            # Logged at the call site; never let an embedding hiccup break
-            # the EDF ingest pipeline.
-            pass
-
         return target
 
     def load(self, kb_name: str, design_id: str) -> CircuitDesign | None:
@@ -304,14 +291,6 @@ class CircuitStore:
         index_after = self._read_index().get("designs", [])
         if len(index_after) < len(index_before):
             removed = True
-        # Cascade-delete from the vector index. Fail-soft: vector cleanup
-        # never blocks the on-disk deletion.
-        try:
-            from src.circuit.vector_index import default_circuit_vector_index
-
-            default_circuit_vector_index._delete_design(kb_name, design_id)
-        except Exception:
-            pass
         return removed
 
     def delete_kb(self, kb_name: str) -> bool:
@@ -332,13 +311,6 @@ class CircuitStore:
             index["updated_at"] = _utcnow_iso()
             _atomic_write(self.index_path(), json.dumps(index, ensure_ascii=False, indent=2))
             removed = True
-        # Cascade-delete the entire circuit vector collection.
-        try:
-            from src.circuit.vector_index import default_circuit_vector_index
-
-            default_circuit_vector_index.drop_kb(kb_name)
-        except Exception:
-            pass
         return removed
 
     # ── module / pdf artifact helpers ─────────────────────────────────────

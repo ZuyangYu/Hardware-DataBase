@@ -38,6 +38,11 @@ class CircuitEvidenceMapper:
                 "department_id": metadata.get("department_id", ""),
                 "source_group": "circuit_design",
                 "evidence_kind": "derived_topology" if kind == "topology" else "circuit_fact",
+                "fact_type": "relationship"
+                if kind in {"net", "module_connection", "module_power"}
+                else "entity"
+                if kind in {"instance", "module"}
+                else "topology",
                 "part_numbers": [str(row["part_number"])] if row.get("part_number") else [],
                 "certainty": row.get("certainty", "direct"),
                 "capability_candidate": bool(row.get("capability_candidate")),

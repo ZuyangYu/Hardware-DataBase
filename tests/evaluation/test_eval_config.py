@@ -63,6 +63,63 @@ class EvaluationConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(EvaluationConfigurationError, "EVAL_EMBEDDING_MODEL"):
                 EvaluationConfig.from_environment()
 
+    def test_scoring_budgets_have_safe_defaults(self):
+        env = {
+            "AGENT_LLM_PROVIDER": "custom",
+            "AGENT_CUSTOM_BASE_URL": "https://judge.test/v1",
+            "AGENT_CUSTOM_API_KEY": "agent-key",
+            "AGENT_CUSTOM_MODEL": "judge",
+            "EVAL_EMBEDDING_BASE_URL": "https://embed.test/v1",
+            "EVAL_EMBEDDING_MODEL": "embed",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = EvaluationConfig.from_environment()
+
+        self.assertEqual(config.llm_max_tokens, 8192)
+        self.assertEqual(config.max_contexts_per_sample, 8)
+        self.assertEqual(config.max_context_chars, 12000)
+        self.assertEqual(
+            config.public_metadata(),
+            {
+                "llm_provider": "custom",
+                "llm_base_url": "https://judge.test/v1",
+                "llm_model": "judge",
+                "embedding_base_url": "https://embed.test/v1",
+                "embedding_model": "embed",
+                "llm_max_tokens": 8192,
+                "max_contexts_per_sample": 8,
+                "max_context_chars": 12000,
+                "timeout_seconds": 120,
+                "max_workers": 4,
+                "max_retries": 2,
+            },
+        )
+
+    def test_scoring_budgets_use_environment_and_reject_non_positive_values(self):
+        env = {
+            "AGENT_LLM_PROVIDER": "custom",
+            "AGENT_CUSTOM_BASE_URL": "https://judge.test/v1",
+            "AGENT_CUSTOM_API_KEY": "agent-key",
+            "AGENT_CUSTOM_MODEL": "judge",
+            "EVAL_EMBEDDING_BASE_URL": "https://embed.test/v1",
+            "EVAL_EMBEDDING_MODEL": "embed",
+            "EVAL_LLM_MAX_TOKENS": "2048",
+            "EVAL_MAX_CONTEXTS_PER_SAMPLE": "3",
+            "EVAL_MAX_CONTEXT_CHARS": "1000",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = EvaluationConfig.from_environment()
+            self.assertEqual(config.llm_max_tokens, 2048)
+            self.assertEqual(config.max_contexts_per_sample, 3)
+            self.assertEqual(config.max_context_chars, 1000)
+
+        for name in ("EVAL_LLM_MAX_TOKENS", "EVAL_MAX_CONTEXTS_PER_SAMPLE", "EVAL_MAX_CONTEXT_CHARS"):
+            invalid = dict(env)
+            invalid[name] = "0"
+            with patch.dict(os.environ, invalid, clear=True):
+                with self.assertRaisesRegex(EvaluationConfigurationError, name):
+                    EvaluationConfig.from_environment()
+
 
 if __name__ == "__main__":
     unittest.main()

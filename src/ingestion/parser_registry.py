@@ -5,6 +5,8 @@ from typing import Callable
 
 from llama_index.core.schema import BaseNode
 
+from src.agents.claim_evidence import EvidenceCapability
+
 
 ParserFactory = Callable[
     [str, str, str, Callable[[int, str], None] | None],
@@ -17,21 +19,28 @@ class DomainManifest:
     name: str
     source_groups: tuple[str, ...] = ()
     parser_factories: dict[str, ParserFactory] = field(default_factory=dict)
+    capabilities: dict[str, tuple[EvidenceCapability, ...]] = field(default_factory=dict)
 
 
 class ParserRegistry:
     def __init__(self):
         self._parsers: dict[str, ParserFactory] = {}
+        self._capabilities: dict[str, tuple[EvidenceCapability, ...]] = {}
 
     def register_manifest(self, manifest: DomainManifest):
         for group, parser in manifest.parser_factories.items():
             self._parsers[group] = parser
+        for group, capabilities in manifest.capabilities.items():
+            self._capabilities[group] = tuple(capabilities)
 
     def get_parser(self, source_group: str) -> ParserFactory | None:
         return self._parsers.get(source_group)
 
     def implemented_groups(self) -> set[str]:
         return set(self._parsers)
+
+    def capabilities_for(self, source_group: str) -> tuple[EvidenceCapability, ...]:
+        return self._capabilities.get(source_group, ())
 
 
 PARSER_REGISTRY = ParserRegistry()

@@ -24,6 +24,24 @@ class BuiltinDatasetTests(unittest.TestCase):
         self.assertTrue(all(sample.id.startswith("hw-v1-") for sample in samples))
         self.assertTrue(all(sample.rubric.required_facts or sample.rubric.must_disclose_missing or sample.rubric.must_disclose_conflicts for sample in samples))
 
+    def test_builtin_dataset_uses_active_adas_new_scope(self):
+        samples = load_dataset(DATASET)
+        self.assertTrue(all(sample.kb_name == "ADAS_new" for sample in samples))
+        standard_scope = [
+            sample
+            for sample in samples
+            if sample.request_context.get("user_id") == "eval_dept_96"
+        ]
+        self.assertTrue(
+            all(sample.request_context.get("allowed_kbs") == ["96:ADAS_new"] for sample in standard_scope)
+        )
+        self.assertTrue(
+            all(
+                sample.request_context.get("kb_permissions") == {"96:ADAS_new": "read"}
+                for sample in standard_scope
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

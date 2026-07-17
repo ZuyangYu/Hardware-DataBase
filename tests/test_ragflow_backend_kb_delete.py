@@ -317,10 +317,8 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
             {"name": "original_file_name", "comparison_operator": "=", "value": "600608964_ADAS_HSI.docx"},
             first_condition["conditions"],
         )
-        self.assertNotIn(
-            {"name": "original_file_name", "comparison_operator": "=", "value": "600608964_ADAS_HSI.docx"},
-            second_condition["conditions"],
-        )
+        self.assertIsNone(second_condition)
+        self.assertTrue(evidences[0].metadata["ragflow_metadata_condition_fallback"])
 
     def test_retrieve_fallback_keeps_only_requested_local_document(self):
         target = _record(5, "target.pdf", PROCESSOR_KIND_RAGFLOW)
@@ -398,14 +396,8 @@ class RAGFlowBackendKnowledgeBaseDeleteTests(unittest.TestCase):
         self.assertEqual([item.id for item in evidences], ["chunk-fallback"])
         self.assertTrue(evidences[0].metadata["ragflow_source_name_fallback"])
         self.assertEqual(len(backend.client.retrieve_calls), 2)
-        self.assertNotIn(
-            {
-                "name": "original_file_name",
-                "comparison_operator": "=",
-                "value": "600608964_ADAS_HSI_0506_1952_shoulin.wang.docx",
-            },
-            backend.client.retrieve_calls[1][3]["conditions"],
-        )
+        self.assertIsNone(backend.client.retrieve_calls[1][3])
+        self.assertTrue(evidences[0].metadata["ragflow_metadata_condition_fallback"])
 
     def test_retrieve_enriches_metadata_free_chunk_from_scoped_local_record(self):
         record = _record(9, "600608964_ADAS_HSI.docx", PROCESSOR_KIND_RAGFLOW)

@@ -8,6 +8,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 MetricStatus = Literal["success", "failed", "not_applicable"]
 SnapshotStatus = Literal["success", "failed"]
+RunStatus = Literal[
+    "queued",
+    "running",
+    "pause_requested",
+    "paused",
+    "cancel_requested",
+    "cancelled",
+    "completed",
+    "failed",
+]
+RunStage = Literal["idle", "collecting", "scoring", "reporting"]
 
 
 class SampleRubric(BaseModel):
@@ -72,6 +83,7 @@ class AnswerSnapshot(BaseModel):
     question: str
     kb_name: str
     response: str = ""
+    scored_response: str = ""
     retrieved_contexts: list[str] = Field(default_factory=list)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     retrieval_summary: dict[str, Any] = Field(default_factory=dict)
@@ -102,10 +114,12 @@ class SampleResult(BaseModel):
     question: str = ""
     reference_answer: str = ""
     response: str = ""
+    scored_response: str = ""
     retrieved_contexts: list[str] = Field(default_factory=list)
     critical: bool = False
     snapshot_status: SnapshotStatus = "success"
     metrics: list[MetricResult] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class GateResult(BaseModel):
@@ -131,3 +145,51 @@ class EvaluationSummary(BaseModel):
     metric_failures: dict[str, int] = Field(default_factory=dict)
     gate: GateResult | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationRunState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    dataset_path: str
+    snapshot_path: str
+    mode: Literal["online", "offline"]
+    score_enabled: bool
+    sample_ids: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    status: RunStatus = "queued"
+    stage: RunStage = "idle"
+    total_samples: int = 0
+    completed_samples: int = 0
+    successful_samples: int = 0
+    failed_samples: int = 0
+    current_sample_id: str = ""
+    current_question: str = ""
+    started_at: str = ""
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    finished_at: str = ""
+    error_message: str = ""
+    report_path: str = ""
+
+    @classmethod
+    def new_online(
+        cls,
+        *,
+        run_id: str,
+        dataset_path: str,
+        snapshot_path: str,
+        total_samples: int,
+        score_enabled: bool,
+        sample_ids: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> "EvaluationRunState":
+        return cls(
+            run_id=run_id,
+            dataset_path=dataset_path,
+            snapshot_path=snapshot_path,
+            mode="online",
+            score_enabled=score_enabled,
+            total_samples=total_samples,
+            sample_ids=sample_ids or [],
+            tags=tags or [],
+        )
