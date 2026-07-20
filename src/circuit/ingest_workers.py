@@ -16,7 +16,7 @@ from src.circuit.parsers.edf_parser import EdfParser
 from src.circuit.parsers.pdf_schematic_parser import PdfSchematicParser
 from src.circuit.store import CircuitStore, make_design_id
 from src.core.logger import error as _error, log as _info
-from src.ingestion.source_groups import NETLIST_GROUP, SCHEMATIC_GROUP
+from src.ingestion.source_groups import SCHEMATIC_GROUP
 
 
 PARSE_LOG_FILENAME = "parse.log"

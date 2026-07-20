@@ -103,7 +103,7 @@ def write_reports(
         )
         rows.append(f"<tr><td colspan='{len(headers)}'>{detail}</td></tr>")
     html_text = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>Hardware RAG Evaluation</title><style>body{font-family:sans-serif;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:.4rem}th{background:#f5f5f5}</style></head><body>"""
+<title>Hardware DataBase Evaluation</title><style>body{font-family:sans-serif;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:.4rem}th{background:#f5f5f5}</style></head><body>"""
     html_text += f"<h1>评估报告 {html.escape(summary.run_id)}</h1>"
     html_text += f"<p>样本 {summary.sample_count}；成功 {summary.successful_samples}；失败 {summary.failed_samples}</p>"
     html_text += "<table><thead><tr>" + "".join(f"<th>{html.escape(name)}</th>" for name in headers) + "</tr></thead>"

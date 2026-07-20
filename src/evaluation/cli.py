@@ -48,7 +48,7 @@ def _add_scoring(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hardware-rag-eval", description="Evaluate Hardware RAG answers")
+    parser = argparse.ArgumentParser(prog="hardware-database-eval", description="Evaluate Hardware DataBase answers")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     validate_parser = subparsers.add_parser("validate", help="validate an evaluation JSONL dataset")

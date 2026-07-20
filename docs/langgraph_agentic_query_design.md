@@ -1,6 +1,6 @@
 # LangGraph 多源 Agentic 查询编排设计
 
-> 目标：在现有 Hardware RAG 的多 pipeline 基础上，引入 LangGraph 作为查询流程编排层，实现“问题拆解确认 → 知识库文件扫描 → 检索范围确认 → 多源检索 → 证据覆盖度评估 → 自动补检索 → grounded answer”的可控问答流程。
+> 目标：在现有 Hardware DataBase 的多 pipeline 基础上，引入 LangGraph 作为查询流程编排层，实现“问题拆解确认 → 知识库文件扫描 → 检索范围确认 → 多源检索 → 证据覆盖度评估 → 自动补检索 → grounded answer”的可控问答流程。
 
 ## 1. 背景与核心问题
 
