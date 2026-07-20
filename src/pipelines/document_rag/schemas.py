@@ -169,7 +169,7 @@ def parse_status_view(raw_status: object, processor_kind: str = "") -> ParseStat
     is_failed = normalized == TASK_STATUS_FAILED
     is_terminal = normalized in {TASK_STATUS_COMPLETED, TASK_STATUS_FAILED, TASK_STATUS_CANCELLED}
     can_show_chunks = is_success and not is_spreadsheet
-    can_cancel = normalized in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+    can_cancel = normalized in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_FAILED}
     return ParseStatusView(
         raw=raw,
         normalized=normalized,
@@ -229,5 +229,4 @@ class BackendHealth:
     message: str = ""
     details: dict[str, Any] = field(default_factory=dict)
     backend: str = "ragflow"
-
 

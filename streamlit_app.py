@@ -19,6 +19,7 @@ from src.pipelines.document_rag.schemas import (
     parse_status_view,
 )
 import config.settings
+from src.ui.evaluation_page import render_evaluation_page
 
 AUTH_QUERY_PARAM = "hd_session"
 
@@ -1049,15 +1050,20 @@ def render_parse_task_panel(pipeline, kb_name: str, key_prefix: str):
                     else:
                         st.caption(task.message)
             with c_actions:
-                stop_help = "停止并移除该未完成解析/索引任务。"
+                action_label = "移除任务" if task_status.is_failed else "停止任务"
+                action_help = (
+                    "移除该失败任务、本地归档与映射；远端清理为尽力执行。"
+                    if task_status.is_failed
+                    else "停止并移除该未完成解析/索引任务。"
+                )
                 if task_status.can_cancel:
-                    if st.button("停止任务", key=f"{key_prefix}_stop_{task.id}", use_container_width=True, help=stop_help):
+                    if st.button(action_label, key=f"{key_prefix}_stop_{task.id}", use_container_width=True, help=action_help):
                         st.session_state.toast_msg = pipeline.delete_parse_task(task.id, ctx=ctx)
                         _clear_backend_task_cache(key_prefix, kb_name, ctx)
                         invalidate_file_cache(kb_name)
                         st.rerun()
                 else:
-                    st.button("停止任务", key=f"{key_prefix}_stop_noop_{task.id}", disabled=True, use_container_width=True, help=stop_help)
+                    st.button(action_label, key=f"{key_prefix}_stop_noop_{task.id}", disabled=True, use_container_width=True, help=action_help)
 
 
 def spreadsheet_profile_summary(metadata: dict | None) -> dict:
@@ -2827,7 +2833,7 @@ def main():
 
         role = st.session_state.get("role")
         if role == ROLE_SYSTEM_ADMIN:
-            tab_options = ["🧭 知识库治理", "👥 部门管理", "📊 日志中心", "⚙️ 系统配置"]
+            tab_options = ["🧭 知识库治理", "👥 部门管理", "📊 日志中心", "🧪 RAGAS 评估", "⚙️ 系统配置"]
         elif role == ROLE_DEPT_ADMIN:
             tab_options = ["💬 智能对话", "👥 部门管理", "📚 知识库管理", "📊 日志中心"]
         else:
@@ -3027,6 +3033,11 @@ def main():
             st.error("当前账号无权访问日志中心")
             st.stop()
         render_log_center_tab()
+    elif selected_tab == "🧪 RAGAS 评估":
+        if st.session_state.get("role") != ROLE_SYSTEM_ADMIN:
+            st.error("当前账号无权访问 RAGAS 评估")
+            st.stop()
+        render_evaluation_page(st.session_state.get("role"))
     elif selected_tab == "⚙️ 系统配置":
         if st.session_state.get("role") != ROLE_SYSTEM_ADMIN:
             st.error("当前账号无权访问系统配置")

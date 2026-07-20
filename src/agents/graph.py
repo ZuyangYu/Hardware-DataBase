@@ -132,10 +132,61 @@ def _keyword_entities(query: str) -> list[str]:
     return entities[:12]
 
 
+def _required_candidate_evidence(question: str) -> set[str]:
+    """Return evidence types that the LLM may supplement but cannot remove."""
+    text = str(question or "")
+    lower = text.casefold()
+    has_refdes = bool(re.search(r"(?<![A-Za-z0-9])[A-Za-z]{1,4}\d+(?![A-Za-z0-9])", text))
+    has_net_identifier = bool(re.search(r"\b[A-Z][A-Z0-9_]{2,}\b", text))
+    circuit_terms = (
+        "connection",
+        "pin",
+        "net",
+        "topology",
+        "signal path",
+        "power path",
+        "power tree",
+        "load switch",
+        "连接",
+        "引脚",
+        "网络",
+        "网表",
+        "拓扑",
+        "信号路径",
+        "供电路径",
+        "电源树",
+        "电源",
+        "电压轨",
+        "负载开关",
+    )
+    protection_terms = ("protection", "tvs", "ocp", "scp", "保护", "过压", "过流", "短路", "反接")
+    required: set[str] = set()
+    if (
+        has_refdes
+        or (has_net_identifier and any(term in lower for term in circuit_terms + protection_terms))
+        or any(term in lower for term in circuit_terms + protection_terms)
+    ):
+        required.add("circuit_design")
+    if any(term in lower for term in ("bom", "mpn", "quantity", "supplier", "vendor", "替代料", "单价", "供应商", "用量", "数量")):
+        required.add("spreadsheet_table")
+    if any(
+        term in lower
+        for term in ("configuration", "register", "software", "datasheet", "manual", "配置", "寄存器", "软件", "手册", "保护能力") + protection_terms
+    ):
+        required.add("document_text")
+    return required
+
+
+def _merge_expected_evidence(question: str, llm_expected: Any) -> list[str]:
+    merged = set(_normalize_expected_evidence(llm_expected))
+    merged.update(_required_candidate_evidence(question))
+    return [kind for kind in ("circuit_design", "document_text", "spreadsheet_table") if kind in merged]
+
+
 def _expected_evidence(question: str) -> list[str]:
     lower = question.lower()
     expected = []
-    has_refdes = bool(re.search(r"\b[A-Za-z]{1,4}\d{1,}\b", question or ""))
+    has_refdes = bool(re.search(r"(?<![A-Za-z0-9])[A-Za-z]{1,4}\d{1,}(?![A-Za-z0-9])", question or ""))
     has_net_identifier = bool(re.search(r"\b[A-Z][A-Z0-9_]{2,}\b", question or ""))
     has_circuit_context = any(word in lower for word in [
         "connection",
@@ -193,7 +244,7 @@ def _expected_evidence(question: str) -> list[str]:
         "原理图",
     ]):
         expected.append("document_text")
-    return expected or ["document_text", "spreadsheet_table", "circuit_design"]
+    return _merge_expected_evidence(question, expected)
 
 
 _SMALL_TALK_PATTERNS = (
@@ -262,7 +313,6 @@ def route_query(state: AgentState, llm_client: Any | None = None) -> AgentState:
         decision = fallback
         trace_node = "route_query"
         trace_msg = "Query routed by deterministic fallback"
-        route_metadata = decision
     else:
         system_prompt = (
             "You are the Query Router in an enterprise hardware Agentic RAG system. "
@@ -304,12 +354,10 @@ def route_query(state: AgentState, llm_client: Any | None = None) -> AgentState:
             }
             trace_node = "query_router"
             trace_msg = "Query routed by LLM router"
-            route_metadata = decision
-        except Exception as exc:
+        except Exception:
             decision = fallback
             trace_node = "query_router"
             trace_msg = "LLM router failed; used deterministic fallback"
-            route_metadata = {"error": str(exc)[:300]}
 
     new_state = {**state, "route_decision": decision}
     if not decision["needs_retrieval"]:
@@ -437,7 +485,7 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
                 SubQuestion(
                     id=str(item.get("id") or f"sq_{index}"),
                     question=question,
-                    expected_evidence=_normalize_expected_evidence(item.get("expected_evidence")),
+                    expected_evidence=_merge_expected_evidence(question, item.get("expected_evidence")),
                 )
             )
         if not sub_questions:
@@ -543,6 +591,55 @@ def _resolve_catalog_source(sources: list[dict[str, Any]], source_name: str) -> 
             return source
     return None
 
+
+def _complete_required_source_plan(state: AgentState, source_plan: SourcePlan) -> SourcePlan:
+    """Ensure indexed circuit sources are not omitted by an LLM source plan."""
+    expected = {
+        evidence_type
+        for sub_question in (state.get("question_analysis") or {}).get("sub_questions") or []
+        for evidence_type in sub_question.get("expected_evidence") or []
+    }
+    if "circuit_design" not in expected:
+        return source_plan
+
+    planned = {item.source_name: item for item in source_plan.source_plan}
+    for source in (state.get("catalog") or {}).get("sources") or []:
+        if source.get("processor_kind") != "circuit_design" or source.get("status") != "indexed":
+            continue
+        source_name = str(source.get("document_name") or "")
+        if not source_name:
+            continue
+        filters = {
+            key: value
+            for key, value in {
+                "source_name": source_name,
+                "record_id": source.get("record_id"),
+            }.items()
+            if value not in (None, "")
+        }
+        item = planned.get(source_name)
+        if item is None:
+            item = SourcePlanItem(
+                source_name=source_name,
+                processor_kind="circuit_design",
+                reason="Deterministic circuit evidence requirement.",
+            )
+            source_plan.source_plan.append(item)
+            planned[source_name] = item
+        if any(call.tool_name == "circuit_query" for call in item.tool_calls):
+            continue
+        item.tool_calls.append(
+            ToolCallPlan(
+                tool_name="circuit_query",
+                query=state.get("user_query", ""),
+                reason="Search indexed circuit source for direct evidence.",
+                top_k=8,
+                filters=filters,
+            )
+        )
+    return source_plan
+
+
 def plan_source_selection(state: AgentState) -> AgentState:
     analysis = state.get("question_analysis") or {}
     sources = (state.get("catalog") or {}).get("sources") or []
@@ -609,7 +706,10 @@ def plan_source_selection(state: AgentState) -> AgentState:
                 tool_calls=calls,
             )
         )
-    source_plan = SourcePlan(source_plan=plan_items, skipped_sources=skipped)
+    source_plan = _complete_required_source_plan(
+        state,
+        SourcePlan(source_plan=plan_items, skipped_sources=skipped),
+    )
     return {
         **state,
         "source_plan": source_plan.model_dump(),
@@ -746,7 +846,10 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
             if source_name not in used_sources and not any(item.get("source_name") == source_name for item in skipped):
                 skipped.append({"source_name": source_name, "reason": "Planner did not select this source for the current query."})
 
-        source_plan = SourcePlan(source_plan=plan_items, skipped_sources=skipped)
+        source_plan = _complete_required_source_plan(
+            state,
+            SourcePlan(source_plan=plan_items, skipped_sources=skipped),
+        )
         return {
             **state,
             "source_plan": source_plan.model_dump(),
@@ -817,6 +920,70 @@ def _allowed_tools_for_processor(processor_kind: str) -> set[str]:
     return {"document_rag"}
 
 
+def _dedupe_tool_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    seen = set()
+    for call in calls:
+        filters = call.get("filters") or {}
+        key = (
+            str(call.get("tool_name") or ""),
+            str(filters.get("source_name") or "").casefold(),
+            str(call.get("query") or "").strip().casefold(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(call)
+    return result
+
+
+def _deterministic_circuit_gap_calls(state: AgentState, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ledger = state.get("retrieval_ledger") or []
+    unsearched = {
+        str(source_name)
+        for item in ledger
+        if "circuit_design" in (item.get("missing_evidence_types") or [])
+        for source_name in item.get("unsearched_relevant_sources") or []
+        if source_name
+    }
+    if not unsearched:
+        return []
+
+    searched = {
+        str((item.get("filters") or {}).get("source_name") or "")
+        for item in state.get("retrieval_diagnostics") or []
+        if item.get("tool_name") == "circuit_query"
+    }
+    if "" in searched:
+        return []
+
+    calls = []
+    for source in sources:
+        source_name = str(source.get("document_name") or "")
+        if (
+            source_name not in unsearched
+            or source_name in searched
+            or source.get("processor_kind") != "circuit_design"
+            or source.get("status") != "indexed"
+        ):
+            continue
+        filters = {
+            key: value
+            for key, value in {"source_name": source_name, "record_id": source.get("record_id")}.items()
+            if value not in (None, "")
+        }
+        calls.append(
+            {
+                "tool_name": "circuit_query",
+                "query": state.get("user_query", ""),
+                "reason": "Retrieve unsearched indexed circuit evidence required by the retrieval ledger.",
+                "top_k": 8,
+                "filters": filters,
+            }
+        )
+    return calls
+
+
 def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool: Any) -> AgentState:
     """多跳重规划：消费 judge_sufficiency 的 suggested_queries + 全量 catalog，
     产出下一轮 tool_calls（支持跨语料 cross-corpus）。
@@ -849,8 +1016,20 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
         return _empty("目录扫描失败，终止迭代。", error=str(exc)[:300])
     sources = catalog.get("sources") or []
     source_by_name = {str(src.get("document_name") or ""): src for src in sources}
+    deterministic_calls = _deterministic_circuit_gap_calls(state, sources)
 
     if llm_client is None:
+        if deterministic_calls:
+            return {
+                **state,
+                "next_retrieval_calls": deterministic_calls,
+                "trace": _trace(
+                    state,
+                    "plan_next_retrieval",
+                    "LLM unavailable; scheduled deterministic circuit gap retrieval.",
+                    {"round": round_no, "suggested_queries": [call["query"] for call in deterministic_calls]},
+                ),
+            }
         return _empty("重规划 LLM 不可用，终止迭代。", error="no_llm_client")
 
     compact_sources = [
@@ -944,6 +1123,7 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
                     "filters": filters,
                 }
             )
+        calls = _dedupe_tool_calls([*deterministic_calls, *calls])
         return {
             **state,
             "next_retrieval_calls": calls,
@@ -1013,7 +1193,9 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
         for item in (state.get("source_plan") or {}).get("source_plan", []):
             calls.extend(item.get("tool_calls", []))
 
-    bounded_calls = list(calls[:8])
+    circuit_calls = [call for call in calls if call.get("tool_name") == "circuit_query"]
+    other_calls = [call for call in calls if call.get("tool_name") != "circuit_query"]
+    bounded_calls = [*circuit_calls, *other_calls[: max(0, 8 - len(circuit_calls))]]
     circuit_hits: list[dict[str, Any]] = []
 
     def _run_call(call: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
@@ -1211,6 +1393,34 @@ def merge_evidence(state: AgentState) -> AgentState:
     }
 
 
+def _direct_entity_tokens(question: str) -> tuple[set[str], set[str]]:
+    text = str(question or "")
+    refdes = {
+        token.casefold()
+        for token in re.findall(r"(?<![A-Za-z0-9])[A-Za-z]{1,4}\d+(?![A-Za-z0-9])", text)
+    }
+    nets = {
+        token.casefold()
+        for token in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", text)
+    }
+    return refdes, nets - refdes
+
+
+def _has_direct_entity_support(question: str, evidence: dict[str, Any]) -> bool:
+    refdes, nets = _direct_entity_tokens(question)
+    if not refdes and not nets:
+        return True
+    searchable = " ".join(
+        (
+            str(evidence.get("content") or ""),
+            str(evidence.get("source_name") or ""),
+        )
+    ).casefold()
+    if refdes:
+        return any(token in searchable for token in refdes)
+    return any(token in searchable for token in nets)
+
+
 def score_and_compare_evidence(state: AgentState) -> AgentState:
     analysis = state.get("question_analysis") or {}
     evidence = state.get("merged_evidence") or []
@@ -1232,7 +1442,7 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
             content = f"{item.get('content', '')} {item.get('source_name', '')}".casefold()
             type_match = not expected or item.get("content_kind") in expected
             token_hits = sum(1 for token in sq_tokens if token in content)
-            if type_match and (token_hits > 0 or not sq_tokens):
+            if type_match and _has_direct_entity_support(sq_text, item) and (token_hits > 0 or not sq_tokens):
                 supporting.append(item.get("id", ""))
                 if item.get("source_name") and item.get("source_name") not in supporting_sources:
                     supporting_sources.append(item.get("source_name", ""))

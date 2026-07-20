@@ -44,6 +44,14 @@ class PipelineDocumentStoreModuleTests(unittest.TestCase):
                 conn.close()
             self.assertIn("kb_id", columns)
 
+    def test_get_dataset_returns_the_persisted_id_and_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PipelineDocumentStore(db_path=os.path.join(tmp, "pipeline_documents.db"))
+            store.save_dataset("design", "dataset-new", "ADAS_new")
+
+            self.assertEqual(store.get_dataset("design"), ("dataset-new", "ADAS_new"))
+            self.assertIsNone(store.get_dataset("missing"))
+
     def test_upsert_document_persists_kb_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "pipeline_documents.db")
