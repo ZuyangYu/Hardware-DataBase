@@ -170,7 +170,13 @@ class RagflowListParseTasksTimeoutTests(unittest.TestCase):
 
     def test_marks_stale_parsing_record_as_failed_task(self):
         record = self._stale_parsing_record(record_id=3)
-        backend = _timeout_backend([record])
+        # 远端确认仍在解析 -> 超时成立 -> 标记失败并清理远端。
+        deleted = []
+        client = SimpleNamespace(
+            list_documents=lambda dataset_id, document_id: [{"run": "1"}],
+            delete_documents=lambda dataset_id, document_ids: deleted.append((dataset_id, list(document_ids))),
+        )
+        backend = _timeout_backend([record], client=client)
 
         tasks = backend.list_parse_tasks("kb", ctx=RequestContext(metadata={"department_id": "dept_a"}))
 
@@ -180,12 +186,10 @@ class RagflowListParseTasksTimeoutTests(unittest.TestCase):
         self.assertEqual(task.progress, 100)
         self.assertEqual(task.stage, "解析超时")
         self.assertIn("超时", task.message)
-        # Remote doc deleted + store marked failed.
-        self.assertEqual(backend.client.deleted, [("dataset-1", ["remote-1"])])
-        self.assertEqual(
-            backend.store.status_updates,
-            [(3, "failed", task.message)],
-        )
+        # 远端确认仍在解析,超时成立 -> 删除远端文档。
+        self.assertEqual(deleted, [("dataset-1", ["remote-1"])])
+        # 刷新会先写一条 parsing 状态,超时再写 failed;最后一条应为 failed。
+        self.assertEqual(backend.store.status_updates[-1], (3, "failed", task.message))
 
     def test_fresh_parsing_record_does_not_time_out(self):
         record = self._fresh_parsing_record(record_id=4)
@@ -207,6 +211,48 @@ class RagflowListParseTasksTimeoutTests(unittest.TestCase):
         self.assertFalse(
             any(u[0] == 4 and u[1] == "failed" for u in backend.store.status_updates),
             "fresh parsing record must not be marked failed",
+        )
+
+    def test_stale_local_but_remote_finished_not_deleted(self):
+        # 本地 status 停在 parsing 且已过阈值,但远端其实已解析完成:
+        # 不能误判超时并删除远端文档(数据丢失防护)。
+        record = self._stale_parsing_record(record_id=5)
+        deleted = []
+        client = SimpleNamespace(
+            list_documents=lambda dataset_id, document_id: [{"run": "2"}],  # 远端已 parsed
+            delete_documents=lambda dataset_id, document_ids: deleted.append((dataset_id, list(document_ids))),
+        )
+        backend = _timeout_backend([record], client=client)
+
+        backend.list_parse_tasks("kb", ctx=RequestContext(metadata={"department_id": "dept_a"}))
+
+        self.assertEqual(deleted, [])
+        self.assertFalse(
+            any(u[0] == 5 and u[1] == "failed" for u in backend.store.status_updates),
+            "finished remote must not be marked failed or deleted",
+        )
+
+    def test_stale_local_but_remote_unreachable_not_deleted(self):
+        # 本地 status 停在 parsing 且已过阈值,但远端不可达:
+        # 状态不明时不能删远端(避免误删可能已成功的文档)。
+        record = self._stale_parsing_record(record_id=6)
+        deleted = []
+
+        def _raise(dataset_id, document_id):
+            raise RuntimeError("ragflow unreachable")
+
+        client = SimpleNamespace(
+            list_documents=_raise,
+            delete_documents=lambda dataset_id, document_ids: deleted.append((dataset_id, list(document_ids))),
+        )
+        backend = _timeout_backend([record], client=client)
+
+        backend.list_parse_tasks("kb", ctx=RequestContext(metadata={"department_id": "dept_a"}))
+
+        self.assertEqual(deleted, [])
+        self.assertFalse(
+            any(u[0] == 6 and u[1] == "failed" for u in backend.store.status_updates),
+            "unreachable remote must not be marked failed or deleted",
         )
 
 

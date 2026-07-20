@@ -244,7 +244,7 @@ class AppPipeline:
         except InvalidKnowledgeBaseName as exc:
             return False, str(exc)
 
-        if ctx is not None and not ctx.has_kb_permission(kb_name, "admin"):
+        if ctx is None or not ctx.has_kb_permission(kb_name, "admin"):
             return False, "权限不足：删除知识库需要 admin 权限。"
 
         log(f"准备彻底删除知识库: {kb_name}")
