@@ -162,6 +162,17 @@ class CircuitIndexService:
             ("module_connection", 0.84, self.query_engine.search_module_connections(kb_name, query, limit=top_k * 2)),
             ("module_power", 0.82, self.query_engine.search_module_power_nets(kb_name, query, limit=top_k * 2)),
         ]
+        refdes_matches = re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d+)(?![A-Za-z0-9])", query)
+        if "connection" in plan.operations and refdes_matches:
+            pin_mapping_rows: list[dict[str, Any]] = []
+            refdes_values = list(dict.fromkeys(refdes_matches))[:3]
+            for design_id in allowed_designs:
+                for refdes in refdes_values:
+                    detail = self.query_engine.get_instance_detail(kb_name, design_id, refdes)
+                    if detail and detail.get("pins"):
+                        pin_mapping_rows.append(detail)
+            if pin_mapping_rows:
+                candidates.append(("pin_mapping", 0.98, pin_mapping_rows))
         if "bias" in plan.operations:
             bias_rows = self.query_engine.search_bias_topologies(kb_name, limit=top_k * 3)
             lowered = query.casefold()

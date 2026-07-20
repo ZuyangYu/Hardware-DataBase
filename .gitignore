@@ -75,6 +75,10 @@ docs/diagrams/
 docs/hardware_database_develop_integration_plan.md
 docs/joint_retrieval_test_cases.md
 
+# Local agent guidance and feature working notes
+/CLAUDE.md
+/docs/features/
+
 .tests/
 
 # Claude Code local settings

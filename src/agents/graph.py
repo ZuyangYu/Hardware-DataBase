@@ -259,7 +259,41 @@ def _required_candidate_evidence(question: str) -> set[str]:
     return required
 
 
+def _is_pure_pin_mapping_question(question: str) -> bool:
+    text = str(question or "")
+    lower = text.casefold()
+    has_refdes = bool(re.search(r"(?<![A-Za-z0-9])[A-Za-z]{1,4}\d+(?![A-Za-z0-9])", text))
+    connectivity_terms = ("connection", "pin", "net", "连接", "引脚", "网络", "网表")
+    additional_evidence_terms = (
+        "datasheet",
+        "manual",
+        "configuration",
+        "register",
+        "bom",
+        "quantity",
+        "supplier",
+        "vendor",
+        "price",
+        "数据手册",
+        "手册",
+        "配置",
+        "寄存器",
+        "替代料",
+        "单价",
+        "供应商",
+        "用量",
+        "数量",
+    )
+    return (
+        has_refdes
+        and any(term in lower for term in connectivity_terms)
+        and not any(term in lower for term in additional_evidence_terms)
+    )
+
+
 def _merge_expected_evidence(question: str, llm_expected: Any) -> list[str]:
+    if _is_pure_pin_mapping_question(question):
+        return ["circuit_design"]
     merged = set(_normalize_expected_evidence(llm_expected))
     merged.update(_required_candidate_evidence(question))
     return [kind for kind in ("circuit_design", "document_text", "spreadsheet_table") if kind in merged]

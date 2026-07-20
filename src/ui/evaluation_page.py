@@ -125,6 +125,13 @@ def _build_current_metric_chart(rows: list[dict[str, object]]):
             alt.Tooltip("scoring_failures:Q", title="评分失败"),
         ],
     )
+    labels = alt.Chart(data).mark_text(
+        align="left", baseline="middle", dx=4, color="#1f2937"
+    ).encode(
+        x=alt.X("score:Q"),
+        y=alt.Y("metric_label:N", sort=None),
+        text=alt.Text("score:Q", format=".3f"),
+    )
     thresholds = (
         alt.Chart(data)
         .transform_filter("isValid(datum.threshold)")
@@ -134,7 +141,7 @@ def _build_current_metric_chart(rows: list[dict[str, object]]):
             y=alt.Y("metric_label:N", sort=None),
         )
     )
-    return bars + thresholds
+    return bars + labels + thresholds
 
 
 def _build_baseline_metric_chart(rows: list[dict[str, object]]):
@@ -148,7 +155,7 @@ def _build_baseline_metric_chart(rows: list[dict[str, object]]):
     comparison_data["run"] = comparison_data["run"].replace(
         {"current": "当前", "baseline": "基线"}
     )
-    return alt.Chart(comparison_data).mark_bar(cornerRadiusEnd=4).encode(
+    bars = alt.Chart(comparison_data).mark_bar(cornerRadiusEnd=4).encode(
         x=alt.X("score:Q", scale=alt.Scale(domain=[0, 1]), title="得分（0-1）"),
         y=alt.Y("metric_label:N", sort=None, title=None),
         yOffset=alt.YOffset("run:N", sort=["当前", "基线"]),
@@ -166,6 +173,15 @@ def _build_baseline_metric_chart(rows: list[dict[str, object]]):
             alt.Tooltip("change:Q", format="+.3f", title="相对基线变化"),
         ],
     )
+    labels = alt.Chart(comparison_data).mark_text(
+        align="left", baseline="middle", dx=4, color="#1f2937"
+    ).encode(
+        x=alt.X("score:Q"),
+        y=alt.Y("metric_label:N", sort=None),
+        yOffset=alt.YOffset("run:N", sort=["当前", "基线"]),
+        text=alt.Text("score:Q", format=".3f"),
+    )
+    return bars + labels
 
 
 def render_saved_evaluation_run(

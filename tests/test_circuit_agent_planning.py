@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from src.agents.graph import (
     _expected_evidence,
+    _merge_expected_evidence,
     _required_candidate_evidence,
     analyze_question_with_llm,
     plan_next_retrieval,
@@ -104,6 +105,23 @@ class _DocumentOnlyNextPlannerLLM:
 
 
 class CircuitAgentPlanningTests(unittest.TestCase):
+    def test_pure_pin_mapping_question_overrides_llm_document_and_table_requirements(self):
+        expected = _merge_expected_evidence(
+            "U1700 的每个关键引脚分别连接到哪个网络？",
+            ["document_text", "spreadsheet_table"],
+        )
+
+        self.assertEqual(expected, ["circuit_design"])
+
+    def test_pin_mapping_question_with_datasheet_keeps_document_requirement(self):
+        expected = _merge_expected_evidence(
+            "U1700 的引脚定义和数据手册要求是什么？",
+            ["document_text"],
+        )
+
+        self.assertIn("circuit_design", expected)
+        self.assertIn("document_text", expected)
+
     def test_required_circuit_evidence_covers_generic_circuit_questions(self):
         for query in [
             "U1700 的每个引脚连接到哪个网络？",

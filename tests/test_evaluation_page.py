@@ -420,8 +420,13 @@ class EvaluationPageTests(unittest.TestCase):
             current_specification["layer"][0]["encoding"]["x"]["scale"]["domain"],
             [0, 1],
         )
-        self.assertEqual(baseline_specification["encoding"]["x"]["field"], "score")
-        self.assertEqual(baseline_specification["encoding"]["y"]["field"], "metric_label")
+        self.assertEqual(
+            baseline_specification["layer"][0]["encoding"]["x"]["field"], "score"
+        )
+        self.assertEqual(
+            baseline_specification["layer"][0]["encoding"]["y"]["field"],
+            "metric_label",
+        )
 
     def test_current_metric_chart_is_horizontal_and_marks_thresholds(self):
         chart = _build_current_metric_chart(
@@ -440,9 +445,13 @@ class EvaluationPageTests(unittest.TestCase):
 
         specification = chart.to_dict()
         bar_layer = specification["layer"][0]
+        current_text_layer = specification["layer"][1]
         self.assertEqual(bar_layer["encoding"]["x"]["field"], "score")
         self.assertEqual(bar_layer["encoding"]["x"]["scale"]["domain"], [0, 1])
         self.assertEqual(bar_layer["encoding"]["y"]["field"], "metric_label")
+        self.assertEqual(current_text_layer["mark"]["type"], "text")
+        self.assertEqual(current_text_layer["encoding"]["text"]["field"], "score")
+        self.assertEqual(current_text_layer["encoding"]["text"]["format"], ".3f")
         self.assertIn("threshold", str(specification))
         self.assertIn("meets_threshold", str(specification))
 
@@ -460,10 +469,20 @@ class EvaluationPageTests(unittest.TestCase):
         )
 
         specification = chart.to_dict()
-        self.assertEqual(specification["encoding"]["x"]["field"], "score")
-        self.assertEqual(specification["encoding"]["x"]["scale"]["domain"], [0, 1])
-        self.assertEqual(specification["encoding"]["y"]["field"], "metric_label")
-        self.assertIn("yOffset", specification["encoding"])
+        comparison_bar_layer = specification["layer"][0]
+        comparison_text_layer = specification["layer"][1]
+        self.assertEqual(comparison_bar_layer["encoding"]["x"]["field"], "score")
+        self.assertEqual(
+            comparison_bar_layer["encoding"]["x"]["scale"]["domain"], [0, 1]
+        )
+        self.assertEqual(
+            comparison_bar_layer["encoding"]["y"]["field"], "metric_label"
+        )
+        self.assertIn("yOffset", comparison_bar_layer["encoding"])
+        self.assertEqual(comparison_text_layer["mark"]["type"], "text")
+        self.assertEqual(comparison_text_layer["encoding"]["text"]["field"], "score")
+        self.assertEqual(comparison_text_layer["encoding"]["text"]["format"], ".3f")
+        self.assertEqual(comparison_text_layer["encoding"]["yOffset"]["field"], "run")
         self.assertIn("change", str(specification))
 
     def test_legacy_summary_without_run_state_still_renders(self):
