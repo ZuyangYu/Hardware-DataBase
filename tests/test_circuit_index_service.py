@@ -59,6 +59,60 @@ class CircuitIndexServiceTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_pin_to_net_query_returns_compact_pin_mapping_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "main_board.edf")
+            with open(source, "w", encoding="utf-8") as fh:
+                fh.write("(edif main_board)")
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=lambda path, progress_callback=None: _Parser(),
+            )
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=7,
+                file_path=source,
+                original_name="main_board.edf",
+                department_id="dept_hw",
+            )
+
+            hits = service.query(
+                kb_name="kb_hw",
+                query="U1200 的引脚连接到哪个网络？",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+                top_k=5,
+            )
+
+        pin_mapping = next(hit for hit in hits if hit.locator["entity_type"] == "pin_mapping")
+        self.assertIn("1 -> CAN0", pin_mapping.content)
+        self.assertNotIn("J3.2", pin_mapping.content)
+
+    def test_plain_component_query_does_not_expand_pin_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "main_board.edf")
+            with open(source, "w", encoding="utf-8") as fh:
+                fh.write("(edif main_board)")
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=lambda path, progress_callback=None: _Parser(),
+            )
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=7,
+                file_path=source,
+                original_name="main_board.edf",
+                department_id="dept_hw",
+            )
+
+            hits = service.query(
+                kb_name="kb_hw",
+                query="U1200 是什么器件？",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+                top_k=5,
+            )
+
+        self.assertNotIn("pin_mapping", {hit.locator["entity_type"] for hit in hits})
+
     def test_query_source_filter_limits_results(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "main_board.edf")

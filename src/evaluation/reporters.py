@@ -63,7 +63,9 @@ def write_reports(
                     "question",
                     "reference_answer",
                     "response",
+                    "scored_response",
                     "retrieved_contexts",
+                    "ragas_scoring",
                     *metric_names,
                 ],
             )
@@ -75,7 +77,12 @@ def write_reports(
                     "question": result.question,
                     "reference_answer": result.reference_answer,
                     "response": result.response,
+                    "scored_response": result.scored_response,
                     "retrieved_contexts": json.dumps(result.retrieved_contexts, ensure_ascii=False),
+                    "ragas_scoring": json.dumps(
+                        result.metadata.get("ragas_scoring", {}),
+                        ensure_ascii=False,
+                    ),
                 }
                 for metric in result.metrics:
                     row[metric.metric_name] = metric.score if metric.status == "success" else metric.status
@@ -95,13 +102,23 @@ def write_reports(
             value = "-" if metric is None else (f"{metric.score:.3f}" if metric.score is not None else metric.status)
             cells.append(html.escape(value))
         rows.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+        scoring = result.metadata.get("ragas_scoring", {})
+        scoring_detail = ""
+        if scoring:
+            scoring_detail = (
+                f"<br><strong>评分上下文：</strong>"
+                f"{scoring.get('scored_context_count', 0)}/{scoring.get('original_context_count', 0)} 段，"
+                f"{scoring.get('scored_context_characters', 0)}/{scoring.get('original_context_characters', 0)} 字符；"
+                f"已裁剪：{'是' if scoring.get('contexts_truncated') else '否'}"
+            )
         detail = (
             f"<strong>问题：</strong>{html.escape(result.question)}<br>"
             f"<strong>参考答案：</strong>{html.escape(result.reference_answer)}<br>"
             f"<strong>实际回答：</strong>{html.escape(result.response)}<br>"
+            f"<strong>评分正文：</strong>{html.escape(result.scored_response)}<br>"
             f"<strong>检索上下文：</strong>{html.escape(' | '.join(result.retrieved_contexts))}"
         )
-        rows.append(f"<tr><td colspan='{len(headers)}'>{detail}</td></tr>")
+        rows.append(f"<tr><td colspan='{len(headers)}'>{detail}{scoring_detail}</td></tr>")
     html_text = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>Hardware RAG Evaluation</title><style>body{font-family:sans-serif;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:.4rem}th{background:#f5f5f5}</style></head><body>"""
     html_text += f"<h1>评估报告 {html.escape(summary.run_id)}</h1>"

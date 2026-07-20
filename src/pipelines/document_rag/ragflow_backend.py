@@ -864,7 +864,7 @@ class RAGFlowBackend(RAGBackend):
         else:
             log(f"RAGFlow source-group route: {route.reason}, no hard filter")
         self._ensure_physical_datasets()
-        dataset_ids = list(self._dataset_ids.values())
+        dataset_ids = list(dict.fromkeys(self._dataset_ids.values()))
         metadata_condition = _metadata_condition(kb_name, ctx, routed_source_groups, filters=filters)
         chunks = self._client().retrieve(
             query,
@@ -873,25 +873,24 @@ class RAGFlowBackend(RAGBackend):
             metadata_condition=metadata_condition,
         )
         source_names = _source_name_filters(filters)
+        # An explicit file selection is a stronger scope than keyword routing.
+        # It remains constrained by the locally scoped document mapping below,
+        # so a mismatched route must not suppress the selected source.
+        apply_routed_source_groups = bool(routed_source_groups) and not source_names
         source_name_fallback = False
-        if not chunks and source_names:
-            fallback_condition = _metadata_condition(
-                kb_name,
-                ctx,
-                routed_source_groups,
-                filters=filters,
-                include_source_names=False,
-            )
+        metadata_condition_fallback = False
+        if not chunks:
             chunks = self._client().retrieve(
                 query,
                 dataset_ids=dataset_ids,
                 top_k=top_k,
-                metadata_condition=fallback_condition,
+                metadata_condition=None,
             )
-            source_name_fallback = True
+            metadata_condition_fallback = True
+            source_name_fallback = bool(source_names)
             log(
-                "RAGFlow scoped source-name retrieve returned 0; retried without "
-                f"original_file_name condition and received {len(chunks)} raw chunks. "
+                "RAGFlow metadata-scoped retrieve returned 0; retried without "
+                f"metadata conditions and received {len(chunks)} raw chunks. "
                 f"source_names={source_names}"
             )
 
@@ -929,7 +928,7 @@ class RAGFlowBackend(RAGBackend):
                 if chunk_source_group and _normalize_chunk_source_group(chunk_source_group) != record_source_group:
                     skipped_counts["source_group"] += 1
                     continue
-                if routed_source_groups and record_source_group not in routed_source_groups:
+                if apply_routed_source_groups and record_source_group not in routed_source_groups:
                     skipped_counts["source_group"] += 1
                     continue
 
@@ -966,6 +965,7 @@ class RAGFlowBackend(RAGBackend):
                             "query_route_confidence": route.confidence,
                             "query_route_source_groups": list(routed_source_groups),
                             "ragflow_source_name_fallback": source_name_fallback,
+                            "ragflow_metadata_condition_fallback": metadata_condition_fallback,
                         },
                         backend=self.name,
                         retriever="ragflow_retrieval",
@@ -975,24 +975,18 @@ class RAGFlowBackend(RAGBackend):
 
         evidences, skipped_counts = _filter_chunks()
         if not evidences and source_names and not source_name_fallback and skipped_counts["source_name"]:
-            fallback_condition = _metadata_condition(
-                kb_name,
-                ctx,
-                routed_source_groups,
-                filters=filters,
-                include_source_names=False,
-            )
             chunks = self._client().retrieve(
                 query,
                 dataset_ids=dataset_ids,
                 top_k=top_k,
-                metadata_condition=fallback_condition,
+                metadata_condition=None,
             )
             source_name_fallback = True
+            metadata_condition_fallback = True
             evidences, skipped_counts = _filter_chunks()
             log(
                 "RAGFlow scoped source-name retrieve was emptied by local filename validation; "
-                "retried without original_file_name condition and received "
+                "retried without metadata conditions and received "
                 f"{len(chunks)} raw chunks. source_names={source_names}"
             )
         if not evidences:
@@ -1000,7 +994,7 @@ class RAGFlowBackend(RAGBackend):
                 "RAGFlow retrieve produced no evidence after filters: "
                 f"raw_chunks={len(chunks)}, skipped={skipped_counts}, "
                 f"source_names={source_names}, route={route.reason}, "
-                f"metadata_condition={metadata_condition}, fallback={source_name_fallback}"
+                f"metadata_condition={metadata_condition}, fallback={metadata_condition_fallback}"
             )
         return evidences[:top_k]
 

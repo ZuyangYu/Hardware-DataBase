@@ -521,6 +521,10 @@ class AgenticRunnerTests(unittest.TestCase):
         self.assertEqual(summary.get("status"), "success")
         self.assertIn("trace", summary)
         self.assertIn("tool_diagnostics", summary)
+        self.assertIn("claim_coverage", summary)
+        self.assertIn("retrieval_ledger", summary)
+        self.assertIn("evidence_quality", summary)
+        self.assertIn("verification", summary)
         self.assertEqual(summary.get("sufficiency_status"), "sufficient")
 
     def test_runner_exposes_token_usage_summary_by_stage(self):

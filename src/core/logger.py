@@ -12,6 +12,7 @@ LOG_FILE = os.path.join(config.settings.LOG_DIR, f"rag_{datetime.now().strftime(
 
 logger = logging.getLogger("RAG")
 logger.setLevel(getattr(logging, getattr(config.settings, "LOG_LEVEL", "INFO").upper(), logging.INFO))
+logger.propagate = False
 formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(trace_id)s%(message)s")
 
 

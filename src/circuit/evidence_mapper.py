@@ -38,6 +38,11 @@ class CircuitEvidenceMapper:
                 "department_id": metadata.get("department_id", ""),
                 "source_group": "circuit_design",
                 "evidence_kind": "derived_topology" if kind == "topology" else "circuit_fact",
+                "fact_type": "relationship"
+                if kind in {"net", "module_connection", "module_power", "pin_mapping"}
+                else "entity"
+                if kind in {"instance", "module"}
+                else "topology",
                 "part_numbers": [str(row["part_number"])] if row.get("part_number") else [],
                 "certainty": row.get("certainty", "direct"),
                 "capability_candidate": bool(row.get("capability_candidate")),
@@ -60,6 +65,16 @@ class CircuitEvidenceMapper:
             details = [row.get("library_cell"), row.get("part_number"), row.get("value"), row.get("footprint")]
             detail_text = ", ".join(str(item) for item in details if item)
             return refdes, f"Instance {refdes}: {detail_text}." if detail_text else f"Instance {refdes} is present."
+
+        if kind == "pin_mapping":
+            refdes = str(row.get("refdes") or "instance")
+            pin_pairs = ", ".join(
+                f"{pin.get('name')} -> {pin.get('net_name')}"
+                for pin in row.get("pins") or []
+                if pin.get("name") and pin.get("net_name")
+            )
+            content = f"Pin mapping for {refdes}: {pin_pairs}." if pin_pairs else f"Pin mapping for {refdes} is unavailable."
+            return refdes, content
 
         if kind == "module":
             module_id = str(row.get("module_id") or row.get("name") or "module")

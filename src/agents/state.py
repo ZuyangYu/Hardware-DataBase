@@ -4,6 +4,8 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
+from src.agents.claim_evidence import Claim
+
 
 class SubQuestion(BaseModel):
     id: str
@@ -17,6 +19,7 @@ class QuestionAnalysis(BaseModel):
     reasoning_summary: str = ""
     entities: list[str] = Field(default_factory=list)
     sub_questions: list[SubQuestion] = Field(default_factory=list)
+    claims: list[Claim] = Field(default_factory=list)
     # 对标 Google Agentic RAG Orchestrator：识别该问题是否需要多步/跨源推理
     # （如先查项目文档拿到 server ID，再去另一源查规格）。多跳查询允许跑到
     # AGENT_MAX_RETRIEVAL_ROUNDS 上限迭代检索。
@@ -139,6 +142,7 @@ class AgentState(TypedDict, total=False):
 
     route_decision: dict[str, Any]
     question_analysis: dict[str, Any]
+    claim_coverage: list[dict[str, Any]]
 
     catalog: dict[str, Any]
     source_plan: dict[str, Any]

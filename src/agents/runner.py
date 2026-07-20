@@ -43,6 +43,33 @@ _OBSERVABILITY_REDACTED_KEYS = {
 }
 
 
+def _select_claim_context(state: dict, *, limit: int = 20) -> list[dict]:
+    """Retain evidence required by supported claims before optional high-score items."""
+
+    evidence = list(state.get("merged_evidence") or [])
+    evidence_by_id = {str(item.get("id") or ""): item for item in evidence}
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+    for coverage in state.get("claim_coverage") or []:
+        if coverage.get("status") not in {"supported", "partial", "conflicting"}:
+            continue
+        for evidence_id in coverage.get("evidence_ids") or []:
+            item = evidence_by_id.get(str(evidence_id))
+            if item is not None and str(evidence_id) not in selected_ids:
+                selected.append(item)
+                selected_ids.add(str(evidence_id))
+                if len(selected) >= limit:
+                    return selected
+    for item in sorted(evidence, key=lambda candidate: float(candidate.get("score") or 0.0), reverse=True):
+        evidence_id = str(item.get("id") or "")
+        if evidence_id not in selected_ids:
+            selected.append(item)
+            selected_ids.add(evidence_id)
+            if len(selected) >= limit:
+                break
+    return selected
+
+
 class MultiSourceAgentRunner:
     def __init__(
         self,
@@ -147,7 +174,7 @@ class MultiSourceAgentRunner:
         return
 
     def _draft_intermediate_answer(self, state):
-        evidence = state.get("merged_evidence") or []
+        evidence = _select_claim_context(state, limit=12)
         if not evidence:
             draft = "当前没有可用于起草答案的证据。"
         else:
@@ -192,7 +219,7 @@ class MultiSourceAgentRunner:
         }
 
     def _compose_answer(self, state):
-        evidence = state.get("merged_evidence") or []
+        evidence = _select_claim_context(state, limit=20)
         coverage = state.get("coverage_matrix") or {}
         ledger = state.get("retrieval_ledger") or []
         evidence_quality = state.get("evidence_quality") or []
@@ -556,6 +583,10 @@ class MultiSourceAgentRunner:
             "sufficiency_status": sufficiency.get("status") or "",
             "trace": state.get("trace") or [],
             "tool_diagnostics": diagnostics,
+            "claim_coverage": state.get("claim_coverage") or [],
+            "retrieval_ledger": state.get("retrieval_ledger") or [],
+            "evidence_quality": state.get("evidence_quality") or [],
+            "verification": state.get("verification") or {},
         }
 
 

@@ -35,8 +35,49 @@ streamlit.out.log
 .tmp_pycache/
 ragflow_store_*/
 
+# Generated RAGAS evaluation snapshots and reports
+evaluation/reports/
+evaluation/results/
+evaluation/snapshots/
+evaluation/.cache/
+storage/evaluations/
+
+# Local test and coverage artifacts
+.coverage
+htmlcov/
+*.log
+
+# Vendored SpyDrNet: exclude upstream documentation, examples, and tests.
+/src/circuit/vendor/spydrnet/docs/
+/src/circuit/vendor/spydrnet/examples/
+/src/circuit/vendor/spydrnet/example_netlists/
+/src/circuit/vendor/spydrnet/tests/
+/src/circuit/vendor/spydrnet/spydrnet_extension/ir/tests/
+/src/circuit/vendor/spydrnet/CONTRIBUTING.rst
+/src/circuit/vendor/spydrnet/CONTRIBUTORS.rst
+/src/circuit/vendor/spydrnet/INSTALL.rst
+/src/circuit/vendor/spydrnet/README.rst
+/src/circuit/vendor/spydrnet/RELEASE.rst
+/src/circuit/vendor/spydrnet/diff_analysis.md
+/src/circuit/vendor/spydrnet/pylint_output.txt
+
+# Generated parser tables in the vendored SpyDrNet source
+/src/circuit/vendor/spydrnet/**/parser.out
+/src/circuit/vendor/spydrnet/**/parsetab.py
+
 
 .agents/
+
+# Local agent workflow records and development plans/specifications
+.superpowers/
+docs/superpowers/
+docs/diagrams/
+docs/hardware_database_develop_integration_plan.md
+docs/joint_retrieval_test_cases.md
+
+# Local agent guidance and feature working notes
+/CLAUDE.md
+/docs/features/
 
 .tests/
 
@@ -50,22 +91,3 @@ ragflow_store_*/
 
 # macOS Finder metadata
 .DS_Store
-
-# Local development plans / specs (not version-controlled)
-docs/superpowers/
-
-# Generated evaluation artifacts
-evaluation/reports/
-evaluation/results/
-evaluation/snapshots/
-evaluation/.cache/
-storage/evaluations/
-
-# Local test and coverage artifacts
-.coverage
-htmlcov/
-*.log
-
-# Generated parser tables in the vendored SpyDrNet source
-/src/circuit/vendor/spydrnet/**/parser.out
-/src/circuit/vendor/spydrnet/**/parsetab.py

@@ -9,6 +9,7 @@ import config.settings
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, StateGraph
 
+from src.agents.claim_evidence import Claim, ClaimCoverage, EvidenceCapability, plan_claims
 from src.agents.query_tokens import tokenize_hardware_query
 from src.agents.state import (
     AgentState,
@@ -25,6 +26,7 @@ from src.agents.state import (
 )
 from src.agents.query_tokens import _HARDWARE_TERMS
 from src.circuit.question_analysis import analyze_question as analyze_circuit_question
+from src.ingestion.parser_registry import PARSER_REGISTRY
 from src.agents.prompts import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
     PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT,
@@ -37,6 +39,86 @@ def _trace(state: AgentState, node: str, message: str, metadata: dict[str, Any] 
     trace = list(state.get("trace") or [])
     trace.append({"node": node, "message": message, "metadata": metadata or {}})
     return trace
+
+
+def _claims_for_subquestions(sub_questions: list[SubQuestion]) -> list[Claim]:
+    claims: list[Claim] = []
+    for sub_question in sub_questions:
+        for index, claim in enumerate(
+            plan_claims(sub_question.question, sub_question.expected_evidence), start=1
+        ):
+            claims.append(claim.model_copy(update={"id": f"{sub_question.id}:claim_{index}"}))
+    return claims
+
+
+_LEGACY_PROCESSOR_CAPABILITIES: dict[str, set[str]] = {
+    "circuit_design": {"entity_lookup", "relationship_lookup"},
+    "spreadsheet_table": {"entity_lookup", "tabular_lookup", "revision_lookup"},
+    "ragflow": {"entity_lookup", "document_claim_lookup"},
+}
+
+
+def _source_capabilities(source: dict[str, Any]) -> set[str]:
+    source_group = str(source.get("source_group") or "")
+    registered: tuple[EvidenceCapability, ...] = PARSER_REGISTRY.capabilities_for(source_group)
+    if registered:
+        return {capability.name for capability in registered}
+    return set(_LEGACY_PROCESSOR_CAPABILITIES.get(str(source.get("processor_kind") or ""), set()))
+
+
+def _claim_compatible(source: dict[str, Any], claim: Claim) -> bool:
+    if source.get("processor_kind") == "circuit_design" and source.get("status") not in {"", "indexed"}:
+        return False
+    available = _source_capabilities(source)
+    required = set(claim.required_capabilities)
+    if not required:
+        return bool(available)
+    if claim.support_mode == "composite":
+        return bool(available & required)
+    return required <= available
+
+
+def _claim_coverage(claims: list[Claim], evidence: list[dict[str, Any]]) -> list[ClaimCoverage]:
+    coverage: list[ClaimCoverage] = []
+    for claim in claims:
+        evidence_ids: list[str] = []
+        missing: list[str] = []
+        for capability in claim.required_capabilities:
+            matches = [item for item in evidence if _evidence_supports_capability(item, capability)]
+            if not matches:
+                missing.append(capability)
+                continue
+            for item in matches:
+                evidence_id = str(item.get("id") or "")
+                if evidence_id and evidence_id not in evidence_ids:
+                    evidence_ids.append(evidence_id)
+        coverage.append(
+            ClaimCoverage(
+                claim_id=claim.id,
+                status="supported" if not missing else "partial" if evidence_ids else "missing",
+                evidence_ids=evidence_ids,
+                missing_capabilities=missing,
+            )
+        )
+    return coverage
+
+
+def _evidence_supports_capability(evidence: dict[str, Any], capability: str) -> bool:
+    content_kind = str(evidence.get("content_kind") or "")
+    metadata = evidence.get("metadata") or {}
+    certainty = str(metadata.get("certainty") or "")
+    fact_type = str(metadata.get("fact_type") or "")
+    if capability == "relationship_lookup":
+        return content_kind == "circuit_design" and certainty == "direct" and fact_type == "relationship"
+    if capability == "entity_lookup":
+        return certainty == "direct" and fact_type in {"entity", "relationship", "attribute"}
+    if capability == "tabular_lookup":
+        return content_kind in {"spreadsheet_table", "test_data"} and certainty == "direct"
+    if capability == "document_claim_lookup":
+        return content_kind == "document_text"
+    if capability == "revision_lookup":
+        return bool(metadata.get("revision") or metadata.get("observed_at"))
+    return False
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -177,7 +259,41 @@ def _required_candidate_evidence(question: str) -> set[str]:
     return required
 
 
+def _is_pure_pin_mapping_question(question: str) -> bool:
+    text = str(question or "")
+    lower = text.casefold()
+    has_refdes = bool(re.search(r"(?<![A-Za-z0-9])[A-Za-z]{1,4}\d+(?![A-Za-z0-9])", text))
+    connectivity_terms = ("connection", "pin", "net", "连接", "引脚", "网络", "网表")
+    additional_evidence_terms = (
+        "datasheet",
+        "manual",
+        "configuration",
+        "register",
+        "bom",
+        "quantity",
+        "supplier",
+        "vendor",
+        "price",
+        "数据手册",
+        "手册",
+        "配置",
+        "寄存器",
+        "替代料",
+        "单价",
+        "供应商",
+        "用量",
+        "数量",
+    )
+    return (
+        has_refdes
+        and any(term in lower for term in connectivity_terms)
+        and not any(term in lower for term in additional_evidence_terms)
+    )
+
+
 def _merge_expected_evidence(question: str, llm_expected: Any) -> list[str]:
+    if _is_pure_pin_mapping_question(question):
+        return ["circuit_design"]
     merged = set(_normalize_expected_evidence(llm_expected))
     merged.update(_required_candidate_evidence(question))
     return [kind for kind in ("circuit_design", "document_text", "spreadsheet_table") if kind in merged]
@@ -426,6 +542,7 @@ def analyze_question(state: AgentState) -> AgentState:
         summary=f"我理解你想查询：{query}",
         entities=entities,
         sub_questions=sub_questions,
+        claims=_claims_for_subquestions(sub_questions),
         multi_hop=len(sub_questions) > 1,
     )
     return {
@@ -498,6 +615,7 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
             reasoning_summary=str(payload.get("reasoning_summary") or ""),
             entities=_as_unique_strings(payload.get("entities") or _keyword_entities(query), limit=12),
             sub_questions=sub_questions[:6],
+            claims=_claims_for_subquestions(sub_questions[:6]),
             multi_hop=bool(payload.get("multi_hop", True)),
         )
         return {
@@ -541,6 +659,9 @@ def _source_matches_analysis(source: dict[str, Any], analysis: dict[str, Any]) -
     content_kind = source.get("content_kind", "")
     name = source.get("document_name", "")
     source_group = source.get("source_group", "")
+    claims = [Claim.model_validate(item) for item in analysis.get("claims") or []]
+    if claims and any(_claim_compatible(source, claim) for claim in claims):
+        return True, "该来源具备至少一条待证明结论所需的检索能力。"
     sub_questions = analysis.get("sub_questions") or []
     expected = {item for sq in sub_questions for item in sq.get("expected_evidence", [])}
     if processor == "spreadsheet_table" and "spreadsheet_table" in expected:
@@ -1424,6 +1545,8 @@ def _has_direct_entity_support(question: str, evidence: dict[str, Any]) -> bool:
 def score_and_compare_evidence(state: AgentState) -> AgentState:
     analysis = state.get("question_analysis") or {}
     evidence = state.get("merged_evidence") or []
+    claims = [Claim.model_validate(item) for item in analysis.get("claims") or []]
+    claim_coverage = _claim_coverage(claims, evidence)
     followups = []
     coverage_items = []
     ledger_items = []
@@ -1535,6 +1658,7 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
     matrix = CoverageMatrix(coverage=coverage_items, conflicts=conflicts, recommended_followups=followups[:6])
     return {
         **state,
+        "claim_coverage": [item.model_dump() for item in claim_coverage],
         "evidence_quality": [quality.model_dump() for quality in quality_by_id.values()],
         "retrieval_ledger": ledger_items,
         "coverage_matrix": matrix.model_dump(),
