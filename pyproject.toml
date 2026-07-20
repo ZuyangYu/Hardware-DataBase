@@ -1,7 +1,7 @@
 [project]
-name = "hardware-rag"
+name = "hardware-database"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hardware DataBase: multi-source Q&A for hardware design assets (documents, spreadsheets, circuit designs) over RAGFlow + a bounded LangGraph agent."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-hardware-rag-eval = "src.evaluation.cli:main"
+hardware-database-eval = "src.evaluation.cli:main"
 
 [build-system]
 requires = ["setuptools>=77"]
@@ -56,3 +56,8 @@ eval = [
 
 [tool.pytest.ini_options]
 norecursedirs = ["build", "src/circuit/vendor/spydrnet"]
+
+[tool.ruff]
+# vendored SpyDrNet (含 sch_parse / spydrnet_extension 等 upstream 风格代码) 与
+# Claude Code skill 脚本不属于本应用源码,不纳入 lint。
+extend-exclude = ["src/circuit/vendor", ".claude"]

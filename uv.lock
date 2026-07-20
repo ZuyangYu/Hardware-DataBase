@@ -706,7 +706,7 @@ wheels = [
 ]
 
 [[package]]
-name = "hardware-rag"
+name = "hardware-database"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

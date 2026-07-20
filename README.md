@@ -1,11 +1,11 @@
 # Hardware DataBase
 
-Hardware DataBase 是一个面向硬件设计资料、项目文档和结构化表格的智能数据基座。
+Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化表格和电路设计（EDF 网表/原理图）的智能数据基座。
 
 ## 核心特性
 
-- **Agentic 查询流程**：问题拆解确认、文件扫描、检索范围确认、多源检索、证据覆盖度判断、自动补检索、最终 grounded answer。
-- **多源 pipeline**：普通文档进入 RAGFlow 检索链路；Excel 进入结构化表格索引，并由 agent 统一调度。
+- **Agentic 查询流程**：问题拆解、知识库文件扫描、检索范围规划、多源检索、证据覆盖度判断、必要时自动补检索、最终 grounded answer。
+- **多源 pipeline**：普通文档进入 RAGFlow 检索链路；Excel 进入结构化表格索引；EDF 网表进入电路结构化索引；均由 agent 统一调度。
 - **RAGFlow 后端固定化**：文档上传、解析任务、检索、删除和知识库治理都通过 RAGFlow 后端适配层完成。
 - **权限与治理**：支持部门、用户、知识库权限、审计日志、查询 trace 和文件处理状态。
 - **独立模型配置**：Agent 最终答案生成使用项目自有 `LLMClient`，支持 Ollama 或 OpenAI-compatible API，不再复用旧 RAG 框架模型封装。
@@ -13,38 +13,32 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档和结构化�
 ## 项目结构
 
 ```text
-Hardware-RAG/
+Hardware-DataBase/
 ├── assets/                     # 应用示例图片
 ├── config/
-│   └── settings.py             # 全局配置与 .env 加载
+│   └── settings.py             # 全局配置与 .env 加载（单一事实来源）
 ├── data/                       # (自动生成) 原始文档存储
 ├── docs/                       # 架构与设计文档
-│   ├── architecture_doc.md
+│   ├── architecture_doc.md     # 当前整体架构
+│   ├── pipeline_contract.md    # pipeline 隔离契约
 │   ├── langgraph_agentic_query_design.md
-│   └── pipeline_contract.md
+│   ├── joint_retrieval_test_cases.md
+│   └── hardware_database_develop_integration_plan.md
+├── evaluation/                 # RAGAS 评估数据集与说明
+│   ├── datasets/hardware_qa_v1.jsonl
+│   └── README.md
 ├── src/
-│   ├── agents/                 # LangGraph Agent 编排
-│   │   ├── graph.py
-│   │   ├── runner.py
-│   │   ├── prompts.py
-│   │   ├── state.py
-│   │   ├── query_tokens.py
-│   │   └── tools/              # 检索工具适配
-│   ├── core/                   # 应用管线、鉴权、LLM 客户端
-│   │   ├── app_pipeline.py
-│   │   ├── auth.py
-│   │   ├── llm_client.py
-│   │   ├── conversation.py
-│   │   ├── source_group_router.py
-│   │   ├── app_logs.py
-│   │   └── logger.py
-│   ├── ingestion/              # 容器检查、路径与解析任务
-│   ├── pipelines/              # 多源 pipeline
-│   │   ├── document_rag/       # RAGFlow 文档检索
-│   │   └── spreadsheet/        # Excel 结构化表格索引
-│   └── services/               # 文档治理、路由与资产清理
+│   ├── agents/                 # LangGraph 查询编排（graph/runner/state/prompts + tools/）
+│   ├── circuit/                # 电路网表/原理图解析与结构化检索
+│   ├── core/                   # AppPipeline、鉴权、LLMClient、会话、source group 路由
+│   ├── evaluation/             # RAGAS 评估子系统（CLI、service、metrics、gates）
+│   ├── ingestion/              # source group 分类、KB 路径、解析任务、容器检查
+│   ├── pipelines/              # 多源 pipeline（document_rag/、spreadsheet/、registry、runtime）
+│   ├── services/               # 文档治理、路由、归档、KB scope、资产清理
+│   ├── test_data/              # 测试数据结构化域（ingest-only）
+│   └── ui/                     # Streamlit 页面组件（评估页等）
 ├── storage/                    # (自动生成) 归档、索引、日志与鉴权库
-├── tests/                      # 单元与集成测试
+├── tests/                      # 单元与集成测试（unittest.TestCase）
 ├── streamlit_app.py            # 前端启动入口
 ├── pyproject.toml
 ├── requirements.txt
@@ -96,7 +90,7 @@ streamlit run streamlit_app.py
 
 支持两种配置方式：**页面配置**（推荐）和 **`.env` 文件配置**。
 
-> 注意：仓库根目录的 `.env.example` 为旧架构模板，其中的 `RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE` 等变量在当前版本已失效，请以下方变量为准。
+> 注意：仓库根目录的 `.env` 已提交且包含**真实 API Key**，并残留若干旧架构变量（`RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE` 等，`config/settings.py` 已忽略）。请以 `.env.example` 为模板，以下方变量为准。
 
 ### 方式一：页面配置（推荐）
 
@@ -123,6 +117,12 @@ AGENT_OLLAMA_BASE_URL=http://localhost:11434
 AGENT_OLLAMA_MODEL=qwen2.5:32b
 AGENT_TEMPERATURE=0.2
 AGENT_TIMEOUT_SECONDS=120
+
+# HTTP 429 重试与模型回退（仅 custom 提供商生效；备用模型复用其 URL 与 API Key）
+AGENT_RATE_LIMIT_MAX_RETRIES=4
+AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS=1
+AGENT_RATE_LIMIT_MAX_DELAY_SECONDS=16
+AGENT_FALLBACK_MODEL=deepseek-ai/DeepSeek-V4-Pro
 
 # 或使用 OpenAI-compatible API（provider=custom 时生效）
 AGENT_CUSTOM_API_KEY=
@@ -158,7 +158,8 @@ Streamlit
   -> LangGraph
   -> Tool adapters
      - RAGFlow document retrieval
-     - Spreadsheet semantic/cell/profile search
+     - Spreadsheet semantic/cell search
+     - Circuit structured query (netlist)
   -> LLMClient 生成最终答案
 ```
 
@@ -187,14 +188,14 @@ A: 请先进入「⚙️ 系统配置」检查并补全 RAGFlow 与 Agent 模型
 
 ```powershell
 uv sync --group eval
-uv run hardware-rag-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
+uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
 ```
 
 运行端到端评估或重评已有快照：
 
 ```powershell
-uv run hardware-rag-eval run --dataset evaluation/datasets/hardware_qa_v1.jsonl --output storage/evaluations
-uv run hardware-rag-eval score --dataset evaluation/datasets/hardware_qa_v1.jsonl --snapshot storage/evaluations/<run_id>/snapshot.jsonl --output storage/evaluations
+uv run hardware-database-eval run --dataset evaluation/datasets/hardware_qa_v1.jsonl --output storage/evaluations
+uv run hardware-database-eval score --dataset evaluation/datasets/hardware_qa_v1.jsonl --snapshot storage/evaluations/<run_id>/snapshot.jsonl --output storage/evaluations
 ```
 
 默认只生成 JSON、CSV 和 HTML 报告。需要在 CI 中启用阈值门禁时添加 `--fail-on-threshold`。可用 `--tag`、`--sample-id`、`--metric` 和 `--threshold faithfulness=0.8` 过滤或覆盖评分设置。

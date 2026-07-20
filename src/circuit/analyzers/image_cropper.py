@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Iterable
 
 from src.circuit.image_cache import ImageCache
 from src.circuit.models import CircuitDesign, ModuleRegion

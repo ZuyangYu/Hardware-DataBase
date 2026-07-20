@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 from src.core.app_logs import AppLogService
-from src.core.auth import ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER, AuthUser
+from src.core.auth import ROLE_DEPT_ADMIN, ROLE_USER, AuthUser
 
 
 def _make_viewer(user_id: int, role: str, department_id: int | None = 1) -> AuthUser:

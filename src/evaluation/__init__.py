@@ -1,4 +1,4 @@
-"""Offline and end-to-end evaluation support for Hardware RAG."""
+"""Offline and end-to-end evaluation support for Hardware DataBase."""
 
 from .schemas import (
     AnswerSnapshot,

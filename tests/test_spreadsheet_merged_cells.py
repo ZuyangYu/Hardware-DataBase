@@ -6,7 +6,6 @@ import xml.etree.ElementTree as ET
 
 from src.pipelines.spreadsheet.xlsx_parser import ParsedSheet, parse_xlsx
 from src.pipelines.spreadsheet.table_store import (
-    TableIndexStore,
     _merged_fill_set,
     _sheet_semantic_rows,
 )
@@ -121,15 +120,21 @@ class ParserMergeExpansionTests(unittest.TestCase):
         sheet = ET.Element(f"{{{ns}}}worksheet")
         sd = ET.SubElement(sheet, f"{{{ns}}}sheetData")
         r1 = ET.SubElement(sd, f"{{{ns}}}row", r="1")
-        c = ET.SubElement(r1, f"{{{ns}}}c", r="A1", t="s"); ET.SubElement(c, f"{{{ns}}}v").text = "0"
-        c = ET.SubElement(r1, f"{{{ns}}}c", r="B1", t="s"); ET.SubElement(c, f"{{{ns}}}v").text = "1"
+        c = ET.SubElement(r1, f"{{{ns}}}c", r="A1", t="s")
+        ET.SubElement(c, f"{{{ns}}}v").text = "0"
+        c = ET.SubElement(r1, f"{{{ns}}}c", r="B1", t="s")
+        ET.SubElement(c, f"{{{ns}}}v").text = "1"
         r2 = ET.SubElement(sd, f"{{{ns}}}row", r="2")
-        c = ET.SubElement(r2, f"{{{ns}}}c", r="A2", t="s"); ET.SubElement(c, f"{{{ns}}}v").text = "0"
-        c = ET.SubElement(r2, f"{{{ns}}}c", r="B2", s="0"); ET.SubElement(c, f"{{{ns}}}v").text = "45656"
+        c = ET.SubElement(r2, f"{{{ns}}}c", r="A2", t="s")
+        ET.SubElement(c, f"{{{ns}}}v").text = "0"
+        c = ET.SubElement(r2, f"{{{ns}}}c", r="B2", s="0")
+        ET.SubElement(c, f"{{{ns}}}v").text = "45656"
         r3 = ET.SubElement(sd, f"{{{ns}}}row", r="3")
-        c = ET.SubElement(r3, f"{{{ns}}}c", r="B3", s="0"); ET.SubElement(c, f"{{{ns}}}v").text = "45657"
+        c = ET.SubElement(r3, f"{{{ns}}}c", r="B3", s="0")
+        ET.SubElement(c, f"{{{ns}}}v").text = "45657"
         r4 = ET.SubElement(sd, f"{{{ns}}}row", r="4")
-        c = ET.SubElement(r4, f"{{{ns}}}c", r="B4", s="0"); ET.SubElement(c, f"{{{ns}}}v").text = "45658"
+        c = ET.SubElement(r4, f"{{{ns}}}c", r="B4", s="0")
+        ET.SubElement(c, f"{{{ns}}}v").text = "45658"
         merges = ET.SubElement(sheet, f"{{{ns}}}mergeCells", count="1")
         ET.SubElement(merges, f"{{{ns}}}mergeCell", ref="A2:A4")
         sheet_buf = ET.tostring(sheet, xml_declaration=True, encoding="UTF-8")

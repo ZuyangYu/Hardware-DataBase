@@ -12,7 +12,7 @@ from src.pipelines.ingestion import (
     _INGEST_LOCKS,
     _ingest_lock,
 )
-from src.pipelines.registry import PIPELINE_REGISTRY, PROCESSOR_KIND_RAGFLOW, PipelineSpec
+from src.pipelines.registry import PROCESSOR_KIND_RAGFLOW, PipelineSpec
 from src.services.document_archive import DocumentArchiveManager
 from src.services.pipeline_asset_cleanup import PipelineAssetCleanupService
 

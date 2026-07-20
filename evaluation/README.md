@@ -1,4 +1,4 @@
-# Hardware RAG 评估数据集
+# Hardware DataBase 评估数据集
 
 `datasets/hardware_qa_v1.jsonl` 是首版 25 条硬件问答评估基线，来源于 `docs/joint_retrieval_test_cases.md` 中已核实的 ADAS 案例，并加入同义问法、噪声、权限隔离和缺失证据变体。
 
@@ -17,7 +17,7 @@
 运行校验：
 
 ```powershell
-uv run hardware-rag-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
+uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
 ```
 
 ## Streamlit 运行控制

@@ -2751,7 +2751,7 @@ def main():
     if pipeline_error:
         st.error(f"❌ 系统初始化失败: {pipeline_error}")
     elif pipeline:
-        ctx = build_request_context(st.session_state)
+        build_request_context(st.session_state)
         refresh_kb_list(pipeline)
         if st.session_state.kb_list and st.session_state.current_kb not in st.session_state.kb_list:
             set_current_kb(st.session_state.kb_list[0])
@@ -2874,7 +2874,7 @@ def main():
                 st.warning("⚠️ 系统未初始化，请先在 ⚙️ 系统配置 中检查并修复配置")
                 st.stop()
 
-            st.markdown(f"**📍 当前对话挂载知识库:**")
+            st.markdown("**📍 当前对话挂载知识库:**")
             if not st.session_state.kb_list:
                 set_current_kb(None)
                 if "kb_selector" in st.session_state:
