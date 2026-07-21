@@ -114,7 +114,20 @@ class AnswerRunnerTests(unittest.TestCase):
 
         self.assertEqual(snapshot.status, "failed")
         self.assertEqual(snapshot.error_stage, "answer_collection")
+        self.assertIn("RuntimeError", snapshot.error_message)
         self.assertNotIn("secret-token", snapshot.error_message)
+
+    def test_collect_redacts_sensitive_values_from_failure_diagnostics(self):
+        class BrokenPipeline(FakePipeline):
+            def query(self, *args, **kwargs):
+                raise RuntimeError("api_key=secret-value")
+
+        snapshot = AnswerRunner(lambda: BrokenPipeline()).collect(_sample())
+
+        self.assertEqual(snapshot.status, "failed")
+        self.assertIn("RuntimeError", snapshot.error_message)
+        self.assertIn("api_key=[redacted]", snapshot.error_message)
+        self.assertNotIn("secret-value", snapshot.error_message)
 
     def test_collect_marks_streamed_system_error_as_failed_snapshot(self):
         class ErrorTextPipeline(FakePipeline):

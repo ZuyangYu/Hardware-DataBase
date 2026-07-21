@@ -251,6 +251,65 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertIn("module_connection", entity_types)
         self.assertIn("module_power", entity_types)
 
+    def test_power_path_query_returns_direct_conversion_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "power_board.edf")
+            with open(source, "w", encoding="utf-8") as fh:
+                fh.write("(edif power_board)")
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=lambda path, progress_callback=None: _PowerPathParser(),
+            )
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=8,
+                file_path=source,
+                original_name="power_board.edf",
+                department_id="dept_hw",
+            )
+
+            hits = service.query(
+                kb_name="kb_hw",
+                query="Ethernet PHY 1.0V power path",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+                top_k=5,
+            )
+
+        topology = next(hit for hit in hits if hit.locator["entity_type"] == "power_topology")
+        self.assertIn("VCC3V3 -> U1500", topology.content)
+        self.assertIn("VCC3V3_ETH", topology.content)
+        self.assertIn("U1501", topology.content)
+        self.assertIn("VCC1V0_ETH", topology.content)
+        self.assertNotIn("Module", topology.content)
+
+    def test_load_switch_query_expands_all_matching_pin_mappings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "switch_board.edf")
+            with open(source, "w", encoding="utf-8") as fh:
+                fh.write("(edif switch_board)")
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=lambda path, progress_callback=None: _PowerSwitchParser(),
+            )
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=9,
+                file_path=source,
+                original_name="switch_board.edf",
+                department_id="dept_hw",
+            )
+
+            hits = service.query(
+                kb_name="kb_hw",
+                query="TPS22918 input output enable",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+                top_k=8,
+            )
+
+        mappings = [hit for hit in hits if hit.locator["entity_type"] == "pin_mapping"]
+        self.assertEqual({hit.locator["entity_id"] for hit in mappings}, {"U1500", "U1802", "U1803"})
+        self.assertTrue(all("VIN" in hit.content and "ON" in hit.content for hit in mappings))
+
 
 class _Parser:
     warnings = ["parser warning"]
@@ -273,6 +332,66 @@ class _Parser:
                 CircuitModule(module_id="mcu", name="MCU", strategy="fixture", instances=["U2"], nets=["VDD", "GND"]),
             ],
         )
+
+
+class _PowerPathParser:
+    def parse(self):
+        return (
+            [
+                ComponentInstance(
+                    refdes="U1500",
+                    library_cell="TPS22918",
+                    pins=[
+                        Pin(name="VIN", net="VCC3V3"),
+                        Pin(name="VOUT", net="VCC3V3_ETH"),
+                        Pin(name="ON", net="MCU_3V3_ETH_EN"),
+                    ],
+                ),
+                ComponentInstance(
+                    refdes="U1501",
+                    library_cell="TPS74501",
+                    pins=[Pin(name="VIN", net="VCC3V3_ETH"), Pin(name="OUT", net="VCC1V0_ETH")],
+                ),
+            ],
+            [
+                Net(name="VCC3V3", connections=[PinRef(refdes="U1500", pin="VIN")], net_type="power"),
+                Net(
+                    name="VCC3V3_ETH",
+                    connections=[PinRef(refdes="U1500", pin="VOUT"), PinRef(refdes="U1501", pin="VIN")],
+                    net_type="power",
+                ),
+                Net(name="VCC1V0_ETH", connections=[PinRef(refdes="U1501", pin="OUT")], net_type="power"),
+                Net(name="MCU_3V3_ETH_EN", connections=[PinRef(refdes="U1500", pin="ON")]),
+            ],
+            [],
+        )
+
+
+class _PowerSwitchParser:
+    def parse(self):
+        instances = [
+            ComponentInstance(
+                refdes="U1500",
+                library_cell="TPS22918",
+                pins=[Pin(name="VIN", net="VCC3V3"), Pin(name="VOUT", net="VCC3V3_ETH"), Pin(name="ON", net="MCU_3V3_ETH_EN")],
+            ),
+            ComponentInstance(
+                refdes="U1802",
+                library_cell="TPS22918",
+                pins=[Pin(name="VIN", net="VCC3V3"), Pin(name="VOUT", net="VCC3V3_EQ"), Pin(name="ON", net="MCU_3V3_EQ_EN")],
+            ),
+            ComponentInstance(
+                refdes="U1803",
+                library_cell="TPS22918",
+                pins=[Pin(name="VIN", net="VCC1V8"), Pin(name="VOUT", net="VCC1V8_EQ"), Pin(name="ON", net="MCU_1V8_EQ_EN")],
+            ),
+        ]
+        nets = [
+            Net(name=pin.net, connections=[PinRef(refdes=instance.refdes, pin=pin.name)], net_type="power" if pin.name != "ON" else "signal")
+            for instance in instances
+            for pin in instance.pins
+        ]
+        return instances, nets, []
 
 
 class _QueryEngine:

@@ -162,6 +162,29 @@ class CircuitIndexService:
             ("module_connection", 0.84, self.query_engine.search_module_connections(kb_name, query, limit=top_k * 2)),
             ("module_power", 0.82, self.query_engine.search_module_power_nets(kb_name, query, limit=top_k * 2)),
         ]
+        if "power_switch" in plan.operations:
+            switch_rows = self.query_engine.search_instances(kb_name, query, limit=top_k * 3)
+            pin_mapping_rows: list[dict[str, Any]] = []
+            for row in switch_rows:
+                design_id = str(row.get("design_id") or row.get("circuit_id") or "")
+                refdes = str(row.get("refdes") or "")
+                if design_id not in allowed_designs or not refdes:
+                    continue
+                detail = self.query_engine.get_instance_detail(kb_name, design_id, refdes)
+                if detail and detail.get("pins"):
+                    pin_mapping_rows.append(detail)
+            candidates = [("pin_mapping", 0.98, pin_mapping_rows), ("instance", 0.92, switch_rows)]
+        if "power_path" in plan.operations:
+            power_topology_rows = [
+                topology
+                for design_id in allowed_designs
+                if (topology := self.query_engine.build_power_topology(kb_name, design_id))
+            ]
+            candidates.append(("power_topology", 0.99, power_topology_rows))
+        if "mcu" in query.casefold():
+            candidates.append(
+                ("instance", 0.97, self.query_engine.search_instances(kb_name, "TC3", limit=top_k * 2))
+            )
         refdes_matches = re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d+)(?![A-Za-z0-9])", query)
         if "connection" in plan.operations and refdes_matches:
             pin_mapping_rows: list[dict[str, Any]] = []

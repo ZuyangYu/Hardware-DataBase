@@ -19,6 +19,16 @@ def _result(sample_id, score=None, *, critical=False, status="success"):
     )
 
 
+def _ragas_and_policy_result(sample_id: str) -> SampleResult:
+    return SampleResult(
+        sample_id=sample_id,
+        metrics=[
+            MetricResult(sample_id=sample_id, metric_name="answer_relevancy", score=0.0),
+            MetricResult(sample_id=sample_id, metric_name="completeness", score=1.0),
+        ],
+    )
+
+
 class GateTests(unittest.TestCase):
     def test_gate_ignores_not_applicable(self):
         gate = evaluate_gate(
@@ -53,6 +63,18 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gate.passed)
         self.assertEqual(gate.exit_code, 2)
         self.assertIn("evaluation failed", " ".join(gate.failures))
+
+    def test_non_retrieval_samples_do_not_contribute_ragas_metrics(self):
+        result = _ragas_and_policy_result("direct")
+
+        gate = evaluate_gate(
+            [result],
+            {"answer_relevancy": 0.7, "completeness": 0.75},
+            sample_cohorts={"direct": "non_retrieval"},
+        )
+
+        self.assertNotIn("answer_relevancy", gate.metric_scores)
+        self.assertEqual(gate.metric_scores["completeness"], 1.0)
 
 
 if __name__ == "__main__":

@@ -76,8 +76,11 @@ class EvaluationConfigTests(unittest.TestCase):
             config = EvaluationConfig.from_environment()
 
         self.assertEqual(config.llm_max_tokens, 8192)
-        self.assertEqual(config.max_contexts_per_sample, 8)
-        self.assertEqual(config.max_context_chars, 12000)
+        self.assertEqual(config.max_contexts_per_sample, 4)
+        self.assertEqual(config.max_context_chars, 4000)
+        self.assertEqual(config.max_context_chars_per_item, 1200)
+        self.assertEqual(config.scoring_max_budget_attempts, 3)
+        self.assertEqual(config.scoring_context_shrink_factor, 0.5)
         self.assertEqual(
             config.public_metadata(),
             {
@@ -87,8 +90,11 @@ class EvaluationConfigTests(unittest.TestCase):
                 "embedding_base_url": "https://embed.test/v1",
                 "embedding_model": "embed",
                 "llm_max_tokens": 8192,
-                "max_contexts_per_sample": 8,
-                "max_context_chars": 12000,
+                "max_contexts_per_sample": 4,
+                "max_context_chars": 4000,
+                "max_context_chars_per_item": 1200,
+                "scoring_max_budget_attempts": 3,
+                "scoring_context_shrink_factor": 0.5,
                 "timeout_seconds": 120,
                 "max_workers": 4,
                 "max_retries": 2,
@@ -106,18 +112,40 @@ class EvaluationConfigTests(unittest.TestCase):
             "EVAL_LLM_MAX_TOKENS": "2048",
             "EVAL_MAX_CONTEXTS_PER_SAMPLE": "3",
             "EVAL_MAX_CONTEXT_CHARS": "1000",
+            "EVAL_MAX_CONTEXT_CHARS_PER_ITEM": "900",
+            "EVAL_SCORING_MAX_BUDGET_ATTEMPTS": "4",
+            "EVAL_SCORING_CONTEXT_SHRINK_FACTOR": "0.4",
         }
         with patch.dict(os.environ, env, clear=True):
             config = EvaluationConfig.from_environment()
             self.assertEqual(config.llm_max_tokens, 2048)
             self.assertEqual(config.max_contexts_per_sample, 3)
             self.assertEqual(config.max_context_chars, 1000)
+            self.assertEqual(config.max_context_chars_per_item, 900)
+            self.assertEqual(config.scoring_max_budget_attempts, 4)
+            self.assertEqual(config.scoring_context_shrink_factor, 0.4)
 
-        for name in ("EVAL_LLM_MAX_TOKENS", "EVAL_MAX_CONTEXTS_PER_SAMPLE", "EVAL_MAX_CONTEXT_CHARS"):
+        for name in (
+            "EVAL_LLM_MAX_TOKENS",
+            "EVAL_MAX_CONTEXTS_PER_SAMPLE",
+            "EVAL_MAX_CONTEXT_CHARS",
+            "EVAL_MAX_CONTEXT_CHARS_PER_ITEM",
+            "EVAL_SCORING_MAX_BUDGET_ATTEMPTS",
+        ):
             invalid = dict(env)
             invalid[name] = "0"
             with patch.dict(os.environ, invalid, clear=True):
                 with self.assertRaisesRegex(EvaluationConfigurationError, name):
+                    EvaluationConfig.from_environment()
+
+        for value in ("0", "1", "not-a-number"):
+            invalid = dict(env)
+            invalid["EVAL_SCORING_CONTEXT_SHRINK_FACTOR"] = value
+            with patch.dict(os.environ, invalid, clear=True):
+                with self.assertRaisesRegex(
+                    EvaluationConfigurationError,
+                    "EVAL_SCORING_CONTEXT_SHRINK_FACTOR",
+                ):
                     EvaluationConfig.from_environment()
 
 

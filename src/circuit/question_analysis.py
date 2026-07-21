@@ -19,6 +19,8 @@ class CircuitQuestionPlan:
 _BIAS_TERMS = ("上拉", "下拉", "pull-up", "pullup", "pull-down", "pulldown", "默认电平", "偏置")
 _CONNECTION_TERMS = ("连接", "连到", "接到", "引脚", "网络", "网表", "路径", "connection", "pin", "net")
 _POWER_TERMS = ("电源输出", "供电路径", "电源路径", "电源树", "power output", "power path", "power tree")
+_POWER_SWITCH_TERMS = ("负载开关", "电源开关", "load switch", "power switch", "tps22918")
+_POWER_ROLE_TERMS = ("输入", "输出", "使能", "vin", "vout", "enable", " on")
 _PROTECTION_TERMS = ("保护", "短电源", "短地", "短路", "过流", "过压", "反接", "esd", "tvs", "ocp", "scp")
 _DATASHEET_TERMS = (
     "短电源", "短地", "短路", "过流", "过压", "反接", "保护能力", "规范", "额定", "datasheet", "ocp", "scp", "thermal",
@@ -36,6 +38,10 @@ def analyze_question(question: str) -> CircuitQuestionPlan:
         operations.append("bias")
     if any(term in text for term in _POWER_TERMS):
         operations.append("power_path")
+    if any(term in text for term in _POWER_SWITCH_TERMS) and any(
+        term in text for term in _POWER_ROLE_TERMS
+    ):
+        operations.append("power_switch")
     if any(term in text for term in _PROTECTION_TERMS):
         operations.append("protection")
     if not operations and any(term in text for term in _CONNECTION_TERMS):

@@ -37,9 +37,9 @@ class CircuitEvidenceMapper:
                 "kb_name": metadata.get("kb_name", ""),
                 "department_id": metadata.get("department_id", ""),
                 "source_group": "circuit_design",
-                "evidence_kind": "derived_topology" if kind == "topology" else "circuit_fact",
+                "evidence_kind": "derived_topology" if kind in {"topology", "power_topology"} else "circuit_fact",
                 "fact_type": "relationship"
-                if kind in {"net", "module_connection", "module_power", "pin_mapping"}
+                if kind in {"net", "module_connection", "module_power", "pin_mapping", "power_topology"}
                 else "entity"
                 if kind in {"instance", "module"}
                 else "topology",
@@ -50,6 +50,23 @@ class CircuitEvidenceMapper:
         )
 
     def _render(self, kind: str, row: dict[str, Any]) -> tuple[str, str]:
+        if kind == "power_topology":
+            edge_text = []
+            for edge in row.get("conversion_edges") or []:
+                source = str(edge.get("from_net") or "")
+                target = str(edge.get("to_net") or "")
+                refdes = str(edge.get("via_refdes") or "")
+                if not (source and target and refdes):
+                    continue
+                label = str(edge.get("via_label") or "")
+                controls = ", ".join(str(item) for item in edge.get("control_nets") or [] if item)
+                via = f"{refdes} ({label})" if label else refdes
+                if controls:
+                    via = f"{via}, controls: {controls}"
+                edge_text.append(f"{source} -> {via} -> {target}")
+            content = "; ".join(edge_text)
+            return "power_path", f"Power conversion path: {content}." if content else "Power conversion path is unavailable."
+
         if kind == "net":
             net_name = str(row.get("net_name") or row.get("name") or "net")
             endpoints = ", ".join(
