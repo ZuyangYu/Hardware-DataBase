@@ -1,3 +1,4 @@
+import contextvars
 import unittest
 from unittest.mock import patch
 
@@ -319,6 +320,40 @@ class LLMClientStreamTests(unittest.TestCase):
         self.assertEqual(summary.completion_tokens, 3)
         self.assertEqual(summary.total_tokens, 12)
         self.assertEqual(summary.by_stage["ollama_answer"].provider, "ollama")
+
+    def test_usage_records_isolated_per_context(self):
+        # LLMClient is a shared singleton (one per AppPipeline); usage must
+        # scope per execution context so one caller never reads another's
+        # records. reset_usage() (called at the start of every stream) rebinds
+        # the contextvar to a fresh list, so a child context that resets +
+        # records must not leak back to the parent.
+        config = LLMClientConfig(
+            provider=settings.Provider.CUSTOM,
+            base_url="https://example.test/v1",
+            model="fake-model",
+        )
+        client = LLMClient(config)
+        response = _FakeJsonResponse(
+            {
+                "choices": [{"message": {"content": "answer"}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            }
+        )
+
+        self.assertEqual(client.get_usage_summary().call_count, 0)
+
+        def run_in_child():
+            client.reset_usage()  # mirrors MultiSourceAgentRunner.stream() entry
+            with patch("src.core.llm_client.requests.post", return_value=response):
+                client.chat([{"role": "user", "content": "hi"}], usage_stage="router")
+            self.assertEqual(client.get_usage_summary().call_count, 1)
+
+        contextvars.copy_context().run(run_in_child)
+
+        # Parent context must not see the child's usage record.
+        summary = client.get_usage_summary()
+        self.assertEqual(summary.call_count, 0)
+        self.assertEqual(summary.total_tokens, 0)
 
 
 if __name__ == "__main__":

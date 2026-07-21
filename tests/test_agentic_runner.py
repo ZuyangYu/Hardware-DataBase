@@ -1,6 +1,7 @@
 import json
 import unittest
 import ast
+import contextvars
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -815,6 +816,39 @@ class AgenticRunnerTests(unittest.TestCase):
         self.assertIn("检索账本", llm.last_user_prompt)
         self.assertIn("优先补查未覆盖来源", llm.last_user_prompt)
         self.assertEqual(planned["next_retrieval_calls"][0]["filters"]["source_name"], "bom.xlsx")
+
+    def test_concurrent_runs_do_not_leak_state_across_contexts(self):
+        # The runner is a process-wide singleton shared across Streamlit
+        # sessions; per-run footer/retrieval-summary must scope per execution
+        # context so one user cannot read another's retrieval summary. A child
+        # context that runs a stream must not leak its results back to the
+        # parent. (Pre-fix, stream() mutated shared instance attributes and the
+        # parent would have seen the child's summary.)
+        runner, backend = self._runner(_FakeLLM(first_sufficient=True))
+
+        # Parent context: no run yet -> defaults.
+        self.assertEqual(runner.get_last_retrieval_summary(), {})
+        self.assertEqual(runner.get_last_footer(), "")
+
+        def run_in_child():
+            out = "".join(
+                runner.stream(
+                    query="查 design_report 选用的料号",
+                    kb_name="kb",
+                    history=[],
+                    ctx=self._ctx(),
+                )
+            )
+            self.assertIn("R-123", out)
+            # Within the child context the run's results are visible.
+            self.assertIn("执行时间线", runner.get_last_footer())
+            self.assertEqual(runner.get_last_retrieval_summary().get("status"), "success")
+
+        contextvars.copy_context().run(run_in_child)
+
+        # Parent context must NOT see the child's run.
+        self.assertEqual(runner.get_last_retrieval_summary(), {})
+        self.assertEqual(runner.get_last_footer(), "")
 
 
 if __name__ == "__main__":
