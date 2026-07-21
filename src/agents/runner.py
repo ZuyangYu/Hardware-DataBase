@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextvars
 import json
+from dataclasses import dataclass, field
 from typing import Generator
 
 from src.agents.graph import (
@@ -28,6 +30,37 @@ from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
+
+
+@dataclass
+class _RunRecord:
+    """Per-execution-context holder for the most recent stream's observability.
+
+    MultiSourceAgentRunner is a process-wide singleton (AppPipeline is
+    @st.cache_resource), so per-instance state would be shared across
+    concurrent Streamlit sessions: one user's retrieval summary / footer /
+    token usage could be read by another after their stream interleaved.
+    Scoping the record to a ContextVar gives each thread/session its own
+    state; the public get_last_* API is unchanged.
+    """
+
+    footer: str = ""
+    retrieval_summary: dict = field(default_factory=dict)
+    token_usage_summary: object = None
+
+
+_RUN_RECORD: contextvars.ContextVar[_RunRecord | None] = contextvars.ContextVar(
+    "agent_run_record", default=None
+)
+
+
+def _current_run() -> _RunRecord:
+    """Return this context's run record, creating one if none exists yet."""
+    record = _RUN_RECORD.get()
+    if record is None:
+        record = _RunRecord()
+        _RUN_RECORD.set(record)
+    return record
 
 
 _OBSERVABILITY_REDACTED_KEYS = {
@@ -85,15 +118,11 @@ class MultiSourceAgentRunner:
         self.spreadsheet_service = spreadsheet_service or SpreadsheetIndexService()
         self.circuit_service = circuit_service or CircuitIndexService()
         self.llm_client = llm_client or LLMClient()
-        # Footer (observability/trace) from the most recent stream; exposed
-        # separately from final_response so the frontend can collapse it.
-        self._last_footer: str = ""
-        # Retrieval summary from the most recent stream (rewritten queries,
-        # retriever type, final evidence count, and the merged evidence list).
-        # Consumed by the log layer to populate query_traces + retrieved_evidence
-        # after the answer finishes streaming. Reset on every stream() entry.
-        self._last_retrieval_summary: dict = {}
-        self._last_token_usage_summary = None
+        # Start this context's run record empty so a freshly constructed runner
+        # (incl. one built per test) never inherits stale state left in the
+        # current thread's context. stream() replaces it per call; concurrent
+        # sessions on this singleton each get their own record via _RUN_RECORD.
+        _RUN_RECORD.set(_RunRecord())
         self.catalog_tool = PipelineCatalogTool(
             document_store=self.document_store,
             spreadsheet_service=self.spreadsheet_service,
@@ -132,6 +161,9 @@ class MultiSourceAgentRunner:
         thread_id: str = "",
     ) -> Generator[str, None, None]:
         """Run the compiled LangGraph agent and stream answer deltas."""
+        # Fresh per-call record so concurrent streams on this singleton each
+        # read their own footer/summary/usage instead of clobbering each other.
+        _RUN_RECORD.set(_RunRecord())
         self._last_footer = ""
         self._last_retrieval_summary = {}
         self._last_token_usage_summary = None
@@ -481,6 +513,33 @@ class MultiSourceAgentRunner:
                 entry["suggested_queries"] = meta.get("suggested_queries", [])
         return [rounds[k] for k in sorted(rounds)]
 
+    @property
+    def _last_footer(self) -> str:
+        record = _RUN_RECORD.get()
+        return record.footer if record is not None else ""
+
+    @_last_footer.setter
+    def _last_footer(self, value: str) -> None:
+        _current_run().footer = value
+
+    @property
+    def _last_retrieval_summary(self) -> dict:
+        record = _RUN_RECORD.get()
+        return record.retrieval_summary if record is not None else {}
+
+    @_last_retrieval_summary.setter
+    def _last_retrieval_summary(self, value: dict) -> None:
+        _current_run().retrieval_summary = value
+
+    @property
+    def _last_token_usage_summary(self):
+        record = _RUN_RECORD.get()
+        return record.token_usage_summary if record is not None else None
+
+    @_last_token_usage_summary.setter
+    def _last_token_usage_summary(self, value) -> None:
+        _current_run().token_usage_summary = value
+
     def get_last_footer(self) -> str:
         """Return the observability/trace footer produced by the most recent
         stream call. The frontend renders this in a collapsed expander."""
@@ -500,7 +559,9 @@ class MultiSourceAgentRunner:
         return self._last_token_usage_summary
 
     def clear_last_token_usage_summary(self) -> None:
-        self._last_token_usage_summary = None
+        record = _RUN_RECORD.get()
+        if record is not None:
+            record.token_usage_summary = None
 
     def _reset_llm_usage(self) -> None:
         reset_usage = getattr(self.llm_client, "reset_usage", None)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import contextvars
 import json
 import random
 import time
@@ -115,6 +116,17 @@ class LLMUsageSummary:
         return self.usage_returned_count > 0
 
 
+# LLMClient is a process-wide singleton (owned by the singleton
+# AppPipeline/MultiSourceAgentRunner), so per-instance usage records would be
+# shared across concurrent Streamlit sessions: one user's chat() could append
+# to / reset / read another user's records. Scoping the list to an execution
+# context (ContextVar) gives each thread/session its own list with no API
+# change to reset_usage / get_usage_summary / _record_usage.
+_USAGE_RECORDS: contextvars.ContextVar[list[LLMUsageRecord] | None] = contextvars.ContextVar(
+    "llm_client_usage_records", default=None
+)
+
+
 class LLMClient:
     """Project-owned chat client for agent answer generation.
 
@@ -124,7 +136,22 @@ class LLMClient:
 
     def __init__(self, config: LLMClientConfig | None = None):
         self.config = config
-        self._usage_records: list[LLMUsageRecord] = []
+        # Reset this context's usage log so a freshly constructed client
+        # (incl. one built per test) never inherits stale records left in the
+        # current thread's context. Goes through the property setter below.
+        self._usage_records = []
+
+    @property
+    def _usage_records(self) -> list[LLMUsageRecord]:
+        records = _USAGE_RECORDS.get()
+        if records is None:
+            records = []
+            _USAGE_RECORDS.set(records)
+        return records
+
+    @_usage_records.setter
+    def _usage_records(self, value: list[LLMUsageRecord]) -> None:
+        _USAGE_RECORDS.set(list(value))
 
     def reset_usage(self) -> None:
         self._usage_records = []
