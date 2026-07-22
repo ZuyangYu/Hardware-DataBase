@@ -46,6 +46,18 @@ uv run ruff check .                         # lint
 uv sync --group eval
 uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
 uv run hardware-database-eval run --dataset evaluation/datasets/hardware_qa_v1.jsonl --output storage/evaluations
+
+# API 服务 + CLI + MCP（为前后端分离铺路；RAGFlow key 只在服务侧）
+uv run hardware-database-server             # 启动 API（默认 127.0.0.1:8000；HDB_API_HOST/PORT）
+uv run hardware-database login --user <u>   # 登录，令牌存 ~/.config/hardware-database/
+uv run hardware-database list-kb            # 列出可访问知识库
+uv run hardware-database query --kb <name> "问题"                  # 检索（流式）；--json 输出结构化结果
+uv run hardware-database upload --kb <name> --group <g> FILE...    # 上传（部门管理员；--group 缺省自动分类）
+uv run hardware-database list-files --kb <name>
+uv run hardware-database delete --kb <name> --file <name>          # 需 admin
+
+# MCP server（把 API 暴露成 Claude Code 等本地 agent 的工具；stdio 传输）
+uv run hardware-database-mcp               # stdio MCP server；需 API 服务在跑 + 已 login
 ```
 
 Tests import via the `src.` package path and run from the repo root.
@@ -196,6 +208,9 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 `summary.csv` / `report.html` to `storage/evaluations/<run_id>/`. Built-in
 25-sample dataset at `evaluation/datasets/hardware_qa_v1.jsonl`; the Streamlit
 "🧪 RAGAS 评估" tab is system-admin-only and wraps `EvaluationService`.
+
+### API、CLI 与 MCP (`src/api/`, `src/cli/`, `src/mcp/`)
+前后端分离的铺路层,长期资产。`src/api/` 是 FastAPI 服务(**就是未来的后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务;`src/cli/` 是它的 HTTP 客户端(`hardware-database` 命令);`src/mcp/`(`server.py`)是 MCP server,把同一套 HTTP API 暴露成 Claude Code 等本地 agent 的工具(**是 API 的客户端,不是 in-process 旁路**),复用 `src/cli/client.ApiClient` 做 HTTP+SSE,token/url 解析也复用 CLI 的 `HDB_TOKEN`/会话。RAGFlow key / `.env` / `auth.db` 只在服务侧,CLI/MCP 不持有。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:普通用户只能检索,部门管理员才能上传/建库/删除。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。`POST /query` 走 SSE(delta/done/error 事件);上传 `POST /kbs/{kb}/files`(multipart)。启动 `hardware-database-server`;CLI 子命令 login/whoami/list-kb/query(--json)/upload/list-files/delete,令牌持久化于 `~/.config/hardware-database/`,API 地址由 `HDB_API_URL`/`--api-url` 指定。MCP server(`hardware-database-mcp`,stdio 传输)工具:health/whoami/list_kbs/list_files/query/upload/delete,出错返回结构化 dict 而非抛异常;项目级 `.mcp.json` 已注册,Claude Code 自动发现。用法:起 `hardware-database-server` + `login` 后,Claude Code 经 MCP 原生调用 `query` 等工具,不必走 Bash。Streamlit 暂不改,与 API/MCP 并存。
 
 ### Other subsystems
 - `src/test_data/` - structured test-data domain (CSV/JSON ->
