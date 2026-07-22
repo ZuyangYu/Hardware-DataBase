@@ -10,6 +10,7 @@ from typing import Callable
 from src.core.app_pipeline import AppPipeline
 
 from .answer_runner import AnswerRunner
+from .cohorts import evaluation_cohort, is_ragas_metric
 from .config import EvaluationConfig
 from .dataset_loader import load_dataset, validate_dataset
 from .gates import DEFAULT_THRESHOLDS, evaluate_gate
@@ -20,6 +21,7 @@ from .schemas import (
     AnswerSnapshot,
     EvaluationSample,
     EvaluationSummary,
+    MetricResult,
     SampleResult,
 )
 from .snapshot_store import SnapshotStore
@@ -96,6 +98,7 @@ class EvaluationService:
     ) -> tuple[EvaluationSummary, list[SampleResult]]:
         metric_names = DEFAULT_STANDARD_METRICS if metric_names is None else metric_names
         snapshot_by_id = {snapshot.sample_id: snapshot for snapshot in snapshots}
+        sample_cohorts = {sample.id: evaluation_cohort(sample) for sample in samples}
         sample_results: dict[str, SampleResult] = {}
         for sample in samples:
             snapshot = snapshot_by_id.get(sample.id)
@@ -112,6 +115,7 @@ class EvaluationService:
                 snapshot_status=status,
                 metrics=metrics,
             )
+            sample_results[sample.id].metadata["evaluation_cohort"] = sample_cohorts[sample.id]
             if snapshot is not None and snapshot.retrieval_summary:
                 sample_results[sample.id].metadata["retrieval_summary"] = (
                     snapshot.retrieval_summary
@@ -122,32 +126,56 @@ class EvaluationService:
                 )
 
         if metric_names:
-            adapter = self.ragas_adapter
-            if adapter is None:
-                config = self.config or EvaluationConfig.from_environment()
-                adapter = RagasAdapter(config)
-            scoring_snapshots = snapshots
-            if isinstance(adapter, RagasAdapter):
-                scoring_snapshots, diagnostics = adapter.prepare_snapshots_for_scoring(snapshots)
-                for sample_id, diagnostic in diagnostics.items():
-                    if sample_id in sample_results:
-                        sample_results[sample_id].metadata["ragas_scoring"] = diagnostic
-                metrics = adapter.score(
-                    samples,
-                    scoring_snapshots,
-                    metric_names,
-                    snapshots_prepared=True,
-                )
-            else:
-                metrics = adapter.score(samples, snapshots, metric_names)
-            for metric in metrics:
-                sample_results[metric.sample_id].metrics.append(metric)
+            retrieval_samples = [
+                sample for sample in samples if sample_cohorts[sample.id] == "retrieval"
+            ]
+            retrieval_ids = {sample.id for sample in retrieval_samples}
+            retrieval_snapshots = [
+                snapshot for snapshot in snapshots if snapshot.sample_id in retrieval_ids
+            ]
+            for sample in samples:
+                if sample_cohorts[sample.id] != "non_retrieval":
+                    continue
+                for metric_name in metric_names:
+                    if is_ragas_metric(metric_name):
+                        sample_results[sample.id].metrics.append(
+                            MetricResult(
+                                sample_id=sample.id,
+                                metric_name=metric_name,
+                                status="not_applicable",
+                                reason="sample intentionally does not use knowledge-base retrieval",
+                            )
+                        )
+            if retrieval_samples:
+                adapter = self.ragas_adapter
+                if adapter is None:
+                    config = self.config or EvaluationConfig.from_environment()
+                    adapter = RagasAdapter(config)
+                scoring_snapshots = retrieval_snapshots
+                if isinstance(adapter, RagasAdapter):
+                    scoring_snapshots, diagnostics = adapter.prepare_snapshots_for_scoring(
+                        retrieval_snapshots
+                    )
+                    for sample_id, diagnostic in diagnostics.items():
+                        if sample_id in sample_results:
+                            sample_results[sample_id].metadata["ragas_scoring"] = diagnostic
+                    metrics = adapter.score(
+                        retrieval_samples,
+                        scoring_snapshots,
+                        metric_names,
+                        snapshots_prepared=True,
+                    )
+                else:
+                    metrics = adapter.score(retrieval_samples, retrieval_snapshots, metric_names)
+                for metric in metrics:
+                    sample_results[metric.sample_id].metrics.append(metric)
 
         ordered_results = [sample_results[sample.id] for sample in samples]
         gate = evaluate_gate(
             ordered_results,
             thresholds or DEFAULT_THRESHOLDS,
             fail_on_threshold=fail_on_threshold,
+            sample_cohorts=sample_cohorts,
         )
         metric_failures = Counter(
             metric.metric_name

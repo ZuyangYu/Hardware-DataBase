@@ -140,6 +140,7 @@ class EvaluationServiceTests(unittest.TestCase):
             results[0].metadata["retrieval_summary"],
             {"final_top_k": 2, "claim_coverage": []},
         )
+        self.assertEqual(results[0].metadata["evaluation_cohort"], "retrieval")
 
     def test_score_retains_raw_response_and_exposes_scored_response(self):
         snapshot = _snapshot().model_copy(
@@ -166,6 +167,24 @@ class EvaluationServiceTests(unittest.TestCase):
         self.assertEqual(summary.failed_samples, 1)
         self.assertEqual(summary.successful_samples, 0)
 
+    def test_non_retrieval_sample_skips_ragas_backend_and_marks_metrics_not_applicable(self):
+        backend = CapturingBackend()
+        service = EvaluationService(ragas_adapter=RagasAdapter(_config(), backend=backend))
+        sample = _sample().model_copy(update={"tags": ["direct", "small-talk"]})
+
+        summary, results = service.score(
+            [sample],
+            [_snapshot().model_copy(update={"retrieved_contexts": []})],
+            metric_names=["answer_correctness", "answer_relevancy"],
+        )
+
+        self.assertEqual(backend.records, [])
+        ragas_metrics = [
+            metric for metric in results[0].metrics if metric.metric_name.startswith("answer_")
+        ]
+        self.assertTrue(all(metric.status == "not_applicable" for metric in ragas_metrics))
+        self.assertNotIn("answer_correctness", summary.metric_scores)
+
     def test_score_preserves_original_contexts_and_records_scoring_budget(self):
         backend = CapturingBackend()
         service = EvaluationService(ragas_adapter=RagasAdapter(_config(), backend=backend))
@@ -185,6 +204,9 @@ class EvaluationServiceTests(unittest.TestCase):
                 "scored_context_characters": 6,
                 "contexts_truncated": True,
                 "context_selection": "original_order",
+                "selected_evidence_ids": [],
+                "selected_claim_ids": [],
+                "excluded_evidence_ids": [],
             },
         )
         self.assertEqual(backend.records[0][0]["retrieved_contexts"], ["aaaa", "bb"])

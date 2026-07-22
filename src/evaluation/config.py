@@ -22,6 +22,16 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _fraction_env(name: str, default: float) -> float:
+    try:
+        value = float(_env(name, str(default)))
+    except ValueError as exc:
+        raise EvaluationConfigurationError(f"{name} must be a number between 0 and 1") from exc
+    if not 0 < value < 1:
+        raise EvaluationConfigurationError(f"{name} must be greater than 0 and less than 1")
+    return value
+
+
 def _ollama_v1_url(base_url: str) -> str:
     base_url = base_url.rstrip("/")
     return base_url if base_url.endswith("/v1") else f"{base_url}/v1"
@@ -37,8 +47,11 @@ class EvaluationConfig:
     embedding_api_key: str
     embedding_model: str
     llm_max_tokens: int = 8192
-    max_contexts_per_sample: int = 8
-    max_context_chars: int = 12000
+    max_contexts_per_sample: int = 4
+    max_context_chars: int = 4000
+    max_context_chars_per_item: int = 1200
+    scoring_max_budget_attempts: int = 3
+    scoring_context_shrink_factor: float = 0.5
     timeout_seconds: int = 120
     max_workers: int = 4
     max_retries: int = 2
@@ -79,8 +92,11 @@ class EvaluationConfig:
         if not embedding_model:
             raise EvaluationConfigurationError("EVAL_EMBEDDING_MODEL is required")
         llm_max_tokens = _positive_int_env("EVAL_LLM_MAX_TOKENS", 8192)
-        max_contexts_per_sample = _positive_int_env("EVAL_MAX_CONTEXTS_PER_SAMPLE", 8)
-        max_context_chars = _positive_int_env("EVAL_MAX_CONTEXT_CHARS", 12000)
+        max_contexts_per_sample = _positive_int_env("EVAL_MAX_CONTEXTS_PER_SAMPLE", 4)
+        max_context_chars = _positive_int_env("EVAL_MAX_CONTEXT_CHARS", 4000)
+        max_context_chars_per_item = _positive_int_env("EVAL_MAX_CONTEXT_CHARS_PER_ITEM", 1200)
+        scoring_max_budget_attempts = _positive_int_env("EVAL_SCORING_MAX_BUDGET_ATTEMPTS", 3)
+        scoring_context_shrink_factor = _fraction_env("EVAL_SCORING_CONTEXT_SHRINK_FACTOR", 0.5)
 
         return cls(
             llm_provider=provider,
@@ -93,13 +109,16 @@ class EvaluationConfig:
             llm_max_tokens=llm_max_tokens,
             max_contexts_per_sample=max_contexts_per_sample,
             max_context_chars=max_context_chars,
+            max_context_chars_per_item=max_context_chars_per_item,
+            scoring_max_budget_attempts=scoring_max_budget_attempts,
+            scoring_context_shrink_factor=scoring_context_shrink_factor,
             timeout_seconds=int(_env("EVAL_TIMEOUT_SECONDS", _env("AGENT_TIMEOUT_SECONDS", "120"))),
             max_workers=max(1, int(_env("EVAL_MAX_WORKERS", "4"))),
             max_retries=max(0, int(_env("EVAL_MAX_RETRIES", "2"))),
             output_root=_env("EVAL_OUTPUT_ROOT", "storage/evaluations"),
         )
 
-    def public_metadata(self) -> dict[str, str | int]:
+    def public_metadata(self) -> dict[str, str | int | float]:
         return {
             "llm_provider": self.llm_provider,
             "llm_base_url": self.llm_base_url,
@@ -109,6 +128,9 @@ class EvaluationConfig:
             "llm_max_tokens": self.llm_max_tokens,
             "max_contexts_per_sample": self.max_contexts_per_sample,
             "max_context_chars": self.max_context_chars,
+            "max_context_chars_per_item": self.max_context_chars_per_item,
+            "scoring_max_budget_attempts": self.scoring_max_budget_attempts,
+            "scoring_context_shrink_factor": self.scoring_context_shrink_factor,
             "timeout_seconds": self.timeout_seconds,
             "max_workers": self.max_workers,
             "max_retries": self.max_retries,

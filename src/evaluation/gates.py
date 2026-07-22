@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 
+from .cohorts import is_ragas_metric
 from .schemas import GateResult, SampleResult
 
 
@@ -23,6 +25,7 @@ def evaluate_gate(
     thresholds: dict[str, float] | None = None,
     *,
     fail_on_threshold: bool = False,
+    sample_cohorts: Mapping[str, str] | None = None,
 ) -> GateResult:
     active_thresholds = dict(DEFAULT_THRESHOLDS if thresholds is None else thresholds)
     scores: dict[str, list[float]] = defaultdict(list)
@@ -30,6 +33,12 @@ def evaluate_gate(
 
     for sample in results:
         for metric in sample.metrics:
+            if (
+                sample_cohorts is not None
+                and sample_cohorts.get(sample.sample_id) == "non_retrieval"
+                and is_ragas_metric(metric.metric_name)
+            ):
+                continue
             threshold = active_thresholds.get(metric.metric_name)
             if sample.critical and metric.status == "failed" and threshold is not None:
                 failures.append(

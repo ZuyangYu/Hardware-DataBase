@@ -10,6 +10,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, StateGraph
 
 from src.agents.claim_evidence import Claim, ClaimCoverage, EvidenceCapability, plan_claims
+from src.agents.answer_constraints import reportable_conflicts
 from src.agents.query_tokens import tokenize_hardware_query
 from src.agents.state import (
     AgentState,
@@ -1654,7 +1655,7 @@ def score_and_compare_evidence(state: AgentState) -> AgentState:
                 gap_feedback=gap_feedback,
             ).model_dump()
         )
-    conflicts = _detect_evidence_conflicts(evidence)
+    conflicts = reportable_conflicts(evidence, state.get("user_query", ""))
     matrix = CoverageMatrix(coverage=coverage_items, conflicts=conflicts, recommended_followups=followups[:6])
     return {
         **state,

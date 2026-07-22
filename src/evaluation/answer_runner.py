@@ -97,6 +97,17 @@ def _sanitize(value: Any, depth: int = 0) -> Any:
     return value
 
 
+def _safe_error_message(exc: Exception | None) -> str:
+    if exc is None:
+        return "evaluation collection failed; see application logs"
+    detail = re.sub(
+        r"(?i)\b(api[_-]?key|password|secret|token|authorization)\b(?:\s*[=:]\s*|\s*[-_]\s*)?\S*",
+        r"\1=[redacted]",
+        str(exc),
+    )
+    return f"evaluation collection failed ({type(exc).__name__}: {detail[:300]})"
+
+
 def _request_context(sample: EvaluationSample) -> RequestContext:
     raw = sample.request_context
     department_id = raw.get("department_id")
@@ -120,8 +131,8 @@ class AnswerRunner:
         started = perf_counter()
         try:
             pipeline = self._pipeline_factory()
-        except Exception:
-            return self._failed(sample, started_at, started, "pipeline_initialization")
+        except Exception as exc:
+            return self._failed(sample, started_at, started, "pipeline_initialization", exc)
 
         try:
             parts = list(
@@ -155,18 +166,24 @@ class AnswerRunner:
                 duration_seconds=max(0.0, perf_counter() - started),
                 metadata={"scored_response_filter": filter_diagnostic},
             )
-        except Exception:
-            return self._failed(sample, started_at, started, "answer_collection")
+        except Exception as exc:
+            return self._failed(sample, started_at, started, "answer_collection", exc)
 
     @staticmethod
-    def _failed(sample: EvaluationSample, started_at: str, started: float, stage: str) -> AnswerSnapshot:
+    def _failed(
+        sample: EvaluationSample,
+        started_at: str,
+        started: float,
+        stage: str,
+        exc: Exception | None = None,
+    ) -> AnswerSnapshot:
         return AnswerSnapshot(
             sample_id=sample.id,
             question=sample.question,
             kb_name=sample.kb_name,
             status="failed",
             error_stage=stage,
-            error_message="evaluation collection failed; see application logs",
+            error_message=_safe_error_message(exc),
             started_at=started_at,
             finished_at=_utc_now(),
             duration_seconds=max(0.0, perf_counter() - started),

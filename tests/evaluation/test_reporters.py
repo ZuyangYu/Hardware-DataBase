@@ -31,12 +31,14 @@ class ReporterTests(unittest.TestCase):
                 scored_response="正文回答",
                 retrieved_contexts=["检索上下文"],
                 metadata={
+                    "evaluation_cohort": "retrieval",
                     "ragas_scoring": {
                         "original_context_count": 3,
                         "original_context_characters": 120,
                         "scored_context_count": 2,
                         "scored_context_characters": 80,
                         "contexts_truncated": True,
+                        "selected_claim_ids": ["c1"],
                     }
                 },
                 metrics=[
@@ -55,6 +57,8 @@ class ReporterTests(unittest.TestCase):
         self.assertEqual(loaded["metric_scores"]["faithfulness"], 0.8)
         result_json = json.loads(paths.results_jsonl.read_text(encoding="utf-8"))
         self.assertEqual(result_json["metadata"]["ragas_scoring"]["scored_context_count"], 2)
+        self.assertEqual(result_json["metadata"]["evaluation_cohort"], "retrieval")
+        self.assertEqual(result_json["metadata"]["ragas_scoring"]["selected_claim_ids"], ["c1"])
         self.assertEqual(result_json["scored_response"], "正文回答")
         with paths.summary_csv.open(encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))

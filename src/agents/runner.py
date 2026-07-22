@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Generator
 
+from src.agents.answer_constraints import answer_contract
 from src.agents.graph import (
     _chat_with_usage_stage,
     _stream_chat_with_usage_stage,
@@ -260,6 +261,12 @@ class MultiSourceAgentRunner:
             answer = "当前知识库中未找到可支撑回答的证据。"
             _write_stream_event({"type": "answer_delta", "delta": answer})
         else:
+            response_contract = answer_contract(
+                str(state.get("user_query") or ""),
+                list(state.get("claim_coverage") or []),
+                list(ledger),
+                list(coverage.get("conflicts") or []),
+            )
             context = "\n\n".join(
                 f"[{index}] Source: {item.get('source_name')} | Kind: {item.get('content_kind')} | "
                 f"Locator: {json.dumps(item.get('locator') or {}, ensure_ascii=False)}\n{item.get('content')}"
@@ -270,6 +277,7 @@ class MultiSourceAgentRunner:
             quality_text = json.dumps(evidence_quality[:20], ensure_ascii=False, indent=2)
             diagnostics_text = json.dumps(retrieval_diagnostics[-12:], ensure_ascii=False, indent=2)
             user_prompt = (
+                f"回答约束：\n{response_contract}\n\n"
                 f"用户问题：{state.get('user_query')}\n\n"
                 f"证据覆盖度：\n{coverage_text}\n\n"
                 f"检索账本（按子问题列出覆盖/缺口/gap feedback）：\n{ledger_text}\n\n"
