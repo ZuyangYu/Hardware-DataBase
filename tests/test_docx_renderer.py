@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import zipfile
 from types import SimpleNamespace
@@ -188,7 +189,8 @@ def test_service_dispatches_docx_fill_plan_to_docx_renderer():
     service.workbook_renderer = None
     service._policy = lambda template: policy
     template = TemplateVersion(
-        template_version_id="docx-template", template_id="docx", format="docx", content_hash="a" * 64,
+        template_version_id="docx-template", template_id="docx", format="docx",
+        content_hash=hashlib.sha256(b"docx bytes").hexdigest(),
         template_schema_id="docx-schema", template_schema_version="1", renderer_policy_id="docx-policy",
     )
 

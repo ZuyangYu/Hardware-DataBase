@@ -13,7 +13,7 @@ approved internal_harness DocumentSchema
   → validated Evidence Package
   → Managed Writer structured DocumentUnitDraft
   → assertion / contamination / consistency validation
-  → validated WorkbookFillPlan
+  → validated WorkbookFillPlan / DocxFillPlan
   → review_candidate + ValidationReport + Human Review Queue
 ```
 
@@ -23,6 +23,7 @@ approved internal_harness DocumentSchema
 - `ManagedWriter` 只接收一个单元的 Schema 文本和已验证 Evidence Package；Provider 必须返回结构化 `DocumentUnitDraft`，不能返回或改写二进制文档。
 - 运行清单记录来源快照 hash、基线 hash、来源版本、解析产物、区域策略、模板 hash、Schema/策略 hash、预算、Prompt 版本及本次使用的 Evidence 内容 hash。
 - Writer 输出先校验 Evidence ID、断言 Evidence ID 和词法锚点；再检测登记的 `LegacyTemplateClaim`，并检查带 `consistency_key` 的跨单元冲突。仅 `supported + ready_to_render` 的 Draft 可生成 FillPlan。
+- DOCX FillPlan 只能落到已确认的 allowlisted Region；renderer 只允许 `word/document.xml` 的批准变动，并保留其他包成员、relationship 与主动内容的完整性。模板确认绑定持久化内容 hash；每次渲染前服务会重新计算存储字节并要求其匹配冻结的 TemplateVersion 和分析记录，不能将分析结果应用于任何后来替换的字节。
 
 ## 调用方式
 
@@ -36,7 +37,7 @@ candidate = document_generation.run_internal_harness(
 )
 ```
 
-Streamlit 创建页会根据批准 Schema 的 `execution_mode` 显示 Harness Policy 选择；确定性 Schema 不显示该项。运行状态中会显示最新 HarnessRun 的节点、步骤和检索轮次。
+Streamlit 创建页会根据批准 Schema 的 `execution_mode` 显示 Harness Policy 选择；确定性 Schema 不显示该项。运行状态中会从持久化 HarnessRun、Checkpoint、WorkOrder 和 Artifact 读取最新节点、步骤、检索轮次及候选状态，页面刷新不会把会话内存当作运行状态。
 
 ## 已覆盖的安全回归
 
@@ -51,3 +52,5 @@ Streamlit 创建页会根据批准 Schema 的 `execution_mode` 显示 Harness Po
 ## 后续可靠性边界
 
 P2c 的第一增量已经补充 SQLite 租约、heartbeat、fencing token、Checkpoint、Draft 节点回执以及暂停/取消/有限重试，见 [document_authoring_p2c.md](document_authoring_p2c.md)。多实例调度、交易 outbox、Artifact/人工事件回执和进程重启后的回调重建仍不属于当前实现。
+
+外部 Agent Adapter、MCP、聊天 Agent 回退、全局来源搜索、任意文件访问及模型专属测试依赖仍属于 P3 范围，不能作为内部 Harness 的替代输入或执行路径。

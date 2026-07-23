@@ -778,7 +778,7 @@ class DocumentGenerationService:
     ) -> tuple[bytes, dict]:
         if fill_plan.template_version_id != template.template_version_id:
             raise PermissionError("FillPlan belongs to a different frozen template version")
-        content = self.store.read_template_content(template.template_version_id)
+        content = self._read_hash_bound_template_content(template)
         policy = self._policy(template)
         if template.format in {"xlsx", "xlsm"}:
             if not isinstance(fill_plan, WorkbookFillPlan):
@@ -803,6 +803,18 @@ class DocumentGenerationService:
         else:
             raise ValueError(f"unsupported controlled output format: {template.format}")
         return result.content, result.integrity_manifest
+
+    def _read_hash_bound_template_content(self, template: TemplateVersion) -> bytes:
+        """Return only bytes that still match the frozen template analysis and version."""
+        content = self.store.read_template_content(template.template_version_id)
+        actual_hash = hashlib.sha256(content).hexdigest()
+        if actual_hash != template.content_hash:
+            raise ValueError("template content hash changed since confirmation")
+        get_analysis = getattr(self.store, "get_template_analysis", None)
+        analysis = get_analysis(template.template_version_id) if get_analysis is not None else None
+        if analysis is not None and analysis.content_hash != actual_hash:
+            raise ValueError("template content hash no longer matches its analysis")
+        return content
 
     @staticmethod
     def _validate_retrieval_outcome(order: DocumentWorkOrder, snapshot, outcome: RetrievalOutcome) -> None:
