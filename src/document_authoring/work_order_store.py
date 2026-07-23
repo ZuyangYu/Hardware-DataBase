@@ -31,6 +31,7 @@ from src.document_authoring.models import (
     AuthoringRunManifest,
     content_hash,
     RendererPolicy,
+    TemplateSanitizationReport,
     TemplateSecurityReport,
     TemplateUnitBinding,
     TemplateVersion,
@@ -82,6 +83,11 @@ class DocumentAuthoringStore:
                 );
                 CREATE TABLE IF NOT EXISTS template_security_reports (
                     report_id TEXT PRIMARY KEY, template_version_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    FOREIGN KEY(template_version_id) REFERENCES template_versions(template_version_id)
+                );
+                CREATE TABLE IF NOT EXISTS template_sanitization_reports (
+                    template_version_id TEXT PRIMARY KEY,
                     payload_json TEXT NOT NULL,
                     FOREIGN KEY(template_version_id) REFERENCES template_versions(template_version_id)
                 );
@@ -270,6 +276,75 @@ class DocumentAuthoringStore:
                 raise
         return template
 
+    def save_sanitized_template(
+        self,
+        template: TemplateVersion,
+        source_content: bytes,
+        source_format: str,
+        sanitized_content: bytes,
+        security_report: TemplateSecurityReport,
+        sanitization_report: TemplateSanitizationReport,
+    ) -> TemplateVersion:
+        """Persist a safe renderable template and its audit-only uploaded source."""
+        source_hash = hashlib.sha256(source_content).hexdigest()
+        sanitized_hash = hashlib.sha256(sanitized_content).hexdigest()
+        allowed_conversions = {("xlsm", "xlsx"), ("xlsx", "xlsx"), ("docx", "docx")}
+        if (source_format, template.format) not in allowed_conversions:
+            raise ValueError("unsupported sanitization conversion")
+        if sanitization_report.status != "sanitized":
+            raise ValueError("sanitization report must have sanitized status")
+        if (
+            sanitization_report.template_version_id != template.template_version_id
+            or sanitization_report.source_format != source_format
+            or sanitization_report.sanitized_format != template.format
+        ):
+            raise ValueError("sanitization report does not match template formats")
+        if sanitization_report.source_content_hash != source_hash:
+            raise ValueError("source content hash does not match source bytes")
+        if template.content_hash != sanitized_hash or sanitization_report.sanitized_content_hash != sanitized_hash:
+            raise ValueError("sanitized content hash does not match sanitized bytes")
+        if (
+            security_report.content_hash != sanitized_hash
+            or security_report.format != template.format
+            or security_report.active_content_status != "clean"
+        ):
+            raise ValueError("security report does not attest to the clean sanitized template")
+
+        safe_path = self._storage_path("templates", f"{template.template_version_id}.{template.format}")
+        source_path = self._storage_path("template_sources", f"{template.template_version_id}.{source_format}")
+        template = template.model_copy(update={
+            "storage_ref": safe_path,
+            "security_report_id": security_report.report_id,
+        })
+        sanitization_report = sanitization_report.model_copy(update={"source_storage_ref": source_path})
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT 1 FROM template_versions WHERE template_version_id = ?", (template.template_version_id,)
+                ).fetchone()
+                if existing is not None:
+                    raise ValueError("template already exists")
+                self._atomic_write(source_path, source_content)
+                self._atomic_write(safe_path, sanitized_content)
+                self._put(conn, "template_versions", {
+                    "template_version_id": template.template_version_id,
+                    "status": template.status,
+                    "content_hash": template.content_hash,
+                }, template)
+                self._put(conn, "template_security_reports", {
+                    "report_id": security_report.report_id,
+                    "template_version_id": template.template_version_id,
+                }, security_report)
+                self._put(conn, "template_sanitization_reports", {
+                    "template_version_id": template.template_version_id,
+                }, sanitization_report)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return template
+
     def get_template(self, template_version_id: str) -> TemplateVersion | None:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT payload_json FROM template_versions WHERE template_version_id = ?", (template_version_id,)).fetchone()
@@ -353,6 +428,14 @@ class DocumentAuthoringStore:
                 "SELECT payload_json FROM template_security_reports WHERE template_version_id = ?", (template_version_id,)
             ).fetchone()
         return TemplateSecurityReport.model_validate(_payload(row)) if row else None
+
+    def get_template_sanitization_report(self, template_version_id: str) -> TemplateSanitizationReport | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM template_sanitization_reports WHERE template_version_id = ?",
+                (template_version_id,),
+            ).fetchone()
+        return TemplateSanitizationReport.model_validate(_payload(row)) if row else None
 
     def save_legacy_template_claims(self, template_version_id: str, claims: list[LegacyTemplateClaim]) -> None:
         with closing(self._connect()) as conn:

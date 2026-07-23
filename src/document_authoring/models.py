@@ -41,6 +41,21 @@ class TemplateSecurityReport(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class TemplateSanitizationReport(BaseModel):
+    """Audit record linking an immutable uploaded source to its safe derivative."""
+
+    template_version_id: str
+    source_format: Literal["xlsm", "xlsx", "docx"]
+    source_content_hash: str
+    source_storage_ref: str
+    sanitized_format: Literal["xlsx", "docx"]
+    sanitized_content_hash: str
+    removed_parts: list[str] = Field(default_factory=list)
+    removed_relationships: list[str] = Field(default_factory=list)
+    status: Literal["sanitized", "failed"]
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class RendererPolicy(BaseModel):
     renderer_policy_id: str
     version: str = "1"
