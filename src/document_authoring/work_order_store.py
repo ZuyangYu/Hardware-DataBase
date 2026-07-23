@@ -307,8 +307,11 @@ class DocumentAuthoringStore:
             security_report.content_hash != sanitized_hash
             or security_report.format != template.format
             or security_report.active_content_status != "clean"
+            or security_report.macro_parts
+            or security_report.external_links
+            or security_report.embedded_parts
         ):
-            raise ValueError("security report does not attest to the clean sanitized template")
+            raise ValueError("security report does not attest to a clean template without active content")
 
         safe_path = self._storage_path("templates", f"{template.template_version_id}.{template.format}")
         source_path = self._storage_path("template_sources", f"{template.template_version_id}.{source_format}")
@@ -319,14 +322,17 @@ class DocumentAuthoringStore:
         sanitization_report = sanitization_report.model_copy(update={"source_storage_ref": source_path})
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            created_paths: list[str] = []
             try:
                 existing = conn.execute(
                     "SELECT 1 FROM template_versions WHERE template_version_id = ?", (template.template_version_id,)
                 ).fetchone()
                 if existing is not None:
                     raise ValueError("template already exists")
-                self._atomic_write(source_path, source_content)
-                self._atomic_write(safe_path, sanitized_content)
+                self._atomic_create(source_path, source_content)
+                created_paths.append(source_path)
+                self._atomic_create(safe_path, sanitized_content)
+                created_paths.append(safe_path)
                 self._put(conn, "template_versions", {
                     "template_version_id": template.template_version_id,
                     "status": template.status,
@@ -342,6 +348,11 @@ class DocumentAuthoringStore:
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
+                for path in reversed(created_paths):
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
                 raise
         return template
 
@@ -1422,3 +1433,27 @@ class DocumentAuthoringStore:
             except OSError:
                 pass
             raise
+
+    @staticmethod
+    def _atomic_create(path: str, content: bytes) -> None:
+        """Atomically create immutable content without replacing an existing file."""
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".tmp_", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+        else:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
