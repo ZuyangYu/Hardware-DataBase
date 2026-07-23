@@ -468,18 +468,19 @@ def _relationship_part_for_owner(owner: str) -> str:
 def _active_content_removal_set(package: _Package, source_format: SourceFormat) -> _Removal:
     content_types = _content_types(package)
     main_part = _MAIN_PARTS[source_format]
+    relationships_by_part = _relationships_by_part(package)
+    active_vml_parts = _active_vml_parts(package, content_types, relationships_by_part)
     parts = {
         part_name
-        for part_name, entry in package.entries.items()
+        for part_name in package.entries
         if part_name not in {_CONTENT_TYPES_PART, _ROOT_RELATIONSHIPS_PART, main_part}
         and (
             _is_active_part_name(part_name)
             or _is_active_content_type(content_types.get(part_name, ""))
-            or _xml_part_contains_active_vml(part_name, entry.content)
+            or part_name in active_vml_parts
         )
     }
     relationship_ids: dict[str, set[str]] = {}
-    relationships_by_part = _relationships_by_part(package)
 
     changed = True
     while changed:
@@ -638,9 +639,32 @@ def _relationship_type_name(relationship_type: str) -> str:
     return relationship_type.rstrip("/").rsplit("/", 1)[-1].lower()
 
 
+def _active_vml_parts(
+    package: _Package,
+    content_types: dict[str, str],
+    relationships_by_part: dict[str, list[_Relationship]],
+) -> set[str]:
+    candidates = {
+        part_name
+        for part_name in package.entries
+        if part_name.lower().endswith(".vml")
+        or "vmldrawing" in content_types.get(part_name, "").lower()
+    }
+    for relationships_part, relationships in relationships_by_part.items():
+        candidates.update(
+            _resolve_relationship_target(relationships_part, relationship.target)
+            for relationship in relationships
+            if not relationship.external
+            and _relationship_type_name(relationship.relationship_type) == "vmldrawing"
+        )
+    return {
+        part_name
+        for part_name in candidates
+        if _xml_part_contains_active_vml(part_name, package.entries[part_name].content)
+    }
+
+
 def _xml_part_contains_active_vml(part_name: str, content: bytes) -> bool:
-    if not part_name.lower().endswith(".vml"):
-        return False
     root = _parse_xml(content, part_name)
     for element in root.iter():
         local_name = _local_name(element.tag).lower()
@@ -809,15 +833,17 @@ def _validate_sanitized_package(content: bytes, safe_format: SafeFormat) -> None
     package = _read_package(content)
     _validate_package_structure(package, safe_format)
     content_types = _content_types(package)
+    relationships_by_part = _relationships_by_part(package)
+    active_vml_parts = _active_vml_parts(package, content_types, relationships_by_part)
     for part_name, entry in package.entries.items():
         if _is_active_part_name(part_name) or _is_active_content_type(content_types.get(part_name, "")):
             raise TemplateSanitizationError(f"residual active content part: {part_name}")
-        if _xml_part_contains_active_vml(part_name, entry.content):
+        if part_name in active_vml_parts:
             raise TemplateSanitizationError(f"residual active VML content: {part_name}")
         if _part_is_xml(part_name, content_types) and not part_name.endswith(".rels"):
             _validate_no_active_xml_elements(entry.content, part_name)
 
-    for relationships_part, relationships in _relationships_by_part(package).items():
+    for relationships_part, relationships in relationships_by_part.items():
         for relationship in relationships:
             if relationship.external:
                 raise TemplateSanitizationError(

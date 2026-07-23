@@ -366,6 +366,58 @@ def test_sanitize_xlsx_removes_a_form_control_vml_content_type():
         assert b"legacyDrawing" not in archive.read("xl/worksheets/sheet1.xml")
 
 
+def test_sanitize_xlsx_removes_active_vml_renamed_with_an_xml_suffix():
+    content = _package(
+        {
+            "[Content_Types].xml": _content_types(
+                (
+                    "xl/workbook.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+                ),
+                (
+                    "xl/drawings/control.xml",
+                    "application/vnd.openxmlformats-officedocument.vmlDrawing",
+                ),
+            ),
+            "_rels/.rels": _relationships(
+                _relationship("rRoot", "officeDocument", "xl/workbook.xml"),
+            ),
+            "xl/workbook.xml": _xml(
+                f'<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}">'
+                '<sheets><sheet name="Safe" sheetId="1" r:id="rSheet"/></sheets>'
+                "</workbook>",
+            ),
+            "xl/_rels/workbook.xml.rels": _relationships(
+                _relationship("rSheet", "worksheet", "worksheets/sheet1.xml"),
+            ),
+            "xl/worksheets/sheet1.xml": _xml(
+                f'<worksheet xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}">'
+                '<sheetData/><legacyDrawing r:id="rVml"/></worksheet>',
+            ),
+            "xl/worksheets/_rels/sheet1.xml.rels": _relationships(
+                _relationship("rVml", "vmlDrawing", "../drawings/control.xml"),
+            ),
+            "xl/drawings/control.xml": _xml(
+                '<xml xmlns:x="urn:schemas-microsoft-com:office:excel">'
+                '<shape><x:ClientData ObjectType="Button"/></shape></xml>',
+            ),
+        },
+    )
+
+    result = sanitize_template(content, "xlsx")
+
+    assert "xl/drawings/control.xml" in result.removed_parts
+    with ZipFile(BytesIO(result.content)) as archive:
+        assert "xl/drawings/control.xml" not in archive.namelist()
+        assert b"/xl/drawings/control.xml" not in archive.read("[Content_Types].xml")
+        assert b"rVml" not in archive.read("xl/worksheets/_rels/sheet1.xml.rels")
+        assert b"legacyDrawing" not in archive.read("xl/worksheets/sheet1.xml")
+
+
 def test_sanitize_rejects_a_package_with_a_dangling_relationship():
     with pytest.raises(TemplateSanitizationError, match="dangling"):
         sanitize_template(_package_with_dangling_relationship(), "xlsx")
