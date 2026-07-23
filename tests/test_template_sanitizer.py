@@ -5,6 +5,7 @@ from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 import pytest
 
+from src.document_authoring import template_sanitizer
 from src.document_authoring.template_sanitizer import (
     TemplateSanitizationError,
     sanitize_template,
@@ -16,6 +17,8 @@ RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/package/2006/relationships
 OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 WORDPROCESSING_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+MARKUP_COMPATIBILITY_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+X15_NS = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main"
 
 
 def _xml(value: str) -> bytes:
@@ -416,6 +419,286 @@ def test_sanitize_xlsx_removes_active_vml_renamed_with_an_xml_suffix():
         assert b"/xl/drawings/control.xml" not in archive.read("[Content_Types].xml")
         assert b"rVml" not in archive.read("xl/worksheets/_rels/sheet1.xml.rels")
         assert b"legacyDrawing" not in archive.read("xl/worksheets/sheet1.xml")
+
+
+def test_sanitize_xlsx_prunes_nested_compatibility_wrappers_around_form_controls():
+    content = _package(
+        {
+            "[Content_Types].xml": _content_types(
+                (
+                    "xl/workbook.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+                ),
+                (
+                    "xl/ctrlProps/ctrlProp1.xml",
+                    "application/vnd.ms-excel.controlproperties+xml",
+                ),
+            ),
+            "_rels/.rels": _relationships(
+                _relationship("rRoot", "officeDocument", "xl/workbook.xml"),
+            ),
+            "xl/workbook.xml": _xml(
+                f'<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}">'
+                '<sheets><sheet name="Safe" sheetId="1" r:id="rSheet"/></sheets>'
+                "</workbook>",
+            ),
+            "xl/_rels/workbook.xml.rels": _relationships(
+                _relationship("rSheet", "worksheet", "worksheets/sheet1.xml"),
+            ),
+            "xl/worksheets/sheet1.xml": _xml(
+                f'<worksheet xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}" '
+                f'xmlns:mc="{MARKUP_COMPATIBILITY_NS}" xmlns:x15="{X15_NS}">'
+                "<sheetData/>"
+                '<mc:AlternateContent><mc:Choice Requires="x15"><controls>'
+                '<mc:AlternateContent><mc:Choice Requires="x15">'
+                '<control shapeId="1" r:id="rControl"/>'
+                "</mc:Choice></mc:AlternateContent>"
+                "</controls></mc:Choice></mc:AlternateContent>"
+                "</worksheet>",
+            ),
+            "xl/worksheets/_rels/sheet1.xml.rels": _relationships(
+                _relationship("rControl", "ctrlProp", "../ctrlProps/ctrlProp1.xml"),
+            ),
+            "xl/ctrlProps/ctrlProp1.xml": _xml("<formControl/>"),
+        },
+    )
+
+    result = sanitize_template(content, "xlsx")
+
+    with ZipFile(BytesIO(result.content)) as archive:
+        worksheet = archive.read("xl/worksheets/sheet1.xml")
+        assert b"control" not in worksheet
+        assert b"AlternateContent" not in worksheet
+        assert b"Choice" not in worksheet
+
+
+def test_sanitize_xlsx_keeps_unrelated_empty_compatibility_branches():
+    content = _package(
+        {
+            "[Content_Types].xml": _content_types(
+                (
+                    "xl/workbook.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+                ),
+            ),
+            "_rels/.rels": _relationships(
+                _relationship("rRoot", "officeDocument", "xl/workbook.xml"),
+            ),
+            "xl/workbook.xml": _xml(
+                f'<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}">'
+                '<sheets><sheet name="Safe" sheetId="1" r:id="rSheet"/></sheets>'
+                "</workbook>",
+            ),
+            "xl/_rels/workbook.xml.rels": _relationships(
+                _relationship("rSheet", "worksheet", "worksheets/sheet1.xml"),
+            ),
+            "xl/worksheets/sheet1.xml": _xml(
+                f'<worksheet xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}" '
+                f'xmlns:mc="{MARKUP_COMPATIBILITY_NS}" xmlns:x15="{X15_NS}">'
+                '<mc:AlternateContent><mc:Choice Requires="x15"/>'
+                "</mc:AlternateContent>"
+                '<hyperlinks><hyperlink ref="A1" r:id="rWeb"/></hyperlinks>'
+                "</worksheet>",
+            ),
+            "xl/worksheets/_rels/sheet1.xml.rels": _relationships(
+                _relationship("rWeb", "hyperlink", "https://example.invalid", external=True),
+            ),
+        },
+    )
+
+    result = sanitize_template(content, "xlsx")
+
+    with ZipFile(BytesIO(result.content)) as archive:
+        worksheet = archive.read("xl/worksheets/sheet1.xml")
+    from xml.etree import ElementTree
+
+    root = ElementTree.fromstring(worksheet)
+    choice = root.find(f".//{{{MARKUP_COMPATIBILITY_NS}}}Choice")
+    assert choice is not None
+    assert choice.attrib["Requires"] == "x15"
+
+
+def test_sanitize_xlsx_preserves_namespaces_referenced_only_by_mce_attributes():
+    content = _package(
+        {
+            "[Content_Types].xml": _content_types(
+                (
+                    "xl/workbook.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+                ),
+            ),
+            "_rels/.rels": _relationships(
+                _relationship("rRoot", "officeDocument", "xl/workbook.xml"),
+            ),
+            "xl/workbook.xml": _xml(
+                f'<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}">'
+                '<sheets><sheet name="Safe" sheetId="1" r:id="rSheet"/></sheets>'
+                "</workbook>",
+            ),
+            "xl/_rels/workbook.xml.rels": _relationships(
+                _relationship("rSheet", "worksheet", "worksheets/sheet1.xml"),
+            ),
+            "xl/worksheets/sheet1.xml": _xml(
+                f'<worksheet xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}" '
+                f'xmlns:mc="{MARKUP_COMPATIBILITY_NS}" xmlns:x15="{X15_NS}" '
+                'mc:Ignorable="x15">'
+                '<mc:AlternateContent><mc:Choice Requires="x15">'
+                '<sheetData><custom xmlns:x15="urn:unrelated"/></sheetData>'
+                "</mc:Choice></mc:AlternateContent>"
+                '<hyperlinks><hyperlink ref="A1" r:id="rWeb"/></hyperlinks>'
+                "</worksheet>",
+            ),
+            "xl/worksheets/_rels/sheet1.xml.rels": _relationships(
+                _relationship("rWeb", "hyperlink", "https://example.invalid", external=True),
+            ),
+        },
+    )
+
+    result = sanitize_template(content, "xlsx")
+
+    with ZipFile(BytesIO(result.content)) as archive:
+        worksheet = archive.read("xl/worksheets/sheet1.xml")
+    from xml.etree import ElementTree
+
+    namespace_bindings = dict(
+        binding
+        for _event, binding in ElementTree.iterparse(
+            BytesIO(worksheet),
+            events=("start-ns",),
+        )
+    )
+    root = ElementTree.fromstring(worksheet)
+    choice = root.find(f".//{{{MARKUP_COMPATIBILITY_NS}}}Choice")
+    assert namespace_bindings["x15"] == X15_NS
+    assert root.attrib[f"{{{MARKUP_COMPATIBILITY_NS}}}Ignorable"] == "x15"
+    assert choice is not None
+    assert choice.attrib["Requires"] == "x15"
+
+
+def test_sanitize_xlsx_rejects_an_mce_prefix_bound_only_in_a_descendant():
+    content = _package(
+        {
+            "[Content_Types].xml": _content_types(
+                (
+                    "xl/workbook.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+                ),
+            ),
+            "_rels/.rels": _relationships(
+                _relationship("rRoot", "officeDocument", "xl/workbook.xml"),
+            ),
+            "xl/workbook.xml": _xml(
+                f'<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}">'
+                '<sheets><sheet name="Safe" sheetId="1" r:id="rSheet"/></sheets>'
+                "</workbook>",
+            ),
+            "xl/_rels/workbook.xml.rels": _relationships(
+                _relationship("rSheet", "worksheet", "worksheets/sheet1.xml"),
+            ),
+            "xl/worksheets/sheet1.xml": _xml(
+                f'<worksheet xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}" '
+                f'xmlns:mc="{MARKUP_COMPATIBILITY_NS}" mc:Ignorable="x15">'
+                f'<sheetData><custom xmlns:x15="{X15_NS}"/></sheetData>'
+                '<hyperlinks><hyperlink ref="A1" r:id="rWeb"/></hyperlinks>'
+                "</worksheet>",
+            ),
+            "xl/worksheets/_rels/sheet1.xml.rels": _relationships(
+                _relationship("rWeb", "hyperlink", "https://example.invalid", external=True),
+            ),
+        },
+    )
+
+    with pytest.raises(TemplateSanitizationError, match="undeclared.*x15"):
+        sanitize_template(content, "xlsx")
+
+
+def test_sanitize_xlsx_preserves_a_lexical_prefix_named_like_elementtree_output():
+    content = _package(
+        {
+            "[Content_Types].xml": _content_types(
+                (
+                    "xl/workbook.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                ),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+                ),
+            ),
+            "_rels/.rels": _relationships(
+                _relationship("rRoot", "officeDocument", "xl/workbook.xml"),
+            ),
+            "xl/workbook.xml": _xml(
+                f'<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}">'
+                '<sheets><sheet name="Safe" sheetId="1" r:id="rSheet"/></sheets>'
+                "</workbook>",
+            ),
+            "xl/_rels/workbook.xml.rels": _relationships(
+                _relationship("rSheet", "worksheet", "worksheets/sheet1.xml"),
+            ),
+            "xl/worksheets/sheet1.xml": _xml(
+                f'<worksheet xmlns="{SPREADSHEET_NS}" xmlns:r="{OFFICE_REL_NS}" '
+                f'xmlns:mc="{MARKUP_COMPATIBILITY_NS}" xmlns:ns1="{X15_NS}" '
+                'mc:Ignorable="ns1">'
+                '<mc:AlternateContent><mc:Choice Requires="ns1"><sheetData/>'
+                "</mc:Choice></mc:AlternateContent>"
+                '<hyperlinks><hyperlink ref="A1" r:id="rWeb"/></hyperlinks>'
+                "</worksheet>",
+            ),
+            "xl/worksheets/_rels/sheet1.xml.rels": _relationships(
+                _relationship("rWeb", "hyperlink", "https://example.invalid", external=True),
+            ),
+        },
+    )
+
+    result = sanitize_template(content, "xlsx")
+
+    with ZipFile(BytesIO(result.content)) as archive:
+        worksheet = archive.read("xl/worksheets/sheet1.xml")
+    from xml.etree import ElementTree
+
+    namespace_bindings = dict(
+        binding
+        for _event, binding in ElementTree.iterparse(
+            BytesIO(worksheet),
+            events=("start-ns",),
+        )
+    )
+    assert namespace_bindings["ns1"] == X15_NS
+
+
+def test_namespace_scope_tracking_retains_only_mce_lexical_bindings():
+    xml = _xml(
+        f'<worksheet xmlns="{SPREADSHEET_NS}" '
+        f'xmlns:mc="{MARKUP_COMPATIBILITY_NS}" xmlns:x15="{X15_NS}" '
+        'mc:Ignorable="x15">'
+        "<sheetData>"
+        + "".join(f"<row><c r=\"A{index}\"/></row>" for index in range(100))
+        + "</sheetData></worksheet>",
+    )
+
+    root, scopes = template_sanitizer._parse_xml_with_namespace_scopes(
+        xml,
+        "xl/worksheets/sheet1.xml",
+    )
+
+    assert scopes == {id(root): {"x15": X15_NS}}
 
 
 def test_sanitize_rejects_a_package_with_a_dangling_relationship():

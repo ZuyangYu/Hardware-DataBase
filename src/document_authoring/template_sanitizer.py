@@ -26,6 +26,9 @@ _PACKAGE_RELATIONSHIP_NAMESPACES = {
     "http://purl.oclc.org/ooxml/package/relationships",
     "http://schemas.openxmlformats.org/package/2006/relationships",
 }
+_MARKUP_COMPATIBILITY_NAMESPACE = (
+    "http://schemas.openxmlformats.org/markup-compatibility/2006"
+)
 _RELATIONSHIP_NAMESPACES = {
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "http://purl.oclc.org/ooxml/officeDocument/relationships",
@@ -112,6 +115,7 @@ _MAX_COMPRESSION_RATIO = 500
 _MIN_RATIO_CHECK_BYTES = 1024 * 1024
 _MAX_XML_BYTES = 16 * 1024 * 1024
 _MAX_XML_DEPTH = 256
+_XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace"
 
 
 class _ForbiddenXmlConstruct(Exception):
@@ -709,40 +713,56 @@ def _remove_relationship_consumers(
         ):
             continue
         entry = package.entries[owner]
-        root = _parse_xml(entry.content, owner)
+        root, mce_namespace_bindings = _parse_xml_with_namespace_scopes(
+            entry.content,
+            owner,
+        )
         if _remove_consumer_elements(root, relationship_ids):
-            entry.content = _serialize_xml(root)
+            entry.content = _serialize_xml_preserving_mce_namespaces(
+                root,
+                mce_namespace_bindings,
+                owner,
+            )
 
 
 def _remove_consumer_elements(root: ElementTree.Element, relationship_ids: set[str]) -> bool:
-    changed = False
-    for parent in root.iter():
-        for child in list(parent):
-            if _element_references_relationship(child, relationship_ids):
-                parent.remove(child)
-                changed = True
+    return _remove_consumer_descendants(root, relationship_ids)
 
-    pruned = True
-    while pruned:
-        pruned = False
-        for parent in root.iter():
-            for child in list(parent):
-                if (
-                    len(child) == 0
-                    and not child.attrib
-                    and not (child.text or "").strip()
-                    and _local_name(child.tag).lower() in {
-                        "controls",
-                        "externalreferences",
-                        "hyperlinks",
-                        "object",
-                        "oleobjects",
-                    }
-                ):
-                    parent.remove(child)
-                    pruned = True
-                    changed = True
+
+def _remove_consumer_descendants(
+    parent: ElementTree.Element,
+    relationship_ids: set[str],
+) -> bool:
+    changed = False
+    for child in list(parent):
+        if _element_references_relationship(child, relationship_ids):
+            parent.remove(child)
+            changed = True
+            continue
+        if not _remove_consumer_descendants(child, relationship_ids):
+            continue
+        changed = True
+        if _is_empty_consumer_wrapper(child):
+            parent.remove(child)
     return changed
+
+
+def _is_empty_consumer_wrapper(element: ElementTree.Element) -> bool:
+    if len(element) != 0 or (element.text or "").strip():
+        return False
+    local_name = _local_name(element.tag).lower()
+    if (
+        _namespace(element.tag) == _MARKUP_COMPATIBILITY_NAMESPACE
+        and local_name in {"alternatecontent", "choice", "fallback"}
+    ):
+        return True
+    return not element.attrib and local_name in {
+        "controls",
+        "externalreferences",
+        "hyperlinks",
+        "object",
+        "oleobjects",
+    }
 
 
 def _element_references_relationship(
@@ -917,6 +937,203 @@ def _part_is_xml(part_name: str, content_types: dict[str, str]) -> bool:
 
 def _serialize_xml(root: ElementTree.Element) -> bytes:
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _serialize_xml_preserving_mce_namespaces(
+    root: ElementTree.Element,
+    original_mce_namespace_bindings: dict[int, dict[str, str]],
+    part_name: str,
+) -> bytes:
+    source_elements = list(root.iter())
+    output_root = copy.deepcopy(root)
+    output_elements = list(output_root.iter())
+    required_prefixes = {
+        prefix
+        for element in source_elements
+        for prefix in _mce_lexical_namespace_prefixes(element)
+    }
+    qname_prefixes = _collision_free_qname_prefixes(root, required_prefixes)
+
+    for output in output_elements:
+        output.tag = _prefixed_qname(output.tag, qname_prefixes)
+        attributes = {
+            _prefixed_qname(attribute, qname_prefixes): value
+            for attribute, value in output.attrib.items()
+        }
+        output.attrib.clear()
+        output.attrib.update(attributes)
+
+    for namespace, prefix in qname_prefixes.items():
+        declaration = "xmlns" if not prefix else f"xmlns:{prefix}"
+        output_root.set(declaration, namespace)
+
+    for source, output in zip(source_elements, output_elements, strict=True):
+        bindings = original_mce_namespace_bindings.get(id(source), {})
+        for prefix in sorted(_mce_lexical_namespace_prefixes(source)):
+            namespace = bindings.get(prefix)
+            if namespace is None:
+                raise TemplateSanitizationError(
+                    f"undeclared markup-compatibility namespace prefix {prefix!r} "
+                    f"in {part_name}",
+                )
+            if prefix == "xml":
+                if namespace != _XML_NAMESPACE:
+                    raise TemplateSanitizationError(
+                        f"invalid xml namespace binding in {part_name}",
+                    )
+                continue
+            output.set(f"xmlns:{prefix}", namespace)
+
+    serialized = _serialize_xml(output_root)
+    serialized_root, serialized_mce_namespace_bindings = (
+        _parse_xml_with_namespace_scopes(serialized, part_name)
+    )
+    serialized_elements = list(serialized_root.iter())
+    if len(source_elements) != len(serialized_elements) or any(
+        source.tag != output.tag
+        for source, output in zip(source_elements, serialized_elements, strict=True)
+    ):
+        raise TemplateSanitizationError(
+            f"XML serialization changed element structure in {part_name}",
+        )
+    for source, output in zip(source_elements, serialized_elements, strict=True):
+        expected = original_mce_namespace_bindings.get(id(source), {})
+        actual = serialized_mce_namespace_bindings.get(id(output), {})
+        for prefix in _mce_lexical_namespace_prefixes(source):
+            if actual.get(prefix) != expected.get(prefix):
+                raise TemplateSanitizationError(
+                    f"could not preserve markup-compatibility namespace bindings "
+                    f"in {part_name}",
+                )
+    return serialized
+
+
+def _collision_free_qname_prefixes(
+    root: ElementTree.Element,
+    reserved_prefixes: set[str],
+) -> dict[str, str]:
+    namespaces: list[str] = []
+    for element in root.iter():
+        for name in (element.tag, *element.attrib):
+            namespace = _namespace(name)
+            if namespace and namespace not in namespaces:
+                namespaces.append(namespace)
+
+    result: dict[str, str] = {}
+    used_prefixes = set(reserved_prefixes) | {"xml", "xmlns"}
+    root_namespace = _namespace(root.tag)
+    if root_namespace:
+        result[root_namespace] = ""
+    preferred_prefixes = {
+        _MARKUP_COMPATIBILITY_NAMESPACE: "mc",
+        **{namespace: "r" for namespace in _RELATIONSHIP_NAMESPACES},
+    }
+    next_index = 0
+    for namespace in namespaces:
+        if namespace in result:
+            continue
+        if namespace == _XML_NAMESPACE:
+            result[namespace] = "xml"
+            continue
+        prefix = preferred_prefixes.get(namespace)
+        if prefix is None or prefix in used_prefixes:
+            while f"q{next_index}" in used_prefixes:
+                next_index += 1
+            prefix = f"q{next_index}"
+            next_index += 1
+        result[namespace] = prefix
+        used_prefixes.add(prefix)
+    return result
+
+
+def _prefixed_qname(name: str, qname_prefixes: dict[str, str]) -> str:
+    namespace = _namespace(name)
+    if not namespace:
+        return name
+    local_name = _local_name(name)
+    prefix = qname_prefixes[namespace]
+    return f"{prefix}:{local_name}" if prefix else local_name
+
+
+def _mce_lexical_namespace_prefixes(element: ElementTree.Element) -> set[str]:
+    prefixes: set[str] = set()
+    for attribute, value in element.attrib.items():
+        attribute_namespace = _namespace(attribute)
+        attribute_name = _local_name(attribute).lower()
+        is_mce_prefix_list = (
+            attribute_namespace == _MARKUP_COMPATIBILITY_NAMESPACE
+            and attribute_name
+            in {
+                "ignorable",
+                "preserveattributes",
+                "preserveelements",
+                "processcontent",
+            }
+        )
+        is_choice_requires = (
+            _namespace(element.tag) == _MARKUP_COMPATIBILITY_NAMESPACE
+            and _local_name(element.tag).lower() == "choice"
+            and not attribute_namespace
+            and attribute_name == "requires"
+        )
+        if not is_mce_prefix_list and not is_choice_requires:
+            continue
+        prefixes.update(
+            token.split(":", 1)[0]
+            for token in value.split()
+            if token
+        )
+    return prefixes
+
+
+def _parse_xml_with_namespace_scopes(
+    content: bytes,
+    part_name: str,
+) -> tuple[ElementTree.Element, dict[int, dict[str, str]]]:
+    if len(content) > _MAX_XML_BYTES:
+        raise TemplateSanitizationError(f"XML resource limit exceeded in {part_name}")
+    _validate_xml_safety(content, part_name)
+    pending_bindings: list[tuple[str, str]] = []
+    scope_stack: list[dict[str, str]] = []
+    scopes: dict[int, dict[str, str]] = {}
+    try:
+        iterator = ElementTree.iterparse(
+            BytesIO(content),
+            events=("start", "end", "start-ns"),
+        )
+        for event, item in iterator:
+            if event == "start-ns":
+                pending_bindings.append(item)
+                continue
+            if event == "start":
+                scope = dict(pending_bindings)
+                pending_bindings.clear()
+                scope_stack.append(scope)
+                required_prefixes = _mce_lexical_namespace_prefixes(item)
+                if required_prefixes:
+                    bindings: dict[str, str] = {}
+                    for prefix in required_prefixes:
+                        namespace = _namespace_in_scope(prefix, scope_stack)
+                        if namespace is not None:
+                            bindings[prefix] = namespace
+                    scopes[id(item)] = bindings
+                continue
+            scope_stack.pop()
+        return iterator.root, scopes
+    except (ElementTree.ParseError, ValueError) as exc:
+        raise TemplateSanitizationError(f"malformed XML in {part_name}: {exc}") from exc
+
+
+def _namespace_in_scope(
+    prefix: str,
+    scope_stack: list[dict[str, str]],
+) -> str | None:
+    if prefix == "xml":
+        return _XML_NAMESPACE
+    for scope in reversed(scope_stack):
+        if prefix in scope:
+            return scope[prefix]
+    return None
 
 
 def _local_name(name: str) -> str:
