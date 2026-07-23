@@ -3153,6 +3153,20 @@ docs/22_825504681 825504682_CAM_硬件原理图设计评审检查单.xlsm
 
 它只作为结构、格式和检查项来源，其中的 CAM 项目编号、ERP、原理图名称、Pass、Closed、审查人和签名均是 Legacy Claims/旧状态。由于包内存在主动内容和复杂关系，这个模板必须先通过 P0.5，不能将普通 `.xlsx` 解析/保存能力视为等价的 XLSM Renderer 能力。
 
+#### 模板上传与净化操作
+
+操作人员在“文档生成”页面上传 `.xlsx`、`.xlsm` 或 `.docx` 模板后，只需查看安全摘要并按正常流程确认启用；不需要在 Excel 或压缩包中手工删除宏、外部链接、嵌入对象或控件。服务端会保留上传原件作为仅审计用途的不可变来源，并将其与生成用的安全副本及各自的内容 hash、净化报告关联保存。
+
+对于 XLSM，净化会移除活动内容并把生成用副本转换为 `.xlsx`；后续模板分析、区域确认和文档生成均只使用该 `.xlsx` 安全副本，绝不修改或执行原始 XLSM。若安全摘要或分析结果要求人工核对，应修正模板后重新上传，而不是绕过摘要直接启用。
+
+本地验收 CAM 样本时，可在含有该未跟踪样本的仓库根目录运行：
+
+```bash
+.venv/bin/python -c "from pathlib import Path; from src.document_authoring.template_sanitizer import sanitize_template; p=Path('docs/22_825504681 825504682_CAM_硬件原理图设计评审检查单.xlsm'); r=sanitize_template(p.read_bytes(), 'xlsm'); assert r.format == 'xlsx'; assert r.removed_parts; print('CAM sanitize passed', len(r.removed_parts))"
+```
+
+此命令只在内存中验证净化结果，不会改写或提交 CAM 原文件；该本地样本不属于 CI 输入，CI 使用提交的合成 fixture 覆盖相同净化契约。
+
 ### 28.2 ADAS 项目资料
 
 ```text
