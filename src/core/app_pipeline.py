@@ -12,6 +12,8 @@ from src.core.logger import error, log, warn
 from src.ingestion.kb_paths import InvalidKnowledgeBaseName, validate_kb_name
 from src.pipelines.document_rag.factory import create_rag_backend
 from src.pipelines.document_rag.schemas import IngestResult, RequestContext
+from src.projects.service import ProjectService
+from src.document_authoring.service import DocumentGenerationService
 from src.services.document_manager import DocumentManager
 from src.services.kb_scope import kb_scope_from_context
 
@@ -53,6 +55,11 @@ class AppPipeline:
                 spreadsheet_service=getattr(self.backend, "spreadsheet_indexes", None),
                 circuit_service=getattr(self.backend, "circuit_indexes", None),
             )
+            # Authoring is deliberately a sibling of the query agent.  It
+            # shares source/evidence services but never stores WorkOrder state
+            # in a chat session or AgentState.
+            self.projects = ProjectService()
+            self.document_generation = DocumentGenerationService(self.projects)
         except Exception as exc:
             error(f"AppPipeline 初始化失败: {exc}")
             raise
@@ -282,3 +289,109 @@ class AppPipeline:
 
     def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None):
         return self.documents.get_parse_result(kb_name, document_id, ctx=ctx)
+
+    # Project/document-authoring domain entry points.  REST, UI and future MCP
+    # adapters must use these service methods instead of reaching into SQLite,
+    # pipeline archives or renderer file paths directly.
+
+    def create_project(self, project, ctx: RequestContext):
+        return self.projects.create_project(ctx, project)
+
+    def get_project_context(self, project_id: str, ctx: RequestContext):
+        return self.projects.get_project_context(ctx, project_id)
+
+    def list_accessible_projects(self, ctx: RequestContext):
+        return self.projects.list_accessible_projects(ctx)
+
+    def get_project_source_catalog(self, project_id: str, ctx: RequestContext):
+        return self.projects.list_source_catalog(ctx, project_id)
+
+    def register_renderer_policy(self, policy):
+        return self.document_generation.register_renderer_policy(policy)
+
+    def register_document_schema(self, schema):
+        return self.document_generation.register_document_schema(schema)
+
+    def register_template(self, template, content: bytes, *, regions, bindings, legacy_claims=None):
+        return self.document_generation.register_template(
+            template,
+            content,
+            regions=regions,
+            bindings=bindings,
+            legacy_claims=legacy_claims,
+        )
+
+    def register_harness_policy(self, policy):
+        return self.document_generation.register_harness_policy(policy)
+
+    def approve_template_schema(self, template_version_id: str, actor_id: str):
+        return self.document_generation.approve_template(template_version_id, actor_id)
+
+    def create_document_work_order(self, ctx: RequestContext, **kwargs):
+        return self.document_generation.create_document_work_order(ctx, **kwargs)
+
+    def start_document_generation(self, ctx: RequestContext, work_order_id: str, *, rule_inputs, retrieval_outcomes):
+        return self.document_generation.start_document_generation(
+            ctx, work_order_id, rule_inputs=rule_inputs, retrieval_outcomes=retrieval_outcomes,
+        )
+
+    def run_internal_document_harness(self, ctx: RequestContext, work_order_id: str, *, retrieve, writer=None):
+        return self.document_generation.run_internal_harness(
+            ctx,
+            work_order_id,
+            retrieve=retrieve,
+            writer=writer,
+        )
+
+    def resume_internal_document_harness(self, ctx: RequestContext, harness_run_id: str, *, retrieve, writer=None):
+        return self.document_generation.resume_internal_harness(
+            ctx,
+            harness_run_id,
+            retrieve=retrieve,
+            writer=writer,
+        )
+
+    def pause_harness_run(self, ctx: RequestContext, harness_run_id: str):
+        return self.document_generation.pause_harness_run(ctx, harness_run_id)
+
+    def cancel_harness_run(self, ctx: RequestContext, harness_run_id: str):
+        return self.document_generation.cancel_harness_run(ctx, harness_run_id)
+
+    def get_document_run_status(self, work_order_id: str, ctx: RequestContext | None = None):
+        order = self.document_generation.store.get_work_order(work_order_id)
+        if order is None:
+            return None
+        if ctx is not None:
+            self.projects.access.require(ctx, order.project_id, "view_project")
+        status = {
+            "work_order_id": order.work_order_id,
+            "status": order.status,
+            "unit_statuses": dict(order.unit_statuses),
+            "validation_report_id": order.validation_report_id,
+        }
+        if order.run_manifest_id:
+            status["run_manifest_id"] = order.run_manifest_id
+        harness_runs = self.document_generation.store.list_harness_runs(order.work_order_id)
+        if harness_runs:
+            latest_run = harness_runs[-1]
+            status["harness_run"] = {
+                "run_id": latest_run.harness_run_id,
+                "status": latest_run.status,
+                "current_node": latest_run.current_node,
+                "step_count": latest_run.step_count,
+                "retrieval_round_count": latest_run.retrieval_round_count,
+                "retry_count": latest_run.retry_count,
+                "checkpoint_id": latest_run.checkpoint_id,
+                "fencing_token": latest_run.fencing_token,
+                "error": latest_run.error,
+            }
+        return status
+
+    def submit_document_human_event(self, ctx: RequestContext, **kwargs):
+        return self.document_generation.submit_document_human_event(ctx, **kwargs)
+
+    def approve_document_artifact(self, ctx: RequestContext, artifact_id: str, *, comment: str = ""):
+        return self.document_generation.approve_document_artifact(ctx, artifact_id, comment=comment)
+
+    def download_document_artifact(self, ctx: RequestContext, artifact_id: str) -> bytes:
+        return self.document_generation.download_document_artifact(ctx, artifact_id)
