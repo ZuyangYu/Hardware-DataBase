@@ -199,6 +199,23 @@ def test_active_xlsm_upload_is_analyzed_as_a_safe_xlsx_template(authoring_servic
     assert policy.allowlisted_template_hashes == []
 
 
+def test_pipeline_sanitization_summary_exposes_only_counts_and_safe_format(pipeline, author_ctx):
+    analysis = pipeline.analyze_document_template(
+        author_ctx,
+        filename="review.xlsm",
+        content=_workbook_with_vba_external_link_and_embedded_object(),
+        template_name="review",
+    )
+
+    summary = pipeline.get_document_template_sanitization_summary(author_ctx, analysis.template_version_id)
+
+    assert summary["安全模板格式"] == "xlsx"
+    assert summary["已移除宏"] == 1
+    assert summary["已移除外链"] >= 1
+    assert {"removed_parts", "removed_relationships", "source_storage_ref"}.isdisjoint(summary)
+    assert "vbaProject.bin" not in str(summary)
+
+
 @pytest.mark.parametrize(
     ("renderer", "content", "fill_plan"),
     [

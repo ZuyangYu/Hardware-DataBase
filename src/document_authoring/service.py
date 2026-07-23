@@ -212,8 +212,33 @@ class DocumentGenerationService:
         analysis.validate_suggestions()
         return self.store.save_template_analysis(analysis)
 
-    def get_template_sanitization_report(self, template_version_id: str) -> TemplateSanitizationReport | None:
-        """Return the immutable sanitization audit record for a template version."""
+    def get_template_sanitization_summary(
+        self,
+        ctx: RequestContext,
+        template_version_id: str,
+    ) -> dict[str, int | str] | None:
+        """Return only safe aggregate sanitization results to application callers."""
+        if not ctx.user_id or ctx.user_id == "anonymous":
+            raise PermissionError("authenticated user is required to view template sanitization results")
+        report = self._get_template_sanitization_report(template_version_id)
+        if report is None:
+            return None
+        removed_parts = [part.lower() for part in report.removed_parts]
+        counts = {
+            "已移除宏": sum("vba" in part for part in removed_parts),
+            "已移除外链": sum("externallink" in part for part in removed_parts),
+            "已移除嵌入/控件": sum(
+                any(marker in part for marker in ("embedding", "ole", "activex", "control", "ctrlprop"))
+                for part in removed_parts
+            ),
+        }
+        displayed_counts = counts if not any(counts.values()) else {
+            label: count for label, count in counts.items() if count
+        }
+        return {**displayed_counts, "安全模板格式": report.sanitized_format}
+
+    def _get_template_sanitization_report(self, template_version_id: str) -> TemplateSanitizationReport | None:
+        """Read the complete audit record only within the document-authoring service."""
         return self.store.get_template_sanitization_report(template_version_id)
 
     def confirm_template_analysis(

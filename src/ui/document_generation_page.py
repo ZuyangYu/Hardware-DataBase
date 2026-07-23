@@ -61,23 +61,6 @@ def _safe_analysis_summary(analysis: Any) -> list[dict[str, Any]]:
     ]
 
 
-def _safe_sanitization_summary(report: Any) -> dict[str, Any]:
-    """Reduce sanitization audit data to aggregate counts safe for the upload UI."""
-    removed_parts = [str(part).lower() for part in _value(report, "removed_parts", [])]
-    counts = {
-        "已移除宏": sum("vba" in part for part in removed_parts),
-        "已移除外链": sum("externallink" in part for part in removed_parts),
-        "已移除嵌入/控件": sum(
-            any(marker in part for marker in ("embedding", "ole", "activex", "control", "ctrlprop"))
-            for part in removed_parts
-        ),
-    }
-    displayed_counts = counts if not any(counts.values()) else {
-        label: count for label, count in counts.items() if count
-    }
-    return {**displayed_counts, "安全模板格式": _value(report, "sanitized_format")}
-
-
 def _matching_schemas(template: Any, schemas: list[Any]) -> dict[str, Any]:
     """Return schemas bound to both immutable template schema id and version."""
     schema_id = _value(template, "template_schema_id")
@@ -122,15 +105,15 @@ def _render_template_upload(st, pipeline, ctx) -> None:
     analysis_status = _value(analysis, "status")
     st.caption(f"分析 ID：{_value(analysis, 'analysis_id')}；格式：{_value(analysis, 'format')}")
     try:
-        sanitization_report = pipeline.get_document_template_sanitization_report(
+        sanitization_summary = pipeline.get_document_template_sanitization_summary(
             ctx, _value(analysis, "template_version_id"),
         )
     except (PermissionError, ValueError, KeyError) as exc:
         st.error(f"无法读取模板净化结果：{exc}")
         return
-    if sanitization_report is not None and _value(sanitization_report, "status") == "sanitized":
+    if sanitization_summary is not None:
         st.success("已生成无活动内容的安全模板；后续分析与生成仅使用该副本。")
-        st.json(_safe_sanitization_summary(sanitization_report), expanded=False)
+        st.json(sanitization_summary, expanded=False)
     st.dataframe(_safe_analysis_summary(analysis), width="stretch", hide_index=True)
     suggestions = [
         {"语义单元": _value(item, "label") or _value(item, "semantic_unit_id"), "置信度": _value(item, "confidence")}

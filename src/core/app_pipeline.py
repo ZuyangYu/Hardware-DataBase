@@ -353,8 +353,8 @@ class AppPipeline:
             ctx, filename=filename, content=content, template_name=template_name,
         )
 
-    def get_document_template_sanitization_report(self, ctx: RequestContext, template_version_id: str):
-        return self.document_generation.get_template_sanitization_report(template_version_id)
+    def get_document_template_sanitization_summary(self, ctx: RequestContext, template_version_id: str):
+        return self.document_generation.get_template_sanitization_summary(ctx, template_version_id)
 
     def confirm_document_template(self, ctx: RequestContext, *, analysis_id: str, display_name: str):
         return self.document_generation.confirm_template_analysis(
