@@ -120,19 +120,19 @@ git commit -m "feat: add strict RAGFlow document query"
 def test_adapter_uses_only_frozen_locator_and_returns_envelope(project_fixture):
     outcome = project_fixture.retrieve_strict([
         {"id": "chunk-a", "document_id": "remote-a", "content": "CAN_H",
-         "locator": {"section": "CAN"}, "similarity": 0.9},
+         "similarity": 0.9},
     ])
 
     assert outcome.status == "success_with_hits"
     assert outcome.evidences[0].source_version_id == "version-a"
     assert outcome.evidences[0].processing_artifact_id == "artifact-a"
-    assert outcome.evidences[0].locator == {"section": "CAN"}
+    assert outcome.evidences[0].locator == {"document_id": "remote-a", "chunk_id": "chunk-a"}
     assert project_fixture.client.strict_calls == [("CAN", "dataset-a", "remote-a", 20)]
 
 
 @pytest.mark.parametrize("chunk", [
-    {"id": "wrong-doc", "document_id": "remote-b", "content": "bad", "locator": {"section": "CAN"}},
-    {"id": "no-locator", "document_id": "remote-a", "content": "bad"},
+    {"id": "wrong-doc", "document_id": "remote-b", "content": "bad"},
+    {"document_id": "remote-a", "content": "bad"},
 ])
 def test_adapter_rejects_unverifiable_chunk_scope(project_fixture, chunk):
     outcome = project_fixture.retrieve_strict([chunk])
@@ -140,10 +140,8 @@ def test_adapter_rejects_unverifiable_chunk_scope(project_fixture, chunk):
     assert outcome.source_outcomes[0].status == "filter_unsupported"
 
 
-def test_adapter_rejects_region_that_cannot_match_chunk_locator(project_fixture):
-    outcome = project_fixture.retrieve_strict([
-        {"id": "chunk-a", "document_id": "remote-a", "content": "CAN_H", "locator": {"section": "POWER"}},
-    ])
+def test_adapter_rejects_non_document_region_policy(project_fixture):
+    outcome = project_fixture.retrieve_strict_with_region_policy({"section": "POWER"})
     assert outcome.source_outcomes[0].status == "filter_unsupported"
 ```
 
