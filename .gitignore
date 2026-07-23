@@ -67,6 +67,7 @@ htmlcov/
 
 
 .agents/
+.worktrees/
 
 # Local agent workflow records and development plans/specifications
 .superpowers/
