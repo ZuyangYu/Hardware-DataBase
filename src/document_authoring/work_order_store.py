@@ -631,6 +631,16 @@ class DocumentAuthoringStore:
             row = conn.execute("SELECT payload_json FROM document_work_orders WHERE work_order_id = ?", (work_order_id,)).fetchone()
         return DocumentWorkOrder.model_validate(_payload(row)) if row else None
 
+    def list_work_orders(self, tenant_id: str, project_id: str) -> list[DocumentWorkOrder]:
+        """Return durable work orders for one authorized project, newest first."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT payload_json FROM document_work_orders
+                   WHERE tenant_id = ? AND project_id = ? ORDER BY rowid DESC""",
+                (tenant_id, project_id),
+            ).fetchall()
+        return [DocumentWorkOrder.model_validate(_payload(row)) for row in rows]
+
     def replace_work_order(self, order: DocumentWorkOrder) -> DocumentWorkOrder:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")

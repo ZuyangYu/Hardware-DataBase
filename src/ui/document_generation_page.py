@@ -1,130 +1,296 @@
-"""Minimal P2a/P2b Streamlit surface for project-bound document work orders."""
+"""Governed Streamlit workflow for durable document-authoring work orders."""
 
 from __future__ import annotations
+
+import uuid
+from typing import Any
+
+
+_TIMELINE_STAGES = ("排队", "检索", "撰写", "校验", "渲染", "人工审批")
+_NODE_STAGES = {
+    "initialize": "排队", "authoring_graph": "检索",
+    "create_information_requirements": "检索", "retrieve_requirement_evidence": "检索",
+    "draft_ready_unit": "撰写", "validate_unit_draft": "校验",
+    "detect_template_contamination": "校验", "validate_cross_unit": "校验",
+    "complete": "人工审批",
+}
+_ORDER_STAGES = {
+    "planned": "排队", "retrieving": "检索", "ready_to_draft": "撰写", "drafting": "撰写",
+    "validating": "校验", "waiting_human_input": "人工审批", "waiting_human_approval": "人工审批",
+    "ready_to_render": "渲染", "rendering": "渲染", "blocked": "校验",
+}
+
+
+def _run_timeline(status: dict) -> list[tuple[str, str]]:
+    """Map persisted WorkOrder/HarnessRun state to a compact UI timeline."""
+    harness_run = status.get("harness_run") or {}
+    node = harness_run.get("current_node")
+    if status.get("status") == "complete":
+        result = [(stage, "done") for stage in _TIMELINE_STAGES]
+    else:
+        active_stage = _NODE_STAGES.get(node) or _ORDER_STAGES.get(status.get("status"), "排队")
+        active_index = _TIMELINE_STAGES.index(active_stage)
+        result = [
+            (stage, "done" if index < active_index else "active" if index == active_index else "pending")
+            for index, stage in enumerate(_TIMELINE_STAGES)
+        ]
+    if harness_run.get("status") == "failed" or node == "failed":
+        error = harness_run.get("error") or {}
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        result.append((f"失败：{message or '未知错误'}", "error"))
+    elif status.get("status") == "cancelled":
+        result.append(("已取消", "error"))
+    elif status.get("status") == "blocked":
+        result.append(("已阻塞", "error"))
+    return result
+
+
+def _value(item: Any, name: str, default: Any = None) -> Any:
+    return item.get(name, default) if isinstance(item, dict) else getattr(item, name, default)
+
+
+def _safe_analysis_summary(analysis: Any) -> list[dict[str, Any]]:
+    """Expose labels and writeability, never OOXML locators or uploaded bytes."""
+    return [
+        {
+            "单元": _value(unit, "label") or _value(unit, "unit_id"),
+            "可写": _value(unit, "writable", False),
+            "限制": _value(unit, "blocked_reason") or "",
+        }
+        for unit in _value(analysis, "units", [])
+    ]
+
+
+def _matching_schemas(template: Any, schemas: list[Any]) -> dict[str, Any]:
+    """Return schemas bound to both immutable template schema id and version."""
+    schema_id = _value(template, "template_schema_id")
+    schema_version = _value(template, "template_schema_version")
+    return {
+        f"{_value(schema, 'document_schema_id')}@{_value(schema, 'version')}": schema
+        for schema in schemas
+        if _value(schema, "document_schema_id") == schema_id and _value(schema, "version") == schema_version
+    }
 
 
 def render_document_generation_page(st, pipeline, ctx) -> None:
     st.header("📝 文档生成")
-    st.caption("任务固定到项目、已批准配置基线、模板版本和来源快照；聊天上下文不会参与生成。")
+    st.caption("所有任务固定到项目、已批准基线、模板版本和来源快照；页面不从会话状态启动运行。")
+    upload_tab, create_tab, runs_tab = st.tabs(["上传模板", "新建生成任务", "任务与下载"])
+    with upload_tab:
+        _render_template_upload(st, pipeline, ctx)
+    with create_tab:
+        _render_work_order_creation(st, pipeline, ctx)
+    with runs_tab:
+        _render_durable_runs(st, pipeline, ctx)
+
+
+def _render_template_upload(st, pipeline, ctx) -> None:
+    st.subheader("上传并分析受控模板")
+    upload = st.file_uploader("上传模板", type=["xlsx", "xlsm", "docx"], key="document-template-upload")
+    display_name = st.text_input("模板名称", key="document-template-name")
+    if st.button("分析模板", type="primary", key="analyze-document-template", disabled=upload is None):
+        try:
+            analysis = pipeline.analyze_document_template(
+                ctx, filename=upload.name, content=upload.getvalue(), template_name=display_name or upload.name,
+            )
+        except (PermissionError, ValueError, KeyError) as exc:
+            st.error(f"模板分析失败：{exc}")
+        else:
+            # Keep only a persisted-analysis reference for confirmation; no run is started from session state.
+            st.session_state["document-template-analysis"] = analysis
+
+    analysis = st.session_state.get("document-template-analysis")
+    if analysis is None:
+        return
+    analysis_status = _value(analysis, "status")
+    st.caption(f"分析 ID：{_value(analysis, 'analysis_id')}；格式：{_value(analysis, 'format')}")
+    st.dataframe(_safe_analysis_summary(analysis), width="stretch", hide_index=True)
+    suggestions = [
+        {"语义单元": _value(item, "label") or _value(item, "semantic_unit_id"), "置信度": _value(item, "confidence")}
+        for item in _value(analysis, "suggestions", [])
+    ]
+    if suggestions:
+        st.caption("建议绑定（仅展示安全摘要）")
+        st.dataframe(suggestions, width="stretch", hide_index=True)
+    if analysis_status == "requires_human":
+        st.warning("分析发现受限或需要人工核对的区域。请修正模板后重新上传并分析。")
+        st.text_area("修正说明", key="document-template-correction-note")
+        if st.button("重新分析修正模板", key="reanalyze-document-template", disabled=upload is None):
+            try:
+                st.session_state["document-template-analysis"] = pipeline.analyze_document_template(
+                    ctx, filename=upload.name, content=upload.getvalue(), template_name=display_name or upload.name,
+                )
+            except (PermissionError, ValueError, KeyError) as exc:
+                st.error(f"模板分析失败：{exc}")
+        return
+    if analysis_status != "ready_for_confirmation":
+        st.error("模板分析未完成，不能启用。")
+        return
+    if st.button("确认并启用模板", type="primary", key="confirm-document-template"):
+        try:
+            template = pipeline.confirm_document_template(
+                ctx, analysis_id=_value(analysis, "analysis_id"),
+                display_name=display_name or _value(analysis, "format", "模板"),
+            )
+        except (PermissionError, ValueError, KeyError) as exc:
+            st.error(f"启用模板失败：{exc}")
+        else:
+            st.success(f"已启用受控模板：{_value(template, 'template_version_id')}")
+            st.session_state.pop("document-template-analysis", None)
+
+
+def _render_work_order_creation(st, pipeline, ctx) -> None:
+    st.subheader("新建生成任务")
     try:
         projects = pipeline.list_accessible_projects(ctx)
     except PermissionError as exc:
         st.error(str(exc))
         return
     if not projects:
-        st.info("当前账号没有可访问的项目。请由项目管理员添加 ProjectPrincipalBinding 后重试。")
+        st.info("当前账号没有可访问的项目。")
         return
-
-    project_by_id = {project.project_id: project for project in projects}
+    project_by_id = {_value(project, "project_id"): project for project in projects}
     project_id = st.selectbox(
-        "项目",
-        options=list(project_by_id),
-        format_func=lambda value: f"{project_by_id[value].name} ({value})",
+        "项目", list(project_by_id), format_func=lambda value: f"{_value(project_by_id[value], 'name')} ({value})",
         key="document-generation-project",
     )
     try:
-        sources = pipeline.get_project_source_catalog(project_id, ctx)
-    except PermissionError:
-        sources = []
+        source_catalog = pipeline.get_project_source_catalog(project_id, ctx)
+        options = pipeline.list_document_generation_options(ctx, project_id=project_id)
+    except (PermissionError, ValueError, KeyError) as exc:
+        st.error(f"无法读取项目生成配置：{exc}")
+        return
     with st.expander("冻结前的项目来源目录", expanded=False):
-        if not sources:
-            st.warning("项目尚无可用来源。任务创建会拒绝未批准的基线、版本或区域策略。")
-        else:
-            st.dataframe([source.model_dump(mode="json") for source in sources], width="stretch", hide_index=True)
-
-    baselines = pipeline.projects.store.list_baselines(project_id, ctx.tenant_id or "default", approved_only=True)
-    templates = pipeline.document_generation.store.list_templates(approved_only=True)
-    schemas = pipeline.document_generation.store.list_document_schemas(approved_only=True)
-    st.subheader("新建文档工作单")
+        rows = [source.model_dump(mode="json") if hasattr(source, "model_dump") else source for source in source_catalog]
+        st.dataframe(rows, width="stretch", hide_index=True)
+    baselines, templates, schemas = options["baselines"], options["templates"], options["schemas"]
     if not baselines or not templates or not schemas:
-        st.warning("需要先由管理员完成项目基线、模板和 Document Schema 的注册与批准。")
-    else:
-        baseline_by_id = {baseline.baseline_id: baseline for baseline in baselines}
-        template_by_id = {template.template_version_id: template for template in templates}
-        schema_by_key = {f"{schema.document_schema_id}@{schema.version}": schema for schema in schemas}
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            baseline_id = st.selectbox("配置基线", list(baseline_by_id), format_func=lambda value: baseline_by_id[value].name)
-        with col2:
-            template_id = st.selectbox("受控模板", list(template_by_id), format_func=lambda value: template_by_id[value].template_id)
-        with col3:
-            schema_key = st.selectbox("Document Schema", list(schema_by_key))
-        schema = schema_by_key[schema_key]
-        harness_policy_id = None
-        if schema.execution_mode == "internal_harness":
-            policies = pipeline.document_generation.store.list_harness_policies(approved_only=True)
-            if not policies:
-                st.warning("此 Schema 需要已批准的 Harness Policy，当前无法创建工作单。")
-            else:
-                policy_by_key = {
-                    f"{policy.harness_policy_id}@{policy.version}": policy for policy in policies
-                }
-                policy_key = st.selectbox("Harness Policy", list(policy_by_key))
-                harness_policy_id = policy_by_key[policy_key].harness_policy_id
-                st.caption("语义草稿仅可使用冻结来源中的已验证 Evidence；模型不会获得模板原件或任意工具权限。")
+        st.warning("需要已批准的项目基线、模板和 Document Schema 才能创建任务。")
+        return
+    baseline_by_id = {_value(item, "baseline_id"): item for item in baselines}
+    template_by_id = {_value(item, "template_version_id"): item for item in templates}
+    left, middle, right = st.columns(3)
+    with left:
+        baseline_id = st.selectbox("配置基线", list(baseline_by_id), format_func=lambda value: _value(baseline_by_id[value], "name"))
+    with middle:
+        template_id = st.selectbox("受控模板", list(template_by_id), format_func=lambda value: _value(template_by_id[value], "template_id"))
+    template = template_by_id[template_id]
+    compatible_schemas = _matching_schemas(template, schemas)
+    with right:
+        if not compatible_schemas:
+            st.warning("选中的模板没有已批准的匹配 Schema。")
+            return
+        schema_key = st.selectbox("Document Schema", list(compatible_schemas))
+    schema = compatible_schemas[schema_key]
+    if st.button("创建生成任务", type="primary", key="create-document-work-order"):
+        try:
+            order = pipeline.create_document_work_order(
+                ctx, project_id=project_id, baseline_id=baseline_id, template_version_id=template_id,
+                document_schema_id=_value(schema, "document_schema_id"),
+                document_schema_version=_value(schema, "version"), idempotency_key=f"streamlit-{uuid.uuid4().hex}",
+            )
+        except (PermissionError, ValueError, KeyError) as exc:
+            st.error(f"无法创建生成任务：{exc}")
         else:
-            st.caption("此 Schema 使用确定性工作流，不调用 Writer。")
-        idempotency_key = st.text_input("幂等键（可选）", key="document-generation-idempotency")
-        if st.button(
-            "创建工作单",
-            type="primary",
-            key="create-document-work-order",
-            disabled=schema.execution_mode == "internal_harness" and harness_policy_id is None,
-        ):
-            try:
-                order = pipeline.create_document_work_order(
-                    ctx,
-                    project_id=project_id,
-                    baseline_id=baseline_id,
-                    template_version_id=template_id,
-                    document_schema_id=schema.document_schema_id,
-                    document_schema_version=schema.version,
-                    idempotency_key=idempotency_key or None,
-                    harness_policy_id=harness_policy_id,
-                )
-            except (PermissionError, ValueError, KeyError) as exc:
-                st.error(f"无法创建工作单：{exc}")
-            else:
-                st.success(f"已创建工作单：{order.work_order_id}")
+            st.success(f"已创建工作单：{_value(order, 'work_order_id')}")
 
-    st.subheader("任务状态与产物")
-    work_order_id = st.text_input("工作单 ID", key="document-generation-work-order")
-    if work_order_id:
-        status = pipeline.get_document_run_status(work_order_id, ctx)
-        if status is None:
-            st.warning("未找到该工作单。")
+
+def _render_durable_runs(st, pipeline, ctx) -> None:
+    st.subheader("任务与下载")
+    try:
+        projects = pipeline.list_accessible_projects(ctx)
+    except PermissionError as exc:
+        st.error(str(exc))
+        return
+    if not projects:
+        st.info("当前账号没有可访问的项目。")
+        return
+    project_by_id = {_value(project, "project_id"): project for project in projects}
+    project_id = st.selectbox(
+        "项目", list(project_by_id), format_func=lambda value: f"{_value(project_by_id[value], 'name')} ({value})",
+        key="document-run-project",
+    )
+    try:
+        work_orders = pipeline.list_document_work_orders(ctx, project_id=project_id)
+    except (PermissionError, ValueError, KeyError) as exc:
+        st.error(f"无法读取工作单：{exc}")
+        return
+    if not work_orders:
+        st.info("该项目尚无持久化工作单。")
+        return
+    work_order_id = st.selectbox("工作单", [_value(order, "work_order_id") for order in work_orders], key="document-generation-work-order")
+    status = pipeline.get_document_run_status(work_order_id, ctx)
+    if status is None:
+        st.warning("未找到该工作单。")
+        return
+    _render_run_status(st, pipeline, ctx, status)
+
+
+def _render_run_status(st, pipeline, ctx, status: dict) -> None:
+    st.write(" · ".join(f"{label}（{state}）" for label, state in _run_timeline(status)))
+    harness_run = status.get("harness_run") or {}
+    if harness_run:
+        st.caption(
+            f"节点：{harness_run.get('current_node') or '-'}；检查点：{harness_run.get('checkpoint_id') or '-'}；"
+            f"重试：{harness_run.get('retry_count', 0)}；检索轮次：{harness_run.get('retrieval_round_count', 0)}"
+        )
+    units = status.get("unit_statuses") or {}
+    if units:
+        st.dataframe([{"单元": unit_id, "状态": value} for unit_id, value in units.items()], width="stretch", hide_index=True)
+    validation = status.get("validation") or {}
+    if validation.get("issues"):
+        st.warning(f"验证状态：{validation.get('status')}")
+        st.dataframe(validation["issues"], width="stretch", hide_index=True)
+    if harness_run.get("status") in {"queued", "running", "retrying"}:
+        left, right = st.columns(2)
+        with left:
+            if st.button("暂停 Harness", key=f"pause-harness-{harness_run['run_id']}"):
+                _call_run_control(st, pipeline.pause_harness_run, ctx, harness_run["run_id"], "暂停")
+        with right:
+            if st.button("取消 Harness", key=f"cancel-harness-{harness_run['run_id']}"):
+                _call_run_control(st, pipeline.cancel_harness_run, ctx, harness_run["run_id"], "取消")
+        refresh = getattr(st, "autorefresh", None)
+        if callable(refresh):
+            refresh(interval=2000, key=f"document-run-refresh-{status['work_order_id']}")
         else:
-            st.json(status)
-            harness_run = status.get("harness_run")
-            if harness_run and harness_run["status"] in {"queued", "running", "retrying"}:
-                control_left, control_right = st.columns(2)
-                with control_left:
-                    if st.button("暂停 Harness", key=f"pause-harness-{harness_run['run_id']}"):
-                        try:
-                            pipeline.pause_harness_run(ctx, harness_run["run_id"])
-                        except (KeyError, PermissionError, ValueError) as exc:
-                            st.error(f"暂停失败：{exc}")
-                        else:
-                            st.success("已请求暂停；正在运行的节点会在下一次受控状态提交前停止。")
-                with control_right:
-                    if st.button("取消 Harness", key=f"cancel-harness-{harness_run['run_id']}"):
-                        try:
-                            pipeline.cancel_harness_run(ctx, harness_run["run_id"])
-                        except (KeyError, PermissionError, ValueError) as exc:
-                            st.error(f"取消失败：{exc}")
-                        else:
-                            st.success("已取消 Harness。")
-            artifacts = pipeline.document_generation.store.list_artifacts(work_order_id)
-            for artifact in artifacts:
-                st.write(f"{artifact.stage}: {artifact.artifact_id}")
+            st.button("刷新状态", key=f"refresh-document-run-{status['work_order_id']}")
+    for artifact in status.get("artifacts", []):
+        artifact_id = artifact["artifact_id"]
+        st.write(f"{artifact.get('stage', '产物')}：{artifact_id}")
+        _render_artifact_download(st, pipeline, ctx, status, artifact_id)
+        if artifact.get("stage") == "review_candidate":
+            comment = st.text_input("批准说明", key=f"approval-comment-{artifact_id}")
+            if st.button("批准并发布", key=f"approve-artifact-{artifact_id}"):
                 try:
-                    data = pipeline.download_document_artifact(ctx, artifact.artifact_id)
-                except PermissionError:
-                    st.caption("当前权限不能下载此产物。")
-                    continue
-                st.download_button(
-                    "下载",
-                    data=data,
-                    file_name=f"{artifact.artifact_id}.{pipeline.document_generation.store.get_work_order(work_order_id).target_format}",
-                    key=f"download-{artifact.artifact_id}",
-                )
+                    pipeline.approve_document_artifact(ctx, artifact_id, comment=comment)
+                except (PermissionError, ValueError, KeyError) as exc:
+                    st.error(f"批准失败：{exc}")
+                else:
+                    st.success("已批准并发布。")
+
+
+def _call_run_control(st, action, ctx, run_id: str, label: str) -> None:
+    try:
+        action(ctx, run_id)
+    except (PermissionError, ValueError, KeyError) as exc:
+        st.error(f"{label}失败：{exc}")
+    else:
+        st.success(f"已请求{label} Harness。")
+
+
+def _render_artifact_download(st, pipeline, ctx, status: dict, artifact_id: str) -> None:
+    """Read artifact bytes only after an explicit request, never on polling reruns."""
+    data_key = f"document-artifact-download-{artifact_id}"
+    content = st.session_state.get(data_key)
+    if content is None and st.button("准备下载", key=f"prepare-download-{artifact_id}"):
+        try:
+            content = pipeline.download_document_artifact(ctx, artifact_id)
+        except PermissionError:
+            st.caption("当前权限不能下载此产物。")
+        else:
+            st.session_state[data_key] = content
+    if content is not None:
+        st.download_button(
+            "下载", data=content, file_name=f"{artifact_id}.{status.get('target_format', 'bin')}",
+            key=f"download-{artifact_id}",
+        )

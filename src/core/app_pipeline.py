@@ -306,6 +306,27 @@ class AppPipeline:
     def get_project_source_catalog(self, project_id: str, ctx: RequestContext):
         return self.projects.list_source_catalog(ctx, project_id)
 
+    def list_document_generation_options(self, ctx: RequestContext, *, project_id: str):
+        """Return only approved, project-scoped choices for a new work order."""
+        self.projects.access.require(ctx, project_id, "view_project")
+        tenant_id = ctx.tenant_id or "default"
+        baselines = [
+            baseline
+            for baseline in self.projects.store.list_baselines(project_id, tenant_id, approved_only=True)
+            if baseline.status in {"approved", "released"}
+        ]
+        return {
+            "baselines": baselines,
+            "templates": self.document_generation.store.list_templates(approved_only=True),
+            "schemas": self.document_generation.store.list_document_schemas(approved_only=True),
+            "harness_policies": self.document_generation.store.list_harness_policies(approved_only=True),
+        }
+
+    def list_document_work_orders(self, ctx: RequestContext, *, project_id: str):
+        """List durable work-order summaries visible to the current project user."""
+        self.projects.access.require(ctx, project_id, "view_project")
+        return self.document_generation.store.list_work_orders(ctx.tenant_id or "default", project_id)
+
     def register_renderer_policy(self, policy):
         return self.document_generation.register_renderer_policy(policy)
 
@@ -376,6 +397,8 @@ class AppPipeline:
         status = {
             "work_order_id": order.work_order_id,
             "status": order.status,
+            "project_id": order.project_id,
+            "target_format": order.target_format,
             "unit_statuses": dict(order.unit_statuses),
             "validation_report_id": order.validation_report_id,
         }
@@ -395,6 +418,20 @@ class AppPipeline:
                 "fencing_token": latest_run.fencing_token,
                 "error": latest_run.error,
             }
+        if order.validation_report_id:
+            report = self.document_generation.store.get_validation_report(order.validation_report_id)
+            if report is not None:
+                status["validation"] = {"status": report.status, "issues": list(report.issues)}
+        status["artifacts"] = [
+            {
+                "artifact_id": artifact.artifact_id,
+                "stage": artifact.stage,
+                "validation_report_id": artifact.validation_report_id,
+                "validity_status": artifact.validity_status,
+                "policy_status": artifact.policy_status,
+            }
+            for artifact in self.document_generation.store.list_artifacts(order.work_order_id)
+        ]
         return status
 
     def submit_document_human_event(self, ctx: RequestContext, **kwargs):
