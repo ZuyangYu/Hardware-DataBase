@@ -26,6 +26,7 @@ from src.document_authoring.models import (
     DocumentSchema,
     DocumentWorkOrder,
     RendererPolicy,
+    TemplateSanitizationReport,
     TemplateUnitBinding,
     TemplateVersion,
     DocxFill,
@@ -39,6 +40,7 @@ from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
 from src.document_authoring.template_analysis import DocxRegionSchema, TemplateAnalysis
 from src.document_authoring.template_analyzers import analyze_template
+from src.document_authoring.template_sanitizer import sanitize_template
 from src.document_authoring.template_suggester import LLMTemplateSuggestionProvider, TemplateSuggestionProvider
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
@@ -153,37 +155,56 @@ class DocumentGenerationService:
             raise ValueError("template upload supports only .xlsx, .xlsm, and .docx files")
         if not isinstance(content, bytes) or not content:
             raise ValueError("template content must be non-empty bytes")
-        digest = hashlib.sha256(content).hexdigest()
+        source_digest = hashlib.sha256(content).hexdigest()
         template_version_id = f"template-{uuid.uuid4().hex}"
         template_schema_id = f"template-schema-{uuid.uuid4().hex}"
-        report = self.docx_renderer.inspect(content) if suffix == "docx" else self.workbook_renderer.inspect(content, suffix)
+        sanitized = sanitize_template(content, suffix)
+        digest = hashlib.sha256(sanitized.content).hexdigest()
+        report = self._inspect(sanitized.content, sanitized.format)
+        if report.active_content_status != "clean":
+            raise ValueError("sanitized template still contains active content")
         # Security findings are content-addressed, but each immutable template
         # version owns its own report row and confirmation lifecycle.
         report = report.model_copy(update={"report_id": f"template-security-{template_version_id}"})
         policy = RendererPolicy(
             renderer_policy_id=f"renderer-{template_version_id}",
             version="1",
-            macro_policy="preserve" if report.macro_parts else "quarantine",
-            external_link_policy="preserve" if report.external_links else "strip",
-            embedded_object_policy="preserve" if report.embedded_parts else "quarantine",
-            allowlisted_template_hashes=[digest] if report.active_content_status != "clean" else [],
-            allowed_changed_parts=["word/document.xml"] if suffix == "docx" else ["xl/worksheets/"],
+            macro_policy="strip",
+            external_link_policy="strip",
+            embedded_object_policy="strip",
+            allowlisted_template_hashes=[],
+            allowed_changed_parts=["word/document.xml"] if sanitized.format == "docx" else ["xl/worksheets/"],
         )
         self.store.save_renderer_policy(policy)
-        template = self.store.save_template(
-            TemplateVersion(
-                template_version_id=template_version_id,
-                template_id=template_name.strip() or filename,
-                format=suffix,
-                content_hash=digest,
-                template_schema_id=template_schema_id,
-                template_schema_version="1",
-                renderer_policy_id=policy.renderer_policy_id,
-            ),
-            content,
-            report,
+        template = TemplateVersion(
+            template_version_id=template_version_id,
+            template_id=template_name.strip() or filename,
+            format=sanitized.format,
+            content_hash=digest,
+            template_schema_id=template_schema_id,
+            template_schema_version="1",
+            renderer_policy_id=policy.renderer_policy_id,
         )
-        analysis = analyze_template(content, suffix).model_copy(update={
+        sanitization_report = TemplateSanitizationReport(
+            template_version_id=template_version_id,
+            source_format=suffix,
+            source_content_hash=source_digest,
+            source_storage_ref="",
+            sanitized_format=sanitized.format,
+            sanitized_content_hash=digest,
+            removed_parts=sanitized.removed_parts,
+            removed_relationships=sanitized.removed_relationships,
+            status="sanitized",
+        )
+        template = self.store.save_sanitized_template(
+            template,
+            content,
+            suffix,
+            sanitized.content,
+            report,
+            sanitization_report,
+        )
+        analysis = analyze_template(sanitized.content, sanitized.format).model_copy(update={
             "analysis_id": f"analysis-{uuid.uuid4().hex}",
             "template_version_id": template.template_version_id,
         })
@@ -354,6 +375,7 @@ class DocumentGenerationService:
 
         fill_plan = self._fill_plan(template, fills)
         rendered_content, integrity_manifest = self._render_fill_plan(template, fill_plan)
+        self._assert_generated_artifact_clean(rendered_content, template.format)
         report = self.validator.validate(
             work_order_id=order.work_order_id, matrix_rows=matrix_rows, integrity_manifest=integrity_manifest,
         )
@@ -489,6 +511,7 @@ class DocumentGenerationService:
         binding_by_unit = {binding.semantic_unit_id: binding for binding in bindings}
         fills = self._semantic_fills(template, result.drafts, result.unit_statuses, binding_by_unit)
         rendered_content, integrity_manifest = self._render_fill_plan(template, fills)
+        self._assert_generated_artifact_clean(rendered_content, template.format)
         report = self.validator.validate(
             work_order_id=order.work_order_id, matrix_rows=result.matrix_rows,
             integrity_manifest=integrity_manifest, additional_issues=result.issues,
@@ -583,6 +606,10 @@ class DocumentGenerationService:
         snapshot = self.projects.store.get_source_set_snapshot(order.source_set_snapshot_id, ctx.tenant_id or "default")
         if report is None or snapshot is None or report.status == "failed":
             raise ValueError("candidate does not have a releasable validation result")
+        candidate_content = self.store.read_artifact_content(candidate.artifact_id)
+        self._assert_generated_artifact_clean(candidate_content, order.target_format)
+        if hashlib.sha256(candidate_content).hexdigest() != candidate.content_hash:
+            raise ValueError("candidate content hash changed since validation")
         subject_hash = _approval_subject_hash(candidate.content_hash, report.content_hash, snapshot.content_hash)
         approvals = [event for event in self.store.list_human_events(candidate.artifact_id) if event.event_type in {"approve", "sign"}]
         if not approvals:
@@ -600,7 +627,7 @@ class DocumentGenerationService:
             approval_event_ids=[event.event_id for event in approvals], integrity_manifest_id=candidate.integrity_manifest_id,
             released_at=datetime.now(timezone.utc),
         )
-        released = self.store.save_artifact(released, self.store.read_artifact_content(candidate.artifact_id), order.target_format)
+        released = self.store.save_artifact(released, candidate_content, order.target_format)
         self._replace_order(order, status="complete")
         return released
 
@@ -803,6 +830,15 @@ class DocumentGenerationService:
         else:
             raise ValueError(f"unsupported controlled output format: {template.format}")
         return result.content, result.integrity_manifest
+
+    def _inspect(self, content: bytes, format: str):
+        if format == "docx":
+            return self.docx_renderer.inspect(content)
+        return self.workbook_renderer.inspect(content, format)
+
+    def _assert_generated_artifact_clean(self, content: bytes, format: str) -> None:
+        if self._inspect(content, format).active_content_status != "clean":
+            raise ValueError("generated artifact contains active content")
 
     def _read_hash_bound_template_content(self, template: TemplateVersion) -> bytes:
         """Return only bytes that still match the frozen template analysis and version."""

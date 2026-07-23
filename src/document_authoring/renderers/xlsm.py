@@ -126,6 +126,8 @@ class XlsmRenderer:
 
         rendered = output.getvalue()
         after = self.inspect(rendered)
+        if after.active_content_status != "clean":
+            raise ValueError("generated artifact contains active content")
         manifest = self._integrity_manifest(report, after, changed_parts, policy)
         if manifest["policy_violations"]:
             raise ValueError("renderer integrity policy rejected output: " + "; ".join(manifest["policy_violations"]))

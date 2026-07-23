@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from src.document_authoring.models import DocxFillPlan, RendererPolicy, WorkbookFillPlan
+from src.document_authoring.renderers.docx import DocxRenderer
+from src.document_authoring.renderers.xlsm import XlsmRenderer
 from src.document_authoring.service import DocumentGenerationService
+from src.document_authoring.template_sanitizer import sanitize_template
 from src.document_authoring.template_analysis import TemplateAnalysisSuggestion
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.writers.managed import LLMManagedWriter
@@ -15,12 +19,26 @@ from src.document_authoring.writers.provider import WriterRequest
 from src.core.app_pipeline import AppPipeline
 from src.pipelines.document_rag.schemas import RequestContext
 from test_document_authoring_p2a import _prepare_project
+from test_template_sanitizer import _workbook_with_vba_external_link_and_embedded_object
 
 
 def _docx_with_text(text: str) -> bytes:
     parts = {
-        "[Content_Types].xml": b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
-        "_rels/.rels": b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+        "[Content_Types].xml": (
+            b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            b'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            b'<Default Extension="xml" ContentType="application/xml"/>'
+            b'<Override PartName="/word/document.xml" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            b"</Types>"
+        ),
+        "_rels/.rels": (
+            b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            b'<Relationship Id="rRoot" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            b'Target="word/document.xml"/>'
+            b"</Relationships>"
+        ),
         "word/document.xml": (
             '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
             f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"
@@ -36,6 +54,9 @@ def _docx_with_text(text: str) -> bytes:
 
 class _SuggestedSemanticUnit:
     def suggest(self, analysis):
+        if not analysis.units:
+            analysis.suggestions = []
+            return []
         suggestions = [TemplateAnalysisSuggestion(
             semantic_unit_id="project_summary",
             label="Project Summary",
@@ -153,6 +174,74 @@ def test_identical_uploads_receive_distinct_confirmation_ids(authoring_service, 
 
     assert first.content_hash == second.content_hash
     assert first.analysis_id != second.analysis_id
+
+
+def test_active_xlsm_upload_is_analyzed_as_a_safe_xlsx_template(authoring_service, author_ctx):
+    analysis = authoring_service.analyze_uploaded_template(
+        author_ctx,
+        filename="review.xlsm",
+        content=_workbook_with_vba_external_link_and_embedded_object(),
+        template_name="review",
+    )
+
+    template = authoring_service.store.get_template(analysis.template_version_id)
+    assert template is not None
+    report = authoring_service.store.get_template_sanitization_report(template.template_version_id)
+
+    assert analysis.status == "ready_for_confirmation"
+    assert analysis.format == template.format == "xlsx"
+    assert report is not None and report.source_format == "xlsm"
+    content = authoring_service.store.read_template_content(template.template_version_id)
+    assert authoring_service.workbook_renderer.inspect(content, template.format).active_content_status == "clean"
+    policy = authoring_service.store.get_renderer_policy(template.renderer_policy_id)
+    assert policy is not None
+    assert policy.macro_policy == policy.external_link_policy == policy.embedded_object_policy == "strip"
+    assert policy.allowlisted_template_hashes == []
+
+
+@pytest.mark.parametrize(
+    ("renderer", "content", "fill_plan"),
+    [
+        (DocxRenderer(), _docx_with_text("Safe"), DocxFillPlan(template_version_id="template-1")),
+        (
+            XlsmRenderer(),
+            sanitize_template(_workbook_with_vba_external_link_and_embedded_object(), "xlsm").content,
+            WorkbookFillPlan(template_version_id="template-1"),
+        ),
+    ],
+    ids=["docx", "xlsx"],
+)
+def test_renderer_rejects_output_when_final_inspection_finds_active_content(
+    monkeypatch,
+    renderer,
+    content,
+    fill_plan,
+):
+    real_inspect = renderer.inspect
+    inspections = 0
+
+    def inspect_with_active_output(rendered_content, *args):
+        nonlocal inspections
+        inspections += 1
+        report = real_inspect(rendered_content, *args)
+        if inspections == 2:
+            return report.model_copy(update={
+                "embedded_parts": ["injected-active-part"],
+                "active_content_status": "requires_approval",
+            })
+        return report
+
+    monkeypatch.setattr(renderer, "inspect", inspect_with_active_output)
+    policy = RendererPolicy(
+        renderer_policy_id="strip-active-content",
+        macro_policy="strip",
+        external_link_policy="strip",
+        embedded_object_policy="strip",
+        allowlisted_template_hashes=[],
+    )
+
+    with pytest.raises(ValueError, match="generated artifact contains active content"):
+        renderer.render(content, [], fill_plan, policy)
 
 
 def _upload_and_confirm_semantic_template(pipeline, author_ctx):

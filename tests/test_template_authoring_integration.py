@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from src.document_authoring.models import HarnessPolicy
+from src.document_authoring.renderers.docx import DocxRenderer, DocxRenderResult
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.template_analysis import TemplateAnalysisSuggestion
 from src.document_authoring.work_order_store import DocumentAuthoringStore
@@ -15,12 +16,26 @@ from src.core.app_pipeline import AppPipeline
 from src.pipelines.document_rag.schemas import EvidenceEnvelope
 from src.projects.retrieval import ProjectEvidenceRetrievalService
 from test_document_authoring_p2a import _prepare_project
+from test_template_sanitizer import _active_parts, _docx_with_external_link_and_ole_object
 
 
 def _docx_with_text(text: str) -> bytes:
     parts = {
-        "[Content_Types].xml": b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
-        "_rels/.rels": b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+        "[Content_Types].xml": (
+            b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            b'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            b'<Default Extension="xml" ContentType="application/xml"/>'
+            b'<Override PartName="/word/document.xml" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            b"</Types>"
+        ),
+        "_rels/.rels": (
+            b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            b'<Relationship Id="rRoot" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            b'Target="word/document.xml"/>'
+            b"</Relationships>"
+        ),
         "word/document.xml": (
             '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
             f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"
@@ -32,6 +47,25 @@ def _docx_with_text(text: str) -> bytes:
         for name, value in parts.items():
             package.writestr(name, value)
     return output.getvalue()
+
+
+def _with_embedded_object_part(content: bytes) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(content)) as source, zipfile.ZipFile(output, "w") as target:
+        for info in source.infolist():
+            target.writestr(info, source.read(info.filename))
+        target.writestr("word/embeddings/injected.bin", b"active")
+    return output.getvalue()
+
+
+class _ActiveOutputDocxRenderer(DocxRenderer):
+    def render(self, *args, **kwargs):
+        result = super().render(*args, **kwargs)
+        return DocxRenderResult(
+            content=_with_embedded_object_part(result.content),
+            security_report=result.security_report,
+            integrity_manifest=result.integrity_manifest,
+        )
 
 
 class _DeterministicTemplateSuggester:
@@ -129,6 +163,140 @@ def test_uploaded_docx_is_analyzed_confirmed_written_from_project_evidence_and_d
     assert b"STM32H743" in downloaded
     with zipfile.ZipFile(io.BytesIO(downloaded)) as document:
         assert b"STM32H743" in document.read("word/document.xml")
+
+
+def test_rendered_artifact_from_sanitized_template_contains_no_active_content(tmp_path):
+    pipeline, ctx, baseline, retrieve = _pipeline_with_approved_project_source(tmp_path)
+    analysis = pipeline.analyze_document_template(
+        ctx,
+        filename="review.docx",
+        content=_docx_with_external_link_and_ole_object(),
+        template_name="Review",
+    )
+    template = pipeline.confirm_document_template(
+        ctx,
+        analysis_id=analysis.analysis_id,
+        display_name="Review",
+    )
+    order = pipeline.create_document_work_order(
+        ctx,
+        project_id=baseline.project_id,
+        baseline_id=baseline.baseline_id,
+        template_version_id=template.template_version_id,
+        document_schema_id=template.template_schema_id,
+        document_schema_version=template.template_schema_version,
+        harness_policy_id="deterministic-docx-writer",
+    )
+
+    candidate = pipeline.run_internal_document_harness(
+        ctx,
+        order.work_order_id,
+        retrieve=retrieve,
+    )
+
+    assert _active_parts(pipeline.download_document_artifact(ctx, candidate.artifact_id)) == []
+
+
+def test_candidate_is_not_saved_when_service_reinspection_finds_active_content(tmp_path):
+    pipeline, ctx, baseline, retrieve = _pipeline_with_approved_project_source(tmp_path)
+    analysis = pipeline.analyze_document_template(
+        ctx,
+        filename="review.docx",
+        content=_docx_with_text("Controller"),
+        template_name="Review",
+    )
+    template = pipeline.confirm_document_template(
+        ctx,
+        analysis_id=analysis.analysis_id,
+        display_name="Review",
+    )
+    order = pipeline.create_document_work_order(
+        ctx,
+        project_id=baseline.project_id,
+        baseline_id=baseline.baseline_id,
+        template_version_id=template.template_version_id,
+        document_schema_id=template.template_schema_id,
+        document_schema_version=template.template_schema_version,
+        harness_policy_id="deterministic-docx-writer",
+    )
+    pipeline.document_generation.docx_renderer = _ActiveOutputDocxRenderer()
+
+    with pytest.raises(ValueError, match="generated artifact contains active content"):
+        pipeline.run_internal_document_harness(ctx, order.work_order_id, retrieve=retrieve)
+
+    assert pipeline.document_generation.store.list_artifacts(order.work_order_id) == []
+
+
+def test_release_is_not_saved_when_candidate_bytes_contain_active_content(tmp_path):
+    pipeline, ctx, baseline, retrieve = _pipeline_with_approved_project_source(tmp_path)
+    analysis = pipeline.analyze_document_template(
+        ctx,
+        filename="review.docx",
+        content=_docx_with_text("Controller"),
+        template_name="Review",
+    )
+    template = pipeline.confirm_document_template(
+        ctx,
+        analysis_id=analysis.analysis_id,
+        display_name="Review",
+    )
+    order = pipeline.create_document_work_order(
+        ctx,
+        project_id=baseline.project_id,
+        baseline_id=baseline.baseline_id,
+        template_version_id=template.template_version_id,
+        document_schema_id=template.template_schema_id,
+        document_schema_version=template.template_schema_version,
+        harness_policy_id="deterministic-docx-writer",
+    )
+    candidate = pipeline.run_internal_document_harness(ctx, order.work_order_id, retrieve=retrieve)
+    assert candidate.storage_ref
+    Path(candidate.storage_ref).write_bytes(
+        _with_embedded_object_part(
+            pipeline.document_generation.store.read_artifact_content(candidate.artifact_id),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="generated artifact contains active content"):
+        pipeline.approve_document_artifact(ctx, candidate.artifact_id)
+
+    assert [artifact.stage for artifact in pipeline.document_generation.store.list_artifacts(order.work_order_id)] == [
+        "review_candidate",
+    ]
+
+
+def test_release_is_not_saved_when_clean_candidate_bytes_do_not_match_hash(tmp_path):
+    pipeline, ctx, baseline, retrieve = _pipeline_with_approved_project_source(tmp_path)
+    analysis = pipeline.analyze_document_template(
+        ctx,
+        filename="review.docx",
+        content=_docx_with_text("Controller"),
+        template_name="Review",
+    )
+    template = pipeline.confirm_document_template(
+        ctx,
+        analysis_id=analysis.analysis_id,
+        display_name="Review",
+    )
+    order = pipeline.create_document_work_order(
+        ctx,
+        project_id=baseline.project_id,
+        baseline_id=baseline.baseline_id,
+        template_version_id=template.template_version_id,
+        document_schema_id=template.template_schema_id,
+        document_schema_version=template.template_schema_version,
+        harness_policy_id="deterministic-docx-writer",
+    )
+    candidate = pipeline.run_internal_document_harness(ctx, order.work_order_id, retrieve=retrieve)
+    assert candidate.storage_ref
+    Path(candidate.storage_ref).write_bytes(_docx_with_text("Clean but tampered"))
+
+    with pytest.raises(ValueError, match="candidate content hash changed"):
+        pipeline.approve_document_artifact(ctx, candidate.artifact_id)
+
+    assert [artifact.stage for artifact in pipeline.document_generation.store.list_artifacts(order.work_order_id)] == [
+        "review_candidate",
+    ]
 
 
 def test_docx_confirmation_rejects_a_persisted_template_change(tmp_path):
