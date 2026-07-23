@@ -14,6 +14,7 @@
 - Preserve ProjectBaseline, SourceSetSnapshot, Evidence validation, Harness, WorkOrder, approval, audit, and existing XLSM safeguards.
 - Store the uploaded bytes immutably and bind analysis, activation, rendering, and approval to the exact SHA-256 content hash.
 - The LLM receives only the normalized structural inventory and returns Pydantic-validated JSON; it never receives binary bytes, arbitrary paths, database access, or raw project sources.
+- Template analysis and model-backed document writing reuse the intelligent-chat `LLMClient` and its existing `AGENT_*` URL, model, timeout, and API-key configuration; do not add document-specific provider settings or secret storage.
 - Formula, macro, external-link, embedded-object, signature, protected, human-input, and human-approval locations are non-writable by machine execution.
 - Use red-green-refactor. Run new tests with `.venv/bin/pytest`; never stage the user-owned `docs/ADAS/` directory or CAM XLSM file.
 - The rollback task produces a reviewable inventory only. Do not delete, rewrite history, or change retained behavior until the user approves an exact deletion list.
@@ -351,7 +352,7 @@ Expected: missing upload/confirmation APIs.
 
 Infer the format from the lower-case suffix and reject all other suffixes. On upload calculate SHA-256; create a draft `TemplateVersion`; inspect/persist immutable bytes; run deterministic analysis then constrained suggestions; save the analysis. On confirmation load analysis/template; verify matching hashes; validate suggested targets; create regions/bindings and a draft `DocumentSchema`; approve schema/template in one SQLite transaction. Do not enable `requires_human` analyses until exception corrections specify allowed targets. Active-content templates require exact-hash allowlisting in `RendererPolicy`.
 
-When no approved policy exists, create one approved `HarnessPolicy` using the existing five-tool allowlist and deterministic writer provider. An explicit approved policy still takes precedence.
+When no approved policy exists, create one approved `HarnessPolicy` using the existing five-tool allowlist and a managed provider that calls the same `LLMClient` configuration used by intelligent chat. It must turn the model response into `DocumentUnitDraft` and reject malformed, unsupported, or ungrounded output. The deterministic evidence writer remains the test/offline provider. Do not add document-specific URL, model, or API-key settings. An explicit approved policy still takes precedence.
 
 - [ ] **Step 4: Add and run automatic Harness-selection test**
 
@@ -484,4 +485,3 @@ git commit -m "test: cover governed uploaded-template authoring"
 - Spec coverage: Tasks 2–5 implement immutable upload, rule/LLM analysis, controlled confirmation, Harness use, and both OOXML output formats. Task 6 implements simplified real-time Streamlit workflow. Task 7 verifies the governed end-to-end path. Task 1 isolates the requested rollback audit from source deletion.
 - Placeholder scan: every task identifies concrete files, public method names, assertions, and commands.
 - Type consistency: `TemplateAnalysis` flows from analyzer through store/service to Streamlit. `DocxFillPlan` stays separate from `WorkbookFillPlan`; renderer dispatch uses frozen `TemplateVersion.format`.
-
