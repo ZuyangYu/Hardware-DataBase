@@ -36,6 +36,7 @@ from src.document_authoring.models import (
     ValidationReport,
     WorkbookRegionSchema,
 )
+from src.document_authoring.template_analysis import TemplateAnalysis
 
 
 ModelT = TypeVar("ModelT")
@@ -72,6 +73,11 @@ class DocumentAuthoringStore:
                 CREATE TABLE IF NOT EXISTS template_versions (
                     template_version_id TEXT PRIMARY KEY, status TEXT NOT NULL,
                     content_hash TEXT NOT NULL, payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS template_analyses (
+                    template_version_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    FOREIGN KEY(template_version_id) REFERENCES template_versions(template_version_id)
                 );
                 CREATE TABLE IF NOT EXISTS template_security_reports (
                     report_id TEXT PRIMARY KEY, template_version_id TEXT NOT NULL,
@@ -232,6 +238,50 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT payload_json FROM template_versions WHERE template_version_id = ?", (template_version_id,)).fetchone()
         return TemplateVersion.model_validate(_payload(row)) if row else None
+
+    def save_template_analysis(self, analysis: TemplateAnalysis) -> TemplateAnalysis:
+        template = self.get_template(analysis.template_version_id)
+        if template is None:
+            raise KeyError(f"template not found: {analysis.template_version_id}")
+        if analysis.content_hash != template.content_hash:
+            raise ValueError("template analysis content hash does not match template content hash")
+        if analysis.format != template.format:
+            raise ValueError("template analysis format does not match template format")
+        analysis.validate_suggestions()
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO template_analyses (template_version_id, content_hash, payload_json)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(template_version_id) DO UPDATE SET
+                       content_hash = excluded.content_hash, payload_json = excluded.payload_json""",
+                (analysis.template_version_id, analysis.content_hash, _json(analysis)),
+            )
+        return analysis
+
+    def get_template_analysis(self, template_version_id: str) -> TemplateAnalysis | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload_json, content_hash FROM template_analyses WHERE template_version_id = ?",
+                (template_version_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        analysis = TemplateAnalysis.model_validate(_payload(row))
+        if analysis.template_version_id != template_version_id:
+            raise ValueError("template analysis template version does not match persistence key")
+        template = self.get_template(template_version_id)
+        if template is None:
+            raise KeyError(f"template not found: {template_version_id}")
+        if (
+            row["content_hash"] != template.content_hash
+            or analysis.content_hash != row["content_hash"]
+            or analysis.content_hash != template.content_hash
+        ):
+            raise ValueError("template analysis content hash does not match template content hash")
+        if analysis.format != template.format:
+            raise ValueError("template analysis format does not match template format")
+        analysis.validate_suggestions()
+        return analysis
 
     def list_templates(self, approved_only: bool = False) -> list[TemplateVersion]:
         sql = "SELECT payload_json FROM template_versions"

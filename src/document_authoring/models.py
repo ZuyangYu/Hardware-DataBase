@@ -14,6 +14,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from src.agents.claim_evidence import InformationRequirement
+from src.document_authoring.template_analysis import DocxRegionSchema
 
 
 def utc_now() -> datetime:
