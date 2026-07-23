@@ -212,6 +212,10 @@ class DocumentGenerationService:
         analysis.validate_suggestions()
         return self.store.save_template_analysis(analysis)
 
+    def get_template_sanitization_report(self, template_version_id: str) -> TemplateSanitizationReport | None:
+        """Return the immutable sanitization audit record for a template version."""
+        return self.store.get_template_sanitization_report(template_version_id)
+
     def confirm_template_analysis(
         self,
         ctx: RequestContext,

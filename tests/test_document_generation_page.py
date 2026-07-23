@@ -1,6 +1,24 @@
 from __future__ import annotations
 
-from src.ui.document_generation_page import _matching_schemas, _run_timeline
+from src.ui.document_generation_page import _matching_schemas, _run_timeline, _safe_sanitization_summary
+
+
+def _report(**overrides):
+    return {
+        "removed_parts": [],
+        "removed_relationships": [],
+        "sanitized_format": "xlsx",
+        **overrides,
+    }
+
+
+def test_sanitization_summary_exposes_only_asset_counts_and_safe_format():
+    summary = _safe_sanitization_summary(_report(
+        removed_parts=["xl/vbaProject.bin", "xl/externalLinks/a.xml"],
+    ))
+
+    assert summary == {"已移除宏": 1, "已移除外链": 1, "安全模板格式": "xlsx"}
+    assert "vbaProject.bin" not in str(summary)
 
 
 def test_run_timeline_marks_current_harness_node_and_terminal_error():
