@@ -14,7 +14,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from src.agents.claim_evidence import InformationRequirement
-from src.document_authoring.template_analysis import DocxRegionSchema
+from src.document_authoring.template_analysis import DocxRegionSchema  # noqa: F401
 
 
 def utc_now() -> datetime:
@@ -48,7 +48,7 @@ class RendererPolicy(BaseModel):
     external_link_policy: Literal["preserve", "strip", "quarantine"] = "strip"
     embedded_object_policy: Literal["preserve", "strip", "quarantine"] = "quarantine"
     allowlisted_template_hashes: list[str] = Field(default_factory=list)
-    allowed_changed_parts: list[str] = Field(default_factory=lambda: ["xl/worksheets/"])
+    allowed_changed_parts: list[str] = Field(default_factory=lambda: ["xl/worksheets/", "word/document.xml"])
     reject_formula_like_text: bool = True
 
 
@@ -429,6 +429,21 @@ class WorkbookFill(BaseModel):
 class WorkbookFillPlan(BaseModel):
     template_version_id: str
     fills: list[WorkbookFill] = Field(default_factory=list)
+
+
+class DocxFill(BaseModel):
+    """A value destined for one pre-registered DOCX region."""
+
+    region_id: str
+    value: str
+    semantic_unit_id: str
+
+
+class DocxFillPlan(BaseModel):
+    """A hash-bound allowlist of DOCX paragraph, table-cell, or control fills."""
+
+    template_version_id: str
+    fills: list[DocxFill] = Field(default_factory=list)
 
 
 class ValidationReport(BaseModel):

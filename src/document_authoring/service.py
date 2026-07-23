@@ -28,12 +28,16 @@ from src.document_authoring.models import (
     RendererPolicy,
     TemplateUnitBinding,
     TemplateVersion,
+    DocxFill,
+    DocxFillPlan,
     WorkbookFill,
     WorkbookFillPlan,
     WorkbookRegionSchema,
     content_hash,
 )
+from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
+from src.document_authoring.template_analysis import DocxRegionSchema
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.worker import DocumentGenerationWorker
@@ -49,10 +53,15 @@ class DocumentGenerationService:
         store: DocumentAuthoringStore | None = None,
         renderer: XlsmRenderer | None = None,
         worker: DocumentGenerationWorker | None = None,
+        docx_renderer: DocxRenderer | None = None,
     ):
         self.projects = project_service or ProjectService()
         self.store = store or DocumentAuthoringStore()
-        self.renderer = renderer or XlsmRenderer()
+        self.workbook_renderer = renderer or XlsmRenderer()
+        # Keep the existing public attribute for callers that supplied the
+        # XLSX/XLSM renderer before DOCX support was introduced.
+        self.renderer = self.workbook_renderer
+        self.docx_renderer = docx_renderer or DocxRenderer()
         self.rules = DeterministicRuleExecutor()
         self.validator = DocumentValidator()
         self.worker = worker or DocumentGenerationWorker()
@@ -77,15 +86,20 @@ class DocumentGenerationService:
         template: TemplateVersion,
         content: bytes,
         *,
-        regions: list[WorkbookRegionSchema],
+        regions: list[WorkbookRegionSchema] | list[DocxRegionSchema],
         bindings: list[TemplateUnitBinding],
         legacy_claims: list[LegacyTemplateClaim] | None = None,
     ) -> TemplateVersion:
         actual_hash = hashlib.sha256(content).hexdigest()
         if template.content_hash != actual_hash:
             raise ValueError("template content hash does not match supplied bytes")
-        if template.format not in {"xlsm", "xlsx"}:
-            raise NotImplementedError("P2a controlled renderer supports XLSM/XLSX only")
+        if template.format not in {"xlsm", "xlsx", "docx"}:
+            raise NotImplementedError(f"controlled renderer does not support {template.format.upper()}")
+        if template.format == "docx":
+            if not all(isinstance(region, DocxRegionSchema) for region in regions):
+                raise TypeError("DOCX templates require DocxRegionSchema regions")
+        elif not all(isinstance(region, WorkbookRegionSchema) for region in regions):
+            raise TypeError("XLSX/XLSM templates require WorkbookRegionSchema regions")
         seen_regions = {region.region_id for region in regions}
         if len(seen_regions) != len(regions):
             raise ValueError("template region ids must be unique")
@@ -94,9 +108,12 @@ class DocumentGenerationService:
                 raise ValueError("template unit binding schema version mismatch")
             if not set(binding.target_region_ids) <= seen_regions:
                 raise ValueError(f"binding references unknown regions: {binding.binding_id}")
-        report = self.renderer.inspect(content, template.format)
+        report = self.docx_renderer.inspect(content) if template.format == "docx" else self.workbook_renderer.inspect(content, template.format)
         saved = self.store.save_template(template, content, report)
-        self.store.save_workbook_regions(template.template_schema_id, template.template_schema_version, regions)
+        if template.format == "docx":
+            self.store.save_docx_regions(template.template_schema_id, template.template_schema_version, regions)
+        else:
+            self.store.save_workbook_regions(template.template_schema_id, template.template_schema_version, regions)
         self.store.save_unit_bindings(bindings)
         self.store.save_legacy_template_claims(template.template_version_id, legacy_claims or [])
         return saved
@@ -200,12 +217,11 @@ class DocumentGenerationService:
         snapshot = self.projects.store.get_source_set_snapshot(order.source_set_snapshot_id, order.tenant_id)
         if snapshot is None:
             raise ValueError("work order source set snapshot is missing")
-        regions = self.store.list_workbook_regions(order.template_schema_id, order.template_schema_version)
         bindings = self.store.list_unit_bindings(order.template_schema_id, order.template_schema_version)
         by_unit = {binding.semantic_unit_id: binding for binding in bindings}
 
         matrix_rows: list[dict[str, Any]] = []
-        fills: list[WorkbookFill] = []
+        fills: list[WorkbookFill] | list[DocxFill] = []
         statuses: dict[str, str] = {}
         for item in schema.review_items:
             outcome = retrieval_outcomes.get(item.retrieval_rule_id)
@@ -233,26 +249,26 @@ class DocumentGenerationService:
             if binding is not None:
                 label = _result_label(result_status, display)
                 for region_id in binding.target_region_ids:
-                    fills.append(WorkbookFill(region_id=region_id, value=label, semantic_unit_id=item.review_item_id))
+                    if template.format == "docx":
+                        fills.append(DocxFill(region_id=region_id, value=label, semantic_unit_id=item.review_item_id))
+                    else:
+                        fills.append(WorkbookFill(region_id=region_id, value=label, semantic_unit_id=item.review_item_id))
 
-        fill_plan = WorkbookFillPlan(template_version_id=template.template_version_id, fills=fills)
-        output = self.renderer.render(
-            self.store.read_template_content(template.template_version_id), regions, fill_plan,
-            self._policy(template), security_approved=True,
-        )
+        fill_plan = self._fill_plan(template, fills)
+        rendered_content, integrity_manifest = self._render_fill_plan(template, fill_plan)
         report = self.validator.validate(
-            work_order_id=order.work_order_id, matrix_rows=matrix_rows, integrity_manifest=output.integrity_manifest,
+            work_order_id=order.work_order_id, matrix_rows=matrix_rows, integrity_manifest=integrity_manifest,
         )
         self.store.save_evidence_matrix(order.work_order_id, matrix_rows)
         self.store.save_validation_report(report)
         artifact = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=order.tenant_id,
             work_order_id=order.work_order_id, run_id=f"run-{uuid.uuid4().hex}",
-            stage="review_candidate", content_hash=hashlib.sha256(output.content).hexdigest(),
+            stage="review_candidate", content_hash=hashlib.sha256(rendered_content).hexdigest(),
             validation_report_id=report.validation_report_id,
-            integrity_manifest_id=output.integrity_manifest["manifest_hash"],
+            integrity_manifest_id=integrity_manifest["manifest_hash"],
         )
-        artifact = self.store.save_artifact(artifact, output.content, template.format)
+        artifact = self.store.save_artifact(artifact, rendered_content, template.format)
         next_status = "waiting_human_approval" if report.status in {"passed", "requires_human"} else "blocked"
         self._replace_order(order, status=next_status, unit_statuses=statuses,
                             evidence_matrix_id=f"matrix-{order.work_order_id}", validation_report_id=report.validation_report_id)
@@ -371,28 +387,24 @@ class DocumentGenerationService:
         harness_run_id: str,
         result,
     ) -> DocumentArtifact:
-        regions = self.store.list_workbook_regions(order.template_schema_id, order.template_schema_version)
         bindings = self.store.list_unit_bindings(order.template_schema_id, order.template_schema_version)
         binding_by_unit = {binding.semantic_unit_id: binding for binding in bindings}
-        fills = self._semantic_fills(template.template_version_id, result.drafts, result.unit_statuses, binding_by_unit)
-        output = self.renderer.render(
-            self.store.read_template_content(template.template_version_id), regions, fills,
-            self._policy(template), security_approved=True,
-        )
+        fills = self._semantic_fills(template, result.drafts, result.unit_statuses, binding_by_unit)
+        rendered_content, integrity_manifest = self._render_fill_plan(template, fills)
         report = self.validator.validate(
             work_order_id=order.work_order_id, matrix_rows=result.matrix_rows,
-            integrity_manifest=output.integrity_manifest, additional_issues=result.issues,
+            integrity_manifest=integrity_manifest, additional_issues=result.issues,
         )
         self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
         self.store.save_validation_report(report)
         artifact = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=order.tenant_id,
             work_order_id=order.work_order_id, run_id=harness_run_id,
-            stage="review_candidate", content_hash=hashlib.sha256(output.content).hexdigest(),
+            stage="review_candidate", content_hash=hashlib.sha256(rendered_content).hexdigest(),
             validation_report_id=report.validation_report_id,
-            integrity_manifest_id=output.integrity_manifest["manifest_hash"],
+            integrity_manifest_id=integrity_manifest["manifest_hash"],
         )
-        artifact = self.store.save_artifact(artifact, output.content, template.format)
+        artifact = self.store.save_artifact(artifact, rendered_content, template.format)
         next_status = "waiting_human_input" if any(
             status in {"requires_human", "blocked", "conflicting", "retrieval_failed", "insufficient_evidence", "tbd"}
             for status in result.unit_statuses.values()
@@ -562,12 +574,12 @@ class DocumentGenerationService:
 
     @staticmethod
     def _semantic_fills(
-        template_version_id: str,
+        template: TemplateVersion,
         drafts: list[DocumentUnitDraft],
         statuses: dict[str, str],
         bindings: dict[str, TemplateUnitBinding],
-    ) -> WorkbookFillPlan:
-        fills: list[WorkbookFill] = []
+    ) -> WorkbookFillPlan | DocxFillPlan:
+        fills: list[WorkbookFill] | list[DocxFill] = []
         for draft in drafts:
             if draft.validation_status != "supported" or statuses.get(draft.unit_id) != "ready_to_render":
                 continue
@@ -579,8 +591,53 @@ class DocumentGenerationService:
             if value is None:
                 continue
             for region_id in binding.target_region_ids:
-                fills.append(WorkbookFill(region_id=region_id, value=str(value), semantic_unit_id=semantic_unit_id))
-        return WorkbookFillPlan(template_version_id=template_version_id, fills=fills)
+                if template.format == "docx":
+                    fills.append(DocxFill(region_id=region_id, value=str(value), semantic_unit_id=semantic_unit_id))
+                else:
+                    fills.append(WorkbookFill(region_id=region_id, value=str(value), semantic_unit_id=semantic_unit_id))
+        return DocumentGenerationService._fill_plan(template, fills)
+
+    @staticmethod
+    def _fill_plan(
+        template: TemplateVersion,
+        fills: list[WorkbookFill] | list[DocxFill],
+    ) -> WorkbookFillPlan | DocxFillPlan:
+        if template.format == "docx":
+            return DocxFillPlan(template_version_id=template.template_version_id, fills=fills)
+        return WorkbookFillPlan(template_version_id=template.template_version_id, fills=fills)
+
+    def _render_fill_plan(
+        self,
+        template: TemplateVersion,
+        fill_plan: WorkbookFillPlan | DocxFillPlan,
+    ) -> tuple[bytes, dict]:
+        if fill_plan.template_version_id != template.template_version_id:
+            raise PermissionError("FillPlan belongs to a different frozen template version")
+        content = self.store.read_template_content(template.template_version_id)
+        policy = self._policy(template)
+        if template.format in {"xlsx", "xlsm"}:
+            if not isinstance(fill_plan, WorkbookFillPlan):
+                raise TypeError("XLSX/XLSM templates require WorkbookFillPlan")
+            result = self.workbook_renderer.render(
+                content,
+                self.store.list_workbook_regions(template.template_schema_id, template.template_schema_version),
+                fill_plan,
+                policy,
+                security_approved=True,
+            )
+        elif template.format == "docx":
+            if not isinstance(fill_plan, DocxFillPlan):
+                raise TypeError("DOCX templates require DocxFillPlan")
+            result = self.docx_renderer.render(
+                content,
+                self.store.list_docx_regions(template.template_schema_id, template.template_schema_version),
+                fill_plan,
+                policy,
+                security_approved=True,
+            )
+        else:
+            raise ValueError(f"unsupported controlled output format: {template.format}")
+        return result.content, result.integrity_manifest
 
     @staticmethod
     def _validate_retrieval_outcome(order: DocumentWorkOrder, snapshot, outcome: RetrievalOutcome) -> None:

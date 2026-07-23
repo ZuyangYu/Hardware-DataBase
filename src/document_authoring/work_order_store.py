@@ -36,7 +36,7 @@ from src.document_authoring.models import (
     ValidationReport,
     WorkbookRegionSchema,
 )
-from src.document_authoring.template_analysis import TemplateAnalysis
+from src.document_authoring.template_analysis import DocxRegionSchema, TemplateAnalysis
 
 
 ModelT = TypeVar("ModelT")
@@ -97,6 +97,11 @@ class DocumentAuthoringStore:
                 CREATE TABLE IF NOT EXISTS workbook_regions (
                     region_id TEXT PRIMARY KEY, template_schema_id TEXT NOT NULL,
                     template_schema_version TEXT NOT NULL, payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS docx_regions (
+                    region_id TEXT NOT NULL, template_schema_id TEXT NOT NULL,
+                    template_schema_version TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    PRIMARY KEY(template_schema_id, template_schema_version, region_id)
                 );
                 CREATE TABLE IF NOT EXISTS template_unit_bindings (
                     binding_id TEXT PRIMARY KEY, template_schema_id TEXT NOT NULL,
@@ -204,6 +209,36 @@ class DocumentAuthoringStore:
                     ON document_outbox_events(status, created_at, event_id);
                 """
             )
+            self._migrate_docx_regions(conn)
+
+    @staticmethod
+    def _migrate_docx_regions(conn: sqlite3.Connection) -> None:
+        columns = conn.execute("PRAGMA table_info(docx_regions)").fetchall()
+        primary_key = [row["name"] for row in sorted(columns, key=lambda row: row["pk"]) if row["pk"]]
+        expected_key = ["template_schema_id", "template_schema_version", "region_id"]
+        if primary_key == expected_key:
+            return
+        conn.execute("BEGIN")
+        try:
+            conn.execute("ALTER TABLE docx_regions RENAME TO docx_regions_legacy")
+            conn.execute(
+                """CREATE TABLE docx_regions (
+                    region_id TEXT NOT NULL, template_schema_id TEXT NOT NULL,
+                    template_schema_version TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    PRIMARY KEY(template_schema_id, template_schema_version, region_id)
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO docx_regions
+                    (region_id, template_schema_id, template_schema_version, payload_json)
+                    SELECT region_id, template_schema_id, template_schema_version, payload_json
+                    FROM docx_regions_legacy"""
+            )
+            conn.execute("DROP TABLE docx_regions_legacy")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _put(conn, table: str, columns: dict[str, Any], payload: Any) -> None:
@@ -399,6 +434,29 @@ class DocumentAuthoringStore:
                 (template_schema_id, version),
             ).fetchall()
         return [WorkbookRegionSchema.model_validate(_payload(row)) for row in rows]
+
+    def save_docx_regions(self, template_schema_id: str, template_schema_version: str, regions: list[DocxRegionSchema]) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            try:
+                for region in regions:
+                    self._put(conn, "docx_regions", {
+                        "region_id": region.region_id, "template_schema_id": template_schema_id,
+                        "template_schema_version": template_schema_version,
+                    }, region)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def list_docx_regions(self, template_schema_id: str, version: str) -> list[DocxRegionSchema]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT payload_json FROM docx_regions
+                   WHERE template_schema_id = ? AND template_schema_version = ? ORDER BY region_id""",
+                (template_schema_id, version),
+            ).fetchall()
+        return [DocxRegionSchema.model_validate(_payload(row)) for row in rows]
 
     def save_unit_bindings(self, bindings: list[TemplateUnitBinding]) -> None:
         with closing(self._connect()) as conn:
