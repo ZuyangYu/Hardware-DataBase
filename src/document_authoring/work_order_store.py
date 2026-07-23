@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -387,21 +388,31 @@ class DocumentAuthoringStore:
         self,
         *,
         template: TemplateVersion,
+        analysis_content_hash: str,
         schema: DocumentSchema,
         regions: list[WorkbookRegionSchema] | list[DocxRegionSchema],
         bindings: list[TemplateUnitBinding],
     ) -> TemplateVersion:
         """Approve the hash-checked template and its generated schema atomically."""
         with closing(self._connect()) as conn:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             try:
                 current = conn.execute(
-                    "SELECT content_hash FROM template_versions WHERE template_version_id = ?",
+                    "SELECT content_hash, payload_json FROM template_versions WHERE template_version_id = ?",
                     (template.template_version_id,),
                 ).fetchone()
                 if current is None:
                     raise KeyError(f"template not found: {template.template_version_id}")
-                if current["content_hash"] != template.content_hash:
+                stored_template = TemplateVersion.model_validate(_payload(current))
+                if not stored_template.storage_ref:
+                    raise ValueError("template storage reference is missing")
+                persisted_hash = hashlib.sha256(Path(stored_template.storage_ref).read_bytes()).hexdigest()
+                if (
+                    current["content_hash"] != template.content_hash
+                    or persisted_hash != current["content_hash"]
+                    or persisted_hash != stored_template.content_hash
+                    or persisted_hash != analysis_content_hash
+                ):
                     raise ValueError("template content hash changed before activation")
                 conn.execute(
                     "UPDATE template_versions SET status = ?, payload_json = ? WHERE template_version_id = ?",

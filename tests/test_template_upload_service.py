@@ -112,6 +112,35 @@ def test_confirmation_rejects_when_template_hash_changes(authoring_service, auth
         )
 
 
+def test_confirmation_rechecks_persisted_bytes_inside_activation(author_ctx, tmp_path: Path):
+    class _ActivationMutationStore(DocumentAuthoringStore):
+        replacement: bytes | None = None
+
+        def activate_template_analysis(self, **kwargs):
+            if self.replacement is not None:
+                template = kwargs["template"]
+                assert template.storage_ref
+                Path(template.storage_ref).write_bytes(self.replacement)
+                self.replacement = None
+            return super().activate_template_analysis(**kwargs)
+
+    store = _ActivationMutationStore(str(tmp_path / "authoring.db"), str(tmp_path / "authoring-files"))
+    service = DocumentGenerationService(store=store, suggestion_provider=_SuggestedSemanticUnit())
+    analysis = service.analyze_uploaded_template(
+        author_ctx, filename="review.docx", content=_docx_with_text("A"), template_name="Review",
+    )
+    store.replacement = _docx_with_text("B")
+
+    with pytest.raises(ValueError, match="content hash"):
+        service.confirm_template_analysis(
+            author_ctx, analysis_id=analysis.analysis_id, display_name="Review",
+        )
+
+    template = store.get_template(analysis.template_version_id)
+    assert template is not None and template.status == "draft"
+    assert store.get_document_schema(template.template_schema_id, "1") is None
+
+
 def test_identical_uploads_receive_distinct_confirmation_ids(authoring_service, author_ctx):
     content = _docx_with_text("Project Summary")
 

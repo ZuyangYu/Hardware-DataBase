@@ -225,7 +225,8 @@ class DocumentGenerationService:
             "approved_at": datetime.now(timezone.utc),
         })
         return self.store.activate_template_analysis(
-            template=approved, schema=schema, regions=regions, bindings=bindings,
+            template=approved, analysis_content_hash=analysis.content_hash,
+            schema=schema, regions=regions, bindings=bindings,
         )
 
     # Work order creation --------------------------------------------------------------
