@@ -70,6 +70,7 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
     units: list[TemplateAnalysisUnit] = []
     for sheet in workbook.findall("x:sheets/x:sheet", NS):
         sheet_name = sheet.attrib.get("name", "Sheet")
+        sheet_hidden = sheet.attrib.get("state", "visible").lower() in {"hidden", "veryhidden"}
         relationship_id = sheet.attrib.get(f"{{{OFFICE_REL_NS}}}id", "")
         target = rel_targets.get(relationship_id)
         if not target:
@@ -80,6 +81,7 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
         root = ET.fromstring(package.read(sheet_path))
         sheet_protected = workbook_protected or root.find("x:sheetProtection", NS) is not None
         merged_non_anchors = _merged_non_anchors(root)
+        hidden_column_ranges, invalid_hidden_column_range = _hidden_column_ranges(root)
         for row in root.findall(".//x:sheetData/x:row", NS):
             row_hidden = row.attrib.get("hidden") in {"1", "true", "True"}
             for cell in row.findall("x:c", NS):
@@ -88,15 +90,23 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                     continue
                 has_formula = cell.find("x:f", NS) is not None
                 style = _style_index(cell.attrib.get("s"))
+                invalid_style = style is None
                 # A protected sheet must fail closed when its style table is
                 # malformed or references an unknown cell style.
-                style_locked, style_hidden = styles.get(style, (True, False))
-                protected = sheet_protected and style_locked
+                style_locked, style_hidden = styles.get(style, (True, False)) if style is not None else (True, False)
+                protected = sheet_protected and (invalid_style or style_locked)
+                column, _ = _cell_coordinates(ref)
+                hidden_column = invalid_hidden_column_range or any(
+                    lower <= column <= upper for lower, upper in hidden_column_ranges
+                )
                 hidden = row_hidden or style_hidden
                 blocked_reason = _workbook_blocked_reason(
                     has_formula=has_formula,
                     merged_non_anchor=ref in merged_non_anchors,
+                    invalid_style=invalid_style,
                     protected=protected,
+                    hidden_sheet=sheet_hidden,
+                    hidden_column=hidden_column,
                     hidden=hidden,
                     active_content=active_content,
                 )
@@ -120,12 +130,26 @@ def _workbook_has_active_content(names: set[str], package: zipfile.ZipFile) -> b
 
 
 def _workbook_blocked_reason(
-    *, has_formula: bool, merged_non_anchor: bool, protected: bool, hidden: bool, active_content: bool,
+    *,
+    has_formula: bool,
+    merged_non_anchor: bool,
+    invalid_style: bool,
+    protected: bool,
+    hidden_sheet: bool,
+    hidden_column: bool,
+    hidden: bool,
+    active_content: bool,
 ) -> str | None:
     if has_formula:
         return "formula"
     if merged_non_anchor:
         return "merged_non_anchor"
+    if hidden_sheet:
+        return "hidden_sheet"
+    if hidden_column:
+        return "hidden_column"
+    if invalid_style:
+        return "invalid_style"
     if protected:
         return "protected"
     if hidden:
@@ -148,11 +172,31 @@ def _style_protection(styles_xml: bytes | None) -> dict[int, tuple[bool, bool]]:
     return result or {0: (True, False)}
 
 
-def _style_index(value: str | None) -> int:
-    try:
-        return int(value or "0")
-    except ValueError:
+def _style_index(value: str | None) -> int | None:
+    if value is None:
         return 0
+    if not value.isascii() or not value.isdecimal():
+        return None
+    return int(value)
+
+
+def _hidden_column_ranges(root: ET.Element) -> tuple[list[tuple[int, int]], bool]:
+    ranges: list[tuple[int, int]] = []
+    invalid_hidden_range = False
+    for column in root.findall("x:cols/x:col", NS):
+        if column.attrib.get("hidden") not in {"1", "true", "True"}:
+            continue
+        try:
+            lower = int(column.attrib["min"])
+            upper = int(column.attrib["max"])
+        except (KeyError, ValueError):
+            invalid_hidden_range = True
+            continue
+        if lower < 1 or upper < lower:
+            invalid_hidden_range = True
+            continue
+        ranges.append((lower, upper))
+    return ranges, invalid_hidden_range
 
 
 def _merged_non_anchors(root: ET.Element) -> set[str]:

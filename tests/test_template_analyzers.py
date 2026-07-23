@@ -99,6 +99,62 @@ def test_xlsx_analysis_fails_closed_for_an_unknown_style_in_a_protected_sheet():
     assert by_id["sheet:Review!A1"].blocked_reason == "protected"
 
 
+def test_xlsx_analysis_blocks_cells_on_hidden_or_very_hidden_sheets():
+    for state in (b"hidden", b"veryHidden"):
+        hidden_sheet = _replace_part(
+            _xlsx_with_merged_and_protected_cells(),
+            "xl/workbook.xml",
+            b'<sheet name="Review"',
+            b'<sheet name="Review" state="' + state + b'"',
+        )
+
+        analysis = analyze_template(hidden_sheet, "xlsx")
+
+        by_id = {unit.unit_id: unit for unit in analysis.units}
+        assert by_id["sheet:Review!A1"].writable is False
+        assert by_id["sheet:Review!A1"].blocked_reason == "hidden_sheet"
+
+
+def test_xlsx_analysis_blocks_cells_in_hidden_column_ranges():
+    no_sheet_protection = _replace_part(
+        _xlsx_with_merged_and_protected_cells(),
+        "xl/worksheets/sheet1.xml",
+        b'<sheetProtection sheet="1"/>',
+        b"",
+    )
+    hidden_column = _replace_part(
+        no_sheet_protection,
+        "xl/worksheets/sheet1.xml",
+        b"<sheetData>",
+        b'<cols><col min="1" max="1" hidden="1"/></cols><sheetData>',
+    )
+
+    analysis = analyze_template(hidden_column, "xlsx")
+
+    by_id = {unit.unit_id: unit for unit in analysis.units}
+    assert by_id["sheet:Review!A1"].writable is False
+    assert by_id["sheet:Review!A1"].blocked_reason == "hidden_column"
+
+
+def test_xlsx_analysis_fails_closed_for_malformed_style_id_in_a_protected_sheet():
+    with_unlocked_style = _replace_part(
+        _xlsx_with_merged_and_protected_cells(),
+        "xl/worksheets/sheet1.xml",
+        b'<c r="A1"',
+        b'<c r="A1" s="malformed"',
+    )
+    with zipfile.ZipFile(io.BytesIO(with_unlocked_style)) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/styles.xml"] = b'''<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<cellXfs count="1"><xf><protection locked="0"/></xf></cellXfs></styleSheet>'''
+
+    analysis = analyze_template(_package(parts), "xlsx")
+
+    by_id = {unit.unit_id: unit for unit in analysis.units}
+    assert by_id["sheet:Review!A1"].writable is False
+    assert by_id["sheet:Review!A1"].blocked_reason == "invalid_style"
+
+
 def test_docx_analysis_exposes_paragraph_and_table_cells_but_protects_external_relationships():
     analysis = analyze_template(_docx_with_paragraph_table_and_external_link(), "docx")
 
