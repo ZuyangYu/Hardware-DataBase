@@ -318,6 +318,19 @@ class DocumentAuthoringStore:
         analysis.validate_suggestions()
         return analysis
 
+    def get_template_analysis_by_id(self, analysis_id: str) -> TemplateAnalysis | None:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM template_analyses WHERE json_extract(payload_json, '$.analysis_id') = ?",
+                (analysis_id,),
+            ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("template analysis id is not unique")
+        analysis = TemplateAnalysis.model_validate(_payload(rows[0]))
+        return self.get_template_analysis(analysis.template_version_id)
+
     def list_templates(self, approved_only: bool = False) -> list[TemplateVersion]:
         sql = "SELECT payload_json FROM template_versions"
         if approved_only:
@@ -368,6 +381,57 @@ class DocumentAuthoringStore:
                 "UPDATE template_versions SET status = ?, payload_json = ? WHERE template_version_id = ?",
                 (template.status, _json(template), template.template_version_id),
             )
+        return template
+
+    def activate_template_analysis(
+        self,
+        *,
+        template: TemplateVersion,
+        schema: DocumentSchema,
+        regions: list[WorkbookRegionSchema] | list[DocxRegionSchema],
+        bindings: list[TemplateUnitBinding],
+    ) -> TemplateVersion:
+        """Approve the hash-checked template and its generated schema atomically."""
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            try:
+                current = conn.execute(
+                    "SELECT content_hash FROM template_versions WHERE template_version_id = ?",
+                    (template.template_version_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(f"template not found: {template.template_version_id}")
+                if current["content_hash"] != template.content_hash:
+                    raise ValueError("template content hash changed before activation")
+                conn.execute(
+                    "UPDATE template_versions SET status = ?, payload_json = ? WHERE template_version_id = ?",
+                    (template.status, _json(template), template.template_version_id),
+                )
+                self._put(conn, "document_schemas", {
+                    "document_schema_id": schema.document_schema_id, "version": schema.version,
+                    "status": schema.status,
+                }, schema)
+                for region in regions:
+                    if isinstance(region, DocxRegionSchema):
+                        self._put(conn, "docx_regions", {
+                            "region_id": region.region_id, "template_schema_id": template.template_schema_id,
+                            "template_schema_version": template.template_schema_version,
+                        }, region)
+                    else:
+                        self._put(conn, "workbook_regions", {
+                            "region_id": region.region_id, "template_schema_id": template.template_schema_id,
+                            "template_schema_version": template.template_schema_version,
+                        }, region)
+                for binding in bindings:
+                    self._put(conn, "template_unit_bindings", {
+                        "binding_id": binding.binding_id, "template_schema_id": binding.template_schema_id,
+                        "template_schema_version": binding.template_schema_version,
+                        "semantic_unit_id": binding.semantic_unit_id,
+                    }, binding)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         return template
 
     def save_renderer_policy(self, policy: RendererPolicy) -> RendererPolicy:

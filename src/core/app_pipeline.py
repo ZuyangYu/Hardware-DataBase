@@ -327,6 +327,16 @@ class AppPipeline:
     def approve_template_schema(self, template_version_id: str, actor_id: str):
         return self.document_generation.approve_template(template_version_id, actor_id)
 
+    def analyze_document_template(self, ctx: RequestContext, *, filename: str, content: bytes, template_name: str):
+        return self.document_generation.analyze_uploaded_template(
+            ctx, filename=filename, content=content, template_name=template_name,
+        )
+
+    def confirm_document_template(self, ctx: RequestContext, *, analysis_id: str, display_name: str):
+        return self.document_generation.confirm_template_analysis(
+            ctx, analysis_id=analysis_id, display_name=display_name,
+        )
+
     def create_document_work_order(self, ctx: RequestContext, **kwargs):
         return self.document_generation.create_document_work_order(ctx, **kwargs)
 

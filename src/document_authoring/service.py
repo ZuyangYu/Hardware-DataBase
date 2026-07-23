@@ -37,11 +37,14 @@ from src.document_authoring.models import (
 )
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
-from src.document_authoring.template_analysis import DocxRegionSchema
+from src.document_authoring.template_analysis import DocxRegionSchema, TemplateAnalysis
+from src.document_authoring.template_analyzers import analyze_template
+from src.document_authoring.template_suggester import LLMTemplateSuggestionProvider, TemplateSuggestionProvider
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.worker import DocumentGenerationWorker
-from src.document_authoring.writers.managed import DeterministicEvidenceWriter, ManagedWriter
+from src.document_authoring.writers.managed import DeterministicEvidenceWriter, LLMManagedWriter, ManagedWriter
+from src.core.llm_client import LLMClient
 from src.pipelines.document_rag.schemas import RequestContext
 from src.projects.service import ProjectService
 
@@ -54,6 +57,7 @@ class DocumentGenerationService:
         renderer: XlsmRenderer | None = None,
         worker: DocumentGenerationWorker | None = None,
         docx_renderer: DocxRenderer | None = None,
+        suggestion_provider: TemplateSuggestionProvider | None = None,
     ):
         self.projects = project_service or ProjectService()
         self.store = store or DocumentAuthoringStore()
@@ -66,6 +70,7 @@ class DocumentGenerationService:
         self.validator = DocumentValidator()
         self.worker = worker or DocumentGenerationWorker()
         self.harness_runtime = InternalDocumentHarnessRuntime(self.store, self.validator)
+        self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider(LLMClient())
 
     # Template and schema registration -------------------------------------------------
 
@@ -134,6 +139,95 @@ class DocumentGenerationService:
         })
         return self.store.replace_template(approved)
 
+    def analyze_uploaded_template(
+        self,
+        ctx: RequestContext,
+        *,
+        filename: str,
+        content: bytes,
+        template_name: str,
+    ) -> TemplateAnalysis:
+        """Persist an immutable draft then analyze its structure, never its bytes by LLM."""
+        suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if suffix not in {"xlsx", "xlsm", "docx"}:
+            raise ValueError("template upload supports only .xlsx, .xlsm, and .docx files")
+        if not isinstance(content, bytes) or not content:
+            raise ValueError("template content must be non-empty bytes")
+        digest = hashlib.sha256(content).hexdigest()
+        template_version_id = f"template-{uuid.uuid4().hex}"
+        template_schema_id = f"template-schema-{uuid.uuid4().hex}"
+        report = self.docx_renderer.inspect(content) if suffix == "docx" else self.workbook_renderer.inspect(content, suffix)
+        # Security findings are content-addressed, but each immutable template
+        # version owns its own report row and confirmation lifecycle.
+        report = report.model_copy(update={"report_id": f"template-security-{template_version_id}"})
+        policy = RendererPolicy(
+            renderer_policy_id=f"renderer-{template_version_id}",
+            version="1",
+            macro_policy="preserve" if report.macro_parts else "quarantine",
+            external_link_policy="preserve" if report.external_links else "strip",
+            embedded_object_policy="preserve" if report.embedded_parts else "quarantine",
+            allowlisted_template_hashes=[digest] if report.active_content_status != "clean" else [],
+            allowed_changed_parts=["word/document.xml"] if suffix == "docx" else ["xl/worksheets/"],
+        )
+        self.store.save_renderer_policy(policy)
+        template = self.store.save_template(
+            TemplateVersion(
+                template_version_id=template_version_id,
+                template_id=template_name.strip() or filename,
+                format=suffix,
+                content_hash=digest,
+                template_schema_id=template_schema_id,
+                template_schema_version="1",
+                renderer_policy_id=policy.renderer_policy_id,
+            ),
+            content,
+            report,
+        )
+        analysis = analyze_template(content, suffix).model_copy(update={
+            "analysis_id": f"analysis-{uuid.uuid4().hex}",
+            "template_version_id": template.template_version_id,
+        })
+        self.template_suggester.suggest(analysis)
+        analysis.validate_suggestions()
+        return self.store.save_template_analysis(analysis)
+
+    def confirm_template_analysis(
+        self,
+        ctx: RequestContext,
+        *,
+        analysis_id: str,
+        display_name: str,
+    ) -> TemplateVersion:
+        analysis = self.store.get_template_analysis_by_id(analysis_id)
+        if analysis is None:
+            raise KeyError(f"template analysis not found: {analysis_id}")
+        if analysis.status != "ready_for_confirmation":
+            raise ValueError("template analysis requires human exception corrections before confirmation")
+        template = self._template(analysis.template_version_id)
+        actual_hash = hashlib.sha256(self.store.read_template_content(template.template_version_id)).hexdigest()
+        if actual_hash != analysis.content_hash or actual_hash != template.content_hash:
+            raise ValueError("template content hash changed since analysis")
+        analysis.validate_suggestions()
+        regions, bindings = self._regions_and_bindings(template, analysis)
+        schema = DocumentSchema(
+            document_schema_id=template.template_schema_id,
+            version=template.template_schema_version,
+            document_type=display_name.strip() or template.template_id,
+            fields=[
+                self._field_for_suggestion(suggestion)
+                for suggestion in analysis.suggestions
+            ],
+            status="approved",
+            execution_mode="internal_harness" if analysis.suggestions else "deterministic_only",
+        )
+        approved = template.model_copy(update={
+            "status": "approved", "approved_by": ctx.user_id,
+            "approved_at": datetime.now(timezone.utc),
+        })
+        return self.store.activate_template_analysis(
+            template=approved, schema=schema, regions=regions, bindings=bindings,
+        )
+
     # Work order creation --------------------------------------------------------------
 
     def create_document_work_order(
@@ -166,8 +260,11 @@ class DocumentGenerationService:
         harness_policy = None
         if schema.execution_mode == "internal_harness":
             if not harness_policy_id:
-                raise ValueError("internal-harness work orders require an approved HarnessPolicy")
-            harness_policy = self.store.get_harness_policy(harness_policy_id)
+                existing = self.store.list_harness_policies(approved_only=True)
+                harness_policy = existing[0] if existing else self._create_default_harness_policy()
+                harness_policy_id = harness_policy.harness_policy_id
+            else:
+                harness_policy = self.store.get_harness_policy(harness_policy_id)
             if harness_policy is None or harness_policy.status != "approved":
                 raise ValueError("internal-harness work orders require an approved HarnessPolicy")
         baseline = self.projects.store.get_baseline(baseline_id, tenant_id)
@@ -292,7 +389,7 @@ class DocumentGenerationService:
         policy = self.store.get_harness_policy(order.harness_policy_id, order.harness_policy_version)
         if policy is None or policy.status != "approved":
             raise ValueError("approved HarnessPolicy is required")
-        writer = writer or ManagedWriter(DeterministicEvidenceWriter())
+        writer = writer or self._writer_for_policy(policy)
         if writer.provider.provider_id != policy.writer_provider_id:
             raise PermissionError("writer provider does not match the approved HarnessPolicy")
         schema = self._schema(order.document_schema_id, order.document_schema_version)
@@ -358,7 +455,7 @@ class DocumentGenerationService:
             raise ValueError("run manifest does not match the frozen work order inputs")
         if manifest.source_set_snapshot_id != order.source_set_snapshot_id:
             raise ValueError("run manifest source set does not match the work order")
-        writer = writer or ManagedWriter(DeterministicEvidenceWriter())
+        writer = writer or self._writer_for_policy(policy)
         if writer.provider.provider_id != policy.writer_provider_id:
             raise PermissionError("writer provider does not match the frozen HarnessPolicy")
         schema = self._schema(order.document_schema_id, order.document_schema_version)
@@ -520,6 +617,73 @@ class DocumentGenerationService:
         if template is None:
             raise KeyError(f"template not found: {template_version_id}")
         return template
+
+    def _create_default_harness_policy(self) -> HarnessPolicy:
+        policy = HarnessPolicy(
+            harness_policy_id="default-managed-document-writer",
+            version="1",
+            status="approved",
+            writer_provider_id=LLMManagedWriter.provider_id,
+        )
+        return self.store.save_harness_policy(policy)
+
+    @staticmethod
+    def _field_for_suggestion(suggestion) -> Any:
+        from src.document_authoring.models import DocumentFieldSchema
+
+        return DocumentFieldSchema(
+            field_id=suggestion.semantic_unit_id,
+            label=suggestion.label,
+            retrieval_policy_id=f"retrieval-{suggestion.semantic_unit_id}",
+            verification_policy_id=f"verification-{suggestion.semantic_unit_id}",
+            query_terms=list(suggestion.retrieval_terms),
+            authoring_policy="managed_writer",
+        )
+
+    @staticmethod
+    def _regions_and_bindings(template: TemplateVersion, analysis) -> tuple[list[Any], list[TemplateUnitBinding]]:
+        unit_by_id = {unit.unit_id: unit for unit in analysis.units}
+        regions: list[Any] = []
+        bindings: list[TemplateUnitBinding] = []
+        seen_targets: set[str] = set()
+        for suggestion in analysis.suggestions:
+            target_regions: list[str] = []
+            for unit_id in suggestion.target_unit_ids:
+                if unit_id in seen_targets:
+                    raise ValueError("suggested template targets may only be bound once")
+                unit = unit_by_id[unit_id]
+                region_id = f"region-{hashlib.sha256(unit_id.encode('utf-8')).hexdigest()[:16]}"
+                if template.format == "docx":
+                    regions.append(DocxRegionSchema(
+                        region_id=region_id, locator=dict(unit.locator), role="semantic_draft",
+                        write_policy="validated_draft", value_type="text",
+                    ))
+                else:
+                    from src.document_authoring.models import WorkbookRegionSchema
+
+                    regions.append(WorkbookRegionSchema(
+                        region_id=region_id, sheet_name=str(unit.locator["sheet_name"]),
+                        locator={"cell": unit.locator["cell"]}, role="semantic_draft",
+                        write_policy="validated_draft", value_type="text",
+                    ))
+                seen_targets.add(unit_id)
+                target_regions.append(region_id)
+            bindings.append(TemplateUnitBinding(
+                binding_id=f"binding-{hashlib.sha256(suggestion.semantic_unit_id.encode('utf-8')).hexdigest()[:16]}",
+                template_schema_id=template.template_schema_id,
+                template_schema_version=template.template_schema_version,
+                semantic_unit_type="field", semantic_unit_id=suggestion.semantic_unit_id,
+                target_region_ids=target_regions,
+            ))
+        return regions, bindings
+
+    @staticmethod
+    def _writer_for_policy(policy: HarnessPolicy) -> ManagedWriter:
+        if policy.writer_provider_id == DeterministicEvidenceWriter.provider_id:
+            return ManagedWriter(DeterministicEvidenceWriter())
+        if policy.writer_provider_id == LLMManagedWriter.provider_id:
+            return ManagedWriter(LLMManagedWriter())
+        raise PermissionError("approved HarnessPolicy references an unsupported managed writer provider")
 
     def _schema(self, schema_id: str, version: str) -> DocumentSchema:
         schema = self.store.get_document_schema(schema_id, version)
