@@ -17,7 +17,7 @@
 - 当前认证的 `RequestContext`；
 - `InformationRequirement`；
 - `SourceSetSnapshot` 中的单一 `source_version_id` 与已冻结 `processing_artifact_id`；
-- 该 ProcessingArtifact 的 RAGFlow `backend_locator`；
+- 该 ProcessingArtifact 的 RAGFlow `backend_locator`（必须含 `dataset_id`、`document_id` 和 `strict_filter_version=1`）；
 - 快照冻结且人工批准的 Region Policy 版本。
 
 调用者、UI、Managed Writer 与外部 Agent 都不能传入任意 RAGFlow document ID、metadata 条件、文件路径或项目范围。
@@ -28,8 +28,9 @@
 2. 适配器从 `ProcessingArtifact.backend_locator` 获取精确的 `dataset_id` 与 `document_id`。缺少、格式非法或与本地 Pipeline Record 不一致时，报告 `source_unavailable`。
 3. 适配器发起只针对该冻结 document 的服务端检索。请求必须带 document-ID 或经过验证的等价 metadata 过滤；`top_k` 在该过滤之后生效。
 4. 适配器不得调用没有该限制的检索接口，也不得在零命中或本地过滤后零命中时重试全局查询。
-5. 返回的每个 chunk 必须可验证属于冻结 document，并具有可以映射到来源 Region Policy 的稳定 locator/quote span。范围不匹配、缺失定位或无法前置区域过滤时，报告 `filter_unsupported`。
-6. 仅允许区域中的 chunk 被转换为 `EvidenceEnvelope`，由既有 `ProjectEvidenceRetrievalService` 再验证项目、版本和处理产物范围。
+5. V1 只接受 locator 明确等于冻结 `document_id` 的整文档 allow Region Policy；section/page/range 级策略不能由当前 RAGFlow API 在排序前表达，必须报告 `filter_unsupported`。
+6. 返回的每个 chunk 必须可验证属于冻结 document，并具有稳定的 `document_id + chunk_id` locator/quote span。范围不匹配、缺失定位或无法前置区域过滤时，报告 `filter_unsupported`。
+7. 仅允许通过整文档策略的 chunk 被转换为 `EvidenceEnvelope`，由既有 `ProjectEvidenceRetrievalService` 再验证项目、版本和处理产物范围。
 
 ## 错误语义
 
@@ -39,7 +40,7 @@
 | 成功、范围和区域均已验证但无命中 | `success_empty` |
 | 冻结来源没有可用远端 locator，或远端服务不可用 | `source_unavailable` |
 | 请求、响应解析或不可恢复的远端调用错误 | `retrieval_failed` |
-| 远端不能强制过滤、返回越界 chunk、缺少稳定 locator，或无法在排序前执行 Region Policy | `filter_unsupported` |
+| 远端不能强制过滤、来源没有 `strict_filter_version=1`、返回越界 chunk、缺少稳定 locator，或 Region Policy 不是整文档策略 | `filter_unsupported` |
 
 `success_empty` 是唯一允许上层按缺失策略产生 TBD 的空结果。其余状态必须保留失败语义，不能被合并为 `missing` 或触发无范围 fallback。
 
@@ -55,10 +56,10 @@
 
 自动化测试必须证明：
 
-1. 严格请求只包含单一冻结来源的服务端过滤；
+1. 严格请求只包含单一、带 `strict_filter_version=1` 的冻结来源的服务端过滤；
 2. 过滤后才应用 top-k；
 3. 严格路径没有 metadata-free 或全局 fallback；
-4. 越界 chunk、缺失 locator 和不允许区域均不能成为 Evidence；
+4. 越界 chunk、缺失 locator、未回填来源和非整文档区域均不能成为 Evidence；
 5. 零结果、来源不可用、检索失败和过滤不支持被映射为不同的 `RetrievalOutcome`；
 6. 普通问答原有 fallback 回归保持通过；
 7. 真实 RAGFlow 冒烟测试在配置环境中验证服务端 document-ID/等价 metadata 过滤和 locator 行为。

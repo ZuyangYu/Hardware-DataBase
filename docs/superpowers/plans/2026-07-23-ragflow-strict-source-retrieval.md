@@ -11,9 +11,9 @@
 ## Global Constraints
 
 - The ordinary `RAGFlowBackend.retrieve()` fallback behavior must not change.
-- The strict path accepts remote identity only from a frozen `ProcessingArtifact.backend_locator` with `dataset_id` and `document_id`.
+- The strict path accepts remote identity only from a frozen `ProcessingArtifact.backend_locator` with `dataset_id`, `document_id` and `strict_filter_version=1`.
 - The strict request uses server-side `ragflow_document_id == document_id`; a missing or unsupported condition is a failure, not a reason to query broadly.
-- Region policy must be validated before the strict path applies its final top-k; an unmappable Region Policy produces `filter_unsupported`.
+- V1 accepts only a whole-document allow Region Policy whose locator identifies the frozen `document_id`; section/page/range policies produce `filter_unsupported` because the current RAGFlow API cannot filter them before top-k.
 - Only a verified empty result may become `success_empty`; unavailable, retrieval, access and filter failures preserve their distinct source-outcome values.
 - No UI, writer, Agent or external caller may provide an arbitrary document ID, query filter or filesystem path.
 - Real RAGFlow tests are opt-in and must skip without `RAGFLOW_STRICT_POC=1`.
@@ -175,15 +175,19 @@ class StrictRAGFlowRetrievalAdapter:
         dataset_id, document_id = str(remote.get("dataset_id") or ""), str(remote.get("document_id") or "")
         if not artifact or artifact.processor_kind != "ragflow" or not dataset_id or not document_id:
             raise SourceUnavailableError("frozen artifact has no strict RAGFlow locator")
+        if remote.get("strict_filter_version") != "1":
+            raise FilterUnsupportedError("source has no verified strict RAGFlow metadata")
         policies = self.projects.store.allowed_region_policies(version_id, artifact_id)
         if not policies or any(policy_versions.get(p.region_policy_id) != p.policy_version for p in policies):
             raise RetrievalFailedError("frozen region policy is unavailable")
+        if any(dict(policy.locator) not in ({"document_id": document_id}, {"ragflow_document_id": document_id}) for policy in policies):
+            raise FilterUnsupportedError("region policy cannot be filtered by RAGFlow before top-k")
         chunks = self.client.retrieve_document_strict(requirement.subject, dataset_id, document_id, self.top_k)
         return [self._to_envelope(chunk, ctx, requirement, version_id, artifact_id, document_id, policies)
                 for chunk in chunks]
 ```
 
-Implement `_to_envelope` to reject a mismatched `chunk["document_id"]`, missing non-empty mapping `chunk["locator"]`, or a chunk whose locator does not contain every key/value in one approved allow-policy locator. Raise `RetrievalFailedError("filter_unsupported: ...")` for each of those cases. Use `to_evidence_envelope` to make the immutable evidence ID and copy the verified locator into `quote_span`.
+Implement `_to_envelope` to reject a mismatched `chunk["document_id"]` or missing `chunk["id"]`/`chunk["chunk_id"]`. Raise `FilterUnsupportedError` for each case. Build the stable locator as `{ "document_id": document_id, "chunk_id": chunk_id }`, use `to_evidence_envelope` to make the immutable evidence ID, and copy the verified locator into `quote_span`.
 
 - [ ] **Step 4: Run adapter tests to verify success**
 
@@ -207,7 +211,7 @@ git commit -m "feat: add project-scoped strict RAGFlow adapter"
 - Test: `tests/test_ragflow_metadata_fallback.py`
 
 **Interfaces:**
-- Produces: `ProjectEvidenceRetrievalService.retrieve_with_adapter(ctx, requirement, snapshot_id, adapter) -> RetrievalOutcome`.
+- Produces: `FilterUnsupportedError`, `ProjectEvidenceRetrievalService.retrieve_with_adapter(ctx, requirement, snapshot_id, adapter) -> RetrievalOutcome`.
 - Produces: `DocumentGenerationService.retrieve_ragflow_evidence(ctx, work_order_id, requirement, adapter) -> RetrievalOutcome`.
 
 - [ ] **Step 1: Write failing boundary and regression tests**
@@ -221,6 +225,12 @@ def test_document_service_uses_strict_adapter_for_frozen_work_order(authoring_fi
     assert outcome.applied_source_set_snapshot_id == authoring_fixture.work_order.source_set_snapshot_id
     assert outcome.status == "success_with_hits"
     assert authoring_fixture.client.global_fallback_calls == 0
+
+
+def test_project_retrieval_preserves_filter_unsupported_source_outcome(authoring_fixture):
+    outcome = authoring_fixture.retrieve_strict_with_locator({"dataset_id": "dataset-a", "document_id": "remote-a"})
+    assert outcome.status == "retrieval_failed"
+    assert outcome.source_outcomes[0].status == "filter_unsupported"
 
 
 def test_conversational_retrieve_still_retries_metadata_free_when_compatibility_requires_it():
@@ -240,8 +250,13 @@ Expected: FAIL because the two bounded service methods do not exist; the convers
 
 ```python
 class ProjectEvidenceRetrievalService:
+    # Define FilterUnsupportedError as a RetrievalFailedError subclass.
     def retrieve_with_adapter(self, ctx, requirement, snapshot_id, adapter):
         return self.retrieve(ctx, requirement, snapshot_id, adapter.callback(ctx, requirement))
+
+    # In retrieve(), catch FilterUnsupportedError before RetrievalFailedError:
+    # outcomes.append(RetrievalSourceOutcome(source_version_id=version_id,
+    #     status="filter_unsupported", error_code=str(exc), retryable=False))
 
 
 class DocumentGenerationService:
@@ -343,4 +358,3 @@ git commit -m "docs: add RAGFlow strict retrieval PoC gate"
 - [ ] Run `.venv/bin/pytest -q` and require the full suite to pass.
 - [ ] Run `git diff --check` and require no output.
 - [ ] If an approved live RAGFlow environment is available, run `RAGFLOW_STRICT_POC=1 .venv/bin/pytest -q tests/test_ragflow_strict_poc.py`; otherwise record no-go pending live validation and do not claim P0.5-B complete.
-
