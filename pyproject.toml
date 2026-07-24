@@ -9,7 +9,6 @@ dependencies = [
     "httpx>=0.27,<1",
     "langgraph>=1.0.0,<2",
     "llama-index-core>=0.12.52,<0.13",
-    "mcp>=1.28.1",
     "networkx>=3.5",
     "pandas>=2.3.3,<3",
     "pydantic>=2.11.10,<3",
@@ -22,10 +21,8 @@ dependencies = [
 ]
 
 [project.scripts]
-hardware-database = "src.cli.main:main"
 hardware-database-eval = "src.evaluation.cli:main"
 hardware-database-server = "src.api.app:main"
-hardware-database-mcp = "src.mcp.server:main"
 
 [build-system]
 requires = ["setuptools>=77"]
@@ -66,6 +63,5 @@ eval = [
 norecursedirs = ["build", "src/circuit/vendor/spydrnet"]
 
 [tool.ruff]
-# vendored SpyDrNet (含 sch_parse / spydrnet_extension 等 upstream 风格代码) 与
-# Claude Code skill 脚本不属于本应用源码,不纳入 lint。
-extend-exclude = ["src/circuit/vendor", ".claude"]
+# vendored SpyDrNet (含 sch_parse / spydrnet_extension 等 upstream 风格代码) 不属于本应用源码,不纳入 lint。
+extend-exclude = ["src/circuit/vendor"]
