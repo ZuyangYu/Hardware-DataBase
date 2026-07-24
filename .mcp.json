@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "hardware-database": {
-      "command": "uv",
-      "args": ["run", "hardware-database-mcp"]
-    }
-  }
-}
