@@ -138,6 +138,39 @@ def test_knowledge_base_work_order_rejects_creation_without_read_permission(
         )
 
 
+def test_knowledge_base_work_order_recovers_from_idempotency_insert_race(
+    service, ctx, approved_template, approved_schema, monkeypatch
+):
+    original_create = service.store.create_work_order
+    canonical_order = None
+
+    def create_after_competing_request(order):
+        nonlocal canonical_order
+        if canonical_order is None:
+            payload = order.model_dump(mode="json")
+            payload.update(
+                work_order_id="wo-canonical",
+                input_fingerprint="",
+            )
+            canonical_order = DocumentWorkOrder.model_validate(payload)
+            original_create(canonical_order)
+        return original_create(order)
+
+    monkeypatch.setattr(service.store, "create_work_order", create_after_competing_request)
+
+    resolved = service.create_knowledge_base_work_order(
+        ctx,
+        knowledge_base_name="hardware",
+        source_names=["spec.pdf"],
+        template_version_id=approved_template.template_version_id,
+        document_schema_id=approved_schema.document_schema_id,
+        document_schema_version=approved_schema.version,
+        idempotency_key="request-a",
+    )
+
+    assert resolved == canonical_order
+
+
 def test_knowledge_base_work_order_resolves_its_frozen_source_snapshot(
     service, ctx, approved_template, approved_schema
 ):
@@ -310,6 +343,24 @@ def test_knowledge_base_artifact_actions_recheck_live_read_permission(
         service.approve_document_artifact(ctx, candidate.artifact_id)
     with pytest.raises(PermissionError, match="knowledge base"):
         service.download_document_artifact(ctx, candidate.artifact_id)
+
+
+def test_knowledge_base_background_status_rechecks_live_read_permission(
+    service, ctx, approved_template, approved_schema
+):
+    order = service.create_knowledge_base_work_order(
+        ctx,
+        knowledge_base_name="hardware",
+        source_names=["spec.pdf"],
+        template_version_id=approved_template.template_version_id,
+        document_schema_id=approved_schema.document_schema_id,
+        document_schema_version=approved_schema.version,
+    )
+    run_id = service.worker.submit(order.work_order_id, lambda: None)
+    ctx.kb_permissions.clear()
+
+    with pytest.raises(PermissionError, match="knowledge base"):
+        service.get_background_run_status(ctx, run_id)
 
 
 def test_knowledge_base_harness_control_rechecks_live_read_permission(

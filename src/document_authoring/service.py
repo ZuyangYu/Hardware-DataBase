@@ -8,6 +8,7 @@ templates, project stores or artifacts directly.
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from collections.abc import Callable
@@ -341,15 +342,10 @@ class DocumentGenerationService:
             raise PermissionError("knowledge base read permission is required")
         tenant_id = ctx.tenant_id or "default"
         if idempotency_key:
-            existing = next(
-                (
-                    order
-                    for order in self.store.list_work_orders_for_knowledge_base(
-                        tenant_id, knowledge_base_name
-                    )
-                    if order.idempotency_key == idempotency_key
-                ),
-                None,
+            existing = self._find_knowledge_base_work_order_by_idempotency(
+                tenant_id,
+                knowledge_base_name,
+                idempotency_key,
             )
             if existing is not None:
                 return existing
@@ -361,15 +357,43 @@ class DocumentGenerationService:
         snapshot = self._create_knowledge_base_source_snapshot(
             ctx, knowledge_base_name, source_names
         )
-        return self._create_frozen_work_order(
-            ctx,
-            scope_type="knowledge_base",
-            snapshot=snapshot,
-            knowledge_base_name=knowledge_base_name,
-            template_version_id=template_version_id,
-            document_schema_id=document_schema_id,
-            document_schema_version=document_schema_version,
-            idempotency_key=idempotency_key,
+        try:
+            return self._create_frozen_work_order(
+                ctx,
+                scope_type="knowledge_base",
+                snapshot=snapshot,
+                knowledge_base_name=knowledge_base_name,
+                template_version_id=template_version_id,
+                document_schema_id=document_schema_id,
+                document_schema_version=document_schema_version,
+                idempotency_key=idempotency_key,
+            )
+        except sqlite3.IntegrityError:
+            if idempotency_key:
+                existing = self._find_knowledge_base_work_order_by_idempotency(
+                    tenant_id,
+                    knowledge_base_name,
+                    idempotency_key,
+                )
+                if existing is not None:
+                    return existing
+            raise
+
+    def _find_knowledge_base_work_order_by_idempotency(
+        self,
+        tenant_id: str,
+        knowledge_base_name: str,
+        idempotency_key: str,
+    ) -> DocumentWorkOrder | None:
+        return next(
+            (
+                order
+                for order in self.store.list_work_orders_for_knowledge_base(
+                    tenant_id, knowledge_base_name
+                )
+                if order.idempotency_key == idempotency_key
+            ),
+            None,
         )
 
     def _create_frozen_work_order(
@@ -703,10 +727,15 @@ class DocumentGenerationService:
             ),
         )
 
-    def get_background_run_status(self, run_id: str) -> dict[str, str] | None:
+    def get_background_run_status(
+        self,
+        ctx: RequestContext,
+        run_id: str,
+    ) -> dict[str, str] | None:
         run = self.worker.get(run_id)
         if run is None:
             return None
+        self._order(ctx, run.work_order_id, "run_deterministic_work_order")
         return {"run_id": run.run_id, "work_order_id": run.work_order_id, "status": run.status, "error": run.error}
 
     # Human review and release ---------------------------------------------------------
