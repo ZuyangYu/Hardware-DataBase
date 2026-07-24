@@ -26,6 +26,7 @@ from src.document_authoring.models import (
     HarnessCheckpoint,
     HarnessPolicy,
     HarnessRun,
+    KnowledgeBaseSourceSnapshot,
     LegacyTemplateClaim,
     NodeExecutionReceipt,
     AuthoringRunManifest,
@@ -126,9 +127,15 @@ class DocumentAuthoringStore:
                 );
                 CREATE TABLE IF NOT EXISTS document_work_orders (
                     work_order_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
-                    project_id TEXT NOT NULL, status TEXT NOT NULL,
+                    scope_type TEXT NOT NULL, scope_key TEXT NOT NULL,
+                    project_id TEXT, knowledge_base_name TEXT, status TEXT NOT NULL,
                     idempotency_key TEXT, payload_json TEXT NOT NULL,
-                    UNIQUE(tenant_id, project_id, idempotency_key)
+                    UNIQUE(tenant_id, scope_key, idempotency_key)
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_base_source_snapshots (
+                    source_set_snapshot_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                    knowledge_base_name TEXT NOT NULL, content_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS evidence_matrices (
                     work_order_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL,
@@ -217,6 +224,7 @@ class DocumentAuthoringStore:
                 """
             )
             self._migrate_docx_regions(conn)
+            self._migrate_document_work_orders(conn)
 
     @staticmethod
     def _migrate_docx_regions(conn: sqlite3.Connection) -> None:
@@ -246,6 +254,43 @@ class DocumentAuthoringStore:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    @staticmethod
+    def _migrate_document_work_orders(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(document_work_orders)").fetchall()
+        }
+        if {"scope_type", "scope_key", "knowledge_base_name"} <= columns:
+            return
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """CREATE TABLE document_work_orders_new (
+                    work_order_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                    scope_type TEXT NOT NULL, scope_key TEXT NOT NULL,
+                    project_id TEXT, knowledge_base_name TEXT, status TEXT NOT NULL,
+                    idempotency_key TEXT, payload_json TEXT NOT NULL,
+                    UNIQUE(tenant_id, scope_key, idempotency_key)
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO document_work_orders_new (
+                       work_order_id, tenant_id, scope_type, scope_key, project_id,
+                       knowledge_base_name, status, idempotency_key, payload_json
+                   )
+                   SELECT work_order_id, tenant_id, 'project', 'project:' || project_id,
+                          project_id, NULL, status, idempotency_key, payload_json
+                   FROM document_work_orders"""
+            )
+            conn.execute("DROP TABLE document_work_orders")
+            conn.execute("ALTER TABLE document_work_orders_new RENAME TO document_work_orders")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _put(conn, table: str, columns: dict[str, Any], payload: Any) -> None:
@@ -695,13 +740,53 @@ class DocumentAuthoringStore:
             rows = conn.execute(sql).fetchall()
         return [HarnessPolicy.model_validate(_payload(row)) for row in rows]
 
+    def create_knowledge_base_source_snapshot(
+        self,
+        snapshot: KnowledgeBaseSourceSnapshot,
+    ) -> KnowledgeBaseSourceSnapshot:
+        with closing(self._connect()) as conn:
+            self._put(conn, "knowledge_base_source_snapshots", {
+                "source_set_snapshot_id": snapshot.source_set_snapshot_id,
+                "tenant_id": snapshot.tenant_id,
+                "knowledge_base_name": snapshot.knowledge_base_name,
+                "content_hash": snapshot.content_hash,
+            }, snapshot)
+        return snapshot
+
+    def get_knowledge_base_source_snapshot(
+        self,
+        source_set_snapshot_id: str,
+    ) -> KnowledgeBaseSourceSnapshot | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT content_hash, payload_json
+                   FROM knowledge_base_source_snapshots WHERE source_set_snapshot_id = ?""",
+                (source_set_snapshot_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        snapshot = KnowledgeBaseSourceSnapshot.model_validate(_payload(row))
+        if snapshot.content_hash != row["content_hash"]:
+            raise ValueError("knowledge-base source snapshot hash does not match persistence record")
+        return snapshot
+
+    @staticmethod
+    def _work_order_scope_key(work_order: DocumentWorkOrder) -> str:
+        if work_order.scope_type == "knowledge_base":
+            return f"knowledge_base:{work_order.knowledge_base_name}"
+        return f"project:{work_order.project_id}"
+
     def create_work_order(self, work_order: DocumentWorkOrder) -> DocumentWorkOrder:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 self._put(conn, "document_work_orders", {
                     "work_order_id": work_order.work_order_id, "tenant_id": work_order.tenant_id,
-                    "project_id": work_order.project_id, "status": work_order.status,
+                    "scope_type": work_order.scope_type,
+                    "scope_key": self._work_order_scope_key(work_order),
+                    "project_id": work_order.project_id,
+                    "knowledge_base_name": work_order.knowledge_base_name,
+                    "status": work_order.status,
                     "idempotency_key": work_order.idempotency_key,
                 }, work_order)
                 self._put_outbox_event(conn, self._work_order_outbox_event(work_order, "created"))
@@ -715,8 +800,8 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """SELECT payload_json FROM document_work_orders
-                   WHERE tenant_id = ? AND project_id = ? AND idempotency_key = ?""",
-                (tenant_id, project_id, key),
+                   WHERE tenant_id = ? AND scope_key = ? AND idempotency_key = ?""",
+                (tenant_id, f"project:{project_id}", key),
             ).fetchone()
         return DocumentWorkOrder.model_validate(_payload(row)) if row else None
 
@@ -730,8 +815,21 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT payload_json FROM document_work_orders
-                   WHERE tenant_id = ? AND project_id = ? ORDER BY rowid DESC""",
-                (tenant_id, project_id),
+                   WHERE tenant_id = ? AND scope_key = ? ORDER BY rowid DESC""",
+                (tenant_id, f"project:{project_id}"),
+            ).fetchall()
+        return [DocumentWorkOrder.model_validate(_payload(row)) for row in rows]
+
+    def list_work_orders_for_knowledge_base(
+        self,
+        tenant_id: str,
+        knowledge_base_name: str,
+    ) -> list[DocumentWorkOrder]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT payload_json FROM document_work_orders
+                   WHERE tenant_id = ? AND scope_key = ? ORDER BY rowid DESC""",
+                (tenant_id, f"knowledge_base:{knowledge_base_name}"),
             ).fetchall()
         return [DocumentWorkOrder.model_validate(_payload(row)) for row in rows]
 

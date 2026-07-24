@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -215,11 +216,48 @@ class DeterministicRuleSpec(BaseModel):
         return self
 
 
+class KnowledgeBaseSourceSnapshot(BaseModel):
+    source_set_snapshot_id: str
+    tenant_id: str
+    knowledge_base_name: str
+    source_names: list[str]
+    created_by: str
+    created_at: datetime = Field(default_factory=utc_now)
+    content_hash: str = ""
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        tenant_id: str,
+        knowledge_base_name: str,
+        source_names: list[str],
+        created_by: str,
+    ) -> KnowledgeBaseSourceSnapshot:
+        return cls(
+            source_set_snapshot_id=f"kb-source-set-{uuid.uuid4().hex}",
+            tenant_id=tenant_id,
+            knowledge_base_name=knowledge_base_name,
+            source_names=source_names,
+            created_by=created_by,
+        )
+
+    @model_validator(mode="after")
+    def bind_content_hash(self):
+        expected = content_hash(self.model_dump(mode="json", exclude={"content_hash"}))
+        if self.content_hash and self.content_hash != expected:
+            raise ValueError("knowledge-base source snapshot hash does not match contents")
+        self.content_hash = expected
+        return self
+
+
 class DocumentWorkOrder(BaseModel):
     work_order_id: str
     tenant_id: str = "default"
-    project_id: str
-    baseline_id: str
+    scope_type: Literal["project", "knowledge_base"] = "project"
+    knowledge_base_name: str | None = None
+    project_id: str | None
+    baseline_id: str | None
     baseline_content_hash: str
     source_set_snapshot_id: str
     template_version_id: str
@@ -252,14 +290,31 @@ class DocumentWorkOrder(BaseModel):
 
     @model_validator(mode="after")
     def calculate_input_fingerprint(self):
+        if self.scope_type == "project":
+            if not self.project_id or not self.baseline_id:
+                raise ValueError("project-scoped work orders require project_id and baseline_id")
+            if self.knowledge_base_name is not None:
+                raise ValueError("project-scoped work orders cannot name a knowledge base")
+        else:
+            if not self.knowledge_base_name:
+                raise ValueError("knowledge-base work orders require knowledge_base_name")
+            if self.project_id is not None or self.baseline_id is not None:
+                raise ValueError("knowledge-base work orders cannot name a project or baseline")
+            if self.baseline_content_hash:
+                raise ValueError("knowledge-base work orders cannot bind a baseline content hash")
         if self.execution_mode == "internal_harness" and (
             not self.harness_policy_id or not self.harness_policy_version
         ):
             raise ValueError("internal-harness work orders require a frozen HarnessPolicy version")
-        expected = content_hash(self.model_dump(mode="json", exclude={
+        excluded = {
             "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
             "evidence_matrix_id", "validation_report_id", "run_manifest_id",
-        }))
+        }
+        if self.scope_type == "project":
+            # Preserve fingerprints from persisted project work orders created
+            # before the explicit scope fields existed.
+            excluded.update({"scope_type", "knowledge_base_name"})
+        expected = content_hash(self.model_dump(mode="json", exclude=excluded))
         if self.input_fingerprint and self.input_fingerprint != expected:
             raise ValueError("work order input_fingerprint does not match frozen inputs")
         self.input_fingerprint = expected
