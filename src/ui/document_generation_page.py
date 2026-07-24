@@ -74,7 +74,7 @@ def _matching_schemas(template: Any, schemas: list[Any]) -> dict[str, Any]:
 
 def render_document_generation_page(st, pipeline, ctx) -> None:
     st.header("📝 文档生成")
-    st.caption("所有任务固定到项目、已批准基线、模板版本和来源快照；页面不从会话状态启动运行。")
+    st.caption("所有任务固定到已授权知识库、模板版本和来源快照；页面不从会话状态启动运行。")
     upload_tab, create_tab, runs_tab = st.tabs(["上传模板", "新建生成任务", "任务与下载"])
     with upload_tab:
         _render_template_upload(st, pipeline, ctx)
@@ -152,37 +152,24 @@ def _render_template_upload(st, pipeline, ctx) -> None:
 def _render_work_order_creation(st, pipeline, ctx) -> None:
     st.subheader("新建生成任务")
     try:
-        projects = pipeline.list_accessible_projects(ctx)
-    except PermissionError as exc:
-        st.error(str(exc))
-        return
-    if not projects:
-        st.info("当前账号没有可访问的项目。")
-        return
-    project_by_id = {_value(project, "project_id"): project for project in projects}
-    project_id = st.selectbox(
-        "项目", list(project_by_id), format_func=lambda value: f"{_value(project_by_id[value], 'name')} ({value})",
-        key="document-generation-project",
-    )
-    try:
-        source_catalog = pipeline.get_project_source_catalog(project_id, ctx)
-        options = pipeline.list_document_generation_options(ctx, project_id=project_id)
+        options = pipeline.list_knowledge_base_document_generation_options(ctx)
     except (PermissionError, ValueError, KeyError) as exc:
-        st.error(f"无法读取项目生成配置：{exc}")
+        st.error(f"无法读取知识库生成配置：{exc}")
         return
-    with st.expander("冻结前的项目来源目录", expanded=False):
-        rows = [source.model_dump(mode="json") if hasattr(source, "model_dump") else source for source in source_catalog]
-        st.dataframe(rows, width="stretch", hide_index=True)
-    baselines, templates, schemas = options["baselines"], options["templates"], options["schemas"]
-    if not baselines or not templates or not schemas:
-        st.warning("需要已批准的项目基线、模板和 Document Schema 才能创建任务。")
+    knowledge_bases = options["knowledge_bases"]
+    if not knowledge_bases:
+        st.info("当前账号没有可用于文档生成的知识库，请联系管理员授权知识库。")
         return
-    baseline_by_id = {_value(item, "baseline_id"): item for item in baselines}
+    knowledge_base_name = st.selectbox(
+        "已授权知识库", knowledge_bases, key="document-generation-kb",
+    )
+    templates, schemas = options["templates"], options["schemas"]
+    if not templates or not schemas:
+        st.warning("需要已批准的模板和 Document Schema 才能创建任务。")
+        return
     template_by_id = {_value(item, "template_version_id"): item for item in templates}
-    left, middle, right = st.columns(3)
+    left, right = st.columns(2)
     with left:
-        baseline_id = st.selectbox("配置基线", list(baseline_by_id), format_func=lambda value: _value(baseline_by_id[value], "name"))
-    with middle:
         template_id = st.selectbox("受控模板", list(template_by_id), format_func=lambda value: _value(template_by_id[value], "template_id"))
     template = template_by_id[template_id]
     compatible_schemas = _matching_schemas(template, schemas)
@@ -194,10 +181,10 @@ def _render_work_order_creation(st, pipeline, ctx) -> None:
     schema = compatible_schemas[schema_key]
     if st.button("创建生成任务", type="primary", key="create-document-work-order"):
         try:
-            order = pipeline.create_document_work_order(
-                ctx, project_id=project_id, baseline_id=baseline_id, template_version_id=template_id,
+            order = pipeline.create_knowledge_base_document_work_order(
+                ctx, knowledge_base_name=knowledge_base_name, template_version_id=template_id,
                 document_schema_id=_value(schema, "document_schema_id"),
-                document_schema_version=_value(schema, "version"), idempotency_key=f"streamlit-{uuid.uuid4().hex}",
+                document_schema_version=_value(schema, "version"), idempotency_key=f"streamlit-kb-{uuid.uuid4().hex}",
             )
         except (PermissionError, ValueError, KeyError) as exc:
             st.error(f"无法创建生成任务：{exc}")
@@ -208,25 +195,24 @@ def _render_work_order_creation(st, pipeline, ctx) -> None:
 def _render_durable_runs(st, pipeline, ctx) -> None:
     st.subheader("任务与下载")
     try:
-        projects = pipeline.list_accessible_projects(ctx)
-    except PermissionError as exc:
-        st.error(str(exc))
+        options = pipeline.list_knowledge_base_document_generation_options(ctx)
+    except (PermissionError, ValueError, KeyError) as exc:
+        st.error(f"无法读取知识库：{exc}")
         return
-    if not projects:
-        st.info("当前账号没有可访问的项目。")
+    knowledge_bases = options["knowledge_bases"]
+    if not knowledge_bases:
+        st.info("当前账号没有可用于文档生成的知识库，请联系管理员授权知识库。")
         return
-    project_by_id = {_value(project, "project_id"): project for project in projects}
-    project_id = st.selectbox(
-        "项目", list(project_by_id), format_func=lambda value: f"{_value(project_by_id[value], 'name')} ({value})",
-        key="document-run-project",
+    knowledge_base_name = st.selectbox(
+        "已授权知识库", knowledge_bases, key="document-run-kb",
     )
     try:
-        work_orders = pipeline.list_document_work_orders(ctx, project_id=project_id)
+        work_orders = pipeline.list_knowledge_base_document_work_orders(ctx, knowledge_base_name)
     except (PermissionError, ValueError, KeyError) as exc:
         st.error(f"无法读取工作单：{exc}")
         return
     if not work_orders:
-        st.info("该项目尚无持久化工作单。")
+        st.info("该知识库尚无持久化工作单。")
         return
     work_order_id = st.selectbox("工作单", [_value(order, "work_order_id") for order in work_orders], key="document-generation-work-order")
     status = pipeline.get_document_run_status(work_order_id, ctx)
