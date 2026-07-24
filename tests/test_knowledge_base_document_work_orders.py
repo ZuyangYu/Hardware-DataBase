@@ -320,6 +320,13 @@ def approved_schema(service):
     )
 
 
+def test_list_approved_templates_orders_by_persisted_columns(service, approved_template):
+    """A fresh authoring database must list approved templates without SQL errors."""
+    assert [item.template_version_id for item in service.store.list_templates(approved_only=True)] == [
+        approved_template.template_version_id
+    ]
+
+
 def make_work_order(**updates) -> DocumentWorkOrder:
     values = {
         "work_order_id": "work-order-a",

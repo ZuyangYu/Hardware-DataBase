@@ -467,7 +467,7 @@ class DocumentAuthoringStore:
         sql = "SELECT payload_json FROM template_versions"
         if approved_only:
             sql += " WHERE status = 'approved'"
-        sql += " ORDER BY template_id, template_version_id"
+        sql += " ORDER BY json_extract(payload_json, '$.template_id'), template_version_id"
         with closing(self._connect()) as conn:
             rows = conn.execute(sql).fetchall()
         return [TemplateVersion.model_validate(_payload(row)) for row in rows]
