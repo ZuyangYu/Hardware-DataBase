@@ -107,6 +107,34 @@ def test_template_analysis_rejects_duplicate_suggestion_targets():
         analysis.validate_suggestions()
 
 
+def test_template_analysis_rejects_duplicate_targets_within_one_suggestion():
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-1",
+        template_version_id="template-1",
+        content_hash="a" * 64,
+        format="docx",
+        status="ready_for_confirmation",
+        units=[
+            TemplateAnalysisUnit(
+                unit_id="paragraph-1",
+                locator={"paragraph_index": 1},
+                writable=True,
+            ),
+        ],
+        suggestions=[
+            TemplateAnalysisSuggestion(
+                semantic_unit_id="summary",
+                label="摘要",
+                target_unit_ids=["paragraph-1", "paragraph-1"],
+                confidence=0.9,
+            ),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="suggestion target may only be used once: paragraph-1"):
+        analysis.validate_suggestions()
+
+
 def test_store_round_trips_hash_bound_template_analysis(tmp_path):
     store = DocumentAuthoringStore(db_path=str(tmp_path / "authoring.db"), artifact_root=str(tmp_path / "artifacts"))
     analysis = _docx_analysis("template-1")
