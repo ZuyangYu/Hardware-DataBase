@@ -19,6 +19,7 @@ from src.document_authoring.models import (
     DocumentUnitDraft,
     DocumentWorkOrder,
     HarnessRun,
+    KnowledgeBaseSourceSnapshot,
     LegacyTemplateClaim,
 )
 from src.document_authoring.validator import DocumentValidator
@@ -32,7 +33,7 @@ class DocumentAuthoringState(TypedDict, total=False):
     harness_run: HarnessRun
     run_manifest: AuthoringRunManifest
     document_schema: DocumentSchema
-    source_set_snapshot: SourceSetSnapshot
+    source_set_snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot
     information_requirements: dict[str, InformationRequirement]
     evidence_matrix: list[dict[str, Any]]
     retrieval_ledger: list[dict[str, Any]]
@@ -82,7 +83,7 @@ class AuthoringGraph:
         harness_run: HarnessRun,
         run_manifest: AuthoringRunManifest,
         schema: DocumentSchema,
-        snapshot: SourceSetSnapshot,
+        snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
         legacy_claims: list[LegacyTemplateClaim],
         retrieve: RetrievalProvider,
     ) -> HarnessExecutionResult:
@@ -220,7 +221,11 @@ def _semantic_units(schema: DocumentSchema) -> list[dict[str, Any]]:
     return units
 
 
-def _requirement_for_unit(unit: dict[str, Any], work_order: DocumentWorkOrder, snapshot: SourceSetSnapshot) -> InformationRequirement:
+def _requirement_for_unit(
+    unit: dict[str, Any],
+    work_order: DocumentWorkOrder,
+    snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
+) -> InformationRequirement:
     schema = unit["schema"]
     if unit["kind"] == "field":
         capability = _capabilities(schema.required_capabilities)
@@ -244,7 +249,12 @@ def _requirement_for_unit(unit: dict[str, Any], work_order: DocumentWorkOrder, s
         claim_type=claim_type, subject=subject, predicate=predicate,
         required_capabilities=capability, preferred_source_roles=source_roles,
         project_id=work_order.project_id, baseline_id=work_order.baseline_id,
-        source_version_scope=list(snapshot.source_version_ids), missing_policy=missing_policy,
+        source_version_scope=list(
+            snapshot.source_names
+            if work_order.scope_type == "knowledge_base"
+            else snapshot.source_version_ids
+        ),
+        missing_policy=missing_policy,
     )
 
 
@@ -253,9 +263,41 @@ def _capabilities(values: list[str]) -> list[str]:
     return [value for value in values if value in allowed]
 
 
-def _validated_evidence(work_order: DocumentWorkOrder, snapshot: SourceSetSnapshot, outcome: RetrievalOutcome) -> list[dict[str, Any]]:
+def _validated_evidence(
+    work_order: DocumentWorkOrder,
+    snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
+    outcome: RetrievalOutcome,
+) -> list[dict[str, Any]]:
     if outcome.applied_source_set_snapshot_id != snapshot.source_set_snapshot_id:
         raise PermissionError("harness retrieval outcome source-set mismatch")
+    if work_order.scope_type == "knowledge_base":
+        if outcome.applied_region_policy_versions:
+            raise PermissionError(
+                "knowledge base harness outcome used unexpected region policies"
+            )
+        if outcome.status not in {"success_with_hits", "success_empty"}:
+            return []
+        result: list[dict[str, Any]] = []
+        for evidence in outcome.evidences:
+            if (
+                evidence.metadata.get("knowledge_base_name")
+                != work_order.knowledge_base_name
+                or evidence.source_name not in snapshot.source_names
+            ):
+                raise PermissionError(
+                    "harness received evidence outside the frozen source set"
+                )
+            result.append(
+                {
+                    "id": evidence.id,
+                    "content": evidence.content,
+                    "source_name": evidence.source_name,
+                    "metadata": dict(evidence.metadata),
+                    "locator": dict(evidence.locator),
+                    "fact_type": evidence.fact_type,
+                }
+            )
+        return result
     if outcome.applied_region_policy_versions != snapshot.region_policy_versions:
         raise PermissionError("harness retrieval outcome region-policy mismatch")
     if outcome.status not in {"success_with_hits", "success_empty"}:

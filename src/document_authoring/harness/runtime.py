@@ -16,6 +16,7 @@ from src.document_authoring.models import (
     HarnessCheckpoint,
     HarnessPolicy,
     HarnessRun,
+    KnowledgeBaseSourceSnapshot,
     LegacyTemplateClaim,
     NodeExecutionReceipt,
     TemplateVersion,
@@ -36,20 +37,42 @@ class InternalDocumentHarnessRuntime:
         self,
         work_order: DocumentWorkOrder,
         policy: HarnessPolicy,
-        snapshot: SourceSetSnapshot,
+        snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
         template: TemplateVersion,
         schema: DocumentSchema,
     ) -> tuple[HarnessRun, AuthoringRunManifest]:
-        manifest = AuthoringRunManifest(
+        manifest = self.build_manifest(work_order, policy, snapshot, template, schema)
+        run = HarnessRun(
+            harness_run_id=f"harness-{uuid.uuid4().hex}", work_order_id=work_order.work_order_id,
+            run_manifest_id=manifest.run_manifest_id, status="queued", max_retries=policy.max_retries,
+        )
+        self.store.save_run_manifest(manifest)
+        self.store.create_harness_run(run)
+        return run, manifest
+
+    @staticmethod
+    def build_manifest(
+        work_order: DocumentWorkOrder,
+        policy: HarnessPolicy,
+        snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
+        template: TemplateVersion,
+        schema: DocumentSchema,
+    ) -> AuthoringRunManifest:
+        source_names = (
+            list(snapshot.source_names)
+            if work_order.scope_type == "knowledge_base"
+            else list(snapshot.source_version_ids)
+        )
+        return AuthoringRunManifest(
             run_manifest_id=f"manifest-{uuid.uuid4().hex}", work_order_id=work_order.work_order_id,
             harness_policy_id=policy.harness_policy_id, harness_policy_version=policy.version,
             writer_provider_id=policy.writer_provider_id, prompt_version=policy.prompt_version,
             source_set_snapshot_id=work_order.source_set_snapshot_id, input_fingerprint=work_order.input_fingerprint,
             source_set_snapshot_hash=snapshot.content_hash,
             baseline_content_hash=work_order.baseline_content_hash,
-            source_version_ids=list(snapshot.source_version_ids),
-            processing_artifact_ids=list(snapshot.processing_artifact_ids),
-            region_policy_versions=dict(snapshot.region_policy_versions),
+            source_version_ids=source_names,
+            processing_artifact_ids=list(getattr(snapshot, "processing_artifact_ids", [])),
+            region_policy_versions=dict(getattr(snapshot, "region_policy_versions", {})),
             template_content_hash=template.content_hash,
             document_schema_hash=content_hash(schema),
             template_schema_hash=content_hash({
@@ -62,13 +85,6 @@ class InternalDocumentHarnessRuntime:
             max_steps=policy.max_steps,
             max_retrieval_rounds=policy.max_retrieval_rounds,
         )
-        run = HarnessRun(
-            harness_run_id=f"harness-{uuid.uuid4().hex}", work_order_id=work_order.work_order_id,
-            run_manifest_id=manifest.run_manifest_id, status="queued", max_retries=policy.max_retries,
-        )
-        self.store.save_run_manifest(manifest)
-        self.store.create_harness_run(run)
-        return run, manifest
 
     def execute(
         self,
@@ -78,7 +94,7 @@ class InternalDocumentHarnessRuntime:
         manifest: AuthoringRunManifest,
         policy: HarnessPolicy,
         schema: DocumentSchema,
-        snapshot: SourceSetSnapshot,
+        snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
         legacy_claims: list[LegacyTemplateClaim],
         writer: ManagedWriter,
         retrieve: RetrievalProvider,

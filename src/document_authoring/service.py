@@ -22,6 +22,7 @@ from src.document_authoring.models import (
     DocumentHumanEvent,
     DocumentUnitDraft,
     HarnessPolicy,
+    KnowledgeBaseSourceSnapshot,
     LegacyTemplateClaim,
     DocumentSchema,
     DocumentWorkOrder,
@@ -300,24 +301,12 @@ class DocumentGenerationService:
             existing = self.store.find_work_order_by_idempotency(tenant_id, project_id, idempotency_key)
             if existing is not None:
                 return existing
-        template = self._template(template_version_id)
-        schema = self._schema(document_schema_id, document_schema_version)
-        if template.status != "approved" or schema.status != "approved":
-            raise ValueError("document generation requires approved template and document schema")
-        if template.template_schema_id != template.template_schema_id:  # pragma: no cover - defensive invariant
-            raise ValueError("invalid template schema")
-        if schema.execution_mode not in {"deterministic_only", "internal_harness"}:
-            raise ValueError("external-agent work orders are not enabled before P3")
-        harness_policy = None
-        if schema.execution_mode == "internal_harness":
-            if not harness_policy_id:
-                existing = self.store.list_harness_policies(approved_only=True)
-                harness_policy = existing[0] if existing else self._create_default_harness_policy()
-                harness_policy_id = harness_policy.harness_policy_id
-            else:
-                harness_policy = self.store.get_harness_policy(harness_policy_id)
-            if harness_policy is None or harness_policy.status != "approved":
-                raise ValueError("internal-harness work orders require an approved HarnessPolicy")
+        self._validate_work_order_definition(
+            template_version_id,
+            document_schema_id,
+            document_schema_version,
+            harness_policy_id,
+        )
         baseline = self.projects.store.get_baseline(baseline_id, tenant_id)
         if baseline is None:
             raise ValueError("baseline not found")
@@ -326,24 +315,159 @@ class DocumentGenerationService:
             ctx, work_order_id=work_order_id, project_id=project_id, baseline_id=baseline_id,
             processing_artifact_ids=processing_artifact_ids,
         )
+        return self._create_frozen_work_order(
+            ctx,
+            scope_type="project",
+            snapshot=snapshot,
+            template_version_id=template_version_id,
+            document_schema_id=document_schema_id,
+            document_schema_version=document_schema_version,
+            idempotency_key=idempotency_key,
+            harness_policy_id=harness_policy_id,
+        )
+
+    def create_knowledge_base_work_order(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+        source_names: list[str],
+        template_version_id: str,
+        document_schema_id: str,
+        document_schema_version: str,
+        idempotency_key: str | None = None,
+    ) -> DocumentWorkOrder:
+        if not ctx.has_kb_permission(knowledge_base_name, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        tenant_id = ctx.tenant_id or "default"
+        if idempotency_key:
+            existing = next(
+                (
+                    order
+                    for order in self.store.list_work_orders_for_knowledge_base(
+                        tenant_id, knowledge_base_name
+                    )
+                    if order.idempotency_key == idempotency_key
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+        self._validate_work_order_definition(
+            template_version_id,
+            document_schema_id,
+            document_schema_version,
+        )
+        snapshot = self._create_knowledge_base_source_snapshot(
+            ctx, knowledge_base_name, source_names
+        )
+        return self._create_frozen_work_order(
+            ctx,
+            scope_type="knowledge_base",
+            snapshot=snapshot,
+            knowledge_base_name=knowledge_base_name,
+            template_version_id=template_version_id,
+            document_schema_id=document_schema_id,
+            document_schema_version=document_schema_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def _create_frozen_work_order(
+        self,
+        ctx: RequestContext,
+        *,
+        scope_type: str,
+        snapshot,
+        template_version_id: str,
+        document_schema_id: str,
+        document_schema_version: str,
+        knowledge_base_name: str | None = None,
+        idempotency_key: str | None = None,
+        harness_policy_id: str | None = None,
+    ) -> DocumentWorkOrder:
+        template = self._template(template_version_id)
+        schema = self._schema(document_schema_id, document_schema_version)
+        if template.status != "approved" or schema.status != "approved":
+            raise ValueError(
+                "document generation requires approved template and document schema"
+            )
+        if schema.execution_mode not in {"deterministic_only", "internal_harness"}:
+            raise ValueError("external-agent work orders are not enabled before P3")
+        harness_policy = None
+        if schema.execution_mode == "internal_harness":
+            if harness_policy_id:
+                harness_policy = self.store.get_harness_policy(harness_policy_id)
+            else:
+                existing_policies = self.store.list_harness_policies(
+                    approved_only=True
+                )
+                harness_policy = (
+                    existing_policies[0]
+                    if existing_policies
+                    else self._create_default_harness_policy()
+                )
+                harness_policy_id = harness_policy.harness_policy_id
+            if harness_policy is None or harness_policy.status != "approved":
+                raise ValueError(
+                    "internal-harness work orders require an approved HarnessPolicy"
+                )
+        is_knowledge_base = scope_type == "knowledge_base"
         order = DocumentWorkOrder(
-            work_order_id=work_order_id, tenant_id=tenant_id, project_id=project_id,
-            baseline_id=baseline_id, baseline_content_hash=baseline.content_hash,
+            work_order_id=(
+                f"wo-{uuid.uuid4().hex}"
+                if is_knowledge_base
+                else snapshot.work_order_id
+            ),
+            tenant_id=snapshot.tenant_id,
+            scope_type=scope_type,
+            knowledge_base_name=knowledge_base_name if is_knowledge_base else None,
+            project_id=None if is_knowledge_base else snapshot.project_id,
+            baseline_id=None if is_knowledge_base else snapshot.baseline_id,
+            baseline_content_hash=(
+                "" if is_knowledge_base else snapshot.baseline_content_hash
+            ),
             source_set_snapshot_id=snapshot.source_set_snapshot_id,
             template_version_id=template.template_version_id,
-            document_schema_id=schema.document_schema_id, document_schema_version=schema.version,
-            template_schema_id=template.template_schema_id, template_schema_version=template.template_schema_version,
-            retrieval_policy_version="1", renderer_policy_version=self._policy(template).version,
-            target_format=template.format, execution_mode=schema.execution_mode,
+            document_schema_id=schema.document_schema_id,
+            document_schema_version=schema.version,
+            template_schema_id=template.template_schema_id,
+            template_schema_version=template.template_schema_version,
+            retrieval_policy_version="1",
+            renderer_policy_version=self._policy(template).version,
+            target_format=template.format,
+            execution_mode=schema.execution_mode,
             harness_policy_id=harness_policy_id,
             harness_policy_version=harness_policy.version if harness_policy else None,
             unit_statuses={
                 **{item.field_id: "planned" for item in schema.fields},
                 **{item.review_item_id: "planned" for item in schema.review_items},
             },
-            created_by=ctx.user_id, idempotency_key=idempotency_key,
+            created_by=ctx.user_id,
+            idempotency_key=idempotency_key,
         )
         return self.store.create_work_order(order)
+
+    def _validate_work_order_definition(
+        self,
+        template_version_id: str,
+        document_schema_id: str,
+        document_schema_version: str,
+        harness_policy_id: str | None = None,
+    ) -> None:
+        template = self._template(template_version_id)
+        schema = self._schema(document_schema_id, document_schema_version)
+        if template.status != "approved" or schema.status != "approved":
+            raise ValueError(
+                "document generation requires approved template and document schema"
+            )
+        if schema.execution_mode not in {"deterministic_only", "internal_harness"}:
+            raise ValueError("external-agent work orders are not enabled before P3")
+        if schema.execution_mode == "internal_harness" and harness_policy_id:
+            policy = self.store.get_harness_policy(harness_policy_id)
+            if policy is None or policy.status != "approved":
+                raise ValueError(
+                    "internal-harness work orders require an approved HarnessPolicy"
+                )
 
     # Deterministic execution ----------------------------------------------------------
 
@@ -362,9 +486,7 @@ class DocumentGenerationService:
             raise ValueError(f"work order cannot run from status {order.status}")
         schema = self._schema(order.document_schema_id, order.document_schema_version)
         template = self._template(order.template_version_id)
-        snapshot = self.projects.store.get_source_set_snapshot(order.source_set_snapshot_id, order.tenant_id)
-        if snapshot is None:
-            raise ValueError("work order source set snapshot is missing")
+        snapshot = self.resolve_source_snapshot(order)
         bindings = self.store.list_unit_bindings(order.template_schema_id, order.template_schema_version)
         by_unit = {binding.semantic_unit_id: binding for binding in bindings}
 
@@ -445,9 +567,7 @@ class DocumentGenerationService:
         if writer.provider.provider_id != policy.writer_provider_id:
             raise PermissionError("writer provider does not match the approved HarnessPolicy")
         schema = self._schema(order.document_schema_id, order.document_schema_version)
-        snapshot = self.projects.store.get_source_set_snapshot(order.source_set_snapshot_id, order.tenant_id)
-        if snapshot is None:
-            raise ValueError("work order source set snapshot is missing")
+        snapshot = self.resolve_source_snapshot(order)
         template = self._template(order.template_version_id)
         run, manifest = self.harness_runtime.create_run(order, policy, snapshot, template, schema)
         order = self._replace_order(order, status="retrieving", run_manifest_id=manifest.run_manifest_id)
@@ -511,9 +631,7 @@ class DocumentGenerationService:
         if writer.provider.provider_id != policy.writer_provider_id:
             raise PermissionError("writer provider does not match the frozen HarnessPolicy")
         schema = self._schema(order.document_schema_id, order.document_schema_version)
-        snapshot = self.projects.store.get_source_set_snapshot(order.source_set_snapshot_id, order.tenant_id)
-        if snapshot is None:
-            raise ValueError("frozen work order source set snapshot is unavailable")
+        snapshot = self.resolve_source_snapshot(order)
         template = self._template(order.template_version_id)
         order = self._replace_order(order, status="retrieving", run_manifest_id=manifest.run_manifest_id)
         try:
@@ -605,16 +723,17 @@ class DocumentGenerationService:
     ) -> DocumentHumanEvent:
         artifact = self._artifact_for_context(ctx, artifact_id)
         required = "approve_artifact" if event_type in {"approve", "sign"} else "submit_human_event"
-        self.projects.access.require(ctx, self._order_raw(artifact.work_order_id).project_id, required)
-        actor_role = self._actor_role(ctx, self._order_raw(artifact.work_order_id).project_id)
+        order = self._order_raw(artifact.work_order_id)
+        self.require_work_order_capability(ctx, order, required)
+        actor_role = (
+            "knowledge_base_reader"
+            if order.scope_type == "knowledge_base"
+            else self._actor_role(ctx, order.project_id)
+        )
         report = self.store.get_validation_report(artifact.validation_report_id)
         if report is None:
             raise ValueError("artifact validation report is missing")
-        snapshot = self.projects.store.get_source_set_snapshot(
-            self._order_raw(artifact.work_order_id).source_set_snapshot_id, ctx.tenant_id or "default"
-        )
-        if snapshot is None:
-            raise ValueError("artifact source set snapshot is missing")
+        snapshot = self.resolve_source_snapshot(order)
         subject_hash = _approval_subject_hash(artifact.content_hash, report.content_hash, snapshot.content_hash)
         event = DocumentHumanEvent(
             event_id=f"event-{uuid.uuid4().hex}", work_order_id=artifact.work_order_id,
@@ -630,10 +749,9 @@ class DocumentGenerationService:
         if candidate.stage != "review_candidate":
             raise ValueError("only a review candidate may be approved")
         order = self._order(ctx, candidate.work_order_id, "approve_artifact")
-        self.projects.access.require(ctx, order.project_id, "approve_artifact")
         report = self.store.get_validation_report(candidate.validation_report_id)
-        snapshot = self.projects.store.get_source_set_snapshot(order.source_set_snapshot_id, ctx.tenant_id or "default")
-        if report is None or snapshot is None or report.status == "failed":
+        snapshot = self.resolve_source_snapshot(order)
+        if report is None or report.status == "failed":
             raise ValueError("candidate does not have a releasable validation result")
         candidate_content = self.store.read_artifact_content(candidate.artifact_id)
         self._assert_generated_artifact_clean(candidate_content, order.target_format)
@@ -664,7 +782,7 @@ class DocumentGenerationService:
         artifact = self._artifact_for_context(ctx, artifact_id)
         order = self._order_raw(artifact.work_order_id)
         capability = "download_approved_release" if artifact.stage == "approved_release" else "download_review_candidate"
-        self.projects.access.require(ctx, order.project_id, capability)
+        self.require_work_order_capability(ctx, order, capability)
         return self.store.read_artifact_content(artifact_id)
 
     # Internal helpers -----------------------------------------------------------------
@@ -762,8 +880,68 @@ class DocumentGenerationService:
 
     def _order(self, ctx: RequestContext, work_order_id: str, capability: str) -> DocumentWorkOrder:
         order = self._order_raw(work_order_id)
-        self.projects.access.require(ctx, order.project_id, capability)
+        self.require_work_order_capability(ctx, order, capability)
         return order
+
+    def require_work_order_capability(
+        self,
+        ctx: RequestContext,
+        order: DocumentWorkOrder,
+        capability: str,
+    ) -> None:
+        if order.scope_type == "knowledge_base":
+            if (
+                order.tenant_id != (ctx.tenant_id or "default")
+                or not order.knowledge_base_name
+                or not ctx.has_kb_permission(order.knowledge_base_name, "read")
+            ):
+                raise PermissionError(
+                    "knowledge base access is required for this work order"
+                )
+            return
+        self.projects.access.require(ctx, order.project_id, capability)
+
+    def resolve_source_snapshot(self, order: DocumentWorkOrder):
+        if order.scope_type == "knowledge_base":
+            snapshot = self.store.get_knowledge_base_source_snapshot(
+                order.source_set_snapshot_id
+            )
+            if (
+                snapshot is None
+                or snapshot.tenant_id != order.tenant_id
+                or snapshot.knowledge_base_name != order.knowledge_base_name
+            ):
+                raise ValueError(
+                    "work order knowledge-base source snapshot is missing or mismatched"
+                )
+            return snapshot
+        snapshot = self.projects.store.get_source_set_snapshot(
+            order.source_set_snapshot_id, order.tenant_id
+        )
+        if (
+            snapshot is None
+            or snapshot.project_id != order.project_id
+            or snapshot.baseline_id != order.baseline_id
+            or snapshot.baseline_content_hash != order.baseline_content_hash
+        ):
+            raise ValueError(
+                "work order project source snapshot is missing or mismatched"
+            )
+        return snapshot
+
+    def _create_knowledge_base_source_snapshot(
+        self,
+        ctx: RequestContext,
+        knowledge_base_name: str,
+        source_names: list[str],
+    ) -> KnowledgeBaseSourceSnapshot:
+        snapshot = KnowledgeBaseSourceSnapshot.create(
+            tenant_id=ctx.tenant_id or "default",
+            knowledge_base_name=knowledge_base_name,
+            source_names=source_names,
+            created_by=ctx.user_id,
+        )
+        return self.store.create_knowledge_base_source_snapshot(snapshot)
 
     def _order_raw(self, work_order_id: str) -> DocumentWorkOrder:
         order = self.store.get_work_order(work_order_id)
@@ -782,7 +960,9 @@ class DocumentGenerationService:
         if run is None:
             raise KeyError(f"harness run not found: {harness_run_id}")
         order = self._order_raw(run.work_order_id)
-        self.projects.access.require(ctx, order.project_id, "run_deterministic_work_order")
+        self.require_work_order_capability(
+            ctx, order, "run_deterministic_work_order"
+        )
         return run
 
     def _replace_order(self, order: DocumentWorkOrder, **updates: Any) -> DocumentWorkOrder:
@@ -885,6 +1065,21 @@ class DocumentGenerationService:
     def _validate_retrieval_outcome(order: DocumentWorkOrder, snapshot, outcome: RetrievalOutcome) -> None:
         if outcome.applied_source_set_snapshot_id != snapshot.source_set_snapshot_id:
             raise PermissionError("retrieval outcome was not produced for this work order source set")
+        if order.scope_type == "knowledge_base":
+            if outcome.applied_region_policy_versions:
+                raise PermissionError(
+                    "knowledge base retrieval outcome used unexpected region policies"
+                )
+            for evidence in outcome.evidences:
+                if evidence.metadata.get("knowledge_base_name") != order.knowledge_base_name:
+                    raise PermissionError(
+                        "retrieval evidence knowledge base does not match work order"
+                    )
+                if evidence.source_name not in snapshot.source_names:
+                    raise PermissionError(
+                        "retrieval evidence is outside the frozen source set"
+                    )
+            return
         allowed_versions = set(snapshot.source_version_ids) | set(snapshot.shared_reference_version_ids)
         allowed_artifacts = set(snapshot.processing_artifact_ids)
         if outcome.applied_region_policy_versions != snapshot.region_policy_versions:
