@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import Depends, Header, HTTPException
 
 from src.core.app_pipeline import AppPipeline
-from src.core.auth import ROLE_DEPT_ADMIN, AuthService, AuthUser
+from src.core.auth import ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, AuthService, AuthUser
 from src.pipelines.document_rag.schemas import RequestContext
 
 from src.api.context import build_context_for_user
@@ -53,6 +53,18 @@ def current_user(
 def require_dept_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
     if user.role != ROLE_DEPT_ADMIN:
         raise HTTPException(status_code=403, detail="department admin role required")
+    return user
+
+
+def require_system_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
+    if user.role != ROLE_SYSTEM_ADMIN:
+        raise HTTPException(status_code=403, detail="system admin role required")
+    return user
+
+
+def require_any_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
+    if user.role not in (ROLE_SYSTEM_ADMIN, ROLE_DEPT_ADMIN):
+        raise HTTPException(status_code=403, detail="admin role required")
     return user
 
 

@@ -48,7 +48,7 @@ async def query(
     def producer() -> None:
         try:
             answer_parts: list[str] = []
-            for chunk in pipeline.query(body.query, body.kb_name, history, ctx):
+            for chunk in pipeline.query(body.query, body.kb_name, history, ctx, agent_thread_id=body.thread_id):
                 if chunk:
                     answer_parts.append(chunk)
                     q.put(("delta", {"text": chunk}))

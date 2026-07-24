@@ -80,6 +80,26 @@ def create_kb(
     return OkResponse(ok=True, message=msg)
 
 
+@router.delete("/kbs/{kb_name}", response_model=OkResponse)
+def delete_kb(
+    kb_name: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Delete a knowledge base and all its documents / archives / indexes.
+
+    Requires ``admin`` permission on the KB (implicit for the owning dept_admin).
+    """
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    if not ctx.has_kb_permission(kb_name, "admin"):
+        raise HTTPException(status_code=403, detail="admin permission required")
+    ok, msg = pipeline.delete_knowledge_base(kb_name, ctx=ctx)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return OkResponse(ok=True, message=msg)
+
+
 @router.delete("/kbs/{kb_name}/files/{filename}", response_model=OkResponse)
 def delete_file(
     kb_name: str,
