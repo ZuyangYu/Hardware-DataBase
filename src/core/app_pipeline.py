@@ -322,10 +322,38 @@ class AppPipeline:
             "harness_policies": self.document_generation.store.list_harness_policies(approved_only=True),
         }
 
+    def list_knowledge_base_document_generation_options(
+        self,
+        ctx: RequestContext,
+    ) -> dict[str, list]:
+        """Return approved authoring choices plus only the caller's readable KBs."""
+        return {
+            "knowledge_bases": self.list_knowledge_bases(ctx),
+            "templates": self.document_generation.store.list_templates(
+                approved_only=True
+            ),
+            "schemas": self.document_generation.store.list_document_schemas(
+                approved_only=True
+            ),
+        }
+
     def list_document_work_orders(self, ctx: RequestContext, *, project_id: str):
         """List durable work-order summaries visible to the current project user."""
         self.projects.access.require(ctx, project_id, "view_project")
         return self.document_generation.store.list_work_orders(ctx.tenant_id or "default", project_id)
+
+    def list_knowledge_base_document_work_orders(
+        self,
+        ctx: RequestContext,
+        knowledge_base_name: str,
+    ):
+        """List work orders only while the caller retains KB read permission."""
+        if not ctx.has_kb_permission(knowledge_base_name, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        return self.document_generation.store.list_work_orders_for_knowledge_base(
+            ctx.tenant_id or "default",
+            knowledge_base_name,
+        )
 
     def register_renderer_policy(self, policy):
         return self.document_generation.register_renderer_policy(policy)
@@ -364,6 +392,112 @@ class AppPipeline:
     def create_document_work_order(self, ctx: RequestContext, **kwargs):
         return self.document_generation.create_document_work_order(ctx, **kwargs)
 
+    def create_knowledge_base_document_work_order(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+        **kwargs,
+    ):
+        """Create a KB work order from the sources readable at creation time."""
+        if not ctx.has_kb_permission(knowledge_base_name, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        source_names = []
+        for document in self.list_file_infos(knowledge_base_name, ctx):
+            name = (
+                document.get("name", "")
+                if isinstance(document, dict)
+                else getattr(document, "name", "")
+            )
+            normalized = str(name).strip()
+            if normalized and normalized not in source_names:
+                source_names.append(normalized)
+        if not source_names:
+            raise ValueError(
+                "knowledge base has no readable source documents; "
+                "upload and parse a source before generating a document"
+            )
+        kwargs.pop("source_names", None)
+        return self.document_generation.create_knowledge_base_work_order(
+            ctx,
+            knowledge_base_name=knowledge_base_name,
+            source_names=source_names,
+            **kwargs,
+        )
+
+    def auto_generate_knowledge_base_document(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+        **kwargs,
+    ):
+        """Create and run a KB work order using only its frozen source snapshot."""
+        order = self.create_knowledge_base_document_work_order(
+            ctx,
+            knowledge_base_name=knowledge_base_name,
+            **kwargs,
+        )
+        snapshot = self.document_generation.resolve_source_snapshot(order)
+        retrieve = self._knowledge_base_retriever(
+            ctx,
+            knowledge_base_name,
+            list(snapshot.source_names),
+            source_set_snapshot_id=snapshot.source_set_snapshot_id,
+        )
+        candidate = self.document_generation.run_internal_harness(
+            ctx,
+            order.work_order_id,
+            retrieve=retrieve,
+        )
+        current = self.document_generation.store.get_work_order(order.work_order_id)
+        if current is None or current.status != "waiting_human_approval":
+            return candidate
+        return self.document_generation.approve_document_artifact(
+            ctx,
+            candidate.artifact_id,
+            comment="自动生成并发布",
+        )
+
+    def _knowledge_base_retriever(
+        self,
+        ctx: RequestContext,
+        kb_name: str,
+        source_names: list[str],
+        *,
+        source_set_snapshot_id: str = "",
+    ):
+        if not ctx.has_kb_permission(kb_name, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        frozen_source_names = list(dict.fromkeys(source_names))
+
+        def retrieve(requirement, _attempt):
+            query = " ".join(
+                value
+                for value in (
+                    requirement.subject,
+                    requirement.predicate,
+                    requirement.object_hint,
+                )
+                if value
+            )
+            evidences = self.backend.retrieve(
+                kb_name,
+                query,
+                top_k=config.settings.FINAL_TOP_K,
+                ctx=ctx,
+                filters={"source_names": frozen_source_names},
+            )
+            return self.document_generation.build_knowledge_base_retrieval_outcome(
+                kb_name,
+                frozen_source_names,
+                evidences,
+                requirement_id=requirement.requirement_id,
+                source_set_snapshot_id=source_set_snapshot_id,
+            )
+
+        return retrieve
+
     def start_document_generation(self, ctx: RequestContext, work_order_id: str, *, rule_inputs, retrieval_outcomes):
         return self.document_generation.start_document_generation(
             ctx, work_order_id, rule_inputs=rule_inputs, retrieval_outcomes=retrieval_outcomes,
@@ -395,11 +529,21 @@ class AppPipeline:
         order = self.document_generation.store.get_work_order(work_order_id)
         if order is None:
             return None
+        if ctx is None and order.scope_type == "knowledge_base":
+            raise PermissionError(
+                "request context is required for knowledge base work order status"
+            )
         if ctx is not None:
-            self.projects.access.require(ctx, order.project_id, "view_project")
+            self.document_generation.require_work_order_capability(
+                ctx,
+                order,
+                "view_project",
+            )
         status = {
             "work_order_id": order.work_order_id,
             "status": order.status,
+            "scope_type": order.scope_type,
+            "knowledge_base_name": order.knowledge_base_name,
             "project_id": order.project_id,
             "target_format": order.target_format,
             "unit_statuses": dict(order.unit_statuses),

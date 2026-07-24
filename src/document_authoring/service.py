@@ -10,11 +10,12 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import uuid
+from copy import copy
 from datetime import datetime, timezone
 from collections.abc import Callable
 from typing import Any
 
-from src.agents.claim_evidence import RetrievalOutcome
+from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
 from src.document_authoring.models import (
@@ -957,6 +958,68 @@ class DocumentGenerationService:
                 "work order project source snapshot is missing or mismatched"
             )
         return snapshot
+
+    @staticmethod
+    def build_knowledge_base_retrieval_outcome(
+        knowledge_base_name: str,
+        source_names: list[str],
+        evidences: list[Any],
+        *,
+        requirement_id: str = "knowledge-base-retrieval",
+        source_set_snapshot_id: str = "",
+    ) -> RetrievalOutcome:
+        """Bind backend evidence to one selected knowledge base and source set."""
+        frozen_source_names = list(dict.fromkeys(source_names))
+        accepted = []
+        for evidence in evidences:
+            if evidence.source_name not in frozen_source_names:
+                raise PermissionError("retrieval evidence is outside the frozen source set")
+            declared_kb_names = {
+                str(evidence.metadata.get(key) or "").strip()
+                for key in ("knowledge_base_name", "kb_name")
+            } - {""}
+            if any(name != knowledge_base_name for name in declared_kb_names):
+                raise PermissionError("retrieval evidence knowledge base does not match selection")
+            bound_evidence = copy(evidence)
+            bound_evidence.metadata = {
+                **evidence.metadata,
+                "knowledge_base_name": knowledge_base_name,
+            }
+            accepted.append(bound_evidence)
+        evidence_by_source = {
+            source_name: [
+                evidence.id
+                for evidence in accepted
+                if evidence.source_name == source_name
+            ]
+            for source_name in frozen_source_names
+        }
+        return RetrievalOutcome(
+            requirement_id=requirement_id,
+            status="success_with_hits" if accepted else "success_empty",
+            evidences=accepted,
+            source_outcomes=[
+                RetrievalSourceOutcome(
+                    source_version_id=source_name,
+                    status=(
+                        "success_with_hits"
+                        if evidence_by_source[source_name]
+                        else "success_empty"
+                    ),
+                    evidence_ids=evidence_by_source[source_name],
+                )
+                for source_name in frozen_source_names
+            ],
+            query_fingerprint=hashlib.sha256(
+                (
+                    f"{requirement_id}|{knowledge_base_name}|"
+                    f"{'|'.join(frozen_source_names)}|"
+                    f"{'|'.join(evidence.id for evidence in accepted)}"
+                ).encode("utf-8")
+            ).hexdigest(),
+            applied_source_set_snapshot_id=source_set_snapshot_id,
+            applied_region_policy_versions={},
+        )
 
     def _create_knowledge_base_source_snapshot(
         self,

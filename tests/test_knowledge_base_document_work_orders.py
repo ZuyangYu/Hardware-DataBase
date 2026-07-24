@@ -3,10 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from types import SimpleNamespace
+from unittest.mock import ANY, Mock
 
 import pytest
 
-from src.agents.claim_evidence import RetrievalOutcome
+from src.agents.claim_evidence import InformationRequirement, RetrievalOutcome
+from src.core.app_pipeline import AppPipeline
 from src.document_authoring.models import (
     DocumentFieldSchema,
     DocumentSchema,
@@ -42,6 +45,243 @@ def ctx():
         metadata={"department_id": "hw"},
         kb_permissions={"hw:hardware": "read"},
     )
+
+
+@pytest.fixture
+def pipeline(service):
+    pipeline = object.__new__(AppPipeline)
+    pipeline.backend = Mock()
+    pipeline.documents = Mock()
+    pipeline.document_generation = service
+    return pipeline
+
+
+def requirement(subject: str) -> InformationRequirement:
+    return InformationRequirement(
+        requirement_id=f"requirement-{subject}",
+        semantic_unit_id="summary",
+        claim_type="attribute",
+        subject=subject,
+    )
+
+
+def test_pipeline_knowledge_base_retriever_is_scoped(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []
+
+    retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["spec.pdf"])
+    retrieve(requirement("voltage"), 0)
+
+    pipeline.backend.retrieve.assert_called_once_with(
+        "hardware",
+        "voltage",
+        top_k=ANY,
+        ctx=ctx,
+        filters={"source_names": ["spec.pdf"]},
+    )
+
+
+def test_knowledge_base_retrieval_outcome_rejects_backend_kb_mismatch(service):
+    evidence = EvidenceEnvelope(
+        id="cross-kb",
+        content="must not be relabeled",
+        source_name="spec.pdf",
+        metadata={"kb_name": "firmware"},
+    )
+
+    with pytest.raises(PermissionError, match="knowledge base"):
+        service.build_knowledge_base_retrieval_outcome(
+            "hardware",
+            ["spec.pdf"],
+            [evidence],
+            requirement_id="requirement-voltage",
+            source_set_snapshot_id="snapshot-frozen",
+        )
+
+    assert evidence.metadata == {"kb_name": "firmware"}
+
+
+def test_pipeline_knowledge_base_options_are_authorized_and_approved(
+    pipeline, ctx, approved_template, approved_schema
+):
+    pipeline.list_knowledge_bases = Mock(return_value=["hardware"])
+    pipeline.document_generation.store.list_templates = Mock(
+        return_value=[approved_template]
+    )
+    pipeline.document_generation.store.list_document_schemas = Mock(
+        return_value=[approved_schema]
+    )
+
+    options = pipeline.list_knowledge_base_document_generation_options(ctx)
+
+    assert options == {
+        "knowledge_bases": ["hardware"],
+        "templates": [approved_template],
+        "schemas": [approved_schema],
+    }
+    pipeline.list_knowledge_bases.assert_called_once_with(ctx)
+    pipeline.document_generation.store.list_templates.assert_called_once_with(
+        approved_only=True
+    )
+    pipeline.document_generation.store.list_document_schemas.assert_called_once_with(
+        approved_only=True
+    )
+
+
+def test_pipeline_creates_knowledge_base_work_order_from_readable_sources(
+    pipeline, ctx, approved_template, approved_schema
+):
+    pipeline.list_file_infos = Mock(
+        return_value=[
+            SimpleNamespace(name="spec.pdf"),
+            SimpleNamespace(name="spec.pdf"),
+            SimpleNamespace(name="limits.xlsx"),
+        ]
+    )
+
+    order = pipeline.create_knowledge_base_document_work_order(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id=approved_template.template_version_id,
+        document_schema_id=approved_schema.document_schema_id,
+        document_schema_version=approved_schema.version,
+    )
+
+    snapshot = pipeline.document_generation.resolve_source_snapshot(order)
+    assert snapshot.source_names == ["spec.pdf", "limits.xlsx"]
+    pipeline.list_file_infos.assert_called_once_with("hardware", ctx)
+
+
+def test_pipeline_rejects_empty_knowledge_base_work_order(
+    pipeline, ctx, approved_template, approved_schema
+):
+    pipeline.list_file_infos = Mock(return_value=[])
+
+    with pytest.raises(ValueError, match="no readable source documents"):
+        pipeline.create_knowledge_base_document_work_order(
+            ctx,
+            knowledge_base_name="hardware",
+            template_version_id=approved_template.template_version_id,
+            document_schema_id=approved_schema.document_schema_id,
+            document_schema_version=approved_schema.version,
+        )
+
+
+def test_pipeline_lists_only_live_authorized_knowledge_base_work_orders(
+    pipeline, ctx, approved_template, approved_schema
+):
+    pipeline.list_file_infos = Mock(
+        return_value=[SimpleNamespace(name="spec.pdf")]
+    )
+    order = pipeline.create_knowledge_base_document_work_order(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id=approved_template.template_version_id,
+        document_schema_id=approved_schema.document_schema_id,
+        document_schema_version=approved_schema.version,
+    )
+
+    assert pipeline.list_knowledge_base_document_work_orders(
+        ctx, "hardware"
+    ) == [order]
+
+    ctx.kb_permissions.clear()
+    with pytest.raises(PermissionError, match="knowledge base read"):
+        pipeline.list_knowledge_base_document_work_orders(ctx, "hardware")
+
+
+def test_pipeline_auto_generation_uses_created_order_frozen_snapshot(pipeline, ctx):
+    service = Mock()
+    order = SimpleNamespace(
+        work_order_id="wo-kb",
+        source_set_snapshot_id="snapshot-frozen",
+    )
+    snapshot = SimpleNamespace(
+        source_set_snapshot_id="snapshot-frozen",
+        source_names=["frozen.pdf"],
+    )
+    candidate = SimpleNamespace(
+        artifact_id="candidate-a",
+        stage="review_candidate",
+    )
+    release = SimpleNamespace(
+        artifact_id="release-a",
+        stage="approved_release",
+    )
+    service.create_knowledge_base_work_order.return_value = order
+    service.resolve_source_snapshot.return_value = snapshot
+    service.run_internal_harness.return_value = candidate
+    service.store.get_work_order.return_value = SimpleNamespace(
+        status="waiting_human_approval"
+    )
+    service.approve_document_artifact.return_value = release
+    pipeline.document_generation = service
+    pipeline.list_file_infos = Mock(
+        return_value=[SimpleNamespace(name="currently-readable.pdf")]
+    )
+    retrieve = Mock()
+    pipeline._knowledge_base_retriever = Mock(return_value=retrieve)
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+        source_names=["untrusted-ui-file.pdf"],
+    )
+
+    assert result == release
+    service.create_knowledge_base_work_order.assert_called_once_with(
+        ctx,
+        knowledge_base_name="hardware",
+        source_names=["currently-readable.pdf"],
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+    service.resolve_source_snapshot.assert_called_once_with(order)
+    pipeline._knowledge_base_retriever.assert_called_once_with(
+        ctx,
+        "hardware",
+        ["frozen.pdf"],
+        source_set_snapshot_id="snapshot-frozen",
+    )
+    service.run_internal_harness.assert_called_once_with(
+        ctx, "wo-kb", retrieve=retrieve
+    )
+    service.approve_document_artifact.assert_called_once_with(
+        ctx, "candidate-a", comment="自动生成并发布"
+    )
+
+
+def test_pipeline_knowledge_base_status_is_scope_aware_and_reauthorized(
+    pipeline, ctx, approved_template, approved_schema
+):
+    pipeline.list_file_infos = Mock(
+        return_value=[SimpleNamespace(name="secret-spec.pdf")]
+    )
+    order = pipeline.create_knowledge_base_document_work_order(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id=approved_template.template_version_id,
+        document_schema_id=approved_schema.document_schema_id,
+        document_schema_version=approved_schema.version,
+    )
+
+    status = pipeline.get_document_run_status(order.work_order_id, ctx)
+
+    assert status["scope_type"] == "knowledge_base"
+    assert status["knowledge_base_name"] == "hardware"
+    assert status["project_id"] is None
+    assert "source_names" not in status
+    assert "secret-spec.pdf" not in json.dumps(status)
+
+    with pytest.raises(PermissionError, match="request context"):
+        pipeline.get_document_run_status(order.work_order_id)
+
+    ctx.kb_permissions.clear()
+    with pytest.raises(PermissionError, match="knowledge base"):
+        pipeline.get_document_run_status(order.work_order_id, ctx)
 
 
 @pytest.fixture
