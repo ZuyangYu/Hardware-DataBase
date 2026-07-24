@@ -32,7 +32,7 @@ class TemplateAnalysis(BaseModel):
     units: list[TemplateAnalysisUnit]
     suggestions: list[TemplateAnalysisSuggestion] = Field(default_factory=list)
 
-    def validate_suggestions(self) -> None:
+    def validate_suggestion_targets(self) -> None:
         units = {unit.unit_id: unit for unit in self.units}
         for suggestion in self.suggestions:
             for unit_id in suggestion.target_unit_ids:
@@ -40,6 +40,15 @@ class TemplateAnalysis(BaseModel):
                     raise ValueError(f"suggestion references unknown analysis unit: {unit_id}")
                 if not units[unit_id].writable:
                     raise PermissionError(f"suggestion targets non-writable analysis unit: {unit_id}")
+
+    def validate_suggestions(self) -> None:
+        self.validate_suggestion_targets()
+        seen_targets: set[str] = set()
+        for suggestion in self.suggestions:
+            for unit_id in suggestion.target_unit_ids:
+                if unit_id in seen_targets:
+                    raise ValueError(f"suggestion target may only be used once: {unit_id}")
+                seen_targets.add(unit_id)
 
 
 class DocxRegionSchema(BaseModel):
