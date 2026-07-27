@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from hashlib import sha256
+from typing import TYPE_CHECKING
 
 from src.document_authoring.harness.graph import AuthoringGraph, HarnessExecutionResult, RetrievalProvider
 from src.document_authoring.harness.policy import HarnessLeaseLost, HarnessToolPolicy
@@ -26,6 +27,9 @@ from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.writers.managed import ManagedWriter
 from src.projects.models import SourceSetSnapshot
+
+if TYPE_CHECKING:
+    from src.document_authoring.writers.query_rewriter import QueryRewriter
 
 
 class InternalDocumentHarnessRuntime:
@@ -84,6 +88,7 @@ class InternalDocumentHarnessRuntime:
             tool_policy_hash=content_hash(policy),
             max_steps=policy.max_steps,
             max_retrieval_rounds=policy.max_retrieval_rounds,
+            max_retrieval_attempts_per_unit=policy.max_retrieval_attempts_per_unit,
         )
 
     def execute(
@@ -98,6 +103,7 @@ class InternalDocumentHarnessRuntime:
         legacy_claims: list[LegacyTemplateClaim],
         writer: ManagedWriter,
         retrieve: RetrievalProvider,
+        rewriter: "QueryRewriter | None" = None,
     ) -> HarnessExecutionResult:
         lease_owner = f"harness-worker-{uuid.uuid4().hex}"
         running = self.store.claim_harness_run(run.harness_run_id, lease_owner, policy.lease_seconds)
@@ -146,6 +152,11 @@ class InternalDocumentHarnessRuntime:
                 if receipt.output_payload is None:
                     raise RuntimeError("committed draft receipt has no output payload")
                 return DocumentUnitDraft.model_validate(receipt.output_payload)
+            # Refresh the lease right before the (potentially long) writer call
+            # so a slow LLM does not silently expire the lease and lose the run.
+            self.store.heartbeat_harness_run(
+                running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
+            )
             try:
                 draft = writer.generate(request)
             except Exception as exc:
@@ -157,6 +168,11 @@ class InternalDocumentHarnessRuntime:
                     {"type": type(exc).__name__, "message": str(exc)},
                 )
                 raise
+            # Refresh the lease again after the writer call so the commit is
+            # safe even if the writer took most of the lease window.
+            self.store.heartbeat_harness_run(
+                running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
+            )
             self.store.commit_node_execution_owned(
                 receipt.receipt_id,
                 running.harness_run_id,
@@ -173,6 +189,7 @@ class InternalDocumentHarnessRuntime:
                 self.validator,
                 on_progress=save_progress,
                 draft_provider=draft_with_receipt,
+                rewriter=rewriter,
             )
             result = graph.run(
                 work_order=work_order, harness_run=running, run_manifest=manifest, schema=schema, snapshot=snapshot,
@@ -197,6 +214,11 @@ class InternalDocumentHarnessRuntime:
             self.store.finalize_harness_checkpoint(checkpoint.checkpoint_id, "failed")
             raise
         final_status = "waiting_human" if any(status in {"requires_human", "blocked", "conflicting", "retrieval_failed"} for status in result.unit_statuses.values()) else "completed"
+        # Refresh the lease before expensive finalization steps so the commit
+        # is safe even if the graph took most of the lease window.
+        self.store.heartbeat_harness_run(
+            running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
+        )
         self.store.save_unit_drafts(
             work_order.work_order_id,
             run.harness_run_id,

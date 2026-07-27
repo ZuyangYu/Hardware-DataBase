@@ -649,3 +649,82 @@ def test_work_order_state_changes_use_transactional_outbox(tmp_path: Path):
     delivered = store.mark_outbox_event_delivered(changed.event_id)
     assert delivered.status == "delivered" and delivered.delivery_attempts == 2
     assert changed.event_id not in {event.event_id for event in store.list_pending_outbox_events()}
+
+
+def test_internal_harness_rewrites_query_on_success_empty(tmp_path: Path, monkeypatch):
+    """End-to-end: success_empty on attempt 1 triggers a rewrite used on attempt 2."""
+    project_service, ctx, project, baseline, _ = _prepare_project(tmp_path)
+    authoring_store = DocumentAuthoringStore(str(tmp_path / "authoring.db"), str(tmp_path / "authoring-files"))
+    service = DocumentGenerationService(project_service, authoring_store)
+    content = _xlsx_template()
+    service.register_renderer_policy(RendererPolicy(renderer_policy_id="policy-render", version="1"))
+    # Policy defaults include rewrite_query (HarnessPolicy default allowlist).
+    policy = service.register_harness_policy(HarnessPolicy(
+        harness_policy_id="rewrite-writer", version="1", status="approved",
+        writer_provider_id="deterministic_evidence_writer",
+    ))
+    schema = service.register_document_schema(DocumentSchema(
+        document_schema_id="rewrite-schema", version="1", document_type="hardware_design_spec",
+        status="approved", execution_mode="internal_harness", fields=[DocumentFieldSchema(
+            field_id="controller", label="主控制器", description="已批准主控制器型号",
+            retrieval_policy_id="controller-evidence", verification_policy_id="controller-verify",
+            required_capabilities=["document_claim_lookup"], authoring_policy="managed_writer",
+        )],
+    ))
+    template = service.register_template(
+        TemplateVersion(
+            template_version_id="rewrite-template", template_id="hardware-design-spec", format="xlsx",
+            content_hash=hashlib.sha256(content).hexdigest(), template_schema_id="semantic-workbook",
+            template_schema_version="1", renderer_policy_id="policy-render",
+        ),
+        content,
+        regions=[WorkbookRegionSchema(
+            region_id="controller-cell", sheet_name="Review", locator={"cell": "A1"},
+            role="semantic_draft", write_policy="validated_draft",
+        )],
+        bindings=[TemplateUnitBinding(
+            binding_id="controller-binding", template_schema_id="semantic-workbook", template_schema_version="1",
+            semantic_unit_type="field", semantic_unit_id="controller", target_region_ids=["controller-cell"],
+        )],
+    )
+    service.approve_template(template.template_version_id, "template-admin")
+    order = service.create_document_work_order(
+        ctx, project_id=project.project_id, baseline_id=baseline.baseline_id,
+        template_version_id=template.template_version_id, document_schema_id=schema.document_schema_id,
+        document_schema_version=schema.version, harness_policy_id=policy.harness_policy_id,
+    )
+
+    overrides = []
+
+    def retrieve(requirement, attempt, query_override=None):
+        overrides.append(query_override)
+        if attempt == 1:
+            return RetrievalOutcome(
+                requirement_id=requirement.requirement_id, status="success_empty",
+                evidences=[], source_outcomes=[],
+                query_fingerprint="empty", applied_source_set_snapshot_id=order.source_set_snapshot_id,
+                applied_region_policy_versions={"policy-a": "1"},
+            )
+        # attempt 2: rewrite produced a hit
+        assert query_override == "rewrite-query"
+        return RetrievalOutcome(
+            requirement_id=requirement.requirement_id, status="success_with_hits",
+            evidences=[EvidenceEnvelope(
+                id="controller-evidence", content="主控制器为 STM32H743IIT6。",
+                project_id=project.project_id, source_version_id="version-a",
+                processing_artifact_id="processing-a",
+            )],
+            query_fingerprint="hit", applied_source_set_snapshot_id=order.source_set_snapshot_id,
+            applied_region_policy_versions={"policy-a": "1"},
+        )
+
+    rewriter = Mock()
+    rewriter.rewrite.return_value = "rewrite-query"
+    monkeypatch.setattr(service, "_rewriter_for_policy", lambda _policy: rewriter)
+
+    candidate = service.run_internal_harness(ctx, order.work_order_id, retrieve=retrieve)
+
+    assert candidate.stage == "review_candidate"
+    # attempt 1 used no override; attempt 2 used the rewrite.
+    assert overrides == [None, "rewrite-query"]
+    rewriter.rewrite.assert_called_once()
