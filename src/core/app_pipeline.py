@@ -11,9 +11,11 @@ from src.core.auth import AuthService
 from src.core.logger import error, log, warn
 from src.ingestion.kb_paths import InvalidKnowledgeBaseName, validate_kb_name
 from src.pipelines.document_rag.factory import create_rag_backend
-from src.pipelines.document_rag.schemas import IngestResult, RequestContext
+from src.pipelines.document_rag.schemas import EvidenceEnvelope, IngestResult, RequestContext
 from src.projects.service import ProjectService
+from src.projects.retrieval import ProjectEvidenceRetrievalService, SourceUnavailableError
 from src.document_authoring.service import DocumentGenerationService
+from src.document_authoring.template_progress import TemplateProgressCallback
 from src.services.document_manager import DocumentManager
 from src.services.kb_scope import kb_scope_from_context
 
@@ -59,7 +61,12 @@ class AppPipeline:
             # shares source/evidence services but never stores WorkOrder state
             # in a chat session or AgentState.
             self.projects = ProjectService()
+            self.project_retrieval = ProjectEvidenceRetrievalService(self.projects)
             self.document_generation = DocumentGenerationService(self.projects)
+            # Spreadsheet structured index (xlsx TableIndexStore). Shared with
+            # the query agent; the KB authoring retriever also needs it so
+            # frozen .xlsx sources can produce tabular evidence.
+            self.spreadsheet_service = getattr(self.backend, "spreadsheet_indexes", None)
         except Exception as exc:
             error(f"AppPipeline 初始化失败: {exc}")
             raise
@@ -381,6 +388,23 @@ class AppPipeline:
             ctx, filename=filename, content=content, template_name=template_name,
         )
 
+    def analyze_and_activate_document_template(
+        self,
+        ctx: RequestContext,
+        *,
+        filename: str,
+        content: bytes,
+        template_name: str,
+        progress_callback: TemplateProgressCallback | None = None,
+    ):
+        return self.document_generation.analyze_and_activate_uploaded_template(
+            ctx,
+            filename=filename,
+            content=content,
+            template_name=template_name,
+            progress_callback=progress_callback,
+        )
+
     def get_document_template_sanitization_summary(self, ctx: RequestContext, template_version_id: str):
         return self.document_generation.get_template_sanitization_summary(ctx, template_version_id)
 
@@ -459,6 +483,17 @@ class AppPipeline:
             comment="自动生成并发布",
         )
 
+    def auto_generate_document(self, ctx: RequestContext, **kwargs):
+        """Run and publish a document using the frozen project source snapshot."""
+        project_id = kwargs["project_id"]
+
+        def retrieve_factory(order):
+            return self._project_retriever(ctx, project_id, order.source_set_snapshot_id)
+
+        return self.document_generation.auto_generate_document(
+            ctx, retrieve_factory=retrieve_factory, **kwargs,
+        )
+
     def _knowledge_base_retriever(
         self,
         ctx: RequestContext,
@@ -495,6 +530,59 @@ class AppPipeline:
                 requirement_id=requirement.requirement_id,
                 source_set_snapshot_id=source_set_snapshot_id,
             )
+
+        return retrieve
+
+    def _project_retriever(self, ctx: RequestContext, project_id: str, snapshot_id: str):
+        tenant_id = ctx.tenant_id or "default"
+        bindings = self.projects.store.list_knowledge_bindings(project_id, tenant_id)
+        fallback_kb_names = [binding.kb_name_snapshot for binding in bindings if binding.kb_name_snapshot]
+
+        def retrieve(requirement, _attempt):
+            def retrieve_one(version_id: str, artifact_ids: list[str], _region_policies: dict[str, str]):
+                version = self.projects.store.get_source_version(version_id, tenant_id)
+                if version is None:
+                    raise SourceUnavailableError(f"source version not found: {version_id}")
+                document = self.projects.store.get_logical_document(version.document_id, tenant_id)
+                if document is None:
+                    raise SourceUnavailableError(f"logical document not found: {version.document_id}")
+                source_kb_name = str(document.metadata.get("kb_name") or "").strip()
+                kb_names = [source_kb_name] if source_kb_name else list(fallback_kb_names)
+                kb_names = [name for name in kb_names if name]
+                if not kb_names:
+                    raise SourceUnavailableError(f"knowledge base is not configured for source: {version_id}")
+                query = " ".join(
+                    value for value in (requirement.subject, requirement.predicate, requirement.object_hint) if value
+                )
+                result: list[EvidenceEnvelope] = []
+                for kb_name in dict.fromkeys(kb_names):
+                    evidences = self.backend.retrieve(
+                        kb_name,
+                        query,
+                        top_k=config.settings.FINAL_TOP_K,
+                        ctx=ctx,
+                        filters={"source_names": [document.title]},
+                    )
+                    for evidence in evidences:
+                        result.append(EvidenceEnvelope(
+                            id=evidence.id,
+                            content=evidence.content,
+                            source_name=evidence.source_name,
+                            source_type=evidence.source_type,
+                            score=evidence.score,
+                            metadata=dict(evidence.metadata),
+                            backend=evidence.backend,
+                            retriever=evidence.retriever,
+                            project_id=project_id,
+                            source_version_id=version_id,
+                            processing_artifact_id=artifact_ids[0] if len(artifact_ids) == 1 else None,
+                            document_role=document.document_role,
+                            revision=version.revision,
+                            approval_status=version.approval_status,
+                        ))
+                return result
+
+            return self.project_retrieval.retrieve(ctx, requirement, snapshot_id, retrieve_one)
 
         return retrieve
 

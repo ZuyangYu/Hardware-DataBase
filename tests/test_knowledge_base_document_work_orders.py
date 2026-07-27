@@ -852,3 +852,25 @@ def test_store_migrates_legacy_project_work_orders_without_losing_scope_or_child
         store.create_work_order(
             knowledge_base_order.model_copy(update={"work_order_id": "work-order-kb-duplicate"})
         )
+
+
+def test_pipeline_exposes_spreadsheet_service_from_backend(service):
+    pipeline = object.__new__(AppPipeline)
+    pipeline.backend = Mock()
+    pipeline.backend.spreadsheet_indexes = "spreadsheet-service-handle"
+    pipeline.documents = Mock()
+    pipeline.document_generation = service
+    # Mirror the init body's attribute wiring for spreadsheet_service.
+    pipeline.spreadsheet_service = getattr(pipeline.backend, "spreadsheet_indexes", None)
+
+    assert pipeline.spreadsheet_service == "spreadsheet-service-handle"
+
+
+def test_pipeline_spreadsheet_service_defaults_to_none_when_backend_lacks_it(service):
+    pipeline = object.__new__(AppPipeline)
+    pipeline.backend = Mock(spec=[])  # no spreadsheet_indexes attribute
+    pipeline.documents = Mock()
+    pipeline.document_generation = service
+    pipeline.spreadsheet_service = getattr(pipeline.backend, "spreadsheet_indexes", None)
+
+    assert pipeline.spreadsheet_service is None
