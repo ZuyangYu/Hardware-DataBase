@@ -6,6 +6,8 @@ not redefine business schemas here.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -35,11 +37,6 @@ class OkResponse(BaseModel):
     message: str = ""
 
 
-class ErrorResponse(BaseModel):
-    """Unified error envelope for agent-parsable responses."""
-    error: dict = Field(default_factory=dict)
-
-
 # ---------------------------------------------------------------------------
 # Knowledge Bases
 # ---------------------------------------------------------------------------
@@ -63,6 +60,7 @@ class FileView(BaseModel):
     status: str = ""
     processor_kind: str = ""
     dataset_kind: str = ""
+    metadata: dict = Field(default_factory=dict)
 
 
 class UploadAck(BaseModel):
@@ -81,7 +79,10 @@ class UploadAck(BaseModel):
 class QueryRequest(BaseModel):
     kb_name: str
     query: str
-    history: list[list[str]] = Field(default_factory=list)
+    # Route also slices [-5:] as defence in depth; the schema cap keeps a
+    # misconfigured client from wasting bandwidth on multi-MB history bodies
+    # (and blocks DoS-shaped requests before the body is even read).
+    history: list[list[str]] = Field(default_factory=list, max_length=100)
     thread_id: str = ""
 
 
@@ -173,7 +174,7 @@ class AuthUserView(BaseModel):
 class CreateUserRequest(BaseModel):
     username: str
     password: str
-    role: str = "user"
+    role: Literal["user", "dept_admin", "system_admin"] = "user"
     department_id: int | None = None
 
 
@@ -211,7 +212,7 @@ class KbPermissionView(BaseModel):
 
 class GrantKbPermissionRequest(BaseModel):
     user_id: int
-    permission: str = "read"  # read | write | admin
+    permission: Literal["read", "write", "admin"] = "read"
 
 
 class AssignKbRequest(BaseModel):
@@ -235,6 +236,24 @@ class KbSummaryView(BaseModel):
     registered: bool = False
     physical_exists: bool = False
     created_at: str = ""
+    # Document counts joined from governance_stats so the frontend can render
+    # the governance panel (and its anomaly flags) from a single endpoint.
+    files: int = 0
+    failed: int = 0
+    parsing: int = 0
+    issue_flags: list[str] = Field(default_factory=list)
+
+
+class KbStatsEntry(BaseModel):
+    """Per-KB document counts returned by governance_stats."""
+    files: int = 0
+    failed: int = 0
+    parsing: int = 0
+
+
+class GovernanceStatsResponse(BaseModel):
+    """governance_stats: keyed by KB identity (kb_id:<id> or department:<d>:kb:<name>)."""
+    stats: dict[str, KbStatsEntry] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +266,10 @@ class ConfigResponse(BaseModel):
 
 
 class UpdateConfigRequest(BaseModel):
-    settings: dict[str, object] = Field(default_factory=dict)
+    # Only scalar types are allowed -- config values end up written to .env as
+    # strings, so lists/dicts would silently stringify to garbage. Pydantic
+    # rejects non-scalar values with 422 before the route sees them.
+    settings: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
 
 
 class RagflowHealthResponse(BaseModel):
@@ -256,12 +278,19 @@ class RagflowHealthResponse(BaseModel):
     missing_datasets: list[str] = Field(default_factory=list)
 
 
+class LlmHealthResponse(BaseModel):
+    reachable: bool
+    message: str
+    provider: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Logs (system_admin: global, dept_admin: department-scoped)
 # ---------------------------------------------------------------------------
 
 class AuditEventView(BaseModel):
     id: int
+    actor_user_id: int | None = None
     actor_username: str = ""
     actor_role: str = ""
     department_id: int | None = None
@@ -287,6 +316,8 @@ class QueryTraceView(BaseModel):
     username: str = ""
     department_id: int | None = None
     chat_session_id: int | None = None
+    user_message_id: int | None = None
+    assistant_message_id: int | None = None
     kb_name: str = ""
     original_query: str = ""
     rewritten_query: str = ""
@@ -320,3 +351,18 @@ class EvidenceView(BaseModel):
     text_preview: str = ""
     metadata_json: str = ""
     created_at: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Evaluation (system_admin only)
+# ---------------------------------------------------------------------------
+
+class CreateEvaluationRunRequest(BaseModel):
+    """Body for POST /evaluation/runs. Replaces the loose dict so pydantic
+    validates types (mode enum, score_enabled bool, sample_ids/tags lists)."""
+    dataset_path: str
+    mode: Literal["online", "offline"] = "online"
+    score_enabled: bool = True
+    sample_ids: list[str] | None = None
+    tags: list[str] | None = None
+    snapshot_path: str | None = None  # required when mode == "offline"

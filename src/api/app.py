@@ -17,6 +17,7 @@ from src.api.routes import (
     config,
     conversations,
     departments,
+    evaluation,
     files,
     governance,
     kb_permissions,
@@ -34,27 +35,45 @@ def create_app() -> FastAPI:
     install_error_handlers(app)
 
     # CORS: allow browser-based clients and agent tools to reach the API.
+    # allow_origins=["*"] + allow_credentials=True is rejected by browsers, so
+    # origins are configurable via HDB_API_CORS_ORIGINS (comma-separated). When
+    # unset we default to local dev origins; credentials are enabled to support
+    # cookie/header-based sessions from the future frontend.
+    cors_env = os.getenv("HDB_API_CORS_ORIGINS", "")
+    if cors_env.strip():
+        origins = [o.strip() for o in cors_env.split(",") if o.strip()]
+    else:
+        origins = [
+            "http://localhost:8501",
+            "http://127.0.0.1:8501",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
-    app.include_router(auth.router)
-    app.include_router(conversations.router)
-    app.include_router(kbs.router)
-    app.include_router(files.router)
-    app.include_router(parse_tasks.router)
-    app.include_router(query.router)
-    app.include_router(upload.router)
-    app.include_router(users.router)
-    app.include_router(departments.router)
-    app.include_router(kb_permissions.router)
-    app.include_router(governance.router)
-    app.include_router(config.router)
-    app.include_router(logs.router)
+    api_v1 = "/api/v1"
+    app.include_router(auth.router, prefix=api_v1)
+    app.include_router(conversations.router, prefix=api_v1)
+    app.include_router(kbs.router, prefix=api_v1)
+    app.include_router(files.router, prefix=api_v1)
+    app.include_router(parse_tasks.router, prefix=api_v1)
+    app.include_router(query.router, prefix=api_v1)
+    app.include_router(upload.router, prefix=api_v1)
+    app.include_router(users.router, prefix=api_v1)
+    app.include_router(departments.router, prefix=api_v1)
+    app.include_router(kb_permissions.router, prefix=api_v1)
+    app.include_router(governance.router, prefix=api_v1)
+    app.include_router(config.router, prefix=api_v1)
+    app.include_router(logs.router, prefix=api_v1)
+    app.include_router(evaluation.router, prefix=api_v1)
 
     @app.get("/health", tags=["health"])
     def health() -> dict:

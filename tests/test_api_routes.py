@@ -44,7 +44,7 @@ class ApiRoutesTests(unittest.TestCase):
         self.addCleanup(self.client.close)
 
     def _token(self, username: str, password: str = "pw123456") -> str:
-        r = self.client.post("/login", json={"username": username, "password": password})
+        r = self.client.post("/api/v1/login", json={"username": username, "password": password})
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()["token"]
 
@@ -52,15 +52,15 @@ class ApiRoutesTests(unittest.TestCase):
         return {"Authorization": f"Bearer {token}"}
 
     def test_login_wrong_password(self):
-        r = self.client.post("/login", json={"username": "admin1", "password": "bad"})
+        r = self.client.post("/api/v1/login", json={"username": "admin1", "password": "bad"})
         self.assertEqual(r.status_code, 401)
 
     def test_whoami_requires_token(self):
-        self.assertEqual(self.client.get("/whoami").status_code, 401)
+        self.assertEqual(self.client.get("/api/v1/whoami").status_code, 401)
 
     def test_whoami_ok(self):
         t = self._token("admin1")
-        r = self.client.get("/whoami", headers=self._auth(t))
+        r = self.client.get("/api/v1/whoami", headers=self._auth(t))
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertEqual(body["username"], "admin1")
@@ -68,7 +68,7 @@ class ApiRoutesTests(unittest.TestCase):
 
     def test_list_kb_returns_accessible(self):
         t = self._token("user1")
-        r = self.client.get("/kbs", headers=self._auth(t))
+        r = self.client.get("/api/v1/kbs", headers=self._auth(t))
         self.assertEqual(r.status_code, 200)
         kbs = r.json()
         self.assertEqual([k["name"] for k in kbs], ["shared"])
@@ -76,14 +76,14 @@ class ApiRoutesTests(unittest.TestCase):
 
     def test_list_files_user_read_ok(self):
         t = self._token("user1")
-        r = self.client.get("/kbs/shared/files", headers=self._auth(t))
+        r = self.client.get("/api/v1/kbs/shared/files", headers=self._auth(t))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()[0]["name"], "a.pdf")
 
     def test_upload_user_forbidden(self):
         t = self._token("user1")
         r = self.client.post(
-            "/kbs/shared/files",
+            "/api/v1/kbs/shared/files",
             headers=self._auth(t),
             files=[("files", ("a.txt", b"hello"))],
         )
@@ -92,7 +92,7 @@ class ApiRoutesTests(unittest.TestCase):
     def test_upload_admin_ok(self):
         t = self._token("admin1")
         r = self.client.post(
-            "/kbs/shared/files",
+            "/api/v1/kbs/shared/files",
             headers=self._auth(t),
             files=[("files", ("a.txt", b"hello"))],
             data={"source_group": "文档资料"},
@@ -103,30 +103,30 @@ class ApiRoutesTests(unittest.TestCase):
 
     def test_create_kb_requires_dept_admin(self):
         t = self._token("user1")
-        r = self.client.post("/kbs", json={"name": "newkb"}, headers=self._auth(t))
+        r = self.client.post("/api/v1/kbs", json={"name": "newkb"}, headers=self._auth(t))
         self.assertEqual(r.status_code, 403)
 
     def test_create_kb_admin_ok(self):
         t = self._token("admin1")
-        r = self.client.post("/kbs", json={"name": "newkb"}, headers=self._auth(t))
+        r = self.client.post("/api/v1/kbs", json={"name": "newkb"}, headers=self._auth(t))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.stub.created, ["newkb"])
 
     def test_delete_requires_admin(self):
         t = self._token("user1")
-        r = self.client.delete("/kbs/shared/files/a.pdf", headers=self._auth(t))
+        r = self.client.delete("/api/v1/kbs/shared/files/a.pdf", headers=self._auth(t))
         self.assertEqual(r.status_code, 403)
 
     def test_delete_admin_ok(self):
         t = self._token("admin1")
-        r = self.client.delete("/kbs/shared/files/a.pdf", headers=self._auth(t))
+        r = self.client.delete("/api/v1/kbs/shared/files/a.pdf", headers=self._auth(t))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.stub.deleted, [("shared", "a.pdf")])
 
     def test_query_no_permission(self):
         t = self._token("user1")
         r = self.client.post(
-            "/query",
+            "/api/v1/query",
             json={"kb_name": "other_kb", "query": "问"},
             headers=self._auth(t),
         )
@@ -135,7 +135,7 @@ class ApiRoutesTests(unittest.TestCase):
     def test_query_sse(self):
         t = self._token("user1")
         with self.client.stream(
-            "POST", "/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
+            "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
         ) as r:
             self.assertEqual(r.status_code, 200)
             body = b"".join(r.iter_bytes()).decode("utf-8")

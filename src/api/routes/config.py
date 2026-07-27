@@ -20,6 +20,7 @@ from src.core.auth import AuthUser
 from src.api.deps import get_pipeline, require_system_admin, reset_pipeline
 from src.api.schemas import (
     ConfigResponse,
+    LlmHealthResponse,
     OkResponse,
     RagflowHealthResponse,
     UpdateConfigRequest,
@@ -82,6 +83,24 @@ def update_config(
     # Streamlit does init_pipeline.clear() so the next call rebuilds the pipeline
     # with the fresh settings; do the same on the API side.
     reset_pipeline()
+    # Record the change in the audit log. apply_settings is a stateless
+    # staticmethod with no actor, so the audit lives at the route layer (the
+    # only caller besides the Streamlit settings panel, which records its own).
+    try:
+        from src.core.app_logs import AppLogService
+
+        AppLogService().record_audit(
+            action="change_settings",
+            actor=_actor,
+            target_type="system_settings",
+            target_id="env",
+            metadata={
+                "keys": list(body.settings.keys()),
+                "source": "api",
+            },
+        )
+    except Exception:
+        pass  # fail-soft: audit must not break the config update
     return OkResponse(ok=True, message="config updated")
 
 
@@ -98,3 +117,18 @@ def health_ragflow(_actor: AuthUser = Depends(require_system_admin)):
         timeout=settings.RAGFLOW_TIMEOUT_SECONDS,
     )
     return RagflowHealthResponse(reachable=reachable, message=message, missing_datasets=missing)
+
+
+@router.get("/health/llm", response_model=LlmHealthResponse)
+def health_llm(_actor: AuthUser = Depends(require_system_admin)):
+    """Probe the configured LLM provider with a 1-token ping. Mirrors the
+    Streamlit sidebar AI-status indicator."""
+    from src.core.llm_client import LLMClient
+
+    provider_value = getattr(settings.AGENT_LLM_PROVIDER, "value", settings.AGENT_LLM_PROVIDER)
+    try:
+        client = LLMClient()
+        client.chat([{"role": "user", "content": "ping"}])
+        return LlmHealthResponse(reachable=True, message="LLM 连接正常", provider=str(provider_value))
+    except Exception as exc:
+        return LlmHealthResponse(reachable=False, message=f"LLM 连接失败: {exc}", provider=str(provider_value))

@@ -11,7 +11,7 @@ from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
 
 from src.api.context import build_context_for_user
-from src.api.deps import current_user, get_auth_service, get_pipeline
+from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import ChunkView, ParseResultView
 
 router = APIRouter(tags=["files"])
@@ -27,6 +27,7 @@ def get_file_chunks(
 ):
     """Return the parsed chunks for a document (RAGFlow-parsed content)."""
     ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
     result = pipeline.get_parse_result(kb_name, file_id, ctx=ctx)

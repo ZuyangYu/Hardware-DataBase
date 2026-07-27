@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from src.core.auth import AuthService, AuthUser
 from src.services.kb_scope import kb_scope_from_context
@@ -34,8 +34,16 @@ def list_kb_permissions(
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """List all users with permissions on a KB (department-scoped by caller)."""
+    """List all users with permissions on a KB (department-scoped by caller).
+
+    system_admin sees the grant list as governance data. Other roles need
+    read on the KB so a plain user can't enumerate another KB's grants;
+    dept_admins (who manage grants in the Streamlit KB panel) have read
+    implicitly via their department scope.
+    """
     ctx = build_context_for_user(user, kb_name, auth=auth)
+    if not ctx.is_system_admin() and not ctx.has_kb_permission(kb_name, "read"):
+        raise HTTPException(status_code=403, detail="read permission required")
     scope = kb_scope_from_context(kb_name, ctx)
     perms = auth.list_knowledge_base_permissions(
         scope.kb_name,
@@ -89,3 +97,16 @@ def assign_kb(
         owner_user_id=body.owner_user_id,
     )
     return OkResponse(ok=True, message="knowledge base reassigned")
+
+
+@router.delete("/kbs/{kb_name}/permissions/{user_id}", response_model=OkResponse)
+def revoke_kb_permission(
+    kb_name: str,
+    user_id: int,
+    actor: AuthUser = Depends(require_dept_admin),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Revoke a user's permission on a KB. Dept-admin only; scoping is
+    enforced inside :meth:`AuthService.revoke_kb_permission_as`."""
+    auth.revoke_kb_permission_as(actor, kb_name, user_id)
+    return OkResponse(ok=True, message="permission revoked")

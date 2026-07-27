@@ -79,6 +79,9 @@ class StubPipeline:
 
     def delete_document(self, filename, kb_name, ctx=None):
         self.deleted.append((kb_name, filename))
+        # The API route calls pipeline.delete_document directly and treats the
+        # return value as a message string (same as AppPipeline.delete_document
+        # which returns BackendResult.message). Tests assert on .deleted only.
         return "已删除"
 
     # Parse tasks --------------------------------------------------------

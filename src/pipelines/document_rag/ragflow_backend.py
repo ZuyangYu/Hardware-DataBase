@@ -2,6 +2,7 @@ import calendar
 import hashlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -531,6 +532,10 @@ class RAGFlowBackend(RAGBackend):
     """RAGFlow adapter with two physical datasets and local logical-KB permission control."""
 
     name = "ragflow"
+    # Serialises dataset creation across threads in this process. Two concurrent
+    # retrieve()/upload_files() calls could otherwise both see no saved mapping
+    # for a kind and each create a duplicate RAGFlow dataset.
+    _DATASET_LOCK = threading.Lock()
 
     def __init__(self):
         self._client_instance: RAGFlowClient | None = None
@@ -594,10 +599,20 @@ class RAGFlowBackend(RAGBackend):
             if not callable(get_dataset) and dataset_ids.get(kind):
                 continue
 
-            dataset_id = self._client().ensure_dataset(name)
-            if store is not None:
-                store.save_dataset(kind, dataset_id, name)
-            dataset_ids[kind] = dataset_id
+            # Hold a process-wide lock so two concurrent callers don't both
+            # create the same dataset; re-check the saved mapping inside the
+            # lock in case another thread just created it.
+            with self._DATASET_LOCK:
+                if callable(get_dataset):
+                    saved_mapping = get_dataset(kind)
+                    saved_id, saved_name = saved_mapping or ("", "")
+                    if saved_id and saved_name == name:
+                        dataset_ids[kind] = saved_id
+                        continue
+                dataset_id = self._client().ensure_dataset(name)
+                if store is not None:
+                    store.save_dataset(kind, dataset_id, name)
+                dataset_ids[kind] = dataset_id
 
     def _audit(
         self,

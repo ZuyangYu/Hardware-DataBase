@@ -7,7 +7,7 @@ by :func:`require_any_admin`).
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from src.core.app_logs import AppLogService
 from src.core.auth import AuthUser
@@ -31,6 +31,7 @@ def _log_service() -> AppLogService:
 def _audit_view(e) -> AuditEventView:
     return AuditEventView(
         id=e.id,
+        actor_user_id=e.actor_user_id,
         actor_username=e.actor_username,
         actor_role=e.actor_role,
         department_id=e.department_id,
@@ -51,6 +52,8 @@ def _trace_view(t) -> QueryTraceView:
         username=t.username,
         department_id=t.department_id,
         chat_session_id=t.chat_session_id,
+        user_message_id=t.user_message_id,
+        assistant_message_id=t.assistant_message_id,
         kb_name=t.kb_name,
         original_query=t.original_query,
         rewritten_query=t.rewritten_query,
@@ -93,7 +96,7 @@ def list_audit(
     kb_name: str | None = None,
     success: bool | None = None,
     keyword: str | None = None,
-    limit: int = 300,
+    limit: int = Query(default=300, ge=1, le=1000),
     viewer: AuthUser = Depends(require_any_admin),
     logs: AppLogService = Depends(_log_service),
 ):
@@ -142,7 +145,7 @@ def list_query_traces(
     kb_name: str | None = None,
     status: str | None = None,
     keyword: str | None = None,
-    limit: int = 300,
+    limit: int = Query(default=300, ge=1, le=1000),
     viewer: AuthUser = Depends(require_any_admin),
     logs: AppLogService = Depends(_log_service),
 ):

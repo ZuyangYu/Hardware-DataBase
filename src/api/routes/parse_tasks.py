@@ -12,7 +12,7 @@ from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
 
 from src.api.context import build_context_for_user
-from src.api.deps import current_user, get_auth_service, get_pipeline
+from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import OkResponse, ParseTaskView
 
 router = APIRouter(tags=["parse-tasks"])
@@ -46,10 +46,16 @@ def list_parse_tasks(
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """List active parse tasks for a KB (auto-refreshes remote status)."""
+    """List active parse tasks for a KB (auto-refreshes remote status).
+
+    Requires write -- the Streamlit parse-task panel is only shown to users
+    with write on the KB (dept_admins managing ingestion). read-only users
+    see file status via GET /kbs/{kb}/files instead.
+    """
     ctx = build_context_for_user(user, kb_name, auth=auth)
-    if not ctx.has_kb_permission(kb_name, "read"):
-        raise HTTPException(status_code=403, detail="read permission required")
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "write"):
+        raise HTTPException(status_code=403, detail="write permission required")
     tasks = pipeline.list_parse_tasks(kb_name, ctx=ctx) or []
     return [_task_view(t) for t in tasks]
 
@@ -65,6 +71,7 @@ def clear_finished_parse_tasks(
 ):
     """Clear terminal (completed / failed) parse tasks from the ledger."""
     ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "write"):
         raise HTTPException(status_code=403, detail="write permission required")
     pipeline.clear_finished_parse_tasks(kb_name, ctx=ctx)
@@ -81,6 +88,7 @@ def delete_parse_task(
 ):
     """Stop and remove a parse task (deletes the remote doc + local archive)."""
     ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "write"):
         raise HTTPException(status_code=403, detail="write permission required")
     msg = pipeline.delete_parse_task(task_id, ctx=ctx)
@@ -97,6 +105,7 @@ def pause_parse_task(
 ):
     """Pause a parse task. RAGFlow returns "not supported"."""
     ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "write"):
         raise HTTPException(status_code=403, detail="write permission required")
     msg = pipeline.pause_parse_task(task_id, ctx=ctx)
@@ -113,6 +122,7 @@ def resume_parse_task(
 ):
     """Resume a paused parse task. RAGFlow returns "not supported"."""
     ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "write"):
         raise HTTPException(status_code=403, detail="write permission required")
     msg = pipeline.resume_parse_task(task_id, ctx=ctx)

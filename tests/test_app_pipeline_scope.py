@@ -27,11 +27,11 @@ document_manager_module.DocumentManager = object
 sys.modules["src.services.document_manager"] = document_manager_module
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthUser, ROLE_DEPT_ADMIN
-from src.pipelines.document_rag.schemas import RequestContext
+from src.pipelines.document_rag.schemas import BackendResult, RequestContext
 
 
 class _Backend:
@@ -133,6 +133,33 @@ class AppPipelineScopeTests(unittest.TestCase):
         self.assertTrue(response)
         self.assertIsNone(pipeline.get_last_token_usage_summary())
         self.assertEqual(pipeline.agent.clear_calls, 1)
+
+    def test_delete_document_audit_success_from_backend_ok(self):
+        """AppPipeline.delete_document must use BackendResult.ok to determine
+        the audit success flag instead of sniffing error prefixes from the
+        message string (the old approach missed "Document mapping was not found"
+        and "Document does not belong to the current department")."""
+        pipeline = self._pipeline()
+        # Mock documents to return a BackendResult with ok=False so we can
+        # verify the audit flag is False too.
+        mock_docs = MagicMock()
+        mock_docs.delete_document.return_value = BackendResult(
+            ok=False, message="Document mapping was not found.", backend="ragflow"
+        )
+        pipeline.documents = mock_docs
+        pipeline._audit = MagicMock()
+
+        ctx = RequestContext(user_id="admin_a", roles=[ROLE_DEPT_ADMIN])
+        # Returns the message string; does NOT raise (BackendResult carries
+        # the failure signal in .ok, not by raising).
+        msg = pipeline.delete_document("d1", "kb", ctx=ctx)
+        self.assertEqual(msg, "Document mapping was not found.")
+
+        # The audit call must have success=False because BackendResult.ok is False.
+        pipeline._audit.assert_called_once()
+        call_kwargs = pipeline._audit.call_args[1]
+        self.assertFalse(call_kwargs.get("success", True))
+        self.assertIn("not found", call_kwargs.get("error_message", ""))
 
 
 if __name__ == "__main__":

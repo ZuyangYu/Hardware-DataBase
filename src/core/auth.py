@@ -88,6 +88,40 @@ class AuthService:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _audit(
+        self,
+        action: str,
+        actor: AuthUser | None = None,
+        target_type: str = "",
+        target_id: str = "",
+        kb_name: str = "",
+        success: bool = True,
+        error_message: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        """Record an audit event, fail-soft: never let audit failure break the
+        caller. Centralizing this here means both Streamlit and the API layer
+        get audit coverage for free, with no client-side record_audit calls."""
+        try:
+            # Deferred import: src.core.app_logs imports auth for role constants,
+            # so a top-level import here would cycle.
+            from src.core.app_logs import AppLogService
+
+            AppLogService().record_audit(
+                action=action,
+                actor=actor,
+                target_type=target_type,
+                target_id=target_id,
+                kb_name=kb_name,
+                success=success,
+                error_message=error_message,
+                metadata=metadata,
+            )
+        except Exception as audit_error:
+            from src.core.logger import warn
+
+            warn(f"AuthService audit failed: {audit_error}")
+
     def _init_db(self):
         with closing(self._connect()) as conn:
             conn.execute("""
@@ -298,26 +332,47 @@ class AuthService:
         role: str = ROLE_USER,
         department_id: int | None = None,
     ) -> AuthUser:
-        if actor.role == ROLE_SYSTEM_ADMIN:
-            if role == ROLE_USER:
-                raise PermissionError("系统管理员不能创建普通用户，请由部门管理员创建。")
-            system_department_id = self._system_department_id()
-            if role == ROLE_SYSTEM_ADMIN:
-                department_id = system_department_id
-            elif role == ROLE_DEPT_ADMIN and (department_id is None or department_id == system_department_id):
-                raise ValueError("部门管理员必须归属到业务部门，不能归属 system 部门")
-        elif actor.role == ROLE_DEPT_ADMIN:
-            if role != ROLE_USER:
-                raise PermissionError("部门管理员只能创建普通用户。")
-            if actor.department_id is None:
-                raise PermissionError("部门管理员必须归属到部门后才能创建用户。")
-            if department_id is not None and department_id != actor.department_id:
-                raise PermissionError("部门管理员只能创建本部门用户。")
-            department_id = actor.department_id
-        else:
-            raise PermissionError("无权创建用户。")
+        scope = "system" if actor.role == ROLE_SYSTEM_ADMIN else "department"
+        try:
+            if actor.role == ROLE_SYSTEM_ADMIN:
+                if role == ROLE_USER:
+                    raise PermissionError("系统管理员不能创建普通用户，请由部门管理员创建。")
+                system_department_id = self._system_department_id()
+                if role == ROLE_SYSTEM_ADMIN:
+                    department_id = system_department_id
+                elif role == ROLE_DEPT_ADMIN and (department_id is None or department_id == system_department_id):
+                    raise ValueError("部门管理员必须归属到业务部门，不能归属 system 部门")
+            elif actor.role == ROLE_DEPT_ADMIN:
+                if role != ROLE_USER:
+                    raise PermissionError("部门管理员只能创建普通用户。")
+                if actor.department_id is None:
+                    raise PermissionError("部门管理员必须归属到部门后才能创建用户。")
+                if department_id is not None and department_id != actor.department_id:
+                    raise PermissionError("部门管理员只能创建本部门用户。")
+                department_id = actor.department_id
+            else:
+                raise PermissionError("无权创建用户。")
 
-        return self._create_user_record(username, password, role, department_id)
+            created = self._create_user_record(username, password, role, department_id)
+        except Exception as exc:
+            self._audit(
+                "create_user",
+                actor=actor,
+                target_type="user",
+                target_id=username.strip(),
+                success=False,
+                error_message=str(exc),
+                metadata={"role": role, "scope": scope},
+            )
+            raise
+        self._audit(
+            "create_user",
+            actor=actor,
+            target_type="user",
+            target_id=created.username,
+            metadata={"role": role, "scope": scope},
+        )
+        return created
 
     def _system_department_id(self) -> int | None:
         with closing(self._connect()) as conn:
@@ -349,6 +404,7 @@ class AuthService:
         return row_to_user(row)
 
     def authenticate(self, username: str, password: str) -> AuthSession | None:
+        clean_username = username.strip()
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """
@@ -357,9 +413,16 @@ class AuthService:
                 LEFT JOIN departments d ON d.id = u.department_id
                 WHERE u.username = ? AND u.is_active = 1
                 """,
-                (username.strip(),),
+                (clean_username,),
             ).fetchone()
             if row is None or not verify_password(password, row["password_hash"]):
+                self._audit(
+                    "login_failed",
+                    target_type="user",
+                    target_id=clean_username,
+                    success=False,
+                    error_message="用户名或密码错误",
+                )
                 return None
 
             token = secrets.token_urlsafe(32)
@@ -372,7 +435,15 @@ class AuthService:
                 """,
                 (hash_token(token), row["id"], now_dt.isoformat(), expires_dt.isoformat()),
             )
-        return AuthSession(token=token, user=row_to_user(row), expires_at=expires_dt.isoformat())
+        user = row_to_user(row)
+        self._audit(
+            "login_success",
+            actor=user,
+            target_type="user",
+            target_id=user.username,
+            success=True,
+        )
+        return AuthSession(token=token, user=user, expires_at=expires_dt.isoformat())
 
     def get_user_by_token(self, token: str | None) -> AuthUser | None:
         if not token:
@@ -394,14 +465,24 @@ class AuthService:
             ).fetchone()
         return row_to_user(row) if row else None
 
-    def revoke_session(self, token: str | None):
+    def revoke_session(self, token: str | None, actor: AuthUser | None = None):
         if not token:
             return
+        # Caller may pass the already-resolved actor (e.g. the API logout route,
+        # which has current_user) to avoid a second get_user_by_token query.
+        if actor is None:
+            actor = self.get_user_by_token(token)
         with closing(self._connect()) as conn:
             conn.execute(
                 "UPDATE auth_sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
                 (utc_now(), hash_token(token)),
             )
+        self._audit(
+            "logout",
+            actor=actor,
+            target_type="user",
+            target_id=actor.username if actor else "",
+        )
 
     def list_users(self) -> list[AuthUser]:
         with closing(self._connect()) as conn:
@@ -459,54 +540,94 @@ class AuthService:
                 )
 
     def set_user_active_as(self, actor: AuthUser, user_id: int, is_active: bool):
-        with closing(self._connect()) as conn:
-            target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-            if target is None:
-                raise ValueError("User does not exist")
-            if actor.id == user_id:
-                raise PermissionError("Cannot change the active state of the current account here.")
-            if actor.role == ROLE_SYSTEM_ADMIN:
-                pass
-            elif actor.role == ROLE_DEPT_ADMIN:
-                if target["role"] != ROLE_USER or target["department_id"] != actor.department_id:
-                    raise PermissionError("Department administrators can only manage users in their department.")
-            else:
-                raise PermissionError("User activation requires an administrator role.")
-        self.set_user_active(user_id, is_active)
+        scope = "system" if actor.role == ROLE_SYSTEM_ADMIN else "department"
+        try:
+            with closing(self._connect()) as conn:
+                target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                if target is None:
+                    raise ValueError("User does not exist")
+                if actor.id == user_id:
+                    raise PermissionError("Cannot change the active state of the current account here.")
+                if actor.role == ROLE_SYSTEM_ADMIN:
+                    pass
+                elif actor.role == ROLE_DEPT_ADMIN:
+                    if target["role"] != ROLE_USER or target["department_id"] != actor.department_id:
+                        raise PermissionError("Department administrators can only manage users in their department.")
+                else:
+                    raise PermissionError("User activation requires an administrator role.")
+            self.set_user_active(user_id, is_active)
+        except Exception as exc:
+            self._audit(
+                "set_user_active",
+                actor=actor,
+                target_type="user",
+                target_id=str(user_id),
+                success=False,
+                error_message=str(exc),
+                metadata={"is_active": is_active, "scope": scope},
+            )
+            raise
+        self._audit(
+            "set_user_active",
+            actor=actor,
+            target_type="user",
+            target_id=target["username"],
+            metadata={"is_active": is_active, "scope": scope},
+        )
 
     def reset_user_password_as(self, actor: AuthUser, user_id: int, new_password: str):
-        if not new_password:
-            raise ValueError("密码不能为空")
-        if len(new_password) < 8:
-            raise ValueError("密码长度不能少于 8 位")
+        scope = "system" if actor.role == ROLE_SYSTEM_ADMIN else "department"
+        try:
+            if not new_password:
+                raise ValueError("密码不能为空")
+            if len(new_password) < 8:
+                raise ValueError("密码长度不能少于 8 位")
 
-        with closing(self._connect()) as conn:
-            target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-            if target is None:
-                raise ValueError("目标用户不存在")
-            if actor.id == user_id:
-                raise PermissionError("不能在这里重置当前登录账号密码")
+            with closing(self._connect()) as conn:
+                target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                if target is None:
+                    raise ValueError("目标用户不存在")
+                if actor.id == user_id:
+                    raise PermissionError("不能在这里重置当前登录账号密码")
 
-            if actor.role == ROLE_SYSTEM_ADMIN:
-                pass
-            elif actor.role == ROLE_DEPT_ADMIN:
-                if target["role"] != ROLE_USER or target["department_id"] != actor.department_id:
-                    raise PermissionError("部门管理员只能重置本部门普通用户密码")
-            else:
-                raise PermissionError("无权重置用户密码")
+                if actor.role == ROLE_SYSTEM_ADMIN:
+                    pass
+                elif actor.role == ROLE_DEPT_ADMIN:
+                    if target["role"] != ROLE_USER or target["department_id"] != actor.department_id:
+                        raise PermissionError("部门管理员只能重置本部门普通用户密码")
+                else:
+                    raise PermissionError("无权重置用户密码")
 
-            conn.execute(
-                """
-                UPDATE users
-                SET password_hash = ?, managed_by_env = 0, updated_at = ?
-                WHERE id = ?
-                """,
-                (hash_password(new_password), utc_now(), user_id),
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET password_hash = ?, managed_by_env = 0, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (hash_password(new_password), utc_now(), user_id),
+                )
+                conn.execute(
+                    "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+                    (utc_now(), user_id),
+                )
+        except Exception as exc:
+            self._audit(
+                "reset_user_password",
+                actor=actor,
+                target_type="user",
+                target_id=str(user_id),
+                success=False,
+                error_message=str(exc),
+                metadata={"scope": scope},
             )
-            conn.execute(
-                "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
-                (utc_now(), user_id),
-            )
+            raise
+        self._audit(
+            "reset_user_password",
+            actor=actor,
+            target_type="user",
+            target_id=target["username"],
+            metadata={"scope": scope},
+        )
 
     def create_department(self, name: str) -> Department:
         name = name.strip()
@@ -521,9 +642,27 @@ class AuthService:
         return Department(id=int(row["id"]), name=row["name"])
 
     def create_department_as(self, actor: AuthUser, name: str) -> Department:
-        if actor.role != ROLE_SYSTEM_ADMIN:
-            raise PermissionError("Department creation requires a system administrator role.")
-        return self.create_department(name)
+        try:
+            if actor.role != ROLE_SYSTEM_ADMIN:
+                raise PermissionError("Department creation requires a system administrator role.")
+            dept = self.create_department(name)
+        except Exception as exc:
+            self._audit(
+                "create_department",
+                actor=actor,
+                target_type="department",
+                target_id=name.strip(),
+                success=False,
+                error_message=str(exc),
+            )
+            raise
+        self._audit(
+            "create_department",
+            actor=actor,
+            target_type="department",
+            target_id=dept.name,
+        )
+        return dept
 
     def delete_department(self, department_id: int):
         with closing(self._connect()) as conn:
@@ -547,9 +686,26 @@ class AuthService:
             conn.execute("DELETE FROM departments WHERE id = ?", (department_id,))
 
     def delete_department_as(self, actor: AuthUser, department_id: int):
-        if actor.role != ROLE_SYSTEM_ADMIN:
-            raise PermissionError("Department deletion requires a system administrator role.")
-        self.delete_department(department_id)
+        try:
+            if actor.role != ROLE_SYSTEM_ADMIN:
+                raise PermissionError("Department deletion requires a system administrator role.")
+            self.delete_department(department_id)
+        except Exception as exc:
+            self._audit(
+                "delete_department",
+                actor=actor,
+                target_type="department",
+                target_id=str(department_id),
+                success=False,
+                error_message=str(exc),
+            )
+            raise
+        self._audit(
+            "delete_department",
+            actor=actor,
+            target_type="department",
+            target_id=str(department_id),
+        )
 
     def _get_kb_row(
         self,
@@ -728,58 +884,85 @@ class AuthService:
         department_id: int,
         owner_user_id: int | None = None,
     ):
-        if actor is None or actor.role != ROLE_SYSTEM_ADMIN:
-            raise PermissionError("只有系统管理员可以调整知识库归属。")
-        if not kb_name.strip():
-            raise ValueError("知识库名称不能为空")
+        try:
+            if actor is None or actor.role != ROLE_SYSTEM_ADMIN:
+                raise PermissionError("只有系统管理员可以调整知识库归属。")
+            if not kb_name.strip():
+                raise ValueError("知识库名称不能为空")
 
-        kb_name = kb_name.strip()
-        with closing(self._connect()) as conn:
-            department = conn.execute("SELECT id, name FROM departments WHERE id = ?", (department_id,)).fetchone()
-            if department is None:
-                raise ValueError("部门不存在")
+            kb_name = kb_name.strip()
+            with closing(self._connect()) as conn:
+                department = conn.execute("SELECT id, name FROM departments WHERE id = ?", (department_id,)).fetchone()
+                if department is None:
+                    raise ValueError("部门不存在")
 
-            if owner_user_id is not None:
-                owner = conn.execute("SELECT * FROM users WHERE id = ?", (owner_user_id,)).fetchone()
-                if owner is None:
-                    raise ValueError("负责人不存在")
-                if owner["role"] != ROLE_DEPT_ADMIN:
-                    raise ValueError("知识库负责人必须是部门管理员")
-                if owner["department_id"] != department_id:
-                    raise ValueError("负责人必须属于所选部门")
+                if owner_user_id is not None:
+                    owner = conn.execute("SELECT * FROM users WHERE id = ?", (owner_user_id,)).fetchone()
+                    if owner is None:
+                        raise ValueError("负责人不存在")
+                    if owner["role"] != ROLE_DEPT_ADMIN:
+                        raise ValueError("知识库负责人必须是部门管理员")
+                    if owner["department_id"] != department_id:
+                        raise ValueError("负责人必须属于所选部门")
 
-            conn.execute(
-                """
-                INSERT INTO knowledge_bases (name, department_id, owner_user_id, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(department_id, name) DO UPDATE SET
-                    department_id = excluded.department_id,
-                    owner_user_id = excluded.owner_user_id
-                """,
-                (kb_name, department_id, owner_user_id, utc_now()),
-            )
-            kb = self._get_kb_row(conn, kb_name, department_id)
-            conn.execute(
-                """
-                DELETE FROM kb_permissions
-                WHERE kb_id = ?
-                  AND user_id IN (
-                      SELECT id
-                      FROM users
-                      WHERE department_id IS NULL OR department_id != ?
-                  )
-                """,
-                (kb["id"], department_id),
-            )
-            if owner_user_id is not None:
-                self.grant_kb_permission(
-                    kb_name,
-                    owner_user_id,
-                    "admin",
-                    conn=conn,
-                    department_id=department_id,
-                    kb_id=kb["id"],
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_bases (name, department_id, owner_user_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(department_id, name) DO UPDATE SET
+                        department_id = excluded.department_id,
+                        owner_user_id = excluded.owner_user_id
+                    """,
+                    (kb_name, department_id, owner_user_id, utc_now()),
                 )
+                kb = self._get_kb_row(conn, kb_name, department_id)
+                # Re-assigning to a new department strips cross-department grants;
+                # flag it in audit metadata so the side effect is traceable.
+                conn.execute(
+                    """
+                    DELETE FROM kb_permissions
+                    WHERE kb_id = ?
+                      AND user_id IN (
+                          SELECT id
+                          FROM users
+                          WHERE department_id IS NULL OR department_id != ?
+                      )
+                    """,
+                    (kb["id"], department_id),
+                )
+                if owner_user_id is not None:
+                    self.grant_kb_permission(
+                        kb_name,
+                        owner_user_id,
+                        "admin",
+                        conn=conn,
+                        department_id=department_id,
+                        kb_id=kb["id"],
+                    )
+        except Exception as exc:
+            self._audit(
+                "assign_kb",
+                actor=actor,
+                target_type="knowledge_base",
+                target_id=kb_name.strip() if kb_name else "",
+                kb_name=kb_name.strip() if kb_name else "",
+                success=False,
+                error_message=str(exc),
+                metadata={"department_id": department_id, "owner_user_id": owner_user_id},
+            )
+            raise
+        self._audit(
+            "assign_kb",
+            actor=actor,
+            target_type="knowledge_base",
+            target_id=kb_name,
+            kb_name=kb_name,
+            metadata={
+                "department_id": department_id,
+                "owner_user_id": owner_user_id,
+                "removed_cross_dept_perms": True,
+            },
+        )
 
     def grant_kb_permission(
         self,
@@ -823,37 +1006,142 @@ class AuthService:
     ):
         if permission not in {"read", "write", "admin"}:
             raise ValueError("权限必须为 read、write 或 admin")
-        with closing(self._connect()) as conn:
-            target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-            if target is None:
-                raise ValueError("目标用户不存在")
-            if target["role"] == ROLE_SYSTEM_ADMIN:
-                raise ValueError("不能授予系统管理员知识库内容权限")
+        try:
+            with closing(self._connect()) as conn:
+                target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                if target is None:
+                    raise ValueError("目标用户不存在")
+                if target["role"] == ROLE_SYSTEM_ADMIN:
+                    raise ValueError("不能授予系统管理员知识库内容权限")
 
-            if actor.role == ROLE_DEPT_ADMIN and department_id in (None, "") and kb_id is None:
-                department_id = actor.department_id
-            kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
+                if actor.role == ROLE_DEPT_ADMIN and department_id in (None, "") and kb_id is None:
+                    department_id = actor.department_id
+                kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
+                if kb is None:
+                    raise ValueError("知识库不存在")
+
+                if actor.role == ROLE_SYSTEM_ADMIN:
+                    raise PermissionError("System administrators cannot grant knowledge-base content permissions.")
+                elif actor.role == ROLE_DEPT_ADMIN:
+                    if kb["department_id"] != actor.department_id:
+                        raise PermissionError("只能授权本部门知识库")
+                    if target["department_id"] != actor.department_id or target["role"] != ROLE_USER:
+                        raise PermissionError("部门管理员只能授权本部门普通用户")
+                else:
+                    raise PermissionError("无权授权知识库")
+
+                self.grant_kb_permission(
+                    kb_name,
+                    user_id,
+                    permission,
+                    conn=conn,
+                    department_id=kb["department_id"],
+                    kb_id=kb["id"],
+                )
+        except Exception as exc:
+            self._audit(
+                "grant_kb_permission",
+                actor=actor,
+                target_type="kb_permission",
+                target_id=str(user_id),
+                kb_name=kb_name,
+                success=False,
+                error_message=str(exc),
+                metadata={"permission": permission, "target_user_id": user_id},
+            )
+            raise
+        self._audit(
+            "grant_kb_permission",
+            actor=actor,
+            target_type="kb_permission",
+            target_id=target["username"],
+            kb_name=kb_name,
+            metadata={"permission": permission, "target_user_id": user_id},
+        )
+
+    def delete_kb_permission(
+        self,
+        kb_name: str,
+        user_id: int,
+        conn=None,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ):
+        """Remove a user's permission row on a KB. Internal helper; does
+        not validate the caller's role."""
+        target_conn = conn or self._connect()
+        should_close = conn is None
+        try:
+            kb = self._get_kb_row(target_conn, kb_name, department_id, kb_id)
             if kb is None:
                 raise ValueError("知识库不存在")
-
-            if actor.role == ROLE_SYSTEM_ADMIN:
-                raise PermissionError("System administrators cannot grant knowledge-base content permissions.")
-            elif actor.role == ROLE_DEPT_ADMIN:
-                if kb["department_id"] != actor.department_id:
-                    raise PermissionError("只能授权本部门知识库")
-                if target["department_id"] != actor.department_id or target["role"] != ROLE_USER:
-                    raise PermissionError("部门管理员只能授权本部门普通用户")
-            else:
-                raise PermissionError("无权授权知识库")
-
-            self.grant_kb_permission(
-                kb_name,
-                user_id,
-                permission,
-                conn=conn,
-                department_id=kb["department_id"],
-                kb_id=kb["id"],
+            target_conn.execute(
+                "DELETE FROM kb_permissions WHERE kb_id = ? AND user_id = ?",
+                (kb["id"], user_id),
             )
+        finally:
+            if should_close:
+                target_conn.close()
+
+    def revoke_kb_permission_as(
+        self,
+        actor: AuthUser,
+        kb_name: str,
+        user_id: int,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ):
+        try:
+            with closing(self._connect()) as conn:
+                target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                if target is None:
+                    raise ValueError("目标用户不存在")
+                if target["role"] == ROLE_SYSTEM_ADMIN:
+                    raise ValueError("系统管理员不拥有知识库内容权限，无需撤销")
+
+                if actor.role == ROLE_DEPT_ADMIN and department_id in (None, "") and kb_id is None:
+                    department_id = actor.department_id
+                kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
+                if kb is None:
+                    raise ValueError("知识库不存在")
+
+                if actor.role == ROLE_SYSTEM_ADMIN:
+                    raise PermissionError("系统管理员不能管理知识库内容权限")
+                elif actor.role == ROLE_DEPT_ADMIN:
+                    if kb["department_id"] != actor.department_id:
+                        raise PermissionError("只能撤销本部门知识库的权限")
+                    if target["department_id"] != actor.department_id or target["role"] != ROLE_USER:
+                        raise PermissionError("部门管理员只能撤销本部门普通用户的权限")
+                else:
+                    raise PermissionError("无权撤销知识库权限")
+
+                self.delete_kb_permission(
+                    kb_name,
+                    user_id,
+                    conn=conn,
+                    department_id=kb["department_id"],
+                    kb_id=kb["id"],
+                )
+        except Exception as exc:
+            self._audit(
+                "revoke_kb_permission",
+                actor=actor,
+                target_type="kb_permission",
+                target_id=str(user_id),
+                kb_name=kb_name,
+                success=False,
+                error_message=str(exc),
+                metadata={"target_user_id": user_id},
+            )
+            raise
+        self._audit(
+            "revoke_kb_permission",
+            actor=actor,
+            target_type="kb_permission",
+            target_id=target["username"],
+            kb_name=kb_name,
+            metadata={"target_user_id": user_id},
+        )
 
     def list_accessible_kbs(self, user: AuthUser, existing_kbs: list[str]) -> list[str]:
         if user.role == ROLE_SYSTEM_ADMIN:

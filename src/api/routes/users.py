@@ -6,9 +6,9 @@ role and department off ``actor``. `system_admin` sees all users;
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
-from src.core.auth import AuthService, AuthUser
+from src.core.auth import ROLE_DEPT_ADMIN, ROLE_USER, AuthService, AuthUser
 
 from src.api.deps import get_auth_service, require_any_admin
 from src.api.schemas import (
@@ -35,11 +35,19 @@ def _user_view(u: AuthUser) -> AuthUserView:
 
 @router.get("/users", response_model=list[AuthUserView])
 def list_users(
+    include_admins: bool = Query(default=False),
     actor: AuthUser = Depends(require_any_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """List users. system_admin sees all; dept_admin sees own department only."""
+    """List users. system_admin sees all; dept_admin sees own department only.
+
+    By default dept_admin sees only plain users (``ROLE_USER``), matching the
+    Streamlit department-management view. Pass ``include_admins=true`` to also
+    return dept_admin/system_admin rows in scope (e.g. for an admin picker).
+    """
     users = auth.list_users_as(actor)
+    if actor.role == ROLE_DEPT_ADMIN and not include_admins:
+        users = [u for u in users if u.role == ROLE_USER]
     return [_user_view(u) for u in users]
 
 

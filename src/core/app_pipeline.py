@@ -57,6 +57,37 @@ class AppPipeline:
             error(f"AppPipeline 初始化失败: {exc}")
             raise
 
+    def _audit(
+        self,
+        action: str,
+        ctx: RequestContext | None,
+        target_type: str = "",
+        target_id: str = "",
+        kb_name: str = "",
+        success: bool = True,
+        error_message: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        """Record an audit event, fail-soft. Actor is resolved from ctx.user_id
+        (same pattern as RAGFlowBackend._audit). Centralizing write-op audits
+        here covers Streamlit, the API layer, and any future client uniformly."""
+        try:
+            from src.core.app_logs import AppLogService
+
+            actor = AuthService().get_user_by_username(ctx.user_id) if ctx and ctx.user_id else None
+            AppLogService().record_audit(
+                action=action,
+                actor=actor,
+                target_type=target_type,
+                target_id=target_id,
+                kb_name=kb_name,
+                success=success,
+                error_message=error_message,
+                metadata=metadata,
+            )
+        except Exception as audit_error:
+            warn(f"AppPipeline audit failed: {audit_error}")
+
     def list_knowledge_bases(self, ctx: RequestContext | None = None) -> List[str]:
         auth_service = AuthService()
         kbs = self.backend.list_knowledge_bases()
@@ -134,13 +165,42 @@ class AppPipeline:
                     file_paths.append(temp_path)
                 else:
                     raise TypeError(f"Unsupported file argument: {type(file_obj).__name__}")
-            return self.documents.upload_files(
+            result = self.documents.upload_files(
                 file_paths,
                 target_kb,
                 ctx=ctx,
                 source_group=source_group,
                 progress_callback=progress_callback,
             )
+            self._audit(
+                "upload_document",
+                ctx,
+                target_type="document",
+                target_id=", ".join(os.path.basename(p) for p in file_paths),
+                kb_name=target_kb,
+                success=result.success_count > 0,
+                error_message="" if result.success_count > 0 else "; ".join(result.messages),
+                metadata={
+                    "file_count": len(file_paths),
+                    "source_group": source_group,
+                    "success_count": result.success_count,
+                    "failed_count": result.failed_count,
+                    "skipped_count": result.skipped_count,
+                },
+            )
+            return result
+        except Exception as exc:
+            self._audit(
+                "upload_document",
+                ctx,
+                target_type="document",
+                target_id=", ".join(os.path.basename(p) for p in file_paths),
+                kb_name=target_kb,
+                success=False,
+                error_message=str(exc),
+                metadata={"file_count": len(file_paths), "source_group": source_group},
+            )
+            raise
         finally:
             for temp_path in temp_paths:
                 try:
@@ -211,20 +271,50 @@ class AppPipeline:
         config.settings.reload_settings()
 
     def delete_document(self, filename: str, kb_name: str, ctx: RequestContext | None = None) -> str:
-        return self.documents.delete_document(filename, kb_name, ctx=ctx)
+        try:
+            result = self.documents.delete_document(filename, kb_name, ctx=ctx)
+            # DocumentManager now returns the full BackendResult; branch on .ok
+            # instead of sniffing error prefixes out of the message string.
+            delete_ok = bool(getattr(result, "ok", False))
+            message = getattr(result, "message", str(result))
+            self._audit(
+                "delete_document",
+                ctx,
+                target_type="document",
+                target_id=filename,
+                kb_name=kb_name,
+                success=delete_ok,
+                error_message="" if delete_ok else message,
+            )
+            return message
+        except Exception as exc:
+            self._audit(
+                "delete_document",
+                ctx,
+                target_type="document",
+                target_id=filename,
+                kb_name=kb_name,
+                success=False,
+                error_message=str(exc),
+            )
+            raise
 
     def create_kb(self, name: str, ctx: RequestContext | None = None) -> Tuple[bool, str]:
         try:
             name = validate_kb_name(name.strip().replace(" ", "_"))
             if not name:
+                self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="名称不能为空")
                 return False, "名称不能为空"
             if ctx is not None and "anonymous" in ctx.roles:
+                self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="权限不足：请先登录再创建知识库。")
                 return False, "权限不足：请先登录再创建知识库。"
             if ctx is not None and ctx.is_system_admin():
+                self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="系统管理员不能创建内容知识库")
                 return False, "系统管理员不能创建内容知识库，请由部门管理员创建。"
             auth_service = AuthService()
             scope = kb_scope_from_context(name, ctx).require_department("create")
             if auth_service.knowledge_base_exists(scope.kb_name, department_id=scope.department_id):
+                self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="知识库已存在")
                 return False, "知识库已存在"
 
             self.backend.create_kb_storage(scope.kb_name, ctx=ctx)
@@ -233,30 +323,49 @@ class AppPipeline:
                 owner = auth_service.get_user_by_username(ctx.user_id)
                 auth_service.register_knowledge_base(scope.kb_name, owner=owner)
             log(f"知识库 '{name}' 创建成功（后端 {self.backend.name}）")
+            self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=True)
             return True, f"知识库 '{name}' 创建成功"
         except Exception as exc:
             error(f"创建知识库失败: {exc}")
+            self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message=str(exc))
             return False, str(exc)
 
     def delete_knowledge_base(self, kb_name: str, ctx: RequestContext | None = None) -> Tuple[bool, str]:
         try:
             kb_name = validate_kb_name(kb_name)
         except InvalidKnowledgeBaseName as exc:
+            self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message=str(exc))
             return False, str(exc)
 
         if ctx is None or not ctx.has_kb_permission(kb_name, "admin"):
+            self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message="权限不足：删除知识库需要 admin 权限。")
             return False, "权限不足：删除知识库需要 admin 权限。"
 
         log(f"准备彻底删除知识库: {kb_name}")
         try:
             result = self.documents.delete_knowledge_base_documents(kb_name, ctx=ctx)
             if not result.ok:
+                self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message=result.message)
                 return False, result.message
             scope = kb_scope_from_context(kb_name, ctx)
             AuthService().delete_knowledge_base_record(scope.kb_name, department_id=scope.department_id, kb_id=scope.kb_id)
+            # Surface partial cleanup (some archive assets failed to delete) in
+            # audit metadata so the governance log shows it wasn't fully clean.
+            partial = bool(getattr(result, "partial", False))
+            cleanup_errors = list(getattr(result, "errors", []) or [])
+            self._audit(
+                "delete_kb",
+                ctx,
+                target_type="knowledge_base",
+                target_id=kb_name,
+                kb_name=kb_name,
+                success=True,
+                metadata={"partial": partial, "cleanup_errors": cleanup_errors},
+            )
             return True, result.message
         except Exception as exc:
             error(f"删除知识库失败: {exc}")
+            self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message=str(exc))
             return False, f"删除失败: {str(exc)}"
 
     def list_files(self, kb_name: str, ctx: RequestContext | None = None) -> List[str]:
@@ -275,10 +384,51 @@ class AppPipeline:
         return self.documents.resume_parse_task(task_id, ctx=ctx)
 
     def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
-        return self.documents.delete_parse_task(task_id, ctx=ctx)
+        # Stopping a parse task deletes the remote RAGFlow document + local
+        # archive; audit it so the governance log can trace who cancelled what.
+        try:
+            result = self.documents.delete_parse_task(task_id, ctx=ctx)
+            self._audit(
+                "delete_parse_task",
+                ctx,
+                target_type="parse_task",
+                target_id=str(task_id),
+                success=True,
+            )
+            return result
+        except Exception as exc:
+            self._audit(
+                "delete_parse_task",
+                ctx,
+                target_type="parse_task",
+                target_id=str(task_id),
+                success=False,
+                error_message=str(exc),
+            )
+            raise
 
     def clear_finished_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
-        self.documents.clear_finished_parse_tasks(kb_name, ctx=ctx)
+        try:
+            self.documents.clear_finished_parse_tasks(kb_name, ctx=ctx)
+            self._audit(
+                "clear_parse_tasks",
+                ctx,
+                target_type="parse_task",
+                target_id=kb_name or "",
+                kb_name=kb_name or "",
+                success=True,
+            )
+        except Exception as exc:
+            self._audit(
+                "clear_parse_tasks",
+                ctx,
+                target_type="parse_task",
+                target_id=kb_name or "",
+                kb_name=kb_name or "",
+                success=False,
+                error_message=str(exc),
+            )
+            raise
 
     def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None):
         return self.documents.get_parse_result(kb_name, document_id, ctx=ctx)

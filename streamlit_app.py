@@ -657,14 +657,6 @@ def create_kb_callback(pipeline):
 
     ctx = build_request_context(st.session_state)
     ok, msg = pipeline.create_kb(name, ctx=ctx)
-    record_audit(
-        "create_kb",
-        target_type="knowledge_base",
-        target_id=name,
-        kb_name=name,
-        success=ok,
-        error_message="" if ok else msg,
-    )
     if ok:
         st.session_state.kb_list = pipeline.list_knowledge_bases(ctx=ctx)
         refresh_kb_identity_map(st.session_state.kb_list)
@@ -689,14 +681,6 @@ def delete_kb_confirmed(pipeline, kb_name):
     """Delete a confirmed knowledge base."""
     ctx = build_request_context(st.session_state)
     ok, msg = pipeline.delete_knowledge_base(kb_name, ctx=ctx)
-    record_audit(
-        "delete_kb",
-        target_type="knowledge_base",
-        target_id=kb_name,
-        kb_name=kb_name,
-        success=ok,
-        error_message="" if ok else msg,
-    )
     if ok:
         invalidate_file_cache(kb_name)
         ctx = build_request_context(st.session_state)
@@ -1263,13 +1247,6 @@ def render_login_page():
         if submitted:
             session = auth_service.authenticate(username.strip(), password)
             if session:
-                init_log_service().record_audit(
-                    action="login_success",
-                    actor=session.user,
-                    target_type="user",
-                    target_id=session.user.username,
-                    success=True,
-                )
                 st.session_state.authenticated = True
                 st.session_state.username = session.user.username
                 st.session_state.role = session.user.role
@@ -1282,14 +1259,6 @@ def render_login_page():
                 time.sleep(0.2)
                 st.rerun()
             else:
-                init_log_service().record_audit(
-                    action="login_failed",
-                    target_type="user",
-                    target_id=username.strip(),
-                    success=False,
-                    error_message="用户名或密码错误",
-                    metadata={"attempted_username": username.strip()},
-                )
                 st.error("用户名或密码错误")
         st.markdown("""
             <div class="login-footnote">
@@ -1299,8 +1268,12 @@ def render_login_page():
 
 
 def logout():
-    record_audit("logout", target_type="user", target_id=st.session_state.get("username") or "")
-    init_auth_service().revoke_session(st.session_state.get("auth_token"))
+    # Pass the current user into revoke_session so it doesn't re-query
+    # get_user_by_token(token) just to resolve the actor for the audit row.
+    init_auth_service().revoke_session(
+        st.session_state.get("auth_token"),
+        actor=current_auth_user(),
+    )
     render_auth_clear_script()
     st.session_state.authenticated = False
     st.session_state.username = None
@@ -1631,12 +1604,16 @@ AUDIT_ACTION_LABELS = {
     "upload_document": "上传文档",
     "delete_document": "删除文档",
     "grant_kb_permission": "授权知识库",
+    "revoke_kb_permission": "撤销知识库权限",
     "change_settings": "修改配置",
     "create_user": "创建用户",
     "set_user_active": "启停用户",
     "reset_user_password": "重置密码",
     "create_department": "创建部门",
     "delete_department": "删除部门",
+    "assign_kb": "重挂知识库",
+    "delete_parse_task": "取消解析任务",
+    "clear_parse_tasks": "清理解析任务",
 }
 
 
@@ -2073,23 +2050,9 @@ def render_department_management_tab():
                     if st.button(button_label, key=f"dept_user_toggle_{user.id}", width="stretch"):
                         try:
                             auth_service.set_user_active_as(current_user, user.id, next_active)
-                            record_audit(
-                                "set_user_active",
-                                target_type="user",
-                                target_id=user.username,
-                                metadata={"is_active": next_active, "scope": "department"},
-                            )
                             st.success(f"已{button_label}: {user.username}")
                             st.rerun()
                         except Exception as e:
-                            record_audit(
-                                "set_user_active",
-                                target_type="user",
-                                target_id=user.username,
-                                success=False,
-                                error_message=str(e),
-                                metadata={"is_active": next_active, "scope": "department"},
-                            )
                             st.error(f"操作失败: {e}")
                 with c4:
                     with st.popover("重置密码", use_container_width=True):
@@ -2101,23 +2064,9 @@ def render_department_management_tab():
                         if st.button("确认重置", key=f"dept_reset_pwd_btn_{user.id}", use_container_width=True):
                             try:
                                 auth_service.reset_user_password_as(current_user, user.id, new_password)
-                                record_audit(
-                                    "reset_user_password",
-                                    target_type="user",
-                                    target_id=user.username,
-                                    metadata={"scope": "department"},
-                                )
                                 st.success(f"已重置密码: {user.username}")
                                 st.rerun()
                             except Exception as e:
-                                record_audit(
-                                    "reset_user_password",
-                                    target_type="user",
-                                    target_id=user.username,
-                                    success=False,
-                                    error_message=str(e),
-                                    metadata={"scope": "department"},
-                                )
                                 st.error(f"重置失败: {e}")
 
         st.divider()
@@ -2134,23 +2083,9 @@ def render_department_management_tab():
                         ROLE_USER,
                         department_id=current_user.department_id,
                     )
-                    record_audit(
-                        "create_user",
-                        target_type="user",
-                        target_id=new_username,
-                        metadata={"role": ROLE_USER, "scope": "department"},
-                    )
                     st.success(f"已创建普通用户: {new_username}")
                     st.rerun()
                 except Exception as e:
-                    record_audit(
-                        "create_user",
-                        target_type="user",
-                        target_id=new_username,
-                        success=False,
-                        error_message=str(e),
-                        metadata={"role": ROLE_USER, "scope": "department"},
-                    )
                     st.error(f"创建用户失败: {e}")
         return
 
@@ -2193,23 +2128,9 @@ def render_system_department_management(current_user):
                             if st.button(button_label, key=f"user_toggle_{user.id}", width="stretch"):
                                 try:
                                     auth_service.set_user_active_as(current_user, user.id, next_active)
-                                    record_audit(
-                                        "set_user_active",
-                                        target_type="user",
-                                        target_id=user.username,
-                                        metadata={"is_active": next_active},
-                                    )
                                     st.success(f"已{button_label}: {user.username}")
                                     st.rerun()
                                 except Exception as e:
-                                    record_audit(
-                                        "set_user_active",
-                                        target_type="user",
-                                        target_id=user.username,
-                                        success=False,
-                                        error_message=str(e),
-                                        metadata={"is_active": next_active},
-                                    )
                                     st.error(f"操作失败: {e}")
                     with c5:
                         if user.id == st.session_state.get("user_id"):
@@ -2224,23 +2145,9 @@ def render_system_department_management(current_user):
                                 if st.button("确认重置", key=f"sys_reset_pwd_btn_{user.id}", use_container_width=True):
                                     try:
                                         auth_service.reset_user_password_as(current_user, user.id, new_password)
-                                        record_audit(
-                                            "reset_user_password",
-                                            target_type="user",
-                                            target_id=user.username,
-                                            metadata={"role": user.role},
-                                        )
                                         st.success(f"已重置密码: {user.username}")
                                         st.rerun()
                                     except Exception as e:
-                                        record_audit(
-                                            "reset_user_password",
-                                            target_type="user",
-                                            target_id=user.username,
-                                            success=False,
-                                            error_message=str(e),
-                                            metadata={"role": user.role},
-                                        )
                                         st.error(f"重置失败: {e}")
 
     with dept_tab:
@@ -2258,21 +2165,9 @@ def render_system_department_management(current_user):
                     if st.button("删除", key=f"dept_delete_{dept.id}", width="stretch"):
                         try:
                             auth_service.delete_department_as(current_user, dept.id)
-                            record_audit(
-                                "delete_department",
-                                target_type="department",
-                                target_id=dept.name,
-                            )
                             st.success(f"已删除部门: {dept.name}")
                             st.rerun()
                         except Exception as e:
-                            record_audit(
-                                "delete_department",
-                                target_type="department",
-                                target_id=dept.name,
-                                success=False,
-                                error_message=str(e),
-                            )
                             st.error(f"删除部门失败: {e}")
 
     with create_tab:
@@ -2284,21 +2179,9 @@ def render_system_department_management(current_user):
                 if st.form_submit_button("创建部门", width="stretch"):
                     try:
                         auth_service.create_department_as(current_user, new_department_name)
-                        record_audit(
-                            "create_department",
-                            target_type="department",
-                            target_id=new_department_name,
-                        )
                         st.success(f"已创建部门: {new_department_name}")
                         st.rerun()
                     except Exception as e:
-                        record_audit(
-                            "create_department",
-                            target_type="department",
-                            target_id=new_department_name,
-                            success=False,
-                            error_message=str(e),
-                        )
                         st.error(f"创建部门失败: {e}")
 
         with col_user:
@@ -2325,23 +2208,9 @@ def render_system_department_management(current_user):
                             new_role,
                             department_id=department_id,
                         )
-                        record_audit(
-                            "create_user",
-                            target_type="user",
-                            target_id=new_username,
-                            metadata={"role": new_role, "department": selected_department},
-                        )
                         st.success(f"已创建用户: {new_username}")
                         st.rerun()
                     except Exception as e:
-                        record_audit(
-                            "create_user",
-                            target_type="user",
-                            target_id=new_username,
-                            success=False,
-                            error_message=str(e),
-                            metadata={"role": new_role, "department": selected_department},
-                        )
                         st.error(f"创建用户失败: {e}")
 def render_kb_governance_tab(pipeline):
     st.markdown('<div style="height: 30px;"></div>', unsafe_allow_html=True)
@@ -2460,21 +2329,6 @@ def render_kb_management_tab(pipeline):
                     result_summary = result_message.split("\n")[0] if result_message else ""
                     upload_ok = result.ok
                     upload_partial = result.partial
-                    record_audit(
-                        "upload_document",
-                        target_type="document",
-                        target_id=", ".join(f.name for f in files),
-                        kb_name=st.session_state.current_kb,
-                        success=upload_ok or upload_partial,
-                        error_message="" if upload_ok or upload_partial else result_message,
-                        metadata={
-                            "file_count": len(files),
-                            "source_group": source_group,
-                            "result": result_summary,
-                            "full_result": result_message,
-                            "backend": result.backend,
-                        },
-                    )
                     invalidate_file_cache(st.session_state.current_kb)
                     _clear_backend_task_cache("kb_mgmt", st.session_state.current_kb, ctx)
                     progress_bar.progress(100, text="文件处理流程完成")
@@ -2553,24 +2407,8 @@ def render_kb_management_tab(pipeline):
                             for target_user in selected_users:
                                 try:
                                     auth_service.grant_kb_permission_as(manager, grant_kb, target_user.id, permission)
-                                    record_audit(
-                                        "grant_kb_permission",
-                                        target_type="kb_permission",
-                                        target_id=target_user.username,
-                                        kb_name=grant_kb,
-                                        metadata={"permission": permission, "target_user_id": target_user.id},
-                                    )
                                     success_users.append(target_user.username)
                                 except Exception as e:
-                                    record_audit(
-                                        "grant_kb_permission",
-                                        target_type="kb_permission",
-                                        target_id=target_user.username,
-                                        kb_name=grant_kb,
-                                        success=False,
-                                        error_message=str(e),
-                                        metadata={"permission": permission, "target_user_id": target_user.id},
-                                    )
                                     failed_messages.append(f"{target_user.username}: {e}")
                             if success_users:
                                 st.success(f"已授权 {len(success_users)} 个用户访问 {grant_kb}: {permission}")
@@ -2665,14 +2503,6 @@ def render_kb_management_tab(pipeline):
                                             ctx = build_request_context(st.session_state)
                                             res = pipeline.delete_document(doc_id, kb, ctx=ctx)
                                             delete_ok = not str(res).startswith(("Error:", "系统错误:", "删除失败"))
-                                            record_audit(
-                                                "delete_document",
-                                                target_type="document",
-                                                target_id=f,
-                                                kb_name=kb,
-                                                success=delete_ok,
-                                                error_message="" if delete_ok else str(res),
-                                            )
                                             invalidate_file_cache(kb)
                                             st.session_state.confirm_delete_file = None
                                             if st.session_state.get(_selected_parse_result_key(f"mgmt_{kb}")) == doc_id:

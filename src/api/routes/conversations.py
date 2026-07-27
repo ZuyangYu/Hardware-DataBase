@@ -5,8 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from src.core.auth import AuthUser
 from src.core.conversation import ConversationService
 
-from src.api.context import build_context_for_user
-from src.api.deps import current_user, get_auth_service
+from src.api.deps import current_user
 from src.api.schemas import (
     AddMessageRequest,
     CreateSessionRequest,
