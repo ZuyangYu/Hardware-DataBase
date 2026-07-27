@@ -40,7 +40,10 @@ def whoami(user=Depends(current_user)) -> UserInfo:
 @router.post("/logout", response_model=OkResponse)
 def logout(
     authorization: str | None = Header(default=None),
+    user=Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ) -> OkResponse:
-    auth.revoke_session(bearer_token(authorization))
+    # current_user already rejected empty/invalid tokens with 401; pass the
+    # resolved user into revoke_session so it doesn't re-query get_user_by_token.
+    auth.revoke_session(bearer_token(authorization), actor=user)
     return OkResponse(ok=True, message="logged out")

@@ -29,6 +29,9 @@ class PipelineRuntime:
         self._worker_lock = threading.RLock()
         self._worker_thread: threading.Thread | None = None
         self._worker_id = f"{self.worker_name}-{uuid.uuid4().hex}"
+        # Set by stop() so a running parse_worker_loop exits between records
+        # instead of processing the whole queue after the pipeline is reset.
+        self._stop_event = threading.Event()
 
     @property
     def handlers(self) -> dict[str, PipelineHandler]:
@@ -38,6 +41,7 @@ class PipelineRuntime:
         with self._worker_lock:
             if self._worker_thread and self._worker_thread.is_alive():
                 return
+            self._stop_event.clear()
             self._worker_thread = threading.Thread(
                 target=self.parse_worker_loop,
                 name=self.worker_name,
@@ -45,9 +49,15 @@ class PipelineRuntime:
             )
             self._worker_thread.start()
 
+    def stop(self):
+        """Signal the parse worker to exit after its current record. Called on
+        pipeline teardown (reset_pipeline) so a reset doesn't leave an orphan
+        worker competing with the new pipeline's worker for the same SQLite."""
+        self._stop_event.set()
+
     def parse_worker_loop(self):
         processor_kinds = self.background_processor_kinds()
-        while True:
+        while not self._stop_event.is_set():
             record = self.store.claim_next_parse_record(self._worker_id, processor_kinds=processor_kinds)
             if not record:
                 return

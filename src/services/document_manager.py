@@ -3,7 +3,7 @@ from typing import Callable
 
 from src.core.logger import warn
 from src.pipelines.document_rag.base import RAGBackend
-from src.pipelines.document_rag.schemas import IngestResult, RequestContext
+from src.pipelines.document_rag.schemas import BackendResult, IngestResult, RequestContext
 from src.services.document_routing import supported_pipeline_for_file
 from src.services.pipeline_asset_cleanup import PipelineAssetCleanupService
 
@@ -55,8 +55,10 @@ class DocumentManager:
     def processing_pipeline_for_file(self, file_path: str) -> str | None:
         return supported_pipeline_for_file(file_path)
 
-    def delete_document(self, document_id: str, kb_name: str, ctx: RequestContext | None = None) -> str:
-        return self.processing_backend.delete_document(kb_name, document_id, ctx=ctx).message
+    def delete_document(self, document_id: str, kb_name: str, ctx: RequestContext | None = None) -> BackendResult:
+        """Return the full BackendResult so callers can branch on ``ok``
+        rather than sniffing error prefixes out of ``message``."""
+        return self.processing_backend.delete_document(kb_name, document_id, ctx=ctx)
 
     def delete_knowledge_base_documents(
         self,

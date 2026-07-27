@@ -7,7 +7,7 @@ from src.core.auth import AuthService, AuthUser
 from src.pipelines.document_rag.schemas import kb_scope_key
 
 from src.api.context import build_context_for_user
-from src.api.deps import current_user, get_auth_service, get_pipeline, require_dept_admin
+from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access, require_dept_admin
 from src.api.schemas import CreateKbRequest, FileView, KbView, OkResponse
 
 router = APIRouter(tags=["kbs"])
@@ -39,7 +39,13 @@ def list_kbs(
     auth: AuthService = Depends(get_auth_service),
 ):
     ctx = build_context_for_user(user, auth=auth)
-    kbs = pipeline.list_knowledge_bases(ctx=ctx)
+    # system_admin has no dept-scoped KB grants (list_accessible_kbs returns []),
+    # so branch to the admin view that lists every KB -- mirrors Streamlit's
+    # governance/management panels. Other roles see their accessible KBs.
+    if ctx.is_system_admin():
+        kbs = pipeline.list_all_knowledge_bases_for_admin(ctx=ctx)
+    else:
+        kbs = pipeline.list_knowledge_bases(ctx=ctx)
     return _kb_views(user, kbs, auth)
 
 
@@ -51,6 +57,7 @@ def list_files(
     auth: AuthService = Depends(get_auth_service),
 ):
     ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
     infos = pipeline.list_file_infos(kb_name, ctx=ctx)
@@ -61,6 +68,7 @@ def list_files(
             status=info.status,
             processor_kind=info.processor_kind,
             dataset_kind=info.dataset_kind,
+            metadata=info.metadata or {},
         )
         for info in infos
     ]
@@ -80,6 +88,27 @@ def create_kb(
     return OkResponse(ok=True, message=msg)
 
 
+@router.delete("/kbs/{kb_name}", response_model=OkResponse)
+def delete_kb(
+    kb_name: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Delete a knowledge base and all its documents / archives / indexes.
+
+    Requires ``admin`` permission on the KB (implicit for the owning dept_admin).
+    """
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "admin"):
+        raise HTTPException(status_code=403, detail="admin permission required")
+    ok, msg = pipeline.delete_knowledge_base(kb_name, ctx=ctx)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return OkResponse(ok=True, message=msg)
+
+
 @router.delete("/kbs/{kb_name}/files/{filename}", response_model=OkResponse)
 def delete_file(
     kb_name: str,
@@ -89,6 +118,7 @@ def delete_file(
     auth: AuthService = Depends(get_auth_service),
 ):
     ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "admin"):
         raise HTTPException(status_code=403, detail="admin permission required")
     msg = pipeline.delete_document(filename, kb_name, ctx=ctx)

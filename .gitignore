@@ -91,3 +91,8 @@ docs/joint_retrieval_test_cases.md
 
 # macOS Finder metadata
 .DS_Store
+
+# Local business data / experiment scripts (not for repo)
+AAA/
+ingest_aaa_test.py
+verify_recall.py

@@ -7,7 +7,29 @@ import config.settings
 import httpx
 import uvicorn
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_USER
-from src.pipelines.document_rag.schemas import DocumentInfo, IngestResult
+from src.pipelines.document_rag.schemas import DocumentInfo, IngestResult, ParsedChunk, ParseResult
+
+
+class StubParseTask:
+    """Duck-typed stand-in for ``ingestion.parse_tasks.ParseTask``."""
+
+    def __init__(self, task_id: str, kb_name: str, status: str = "running", progress: int = 42):
+        self.id = task_id
+        self.kb_name = kb_name
+        self.source_path = ""
+        self.original_name = "sample.pdf"
+        self.source_group = "文档资料"
+        self.created_by = "admin1"
+        self.status = status
+        self.progress = progress
+        self.stage = "解析中"
+        self.message = ""
+        self.result = ""
+        self.document_id = "d1"
+        self.created_at = 0.0
+        self.updated_at = 0.0
+        self.started_at = None
+        self.finished_at = None
 
 
 class StubPipeline:
@@ -17,9 +39,19 @@ class StubPipeline:
         self.uploaded: list = []
         self.created: list = []
         self.deleted: list = []
+        self.deleted_kbs: list = []
+        self.deleted_tasks: list = []
+        self.paused_tasks: list = []
+        self.resumed_tasks: list = []
+        self.cleared_kbs: list = []
+        self.applied_settings: list = []
         self.query_chunks = ["第一段", "第二段"]
 
+    # KB / files ---------------------------------------------------------
     def list_knowledge_bases(self, ctx=None):
+        return ["shared"]
+
+    def list_all_knowledge_bases_for_admin(self, ctx=None):
         return ["shared"]
 
     def list_file_infos(self, kb_name, ctx=None):
@@ -41,11 +73,54 @@ class StubPipeline:
         self.created.append(name)
         return True, f"知识库 '{name}' 创建成功"
 
+    def delete_knowledge_base(self, kb_name, ctx=None):
+        self.deleted_kbs.append(kb_name)
+        return True, f"知识库 '{kb_name}' 已删除"
+
     def delete_document(self, filename, kb_name, ctx=None):
         self.deleted.append((kb_name, filename))
+        # The API route calls pipeline.delete_document directly and treats the
+        # return value as a message string (same as AppPipeline.delete_document
+        # which returns BackendResult.message). Tests assert on .deleted only.
         return "已删除"
 
-    def query(self, msg, kb_name, history, ctx):
+    # Parse tasks --------------------------------------------------------
+    def list_parse_tasks(self, kb_name=None, ctx=None):
+        return [StubParseTask("t1", kb_name or "shared")]
+
+    def delete_parse_task(self, task_id, ctx=None):
+        self.deleted_tasks.append(task_id)
+        return "任务已删除"
+
+    def pause_parse_task(self, task_id, ctx=None):
+        self.paused_tasks.append(task_id)
+        return "当前后端不支持暂停解析任务"
+
+    def resume_parse_task(self, task_id, ctx=None):
+        self.resumed_tasks.append(task_id)
+        return "当前后端不支持启动解析任务"
+
+    def clear_finished_parse_tasks(self, kb_name=None, ctx=None):
+        self.cleared_kbs.append(kb_name)
+
+    def get_parse_result(self, kb_name, document_id, ctx=None):
+        if document_id == "missing":
+            return None
+        return ParseResult(
+            document_id=document_id,
+            file_name="a.pdf",
+            chunk_count=2,
+            chunks=[
+                ParsedChunk(index=0, content="chunk 0", metadata={"page": 1}),
+                ParsedChunk(index=1, content="chunk 1", metadata={"page": 2}),
+            ],
+        )
+
+    # Query --------------------------------------------------------------
+    def query(self, msg, kb_name, history, ctx, agent_thread_id=""):
+        # ``agent_thread_id`` is the LangGraph thread id; the stub just records
+        # it via a side attribute so tests can assert on it if they care.
+        self.last_thread_id = agent_thread_id
         for chunk in self.query_chunks:
             yield chunk
 
@@ -57,6 +132,18 @@ class StubPipeline:
 
     def get_last_token_usage_summary(self):
         return {"total_tokens": 10}
+
+    # Governance / config ------------------------------------------------
+    @staticmethod
+    def governance_stats(ctx=None):
+        return {"shared": {"files": 1, "failed": 0, "parsing": 0}}
+
+    @staticmethod
+    def check_ragflow_connection(base_url, api_key, dataset_names, timeout=120):
+        return True, "ok", []
+
+    def apply_settings(self, new_settings):
+        self.applied_settings.append(dict(new_settings))
 
 
 def make_auth(db_path: str):

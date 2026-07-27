@@ -209,8 +209,20 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 25-sample dataset at `evaluation/datasets/hardware_qa_v1.jsonl`; the Streamlit
 "🧪 RAGAS 评估" tab is system-admin-only and wraps `EvaluationService`.
 
-### API、CLI 与 MCP (`src/api/`, `src/cli/`, `src/mcp/`)
-前后端分离的铺路层,长期资产。`src/api/` 是 FastAPI 服务(**就是未来的后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务;`src/cli/` 是它的 HTTP 客户端(`hardware-database` 命令);`src/mcp/`(`server.py`)是 MCP server,把同一套 HTTP API 暴露成 Claude Code 等本地 agent 的工具(**是 API 的客户端,不是 in-process 旁路**),复用 `src/cli/client.ApiClient` 做 HTTP+SSE,token/url 解析也复用 CLI 的 `HDB_TOKEN`/会话。RAGFlow key / `.env` / `auth.db` 只在服务侧,CLI/MCP 不持有。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:普通用户只能检索,部门管理员才能上传/建库/删除。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。`POST /query` 走 SSE(delta/done/error 事件);上传 `POST /kbs/{kb}/files`(multipart)。启动 `hardware-database-server`;CLI 子命令 login/whoami/list-kb/query(--json)/upload/list-files/delete,令牌持久化于 `~/.config/hardware-database/`,API 地址由 `HDB_API_URL`/`--api-url` 指定。MCP server(`hardware-database-mcp`,stdio 传输)工具:health/whoami/list_kbs/list_files/query/upload/delete,出错返回结构化 dict 而非抛异常;项目级 `.mcp.json` 已注册,Claude Code 自动发现。用法:起 `hardware-database-server` + `login` 后,Claude Code 经 MCP 原生调用 `query` 等工具,不必走 Bash。Streamlit 暂不改,与 API/MCP 并存。
+### API 层 (`src/api/`)
+前后端分离的后端,长期资产。`src/api/` 是 FastAPI 服务(**就是未来的后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务。所有业务路由挂在 `/api/v1` 前缀下(`/health` 保留根路径探针)。CORS 由 `HDB_API_CORS_ORIGINS`(逗号分隔)配置,默认放行本地开发 origin(8501/3000/5173),**生产部署必须显式设为前端实际域名**。RAGFlow key / `.env` / `auth.db` 只在服务侧。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:普通用户只能检索,部门管理员才能上传/建库/删除。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。`POST /query` 走 SSE(delta/done/error 事件);上传 `POST /kbs/{kb}/files`(multipart,分片写盘 + 大小上限 `HDB_API_MAX_UPLOAD_BYTES`)。
+
+**审计下沉**:管理写操作的 `record_audit` 住在 `AuthService._audit` / `AppPipeline._audit` 内部(fail-soft),Streamlit 与 API 两条路径自动覆盖、无双写。唯一例外是 `change_settings`(`apply_settings` 是 staticmethod 无 actor),由 `PUT /config` 路由层与 Streamlit 设置页各自记一次。
+
+**角色权力分离**(三个角色的可达范围与 Streamlit tab 严格对齐):
+- `system_admin` = **治理角色**,只碰元数据。可用:部门/用户/KB 挂载(`assign_kb`)/权限清单查看/系统配置/日志中心/RAGAS 评估/治理面板。**不能**访问任何 KB 内容(检索、上传、看文件、删文件、看解析任务)。`RequestContext.has_kb_permission` 对 sysadmin 恒返回 False;API 路由用 `deps.reject_system_admin_kb_access(ctx)` 提前拒并给明确错误信息("system_admin 是治理角色,不能访问知识库内容")。这条铁律的目的是防"平台管理员静默窥视各部门私有数据"。
+- `dept_admin` = **部门治理 + 部门内容**。可用:本部门用户管理、本部门 KB 建/删/权限授予撤销、本部门文件上传/删除/查看、检索。
+- `user` = **纯消费**。可用:对已被授权的 KB 检索、查看文件、看自己的会话。
+
+**API 查询不自动持久化会话**:`POST /query` 只流式返回答案并写 query trace + 证据到日志中心,**不**自动把 user/assistant 消息写入 `conversations`。前端须在 `done` 事件后手动 `POST /conversations/{id}/messages` 追加两条消息,否则历史会话拿不到 API 产生的问答(这是有意职责划分,与 Streamlit 自动落库不同)。
+
+**注**:`src/cli/` 与 `src/mcp/` 已随「移除主项目内置 CLI/MCP」提交删除,本段历史描述的 CLI/MCP 客户端不再存在;API 是当前唯一的后端入口。Streamlit 暂作为 demo 期 UI 与 API 并存,后续被真正的前端取代。
+
 
 ### Other subsystems
 - `src/test_data/` - structured test-data domain (CSV/JSON ->
