@@ -9,6 +9,7 @@ from unittest.mock import ANY, Mock
 import pytest
 
 from src.agents.claim_evidence import InformationRequirement, RetrievalOutcome
+from src.agents.state import Evidence
 from src.core.app_pipeline import AppPipeline
 from src.document_authoring.models import (
     DocumentFieldSchema,
@@ -53,6 +54,9 @@ def pipeline(service):
     pipeline.backend = Mock()
     pipeline.documents = Mock()
     pipeline.document_generation = service
+    # Default to no spreadsheet service; tests that exercise the spreadsheet
+    # path override this attribute explicitly.
+    pipeline.spreadsheet_service = None
     return pipeline
 
 
@@ -874,3 +878,88 @@ def test_pipeline_spreadsheet_service_defaults_to_none_when_backend_lacks_it(ser
     pipeline.spreadsheet_service = getattr(pipeline.backend, "spreadsheet_indexes", None)
 
     assert pipeline.spreadsheet_service is None
+
+
+def requirement_with_capabilities(subject: str, capabilities: list[str]) -> InformationRequirement:
+    return InformationRequirement(
+        requirement_id=f"requirement-{subject}",
+        semantic_unit_id="summary",
+        claim_type="attribute",
+        subject=subject,
+        required_capabilities=capabilities,
+    )
+
+
+def _xlsx_evidence(source_name: str, content: str = "BOM row") -> Evidence:
+    return Evidence(
+        id=f"xlsx:{source_name}:Sheet1:0:semantic",
+        content=content,
+        source_name=source_name,
+        content_kind="spreadsheet_table",
+        processor_kind="spreadsheet_table",
+        score=0.9,
+        locator={"record_id": 1, "sheet_name": "Sheet1", "row_index": 0},
+        metadata={"tool": "spreadsheet_semantic"},
+    )
+
+
+def _patch_spreadsheet_tool(pipeline, spreadsheet_tool):
+    """Patch SpreadsheetSemanticTool in the app_pipeline module to return ``spreadsheet_tool``."""
+    import src.core.app_pipeline as app_pipeline_mod
+    original = app_pipeline_mod.SpreadsheetSemanticTool
+    app_pipeline_mod.SpreadsheetSemanticTool = Mock(return_value=spreadsheet_tool)
+    return original
+
+
+def _restore_spreadsheet_tool(original):
+    import src.core.app_pipeline as app_pipeline_mod
+    app_pipeline_mod.SpreadsheetSemanticTool = original
+
+
+def test_kb_retriever_adds_spreadsheet_evidence_for_tabular_lookup(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []  # RAGFlow empty
+    spreadsheet_tool = Mock()
+    spreadsheet_tool.run.return_value = [_xlsx_evidence("bom.xlsx")]
+    pipeline.spreadsheet_service = Mock()
+    original = _patch_spreadsheet_tool(pipeline, spreadsheet_tool)
+    try:
+        retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["bom.xlsx"])
+        outcome = retrieve(requirement_with_capabilities("用量", ["tabular_lookup"]), 0)
+    finally:
+        _restore_spreadsheet_tool(original)
+
+    spreadsheet_tool.run.assert_called_once()
+    assert outcome.status == "success_with_hits"
+    assert any(e.source_name == "bom.xlsx" for e in outcome.evidences)
+
+
+def test_kb_retriever_skips_spreadsheet_when_no_tabular_lookup(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []
+    spreadsheet_tool = Mock()
+    spreadsheet_tool.run.return_value = [_xlsx_evidence("bom.xlsx")]
+    pipeline.spreadsheet_service = Mock()
+    original = _patch_spreadsheet_tool(pipeline, spreadsheet_tool)
+    try:
+        retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["bom.xlsx"])
+        retrieve(requirement_with_capabilities("描述", ["entity_lookup"]), 0)
+    finally:
+        _restore_spreadsheet_tool(original)
+
+    spreadsheet_tool.run.assert_not_called()
+
+
+def test_kb_retriever_skips_spreadsheet_when_service_missing(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []
+    pipeline.spreadsheet_service = None
+    import src.core.app_pipeline as app_pipeline_mod
+    spy = Mock()
+    app_pipeline_mod.SpreadsheetSemanticTool = spy  # should not be instantiated
+    try:
+        retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["bom.xlsx"])
+        outcome = retrieve(requirement_with_capabilities("用量", ["tabular_lookup"]), 0)
+    finally:
+        from src.agents.tools.spreadsheet_tools import SpreadsheetSemanticTool as RealTool
+        app_pipeline_mod.SpreadsheetSemanticTool = RealTool
+
+    spy.assert_not_called()
+    assert outcome.status == "success_empty"

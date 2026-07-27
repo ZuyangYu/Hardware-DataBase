@@ -7,6 +7,7 @@ from typing import Callable, Generator, List, Tuple
 
 import config.settings
 from src.agents.runner import MultiSourceAgentRunner
+from src.agents.tools.spreadsheet_tools import SpreadsheetSemanticTool
 from src.core.auth import AuthService
 from src.core.logger import error, log, warn
 from src.ingestion.kb_paths import InvalidKnowledgeBaseName, validate_kb_name
@@ -506,6 +507,18 @@ class AppPipeline:
             raise PermissionError("knowledge base read permission is required")
         frozen_source_names = list(dict.fromkeys(source_names))
 
+        # Spreadsheet structured index (xlsx TableIndexStore). Instantiated
+        # once per retriever so multiple units reuse the same tool. The tool
+        # does not honour source_names in `filters` (only record_id), so the
+        # closure filters frozen-set membership itself before merging; the
+        # downstream build_knowledge_base_retrieval_outcome re-checks as a
+        # second guard.
+        spreadsheet_tool = (
+            SpreadsheetSemanticTool(self.spreadsheet_service)
+            if self.spreadsheet_service is not None
+            else None
+        )
+
         def retrieve(requirement, _attempt):
             query = " ".join(
                 value
@@ -516,13 +529,34 @@ class AppPipeline:
                 )
                 if value
             )
-            evidences = self.backend.retrieve(
-                kb_name,
-                query,
-                top_k=config.settings.FINAL_TOP_K,
-                ctx=ctx,
-                filters={"source_names": frozen_source_names},
+            evidences = list(
+                self.backend.retrieve(
+                    kb_name,
+                    query,
+                    top_k=config.settings.FINAL_TOP_K,
+                    ctx=ctx,
+                    filters={"source_names": frozen_source_names},
+                )
             )
+            if (
+                spreadsheet_tool is not None
+                and "tabular_lookup" in (requirement.required_capabilities or [])
+            ):
+                sp_evidences = spreadsheet_tool.run(
+                    query,
+                    kb_name,
+                    ctx,
+                    top_k=config.settings.FINAL_TOP_K,
+                    filters=None,
+                )
+                # Drop anything outside the frozen source set before it reaches
+                # the domain-binding step, which would otherwise raise
+                # PermissionError and abort the whole run.
+                evidences.extend(
+                    evidence
+                    for evidence in sp_evidences
+                    if evidence.source_name in frozen_source_names
+                )
             return self.document_generation.build_knowledge_base_retrieval_outcome(
                 kb_name,
                 frozen_source_names,
