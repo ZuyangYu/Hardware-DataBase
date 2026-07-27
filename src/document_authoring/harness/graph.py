@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Callable, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, TypedDict
 
 from src.agents.claim_evidence import InformationRequirement, RetrievalOutcome
 from src.document_authoring.harness.policy import HarnessBudgetExceeded, HarnessToolPolicy
@@ -26,6 +26,9 @@ from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.writers.managed import ManagedWriter
 from src.document_authoring.writers.provider import WriterRequest
 from src.projects.models import SourceSetSnapshot
+
+if TYPE_CHECKING:
+    from src.document_authoring.writers.query_rewriter import QueryRewriter
 
 
 class DocumentAuthoringState(TypedDict, total=False):
@@ -69,12 +72,14 @@ class AuthoringGraph:
         validator: DocumentValidator | None = None,
         on_progress: ProgressCallback | None = None,
         draft_provider: DraftProvider | None = None,
+        rewriter: "QueryRewriter | None" = None,
     ):
         self.policy = policy
         self.writer = writer
         self.validator = validator or DocumentValidator()
         self.on_progress = on_progress
         self.draft_provider = draft_provider or writer.generate
+        self.rewriter = rewriter
 
     def run(
         self,
@@ -190,17 +195,65 @@ class AuthoringGraph:
         retrieve: RetrievalProvider,
     ) -> RetrievalOutcome:
         self.policy.require_tool("retrieve_evidence")
+        original_query = _query_string(requirement)
         last: RetrievalOutcome | None = None
         for attempt in range(1, self.policy.policy.max_retrieval_attempts_per_unit + 1):
             self._step(state, "retrieve_requirement_evidence")
             state["retrieval_round_count"] += 1
             self.policy.require_retrieval_round(state["retrieval_round_count"])
-            outcome = retrieve(requirement, attempt)
+            if attempt == 1:
+                outcome = retrieve(requirement, attempt, None)
+            elif last is not None and last.status == "success_empty":
+                # An empty success means the query missed, not that the source
+                # failed; rewrite and retry once before giving up.
+                override = self._rewrite_for_retry(state, requirement, original_query)
+                outcome = retrieve(requirement, attempt, override)
+            else:
+                # Hard-failure statuses retry with the original query.
+                outcome = retrieve(requirement, attempt, None)
             last = outcome
-            if outcome.status not in {"retrieval_failed", "source_unavailable", "access_denied", "partial_failure"}:
+            if outcome.status not in {
+                "retrieval_failed", "source_unavailable", "access_denied",
+                "partial_failure", "success_empty",
+            }:
                 return outcome
         assert last is not None
         return last
+
+    def _rewrite_for_retry(
+        self,
+        state: DocumentAuthoringState,
+        requirement: InformationRequirement,
+        original_query: str,
+    ) -> str | None:
+        if self.rewriter is None:
+            return None
+        # Gate the LLM rewrite on the policy allowlist. A frozen old policy
+        # without rewrite_query never reaches here (rewriter is None), but the
+        # guard defends against mismatched injection.
+        self.policy.require_tool("rewrite_query")
+        ledger = state.setdefault("retrieval_ledger", [])
+        already_rewritten = sum(
+            1
+            for row in ledger
+            if row.get("unit_id") == requirement.semantic_unit_id
+            and row.get("rewrite") is not None
+        )
+        if already_rewritten >= self.policy.policy.max_query_rewrite_rounds:
+            # Budget exhausted; do not rewrite again, fall back to original.
+            return None
+        self._step(state, "rewrite_query")
+        try:
+            rewritten = self.rewriter.rewrite(requirement)
+        except Exception:
+            rewritten = None
+        ledger.append({
+            "unit_id": requirement.semantic_unit_id,
+            "original_query": original_query,
+            "rewrite": rewritten,
+            "attempt": 2,
+        })
+        return rewritten
 
     def _step(self, state: DocumentAuthoringState, node: str) -> None:
         state["current_node"] = node
@@ -261,6 +314,14 @@ def _requirement_for_unit(
 def _capabilities(values: list[str]) -> list[str]:
     allowed = {"entity_lookup", "relationship_lookup", "tabular_lookup", "document_claim_lookup", "revision_lookup"}
     return [value for value in values if value in allowed]
+
+
+def _query_string(requirement: InformationRequirement) -> str:
+    return " ".join(
+        value
+        for value in (requirement.subject, requirement.predicate, requirement.object_hint)
+        if value
+    )
 
 
 def _validated_evidence(

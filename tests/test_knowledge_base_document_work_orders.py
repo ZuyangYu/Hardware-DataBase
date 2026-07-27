@@ -684,7 +684,7 @@ def test_internal_harness_uses_frozen_knowledge_base_source_names(
         document_schema_version=schema.version,
     )
 
-    def retrieve(requirement, attempt):
+    def retrieve(requirement, attempt, query_override=None):
         assert requirement.source_version_scope == ["spec.pdf"]
         assert requirement.project_id is None
         assert requirement.baseline_id is None

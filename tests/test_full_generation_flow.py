@@ -243,7 +243,7 @@ def test_full_generation_flow_with_deterministic_writer(tmp_path: Path):
     print(f"  harness_policy_id: {order1.harness_policy_id}")
     print(f"  source_set_snapshot_id: {order1.source_set_snapshot_id}")
 
-    def retrieve(requirement: InformationRequirement, attempt: int) -> RetrievalOutcome:
+    def retrieve(requirement: InformationRequirement, attempt: int, query_override: str | None = None) -> RetrievalOutcome:
         return RetrievalOutcome(
             requirement_id=requirement.requirement_id,
             status="success_with_hits",

@@ -4,6 +4,7 @@ import hashlib
 import io
 import zipfile
 from pathlib import Path
+from unittest.mock import Mock
 from xml.etree import ElementTree as ET
 
 import pytest
@@ -31,6 +32,8 @@ from src.document_authoring.models import (
 )
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.work_order_store import DocumentAuthoringStore
+from src.document_authoring.harness.graph import AuthoringGraph
+from src.document_authoring.harness.policy import HarnessToolPolicy
 from src.document_authoring.harness.policy import HarnessLeaseLost
 from src.document_authoring.writers.managed import CallableWriter, ManagedWriter
 from src.pipelines.document_rag.schemas import EvidenceEnvelope, RequestContext
@@ -322,7 +325,7 @@ def test_internal_harness_writes_only_validated_evidence_draft(tmp_path: Path):
         document_schema_version=schema.version, harness_policy_id=policy.harness_policy_id,
     )
 
-    def retrieve(requirement, attempt):
+    def retrieve(requirement, attempt, query_override=None):
         assert requirement.semantic_unit_id == "field:controller"
         assert attempt == 1
         return RetrievalOutcome(
@@ -410,7 +413,7 @@ def test_internal_harness_detects_legacy_template_contamination(tmp_path: Path):
             )],
         )
 
-    def retrieve(requirement, attempt):
+    def retrieve(requirement, attempt, query_override=None):
         return RetrievalOutcome(
             requirement_id=requirement.requirement_id, status="success_with_hits",
             evidences=[EvidenceEnvelope(
@@ -471,7 +474,7 @@ def test_internal_harness_budget_exhaustion_routes_to_human_review(tmp_path: Pat
         document_schema_version=schema.version, harness_policy_id=policy.harness_policy_id,
     )
 
-    def retrieve(requirement, attempt):
+    def retrieve(requirement, attempt, query_override=None):
         raise AssertionError("budget must stop before invoking retrieval")
 
     candidate = service.run_internal_harness(ctx, order.work_order_id, retrieve=retrieve)
@@ -482,6 +485,59 @@ def test_internal_harness_budget_exhaustion_routes_to_human_review(tmp_path: Pat
     assert report is not None and report.status == "requires_human"
     assert any(issue["kind"] == "harness_budget_exceeded" for issue in report.issues)
     assert authoring_store.get_work_order(order.work_order_id).status == "waiting_human_input"
+
+
+def test_harness_retries_each_unit_with_a_separate_global_budget():
+    policy = HarnessPolicy(
+        harness_policy_id="retrieval-budget",
+        version="1",
+        status="approved",
+        max_steps=20,
+        max_retrieval_rounds=4,
+        max_retrieval_attempts_per_unit=1,
+    )
+    graph = AuthoringGraph(HarnessToolPolicy(policy), Mock())
+    state = {"step_count": 0, "retrieval_round_count": 0}
+    first_attempts: list[int] = []
+    second_attempts: list[int] = []
+    first_requirement = InformationRequirement(
+        requirement_id="first",
+        semantic_unit_id="field:first",
+        claim_type="attribute",
+        subject="first",
+    )
+    second_requirement = InformationRequirement(
+        requirement_id="second",
+        semantic_unit_id="field:second",
+        claim_type="attribute",
+        subject="second",
+    )
+
+    def first_retrieve(requirement, attempt, query_override=None):
+        first_attempts.append(attempt)
+        return RetrievalOutcome(
+            requirement_id=requirement.requirement_id,
+            status="retrieval_failed",
+            query_fingerprint=f"first-{attempt}",
+            applied_source_set_snapshot_id="snapshot",
+        )
+
+    def second_retrieve(requirement, attempt, query_override=None):
+        second_attempts.append(attempt)
+        return RetrievalOutcome(
+            requirement_id=requirement.requirement_id,
+            status="success_empty",
+            query_fingerprint=f"second-{attempt}",
+            applied_source_set_snapshot_id="snapshot",
+        )
+
+    graph._retrieve_with_budget(state, first_requirement, first_retrieve)
+    graph._retrieve_with_budget(state, second_requirement, second_retrieve)
+
+    assert policy.max_retrieval_attempts_per_unit == 1
+    assert first_attempts == [1]
+    assert second_attempts == [1]
+    assert state["retrieval_round_count"] == 2
 
 
 def test_harness_fencing_checkpoint_and_node_receipts_are_durable(tmp_path: Path):

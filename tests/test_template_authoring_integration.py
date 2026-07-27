@@ -100,7 +100,7 @@ def _pipeline_with_approved_project_source(tmp_path):
     pipeline.document_generation = generation
     project_retrieval = ProjectEvidenceRetrievalService(projects)
 
-    def retrieve(requirement, attempt):
+    def retrieve(requirement, attempt, query_override=None):
         orders = store.list_work_orders(ctx.tenant_id, baseline.project_id)
         assert len(orders) == 1
         order = orders[0]
