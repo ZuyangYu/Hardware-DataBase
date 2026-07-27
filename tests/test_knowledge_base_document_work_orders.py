@@ -963,3 +963,25 @@ def test_kb_retriever_skips_spreadsheet_when_service_missing(pipeline, ctx):
 
     spy.assert_not_called()
     assert outcome.status == "success_empty"
+
+
+def test_kb_retriever_drops_spreadsheet_evidence_outside_frozen_set(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []
+    # Tool returns one in-scope and one out-of-scope (added after freeze).
+    spreadsheet_tool = Mock()
+    spreadsheet_tool.run.return_value = [
+        _xlsx_evidence("bom.xlsx", "in scope"),
+        _xlsx_evidence("added_after_freeze.xlsx", "out of scope"),
+    ]
+    pipeline.spreadsheet_service = Mock()
+    original = _patch_spreadsheet_tool(pipeline, spreadsheet_tool)
+    try:
+        retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["bom.xlsx"])
+        outcome = retrieve(requirement_with_capabilities("用量", ["tabular_lookup"]), 0)
+    finally:
+        _restore_spreadsheet_tool(original)
+
+    sources = {e.source_name for e in outcome.evidences}
+    assert sources == {"bom.xlsx"}
+    assert "added_after_freeze.xlsx" not in sources
+    assert outcome.status == "success_with_hits"
