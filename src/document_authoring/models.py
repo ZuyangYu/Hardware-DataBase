@@ -328,12 +328,14 @@ class HarnessPolicy(BaseModel):
     version: str
     max_steps: int = 40
     max_retrieval_rounds: int = 2
+    max_retrieval_attempts_per_unit: int = 2
     max_units_per_run: int = 20
     max_retries: int = 1
     lease_seconds: int = 60
+    max_query_rewrite_rounds: int = 1
     allowed_tools: list[str] = Field(default_factory=lambda: [
         "retrieve_evidence", "draft_ready_unit", "validate_unit_draft",
-        "detect_template_contamination", "validate_cross_unit",
+        "detect_template_contamination", "validate_cross_unit", "rewrite_query",
     ])
     writer_provider_id: str = "managed"
     prompt_version: str = "1"
@@ -341,7 +343,14 @@ class HarnessPolicy(BaseModel):
 
     @model_validator(mode="after")
     def validate_budget(self):
-        if min(self.max_steps, self.max_retrieval_rounds, self.max_units_per_run, self.lease_seconds) < 1:
+        if min(
+            self.max_steps,
+            self.max_retrieval_rounds,
+            self.max_retrieval_attempts_per_unit,
+            self.max_units_per_run,
+            self.lease_seconds,
+            self.max_query_rewrite_rounds,
+        ) < 1:
             raise ValueError("harness policy budgets must be positive")
         if self.max_retries < 0:
             raise ValueError("harness policy max_retries cannot be negative")
@@ -373,6 +382,7 @@ class AuthoringRunManifest(BaseModel):
     tool_policy_hash: str = ""
     max_steps: int | None = None
     max_retrieval_rounds: int | None = None
+    max_retrieval_attempts_per_unit: int | None = None
     validator_version: str = "p2b-1"
     renderer_version: str = "p2a-1"
     created_at: datetime = Field(default_factory=utc_now)

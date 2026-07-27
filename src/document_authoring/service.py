@@ -8,12 +8,15 @@ templates, project stores or artifacts directly.
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 import uuid
 from copy import copy
 from datetime import datetime, timezone
 from collections.abc import Callable
 from typing import Any
+
+import requests
 
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
@@ -43,8 +46,17 @@ from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
 from src.document_authoring.template_analysis import DocxRegionSchema, TemplateAnalysis
 from src.document_authoring.template_analyzers import analyze_template
+from src.document_authoring.template_progress import (
+    TemplateProgress,
+    TemplateProgressCallback,
+    report_template_progress,
+)
 from src.document_authoring.template_sanitizer import sanitize_template
-from src.document_authoring.template_suggester import LLMTemplateSuggestionProvider, TemplateSuggestionProvider
+from src.document_authoring.template_suggester import (
+    LLMTemplateSuggestionProvider,
+    TemplateSuggestionProvider,
+    TemplateSuggestionTechnicalFailure,
+)
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.worker import DocumentGenerationWorker
@@ -52,6 +64,16 @@ from src.document_authoring.writers.managed import DeterministicEvidenceWriter, 
 from src.core.llm_client import LLMClient
 from src.pipelines.document_rag.schemas import RequestContext
 from src.projects.service import ProjectService
+
+
+logger = logging.getLogger(__name__)
+
+_MAX_AUTO_HARNESS_UNITS = 500
+_MAX_AUTO_HARNESS_RETRIEVAL_ROUNDS = 1_000
+# max_steps = 2 + unit_count * (attempts + 4); with 500 units and attempts=2
+# that is 3002, so the ceiling must leave headroom for the rewrite step.
+_MAX_AUTO_HARNESS_STEPS = 3_600
+_DEFAULT_RETRIEVAL_ATTEMPTS_PER_UNIT = 2
 
 
 class DocumentGenerationService:
@@ -151,8 +173,10 @@ class DocumentGenerationService:
         filename: str,
         content: bytes,
         template_name: str,
+        progress_callback: TemplateProgressCallback | None = None,
     ) -> TemplateAnalysis:
         """Persist an immutable draft then analyze its structure, never its bytes by LLM."""
+        report_template_progress(progress_callback, TemplateProgress(stage="upload_started"))
         suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         if suffix not in {"xlsx", "xlsm", "docx"}:
             raise ValueError("template upload supports only .xlsx, .xlsm, and .docx files")
@@ -207,13 +231,134 @@ class DocumentGenerationService:
             report,
             sanitization_report,
         )
+        report_template_progress(
+            progress_callback,
+            TemplateProgress(stage="sanitization_completed", template_version_id=template.template_version_id),
+        )
         analysis = analyze_template(sanitized.content, sanitized.format).model_copy(update={
             "analysis_id": f"analysis-{uuid.uuid4().hex}",
             "template_version_id": template.template_version_id,
         })
-        self.template_suggester.suggest(analysis)
-        analysis.validate_suggestions()
-        return self.store.save_template_analysis(analysis)
+        report_template_progress(
+            progress_callback,
+            TemplateProgress(
+                stage="structure_analysis_completed",
+                template_version_id=template.template_version_id,
+                unit_count=len(analysis.units),
+                writable_unit_count=sum(unit.writable for unit in analysis.units),
+            ),
+        )
+        try:
+            if isinstance(self.template_suggester, LLMTemplateSuggestionProvider):
+                self.template_suggester.suggest(analysis, progress_callback=progress_callback)
+            else:
+                self.template_suggester.suggest(analysis)
+            analysis.validate_suggestions()
+        except (TemplateSuggestionTechnicalFailure, requests.RequestException) as exc:
+            logger.exception(
+                "Template suggestion technical failure; preserving the sanitized draft for audit: "
+                "template_version_id=%s error_type=%s",
+                template.template_version_id,
+                type(exc).__name__,
+            )
+            analysis.status = "failed"
+            analysis.suggestions = []
+            self.store.save_template_analysis(analysis)
+            report_template_progress(
+                progress_callback,
+                TemplateProgress(
+                    stage="analysis_failed",
+                    template_version_id=template.template_version_id,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            raise TemplateSuggestionTechnicalFailure(
+                "automatic template upload failed",
+                template_version_id=template.template_version_id,
+            ) from exc
+        except Exception:
+            logger.exception(
+                "Template suggestion analysis failed; preserving the sanitized draft for audit: template_version_id=%s",
+                template.template_version_id,
+            )
+            analysis.status = "requires_human"
+            analysis.suggestions = []
+        saved_analysis = self.store.save_template_analysis(analysis)
+        report_template_progress(
+            progress_callback,
+            TemplateProgress(stage="analysis_persisted", template_version_id=template.template_version_id),
+        )
+        return saved_analysis
+
+    def analyze_and_activate_uploaded_template(
+        self,
+        ctx: RequestContext,
+        *,
+        filename: str,
+        content: bytes,
+        template_name: str,
+        progress_callback: TemplateProgressCallback | None = None,
+    ) -> TemplateVersion:
+        """Persist, analyze, and activate a template without a manual confirmation step.
+
+        Failed analyses remain stored as draft records for audit, but only a
+        fully validated analysis may activate a template.
+        """
+        try:
+            analysis = self.analyze_uploaded_template(
+                ctx,
+                filename=filename,
+                content=content,
+                template_name=template_name,
+                progress_callback=progress_callback,
+            )
+        except TemplateSuggestionTechnicalFailure as exc:
+            report_template_progress(
+                progress_callback,
+                TemplateProgress(
+                    stage="activation_failed",
+                    template_version_id=exc.template_version_id,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            raise
+        if analysis.status != "ready_for_confirmation":
+            report_template_progress(
+                progress_callback,
+                TemplateProgress(
+                    stage="activation_failed",
+                    template_version_id=analysis.template_version_id,
+                    error_type="AnalysisNotReady",
+                ),
+            )
+            raise ValueError(
+                f"automatic template activation failed: analysis status is {analysis.status}"
+            )
+        report_template_progress(
+            progress_callback,
+            TemplateProgress(stage="activation_started", template_version_id=analysis.template_version_id),
+        )
+        try:
+            template = self.confirm_template_analysis(
+                ctx,
+                analysis_id=analysis.analysis_id,
+                display_name=template_name.strip() or filename,
+            )
+        except Exception as exc:
+            report_template_progress(
+                progress_callback,
+                TemplateProgress(
+                    stage="activation_failed",
+                    template_version_id=analysis.template_version_id,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            raise
+        report_template_progress(
+            progress_callback,
+            TemplateProgress(stage="activation_completed", template_version_id=template.template_version_id),
+        )
+        return template
 
     def get_template_sanitization_summary(
         self,
@@ -423,14 +568,7 @@ class DocumentGenerationService:
             if harness_policy_id:
                 harness_policy = self.store.get_harness_policy(harness_policy_id)
             else:
-                existing_policies = self.store.list_harness_policies(
-                    approved_only=True
-                )
-                harness_policy = (
-                    existing_policies[0]
-                    if existing_policies
-                    else self._create_default_harness_policy()
-                )
+                harness_policy = self._schema_harness_policy(schema)
                 harness_policy_id = harness_policy.harness_policy_id
             if harness_policy is None or harness_policy.status != "approved":
                 raise ValueError(
@@ -493,6 +631,46 @@ class DocumentGenerationService:
                 raise ValueError(
                     "internal-harness work orders require an approved HarnessPolicy"
                 )
+
+    def auto_generate_document(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        baseline_id: str,
+        template_version_id: str,
+        document_schema_id: str,
+        document_schema_version: str,
+        retrieve: Callable[[Any, int], RetrievalOutcome] | None = None,
+        retrieve_factory: Callable[[DocumentWorkOrder], Callable[[Any, int], RetrievalOutcome]] | None = None,
+        idempotency_key: str | None = None,
+    ):
+        """Create, run, validate, and release a document without approval clicks.
+
+        A candidate is released only when the Harness reaches
+        ``waiting_human_approval``. Evidence gaps, conflicts, or validation
+        findings remain a review candidate and therefore still require a human.
+        """
+        order = self.create_document_work_order(
+            ctx,
+            project_id=project_id,
+            baseline_id=baseline_id,
+            template_version_id=template_version_id,
+            document_schema_id=document_schema_id,
+            document_schema_version=document_schema_version,
+            idempotency_key=idempotency_key,
+        )
+        if retrieve_factory is not None:
+            retrieve = retrieve_factory(order)
+        if retrieve is None:
+            raise ValueError("auto generation requires a retrieval provider")
+        candidate = self.run_internal_harness(ctx, order.work_order_id, retrieve=retrieve)
+        current = self.store.get_work_order(order.work_order_id)
+        if current is None or current.status != "waiting_human_approval":
+            return candidate
+        return self.approve_document_artifact(
+            ctx, candidate.artifact_id, comment="自动生成并发布",
+        )
 
     # Deterministic execution ----------------------------------------------------------
 
@@ -831,6 +1009,42 @@ class DocumentGenerationService:
             writer_provider_id=LLMManagedWriter.provider_id,
         )
         return self.store.save_harness_policy(policy)
+
+    def _schema_harness_policy(self, schema: DocumentSchema) -> HarnessPolicy:
+        """Persist the bounded policy required by one approved semantic schema."""
+        unit_count = (
+            sum(field.authoring_policy == "managed_writer" for field in schema.fields)
+            + sum(item.evaluation_mode == "semantic_assisted" for item in schema.review_items)
+        )
+        attempts = _DEFAULT_RETRIEVAL_ATTEMPTS_PER_UNIT
+        retrieval_rounds = max(1, unit_count * attempts)
+        # Each unit may spend one extra step on query rewrite (stage 1).
+        max_steps = 2 + unit_count * (attempts + 4)
+        if (
+            unit_count > _MAX_AUTO_HARNESS_UNITS
+            or retrieval_rounds > _MAX_AUTO_HARNESS_RETRIEVAL_ROUNDS
+            or max_steps > _MAX_AUTO_HARNESS_STEPS
+        ):
+            raise ValueError(
+                "schema semantic unit count exceeds automatic-generation capacity"
+            )
+        return self.store.save_harness_policy(HarnessPolicy(
+            harness_policy_id=(
+                f"schema-{schema.document_schema_id}-{schema.version}-managed-writer"
+            ),
+            version=f"units-{unit_count}-attempts-{attempts}-rewrite",
+            status="approved",
+            max_units_per_run=max(1, unit_count),
+            max_retrieval_attempts_per_unit=attempts,
+            max_retrieval_rounds=retrieval_rounds,
+            max_steps=max_steps,
+            # LLM writer calls can take 30-120s each; give each unit a
+            # generous per-lease budget so the lease survives one LLM roundtrip
+            # even without between-token heartbeats. Runtime heartbeats between
+            # each _step call keep the actual usage well below this ceiling.
+            lease_seconds=max(300, unit_count * 120),
+            writer_provider_id=LLMManagedWriter.provider_id,
+        ))
 
     @staticmethod
     def _field_for_suggestion(suggestion) -> Any:
