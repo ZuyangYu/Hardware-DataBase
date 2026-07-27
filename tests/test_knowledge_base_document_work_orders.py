@@ -985,3 +985,28 @@ def test_kb_retriever_drops_spreadsheet_evidence_outside_frozen_set(pipeline, ct
     assert sources == {"bom.xlsx"}
     assert "added_after_freeze.xlsx" not in sources
     assert outcome.status == "success_with_hits"
+
+
+def test_kb_retriever_uses_query_override_when_provided(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []
+    pipeline.spreadsheet_service = None
+    retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["spec.pdf"])
+    retrieve(
+        requirement_with_capabilities("描述", ["entity_lookup"]),
+        0,
+        query_override="override query",
+    )
+
+    # backend.retrieve was called with the override query, not the subject.
+    called_query = pipeline.backend.retrieve.call_args.args[1]
+    assert called_query == "override query"
+
+
+def test_kb_retriever_falls_back_to_subject_query_without_override(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []
+    pipeline.spreadsheet_service = None
+    retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["spec.pdf"])
+    retrieve(requirement("voltage"), 0)  # no query_override
+
+    called_query = pipeline.backend.retrieve.call_args.args[1]
+    assert "voltage" in called_query

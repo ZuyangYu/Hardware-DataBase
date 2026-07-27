@@ -519,8 +519,8 @@ class AppPipeline:
             else None
         )
 
-        def retrieve(requirement, _attempt):
-            query = " ".join(
+        def retrieve(requirement, _attempt, query_override=None):
+            query = query_override or " ".join(
                 value
                 for value in (
                     requirement.subject,
@@ -572,7 +572,7 @@ class AppPipeline:
         bindings = self.projects.store.list_knowledge_bindings(project_id, tenant_id)
         fallback_kb_names = [binding.kb_name_snapshot for binding in bindings if binding.kb_name_snapshot]
 
-        def retrieve(requirement, _attempt):
+        def retrieve(requirement, _attempt, query_override=None):
             def retrieve_one(version_id: str, artifact_ids: list[str], _region_policies: dict[str, str]):
                 version = self.projects.store.get_source_version(version_id, tenant_id)
                 if version is None:
@@ -585,7 +585,7 @@ class AppPipeline:
                 kb_names = [name for name in kb_names if name]
                 if not kb_names:
                     raise SourceUnavailableError(f"knowledge base is not configured for source: {version_id}")
-                query = " ".join(
+                query = query_override or " ".join(
                     value for value in (requirement.subject, requirement.predicate, requirement.object_hint) if value
                 )
                 result: list[EvidenceEnvelope] = []

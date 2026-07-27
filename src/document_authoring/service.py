@@ -641,8 +641,8 @@ class DocumentGenerationService:
         template_version_id: str,
         document_schema_id: str,
         document_schema_version: str,
-        retrieve: Callable[[Any, int], RetrievalOutcome] | None = None,
-        retrieve_factory: Callable[[DocumentWorkOrder], Callable[[Any, int], RetrievalOutcome]] | None = None,
+        retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome] | None = None,
+        retrieve_factory: Callable[[DocumentWorkOrder], Callable[[Any, int, "str | None"], RetrievalOutcome]] | None = None,
         idempotency_key: str | None = None,
     ):
         """Create, run, validate, and release a document without approval clicks.
@@ -755,7 +755,7 @@ class DocumentGenerationService:
         ctx: RequestContext,
         work_order_id: str,
         *,
-        retrieve: Callable[[Any, int], RetrievalOutcome],
+        retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome],
         writer: ManagedWriter | None = None,
     ) -> DocumentArtifact:
         order = self._order(ctx, work_order_id, "run_deterministic_work_order")
@@ -811,7 +811,7 @@ class DocumentGenerationService:
         ctx: RequestContext,
         harness_run_id: str,
         *,
-        retrieve: Callable[[Any, int], RetrievalOutcome],
+        retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome],
         writer: ManagedWriter | None = None,
     ) -> DocumentArtifact:
         run = self._harness_run_for_context(ctx, harness_run_id)

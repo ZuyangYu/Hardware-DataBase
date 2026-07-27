@@ -44,7 +44,7 @@ class DocumentAuthoringState(TypedDict, total=False):
     last_error: dict[str, Any] | None
 
 
-RetrievalProvider = Callable[[InformationRequirement, int], RetrievalOutcome]
+RetrievalProvider = Callable[[InformationRequirement, int, "str | None"], RetrievalOutcome]
 ProgressCallback = Callable[[DocumentAuthoringState], None]
 DraftProvider = Callable[[WriterRequest], DocumentUnitDraft]
 
@@ -191,7 +191,7 @@ class AuthoringGraph:
     ) -> RetrievalOutcome:
         self.policy.require_tool("retrieve_evidence")
         last: RetrievalOutcome | None = None
-        for attempt in range(1, self.policy.policy.max_retrieval_rounds + 1):
+        for attempt in range(1, self.policy.policy.max_retrieval_attempts_per_unit + 1):
             self._step(state, "retrieve_requirement_evidence")
             state["retrieval_round_count"] += 1
             self.policy.require_retrieval_round(state["retrieval_round_count"])
@@ -293,8 +293,8 @@ def _validated_evidence(
                     "content": evidence.content,
                     "source_name": evidence.source_name,
                     "metadata": dict(evidence.metadata),
-                    "locator": dict(evidence.locator),
-                    "fact_type": evidence.fact_type,
+                    "locator": dict(getattr(evidence, "locator", {})),
+                    "fact_type": getattr(evidence, "fact_type", None),
                 }
             )
         return result
@@ -314,9 +314,10 @@ def _validated_evidence(
             raise PermissionError("harness received evidence outside the frozen source set")
         result.append({
             "id": evidence.id, "content": evidence.content,
-            "source_version_id": evidence.source_version_id,
-            "processing_artifact_id": evidence.processing_artifact_id,
-            "locator": dict(evidence.locator), "fact_type": evidence.fact_type,
+            "source_version_id": getattr(evidence, "source_version_id", None),
+            "processing_artifact_id": getattr(evidence, "processing_artifact_id", None),
+            "locator": dict(getattr(evidence, "locator", {})),
+            "fact_type": getattr(evidence, "fact_type", None),
         })
     return result
 
