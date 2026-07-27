@@ -186,4 +186,5 @@ capabilities 不分流(P4) ─┘                                          ─�
 | 阶段 | 状态 | 说明 |
 |------|------|------|
 | 阶段 0（spreadsheet 接通） | 已实施 | 闭包隔离 + 仅 `tabular_lookup` 触发 + 冻结集过滤；spec 见 `docs/superpowers/specs/2026-07-27-spreadsheet-retrieval-stage0-design.md`，计划见 `docs/superpowers/plans/2026-07-27-spreadsheet-retrieval-stage0.md` |
-| 阶段 1–5 | 未实施 | 见 §3 |
+| 阶段 1（查询改写+空结果重试） | 已实施 | retrieve 签名加 `query_override`；`QueryRewriter` 仿 writer 注入 harness，`require_tool("rewrite_query")` 守门，`success_empty` 触发改写重试，LLM 失败降级原串；spec 见 `docs/superpowers/specs/2026-07-27-query-rewrite-stage1-design.md` |
+| 阶段 2–5 | 未实施 | 见 §3 |
