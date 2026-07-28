@@ -81,6 +81,24 @@ _MAX_AUTO_HARNESS_STEPS = 3_600
 _DEFAULT_RETRIEVAL_ATTEMPTS_PER_UNIT = 2
 
 
+class TemplateRequiresHumanReview(ValueError):
+    def __init__(
+        self,
+        *,
+        analysis_id: str,
+        template_version_id: str,
+        reason_codes: list[str],
+    ):
+        self.analysis_id = analysis_id
+        self.template_version_id = template_version_id
+        self.reason_codes = list(reason_codes)
+        reasons = ", ".join(self.reason_codes) or "unspecified_template_risk"
+        super().__init__(
+            "automatic template activation failed: analysis status is requires_human; "
+            f"analysis_id={analysis_id}; reason_codes={reasons}"
+        )
+
+
 class DocumentGenerationService:
     def __init__(
         self,
@@ -350,6 +368,16 @@ class DocumentGenerationService:
                     error_type="AnalysisNotReady",
                 ),
             )
+            if analysis.status == "requires_human":
+                raise TemplateRequiresHumanReview(
+                    analysis_id=analysis.analysis_id,
+                    template_version_id=analysis.template_version_id,
+                    reason_codes=(
+                        analysis.activation_decision.reason_codes
+                        if analysis.activation_decision is not None
+                        else []
+                    ),
+                )
             raise ValueError(
                 f"automatic template activation failed: analysis status is {analysis.status}"
             )
@@ -407,6 +435,19 @@ class DocumentGenerationService:
     def _get_template_sanitization_report(self, template_version_id: str) -> TemplateSanitizationReport | None:
         """Read the complete audit record only within the document-authoring service."""
         return self.store.get_template_sanitization_report(template_version_id)
+
+    def get_template_analysis_for_review(
+        self,
+        ctx: RequestContext,
+        *,
+        analysis_id: str,
+    ) -> TemplateAnalysis:
+        if not ctx.user_id or ctx.user_id == "anonymous":
+            raise PermissionError("authenticated user is required to review a template analysis")
+        analysis = self.store.get_template_analysis_by_id(analysis_id)
+        if analysis is None:
+            raise KeyError(f"template analysis not found: {analysis_id}")
+        return analysis
 
     def correct_template_analysis(
         self,

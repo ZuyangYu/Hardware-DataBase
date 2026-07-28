@@ -415,6 +415,23 @@ class AppPipeline:
     def get_document_template_sanitization_summary(self, ctx: RequestContext, template_version_id: str):
         return self.document_generation.get_template_sanitization_summary(ctx, template_version_id)
 
+    def get_document_template_analysis_for_review(
+        self,
+        ctx: RequestContext,
+        *,
+        analysis_id: str,
+    ):
+        return self.document_generation.get_template_analysis_for_review(
+            ctx,
+            analysis_id=analysis_id,
+        )
+
+    def correct_document_template_analysis(self, ctx: RequestContext, *, correction):
+        return self.document_generation.correct_template_analysis(
+            ctx,
+            correction=correction,
+        )
+
     def confirm_document_template(self, ctx: RequestContext, *, analysis_id: str, display_name: str):
         return self.document_generation.confirm_template_analysis(
             ctx, analysis_id=analysis_id, display_name=display_name,
