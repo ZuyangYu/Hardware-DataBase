@@ -117,15 +117,24 @@ capabilities 不分流(P4) ─┘                                          ─�
 
 **验收**：非 LLM 部署下草稿不再是裸片段（多证据含全部证据）；草稿与字段需求不匹配时被标记而非直接放行（启用 fit check 的部署）。
 
-### 阶段 5：自适应恢复 —— 闭环 P3 的极端情况
+### 阶段 5：自适应恢复 -- 闭环 P3 的极端情况
 
 **目标**：`success_empty` 且改写仍空时，在策略允许范围内放宽 scope 重试一次，标记低置信交人工。
 
 **改动点**：Coordinator 在用尽 attempts 后，若策略允许，drop source_group 硬过滤（退回 balanced route）再查一次，证据打 `low_confidence` 标。
 
-**风险**：放宽 scope 必须仍在冻结 source_names 内，不破坏落域校验；需策略开关。
+**走查对齐**：source_group 硬过滤在 harness 路径有两层——服务端 `metadata_condition`（`_metadata_condition` 把 `routed_source_groups` 加入 RAGFlow 检索条件，**两路径都生效**）与本地 `_filter_chunks` 后过滤（`apply_routed_source_groups = bool(routed) and not source_names`，harness 传 `source_names` -> **已关**）。现有 0-chunk fallback（`ragflow_backend.py:882`）仅当 raw chunks=0 才丢 metadata_condition 重查。真实盲区：高置信路由到 group X 但冻结集相关文档在别的 group 时，服务端按 X 返回非冻结集 chunks（>0，**fallback 不触发**）-> 本地 `source_names` 全丢 -> `success_empty`，冻结集内 group Y 文档从未被查。"drop source_group"= 让 RAGFlow 跨 group 检索、再用冻结 `source_names` 兜底，即"退回 balanced route……仍在冻结 source_names 内"。
 
-**验收**：原本判 blocked 的字段有机会以低置信证据进入人工审核，而非直接终止。
+**实施**：
+1. `HarnessPolicy` 增 `max_adaptive_recovery_rounds: int = 0`（默认 0=关），`allowed_tools` 默认**不含** `adaptive_recovery`——工具 allowlist + 预算字段双开关（镜像 `rewrite_query`+`max_query_rewrite_rounds`），**opt-in**（与 `requirement_fit_check` 同前例：status-changing + 真实 backend 调用，默认关以零回归）。
+2. `RAGFlowBackend.retrieve` 识别 `filters["balanced_route"]`，为真则 `routed_source_groups=()`——`metadata_condition` 不加 source_group、本地后过滤仍关。**保留** kb_name/department/source_names 条件。route reason/confidence 仍反映计算所得路由（可观测），仅硬过滤被 drop。
+3. `_retrieve_with_budget` 用尽 attempts 后，若 `adaptive_recovery` 在 allowlist + `max_adaptive_recovery_rounds>0` + 终态 `success_empty`，做一次 `retrieve(req, attempt+1, None, relaxed=True)`；命中则 `_tag_low_confidence`。**仅 `success_empty` 触发**（hard-fail 是源不可用，balanced 无益）。恢复走独立预算，**不调 `require_retrieval_round`**（避免与 `max_retrieval_rounds` 冲突）。返回签名不变（信号经 `outcome.evidences[*].metadata["low_confidence"]` 传递，既有 `_retrieve_with_budget` 测试不破坏）。
+4. KB/project 两条 retrieve 闭包接受 `relaxed`，`relaxed=True` 时给 RAGFlow filters 追加 `balanced_route: True`（KB 经 `RetrieverRegistry.retrieve(balanced_route=)`，project 经 `retrieve_one` 闭包捕获 `balanced` 标）。
+5. run loop 从 `outcome.evidences`（raw，metadata 完整）读 `recovery_triggered`（在 `_validated_evidence` 剥 metadata 之前），记入 ledger row；**若 `recovery_triggered` 且 evidence 非空**，强制 `unit_status="requires_human"` + issue `low_confidence_recovery` + 把 supported 草稿翻为 requires_human（低置信必进人审）。
+
+**风险与约束**：放宽 scope 仅 drop source_group，**不放宽冻结 `source_names`/`source_version_ids`**——`_validated_evidence` + `build_knowledge_base_retrieval_outcome` 双重落域校验不变，恢复证据必在冻结集内。不动 writer/validator 确定性逻辑、不改 artifact 寻址。
+
+**验收**：默认 policy（无 `adaptive_recovery`）行为与阶段 4 byte-identical（零回归，现有测试全绿）；opt-in 启用后，原本 `success_empty`->`blocked` 的 `block_section` 字段若 balanced 恢复命中冻结集内证据，则产低置信草稿、`requires_human`、issue、ledger `recovery_triggered=True`，人审页可见证据与草稿；未命中维持原 `blocked`/`tbd`。spec 见 `docs/superpowers/specs/2026-07-28-adaptive-recovery-stage5-design.md`，计划见 `docs/superpowers/plans/2026-07-28-adaptive-recovery-stage5.md`。
 
 ---
 
@@ -193,4 +202,4 @@ capabilities 不分流(P4) ─┘                                          ─�
 | 阶段 2（capability-aware 分发） | 已实施 | `RetrieverRegistry`（default RAGFlow 始终调用 + specialized 叠加）泛化阶段 0；按 `content` 哈希去重；`preferred_source_roles` 加分（P7）；`CrossUnitEvidenceCache` 跨单元复用（P8）；project 路径补 spreadsheet 分派（绑 version_id+artifact 过 `retrieval.py:70`）；spec 见 `docs/superpowers/specs/2026-07-27-capability-dispatch-stage2-design.md` |
 | 阶段 3（rerank + 检索可观测性） | 已实施 | `EvidenceReranker`（LLM-as-judge，受 `rerank_evidence` allowlist 守门，v1 只重排不截断）送 writer 前重排；per-unit `RetrievalLedgerRow` 嵌 matrix row + 回填 `HarnessExecutionResult.retrieval_ledger`（修复预留字段从未写入 result）；`fallback_triggered` 从 `outcome.evidences` 取；spec 见 `docs/superpowers/specs/2026-07-28-rerank-ledger-stage3-design.md` |
 | 阶段 4（草稿质量） | 已实施 | `DeterministicEvidenceWriter` 多证据结构化汇总（单证据原样）+ LLM fallback 升级；回归锁定 `_build_user_prompt` 传全部 evidence；独立 `RequirementFitChecker`（LLM-as-judge，**opt-in** 不进默认 allowlist，受 `requirement_fit_check` 守门，失败降级 pass）注入 graph，unfit 置 `requires_human`；spec 见 `docs/superpowers/specs/2026-07-28-draft-quality-stage4-design.md` |
-| 阶段 5 | 未实施 | 见 §3 |
+| 阶段 5（自适应恢复） | 已实施 | `RAGFlowBackend.retrieve` 支持 `balanced_route`（drop source_group 硬过滤，保留冻结 source_names）；`_retrieve_with_budget` 用尽 attempts 后 opt-in 做一次 balanced 恢复检索，命中打 `low_confidence` 标 -> 强制 `requires_human` + issue + ledger `recovery_triggered`；`HarnessPolicy.max_adaptive_recovery_rounds`（默认 0）+ `adaptive_recovery` allowlist 双开关（**opt-in**）；KB/project 闭包透传 `relaxed`；默认 policy 零回归；spec 见 `docs/superpowers/specs/2026-07-28-adaptive-recovery-stage5-design.md` |
