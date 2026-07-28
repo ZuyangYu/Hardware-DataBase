@@ -525,14 +525,21 @@ class AppPipeline:
             else None
         )
 
-        def default_retriever(query, requirement):
+        def default_retriever(query, requirement, *, balanced_route: bool = False):
+            # Stage 5 adaptive recovery: balanced_route drops the source_group
+            # hard filter so a mis-routed query can reach frozen sources. The
+            # frozen source_names scope stays, so the result never widens
+            # beyond the frozen source set.
+            filters = {"source_names": frozen_source_names}
+            if balanced_route:
+                filters["balanced_route"] = True
             return list(
                 self.backend.retrieve(
                     kb_name,
                     query,
                     top_k=config.settings.FINAL_TOP_K,
                     ctx=ctx,
-                    filters={"source_names": frozen_source_names},
+                    filters=filters,
                 )
             )
 
@@ -568,7 +575,7 @@ class AppPipeline:
             cross_unit_cache=CrossUnitEvidenceCache(),
         )
 
-        def retrieve(requirement, _attempt, query_override=None):
+        def retrieve(requirement, _attempt, query_override=None, *, relaxed: bool = False):
             query = query_override or " ".join(
                 value
                 for value in (
@@ -578,7 +585,7 @@ class AppPipeline:
                 )
                 if value
             )
-            evidences = registry.retrieve(requirement, query)
+            evidences = registry.retrieve(requirement, query, balanced_route=relaxed)
             return self.document_generation.build_knowledge_base_retrieval_outcome(
                 kb_name,
                 frozen_source_names,
@@ -598,7 +605,13 @@ class AppPipeline:
         # unit's fresh retrieval is empty, so reuse never adds noise to a hit.
         cross_unit_cache = CrossUnitEvidenceCache()
 
-        def retrieve(requirement, _attempt, query_override=None):
+        def retrieve(requirement, _attempt, query_override=None, *, relaxed: bool = False):
+            # Stage 5 adaptive recovery: relaxed drops the source_group hard
+            # filter (balanced_route) on each version's RAGFlow retrieve. The
+            # per-version source_names scope ([document.title]) stays, so the
+            # result never widens beyond the frozen source set.
+            balanced = relaxed
+
             def retrieve_one(version_id: str, artifact_ids: list[str], _region_policies: dict[str, str]):
                 version = self.projects.store.get_source_version(version_id, tenant_id)
                 if version is None:
@@ -616,12 +629,15 @@ class AppPipeline:
                 )
                 result: list[EvidenceEnvelope] = []
                 for kb_name in dict.fromkeys(kb_names):
+                    version_filters = {"source_names": [document.title]}
+                    if balanced:
+                        version_filters["balanced_route"] = True
                     evidences = self.backend.retrieve(
                         kb_name,
                         query,
                         top_k=config.settings.FINAL_TOP_K,
                         ctx=ctx,
-                        filters={"source_names": [document.title]},
+                        filters=version_filters,
                     )
                     for evidence in evidences:
                         result.append(EvidenceEnvelope(

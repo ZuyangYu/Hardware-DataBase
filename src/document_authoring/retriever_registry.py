@@ -162,8 +162,8 @@ class RetrieverRegistry:
         self.cross_unit_cache = cross_unit_cache
         self.role_boost_factor = role_boost_factor
 
-    def retrieve(self, requirement: Any, query: str) -> list[Any]:
-        fresh: list[Any] = list(self.default_retriever(query, requirement))
+    def retrieve(self, requirement: Any, query: str, *, balanced_route: bool = False) -> list[Any]:
+        fresh: list[Any] = list(self.default_retriever(query, requirement, balanced_route=balanced_route))
         for capability in requirement.required_capabilities or []:
             retriever = self.specialized.get(capability)
             if retriever is None:
