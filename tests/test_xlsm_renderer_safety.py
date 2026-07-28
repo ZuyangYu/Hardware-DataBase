@@ -108,6 +108,21 @@ def test_renderer_rejects_an_unauthorized_nonempty_overwrite():
         )
 
 
+def test_renderer_rejects_nonempty_legacy_region_without_a_frozen_baseline():
+    legacy_region = _region(expected="Fixed label")
+    legacy_region.expected_value_hash = None
+    legacy_region.allow_nonempty_overwrite = True
+
+    with pytest.raises(PermissionError, match="baseline"):
+        XlsmRenderer().render(
+            _xlsx("Fixed label"),
+            [legacy_region],
+            _plan(),
+            _policy(),
+            security_approved=True,
+        )
+
+
 def test_renderer_rejects_duplicate_fill_targets():
     fill = WorkbookFill(
         region_id="region-a1",

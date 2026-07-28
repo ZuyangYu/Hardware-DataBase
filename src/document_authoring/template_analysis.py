@@ -91,6 +91,7 @@ class TemplateAnalysis(BaseModel):
     locked_unit_ids: list[str] = Field(default_factory=list)
     correction_actor_id: str | None = None
     correction_comment: str | None = None
+    mapping_conflict_unit_ids: list[str] = Field(default_factory=list)
 
     def validate_suggestion_targets(self) -> None:
         units = {unit.unit_id: unit for unit in self.units}

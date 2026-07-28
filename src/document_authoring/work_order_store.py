@@ -465,6 +465,71 @@ class DocumentAuthoringStore:
                 raise
         return analysis
 
+    def save_corrected_template_analysis(
+        self,
+        analysis: TemplateAnalysis,
+        *,
+        expected_parent_analysis_id: str,
+    ) -> TemplateAnalysis:
+        """Atomically append a correction revision and advance the current pointer."""
+        template = self.get_template(analysis.template_version_id)
+        if template is None:
+            raise KeyError(f"template not found: {analysis.template_version_id}")
+        if (
+            analysis.content_hash != template.content_hash
+            or analysis.format != template.format
+        ):
+            raise ValueError("template analysis content or format does not match template")
+        analysis.validate_suggestions()
+        payload_json = _json(analysis)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = conn.execute(
+                    """SELECT payload_json FROM template_analyses
+                       WHERE template_version_id = ?""",
+                    (analysis.template_version_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(
+                        f"template analysis not found: {analysis.template_version_id}"
+                    )
+                current_analysis_id = json.loads(current["payload_json"]).get(
+                    "analysis_id"
+                )
+                if current_analysis_id != expected_parent_analysis_id:
+                    raise ValueError("template analysis correction is stale")
+                conn.execute(
+                    """INSERT INTO template_analysis_revisions
+                       (analysis_id, template_version_id, content_hash, payload_json)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        analysis.analysis_id,
+                        analysis.template_version_id,
+                        analysis.content_hash,
+                        payload_json,
+                    ),
+                )
+                updated = conn.execute(
+                    """UPDATE template_analyses
+                       SET content_hash = ?, payload_json = ?
+                       WHERE template_version_id = ?
+                         AND json_extract(payload_json, '$.analysis_id') = ?""",
+                    (
+                        analysis.content_hash,
+                        payload_json,
+                        analysis.template_version_id,
+                        expected_parent_analysis_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError("template analysis correction is stale")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return analysis
+
     def get_template_analysis(self, template_version_id: str) -> TemplateAnalysis | None:
         with closing(self._connect()) as conn:
             row = conn.execute(

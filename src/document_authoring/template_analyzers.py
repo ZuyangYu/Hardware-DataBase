@@ -104,14 +104,16 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                 ref = cell.attrib.get("r", "")
                 if not ref:
                     continue
+                column, row_number = _cell_coordinates(ref)
+                if column is None or row_number is None:
+                    raise ValueError(f"invalid workbook cell reference: {ref}")
                 has_formula = cell.find("x:f", NS) is not None
                 style = _style_index(cell.attrib.get("s"))
-                invalid_style = style is None
+                invalid_style = style is None or style not in styles
                 # A protected sheet must fail closed when its style table is
                 # malformed or references an unknown cell style.
                 style_locked, style_hidden = styles.get(style, (True, False)) if style is not None else (True, False)
                 protected = sheet_protected and (invalid_style or style_locked)
-                column, _ = _cell_coordinates(ref)
                 hidden_column = invalid_hidden_column_range or any(
                     lower <= column <= upper for lower, upper in hidden_column_ranges
                 )
@@ -127,9 +129,6 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                     hidden=hidden,
                     active_content=active_content,
                 )
-                _, row_number = _cell_coordinates(ref)
-                if column is None or row_number is None:
-                    continue
                 unit = TemplateAnalysisUnit(
                     unit_id=f"sheet:{sheet_name}!{ref}",
                     locator={"sheet_name": sheet_name, "cell": ref},

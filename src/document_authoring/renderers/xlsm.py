@@ -142,6 +142,14 @@ class XlsmRenderer:
                 )
                 baseline_hash = workbook_value_hash(baseline_value)
                 if (
+                    region.expected_value_hash is None
+                    and baseline_value is not None
+                ):
+                    raise PermissionError(
+                        f"workbook region has no frozen baseline for non-empty cell: "
+                        f"{region.sheet_name}!{ref}"
+                    )
+                if (
                     region.expected_value_hash is not None
                     and baseline_hash != region.expected_value_hash
                 ):

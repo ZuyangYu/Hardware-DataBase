@@ -234,3 +234,32 @@ def test_store_migrates_current_analysis_into_revision_history(
     reopened = DocumentAuthoringStore(store.db_path, store.artifact_root)
 
     assert reopened.get_template_analysis_by_id(analysis.analysis_id) is not None
+
+
+def test_store_compare_and_swap_rejects_a_second_correction_from_same_parent(
+    store: DocumentAuthoringStore,
+    ctx: RequestContext,
+):
+    service = DocumentGenerationService(
+        store=store,
+        suggestion_provider=_FirstPlaceholderSuggester(),
+    )
+    parent = service.analyze_uploaded_template(
+        ctx,
+        filename="normal.xlsx",
+        content=_xlsx("{{project_summary}}"),
+        template_name="Normal",
+    )
+    first = parent.model_copy(update={"analysis_id": "analysis-first"})
+    second = parent.model_copy(update={"analysis_id": "analysis-second"})
+
+    store.save_corrected_template_analysis(
+        first,
+        expected_parent_analysis_id=parent.analysis_id,
+    )
+
+    with pytest.raises(ValueError, match="stale"):
+        store.save_corrected_template_analysis(
+            second,
+            expected_parent_analysis_id=parent.analysis_id,
+        )

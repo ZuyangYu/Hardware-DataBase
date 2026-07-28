@@ -55,6 +55,8 @@ def decide_template_activation(
 
     if analysis.status == "requires_human":
         reject("missing_semantic_context")
+    if analysis.mapping_conflict_unit_ids:
+        reject("mapping_conflict")
 
     seen_targets: set[str] = set()
     for suggestion in analysis.suggestions:
@@ -98,14 +100,25 @@ def decide_template_activation(
             ):
                 reject("nonempty_target_not_placeholder")
 
-    if analysis.format != "docx" and target_count and not any(
-        unit.structural_role_hint == "placeholder"
-        or unit.unit_id in analysis.human_confirmed_target_unit_ids
-        for unit in target_units
-    ):
-        if metrics.target_ratio > effective.max_target_ratio:
+    if analysis.format != "docx" and target_count:
+        risky_targets = [
+            unit
+            for unit in target_units
+            if unit.structural_role_hint != "placeholder"
+            and unit.unit_id not in analysis.human_confirmed_target_unit_ids
+        ]
+        risky_target_ratio = (
+            len(risky_targets) / total_unit_count if total_unit_count else 0.0
+        )
+        risky_nonempty_ratio = (
+            sum(unit.value_kind != "blank" for unit in risky_targets)
+            / len(risky_targets)
+            if risky_targets
+            else 0.0
+        )
+        if risky_target_ratio > effective.max_target_ratio:
             reject("destructive_target_ratio")
-        if metrics.nonempty_overwrite_ratio > effective.max_nonempty_overwrite_ratio:
+        if risky_nonempty_ratio > effective.max_nonempty_overwrite_ratio:
             reject("destructive_target_ratio")
 
     return TemplateActivationDecision(

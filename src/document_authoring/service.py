@@ -8,9 +8,11 @@ templates, project stores or artifacts directly.
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import sqlite3
 import uuid
+import zipfile
 from copy import copy
 from datetime import datetime, timezone
 from collections.abc import Callable
@@ -49,6 +51,7 @@ from src.document_authoring.template_analysis import (
     DocxRegionSchema,
     TemplateAnalysis,
     TemplateMappingCorrection,
+    workbook_value_hash,
 )
 from src.document_authoring.template_analyzers import analyze_template
 from src.document_authoring.template_progress import (
@@ -155,6 +158,31 @@ class DocumentGenerationService:
                 raise TypeError("DOCX templates require DocxRegionSchema regions")
         elif not all(isinstance(region, WorkbookRegionSchema) for region in regions):
             raise TypeError("XLSX/XLSM templates require WorkbookRegionSchema regions")
+        if template.format != "docx":
+            with zipfile.ZipFile(io.BytesIO(content), "r") as package:
+                worksheet_map = self.workbook_renderer._worksheet_part_map(package)
+                shared_strings = (
+                    self.workbook_renderer._shared_strings(
+                        package.read("xl/sharedStrings.xml")
+                    )
+                    if "xl/sharedStrings.xml" in package.namelist()
+                    else []
+                )
+                regions = [
+                    region
+                    if region.expected_value_hash is not None
+                    else region.model_copy(update={
+                        "expected_value_hash": workbook_value_hash(
+                            self.workbook_renderer._cell_value(
+                                package.read(worksheet_map[region.sheet_name]),
+                                str(region.locator["cell"]).upper(),
+                                shared_strings,
+                            )
+                        ),
+                        "allow_nonempty_overwrite": True,
+                    })
+                    for region in regions
+                ]
         seen_regions = {region.region_id for region in regions}
         if len(seen_regions) != len(regions):
             raise ValueError("template region ids must be unique")
@@ -501,6 +529,7 @@ class DocumentGenerationService:
             "locked_unit_ids": sorted(locked_ids),
             "correction_actor_id": correction.actor_id,
             "correction_comment": correction.comment,
+            "mapping_conflict_unit_ids": [],
             "activation_decision": None,
         })
         corrected.validate_suggestions()
@@ -513,7 +542,10 @@ class DocumentGenerationService:
                 else "requires_human"
             ),
         })
-        return self.store.save_template_analysis(corrected)
+        return self.store.save_corrected_template_analysis(
+            corrected,
+            expected_parent_analysis_id=analysis.analysis_id,
+        )
 
     def confirm_template_analysis(
         self,

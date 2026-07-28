@@ -141,7 +141,42 @@ def test_xlsx_analysis_fails_closed_for_an_unknown_style_in_a_protected_sheet():
     analysis = analyze_template(content, "xlsx")
 
     by_id = {unit.unit_id: unit for unit in analysis.units}
-    assert by_id["sheet:Review!A1"].blocked_reason == "protected"
+    assert by_id["sheet:Review!A1"].blocked_reason == "invalid_style"
+
+
+def test_xlsx_analysis_blocks_an_unknown_style_on_an_unprotected_sheet():
+    content = _replace_part(
+        _xlsx_with_semantic_cell_context(),
+        "xl/worksheets/sheet1.xml",
+        b'<c r="A1"',
+        b'<c r="A1" s="999"',
+    )
+
+    analysis = analyze_template(content, "xlsx")
+
+    by_id = {unit.unit_id: unit for unit in analysis.units}
+    assert by_id["sheet:Review!A1"].writable is False
+    assert by_id["sheet:Review!A1"].blocked_reason == "invalid_style"
+
+
+def test_xlsx_analysis_fails_closed_for_malformed_cell_reference_with_hidden_columns():
+    content = _replace_part(
+        _xlsx_with_semantic_cell_context(),
+        "xl/worksheets/sheet1.xml",
+        b"<sheetData>",
+        b'<cols><col min="1" max="1" hidden="1"/></cols><sheetData>',
+    )
+    content = _replace_part(
+        content,
+        "xl/worksheets/sheet1.xml",
+        b'<c r="A1"',
+        b'<c r="malformed"',
+    )
+
+    analysis = analyze_template(content, "xlsx")
+
+    assert analysis.status == "failed"
+    assert analysis.units == []
 
 
 def test_xlsx_analysis_blocks_cells_on_hidden_or_very_hidden_sheets():

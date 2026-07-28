@@ -147,3 +147,78 @@ def test_duplicate_targets_are_reported_as_mapping_conflict():
     decision = decide_template_activation(analysis)
 
     assert "mapping_conflict" in decision.reason_codes
+
+
+def test_one_placeholder_cannot_hide_a_destructive_mixed_target_ratio():
+    units = [
+        TemplateAnalysisUnit(
+            unit_id=f"sheet:Review!A{index}",
+            locator={"sheet_name": "Review", "cell": f"A{index}"},
+            writable=True,
+            value_preview=(
+                "{{safe_placeholder}}" if index == 1 else f"Fixed label {index}"
+            ),
+            value_kind="text",
+            style_fingerprint="style-1",
+            structural_role_hint="placeholder" if index == 1 else "fixed_label",
+        )
+        for index in range(1, 11)
+    ]
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-mixed",
+        template_version_id="template-mixed",
+        content_hash="a" * 64,
+        format="xlsx",
+        status="ready_for_confirmation",
+        units=units,
+        suggestions=[
+            TemplateAnalysisSuggestion(
+                semantic_unit_id=f"field-{index}",
+                label=f"Field {index}",
+                target_unit_ids=[unit.unit_id],
+                confidence=0.99,
+            )
+            for index, unit in enumerate(units[:5])
+        ],
+    )
+
+    decision = decide_template_activation(analysis)
+
+    assert "destructive_target_ratio" in decision.reason_codes
+
+
+def test_explicit_placeholders_are_not_counted_as_destructive_targets():
+    units = [
+        TemplateAnalysisUnit(
+            unit_id=f"sheet:Review!A{index}",
+            locator={"sheet_name": "Review", "cell": f"A{index}"},
+            writable=True,
+            value_preview=f"{{{{field_{index}}}}}",
+            value_kind="text",
+            style_fingerprint="style-1",
+            structural_role_hint="placeholder",
+        )
+        for index in range(1, 6)
+    ]
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-placeholders",
+        template_version_id="template-placeholders",
+        content_hash="a" * 64,
+        format="xlsx",
+        status="ready_for_confirmation",
+        units=units,
+        suggestions=[
+            TemplateAnalysisSuggestion(
+                semantic_unit_id=f"field-{index}",
+                label=f"Field {index}",
+                target_unit_ids=[unit.unit_id],
+                confidence=0.99,
+            )
+            for index, unit in enumerate(units)
+        ],
+    )
+
+    decision = decide_template_activation(analysis)
+
+    assert decision.status == "auto_accepted"
+    assert "destructive_target_ratio" not in decision.reason_codes
