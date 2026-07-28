@@ -333,6 +333,11 @@ class HarnessPolicy(BaseModel):
     max_retries: int = 1
     lease_seconds: int = 60
     max_query_rewrite_rounds: int = 1
+    # Adaptive recovery (stage 5): after attempts are exhausted on an empty
+    # success, one balanced-route retrieve may recover low-confidence evidence.
+    # Zero disables it even when the tool is allowlisted; the tool + budget
+    # form a double switch, mirroring rewrite_query + max_query_rewrite_rounds.
+    max_adaptive_recovery_rounds: int = 0
     allowed_tools: list[str] = Field(default_factory=lambda: [
         "retrieve_evidence", "draft_ready_unit", "validate_unit_draft",
         "detect_template_contamination", "validate_cross_unit", "rewrite_query",
@@ -355,6 +360,8 @@ class HarnessPolicy(BaseModel):
             raise ValueError("harness policy budgets must be positive")
         if self.max_retries < 0:
             raise ValueError("harness policy max_retries cannot be negative")
+        if self.max_adaptive_recovery_rounds < 0:
+            raise ValueError("harness policy max_adaptive_recovery_rounds cannot be negative")
         if len(self.allowed_tools) != len(set(self.allowed_tools)):
             raise ValueError("harness policy tools must be unique")
         return self
