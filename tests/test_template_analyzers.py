@@ -55,6 +55,51 @@ def _xlsx_with_merged_and_protected_cells() -> bytes:
     })
 
 
+def _xlsx_with_semantic_cell_context() -> bytes:
+    return _package({
+        "xl/workbook.xml": b'''<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Review" sheetId="1" r:id="rId1"/></sheets></workbook>''',
+        "xl/_rels/workbook.xml.rels": b'''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>''',
+        "xl/sharedStrings.xml": b'''<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
+<si><t>Project</t></si></sst>''',
+        "xl/styles.xml": b'''<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<cellXfs count="2"><xf/><xf fillId="1"/></cellXfs></styleSheet>''',
+        "xl/worksheets/sheet1.xml": b'''<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData><row r="1">
+<c r="A1" t="s"><v>0</v></c>
+<c r="B1" t="inlineStr"><is><t>{{project_summary}}</t></is></c>
+<c r="C1" s="1"/>
+<c r="D1"><f>SUM(E1:E2)</f><v>3</v></c>
+<c r="E1"><v>42</v></c>
+</row></sheetData></worksheet>''',
+    })
+
+
+def test_xlsx_analysis_exposes_bounded_content_roles_styles_and_neighborhoods():
+    analysis = analyze_template(_xlsx_with_semantic_cell_context(), "xlsx")
+
+    units = {unit.unit_id: unit for unit in analysis.units}
+    assert units["sheet:Review!A1"].value_preview == "Project"
+    assert units["sheet:Review!A1"].value_kind == "text"
+    assert units["sheet:Review!A1"].structural_role_hint == "fixed_label"
+    assert units["sheet:Review!B1"].value_preview == "{{project_summary}}"
+    assert units["sheet:Review!B1"].structural_role_hint == "placeholder"
+    assert units["sheet:Review!C1"].value_kind == "blank"
+    assert units["sheet:Review!C1"].structural_role_hint == "layout_blank"
+    assert units["sheet:Review!C1"].style_fingerprint
+    assert units["sheet:Review!D1"].value_kind == "formula"
+    assert units["sheet:Review!D1"].value_preview is None
+    assert units["sheet:Review!D1"].writable is False
+    assert units["sheet:Review!E1"].value_kind == "number"
+    assert any(
+        neighbor.value_preview == "Project"
+        for neighbor in units["sheet:Review!B1"].neighborhood
+    )
+
+
 def _docx_with_paragraph_table_and_external_link() -> bytes:
     return _package({
         "word/document.xml": b'''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">

@@ -5,11 +5,16 @@ from __future__ import annotations
 import hashlib
 import io
 import posixpath
+import re
 import zipfile
 from typing import Literal
 from xml.etree import ElementTree as ET
 
-from src.document_authoring.template_analysis import TemplateAnalysis, TemplateAnalysisUnit
+from src.document_authoring.template_analysis import (
+    TemplateAnalysis,
+    TemplateAnalysisUnit,
+    TemplateNeighbor,
+)
 
 
 SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -17,6 +22,11 @@ OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relations
 PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS = {"x": SPREADSHEET_NS, "r": OFFICE_REL_NS, "pr": PACKAGE_REL_NS, "w": WORD_NS}
+_PLACEHOLDER_RE = re.compile(
+    r"^(?:\{\{[A-Za-z_][A-Za-z0-9_.-]*\}\}|\$\{[A-Za-z_][A-Za-z0-9_.-]*\}|<<[A-Za-z_][A-Za-z0-9_.-]*>>)$"
+)
+_MAX_VALUE_PREVIEW = 256
+_NEIGHBOR_RADIUS = 2
 
 
 def analyze_template(
@@ -66,7 +76,10 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
     workbook = ET.fromstring(package.read("xl/workbook.xml"))
     workbook_protected = workbook.find("x:workbookProtection", NS) is not None
     rel_targets = _relationship_targets(package.read("xl/_rels/workbook.xml.rels"))
-    styles = _style_protection(package.read("xl/styles.xml") if "xl/styles.xml" in names else None)
+    styles_xml = package.read("xl/styles.xml") if "xl/styles.xml" in names else None
+    styles = _style_protection(styles_xml)
+    style_fingerprints = _style_fingerprints(styles_xml)
+    shared_strings = _shared_strings(package.read("xl/sharedStrings.xml")) if "xl/sharedStrings.xml" in names else []
     units: list[TemplateAnalysisUnit] = []
     for sheet in workbook.findall("x:sheets/x:sheet", NS):
         sheet_name = sheet.attrib.get("name", "Sheet")
@@ -82,6 +95,8 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
         sheet_protected = workbook_protected or root.find("x:sheetProtection", NS) is not None
         merged_non_anchors = _merged_non_anchors(root)
         hidden_column_ranges, invalid_hidden_column_range = _hidden_column_ranges(root)
+        sheet_units: list[tuple[TemplateAnalysisUnit, int, int]] = []
+        nonempty_values: dict[tuple[int, int], str] = {}
         for row in root.findall(".//x:sheetData/x:row", NS):
             row_hidden = row.attrib.get("hidden") in {"1", "true", "True"}
             for cell in row.findall("x:c", NS):
@@ -100,6 +115,7 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                     lower <= column <= upper for lower, upper in hidden_column_ranges
                 )
                 hidden = row_hidden or style_hidden
+                value_kind, value_preview = _workbook_cell_value(cell, shared_strings)
                 blocked_reason = _workbook_blocked_reason(
                     has_formula=has_formula,
                     merged_non_anchor=ref in merged_non_anchors,
@@ -110,14 +126,96 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                     hidden=hidden,
                     active_content=active_content,
                 )
-                units.append(TemplateAnalysisUnit(
+                _, row_number = _cell_coordinates(ref)
+                if column is None or row_number is None:
+                    continue
+                unit = TemplateAnalysisUnit(
                     unit_id=f"sheet:{sheet_name}!{ref}",
                     locator={"sheet_name": sheet_name, "cell": ref},
                     label=f"{sheet_name}!{ref}",
                     writable=blocked_reason is None,
                     blocked_reason=blocked_reason,
-                ))
+                    value_preview=value_preview,
+                    value_kind=value_kind,
+                    style_fingerprint=style_fingerprints.get(
+                        style,
+                        hashlib.sha256(f"style:{style}".encode("utf-8")).hexdigest()[:16],
+                    ),
+                    structural_role_hint=_structural_role(value_kind, value_preview),
+                )
+                sheet_units.append((unit, column, row_number))
+                if value_preview:
+                    nonempty_values[(column, row_number)] = value_preview
+        for unit, column, row_number in sheet_units:
+            neighbors = [
+                TemplateNeighbor(
+                    relative_row=neighbor_row - row_number,
+                    relative_column=neighbor_column - column,
+                    value_preview=preview,
+                )
+                for neighbor_row in range(max(1, row_number - _NEIGHBOR_RADIUS), row_number + _NEIGHBOR_RADIUS + 1)
+                for neighbor_column in range(max(1, column - _NEIGHBOR_RADIUS), column + _NEIGHBOR_RADIUS + 1)
+                if (neighbor_column, neighbor_row) != (column, row_number)
+                if (preview := nonempty_values.get((neighbor_column, neighbor_row))) is not None
+            ]
+            units.append(unit.model_copy(update={"neighborhood": neighbors}))
     return units, active_content
+
+
+def _shared_strings(content: bytes) -> list[str]:
+    root = ET.fromstring(content)
+    return [
+        _bounded_preview("".join(text.text or "" for text in item.findall(".//x:t", NS))) or ""
+        for item in root.findall("x:si", NS)
+    ]
+
+
+def _workbook_cell_value(
+    cell: ET.Element,
+    shared_strings: list[str],
+) -> tuple[Literal["blank", "text", "number", "boolean", "formula", "error"], str | None]:
+    if cell.find("x:f", NS) is not None:
+        return "formula", None
+    cell_type = cell.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        return "text", _bounded_preview("".join(text.text or "" for text in cell.findall(".//x:t", NS)))
+    value = cell.findtext("x:v", default="", namespaces=NS)
+    if cell_type == "s":
+        try:
+            return "text", _bounded_preview(shared_strings[int(value)])
+        except (ValueError, IndexError):
+            return "error", None
+    if cell_type == "b":
+        return "boolean", "TRUE" if value == "1" else "FALSE"
+    if cell_type == "e":
+        return "error", _bounded_preview(value)
+    if cell_type in {"str", "d"}:
+        return "text", _bounded_preview(value)
+    if value == "":
+        return "blank", None
+    return "number", _bounded_preview(value)
+
+
+def _bounded_preview(value: str) -> str | None:
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized[:_MAX_VALUE_PREVIEW]
+
+
+def _structural_role(
+    value_kind: Literal["blank", "text", "number", "boolean", "formula", "error"],
+    value_preview: str | None,
+) -> Literal["unknown", "fixed_label", "placeholder", "value", "layout_blank"]:
+    if value_kind == "formula":
+        return "unknown"
+    if value_kind == "blank":
+        return "layout_blank"
+    if value_kind == "text" and value_preview and _PLACEHOLDER_RE.fullmatch(value_preview):
+        return "placeholder"
+    if value_kind == "text":
+        return "fixed_label"
+    return "value"
 
 
 def _workbook_has_active_content(names: set[str], package: zipfile.ZipFile) -> bool:
@@ -170,6 +268,17 @@ def _style_protection(styles_xml: bytes | None) -> dict[int, tuple[bool, bool]]:
         hidden = protection is not None and protection.attrib.get("hidden", "0") == "1"
         result[index] = (locked, hidden)
     return result or {0: (True, False)}
+
+
+def _style_fingerprints(styles_xml: bytes | None) -> dict[int, str]:
+    if not styles_xml:
+        return {0: hashlib.sha256(b"default-cell-style").hexdigest()[:16]}
+    root = ET.fromstring(styles_xml)
+    result = {
+        index: hashlib.sha256(ET.tostring(xf, encoding="utf-8")).hexdigest()[:16]
+        for index, xf in enumerate(root.findall("x:cellXfs/x:xf", NS))
+    }
+    return result or {0: hashlib.sha256(b"default-cell-style").hexdigest()[:16]}
 
 
 def _style_index(value: str | None) -> int | None:

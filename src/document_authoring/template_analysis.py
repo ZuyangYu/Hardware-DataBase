@@ -7,12 +7,31 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+class TemplateNeighbor(BaseModel):
+    relative_row: int
+    relative_column: int
+    value_preview: str
+
+
 class TemplateAnalysisUnit(BaseModel):
     unit_id: str
     locator: dict[str, Any]
     label: str = ""
     writable: bool = False
     blocked_reason: str | None = None
+    value_preview: str | None = None
+    value_kind: Literal["blank", "text", "number", "boolean", "formula", "error"] = "blank"
+    style_fingerprint: str = ""
+    neighborhood: list[TemplateNeighbor] = Field(default_factory=list)
+    structural_role_hint: Literal[
+        "unknown",
+        "fixed_label",
+        "placeholder",
+        "value",
+        "table_header",
+        "table_body",
+        "layout_blank",
+    ] = "unknown"
 
 
 class TemplateAnalysisSuggestion(BaseModel):
@@ -21,6 +40,7 @@ class TemplateAnalysisSuggestion(BaseModel):
     target_unit_ids: list[str]
     retrieval_terms: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
+    value_shape: Literal["scalar", "repeating_table"] = "scalar"
 
 
 class TemplateAnalysis(BaseModel):
