@@ -99,13 +99,14 @@ capabilities 不分流(P4) ─┘                                          ─�
 
 **验收**：不同 capability 的字段走不同检索器；`tabular_lookup` 字段命中 spreadsheet 证据（KB 与 project 路径均成立）。
 
-### 阶段 3：rerank + 检索可观测性 —— 闭环 P6/P9
+### 阶段 3：rerank + 检索可观测性 -- 闭环 P6/P9
 
 **改动点**：
-1. Coordinator 合并后、送 writer 前，加轻量 reranker（cross-encoder 或 LLM-as-judge，受 `allowed_tools` 守门），按 requirement 相关性重排取 top_k。
-2. 持久化 per-unit `RetrievalLedgerRow`：`{unit_id, original_query, rewrites[], per_retriever: {tool, query, hit_count, fallback_triggered}, final_evidence_ids}`，存入 evidence_matrix，并在人工审核 UI 展示。现成锚点：`DocumentAuthoringState` 已预留 `retrieval_ledger` 字段（`graph.py:39`，从未写入），matrix row 已带 per-source `diagnostics`（`graph.py:124`），可直接复用。
+1. Coordinator 合并后、送 writer 前，加轻量 reranker（LLM-as-judge，复用 `LLMClient`，受 `allowed_tools` 守门），按 requirement 相关性重排已校验证据。**v1 只重排不截断**（避免丢弃已过落域校验的证据致字段误判 missing）；`top_k` 截断能力已实现并有单测，待阶段 4 `requirement_fit_check` 就位后启用。旧 policy 无 `rerank_evidence` -> reranker 不注入 -> pass-through（与阶段 1 `rewrite_query` 同前例）。
+2. 持久化 per-unit `RetrievalLedgerRow`：`{unit_id, original_query, rewrites[], per_source[], fallback_triggered, final_evidence_ids}`，嵌入 matrix row 复用 `save_evidence_matrix` 持久化供人工审核 UI 展示，并回填 `HarnessExecutionResult.retrieval_ledger`（修复 `DocumentAuthoringState.retrieval_ledger` 预留字段从未写入 result 的 latent 缺口）。现成锚点：matrix row 已带 per-source `diagnostics`（= `outcome.source_outcomes`），`per_source` 直接聚合；`rewrites` 复用阶段 1 改写记录。
+3. `fallback_triggered` 从 `outcome.evidences`（保留 metadata）取 RAGFlow `ragflow_source_name_fallback`/`ragflow_metadata_condition_fallback` 标志，**不用** validated dict（project 路径 `_validated_evidence` 已剥 metadata）。
 
-**验收**：人工审核页能看到每个字段的"查询串/改写/各检索器命中数/是否触发 fallback"；rerank 后送 writer 的证据更相关。
+**验收**：人工审核页能看到每个字段的"查询串/改写/各来源命中数/是否触发 fallback/最终证据"；rerank 后送 writer 的证据按相关性重排（reranker=None 时原序，零回归）。
 
 ### 阶段 4：草稿质量 —— 闭环 P5/P10
 
@@ -190,4 +191,5 @@ capabilities 不分流(P4) ─┘                                          ─�
 | 阶段 0（spreadsheet 接通） | 已实施 | 闭包隔离 + 仅 `tabular_lookup` 触发 + 冻结集过滤；spec 见 `docs/superpowers/specs/2026-07-27-spreadsheet-retrieval-stage0-design.md`，计划见 `docs/superpowers/plans/2026-07-27-spreadsheet-retrieval-stage0.md` |
 | 阶段 1（查询改写+空结果重试） | 已实施 | retrieve 签名加 `query_override`；`QueryRewriter` 仿 writer 注入 harness，`require_tool("rewrite_query")` 守门，`success_empty` 触发改写重试，LLM 失败降级原串；spec 见 `docs/superpowers/specs/2026-07-27-query-rewrite-stage1-design.md` |
 | 阶段 2（capability-aware 分发） | 已实施 | `RetrieverRegistry`（default RAGFlow 始终调用 + specialized 叠加）泛化阶段 0；按 `content` 哈希去重；`preferred_source_roles` 加分（P7）；`CrossUnitEvidenceCache` 跨单元复用（P8）；project 路径补 spreadsheet 分派（绑 version_id+artifact 过 `retrieval.py:70`）；spec 见 `docs/superpowers/specs/2026-07-27-capability-dispatch-stage2-design.md` |
-| 阶段 3–5 | 未实施 | 见 §3 |
+| 阶段 3（rerank + 检索可观测性） | 已实施 | `EvidenceReranker`（LLM-as-judge，受 `rerank_evidence` allowlist 守门，v1 只重排不截断）送 writer 前重排；per-unit `RetrievalLedgerRow` 嵌 matrix row + 回填 `HarnessExecutionResult.retrieval_ledger`（修复预留字段从未写入 result）；`fallback_triggered` 从 `outcome.evidences` 取；spec 见 `docs/superpowers/specs/2026-07-28-rerank-ledger-stage3-design.md` |
+| 阶段 4–5 | 未实施 | 见 §3 |
