@@ -30,6 +30,7 @@ from src.projects.models import SourceSetSnapshot
 if TYPE_CHECKING:
     from src.document_authoring.writers.evidence_reranker import EvidenceReranker
     from src.document_authoring.writers.query_rewriter import QueryRewriter
+    from src.document_authoring.writers.requirement_fit_checker import RequirementFitChecker
 
 
 class DocumentAuthoringState(TypedDict, total=False):
@@ -76,6 +77,7 @@ class AuthoringGraph:
         draft_provider: DraftProvider | None = None,
         rewriter: "QueryRewriter | None" = None,
         reranker: "EvidenceReranker | None" = None,
+        fit_checker: "RequirementFitChecker | None" = None,
     ):
         self.policy = policy
         self.writer = writer
@@ -84,6 +86,7 @@ class AuthoringGraph:
         self.draft_provider = draft_provider or writer.generate
         self.rewriter = rewriter
         self.reranker = reranker
+        self.fit_checker = fit_checker
 
     def run(
         self,
@@ -178,6 +181,27 @@ class AuthoringGraph:
                     result.unit_statuses[unit_id] = "requires_human"
                 elif validated.validation_status != "supported":
                     result.unit_statuses[unit_id] = "requires_human"
+                elif self.fit_checker is not None:
+                    # Requirement fit check (P10): LLM judges whether the draft
+                    # actually answers the requirement. Gated by the allowlist;
+                    # an old policy without requirement_fit_check never injects
+                    # a fit_checker, and require_tool defends a mismatched
+                    # injection. Degrades to a pass verdict on LLM failure.
+                    self._step(state, "requirement_fit_check")
+                    self.policy.require_tool("requirement_fit_check")
+                    verdict = self.fit_checker.check(validated, requirement)
+                    if not verdict["fit"]:
+                        validated = validated.model_copy(update={
+                            "validation_status": "requires_human",
+                            "validation_notes": [*validated.validation_notes, f"requirement fit check: {verdict['reason']}"],
+                        })
+                        result.issues.append({
+                            "kind": "requirement_fit_failed", "unit_id": unit_id,
+                            "reason": verdict["reason"],
+                        })
+                        result.unit_statuses[unit_id] = "requires_human"
+                    else:
+                        result.unit_statuses[unit_id] = "ready_to_render"
                 else:
                     result.unit_statuses[unit_id] = "ready_to_render"
                 result.drafts.append(validated)
