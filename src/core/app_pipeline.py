@@ -593,6 +593,10 @@ class AppPipeline:
         tenant_id = ctx.tenant_id or "default"
         bindings = self.projects.store.list_knowledge_bindings(project_id, tenant_id)
         fallback_kb_names = [binding.kb_name_snapshot for binding in bindings if binding.kb_name_snapshot]
+        # Cross-unit evidence reuse cache (P8): persists across units within one
+        # run (the closure is reused per unit). Offer is only consulted when a
+        # unit's fresh retrieval is empty, so reuse never adds noise to a hit.
+        cross_unit_cache = CrossUnitEvidenceCache()
 
         def retrieve(requirement, _attempt, query_override=None):
             def retrieve_one(version_id: str, artifact_ids: list[str], _region_policies: dict[str, str]):
@@ -636,9 +640,69 @@ class AppPipeline:
                             revision=version.revision,
                             approval_status=version.approval_status,
                         ))
+                # Capability-aware spreadsheet dispatch (closes the project-path
+                # gap symmetrical to P1): tabular_lookup requirements also query
+                # the spreadsheet structured index. The tool's `filters` only
+                # honours record_id, so we filter by document.title (same scope
+                # as the RAGFlow source_names filter) and bind each hit to the
+                # current version + artifact so it passes the per-version scope
+                # validation in ProjectEvidenceRetrievalService.retrieve.
+                if (
+                    self.spreadsheet_service is not None
+                    and "tabular_lookup" in (requirement.required_capabilities or [])
+                ):
+                    sp_evidences = SpreadsheetSemanticTool(self.spreadsheet_service).run(
+                        query,
+                        source_kb_name or (kb_names[0] if kb_names else ""),
+                        ctx,
+                        top_k=config.settings.FINAL_TOP_K,
+                        filters=None,
+                    )
+                    for evidence in sp_evidences:
+                        if evidence.source_name != document.title:
+                            continue
+                        result.append(EvidenceEnvelope(
+                            id=evidence.id,
+                            content=evidence.content,
+                            source_name=evidence.source_name,
+                            source_type=getattr(evidence, "source_type", "spreadsheet"),
+                            score=evidence.score,
+                            metadata=dict(evidence.metadata),
+                            backend=getattr(evidence, "backend", "spreadsheet"),
+                            retriever=getattr(evidence, "retriever", "spreadsheet_semantic"),
+                            project_id=project_id,
+                            source_version_id=version_id,
+                            processing_artifact_id=artifact_ids[0] if len(artifact_ids) == 1 else None,
+                            document_role=document.document_role,
+                            revision=version.revision,
+                            approval_status=version.approval_status,
+                        ))
                 return result
 
-            return self.project_retrieval.retrieve(ctx, requirement, snapshot_id, retrieve_one)
+            outcome = self.project_retrieval.retrieve(ctx, requirement, snapshot_id, retrieve_one)
+            query = query_override or " ".join(
+                value for value in (requirement.subject, requirement.predicate, requirement.object_hint) if value
+            )
+            # Post-process the validated evidence: dedup by content hash (P4
+            # merge), boost preferred_source_roles (P7), and cross-unit reuse
+            # on empty retrieval (P8). Only genuinely fresh evidence is ingested
+            # so provenance is preserved; reused evidence is tagged for the
+            # Stage 4 requirement_fit_check to scrutinise.
+            fresh = dedup_by_content(list(outcome.evidences))
+            fresh = apply_role_boost(fresh, requirement.preferred_source_roles)
+            if fresh:
+                outcome.evidences = fresh
+                cross_unit_cache.ingest(fresh, requirement.semantic_unit_id)
+            else:
+                reused = cross_unit_cache.offer(requirement, query, requirement.semantic_unit_id)
+                if reused:
+                    outcome.evidences = reused
+                    # Upgraded from success_empty: reused evidence makes the
+                    # unit answerable (low-confidence, routed to human review).
+                    outcome.status = "success_with_hits"
+                else:
+                    outcome.evidences = []
+            return outcome
 
         return retrieve
 
