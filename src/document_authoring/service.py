@@ -770,6 +770,7 @@ class DocumentGenerationService:
         if writer.provider.provider_id != policy.writer_provider_id:
             raise PermissionError("writer provider does not match the approved HarnessPolicy")
         rewriter = self._rewriter_for_policy(policy)
+        reranker = self._reranker_for_policy(policy)
         schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
         template = self._template(order.template_version_id)
@@ -779,7 +780,7 @@ class DocumentGenerationService:
             result = self.harness_runtime.execute(
                 work_order=order, run=run, manifest=manifest, policy=policy, schema=schema, snapshot=snapshot,
                 legacy_claims=self.store.list_legacy_template_claims(template.template_version_id),
-                writer=writer, retrieve=retrieve, rewriter=rewriter,
+                writer=writer, retrieve=retrieve, rewriter=rewriter, reranker=reranker,
             )
         except Exception:
             current_run = self.store.get_harness_run(run.harness_run_id)
@@ -835,6 +836,7 @@ class DocumentGenerationService:
         if writer.provider.provider_id != policy.writer_provider_id:
             raise PermissionError("writer provider does not match the frozen HarnessPolicy")
         rewriter = self._rewriter_for_policy(policy)
+        reranker = self._reranker_for_policy(policy)
         schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
         template = self._template(order.template_version_id)
@@ -843,7 +845,7 @@ class DocumentGenerationService:
             result = self.harness_runtime.execute(
                 work_order=order, run=run, manifest=manifest, policy=policy, schema=schema, snapshot=snapshot,
                 legacy_claims=self.store.list_legacy_template_claims(template.template_version_id),
-                writer=writer, retrieve=retrieve, rewriter=rewriter,
+                writer=writer, retrieve=retrieve, rewriter=rewriter, reranker=reranker,
             )
         except Exception:
             current_run = self.store.get_harness_run(run.harness_run_id)
@@ -1112,6 +1114,14 @@ class DocumentGenerationService:
         if "rewrite_query" in policy.allowed_tools:
             from src.document_authoring.writers.query_rewriter import QueryRewriter
             return QueryRewriter()
+        return None
+
+    @staticmethod
+    def _reranker_for_policy(policy: HarnessPolicy):
+        """Build an EvidenceReranker only when the frozen policy allows it."""
+        if "rerank_evidence" in policy.allowed_tools:
+            from src.document_authoring.writers.evidence_reranker import EvidenceReranker
+            return EvidenceReranker()
         return None
 
     def _schema(self, schema_id: str, version: str) -> DocumentSchema:

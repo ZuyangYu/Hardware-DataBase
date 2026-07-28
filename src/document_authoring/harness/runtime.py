@@ -29,6 +29,7 @@ from src.document_authoring.writers.managed import ManagedWriter
 from src.projects.models import SourceSetSnapshot
 
 if TYPE_CHECKING:
+    from src.document_authoring.writers.evidence_reranker import EvidenceReranker
     from src.document_authoring.writers.query_rewriter import QueryRewriter
 
 
@@ -104,6 +105,7 @@ class InternalDocumentHarnessRuntime:
         writer: ManagedWriter,
         retrieve: RetrievalProvider,
         rewriter: "QueryRewriter | None" = None,
+        reranker: "EvidenceReranker | None" = None,
     ) -> HarnessExecutionResult:
         lease_owner = f"harness-worker-{uuid.uuid4().hex}"
         running = self.store.claim_harness_run(run.harness_run_id, lease_owner, policy.lease_seconds)
@@ -190,6 +192,7 @@ class InternalDocumentHarnessRuntime:
                 on_progress=save_progress,
                 draft_provider=draft_with_receipt,
                 rewriter=rewriter,
+                reranker=reranker,
             )
             result = graph.run(
                 work_order=work_order, harness_run=running, run_manifest=manifest, schema=schema, snapshot=snapshot,

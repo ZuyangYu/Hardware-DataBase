@@ -336,6 +336,7 @@ class HarnessPolicy(BaseModel):
     allowed_tools: list[str] = Field(default_factory=lambda: [
         "retrieve_evidence", "draft_ready_unit", "validate_unit_draft",
         "detect_template_contamination", "validate_cross_unit", "rewrite_query",
+        "rerank_evidence",
     ])
     writer_provider_id: str = "managed"
     prompt_version: str = "1"
