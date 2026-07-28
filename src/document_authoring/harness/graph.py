@@ -28,6 +28,7 @@ from src.document_authoring.writers.provider import WriterRequest
 from src.projects.models import SourceSetSnapshot
 
 if TYPE_CHECKING:
+    from src.document_authoring.writers.evidence_reranker import EvidenceReranker
     from src.document_authoring.writers.query_rewriter import QueryRewriter
 
 
@@ -57,6 +58,7 @@ class HarnessExecutionResult:
     requirements: dict[str, InformationRequirement] = field(default_factory=dict)
     outcomes: dict[str, RetrievalOutcome] = field(default_factory=dict)
     matrix_rows: list[dict[str, Any]] = field(default_factory=list)
+    retrieval_ledger: list[dict[str, Any]] = field(default_factory=list)
     drafts: list[DocumentUnitDraft] = field(default_factory=list)
     unit_statuses: dict[str, str] = field(default_factory=dict)
     issues: list[dict[str, Any]] = field(default_factory=list)
@@ -73,6 +75,7 @@ class AuthoringGraph:
         on_progress: ProgressCallback | None = None,
         draft_provider: DraftProvider | None = None,
         rewriter: "QueryRewriter | None" = None,
+        reranker: "EvidenceReranker | None" = None,
     ):
         self.policy = policy
         self.writer = writer
@@ -80,6 +83,7 @@ class AuthoringGraph:
         self.on_progress = on_progress
         self.draft_provider = draft_provider or writer.generate
         self.rewriter = rewriter
+        self.reranker = reranker
 
     def run(
         self,
@@ -119,6 +123,19 @@ class AuthoringGraph:
                 outcome = self._retrieve_with_budget(state, requirement, retrieve)
                 result.outcomes[unit_id] = outcome
                 evidence = _validated_evidence(work_order, snapshot, outcome)
+                if evidence and self.reranker is not None:
+                    # Rerank (P6): reorder validated evidence by requirement
+                    # relevance before the writer. Gated by the allowlist; an
+                    # old policy without rerank_evidence never injects a
+                    # reranker, and require_tool defends a mismatched injection.
+                    self._step(state, "rerank_evidence")
+                    self.policy.require_tool("rerank_evidence")
+                    evidence = self.reranker.rerank(requirement, evidence)
+                # Retrieval ledger (P9): per-unit observability row surfaced in
+                # the matrix (for human review) and on the result, so it is no
+                # longer dropped when run() returns.
+                ledger_row = _retrieval_ledger_row(unit_id, requirement, outcome, evidence, state)
+                result.retrieval_ledger.append(ledger_row)
                 result.matrix_rows.append({
                     "field_id": unit_id.removeprefix("field:") if unit_id.startswith("field:") else None,
                     "review_item_id": unit_id.removeprefix("review:") if unit_id.startswith("review:") else None,
@@ -127,6 +144,7 @@ class AuthoringGraph:
                     "evidence_ids": [entry["id"] for entry in evidence],
                     "display_value": None,
                     "diagnostics": [source.model_dump(mode="json") for source in outcome.source_outcomes],
+                    "retrieval_ledger": ledger_row,
                 })
                 if not evidence:
                     result.unit_statuses[unit_id] = _missing_status(unit_id, schema, outcome)
@@ -321,6 +339,55 @@ def _query_string(requirement: InformationRequirement) -> str:
         value
         for value in (requirement.subject, requirement.predicate, requirement.object_hint)
         if value
+    )
+
+
+def _retrieval_ledger_row(
+    unit_id: str,
+    requirement: InformationRequirement,
+    outcome: RetrievalOutcome,
+    evidence: list[dict[str, Any]],
+    state: DocumentAuthoringState,
+) -> dict[str, Any]:
+    """Build a per-unit retrieval observability row (P9).
+
+    Surfaces the query, any rewrites, per-source hit counts, whether a RAGFlow
+    fallback was triggered, and the final (post-rerank) evidence ids so a human
+    reviewer can see why a field is empty. ``fallback_triggered`` is read from
+    ``outcome.evidences`` (which retain metadata), not the validated dicts --
+    the project path strips metadata during validation.
+    """
+    rewrites = [
+        entry["rewrite"]
+        for entry in state.get("retrieval_ledger", [])
+        if entry.get("unit_id") == unit_id and entry.get("rewrite")
+    ]
+    per_source = [
+        {
+            "source": source.source_version_id,
+            "status": source.status,
+            "hit_count": len(source.evidence_ids),
+        }
+        for source in outcome.source_outcomes
+    ]
+    return {
+        "unit_id": unit_id,
+        "original_query": _query_string(requirement),
+        "rewrites": rewrites,
+        "per_source": per_source,
+        "fallback_triggered": any(
+            _evidence_fallback(evidence_obj) for evidence_obj in outcome.evidences
+        ),
+        "final_evidence_ids": [entry["id"] for entry in evidence],
+    }
+
+
+def _evidence_fallback(evidence: Any) -> bool:
+    """True if a RAGFlow source-group fallback flag is set on the evidence."""
+    metadata = getattr(evidence, "metadata", None) or {}
+    return bool(
+        metadata.get("ragflow_source_name_fallback")
+        or metadata.get("ragflow_metadata_condition_fallback")
     )
 
 
