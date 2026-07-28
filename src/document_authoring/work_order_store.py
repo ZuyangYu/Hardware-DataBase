@@ -82,6 +82,13 @@ class DocumentAuthoringStore:
                     payload_json TEXT NOT NULL,
                     FOREIGN KEY(template_version_id) REFERENCES template_versions(template_version_id)
                 );
+                CREATE TABLE IF NOT EXISTS template_analysis_revisions (
+                    analysis_id TEXT PRIMARY KEY, template_version_id TEXT NOT NULL,
+                    content_hash TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    FOREIGN KEY(template_version_id) REFERENCES template_versions(template_version_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_template_analysis_revisions_template
+                    ON template_analysis_revisions(template_version_id);
                 CREATE TABLE IF NOT EXISTS template_security_reports (
                     report_id TEXT PRIMARY KEY, template_version_id TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
@@ -225,6 +232,14 @@ class DocumentAuthoringStore:
             )
             self._migrate_docx_regions(conn)
             self._migrate_document_work_orders(conn)
+            conn.execute(
+                """INSERT OR IGNORE INTO template_analysis_revisions
+                   (analysis_id, template_version_id, content_hash, payload_json)
+                   SELECT json_extract(payload_json, '$.analysis_id'),
+                          template_version_id, content_hash, payload_json
+                   FROM template_analyses
+                   WHERE json_extract(payload_json, '$.analysis_id') IS NOT NULL"""
+            )
 
     @staticmethod
     def _migrate_docx_regions(conn: sqlite3.Connection) -> None:
@@ -416,13 +431,38 @@ class DocumentAuthoringStore:
             raise ValueError("template analysis format does not match template format")
         analysis.validate_suggestions()
         with closing(self._connect()) as conn:
-            conn.execute(
-                """INSERT INTO template_analyses (template_version_id, content_hash, payload_json)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(template_version_id) DO UPDATE SET
-                       content_hash = excluded.content_hash, payload_json = excluded.payload_json""",
-                (analysis.template_version_id, analysis.content_hash, _json(analysis)),
-            )
+            payload_json = _json(analysis)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json FROM template_analysis_revisions WHERE analysis_id = ?",
+                    (analysis.analysis_id,),
+                ).fetchone()
+                if existing is not None and existing["payload_json"] != payload_json:
+                    raise ValueError("template analysis revision is immutable")
+                if existing is None:
+                    conn.execute(
+                        """INSERT INTO template_analysis_revisions
+                           (analysis_id, template_version_id, content_hash, payload_json)
+                           VALUES (?, ?, ?, ?)""",
+                        (
+                            analysis.analysis_id,
+                            analysis.template_version_id,
+                            analysis.content_hash,
+                            payload_json,
+                        ),
+                    )
+                conn.execute(
+                    """INSERT INTO template_analyses (template_version_id, content_hash, payload_json)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(template_version_id) DO UPDATE SET
+                           content_hash = excluded.content_hash, payload_json = excluded.payload_json""",
+                    (analysis.template_version_id, analysis.content_hash, payload_json),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         return analysis
 
     def get_template_analysis(self, template_version_id: str) -> TemplateAnalysis | None:
@@ -452,16 +492,27 @@ class DocumentAuthoringStore:
 
     def get_template_analysis_by_id(self, analysis_id: str) -> TemplateAnalysis | None:
         with closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT payload_json FROM template_analyses WHERE json_extract(payload_json, '$.analysis_id') = ?",
+            row = conn.execute(
+                """SELECT payload_json, content_hash, template_version_id
+                   FROM template_analysis_revisions WHERE analysis_id = ?""",
                 (analysis_id,),
-            ).fetchall()
-        if not rows:
+            ).fetchone()
+        if row is None:
             return None
-        if len(rows) != 1:
-            raise ValueError("template analysis id is not unique")
-        analysis = TemplateAnalysis.model_validate(_payload(rows[0]))
-        return self.get_template_analysis(analysis.template_version_id)
+        analysis = TemplateAnalysis.model_validate(_payload(row))
+        template = self.get_template(row["template_version_id"])
+        if template is None:
+            raise KeyError(f"template not found: {row['template_version_id']}")
+        if (
+            analysis.analysis_id != analysis_id
+            or analysis.template_version_id != row["template_version_id"]
+            or row["content_hash"] != template.content_hash
+            or analysis.content_hash != row["content_hash"]
+            or analysis.format != template.format
+        ):
+            raise ValueError("template analysis revision integrity check failed")
+        analysis.validate_suggestions()
+        return analysis
 
     def list_templates(self, approved_only: bool = False) -> list[TemplateVersion]:
         sql = "SELECT payload_json FROM template_versions"

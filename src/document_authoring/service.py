@@ -44,7 +44,12 @@ from src.document_authoring.models import (
 )
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
-from src.document_authoring.template_analysis import DocxRegionSchema, TemplateAnalysis
+from src.document_authoring.template_activation import decide_template_activation
+from src.document_authoring.template_analysis import (
+    DocxRegionSchema,
+    TemplateAnalysis,
+    TemplateMappingCorrection,
+)
 from src.document_authoring.template_analyzers import analyze_template
 from src.document_authoring.template_progress import (
     TemplateProgress,
@@ -254,6 +259,15 @@ class DocumentGenerationService:
             else:
                 self.template_suggester.suggest(analysis)
             analysis.validate_suggestions()
+            activation_decision = decide_template_activation(analysis)
+            analysis = analysis.model_copy(update={
+                "activation_decision": activation_decision,
+                "status": (
+                    "ready_for_confirmation"
+                    if activation_decision.status == "auto_accepted"
+                    else "requires_human"
+                ),
+            })
         except (TemplateSuggestionTechnicalFailure, requests.RequestException) as exc:
             logger.exception(
                 "Template suggestion technical failure; preserving the sanitized draft for audit: "
@@ -283,6 +297,7 @@ class DocumentGenerationService:
             )
             analysis.status = "requires_human"
             analysis.suggestions = []
+            analysis.activation_decision = decide_template_activation(analysis)
         saved_analysis = self.store.save_template_analysis(analysis)
         report_template_progress(
             progress_callback,
@@ -322,7 +337,11 @@ class DocumentGenerationService:
                 ),
             )
             raise
-        if analysis.status != "ready_for_confirmation":
+        if (
+            analysis.status != "ready_for_confirmation"
+            or analysis.activation_decision is None
+            or analysis.activation_decision.status != "auto_accepted"
+        ):
             report_template_progress(
                 progress_callback,
                 TemplateProgress(
@@ -389,6 +408,70 @@ class DocumentGenerationService:
         """Read the complete audit record only within the document-authoring service."""
         return self.store.get_template_sanitization_report(template_version_id)
 
+    def correct_template_analysis(
+        self,
+        ctx: RequestContext,
+        *,
+        correction: TemplateMappingCorrection,
+    ) -> TemplateAnalysis:
+        if not ctx.user_id or ctx.user_id == "anonymous":
+            raise PermissionError("authenticated user is required to correct a template analysis")
+        if correction.actor_id != ctx.user_id:
+            raise PermissionError("template correction actor does not match request context")
+        analysis = self.store.get_template_analysis_by_id(correction.analysis_id)
+        if analysis is None:
+            raise KeyError(f"template analysis not found: {correction.analysis_id}")
+        current = self.store.get_template_analysis(analysis.template_version_id)
+        if current is None or current.analysis_id != analysis.analysis_id:
+            raise ValueError("template analysis correction is stale")
+        template = self._template(analysis.template_version_id)
+        actual_hash = hashlib.sha256(
+            self.store.read_template_content(template.template_version_id)
+        ).hexdigest()
+        if (
+            correction.expected_content_hash != analysis.content_hash
+            or actual_hash != analysis.content_hash
+            or actual_hash != template.content_hash
+        ):
+            raise ValueError("template correction content hash does not match template content hash")
+
+        unit_ids = {unit.unit_id for unit in analysis.units}
+        target_ids = {
+            unit_id
+            for suggestion in correction.suggestions
+            for unit_id in suggestion.target_unit_ids
+        }
+        locked_ids = set(correction.locked_unit_ids)
+        overwrite_ids = set(correction.approved_overwrite_unit_ids)
+        unknown_ids = (target_ids | locked_ids | overwrite_ids) - unit_ids
+        if unknown_ids:
+            raise ValueError(f"template correction references unknown units: {sorted(unknown_ids)}")
+        if target_ids & locked_ids:
+            raise ValueError("template correction targets a locked unit")
+        if not overwrite_ids <= target_ids:
+            raise ValueError("overwrite permissions must reference corrected targets")
+
+        corrected = analysis.model_copy(update={
+            "analysis_id": f"analysis-{uuid.uuid4().hex}",
+            "status": "ready_for_confirmation",
+            "suggestions": list(correction.suggestions),
+            "human_confirmed_target_unit_ids": sorted(target_ids),
+            "approved_overwrite_unit_ids": sorted(overwrite_ids),
+            "locked_unit_ids": sorted(locked_ids),
+            "activation_decision": None,
+        })
+        corrected.validate_suggestions()
+        decision = decide_template_activation(corrected)
+        corrected = corrected.model_copy(update={
+            "activation_decision": decision,
+            "status": (
+                "ready_for_confirmation"
+                if decision.status == "auto_accepted"
+                else "requires_human"
+            ),
+        })
+        return self.store.save_template_analysis(corrected)
+
     def confirm_template_analysis(
         self,
         ctx: RequestContext,
@@ -401,6 +484,9 @@ class DocumentGenerationService:
             raise KeyError(f"template analysis not found: {analysis_id}")
         if analysis.status != "ready_for_confirmation":
             raise ValueError("template analysis requires human exception corrections before confirmation")
+        current = self.store.get_template_analysis(analysis.template_version_id)
+        if current is None or current.analysis_id != analysis.analysis_id:
+            raise ValueError("template analysis is not the current revision")
         template = self._template(analysis.template_version_id)
         actual_hash = hashlib.sha256(self.store.read_template_content(template.template_version_id)).hexdigest()
         if actual_hash != analysis.content_hash or actual_hash != template.content_hash:

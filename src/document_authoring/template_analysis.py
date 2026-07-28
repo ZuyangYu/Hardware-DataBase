@@ -59,6 +59,16 @@ class TemplateActivationDecision(BaseModel):
     metrics: TemplateRiskMetrics = Field(default_factory=TemplateRiskMetrics)
 
 
+class TemplateMappingCorrection(BaseModel):
+    analysis_id: str
+    expected_content_hash: str
+    suggestions: list[TemplateAnalysisSuggestion]
+    locked_unit_ids: list[str] = Field(default_factory=list)
+    approved_overwrite_unit_ids: list[str] = Field(default_factory=list)
+    actor_id: str
+    comment: str = Field(min_length=1)
+
+
 class TemplateAnalysis(BaseModel):
     analysis_id: str
     template_version_id: str
@@ -68,6 +78,9 @@ class TemplateAnalysis(BaseModel):
     units: list[TemplateAnalysisUnit]
     suggestions: list[TemplateAnalysisSuggestion] = Field(default_factory=list)
     activation_decision: TemplateActivationDecision | None = None
+    human_confirmed_target_unit_ids: list[str] = Field(default_factory=list)
+    approved_overwrite_unit_ids: list[str] = Field(default_factory=list)
+    locked_unit_ids: list[str] = Field(default_factory=list)
 
     def validate_suggestion_targets(self) -> None:
         units = {unit.unit_id: unit for unit in self.units}

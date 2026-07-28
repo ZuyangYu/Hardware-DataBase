@@ -72,25 +72,36 @@ def decide_template_activation(
             if unit is None or not unit.writable:
                 reject("mapping_conflict")
                 continue
+            if unit_id in analysis.locked_unit_ids:
+                reject("mapping_conflict")
+                continue
             if analysis.format == "docx":
                 continue
+            human_confirmed = unit_id in analysis.human_confirmed_target_unit_ids
             if (
                 unit.structural_role_hint == "unknown"
                 and unit.value_preview is None
                 and not unit.style_fingerprint
                 and not unit.neighborhood
+                and not human_confirmed
             ):
                 reject("missing_semantic_context")
-            if unit.structural_role_hint == "layout_blank":
+            if unit.structural_role_hint == "layout_blank" and not human_confirmed:
                 reject("layout_blank_target")
             if (
                 unit.value_kind != "blank"
                 and unit.structural_role_hint != "placeholder"
+                and not (
+                    human_confirmed
+                    and unit_id in analysis.approved_overwrite_unit_ids
+                )
             ):
                 reject("nonempty_target_not_placeholder")
 
     if analysis.format != "docx" and target_count and not any(
-        unit.structural_role_hint == "placeholder" for unit in target_units
+        unit.structural_role_hint == "placeholder"
+        or unit.unit_id in analysis.human_confirmed_target_unit_ids
+        for unit in target_units
     ):
         if metrics.target_ratio > effective.max_target_ratio:
             reject("destructive_target_ratio")
