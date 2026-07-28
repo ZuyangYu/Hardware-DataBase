@@ -499,6 +499,8 @@ class DocumentGenerationService:
             "human_confirmed_target_unit_ids": sorted(target_ids),
             "approved_overwrite_unit_ids": sorted(overwrite_ids),
             "locked_unit_ids": sorted(locked_ids),
+            "correction_actor_id": correction.actor_id,
+            "correction_comment": correction.comment,
             "activation_decision": None,
         })
         corrected.validate_suggestions()

@@ -89,6 +89,8 @@ class TemplateAnalysis(BaseModel):
     human_confirmed_target_unit_ids: list[str] = Field(default_factory=list)
     approved_overwrite_unit_ids: list[str] = Field(default_factory=list)
     locked_unit_ids: list[str] = Field(default_factory=list)
+    correction_actor_id: str | None = None
+    correction_comment: str | None = None
 
     def validate_suggestion_targets(self) -> None:
         units = {unit.unit_id: unit for unit in self.units}

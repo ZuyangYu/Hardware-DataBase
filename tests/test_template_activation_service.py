@@ -172,6 +172,8 @@ def test_human_correction_creates_hash_bound_revision_that_can_activate(
     assert corrected.status == "ready_for_confirmation"
     assert corrected.activation_decision is not None
     assert corrected.activation_decision.status == "auto_accepted"
+    assert corrected.correction_actor_id == "alice"
+    assert corrected.correction_comment == "Use the first explicit placeholder."
     assert store.get_template_analysis_by_id(analysis.analysis_id) is not None
     assert store.get_template_analysis_by_id(corrected.analysis_id) is not None
 
