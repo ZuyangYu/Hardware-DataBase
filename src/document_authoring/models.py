@@ -15,7 +15,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from src.agents.claim_evidence import InformationRequirement
-from src.document_authoring.template_analysis import DocxRegionSchema  # noqa: F401
+from src.document_authoring.template_analysis import (  # noqa: F401
+    DocxRegionSchema,
+    workbook_cell_coordinates,
+)
 
 
 def utc_now() -> datetime:
@@ -113,8 +116,10 @@ class WorkbookRegionSchema(BaseModel):
 
     @model_validator(mode="after")
     def validate_locator(self):
-        if not self.locator.get("cell"):
+        cell = self.locator.get("cell")
+        if not cell:
             raise ValueError("P2a workbook regions require an explicit cell locator")
+        workbook_cell_coordinates(str(cell))
         if self.role == "formula" and self.write_policy == "never":
             return self
         if self.preserve_formula and self.write_policy != "never":

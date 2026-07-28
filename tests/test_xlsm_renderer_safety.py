@@ -123,6 +123,17 @@ def test_renderer_rejects_nonempty_legacy_region_without_a_frozen_baseline():
         )
 
 
+@pytest.mark.parametrize("reference", ["A0", "A1foo", "$A$1", "XFE1", "A1048577"])
+def test_workbook_region_rejects_noncanonical_or_out_of_bounds_cell_references(
+    reference: str,
+):
+    with pytest.raises(ValueError, match="valid Excel A1 reference"):
+        WorkbookRegionSchema.model_validate({
+            **_region().model_dump(),
+            "locator": {"cell": reference},
+        })
+
+
 def test_renderer_rejects_duplicate_fill_targets():
     fill = WorkbookFill(
         region_id="region-a1",

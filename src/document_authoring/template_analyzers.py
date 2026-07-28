@@ -14,6 +14,7 @@ from src.document_authoring.template_analysis import (
     TemplateAnalysis,
     TemplateAnalysisUnit,
     TemplateNeighbor,
+    workbook_cell_coordinates,
     workbook_value_hash,
 )
 
@@ -339,14 +340,10 @@ def _merged_non_anchors(root: ET.Element) -> set[str]:
 
 
 def _cell_coordinates(reference: str) -> tuple[int | None, int | None]:
-    letters = "".join(char for char in reference if char.isalpha()).upper()
-    numbers = "".join(char for char in reference if char.isdigit())
-    if not letters or not numbers:
+    try:
+        return workbook_cell_coordinates(reference)
+    except ValueError:
         return None, None
-    column = 0
-    for char in letters:
-        column = column * 26 + ord(char) - ord("A") + 1
-    return column, int(numbers)
 
 
 def _column_name(number: int) -> str:

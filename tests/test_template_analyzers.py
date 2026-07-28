@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import zipfile
 
+import pytest
+
 from src.document_authoring.template_analyzers import analyze_template
 
 
@@ -142,6 +144,26 @@ def test_xlsx_analysis_fails_closed_for_an_unknown_style_in_a_protected_sheet():
 
     by_id = {unit.unit_id: unit for unit in analysis.units}
     assert by_id["sheet:Review!A1"].blocked_reason == "invalid_style"
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["A0", "A-1", "A1foo", "$A$1", "XFE1", "A1048577"],
+)
+def test_xlsx_analysis_rejects_noncanonical_or_out_of_bounds_cell_references(
+    reference: str,
+):
+    content = _replace_part(
+        _xlsx_with_semantic_cell_context(),
+        "xl/worksheets/sheet1.xml",
+        b'<c r="A1"',
+        f'<c r="{reference}"'.encode(),
+    )
+
+    analysis = analyze_template(content, "xlsx")
+
+    assert analysis.status == "failed"
+    assert analysis.units == []
 
 
 def test_xlsx_analysis_blocks_an_unknown_style_on_an_unprotected_sheet():

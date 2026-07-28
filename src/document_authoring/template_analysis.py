@@ -4,9 +4,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+
+_WORKBOOK_CELL_RE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]*)$")
+_MAX_WORKBOOK_COLUMN = 16_384  # XFD
+_MAX_WORKBOOK_ROW = 1_048_576
+
+
+def workbook_cell_coordinates(reference: str) -> tuple[int, int]:
+    """Parse one canonical, in-bounds Excel A1 cell reference."""
+    match = _WORKBOOK_CELL_RE.fullmatch(reference)
+    if match is None:
+        raise ValueError(f"not a valid Excel A1 reference: {reference}")
+    column = 0
+    for char in match.group(1):
+        column = column * 26 + ord(char) - ord("A") + 1
+    row = int(match.group(2))
+    if column > _MAX_WORKBOOK_COLUMN or row > _MAX_WORKBOOK_ROW:
+        raise ValueError(f"not a valid Excel A1 reference: {reference}")
+    return column, row
 
 
 def workbook_value_hash(value: str | None) -> str:

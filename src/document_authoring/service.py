@@ -179,7 +179,6 @@ class DocumentGenerationService:
                                 shared_strings,
                             )
                         ),
-                        "allow_nonempty_overwrite": True,
                     })
                     for region in regions
                 ]

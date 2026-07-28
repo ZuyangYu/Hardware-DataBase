@@ -24,7 +24,10 @@ from src.document_authoring.models import (
     WorkbookRegionSchema,
     content_hash,
 )
-from src.document_authoring.template_analysis import workbook_value_hash
+from src.document_authoring.template_analysis import (
+    workbook_cell_coordinates,
+    workbook_value_hash,
+)
 
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -34,7 +37,6 @@ NS = {"x": MAIN_NS, "r": REL_NS, "pr": PKG_REL_NS}
 ET.register_namespace("", MAIN_NS)
 ET.register_namespace("r", REL_NS)
 
-_CELL_RE = re.compile(r"^([A-Z]+)([1-9][0-9]*)$")
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
@@ -284,10 +286,10 @@ class XlsmRenderer:
         rows = {int(row.attrib["r"]): row for row in sheet_data.findall("x:row", NS) if row.attrib.get("r", "").isdigit()}
         for region, value in fills:
             ref = str(region.locator["cell"]).upper()
-            match = _CELL_RE.fullmatch(ref)
-            if not match:
+            try:
+                _column_number, row_number = workbook_cell_coordinates(ref)
+            except ValueError:
                 raise ValueError(f"invalid A1 cell locator: {ref}")
-            row_number = int(match.group(2))
             row = rows.get(row_number)
             if row is None:
                 row = ET.Element(f"{{{MAIN_NS}}}row", {"r": str(row_number)})
