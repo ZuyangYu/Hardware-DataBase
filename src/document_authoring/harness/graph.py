@@ -125,6 +125,13 @@ class AuthoringGraph:
             for unit_id, requirement in result.requirements.items():
                 outcome = self._retrieve_with_budget(state, requirement, retrieve)
                 result.outcomes[unit_id] = outcome
+                # Read the low_confidence signal from the raw outcome evidences
+                # (which retain metadata) before _validated_evidence strips it
+                # on the project path.
+                recovery_triggered = any(
+                    _evidence_low_confidence(evidence_obj)
+                    for evidence_obj in outcome.evidences
+                )
                 evidence = _validated_evidence(work_order, snapshot, outcome)
                 if evidence and self.reranker is not None:
                     # Rerank (P6): reorder validated evidence by requirement
@@ -137,7 +144,9 @@ class AuthoringGraph:
                 # Retrieval ledger (P9): per-unit observability row surfaced in
                 # the matrix (for human review) and on the result, so it is no
                 # longer dropped when run() returns.
-                ledger_row = _retrieval_ledger_row(unit_id, requirement, outcome, evidence, state)
+                ledger_row = _retrieval_ledger_row(
+                    unit_id, requirement, outcome, evidence, state, recovery_triggered
+                )
                 result.retrieval_ledger.append(ledger_row)
                 result.matrix_rows.append({
                     "field_id": unit_id.removeprefix("field:") if unit_id.startswith("field:") else None,
@@ -204,6 +213,21 @@ class AuthoringGraph:
                         result.unit_statuses[unit_id] = "ready_to_render"
                 else:
                     result.unit_statuses[unit_id] = "ready_to_render"
+                if recovery_triggered and evidence:
+                    # Stage 5: evidence recovered via a relaxed balanced-route
+                    # retry is low-confidence. Route it to human review even if
+                    # the draft otherwise validated as supported, rather than
+                    # auto-rendering a draft built on a relaxed-scope retrieve.
+                    if validated.validation_status == "supported":
+                        validated = validated.model_copy(update={
+                            "validation_status": "requires_human",
+                            "validation_notes": [*validated.validation_notes, "low-confidence recovery evidence"],
+                        })
+                    result.unit_statuses[unit_id] = "requires_human"
+                    result.issues.append({
+                        "kind": "low_confidence_recovery", "unit_id": unit_id,
+                        "reason": "evidence recovered via balanced-route retry",
+                    })
                 result.drafts.append(validated)
 
             self._step(state, "validate_cross_unit")
@@ -260,6 +284,27 @@ class AuthoringGraph:
             }:
                 return outcome
         assert last is not None
+        # Adaptive recovery (stage 5, P3 extreme): attempts exhausted on an
+        # empty success. If the policy allows it, make one balanced-route
+        # retrieve (relaxed=True) that drops the source_group hard filter
+        # while keeping the frozen source_names scope, so a mis-routed query
+        # can still reach frozen sources. Recovered evidence is tagged
+        # low_confidence and routed to human review rather than leaving the
+        # field blocked. This uses its own budget (max_adaptive_recovery_rounds)
+        # and does NOT call require_retrieval_round, so it never collides with
+        # max_retrieval_rounds. Only success_empty triggers it: hard failures
+        # mean the source is unavailable and a balanced retry cannot help.
+        if (
+            "adaptive_recovery" in self.policy.policy.allowed_tools
+            and last.status == "success_empty"
+            and self.policy.policy.max_adaptive_recovery_rounds > 0
+        ):
+            self._step(state, "adaptive_recovery")
+            self.policy.require_tool("adaptive_recovery")
+            recovery = retrieve(requirement, attempt + 1, None, relaxed=True)
+            if recovery.status == "success_with_hits" and recovery.evidences:
+                _tag_low_confidence(recovery)
+                last = recovery
         return last
 
     def _rewrite_for_retry(
@@ -372,6 +417,7 @@ def _retrieval_ledger_row(
     outcome: RetrievalOutcome,
     evidence: list[dict[str, Any]],
     state: DocumentAuthoringState,
+    recovery_triggered: bool = False,
 ) -> dict[str, Any]:
     """Build a per-unit retrieval observability row (P9).
 
@@ -379,7 +425,8 @@ def _retrieval_ledger_row(
     fallback was triggered, and the final (post-rerank) evidence ids so a human
     reviewer can see why a field is empty. ``fallback_triggered`` is read from
     ``outcome.evidences`` (which retain metadata), not the validated dicts --
-    the project path strips metadata during validation.
+    the project path strips metadata during validation. ``recovery_triggered``
+    records whether stage 5 adaptive recovery supplied the evidence.
     """
     rewrites = [
         entry["rewrite"]
@@ -403,6 +450,7 @@ def _retrieval_ledger_row(
             _evidence_fallback(evidence_obj) for evidence_obj in outcome.evidences
         ),
         "final_evidence_ids": [entry["id"] for entry in evidence],
+        "recovery_triggered": recovery_triggered,
     }
 
 
@@ -413,6 +461,23 @@ def _evidence_fallback(evidence: Any) -> bool:
         metadata.get("ragflow_source_name_fallback")
         or metadata.get("ragflow_metadata_condition_fallback")
     )
+
+
+def _evidence_low_confidence(evidence: Any) -> bool:
+    """True if stage 5 adaptive recovery tagged the evidence low-confidence."""
+    metadata = getattr(evidence, "metadata", None) or {}
+    return bool(metadata.get("low_confidence"))
+
+
+def _tag_low_confidence(outcome: RetrievalOutcome) -> None:
+    """Tag every evidence of a recovery outcome as low-confidence (stage 5)."""
+    for evidence in outcome.evidences:
+        metadata = dict(getattr(evidence, "metadata", {}) or {})
+        metadata["low_confidence"] = True
+        try:
+            evidence.metadata = metadata
+        except Exception:  # pragma: no cover - defensive for non-model objects
+            pass
 
 
 def _validated_evidence(
