@@ -108,14 +108,14 @@ capabilities 不分流(P4) ─┘                                          ─�
 
 **验收**：人工审核页能看到每个字段的"查询串/改写/各来源命中数/是否触发 fallback/最终证据"；rerank 后送 writer 的证据按相关性重排（reranker=None 时原序，零回归）。
 
-### 阶段 4：草稿质量 —— 闭环 P5/P10
+### 阶段 4：草稿质量 -- 闭环 P5/P10
 
 **改动点**：
-1. `DeterministicEvidenceWriter` 从"逐字 evidence[0]"升级为"结构化汇总全部证据"（模板化拼接，不捏造，带多证据引用）。
+1. `DeterministicEvidenceWriter` 从"逐字 evidence[0]"升级为"结构化汇总全部证据"：单证据保持原样、多证据枚举拼接 + 一条引用全部证据的 summary assertion（避免单元内 cross-unit 冲突），不捏造。同时升级 `LLMManagedWriter` 的 fallback 草稿。
 2. 回归锁定项：`LLMManagedWriter._build_user_prompt` 已把含全部 evidence 的 request 传给 LLM（`managed.py:235`），"使用全部 evidence"现状即满足，改为回归测试锁定，不重复实现。
-3. validator 增加 `requirement_fit_check`：LLM 判定草稿是否回答了 requirement，未通过置 `requires_human`。
+3. 新增独立 `RequirementFitChecker`（LLM-as-judge，仿 `EvidenceReranker`）注入 graph：判定草稿是否回答了 requirement，未通过置 `requires_human`。**opt-in**（不进默认 allowlist，因 fit check 是 status-changing LLM 门控，与 status-preserving 的 rerank/rewrite 不同），受 `requirement_fit_check` 守门，LLM 失败降级 pass。
 
-**验收**：非 LLM 部署下草稿不再是裸片段；草稿与字段需求不匹配时被标记而非直接放行。
+**验收**：非 LLM 部署下草稿不再是裸片段（多证据含全部证据）；草稿与字段需求不匹配时被标记而非直接放行（启用 fit check 的部署）。
 
 ### 阶段 5：自适应恢复 —— 闭环 P3 的极端情况
 
@@ -192,4 +192,5 @@ capabilities 不分流(P4) ─┘                                          ─�
 | 阶段 1（查询改写+空结果重试） | 已实施 | retrieve 签名加 `query_override`；`QueryRewriter` 仿 writer 注入 harness，`require_tool("rewrite_query")` 守门，`success_empty` 触发改写重试，LLM 失败降级原串；spec 见 `docs/superpowers/specs/2026-07-27-query-rewrite-stage1-design.md` |
 | 阶段 2（capability-aware 分发） | 已实施 | `RetrieverRegistry`（default RAGFlow 始终调用 + specialized 叠加）泛化阶段 0；按 `content` 哈希去重；`preferred_source_roles` 加分（P7）；`CrossUnitEvidenceCache` 跨单元复用（P8）；project 路径补 spreadsheet 分派（绑 version_id+artifact 过 `retrieval.py:70`）；spec 见 `docs/superpowers/specs/2026-07-27-capability-dispatch-stage2-design.md` |
 | 阶段 3（rerank + 检索可观测性） | 已实施 | `EvidenceReranker`（LLM-as-judge，受 `rerank_evidence` allowlist 守门，v1 只重排不截断）送 writer 前重排；per-unit `RetrievalLedgerRow` 嵌 matrix row + 回填 `HarnessExecutionResult.retrieval_ledger`（修复预留字段从未写入 result）；`fallback_triggered` 从 `outcome.evidences` 取；spec 见 `docs/superpowers/specs/2026-07-28-rerank-ledger-stage3-design.md` |
-| 阶段 4–5 | 未实施 | 见 §3 |
+| 阶段 4（草稿质量） | 已实施 | `DeterministicEvidenceWriter` 多证据结构化汇总（单证据原样）+ LLM fallback 升级；回归锁定 `_build_user_prompt` 传全部 evidence；独立 `RequirementFitChecker`（LLM-as-judge，**opt-in** 不进默认 allowlist，受 `requirement_fit_check` 守门，失败降级 pass）注入 graph，unfit 置 `requires_human`；spec 见 `docs/superpowers/specs/2026-07-28-draft-quality-stage4-design.md` |
+| 阶段 5 | 未实施 | 见 §3 |
