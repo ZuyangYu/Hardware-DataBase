@@ -14,6 +14,7 @@ from src.document_authoring.template_analysis import (
     TemplateAnalysis,
     TemplateAnalysisUnit,
     TemplateNeighbor,
+    workbook_value_hash,
 )
 
 
@@ -115,7 +116,7 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                     lower <= column <= upper for lower, upper in hidden_column_ranges
                 )
                 hidden = row_hidden or style_hidden
-                value_kind, value_preview = _workbook_cell_value(cell, shared_strings)
+                value_kind, value_preview, value_hash = _workbook_cell_value(cell, shared_strings)
                 blocked_reason = _workbook_blocked_reason(
                     has_formula=has_formula,
                     merged_non_anchor=ref in merged_non_anchors,
@@ -136,6 +137,7 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                     writable=blocked_reason is None,
                     blocked_reason=blocked_reason,
                     value_preview=value_preview,
+                    value_hash=value_hash,
                     value_kind=value_kind,
                     style_fingerprint=style_fingerprints.get(
                         style,
@@ -165,7 +167,7 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
 def _shared_strings(content: bytes) -> list[str]:
     root = ET.fromstring(content)
     return [
-        _bounded_preview("".join(text.text or "" for text in item.findall(".//x:t", NS))) or ""
+        "".join(text.text or "" for text in item.findall(".//x:t", NS)).strip()
         for item in root.findall("x:si", NS)
     ]
 
@@ -173,27 +175,37 @@ def _shared_strings(content: bytes) -> list[str]:
 def _workbook_cell_value(
     cell: ET.Element,
     shared_strings: list[str],
-) -> tuple[Literal["blank", "text", "number", "boolean", "formula", "error"], str | None]:
+) -> tuple[
+    Literal["blank", "text", "number", "boolean", "formula", "error"],
+    str | None,
+    str,
+]:
     if cell.find("x:f", NS) is not None:
-        return "formula", None
+        return "formula", None, workbook_value_hash(None)
     cell_type = cell.attrib.get("t", "")
     if cell_type == "inlineStr":
-        return "text", _bounded_preview("".join(text.text or "" for text in cell.findall(".//x:t", NS)))
+        full_value = "".join(text.text or "" for text in cell.findall(".//x:t", NS)).strip() or None
+        return "text", _bounded_preview(full_value or ""), workbook_value_hash(full_value)
     value = cell.findtext("x:v", default="", namespaces=NS)
     if cell_type == "s":
         try:
-            return "text", _bounded_preview(shared_strings[int(value)])
+            full_value = shared_strings[int(value)] or None
+            return "text", _bounded_preview(full_value or ""), workbook_value_hash(full_value)
         except (ValueError, IndexError):
-            return "error", None
+            return "error", None, workbook_value_hash(None)
     if cell_type == "b":
-        return "boolean", "TRUE" if value == "1" else "FALSE"
+        full_value = "TRUE" if value == "1" else "FALSE"
+        return "boolean", full_value, workbook_value_hash(full_value)
     if cell_type == "e":
-        return "error", _bounded_preview(value)
+        full_value = value.strip() or None
+        return "error", _bounded_preview(value), workbook_value_hash(full_value)
     if cell_type in {"str", "d"}:
-        return "text", _bounded_preview(value)
+        full_value = value.strip() or None
+        return "text", _bounded_preview(value), workbook_value_hash(full_value)
     if value == "":
-        return "blank", None
-    return "number", _bounded_preview(value)
+        return "blank", None, workbook_value_hash(None)
+    full_value = value.strip()
+    return "number", _bounded_preview(value), workbook_value_hash(full_value)
 
 
 def _bounded_preview(value: str) -> str | None:

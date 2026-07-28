@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+
+def workbook_value_hash(value: str | None) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class TemplateNeighbor(BaseModel):
@@ -20,6 +27,7 @@ class TemplateAnalysisUnit(BaseModel):
     writable: bool = False
     blocked_reason: str | None = None
     value_preview: str | None = None
+    value_hash: str | None = None
     value_kind: Literal["blank", "text", "number", "boolean", "formula", "error"] = "blank"
     style_fingerprint: str = ""
     neighborhood: list[TemplateNeighbor] = Field(default_factory=list)

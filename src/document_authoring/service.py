@@ -1160,6 +1160,11 @@ class DocumentGenerationService:
         bindings: list[TemplateUnitBinding] = []
         seen_targets: set[str] = set()
         for suggestion in analysis.suggestions:
+            if template.format != "docx":
+                if suggestion.value_shape != "scalar":
+                    raise ValueError("workbook repeating tables require an explicit table schema")
+                if len(suggestion.target_unit_ids) != 1:
+                    raise ValueError("workbook scalar mappings require exactly one target")
             target_regions: list[str] = []
             for unit_id in suggestion.target_unit_ids:
                 if unit_id in seen_targets:
@@ -1178,6 +1183,11 @@ class DocumentGenerationService:
                         region_id=region_id, sheet_name=str(unit.locator["sheet_name"]),
                         locator={"cell": unit.locator["cell"]}, role="semantic_draft",
                         write_policy="validated_draft", value_type="text",
+                        expected_value_hash=unit.value_hash,
+                        allow_nonempty_overwrite=(
+                            unit.structural_role_hint == "placeholder"
+                            or unit_id in analysis.approved_overwrite_unit_ids
+                        ),
                     ))
                 seen_targets.add(unit_id)
                 target_regions.append(region_id)
@@ -1412,6 +1422,8 @@ class DocumentGenerationService:
             binding = bindings.get(semantic_unit_id)
             if binding is None:
                 continue
+            if template.format != "docx" and len(binding.target_region_ids) != 1:
+                raise ValueError("workbook scalar bindings require exactly one target")
             value = draft.proposed_value if draft.proposed_value is not None else draft.content
             if value is None:
                 continue

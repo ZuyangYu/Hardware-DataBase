@@ -108,6 +108,8 @@ class WorkbookRegionSchema(BaseModel):
     write_policy: Literal["never", "deterministic_only", "validated_draft", "human_only"]
     preserve_formula: bool = False
     value_type: str | None = None
+    expected_value_hash: str | None = None
+    allow_nonempty_overwrite: bool = False
 
     @model_validator(mode="after")
     def validate_locator(self):
