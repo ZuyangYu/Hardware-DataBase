@@ -189,6 +189,7 @@ def _setup_template_and_schema(
             region_id="region-full-0", sheet_name="Review",
             locator={"cell": "A1"}, role="semantic_draft",
             write_policy="validated_draft",
+            allow_nonempty_overwrite=True,
         )],
         bindings=[TemplateUnitBinding(
             binding_id="binding-full-0",
