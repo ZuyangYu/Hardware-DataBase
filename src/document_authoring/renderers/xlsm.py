@@ -24,6 +24,7 @@ from src.document_authoring.models import (
     WorkbookRegionSchema,
     content_hash,
 )
+from src.document_authoring.template_analysis import workbook_value_hash
 
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -80,12 +81,21 @@ class XlsmRenderer:
     ) -> XlsmRenderResult:
         report = self.inspect(template_content)
         self._validate_active_content(report, policy, security_approved)
+        if len({region.region_id for region in regions}) != len(regions):
+            raise ValueError("duplicate workbook region ids are not allowed")
         region_by_id = {region.region_id: region for region in regions}
         fills = []
+        seen_region_ids: set[str] = set()
+        seen_locators: set[tuple[str, str]] = set()
         for fill in fill_plan.fills:
             region = region_by_id.get(fill.region_id)
             if region is None:
                 raise ValueError(f"fill references an unregistered region: {fill.region_id}")
+            locator = (region.sheet_name, str(region.locator.get("cell", "")).upper())
+            if fill.region_id in seen_region_ids or locator in seen_locators:
+                raise ValueError(f"duplicate workbook fill target: {fill.region_id}")
+            seen_region_ids.add(fill.region_id)
+            seen_locators.add(locator)
             if region.write_policy not in {"deterministic_only", "validated_draft"}:
                 raise PermissionError(f"region is not renderer-writable: {fill.region_id}")
             if region.role in {"formula", "human_input", "human_approval", "locked_template", "legacy_example"}:
@@ -95,21 +105,64 @@ class XlsmRenderer:
                 # In OOXML an inline string is not calculated, but rejecting it
                 # makes formula/link injection impossible across spreadsheet clients.
                 raise ValueError(f"formula-like text is not allowed in generated content: {fill.region_id}")
-            fills.append((region, value))
+            fills.append((region, value, fill.semantic_unit_id))
+
+        long_value_counts: dict[str, int] = {}
+        for _region, value, _semantic_unit_id in fills:
+            if len(value) >= 80:
+                long_value_counts[value] = long_value_counts.get(value, 0) + 1
+        if any(count > 4 for count in long_value_counts.values()):
+            raise ValueError("abnormal duplicate long value fan-out is not allowed")
 
         sheet_fills: dict[str, list[tuple[WorkbookRegionSchema, str]]] = {}
-        for region, value in fills:
+        for region, value, _semantic_unit_id in fills:
             sheet_fills.setdefault(region.sheet_name, []).append((region, value))
 
         source = io.BytesIO(template_content)
         output = io.BytesIO()
         changed_parts: set[str] = set()
+        cell_changes: list[dict[str, Any]] = []
         with zipfile.ZipFile(source, "r") as src, zipfile.ZipFile(output, "w") as dst:
             worksheet_map = self._worksheet_part_map(src)
+            shared_strings = (
+                self._shared_strings(src.read("xl/sharedStrings.xml"))
+                if "xl/sharedStrings.xml" in src.namelist()
+                else []
+            )
             required_sheets = set(sheet_fills)
             missing_sheets = required_sheets - set(worksheet_map)
             if missing_sheets:
                 raise ValueError(f"template sheets not found: {sorted(missing_sheets)}")
+            for region, value, semantic_unit_id in fills:
+                ref = str(region.locator["cell"]).upper()
+                baseline_value = self._cell_value(
+                    src.read(worksheet_map[region.sheet_name]),
+                    ref,
+                    shared_strings,
+                )
+                baseline_hash = workbook_value_hash(baseline_value)
+                if (
+                    region.expected_value_hash is not None
+                    and baseline_hash != region.expected_value_hash
+                ):
+                    raise PermissionError(f"workbook cell baseline changed: {region.sheet_name}!{ref}")
+                if (
+                    region.expected_value_hash is not None
+                    and baseline_value is not None
+                    and not region.allow_nonempty_overwrite
+                ):
+                    raise PermissionError(
+                        f"non-empty workbook overwrite is not authorized: {region.sheet_name}!{ref}"
+                    )
+                cell_changes.append({
+                    "sheet_name": region.sheet_name,
+                    "cell": ref,
+                    "baseline_value_hash": baseline_hash,
+                    "generated_value_hash": workbook_value_hash(value),
+                    "baseline_empty": baseline_value is None,
+                    "semantic_unit_id": semantic_unit_id,
+                    "region_id": region.region_id,
+                })
             replacements: dict[str, bytes] = {}
             for sheet_name, fill_values in sheet_fills.items():
                 part = worksheet_map[sheet_name]
@@ -128,10 +181,57 @@ class XlsmRenderer:
         after = self.inspect(rendered)
         if after.active_content_status != "clean":
             raise ValueError("generated artifact contains active content")
-        manifest = self._integrity_manifest(report, after, changed_parts, policy)
+        manifest = self._integrity_manifest(
+            report,
+            after,
+            changed_parts,
+            policy,
+            cell_changes,
+        )
         if manifest["policy_violations"]:
             raise ValueError("renderer integrity policy rejected output: " + "; ".join(manifest["policy_violations"]))
         return XlsmRenderResult(content=rendered, security_report=after, integrity_manifest=manifest)
+
+    @staticmethod
+    def _shared_strings(content: bytes) -> list[str]:
+        root = ET.fromstring(content)
+        return [
+            "".join(text.text or "" for text in item.findall(".//x:t", NS)).strip()
+            for item in root.findall("x:si", NS)
+        ]
+
+    @staticmethod
+    def _cell_value(
+        worksheet: bytes,
+        ref: str,
+        shared_strings: list[str],
+    ) -> str | None:
+        root = ET.fromstring(worksheet)
+        cell = next(
+            (
+                candidate
+                for candidate in root.findall(".//x:sheetData/x:row/x:c", NS)
+                if candidate.attrib.get("r", "").upper() == ref
+            ),
+            None,
+        )
+        if cell is None or cell.find("x:f", NS) is not None:
+            return None
+        cell_type = cell.attrib.get("t", "")
+        if cell_type == "inlineStr":
+            return (
+                "".join(text.text or "" for text in cell.findall(".//x:t", NS)).strip()
+                or None
+            )
+        value = cell.findtext("x:v", default="", namespaces=NS).strip()
+        if cell_type == "s":
+            try:
+                return shared_strings[int(value)] or None
+            except (ValueError, IndexError):
+                return None
+        if cell_type == "b":
+            return "TRUE" if value == "1" else "FALSE"
+        return value or None
 
     @staticmethod
     def _validate_active_content(report: TemplateSecurityReport, policy: RendererPolicy, security_approved: bool) -> None:
@@ -214,6 +314,7 @@ class XlsmRenderer:
         after: TemplateSecurityReport,
         changed_parts: set[str],
         policy: RendererPolicy,
+        cell_changes: list[dict[str, Any]],
     ) -> dict[str, Any]:
         before_names, after_names = set(before.parts), set(after.parts)
         changed = sorted(
@@ -242,5 +343,11 @@ class XlsmRenderer:
             "part_count_before": len(before.parts),
             "part_count_after": len(after.parts),
             "policy_violations": policy_violations,
-            "manifest_hash": content_hash({"before": before.parts, "after": after.parts, "changed": changed}),
+            "cell_changes": cell_changes,
+            "manifest_hash": content_hash({
+                "before": before.parts,
+                "after": after.parts,
+                "changed": changed,
+                "cell_changes": cell_changes,
+            }),
         }

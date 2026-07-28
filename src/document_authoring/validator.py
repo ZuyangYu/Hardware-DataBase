@@ -32,6 +32,8 @@ class DocumentValidator:
                 issues.append({"unit_id": row.get("review_item_id") or row.get("field_id"), "kind": "conflicting"})
         for violation in integrity_manifest.get("policy_violations", []):
             issues.append({"kind": "renderer_integrity", "message": violation})
+        for violation in integrity_manifest.get("cell_policy_violations", []):
+            issues.append({"kind": "renderer_integrity", "message": violation})
         issues.extend(additional_issues or [])
         status = "failed" if any(issue["kind"] == "renderer_integrity" for issue in issues) else (
             "requires_human" if issues else "passed"
