@@ -771,6 +771,7 @@ class DocumentGenerationService:
             raise PermissionError("writer provider does not match the approved HarnessPolicy")
         rewriter = self._rewriter_for_policy(policy)
         reranker = self._reranker_for_policy(policy)
+        fit_checker = self._fit_checker_for_policy(policy)
         schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
         template = self._template(order.template_version_id)
@@ -781,6 +782,7 @@ class DocumentGenerationService:
                 work_order=order, run=run, manifest=manifest, policy=policy, schema=schema, snapshot=snapshot,
                 legacy_claims=self.store.list_legacy_template_claims(template.template_version_id),
                 writer=writer, retrieve=retrieve, rewriter=rewriter, reranker=reranker,
+                fit_checker=fit_checker,
             )
         except Exception:
             current_run = self.store.get_harness_run(run.harness_run_id)
@@ -837,6 +839,7 @@ class DocumentGenerationService:
             raise PermissionError("writer provider does not match the frozen HarnessPolicy")
         rewriter = self._rewriter_for_policy(policy)
         reranker = self._reranker_for_policy(policy)
+        fit_checker = self._fit_checker_for_policy(policy)
         schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
         template = self._template(order.template_version_id)
@@ -846,6 +849,7 @@ class DocumentGenerationService:
                 work_order=order, run=run, manifest=manifest, policy=policy, schema=schema, snapshot=snapshot,
                 legacy_claims=self.store.list_legacy_template_claims(template.template_version_id),
                 writer=writer, retrieve=retrieve, rewriter=rewriter, reranker=reranker,
+                fit_checker=fit_checker,
             )
         except Exception:
             current_run = self.store.get_harness_run(run.harness_run_id)
@@ -1122,6 +1126,14 @@ class DocumentGenerationService:
         if "rerank_evidence" in policy.allowed_tools:
             from src.document_authoring.writers.evidence_reranker import EvidenceReranker
             return EvidenceReranker()
+        return None
+
+    @staticmethod
+    def _fit_checker_for_policy(policy: HarnessPolicy):
+        """Build a RequirementFitChecker only when the frozen policy allows it."""
+        if "requirement_fit_check" in policy.allowed_tools:
+            from src.document_authoring.writers.requirement_fit_checker import RequirementFitChecker
+            return RequirementFitChecker()
         return None
 
     def _schema(self, schema_id: str, version: str) -> DocumentSchema:

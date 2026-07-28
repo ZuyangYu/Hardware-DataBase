@@ -53,3 +53,26 @@ def test_reranker_for_policy_returns_reranker_when_allowed():
 def test_reranker_for_policy_returns_none_when_not_allowed():
     policy = _make_policy(allowed_tools=["retrieve_evidence"])
     assert DocumentGenerationService._reranker_for_policy(policy) is None
+
+
+from src.document_authoring.writers.requirement_fit_checker import RequirementFitChecker
+
+
+def test_default_allowed_tools_do_not_include_requirement_fit_check():
+    # Requirement fit check is opt-in: it is the first status-CHANGING LLM
+    # gate (unfit -> requires_human), unlike the status-preserving rerank/
+    # rewrite tools. Deployments enable it explicitly after validating the
+    # LLM's fit judgment, so it is not in the default allowlist.
+    policy = _make_policy()
+    assert "requirement_fit_check" not in policy.allowed_tools
+
+
+def test_fit_checker_for_policy_returns_checker_when_allowed():
+    policy = _make_policy(allowed_tools=["requirement_fit_check", "retrieve_evidence"])
+    checker = DocumentGenerationService._fit_checker_for_policy(policy)
+    assert isinstance(checker, RequirementFitChecker)
+
+
+def test_fit_checker_for_policy_returns_none_when_not_allowed():
+    policy = _make_policy(allowed_tools=["retrieve_evidence"])
+    assert DocumentGenerationService._fit_checker_for_policy(policy) is None
