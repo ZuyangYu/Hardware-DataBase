@@ -43,6 +43,22 @@ class TemplateAnalysisSuggestion(BaseModel):
     value_shape: Literal["scalar", "repeating_table"] = "scalar"
 
 
+class TemplateRiskMetrics(BaseModel):
+    total_unit_count: int = 0
+    target_count: int = 0
+    nonempty_target_count: int = 0
+    target_ratio: float = 0.0
+    nonempty_overwrite_ratio: float = 0.0
+    min_confidence: float | None = None
+
+
+class TemplateActivationDecision(BaseModel):
+    status: Literal["auto_accepted", "requires_human"]
+    reason_codes: list[str] = Field(default_factory=list)
+    suggestion_ids: list[str] = Field(default_factory=list)
+    metrics: TemplateRiskMetrics = Field(default_factory=TemplateRiskMetrics)
+
+
 class TemplateAnalysis(BaseModel):
     analysis_id: str
     template_version_id: str
@@ -51,6 +67,7 @@ class TemplateAnalysis(BaseModel):
     status: Literal["ready_for_confirmation", "requires_human", "failed"]
     units: list[TemplateAnalysisUnit]
     suggestions: list[TemplateAnalysisSuggestion] = Field(default_factory=list)
+    activation_decision: TemplateActivationDecision | None = None
 
     def validate_suggestion_targets(self) -> None:
         units = {unit.unit_id: unit for unit in self.units}
