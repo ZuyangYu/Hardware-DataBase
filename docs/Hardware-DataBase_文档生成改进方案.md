@@ -91,11 +91,13 @@ capabilities 不分流(P4) ─┘                                          ─�
 **目标**：把 `required_capabilities` 真正路由到对应检索器。
 
 **改动点**：
-1. 定义 `RetrieverRegistry`：capability → retriever（`document_claim_lookup`/`entity_lookup` → RAGFlow；`tabular_lookup` → spreadsheet 工具；`revision_lookup` → 预留）。
-2. Coordinator 按 unit 的 `required_capabilities` 扇出，合并去重（按 `content` 哈希）。
-3. 顺带处理 `preferred_source_roles`（P7）：对匹配 role 的来源加分。
+1. 定义 `RetrieverRegistry`（`src/document_authoring/retriever_registry.py`）：capability → retriever（`document_claim_lookup`/`entity_lookup`/`relationship_lookup` → RAGFlow 作为 default 始终调用；`tabular_lookup` → spreadsheet 工具作为 specialized 叠加调用；`revision_lookup` → 预留，走 default）。**分派语义**：RAGFlow default 始终调用（保留阶段 0 行为、不回归文本召回），specialized 检索器按声明 capability **叠加**调用（`tabular_lookup` 字段 = RAGFlow + spreadsheet，与阶段 0 一致）。
+2. Registry 合并多检索器 evidence，按 `content` 哈希去重（保留 `score` 高者）；KB 闭包与 project 闭包共用去重函数。
+3. 顺带处理 `preferred_source_roles`（P7）：对匹配 role 的来源 `score *= 1.5` 并打 `preferred_source_role_match` 标。**注**：KB 路径 `state.Evidence` 无 `document_role` 字段，加分为 no-op；project 路径 `EvidenceEnvelope.document_role` 有值时加分生效。
+4. 跨单元 evidence 复用缓存（P8）：`CrossUnitEvidenceCache` 在闭包内一次 run 一个实例，当前 unit 新检索**结果为空**时回填前序 unit 的命中证据（带 `reused`/`reused_from_unit` 标，受 `max_reuse_per_unit=5` 约束）；复用证据已在同冻结集内通过落域校验，不破坏正确性。
+5. project 路径同构改造（`_project_retriever`）：`retrieve_one` 内补 spreadsheet 分派，**落域约束**：spreadsheet evidence 须绑 `source_version_id` + `processing_artifact_id`（镜像 RAGFlow envelope 构造）以过 `ProjectEvidenceRetrievalService.retrieve`（`retrieval.py:70`）的 per-version 三重校验，避免触发 `filter_unsupported`。闭包对 outcome 做去重 + role 加分 + 跨单元复用后处理；复用命中时 status 升级为 `success_with_hits`，避免 harness 误判空结果触发改写。
 
-**验收**：不同 capability 的字段走不同检索器；`tabular_lookup` 字段命中 spreadsheet 证据。
+**验收**：不同 capability 的字段走不同检索器；`tabular_lookup` 字段命中 spreadsheet 证据（KB 与 project 路径均成立）。
 
 ### 阶段 3：rerank + 检索可观测性 —— 闭环 P6/P9
 
@@ -187,4 +189,5 @@ capabilities 不分流(P4) ─┘                                          ─�
 |------|------|------|
 | 阶段 0（spreadsheet 接通） | 已实施 | 闭包隔离 + 仅 `tabular_lookup` 触发 + 冻结集过滤；spec 见 `docs/superpowers/specs/2026-07-27-spreadsheet-retrieval-stage0-design.md`，计划见 `docs/superpowers/plans/2026-07-27-spreadsheet-retrieval-stage0.md` |
 | 阶段 1（查询改写+空结果重试） | 已实施 | retrieve 签名加 `query_override`；`QueryRewriter` 仿 writer 注入 harness，`require_tool("rewrite_query")` 守门，`success_empty` 触发改写重试，LLM 失败降级原串；spec 见 `docs/superpowers/specs/2026-07-27-query-rewrite-stage1-design.md` |
-| 阶段 2–5 | 未实施 | 见 §3 |
+| 阶段 2（capability-aware 分发） | 已实施 | `RetrieverRegistry`（default RAGFlow 始终调用 + specialized 叠加）泛化阶段 0；按 `content` 哈希去重；`preferred_source_roles` 加分（P7）；`CrossUnitEvidenceCache` 跨单元复用（P8）；project 路径补 spreadsheet 分派（绑 version_id+artifact 过 `retrieval.py:70`）；spec 见 `docs/superpowers/specs/2026-07-27-capability-dispatch-stage2-design.md` |
+| 阶段 3–5 | 未实施 | 见 §3 |
