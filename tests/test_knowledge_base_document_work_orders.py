@@ -1010,3 +1010,65 @@ def test_kb_retriever_falls_back_to_subject_query_without_override(pipeline, ctx
 
     called_query = pipeline.backend.retrieve.call_args.args[1]
     assert "voltage" in called_query
+
+
+def _req_for_unit(unit_id: str, subject: str, capabilities: list[str]) -> InformationRequirement:
+    return InformationRequirement(
+        requirement_id=f"requirement-{unit_id}",
+        semantic_unit_id=unit_id,
+        claim_type="attribute",
+        subject=subject,
+        required_capabilities=capabilities,
+    )
+
+
+def test_kb_retriever_dedups_across_ragflow_and_spreadsheet(pipeline, ctx):
+    # Both backends return the same content; dedup must keep the higher score.
+    pipeline.backend.retrieve.return_value = [
+        Evidence(
+            id="rag:1",
+            content="BOM row",
+            source_name="bom.xlsx",
+            content_kind="document_text",
+            processor_kind="ragflow",
+            score=0.3,
+        )
+    ]
+    spreadsheet_tool = Mock()
+    spreadsheet_tool.run.return_value = [_xlsx_evidence("bom.xlsx", "BOM row")]  # score 0.9
+    pipeline.spreadsheet_service = Mock()
+    original = _patch_spreadsheet_tool(pipeline, spreadsheet_tool)
+    try:
+        retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["bom.xlsx"])
+        outcome = retrieve(_req_for_unit("field:f1", "用量", ["tabular_lookup"]), 0)
+    finally:
+        _restore_spreadsheet_tool(original)
+
+    assert len(outcome.evidences) == 1
+    assert outcome.evidences[0].score == 0.9
+    assert outcome.evidences[0].content == "BOM row"
+
+
+def test_kb_retriever_cross_unit_reuse_on_empty(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []  # RAGFlow empty for both units
+    spreadsheet_tool = Mock()
+    # Unit A hits; unit B empty.
+    spreadsheet_tool.run.side_effect = [
+        [_xlsx_evidence("bom.xlsx", "用量 row")],
+        [],
+    ]
+    pipeline.spreadsheet_service = Mock()
+    original = _patch_spreadsheet_tool(pipeline, spreadsheet_tool)
+    try:
+        retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["bom.xlsx"])
+        outcome_a = retrieve(_req_for_unit("field:a", "用量", ["tabular_lookup"]), 0)
+        outcome_b = retrieve(_req_for_unit("field:b", "用量", ["tabular_lookup"]), 0)
+    finally:
+        _restore_spreadsheet_tool(original)
+
+    assert outcome_a.status == "success_with_hits"
+    # Unit B had no fresh hits; the cache re-offers unit A's evidence.
+    assert outcome_b.status == "success_with_hits"
+    assert len(outcome_b.evidences) == 1
+    assert outcome_b.evidences[0].metadata.get("reused") is True
+    assert outcome_b.evidences[0].metadata.get("reused_from_unit") == "field:a"

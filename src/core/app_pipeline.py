@@ -3,7 +3,7 @@ import os
 import shutil
 import tempfile
 import traceback
-from typing import Callable, Generator, List, Tuple
+from typing import Any, Callable, Generator, List, Tuple
 
 import config.settings
 from src.agents.runner import MultiSourceAgentRunner
@@ -17,6 +17,12 @@ from src.projects.service import ProjectService
 from src.projects.retrieval import ProjectEvidenceRetrievalService, SourceUnavailableError
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.template_progress import TemplateProgressCallback
+from src.document_authoring.retriever_registry import (
+    CrossUnitEvidenceCache,
+    RetrieverRegistry,
+    apply_role_boost,
+    dedup_by_content,
+)
 from src.services.document_manager import DocumentManager
 from src.services.kb_scope import kb_scope_from_context
 
@@ -510,13 +516,56 @@ class AppPipeline:
         # Spreadsheet structured index (xlsx TableIndexStore). Instantiated
         # once per retriever so multiple units reuse the same tool. The tool
         # does not honour source_names in `filters` (only record_id), so the
-        # closure filters frozen-set membership itself before merging; the
-        # downstream build_knowledge_base_retrieval_outcome re-checks as a
-        # second guard.
+        # specialised retriever filters frozen-set membership itself before
+        # merging; the downstream build_knowledge_base_retrieval_outcome
+        # re-checks as a second guard.
         spreadsheet_tool = (
             SpreadsheetSemanticTool(self.spreadsheet_service)
             if self.spreadsheet_service is not None
             else None
+        )
+
+        def default_retriever(query, requirement):
+            return list(
+                self.backend.retrieve(
+                    kb_name,
+                    query,
+                    top_k=config.settings.FINAL_TOP_K,
+                    ctx=ctx,
+                    filters={"source_names": frozen_source_names},
+                )
+            )
+
+        specialized: dict[str, Callable[[str, Any], list]] = {}
+        if spreadsheet_tool is not None:
+            def _tabular_retriever(query, requirement):
+                sp_evidences = spreadsheet_tool.run(
+                    query,
+                    kb_name,
+                    ctx,
+                    top_k=config.settings.FINAL_TOP_K,
+                    filters=None,
+                )
+                # Drop anything outside the frozen source set before it reaches
+                # the domain-binding step, which would otherwise raise
+                # PermissionError and abort the whole run.
+                return [
+                    evidence
+                    for evidence in sp_evidences
+                    if evidence.source_name in frozen_source_names
+                ]
+            specialized["tabular_lookup"] = _tabular_retriever
+
+        # The registry generalises the Stage 0 tabular_lookup dispatch: the
+        # default (RAGFlow) retriever is always invoked, specialised retrievers
+        # are additively invoked per declared capability, evidence is deduplicated
+        # by content hash, preferred_source_roles are boosted (P7), and a
+        # cross-unit cache reuses evidence on empty retrieval (P8). Closure-
+        # internal, no policy gating (same precedent as Stage 0).
+        registry = RetrieverRegistry(
+            default_retriever=default_retriever,
+            specialized=specialized,
+            cross_unit_cache=CrossUnitEvidenceCache(),
         )
 
         def retrieve(requirement, _attempt, query_override=None):
@@ -529,34 +578,7 @@ class AppPipeline:
                 )
                 if value
             )
-            evidences = list(
-                self.backend.retrieve(
-                    kb_name,
-                    query,
-                    top_k=config.settings.FINAL_TOP_K,
-                    ctx=ctx,
-                    filters={"source_names": frozen_source_names},
-                )
-            )
-            if (
-                spreadsheet_tool is not None
-                and "tabular_lookup" in (requirement.required_capabilities or [])
-            ):
-                sp_evidences = spreadsheet_tool.run(
-                    query,
-                    kb_name,
-                    ctx,
-                    top_k=config.settings.FINAL_TOP_K,
-                    filters=None,
-                )
-                # Drop anything outside the frozen source set before it reaches
-                # the domain-binding step, which would otherwise raise
-                # PermissionError and abort the whole run.
-                evidences.extend(
-                    evidence
-                    for evidence in sp_evidences
-                    if evidence.source_name in frozen_source_names
-                )
+            evidences = registry.retrieve(requirement, query)
             return self.document_generation.build_knowledge_base_retrieval_outcome(
                 kb_name,
                 frozen_source_names,
