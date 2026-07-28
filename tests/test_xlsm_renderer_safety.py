@@ -156,7 +156,7 @@ def test_renderer_rejects_abnormal_duplicate_long_values():
             write_policy="validated_draft",
             expected_value_hash=workbook_value_hash(None),
         )
-        for cell in ("A1", "B1", "C1", "D1", "E1")
+        for cell in ("A1", "B1")
     ]
     plan = _plan(*[
         WorkbookFill(

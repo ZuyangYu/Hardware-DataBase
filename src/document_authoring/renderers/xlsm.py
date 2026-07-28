@@ -111,7 +111,7 @@ class XlsmRenderer:
         for _region, value, _semantic_unit_id in fills:
             if len(value) >= 80:
                 long_value_counts[value] = long_value_counts.get(value, 0) + 1
-        if any(count > 4 for count in long_value_counts.values()):
+        if any(count > 1 for count in long_value_counts.values()):
             raise ValueError("abnormal duplicate long value fan-out is not allowed")
 
         sheet_fills: dict[str, list[tuple[WorkbookRegionSchema, str]]] = {}
