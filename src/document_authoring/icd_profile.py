@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Literal
 import zipfile
+from xml.etree import ElementTree as ET
 
 from src.document_authoring.icd_generation import (
     connector_refdes_from_front_view_template,
@@ -30,6 +31,14 @@ class IcdConnectorBlock:
     board_connector_model: str
     board_connector_model_cell: str
     pin_header_row: int
+
+
+@dataclass(frozen=True)
+class _LabeledValue:
+    value: str
+    cell: str
+    physical_row: int
+    label_column: int
 
 
 @dataclass(frozen=True)
@@ -59,19 +68,13 @@ def classify_icd_template(content: bytes, target_format: str) -> IcdTemplateProf
         return _generic_profile("empty_template")
     try:
         workbook = parse_xlsx(BytesIO(content))
-    except (KeyError, OSError, ValueError, zipfile.BadZipFile):
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile, ET.ParseError):
         return _generic_profile("unreadable_workbook")
 
     formal_sheets = [
         sheet for sheet in workbook.sheets if not is_example_sheet_name(sheet.name)
     ]
-    connector_blocks = [
-        block
-        for sheet in formal_sheets
-        for header_row in _pin_table_header_rows(sheet)
-        for block in [_connector_block(sheet, header_row)]
-        if block is not None
-    ]
+    connector_blocks = [block for sheet in formal_sheets for block in _connector_blocks(sheet)]
     has_icd_labels = any(_has_pin_table(sheet) for sheet in workbook.sheets)
     front_view_refdes = connector_refdes_from_front_view_template(content)
     if connector_blocks:
@@ -110,18 +113,60 @@ def _generic_profile(
     )
 
 
-def _connector_block(sheet: ParsedSheet, header_row: int) -> IcdConnectorBlock | None:
-    location = _nearest_labeled_value(sheet, header_row, _LOCATION_LABELS)
-    board_model = _nearest_labeled_value(sheet, header_row, _BOARD_MODEL_LABELS)
-    if location is None or board_model is None:
+def _connector_blocks(sheet: ParsedSheet) -> list[IcdConnectorBlock]:
+    header_rows = _pin_table_header_rows(sheet)
+    locations = _labeled_values(sheet, _LOCATION_LABELS)
+    board_models = _labeled_values(sheet, _BOARD_MODEL_LABELS)
+    return [
+        block
+        for header_row in header_rows
+        for block in [_connector_block(
+            sheet,
+            header_row,
+            header_rows,
+            locations,
+            board_models,
+        )]
+        if block is not None
+    ]
+
+
+def _connector_block(
+    sheet: ParsedSheet,
+    header_row: int,
+    header_rows: list[int],
+    locations: list[_LabeledValue],
+    board_models: list[_LabeledValue],
+) -> IcdConnectorBlock | None:
+    location_candidates = _values_in_header_block(
+        sheet,
+        header_row,
+        header_rows,
+        locations,
+    )
+    board_model_candidates = _values_in_header_block(
+        sheet,
+        header_row,
+        header_rows,
+        board_models,
+    )
+    if not location_candidates or not board_model_candidates:
         return None
+    location, board_model = min(
+        (
+            (location, board_model)
+            for location in location_candidates
+            for board_model in board_model_candidates
+        ),
+        key=lambda pair: _identity_pair_score(sheet, header_row, *pair),
+    )
     return IcdConnectorBlock(
         sheet_name=sheet.name,
-        location_number=location[0],
-        location_cell=location[1],
-        board_connector_model=board_model[0],
-        board_connector_model_cell=board_model[1],
-        pin_header_row=header_row + 1,
+        location_number=location.value,
+        location_cell=location.cell,
+        board_connector_model=board_model.value,
+        board_connector_model_cell=board_model.cell,
+        pin_header_row=_physical_row(sheet, header_row),
     )
 
 
@@ -142,12 +187,11 @@ def _row_has_labels(row: list[str], *label_groups: tuple[str, ...]) -> bool:
     return all(any(_contains(label, group) for label in labels) for group in label_groups)
 
 
-def _nearest_labeled_value(
+def _labeled_values(
     sheet: ParsedSheet,
-    header_row: int,
     labels: tuple[str, ...],
-) -> tuple[str, str] | None:
-    candidates: list[tuple[int, int, str, str]] = []
+) -> list[_LabeledValue]:
+    candidates: list[_LabeledValue] = []
     for row_index, row in enumerate(sheet.rows):
         for column_index, raw_label in enumerate(row):
             if not _contains(_normalize(raw_label), labels):
@@ -156,16 +200,85 @@ def _nearest_labeled_value(
             if value is None:
                 continue
             text, value_index = value
-            candidates.append((
-                abs(row_index - header_row),
-                column_index,
-                text,
-                _cell_ref(value_index + 1, row_index + 1),
+            physical_row = _physical_row(sheet, row_index)
+            candidates.append(_LabeledValue(
+                value=text,
+                cell=_cell_ref(value_index + 1, physical_row),
+                physical_row=physical_row,
+                label_column=column_index,
             ))
-    if not candidates:
-        return None
-    _distance, _column, value, cell = min(candidates)
-    return value, cell
+    return candidates
+
+
+def _values_in_header_block(
+    sheet: ParsedSheet,
+    header_row: int,
+    header_rows: list[int],
+    candidates: list[_LabeledValue],
+) -> list[_LabeledValue]:
+    return [
+        candidate
+        for candidate in candidates
+        if _nearest_header_row(sheet, candidate, header_rows) == header_row
+    ]
+
+
+def _nearest_header_row(
+    sheet: ParsedSheet,
+    candidate: _LabeledValue,
+    header_rows: list[int],
+) -> int:
+    return min(
+        header_rows,
+        key=lambda header_row: (
+            _header_distance(sheet, header_row, candidate),
+            _physical_row(sheet, header_row),
+            header_row,
+        ),
+    )
+
+
+def _identity_pair_score(
+    sheet: ParsedSheet,
+    header_row: int,
+    location: _LabeledValue,
+    board_model: _LabeledValue,
+) -> tuple[int, int, int, int]:
+    return (
+        _header_distance(sheet, header_row, location)
+        + _header_distance(sheet, header_row, board_model),
+        abs(location.physical_row - board_model.physical_row)
+        + abs(location.label_column - board_model.label_column),
+        location.physical_row,
+        location.label_column,
+    )
+
+
+def _header_distance(
+    sheet: ParsedSheet,
+    header_row: int,
+    candidate: _LabeledValue,
+) -> int:
+    header_columns = _pin_header_columns(sheet.rows[header_row])
+    return abs(candidate.physical_row - _physical_row(sheet, header_row)) + min(
+        abs(candidate.label_column - column)
+        for column in header_columns
+    )
+
+
+def _pin_header_columns(row: list[str]) -> list[int]:
+    return [
+        column_index
+        for column_index, value in enumerate(row)
+        if _contains(_normalize(value), _PIN_LABELS)
+        or _contains(_normalize(value), _DEFINITION_LABELS)
+    ]
+
+
+def _physical_row(sheet: ParsedSheet, row_index: int) -> int:
+    if row_index < len(sheet.row_indices):
+        return sheet.row_indices[row_index]
+    return row_index + 1
 
 
 def _next_value(row: list[str], label_index: int) -> tuple[str, int] | None:

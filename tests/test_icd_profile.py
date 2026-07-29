@@ -4,8 +4,13 @@ import zipfile
 from src.document_authoring.icd_profile import IcdTemplateProfile, classify_icd_template
 
 
-def _workbook_bytes(sheet_name: str, rows: list[list[str]]) -> bytes:
+def _workbook_bytes(
+    sheet_name: str,
+    rows: list[list[str]],
+    row_numbers: list[int] | None = None,
+) -> bytes:
     content = BytesIO()
+    row_numbers = row_numbers or list(range(1, len(rows) + 1))
     sheet_rows = "".join(
         f'<row r="{row_number}">' + "".join(
             f'<c r="{chr(65 + column_number)}{row_number}" t="inlineStr">'
@@ -13,7 +18,7 @@ def _workbook_bytes(sheet_name: str, rows: list[list[str]]) -> bytes:
             for column_number, value in enumerate(row)
             if value
         ) + "</row>"
-        for row_number, row in enumerate(rows, start=1)
+        for row_number, row in zip(row_numbers, rows, strict=True)
     )
     with zipfile.ZipFile(content, "w") as archive:
         archive.writestr(
@@ -110,3 +115,52 @@ def test_profile_contract_does_not_require_front_view_data():
     )
 
     assert profile.connector_refdes == []
+
+
+def test_adjacent_connector_blocks_keep_each_identity_pair_local_to_its_pin_table():
+    content = _workbook_bytes("ICD", [
+        ["Location Number", "J-LEFT"],
+        ["", "", "", "", "", "Location Number", "J-RIGHT"],
+        ["Board Connector", "MODEL-LEFT"],
+        ["Pin Number", "Pin Definition"],
+        ["", "", "", "", "", "Board Connector", "MODEL-RIGHT"],
+        ["", "", "", "", "", "Pin Number", "Pin Definition"],
+    ])
+
+    blocks = classify_icd_template(content, "xlsx").connector_blocks
+
+    assert [
+        (block.location_number, block.board_connector_model)
+        for block in blocks
+    ] == [("J-LEFT", "MODEL-LEFT"), ("J-RIGHT", "MODEL-RIGHT")]
+
+
+def test_connector_block_uses_sparse_physical_rows_for_geometry_and_addresses():
+    content = _workbook_bytes(
+        "ICD",
+        [
+            ["Location Number", "J-FAR", "Board Connector", "MODEL-FAR"],
+            ["Pin Number", "Pin Definition"],
+            ["Location Number", "J-NEAR", "Board Connector", "MODEL-NEAR"],
+        ],
+        row_numbers=[2, 100, 101],
+    )
+
+    block = classify_icd_template(content, "xlsx").connector_blocks[0]
+
+    assert block.location_number == "J-NEAR"
+    assert block.location_cell == "B101"
+    assert block.board_connector_model == "MODEL-NEAR"
+    assert block.board_connector_model_cell == "D101"
+    assert block.pin_header_row == 100
+
+
+def test_malformed_workbook_xml_is_unreadable_generic_profile():
+    content = BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr("xl/workbook.xml", "<workbook>")
+
+    profile = classify_icd_template(content.getvalue(), "xlsx")
+
+    assert profile.kind == "generic"
+    assert profile.reasons == ["unreadable_workbook"]
