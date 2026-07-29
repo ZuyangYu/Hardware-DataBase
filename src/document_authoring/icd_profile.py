@@ -30,6 +30,11 @@ _BOARD_CONNECTOR_MODEL_LABELS = frozenset({
 })
 _BOARD_MODEL_LABEL_KINDS = frozenset({"board_connector", "board_connector_model"})
 _IDENTITY_LABEL_SEPARATORS = frozenset(" :：;；,，|/\\-–—")
+_IDENTITY_LABEL_KINDS = (
+    ("location", _LOCATION_LABELS),
+    ("board_connector_model", _BOARD_CONNECTOR_MODEL_LABELS),
+    ("board_connector", _BOARD_CONNECTOR_LABELS),
+)
 
 
 @dataclass(frozen=True)
@@ -313,12 +318,17 @@ def _identity_label_kind(value: object) -> str | None:
         _normalize(part).strip("".join(_IDENTITY_LABEL_SEPARATORS))
         for part in re.split(r"[:：;；,，|\-–—]", normalized)
     )
-    if label_parts & _LOCATION_LABELS:
-        return "location"
-    if label_parts & _BOARD_CONNECTOR_MODEL_LABELS:
-        return "board_connector_model"
-    if label_parts & _BOARD_CONNECTOR_LABELS:
-        return "board_connector"
+    for label_kind, labels in _IDENTITY_LABEL_KINDS:
+        if label_parts & labels:
+            return label_kind
+    for label_kind, labels in _IDENTITY_LABEL_KINDS:
+        if any(
+            normalized.startswith(f"{label} ")
+            and normalized.removeprefix(f"{label} ") in other_labels
+            for label in labels
+            for _, other_labels in _IDENTITY_LABEL_KINDS
+        ):
+            return label_kind
     return None
 
 
