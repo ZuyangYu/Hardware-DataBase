@@ -156,6 +156,16 @@ def test_front_view_artifact_shim_uses_frozen_facts_without_a_template_path(tmp_
     assert _values(rendered.content, tmp_path)[1][1] == "ETH_P"
 
 
+def test_non_workbook_icd_template_has_no_front_view_connector_candidates():
+    from src.document_authoring.icd_generation import connector_refdes_from_front_view_template
+
+    docx_like = BytesIO()
+    with zipfile.ZipFile(docx_like, "w") as archive:
+        archive.writestr("word/document.xml", "<document/>")
+
+    assert connector_refdes_from_front_view_template(docx_like.getvalue()) == []
+
+
 def test_front_view_connector_parser_reads_explicit_refdes_from_template_bytes(tmp_path: Path):
     template = tmp_path / "template.xlsx"
     _xlsx(template, [

@@ -86,7 +86,7 @@ def connector_refdes_from_front_view_template(content: bytes) -> list[str]:
         return []
     try:
         workbook = parse_xlsx(BytesIO(content))
-    except (OSError, ValueError, zipfile.BadZipFile):
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile):
         return []
 
     candidates: list[str] = []
