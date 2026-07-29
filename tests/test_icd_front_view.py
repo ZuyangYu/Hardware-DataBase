@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 import zipfile
 
 from src.document_authoring.icd_generation import (
     build_front_view_fills,
     render_icd_front_views,
 )
-from src.document_authoring.models import RendererPolicy, WorkbookFillPlan
+from src.document_authoring.models import RendererPolicy, ValidationReport, WorkbookFillPlan
 from src.document_authoring.renderers.xlsm import XlsmRenderer
+from src.document_authoring.icd_scope_decision import IcdScopeDecision
+from src.document_authoring.models import IcdScopeReview
+from src.document_authoring.service import DocumentGenerationService
 from src.pipelines.spreadsheet.xlsx_parser import parse_xlsx
 
 
@@ -148,6 +153,82 @@ def test_front_view_artifact_shim_uses_frozen_facts_without_a_template_path(tmp_
     assert rendered.issues == []
     assert rendered.detected_layout_count == 1
     assert _values(rendered.content, tmp_path)[1][1] == "ETH_P"
+
+
+def test_harness_finalization_overlay_uses_the_frozen_scope_not_writer_order(tmp_path: Path):
+    template_path = tmp_path / "template.xlsx"
+    _xlsx(template_path, [
+        ["板端接插件前视图管序布局和定义"],
+        ["管脚定义 Pin Definition", "旧"],
+        ["管脚号 Pin Number", "X1902-1"],
+        ["板端接插件序号", "1"],
+    ])
+    review = IcdScopeReview(
+        work_order_id="work-front-view",
+        source_snapshot_hash="snapshot",
+        status="frozen",
+        decision=IcdScopeDecision(frozen_pin_mappings=[{
+            "refdes": "X1902", "pin_name": "1", "net_name": "ETH_P",
+        }]),
+    )
+    service = object.__new__(DocumentGenerationService)
+    service.store = Mock()
+    service.store.get_icd_scope_review.return_value = review
+    content, manifest, issues = service._apply_icd_front_view_layout(
+        SimpleNamespace(work_order_id="work-front-view"),
+        SimpleNamespace(format="xlsx", template_version_id="template-front-view"),
+        template_path.read_bytes(),
+        {
+            "manifest_hash": "base-manifest",
+            "changed_parts": [],
+            "policy_violations": [],
+            "cell_policy_violations": [],
+            "cell_changes": [],
+            "table_row_operations": [],
+        },
+    )
+
+    assert issues == []
+    assert manifest["manifest_hash"] != "base-manifest"
+    assert _values(content, tmp_path)[1][1] == "ETH_P"
+
+
+def test_harness_front_view_issue_becomes_an_icd_approval_blocker(tmp_path: Path):
+    template_path = tmp_path / "template.xlsx"
+    _xlsx(template_path, [
+        ["板端接插件前视图管序布局和定义"],
+        ["管脚定义 Pin Definition", "旧"],
+        ["管脚号 Pin Number", "X1902-99"],
+        ["板端接插件序号", "99"],
+    ])
+    review = IcdScopeReview(
+        work_order_id="work-front-view-invalid",
+        source_snapshot_hash="snapshot",
+        status="frozen",
+        decision=IcdScopeDecision(frozen_pin_mappings=[{
+            "refdes": "X1902", "pin_name": "1", "net_name": "ETH_P",
+        }]),
+    )
+    service = object.__new__(DocumentGenerationService)
+    service.store = Mock()
+    service.store.get_icd_scope_review.return_value = review
+    content, _manifest, issues = service._apply_icd_front_view_layout(
+        SimpleNamespace(work_order_id="work-front-view-invalid"),
+        SimpleNamespace(format="xlsx", template_version_id="template-front-view"),
+        template_path.read_bytes(),
+        {"manifest_hash": "base-manifest"},
+    )
+    report = service._append_icd_validation_issues(
+        ValidationReport(
+            validation_report_id="report-front-view", work_order_id="work-front-view-invalid",
+            status="passed", evidence_matrix_hash="matrix",
+        ),
+        issues,
+    )
+
+    assert content == template_path.read_bytes()
+    assert report.status == "requires_human"
+    assert service._has_icd_blocking_issue(report.issues)
 
 
 def test_front_view_reports_unknown_or_unparsed_slots_as_blocking(tmp_path: Path):

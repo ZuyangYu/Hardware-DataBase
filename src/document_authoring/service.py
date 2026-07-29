@@ -24,6 +24,7 @@ from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
+from src.document_authoring.icd_generation import render_icd_front_views
 from src.document_authoring.icd_validation import validate_icd_pin_set
 from src.document_authoring.icd_scope_decision import effective_frozen_pin_mappings
 from src.document_authoring.models import (
@@ -1232,6 +1233,12 @@ class DocumentGenerationService:
         self,
         ctx: RequestContext,
         *,
+        rendered_content, integrity_manifest, front_view_issues = self._apply_icd_front_view_layout(
+            order,
+            template,
+            rendered_content,
+            integrity_manifest,
+        )
         artifact_id: str,
         unit_id: str,
         event_type: str,
@@ -1242,6 +1249,7 @@ class DocumentGenerationService:
             raise ValueError("feedback comment is required")
         artifact = self._artifact_for_context(ctx, artifact_id)
         required = "approve_artifact" if event_type in {"approve", "sign"} else "submit_human_event"
+        report = self._append_icd_validation_issues(report, front_view_issues)
         order = self._order_raw(artifact.work_order_id)
         self.require_work_order_capability(ctx, order, required)
         actor_role = (
@@ -1262,6 +1270,62 @@ class DocumentGenerationService:
             value=value, actor_id=ctx.user_id, actor_role=actor_role, comment=comment,
         )
         return self.store.save_human_event(event)
+    def _apply_icd_front_view_layout(
+        self,
+        order: DocumentWorkOrder,
+        template: TemplateVersion,
+        rendered_content: bytes,
+        integrity_manifest: dict[str, Any],
+    ) -> tuple[bytes, dict[str, Any], list[dict[str, str]]]:
+        """Overlay detected ICD front views using the same frozen pin facts.
+
+        The normal semantic writer owns document prose and Pin Definition rows.
+        This deterministic post-render pass owns only a template's physical
+        connector-view slots, so an LLM can never reverse or redraw their
+        numbering.  It is intentionally a no-op outside a frozen ICD scope.
+        """
+        review = self.store.get_icd_scope_review(order.work_order_id)
+        if review is None or review.pending_count:
+            return rendered_content, integrity_manifest, []
+        if template.format.casefold() not in {"xlsx", "xlsm"}:
+            return rendered_content, integrity_manifest, []
+        front_view = render_icd_front_views(
+            rendered_content,
+            effective_frozen_pin_mappings(review),
+            target_format=template.format,
+            template_version_id=template.template_version_id,
+        )
+        if front_view.integrity_manifest is None:
+            return front_view.content, integrity_manifest, front_view.issues
+        overlay_manifest = front_view.integrity_manifest
+        combined_manifest = {
+            **integrity_manifest,
+            "after_content_hash": overlay_manifest.get("after_content_hash"),
+            "changed_parts": sorted(set(integrity_manifest.get("changed_parts", [])) | set(overlay_manifest.get("changed_parts", []))),
+            "policy_violations": [
+                *integrity_manifest.get("policy_violations", []),
+                *overlay_manifest.get("policy_violations", []),
+            ],
+            "cell_policy_violations": [
+                *integrity_manifest.get("cell_policy_violations", []),
+                *overlay_manifest.get("cell_policy_violations", []),
+            ],
+            "cell_changes": [
+                *integrity_manifest.get("cell_changes", []),
+                *overlay_manifest.get("cell_changes", []),
+            ],
+            "table_row_operations": [
+                *integrity_manifest.get("table_row_operations", []),
+                *overlay_manifest.get("table_row_operations", []),
+            ],
+        }
+        combined_manifest["manifest_hash"] = content_hash({
+            "base_manifest_hash": integrity_manifest.get("manifest_hash"),
+            "front_view_manifest_hash": overlay_manifest.get("manifest_hash"),
+            "after_content_hash": overlay_manifest.get("after_content_hash"),
+        })
+        return front_view.content, combined_manifest, front_view.issues
+
 
     def submit_document_feedback(
         self,
@@ -1405,6 +1469,10 @@ class DocumentGenerationService:
         ):
             raise ValueError(
                 "schema semantic unit count exceeds automatic-generation capacity"
+        return self._append_icd_validation_issues(report, issues)
+
+    @staticmethod
+    def _append_icd_validation_issues(report, issues: list[dict[str, Any]]):
             )
         return self.store.save_harness_policy(HarnessPolicy(
             harness_policy_id=(
