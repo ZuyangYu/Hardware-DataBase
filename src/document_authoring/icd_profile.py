@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from io import BytesIO
+import re
 from typing import Literal
 import zipfile
 from xml.etree import ElementTree as ET
@@ -17,8 +18,17 @@ from src.pipelines.spreadsheet.xlsx_parser import ParsedSheet, parse_xlsx
 
 _PIN_LABELS = ("pin number", "管脚号", "引脚号", "针脚号")
 _DEFINITION_LABELS = ("pin definition", "管脚定义", "引脚定义", "signal definition")
-_LOCATION_LABELS = ("location number", "控制器上编号", "位置编号", "接插件位置")
-_BOARD_MODEL_LABELS = ("board connector", "pcb connector", "板端接插件", "板端型号")
+_LOCATION_LABELS = frozenset({
+    "location number", "控制器上编号", "在控制器上编号", "位置编号", "接插件位置",
+})
+_BOARD_CONNECTOR_LABELS = frozenset({
+    "board connector", "pcb connector", "板端接插件", "板端连接器",
+})
+_BOARD_CONNECTOR_MODEL_LABELS = frozenset({
+    "board connector model", "pcb connector model", "板端接插件型号", "板端连接器型号",
+    "板端接插件供应商/型号", "板端型号",
+})
+_BOARD_MODEL_LABEL_KINDS = frozenset({"board_connector", "board_connector_model"})
 _IDENTITY_LABEL_SEPARATORS = frozenset(" :：;；,，|/\\-–—")
 
 
@@ -116,8 +126,8 @@ def _generic_profile(
 
 def _connector_blocks(sheet: ParsedSheet) -> list[IcdConnectorBlock]:
     header_rows = _pin_table_header_rows(sheet)
-    locations = _labeled_values(sheet, _LOCATION_LABELS)
-    board_models = _labeled_values(sheet, _BOARD_MODEL_LABELS)
+    locations = _labeled_values(sheet, "location")
+    board_models = _labeled_values(sheet, *_BOARD_MODEL_LABEL_KINDS)
     return [
         block
         for header_row in header_rows
@@ -190,12 +200,12 @@ def _row_has_labels(row: list[str], *label_groups: tuple[str, ...]) -> bool:
 
 def _labeled_values(
     sheet: ParsedSheet,
-    labels: tuple[str, ...],
+    *label_kinds: str,
 ) -> list[_LabeledValue]:
     candidates: list[_LabeledValue] = []
     for row_index, row in enumerate(sheet.rows):
         for column_index, raw_label in enumerate(row):
-            if not _contains(_normalize(raw_label), labels):
+            if _identity_label_kind(raw_label) not in label_kinds:
                 continue
             value = _next_value(row, column_index)
             if value is None:
@@ -293,19 +303,23 @@ def _next_value(row: list[str], label_index: int) -> tuple[str, int] | None:
 
 
 def _is_identity_label(value: str) -> bool:
-    normalized = _normalize(value)
-    return any(
-        normalized == label
-        or (
-            normalized.startswith(label)
-            and normalized[len(label):]
-            and all(
-                character in _IDENTITY_LABEL_SEPARATORS
-                for character in normalized[len(label):]
-            )
-        )
-        for label in _LOCATION_LABELS + _BOARD_MODEL_LABELS
+    return _identity_label_kind(value) is not None
+
+
+def _identity_label_kind(value: object) -> str | None:
+    normalized = _normalize(value).strip("".join(_IDENTITY_LABEL_SEPARATORS))
+    label_parts = {normalized}
+    label_parts.update(
+        part.strip("".join(_IDENTITY_LABEL_SEPARATORS))
+        for part in re.split(r"[:：;；,，|\\-–—]", normalized)
     )
+    if label_parts & _LOCATION_LABELS:
+        return "location"
+    if label_parts & _BOARD_CONNECTOR_MODEL_LABELS:
+        return "board_connector_model"
+    if label_parts & _BOARD_CONNECTOR_LABELS:
+        return "board_connector"
+    return None
 
 
 def _normalize(value: object) -> str:
