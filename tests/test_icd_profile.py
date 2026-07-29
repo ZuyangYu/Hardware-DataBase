@@ -155,6 +155,18 @@ def test_connector_block_uses_sparse_physical_rows_for_geometry_and_addresses():
     assert block.pin_header_row == 100
 
 
+def test_identity_label_cannot_be_used_as_a_location_number_value():
+    content = _workbook_bytes("ICD", [
+        ["Location Number", "Board Connector", "MODEL-1"],
+        ["Pin Number", "Pin Definition"],
+    ])
+
+    profile = classify_icd_template(content, "xlsx")
+
+    assert profile.kind == "icd_sample"
+    assert "formal_connector_block_missing" in _codes(profile.issues)
+
+
 def test_malformed_workbook_xml_is_unreadable_generic_profile():
     content = BytesIO()
     with zipfile.ZipFile(content, "w") as archive:

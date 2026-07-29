@@ -285,6 +285,8 @@ def _next_value(row: list[str], label_index: int) -> tuple[str, int] | None:
     for value_index, value in enumerate(row[label_index + 1:], start=label_index + 1):
         text = str(value).strip()
         if text:
+            if _contains(_normalize(text), _LOCATION_LABELS + _BOARD_MODEL_LABELS):
+                return None
             return text, value_index
     return None
 
