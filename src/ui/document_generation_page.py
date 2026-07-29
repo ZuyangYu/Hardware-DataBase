@@ -81,10 +81,11 @@ def _render_icd_scope_review(st, pipeline, ctx, work_order_id: str) -> None:
         return
     if review is None:
         return
-    with st.expander(
-        f"已自动确认 {len(_value(_value(review, 'decision'), 'auto_items', []))} 项",
-        expanded=False,
-    ):
+    if not callable(getattr(st, "expander", None)):
+        return
+
+    auto_count = len(_value(_value(review, "decision"), "auto_items", []))
+    with st.expander(f"已自动确认 {auto_count} 项", expanded=False):
         st.caption("这些管脚已有直接电路与佐证来源，默认折叠以便专注异常。")
     exceptions = _value(review, "exceptions", [])
     if not exceptions:
