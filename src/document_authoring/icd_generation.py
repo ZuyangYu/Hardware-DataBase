@@ -121,6 +121,12 @@ def connector_refdes_from_front_view_template(content: bytes) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def is_example_sheet_name(name: str) -> bool:
+    """Return whether a sheet name marks its contents as non-formal example data."""
+
+    return _is_example_sheet(name)
+
+
 def build_front_view_fills(
     workbook: Any,
     frozen_pin_mappings: Iterable[dict[str, Any]],
