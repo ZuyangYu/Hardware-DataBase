@@ -19,6 +19,7 @@ _PIN_LABELS = ("pin number", "管脚号", "引脚号", "针脚号")
 _DEFINITION_LABELS = ("pin definition", "管脚定义", "引脚定义", "signal definition")
 _LOCATION_LABELS = ("location number", "控制器上编号", "位置编号", "接插件位置")
 _BOARD_MODEL_LABELS = ("board connector", "pcb connector", "板端接插件", "板端型号")
+_IDENTITY_LABEL_SEPARATORS = frozenset(" :：;；,，|/\\-–—")
 
 
 @dataclass(frozen=True)
@@ -285,10 +286,26 @@ def _next_value(row: list[str], label_index: int) -> tuple[str, int] | None:
     for value_index, value in enumerate(row[label_index + 1:], start=label_index + 1):
         text = str(value).strip()
         if text:
-            if _contains(_normalize(text), _LOCATION_LABELS + _BOARD_MODEL_LABELS):
+            if _is_identity_label(text):
                 return None
             return text, value_index
     return None
+
+
+def _is_identity_label(value: str) -> bool:
+    normalized = _normalize(value)
+    return any(
+        normalized == label
+        or (
+            normalized.startswith(label)
+            and normalized[len(label):]
+            and all(
+                character in _IDENTITY_LABEL_SEPARATORS
+                for character in normalized[len(label):]
+            )
+        )
+        for label in _LOCATION_LABELS + _BOARD_MODEL_LABELS
+    )
 
 
 def _normalize(value: object) -> str:
