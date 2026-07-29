@@ -21,6 +21,7 @@ from typing import Any
 import requests
 
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
+from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
 from src.document_authoring.models import (
@@ -805,12 +806,7 @@ class DocumentGenerationService:
         retrieve_factory: Callable[[DocumentWorkOrder], Callable[[Any, int, "str | None"], RetrievalOutcome]] | None = None,
         idempotency_key: str | None = None,
     ):
-        """Create, run, validate, and release a document without approval clicks.
-
-        A candidate is released only when the Harness reaches
-        ``waiting_human_approval``. Evidence gaps, conflicts, or validation
-        findings remain a review candidate and therefore still require a human.
-        """
+        """Create, run, and validate a document as a human-review candidate."""
         order = self.create_document_work_order(
             ctx,
             project_id=project_id,
@@ -824,13 +820,7 @@ class DocumentGenerationService:
             retrieve = retrieve_factory(order)
         if retrieve is None:
             raise ValueError("auto generation requires a retrieval provider")
-        candidate = self.run_internal_harness(ctx, order.work_order_id, retrieve=retrieve)
-        current = self.store.get_work_order(order.work_order_id)
-        if current is None or current.status != "waiting_human_approval":
-            return candidate
-        return self.approve_document_artifact(
-            ctx, candidate.artifact_id, comment="自动生成并发布",
-        )
+        return self.run_internal_harness(ctx, order.work_order_id, retrieve=retrieve)
 
     # Deterministic execution ----------------------------------------------------------
 
@@ -1097,6 +1087,8 @@ class DocumentGenerationService:
         value: Any = None,
         comment: str = "",
     ) -> DocumentHumanEvent:
+        if event_type == "feedback" and not comment.strip():
+            raise ValueError("feedback comment is required")
         artifact = self._artifact_for_context(ctx, artifact_id)
         required = "approve_artifact" if event_type in {"approve", "sign"} else "submit_human_event"
         order = self._order_raw(artifact.work_order_id)
@@ -1119,6 +1111,25 @@ class DocumentGenerationService:
             value=value, actor_id=ctx.user_id, actor_role=actor_role, comment=comment,
         )
         return self.store.save_human_event(event)
+
+    def submit_document_feedback(
+        self,
+        ctx: RequestContext,
+        artifact_id: str,
+        *,
+        comment: str,
+    ) -> DocumentHumanEvent:
+        """Record review feedback without changing candidate or release state."""
+        normalized_comment = comment.strip()
+        if not normalized_comment:
+            raise ValueError("feedback comment is required")
+        return self.submit_document_human_event(
+            ctx,
+            artifact_id=artifact_id,
+            unit_id="artifact",
+            event_type="feedback",
+            comment=normalized_comment,
+        )
 
     def approve_document_artifact(self, ctx: RequestContext, artifact_id: str, *, comment: str = "") -> DocumentArtifact:
         candidate = self._artifact_for_context(ctx, artifact_id)
@@ -1160,6 +1171,17 @@ class DocumentGenerationService:
         capability = "download_approved_release" if artifact.stage == "approved_release" else "download_review_candidate"
         self.require_work_order_capability(ctx, order, capability)
         return self.store.read_artifact_content(artifact_id)
+
+    def preview_document_artifact(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
+        """Return a bounded, read-only artifact preview after download-equivalent checks."""
+        artifact = self._artifact_for_context(ctx, artifact_id)
+        order = self._order_raw(artifact.work_order_id)
+        capability = "download_approved_release" if artifact.stage == "approved_release" else "download_review_candidate"
+        self.require_work_order_capability(ctx, order, capability)
+        return preview_artifact(
+            self.store.read_artifact_content(artifact_id),
+            order.target_format,
+        )
 
     # Internal helpers -----------------------------------------------------------------
 

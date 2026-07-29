@@ -255,6 +255,15 @@ def _render_run_status(st, pipeline, ctx, status: dict) -> None:
         st.write(f"{artifact.get('stage', '产物')}：{artifact_id}")
         _render_artifact_download(st, pipeline, ctx, status, artifact_id)
         if artifact.get("stage") == "review_candidate":
+            _render_artifact_preview(st, pipeline, ctx, artifact_id)
+            feedback = st.text_input("反馈说明", key=f"feedback-comment-{artifact_id}")
+            if st.button("提交反馈", key=f"submit-feedback-{artifact_id}"):
+                try:
+                    pipeline.submit_document_feedback(ctx, artifact_id, comment=feedback)
+                except (PermissionError, ValueError, KeyError) as exc:
+                    st.error(f"提交反馈失败：{exc}")
+                else:
+                    st.success("反馈已保存；候选文件仍未发布。")
             comment = st.text_input("批准说明", key=f"approval-comment-{artifact_id}")
             if st.button("批准并发布", key=f"approve-artifact-{artifact_id}"):
                 try:
@@ -290,3 +299,35 @@ def _render_artifact_download(st, pipeline, ctx, status: dict, artifact_id: str)
             "下载", data=content, file_name=f"{artifact_id}.{status.get('target_format', 'bin')}",
             key=f"download-{artifact_id}",
         )
+
+
+def _render_artifact_preview(st, pipeline, ctx, artifact_id: str) -> None:
+    """Load a bounded preview only after an explicit user action."""
+    preview_key = f"document-artifact-preview-{artifact_id}"
+    preview = st.session_state.get(preview_key)
+    if preview is None and st.button("加载预览", key=f"prepare-preview-{artifact_id}"):
+        try:
+            preview = pipeline.preview_document_artifact(ctx, artifact_id)
+        except PermissionError:
+            st.caption("当前权限不能预览此产物。")
+            return
+        except (ValueError, KeyError) as exc:
+            st.error(f"加载预览失败：{exc}")
+            return
+        st.session_state[preview_key] = preview
+    if preview is None:
+        return
+    if preview.get("warnings"):
+        for warning in preview["warnings"]:
+            st.warning(warning)
+    if preview.get("format") in {"xlsx", "xlsm"}:
+        for sheet in preview.get("sheets", []):
+            st.caption(f"预览工作表：{sheet.get('name', '未命名')}（最多 50 行、12 列）")
+            st.dataframe(sheet.get("rows", []), width="stretch", hide_index=True)
+    elif preview.get("format") == "docx":
+        for paragraph in preview.get("paragraphs", []):
+            st.write(paragraph)
+        for table in preview.get("tables", []):
+            st.dataframe(table, width="stretch", hide_index=True)
+    if preview.get("truncated"):
+        st.caption("预览已截断；下载候选文件可查看完整内容。")

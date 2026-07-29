@@ -207,17 +207,9 @@ def test_pipeline_auto_generation_uses_created_order_frozen_snapshot(pipeline, c
         artifact_id="candidate-a",
         stage="review_candidate",
     )
-    release = SimpleNamespace(
-        artifact_id="release-a",
-        stage="approved_release",
-    )
     service.create_knowledge_base_work_order.return_value = order
     service.resolve_source_snapshot.return_value = snapshot
     service.run_internal_harness.return_value = candidate
-    service.store.get_work_order.return_value = SimpleNamespace(
-        status="waiting_human_approval"
-    )
-    service.approve_document_artifact.return_value = release
     pipeline.document_generation = service
     pipeline.list_file_infos = Mock(
         return_value=[SimpleNamespace(name="currently-readable.pdf")]
@@ -234,7 +226,7 @@ def test_pipeline_auto_generation_uses_created_order_frozen_snapshot(pipeline, c
         source_names=["untrusted-ui-file.pdf"],
     )
 
-    assert result == release
+    assert result == candidate
     service.create_knowledge_base_work_order.assert_called_once_with(
         ctx,
         knowledge_base_name="hardware",
@@ -253,9 +245,7 @@ def test_pipeline_auto_generation_uses_created_order_frozen_snapshot(pipeline, c
     service.run_internal_harness.assert_called_once_with(
         ctx, "wo-kb", retrieve=retrieve
     )
-    service.approve_document_artifact.assert_called_once_with(
-        ctx, "candidate-a", comment="自动生成并发布"
-    )
+    service.approve_document_artifact.assert_not_called()
 
 
 def test_pipeline_knowledge_base_status_is_scope_aware_and_reauthorized(

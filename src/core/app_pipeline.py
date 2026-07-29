@@ -498,17 +498,10 @@ class AppPipeline:
             order.work_order_id,
             retrieve=retrieve,
         )
-        current = self.document_generation.store.get_work_order(order.work_order_id)
-        if current is None or current.status != "waiting_human_approval":
-            return candidate
-        return self.document_generation.approve_document_artifact(
-            ctx,
-            candidate.artifact_id,
-            comment="自动生成并发布",
-        )
+        return candidate
 
     def auto_generate_document(self, ctx: RequestContext, **kwargs):
-        """Run and publish a document using the frozen project source snapshot."""
+        """Run a document using the frozen project source snapshot and return a candidate."""
         project_id = kwargs["project_id"]
 
         def retrieve_factory(order):
@@ -825,8 +818,18 @@ class AppPipeline:
     def submit_document_human_event(self, ctx: RequestContext, **kwargs):
         return self.document_generation.submit_document_human_event(ctx, **kwargs)
 
+    def submit_document_feedback(self, ctx: RequestContext, artifact_id: str, *, comment: str):
+        return self.document_generation.submit_document_feedback(
+            ctx,
+            artifact_id,
+            comment=comment,
+        )
+
     def approve_document_artifact(self, ctx: RequestContext, artifact_id: str, *, comment: str = ""):
         return self.document_generation.approve_document_artifact(ctx, artifact_id, comment=comment)
 
     def download_document_artifact(self, ctx: RequestContext, artifact_id: str) -> bytes:
         return self.document_generation.download_document_artifact(ctx, artifact_id)
+
+    def preview_document_artifact(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
+        return self.document_generation.preview_document_artifact(ctx, artifact_id)

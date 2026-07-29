@@ -585,7 +585,7 @@ class DocumentHumanEvent(BaseModel):
     artifact_id: str
     unit_id: str
     event_type: Literal[
-        "provide_value", "approve_na", "confirm_result", "assign_owner", "close_action", "approve", "sign",
+        "provide_value", "approve_na", "confirm_result", "assign_owner", "close_action", "approve", "sign", "feedback",
     ]
     event_schema_version: str = "1"
     previous_value_hash: str | None = None
