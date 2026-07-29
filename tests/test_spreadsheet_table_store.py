@@ -61,6 +61,33 @@ class SpreadsheetTableStoreTests(unittest.TestCase):
             del store
             gc.collect()
 
+    def test_routing_rank_prefers_exact_hardware_entity_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "table_indexes.db")
+            store = TableIndexStore(db_path=db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executemany(
+                    """
+                    INSERT INTO table_cells (record_id, sheet_name, row_index, col_index, cell_ref, value, header, raw_value)
+                    VALUES (?, 'BOM', 2, 1, 'A2', ?, 'Part Number', ?)
+                    """,
+                    [
+                        (7, "U1800", "U1800"),
+                        (8, "U1700", "U1700"),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            ranked = store.rank_documents_by_terms(["u1800", "part"])
+
+            self.assertIn(7, ranked)
+            self.assertNotIn(8, ranked)
+            self.assertEqual(ranked[7]["matched_terms"], ["part", "u1800"])
+            self.assertGreaterEqual(ranked[7]["score"], 11)
+
     def test_pure_numeric_rows_are_not_inferred_as_headers(self):
         rows = [
             ["1001", "1002", "1003", "1004", "1005", "1006", "1007", "1008"],

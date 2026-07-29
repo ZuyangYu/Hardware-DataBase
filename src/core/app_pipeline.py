@@ -8,6 +8,7 @@ from typing import Callable, Generator, List, Tuple
 import config.settings
 from src.agents.runner import MultiSourceAgentRunner
 from src.core.auth import AuthService
+from src.core.cancellation import QueryCancelled
 from src.core.logger import error, log, warn
 from src.ingestion.kb_paths import InvalidKnowledgeBaseName, validate_kb_name
 from src.pipelines.document_rag.factory import create_rag_backend
@@ -110,6 +111,9 @@ class AppPipeline:
         history: List[Tuple[str, str]],
         ctx: RequestContext | None = None,
         agent_thread_id: str = "",
+        progress_callback: Callable[[str, str, str, str], None] | None = None,
+        query_mode: str = "deep",
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -125,7 +129,12 @@ class AppPipeline:
                 history=history,
                 ctx=ctx,
                 thread_id=agent_thread_id,
+                progress_callback=progress_callback,
+                query_mode=query_mode,
+                should_cancel=should_cancel,
             )
+        except QueryCancelled:
+            return
         except Exception as exc:
             error(f"查询出错: {exc}")
             traceback.print_exc()

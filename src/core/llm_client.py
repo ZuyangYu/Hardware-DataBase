@@ -276,7 +276,9 @@ class LLMClient:
         response.encoding = "utf-8"
         parts: list[str] = []
         usage: dict[str, int] | None = None
-        for line in response.iter_lines(decode_unicode=True):
+        # requests defaults to 512-byte chunks here, which delays short model
+        # deltas until the buffer fills and makes a streaming UI look frozen.
+        for line in response.iter_lines(chunk_size=1, decode_unicode=True):
             if not line:
                 continue
             data = json.loads(line)
@@ -373,7 +375,9 @@ class LLMClient:
         response.encoding = "utf-8"
         parts: list[str] = []
         usage: dict[str, int] | None = None
-        for event_data in _iter_sse_data_events(response.iter_lines(decode_unicode=True)):
+        # Keep upstream SSE token latency intact; the default 512-byte buffer
+        # turns short answers into a single end-of-stream burst.
+        for event_data in _iter_sse_data_events(response.iter_lines(chunk_size=1, decode_unicode=True)):
             if event_data == "[DONE]":
                 break
             data = json.loads(event_data)

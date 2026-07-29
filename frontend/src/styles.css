@@ -1,0 +1,439 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/geist";
+
+* {
+  box-sizing: border-box;
+}
+
+/* 主题 token 照搬 frontend-enterprise。
+   第一个 :root 是暖色基础,第二个 :root(中性灰)覆盖成中性灰黑--后者是实时外观。
+   --primary/--ring/--chart-* 保持青绿 #0f766e(中性主题不覆盖),品牌 mark 也用青绿。 */
+:root {
+  --background: #f7f5ef;
+  --foreground: #20201d;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-muted: #eeece4;
+  --surface-subtle: #fbfaf6;
+  --border: #ded7cc;
+  --border-strong: #cfc5b7;
+  --line: #e7dfd3;
+  --muted: #eeece4;
+  --muted-soft: #9a9b95;
+  --accent: #0f766e;
+  --accent-soft: #e1f1ed;
+  --accent-foreground: #ffffff;
+  --danger: #dc2626;
+  --warning: #b45309;
+  --success: #138a55;
+  --ink-soft: #343633;
+  --copper: #a85d32;
+  --olive: #6f7b42;
+  --shadow-float: 0 20px 54px rgba(37, 32, 24, 0.1);
+  --shadow-soft: 0 10px 30px rgba(37, 32, 24, 0.055);
+  --font-body: "Geist Variable", "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-display: "Geist Variable", "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --page-gradient-a: rgba(15, 118, 110, 0.055);
+  --page-gradient-top: #fbfaf6;
+  --page-gradient-bottom: #f3f0e8;
+  --panel-bg: rgba(249, 247, 241, 0.82);
+  --code-bg: #ffffff;
+  --code-fg: #1f1f1f;
+  --code-border: #e5e5e5;
+  --code-sidebar-bg: #f3f3f3;
+  --code-sidebar-active: #e8e8e8;
+  --code-tab-bg: #f3f3f3;
+  --code-selection: rgba(0, 120, 215, 0.24);
+  --code-comment: #008000;
+  --code-string: #a31515;
+  --code-number: #098658;
+  --code-keyword: #0000ff;
+  --code-function: #795e26;
+  --code-builtin: #267f99;
+  --code-operator: #1f1f1f;
+  --code-punctuation: #666666;
+  --code-property: #001080;
+  --code-boolean: #0000ff;
+  --thinking-base: #8a918d;
+  --thinking-focus: #2f3734;
+  --thinking-flow-duration: 4.2s;
+  --card: #ffffff;
+  --card-foreground: #20201d;
+  --popover: #ffffff;
+  --popover-foreground: #20201d;
+  --primary: #0f766e;
+  --primary-foreground: #ffffff;
+  --secondary: #eeece4;
+  --secondary-foreground: #20201d;
+  --muted-foreground: #6d726e;
+  --destructive: #dc2626;
+  --input: #ded7cc;
+  --ring: #0f766e;
+  --chart-1: #0f766e;
+  --chart-2: #6f7b42;
+  --chart-3: #a85d32;
+  --chart-4: #138a55;
+  --chart-5: #b45309;
+  --radius: 0.625rem;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #858b9c;
+  --sidebar-primary: #18181a;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f6f6f6;
+  --sidebar-accent-foreground: #18181a;
+  --sidebar-border: #f4f4f4;
+  --sidebar-ring: #18181a;
+}
+
+/* 中性灰主题对齐 —— 实时中性灰黑主题(覆盖上面的暖色) */
+:root {
+  --background: #f7f8fa;
+  --foreground: #111111;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-muted: #f3f4f6;
+  --surface-subtle: #fafafa;
+  --border: #e5e7eb;
+  --border-strong: #d4d4d8;
+  --line: #eceef1;
+  --muted: #6b7280;
+  --muted-soft: #9ca3af;
+  --accent: #111111;
+  --accent-soft: #f2f3f5;
+  --accent-foreground: #ffffff;
+  --shadow-float: 0 18px 48px rgba(17, 17, 17, 0.1);
+  --shadow-soft: 0 8px 24px rgba(17, 17, 17, 0.045);
+  --font-body: "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-display: var(--font-body);
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --page-gradient-a: transparent;
+  --page-gradient-top: #f7f8fa;
+  --page-gradient-bottom: #f7f8fa;
+  --panel-bg: rgba(255, 255, 255, 0.94);
+}
+
+/* Tailwind 4 主题桥:CSS var -> utility 类(bg-primary、text-muted-foreground…)
+   shadcn 组件全靠这些类才有样式。照搬 的 @theme inline(含 chart + radius 刻度)。 */
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: 'Geist Variable', sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    linear-gradient(135deg, var(--page-gradient-a), transparent 30%),
+    linear-gradient(180deg, var(--page-gradient-top) 0%, var(--background) 58%, var(--page-gradient-bottom) 100%);
+  color: var(--foreground);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 260ms ease, color 260ms ease;
+}
+
+@layer base {
+  button,
+  textarea,
+  input {
+    font: inherit;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled),
+  a[href],
+  label[for],
+  select:not(:disabled),
+  summary {
+    cursor: pointer;
+  }
+
+  * {
+    @apply border-border outline-ring/50;
+  }
+}
+
+button,
+a,
+input,
+textarea,
+select,
+[role="button"] {
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    color 180ms ease,
+    box-shadow 180ms ease,
+    opacity 180ms ease,
+    transform 180ms ease;
+}
+
+/* AppIcon 的 SVG 基础样式(stroke 描边图标,缺这个会渲染成黑色实心) */
+.app-icon {
+  width: 18px;
+  height: 18px;
+  display: inline-block;
+  flex: 0 0 auto;
+  color: currentColor;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.65;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: -0.22em;
+}
+
+.app-icon-more {
+  stroke-width: 2.4;
+}
+
+.app-icon-spin {
+  animation: app-spin 1s linear infinite;
+}
+
+/* 流式输出时的"思考中"流光文字(trace-flow) */
+.app-trace-flow-text {
+  display: inline-block;
+  color: transparent;
+  background-color: var(--thinking-base);
+  background-image: linear-gradient(
+    90deg,
+    var(--thinking-base) 0%,
+    var(--thinking-base) 35%,
+    var(--thinking-focus) 50%,
+    var(--thinking-base) 65%,
+    var(--thinking-base) 100%
+  );
+  background-position: 125% 0;
+  background-repeat: no-repeat;
+  background-size: 260% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: trace-text-flow var(--thinking-flow-duration) cubic-bezier(0.45, 0, 0.15, 1) infinite;
+}
+
+@keyframes app-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes trace-text-flow {
+  0%,
+  4% {
+    background-position: 125% 0;
+  }
+  72%,
+  100% {
+    background-position: -45% 0;
+  }
+}
+
+.login-data-flow {
+  --login-graph-ink: rgba(54, 60, 70, 0.74);
+  --login-graph-line: rgba(54, 60, 70, 0.16);
+  position: absolute;
+  inset: 60px 0 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 44%, rgba(54, 60, 70, 0.06), transparent 36%),
+    radial-gradient(circle at 50% 50%, rgba(54, 60, 70, 0.035), transparent 48%);
+  mask-image: linear-gradient(180deg, transparent 0%, #000 12%, #000 88%, transparent 100%);
+}
+
+.login-graph-lines {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.92;
+}
+
+.login-graph-line {
+  stroke: var(--login-graph-line);
+  stroke-width: 0.12;
+  stroke-linecap: round;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: login-graph-line-draw 7.4s ease-in-out infinite;
+}
+
+.login-graph-node {
+  position: absolute;
+  border-radius: 50%;
+  background: var(--login-graph-ink);
+  box-shadow: none;
+  transform: translate(-50%, -50%) translate(var(--drift-x), var(--drift-y)) scale(0.7);
+  animation: login-graph-node-gather 7.4s cubic-bezier(0.45, 0, 0.15, 1) infinite;
+}
+
+@keyframes login-graph-node-gather {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) translate(var(--drift-x), var(--drift-y)) scale(0.62);
+  }
+  18% {
+    opacity: 0.84;
+  }
+  42%,
+  72% {
+    opacity: 1;
+    transform: translate(-50%, -50%) translate(0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) translate(calc(var(--drift-x) * -0.35), calc(var(--drift-y) * -0.35)) scale(0.76);
+  }
+}
+
+@keyframes login-graph-line-draw {
+  0%,
+  20% {
+    opacity: 0;
+    stroke-dashoffset: 1;
+  }
+  42%,
+  72% {
+    opacity: 1;
+    stroke-dashoffset: 0;
+  }
+  100% {
+    opacity: 0;
+    stroke-dashoffset: -0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-graph-node,
+  .login-graph-line {
+    animation: none;
+    opacity: 0.55;
+    stroke-dashoffset: 0;
+  }
+}
+
+pre {
+  max-width: 100%;
+  overflow: auto;
+  font-family: var(--font-mono);
+}
+
+code {
+  font-family: var(--font-mono);
+}
+
+/* CodeBlock(聊天 markdown 代码块):VS Code 风格着色,用 --code-* token */
+.code-block-vscode {
+  margin: 0;
+  padding: 12px 14px;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  border: 1px solid var(--code-border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.code-token.comment {
+  color: var(--code-comment);
+}
+.code-token.string {
+  color: var(--code-string);
+}
+.code-token.number {
+  color: var(--code-number);
+}
+.code-token.keyword {
+  color: var(--code-keyword);
+}
+.code-token.function {
+  color: var(--code-function);
+}
+.code-token.builtin {
+  color: var(--code-builtin);
+}
+.code-token.operator {
+  color: var(--code-operator);
+}
+.code-token.punctuation {
+  color: var(--code-punctuation);
+}
+.code-token.property {
+  color: var(--code-property);
+}
+.code-token.boolean {
+  color: var(--code-boolean);
+}
+
+::selection {
+  color: #ffffff;
+  background: var(--accent);
+}
+
+.app-shell {
+  height: 100vh;
+  min-height: 0;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  background: var(--background);
+}
+
+.content {
+  height: 100vh;
+  min-height: 0;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0 !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  background: var(--background);
+}

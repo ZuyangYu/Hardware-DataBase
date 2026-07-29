@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -27,6 +28,7 @@ from src.agents.state import (
 )
 from src.agents.query_tokens import _HARDWARE_TERMS
 from src.circuit.question_analysis import analyze_question as analyze_circuit_question
+from src.core.cancellation import QueryCancelled
 from src.ingestion.parser_registry import PARSER_REGISTRY
 from src.agents.prompts import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
@@ -36,9 +38,118 @@ from src.agents.prompts import (
 )
 
 
+def _write_stream_event(event: dict[str, Any]) -> None:
+    if get_stream_writer is None:
+        return
+    try:
+        get_stream_writer()(event)
+    except RuntimeError:
+        return
+
+
+_STAGE_LABELS = {
+    "route_query": "识别问题类型",
+    "query_router": "识别问题类型",
+    "compose_direct_answer": "生成直接回答",
+    "analyze_question": "分析硬件问题",
+    "question_analysis_agent": "分析硬件问题",
+    "scan_kb_catalog": "读取数据目录",
+    "plan_source_selection": "规划检索来源",
+    "retrieval_planner_agent": "规划检索来源",
+    "retrieve_evidence": "多源硬件数据召回",
+    "merge_evidence": "整理证据",
+    "score_and_compare_evidence": "评估证据覆盖",
+    "draft_intermediate_answer": "生成中间草稿",
+    "judge_sufficiency": "判断充分性",
+    "plan_next_retrieval": "规划下一轮检索",
+    "compose_answer": "生成回答",
+    "verify_grounding": "校验来源",
+}
+
+_STAGE_KEYS = {
+    "route_query": "route",
+    "query_router": "route",
+    "compose_direct_answer": "generate",
+    "analyze_question": "analyze",
+    "question_analysis_agent": "analyze",
+    "scan_kb_catalog": "catalog",
+    "plan_source_selection": "plan",
+    "retrieval_planner_agent": "plan",
+    "retrieve_evidence": "retrieve",
+    "merge_evidence": "merge",
+    "score_and_compare_evidence": "evaluate",
+    "draft_intermediate_answer": "draft",
+    "judge_sufficiency": "judge",
+    "plan_next_retrieval": "plan",
+    "compose_answer": "generate",
+    "verify_grounding": "verify",
+}
+
+_STAGE_RUNNING_DETAILS = {
+    "route_query": "正在判断是否需要检索知识库",
+    "compose_direct_answer": "正在生成未挂载知识库的通用回答",
+    "analyze_question": "正在拆解问题、硬件实体和子问题",
+    "scan_kb_catalog": "正在读取当前知识库的数据目录",
+    "plan_source_selection": "正在规划文档、表格和电路数据的检索来源",
+    "retrieve_evidence": "正在并行召回相关硬件资料",
+    "merge_evidence": "正在合并并去重多源证据",
+    "score_and_compare_evidence": "正在评估证据覆盖度和冲突",
+    "draft_intermediate_answer": "正在基于当前证据生成中间草稿",
+    "judge_sufficiency": "正在判断证据是否足够回答",
+    "plan_next_retrieval": "正在根据缺口规划下一轮检索",
+    "compose_answer": "正在流式生成答案正文",
+    "verify_grounding": "正在校验答案是否有来源支撑",
+}
+
+
+def _compact_stage_detail(message: str, metadata: dict[str, Any] | None = None) -> str:
+    parts: list[str] = []
+    if message:
+        parts.append(str(message))
+    compact: list[str] = []
+    for key, value in (metadata or {}).items():
+        if value in (None, "", [], {}, ()):
+            continue
+        if isinstance(value, bool):
+            compact.append(f"{key}={'是' if value else '否'}")
+        elif isinstance(value, (int, float)):
+            compact.append(f"{key}={value}")
+        elif isinstance(value, list):
+            compact.append(f"{key}={len(value)}项")
+        elif isinstance(value, dict):
+            compact.append(f"{key}={len(value)}项")
+        else:
+            text = str(value).strip()
+            if text:
+                compact.append(f"{key}={text[:60]}{'...' if len(text) > 60 else ''}")
+        if len(compact) >= 3:
+            break
+    if compact:
+        parts.append("；".join(compact))
+    return " · ".join(parts)
+
+
+def _write_stage_event(node: str, status: str, detail: str = "") -> None:
+    _write_stream_event(
+        {
+            "type": "stage",
+            "key": _STAGE_KEYS.get(node, node),
+            "label": _STAGE_LABELS.get(node, node),
+            "status": status,
+            "detail": detail or (_STAGE_RUNNING_DETAILS.get(node, "") if status == "running" else ""),
+        }
+    )
+
+
 def _trace(state: AgentState, node: str, message: str, metadata: dict[str, Any] | None = None):
     trace = list(state.get("trace") or [])
     trace.append({"node": node, "message": message, "metadata": metadata or {}})
+    detail = (
+        "已完成问题范围分析"
+        if node in {"analyze_question", "question_analysis_agent"}
+        else _compact_stage_detail(message, metadata)
+    )
+    _write_stage_event(node, "done", detail)
     return trace
 
 
@@ -145,15 +256,6 @@ def _json_for_prompt(value: Any, limit: int = 12000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n... truncated ..."
-
-
-def _write_stream_event(event: dict[str, Any]) -> None:
-    if get_stream_writer is None:
-        return
-    try:
-        get_stream_writer()(event)
-    except RuntimeError:
-        return
 
 
 def _chat_with_usage_stage(llm_client: Any, messages: list[dict[str, str]], stage: str) -> str:
@@ -647,7 +749,14 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
 
 
 def scan_kb_catalog(state: AgentState, catalog_tool) -> AgentState:
-    catalog = catalog_tool.scan(state["kb_name"], state.get("_ctx_obj"))
+    try:
+        catalog = catalog_tool.scan(state["kb_name"], state.get("_ctx_obj"), query=state.get("user_query", ""))
+    except TypeError as exc:
+        if "query" not in str(exc):
+            raise
+        # Preserve compatibility with custom catalog tools that predate
+        # deterministic structured-source ranking.
+        catalog = catalog_tool.scan(state["kb_name"], state.get("_ctx_obj"))
     return {
         **state,
         "catalog": catalog,
@@ -714,7 +823,11 @@ def _resolve_catalog_source(sources: list[dict[str, Any]], source_name: str) -> 
     return None
 
 
-def _complete_required_source_plan(state: AgentState, source_plan: SourcePlan) -> SourcePlan:
+def _complete_required_source_plan(
+    state: AgentState,
+    source_plan: SourcePlan,
+    max_circuit_sources: int | None = None,
+) -> SourcePlan:
     """Ensure indexed circuit sources are not omitted by an LLM source plan."""
     expected = {
         evidence_type
@@ -725,9 +838,18 @@ def _complete_required_source_plan(state: AgentState, source_plan: SourcePlan) -
         return source_plan
 
     planned = {item.source_name: item for item in source_plan.source_plan}
-    for source in (state.get("catalog") or {}).get("sources") or []:
-        if source.get("processor_kind") != "circuit_design" or source.get("status") != "indexed":
-            continue
+    circuit_sources = [
+        source
+        for source in (state.get("catalog") or {}).get("sources") or []
+        if source.get("processor_kind") == "circuit_design" and source.get("status") == "indexed"
+    ]
+    circuit_sources.sort(key=lambda source: (-_routing_metadata(source)[0], str(source.get("document_name") or "")))
+    planned_circuit_count = sum(
+        1 for item in source_plan.source_plan if item.processor_kind == "circuit_design"
+    )
+    for source in circuit_sources:
+        if max_circuit_sources is not None and planned_circuit_count >= max_circuit_sources:
+            break
         source_name = str(source.get("document_name") or "")
         if not source_name:
             continue
@@ -748,6 +870,7 @@ def _complete_required_source_plan(state: AgentState, source_plan: SourcePlan) -
             )
             source_plan.source_plan.append(item)
             planned[source_name] = item
+            planned_circuit_count += 1
         if any(call.tool_name == "circuit_query" for call in item.tool_calls):
             continue
         item.tool_calls.append(
@@ -762,18 +885,69 @@ def _complete_required_source_plan(state: AgentState, source_plan: SourcePlan) -
     return source_plan
 
 
+_FAST_SOURCE_LIMITS = {
+    "spreadsheet_table": 2,
+    "circuit_design": 2,
+    "default": 3,
+}
+
+
+def _routing_metadata(source: dict[str, Any]) -> tuple[int, list[str]]:
+    routing = (source.get("metadata") or {}).get("routing") or {}
+    try:
+        score = max(0, int(routing.get("score") or 0))
+    except (TypeError, ValueError):
+        score = 0
+    terms = [str(term) for term in routing.get("matched_terms") or [] if str(term)]
+    return score, terms
+
+
 def plan_source_selection(state: AgentState) -> AgentState:
     analysis = state.get("question_analysis") or {}
     sources = (state.get("catalog") or {}).get("sources") or []
     plan_items = []
     skipped = []
     query = state.get("user_query", "")
-    for source in sources:
+    candidates_by_processor: dict[str, list[tuple[int, dict, str, int, list[str]]]] = {}
+    for index, source in enumerate(sources):
         source_name = source.get("document_name", "")
         should_use, reason = _source_matches_analysis(source, analysis)
-        if not should_use:
+        processor = str(source.get("processor_kind") or "")
+        routing_score, matched_terms = _routing_metadata(source)
+        if processor == "circuit_design" and str(source.get("status") or "") != "indexed":
+            skipped.append({"source_name": source_name, "reason": "电路文件尚未索引成功，跳过结构化电路检索。"})
+            continue
+        if not should_use and not routing_score:
             skipped.append({"source_name": source_name, "reason": reason})
             continue
+        if routing_score:
+            reason = f"本地结构化索引命中：{', '.join(matched_terms[:4])}。"
+        candidates_by_processor.setdefault(processor or "default", []).append(
+            (index, source, reason, routing_score, matched_terms)
+        )
+
+    selected_indexes: set[int] = set()
+    for processor, candidates in candidates_by_processor.items():
+        limit = _FAST_SOURCE_LIMITS.get(processor, _FAST_SOURCE_LIMITS["default"])
+        matched = [candidate for candidate in candidates if candidate[3] > 0]
+        ranked = sorted(matched or candidates, key=lambda item: (-item[3], item[0]))
+        selected_indexes.update(item[0] for item in ranked[:limit])
+        for index, source, _reason, score, _terms in ranked[limit:]:
+            skipped.append(
+                {
+                    "source_name": source.get("document_name", ""),
+                    "reason": "本地索引相关度较低，未进入快速模式的受控检索范围。" if score else "同类来源过多，未进入快速模式的受控回退范围。",
+                }
+            )
+
+    for index, source in enumerate(sources):
+        if index not in selected_indexes:
+            continue
+        source_name = source.get("document_name", "")
+        _score, _terms = _routing_metadata(source)
+        should_use, reason = _source_matches_analysis(source, analysis)
+        if _score:
+            reason = f"本地结构化索引命中：{', '.join(_terms[:4])}。"
         processor = source.get("processor_kind", "")
         calls = []
         filters = {
@@ -831,6 +1005,7 @@ def plan_source_selection(state: AgentState) -> AgentState:
     source_plan = _complete_required_source_plan(
         state,
         SourcePlan(source_plan=plan_items, skipped_sources=skipped),
+        max_circuit_sources=_FAST_SOURCE_LIMITS["circuit_design"],
     )
     return {
         **state,
@@ -1319,8 +1494,10 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
     other_calls = [call for call in calls if call.get("tool_name") != "circuit_query"]
     bounded_calls = [*circuit_calls, *other_calls[: max(0, 8 - len(circuit_calls))]]
     circuit_hits: list[dict[str, Any]] = []
+    cancel_check = state.get("_cancel_check")
 
     def _run_call(call: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
+        started = time.monotonic()
         tool = tools.get(call.get("tool_name"))
         query = call.get("query") or state.get("user_query", "")
         filters = call.get("filters") or {}
@@ -1334,18 +1511,16 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                     "top_k": top_k,
                     "hit_count": 0,
                     "status": "missing_tool",
+                    "latency_ms": int((time.monotonic() - started) * 1000),
                 },
                 [],
                 None,
             )
         try:
-            hits = tool.run(
-                query,
-                state["kb_name"],
-                state.get("_ctx_obj"),
-                top_k=top_k,
-                filters=filters,
-            )
+            run_kwargs = {"top_k": top_k, "filters": filters}
+            if cancel_check is not None and getattr(tool, "supports_cancellation", False):
+                run_kwargs["should_cancel"] = cancel_check
+            hits = tool.run(query, state["kb_name"], state.get("_ctx_obj"), **run_kwargs)
             return (
                 {
                     "tool_name": call.get("tool_name"),
@@ -1354,10 +1529,13 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                     "top_k": top_k,
                     "hit_count": len(hits),
                     "status": "ok",
+                    "latency_ms": int((time.monotonic() - started) * 1000),
                 },
                 [hit.model_dump() for hit in hits],
                 None,
             )
+        except QueryCancelled:
+            raise
         except Exception as exc:
             return (
                 {
@@ -1368,6 +1546,7 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                     "hit_count": 0,
                     "status": "failed",
                     "error": str(exc),
+                    "latency_ms": int((time.monotonic() - started) * 1000),
                 },
                 [],
                 {"tool": call.get("tool_name"), "error": str(exc)},
@@ -1405,8 +1584,12 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
             tool = tools.get("document_rag")
             if tool is None:
                 break
+            started = time.monotonic()
             try:
-                hits = tool.run(call["query"], state["kb_name"], state.get("_ctx_obj"), top_k=call["top_k"], filters={})
+                run_kwargs = {"top_k": call["top_k"], "filters": {}}
+                if cancel_check is not None and getattr(tool, "supports_cancellation", False):
+                    run_kwargs["should_cancel"] = cancel_check
+                hits = tool.run(call["query"], state["kb_name"], state.get("_ctx_obj"), **run_kwargs)
                 for hit in hits:
                     payload = hit.model_dump()
                     evidence_kind = "datasheet_claim" if _is_matching_datasheet_capability(
@@ -1427,9 +1610,12 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                         "top_k": call["top_k"],
                         "hit_count": len(hits),
                         "status": "ok",
+                        "latency_ms": int((time.monotonic() - started) * 1000),
                         "derived_from": "circuit_part_number",
                     }
                 )
+            except QueryCancelled:
+                raise
             except Exception as exc:
                 diagnostics.append(
                     {
@@ -1441,6 +1627,7 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                         "status": "failed",
                         "derived_from": "circuit_part_number",
                         "error": str(exc),
+                        "latency_ms": int((time.monotonic() - started) * 1000),
                     }
                 )
 
@@ -1945,23 +2132,40 @@ def should_retrieve_more_after_planning(state: AgentState) -> str:
     return "retrieve" if state.get("next_retrieval_calls") else "answer"
 
 
+def _streaming_node(node_name: str, node_func):
+    def wrapped(state: AgentState):
+        _write_stage_event(node_name, "running")
+        return node_func(state)
+
+    return wrapped
+
+
 def build_multi_source_graph(nodes: dict[str, Any]):
     if StateGraph is None:
         raise RuntimeError("langgraph is not installed; install langgraph to build the compiled agent graph.")
     graph = StateGraph(AgentState)
-    graph.add_node("route_query", nodes.get("route_query", route_query))
-    graph.add_node("compose_direct_answer", nodes.get("compose_direct_answer", compose_direct_answer))
-    graph.add_node("analyze_question", nodes.get("analyze_question", analyze_question))
-    graph.add_node("scan_kb_catalog", nodes["scan_kb_catalog"])
-    graph.add_node("plan_source_selection", nodes.get("plan_source_selection", plan_source_selection))
-    graph.add_node("retrieve_evidence", nodes["retrieve_evidence"])
-    graph.add_node("merge_evidence", merge_evidence)
-    graph.add_node("score_and_compare_evidence", score_and_compare_evidence)
-    graph.add_node("draft_intermediate_answer", nodes["draft_intermediate_answer"])
-    graph.add_node("judge_sufficiency", nodes.get("judge_sufficiency", judge_sufficiency))
-    graph.add_node("plan_next_retrieval", nodes.get("plan_next_retrieval", plan_next_retrieval))
-    graph.add_node("compose_answer", nodes["compose_answer"])
-    graph.add_node("verify_grounding", nodes["verify_grounding"])
+    graph.add_node("route_query", _streaming_node("route_query", nodes.get("route_query", route_query)))
+    graph.add_node(
+        "compose_direct_answer",
+        _streaming_node("compose_direct_answer", nodes.get("compose_direct_answer", compose_direct_answer)),
+    )
+    graph.add_node("analyze_question", _streaming_node("analyze_question", nodes.get("analyze_question", analyze_question)))
+    graph.add_node("scan_kb_catalog", _streaming_node("scan_kb_catalog", nodes["scan_kb_catalog"]))
+    graph.add_node(
+        "plan_source_selection",
+        _streaming_node("plan_source_selection", nodes.get("plan_source_selection", plan_source_selection)),
+    )
+    graph.add_node("retrieve_evidence", _streaming_node("retrieve_evidence", nodes["retrieve_evidence"]))
+    graph.add_node("merge_evidence", _streaming_node("merge_evidence", merge_evidence))
+    graph.add_node("score_and_compare_evidence", _streaming_node("score_and_compare_evidence", score_and_compare_evidence))
+    graph.add_node("draft_intermediate_answer", _streaming_node("draft_intermediate_answer", nodes["draft_intermediate_answer"]))
+    graph.add_node("judge_sufficiency", _streaming_node("judge_sufficiency", nodes.get("judge_sufficiency", judge_sufficiency)))
+    graph.add_node(
+        "plan_next_retrieval",
+        _streaming_node("plan_next_retrieval", nodes.get("plan_next_retrieval", plan_next_retrieval)),
+    )
+    graph.add_node("compose_answer", _streaming_node("compose_answer", nodes["compose_answer"]))
+    graph.add_node("verify_grounding", _streaming_node("verify_grounding", nodes["verify_grounding"]))
 
     graph.set_entry_point("route_query")
     graph.add_conditional_edges(

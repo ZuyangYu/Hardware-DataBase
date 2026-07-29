@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from src.agents.state import Evidence
 from src.pipelines.document_rag.base import RAGBackend
@@ -11,6 +11,7 @@ from src.pipelines.document_store import PipelineDocumentStore
 class DocumentRAGTool:
     name = "document_rag"
     description = "Retrieve evidence from document RAG sources such as Word, PDF, and parsed text documents."
+    supports_cancellation = True
 
     def __init__(self, rag_backend: RAGBackend, document_store: PipelineDocumentStore | None = None):
         self.rag_backend = rag_backend
@@ -23,9 +24,21 @@ class DocumentRAGTool:
         ctx: RequestContext | None,
         top_k: int = 5,
         filters: dict | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[Evidence]:
         backend_filters = self._backend_filters(kb_name, ctx, filters)
-        raw = self.rag_backend.retrieve(kb_name, query, top_k=top_k, ctx=ctx, filters=backend_filters)
+        retrieve_kwargs = {
+            "top_k": top_k,
+            "ctx": ctx,
+            "filters": backend_filters,
+        }
+        if should_cancel is not None:
+            retrieve_kwargs["should_cancel"] = should_cancel
+        raw = self.rag_backend.retrieve(
+            kb_name,
+            query,
+            **retrieve_kwargs,
+        )
         evidences: list[Evidence] = []
         for item in raw:
             metadata = dict(item.metadata or {})

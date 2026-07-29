@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextvars
 import json
 from dataclasses import dataclass, field
-from typing import Generator
+from typing import Callable, Generator
 
 from src.agents.answer_constraints import answer_contract
 from src.agents.graph import (
@@ -11,14 +11,18 @@ from src.agents.graph import (
     _stream_chat_with_usage_stage,
     _write_stream_event,
     analyze_question_with_llm,
+    analyze_question,
     build_multi_source_graph,
     compose_direct_answer,
     judge_sufficiency,
+    merge_evidence,
     plan_next_retrieval,
+    plan_source_selection,
     plan_source_selection_with_llm,
     retrieve_evidence,
     route_query,
     scan_kb_catalog,
+    score_and_compare_evidence,
 )
 from src.agents.prompts import ANSWER_SYSTEM_PROMPT
 from src.agents.tools.circuit_tools import CircuitQueryTool
@@ -27,6 +31,7 @@ from src.agents.tools.pipeline_catalog_tool import PipelineCatalogTool
 from src.agents.tools.spreadsheet_tools import SpreadsheetCellTool, SpreadsheetProfileTool, SpreadsheetSemanticTool
 from src.core.llm_client import LLMClient
 from src.circuit.index_service import CircuitIndexService
+from src.core.cancellation import QueryCancelled
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
@@ -54,6 +59,44 @@ _RUN_RECORD: contextvars.ContextVar[_RunRecord | None] = contextvars.ContextVar(
     "agent_run_record", default=None
 )
 
+_TRACE_LABELS = {
+    "route_query": "识别问题类型",
+    "query_router": "识别问题类型",
+    "compose_direct_answer": "生成直接回答",
+    "analyze_question": "分析硬件问题",
+    "question_analysis_agent": "分析硬件问题",
+    "scan_kb_catalog": "读取数据目录",
+    "plan_source_selection": "规划检索来源",
+    "retrieval_planner_agent": "规划检索来源",
+    "retrieve_evidence": "多源硬件数据召回",
+    "merge_evidence": "整理证据",
+    "score_and_compare_evidence": "评估证据覆盖",
+    "draft_intermediate_answer": "生成中间草稿",
+    "judge_sufficiency": "判断充分性",
+    "plan_next_retrieval": "规划下一轮检索",
+    "compose_answer": "生成回答",
+    "verify_grounding": "校验来源",
+}
+
+_TRACE_STAGE_KEYS = {
+    "route_query": "route",
+    "query_router": "route",
+    "compose_direct_answer": "generate",
+    "analyze_question": "analyze",
+    "question_analysis_agent": "analyze",
+    "scan_kb_catalog": "catalog",
+    "plan_source_selection": "plan",
+    "retrieval_planner_agent": "plan",
+    "retrieve_evidence": "retrieve",
+    "merge_evidence": "merge",
+    "score_and_compare_evidence": "evaluate",
+    "draft_intermediate_answer": "draft",
+    "judge_sufficiency": "judge",
+    "plan_next_retrieval": "plan",
+    "compose_answer": "generate",
+    "verify_grounding": "verify",
+}
+
 
 def _current_run() -> _RunRecord:
     """Return this context's run record, creating one if none exists yet."""
@@ -62,6 +105,40 @@ def _current_run() -> _RunRecord:
         record = _RunRecord()
         _RUN_RECORD.set(record)
     return record
+
+
+def _compact_trace_detail(node: str, message: str, metadata: dict | None) -> str:
+    if node in {"analyze_question", "question_analysis_agent"}:
+        # Sub-question decomposition is an internal retrieval plan. Surface a
+        # stable progress summary instead of exposing planner internals.
+        return "已完成问题范围分析"
+    parts: list[str] = []
+    if message:
+        parts.append(str(message))
+    meta = metadata or {}
+    if meta:
+        compact: list[str] = []
+        for key, value in meta.items():
+            if value in (None, "", [], {}, ()):
+                continue
+            if isinstance(value, bool):
+                compact.append(f"{key}={'是' if value else '否'}")
+            elif isinstance(value, (int, float)):
+                compact.append(f"{key}={value}")
+            elif isinstance(value, list):
+                compact.append(f"{key}={len(value)}项")
+            elif isinstance(value, dict):
+                compact.append(f"{key}={len(value)}项")
+            else:
+                text = str(value).strip()
+                if not text:
+                    continue
+                compact.append(f"{key}={text[:60]}{'...' if len(text) > 60 else ''}")
+            if len(compact) >= 3:
+                break
+        if compact:
+            parts.append("；".join(compact))
+    return " · ".join(parts) if parts else _TRACE_LABELS.get(node, node)
 
 
 _OBSERVABILITY_REDACTED_KEYS = {
@@ -127,6 +204,7 @@ class MultiSourceAgentRunner:
         self.catalog_tool = PipelineCatalogTool(
             document_store=self.document_store,
             spreadsheet_service=self.spreadsheet_service,
+            circuit_service=self.circuit_service,
             rag_backend=rag_backend,
         )
         self.tools = {
@@ -160,6 +238,9 @@ class MultiSourceAgentRunner:
         history: list[tuple[str, str]],
         ctx: RequestContext | None = None,
         thread_id: str = "",
+        progress_callback: Callable[[str, str, str, str], None] | None = None,
+        query_mode: str = "deep",
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Generator[str, None, None]:
         """Run the compiled LangGraph agent and stream answer deltas."""
         # Fresh per-call record so concurrent streams on this singleton each
@@ -169,6 +250,9 @@ class MultiSourceAgentRunner:
         self._last_retrieval_summary = {}
         self._last_token_usage_summary = None
         self._reset_llm_usage()
+
+        # Knowledge-base answers always run the complete retrieval graph.
+        # General chat bypasses this runner in the API route.
 
         state = {
             "thread_id": thread_id or f"{ctx.session_id if ctx else 'anonymous'}:{kb_name}",
@@ -180,22 +264,65 @@ class MultiSourceAgentRunner:
             "retrieval_round": 0,
             "evidence": [],
             "trace": [],
+            "_cancel_check": should_cancel,
         }
         # The graph owns routing, retrieval, multi-hop replanning, and answer generation.
         final_state = state
         yielded = False
-        for mode, event in self.graph.stream(
-            state,
-            config={"configurable": {"thread_id": state["thread_id"]}},
-            stream_mode=["custom", "values"],
-        ):
-            if mode == "custom" and isinstance(event, dict) and event.get("type") == "answer_delta":
-                delta = str(event.get("delta") or "")
-                if delta:
-                    yielded = True
-                    yield delta
-            elif mode == "values" and isinstance(event, dict):
-                final_state = event
+        trace_cursor = 0
+
+        def emit_stage(key: str, label: str, status: str = "running", detail: str = "") -> None:
+            if progress_callback is None:
+                return
+            progress_callback(key, label, status, detail)
+
+        emit_stage("permission", "权限校验", "done", "已完成访问范围检查")
+        emit_stage("route", "识别问题类型", "running", "正在判断是否需要检索知识库")
+        try:
+            graph_events = self.graph.stream(
+                state,
+                config={"configurable": {"thread_id": state["thread_id"]}},
+                stream_mode=["custom", "values"],
+            )
+            for mode, event in graph_events:
+                if should_cancel is not None and should_cancel():
+                    return
+                if mode == "custom" and isinstance(event, dict):
+                    if event.get("type") == "answer_delta":
+                        delta = str(event.get("delta") or "")
+                        if delta:
+                            emit_stage("generate", "生成回答", "running", "正在流式输出答案正文")
+                            yielded = True
+                            yield delta
+                    elif event.get("type") == "stage":
+                        emit_stage(
+                            str(event.get("key") or ""),
+                            str(event.get("label") or event.get("key") or ""),
+                            str(event.get("status") or "running"),
+                            str(event.get("detail") or ""),
+                        )
+                    elif event.get("type") == "tool_result":
+                        tool_name = str(event.get("tool_name") or "检索工具")
+                        hit_count = int(event.get("hit_count") or 0)
+                        status = "error" if event.get("status") == "failed" else "running"
+                        emit_stage("retrieve", "多源硬件数据召回", status, f"{tool_name} 返回 {hit_count} 条候选证据")
+                elif mode == "values" and isinstance(event, dict):
+                    final_state = event
+                    trace = list(event.get("trace") or [])
+                    for trace_item in trace[trace_cursor:]:
+                        trace_cursor += 1
+                        if not isinstance(trace_item, dict):
+                            continue
+                        node = str(trace_item.get("node") or f"trace_{trace_cursor}")
+                        stage_key = _TRACE_STAGE_KEYS.get(node, node)
+                        label = _TRACE_LABELS.get(node, str(trace_item.get("message") or node))
+                        detail = _compact_trace_detail(node, str(trace_item.get("message") or ""), trace_item.get("metadata"))
+                        emit_stage(stage_key, label, "done", detail)
+
+                    if event.get("final_response") is not None:
+                        emit_stage("generate", "生成回答", "done", "最终回答已生成")
+        except QueryCancelled:
+            return
         self._last_retrieval_summary = (
             self._build_retrieval_summary(final_state)
             if int(final_state.get("retrieval_round") or 0) > 0
@@ -203,8 +330,121 @@ class MultiSourceAgentRunner:
         )
         self._last_token_usage_summary = self._get_llm_usage_summary()
         if not yielded:
+            emit_stage("generate", "生成回答", "running", "正在生成最终回答")
             yield final_state.get("final_response") or final_state.get("answer") or "未生成回答。"
+            emit_stage("generate", "生成回答", "done", "最终回答已生成")
         return
+
+    def _stream_fast(
+        self,
+        *,
+        query: str,
+        kb_name: str,
+        history: list[tuple[str, str]],
+        ctx: RequestContext | None,
+        thread_id: str,
+        progress_callback: Callable[[str, str, str, str], None] | None,
+        should_cancel: Callable[[], bool] | None,
+    ) -> Generator[str, None, None]:
+        """One-pass multi-source retrieval for the default interactive path.
+
+        It keeps deterministic source planning and evidence constraints while
+        skipping planning LLM calls, draft generation, sufficiency judging and
+        multi-hop retries. That turns the normal chat path into one final model
+        request after parallel retrieval, so time-to-first-token is predictable.
+        """
+        def stage(key: str, label: str, status: str = "running", detail: str = "") -> None:
+            if progress_callback is not None:
+                progress_callback(key, label, status, detail)
+
+        state: dict = {
+            "thread_id": thread_id or f"{ctx.session_id if ctx else 'anonymous'}:{kb_name}",
+            "kb_name": kb_name,
+            "user_query": query,
+            "history": history,
+            "ctx": _ctx_to_dict(ctx),
+            "_ctx_obj": ctx,
+            "retrieval_round": 0,
+            "evidence": [],
+            "trace": [],
+            "_cancel_check": should_cancel,
+        }
+        stage("route", "查询模式", "done", "快速查询：单轮多源召回")
+        stage("analyze", "分析硬件问题")
+        state = analyze_question(state)
+        if should_cancel is not None and should_cancel():
+            return
+        stage("analyze", "分析硬件问题", "done", "已按规则识别实体和证据类型")
+        stage("catalog", "读取数据目录")
+        state = scan_kb_catalog(state, self.catalog_tool)
+        if should_cancel is not None and should_cancel():
+            return
+        stage("catalog", "读取数据目录", "done", "已读取当前知识库可用数据源")
+        stage("plan", "规划检索来源")
+        state = plan_source_selection(state)
+        if should_cancel is not None and should_cancel():
+            return
+        stage("plan", "规划检索来源", "done", "已生成确定性单轮检索计划")
+        stage("retrieve", "多源硬件数据召回")
+        try:
+            state = retrieve_evidence(state, self.tools)
+        except QueryCancelled:
+            return
+        if should_cancel is not None and should_cancel():
+            return
+        stage("retrieve", "多源硬件数据召回", "done", "单轮召回完成")
+        state = merge_evidence(state)
+        state = score_and_compare_evidence(state)
+        evidence = _select_claim_context(state, limit=8)
+        answer_parts: list[str] = []
+        if not evidence:
+            answer = "当前知识库中未找到可支撑回答的证据。"
+            answer_parts.append(answer)
+            stage("generate", "生成回答", "running", "未命中证据，正在输出结果")
+            yield answer
+        else:
+            response_contract = answer_contract(
+                query,
+                list(state.get("claim_coverage") or []),
+                list(state.get("retrieval_ledger") or []),
+                list((state.get("coverage_matrix") or {}).get("conflicts") or []),
+            )
+            context = "\n\n".join(
+                f"[{index}] 来源: {item.get('source_name')} | 类型: {item.get('content_kind')}\n"
+                f"{str(item.get('content') or '')[:1800]}"
+                for index, item in enumerate(evidence, start=1)
+            )
+            recent_history = json.dumps(history[-3:], ensure_ascii=False)
+            prompt = (
+                f"回答约束：\n{response_contract}\n\n"
+                f"最近对话：\n{recent_history}\n\n"
+                f"用户问题：{query}\n\n"
+                f"证据：\n{context}\n\n"
+                "请用中文直接回答，只陈述证据支持的结论；信息不足时明确说明缺口，并给出来源编号。"
+            )
+            stage("generate", "生成回答", "running", "正在流式生成答案正文")
+            for delta in _stream_chat_with_usage_stage(
+                self.llm_client,
+                [{"role": "system", "content": ANSWER_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+                "fast_answer",
+            ):
+                if should_cancel is not None and should_cancel():
+                    return
+                answer_parts.append(delta)
+                yield delta
+        answer = "".join(answer_parts).strip()
+        state["answer"] = answer
+        state["verification"] = {
+            "grounded": bool(evidence),
+            "unsupported_claims": [],
+            "weak_claims": [],
+            "citation_coverage": 1.0 if evidence else 0.0,
+        }
+        state["sufficiency"] = {"status": "fast_single_pass", "missing": [], "suggested_queries": []}
+        self._last_footer = ""
+        self._last_retrieval_summary = {**self._build_retrieval_summary(state), "query_mode": "fast"}
+        self._last_token_usage_summary = self._get_llm_usage_summary()
+        stage("generate", "生成回答", "done", "快速查询已完成")
 
     def _draft_intermediate_answer(self, state):
         evidence = _select_claim_context(state, limit=12)
@@ -284,8 +524,9 @@ class MultiSourceAgentRunner:
                 f"证据质量评分：\n{quality_text}\n\n"
                 f"检索诊断：\n{diagnostics_text}\n\n"
                 f"证据：\n{context}\n\n"
-                "请输出中文答案，按子问题组织，包含来源说明，并列出缺失信息。"
-                "如果检索账本中某个子问题 status 不是 covered，必须明确说明缺口，不要把弱证据写成确定结论。"
+                "请直接回答用户问题，按结论和必要分点组织，并在需要时说明来源与缺失信息。"
+                "不要输出或提及子问题、检索计划、推理过程、检索账本、工具调用或证据质量评分。"
+                "如果某项请求没有被直接证据覆盖，必须明确说明缺口，不要把弱证据写成确定结论。"
                 "如果 coverage_matrix.conflicts 非空，必须单独列出证据冲突，不能把冲突值合并成确定结论。"
                 "对 evidence_kind=derived_topology 的内容只能说明已观察到的连接/拓扑；"
                 "只有同一 part_number 的 evidence_kind=datasheet_claim 才能确认器件保护能力。"

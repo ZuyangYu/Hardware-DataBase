@@ -31,6 +31,8 @@ router = APIRouter(tags=["kb-permissions"])
 @router.get("/kbs/{kb_name}/permissions", response_model=list[KbPermissionView])
 def list_kb_permissions(
     kb_name: str,
+    department_id: int | None = None,
+    kb_id: int | None = None,
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ):
@@ -44,12 +46,18 @@ def list_kb_permissions(
     ctx = build_context_for_user(user, kb_name, auth=auth)
     if not ctx.is_system_admin() and not ctx.has_kb_permission(kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
-    scope = kb_scope_from_context(kb_name, ctx)
-    perms = auth.list_knowledge_base_permissions(
-        scope.kb_name,
-        department_id=scope.department_id or None,
-        kb_id=scope.kb_id,
-    )
+    if ctx.is_system_admin():
+        try:
+            perms = auth.list_knowledge_base_permissions(kb_name, department_id=department_id, kb_id=kb_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        scope = kb_scope_from_context(kb_name, ctx)
+        perms = auth.list_knowledge_base_permissions(
+            scope.kb_name,
+            department_id=scope.department_id or None,
+            kb_id=scope.kb_id,
+        )
     return [
         KbPermissionView(
             username=p.username,
@@ -95,6 +103,7 @@ def assign_kb(
         kb_name,
         body.department_id,
         owner_user_id=body.owner_user_id,
+        source_kb_id=body.source_kb_id,
     )
     return OkResponse(ok=True, message="knowledge base reassigned")
 

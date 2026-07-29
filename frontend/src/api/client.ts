@@ -1,0 +1,160 @@
+import { getAuthSession } from '../auth';
+
+const resolveApiBase = () => {
+  if (import.meta.env.VITE_API_BASE_URL) {
+    return import.meta.env.VITE_API_BASE_URL;
+  }
+  // dev 下走 vite proxy(/api -> HDB_API_PORT/VITE_API_PROXY_TARGET);生产部署由静态服务器反代
+  return '';
+};
+
+const API_BASE = resolveApiBase();
+
+export class ApiError extends Error {
+  status: number;
+  body: string;
+
+  constructor(status: number, body: string, statusText: string) {
+    super(parseErrorMessage(body) || statusText || `HTTP ${status}`);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+export function isAuthError(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401;
+}
+
+export function isForbiddenError(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403;
+}
+
+function parseErrorMessage(body: string): string {
+  if (!body) return '';
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown };
+    if (typeof parsed.detail === 'string') return parsed.detail;
+    if (Array.isArray(parsed.detail)) {
+      // FastAPI 422: detail 是 {loc,msg} 列表
+      return parsed.detail
+        .map((item) => (item && typeof item === 'object' && 'msg' in item ? String((item as { msg: unknown }).msg) : ''))
+        .filter(Boolean)
+        .join('; ');
+    }
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeader(),
+      ...(options.headers || {}),
+    },
+    ...options,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new ApiError(response.status, text, response.statusText);
+  }
+  return response.json() as Promise<T>;
+}
+
+function authHeader(): Record<string, string> {
+  const session = getAuthSession();
+  return session?.token ? { Authorization: `Bearer ${session.token}` } : {};
+}
+
+export const api = {
+  get: <T>(path: string) => request<T>(path),
+  post: <T>(path: string, body?: unknown) =>
+    request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
+  put: <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
+  delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
+};
+
+/** multipart 上传(不能走 request():浏览器要自己拼 boundary) */
+export async function uploadFiles<T>(path: string, form: FormData): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { ...authHeader() },
+    body: form,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new ApiError(response.status, text, response.statusText);
+  }
+  return response.json() as Promise<T>;
+}
+
+/** SSE 流式请求(POST /query):fetch + ReadableStream 自解析 event/data 帧 */
+export type SseEvent = { event: string; data: string };
+
+async function* parseSseResponse(response: Response): AsyncGenerator<SseEvent, void, unknown> {
+  if (!response.ok) {
+    const text = await response.text();
+    throw new ApiError(response.status, text, response.statusText);
+  }
+  if (!response.body) {
+    throw new Error('SSE 响应没有 body');
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sepIndex: number;
+      while ((sepIndex = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+        let event = 'message';
+        const dataLines: string[] = [];
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataLines.push(line.startsWith('data: ') ? line.slice(6) : line.slice(5));
+        }
+        if (dataLines.length > 0) yield { event, data: dataLines.join('\n') };
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => undefined);
+  }
+}
+
+export async function* sseStream(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+): AsyncGenerator<SseEvent, void, unknown> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      ...authHeader(),
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  yield* parseSseResponse(response);
+}
+
+/** 可重放的 turn SSE 订阅; 后端会根据 Last-Event-ID 补发持久化事件。 */
+export async function* sseGetStream(path: string, signal?: AbortSignal, lastEventId?: number): AsyncGenerator<SseEvent, void, unknown> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: {
+      Accept: 'text/event-stream',
+      ...authHeader(),
+      ...(lastEventId ? { 'Last-Event-ID': String(lastEventId) } : {}),
+    },
+    signal,
+  });
+  yield* parseSseResponse(response);
+}

@@ -47,6 +47,15 @@ storage/evaluations/
 htmlcov/
 *.log
 
+# Frontend generated artifacts
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/frontend/*.tsbuildinfo
+/frontend/coverage/
+/frontend/playwright-report/
+/frontend/test-results/
+
 # Vendored SpyDrNet: exclude upstream documentation, examples, and tests.
 /src/circuit/vendor/spydrnet/docs/
 /src/circuit/vendor/spydrnet/examples/

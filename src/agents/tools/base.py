@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Callable, Protocol
 
 from src.agents.state import Evidence
 from src.pipelines.document_rag.schemas import RequestContext
@@ -17,6 +17,6 @@ class AgentTool(Protocol):
         ctx: RequestContext | None,
         top_k: int = 5,
         filters: dict | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[Evidence]:
         ...
-

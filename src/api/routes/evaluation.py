@@ -17,7 +17,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import ValidationError
 
 import config.settings
@@ -25,7 +25,7 @@ import config.settings
 from src.core.auth import AuthUser
 from src.evaluation.dataset_loader import load_dataset, validate_dataset
 from src.evaluation.run_control import EvaluationRunController
-from src.evaluation.schemas import EvaluationSummary, EvaluationRunState
+from src.evaluation.schemas import EvaluationSample, EvaluationSummary, EvaluationRunState
 from src.ui.evaluation_page import (
     DEFAULT_OUTPUT_ROOT,
     list_evaluation_runs,
@@ -45,6 +45,7 @@ router = APIRouter(tags=["evaluation"])
 _EVAL_ROOT = (Path(config.settings.STORAGE_DIR) / "evaluations").resolve()
 _DATASET_ROOT = (Path(config.settings.BASE_DIR) / "evaluation" / "datasets").resolve()
 _SNAPSHOT_ROOT = _EVAL_ROOT
+_BASE_DIR = Path(config.settings.BASE_DIR).resolve()
 
 
 def _within(child: Path, parent: Path) -> bool:
@@ -55,21 +56,54 @@ def _within(child: Path, parent: Path) -> bool:
         return False
 
 
+def _resolve_user_path(value: str | Path) -> Path:
+    p = Path(value)
+    if not p.is_absolute():
+        p = _BASE_DIR / p
+    return p.resolve()
+
+
 def _check_output_root(output_root: str) -> str:
     """output_root must be DEFAULT_OUTPUT_ROOT or a subdirectory of it."""
-    if output_root == str(DEFAULT_OUTPUT_ROOT):
-        return output_root
-    p = Path(output_root)
+    p = _resolve_user_path(output_root)
     if not _within(p, _EVAL_ROOT):
         raise HTTPException(status_code=400, detail="output_root must be under the evaluations storage root")
-    return output_root
+    return str(p)
 
 
 def _check_input_path(value: str, parent: Path, label: str) -> str:
-    p = Path(value)
+    p = _resolve_user_path(value)
     if not _within(p, parent):
         raise HTTPException(status_code=400, detail=f"{label} must be under {parent}")
-    return value
+    return str(p)
+
+
+def _check_dataset_path(value: str, output_root: str) -> str:
+    p = _resolve_user_path(value)
+    upload_root = (Path(output_root) / "uploads").resolve()
+    if _within(p, _DATASET_ROOT) or _within(p, upload_root):
+        return str(p)
+    raise HTTPException(
+        status_code=400,
+        detail=f"dataset_path must be under {_DATASET_ROOT} or {upload_root}",
+    )
+
+
+def _filter_samples(
+    samples: list[EvaluationSample],
+    sample_ids: list[str] | None,
+    tags: list[str] | None,
+) -> list[EvaluationSample]:
+    filtered = samples
+    if sample_ids:
+        selected_ids = set(sample_ids)
+        filtered = [sample for sample in filtered if sample.id in selected_ids]
+    if tags:
+        selected_tags = set(tags)
+        filtered = [sample for sample in filtered if selected_tags.intersection(sample.tags)]
+    if not filtered:
+        raise HTTPException(status_code=400, detail="no samples match the selected filters")
+    return filtered
 
 
 # Process-wide controller cache keyed by output_root. EvaluationRunController
@@ -112,7 +146,7 @@ def list_runs(
 ) -> list[dict[str, Any]]:
     """List evaluation runs (newest first). Returns a lightweight summary per
     run: run_id, status, and whether a summary.json exists."""
-    _check_output_root(output_root)
+    output_root = _check_output_root(output_root)
     runs = []
     for path in list_evaluation_runs(output_root):
         run_id = path.name
@@ -143,32 +177,34 @@ def create_run(
     """Create an evaluation run. ``dataset_path`` is required; ``mode`` selects
     online (default) vs offline (requires ``snapshot_path``). ``score_enabled``
     toggles RAGAS scoring for online runs."""
-    _check_output_root(output_root)
-    _check_input_path(body.dataset_path, _DATASET_ROOT, "dataset_path")
-    errors = validate_dataset(body.dataset_path)
+    output_root = _check_output_root(output_root)
+    dataset_path = _check_dataset_path(body.dataset_path, output_root)
+    errors = validate_dataset(dataset_path)
     if errors:
         raise HTTPException(status_code=400, detail="; ".join(errors))
-    samples = load_dataset(body.dataset_path)
+    samples = _filter_samples(load_dataset(dataset_path), body.sample_ids, body.tags)
 
     if body.mode == "offline":
         if not body.snapshot_path:
             raise HTTPException(status_code=400, detail="snapshot_path is required for offline mode")
-        _check_input_path(body.snapshot_path, _SNAPSHOT_ROOT, "snapshot_path")
+        snapshot_path = _check_input_path(body.snapshot_path, _SNAPSHOT_ROOT, "snapshot_path")
+    else:
+        snapshot_path = None
 
     controller = _controller(output_root)
     try:
         if body.mode == "offline":
             state = controller.create_offline_run(
-                dataset_path=body.dataset_path,
+                dataset_path=dataset_path,
                 output_root=output_root,
                 samples=samples,
-                snapshot_path=body.snapshot_path,
+                snapshot_path=snapshot_path,
                 sample_ids=body.sample_ids,
                 tags=body.tags,
             )
         else:
             state = controller.create_online_run(
-                dataset_path=body.dataset_path,
+                dataset_path=dataset_path,
                 output_root=output_root,
                 samples=samples,
                 score_enabled=body.score_enabled,
@@ -182,13 +218,43 @@ def create_run(
     return _state_dict(state)
 
 
+@router.post("/evaluation/datasets")
+async def upload_dataset(
+    output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
+    file: UploadFile = File(...),
+    _actor: AuthUser = Depends(require_system_admin),
+) -> dict[str, Any]:
+    """Upload a JSONL dataset into the evaluations upload area."""
+    output_root = _check_output_root(output_root)
+    filename = Path(file.filename or "dataset.jsonl").name
+    if Path(filename).suffix.lower() != ".jsonl":
+        raise HTTPException(status_code=400, detail="dataset file must be a .jsonl file")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="dataset file is empty")
+
+    upload_dir = Path(output_root) / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    target = upload_dir / filename
+    target.write_bytes(content)
+    errors = validate_dataset(target)
+    if errors:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="; ".join(errors))
+    return {
+        "dataset_path": str(target),
+        "file_name": filename,
+        "sample_count": len(load_dataset(target)),
+    }
+
+
 @router.post("/evaluation/runs/{run_id}/start")
 def start_run(
     run_id: str,
     output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
     _actor: AuthUser = Depends(require_system_admin),
 ) -> dict[str, Any]:
-    _check_output_root(output_root)
+    output_root = _check_output_root(output_root)
     controller = _controller(output_root)
     try:
         controller.start(run_id)
@@ -203,7 +269,7 @@ def pause_run(
     output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
     _actor: AuthUser = Depends(require_system_admin),
 ) -> dict[str, Any]:
-    _check_output_root(output_root)
+    output_root = _check_output_root(output_root)
     controller = _controller(output_root)
     try:
         state = controller.pause(run_id)
@@ -218,7 +284,7 @@ def resume_run(
     output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
     _actor: AuthUser = Depends(require_system_admin),
 ) -> dict[str, Any]:
-    _check_output_root(output_root)
+    output_root = _check_output_root(output_root)
     controller = _controller(output_root)
     try:
         state = controller.resume(run_id)
@@ -235,7 +301,7 @@ def cancel_run(
     output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
     _actor: AuthUser = Depends(require_system_admin),
 ) -> dict[str, Any]:
-    _check_output_root(output_root)
+    output_root = _check_output_root(output_root)
     controller = _controller(output_root)
     try:
         state = controller.cancel(run_id)
@@ -251,7 +317,7 @@ def get_run(
     _actor: AuthUser = Depends(require_system_admin),
 ) -> dict[str, Any]:
     """Return the run state plus its summary.json (if present)."""
-    _check_output_root(output_root)
+    output_root = _check_output_root(output_root)
     controller = _controller(output_root)
     try:
         state = controller.load_for_display(run_id)
@@ -283,7 +349,7 @@ def compare_run(
     _actor: AuthUser = Depends(require_system_admin),
 ) -> dict[str, Any]:
     """Load summaries for the current run and a baseline run for comparison."""
-    _check_output_root(output_root)
+    output_root = _check_output_root(output_root)
     current_summary_path = Path(output_root) / run_id / "summary.json"
     baseline_summary_path = Path(output_root) / baseline / "summary.json"
     if not current_summary_path.is_file():

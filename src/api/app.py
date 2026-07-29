@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.errors import install_error_handlers
 from src.api.routes import (
+    assets,
     auth,
     config,
     conversations,
@@ -23,8 +24,10 @@ from src.api.routes import (
     kb_permissions,
     kbs,
     logs,
+    metrics,
     parse_tasks,
     query,
+    structured,
     upload,
     users,
 )
@@ -48,8 +51,8 @@ def create_app() -> FastAPI:
             "http://127.0.0.1:8501",
             "http://localhost:3000",
             "http://127.0.0.1:3000",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5174",
         ]
     app.add_middleware(
         CORSMiddleware,
@@ -61,6 +64,7 @@ def create_app() -> FastAPI:
 
     api_v1 = "/api/v1"
     app.include_router(auth.router, prefix=api_v1)
+    app.include_router(assets.router, prefix=api_v1)
     app.include_router(conversations.router, prefix=api_v1)
     app.include_router(kbs.router, prefix=api_v1)
     app.include_router(files.router, prefix=api_v1)
@@ -73,7 +77,9 @@ def create_app() -> FastAPI:
     app.include_router(governance.router, prefix=api_v1)
     app.include_router(config.router, prefix=api_v1)
     app.include_router(logs.router, prefix=api_v1)
+    app.include_router(metrics.router, prefix=api_v1)
     app.include_router(evaluation.router, prefix=api_v1)
+    app.include_router(structured.router, prefix=api_v1)
 
     @app.get("/health", tags=["health"])
     def health() -> dict:
@@ -90,5 +96,5 @@ def main() -> None:
     import uvicorn
 
     host = os.getenv("HDB_API_HOST", "127.0.0.1")
-    port = int(os.getenv("HDB_API_PORT", "8000"))
+    port = int(os.getenv("HDB_API_PORT", "8001"))
     uvicorn.run("src.api.app:app", host=host, port=port)

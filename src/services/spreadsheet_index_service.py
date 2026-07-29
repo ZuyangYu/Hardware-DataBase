@@ -3,6 +3,7 @@ import re
 from typing import Any
 
 import config.settings
+from src.agents.query_tokens import tokenize_hardware_query
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
 from src.pipelines.spreadsheet.pipeline import SpreadsheetIndexRequest, SpreadsheetIndexResult, SpreadsheetPipeline
 from src.pipelines.spreadsheet.table_store import TableIndexStore
@@ -28,6 +29,20 @@ class SpreadsheetIndexService:
 
     def get_document_profile(self, record: Any) -> dict | None:
         return self._pipeline(record.department_id, record.kb_name).get_document_profile(record.id)
+
+    def rank_document_matches(
+        self,
+        kb_name: str,
+        department_id: str | int | None,
+        query: str,
+        limit: int = 20,
+    ) -> dict[int, dict]:
+        """Return local Excel record matches for fast source routing."""
+        db_path = self.db_path(department_id, kb_name, create=False)
+        if not os.path.exists(db_path):
+            return {}
+        terms = tokenize_hardware_query(query, max_tokens=8, include_cjk_ngrams=False)
+        return TableIndexStore(db_path).rank_documents_by_terms(terms, limit=limit)
 
     def delete_record(self, record: Any):
         self._pipeline(record.department_id, record.kb_name).delete(record.id)

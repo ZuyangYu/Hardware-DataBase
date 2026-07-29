@@ -35,7 +35,7 @@ def answer_contract(
     if scope["requested_detail"] == "key":
         lines.append("只列出问题要求的关键项，不要扩展为全部引脚、全部器件或全部网络。")
     if missing_count:
-        lines.append(f"当前有 {missing_count} 个子问题未被完全覆盖，必须在对应结论后简洁标注缺口。")
+        lines.append(f"当前有 {missing_count} 项请求缺少直接证据，必须在对应结论后简洁标注缺口。")
     if conflicts:
         lines.append("存在可比较的来源冲突；分别列出字段、取值和来源，不得合并为确定结论。")
     return "\n".join(lines)

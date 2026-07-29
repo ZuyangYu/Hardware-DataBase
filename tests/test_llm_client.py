@@ -16,7 +16,7 @@ class _FakeStreamResponse:
     def raise_for_status(self):
         return None
 
-    def iter_lines(self, decode_unicode=True):
+    def iter_lines(self, chunk_size=None, decode_unicode=True):
         for line in self.lines:
             if isinstance(line, bytes) and decode_unicode:
                 yield line.decode(self.encoding or "utf-8")
