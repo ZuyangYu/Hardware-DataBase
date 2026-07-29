@@ -602,7 +602,11 @@ class AppPipeline:
                 filters={"source_names": list(snapshot.source_names)},
             )
             connector_refdes = (
-                profile.connector_refdes
+                list(dict.fromkeys(
+                    block.location_number
+                    for block in profile.connector_blocks
+                    if block.location_number
+                ))
                 if profile is not None and profile.kind == "icd"
                 else list(dict.fromkeys([
                     *_connector_refdes_from_schema(icd_schema),

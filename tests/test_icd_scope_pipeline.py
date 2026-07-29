@@ -99,7 +99,10 @@ def _front_view_template_bytes(refdes: str = "X302") -> bytes:
     return content.getvalue()
 
 
-def _formal_icd_template_bytes(*refdes: str) -> bytes:
+def _formal_icd_template_bytes(
+    *refdes: str,
+    front_view_refdes: str | None = None,
+) -> bytes:
     """A formal ICD template declares its connector identities in the template."""
     values_by_sheet = [
         [
@@ -109,6 +112,13 @@ def _formal_icd_template_bytes(*refdes: str) -> bytes:
         ]
         for value in refdes
     ] or [[["Pin Number", "Pin Definition"]]]
+    if front_view_refdes:
+        values_by_sheet.append([
+            ["板端接插件前视图管序布局和定义"],
+            ["管脚定义 Pin Definition"],
+            ["管脚号 Pin Number", f"{front_view_refdes}-20"],
+            ["板端接插件序号", "20"],
+        ])
 
     def sheet_xml(rows: list[list[str]]) -> str:
         return "".join(
@@ -241,6 +251,30 @@ def test_formal_icd_retrieves_only_profile_connector_refdes():
         content="connector J9 pinout",
         metadata={"document_role": "fpt"},
     )]
+    service.prepare_icd_scope_review.return_value = SimpleNamespace(
+        pending_count=1,
+        exceptions=[SimpleNamespace(user_instruction="Confirm J1 exposure")],
+    )
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "scope_review_required"
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
+        "hardware", list(snapshot.source_names), ctx, refdes=["J1", "J2"],
+    )
+
+
+def test_formal_icd_scope_ignores_front_view_only_connector_refdes():
+    pipeline, ctx, service, snapshot = _pipeline()
+    service.store.read_template_content.return_value = _formal_icd_template_bytes(
+        "J1", "J2", front_view_refdes="J9",
+    )
     service.prepare_icd_scope_review.return_value = SimpleNamespace(
         pending_count=1,
         exceptions=[SimpleNamespace(user_instruction="Confirm J1 exposure")],

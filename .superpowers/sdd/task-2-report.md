@@ -26,3 +26,14 @@ GREEN:
 ## Scope notes
 
 The worktree contained unrelated pre-existing modifications in the files touched by this task. The commit stages only Task 2 hunks plus this report; no unrelated change was reverted or staged.
+
+## Follow-up review fix — formal connector scope
+
+- Formal ICD pin-mapping lookup now derives its `refdes` exclusively from the deduplicated `location_number` values in `profile.connector_blocks`.
+- `front_view_refdes` remains available for presentation/routing, but cannot expand formal ICD circuit-evidence scope.
+- Added a regression with formal blocks `J1`/`J2` and a front-view-only `J9`; the circuit query is asserted to receive only `J1` and `J2`.
+
+TDD evidence:
+
+- RED: `uv run python -m pytest -q tests/test_icd_scope_pipeline.py -k formal_icd_scope_ignores_front_view_only_connector_refdes` failed with the prior `refdes=["J1", "J2", "J9"]` query.
+- GREEN: the same regression passed after the scope fix; `tests/test_icd_scope_pipeline.py`, `tests/test_icd_profile.py`, and `tests/test_icd_front_view.py` passed (36 tests total), and targeted Ruff plus `git diff --check` passed.
