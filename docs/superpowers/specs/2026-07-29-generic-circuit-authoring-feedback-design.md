@@ -1,146 +1,118 @@
-# Generic Circuit Evidence for Governed Document Authoring — Design
+# 通用电路证据驱动的受控文档生成与反馈设计
 
-## Goal
+## 目标
 
-Allow governed document authoring to retrieve complete, source-scoped circuit
-facts from EDF/EDIF designs, render them into review candidates without
-project-specific rules, and collect feedback before publication. The design
-must support the current ICD case and unrelated projects whose reference
-designators, connector names, nets, and templates differ.
+让受控文档生成能够从 EDF/EDIF 电路设计中取得完整、来源受限的电路事实，
+将其写入待审核文档，并在发布前收集反馈。方案既要覆盖当前 ICD，也必须适用于
+位号、接插件名称、网络名称和模板都不同的其他项目。
 
-## Scope
+## 范围
 
-- Add circuit retrieval to both knowledge-base and project authoring paths.
-- Preserve every parsed pin for an explicitly requested component or
-  connector; do not special-case X1900, X1902, PGND, or any project name.
-- Normalize OrCAD presentation artifacts (a leading `&` in a pin name) only
-  for display, while retaining the raw value in evidence metadata.
-- Represent an absent EDF net as `NC (no net declared in source)` rather than
-  silently dropping the pin.
-- Add post-generation preview and auditable feedback before a candidate is
-  published.
+- 在知识库路径和项目路径均接入 circuit 检索。
+- 对明确请求的器件或接插件保留每一个已解析管脚；不得为 X1900、X1902、PGND
+  或任何项目名称编写特例。
+- 仅在展示层规范化 OrCAD 产生的管脚名前缀 `&`；原始值必须保存在证据元数据中，
+  以便审计。
+- EDF 中没有网络的管脚显示为 `NC（源文件未声明网络连接）`，不得被静默丢弃。
+- 在候选文档生成后、发布前提供预览和可审计反馈。
 
-The change does not infer whether a connected pin is an interface, shield, or
-mounting pin. That decision belongs to a template's schema and to human review
-because a net named `PGND` is not universally a mounting pin.
+本次改动不会猜测一个已连接管脚是接口脚、屏蔽脚还是安装脚。比如网络名为
+`PGND` 并不能通用地证明它是安装脚；此类选择由模板 Schema 和人工审核决定。
 
-## Architecture
+## 架构
 
-### 1. Capability selection
+### 1. 能力选择
 
-Document information requirements retain their schema-declared capabilities.
-A generic, vocabulary-based enrichment adds `relationship_lookup` for fields
-or tables referring to pins, connectors, nets, or connections (including
-Chinese and English terms), and `entity_lookup` for component identity/model
-requests. It is additive: explicit schema capabilities remain intact, and no
-project identifier or fixed refdes is embedded in the rule.
+文档信息需求保留 Schema 已声明的能力。基于通用词汇的补充规则会为涉及
+pin、connector、net、connection 及其常用中英文表达的字段或表格添加
+`relationship_lookup`；对器件身份、型号等请求添加 `entity_lookup`。
 
-The existing harness allowlist continues to accept both capabilities. A field
-with neither circuit semantic nor declared circuit capability will not trigger
-a circuit lookup.
+这是增量规则：显式声明的能力不会被删除，规则中不包含任何项目标识或固定
+位号。一个字段既没有电路语义、也没有显式电路能力时，不会触发 circuit 查询。
+Harness 中已有的能力白名单继续允许上述两个能力。
 
-### 2. Circuit fact rendering
+### 2. 电路事实渲染
 
-`CircuitQueryEngine.get_instance_detail` remains the lossless data source: it
-returns every stored pin, including ones without a net. `CircuitEvidenceMapper`
-converts that result into an evidence envelope with:
+`CircuitQueryEngine.get_instance_detail` 保持为无损数据来源：返回已存储的所有
+管脚，包括未连网络的管脚。`CircuitEvidenceMapper` 将该结果转换为证据包，其中包括：
 
-- a human-readable, deterministic pin-to-net table for the writer;
-- normalized display pin names (leading `&` removed);
-- an explicit connection state for every pin (`connected` or `no_net`);
-- the raw pin name, normalized name, net name, connection state, refdes, and
-  source design identifier in metadata for traceability.
+- 给 Writer 使用的、顺序稳定且人可读的管脚—网络表；
+- 移除了开头 `&` 的展示管脚名；
+- 每个管脚明确的连接状态：`connected` 或 `no_net`；
+- 用于追溯的原始管脚名、规范化管脚名、网络名、连接状态、位号和源设计标识。
 
-No pin is omitted merely because its net is blank. A `no_net` pin is displayed
-as `NC (no net declared in source)`. A connected `PGND` pin remains a connected
-`PGND` fact. The preview and writer therefore receive complete physical source
-facts without claiming a product-specific interface interpretation.
+任何管脚都不能仅因网络为空而省略。`no_net` 管脚显示为
+`NC（源文件未声明网络连接）`；已连接的 `PGND` 管脚仍作为已连接的 `PGND` 事实保留。
+因此预览和 Writer 得到的是完整物理事实，而不是系统臆测出的项目接口定义。
 
-### 3. Retrieval routes and scope
+### 3. 检索路径和范围控制
 
-The knowledge-base retriever always performs its existing RAGFlow lookup and
-additively invokes `CircuitQueryTool` for `entity_lookup` and
-`relationship_lookup`. Circuit hits are discarded unless `source_name` belongs
-to the frozen knowledge-base source set.
+知识库 retriever 始终执行既有的 RAGFlow 检索，并在需求包含 `entity_lookup` 或
+`relationship_lookup` 时附加调用 `CircuitQueryTool`。只有 `source_name` 位于冻结知识库
+来源集合中的 circuit 命中才会被接受。
 
-The project retriever applies the same capability dispatch per frozen source
-version. It discards circuit hits whose source name differs from the logical
-document title and wraps accepted evidence with that version, its processing
-artifact, role, revision, and approval state. This preserves the existing
-fail-closed project-scope validation.
+项目 retriever 对每个冻结的 source version 使用相同的能力分发规则。它会丢弃
+`source_name` 与逻辑文档标题不一致的 circuit 命中；接受的证据则绑定该 version、
+处理产物、文档角色、修订号和批准状态。这样保留现有项目范围验证的默认拒绝行为。
 
-### 4. Candidate preview, feedback, and release
+### 4. 候选预览、反馈和发布
 
-Generation always ends with a `review_candidate`; it does not auto-release a
-fully generated document. `approve_document_artifact` remains the sole
-publication path and keeps its content-hash, validation-report, source-snapshot,
-permission, and approval-event checks.
+文档生成总是先结束于 `review_candidate`，不得自动发布。唯一发布路径仍然是
+`approve_document_artifact`，并继续执行内容哈希、验证报告、来源快照、权限和批准
+事件校验。
 
-The document-generation UI will provide a read-only, bounded preview for a
-candidate after it is generated:
+文档生成页面在候选产物生成后提供受权限控制的只读、有界预览：
 
-- XLSX/XLSM: a bounded sheet/cell table;
-- DOCX: bounded paragraph/table text;
-- unsupported or failed previews: a clear warning plus the existing candidate
-  download control.
+- XLSX/XLSM：显示有界的工作表和单元格表格；
+- DOCX：显示有界的段落和表格文本；
+- 预览格式不支持或解析失败：明确提示，并保留已有的候选文件下载入口。
 
-Preview extraction is read-only and authorization-gated like candidate
-download. The user can submit a comment as `DocumentHumanEvent(event_type=
-"feedback")`. The event binds the candidate content hash and frozen source
-snapshot. Feedback is immutable audit data: it cannot mutate a candidate,
-modify source evidence, satisfy an approval, or bypass a new generation when
-content needs revision.
+预览提取为只读操作，授权规则与候选文件下载一致。用户可以提交评论，系统以
+`DocumentHumanEvent(event_type="feedback")` 保存。事件绑定候选文件哈希和冻结来源
+快照。反馈是不可变审计数据：不能修改候选文件、不能修改来源证据、不能替代批准，
+也不能绕过重新生成。
 
-## Data Flow
+## 数据流
 
 ```text
-template semantic unit
-  -> declared capabilities + generic semantic enrichment
-  -> frozen-scope RAGFlow retrieval + eligible CircuitQueryTool lookup
-  -> complete, normalized circuit evidence
-  -> governed writer and renderer
+模板语义单元
+  -> 已声明能力 + 通用语义补充
+  -> 冻结范围内的 RAGFlow 检索 + 符合条件的 CircuitQueryTool 查询
+  -> 完整且规范化的电路证据
+  -> 受控 Writer 与渲染器
   -> review_candidate
-  -> read-only preview + optional feedback event
-  -> explicit approval -> approved_release
+  -> 只读预览 + 可选反馈事件
+  -> 显式批准 -> approved_release
 ```
 
-## Error Handling and Safety
+## 异常处理和安全约束
 
-- Missing circuit index, no eligible capability, missing component, or no
-  source-scoped hit yields no circuit evidence; the ordinary retrievers retain
-  their current behavior.
-- Preview parsing errors do not alter the artifact and do not prevent download.
-- A feedback event requires the same document-context authorization as other
-  non-approval human events and is content-hash-bound to the candidate.
-- Candidate feedback never auto-edits or releases a document.
-- Existing source-set filtering and project evidence validation remain
-  authoritative; feedback cannot broaden scope.
+- circuit 索引不存在、没有适用能力、器件不存在或没有范围内命中时，不产生 circuit
+  证据；其他 retriever 保持既有行为。
+- 预览解析失败不修改产物，也不阻止候选文件下载。
+- 反馈事件须具备与其他非批准人工事件相同的文档权限，并绑定候选内容哈希。
+- 候选反馈绝不自动编辑或发布文档。
+- 已有的来源集合过滤与项目证据验证仍是权威约束；反馈不能扩大检索范围。
 
-## Testing
+## 测试
 
-1. **Circuit evidence tests** prove that a connector's evidence retains all
-   pins, displays leading-`&` pin names without the prefix, and emits blank-net
-   pins as `NC (no net declared in source)` with raw provenance metadata.
-2. **Knowledge-base and project retriever tests** prove capability-gated
-   circuit dispatch, frozen-source filtering, correct project binding, and no
-   circuit call when the capability or service is absent.
-3. **End-to-end ICD regression** uses a deterministic controlled writer that
-   consumes its supplied circuit evidence (rather than hard-coded rows). It
-   verifies full X1900 pin facts, the complete source facts for X1902, model
-   data, normalized pin labels, and no-net pin rendering in the rendered
-   candidate.
-4. **Cross-project regression** uses different reference designators, nets,
-   connector model, and template labels to prove that the same capability
-   enrichment and retrieval/rendering path remains data-driven.
-5. **Candidate review tests** prove user-facing preview extraction is bounded
-   and non-mutating, feedback is persisted and cannot approve a candidate, and
-   generated documents are not automatically released.
+1. **电路证据测试**：验证接插件证据保留全部管脚，展示名去除开头 `&`，空网络管脚
+   显示 `NC（源文件未声明网络连接）`，并具有原始值追溯元数据。
+2. **知识库与项目 retriever 测试**：验证 circuit 分发受能力控制、冻结来源过滤正确、
+   项目绑定正确；能力缺失或服务缺失时不得调用 circuit。
+3. **端到端 ICD 回归测试**：使用消费实际 circuit 证据的确定性受控 Writer，而不是
+   写死行数据；验证渲染候选中 X1900 全部管脚事实、X1902 的全部源事实、型号、
+   规范化管脚名和未连网络显示均正确。
+4. **跨项目回归测试**：使用不同位号、网络、接插件型号和模板标签的夹具，证明同一
+   能力补充、检索和渲染路径由数据驱动。
+5. **候选审核测试**：验证预览有界且不写入文件；反馈被持久化但不能批准候选；
+   生成文档不会自动发布。
 
-## Acceptance Criteria
+## 验收标准
 
-- Any authorized EDF/EDIF source in a frozen document set can contribute
-  complete connector pin evidence to a semantic unit that requires it.
-- The system makes no product-specific pin filtering decision.
-- No-net and OrCAD-prefix cases are visible, traceable, and test-covered.
-- A generated document is reviewable and feedback-capable before publication.
-- Tests demonstrate both the ICD case and an unrelated circuit/template case.
+- 任意已授权、位于冻结文档集合内的 EDF/EDIF 来源，都可以向需要它的语义单元提供
+  完整接插件管脚证据。
+- 系统不作项目特定的管脚过滤判断。
+- 无网络和 OrCAD 前缀情况可见、可追溯、且有测试覆盖。
+- 生成的文档在发布前可预览并可提交反馈。
+- 测试同时证明 ICD 场景和无关项目场景均可用。
