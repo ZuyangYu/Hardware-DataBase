@@ -10,12 +10,23 @@ from src.document_authoring.icd_scope_decision import (
 from src.document_authoring.models import (
     DocumentArtifact,
     DocumentWorkOrder,
+    HarnessPolicy,
+    HarnessRun,
+    IcdScopeReview,
     KnowledgeBaseSourceSnapshot,
     ValidationReport,
 )
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.pipelines.document_rag.schemas import RequestContext
+from src.projects.models import (
+    LogicalDocument,
+    SourceAsset,
+    SourceSetSnapshot,
+    SourceVersion,
+)
+from src.projects.service import ProjectService
+from src.projects.store import ProjectStore
 
 
 def _work_order() -> DocumentWorkOrder:
@@ -128,6 +139,18 @@ def test_scope_resolution_rejects_duplicate_exception_ids(scope_review_service):
         )
 
 
+def test_scope_review_rejects_duplicate_decision_exception_ids():
+    exception = decision_with_one_exception().exceptions[0]
+    decision = IcdScopeDecision(exceptions=[exception, exception.model_copy()])
+
+    with pytest.raises(ValueError, match="exception ids must be unique"):
+        IcdScopeReview(
+            work_order_id="work-1",
+            decision=decision,
+            source_snapshot_hash="snapshot-hash",
+        )
+
+
 def test_scope_review_rejects_source_outside_work_order_snapshot(scope_review_service):
     service, ctx, order = scope_review_service
     decision = decision_with_one_exception()
@@ -135,6 +158,108 @@ def test_scope_review_rejects_source_outside_work_order_snapshot(scope_review_se
 
     with pytest.raises(ValueError, match="source names.*frozen work order snapshot"):
         service.prepare_icd_scope_review(ctx, order.work_order_id, decision)
+
+
+def test_scope_review_accepts_knowledge_base_source_names(scope_review_service):
+    service, ctx, order = scope_review_service
+    decision = decision_with_one_exception()
+    decision.exceptions[0].source_names = ["board.edf"]
+
+    review = service.prepare_icd_scope_review(ctx, order.work_order_id, decision)
+
+    assert review.status == "pending"
+
+
+def test_scope_review_accepts_project_document_titles(tmp_path):
+    project_store = ProjectStore(str(tmp_path / "projects.db"))
+    asset = project_store.create_source_asset(SourceAsset(
+        asset_id="asset-1",
+        tenant_id="tenant-1",
+        original_file_name="schematic.edf",
+        content_hash="asset-hash",
+        content_kind="circuit_design",
+        parser_kind="edf",
+        processing_status="ready",
+    ))
+    document = project_store.create_logical_document(LogicalDocument(
+        document_id="document-1",
+        tenant_id="tenant-1",
+        title="Main schematic",
+        document_role="schematic",
+        owner_department_id="hw",
+    ))
+    project_store.create_source_version(SourceVersion(
+        version_id="version-1",
+        tenant_id="tenant-1",
+        document_id=document.document_id,
+        asset_id=asset.asset_id,
+        approval_status="released",
+    ))
+    service = DocumentGenerationService(project_service=ProjectService(project_store))
+    snapshot = SourceSetSnapshot(
+        source_set_snapshot_id="snapshot-1",
+        tenant_id="tenant-1",
+        work_order_id="work-1",
+        project_id="project-1",
+        baseline_id="baseline-1",
+        baseline_content_hash="baseline-hash",
+        baseline_item_ids=["baseline-item-1"],
+        source_version_ids=["version-1"],
+        authorization_snapshot_id="authorization-1",
+    )
+    decision = decision_with_one_exception()
+    decision.exceptions[0].source_names = ["Main schematic"]
+
+    service._validate_icd_scope_decision_sources(decision, snapshot)
+
+
+@pytest.mark.parametrize(
+    ("review_kind", "error_match"),
+    [
+        ("stale", "source snapshot differs"),
+        ("pending", "unresolved ICD scope exceptions"),
+    ],
+)
+def test_resume_blocks_stale_or_pending_scope_review_before_retry_queueing(
+    scope_review_service,
+    monkeypatch,
+    review_kind,
+    error_match,
+):
+    service, ctx, order = scope_review_service
+    snapshot = service.resolve_source_snapshot(order)
+    if review_kind == "stale":
+        review = IcdScopeReview(
+            work_order_id=order.work_order_id,
+            decision=IcdScopeDecision(),
+            source_snapshot_hash="stale-snapshot-hash",
+            status="frozen",
+        )
+    else:
+        review = IcdScopeReview(
+            work_order_id=order.work_order_id,
+            decision=decision_with_one_exception(),
+            source_snapshot_hash=snapshot.content_hash,
+        )
+    service.register_harness_policy(HarnessPolicy(
+        harness_policy_id="policy-1",
+        version="1",
+        status="approved",
+    ))
+    run = service.store.create_harness_run(HarnessRun(
+        harness_run_id=f"run-{review_kind}",
+        work_order_id=order.work_order_id,
+        run_manifest_id="manifest-1",
+        status="paused",
+    ))
+    queue_retry = Mock(return_value=run.model_copy(update={"status": "retrying"}))
+    monkeypatch.setattr(service.store, "get_icd_scope_review", Mock(return_value=review))
+    monkeypatch.setattr(service.store, "queue_harness_retry", queue_retry)
+
+    with pytest.raises(ValueError, match=error_match):
+        service.resume_internal_harness(ctx, run.harness_run_id, retrieve=Mock())
+
+    queue_retry.assert_not_called()
 
 
 def test_unresolved_scope_review_blocks_harness_execution(scope_review_service):

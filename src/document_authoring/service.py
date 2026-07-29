@@ -982,22 +982,36 @@ class DocumentGenerationService:
         })
         return self.store.freeze_icd_scope_review(frozen)
 
-    @staticmethod
-    def _validate_icd_scope_decision_sources(decision, snapshot: Any) -> None:
+    def _validate_icd_scope_decision_sources(self, decision, snapshot: Any) -> None:
         referenced_source_names = {
             source_name.strip()
             for item in [*decision.auto_items, *decision.exceptions]
             for source_name in item.source_names
             if source_name.strip()
         }
-        frozen_source_identities = set(getattr(snapshot, "source_names", []))
+        frozen_source_identities = {
+            source_name.strip()
+            for source_name in getattr(snapshot, "source_names", [])
+            if source_name.strip()
+        }
         if not frozen_source_identities:
-            frozen_source_identities.update(
-                getattr(snapshot, "source_version_ids", [])
+            source_version_ids = (
+                list(getattr(snapshot, "source_version_ids", []))
+                + list(getattr(snapshot, "shared_reference_version_ids", []))
             )
-            frozen_source_identities.update(
-                getattr(snapshot, "shared_reference_version_ids", [])
-            )
+            for source_version_id in source_version_ids:
+                source_version = self.projects.store.get_source_version(
+                    source_version_id,
+                    snapshot.tenant_id,
+                )
+                if source_version is None:
+                    continue
+                document = self.projects.store.get_logical_document(
+                    source_version.document_id,
+                    snapshot.tenant_id,
+                )
+                if document is not None and document.title.strip():
+                    frozen_source_identities.add(document.title.strip())
         foreign_source_names = referenced_source_names - frozen_source_identities
         if foreign_source_names:
             raise ValueError(
@@ -1083,6 +1097,13 @@ class DocumentGenerationService:
         order = self._order_raw(run.work_order_id)
         if order.execution_mode != "internal_harness" or not order.harness_policy_id:
             raise ValueError("work order is not configured for the internal Harness")
+        snapshot = self.resolve_source_snapshot(order)
+        scope_review = self.store.get_icd_scope_review(order.work_order_id)
+        if scope_review is not None:
+            if scope_review.source_snapshot_hash != snapshot.content_hash:
+                raise ValueError("ICD scope review source snapshot differs from the work order")
+            if scope_review.pending_count:
+                raise ValueError("unresolved ICD scope exceptions block Harness execution")
         policy = self.store.get_harness_policy(order.harness_policy_id, order.harness_policy_version)
         if policy is None or policy.status != "approved":
             raise ValueError("frozen HarnessPolicy is no longer approved")

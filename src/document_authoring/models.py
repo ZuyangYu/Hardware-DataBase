@@ -378,6 +378,8 @@ class IcdScopeReview(BaseModel):
         if not self.source_snapshot_hash:
             raise ValueError("ICD scope review requires a source snapshot hash")
         exception_ids = [exception.exception_id for exception in self.decision.exceptions]
+        if len(exception_ids) != len(set(exception_ids)):
+            raise ValueError("ICD scope exception ids must be unique")
         resolved_ids = [resolution.exception_id for resolution in self.resolutions]
         if len(resolved_ids) != len(set(resolved_ids)):
             raise ValueError("ICD scope exceptions may only be resolved once")
