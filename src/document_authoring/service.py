@@ -911,6 +911,7 @@ class DocumentGenerationService:
         """Persist an ICD scope decision against this work order's frozen sources."""
         order = self._order(ctx, work_order_id, "run_deterministic_work_order")
         snapshot = self.resolve_source_snapshot(order)
+        self._validate_icd_scope_decision_sources(decision, snapshot)
         existing = self.store.get_icd_scope_review(work_order_id)
         if existing is not None:
             if existing.source_snapshot_hash != snapshot.content_hash:
@@ -967,6 +968,9 @@ class DocumentGenerationService:
         ]
         if len(batch) != len(resolutions):
             raise ValueError("ICD scope resolutions must be objects")
+        resolution_ids = [resolution.exception_id for resolution in batch]
+        if len(resolution_ids) != len(set(resolution_ids)):
+            raise ValueError("ICD scope resolution batch must resolve every exception exactly once")
         expected_ids = {exception.exception_id for exception in review.exceptions}
         if {resolution.exception_id for resolution in batch} != expected_ids:
             raise ValueError("ICD scope resolution batch must resolve every exception exactly once")
@@ -977,6 +981,28 @@ class DocumentGenerationService:
             "frozen_at": datetime.now(timezone.utc),
         })
         return self.store.freeze_icd_scope_review(frozen)
+
+    @staticmethod
+    def _validate_icd_scope_decision_sources(decision, snapshot: Any) -> None:
+        referenced_source_names = {
+            source_name.strip()
+            for item in [*decision.auto_items, *decision.exceptions]
+            for source_name in item.source_names
+            if source_name.strip()
+        }
+        frozen_source_identities = set(getattr(snapshot, "source_names", []))
+        if not frozen_source_identities:
+            frozen_source_identities.update(
+                getattr(snapshot, "source_version_ids", [])
+            )
+            frozen_source_identities.update(
+                getattr(snapshot, "shared_reference_version_ids", [])
+            )
+        foreign_source_names = referenced_source_names - frozen_source_identities
+        if foreign_source_names:
+            raise ValueError(
+                "ICD scope decision source names differ from the frozen work order snapshot"
+            )
 
     def run_internal_harness(
         self,

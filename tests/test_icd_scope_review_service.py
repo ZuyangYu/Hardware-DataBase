@@ -1,3 +1,4 @@
+import hashlib
 from unittest.mock import Mock
 
 import pytest
@@ -7,8 +8,10 @@ from src.document_authoring.icd_scope_decision import (
     IcdScopeException,
 )
 from src.document_authoring.models import (
+    DocumentArtifact,
     DocumentWorkOrder,
     KnowledgeBaseSourceSnapshot,
+    ValidationReport,
 )
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.work_order_store import DocumentAuthoringStore
@@ -107,6 +110,33 @@ def test_scope_exceptions_are_resolved_in_one_batch_and_frozen(scope_review_serv
         )
 
 
+def test_scope_resolution_rejects_duplicate_exception_ids(scope_review_service):
+    service, ctx, order = scope_review_service
+    review = service.prepare_icd_scope_review(
+        ctx, order.work_order_id, decision_with_one_exception()
+    )
+
+    with pytest.raises(ValueError, match="exactly once"):
+        service.submit_icd_scope_resolution(
+            ctx,
+            order.work_order_id,
+            resolutions=[
+                {"exception_id": review.exceptions[0].exception_id, "action": "exclude"},
+                {"exception_id": review.exceptions[0].exception_id, "action": "exclude"},
+            ],
+            comment="PGND 不进入线束 ICD",
+        )
+
+
+def test_scope_review_rejects_source_outside_work_order_snapshot(scope_review_service):
+    service, ctx, order = scope_review_service
+    decision = decision_with_one_exception()
+    decision.exceptions[0].source_names = ["foreign-source.pdf"]
+
+    with pytest.raises(ValueError, match="source names.*frozen work order snapshot"):
+        service.prepare_icd_scope_review(ctx, order.work_order_id, decision)
+
+
 def test_unresolved_scope_review_blocks_harness_execution(scope_review_service):
     service, ctx, order = scope_review_service
     service.prepare_icd_scope_review(ctx, order.work_order_id, decision_with_one_exception())
@@ -128,8 +158,38 @@ def test_feedback_cannot_change_frozen_scope_review(scope_review_service):
         ],
         comment="PGND 不进入线束 ICD",
     )
-    service.submit_document_human_event = Mock()
+    report = service.store.save_validation_report(ValidationReport(
+        validation_report_id="report-1",
+        work_order_id=order.work_order_id,
+        status="passed",
+        evidence_matrix_hash="matrix-hash",
+    ))
+    artifact_content = b"candidate"
+    artifact = service.store.save_artifact(DocumentArtifact(
+        artifact_id="candidate-1",
+        tenant_id=order.tenant_id,
+        work_order_id=order.work_order_id,
+        run_id="run-1",
+        stage="review_candidate",
+        content_hash=hashlib.sha256(artifact_content).hexdigest(),
+        validation_report_id=report.validation_report_id,
+        integrity_manifest_id="manifest-1",
+    ), artifact_content, "xlsx")
 
-    service.submit_document_feedback(ctx, "candidate-1", comment="please change PGND")
+    event = service.submit_document_feedback(
+        ctx, artifact.artifact_id, comment="please change PGND"
+    )
 
     assert service.get_icd_scope_review(ctx, order.work_order_id).status == "frozen"
+    assert service.store.list_human_events(artifact.artifact_id) == [event]
+
+    denied_ctx = RequestContext(
+        user_id="mallory",
+        tenant_id="tenant-1",
+        metadata={"department_id": "hw"},
+        kb_permissions={},
+    )
+    with pytest.raises(PermissionError, match="knowledge base access"):
+        service.submit_document_feedback(
+            denied_ctx, artifact.artifact_id, comment="change PGND"
+        )
