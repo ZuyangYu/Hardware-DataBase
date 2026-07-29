@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, TypedDict
 
 from src.agents.claim_evidence import InformationRequirement, RetrievalOutcome
+from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
 from src.document_authoring.harness.policy import HarnessBudgetExceeded, HarnessToolPolicy
 from src.document_authoring.models import (
     AuthoringRunManifest,
@@ -368,7 +369,14 @@ def _requirement_for_unit(
 ) -> InformationRequirement:
     schema = unit["schema"]
     if unit["kind"] == "field":
-        capability = _capabilities(schema.required_capabilities)
+        capability = _capabilities(
+            enrich_circuit_capabilities(
+                schema.required_capabilities,
+                label=schema.label,
+                description=schema.description,
+                query_terms=schema.query_terms,
+            )
+        )
         source_roles = schema.preferred_source_roles
         subject = schema.label
         predicate = schema.description or None

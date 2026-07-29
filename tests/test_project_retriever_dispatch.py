@@ -112,6 +112,20 @@ def _restore_spreadsheet_tool(original):
     app_pipeline_mod.SpreadsheetSemanticTool = original
 
 
+def _patch_circuit_tool(circuit_tool):
+    import src.core.app_pipeline as app_pipeline_mod
+
+    original = app_pipeline_mod.CircuitQueryTool
+    app_pipeline_mod.CircuitQueryTool = Mock(return_value=circuit_tool)
+    return original
+
+
+def _restore_circuit_tool(original):
+    import src.core.app_pipeline as app_pipeline_mod
+
+    app_pipeline_mod.CircuitQueryTool = original
+
+
 def _xlsx_evidence(content: str = "BOM row", source_name: str = "bom.xlsx", score: float = 0.9) -> Evidence:
     return Evidence(
         id=f"xlsx:{source_name}:Sheet1:0:semantic",
@@ -122,6 +136,19 @@ def _xlsx_evidence(content: str = "BOM row", source_name: str = "bom.xlsx", scor
         score=score,
         locator={"record_id": 1, "sheet_name": "Sheet1", "row_index": 0},
         metadata={"tool": "spreadsheet_semantic"},
+    )
+
+
+def _circuit_evidence(source_name: str = "bom.xlsx") -> Evidence:
+    return Evidence(
+        id=f"circuit:{source_name}:pin_mapping:J1",
+        content="Pin mapping for J1: 1 -> CAN_H.",
+        source_name=source_name,
+        content_kind="circuit_design",
+        processor_kind="circuit_design",
+        score=0.95,
+        locator={"record_id": 1, "entity_type": "pin_mapping", "entity_id": "J1"},
+        metadata={"source_group": "circuit_design", "pin_mappings": []},
     )
 
 
@@ -181,6 +208,28 @@ def test_project_retriever_skips_spreadsheet_without_tabular_lookup(tmp_path: Pa
         _restore_spreadsheet_tool(original)
 
     spreadsheet_tool.run.assert_not_called()
+
+
+def test_project_retriever_adds_circuit_evidence_for_relationship_lookup(tmp_path: Path):
+    service, ctx, project, version, processing, snapshot = _prepare_xlsx_project(tmp_path)
+    backend = Mock()
+    backend.retrieve.return_value = []
+    pipeline = _build_pipeline(service, backend=backend)
+    pipeline.circuit_service = Mock()
+    circuit_tool = Mock()
+    circuit_tool.run.return_value = [_circuit_evidence()]
+    original = _patch_circuit_tool(circuit_tool)
+    try:
+        retrieve = pipeline._project_retriever(ctx, project.project_id, snapshot.source_set_snapshot_id)
+        outcome = retrieve(_req("引脚定义", ["relationship_lookup"]), 0)
+    finally:
+        _restore_circuit_tool(original)
+
+    circuit_tool.run.assert_called_once()
+    assert outcome.status == "success_with_hits"
+    assert len(outcome.evidences) == 1
+    assert outcome.evidences[0].source_type == "circuit_design"
+    assert outcome.evidences[0].source_version_id == version.version_id
 
 
 def test_project_retriever_skips_spreadsheet_when_service_missing(tmp_path: Path):

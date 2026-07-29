@@ -916,6 +916,33 @@ def _restore_spreadsheet_tool(original):
     app_pipeline_mod.SpreadsheetSemanticTool = original
 
 
+def _patch_circuit_tool(circuit_tool):
+    import src.core.app_pipeline as app_pipeline_mod
+
+    original = app_pipeline_mod.CircuitQueryTool
+    app_pipeline_mod.CircuitQueryTool = Mock(return_value=circuit_tool)
+    return original
+
+
+def _restore_circuit_tool(original):
+    import src.core.app_pipeline as app_pipeline_mod
+
+    app_pipeline_mod.CircuitQueryTool = original
+
+
+def _circuit_evidence(source_name: str) -> Evidence:
+    return Evidence(
+        id=f"circuit:{source_name}:pin_mapping:J1",
+        content="Pin mapping for J1: 1 -> CAN_H.",
+        source_name=source_name,
+        content_kind="circuit_design",
+        processor_kind="circuit_design",
+        score=0.95,
+        locator={"record_id": 1, "entity_type": "pin_mapping", "entity_id": "J1"},
+        metadata={"source_group": "circuit_design", "pin_mappings": []},
+    )
+
+
 def test_kb_retriever_adds_spreadsheet_evidence_for_tabular_lookup(pipeline, ctx):
     pipeline.backend.retrieve.return_value = []  # RAGFlow empty
     spreadsheet_tool = Mock()
@@ -946,6 +973,26 @@ def test_kb_retriever_skips_spreadsheet_when_no_tabular_lookup(pipeline, ctx):
         _restore_spreadsheet_tool(original)
 
     spreadsheet_tool.run.assert_not_called()
+
+
+def test_kb_retriever_adds_frozen_circuit_evidence_for_relationship_lookup(pipeline, ctx):
+    pipeline.backend.retrieve.return_value = []
+    pipeline.circuit_service = Mock()
+    circuit_tool = Mock()
+    circuit_tool.run.return_value = [
+        _circuit_evidence("board.edf"),
+        _circuit_evidence("not-in-frozen-set.edf"),
+    ]
+    original = _patch_circuit_tool(circuit_tool)
+    try:
+        retrieve = pipeline._knowledge_base_retriever(ctx, "hardware", ["board.edf"])
+        outcome = retrieve(requirement_with_capabilities("引脚定义", ["relationship_lookup"]), 0)
+    finally:
+        _restore_circuit_tool(original)
+
+    circuit_tool.run.assert_called_once()
+    assert outcome.status == "success_with_hits"
+    assert [e.source_name for e in outcome.evidences] == ["board.edf"]
 
 
 def test_kb_retriever_skips_spreadsheet_when_service_missing(pipeline, ctx):
