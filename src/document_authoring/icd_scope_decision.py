@@ -57,10 +57,27 @@ class IcdScopeDecision(BaseModel):
 def build_icd_scope_decision(
     circuit_evidences: Iterable[Any],
     supporting_evidences: Iterable[Any],
+    *,
+    connector_refdes: Iterable[str] | None = None,
 ) -> IcdScopeDecision:
-    """Freeze every EDF pin and auto-adopt only directly supported mappings."""
+    """Freeze declared EDF pins and auto-adopt only directly supported mappings.
+
+    When a connector range has already been determined, absent EDF pin mappings
+    are a governed stop rather than an empty, silently frozen ICD scope.
+    """
 
     mappings = _pin_mappings(circuit_evidences)
+    requested_connectors = _unique(
+        str(refdes).strip().upper()
+        for refdes in connector_refdes or []
+        if str(refdes).strip()
+    )
+    if requested_connectors:
+        requested_keys = {refdes.casefold() for refdes in requested_connectors}
+        mappings = [
+            mapping for mapping in mappings
+            if mapping["refdes"].casefold() in requested_keys
+        ]
     supporting = list(supporting_evidences)
     auto_items: list[IcdScopeItem] = []
     exceptions: list[IcdScopeException] = []
@@ -97,6 +114,24 @@ def build_icd_scope_decision(
             recommended_action="mark_pending",
             user_instruction="请提供该预留或裁剪结论对应的直接管脚来源。",
             source_names=_reservation_sources(supporting),
+        ))
+
+    mapped_connectors = {mapping["refdes"].casefold() for mapping in mappings}
+    for refdes in requested_connectors:
+        if refdes.casefold() in mapped_connectors:
+            continue
+        exceptions.append(IcdScopeException(
+            exception_id=_stable_scope_id("exception", {
+                "kind": "connector_mapping_missing",
+                "refdes": refdes,
+            }),
+            kind="connector_mapping_missing",
+            refdes=refdes,
+            recommended_action="check_edf_mapping",
+            user_instruction=(
+                f"已确定接插件 {refdes}，但当前冻结来源中未找到其 EDF 管脚映射。"
+                "请检查已上传 EDF 是否包含该位号并重新解析后再生成。"
+            ),
         ))
 
     decision_payload = {

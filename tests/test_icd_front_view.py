@@ -8,6 +8,7 @@ import zipfile
 
 from src.document_authoring.icd_generation import (
     build_front_view_fills,
+    connector_refdes_from_front_view_template,
     render_icd_front_views,
 )
 from src.document_authoring.models import RendererPolicy, ValidationReport, WorkbookFillPlan
@@ -153,6 +154,25 @@ def test_front_view_artifact_shim_uses_frozen_facts_without_a_template_path(tmp_
     assert rendered.issues == []
     assert rendered.detected_layout_count == 1
     assert _values(rendered.content, tmp_path)[1][1] == "ETH_P"
+
+
+def test_front_view_connector_parser_reads_explicit_refdes_from_template_bytes(tmp_path: Path):
+    template = tmp_path / "template.xlsx"
+    _xlsx(template, [
+        ["板端接插件前视图管序布局和定义"],
+        ["管脚定义 Pin Definition", "旧"],
+        ["管脚号 Pin Number", "X302-20"],
+        ["板端接插件序号", "20"],
+    ])
+
+    assert connector_refdes_from_front_view_template(template.read_bytes()) == ["X302"]
+
+
+def test_front_view_connector_parser_ignores_non_layout_template_bytes(tmp_path: Path):
+    template = tmp_path / "template.xlsx"
+    _xlsx(template, [["Pin Definition"], ["plain table"]])
+
+    assert connector_refdes_from_front_view_template(template.read_bytes()) == []
 
 
 def test_harness_finalization_overlay_uses_the_frozen_scope_not_writer_order(tmp_path: Path):

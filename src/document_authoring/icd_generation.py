@@ -9,11 +9,13 @@ template's labels.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 import os
 from pathlib import Path
 import re
 import tempfile
 from typing import Any, Iterable
+import zipfile
 
 from src.circuit.models import ComponentInstance
 from src.circuit.parsers.edf_parser import EdfParser
@@ -68,6 +70,55 @@ _FRONT_VIEW_PIN = re.compile(
 _PIN_LABELS = ("pin number", "管脚号", "引脚号", "针脚号")
 _DEFINITION_LABELS = ("pin definition", "管脚定义", "引脚定义")
 _BOARD_PIN_LABELS = ("板端接插件序号", "board connector pin", "connector pin number")
+
+
+def connector_refdes_from_front_view_template(content: bytes) -> list[str]:
+    """Read explicit connector identifiers from governed ICD front-view slots.
+
+    This accepts the immutable uploaded template bytes rather than a filesystem
+    path.  It deliberately reuses the layout and slot parser that later fills
+    the diagram, so a value such as ``X302-20`` is interpreted once and has the
+    same meaning during scope discovery and rendering.  A workbook without a
+    complete recognized layout contributes no candidates.
+    """
+
+    if not isinstance(content, bytes) or not content:
+        return []
+    try:
+        workbook = parse_xlsx(BytesIO(content))
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return []
+
+    candidates: list[str] = []
+    for sheet in workbook.sheets:
+        if _is_example_sheet(sheet.name):
+            continue
+        for layout in _front_view_layouts(sheet):
+            top_pin_row = layout["top_pin_row"]
+            if top_pin_row is None:
+                continue
+            slots = _front_view_slots(
+                sheet,
+                int(top_pin_row),
+                int(layout["board_pin_row"] or 0),
+                int(layout["top_definition_row"] or 0),
+                lower_pin_row=(
+                    int(layout["lower_pin_row"])
+                    if layout["lower_pin_row"] is not None
+                    else None
+                ),
+                lower_definition_row=(
+                    int(layout["lower_definition_row"])
+                    if layout["lower_definition_row"] is not None
+                    else None
+                ),
+            )
+            candidates.extend(
+                str(slot["refdes"]).strip().upper()
+                for slot in slots
+                if slot.get("refdes")
+            )
+    return list(dict.fromkeys(candidates))
 
 
 def build_front_view_fills(

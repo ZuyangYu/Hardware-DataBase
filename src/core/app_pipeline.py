@@ -26,6 +26,7 @@ from src.document_authoring.icd_scope_decision import (
     effective_frozen_pin_mappings,
     supported_connector_refdes,
 )
+from src.document_authoring.icd_generation import connector_refdes_from_front_view_template
 from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.retriever_registry import (
     CrossUnitEvidenceCache,
@@ -591,6 +592,7 @@ class AppPipeline:
             connector_refdes = list(dict.fromkeys([
                 *_connector_refdes_from_schema(icd_schema),
                 *supported_connector_refdes(supporting_evidences),
+                *self._icd_front_view_connector_refdes(order),
             ]))
             if connector_refdes:
                 circuit_evidences = (
@@ -606,6 +608,7 @@ class AppPipeline:
                 decision = build_icd_scope_decision(
                     circuit_evidences,
                     supporting_evidences,
+                    connector_refdes=connector_refdes,
                 )
             else:
                 decision = build_unknown_connector_scope_decision()
@@ -864,6 +867,17 @@ class AppPipeline:
         if str(getattr(schema, "document_type", "")).casefold() != "icd":
             return None
         return schema if _schema_has_icd_pin_field(schema) else None
+
+    def _icd_front_view_connector_refdes(self, order: Any) -> list[str]:
+        """Use only explicit ICD front-view slots from the frozen template."""
+        template_version_id = str(getattr(order, "template_version_id", "")).strip()
+        if not template_version_id:
+            return []
+        try:
+            content = self.document_generation.store.read_template_content(template_version_id)
+        except (KeyError, OSError, ValueError):
+            return []
+        return connector_refdes_from_front_view_template(content)
 
     @staticmethod
     def _frozen_icd_pin_evidence(

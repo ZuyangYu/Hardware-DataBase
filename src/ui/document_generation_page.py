@@ -109,6 +109,10 @@ def _render_icd_scope_review(st, pipeline, ctx, work_order_id: str) -> None:
         return
     if not exceptions:
         return
+    if any(_value(exception, "kind") == "connector_mapping_missing" for exception in exceptions):
+        st.subheader("ICD 范围需要检查 EDF 管脚映射")
+        st.caption("请检查已上传 EDF 是否包含所示接插件和管脚映射；修正或重新解析后重新生成。")
+        return
     if any(_value(exception, "kind") == "connector_scope_unknown" for exception in exceptions):
         st.subheader("ICD 范围需要补充检索条件")
         st.caption("请补充模板检索条件/Pin Definition 位号后重新生成。")

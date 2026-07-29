@@ -271,6 +271,28 @@ def test_scope_review_ui_explains_connector_scope_unknown_without_actions():
     )
 
 
+def test_scope_review_ui_explains_connector_mapping_missing_without_actions():
+    review = IcdScopeReview(
+        work_order_id="work-ui-connector-mapping", source_snapshot_hash="snapshot-hash",
+        decision=IcdScopeDecision(exceptions=[IcdScopeException(
+            exception_id="connector-mapping-missing", kind="connector_mapping_missing",
+            refdes="X302", recommended_action="check_edf_mapping",
+            user_instruction="请检查已上传 EDF 是否包含 X302 的管脚映射。",
+        )]),
+    )
+    pipeline = Mock()
+    pipeline.get_icd_scope_review.return_value = review
+    rendered = _ScopeReviewUi()
+
+    document_generation_page._render_icd_scope_review(
+        rendered, pipeline, "ctx", "work-ui-connector-mapping"
+    )
+
+    pipeline.submit_icd_scope_resolution.assert_not_called()
+    assert rendered.options == []
+    assert any("检查已上传 EDF" in message for message in rendered.text)
+
+
 def test_continue_kb_generation_reuses_the_existing_work_order_and_snapshot():
     pipeline = object.__new__(AppPipeline)
     ctx = RequestContext(

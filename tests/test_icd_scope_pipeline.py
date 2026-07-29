@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
+from io import BytesIO
+import zipfile
 
 from src.agents.state import Evidence
 from src.agents.claim_evidence import InformationRequirement
@@ -64,6 +66,34 @@ def _pin_mapping_evidence_for(refdes: str, pin_name: str, net_name: str) -> Evid
     })
 
 
+def _front_view_template_bytes(refdes: str = "X302") -> bytes:
+    """A minimal uploaded ICD template with one explicit front-view slot."""
+    content = BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr(
+            "xl/workbook.xml",
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="接口" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            'Target="worksheets/sheet1.xml"/></Relationships>',
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+            '<row r="1"><c r="A1" t="inlineStr"><is><t>板端接插件前视图管序布局和定义</t></is></c></row>'
+            '<row r="2"><c r="A2" t="inlineStr"><is><t>管脚定义 Pin Definition</t></is></c></row>'
+            f'<row r="3"><c r="A3" t="inlineStr"><is><t>管脚号 Pin Number</t></is></c><c r="B3" t="inlineStr"><is><t>{refdes}-20</t></is></c></row>'
+            '<row r="4"><c r="A4" t="inlineStr"><is><t>板端接插件序号</t></is></c><c r="B4"><v>20</v></c></row>'
+            '</sheetData></worksheet>',
+        )
+    return content.getvalue()
+
+
 def _pipeline() -> tuple[AppPipeline, RequestContext, Mock, SimpleNamespace]:
     pipeline = object.__new__(AppPipeline)
     ctx = RequestContext(
@@ -76,6 +106,7 @@ def _pipeline() -> tuple[AppPipeline, RequestContext, Mock, SimpleNamespace]:
         work_order_id="work-1",
         document_schema_id="schema-a",
         document_schema_version="1",
+        template_version_id="template-a",
     )
     snapshot = SimpleNamespace(
         source_set_snapshot_id="snapshot-1",
@@ -223,6 +254,56 @@ def test_icd_pin_template_without_connector_candidate_returns_one_scope_todo_not
     assert [issue["kind"] for issue in result["exceptions"]] == ["connector_scope_unknown"]
     assert "模板字段的检索条件" in result["exceptions"][0]["user_instruction"]
     pipeline.circuit_service.list_pin_mapping_evidence.assert_not_called()
+
+
+def test_icd_connector_with_no_edf_mapping_returns_controlled_blocker():
+    pipeline, ctx, service, snapshot = _pipeline()
+    service._schema.return_value = _relationship_schema(query_terms=["connector J7 pinout"])
+    pipeline.circuit_service.list_pin_mapping_evidence.return_value = []
+    service.prepare_icd_scope_review.side_effect = lambda _ctx, _work_order_id, decision: SimpleNamespace(
+        pending_count=len(decision.exceptions), exceptions=decision.exceptions,
+    )
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "scope_review_required"
+    assert [issue["kind"] for issue in result["exceptions"]] == ["connector_mapping_missing"]
+    assert result["exceptions"][0]["refdes"] == "J7"
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
+        "hardware", list(snapshot.source_names), ctx, refdes=["J7"],
+    )
+    service.run_internal_harness.assert_not_called()
+
+
+def test_icd_scope_reads_connector_candidate_from_uploaded_front_view_template():
+    pipeline, ctx, service, snapshot = _pipeline()
+    service._schema.return_value = _relationship_schema(query_terms=[])
+    service.store.read_template_content.return_value = _front_view_template_bytes("X302")
+    pipeline.circuit_service.list_pin_mapping_evidence.return_value = [
+        _pin_mapping_evidence_for("X302", "20", "CAN_H")
+    ]
+    service.prepare_icd_scope_review.side_effect = lambda _ctx, _work_order_id, decision: SimpleNamespace(
+        pending_count=len(decision.exceptions), exceptions=decision.exceptions,
+    )
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "scope_review_required"
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
+        "hardware", list(snapshot.source_names), ctx, refdes=["X302"],
+    )
 
 
 def test_kb_relationship_retrieval_includes_the_frozen_pin_set():
