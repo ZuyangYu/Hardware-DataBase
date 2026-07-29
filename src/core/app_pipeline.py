@@ -463,7 +463,10 @@ class AppPipeline:
         comment: str,
     ):
         return self.document_generation.submit_icd_scope_resolution(
-            ctx, work_order_id, resolutions=resolutions, comment=comment,
+            ctx,
+            work_order_id,
+            resolutions=resolutions,
+            comment=comment,
         )
 
     def create_knowledge_base_document_work_order(
