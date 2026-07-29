@@ -310,8 +310,8 @@ def _identity_label_kind(value: object) -> str | None:
     normalized = _normalize(value).strip("".join(_IDENTITY_LABEL_SEPARATORS))
     label_parts = {normalized}
     label_parts.update(
-        part.strip("".join(_IDENTITY_LABEL_SEPARATORS))
-        for part in re.split(r"[:：;；,，|\\-–—]", normalized)
+        _normalize(part).strip("".join(_IDENTITY_LABEL_SEPARATORS))
+        for part in re.split(r"[:：;；,，|\-–—]", normalized)
     )
     if label_parts & _LOCATION_LABELS:
         return "location"

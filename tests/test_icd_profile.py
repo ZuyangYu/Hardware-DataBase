@@ -167,6 +167,23 @@ def test_identity_label_cannot_be_used_as_a_location_number_value():
     assert "formal_connector_block_missing" in _codes(profile.issues)
 
 
+def test_whitespace_wrapped_identity_label_cannot_be_used_as_location_number_value():
+    content = _workbook_bytes("ICD", [
+        [
+            "Location Number",
+            "Location Number | Board Connector | MODEL-1",
+            "Board Connector",
+            "MODEL-2",
+        ],
+        ["Pin Number", "Pin Definition"],
+    ])
+
+    profile = classify_icd_template(content, "xlsx")
+
+    assert profile.kind == "icd_sample"
+    assert "formal_connector_block_missing" in _codes(profile.issues)
+
+
 def test_board_connector_model_label_cannot_be_used_as_a_location_number_value():
     content = _workbook_bytes("ICD", [
         ["Location Number", "Board Connector Model", "M-1"],
