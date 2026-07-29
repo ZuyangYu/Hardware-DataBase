@@ -59,6 +59,33 @@ def test_scope_resolution_api_rejects_unknown_action(scope_review_service):
         )
 
 
+@pytest.mark.parametrize("kind", ["connector_scope_unknown", "connector_mapping_missing"])
+def test_connector_scope_blockers_cannot_be_resolved_as_normal_pin_choices(
+    scope_review_service,
+    kind,
+):
+    service, ctx, order = scope_review_service
+    review = service.prepare_icd_scope_review(
+        ctx,
+        order.work_order_id,
+        IcdScopeDecision(exceptions=[IcdScopeException(
+            exception_id=f"{kind}-1",
+            kind=kind,
+            refdes="X302" if kind == "connector_mapping_missing" else None,
+            recommended_action="check_edf_mapping",
+            user_instruction="Complete the connector scope from the frozen template and EDF.",
+        )]),
+    )
+
+    with pytest.raises(ValueError, match="connector scope must be completed"):
+        service.submit_icd_scope_resolution(
+            ctx,
+            order.work_order_id,
+            resolutions=[{"exception_id": review.exceptions[0].exception_id, "action": "include"}],
+            comment="attempt to bypass connector scope",
+        )
+
+
 def _work_order() -> DocumentWorkOrder:
     return DocumentWorkOrder(
         work_order_id="work-1",

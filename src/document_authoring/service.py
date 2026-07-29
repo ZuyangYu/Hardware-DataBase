@@ -960,6 +960,17 @@ class DocumentGenerationService:
             raise KeyError("ICD scope review not found")
         if review.status == "frozen":
             raise ValueError("ICD scope review is already frozen")
+        blocking_scope_kinds = {
+            "connector_scope_unknown",
+            "connector_mapping_missing",
+        }
+        if any(
+            exception.kind in blocking_scope_kinds
+            for exception in review.exceptions
+        ):
+            raise ValueError(
+                "ICD connector scope must be completed from the template and EDF before resolution"
+            )
         normalized_comment = comment.strip()
         if not normalized_comment:
             raise ValueError("ICD scope resolution comment is required")
