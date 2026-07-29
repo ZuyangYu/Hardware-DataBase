@@ -1166,6 +1166,12 @@ class DocumentGenerationService:
         binding_by_unit = {binding.semantic_unit_id: binding for binding in bindings}
         fills = self._semantic_fills(template, result.drafts, result.unit_statuses, binding_by_unit)
         rendered_content, integrity_manifest = self._render_fill_plan(template, fills)
+        rendered_content, integrity_manifest, front_view_issues = self._apply_icd_front_view_layout(
+            order,
+            template,
+            rendered_content,
+            integrity_manifest,
+        )
         self._assert_generated_artifact_clean(rendered_content, template.format)
         report = self.validator.validate(
             work_order_id=order.work_order_id, matrix_rows=result.matrix_rows,
@@ -1177,6 +1183,7 @@ class DocumentGenerationService:
             rendered_content,
         )
         self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
+        report = self._append_icd_validation_issues(report, front_view_issues)
         self.store.save_validation_report(report)
         artifact = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=order.tenant_id,
@@ -1233,12 +1240,6 @@ class DocumentGenerationService:
         self,
         ctx: RequestContext,
         *,
-        rendered_content, integrity_manifest, front_view_issues = self._apply_icd_front_view_layout(
-            order,
-            template,
-            rendered_content,
-            integrity_manifest,
-        )
         artifact_id: str,
         unit_id: str,
         event_type: str,
@@ -1249,7 +1250,6 @@ class DocumentGenerationService:
             raise ValueError("feedback comment is required")
         artifact = self._artifact_for_context(ctx, artifact_id)
         required = "approve_artifact" if event_type in {"approve", "sign"} else "submit_human_event"
-        report = self._append_icd_validation_issues(report, front_view_issues)
         order = self._order_raw(artifact.work_order_id)
         self.require_work_order_capability(ctx, order, required)
         actor_role = (
@@ -1417,6 +1417,15 @@ class DocumentGenerationService:
             for issue in issues
         )
 
+    @staticmethod
+    def _append_icd_validation_issues(report, issues: list[dict[str, Any]]):
+        if not issues:
+            return report
+        return report.model_copy(update={
+            "issues": [*report.issues, *issues],
+            "status": "failed" if report.status == "failed" else "requires_human",
+        })
+
     def download_document_artifact(self, ctx: RequestContext, artifact_id: str) -> bytes:
         artifact = self._artifact_for_context(ctx, artifact_id)
         order = self._order_raw(artifact.work_order_id)
@@ -1469,10 +1478,6 @@ class DocumentGenerationService:
         ):
             raise ValueError(
                 "schema semantic unit count exceeds automatic-generation capacity"
-        return self._append_icd_validation_issues(report, issues)
-
-    @staticmethod
-    def _append_icd_validation_issues(report, issues: list[dict[str, Any]]):
             )
         return self.store.save_harness_policy(HarnessPolicy(
             harness_policy_id=(
