@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from src.agents.claim_evidence import InformationRequirement
+from src.document_authoring.icd_scope_decision import IcdScopeDecision
 from src.document_authoring.template_analysis import (  # noqa: F401
     DocxRegionSchema,
     workbook_cell_coordinates,
@@ -325,6 +326,70 @@ class DocumentWorkOrder(BaseModel):
         if self.input_fingerprint and self.input_fingerprint != expected:
             raise ValueError("work order input_fingerprint does not match frozen inputs")
         self.input_fingerprint = expected
+        return self
+
+
+class IcdScopeResolution(BaseModel):
+    """One human action for a persisted ICD scope exception."""
+
+    exception_id: str
+    action: str
+    actor_id: str
+    resolved_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def require_action(self):
+        if not self.exception_id.strip() or not self.action.strip():
+            raise ValueError("ICD scope resolutions require an exception id and action")
+        return self
+
+
+class IcdScopeReview(BaseModel):
+    """Hash-bound, one-batch review of an ICD scope decision."""
+
+    work_order_id: str
+    decision: IcdScopeDecision
+    decision_content_hash: str = ""
+    source_snapshot_hash: str
+    status: Literal["pending", "frozen"] = "pending"
+    resolutions: list[IcdScopeResolution] = Field(default_factory=list)
+    resolution_comment: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    frozen_at: datetime | None = None
+
+    @property
+    def exceptions(self):
+        return self.decision.exceptions
+
+    @property
+    def pending_count(self) -> int:
+        resolved_ids = {resolution.exception_id for resolution in self.resolutions}
+        return sum(
+            exception.exception_id not in resolved_ids
+            for exception in self.decision.exceptions
+        )
+
+    @model_validator(mode="after")
+    def validate_frozen_scope(self):
+        expected_hash = content_hash(self.decision)
+        if self.decision_content_hash and self.decision_content_hash != expected_hash:
+            raise ValueError("ICD scope decision hash does not match contents")
+        self.decision_content_hash = expected_hash
+        if not self.source_snapshot_hash:
+            raise ValueError("ICD scope review requires a source snapshot hash")
+        exception_ids = [exception.exception_id for exception in self.decision.exceptions]
+        resolved_ids = [resolution.exception_id for resolution in self.resolutions]
+        if len(resolved_ids) != len(set(resolved_ids)):
+            raise ValueError("ICD scope exceptions may only be resolved once")
+        if set(resolved_ids) - set(exception_ids):
+            raise ValueError("ICD scope resolution references an unknown exception")
+        if self.status == "pending" and self.resolutions:
+            raise ValueError("pending ICD scope review may not contain resolutions")
+        if self.status == "frozen":
+            if set(resolved_ids) != set(exception_ids):
+                raise ValueError("frozen ICD scope review must resolve every exception")
+            if self.frozen_at is None:
+                self.frozen_at = utc_now()
         return self
 
 

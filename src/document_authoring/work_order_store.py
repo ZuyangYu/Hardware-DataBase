@@ -20,6 +20,7 @@ from src.document_authoring.models import (
     DocumentUnitDraft,
     DocumentArtifact,
     DocumentHumanEvent,
+    IcdScopeReview,
     DocumentOutboxEvent,
     DocumentSchema,
     DocumentWorkOrder,
@@ -143,6 +144,14 @@ class DocumentAuthoringStore:
                     source_set_snapshot_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                     knowledge_base_name TEXT NOT NULL, content_hash TEXT NOT NULL,
                     payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS document_icd_scope_reviews (
+                    work_order_id TEXT PRIMARY KEY,
+                    decision_content_hash TEXT NOT NULL,
+                    source_snapshot_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    FOREIGN KEY(work_order_id) REFERENCES document_work_orders(work_order_id)
                 );
                 CREATE TABLE IF NOT EXISTS evidence_matrices (
                     work_order_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL,
@@ -925,6 +934,82 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT payload_json FROM document_work_orders WHERE work_order_id = ?", (work_order_id,)).fetchone()
         return DocumentWorkOrder.model_validate(_payload(row)) if row else None
+
+    def save_icd_scope_review(self, review: IcdScopeReview) -> IcdScopeReview:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    """SELECT decision_content_hash, source_snapshot_hash, payload_json
+                       FROM document_icd_scope_reviews WHERE work_order_id = ?""",
+                    (review.work_order_id,),
+                ).fetchone()
+                if existing is not None:
+                    persisted = IcdScopeReview.model_validate(_payload(existing))
+                    if (
+                        persisted.decision_content_hash != review.decision_content_hash
+                        or persisted.source_snapshot_hash != review.source_snapshot_hash
+                    ):
+                        raise ValueError("ICD scope review is already bound to different frozen inputs")
+                    conn.execute("COMMIT")
+                    return persisted
+                self._put(conn, "document_icd_scope_reviews", {
+                    "work_order_id": review.work_order_id,
+                    "decision_content_hash": review.decision_content_hash,
+                    "source_snapshot_hash": review.source_snapshot_hash,
+                    "status": review.status,
+                }, review)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return review
+
+    def get_icd_scope_review(self, work_order_id: str) -> IcdScopeReview | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT decision_content_hash, source_snapshot_hash, status, payload_json
+                   FROM document_icd_scope_reviews WHERE work_order_id = ?""",
+                (work_order_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        review = IcdScopeReview.model_validate(_payload(row))
+        if (
+            review.work_order_id != work_order_id
+            or review.decision_content_hash != row["decision_content_hash"]
+            or review.source_snapshot_hash != row["source_snapshot_hash"]
+            or review.status != row["status"]
+        ):
+            raise ValueError("ICD scope review persistence record is inconsistent")
+        return review
+
+    def freeze_icd_scope_review(self, review: IcdScopeReview) -> IcdScopeReview:
+        if review.status != "frozen":
+            raise ValueError("only a frozen ICD scope review may be finalized")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                updated = conn.execute(
+                    """UPDATE document_icd_scope_reviews
+                       SET status = ?, payload_json = ?
+                       WHERE work_order_id = ? AND status = 'pending'
+                         AND decision_content_hash = ? AND source_snapshot_hash = ?""",
+                    (
+                        review.status,
+                        _json(review),
+                        review.work_order_id,
+                        review.decision_content_hash,
+                        review.source_snapshot_hash,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise ValueError("ICD scope review is already frozen or has changed")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return review
 
     def list_work_orders(self, tenant_id: str, project_id: str) -> list[DocumentWorkOrder]:
         """Return durable work orders for one authorized project, newest first."""

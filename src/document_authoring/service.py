@@ -30,6 +30,8 @@ from src.document_authoring.models import (
     DocumentHumanEvent,
     DocumentUnitDraft,
     HarnessPolicy,
+    IcdScopeResolution,
+    IcdScopeReview,
     KnowledgeBaseSourceSnapshot,
     LegacyTemplateClaim,
     DocumentSchema,
@@ -900,6 +902,82 @@ class DocumentGenerationService:
 
     # Internal Harness / semantic-assisted execution ----------------------------------
 
+    def prepare_icd_scope_review(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        decision,
+    ) -> IcdScopeReview:
+        """Persist an ICD scope decision against this work order's frozen sources."""
+        order = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        snapshot = self.resolve_source_snapshot(order)
+        existing = self.store.get_icd_scope_review(work_order_id)
+        if existing is not None:
+            if existing.source_snapshot_hash != snapshot.content_hash:
+                raise ValueError("ICD scope review source snapshot differs from the work order")
+            if existing.decision_content_hash != content_hash(decision):
+                raise ValueError("ICD scope review is already bound to a different decision")
+            return existing
+        review = IcdScopeReview(
+            work_order_id=work_order_id,
+            decision=decision,
+            source_snapshot_hash=snapshot.content_hash,
+            status="frozen" if not decision.exceptions else "pending",
+        )
+        return self.store.save_icd_scope_review(review)
+
+    def get_icd_scope_review(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+    ) -> IcdScopeReview | None:
+        order = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        review = self.store.get_icd_scope_review(work_order_id)
+        if review is not None and review.source_snapshot_hash != self.resolve_source_snapshot(order).content_hash:
+            raise ValueError("ICD scope review source snapshot differs from the work order")
+        return review
+
+    def submit_icd_scope_resolution(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        resolutions: list[dict[str, str]],
+        comment: str,
+    ) -> IcdScopeReview:
+        self._order(ctx, work_order_id, "run_deterministic_work_order")
+        review = self.get_icd_scope_review(ctx, work_order_id)
+        if review is None:
+            raise KeyError("ICD scope review not found")
+        if review.status == "frozen":
+            raise ValueError("ICD scope review is already frozen")
+        normalized_comment = comment.strip()
+        if not normalized_comment:
+            raise ValueError("ICD scope resolution comment is required")
+        if not isinstance(resolutions, list):
+            raise ValueError("ICD scope resolutions must be submitted in one batch")
+        batch = [
+            IcdScopeResolution(
+                exception_id=str(resolution.get("exception_id") or ""),
+                action=str(resolution.get("action") or ""),
+                actor_id=ctx.user_id,
+            )
+            for resolution in resolutions
+            if isinstance(resolution, dict)
+        ]
+        if len(batch) != len(resolutions):
+            raise ValueError("ICD scope resolutions must be objects")
+        expected_ids = {exception.exception_id for exception in review.exceptions}
+        if {resolution.exception_id for resolution in batch} != expected_ids:
+            raise ValueError("ICD scope resolution batch must resolve every exception exactly once")
+        frozen = review.model_copy(update={
+            "status": "frozen",
+            "resolutions": batch,
+            "resolution_comment": normalized_comment,
+            "frozen_at": datetime.now(timezone.utc),
+        })
+        return self.store.freeze_icd_scope_review(frozen)
+
     def run_internal_harness(
         self,
         ctx: RequestContext,
@@ -909,6 +987,13 @@ class DocumentGenerationService:
         writer: ManagedWriter | None = None,
     ) -> DocumentArtifact:
         order = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        scope_review = self.store.get_icd_scope_review(work_order_id)
+        if scope_review is not None:
+            snapshot = self.resolve_source_snapshot(order)
+            if scope_review.source_snapshot_hash != snapshot.content_hash:
+                raise ValueError("ICD scope review source snapshot differs from the work order")
+            if scope_review.pending_count:
+                raise ValueError("unresolved ICD scope exceptions block Harness execution")
         if order.execution_mode != "internal_harness" or not order.harness_policy_id:
             raise ValueError("work order is not configured for the internal Harness")
         if order.status not in {"planned", "retrieving", "blocked", "waiting_human_input"}:
