@@ -24,6 +24,7 @@ from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
+from src.document_authoring.icd_validation import validate_icd_pin_set
 from src.document_authoring.models import (
     DeterministicRuleSpec,
     DocumentArtifact,
@@ -885,6 +886,11 @@ class DocumentGenerationService:
         report = self.validator.validate(
             work_order_id=order.work_order_id, matrix_rows=matrix_rows, integrity_manifest=integrity_manifest,
         )
+        report = self._append_icd_pin_validation(
+            order,
+            report,
+            rendered_content,
+        )
         self.store.save_evidence_matrix(order.work_order_id, matrix_rows)
         self.store.save_validation_report(report)
         artifact = DocumentArtifact(
@@ -1156,6 +1162,11 @@ class DocumentGenerationService:
             work_order_id=order.work_order_id, matrix_rows=result.matrix_rows,
             integrity_manifest=integrity_manifest, additional_issues=result.issues,
         )
+        report = self._append_icd_pin_validation(
+            order,
+            report,
+            rendered_content,
+        )
         self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
         self.store.save_validation_report(report)
         artifact = DocumentArtifact(
@@ -1269,6 +1280,8 @@ class DocumentGenerationService:
             raise ValueError("only a review candidate may be approved")
         order = self._order(ctx, candidate.work_order_id, "approve_artifact")
         report = self.store.get_validation_report(candidate.validation_report_id)
+        if report is not None and self._has_icd_blocking_issue(report.issues):
+            raise ValueError("candidate has an ICD blocking validation issue")
         snapshot = self.resolve_source_snapshot(order)
         if report is None or report.status == "failed":
             raise ValueError("candidate does not have a releasable validation result")
@@ -1296,6 +1309,41 @@ class DocumentGenerationService:
         released = self.store.save_artifact(released, candidate_content, order.target_format)
         self._replace_order(order, status="complete")
         return released
+
+    def _append_icd_pin_validation(
+        self,
+        order: DocumentWorkOrder,
+        report,
+        artifact_content: bytes,
+    ):
+        review = self.store.get_icd_scope_review(order.work_order_id)
+        if review is None:
+            return report
+        if review.pending_count:
+            issues = [{
+                "code": "icd_scope_unresolved",
+                "severity": "blocking",
+            }]
+        else:
+            issues = validate_icd_pin_set(
+                list(review.decision.frozen_pin_mappings),
+                artifact_content,
+                order.target_format,
+            )
+        if not issues:
+            return report
+        return report.model_copy(update={
+            "issues": [*report.issues, *issues],
+            "status": "failed" if report.status == "failed" else "requires_human",
+        })
+
+    @staticmethod
+    def _has_icd_blocking_issue(issues: list[dict[str, Any]]) -> bool:
+        return any(
+            issue.get("severity") == "blocking"
+            and str(issue.get("code") or "").startswith("icd_")
+            for issue in issues
+        )
 
     def download_document_artifact(self, ctx: RequestContext, artifact_id: str) -> bytes:
         artifact = self._artifact_for_context(ctx, artifact_id)

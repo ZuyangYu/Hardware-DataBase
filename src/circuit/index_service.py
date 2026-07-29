@@ -147,6 +147,52 @@ class CircuitIndexService:
         hits.sort(key=lambda item: item.score, reverse=True)
         return hits[:top_k]
 
+    def list_pin_mapping_evidence(
+        self,
+        kb_name: str,
+        source_names: list[str],
+        ctx: RequestContext | None,
+    ) -> list[Evidence]:
+        """Enumerate every pin mapping from the frozen, authorized EDF sources."""
+        frozen_source_names = {
+            str(source_name).strip()
+            for source_name in source_names
+            if str(source_name).strip()
+        }
+        if not frozen_source_names:
+            return []
+        department_id = _ctx_department_id(ctx)
+        evidences: list[Evidence] = []
+        for design in self.store.list_designs(kb_name):
+            metadata = self._read_metadata(kb_name, design.design_id)
+            if department_id and str(metadata.get("department_id") or "") != department_id:
+                continue
+            source_name = str(
+                metadata.get("original_name")
+                or (design.files[0].file_name if design.files else design.design_id)
+            )
+            if source_name not in frozen_source_names:
+                continue
+            evidence_metadata = {**metadata, "kb_name": design.kb_name}
+            for instance in design.instances:
+                if not instance.refdes or not instance.pins:
+                    continue
+                evidences.append(self.evidence_mapper.build(
+                    kind="pin_mapping",
+                    row={
+                        "design_id": design.design_id,
+                        "refdes": instance.refdes,
+                        "pins": [
+                            {"name": pin.name, "net_name": pin.net}
+                            for pin in instance.pins
+                        ],
+                    },
+                    metadata=evidence_metadata,
+                    source_name=source_name,
+                    score=1.0,
+                ))
+        return sorted(evidences, key=lambda evidence: evidence.id)
+
     def _structured_evidence(
         self,
         kb_name: str,

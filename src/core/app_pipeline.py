@@ -7,6 +7,8 @@ from typing import Any, Callable, Generator, List, Tuple
 
 import config.settings
 from src.agents.runner import MultiSourceAgentRunner
+from src.agents.state import Evidence
+from src.agents.tools.circuit_tools import CircuitQueryTool
 from src.agents.tools.spreadsheet_tools import SpreadsheetSemanticTool
 from src.core.auth import AuthService
 from src.core.logger import error, log, warn
@@ -16,6 +18,8 @@ from src.pipelines.document_rag.schemas import EvidenceEnvelope, IngestResult, R
 from src.projects.service import ProjectService
 from src.projects.retrieval import ProjectEvidenceRetrievalService, SourceUnavailableError
 from src.document_authoring.service import DocumentGenerationService
+from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
+from src.document_authoring.icd_scope_decision import build_icd_scope_decision
 from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.retriever_registry import (
     CrossUnitEvidenceCache,
@@ -74,6 +78,10 @@ class AppPipeline:
             # the query agent; the KB authoring retriever also needs it so
             # frozen .xlsx sources can produce tabular evidence.
             self.spreadsheet_service = getattr(self.backend, "spreadsheet_indexes", None)
+            # Circuit structured index (EDF/EDIF CircuitStore). Shared with
+            # the query agent; the authoring retrievers also need it so
+            # frozen .edf/.edif sources can produce pin/connectivity evidence.
+            self.circuit_service = getattr(self.backend, "circuit_indexes", None)
         except Exception as exc:
             error(f"AppPipeline 初始化失败: {exc}")
             raise
@@ -487,11 +495,54 @@ class AppPipeline:
             **kwargs,
         )
         snapshot = self.document_generation.resolve_source_snapshot(order)
+        scope_review = None
+        if self._schema_has_relationship_lookup(order):
+            circuit_evidences = (
+                self.circuit_service.list_pin_mapping_evidence(
+                    knowledge_base_name,
+                    list(snapshot.source_names),
+                    ctx,
+                )
+                if getattr(self, "circuit_service", None) is not None
+                else []
+            )
+            supporting_evidences = self.backend.retrieve(
+                knowledge_base_name,
+                "ICD connector pin mapping",
+                top_k=config.settings.FINAL_TOP_K,
+                ctx=ctx,
+                filters={"source_names": list(snapshot.source_names)},
+            )
+            decision = build_icd_scope_decision(
+                circuit_evidences,
+                supporting_evidences,
+            )
+            scope_review = self.document_generation.prepare_icd_scope_review(
+                ctx,
+                order.work_order_id,
+                decision,
+            )
+            if scope_review.pending_count:
+                return {
+                    "stage": "scope_review_required",
+                    "work_order_id": order.work_order_id,
+                    "exceptions": [
+                        exception.model_dump()
+                        if hasattr(exception, "model_dump")
+                        else dict(vars(exception))
+                        for exception in scope_review.exceptions
+                    ],
+                }
+        retriever_kwargs = {
+            "source_set_snapshot_id": snapshot.source_set_snapshot_id,
+        }
+        if scope_review is not None:
+            retriever_kwargs["icd_scope_review"] = scope_review
         retrieve = self._knowledge_base_retriever(
             ctx,
             knowledge_base_name,
             list(snapshot.source_names),
-            source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            **retriever_kwargs,
         )
         candidate = self.document_generation.run_internal_harness(
             ctx,
@@ -518,10 +569,16 @@ class AppPipeline:
         source_names: list[str],
         *,
         source_set_snapshot_id: str = "",
+        icd_scope_review: Any | None = None,
     ):
         if not ctx.has_kb_permission(kb_name, "read"):
             raise PermissionError("knowledge base read permission is required")
         frozen_source_names = list(dict.fromkeys(source_names))
+        frozen_pin_evidence = self._frozen_icd_pin_evidence(
+            kb_name,
+            frozen_source_names,
+            icd_scope_review,
+        )
 
         # Spreadsheet structured index (xlsx TableIndexStore). Instantiated
         # once per retriever so multiple units reuse the same tool. The tool
@@ -532,6 +589,20 @@ class AppPipeline:
         spreadsheet_tool = (
             SpreadsheetSemanticTool(self.spreadsheet_service)
             if self.spreadsheet_service is not None
+            else None
+        )
+
+        # Circuit structured index (EDF CircuitStore). Same dispatch pattern
+        # as the spreadsheet tool: the circuit query tool cannot filter by a
+        # list of source names (only a single source_name), so the
+        # specialised retriever filters frozen-set membership itself before
+        # merging; build_knowledge_base_retrieval_outcome re-checks as a
+        # second guard. getattr keeps object.__new__-built test doubles
+        # without the attribute on the disabled path.
+        circuit_service = getattr(self, "circuit_service", None)
+        circuit_tool = (
+            CircuitQueryTool(circuit_service)
+            if circuit_service is not None
             else None
         )
 
@@ -572,6 +643,35 @@ class AppPipeline:
                     if evidence.source_name in frozen_source_names
                 ]
             specialized["tabular_lookup"] = _tabular_retriever
+        if circuit_tool is not None:
+            def _circuit_retriever(query, requirement):
+                circuit_evidences = circuit_tool.run(
+                    query,
+                    kb_name,
+                    ctx,
+                    top_k=config.settings.FINAL_TOP_K,
+                    filters=None,
+                )
+                # Same frozen-set guard as the tabular retriever: circuit
+                # evidence carries the design's original file name as
+                # source_name; anything outside the frozen snapshot is
+                # dropped before the domain-binding step, which would
+                # otherwise raise PermissionError and abort the whole run.
+                return [
+                    evidence
+                    for evidence in circuit_evidences
+                    if evidence.source_name in frozen_source_names
+                ]
+            specialized["entity_lookup"] = _circuit_retriever
+        if circuit_tool is not None or frozen_pin_evidence:
+            def _relationship_retriever(query, requirement):
+                circuit_evidences = (
+                    _circuit_retriever(query, requirement)
+                    if circuit_tool is not None
+                    else []
+                )
+                return [*circuit_evidences, *frozen_pin_evidence]
+            specialized["relationship_lookup"] = _relationship_retriever
 
         # The registry generalises the Stage 0 tabular_lookup dispatch: the
         # default (RAGFlow) retriever is always invoked, specialised retrievers
@@ -605,6 +705,73 @@ class AppPipeline:
             )
 
         return retrieve
+
+    def _schema_has_relationship_lookup(self, order: Any) -> bool:
+        schema_id = getattr(order, "document_schema_id", "")
+        schema_version = getattr(order, "document_schema_version", "")
+        if not schema_id or not schema_version:
+            return False
+        schema = self.document_generation._schema(
+            schema_id,
+            schema_version,
+        )
+        return any(
+            "relationship_lookup" in enrich_circuit_capabilities(
+                field.required_capabilities,
+                label=field.label,
+                description=field.description,
+                query_terms=field.query_terms,
+            )
+            for field in schema.fields
+        )
+
+    @staticmethod
+    def _frozen_icd_pin_evidence(
+        kb_name: str,
+        source_names: list[str],
+        review: Any | None,
+    ) -> list[Evidence]:
+        mappings = list(
+            getattr(getattr(review, "decision", None), "frozen_pin_mappings", [])
+            or []
+        )
+        if not mappings or not source_names:
+            return []
+        normalized_mappings = [
+            {
+                "refdes": str(mapping.get("refdes") or "").strip(),
+                "pin_name": str(mapping.get("pin_name") or "").strip(),
+                "net_name": str(mapping.get("net_name") or "").strip() or "NC",
+            }
+            for mapping in mappings
+            if isinstance(mapping, dict)
+            and str(mapping.get("refdes") or "").strip()
+            and str(mapping.get("pin_name") or "").strip()
+        ]
+        if not normalized_mappings:
+            return []
+        source_name = source_names[0]
+        pin_text = "; ".join(
+            f"{mapping['refdes']}-{mapping['pin_name']} -> {mapping['net_name']}"
+            for mapping in normalized_mappings
+        )
+        return [Evidence(
+            id="frozen-icd-pin-set:" + "|".join(
+                f"{mapping['refdes']}:{mapping['pin_name']}"
+                for mapping in normalized_mappings
+            ),
+            content=f"Frozen ICD pin mappings: {pin_text}.",
+            source_name=source_name,
+            content_kind="circuit_design",
+            processor_kind="icd_scope_review",
+            score=1.0,
+            metadata={
+                "kb_name": kb_name,
+                "source_group": "circuit_design",
+                "pin_mappings": normalized_mappings,
+                "frozen_icd_scope": True,
+            },
+        )]
 
     def _project_retriever(self, ctx: RequestContext, project_id: str, snapshot_id: str):
         tenant_id = ctx.tenant_id or "default"
