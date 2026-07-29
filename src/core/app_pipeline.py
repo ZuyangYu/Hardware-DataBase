@@ -19,7 +19,10 @@ from src.projects.service import ProjectService
 from src.projects.retrieval import ProjectEvidenceRetrievalService, SourceUnavailableError
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
-from src.document_authoring.icd_scope_decision import build_icd_scope_decision
+from src.document_authoring.icd_scope_decision import (
+    build_icd_scope_decision,
+    effective_frozen_pin_mappings,
+)
 from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.retriever_registry import (
     CrossUnitEvidenceCache,
@@ -731,10 +734,7 @@ class AppPipeline:
         source_names: list[str],
         review: Any | None,
     ) -> list[Evidence]:
-        mappings = list(
-            getattr(getattr(review, "decision", None), "frozen_pin_mappings", [])
-            or []
-        )
+        mappings = effective_frozen_pin_mappings(review)
         if not mappings or not source_names:
             return []
         normalized_mappings = [

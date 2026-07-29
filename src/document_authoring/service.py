@@ -25,6 +25,7 @@ from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
 from src.document_authoring.icd_validation import validate_icd_pin_set
+from src.document_authoring.icd_scope_decision import effective_frozen_pin_mappings
 from src.document_authoring.models import (
     DeterministicRuleSpec,
     DocumentArtifact,
@@ -1326,7 +1327,7 @@ class DocumentGenerationService:
             }]
         else:
             issues = validate_icd_pin_set(
-                list(review.decision.frozen_pin_mappings),
+                effective_frozen_pin_mappings(review),
                 artifact_content,
                 order.target_format,
             )

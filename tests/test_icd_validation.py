@@ -8,6 +8,8 @@ import pytest
 
 from src.document_authoring.icd_validation import validate_icd_pin_set
 from src.document_authoring.models import ValidationReport
+from src.document_authoring.models import IcdScopeResolution, IcdScopeReview
+from src.document_authoring.icd_scope_decision import IcdScopeDecision, IcdScopeException
 from src.document_authoring.service import DocumentGenerationService
 
 
@@ -113,3 +115,46 @@ def test_approval_rejects_icd_blocking_issue_even_when_report_is_passed():
 
     with pytest.raises(ValueError, match="ICD blocking"):
         service.approve_document_artifact(SimpleNamespace(), "candidate-1")
+
+
+def test_validation_uses_effective_scope_after_user_excludes_pgnd():
+    review = IcdScopeReview(
+        work_order_id="work-1",
+        source_snapshot_hash="snapshot-hash",
+        status="frozen",
+        decision=IcdScopeDecision(
+            frozen_pin_mappings=[{"refdes": "J7", "pin_name": "3", "net_name": "PGND"}],
+            exceptions=[IcdScopeException(
+                exception_id="exception-pgnd",
+                kind="extra_pin_exposure",
+                refdes="J7",
+                pin_name="3",
+                net_name="PGND",
+                recommended_action="mark_pending",
+                user_instruction="Confirm PGND exposure",
+            )],
+        ),
+        resolutions=[IcdScopeResolution(
+            exception_id="exception-pgnd",
+            action="exclude",
+            actor_id="alice",
+        )],
+    )
+    service = object.__new__(DocumentGenerationService)
+    service.store = SimpleNamespace(get_icd_scope_review=Mock(return_value=review))
+    report = ValidationReport(
+        validation_report_id="report-1",
+        work_order_id="work-1",
+        status="passed",
+        evidence_matrix_hash="matrix-hash",
+    )
+
+    validated = service._append_icd_pin_validation(
+        SimpleNamespace(work_order_id="work-1", target_format="xlsx"),
+        report,
+        generated_workbook_without("J7-1"),
+    )
+
+    assert validated.status == "passed"
+    assert validated.issues == []
+    assert review.resolutions[0].action == "exclude"

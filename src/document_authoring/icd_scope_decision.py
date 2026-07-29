@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from typing import Any, Iterable
 from uuid import uuid4
@@ -69,6 +71,10 @@ def build_icd_scope_decision(
             ))
             continue
         exceptions.append(IcdScopeException(
+            exception_id=_stable_scope_id("exception", {
+                "kind": "extra_pin_exposure",
+                **mapping,
+            }),
             kind="extra_pin_exposure",
             **mapping,
             recommended_action="mark_pending",
@@ -77,13 +83,23 @@ def build_icd_scope_decision(
 
     if _has_unsupported_reservation(supporting, mappings):
         exceptions.append(IcdScopeException(
+            exception_id=_stable_scope_id("exception", {
+                "kind": "unsupported_reservation",
+                "source_names": _reservation_sources(supporting),
+            }),
             kind="unsupported_reservation",
             recommended_action="mark_pending",
             user_instruction="请提供该预留或裁剪结论对应的直接管脚来源。",
             source_names=_reservation_sources(supporting),
         ))
 
+    decision_payload = {
+        "auto_items": [item.model_dump(mode="json") for item in auto_items],
+        "exceptions": [exception.model_dump(mode="json") for exception in exceptions],
+        "frozen_pin_mappings": mappings,
+    }
     return IcdScopeDecision(
+        decision_id=_stable_scope_id("decision", decision_payload),
         auto_items=auto_items,
         exceptions=exceptions,
         frozen_pin_mappings=mappings,
@@ -151,6 +167,46 @@ def _reservation_sources(evidences: Iterable[Any]) -> list[str]:
         for evidence in evidences
         if re.search(r"预留|裁剪", str(_value(evidence, "content") or ""))
     ]
+
+
+def effective_frozen_pin_mappings(review: Any | None) -> list[dict[str, str | None]]:
+    """Return frozen mappings after applying persisted user exclusions.
+
+    The review itself remains immutable evidence of the user's choices; this
+    projection is the only mapping list that generation consumers should use.
+    """
+    decision = _value(review, "decision")
+    mappings = _value(decision, "frozen_pin_mappings") or []
+    exceptions = {
+        str(_value(exception, "exception_id") or ""): exception
+        for exception in (_value(decision, "exceptions") or [])
+    }
+    excluded_keys = {
+        _scope_mapping_key(exception)
+        for resolution in (_value(review, "resolutions") or [])
+        if str(_value(resolution, "action") or "").strip().casefold() == "exclude"
+        if (exception := exceptions.get(str(_value(resolution, "exception_id") or "")))
+        and _scope_mapping_key(exception) is not None
+    }
+    return [
+        dict(mapping)
+        for mapping in mappings
+        if isinstance(mapping, dict)
+        and _scope_mapping_key(mapping) not in excluded_keys
+    ]
+
+
+def _scope_mapping_key(item: Any) -> tuple[str, str] | None:
+    refdes = str(_value(item, "refdes") or "").strip()
+    pin_name = str(_value(item, "pin_name") or "").strip()
+    if not (refdes and pin_name):
+        return None
+    return refdes.casefold(), pin_name.casefold()
+
+
+def _stable_scope_id(kind: str, payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return f"icd-scope-{kind}-{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
 
 
 def _value(item: Any, name: str) -> Any:

@@ -5,6 +5,8 @@ from src.agents.state import Evidence
 from src.agents.claim_evidence import InformationRequirement
 from src.core.app_pipeline import AppPipeline
 from src.document_authoring.models import DocumentFieldSchema, DocumentSchema
+from src.document_authoring.models import IcdScopeResolution, IcdScopeReview
+from src.document_authoring.icd_scope_decision import IcdScopeDecision, IcdScopeException
 from src.pipelines.document_rag.schemas import RequestContext
 
 
@@ -138,3 +140,56 @@ def test_kb_relationship_retrieval_includes_the_frozen_pin_set():
         {"refdes": "J7", "pin_name": "1", "net_name": "CAN_H"}
     ]
     service.build_knowledge_base_retrieval_outcome.assert_called_once()
+
+
+def test_kb_relationship_retrieval_omits_user_excluded_scope_exception_pin():
+    pipeline, ctx, service, _snapshot = _pipeline()
+    review = IcdScopeReview(
+        work_order_id="work-1",
+        source_snapshot_hash="snapshot-hash",
+        status="frozen",
+        decision=IcdScopeDecision(
+            frozen_pin_mappings=[
+                {"refdes": "J7", "pin_name": "1", "net_name": "CAN_H"},
+                {"refdes": "J7", "pin_name": "3", "net_name": "PGND"},
+            ],
+            exceptions=[IcdScopeException(
+                exception_id="exception-pgnd",
+                kind="extra_pin_exposure",
+                refdes="J7",
+                pin_name="3",
+                net_name="PGND",
+                recommended_action="mark_pending",
+                user_instruction="Confirm PGND exposure",
+            )],
+        ),
+        resolutions=[IcdScopeResolution(
+            exception_id="exception-pgnd",
+            action="exclude",
+            actor_id="alice",
+        )],
+    )
+    pipeline.backend.retrieve.return_value = []
+    pipeline.circuit_service = None
+
+    retrieve = pipeline._knowledge_base_retriever(
+        ctx,
+        "hardware",
+        ["board.edf"],
+        icd_scope_review=review,
+    )
+    outcome = retrieve(
+        InformationRequirement(
+            requirement_id="pins",
+            semantic_unit_id="pins",
+            claim_type="relationship",
+            subject="connector pins",
+            required_capabilities=["relationship_lookup"],
+        ),
+        0,
+    )
+
+    assert outcome.evidences[0].metadata["pin_mappings"] == [
+        {"refdes": "J7", "pin_name": "1", "net_name": "CAN_H"}
+    ]
+    assert review.resolutions[0].action == "exclude"

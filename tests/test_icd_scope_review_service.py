@@ -1,4 +1,5 @@
 import hashlib
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from src.document_authoring.icd_scope_decision import (
     IcdScopeDecision,
     IcdScopeException,
+    build_icd_scope_decision,
 )
 from src.document_authoring.models import (
     DocumentArtifact,
@@ -119,6 +121,43 @@ def test_scope_exceptions_are_resolved_in_one_batch_and_frozen(scope_review_serv
             resolutions=[{"exception_id": "exception-pgnd", "action": "exclude"}],
             comment="retry",
         )
+
+
+def test_scope_retry_reuses_frozen_review_for_identical_evidence(scope_review_service):
+    service, ctx, order = scope_review_service
+    circuit_evidence = SimpleNamespace(
+        source_name="board.edf",
+        content="",
+        locator={"entity_id": "J7"},
+        metadata={
+            "pin_mappings": [
+                {"refdes": "J7", "pin_name": "3", "net_name": "PGND"}
+            ]
+        },
+    )
+
+    review = service.prepare_icd_scope_review(
+        ctx,
+        order.work_order_id,
+        build_icd_scope_decision([circuit_evidence], []),
+    )
+    service.submit_icd_scope_resolution(
+        ctx,
+        order.work_order_id,
+        resolutions=[
+            {"exception_id": review.exceptions[0].exception_id, "action": "exclude"}
+        ],
+        comment="PGND 不进入线束 ICD",
+    )
+
+    retried = service.prepare_icd_scope_review(
+        ctx,
+        order.work_order_id,
+        build_icd_scope_decision([circuit_evidence], []),
+    )
+
+    assert retried.status == "frozen"
+    assert retried.resolutions[0].action == "exclude"
 
 
 def test_scope_resolution_rejects_duplicate_exception_ids(scope_review_service):
