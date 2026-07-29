@@ -451,6 +451,21 @@ class AppPipeline:
     def create_document_work_order(self, ctx: RequestContext, **kwargs):
         return self.document_generation.create_document_work_order(ctx, **kwargs)
 
+    def get_icd_scope_review(self, ctx: RequestContext, work_order_id: str):
+        return self.document_generation.get_icd_scope_review(ctx, work_order_id)
+
+    def submit_icd_scope_resolution(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        resolutions: list[dict[str, str]],
+        comment: str,
+    ):
+        return self.document_generation.submit_icd_scope_resolution(
+            ctx, work_order_id, resolutions=resolutions, comment=comment,
+        )
+
     def create_knowledge_base_document_work_order(
         self,
         ctx: RequestContext,
