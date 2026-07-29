@@ -72,6 +72,51 @@ def _matching_schemas(template: Any, schemas: list[Any]) -> dict[str, Any]:
     }
 
 
+def _render_icd_scope_review(st, pipeline, ctx, work_order_id: str) -> None:
+    """Keep the ICD review focused on the few unresolved scope exceptions."""
+    try:
+        review = pipeline.get_icd_scope_review(ctx, work_order_id)
+    except (PermissionError, ValueError, KeyError) as exc:
+        st.error(f"无法读取 ICD 范围审核：{exc}")
+        return
+    if review is None:
+        return
+    with st.expander(
+        f"已自动确认 {len(_value(_value(review, 'decision'), 'auto_items', []))} 项",
+        expanded=False,
+    ):
+        st.caption("这些管脚已有直接电路与佐证来源，默认折叠以便专注异常。")
+    exceptions = _value(review, "exceptions", [])
+    if not exceptions:
+        return
+    st.subheader("ICD 范围异常待办")
+    resolutions = []
+    for exception in exceptions:
+        exception_id = _value(exception, "exception_id")
+        pin = "-".join(part for part in (_value(exception, "refdes"), _value(exception, "pin_name")) if part) or "未关联具体管脚"
+        for label, detail in (
+            ("发现的问题", f"{_value(exception, 'kind')}：{pin}（{_value(exception, 'net_name') or 'NC'}）"),
+            ("关联管脚", pin),
+            ("系统建议", _value(exception, "recommended_action")),
+            ("你需要做什么", _value(exception, "user_instruction")),
+        ):
+            st.write(label)
+            st.caption(detail)
+        resolutions.append({
+            "exception_id": exception_id,
+            "action": st.selectbox("处理结果", [_value(exception, "recommended_action"), "include", "exclude"], key=f"icd-scope-action-{work_order_id}-{exception_id}"),
+        })
+    comment = st.text_input("处理说明", key=f"icd-scope-comment-{work_order_id}")
+    if st.button("应用处理结果并继续生成", type="primary", key=f"submit-icd-scope-{work_order_id}"):
+        try:
+            pipeline.submit_icd_scope_resolution(ctx, work_order_id, resolutions=resolutions, comment=comment)
+        except (PermissionError, ValueError, KeyError) as exc:
+            st.error(f"应用 ICD 范围处理结果失败：{exc}")
+        else:
+            st.success("ICD 范围已冻结；可以继续生成候选文档。")
+            st.button("继续生成候选文档", key=f"continue-icd-candidate-{work_order_id}")
+
+
 def render_document_generation_page(st, pipeline, ctx) -> None:
     st.header("📝 文档生成")
     st.caption("所有任务固定到已授权知识库、模板版本和来源快照；页面不从会话状态启动运行。")
@@ -220,6 +265,7 @@ def _render_durable_runs(st, pipeline, ctx) -> None:
         st.warning("未找到该工作单。")
         return
     _render_run_status(st, pipeline, ctx, status)
+    _render_icd_scope_review(st, pipeline, ctx, work_order_id)
 
 
 def _render_run_status(st, pipeline, ctx, status: dict) -> None:
