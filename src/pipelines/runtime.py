@@ -1,4 +1,3 @@
-import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,38 +25,28 @@ class PipelineRuntime:
         if not callable(self.audit_callback):
             error("PipelineRuntime audit_callback is not callable; audit events will be skipped.")
             self.audit_callback = _noop_audit
-        self._worker_lock = threading.RLock()
-        self._worker_thread: threading.Thread | None = None
         self._worker_id = f"{self.worker_name}-{uuid.uuid4().hex}"
-        # Set by stop() so a running parse_worker_loop exits between records
-        # instead of processing the whole queue after the pipeline is reset.
-        self._stop_event = threading.Event()
 
     @property
     def handlers(self) -> dict[str, PipelineHandler]:
         return self.ingestion.handlers
 
     def ensure_worker_running(self):
-        with self._worker_lock:
-            if self._worker_thread and self._worker_thread.is_alive():
-                return
-            self._stop_event.clear()
-            self._worker_thread = threading.Thread(
-                target=self.parse_worker_loop,
-                name=self.worker_name,
-                daemon=True,
-            )
-            self._worker_thread.start()
+        """Compatibility hook for ingestion handlers.
+
+        Parsing is now owned by the standalone ``hardware-database-worker``
+        process. Upload only persists a queued record; it must never spawn a
+        parser inside an API worker.
+        """
+        return None
 
     def stop(self):
-        """Signal the parse worker to exit after its current record. Called on
-        pipeline teardown (reset_pipeline) so a reset doesn't leave an orphan
-        worker competing with the new pipeline's worker for the same SQLite."""
-        self._stop_event.set()
+        """Compatibility no-op; process lifetime is controlled by the worker."""
+        return None
 
     def parse_worker_loop(self):
         processor_kinds = self.background_processor_kinds()
-        while not self._stop_event.is_set():
+        while True:
             record = self.store.claim_next_parse_record(self._worker_id, processor_kinds=processor_kinds)
             if not record:
                 return
@@ -72,6 +61,27 @@ class PipelineRuntime:
                     self.store.mark_document_failed_by_id(record.id, str(exc))
                 except Exception as mark_error:
                     error(f"Failed to mark parse task failed for {record.id}: {mark_error}")
+
+    def run_once(self) -> bool:
+        """Process one durable parse record. Used by the standalone worker."""
+        record = self.store.claim_next_parse_record(
+            self._worker_id,
+            processor_kinds=self.background_processor_kinds(),
+        )
+        if not record:
+            return False
+        try:
+            self.process_record(record)
+        except Exception as exc:
+            error(f"Parse worker failed for {record.document_name}: {exc}")
+            try:
+                handler = self.handlers.get(record.processor_kind)
+                if handler is not None:
+                    handler.cleanup_failed_process(record)
+                self.store.mark_document_failed_by_id(record.id, str(exc))
+            except Exception as mark_error:
+                error(f"Failed to mark parse task failed for {record.id}: {mark_error}")
+        return True
 
     def process_record(self, record: PipelineDocumentRecord):
         handler = self.handlers.get(record.processor_kind)

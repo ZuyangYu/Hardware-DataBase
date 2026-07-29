@@ -84,6 +84,60 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             del auth
             gc.collect()
 
+    def test_assign_kb_rejects_system_department(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = self._service(tmp)
+            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            system_dept = next(dept for dept in auth.list_departments() if dept.name == "system")
+            dept_a = auth.create_department("dept_a")
+            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
+            auth.register_knowledge_base("shared", owner=admin_a)
+
+            with self.assertRaises(ValueError):
+                auth.assign_knowledge_base_as(system_admin, "shared", system_dept.id)
+
+            del auth
+            gc.collect()
+
+    def test_assign_kb_blocks_cross_department_move_until_assets_can_migrate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = self._service(tmp)
+            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            dept_a = auth.create_department("dept_a")
+            dept_b = auth.create_department("dept_b")
+            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
+            auth.register_knowledge_base("shared", owner=admin_a)
+            source_id = auth.get_knowledge_base_id("shared", department_id=dept_a.id)
+
+            with self.assertRaises(ValueError):
+                auth.assign_knowledge_base_as(system_admin, "shared", dept_b.id, source_kb_id=source_id)
+
+            summaries = [item for item in auth.list_knowledge_base_summaries(["shared"]) if item.registered]
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0].kb_id, source_id)
+            self.assertEqual(summaries[0].department_id, dept_a.id)
+
+            del auth
+            gc.collect()
+
+    def test_assign_kb_rejects_target_duplicate_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = self._service(tmp)
+            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            dept_a = auth.create_department("dept_a")
+            dept_b = auth.create_department("dept_b")
+            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
+            admin_b = auth.create_user_as(system_admin, "admin_b", "password123", ROLE_DEPT_ADMIN, dept_b.id)
+            auth.register_knowledge_base("shared", owner=admin_a)
+            auth.register_knowledge_base("shared", owner=admin_b)
+            source_id = auth.get_knowledge_base_id("shared", department_id=dept_a.id)
+
+            with self.assertRaises(ValueError):
+                auth.assign_knowledge_base_as(system_admin, "shared", dept_b.id, source_kb_id=source_id)
+
+            del auth
+            gc.collect()
+
     def test_legacy_permission_migration_maps_by_user_department(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "auth.db")

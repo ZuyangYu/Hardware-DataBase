@@ -73,6 +73,95 @@ class UploadAck(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Hardware assets and reviewable AI extraction
+# ---------------------------------------------------------------------------
+
+class AssetEvidenceView(BaseModel):
+    id: int
+    file_id: str = ""
+    file_name: str = ""
+    locator: str = ""
+    excerpt: str = ""
+    metadata: dict = Field(default_factory=dict)
+    created_at: str
+
+
+class AssetView(BaseModel):
+    id: int
+    department_id: int
+    kb_id: int
+    asset_type: str
+    name: str
+    model: str = ""
+    manufacturer: str = ""
+    serial_number: str = ""
+    version: str = ""
+    status: str = "active"
+    owner_user_id: int | None = None
+    attributes: dict = Field(default_factory=dict)
+    evidence_count: int = 0
+    created_at: str
+    updated_at: str
+
+
+class AssetDetailView(AssetView):
+    evidence: list[AssetEvidenceView] = Field(default_factory=list)
+
+
+class AssetCandidateView(BaseModel):
+    id: int
+    kb_name: str
+    file_id: str
+    file_name: str
+    source_kind: str = ""
+    extraction_method: str = "rule"
+    asset_type: str
+    name: str
+    model: str = ""
+    manufacturer: str = ""
+    version: str = ""
+    attributes: dict = Field(default_factory=dict)
+    evidence_excerpt: str = ""
+    evidence_locator: str = ""
+    confidence: float = 0
+    status: str
+    asset_id: int | None = None
+    created_at: str
+    resolved_at: str | None = None
+
+
+class GenerateAssetCandidateRequest(BaseModel):
+    file_id: str = Field(min_length=1, max_length=300)
+
+
+class AssetSourceLinkView(BaseModel):
+    file_id: str
+    file_name: str
+    file_status: str = ""
+    processor_kind: str = ""
+    dataset_kind: str = ""
+    link_status: Literal["unprocessed", "pending_review", "linked", "ignored"]
+    candidate_id: int | None = None
+    asset_id: int | None = None
+    asset_name: str = ""
+    source_category: str = "document_rag"
+    extraction_target: str = "document_assets"
+    asset_eligible: bool = True
+
+
+class ConfirmAssetCandidateRequest(BaseModel):
+    asset_type: Literal["device", "board", "component", "firmware", "other"] | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    model: str | None = Field(default=None, max_length=200)
+    manufacturer: str | None = Field(default=None, max_length=200)
+    serial_number: str | None = Field(default=None, max_length=200)
+    version: str | None = Field(default=None, max_length=100)
+    status: str | None = Field(default=None, max_length=50)
+    owner_user_id: int | None = None
+    attributes: dict | None = None
+
+
+# ---------------------------------------------------------------------------
 # Query
 # ---------------------------------------------------------------------------
 
@@ -82,7 +171,7 @@ class QueryRequest(BaseModel):
     # Route also slices [-5:] as defence in depth; the schema cap keeps a
     # misconfigured client from wasting bandwidth on multi-MB history bodies
     # (and blocks DoS-shaped requests before the body is even read).
-    history: list[list[str]] = Field(default_factory=list, max_length=100)
+    history: list[tuple[str, str]] = Field(default_factory=list, max_length=100)
     thread_id: str = ""
 
 
@@ -109,12 +198,47 @@ class MessageView(BaseModel):
     session_id: int
     role: str
     content: str
+    footer: str = ""
     created_at: str
 
 
 class AddMessageRequest(BaseModel):
     role: str
     content: str
+
+
+class CreateTurnRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=20_000)
+    client_request_id: str | None = Field(default=None, max_length=128)
+    # Retained for wire compatibility; the route normalizes KB turns to deep
+    # retrieval and general chat bypasses the knowledge-base agent entirely.
+    query_mode: Literal["fast", "deep"] = "deep"
+
+
+class TurnView(BaseModel):
+    id: str
+    session_id: int
+    user_message_id: int
+    assistant_message_id: int
+    kb_name: str
+    query: str
+    query_mode: Literal["fast", "deep"] = "fast"
+    status: str
+    cancel_requested: bool = False
+    last_event_seq: int = 0
+    answer: str = ""
+    summary: dict = Field(default_factory=dict)
+    footer: str = ""
+    metrics: dict = Field(default_factory=dict)
+    error_message: str = ""
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+class TurnStartResponse(BaseModel):
+    turn: TurnView
+    user_message: MessageView
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +280,56 @@ class ParseTaskView(BaseModel):
     updated_at: float | None = None
     started_at: float | None = None
     finished_at: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Structured KB data
+# ---------------------------------------------------------------------------
+
+class StructuredRowsResponse(BaseModel):
+    rows: list[dict] = Field(default_factory=list)
+
+
+class SpreadsheetLedgerResponse(BaseModel):
+    totals: dict = Field(default_factory=dict)
+    rows: list[dict] = Field(default_factory=list)
+
+
+class CircuitDesignsResponse(BaseModel):
+    designs: list[dict] = Field(default_factory=list)
+    failed_logs: list[dict] = Field(default_factory=list)
+
+
+class CircuitDesignDetailResponse(BaseModel):
+    summary: dict = Field(default_factory=dict)
+    modules: list[dict] = Field(default_factory=list)
+    nets: list[dict] = Field(default_factory=list)
+    instances: list[dict] = Field(default_factory=list)
+    cross_references: list[dict] = Field(default_factory=list)
+
+
+class CircuitParseLogResponse(BaseModel):
+    exists: bool = False
+    path: str = ""
+    size: int = 0
+    truncated: bool = False
+    content: str = ""
+
+
+class SchematicDesignsResponse(BaseModel):
+    designs: list[dict] = Field(default_factory=list)
+
+
+class SchematicPageResponse(BaseModel):
+    design_id: str
+    page_number: int
+    width: float | None = None
+    height: float | None = None
+    text: str = ""
+    labels: list[dict] = Field(default_factory=list)
+    module_regions: list[dict] = Field(default_factory=list)
+    screenshots: list[str] = Field(default_factory=list)
+    pdf_cache: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +392,7 @@ class GrantKbPermissionRequest(BaseModel):
 class AssignKbRequest(BaseModel):
     department_id: int
     owner_user_id: int | None = None
+    source_kb_id: int | None = None
 
 
 # ---------------------------------------------------------------------------

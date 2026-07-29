@@ -136,6 +136,7 @@ class AgentState(TypedDict, total=False):
     thread_id: str
     kb_name: str
     user_query: str
+    query_mode: Literal["fast", "deep"]
     history: list[tuple[str, str]]
     ctx: dict[str, Any]
     _ctx_obj: Any

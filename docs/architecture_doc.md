@@ -5,7 +5,7 @@
 
 ## 1. 系统定位
 
-Hardware DataBase 当前是一个面向硬件设计资料、项目文档、结构化表格和电路设计（EDF 网表/原理图）的多源问答系统。系统保留“知识库”作为业务隔离、权限治理和资产归属单元，但不再在项目内维护本地向量知识库。
+Hardware DataBase 当前是一个面向硬件设计资料、项目文档、结构化表格和电路设计（EDF 网表/原理图）的硬件数据平台。系统保留“知识库”作为业务隔离、权限治理和资产归属单元；对话只是外接检索入口之一，平台核心是硬件资产管理、解析、召回与治理。
 
 文档检索统一由 RAGFlow 承担；查询编排由 LangGraph agent 承担；Excel 与 EDF 网表等结构化资产由独立 pipeline 建立结构化索引，并通过 agent tool 参与检索。
 
@@ -61,7 +61,7 @@ Tools / Services
   v
 Storage / External Systems
   - RAGFlow datasets（governance / design）
-  - SQLite：auth / 会话 / 文档台账 / 解析任务
+  - SQLite：auth / 会话 / 文档台账 / 解析任务（本地开发单机）
   - Spreadsheet 结构化索引（per-KB SQLite）
   - Circuit 结构化存储 + per-KB 向量索引（ChromaDB）
   - Pipeline 归档文件
@@ -198,6 +198,17 @@ Agent source plan
 ```
 
 ## 7. 配置
+
+### 独立 Worker
+
+HTTP API 只负责鉴权、创建任务和 SSE 订阅；对话 turn 与表格解析由独立进程领取数据库中的持久化任务：
+
+```bash
+hardware-database-server
+.venv/bin/python -m src.workers.main
+```
+
+安装包重新安装后也可使用 `hardware-database-worker`。Worker 通过 `WORKER_POLL_INTERVAL_SECONDS` 控制空队列轮询间隔，`WORKER_PARSE_BATCH_SIZE` 控制每轮最多处理的表格任务数。当前 SQLite worker 用于本地单机和开发验证；生产多实例部署应将同一领取接口迁移至 PostgreSQL，并以 Redis 队列承担唤醒和调度。
 
 核心配置集中在 `config/settings.py`（单一事实来源，`.env` 以 `utf-8-sig` 加载，UI「⚙️ 系统配置」可在线修改并回写 `.env`）：
 

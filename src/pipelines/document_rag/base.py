@@ -40,6 +40,7 @@ class RAGBackend(ABC):
         top_k: int | None = None,
         ctx: RequestContext | None = None,
         filters: dict | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[Evidence]:
         """Retrieve evidence for a query."""
 

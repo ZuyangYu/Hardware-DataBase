@@ -23,6 +23,7 @@ dependencies = [
 [project.scripts]
 hardware-database-eval = "src.evaluation.cli:main"
 hardware-database-server = "src.api.app:main"
+hardware-database-worker = "src.workers.main:main"
 
 [build-system]
 requires = ["setuptools>=77"]

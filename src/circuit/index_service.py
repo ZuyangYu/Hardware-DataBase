@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.agents.state import Evidence
+from src.agents.query_tokens import tokenize_hardware_query
 from src.circuit.evidence_mapper import CircuitEvidenceMapper
 from src.circuit.models import CircuitDesign, CircuitStatus, DesignFile
 from src.circuit.parsers.edf_parser import EdfParser
@@ -146,6 +147,62 @@ class CircuitIndexService:
             hits.extend(self._instance_evidence(design, meta, source_name, needles))
         hits.sort(key=lambda item: item.score, reverse=True)
         return hits[:top_k]
+
+    def rank_document_matches(
+        self,
+        kb_name: str,
+        ctx: RequestContext | None,
+        query: str,
+        limit: int = 20,
+    ) -> dict[int, dict]:
+        """Score circuit files from their indexed hardware entities.
+
+        The result contains only routing metadata. Evidence is still fetched by
+        ``query()`` after the agent applies the department-scoped record filter.
+        """
+        terms = tokenize_hardware_query(query, max_tokens=8, include_cjk_ngrams=False)
+        if not terms:
+            return {}
+        department_id = _ctx_department_id(ctx)
+        ranked: list[tuple[int, int, list[str]]] = []
+        for design in self.store.list_designs(kb_name):
+            metadata = self._read_metadata(kb_name, design.design_id)
+            if department_id and str(metadata.get("department_id") or "") != department_id:
+                continue
+            record_id = metadata.get("record_id")
+            if record_id in (None, ""):
+                continue
+            source_text = " ".join(
+                [design.design_id, *(str(file.file_name or "") for file in design.files)]
+            ).casefold()
+            entity_text = " ".join(
+                str(value or "")
+                for instance in design.instances
+                for value in (instance.refdes, instance.library_cell, instance.part_number, instance.value)
+            ).casefold()
+            net_text = " ".join(str(net.name or "") for net in design.nets).casefold()
+            module_text = " ".join(
+                str(value or "")
+                for module in design.modules
+                for value in (getattr(module, "module_id", ""), getattr(module, "name", ""))
+            ).casefold()
+            matched_scores: dict[str, int] = {}
+            for term in terms:
+                if term in entity_text:
+                    matched_scores[term] = 8
+                elif term in net_text or term in module_text:
+                    matched_scores[term] = 5
+                elif term in source_text:
+                    matched_scores[term] = 3
+            # Filename aliases alone are useful for fallback ordering, but a
+            # precise circuit selection must match an indexed entity or net.
+            if matched_scores and max(matched_scores.values()) >= 5:
+                ranked.append((int(record_id), sum(matched_scores.values()), sorted(matched_scores)))
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        return {
+            record_id: {"score": score, "matched_terms": matched_terms}
+            for record_id, score, matched_terms in ranked[: max(1, int(limit))]
+        }
 
     def _structured_evidence(
         self,

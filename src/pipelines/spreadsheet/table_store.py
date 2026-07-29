@@ -435,6 +435,61 @@ class TableIndexStore:
             ],
         }
 
+    def rank_documents_by_terms(self, terms: list[str], limit: int = 20) -> dict[int, dict]:
+        """Score workbook records by exact/partial matches in indexed cells.
+
+        This is used only for source routing before a fast query. It returns
+        record identifiers and matching terms, never cell content, so the
+        planner can scope the later evidence retrieval without duplicating it.
+        """
+        normalized_terms = list(dict.fromkeys(str(term or "").strip().casefold() for term in terms if str(term or "").strip()))
+        if not normalized_terms:
+            return {}
+
+        by_record: dict[int, dict[str, int]] = {}
+        with closing(self._connect()) as conn:
+            for term in normalized_terms[:8]:
+                pattern = f"%{term}%"
+                rows = conn.execute(
+                    """
+                    SELECT record_id, value, raw_value, header
+                    FROM table_cells
+                    WHERE LOWER(value) LIKE ? OR LOWER(raw_value) LIKE ? OR LOWER(header) LIKE ?
+                    LIMIT 300
+                    """,
+                    (pattern, pattern, pattern),
+                ).fetchall()
+                for row in rows:
+                    value = str(row["value"] or "").casefold()
+                    raw_value = str(row["raw_value"] or "").casefold()
+                    header = str(row["header"] or "").casefold()
+                    if term == value or term == raw_value:
+                        score = 8
+                    elif term in value or term in raw_value:
+                        score = 5
+                    elif term in header:
+                        score = 3
+                    else:
+                        continue
+                    record_scores = by_record.setdefault(int(row["record_id"]), {})
+                    record_scores[term] = max(score, record_scores.get(term, 0))
+
+        ranked = sorted(
+            (
+                (record_id, sum(term_scores.values()), sorted(term_scores))
+                for record_id, term_scores in by_record.items()
+                # A shared column heading (for example "Part Number") is a
+                # weak hint. Require a value/raw-value match before treating a
+                # workbook as a precise source match.
+                if max(term_scores.values()) >= 5
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )[: max(1, int(limit))]
+        return {
+            record_id: {"score": score, "matched_terms": matched_terms}
+            for record_id, score, matched_terms in ranked
+        }
+
 
 def _workbook_stats(workbook: ParsedWorkbook) -> TableIndexStats:
     stats = TableIndexStats(

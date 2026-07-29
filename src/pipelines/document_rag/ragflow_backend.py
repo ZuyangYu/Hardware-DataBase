@@ -1,4 +1,5 @@
 import calendar
+import asyncio
 import hashlib
 import json
 import os
@@ -7,11 +8,13 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+import httpx
 import requests
 
 import config.settings
 from src.core.auth import AuthService
 from src.core.app_logs import AppLogService
+from src.core.cancellation import QueryCancelled
 from src.core.logger import error, log
 from src.core.source_group_router import route_source_groups
 from src.ingestion.kb_paths import validate_kb_name
@@ -408,10 +411,17 @@ def _record_id_from_document_id(document_id: str) -> int | None:
 
 
 class RAGFlowClient:
-    def __init__(self, base_url: str | None = None, api_key: str | None = None, timeout: int | float | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        timeout: int | float | None = None,
+        async_client_factory: Callable[..., httpx.AsyncClient] | None = None,
+    ):
         self.base_url = (base_url or config.settings.RAGFLOW_BASE_URL).rstrip("/")
         self.api_key = api_key if api_key is not None else config.settings.RAGFLOW_API_KEY
         self.timeout = timeout if timeout is not None else config.settings.RAGFLOW_TIMEOUT_SECONDS
+        self._async_client_factory = async_client_factory or httpx.AsyncClient
         if not self.api_key:
             raise ValueError("RAGFLOW_API_KEY is not configured.")
 
@@ -435,6 +445,87 @@ class RAGFlowClient:
         if isinstance(data, dict) and data.get("code") not in {None, 0}:
             raise RAGFlowAPIError(data)
         return data
+
+    async def _async_request_until_cancelled(
+        self,
+        method: str,
+        path: str,
+        cancel_event: threading.Event,
+        **kwargs,
+    ) -> dict:
+        """Run one RAGFlow request and cancel its client task on demand."""
+        try:
+            async with self._async_client_factory(timeout=self.timeout) as client:
+                request_task = asyncio.create_task(
+                    client.request(
+                        method,
+                        self._url(path),
+                        headers={**self.headers, **kwargs.pop("headers", {})},
+                        **kwargs,
+                    )
+                )
+                cancel_task = asyncio.create_task(asyncio.to_thread(cancel_event.wait))
+                done, _ = await asyncio.wait({request_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+                if cancel_task in done:
+                    request_task.cancel()
+                    try:
+                        await request_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise QueryCancelled()
+
+                cancel_task.cancel()
+                response = request_task.result()
+                response.raise_for_status()
+                data = response.json()
+                if isinstance(data, dict) and data.get("code") not in {None, 0}:
+                    raise RAGFlowAPIError(data)
+                return data
+        finally:
+            # Release asyncio.to_thread(cancel_event.wait) on successful calls.
+            cancel_event.set()
+
+    def request_cancellable(
+        self,
+        method: str,
+        path: str,
+        *,
+        should_cancel: Callable[[], bool],
+        **kwargs,
+    ) -> dict:
+        """Synchronously wait for an async HTTP request that can be cancelled.
+
+        The agent graph remains synchronous, while the dedicated request thread
+        owns an AsyncClient task. Setting the event causes that task to be
+        cancelled, which closes the client-side HTTP wait/socket immediately.
+        """
+        if should_cancel():
+            raise QueryCancelled()
+
+        cancel_event = threading.Event()
+        completed = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def run_request() -> None:
+            try:
+                outcome["data"] = asyncio.run(
+                    self._async_request_until_cancelled(method, path, cancel_event, **kwargs)
+                )
+            except Exception as exc:  # Propagate transport and API errors unchanged.
+                outcome["error"] = exc
+            finally:
+                completed.set()
+
+        thread = threading.Thread(target=run_request, name="ragflow-retrieval-request", daemon=True)
+        thread.start()
+        while not completed.wait(0.05):
+            if should_cancel():
+                cancel_event.set()
+
+        request_error = outcome.get("error")
+        if isinstance(request_error, Exception):
+            raise request_error
+        return outcome["data"]  # type: ignore[return-value]
 
     def list_datasets(self, name: str | None = None) -> list[dict]:
         params = {"name": name} if name else {}
@@ -503,7 +594,14 @@ class RAGFlowClient:
         chunks = data.get("data", {}).get("chunks", data.get("data", []))
         return chunks if isinstance(chunks, list) else []
 
-    def retrieve(self, question: str, dataset_ids: list[str], top_k: int, metadata_condition: dict | None = None) -> list[dict]:
+    def retrieve(
+        self,
+        question: str,
+        dataset_ids: list[str],
+        top_k: int,
+        metadata_condition: dict | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[dict]:
         payload = {
             "question": question,
             "dataset_ids": dataset_ids,
@@ -515,7 +613,15 @@ class RAGFlowClient:
         }
         if metadata_condition:
             payload["metadata_condition"] = metadata_condition
-        data = self.request("POST", "/api/v1/retrieval", json=payload)
+        if should_cancel is None:
+            data = self.request("POST", "/api/v1/retrieval", json=payload)
+        else:
+            data = self.request_cancellable(
+                "POST",
+                "/api/v1/retrieval",
+                json=payload,
+                should_cancel=should_cancel,
+            )
         chunks = data.get("data", {}).get("chunks", [])
         return chunks if isinstance(chunks, list) else []
 
@@ -860,6 +966,7 @@ class RAGFlowBackend(RAGBackend):
         top_k: int | None = None,
         ctx: RequestContext | None = None,
         filters: dict | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[Evidence]:
         self._check_kb_access(kb_name, ctx, "read")
         scope = _scope_for_kb(kb_name, ctx).require_department("retrieve from")
@@ -881,12 +988,18 @@ class RAGFlowBackend(RAGBackend):
         self._ensure_physical_datasets()
         dataset_ids = list(dict.fromkeys(self._dataset_ids.values()))
         metadata_condition = _metadata_condition(kb_name, ctx, routed_source_groups, filters=filters)
-        chunks = self._client().retrieve(
-            query,
-            dataset_ids=dataset_ids,
-            top_k=top_k,
-            metadata_condition=metadata_condition,
-        )
+
+        def retrieve_chunks(condition: dict | None) -> list[dict]:
+            retrieve_kwargs = {
+                "dataset_ids": dataset_ids,
+                "top_k": top_k,
+                "metadata_condition": condition,
+            }
+            if should_cancel is not None:
+                retrieve_kwargs["should_cancel"] = should_cancel
+            return self._client().retrieve(query, **retrieve_kwargs)
+
+        chunks = retrieve_chunks(metadata_condition)
         source_names = _source_name_filters(filters)
         # An explicit file selection is a stronger scope than keyword routing.
         # It remains constrained by the locally scoped document mapping below,
@@ -895,12 +1008,7 @@ class RAGFlowBackend(RAGBackend):
         source_name_fallback = False
         metadata_condition_fallback = False
         if not chunks:
-            chunks = self._client().retrieve(
-                query,
-                dataset_ids=dataset_ids,
-                top_k=top_k,
-                metadata_condition=None,
-            )
+            chunks = retrieve_chunks(None)
             metadata_condition_fallback = True
             source_name_fallback = bool(source_names)
             log(
@@ -990,12 +1098,7 @@ class RAGFlowBackend(RAGBackend):
 
         evidences, skipped_counts = _filter_chunks()
         if not evidences and source_names and not source_name_fallback and skipped_counts["source_name"]:
-            chunks = self._client().retrieve(
-                query,
-                dataset_ids=dataset_ids,
-                top_k=top_k,
-                metadata_condition=None,
-            )
+            chunks = retrieve_chunks(None)
             source_name_fallback = True
             metadata_condition_fallback = True
             evidences, skipped_counts = _filter_chunks()

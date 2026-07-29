@@ -883,6 +883,7 @@ class AuthService:
         kb_name: str,
         department_id: int,
         owner_user_id: int | None = None,
+        source_kb_id: int | None = None,
     ):
         try:
             if actor is None or actor.role != ROLE_SYSTEM_ADMIN:
@@ -895,6 +896,18 @@ class AuthService:
                 department = conn.execute("SELECT id, name FROM departments WHERE id = ?", (department_id,)).fetchone()
                 if department is None:
                     raise ValueError("部门不存在")
+                if department["name"] == "system":
+                    raise ValueError("业务知识库不能挂载到 system 部门")
+
+                source_kb = self._get_kb_row(conn, kb_name, kb_id=source_kb_id)
+                target_kb = self._get_kb_row(conn, kb_name, department_id)
+                if source_kb is not None and target_kb is not None and target_kb["id"] != source_kb["id"]:
+                    raise ValueError("目标部门已存在同名知识库")
+                if source_kb is not None and source_kb["department_id"] not in (None, department_id):
+                    # RAGFlow chunks and local structured indexes are scoped by
+                    # department metadata. Moving only this SQL row would make
+                    # documents disappear or cross tenant boundaries.
+                    raise ValueError("暂不支持跨部门迁移已有知识库；请在目标部门新建知识库并执行受控导入。")
 
                 if owner_user_id is not None:
                     owner = conn.execute("SELECT * FROM users WHERE id = ?", (owner_user_id,)).fetchone()
@@ -905,17 +918,25 @@ class AuthService:
                     if owner["department_id"] != department_id:
                         raise ValueError("负责人必须属于所选部门")
 
-                conn.execute(
-                    """
-                    INSERT INTO knowledge_bases (name, department_id, owner_user_id, created_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(department_id, name) DO UPDATE SET
-                        department_id = excluded.department_id,
-                        owner_user_id = excluded.owner_user_id
-                    """,
-                    (kb_name, department_id, owner_user_id, utc_now()),
-                )
-                kb = self._get_kb_row(conn, kb_name, department_id)
+                if source_kb is None:
+                    conn.execute(
+                        """
+                        INSERT INTO knowledge_bases (name, department_id, owner_user_id, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (kb_name, department_id, owner_user_id, utc_now()),
+                    )
+                    kb = self._get_kb_row(conn, kb_name, department_id)
+                else:
+                    conn.execute(
+                        """
+                        UPDATE knowledge_bases
+                        SET department_id = ?, owner_user_id = ?
+                        WHERE id = ?
+                        """,
+                        (department_id, owner_user_id, source_kb["id"]),
+                    )
+                    kb = self._get_kb_row(conn, kb_name, kb_id=source_kb["id"])
                 # Re-assigning to a new department strips cross-department grants;
                 # flag it in audit metadata so the side effect is traceable.
                 conn.execute(
@@ -948,7 +969,7 @@ class AuthService:
                 kb_name=kb_name.strip() if kb_name else "",
                 success=False,
                 error_message=str(exc),
-                metadata={"department_id": department_id, "owner_user_id": owner_user_id},
+                metadata={"department_id": department_id, "owner_user_id": owner_user_id, "source_kb_id": source_kb_id},
             )
             raise
         self._audit(
@@ -960,6 +981,7 @@ class AuthService:
             metadata={
                 "department_id": department_id,
                 "owner_user_id": owner_user_id,
+                "source_kb_id": source_kb_id,
                 "removed_cross_dept_perms": True,
             },
         )
@@ -1224,6 +1246,21 @@ class AuthService:
             return None
         with closing(self._connect()) as conn:
             row = self._get_user_row(conn, username)
+        return row_to_user(row) if row else None
+
+    def get_user_by_id(self, user_id: int | None) -> AuthUser | None:
+        if user_id is None:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT u.*, d.name AS department_name
+                FROM users u
+                LEFT JOIN departments d ON d.id = u.department_id
+                WHERE u.id = ?
+                """,
+                (int(user_id),),
+            ).fetchone()
         return row_to_user(row) if row else None
 
     def _get_user_row(self, conn, username: str):
