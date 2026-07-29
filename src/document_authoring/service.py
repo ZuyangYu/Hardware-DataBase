@@ -25,6 +25,7 @@ from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
 from src.document_authoring.icd_generation import render_icd_front_views
+from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.icd_validation import validate_icd_pin_set
 from src.document_authoring.icd_scope_decision import effective_frozen_pin_mappings
 from src.document_authoring.models import (
@@ -1399,6 +1400,13 @@ class DocumentGenerationService:
         report,
         artifact_content: bytes,
     ):
+        profile = self._icd_template_profile(order)
+        if profile is not None and profile.kind == "icd_sample":
+            report = self._append_icd_validation_issues(report, [{
+                "code": "icd_formal_template_required",
+                "severity": "blocking",
+                "message": "ICD 示例模板不能生成可审核文档；请使用正式 ICD 模板。",
+            }])
         review = self.store.get_icd_scope_review(order.work_order_id)
         if review is None:
             return report
@@ -1413,12 +1421,19 @@ class DocumentGenerationService:
                 artifact_content,
                 order.target_format,
             )
-        if not issues:
-            return report
-        return report.model_copy(update={
-            "issues": [*report.issues, *issues],
-            "status": "failed" if report.status == "failed" else "requires_human",
-        })
+        return self._append_icd_validation_issues(report, issues)
+
+    def _icd_template_profile(self, order: DocumentWorkOrder):
+        """Return the immutable template contract when it can be read safely."""
+        reader = getattr(self.store, "read_template_content", None)
+        template_version_id = str(getattr(order, "template_version_id", "")).strip()
+        if not callable(reader) or not template_version_id:
+            return None
+        try:
+            content = reader(template_version_id)
+        except (KeyError, OSError, ValueError):
+            return None
+        return classify_icd_template(content, order.target_format)
 
     @staticmethod
     def _has_icd_blocking_issue(issues: list[dict[str, Any]]) -> bool:

@@ -352,3 +352,29 @@ def test_auto_generation_scope_block_explains_that_no_candidate_exists_yet():
     st.statuses[0].update.assert_called_with(
         label="已创建工作单，等待 ICD 范围处理", state="complete",
     )
+
+
+def test_auto_generation_template_contract_stop_does_not_claim_a_candidate_exists():
+    st = _ScopeBlockedCreationUi()
+    pipeline = Mock()
+    pipeline.list_knowledge_base_document_generation_options.return_value = {
+        "knowledge_bases": ["hardware"],
+        "templates": [{
+            "template_version_id": "template-v1", "template_id": "icd",
+            "template_schema_id": "icd-schema", "template_schema_version": "1",
+        }],
+        "schemas": [{"document_schema_id": "icd-schema", "version": "1"}],
+    }
+    pipeline.auto_generate_knowledge_base_document.return_value = {
+        "stage": "template_contract_review_required",
+        "work_order_id": "work-template-1",
+        "issues": [{"code": "icd_formal_template_required"}],
+    }
+
+    document_generation_page._render_work_order_creation(st, pipeline, "ctx")
+
+    assert any("正式 ICD 模板" in message for message in st.successes)
+    assert not any("候选文件" in message for message in st.successes)
+    st.statuses[0].update.assert_called_with(
+        label="已创建工作单，等待正式 ICD 模板", state="complete",
+    )

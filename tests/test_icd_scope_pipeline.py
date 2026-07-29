@@ -6,7 +6,12 @@ import zipfile
 from src.agents.state import Evidence
 from src.agents.claim_evidence import InformationRequirement
 from src.core.app_pipeline import AppPipeline
-from src.document_authoring.models import DocumentFieldSchema, DocumentSchema
+from src.document_authoring.models import (
+    DocumentFieldSchema,
+    DocumentSchema,
+    ValidationReport,
+)
+from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.models import IcdScopeResolution, IcdScopeReview
 from src.document_authoring.icd_scope_decision import IcdScopeDecision, IcdScopeException
 from src.pipelines.document_rag.schemas import RequestContext
@@ -94,6 +99,61 @@ def _front_view_template_bytes(refdes: str = "X302") -> bytes:
     return content.getvalue()
 
 
+def _formal_icd_template_bytes(*refdes: str) -> bytes:
+    """A formal ICD template declares its connector identities in the template."""
+    values_by_sheet = [
+        [
+            ["Location Number", value],
+            ["Board Connector Model", f"MODEL-{value}"],
+            ["Pin Number", "Pin Definition"],
+        ]
+        for value in refdes
+    ] or [[["Pin Number", "Pin Definition"]]]
+
+    def sheet_xml(rows: list[list[str]]) -> str:
+        return "".join(
+            f'<row r="{row_number}">' + "".join(
+                f'<c r="{chr(65 + column_number)}{row_number}" t="inlineStr"><is><t>{value}</t></is></c>'
+                for column_number, value in enumerate(row)
+            ) + "</row>"
+            for row_number, row in enumerate(rows, start=1)
+        )
+
+    content = BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr(
+            "xl/workbook.xml",
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            "<sheets>"
+            + "".join(
+                f'<sheet name="ICD-{index}" sheetId="{index}" r:id="rId{index}"/>'
+                for index in range(1, len(values_by_sheet) + 1)
+            )
+            + "</sheets></workbook>",
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            + "".join(
+                f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
+                for index in range(1, len(values_by_sheet) + 1)
+            )
+            + "</Relationships>",
+        )
+        for index, rows in enumerate(values_by_sheet, start=1):
+            archive.writestr(
+                f"xl/worksheets/sheet{index}.xml",
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+                f"{sheet_xml(rows)}</sheetData></worksheet>",
+            )
+    return content.getvalue()
+
+
+def _sample_icd_template_bytes() -> bytes:
+    return _formal_icd_template_bytes()
+
+
 def _pipeline() -> tuple[AppPipeline, RequestContext, Mock, SimpleNamespace]:
     pipeline = object.__new__(AppPipeline)
     ctx = RequestContext(
@@ -153,6 +213,79 @@ def test_kb_auto_run_returns_scope_review_before_harness_when_exception_exists()
         "hardware", list(snapshot.source_names), ctx, refdes=["J7"]
     )
     service.run_internal_harness.assert_not_called()
+
+
+def test_icd_sample_template_returns_a_template_contract_stop_before_retrieval():
+    pipeline, ctx, service, _snapshot = _pipeline()
+    service.store.read_template_content.return_value = _sample_icd_template_bytes()
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "template_contract_review_required"
+    assert result["issues"][0]["code"] == "icd_formal_template_required"
+    pipeline.backend.retrieve.assert_not_called()
+    service.run_internal_harness.assert_not_called()
+
+
+def test_formal_icd_retrieves_only_profile_connector_refdes():
+    pipeline, ctx, service, snapshot = _pipeline()
+    service.store.read_template_content.return_value = _formal_icd_template_bytes("J1", "J2")
+    pipeline.backend.retrieve.return_value = [SimpleNamespace(
+        source_name="FPT.xlsx",
+        content="connector J9 pinout",
+        metadata={"document_role": "fpt"},
+    )]
+    service.prepare_icd_scope_review.return_value = SimpleNamespace(
+        pending_count=1,
+        exceptions=[SimpleNamespace(user_instruction="Confirm J1 exposure")],
+    )
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "scope_review_required"
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
+        "hardware", list(snapshot.source_names), ctx, refdes=["J1", "J2"],
+    )
+
+
+def test_finalization_marks_icd_sample_template_as_a_blocking_issue():
+    service = object.__new__(DocumentGenerationService)
+    service.store = SimpleNamespace(
+        get_icd_scope_review=Mock(return_value=None),
+        read_template_content=Mock(return_value=_sample_icd_template_bytes()),
+    )
+    report = ValidationReport(
+        validation_report_id="report-1",
+        work_order_id="work-1",
+        status="passed",
+        evidence_matrix_hash="matrix-hash",
+    )
+
+    validated = service._append_icd_pin_validation(
+        SimpleNamespace(
+            work_order_id="work-1",
+            template_version_id="template-a",
+            target_format="xlsx",
+        ),
+        report,
+        b"not relevant to template contract",
+    )
+
+    assert validated.status == "requires_human"
+    assert validated.issues[0]["code"] == "icd_formal_template_required"
+    assert validated.issues[0]["severity"] == "blocking"
 
 
 def test_kb_icd_scope_queries_only_explicit_connector_refdes():

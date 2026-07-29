@@ -303,6 +303,13 @@ def _render_work_order_creation(st, pipeline, ctx) -> None:
                     f"已创建工作单：{work_order_id}；需处理少量 ICD 范围异常。"
                     "请在下方“任务与下载”中选择该工作单，完成一次批量处理后系统会继续生成。"
                 )
+            elif result_stage == "template_contract_review_required":
+                work_order_id = _value(result, "work_order_id")
+                status.update(label="已创建工作单，等待正式 ICD 模板", state="complete")
+                st.success(
+                    f"已创建工作单：{work_order_id}；当前为示例 ICD 模板，"
+                    "请改用含连接器编号、板端型号和管脚定义表的正式 ICD 模板后重新生成。"
+                )
             else:
                 status.update(label="已生成候选文件，等待人工审核", state="complete")
                 st.success(

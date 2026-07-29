@@ -27,6 +27,7 @@ from src.document_authoring.icd_scope_decision import (
     supported_connector_refdes,
 )
 from src.document_authoring.icd_generation import connector_refdes_from_front_view_template
+from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.retriever_registry import (
     CrossUnitEvidenceCache,
@@ -579,6 +580,17 @@ class AppPipeline:
             **kwargs,
         )
         snapshot = self.document_generation.resolve_source_snapshot(order)
+        profile = self._icd_template_profile(order)
+        if profile is not None and profile.kind == "icd_sample":
+            return {
+                "stage": "template_contract_review_required",
+                "work_order_id": order.work_order_id,
+                "issues": [{
+                    "code": "icd_formal_template_required",
+                    "severity": "blocking",
+                    "message": "ICD 示例模板缺少正式连接器定义；请上传含连接器编号、板端型号和管脚定义表的正式 ICD 模板。",
+                }, *profile.issues],
+            }
         scope_review = None
         icd_schema = self._icd_connector_scope_schema(order)
         if icd_schema is not None:
@@ -589,11 +601,15 @@ class AppPipeline:
                 ctx=ctx,
                 filters={"source_names": list(snapshot.source_names)},
             )
-            connector_refdes = list(dict.fromkeys([
-                *_connector_refdes_from_schema(icd_schema),
-                *supported_connector_refdes(supporting_evidences),
-                *self._icd_front_view_connector_refdes(order),
-            ]))
+            connector_refdes = (
+                profile.connector_refdes
+                if profile is not None and profile.kind == "icd"
+                else list(dict.fromkeys([
+                    *_connector_refdes_from_schema(icd_schema),
+                    *supported_connector_refdes(supporting_evidences),
+                    *self._icd_front_view_connector_refdes(order),
+                ]))
+            )
             if connector_refdes:
                 circuit_evidences = (
                     self.circuit_service.list_pin_mapping_evidence(
@@ -878,6 +894,20 @@ class AppPipeline:
         except (KeyError, OSError, ValueError):
             return []
         return connector_refdes_from_front_view_template(content)
+
+    def _icd_template_profile(self, order: Any):
+        """Classify the immutable template before an ICD run uses any evidence."""
+        template_version_id = str(getattr(order, "template_version_id", "")).strip()
+        if not template_version_id:
+            return None
+        try:
+            content = self.document_generation.store.read_template_content(template_version_id)
+        except (KeyError, OSError, ValueError):
+            return None
+        return classify_icd_template(
+            content,
+            str(getattr(order, "target_format", "xlsx")),
+        )
 
     @staticmethod
     def _frozen_icd_pin_evidence(
