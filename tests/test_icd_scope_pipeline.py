@@ -10,7 +10,7 @@ from src.document_authoring.icd_scope_decision import IcdScopeDecision, IcdScope
 from src.pipelines.document_rag.schemas import RequestContext
 
 
-def _relationship_schema() -> DocumentSchema:
+def _relationship_schema(*, query_terms: list[str] | None = None) -> DocumentSchema:
     return DocumentSchema(
         document_schema_id="schema-a",
         version="1",
@@ -23,6 +23,9 @@ def _relationship_schema() -> DocumentSchema:
                 required_capabilities=["relationship_lookup"],
                 retrieval_policy_id="retrieval-pins",
                 verification_policy_id="verify-pins",
+                query_terms=(
+                    ["connector J7 pinout"] if query_terms is None else query_terms
+                ),
             )
         ],
     )
@@ -44,6 +47,21 @@ def _pin_mapping_evidence() -> Evidence:
             ],
         },
     )
+
+
+def _pin_mapping_evidence_for(refdes: str, pin_name: str, net_name: str) -> Evidence:
+    evidence = _pin_mapping_evidence()
+    return evidence.model_copy(update={
+        "id": f"circuit:board:pin_mapping:{refdes}",
+        "source_name": "board.edf",
+        "locator": {"entity_id": refdes, "entity_type": "pin_mapping"},
+        "metadata": {
+            "source_group": "circuit_design",
+            "pin_mappings": [{
+                "refdes": refdes, "pin_name": pin_name, "net_name": net_name,
+            }],
+        },
+    })
 
 
 def _pipeline() -> tuple[AppPipeline, RequestContext, Mock, SimpleNamespace]:
@@ -101,9 +119,110 @@ def test_kb_auto_run_returns_scope_review_before_harness_when_exception_exists()
     assert result["stage"] == "scope_review_required"
     assert result["exceptions"][0]["user_instruction"] == "Confirm J7 exposure"
     pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
-        "hardware", list(snapshot.source_names), ctx
+        "hardware", list(snapshot.source_names), ctx, refdes=["J7"]
     )
     service.run_internal_harness.assert_not_called()
+
+
+def test_kb_icd_scope_queries_only_explicit_connector_refdes():
+    pipeline, ctx, service, snapshot = _pipeline()
+    service._schema.return_value = _relationship_schema(query_terms=["connector J7 pinout"])
+    pipeline.circuit_service.list_pin_mapping_evidence.return_value = [
+        _pin_mapping_evidence_for("J7", "1", "CAN_H"),
+        _pin_mapping_evidence_for("U1", "1", "VDD"),
+    ]
+    service.prepare_icd_scope_review.return_value = SimpleNamespace(
+        pending_count=1,
+        exceptions=[SimpleNamespace(user_instruction="Confirm J7 exposure")],
+    )
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "scope_review_required"
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
+        "hardware", list(snapshot.source_names), ctx, refdes=["J7"],
+    )
+
+
+def test_non_icd_relationship_field_does_not_enumerate_every_edf_pin():
+    pipeline, ctx, service, _snapshot = _pipeline()
+    service._schema.return_value = DocumentSchema(
+        document_schema_id="architecture", version="1", document_type="architecture",
+        execution_mode="internal_harness",
+        fields=[DocumentFieldSchema(
+            field_id="net_relation", label="Network relationship",
+            required_capabilities=["relationship_lookup"],
+            retrieval_policy_id="retrieval-network",
+            verification_policy_id="verify-network",
+        )],
+    )
+    service.run_internal_harness.return_value = SimpleNamespace(artifact_id="candidate-1")
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="architecture",
+        document_schema_version="1",
+    )
+
+    assert result.artifact_id == "candidate-1"
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_not_called()
+    service.prepare_icd_scope_review.assert_not_called()
+
+
+def test_icd_scope_uses_direct_refdes_pin_from_fpt_when_template_has_only_pin_headers():
+    pipeline, ctx, service, snapshot = _pipeline()
+    service._schema.return_value = _relationship_schema(query_terms=[])
+    pipeline.backend.retrieve.return_value = [SimpleNamespace(
+        source_name="FPT.xlsx",
+        content="X1900-14 UBD voltage sampling",
+        metadata={"document_role": "fpt"},
+    )]
+    service.prepare_icd_scope_review.return_value = SimpleNamespace(
+        pending_count=1,
+        exceptions=[SimpleNamespace(user_instruction="Confirm X1900 exposure")],
+    )
+
+    pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
+        "hardware", list(snapshot.source_names), ctx, refdes=["X1900"],
+    )
+
+
+def test_icd_pin_template_without_connector_candidate_returns_one_scope_todo_not_a_full_edf_scan():
+    pipeline, ctx, service, _snapshot = _pipeline()
+    service._schema.return_value = _relationship_schema(query_terms=[])
+    pipeline.backend.retrieve.return_value = []
+    service.prepare_icd_scope_review.side_effect = lambda _ctx, _work_order_id, decision: SimpleNamespace(
+        pending_count=1, exceptions=decision.exceptions,
+    )
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "scope_review_required"
+    assert [issue["kind"] for issue in result["exceptions"]] == ["connector_scope_unknown"]
+    assert "模板字段的检索条件" in result["exceptions"][0]["user_instruction"]
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_not_called()
 
 
 def test_kb_relationship_retrieval_includes_the_frozen_pin_set():
@@ -193,3 +312,26 @@ def test_kb_relationship_retrieval_omits_user_excluded_scope_exception_pin():
         {"refdes": "J7", "pin_name": "1", "net_name": "CAN_H"}
     ]
     assert review.resolutions[0].action == "exclude"
+
+
+def test_frozen_icd_pin_evidence_preserves_each_mapping_edf_source():
+    pipeline, ctx, service, _snapshot = _pipeline()
+    pipeline.backend.retrieve.return_value = []
+    pipeline.circuit_service = None
+    review = SimpleNamespace(decision=SimpleNamespace(frozen_pin_mappings=[
+        {"refdes": "J7", "pin_name": "1", "net_name": "CAN_H", "source_name": "left.edf"},
+        {"refdes": "J8", "pin_name": "1", "net_name": "CAN_L", "source_name": "right.edf"},
+    ]))
+
+    retrieve = pipeline._knowledge_base_retriever(
+        ctx, "hardware", ["left.edf", "right.edf"], icd_scope_review=review,
+    )
+    outcome = retrieve(InformationRequirement(
+        requirement_id="pins", semantic_unit_id="pins", claim_type="relationship",
+        subject="connector pins", required_capabilities=["relationship_lookup"],
+    ), 0)
+
+    assert {
+        (evidence.source_name, evidence.metadata["pin_mappings"][0]["source_name"])
+        for evidence in outcome.evidences
+    } == {("left.edf", "left.edf"), ("right.edf", "right.edf")}

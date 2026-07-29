@@ -11,6 +11,11 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
+_PIN_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z]{1,12}\d+[A-Za-z0-9_.-]*)\s*-\s*([A-Za-z0-9_.]+)(?![A-Za-z0-9_])"
+)
+
+
 class IcdScopeItem(BaseModel):
     """A pin mapping safe to include without a user decision."""
 
@@ -67,7 +72,7 @@ def build_icd_scope_decision(
         if direct_sources:
             auto_items.append(IcdScopeItem(
                 **mapping,
-                source_names=direct_sources,
+                source_names=_unique([mapping.get("source_name", ""), *direct_sources]),
             ))
             continue
         exceptions.append(IcdScopeException(
@@ -77,6 +82,7 @@ def build_icd_scope_decision(
             }),
             kind="extra_pin_exposure",
             **mapping,
+            source_names=_unique([mapping.get("source_name", "")]),
             recommended_action="mark_pending",
             user_instruction="确认该脚是否需要在对外 ICD 中暴露。",
         ))
@@ -106,6 +112,38 @@ def build_icd_scope_decision(
     )
 
 
+def supported_connector_refdes(evidences: Iterable[Any]) -> list[str]:
+    """Return refdes values directly cited by classified FPT/requirements sources."""
+    return _unique(
+        match.group(1).upper()
+        for evidence in evidences
+        if _is_authoritative_support(evidence)
+        for match in _PIN_REFERENCE.finditer(str(_value(evidence, "content") or ""))
+    )
+
+
+def build_unknown_connector_scope_decision() -> IcdScopeDecision:
+    """Make one actionable stop instead of expanding an unknown scope to an EDF."""
+    exception = IcdScopeException(
+        exception_id=_stable_scope_id("exception", {"kind": "connector_scope_unknown"}),
+        kind="connector_scope_unknown",
+        recommended_action="add_connector_constraint",
+        user_instruction=(
+            "无法确定接插件范围。请在模板字段的检索条件、别名或值约束中补充"
+            "接插件位号（例如连接器/位号：X100），然后重新生成。"
+        ),
+    )
+    payload = {
+        "auto_items": [],
+        "exceptions": [exception.model_dump(mode="json")],
+        "frozen_pin_mappings": [],
+    }
+    return IcdScopeDecision(
+        decision_id=_stable_scope_id("decision", payload),
+        exceptions=[exception],
+    )
+
+
 def _pin_mappings(circuit_evidences: Iterable[Any]) -> list[dict[str, str]]:
     mappings: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -127,6 +165,7 @@ def _pin_mappings(circuit_evidences: Iterable[Any]) -> list[dict[str, str]]:
                 "refdes": refdes,
                 "pin_name": pin_name,
                 "net_name": net_name,
+                "source_name": str(_value(evidence, "source_name") or "").strip(),
             })
     return mappings
 
@@ -138,11 +177,12 @@ def _direct_sources(
         rf"(?<![A-Za-z0-9_]){re.escape(refdes)}\s*-\s*{re.escape(pin_name)}(?![A-Za-z0-9_])",
         re.IGNORECASE,
     )
-    return [
+    return _unique(
         str(_value(evidence, "source_name") or "")
         for evidence in evidences
-        if pattern.search(str(_value(evidence, "content") or ""))
-    ]
+        if _is_authoritative_support(evidence)
+        and pattern.search(str(_value(evidence, "content") or ""))
+    )
 
 
 def _has_unsupported_reservation(
@@ -162,11 +202,55 @@ def _has_unsupported_reservation(
 
 
 def _reservation_sources(evidences: Iterable[Any]) -> list[str]:
-    return [
+    return _unique(
         str(_value(evidence, "source_name") or "")
         for evidence in evidences
+        if _is_authoritative_support(evidence)
         if re.search(r"预留|裁剪", str(_value(evidence, "content") or ""))
-    ]
+    )
+
+
+def _is_authoritative_support(evidence: Any) -> bool:
+    """Accept only explicitly classified FPT/requirements evidence.
+
+    A direct pin string in a schematic, EDF, or prior ICD is corroboration at
+    most; it cannot decide the external-interface scope.  The KB retrieval
+    contract preserves source classification in metadata, so absent/unknown
+    classification deliberately falls back to the concise exception queue.
+    """
+    metadata = _value(evidence, "metadata") or {}
+    role = " ".join(
+        str(value or "")
+        for value in (
+            _value(evidence, "document_role"),
+            metadata.get("document_role"),
+            _value(evidence, "source_type"),
+            metadata.get("source_type"),
+        )
+    ).casefold()
+    filename = " ".join(
+        str(value or "")
+        for value in (
+            _value(evidence, "source_name"),
+            metadata.get("original_file_name"),
+            metadata.get("file_name"),
+        )
+    ).casefold()
+    classification = " ".join((role, filename))
+    if not classification:
+        return False
+    rejected = ("schematic", "原理图", "netlist", "edf", "edif", "icd", "design")
+    if any(term in classification for term in rejected):
+        return False
+    accepted = (
+        "fpt", "requirement", "requirements", "specification", "spec",
+        "需求", "规范", "规格", "hsi",
+    )
+    return any(term in classification for term in accepted)
+
+
+def _unique(values: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
 
 
 def effective_frozen_pin_mappings(review: Any | None) -> list[dict[str, str | None]]:

@@ -14,6 +14,7 @@ from src.document_authoring.models import (
     DocumentWorkOrder,
     HarnessPolicy,
     HarnessRun,
+    IcdScopeResolution,
     IcdScopeReview,
     KnowledgeBaseSourceSnapshot,
     ValidationReport,
@@ -29,6 +30,33 @@ from src.projects.models import (
 )
 from src.projects.service import ProjectService
 from src.projects.store import ProjectStore
+
+
+def test_scope_resolution_rejects_actions_other_than_include_or_exclude():
+    with pytest.raises(ValueError, match="include or exclude"):
+        IcdScopeResolution(
+            exception_id="exception-pgnd",
+            action="mark_pending",
+            actor_id="alice",
+        )
+
+
+def test_scope_resolution_api_rejects_unknown_action(scope_review_service):
+    service, ctx, order = scope_review_service
+    review = service.prepare_icd_scope_review(
+        ctx, order.work_order_id, decision_with_one_exception()
+    )
+
+    with pytest.raises(ValueError, match="include or exclude"):
+        service.submit_icd_scope_resolution(
+            ctx,
+            order.work_order_id,
+            resolutions=[{
+                "exception_id": review.exceptions[0].exception_id,
+                "action": "mark_pending",
+            }],
+            comment="need a real choice",
+        )
 
 
 def _work_order() -> DocumentWorkOrder:

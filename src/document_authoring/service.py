@@ -964,6 +964,13 @@ class DocumentGenerationService:
             raise ValueError("ICD scope resolution comment is required")
         if not isinstance(resolutions, list):
             raise ValueError("ICD scope resolutions must be submitted in one batch")
+        if any(
+            not isinstance(resolution, dict)
+            or str(resolution.get("action") or "").strip().casefold()
+            not in {"include", "exclude"}
+            for resolution in resolutions
+        ):
+            raise ValueError("ICD scope resolution action must be include or exclude")
         batch = [
             IcdScopeResolution(
                 exception_id=str(resolution.get("exception_id") or ""),

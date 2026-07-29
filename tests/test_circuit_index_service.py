@@ -87,6 +87,28 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertIn("1 -> CAN0", pin_mapping.content)
         self.assertNotIn("J3.2", pin_mapping.content)
 
+    def test_list_pin_mapping_evidence_limits_results_to_requested_connector_refdes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "main_board.edf")
+            with open(source, "w", encoding="utf-8") as fh:
+                fh.write("(edif main_board)")
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=lambda path, progress_callback=None: _Parser(),
+            )
+            service.index_file(
+                kb_name="kb_hw", record_id=7, file_path=source,
+                original_name="main_board.edf", department_id="dept_hw",
+            )
+
+            hits = service.list_pin_mapping_evidence(
+                "kb_hw", ["main_board.edf"],
+                RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+                refdes=["J3"],
+            )
+
+        self.assertEqual([hit.locator["entity_id"] for hit in hits], ["J3"])
+
     def test_plain_component_query_does_not_expand_pin_mapping(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "main_board.edf")

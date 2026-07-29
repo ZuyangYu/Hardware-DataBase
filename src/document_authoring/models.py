@@ -339,8 +339,12 @@ class IcdScopeResolution(BaseModel):
 
     @model_validator(mode="after")
     def require_action(self):
-        if not self.exception_id.strip() or not self.action.strip():
+        normalized_action = self.action.strip().casefold()
+        if not self.exception_id.strip() or not normalized_action:
             raise ValueError("ICD scope resolutions require an exception id and action")
+        if normalized_action not in {"include", "exclude"}:
+            raise ValueError("ICD scope resolution action must be include or exclude")
+        self.action = normalized_action
         return self
 
 

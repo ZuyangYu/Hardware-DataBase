@@ -87,35 +87,82 @@ def _render_icd_scope_review(st, pipeline, ctx, work_order_id: str) -> None:
     auto_count = len(_value(_value(review, "decision"), "auto_items", []))
     with st.expander(f"已自动确认 {auto_count} 项", expanded=False):
         st.caption("这些管脚已有直接电路与佐证来源，默认折叠以便专注异常。")
+
     exceptions = _value(review, "exceptions", [])
+    if _value(review, "status") == "frozen":
+        st.subheader("ICD 范围已冻结")
+        if not exceptions:
+            st.caption("没有需要人工处理的范围异常。")
+            return
+        resolution_by_id = {
+            _value(resolution, "exception_id"): _value(resolution, "action")
+            for resolution in _value(review, "resolutions", [])
+        }
+        st.caption("已应用的处理结果：")
+        for exception in exceptions:
+            pin = "-".join(part for part in (
+                _value(exception, "refdes"), _value(exception, "pin_name"),
+            ) if part) or "未关联具体管脚"
+            st.caption(
+                f"{pin}：{resolution_by_id.get(_value(exception, 'exception_id'), '已记录')}"
+            )
+        return
     if not exceptions:
         return
+    if any(_value(exception, "kind") == "connector_scope_unknown" for exception in exceptions):
+        st.subheader("ICD 范围需要补充检索条件")
+        st.caption("请补充模板检索条件/Pin Definition 位号后重新生成。")
+        return
+
     st.subheader("ICD 范围异常待办")
     resolutions = []
     for exception in exceptions:
         exception_id = _value(exception, "exception_id")
-        pin = "-".join(part for part in (_value(exception, "refdes"), _value(exception, "pin_name")) if part) or "未关联具体管脚"
-        for label, detail in (
-            ("发现的问题", f"{_value(exception, 'kind')}：{pin}（{_value(exception, 'net_name') or 'NC'}）"),
-            ("关联管脚", pin),
-            ("系统建议", _value(exception, "recommended_action")),
-            ("你需要做什么", _value(exception, "user_instruction")),
-        ):
-            st.write(label)
-            st.caption(detail)
-        resolutions.append({
-            "exception_id": exception_id,
-            "action": st.selectbox("处理结果", [_value(exception, "recommended_action"), "include", "exclude"], key=f"icd-scope-action-{work_order_id}-{exception_id}"),
-        })
+        pin = "-".join(part for part in (
+            _value(exception, "refdes"), _value(exception, "pin_name"),
+        ) if part) or "未关联具体管脚"
+        st.write("发现的问题")
+        st.caption(f"{_value(exception, 'kind')}：{pin}（{_value(exception, 'net_name') or 'NC'}）")
+        st.write("关联管脚")
+        st.caption(pin)
+        st.write("系统建议")
+        st.caption(_value(exception, "recommended_action"))
+        st.write("你需要做什么")
+        st.caption(_value(exception, "user_instruction"))
+        action_label = st.selectbox(
+            "处理结果（必选）",
+            ["请选择…", "纳入", "不纳入"],
+            key=f"icd-scope-action-{work_order_id}-{exception_id}",
+        )
+        action = {"纳入": "include", "不纳入": "exclude"}.get(action_label, "")
+        resolutions.append({"exception_id": exception_id, "action": action})
+
     comment = st.text_input("处理说明", key=f"icd-scope-comment-{work_order_id}")
-    if st.button("应用处理结果并继续生成", type="primary", key=f"submit-icd-scope-{work_order_id}"):
-        try:
-            pipeline.submit_icd_scope_resolution(ctx, work_order_id, resolutions=resolutions, comment=comment)
-        except (PermissionError, ValueError, KeyError) as exc:
-            st.error(f"应用 ICD 范围处理结果失败：{exc}")
-        else:
-            st.success("ICD 范围已冻结；可以继续生成候选文档。")
-            st.button("继续生成候选文档", key=f"continue-icd-candidate-{work_order_id}")
+    if not st.button("应用处理结果并继续生成", type="primary", key=f"submit-icd-scope-{work_order_id}"):
+        return
+    if any(item["action"] not in {"include", "exclude"} for item in resolutions):
+        st.error("请为每个范围异常明确选择“纳入”或“不纳入”，再继续生成。")
+        return
+    try:
+        pipeline.submit_icd_scope_resolution(
+            ctx,
+            work_order_id,
+            resolutions=resolutions,
+            comment=comment,
+        )
+    except (PermissionError, ValueError, KeyError) as exc:
+        st.error(f"应用 ICD 范围处理结果失败：{exc}")
+        return
+    try:
+        candidate = pipeline.continue_knowledge_base_document_generation(ctx, work_order_id)
+    except (PermissionError, ValueError, KeyError) as exc:
+        st.error(f"ICD 范围已冻结，但继续生成候选文档失败：{exc}")
+        return
+    artifact_id = _value(candidate, "artifact_id")
+    st.success(
+        "ICD 范围已冻结，并已继续生成候选文档"
+        + (f"：{artifact_id}" if artifact_id else "。")
+    )
 
 
 def render_document_generation_page(st, pipeline, ctx) -> None:
@@ -225,6 +272,39 @@ def _render_work_order_creation(st, pipeline, ctx) -> None:
             return
         schema_key = st.selectbox("Document Schema", list(compatible_schemas))
     schema = compatible_schemas[schema_key]
+    if st.button("自动生成候选文档", type="primary", key="auto-generate-document-submit"):
+        status = st.status("正在自动生成文档…", expanded=True)
+        try:
+            status.update(label="正在创建工作单并冻结来源…", state="running")
+            result = pipeline.auto_generate_knowledge_base_document(
+                ctx,
+                knowledge_base_name=knowledge_base_name,
+                template_version_id=template_id,
+                document_schema_id=_value(schema, "document_schema_id"),
+                document_schema_version=_value(schema, "version"),
+                idempotency_key=f"streamlit-kb-auto-{uuid.uuid4().hex}",
+            )
+        except (PermissionError, ValueError, KeyError) as exc:
+            status.update(label="自动生成失败", state="error")
+            st.error(f"自动生成失败：{exc}")
+        except Exception as exc:
+            status.update(label="自动生成失败", state="error")
+            st.error(f"自动生成失败：{exc}")
+        else:
+            result_stage = _value(result, "stage")
+            if result_stage == "scope_review_required":
+                work_order_id = _value(result, "work_order_id")
+                status.update(label="已创建工作单，等待 ICD 范围处理", state="complete")
+                st.success(
+                    f"已创建工作单：{work_order_id}；需处理少量 ICD 范围异常。"
+                    "请在下方“任务与下载”中选择该工作单，完成一次批量处理后系统会继续生成。"
+                )
+            else:
+                status.update(label="已生成候选文件，等待人工审核", state="complete")
+                st.success(
+                    f"已生成候选文件：{_value(result, 'artifact_id')}；"
+                    "请先加载预览，必要时提交反馈，再显式批准发布。"
+                )
     if st.button("创建生成任务", type="primary", key="create-document-work-order"):
         try:
             order = pipeline.create_knowledge_base_document_work_order(

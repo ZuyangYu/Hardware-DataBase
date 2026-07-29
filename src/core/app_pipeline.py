@@ -1,5 +1,6 @@
 # src/core/app_pipeline.py
 import os
+import re
 import shutil
 import tempfile
 import traceback
@@ -21,7 +22,9 @@ from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
 from src.document_authoring.icd_scope_decision import (
     build_icd_scope_decision,
+    build_unknown_connector_scope_decision,
     effective_frozen_pin_mappings,
+    supported_connector_refdes,
 )
 from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.retriever_registry import (
@@ -32,6 +35,19 @@ from src.document_authoring.retriever_registry import (
 )
 from src.services.document_manager import DocumentManager
 from src.services.kb_scope import kb_scope_from_context
+
+
+_ICD_PIN_TERMS = (
+    "pin", "pinout", "pin definition", "connector", "接插件", "连接器",
+    "引脚", "管脚", "针脚",
+)
+_PIN_FIELD_TERMS = ("pin", "pinout", "pin definition", "引脚", "管脚", "针脚")
+_EXPLICIT_REFDES = re.compile(
+    r"(?:connector|refdes|reference\s+designator|接插件|连接器|位号)\s*[:#]?\s*"
+    r"([a-z]{1,12}\d+[a-z0-9_.-]*)",
+    re.IGNORECASE,
+)
+_COMMON_CONNECTOR_REFDES = re.compile(r"\b(?:x|j|p|cn|con)\d+[a-z0-9_.-]*\b", re.IGNORECASE)
 
 
 def _is_file_like(obj) -> bool:
@@ -56,6 +72,52 @@ def _materialize_to_temp(file_obj) -> str:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
     return temp_path
+
+
+def _connector_refdes_from_schema(schema: Any) -> list[str]:
+    """Extract explicitly declared connector designators from ICD pin fields."""
+    candidates: list[str] = []
+    for field in getattr(schema, "fields", []) or []:
+        values = [
+            getattr(field, "label", ""),
+            getattr(field, "description", ""),
+            *(getattr(field, "query_terms", []) or []),
+            *(getattr(field, "subject_aliases", []) or []),
+            *_string_values(getattr(field, "value_schema", {}) or {}),
+        ]
+        field_text = " ".join(str(value) for value in values if str(value).strip())
+        normalized = field_text.casefold()
+        if not any(term in normalized for term in _ICD_PIN_TERMS):
+            continue
+        candidates.extend(match.group(1) for match in _EXPLICIT_REFDES.finditer(field_text))
+        candidates.extend(match.group(0) for match in _COMMON_CONNECTOR_REFDES.finditer(field_text))
+    return list(dict.fromkeys(value.upper() for value in candidates if value.strip()))
+
+
+def _schema_has_icd_pin_field(schema: Any) -> bool:
+    for field in getattr(schema, "fields", []) or []:
+        text = " ".join(
+            str(value)
+            for value in (
+                getattr(field, "label", ""),
+                getattr(field, "description", ""),
+                *(getattr(field, "query_terms", []) or []),
+            )
+            if str(value).strip()
+        ).casefold()
+        if any(term in text for term in _PIN_FIELD_TERMS):
+            return True
+    return False
+
+
+def _string_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [item for child in value.values() for item in _string_values(child)]
+    if isinstance(value, (list, tuple, set)):
+        return [item for child in value for item in _string_values(child)]
+    return []
 
 
 class AppPipeline:
@@ -517,16 +579,8 @@ class AppPipeline:
         )
         snapshot = self.document_generation.resolve_source_snapshot(order)
         scope_review = None
-        if self._schema_has_relationship_lookup(order):
-            circuit_evidences = (
-                self.circuit_service.list_pin_mapping_evidence(
-                    knowledge_base_name,
-                    list(snapshot.source_names),
-                    ctx,
-                )
-                if getattr(self, "circuit_service", None) is not None
-                else []
-            )
+        icd_schema = self._icd_connector_scope_schema(order)
+        if icd_schema is not None:
             supporting_evidences = self.backend.retrieve(
                 knowledge_base_name,
                 "ICD connector pin mapping",
@@ -534,10 +588,27 @@ class AppPipeline:
                 ctx=ctx,
                 filters={"source_names": list(snapshot.source_names)},
             )
-            decision = build_icd_scope_decision(
-                circuit_evidences,
-                supporting_evidences,
-            )
+            connector_refdes = list(dict.fromkeys([
+                *_connector_refdes_from_schema(icd_schema),
+                *supported_connector_refdes(supporting_evidences),
+            ]))
+            if connector_refdes:
+                circuit_evidences = (
+                    self.circuit_service.list_pin_mapping_evidence(
+                        knowledge_base_name,
+                        list(snapshot.source_names),
+                        ctx,
+                        refdes=connector_refdes,
+                    )
+                    if getattr(self, "circuit_service", None) is not None
+                    else []
+                )
+                decision = build_icd_scope_decision(
+                    circuit_evidences,
+                    supporting_evidences,
+                )
+            else:
+                decision = build_unknown_connector_scope_decision()
             scope_review = self.document_generation.prepare_icd_scope_review(
                 ctx,
                 order.work_order_id,
@@ -571,6 +642,35 @@ class AppPipeline:
             retrieve=retrieve,
         )
         return candidate
+
+    def continue_knowledge_base_document_generation(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+    ):
+        """Run an existing KB work order after its frozen ICD scope is resolved."""
+        order = self.document_generation.store.get_work_order(work_order_id)
+        if order is None:
+            raise ValueError("document work order was not found")
+        self.document_generation.require_work_order_capability(
+            ctx, order, "view_project",
+        )
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("work order is not a knowledge-base document generation")
+        snapshot = self.document_generation.resolve_source_snapshot(order)
+        scope_review = self.document_generation.get_icd_scope_review(ctx, work_order_id)
+        retrieve = self._knowledge_base_retriever(
+            ctx,
+            order.knowledge_base_name,
+            list(snapshot.source_names),
+            source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            icd_scope_review=scope_review,
+        )
+        return self.document_generation.run_internal_harness(
+            ctx,
+            work_order_id,
+            retrieve=retrieve,
+        )
 
     def auto_generate_document(self, ctx: RequestContext, **kwargs):
         """Run a document using the frozen project source snapshot and return a candidate."""
@@ -746,6 +846,25 @@ class AppPipeline:
             for field in schema.fields
         )
 
+    def _icd_connector_scope_schema(self, order: Any) -> Any | None:
+        """Return explicit connector candidates for an ICD pin table only.
+
+        A generic relationship field may need circuit evidence, but it must
+        never turn every component in an EDF into an ICD review item.  The
+        authoring schema is the stable, project-independent place to declare
+        connector/refdes constraints (labels, aliases, query terms or value
+        schema).  Without one, normal retrieval remains available and no
+        unbounded pin scan is attempted.
+        """
+        schema_id = getattr(order, "document_schema_id", "")
+        schema_version = getattr(order, "document_schema_version", "")
+        if not schema_id or not schema_version:
+            return None
+        schema = self.document_generation._schema(schema_id, schema_version)
+        if str(getattr(schema, "document_type", "")).casefold() != "icd":
+            return None
+        return schema if _schema_has_icd_pin_field(schema) else None
+
     @staticmethod
     def _frozen_icd_pin_evidence(
         kb_name: str,
@@ -755,41 +874,56 @@ class AppPipeline:
         mappings = effective_frozen_pin_mappings(review)
         if not mappings or not source_names:
             return []
-        normalized_mappings = [
-            {
-                "refdes": str(mapping.get("refdes") or "").strip(),
-                "pin_name": str(mapping.get("pin_name") or "").strip(),
+        normalized_mappings = []
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                continue
+            refdes = str(mapping.get("refdes") or "").strip()
+            pin_name = str(mapping.get("pin_name") or "").strip()
+            if not (refdes and pin_name):
+                continue
+            normalized = {
+                "refdes": refdes,
+                "pin_name": pin_name,
                 "net_name": str(mapping.get("net_name") or "").strip() or "NC",
             }
-            for mapping in mappings
-            if isinstance(mapping, dict)
-            and str(mapping.get("refdes") or "").strip()
-            and str(mapping.get("pin_name") or "").strip()
-        ]
+            source_name = str(mapping.get("source_name") or "").strip()
+            if source_name:
+                normalized["source_name"] = source_name
+            normalized_mappings.append(normalized)
         if not normalized_mappings:
             return []
-        source_name = source_names[0]
-        pin_text = "; ".join(
-            f"{mapping['refdes']}-{mapping['pin_name']} -> {mapping['net_name']}"
-            for mapping in normalized_mappings
-        )
-        return [Evidence(
-            id="frozen-icd-pin-set:" + "|".join(
-                f"{mapping['refdes']}:{mapping['pin_name']}"
-                for mapping in normalized_mappings
-            ),
-            content=f"Frozen ICD pin mappings: {pin_text}.",
-            source_name=source_name,
-            content_kind="circuit_design",
-            processor_kind="icd_scope_review",
-            score=1.0,
-            metadata={
-                "kb_name": kb_name,
-                "source_group": "circuit_design",
-                "pin_mappings": normalized_mappings,
-                "frozen_icd_scope": True,
-            },
-        )]
+        grouped: dict[str, list[dict[str, str]]] = {}
+        fallback_source_name = source_names[0]
+        for mapping in normalized_mappings:
+            source_name = mapping.get("source_name") or fallback_source_name
+            if source_name not in source_names:
+                continue
+            grouped.setdefault(source_name, []).append(mapping)
+        frozen: list[Evidence] = []
+        for source_name, mappings_for_source in grouped.items():
+            pin_text = "; ".join(
+                f"{mapping['refdes']}-{mapping['pin_name']} -> {mapping['net_name']}"
+                for mapping in mappings_for_source
+            )
+            frozen.append(Evidence(
+                id="frozen-icd-pin-set:" + source_name + ":" + "|".join(
+                    f"{mapping['refdes']}:{mapping['pin_name']}"
+                    for mapping in mappings_for_source
+                ),
+                content=f"Frozen ICD pin mappings: {pin_text}.",
+                source_name=source_name,
+                content_kind="circuit_design",
+                processor_kind="icd_scope_review",
+                score=1.0,
+                metadata={
+                    "kb_name": kb_name,
+                    "source_group": "circuit_design",
+                    "pin_mappings": mappings_for_source,
+                    "frozen_icd_scope": True,
+                },
+            ))
+        return frozen
 
     def _project_retriever(self, ctx: RequestContext, project_id: str, snapshot_id: str):
         tenant_id = ctx.tenant_id or "default"

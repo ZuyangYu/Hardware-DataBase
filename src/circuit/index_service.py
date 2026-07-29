@@ -152,8 +152,10 @@ class CircuitIndexService:
         kb_name: str,
         source_names: list[str],
         ctx: RequestContext | None,
+        *,
+        refdes: list[str] | None = None,
     ) -> list[Evidence]:
-        """Enumerate every pin mapping from the frozen, authorized EDF sources."""
+        """Enumerate selected pin mappings from frozen, authorized EDF sources."""
         frozen_source_names = {
             str(source_name).strip()
             for source_name in source_names
@@ -161,6 +163,11 @@ class CircuitIndexService:
         }
         if not frozen_source_names:
             return []
+        requested_refdes = {
+            str(value).strip().casefold()
+            for value in (refdes or [])
+            if str(value).strip()
+        }
         department_id = _ctx_department_id(ctx)
         evidences: list[Evidence] = []
         for design in self.store.list_designs(kb_name):
@@ -176,6 +183,8 @@ class CircuitIndexService:
             evidence_metadata = {**metadata, "kb_name": design.kb_name}
             for instance in design.instances:
                 if not instance.refdes or not instance.pins:
+                    continue
+                if requested_refdes and instance.refdes.casefold() not in requested_refdes:
                     continue
                 evidences.append(self.evidence_mapper.build(
                     kind="pin_mapping",
