@@ -49,18 +49,18 @@ function PrimaryNavButton({
   tooltip?: string;
 }) {
   return (
-    <SidebarMenuItem className={cn('relative', collapsed ? 'mx-auto flex w-[46px] justify-center' : 'w-full')}>
+    <SidebarMenuItem className={cn('relative', collapsed ? 'flex w-full justify-center' : 'w-full')}>
       {active && !collapsed && (
         <span
           className={cn(
-            'absolute top-1/2 left-[0px] h-[22px] w-[3px] -translate-y-1/2 rounded-full bg-[#18181a]',
+            'absolute top-1/2 left-[0px] h-[24px] w-[3px] -translate-y-1/2 rounded-full bg-[#18181a]',
           )}
         />
       )}
       {active && collapsed && (
         <span
           className={cn(
-            'pointer-events-none absolute left-[-3px] top-1/2 h-[22px] w-[3px] -translate-y-1/2 rounded-full bg-[#18181a]',
+            'pointer-events-none absolute left-[6px] top-1/2 h-[22px] w-[3px] -translate-y-1/2 rounded-full bg-[#18181a]',
           )}
         />
       )}
@@ -73,7 +73,7 @@ function PrimaryNavButton({
           'text-[14px] text-sidebar-foreground',
           collapsed
             ? 'mx-auto flex h-[46px]! w-[46px]! flex-none items-center justify-center rounded-[13px]! p-0!'
-            : 'h-[42px] gap-[10px] rounded-[10px] px-[14px] py-[8px]',
+            : 'h-[46px] gap-[12px] rounded-[14px] px-[16px] py-[10px]',
           'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
           active && 'bg-[#eceff4] text-[#18181a] shadow-[inset_0_0_0_1px_#e1e5ee]',
           'data-active:bg-[#eceff4] data-active:text-[#18181a] data-active:font-semibold',

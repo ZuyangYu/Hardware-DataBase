@@ -54,17 +54,9 @@ class HardwareWorker:
 
     def run_forever(self) -> None:
         log("Hardware DataBase worker started")
-        consecutive_errors = 0
         while self.running:
-            try:
-                if not self.run_once():
-                    time.sleep(max(0.1, config.settings.WORKER_POLL_INTERVAL_SECONDS))
-                consecutive_errors = 0
-            except Exception as exc:
-                consecutive_errors += 1
-                backoff = min(300, max(0.5, config.settings.WORKER_POLL_INTERVAL_SECONDS) * (2 ** min(consecutive_errors - 1, 5)))
-                error(f"Worker iteration failed (consecutive={consecutive_errors}, backoff={backoff:.1f}s): {exc}")
-                time.sleep(backoff)
+            if not self.run_once():
+                time.sleep(max(0.1, config.settings.WORKER_POLL_INTERVAL_SECONDS))
         log("Hardware DataBase worker stopped")
 
 

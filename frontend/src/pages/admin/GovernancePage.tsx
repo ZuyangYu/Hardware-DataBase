@@ -184,7 +184,7 @@ export default function GovernancePage({ auth, onLogout }: Props) {
         onLogout={onLogout}
       />
 
-      <div className="page-toolbar page-toolbar-end mt-[20px] mb-[16px]">
+      <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-end gap-[12px]">
         <Button variant="outline" className={OUTLINE_ACTION_BUTTON_CLASS} onClick={() => load()}>
           <AppIcon name="refresh" size={14} />
           刷新

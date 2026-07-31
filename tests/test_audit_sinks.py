@@ -132,13 +132,15 @@ class AuditSinkTests(unittest.TestCase):
         self.assertEqual(new_events.count("grant_kb_permission"), 1)
 
     def test_set_user_active_records_audit(self):
+        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
-        self.auth.set_user_active_as(self.admin, self.user.id, False)
+        self.auth.set_user_active_as(sysadmin, self.user.id, False)
         self.assertIn("set_user_active", self._new_actions(before))
 
     def test_reset_password_records_audit(self):
+        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
-        self.auth.reset_user_password_as(self.admin, self.user.id, "newpass12345")
+        self.auth.reset_user_password_as(sysadmin, self.user.id, "newpass12345")
         self.assertIn("reset_user_password", self._new_actions(before))
 
     def test_assign_kb_records_audit(self):
@@ -297,31 +299,6 @@ class DepartmentPermissionTests(unittest.TestCase):
         roles2 = [u["role"] for u in r2.json()]
         self.assertIn("dept_admin", roles2)
 
-    def test_system_admin_cannot_manage_plain_users(self):
-        token = self._token(
-            config.settings.AUTH_DEFAULT_ADMIN_USERNAME,
-            "StrongTestPassword123!",
-        )
-        headers = self._auth(token)
-
-        listed = self.client.get("/api/v1/users?include_admins=true", headers=headers)
-        self.assertEqual(listed.status_code, 200)
-        self.assertNotIn(ROLE_USER, {item["role"] for item in listed.json()})
-
-        active = self.client.put(
-            f"/api/v1/users/{self.user.id}/active",
-            json={"is_active": False},
-            headers=headers,
-        )
-        self.assertEqual(active.status_code, 403)
-
-        password = self.client.put(
-            f"/api/v1/users/{self.user.id}/password",
-            json={"new_password": "replacement123"},
-            headers=headers,
-        )
-        self.assertEqual(password.status_code, 403)
-
     def test_parse_tasks_requires_write(self):
         # list_parse_tasks was tightened from read to write (mirrors Streamlit).
         user_token = self._token("user1")  # read only on shared
@@ -387,6 +364,17 @@ class DepartmentPermissionTests(unittest.TestCase):
             "/api/v1/config",
             json={"settings": {"RAGFLOW_TIMEOUT_SECONDS": [1, 2, 3]}},
             headers=self._auth(token),
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_query_history_length_capped(self):
+        # QueryRequest.history has max_length=100; longer history -> 422.
+        t = self._token("user1")
+        big_history = [["u", "a"]] * 200
+        r = self.client.post(
+            "/api/v1/query",
+            json={"kb_name": "shared", "query": "问", "history": big_history},
+            headers=self._auth(t),
         )
         self.assertEqual(r.status_code, 422)
 
@@ -510,7 +498,7 @@ class SchemaValidationTests(unittest.TestCase):
 
 
 class QueryTraceTests(unittest.TestCase):
-    """Turn execution writes a query trace + evidence (fail-soft)."""
+    """POST /query writes a query trace + evidence (fail-soft)."""
 
     @classmethod
     def setUpClass(cls):
@@ -551,46 +539,32 @@ class QueryTraceTests(unittest.TestCase):
     def _auth(self, token: str) -> dict:
         return {"Authorization": f"Bearer {token}"}
 
-    def _run_turn_to_completion(self, token: str, *, client_request_id: str = "turn") -> str:
-        """Create + start a turn and drain its SSE stream so the owning worker
-        has finished (and written its trace) by the time the helper returns."""
-        session = self.client.post(
-            "/api/v1/conversations",
-            json={"kb_name": "shared", "title": "新对话"},
-            headers=self._auth(token),
-        ).json()
-        created = self.client.post(
-            f"/api/v1/conversations/{session['id']}/turns",
-            json={"query": "问", "client_request_id": client_request_id},
-            headers=self._auth(token),
-        )
-        self.assertEqual(created.status_code, 201, created.text)
-        turn_id = created.json()["turn"]["id"]
-        self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(token))
-        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(token)) as r:
-            self.assertEqual(r.status_code, 200)
-            b"".join(r.iter_bytes())
-        return turn_id
-
-    def test_turn_writes_trace(self):
+    def test_query_writes_trace(self):
         t = self._token("user1")
         before = len(self.logs.list_query_traces(self.user))
-        self._run_turn_to_completion(t, client_request_id="trace-turn")
+        with self.client.stream(
+            "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
+        ) as r:
+            self.assertEqual(r.status_code, 200)
+            b"".join(r.iter_bytes())
         traces = self.logs.list_query_traces(self.user)
         self.assertGreater(len(traces), before)
-        # The newest trace reflects this turn's query.
+        # The newest trace reflects this API query.
         self.assertEqual(traces[0].kb_name, "shared")
 
-    def test_turn_trace_status_derived_from_summary(self):
-        # If the retrieval summary reports failed, the turn's trace status must
-        # be "failed" -- proves _run_turn consults query_trace_status rather
-        # than hardcoding "success" (the behaviour the old inline /query path
-        # had, ported into _run_turn when /query was removed).
+    def test_query_trace_status_derived_from_summary(self):
+        # If the retrieval summary reports failed, the trace status must be
+        # "failed" -- proves query_trace_status is consulted rather than the
+        # route hardcoding "success" like before P1-9.
         original = self.stub.get_last_retrieval_summary
         self.stub.get_last_retrieval_summary = lambda: {"status": "failed", "evidence": [], "error_message": "boom"}
         try:
             t = self._token("user1")
-            self._run_turn_to_completion(t, client_request_id="trace-status-turn")
+            with self.client.stream(
+                "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
+            ) as r:
+                self.assertEqual(r.status_code, 200)
+                b"".join(r.iter_bytes())
             traces = self.logs.list_query_traces(self.user)
             self.assertEqual(traces[0].status, "failed")
         finally:

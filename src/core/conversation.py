@@ -156,10 +156,6 @@ class ConversationService:
                 ON chat_turns(session_id, status, created_at)
             """)
             conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chat_turns_session_user_message
-                ON chat_turns(session_id, user_message_id)
-            """)
-            conn.execute("""
                 CREATE TABLE IF NOT EXISTS chat_turn_events (
                     turn_id TEXT NOT NULL,
                     seq INTEGER NOT NULL,
@@ -663,19 +659,16 @@ class ConversationService:
                 if row is None:
                     raise KeyError("turn not found")
                 conn.execute("UPDATE chat_messages SET content = ? WHERE id = ?", (answer, row["assistant_message_id"]))
-                cursor = conn.execute(
+                conn.execute(
                     """
                     UPDATE chat_turns
                     SET status = 'completed', answer = ?, summary_json = ?, footer = ?, metrics_json = ?, finished_at = ?,
                         worker_id = '', worker_heartbeat_at = NULL
-                    WHERE id = ? AND status = 'streaming'
+                    WHERE id = ?
                     """,
                     (answer, json.dumps(summary, ensure_ascii=False, default=str), footer,
                      json.dumps(metrics or {}, ensure_ascii=False, default=str), now, turn_id),
                 )
-                if cursor.rowcount == 0:
-                    conn.execute("COMMIT")
-                    return None
                 conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (now, row["session_id"]))
                 completed = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
                 conn.execute("COMMIT")
@@ -705,8 +698,7 @@ class ConversationService:
                 """
                 UPDATE chat_turns SET status = ?, error_message = ?, finished_at = ?,
                     worker_id = '', worker_heartbeat_at = NULL
-                WHERE id = ? AND status IN ('streaming', 'cancelling')
-                  AND session_id IN (
+                WHERE id = ? AND session_id IN (
                     SELECT id FROM chat_sessions
                     WHERE user_id = ?
                 )

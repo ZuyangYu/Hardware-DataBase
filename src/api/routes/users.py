@@ -1,8 +1,8 @@
 """User management endpoints (system_admin / dept_admin).
 
 Scoping is enforced by :class:`AuthService` methods, which read the caller's
-role and department off ``actor``. `system_admin` manages administrator
-accounts; `dept_admin` is confined to plain users in its own department.
+role and department off ``actor``. `system_admin` sees all users;
+`dept_admin` is confined to plain users in its own department.
 """
 from __future__ import annotations
 
@@ -39,11 +39,11 @@ def list_users(
     actor: AuthUser = Depends(require_any_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """List manageable users for the current administrator.
+    """List users. system_admin sees all; dept_admin sees own department only.
 
-    A system administrator sees only system and department administrators.
-    By default a department administrator sees only plain users in their own
-    department; ``include_admins=true`` also includes their own admin row.
+    By default dept_admin sees only plain users (``ROLE_USER``), matching the
+    Streamlit department-management view. Pass ``include_admins=true`` to also
+    return dept_admin/system_admin rows in scope (e.g. for an admin picker).
     """
     users = auth.list_users_as(actor)
     if actor.role == ROLE_DEPT_ADMIN and not include_admins:
@@ -75,7 +75,7 @@ def set_user_active(
     actor: AuthUser = Depends(require_any_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """Enable or disable a manageable account. Cannot target self."""
+    """Enable or disable a user account. Cannot target self."""
     auth.set_user_active_as(actor, user_id, body.is_active)
     return OkResponse(ok=True, message="user active state updated")
 
@@ -87,6 +87,6 @@ def reset_user_password(
     actor: AuthUser = Depends(require_any_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """Reset a manageable account's password. Cannot target self."""
+    """Reset a user's password. Cannot target self."""
     auth.reset_user_password_as(actor, user_id, body.new_password)
     return OkResponse(ok=True, message="password reset")

@@ -84,14 +84,17 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             del auth
             gc.collect()
 
-    def test_system_is_not_a_department(self):
+    def test_assign_kb_rejects_system_department(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)
             system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
-            self.assertIsNone(system_admin.department_id)
-            self.assertNotIn("system", {dept.name for dept in auth.list_departments()})
+            system_dept = next(dept for dept in auth.list_departments() if dept.name == "system")
+            dept_a = auth.create_department("dept_a")
+            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
+            auth.register_knowledge_base("shared", owner=admin_a)
+
             with self.assertRaises(ValueError):
-                auth.create_department_as(system_admin, "system")
+                auth.assign_knowledge_base_as(system_admin, "shared", system_dept.id)
 
             del auth
             gc.collect()
@@ -212,8 +215,6 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(rows, [(2, 2, "read"), (3, 3, "write")])
-            self.assertNotIn("system", {dept.name for dept in auth.list_departments()})
-            self.assertIsNone(auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME).department_id)
 
             del auth
             gc.collect()
@@ -233,15 +234,6 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 auth.list_users_as(user_a)
             self.assertEqual({user.username for user in auth.list_users_as(admin_a)}, {"admin_a", "user_a"})
-            self.assertEqual(
-                {user.username for user in auth.list_users_as(system_admin)},
-                {config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "admin_a", "admin_b"},
-            )
-
-            with self.assertRaises(PermissionError):
-                auth.set_user_active_as(system_admin, user_a.id, False)
-            with self.assertRaises(PermissionError):
-                auth.reset_user_password_as(system_admin, user_a.id, "newpassword123")
 
             auth.set_user_active_as(admin_a, user_a.id, False)
             self.assertFalse(auth.get_user_by_username("user_a").is_active)

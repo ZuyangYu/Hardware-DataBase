@@ -21,6 +21,9 @@ import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 
+/** system 部门受保护,不可删(后端也会拒)。 */
+const PROTECTED_DEPARTMENT_NAMES = new Set(['system', '系统']);
+
 type Props = {
   auth: AuthSession;
   onLogout: () => void;
@@ -93,12 +96,14 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
         width: 120,
         align: 'right',
         render: (d) => {
+          const protectedDept = PROTECTED_DEPARTMENT_NAMES.has(d.name);
           return (
             <button
               type="button"
+              disabled={protectedDept}
               onClick={() => setDeleteTarget(d)}
-              className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7]"
-              title="删除部门"
+              className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7] disabled:cursor-not-allowed disabled:text-[#b3b8c4] disabled:hover:border-[#e3e7f1] disabled:hover:bg-white"
+              title={protectedDept ? '系统部门不可删除' : '删除部门'}
             >
               <AppIcon name="trash" size={13} />
               删除
@@ -119,7 +124,7 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
         onLogout={onLogout}
       />
 
-      <div className="page-toolbar page-toolbar-end mt-[20px] mb-[16px]">
+      <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-end gap-[12px]">
         <Button variant="outline" className={OUTLINE_ACTION_BUTTON_CLASS} onClick={() => load()}>
           <AppIcon name="refresh" size={14} />
           刷新

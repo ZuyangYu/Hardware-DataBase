@@ -1,9 +1,6 @@
 import asyncio
 import time
 import unittest
-from unittest.mock import patch
-
-import requests
 
 from src.agents.graph import retrieve_evidence
 from src.core.cancellation import QueryCancelled
@@ -29,35 +26,6 @@ class _SlowAsyncClient:
 
 
 class CancellableRAGFlowRetrievalTests(unittest.TestCase):
-    def test_retrieval_retries_transient_failures_and_reuses_session(self):
-        class _Response:
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {"data": {"chunks": [{"id": "chunk-1"}]}}
-
-        class _Session:
-            def __init__(self):
-                self.calls = 0
-
-            def request(self, *_args, **_kwargs):
-                self.calls += 1
-                if self.calls < 3:
-                    raise requests.ConnectionError("temporary outage")
-                return _Response()
-
-        client = RAGFlowClient(base_url="http://ragflow.test", api_key="test-key", timeout=1)
-        session = _Session()
-        client._session = session
-
-        with patch("src.pipelines.document_rag.ragflow_backend.time.sleep"):
-            chunks = client.retrieve("find regulator", dataset_ids=["dataset-1"], top_k=5)
-
-        self.assertEqual(chunks, [{"id": "chunk-1"}])
-        self.assertEqual(session.calls, 3)
-        self.assertIs(client._session, session)
-
     def test_client_cancels_slow_http_request_promptly(self):
         slow_client = _SlowAsyncClient()
         client = RAGFlowClient(

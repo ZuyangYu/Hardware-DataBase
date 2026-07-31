@@ -263,8 +263,8 @@ export default function ConfigPage({ auth, onLogout }: Props) {
         onLogout={onLogout}
       />
 
-      <div className="page-toolbar page-toolbar-between mt-[20px] mb-[16px]">
-        <div className="page-toolbar-group">
+      <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-between gap-[12px]">
+        <div className="flex items-center gap-[8px]">
           <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')} onClick={probeRagflow} disabled={probing === 'ragflow'}>
             <AppIcon name="refresh" size={13} />
             探测 RAGFlow
@@ -274,7 +274,7 @@ export default function ConfigPage({ auth, onLogout }: Props) {
             探测 LLM
           </Button>
         </div>
-        <div className="page-toolbar-group">
+        <div className="flex items-center gap-[8px]">
           <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')} onClick={() => load()}>
             重置
           </Button>

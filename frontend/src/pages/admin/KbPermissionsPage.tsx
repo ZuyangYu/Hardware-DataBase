@@ -110,7 +110,7 @@ export default function KbPermissionsPage({ auth, onLogout }: Props) {
   // 加载部门 + 用户(授予下拉用)
   useEffect(() => {
     api.get<DepartmentView[]>('/api/v1/departments').then(setDepartments).catch(() => undefined);
-    // dept_admin 看本部门 user;sysadmin 只取管理员(用于 owner 选择)
+    // dept_admin 看本部门 user;sysadmin 看全部(用于 owner 选择)
     api
       .get<UserView[]>(`/api/v1/users?include_admins=${sysAdmin ? 'true' : 'false'}`)
       .then(setUsers)
@@ -165,7 +165,10 @@ export default function KbPermissionsPage({ auth, onLogout }: Props) {
       ),
     [assignDeptId, users],
   );
-  const businessDepartments = departments;
+  const businessDepartments = useMemo(
+    () => departments.filter((department) => department.name !== 'system'),
+    [departments],
+  );
 
   useEffect(() => {
     setAssignOwnerId('none');
@@ -316,9 +319,9 @@ export default function KbPermissionsPage({ auth, onLogout }: Props) {
         onLogout={onLogout}
       />
 
-      <div className="page-toolbar mt-[20px] mb-[16px]">
+      <div className="mt-[20px] mb-[16px] flex flex-wrap items-center gap-[12px]">
         <Select value={selectedKbKey} onValueChange={setSelectedKbKey}>
-          <SelectTrigger className="h-[36px] w-[260px] max-w-[calc(100vw-120px)] rounded-[10px] border-[#e3e7f1] bg-white text-[13px] max-[640px]:w-full max-[640px]:max-w-full">
+          <SelectTrigger className="h-[36px] w-[260px] rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
             <SelectValue placeholder="选择知识库" />
           </SelectTrigger>
           <SelectContent>

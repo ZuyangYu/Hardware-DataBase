@@ -279,18 +279,6 @@ export default function LoginPage({ onLogin }: { onLogin: (session: AuthSession)
             ))}
           </div>
         </section>
-
-        <footer className="relative z-[1] mt-auto flex items-center justify-center pb-[28px]">
-          <a
-            href="https://github.com/ZuyangYu/Hardware-DataBase"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-[7px] rounded-[10px] px-[14px] py-[8px] text-[13px] text-[#757f9c] transition-colors hover:bg-[#f0f0f0] hover:text-[#18181a]"
-          >
-            <AppIcon name="github" size={18} />
-            <span>GitHub</span>
-          </a>
-        </footer>
       </main>
     </div>
   );

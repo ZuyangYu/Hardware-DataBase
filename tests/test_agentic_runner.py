@@ -403,11 +403,9 @@ class AgenticRunnerTests(unittest.TestCase):
             "trace": [],
         }
 
-        result = retrieve_evidence(state, {"document_rag": _Tool(), "circuit_query": _Tool()})
+        retrieve_evidence(state, {"document_rag": _Tool(), "circuit_query": _Tool()})
 
         self.assertEqual({source for _, source in calls if source}, {f"board_{i}.edf" for i in range(9)})
-        self.assertEqual(result["truncated_tool_calls"], 1)
-        self.assertTrue(any(item.get("status") == "truncated" for item in result["retrieval_diagnostics"]))
 
     def test_generic_document_text_does_not_cover_a_different_refdes(self):
         state = {
@@ -495,26 +493,6 @@ class AgenticRunnerTests(unittest.TestCase):
         footer = runner.get_last_footer()
         self.assertIn("执行时间线", footer)
         self.assertIn("检索诊断", footer)
-        self.assertTrue(backend.retrieve_calls)
-
-    def test_fast_query_mode_uses_single_pass_compiled_graph(self):
-        llm = _FakeLLM(first_sufficient=False)
-        runner, backend = self._runner(llm)
-
-        out = "".join(
-            runner.stream(
-                query="查 design_report 选用的料号",
-                kb_name="kb",
-                history=[],
-                ctx=self._ctx(),
-                query_mode="fast",
-            )
-        )
-
-        self.assertIn("R-123", out)
-        self.assertEqual(llm._judge_calls, 0)
-        self.assertEqual(runner.get_last_retrieval_summary().get("query_mode"), "fast")
-        self.assertEqual(runner.get_last_retrieval_summary().get("retrieval_rounds"), 1)
         self.assertTrue(backend.retrieve_calls)
 
     def test_multi_hop_dynamic_requery(self):

@@ -1,7 +1,7 @@
 /**
  * useKbChat -- 单 KB 聊天会话的数据层 hook(lean 版,对齐 UseChatSession 的渲染字段)。
  *
- * 封装:会话列表 CRUD、消息加载、SSE 流式查询(turn 事件订阅 `/api/v1/turns/{id}/events`)、done 后落库 assistant 消息
+ * 封装:会话列表 CRUD、消息加载、SSE 流式查询(`/api/v1/query`)、done 后落库 assistant 消息
  * (API 有意不自动持久化会话,前端负责)、证据累积、流式中断。不搬 agent/trace/
  * 定时任务/附件/点赞业务。
  */

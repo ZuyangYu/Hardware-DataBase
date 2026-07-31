@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import inspect
 import threading
 import time
 import uuid
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 import config.settings
 from src.core.app_logs import AppLogService, query_trace_status
@@ -20,7 +23,7 @@ from src.core.llm_client import LLMClient
 
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
-from src.api.schemas import CreateTurnRequest, MessageView, TurnStartResponse, TurnView
+from src.api.schemas import CreateTurnRequest, MessageView, QueryRequest, TurnStartResponse, TurnView
 
 router = APIRouter(tags=["query"])
 GENERAL_CHAT_KB_NAME = "__general__"
@@ -34,6 +37,10 @@ def _sse(event: str, data: dict, event_id: int | None = None) -> str:
     payload = json.dumps(data, ensure_ascii=False, default=str)
     prefix = f"id: {event_id}\n" if event_id is not None else ""
     return f"{prefix}event: {event}\ndata: {payload}\n\n"
+
+
+def _stage(key: str, label: str, status: str = "running", detail: str = "") -> tuple[str, dict]:
+    return ("stage", {"key": key, "label": label, "status": status, "detail": detail})
 
 
 def _conv_service() -> ConversationService:
@@ -237,22 +244,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             raise RuntimeError("未生成回答")
         summary = {**summary, "query_mode": turn.query_mode}
         completed = conv.complete_turn(user.id, turn_id, answer, summary, footer, metrics=metrics(summary=summary))
-        if completed is None:
-            # Status guard rejected the update (e.g. cancel was requested
-            # concurrently); the cancellation already won — surface it.
-            conv.fail_turn(user.id, turn_id, "已停止生成", cancelled=True)
-            emit("error", {"message": "已停止生成", "cancelled": True})
-            _record_query_trace(
-                user=user,
-                kb_name="" if turn.kb_name == GENERAL_CHAT_KB_NAME else turn.kb_name,
-                original_query=turn.query,
-                thread_id=str(turn.session_id),
-                summary=summary,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                status="cancelled",
-                error_message="已停止生成",
-            )
-            return
         emit_stage("generate", "生成回答", "done", "最终回答已生成")
         emit(
             "done",
@@ -263,11 +254,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 "footer": footer,
             },
         )
-        # Derive the trace status from the answer text + retrieval summary
-        # (same helper Streamlit/the old inline /query path used) instead of
-        # hardcoding "success" -- a failed/partial/no-evidence response is then
-        # logged accurately in the log center.
-        trace_status, trace_error = query_trace_status(answer, summary)
         _record_query_trace(
             user=user,
             kb_name="" if turn.kb_name == GENERAL_CHAT_KB_NAME else turn.kb_name,
@@ -275,8 +261,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             thread_id=str(turn.session_id),
             summary=summary,
             latency_ms=int((time.monotonic() - start) * 1000),
-            status=trace_status,
-            error_message=trace_error,
+            status="success",
         )
     except Exception as exc:
         if cancelled():
@@ -455,6 +440,148 @@ async def stream_turn_events(
     )
 
 
+@router.post("/query")
+async def query(
+    body: QueryRequest,
+    request: Request,
+    user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+):
+    if body.kb_name in ("", GENERAL_CHAT_KB_NAME):
+        ctx = build_context_for_user(user, body.kb_name, auth=auth)
+        reject_system_admin_kb_access(ctx)
+        return StreamingResponse(
+            _direct_event_stream(user=user, body=body),
+            media_type="text/event-stream",
+        )
+
+    ctx = build_context_for_user(user, body.kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(body.kb_name, "read"):
+        raise HTTPException(status_code=403, detail="read permission required")
+
+    pipeline = _resolve_pipeline(request)
+    # Keep only the most recent 5 history turns -- Streamlit slices [-5:] and
+    # the agent prompt isn't sized for unbounded history.
+    history = [tuple(h) for h in body.history[-5:]]
+
+    # pipeline.query is a *sync* generator whose _RUN_RECORD ContextVar is set
+    # inside the generator body. If we iterated it via run_in_threadpool the
+    # worker thread could change between next() calls and lose the record, so
+    # the footer/summary read afterwards would be empty. Instead a single
+    # dedicated producer thread owns the whole generator + the post-stream
+    # observability reads; the async side only pulls from the queue.
+    q: queue.Queue = queue.Queue(maxsize=64)
+    sentinel = object()
+    cancel = threading.Event()
+
+    def _put(item) -> None:
+        # Block on a full queue (backpressure) but wake periodically so the
+        # producer can notice the consumer has disconnected and stop early,
+        # instead of buffering an unbounded stream the client will never read.
+        while not cancel.is_set():
+            try:
+                q.put(item, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+        # Consumer gone: drop the item.
+
+    def producer() -> None:
+        start = time.monotonic()
+        summary: dict = {}
+        gen = None
+        try:
+            answer_parts: list[str] = []
+            _put(_stage("permission", "权限校验", "done", "已完成访问范围检查"))
+            gen = _query_generator(
+                pipeline,
+                body.query,
+                body.kb_name,
+                history,
+                ctx,
+                body.thread_id,
+                lambda key, label, status="running", detail="": _put(_stage(key, label, status, detail)),
+            )
+            for chunk in gen:
+                if cancel.is_set():
+                    break
+                if chunk:
+                    answer_parts.append(chunk)
+                    _put(("delta", {"text": chunk}))
+            summary = pipeline.get_last_retrieval_summary() or {}
+            answer = "".join(answer_parts)
+            if not cancel.is_set():
+                q.put(
+                    (
+                        "done",
+                        {
+                            "answer": answer,
+                            "summary": summary,
+                            "footer": pipeline.get_last_agent_footer(),
+                            "token_usage": pipeline.get_last_token_usage_summary(),
+                        },
+                    )
+                )
+            # Derive trace status from the answer text + retrieval summary
+            # (same helper Streamlit uses) instead of hardcoding "success" --
+            # a failed/partial/no-evidence response is then logged accurately.
+            trace_status, trace_error = query_trace_status(answer, summary)
+            _record_query_trace(
+                user=user,
+                kb_name=body.kb_name,
+                original_query=body.query,
+                thread_id=body.thread_id,
+                summary=summary,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                status="failed" if cancel.is_set() else trace_status,
+                error_message=("client disconnected" if cancel.is_set() else trace_error),
+            )
+        except Exception as exc:  # fail-open: surface the error as an SSE event
+            if not cancel.is_set():
+                _put(_stage("generate", "生成回答", "error", "答案生成失败"))
+                q.put(("error", {"message": str(exc)}))
+            _record_query_trace(
+                user=user,
+                kb_name=body.kb_name,
+                original_query=body.query,
+                thread_id=body.thread_id,
+                summary=pipeline.get_last_retrieval_summary() or {},
+                latency_ms=int((time.monotonic() - start) * 1000),
+                status="failed",
+                error_message=str(exc),
+            )
+        finally:
+            # Release the generator if we exited early (client disconnect) so
+            # the LLM producer can stop sooner.
+            if gen is not None:
+                close = getattr(gen, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            q.put(sentinel)
+
+    async def event_stream():
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+        try:
+            while True:
+                item = await run_in_threadpool(q.get)
+                if item is sentinel:
+                    break
+                event, payload = item
+                yield _sse(event, payload)
+        finally:
+            # Client disconnected: signal the producer to stop and give it a
+            # moment to flush its trace + close the generator.
+            cancel.set()
+            thread.join(timeout=2.0)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 def _resolve_pipeline(request: Request) -> AppPipeline:
     provider = request.app.dependency_overrides.get(get_pipeline)
     if provider is not None:
@@ -504,6 +631,96 @@ def _parse_iso_time(value: str) -> datetime:
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return datetime.now(timezone.utc)
+
+
+def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
+    q: queue.Queue = queue.Queue(maxsize=64)
+    sentinel = object()
+    cancel = threading.Event()
+
+    def _put(item) -> None:
+        while not cancel.is_set():
+            try:
+                q.put(item, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
+    def producer() -> None:
+        start = time.monotonic()
+        answer_parts: list[str] = []
+        usage_summary = None
+        try:
+            llm = LLMClient()
+            for delta in llm.stream_chat(_general_messages(body.history, body.query), usage_stage="general_chat"):
+                if cancel.is_set():
+                    break
+                if delta:
+                    answer_parts.append(delta)
+                    q.put(("delta", {"text": delta}))
+            usage_summary = llm.get_usage_summary()
+            answer = "".join(answer_parts)
+            summary = {"retriever_type": "direct", "final_top_k": 0, "evidence": []}
+            if not cancel.is_set():
+                _put(
+                    (
+                        "done",
+                        {
+                            "answer": answer,
+                            "summary": summary,
+                            "footer": "",
+                            "token_usage": _jsonable_usage(usage_summary),
+                        },
+                    )
+                )
+            _record_query_trace(
+                user=user,
+                kb_name="",
+                original_query=body.query,
+                thread_id=body.thread_id,
+                summary=summary,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                status="failed" if cancel.is_set() else "success",
+                error_message="client disconnected" if cancel.is_set() else "",
+            )
+        except Exception as exc:
+            if not cancel.is_set():
+                _put(_stage("generate", "生成通用回答", "error", "通用回答生成失败"))
+                q.put(("error", {"message": str(exc)}))
+            _record_query_trace(
+                user=user,
+                kb_name="",
+                original_query=body.query,
+                thread_id=body.thread_id,
+                summary={"retriever_type": "direct", "final_top_k": 0, "evidence": []},
+                latency_ms=int((time.monotonic() - start) * 1000),
+                status="failed",
+                error_message=str(exc),
+            )
+        finally:
+            q.put(sentinel)
+
+    def iterator():
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+        try:
+            while True:
+                item = q.get()
+                if item is sentinel:
+                    break
+                event, payload = item
+                yield _sse(event, payload)
+        finally:
+            cancel.set()
+            thread.join(timeout=2.0)
+
+    return iterator()
+
+
+def _jsonable_usage(value):
+    if is_dataclass(value):
+        return asdict(value)
+    return value
 
 
 def _record_query_trace(

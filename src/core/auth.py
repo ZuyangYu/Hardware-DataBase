@@ -162,13 +162,6 @@ class AuthService:
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 )
             """)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_revoked "
-                "ON auth_sessions(user_id, revoked_at)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_users_department ON users(department_id)"
-            )
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge_bases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,37 +187,20 @@ class AuthService:
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 )
             """)
+            self._ensure_default_department(conn)
             self._migrate_kb_scope_schema(conn)
-            # One-shot migration: remove the synthetic "system" department from
-            # older installations (schema version < 2).  Once the flag is set the
-            # block is skipped on every subsequent start.
-            if conn.execute("PRAGMA user_version").fetchone()[0] < 2:
-                self._remove_legacy_system_department(conn)
-                conn.execute("PRAGMA user_version = 2")
 
     def _ensure_column(self, conn, table: str, column: str, ddl: str):
         columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
-    def _remove_legacy_system_department(self, conn):
-        """Remove the synthetic department used by older installations."""
+    def _ensure_default_department(self, conn):
+        now = utc_now()
         conn.execute(
-            "UPDATE users SET department_id = NULL, updated_at = ? WHERE role = ? AND department_id IS NOT NULL",
-            (utc_now(), ROLE_SYSTEM_ADMIN),
+            "INSERT OR IGNORE INTO departments (name, created_at) VALUES ('system', ?)",
+            (now,),
         )
-        rows = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchall()
-        for row in rows:
-            department_id = int(row["id"])
-            conn.execute(
-                "UPDATE users SET department_id = NULL, updated_at = ? WHERE department_id = ?",
-                (utc_now(), department_id),
-            )
-            conn.execute(
-                "UPDATE knowledge_bases SET department_id = NULL WHERE department_id = ?",
-                (department_id,),
-            )
-            conn.execute("DELETE FROM departments WHERE id = ?", (department_id,))
 
     def _migrate_kb_scope_schema(self, conn):
         kb_columns = {row["name"] for row in conn.execute("PRAGMA table_info(knowledge_bases)").fetchall()}
@@ -318,6 +294,8 @@ class AuthService:
         if not password or password == "admin123":
             raise RuntimeError("AUTH_DEFAULT_ADMIN_PASSWORD must be set to a non-default strong password.")
         with closing(self._connect()) as conn:
+            dept = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchone()
+            department_id = dept["id"] if dept else None
             row = conn.execute(
                 "SELECT id, password_hash, role, managed_by_env FROM users WHERE username = ?",
                 (username,),
@@ -340,7 +318,7 @@ class AuthService:
                 INSERT INTO users (username, password_hash, role, department_id, is_active, managed_by_env, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 1, 1, ?, ?)
                 """,
-                (username, hash_password(password), ROLE_SYSTEM_ADMIN, None, now, now),
+                (username, hash_password(password), ROLE_SYSTEM_ADMIN, department_id, now, now),
             )
 
     def create_user(self, username: str, password: str, role: str = "user", department_id: int | None = None) -> AuthUser:
@@ -359,10 +337,11 @@ class AuthService:
             if actor.role == ROLE_SYSTEM_ADMIN:
                 if role == ROLE_USER:
                     raise PermissionError("系统管理员不能创建普通用户，请由部门管理员创建。")
+                system_department_id = self._system_department_id()
                 if role == ROLE_SYSTEM_ADMIN:
-                    department_id = None
-                elif role == ROLE_DEPT_ADMIN and department_id is None:
-                    raise ValueError("部门管理员必须归属到业务部门")
+                    department_id = system_department_id
+                elif role == ROLE_DEPT_ADMIN and (department_id is None or department_id == system_department_id):
+                    raise ValueError("部门管理员必须归属到业务部门，不能归属 system 部门")
             elif actor.role == ROLE_DEPT_ADMIN:
                 if role != ROLE_USER:
                     raise PermissionError("部门管理员只能创建普通用户。")
@@ -395,6 +374,11 @@ class AuthService:
         )
         return created
 
+    def _system_department_id(self) -> int | None:
+        with closing(self._connect()) as conn:
+            dept = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchone()
+        return dept["id"] if dept else None
+
     def _create_user_record(self, username: str, password: str, role: str = "user", department_id: int | None = None) -> AuthUser:
         username = username.strip()
         if not username:
@@ -406,12 +390,9 @@ class AuthService:
 
         now = utc_now()
         with closing(self._connect()) as conn:
-            if role == ROLE_SYSTEM_ADMIN:
-                department_id = None
-            elif department_id is None:
-                raise ValueError("普通用户和部门管理员必须归属到部门")
-            elif conn.execute("SELECT 1 FROM departments WHERE id = ?", (department_id,)).fetchone() is None:
-                raise ValueError("部门不存在")
+            if department_id is None:
+                dept = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchone()
+                department_id = dept["id"] if dept else None
             conn.execute(
                 """
                 INSERT INTO users (username, password_hash, role, department_id, is_active, created_at, updated_at)
@@ -515,7 +496,7 @@ class AuthService:
 
     def list_users_for_manager(self, manager: AuthUser) -> list[AuthUser]:
         if manager.role == ROLE_SYSTEM_ADMIN:
-            return [user for user in self.list_users() if user.role != ROLE_USER]
+            return self.list_users()
         if manager.role == ROLE_DEPT_ADMIN:
             with closing(self._connect()) as conn:
                 rows = conn.execute(
@@ -533,7 +514,7 @@ class AuthService:
 
     def list_users_as(self, actor: AuthUser) -> list[AuthUser]:
         if actor.role == ROLE_SYSTEM_ADMIN:
-            return self.list_users_for_manager(actor)
+            return self.list_users()
         if actor.role == ROLE_DEPT_ADMIN:
             return self.list_users_for_manager(actor)
         raise PermissionError("User listing requires an administrator role.")
@@ -568,8 +549,7 @@ class AuthService:
                 if actor.id == user_id:
                     raise PermissionError("Cannot change the active state of the current account here.")
                 if actor.role == ROLE_SYSTEM_ADMIN:
-                    if target["role"] == ROLE_USER:
-                        raise PermissionError("系统管理员不能管理普通用户，请由所属部门管理员操作。")
+                    pass
                 elif actor.role == ROLE_DEPT_ADMIN:
                     if target["role"] != ROLE_USER or target["department_id"] != actor.department_id:
                         raise PermissionError("Department administrators can only manage users in their department.")
@@ -611,8 +591,7 @@ class AuthService:
                     raise PermissionError("不能在这里重置当前登录账号密码")
 
                 if actor.role == ROLE_SYSTEM_ADMIN:
-                    if target["role"] == ROLE_USER:
-                        raise PermissionError("系统管理员不能重置普通用户密码，请由所属部门管理员操作。")
+                    pass
                 elif actor.role == ROLE_DEPT_ADMIN:
                     if target["role"] != ROLE_USER or target["department_id"] != actor.department_id:
                         raise PermissionError("部门管理员只能重置本部门普通用户密码")
@@ -654,8 +633,6 @@ class AuthService:
         name = name.strip()
         if not name:
             raise ValueError("部门名称不能为空")
-        if name.casefold() == "system":
-            raise ValueError("system 是保留名称，请使用业务部门名称")
         with closing(self._connect()) as conn:
             conn.execute(
                 "INSERT INTO departments (name, created_at) VALUES (?, ?)",
@@ -692,6 +669,8 @@ class AuthService:
             dept = conn.execute("SELECT * FROM departments WHERE id = ?", (department_id,)).fetchone()
             if dept is None:
                 raise ValueError("部门不存在")
+            if dept["name"] == "system":
+                raise ValueError("system 部门不可删除")
             user_count = conn.execute(
                 "SELECT COUNT(*) AS count FROM users WHERE department_id = ?",
                 (department_id,),
@@ -917,6 +896,8 @@ class AuthService:
                 department = conn.execute("SELECT id, name FROM departments WHERE id = ?", (department_id,)).fetchone()
                 if department is None:
                     raise ValueError("部门不存在")
+                if department["name"] == "system":
+                    raise ValueError("业务知识库不能挂载到 system 部门")
 
                 source_kb = self._get_kb_row(conn, kb_name, kb_id=source_kb_id)
                 target_kb = self._get_kb_row(conn, kb_name, department_id)

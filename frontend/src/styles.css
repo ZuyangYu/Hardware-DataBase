@@ -176,60 +176,6 @@ body {
   transition: background-color 260ms ease, color 260ms ease;
 }
 
-/* 页面级操作栏：中等宽度保持单行并在必要时局部横向滚动，避免按钮被
-   随机挤成上下两排；手机宽度才允许按操作组自然换行。 */
-.page-toolbar {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 12px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: thin;
-}
-
-.page-toolbar > * {
-  flex-shrink: 0;
-}
-
-.page-toolbar button,
-.page-toolbar [role='button'],
-.page-toolbar-group > * {
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
-.page-toolbar-end {
-  justify-content: flex-end;
-}
-
-.page-toolbar-between {
-  justify-content: space-between;
-}
-
-.page-toolbar-group {
-  display: flex;
-  flex-shrink: 0;
-  align-items: center;
-  gap: 8px;
-}
-
-.data-table button,
-.data-table [role='button'] {
-  white-space: nowrap;
-}
-
-@media (max-width: 640px) {
-  .page-toolbar {
-    flex-wrap: wrap;
-    overflow-x: visible;
-  }
-
-  .page-toolbar-between {
-    align-items: stretch;
-  }
-}
-
 @layer base {
   button,
   textarea,

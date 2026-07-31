@@ -113,14 +113,6 @@ class PipelineDocumentStore:
             """)
             self._ensure_columns(conn)
             self._migrate_department_unique_constraint(conn)
-            conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_pipeline_documents_claim
-                ON pipeline_documents(status, processor_kind, worker_id, retry_count, updated_at)"""
-            )
-            conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_pipeline_documents_content_hash
-                ON pipeline_documents(content_hash)"""
-            )
 
     def _ensure_columns(self, conn):
         columns = {
@@ -651,10 +643,6 @@ class PipelineDocumentStore:
         stale_after_seconds = max(60, int(stale_after_seconds or WORKER_STALE_SECONDS))
         max_retries = max(1, int(max_retries or WORKER_MAX_RETRIES))
         with closing(self._connect()) as conn:
-            # Serialize stale-claim recovery, candidate selection and claiming.
-            # Connections use autocommit mode, so this explicit transaction is
-            # required to keep another worker from selecting the same row.
-            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 f"""
                 UPDATE pipeline_documents
@@ -705,10 +693,9 @@ class PipelineDocumentStore:
                 (*processor_kinds, max_retries),
             ).fetchone()
             if row is None:
-                conn.execute("COMMIT")
                 return None
             record_id = int(row["id"])
-            cursor = conn.execute(
+            conn.execute(
                 f"""
                 UPDATE pipeline_documents
                 SET worker_id = ?,
@@ -724,17 +711,10 @@ class PipelineDocumentStore:
                 """,
                 (worker_id, record_id),
             )
-            if cursor.rowcount != 1:
-                conn.execute("ROLLBACK")
-                return None
             claimed = conn.execute(
                 "SELECT * FROM pipeline_documents WHERE id = ? AND worker_id = ?",
                 (record_id, worker_id),
             ).fetchone()
-            if claimed is None:
-                conn.execute("ROLLBACK")
-                return None
-            conn.execute("COMMIT")
         return PipelineDocumentRecord(**dict(claimed)) if claimed else None
 
     def release_parse_claim(self, record_id: int):
@@ -760,4 +740,5 @@ class PipelineDocumentStore:
             error_message=message,
         )
         self.release_parse_claim(record_id)
+
 

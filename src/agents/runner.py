@@ -11,15 +11,18 @@ from src.agents.graph import (
     _stream_chat_with_usage_stage,
     _write_stream_event,
     analyze_question_with_llm,
-    build_fast_retrieval_graph,
+    analyze_question,
     build_multi_source_graph,
     compose_direct_answer,
     judge_sufficiency,
+    merge_evidence,
     plan_next_retrieval,
+    plan_source_selection,
     plan_source_selection_with_llm,
     retrieve_evidence,
     route_query,
     scan_kb_catalog,
+    score_and_compare_evidence,
 )
 from src.agents.prompts import ANSWER_SYSTEM_PROMPT
 from src.agents.tools.circuit_tools import CircuitQueryTool
@@ -226,12 +229,6 @@ class MultiSourceAgentRunner:
                 "verify_grounding": self._verify_grounding,
             }
         )
-        self.fast_graph = build_fast_retrieval_graph(
-            {
-                "scan_kb_catalog": lambda state: scan_kb_catalog(state, self.catalog_tool),
-                "retrieve_evidence": lambda state: retrieve_evidence(state, self.tools),
-            }
-        )
 
     def stream(
         self,
@@ -254,18 +251,8 @@ class MultiSourceAgentRunner:
         self._last_token_usage_summary = None
         self._reset_llm_usage()
 
-        normalized_query_mode = query_mode if query_mode in {"fast", "deep"} else "deep"
-        if normalized_query_mode == "fast":
-            yield from self._stream_fast(
-                query=query,
-                kb_name=kb_name,
-                history=history,
-                ctx=ctx,
-                thread_id=thread_id,
-                progress_callback=progress_callback,
-                should_cancel=should_cancel,
-            )
-            return
+        # Knowledge-base answers always run the complete retrieval graph.
+        # General chat bypasses this runner in the API route.
 
         state = {
             "thread_id": thread_id or f"{ctx.session_id if ctx else 'anonymous'}:{kb_name}",
@@ -383,17 +370,31 @@ class MultiSourceAgentRunner:
             "_cancel_check": should_cancel,
         }
         stage("route", "查询模式", "done", "快速查询：单轮多源召回")
+        stage("analyze", "分析硬件问题")
+        state = analyze_question(state)
+        if should_cancel is not None and should_cancel():
+            return
+        stage("analyze", "分析硬件问题", "done", "已按规则识别实体和证据类型")
+        stage("catalog", "读取数据目录")
+        state = scan_kb_catalog(state, self.catalog_tool)
+        if should_cancel is not None and should_cancel():
+            return
+        stage("catalog", "读取数据目录", "done", "已读取当前知识库可用数据源")
+        stage("plan", "规划检索来源")
+        state = plan_source_selection(state)
+        if should_cancel is not None and should_cancel():
+            return
+        stage("plan", "规划检索来源", "done", "已生成确定性单轮检索计划")
         stage("retrieve", "多源硬件数据召回")
         try:
-            state = self.fast_graph.invoke(
-                state,
-                config={"configurable": {"thread_id": state["thread_id"]}},
-            )
+            state = retrieve_evidence(state, self.tools)
         except QueryCancelled:
             return
         if should_cancel is not None and should_cancel():
             return
         stage("retrieve", "多源硬件数据召回", "done", "单轮召回完成")
+        state = merge_evidence(state)
+        state = score_and_compare_evidence(state)
         evidence = _select_claim_context(state, limit=8)
         answer_parts: list[str] = []
         if not evidence:
@@ -536,15 +537,8 @@ class MultiSourceAgentRunner:
                     {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ]
-                cancel_check = state.get("_cancel_check")
                 parts = []
-                # Note: cancel_check is only polled between LLM stream deltas,
-                # not during a long-running chunk.  A cancel signal may therefore
-                # be delayed by up to one chunk generation latency (typically
-                # sub-second, but can be several seconds for slow models).
                 for delta in _stream_chat_with_usage_stage(self.llm_client, messages, "final_answer"):
-                    if cancel_check is not None and cancel_check():
-                        break
                     parts.append(delta)
                     _write_stream_event({"type": "answer_delta", "delta": delta})
                 answer = "".join(parts).strip()
@@ -614,14 +608,8 @@ class MultiSourceAgentRunner:
                 {"role": "system", "content": "你是一个硬件领域的智能助手。请使用中文回答。"},
                 {"role": "user", "content": f"对话历史：\n{history}\n\n用户问题：{query}"},
             ]
-            cancel_check = state.get("_cancel_check")
             parts = []
-            # Note: cancel_check is only polled between LLM stream deltas,
-            # not during a long-running chunk.  A cancel signal may therefore
-            # be delayed by up to one chunk generation latency.
             for delta in _stream_chat_with_usage_stage(self.llm_client, messages, "direct_answer"):
-                if cancel_check is not None and cancel_check():
-                    break
                 parts.append(delta)
                 _write_stream_event({"type": "answer_delta", "delta": delta})
             state = {
@@ -872,7 +860,7 @@ class MultiSourceAgentRunner:
         sufficiency = state.get("sufficiency") or {}
         diagnostics = state.get("retrieval_diagnostics") or []
         failed_diagnostic = next(
-            (item for item in diagnostics if item.get("status") not in {"ok", "", "truncated"}),
+            (item for item in diagnostics if item.get("status") not in {"ok", ""}),
             None,
         )
         answer = str(state.get("answer") or state.get("final_response") or "")
@@ -905,7 +893,6 @@ class MultiSourceAgentRunner:
             "sufficiency_status": sufficiency.get("status") or "",
             "trace": state.get("trace") or [],
             "tool_diagnostics": diagnostics,
-            "truncated_tool_calls": int(state.get("truncated_tool_calls") or 0),
             "claim_coverage": state.get("claim_coverage") or [],
             "retrieval_ledger": state.get("retrieval_ledger") or [],
             "evidence_quality": state.get("evidence_quality") or [],

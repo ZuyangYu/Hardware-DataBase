@@ -162,6 +162,20 @@ class ConfirmAssetCandidateRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Query
+# ---------------------------------------------------------------------------
+
+class QueryRequest(BaseModel):
+    kb_name: str
+    query: str
+    # Route also slices [-5:] as defence in depth; the schema cap keeps a
+    # misconfigured client from wasting bandwidth on multi-MB history bodies
+    # (and blocks DoS-shaped requests before the body is even read).
+    history: list[tuple[str, str]] = Field(default_factory=list, max_length=100)
+    thread_id: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------------
 

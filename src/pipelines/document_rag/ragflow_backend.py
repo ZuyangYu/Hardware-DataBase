@@ -15,7 +15,7 @@ import config.settings
 from src.core.auth import AuthService
 from src.core.app_logs import AppLogService
 from src.core.cancellation import QueryCancelled
-from src.core.logger import error, log, warn
+from src.core.logger import error, log
 from src.core.source_group_router import route_source_groups
 from src.ingestion.kb_paths import validate_kb_name
 from src.ingestion.source_groups import (
@@ -92,8 +92,6 @@ RAGFLOW_TERMINAL_REMOVABLE_TASK_STATUSES = {
     RAGFLOW_STATUS_FAILED,
 }
 RAGFLOW_DOCUMENT_READY_TIMEOUT_SECONDS = 10.0
-RAGFLOW_RETRIEVAL_MAX_ATTEMPTS = 3
-RAGFLOW_RETRIEVAL_RETRY_BACKOFF_SECONDS = 0.25
 # RAGFlow 解析卡死兜底阈值:list_parse_tasks/list_documents 检测到 parsing 记录
 # 超过该时长仍未到终态时,标记 failed 并删除远端卡住的文档(见 _ragflow_parse_timed_out)。
 RAGFLOW_PARSE_PROGRESS_TIMEOUT_SECONDS = 3600.0
@@ -424,10 +422,6 @@ class RAGFlowClient:
         self.api_key = api_key if api_key is not None else config.settings.RAGFLOW_API_KEY
         self.timeout = timeout if timeout is not None else config.settings.RAGFLOW_TIMEOUT_SECONDS
         self._async_client_factory = async_client_factory or httpx.AsyncClient
-        # requests.Session keeps HTTP/TLS connections alive across ordinary
-        # RAGFlow calls. Cancellable retrievals still use httpx so an in-flight
-        # socket wait can be interrupted promptly.
-        self._session = requests.Session()
         if not self.api_key:
             raise ValueError("RAGFLOW_API_KEY is not configured.")
 
@@ -438,32 +432,19 @@ class RAGFlowClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
-    def request(self, method: str, path: str, *, retry: bool = False, **kwargs) -> dict:
-        attempts = RAGFLOW_RETRIEVAL_MAX_ATTEMPTS if retry else 1
-        request_headers = {**self.headers, **kwargs.pop("headers", {})}
-        for attempt in range(1, attempts + 1):
-            try:
-                response = self._session.request(
-                    method,
-                    self._url(path),
-                    headers=request_headers,
-                    timeout=self.timeout,
-                    **kwargs,
-                )
-                response.raise_for_status()
-                data = response.json()
-                if isinstance(data, dict) and data.get("code") not in {None, 0}:
-                    raise RAGFlowAPIError(data)
-                return data
-            except requests.RequestException as exc:
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                retryable = status is None or status == 429 or status >= 500
-                if attempt >= attempts or not retryable:
-                    raise
-                delay = RAGFLOW_RETRIEVAL_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                warn(f"RAGFlow request failed; retrying in {delay:.2f}s ({attempt}/{attempts}): {exc}")
-                time.sleep(delay)
-        raise RuntimeError("RAGFlow request retry loop exited unexpectedly")
+    def request(self, method: str, path: str, **kwargs) -> dict:
+        response = requests.request(
+            method,
+            self._url(path),
+            headers={**self.headers, **kwargs.pop("headers", {})},
+            timeout=self.timeout,
+            **kwargs,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and data.get("code") not in {None, 0}:
+            raise RAGFlowAPIError(data)
+        return data
 
     async def _async_request_until_cancelled(
         self,
@@ -472,49 +453,34 @@ class RAGFlowClient:
         cancel_event: threading.Event,
         **kwargs,
     ) -> dict:
-        """Run a retryable RAGFlow request and cancel its client task on demand."""
+        """Run one RAGFlow request and cancel its client task on demand."""
         try:
-            request_headers = {**self.headers, **kwargs.pop("headers", {})}
-            for attempt in range(1, RAGFLOW_RETRIEVAL_MAX_ATTEMPTS + 1):
-                try:
-                    async with self._async_client_factory(timeout=self.timeout) as client:
-                        request_task = asyncio.create_task(
-                            client.request(
-                                method,
-                                self._url(path),
-                                headers=request_headers,
-                                **kwargs,
-                            )
-                        )
-                        cancel_task = asyncio.create_task(asyncio.to_thread(cancel_event.wait))
-                        done, _ = await asyncio.wait({request_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
-                        if cancel_task in done:
-                            request_task.cancel()
-                            try:
-                                await request_task
-                            except asyncio.CancelledError:
-                                pass
-                            raise QueryCancelled()
-
-                        cancel_task.cancel()
-                        response = request_task.result()
-                        response.raise_for_status()
-                        data = response.json()
-                        if isinstance(data, dict) and data.get("code") not in {None, 0}:
-                            raise RAGFlowAPIError(data)
-                        return data
-                except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-                    status = getattr(getattr(exc, "response", None), "status_code", None)
-                    retryable = status is None or status == 429 or status >= 500
-                    if attempt >= RAGFLOW_RETRIEVAL_MAX_ATTEMPTS or not retryable:
-                        raise
-                    delay = RAGFLOW_RETRIEVAL_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                    warn(
-                        f"RAGFlow retrieval failed; retrying in {delay:.2f}s "
-                        f"({attempt}/{RAGFLOW_RETRIEVAL_MAX_ATTEMPTS}): {exc}"
+            async with self._async_client_factory(timeout=self.timeout) as client:
+                request_task = asyncio.create_task(
+                    client.request(
+                        method,
+                        self._url(path),
+                        headers={**self.headers, **kwargs.pop("headers", {})},
+                        **kwargs,
                     )
-                    await asyncio.sleep(delay)
-            raise RuntimeError("RAGFlow retrieval retry loop exited unexpectedly")
+                )
+                cancel_task = asyncio.create_task(asyncio.to_thread(cancel_event.wait))
+                done, _ = await asyncio.wait({request_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+                if cancel_task in done:
+                    request_task.cancel()
+                    try:
+                        await request_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise QueryCancelled()
+
+                cancel_task.cancel()
+                response = request_task.result()
+                response.raise_for_status()
+                data = response.json()
+                if isinstance(data, dict) and data.get("code") not in {None, 0}:
+                    raise RAGFlowAPIError(data)
+                return data
         finally:
             # Release asyncio.to_thread(cancel_event.wait) on successful calls.
             cancel_event.set()
@@ -648,7 +614,7 @@ class RAGFlowClient:
         if metadata_condition:
             payload["metadata_condition"] = metadata_condition
         if should_cancel is None:
-            data = self.request("POST", "/api/v1/retrieval", json=payload, retry=True)
+            data = self.request("POST", "/api/v1/retrieval", json=payload)
         else:
             data = self.request_cancellable(
                 "POST",
