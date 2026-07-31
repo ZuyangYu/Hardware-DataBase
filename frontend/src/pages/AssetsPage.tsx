@@ -288,8 +288,8 @@ export default function AssetsPage({ auth, onLogout, kbs }: Props) {
         onLogout={onLogout}
       />
 
-      <div className="mt-[20px] flex flex-wrap items-center justify-between gap-[12px]">
-        <label className="flex min-w-[220px] items-center gap-[8px] text-[12px] text-[#757f9c]">
+      <div className="page-toolbar page-toolbar-between mt-[20px]">
+        <label className="flex min-w-[220px] max-w-full flex-1 items-center gap-[8px] text-[12px] text-[#757f9c] sm:max-w-[360px]">
           知识库
           <select
             value={kbName}

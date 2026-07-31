@@ -56,7 +56,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
   const load = useCallback(() => {
     let cancelled = false;
     setLoaded(false);
-    // sysadmin 看全部(含管理员);dept_admin 后端默认只返本部门 user
+    // sysadmin 只看管理员;dept_admin 后端默认只返本部门普通用户
     api
       .get<UserView[]>(`/api/v1/users?include_admins=${sysAdmin ? 'true' : 'false'}`)
       .then((rows) => {
@@ -216,12 +216,12 @@ export default function UsersPage({ auth, onLogout }: Props) {
     <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
       <AppHeader
         title="用户管理"
-        description={sysAdmin ? '管理全部用户:创建、停用/启用、重置密码。' : '管理本部门用户:创建、停用/启用、重置密码。'}
+        description={sysAdmin ? '管理系统管理员和部门管理员，不直接管理普通用户。' : '管理本部门用户:创建、停用/启用、重置密码。'}
         userName={auth.user.username}
         onLogout={onLogout}
       />
 
-      <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-end gap-[12px]">
+      <div className="page-toolbar page-toolbar-end mt-[20px] mb-[16px]">
         <Button variant="outline" className={OUTLINE_ACTION_BUTTON_CLASS} onClick={() => load()}>
           <AppIcon name="refresh" size={14} />
           刷新
@@ -237,7 +237,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
 
       <div className="flex flex-col gap-[24px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
         <div className="flex flex-wrap items-stretch gap-[20px]">
-          <StatCard label="用户总数" value={users.length} />
+          <StatCard label={sysAdmin ? '管理员总数' : '用户总数'} value={users.length} />
           <StatCard label="启用" value={activeCount} tone="green" />
           <StatCard label="停用" value={users.length - activeCount} />
         </div>
@@ -373,10 +373,7 @@ function CreateUserDialog({
   // dept_admin 强制 user 角色 + 本部门
   const effectiveRole: Role = sysAdmin ? role : 'user';
   const effectiveDeptId: string = sysAdmin ? departmentId : (myDepartmentId != null ? String(myDepartmentId) : '');
-  const businessDepartments = useMemo(
-    () => departments.filter((d) => d.name !== 'system'),
-    [departments],
-  );
+  const businessDepartments = departments;
 
   async function submit() {
     if (!username.trim() || !password) {
@@ -468,7 +465,7 @@ function CreateUserDialog({
                 </div>
               ) : (
                 <p className="rounded-[10px] bg-[#f6f6f6] px-[10px] py-[8px] text-[12px] text-[#858b9c]">
-                  系统管理员会自动归属到 system 部门。
+                  系统管理员是全局治理角色，不归属任何部门。
                 </p>
               )}
             </>

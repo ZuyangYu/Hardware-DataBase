@@ -148,7 +148,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
     <SidebarProvider
       open={sidebarExpanded}
       onOpenChange={handleSidebarOpenChange}
-      style={{ '--sidebar-width': '240px', '--sidebar-width-icon': '72px' } as CSSProperties}
+      style={{ '--sidebar-width': '216px', '--sidebar-width-icon': '64px' } as CSSProperties}
       className="app-shell"
     >
       <AppSidebar auth={auth} onLogout={onLogout} />

@@ -578,7 +578,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
         onLogout={onLogout}
       />
 
-      <div className="mt-[16px] flex flex-wrap justify-end gap-[8px]">
+      <div className="page-toolbar page-toolbar-end mt-[16px] gap-[8px]">
         <Button
           variant="outline"
           className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px] px-[12px]')}

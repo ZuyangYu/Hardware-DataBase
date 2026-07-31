@@ -41,6 +41,6 @@ def delete_department(
     actor: AuthUser = Depends(require_system_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """Delete a department. Refuses if it still has users / KBs or is system."""
+    """Delete a department. Refuses if it still has users or knowledge bases."""
     auth.delete_department_as(actor, department_id)
     return OkResponse(ok=True, message="department deleted")

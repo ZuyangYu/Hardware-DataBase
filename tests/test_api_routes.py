@@ -158,11 +158,13 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.stub.deleted, [("shared", "a.pdf")])
 
-    def test_query_no_permission(self):
+    def test_session_creation_requires_kb_permission(self):
+        # user1 lacks read permission on "other_kb"; the turn flow gates at
+        # session creation (the live entry point, now that /query is gone).
         t = self._token("user1")
         r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "other_kb", "query": "问"},
+            "/api/v1/conversations",
+            json={"kb_name": "other_kb", "title": "新对话"},
             headers=self._auth(t),
         )
         self.assertEqual(r.status_code, 403)
@@ -201,31 +203,6 @@ class ApiRoutesTests(unittest.TestCase):
             headers=self._auth(t),
         )
         self.assertEqual(r.status_code, 403)
-        r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "__general__", "query": "你好"},
-            headers=self._auth(t),
-        )
-        self.assertEqual(r.status_code, 403)
-        r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "", "query": "你好"},
-            headers=self._auth(t),
-        )
-        self.assertEqual(r.status_code, 403)
-
-    def test_query_sse(self):
-        t = self._token("user1")
-        with self.client.stream(
-            "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
-        ) as r:
-            self.assertEqual(r.status_code, 200)
-            body = b"".join(r.iter_bytes()).decode("utf-8")
-        self.assertIn("event: delta", body)
-        self.assertIn("第一段", body)
-        self.assertIn("event: done", body)
-        self.assertIn('"answer": "第一段第二段"', body)
-        self.assertIn('"status": "success"', body)
 
     def test_turn_persists_messages_and_replays_sse_events(self):
         t = self._token("user1")

@@ -91,7 +91,7 @@ export async function uploadFiles<T>(path: string, form: FormData): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-/** SSE 流式请求(POST /query):fetch + ReadableStream 自解析 event/data 帧 */
+/** SSE 事件帧类型; fetch + ReadableStream 自解析 event/data 帧 */
 export type SseEvent = { event: string; data: string };
 
 async function* parseSseResponse(response: Response): AsyncGenerator<SseEvent, void, unknown> {
@@ -108,8 +108,8 @@ async function* parseSseResponse(response: Response): AsyncGenerator<SseEvent, v
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
       buffer += decoder.decode(value, { stream: true });
+      if (done) break;
       let sepIndex: number;
       while ((sepIndex = buffer.indexOf('\n\n')) >= 0) {
         const frame = buffer.slice(0, sepIndex);
@@ -123,27 +123,24 @@ async function* parseSseResponse(response: Response): AsyncGenerator<SseEvent, v
         if (dataLines.length > 0) yield { event, data: dataLines.join('\n') };
       }
     }
+    // Flush remaining bytes from the TextDecoder's internal buffer
+    // (the final chunk may contain multi-byte UTF-8 characters).
+    buffer += decoder.decode();
+    let sepIndex: number;
+    while ((sepIndex = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, sepIndex);
+      buffer = buffer.slice(sepIndex + 2);
+      let event = 'message';
+      const dataLines: string[] = [];
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataLines.push(line.startsWith('data: ') ? line.slice(6) : line.slice(5));
+      }
+      if (dataLines.length > 0) yield { event, data: dataLines.join('\n') };
+    }
   } finally {
     reader.cancel().catch(() => undefined);
   }
-}
-
-export async function* sseStream(
-  path: string,
-  body: unknown,
-  signal?: AbortSignal,
-): AsyncGenerator<SseEvent, void, unknown> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'text/event-stream',
-      ...authHeader(),
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
-  yield* parseSseResponse(response);
 }
 
 /** 可重放的 turn SSE 订阅; 后端会根据 Last-Event-ID 补发持久化事件。 */

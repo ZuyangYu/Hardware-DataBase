@@ -29,6 +29,7 @@ from src.agents.state import (
 from src.agents.query_tokens import _HARDWARE_TERMS
 from src.circuit.question_analysis import analyze_question as analyze_circuit_question
 from src.core.cancellation import QueryCancelled
+from src.core.logger import warn
 from src.ingestion.parser_registry import PARSER_REGISTRY
 from src.agents.prompts import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
@@ -577,6 +578,21 @@ def route_query(state: AgentState, llm_client: Any | None = None) -> AgentState:
             decision = fallback
             trace_node = "query_router"
             trace_msg = "LLM router failed; used deterministic fallback"
+
+    # Hard override: project/product context signals force retrieval so a
+    # weak LLM cannot misroute "ADAS项目硬件设计" as general_knowledge.
+    # This runs *after* the LLM call above (not before) so the LLM's raw
+    # decision is still recorded in the trace for observability before the
+    # override replaces it.  The LLM cost is a single short routing call
+    # (~tens of tokens) — negligible compared to downstream retrieval.
+    if _has_project_context(query):
+        decision = {
+            "needs_retrieval": True,
+            "category": "hardware_kb_query",
+            "reason": "检测到项目/产品上下文，强制走检索。",
+        }
+        trace_node = "route_query"
+        trace_msg = "Query routed by project-context hard override"
 
     new_state = {**state, "route_decision": decision}
     if not decision["needs_retrieval"]:
@@ -1492,7 +1508,26 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
 
     circuit_calls = [call for call in calls if call.get("tool_name") == "circuit_query"]
     other_calls = [call for call in calls if call.get("tool_name") != "circuit_query"]
-    bounded_calls = [*circuit_calls, *other_calls[: max(0, 8 - len(circuit_calls))]]
+    prioritized_calls = [*circuit_calls, *other_calls]
+    # Circuit sources selected by the planner are required scope, so retain all
+    # of them even when they exceed the ordinary concurrency budget.
+    ordinary_capacity = max(0, 8 - len(circuit_calls))
+    bounded_calls = [*circuit_calls, *other_calls[:ordinary_capacity]]
+    dropped_calls = other_calls[ordinary_capacity:]
+    if dropped_calls:
+        warn(
+            f"Retrieval tool-call limit reached: planned={len(prioritized_calls)}, "
+            f"executed={len(bounded_calls)}, dropped={len(dropped_calls)}"
+        )
+        diagnostics.append(
+            {
+                "status": "truncated",
+                "planned_count": len(prioritized_calls),
+                "executed_count": len(bounded_calls),
+                "dropped_count": len(dropped_calls),
+                "dropped_tools": [str(call.get("tool_name") or "") for call in dropped_calls],
+            }
+        )
     circuit_hits: list[dict[str, Any]] = []
     cancel_check = state.get("_cancel_check")
 
@@ -1646,11 +1681,19 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
         "retrieval_round": round_no,
         "evidence": evidence,
         "retrieval_diagnostics": list(state.get("retrieval_diagnostics") or []) + diagnostics,
+        "truncated_tool_calls": int(state.get("truncated_tool_calls") or 0) + len(dropped_calls),
         "trace": _trace(
             state,
             "retrieve_evidence",
             "Evidence retrieved",
-            {"round": round_no, "total_evidence": len(evidence), "tool_calls": trace_tool_calls},
+            {
+                "round": round_no,
+                "total_evidence": len(evidence),
+                "tool_calls": trace_tool_calls,
+                "planned_tool_calls": len(prioritized_calls),
+                "executed_tool_calls": len(bounded_calls),
+                "dropped_tool_calls": len(dropped_calls),
+            },
         ),
     }
 
@@ -2205,4 +2248,28 @@ def build_multi_source_graph(nodes: dict[str, Any]):
     )
     graph.add_edge("compose_answer", "verify_grounding")
     graph.add_edge("verify_grounding", END)
+    return graph.compile()
+
+
+def build_fast_retrieval_graph(nodes: dict[str, Any]):
+    """Compile the deterministic, single-pass retrieval path used by fast mode."""
+    if StateGraph is None:
+        raise RuntimeError("langgraph is not installed; install langgraph to build the compiled agent graph.")
+    graph = StateGraph(AgentState)
+    graph.add_node("analyze_question", _streaming_node("analyze_question", analyze_question))
+    graph.add_node("scan_kb_catalog", _streaming_node("scan_kb_catalog", nodes["scan_kb_catalog"]))
+    graph.add_node("plan_source_selection", _streaming_node("plan_source_selection", plan_source_selection))
+    graph.add_node("retrieve_evidence", _streaming_node("retrieve_evidence", nodes["retrieve_evidence"]))
+    graph.add_node("merge_evidence", _streaming_node("merge_evidence", merge_evidence))
+    graph.add_node(
+        "score_and_compare_evidence",
+        _streaming_node("score_and_compare_evidence", score_and_compare_evidence),
+    )
+    graph.set_entry_point("analyze_question")
+    graph.add_edge("analyze_question", "scan_kb_catalog")
+    graph.add_edge("scan_kb_catalog", "plan_source_selection")
+    graph.add_edge("plan_source_selection", "retrieve_evidence")
+    graph.add_edge("retrieve_evidence", "merge_evidence")
+    graph.add_edge("merge_evidence", "score_and_compare_evidence")
+    graph.add_edge("score_and_compare_evidence", END)
     return graph.compile()

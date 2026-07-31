@@ -2097,12 +2097,12 @@ def render_department_management_tab():
 
 def render_system_department_management(current_user):
     auth_service = init_auth_service()
-    users = auth_service.list_users()
+    users = auth_service.list_users_as(current_user)
     departments = auth_service.list_departments()
 
     user_tab, dept_tab, create_tab = st.tabs(["用户列表", "部门列表", "创建"])
     with user_tab:
-        st.caption(f"当前用户数: {len(users)}")
+        st.caption(f"当前管理员数: {len(users)}（普通用户由所属部门管理员维护）")
         grouped_users = {}
         for user in users:
             dept_name = user.department_name or "未分配"
@@ -2159,16 +2159,13 @@ def render_system_department_management(current_user):
             with c2:
                 st.markdown(f"`{dept.name}`")
             with c3:
-                if dept.name == "system":
-                    st.button("受保护", key=f"dept_system_{dept.id}", disabled=True, width="stretch")
-                else:
-                    if st.button("删除", key=f"dept_delete_{dept.id}", width="stretch"):
-                        try:
-                            auth_service.delete_department_as(current_user, dept.id)
-                            st.success(f"已删除部门: {dept.name}")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"删除部门失败: {e}")
+                if st.button("删除", key=f"dept_delete_{dept.id}", width="stretch"):
+                    try:
+                        auth_service.delete_department_as(current_user, dept.id)
+                        st.success(f"已删除部门: {dept.name}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"删除部门失败: {e}")
 
     with create_tab:
         col_dept, col_user = st.columns(2)
@@ -2190,11 +2187,10 @@ def render_system_department_management(current_user):
                 new_username = st.text_input("新用户名", key="auth_new_username")
                 new_password = st.text_input("新用户密码", type="password", key="auth_new_password")
                 new_role = st.selectbox("角色", [ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN], key="auth_new_role")
-                business_departments = [dept for dept in departments if dept.name != "system"]
-                selected_department = "system"
+                business_departments = departments
                 if new_role == ROLE_SYSTEM_ADMIN:
-                    st.caption("系统管理员固定归属 system 部门，不挂载业务部门。")
-                    department_id = next((dept.id for dept in departments if dept.name == "system"), None)
+                    st.caption("系统管理员是全局治理角色，不归属任何部门。")
+                    department_id = None
                 else:
                     department_names = [dept.name for dept in business_departments]
                     selected_department = st.selectbox("部门", department_names, key="auth_new_department")
