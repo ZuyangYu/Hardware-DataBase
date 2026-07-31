@@ -95,6 +95,7 @@ class EvaluationService:
         thresholds: dict[str, float] | None = None,
         fail_on_threshold: bool = False,
         run_id: str | None = None,
+        progress_callback: Callable[[EvaluationSummary, list[SampleResult], int, int], bool] | None = None,
     ) -> tuple[EvaluationSummary, list[SampleResult]]:
         metric_names = DEFAULT_STANDARD_METRICS if metric_names is None else metric_names
         snapshot_by_id = {snapshot.sample_id: snapshot for snapshot in snapshots}
@@ -125,6 +126,9 @@ class EvaluationService:
                     snapshot.metadata["scored_response_filter"]
                 )
 
+        total_groups = 0
+        completed_groups = 0
+        stopped = False
         if metric_names:
             retrieval_samples = [
                 sample for sample in samples if sample_cohorts[sample.id] == "retrieval"
@@ -152,6 +156,7 @@ class EvaluationService:
                     config = self.config or EvaluationConfig.from_environment()
                     adapter = RagasAdapter(config)
                 scoring_snapshots = retrieval_snapshots
+                total_groups = len(metric_names)
                 if isinstance(adapter, RagasAdapter):
                     scoring_snapshots, diagnostics = adapter.prepare_snapshots_for_scoring(
                         retrieval_snapshots
@@ -159,18 +164,66 @@ class EvaluationService:
                     for sample_id, diagnostic in diagnostics.items():
                         if sample_id in sample_results:
                             sample_results[sample_id].metadata["ragas_scoring"] = diagnostic
-                    metrics = adapter.score(
-                        retrieval_samples,
-                        scoring_snapshots,
-                        metric_names,
-                        snapshots_prepared=True,
-                    )
                 else:
-                    metrics = adapter.score(retrieval_samples, retrieval_snapshots, metric_names)
-                for metric in metrics:
-                    sample_results[metric.sample_id].metrics.append(metric)
+                    scoring_snapshots = retrieval_snapshots
+                for metric_name in metric_names:
+                    if isinstance(adapter, RagasAdapter):
+                        metrics = adapter.score(
+                            retrieval_samples,
+                            scoring_snapshots,
+                            [metric_name],
+                            snapshots_prepared=True,
+                        )
+                    else:
+                        metrics = adapter.score(retrieval_samples, scoring_snapshots, [metric_name])
+                    for metric in metrics:
+                        if metric.metric_name == metric_name:
+                            sample_results[metric.sample_id].metrics.append(metric)
+                    completed_groups += 1
+                    ordered_results = [sample_results[sample.id] for sample in samples]
+                    summary = self._build_summary(
+                        samples,
+                        ordered_results,
+                        thresholds=thresholds,
+                        fail_on_threshold=fail_on_threshold,
+                        run_id=run_id,
+                        completed_groups=completed_groups,
+                        total_groups=total_groups,
+                        outcome_kind="in_progress",
+                    )
+                    if progress_callback is not None and not progress_callback(
+                        summary, ordered_results, completed_groups, total_groups
+                    ):
+                        stopped = True
+                        break
+                    if stopped:
+                        break
 
         ordered_results = [sample_results[sample.id] for sample in samples]
+        return self._build_summary(
+            samples,
+            ordered_results,
+            thresholds=thresholds,
+            fail_on_threshold=fail_on_threshold,
+            run_id=run_id,
+            completed_groups=completed_groups,
+            total_groups=total_groups,
+            outcome_kind="in_progress" if stopped else None,
+        ), ordered_results
+
+    @staticmethod
+    def _build_summary(
+        samples: list[EvaluationSample],
+        ordered_results: list[SampleResult],
+        *,
+        thresholds: dict[str, float] | None,
+        fail_on_threshold: bool,
+        run_id: str | None,
+        completed_groups: int,
+        total_groups: int,
+        outcome_kind: str | None,
+    ) -> EvaluationSummary:
+        sample_cohorts = {sample.id: evaluation_cohort(sample) for sample in samples}
         gate = evaluate_gate(
             ordered_results,
             thresholds or DEFAULT_THRESHOLDS,
@@ -193,8 +246,15 @@ class EvaluationService:
             metric_counts=gate.metric_counts,
             metric_failures=dict(metric_failures),
             gate=gate,
+            metadata={
+                "run_outcome": {
+                    "kind": outcome_kind or "completed",
+                    "completed_groups": completed_groups,
+                    "total_groups": total_groups,
+                }
+            },
         )
-        return summary, ordered_results
+        return summary
 
     def run(
         self,
