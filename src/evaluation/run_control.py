@@ -97,6 +97,38 @@ class RunStateStore:
     def mark_failed(self, error_message: str = "") -> EvaluationRunState:
         return self.mutate(lambda state: self._mark_failed(state, error_message))
 
+    def update_scoring_progress(
+        self, completed_groups: int, total_groups: int
+    ) -> EvaluationRunState:
+        return self.mutate(
+            lambda state: self._with_update(
+                state,
+                scoring_completed_groups=completed_groups,
+                scoring_total_groups=total_groups,
+            )
+        )
+
+    def publish_partial_report(
+        self,
+        *,
+        report_path: str,
+        error_message: str = "",
+    ) -> EvaluationRunState:
+        with self._lock:
+            state = self.load()
+            if state.status == "pause_requested":
+                return self._write(self._finish(state, "paused", report_path=report_path))
+            if state.status == "cancel_requested":
+                return self._write(self._finish(state, "cancelled", report_path=report_path))
+            return self._write(
+                self._finish(
+                    state,
+                    "failed",
+                    report_path=report_path,
+                    error_message=error_message or "evaluation worker failed; see application logs",
+                )
+            )
+
     def remove_report_artifacts(self) -> None:
         with self._lock:
             self._remove_report_artifacts(
@@ -335,6 +367,7 @@ class EvaluationRunController:
 
     def execute(self, run_id: str) -> EvaluationRunState:
         store = self._store(run_id)
+        latest_checkpoint: tuple[object, object] | None = None
         try:
             state = self._refresh_progress(store)
             if state.status == "queued":
@@ -375,21 +408,75 @@ class EvaluationRunController:
             store.mutate(
                 lambda current: RunStateStore._with_update(current, stage="scoring")
             )
+            def checkpoint(summary, results, completed_groups, total_groups):
+                nonlocal latest_checkpoint
+                latest_checkpoint = (summary, results)
+                store.update_scoring_progress(completed_groups, total_groups)
+                write_reports(store.path.parent / ".checkpoint", summary, results)
+                return store.load().status not in {"pause_requested", "cancel_requested"}
+
             summary, results = (service if state.mode == "online" else self.service_factory()).score(
-                samples, snapshots, run_id=run_id
+                samples, snapshots, run_id=run_id, progress_callback=checkpoint
             )
+            state = store.load()
+            if state.status in {"pause_requested", "cancel_requested"}:
+                outcome_kind = (
+                    "partial_paused" if state.status == "pause_requested" else "partial_cancelled"
+                )
+                paths = write_reports(
+                    store.path.parent,
+                    summary,
+                    results,
+                    metadata={
+                        "run_outcome": {
+                            "kind": outcome_kind,
+                            "completed_groups": state.scoring_completed_groups,
+                            "total_groups": state.scoring_total_groups,
+                        }
+                    },
+                )
+                return store.publish_partial_report(report_path=str(paths.report_html))
             if not self._checkpoint(store):
                 return store.load()
 
             store.mutate(
                 lambda current: RunStateStore._with_update(current, stage="reporting")
             )
-            paths = write_reports(store.path.parent, summary, results)
+            paths = write_reports(
+                store.path.parent,
+                summary,
+                results,
+                metadata={
+                    "run_outcome": {
+                        "kind": "completed",
+                        "completed_groups": store.load().scoring_completed_groups,
+                        "total_groups": store.load().scoring_total_groups,
+                    }
+                },
+            )
             return store.complete_report_or_handle_control(
                 report_path=str(paths.report_html),
             )
         except Exception:
             logging.getLogger(__name__).exception("evaluation worker failed")
+            if latest_checkpoint is not None:
+                summary, results = latest_checkpoint
+                try:
+                    paths = write_reports(
+                        store.path.parent,
+                        summary,
+                        results,
+                        metadata={
+                            "run_outcome": {
+                                "kind": "partial_failed",
+                                "completed_groups": store.load().scoring_completed_groups,
+                                "total_groups": store.load().scoring_total_groups,
+                            }
+                        },
+                    )
+                    return store.publish_partial_report(report_path=str(paths.report_html))
+                except Exception:
+                    logging.getLogger(__name__).exception("failed to publish partial evaluation report")
             try:
                 store.remove_report_artifacts()
             except OSError:

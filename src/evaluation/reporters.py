@@ -40,8 +40,12 @@ def write_reports(
     run_dir: str | Path,
     summary: EvaluationSummary,
     results: list[SampleResult],
+    *,
+    metadata: dict[str, Any] | None = None,
 ) -> ReportPaths:
     run_dir = Path(run_dir)
+    if metadata:
+        summary = summary.model_copy(update={"metadata": {**summary.metadata, **metadata}})
     summary_json = run_dir / "summary.json"
     results_jsonl = run_dir / "results.jsonl"
     summary_csv = run_dir / "summary.csv"
@@ -123,6 +127,9 @@ def write_reports(
 <title>Hardware DataBase Evaluation</title><style>body{font-family:sans-serif;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:.4rem}th{background:#f5f5f5}</style></head><body>"""
     html_text += f"<h1>评估报告 {html.escape(summary.run_id)}</h1>"
     html_text += f"<p>样本 {summary.sample_count}；成功 {summary.successful_samples}；失败 {summary.failed_samples}</p>"
+    outcome = summary.metadata.get("run_outcome", {})
+    if outcome:
+        html_text += f"<p>评估结果：{html.escape(str(outcome.get('kind', 'completed')))}</p>"
     html_text += "<table><thead><tr>" + "".join(f"<th>{html.escape(name)}</th>" for name in headers) + "</tr></thead>"
     html_text += "<tbody>" + "".join(rows) + "</tbody></table></body></html>"
     _atomic_text(report_html, html_text)

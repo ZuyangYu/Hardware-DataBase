@@ -81,6 +81,26 @@ class ReporterTests(unittest.TestCase):
         write_reports(self.run_dir, summary, [])
         self.assertEqual(list(self.run_dir.glob("*.tmp")), [])
 
+    def test_report_writer_adds_run_outcome_metadata(self):
+        summary = EvaluationSummary(run_id="run-1")
+
+        paths = write_reports(
+            self.run_dir,
+            summary,
+            [],
+            metadata={
+                "run_outcome": {
+                    "kind": "partial_cancelled",
+                    "completed_groups": 1,
+                    "total_groups": 5,
+                }
+            },
+        )
+
+        loaded = json.loads(paths.summary_json.read_text(encoding="utf-8"))
+        self.assertEqual(loaded["metadata"]["run_outcome"]["kind"], "partial_cancelled")
+        self.assertIn("partial_cancelled", paths.report_html.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
