@@ -473,6 +473,19 @@ class EvaluationRunControllerTests(unittest.TestCase):
             self.controller.load_for_display(state.run_id).status, "paused"
         )
 
+    def test_orphaned_scoring_run_without_checkpoint_does_not_fabricate_report(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=True
+        )
+        RunStateStore(self.root / state.run_id / "run_state.json").mark_running(
+            stage="scoring"
+        )
+
+        recovered = self.controller.load_for_display(state.run_id)
+
+        self.assertEqual(recovered.status, "paused")
+        self.assertFalse((self.root / state.run_id / "summary.json").exists())
+
     def test_display_recovery_does_not_pause_a_concurrently_registered_worker(self):
         class StartAfterReleaseLock:
             def __init__(self, controller, run_id):
