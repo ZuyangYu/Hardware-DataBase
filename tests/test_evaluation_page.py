@@ -27,8 +27,10 @@ from src.ui.evaluation_page import (
     render_saved_evaluation_run,
     _render_summary,
     _render_run_status,
+    _run_outcome_message,
     render_evaluation_page,
     run_action_availability,
+    should_render_evaluation_summary,
 )
 
 
@@ -97,6 +99,59 @@ class EvaluationPageTests(unittest.TestCase):
 
             self.assertTrue(rendered)
             self.assertEqual(render_summary.call_args.args[1].run_id, "run-1")
+
+    def test_partial_terminal_summary_renders_but_running_summary_stays_active(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for status in ("paused", "cancelled", "failed", "running"):
+                run = root / status
+                run.mkdir()
+                (run / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": status,
+                            "metadata": {
+                                "run_outcome": {
+                                    "kind": "partial_failed",
+                                    "completed_groups": 1,
+                                    "total_groups": 5,
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state = EvaluationRunState.new_online(
+                    run_id=status,
+                    dataset_path="dataset.jsonl",
+                    snapshot_path="snapshot.jsonl",
+                    total_samples=1,
+                    score_enabled=True,
+                ).model_copy(update={"status": status})
+                (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+
+            self.assertTrue(should_render_evaluation_summary(root / "paused"))
+            self.assertTrue(should_render_evaluation_summary(root / "cancelled"))
+            self.assertTrue(should_render_evaluation_summary(root / "failed"))
+            self.assertFalse(should_render_evaluation_summary(root / "running"))
+
+    def test_partial_outcome_message_includes_progress(self):
+        message, level = _run_outcome_message(
+            EvaluationSummary(
+                run_id="run-1",
+                metadata={
+                    "run_outcome": {
+                        "kind": "partial_failed",
+                        "completed_groups": 2,
+                        "total_groups": 5,
+                    }
+                },
+            )
+        )
+
+        self.assertEqual(level, "warning")
+        self.assertIn("部分评分", message)
+        self.assertIn("2 / 5", message)
 
     def test_missing_saved_run_is_cleared_and_returns_to_new_form(self):
         st = Mock()

@@ -96,7 +96,31 @@ def should_render_evaluation_summary(run_dir: str | Path) -> bool:
     if not state_path.is_file():
         return True
     state = EvaluationRunState.model_validate_json(state_path.read_text(encoding="utf-8"))
-    return state.status == "completed"
+    if state.status == "completed":
+        return True
+    if state.status not in {"paused", "cancelled", "failed"}:
+        return False
+    summary = load_evaluation_summary(run_dir / "summary.json")
+    return str(summary.metadata.get("run_outcome", {}).get("kind", "")).startswith("partial_")
+
+
+def _run_outcome_message(summary: EvaluationSummary) -> tuple[str, str] | None:
+    outcome = summary.metadata.get("run_outcome", {})
+    kind = outcome.get("kind")
+    if kind not in {"partial_cancelled", "partial_paused", "partial_failed"}:
+        return None
+    completed = outcome.get("completed_groups", 0)
+    total = outcome.get("total_groups", 0)
+    labels = {
+        "partial_cancelled": "已取消",
+        "partial_paused": "已暂停",
+        "partial_failed": "发生异常",
+    }
+    return (
+        f"部分评分报告：{labels[kind]}；已完成评分组 {completed} / {total}。"
+        "已完成指标可供查看，未完成指标不应作为结论依据。",
+        "warning",
+    )
 
 
 def _build_current_metric_chart(rows: list[dict[str, object]]):
@@ -222,6 +246,10 @@ def _render_summary(
     results: list[SampleResult],
     baseline: EvaluationSummary | None = None,
 ) -> None:
+    outcome = _run_outcome_message(summary)
+    if outcome is not None:
+        message, level = outcome
+        getattr(st, level)(message)
     credibility = build_credibility_summary(summary, results)
     columns = st.columns(5)
     columns[0].metric("样本", summary.sample_count)
@@ -373,6 +401,11 @@ def _render_run_status(st, controller: EvaluationRunController, run_id: str) -> 
     st.write(f"状态：{state.status}；阶段：{state.stage}")
     st.write(f"当前样本：{state.current_sample_id or '无'}")
     st.write(f"当前问题：{state.current_question or '无'}")
+    if state.stage == "scoring":
+        st.write(
+            "评分进度："
+            f"{state.scoring_completed_groups} / {state.scoring_total_groups or '—'} 个指标组"
+        )
     progress = state.completed_samples / state.total_samples if state.total_samples else 0.0
     st.progress(progress, text=f"{state.completed_samples} / {state.total_samples}")
     columns = st.columns(3)
