@@ -387,16 +387,19 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertTrue(Path(final.report_path).is_file())
         self.assertEqual(Path(final.report_path).parent, self.root / state.run_id)
 
-    def test_pause_requested_during_report_write_pauses_without_report_artifacts(self):
+    def test_pause_requested_during_report_write_publishes_partial_report(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples, score_enabled=True
         )
         original_write_reports = write_reports
+        requested = False
 
         def write_then_request_pause(*args, **kwargs):
+            nonlocal requested
             paths = original_write_reports(*args, **kwargs)
-            if Path(args[0]) == self.root / state.run_id:
+            if Path(args[0]) == self.root / state.run_id and not requested:
                 self.controller.pause(state.run_id)
+                requested = True
             return paths
 
         with patch(
@@ -406,19 +409,24 @@ class EvaluationRunControllerTests(unittest.TestCase):
             final = self.controller.execute(state.run_id)
 
         self.assertEqual(final.status, "paused")
-        for name in ("summary.json", "results.jsonl", "summary.csv", "report.html"):
-            self.assertFalse((self.root / state.run_id / name).exists())
+        summary = EvaluationSummary.model_validate_json(
+            (self.root / state.run_id / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary.metadata["run_outcome"]["kind"], "partial_paused")
 
-    def test_cancel_requested_during_report_write_cancels_without_report_artifacts(self):
+    def test_cancel_requested_during_report_write_publishes_partial_report(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples, score_enabled=True
         )
         original_write_reports = write_reports
+        requested = False
 
         def write_then_request_cancel(*args, **kwargs):
+            nonlocal requested
             paths = original_write_reports(*args, **kwargs)
-            if Path(args[0]) == self.root / state.run_id:
+            if Path(args[0]) == self.root / state.run_id and not requested:
                 self.controller.cancel(state.run_id)
+                requested = True
             return paths
 
         with patch(
@@ -428,8 +436,10 @@ class EvaluationRunControllerTests(unittest.TestCase):
             final = self.controller.execute(state.run_id)
 
         self.assertEqual(final.status, "cancelled")
-        for name in ("summary.json", "results.jsonl", "summary.csv", "report.html"):
-            self.assertFalse((self.root / state.run_id / name).exists())
+        summary = EvaluationSummary.model_validate_json(
+            (self.root / state.run_id / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary.metadata["run_outcome"]["kind"], "partial_cancelled")
 
     def test_report_write_failure_removes_published_report_artifacts(self):
         state = self.controller.create_online_run(

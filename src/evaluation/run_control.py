@@ -22,6 +22,7 @@ _REPORT_ARTIFACT_NAMES = (
     "results.jsonl",
     "summary.csv",
     "report.html",
+    "report_complete.json",
 )
 
 
@@ -436,9 +437,6 @@ class EvaluationRunController:
                     },
                 )
                 return store.publish_partial_report(report_path=str(paths.report_html))
-            if not self._checkpoint(store):
-                return store.load()
-
             store.mutate(
                 lambda current: RunStateStore._with_update(current, stage="reporting")
             )
@@ -454,9 +452,25 @@ class EvaluationRunController:
                     }
                 },
             )
-            return store.complete_report_or_handle_control(
-                report_path=str(paths.report_html),
-            )
+            state = store.load()
+            if state.status in {"pause_requested", "cancel_requested"}:
+                outcome_kind = (
+                    "partial_paused" if state.status == "pause_requested" else "partial_cancelled"
+                )
+                paths = write_reports(
+                    store.path.parent,
+                    summary,
+                    results,
+                    metadata={
+                        "run_outcome": {
+                            "kind": outcome_kind,
+                            "completed_groups": state.scoring_completed_groups,
+                            "total_groups": state.scoring_total_groups,
+                        }
+                    },
+                )
+                return store.publish_partial_report(report_path=str(paths.report_html))
+            return store.complete_report_or_handle_control(report_path=str(paths.report_html))
         except Exception:
             logging.getLogger(__name__).exception("evaluation worker failed")
             if latest_checkpoint is not None:

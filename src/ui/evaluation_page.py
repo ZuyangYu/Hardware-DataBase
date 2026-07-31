@@ -96,6 +96,8 @@ def should_render_evaluation_summary(run_dir: str | Path) -> bool:
     if not state_path.is_file():
         return True
     state = EvaluationRunState.model_validate_json(state_path.read_text(encoding="utf-8"))
+    if not (run_dir / "report_complete.json").is_file():
+        return False
     if state.status == "completed":
         return True
     if state.status not in {"paused", "cancelled", "failed"}:

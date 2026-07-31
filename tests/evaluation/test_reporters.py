@@ -80,6 +80,7 @@ class ReporterTests(unittest.TestCase):
         summary = EvaluationSummary(run_id="run-1")
         write_reports(self.run_dir, summary, [])
         self.assertEqual(list(self.run_dir.glob("*.tmp")), [])
+        self.assertTrue((self.run_dir / "report_complete.json").is_file())
 
     def test_report_writer_adds_run_outcome_metadata(self):
         summary = EvaluationSummary(run_id="run-1")

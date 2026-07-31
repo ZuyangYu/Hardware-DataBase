@@ -129,6 +129,7 @@ class EvaluationPageTests(unittest.TestCase):
                     score_enabled=True,
                 ).model_copy(update={"status": status})
                 (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+                (run / "report_complete.json").write_text("{}\n", encoding="utf-8")
 
             self.assertTrue(should_render_evaluation_summary(root / "paused"))
             self.assertTrue(should_render_evaluation_summary(root / "cancelled"))
@@ -152,6 +153,22 @@ class EvaluationPageTests(unittest.TestCase):
         self.assertEqual(level, "warning")
         self.assertIn("部分评分", message)
         self.assertIn("2 / 5", message)
+
+    def test_partial_terminal_summary_without_completion_marker_stays_active(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run = Path(temp_dir) / "run-1"
+            run.mkdir()
+            state = EvaluationRunState.new_online(
+                run_id="run-1", dataset_path="dataset.jsonl", snapshot_path="snapshot.jsonl",
+                total_samples=1, score_enabled=True,
+            ).model_copy(update={"status": "failed"})
+            (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+            (run / "summary.json").write_text(
+                json.dumps({"run_id": "run-1", "metadata": {"run_outcome": {"kind": "partial_failed"}}}),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(should_render_evaluation_summary(run))
 
     def test_missing_saved_run_is_cleared_and_returns_to_new_form(self):
         st = Mock()

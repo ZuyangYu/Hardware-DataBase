@@ -50,6 +50,9 @@ def write_reports(
     results_jsonl = run_dir / "results.jsonl"
     summary_csv = run_dir / "summary.csv"
     report_html = run_dir / "report.html"
+    completion_marker = run_dir / "report_complete.json"
+
+    completion_marker.unlink(missing_ok=True)
 
     _atomic_text(summary_json, summary.model_dump_json(indent=2) + "\n")
     _atomic_text(results_jsonl, "\n".join(item.model_dump_json() for item in results) + ("\n" if results else ""))
@@ -133,5 +136,9 @@ def write_reports(
     html_text += "<table><thead><tr>" + "".join(f"<th>{html.escape(name)}</th>" for name in headers) + "</tr></thead>"
     html_text += "<tbody>" + "".join(rows) + "</tbody></table></body></html>"
     _atomic_text(report_html, html_text)
+    _atomic_text(
+        completion_marker,
+        json.dumps({"run_id": summary.run_id}, ensure_ascii=False) + "\n",
+    )
 
     return ReportPaths(summary_json, results_jsonl, summary_csv, report_html)
