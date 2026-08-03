@@ -1,4 +1,6 @@
 import unittest
+import json
+from pathlib import Path
 
 from src.circuit.question_analysis import analyze_question
 
@@ -21,6 +23,22 @@ class CircuitQuestionAnalysisTests(unittest.TestCase):
 
     def test_unknown_question_has_no_circuit_operations(self):
         self.assertEqual(analyze_question("今天天气如何？").operations, ())
+
+    def test_evaluation_questions_select_structural_operations(self):
+        dataset = Path(__file__).resolve().parents[1] / "evaluation" / "datasets" / "ai_database_test.jsonl"
+        expected_operations = {
+            "ai-db-v1-power-9-12v-to-3v3": {"component_selection", "power_path"},
+            "ai-db-v1-i2c-buses-and-pullups": {"i2c", "bias", "connection"},
+            "ai-db-v1-ln10046-enable-sources": {"enable", "connection"},
+            "ai-db-v1-mcu-soc-crystals": {"clock", "component_selection"},
+            "ai-db-v1-can0-rxd-pullup": {"bias", "connection", "value"},
+        }
+
+        for line in dataset.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            with self.subTest(row_id=row["id"]):
+                plan = analyze_question(row["question"])
+                self.assertTrue(expected_operations[row["id"]].issubset(plan.operations))
 
 
 if __name__ == "__main__":

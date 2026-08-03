@@ -25,6 +25,12 @@ _PROTECTION_TERMS = ("保护", "短电源", "短地", "短路", "过流", "过�
 _DATASHEET_TERMS = (
     "短电源", "短地", "短路", "过流", "过压", "反接", "保护能力", "规范", "额定", "datasheet", "ocp", "scp", "thermal",
 )
+_PLACEMENT_TERMS = ("靠近", "布局", "摆放", "placement", "layout", "near")
+_VALUE_TERMS = ("阻值", "数值", "参数", "value", "resistance", "频率")
+_CLOCK_TERMS = ("晶振", "晶体", "振荡器", "频率", "时钟", "crystal", "oscillator", "clock", "frequency")
+_ENABLE_TERMS = ("使能", "禁止", "唤醒", "inhibit", "wakeup", "enable", "en_sync", "ecu_en")
+_I2C_TERMS = ("i2c", "i²c", "scl", "sda")
+_COMPONENT_SELECTION_TERMS = ("芯片型号", "器件型号", "型号", "选型", "可使用", "model", "part number", "component selection")
 
 
 def analyze_question(question: str) -> CircuitQuestionPlan:
@@ -36,7 +42,21 @@ def analyze_question(question: str) -> CircuitQuestionPlan:
     operations: list[str] = []
     if any(term in text for term in _BIAS_TERMS):
         operations.append("bias")
+    if any(term in text for term in _I2C_TERMS):
+        operations.append("i2c")
+    if any(term in text for term in _ENABLE_TERMS):
+        operations.append("enable")
+    if any(term in text for term in _CLOCK_TERMS):
+        operations.append("clock")
+    if any(term in text for term in _COMPONENT_SELECTION_TERMS):
+        operations.append("component_selection")
+    if any(term in text for term in _PLACEMENT_TERMS):
+        operations.append("placement")
+    if any(term in text for term in _VALUE_TERMS):
+        operations.append("value")
     if any(term in text for term in _POWER_TERMS):
+        operations.append("power_path")
+    if any(term in text for term in ("输入电压", "输出电压", "输出电流", "vin", "vout")) and "power_path" not in operations:
         operations.append("power_path")
     if any(term in text for term in _POWER_SWITCH_TERMS) and any(
         term in text for term in _POWER_ROLE_TERMS
@@ -44,10 +64,10 @@ def analyze_question(question: str) -> CircuitQuestionPlan:
         operations.append("power_switch")
     if any(term in text for term in _PROTECTION_TERMS):
         operations.append("protection")
-    if not operations and any(term in text for term in _CONNECTION_TERMS):
+    if any(term in text for term in _CONNECTION_TERMS) or "i2c" in operations or "enable" in operations:
         operations.append("connection")
 
     return CircuitQuestionPlan(
-        operations=tuple(operations),
+        operations=tuple(dict.fromkeys(operations)),
         requires_datasheet=bool(operations and any(term in text for term in _DATASHEET_TERMS)),
     )

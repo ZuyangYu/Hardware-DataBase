@@ -15,7 +15,7 @@ from src.circuit.parsers.edf_parser import EdfParser
 from src.circuit.question_analysis import analyze_question
 from src.circuit.query_engine import CircuitQueryEngine
 from src.circuit.store import CircuitStore, make_design_id
-from src.circuit.vector_index import CircuitVectorIndex, default_circuit_vector_index
+from src.circuit.vector_index import KIND_INSTANCE, KIND_MODULE, KIND_NET, CircuitVectorIndex, default_circuit_vector_index
 from src.pipelines.document_rag.schemas import RequestContext
 
 
@@ -162,11 +162,14 @@ class CircuitIndexService:
         if not allowed_designs:
             return []
 
-        hits = self._structured_evidence(kb_name, query, allowed_designs, top_k)
-        if hits:
-            return hits[:top_k]
-
-        hits = []
+        # Retrieval is deliberately staged.  Structured facts are authoritative;
+        # graph expansion adds topology context without replacing them; semantic
+        # recall is used only when neither has grounded an answer.
+        structured_hits = self._structured_evidence(kb_name, query, allowed_designs, top_k)
+        graph_hits = self._graph_evidence(kb_name, query, allowed_designs)
+        hits = self._deduplicate([*structured_hits, *graph_hits])
+        if not hits:
+            hits.extend(self._semantic_evidence(kb_name, query, allowed_designs, top_k))
         for design in self.store.list_designs(kb_name):
             allowed = allowed_designs.get(design.design_id)
             if allowed is None:
@@ -174,8 +177,99 @@ class CircuitIndexService:
             meta, source_name = allowed
             hits.extend(self._net_evidence(design, meta, source_name, needles))
             hits.extend(self._instance_evidence(design, meta, source_name, needles))
-        hits.sort(key=lambda item: item.score, reverse=True)
-        return hits[:top_k]
+        return self._deduplicate(hits)[:top_k]
+
+    @staticmethod
+    def _deduplicate(hits: list[Evidence]) -> list[Evidence]:
+        by_id: dict[str, Evidence] = {}
+        for hit in hits:
+            current = by_id.get(hit.id)
+            if current is None or hit.score > current.score:
+                by_id[hit.id] = hit
+        return sorted(by_id.values(), key=lambda item: (-item.score, item.id))
+
+    def _graph_evidence(
+        self,
+        kb_name: str,
+        query: str,
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+    ) -> list[Evidence]:
+        load = getattr(self.graph_store, "load", None)
+        if not callable(load):
+            return []
+        refdes_values = list(dict.fromkeys(re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d+)(?![A-Za-z0-9])", query)))
+        if not refdes_values:
+            return []
+        results: list[Evidence] = []
+        for design_id, (metadata, source_name) in allowed_designs.items():
+            try:
+                graph = load(self.store.design_dir(kb_name, design_id))
+            except Exception:
+                continue
+            if graph is None:
+                continue
+            for refdes in refdes_values:
+                neighbors = self.graph_store.connected_entities(graph, refdes=refdes)
+                net_names = [str(item.get("net_name") or item.get("name") or "") for item in neighbors if item.get("kind") == "net"]
+                for net_name in net_names:
+                    related = self.graph_store.connected_entities(graph, net_name=net_name)
+                    endpoints = [item for item in related if item.get("kind") == "pin"]
+                    components = sorted({str(item.get("refdes") or "") for item in related if item.get("kind") == "component" and item.get("refdes")})
+                    for endpoint in endpoints:
+                        pin = str(endpoint.get("pin") or endpoint.get("pin_name") or "")
+                        endpoint_refdes = str(endpoint.get("refdes") or "")
+                        if not pin or not endpoint_refdes:
+                            continue
+                        content = f"Graph net {net_name}: {refdes} is related through {endpoint_refdes}.{pin}; components: {', '.join(components)}."
+                        record_id = metadata.get("record_id")
+                        results.append(Evidence(
+                            id=f"circuit:{record_id or design_id}:graph_relationship:{refdes}:{endpoint_refdes}.{pin}:{net_name}",
+                            content=content,
+                            source_name=source_name,
+                            content_kind="circuit_design",
+                            processor_kind="circuit_design",
+                            score=0.88,
+                            locator={"record_id": record_id, "circuit_id": design_id, "entity_type": "graph_relationship", "entity_id": refdes, "pin": pin, "net": net_name},
+                            metadata={"kb_name": kb_name, "department_id": metadata.get("department_id", ""), "source_group": "circuit_design", "evidence_kind": "graph_relationship"},
+                        ))
+        return self._deduplicate(results)
+
+    def _semantic_evidence(
+        self,
+        kb_name: str,
+        query: str,
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+        top_k: int,
+    ) -> list[Evidence]:
+        search = getattr(self.vector_index, "semantic_search", None)
+        if not callable(search):
+            return []
+        try:
+            vector_hits = search(kb_name, query, top_k=top_k * 2, kinds=(KIND_INSTANCE, KIND_NET, KIND_MODULE))
+        except Exception:
+            return []
+        results: list[Evidence] = []
+        for hit in vector_hits:
+            context = allowed_designs.get(str(getattr(hit, "design_id", "")))
+            if context is None:
+                continue
+            metadata, source_name = context
+            kind = str(getattr(hit, "kind", "") or "instance")
+            entity_id = str(getattr(hit, "natural_id", "") or "semantic")
+            record_id = metadata.get("record_id")
+            # Semantic scores must never outrank direct EDF facts.
+            score = min(0.69, max(0.0, float(getattr(hit, "score", 0.0))))
+            results.append(Evidence(
+                id=f"circuit:{record_id or hit.design_id}:semantic_{kind}:{entity_id}",
+                content=str(getattr(hit, "document", "") or f"Semantic circuit match: {entity_id}."),
+                source_name=source_name,
+                content_kind="circuit_design",
+                processor_kind="circuit_design",
+                score=score,
+                locator={"record_id": record_id, "circuit_id": hit.design_id, "entity_type": f"semantic_{kind}", "entity_id": entity_id},
+                metadata={"kb_name": kb_name, "department_id": metadata.get("department_id", ""), "source_group": "circuit_design", "evidence_kind": "semantic"},
+            ))
+        return self._deduplicate(results)
 
     def list_pin_mapping_evidence(
         self,

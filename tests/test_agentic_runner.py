@@ -5,7 +5,7 @@ import contextvars
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from src.agents.graph import judge_sufficiency, plan_next_retrieval, plan_source_selection_with_llm, retrieve_evidence, score_and_compare_evidence
+from src.agents.graph import analyze_question, analyze_question_with_llm, judge_sufficiency, plan_next_retrieval, plan_source_selection, plan_source_selection_with_llm, retrieve_evidence, score_and_compare_evidence
 from src.agents.query_tokens import tokenize_hardware_query
 from src.agents.runner import MultiSourceAgentRunner
 from src.agents.tools.document_rag_tool import DocumentRAGTool
@@ -362,7 +362,36 @@ class _PromptCaptureLLM:
         return json.dumps(self.payload, ensure_ascii=False)
 
 
+class _EvaluationPlannerLLM:
+    """Deliberately omits circuit evidence so deterministic completion is exercised."""
+
+    def chat(self, messages):
+        system = messages[0]["content"]
+        if "Question Analysis Agent" in system:
+            return json.dumps({
+                "intent": "lookup",
+                "summary": "LLM omitted structural evidence.",
+                "entities": [],
+                "sub_questions": [{"id": "sq_1", "question": messages[-1]["content"].split("User query:\n", 1)[-1].split("\n", 1)[0], "expected_evidence": ["document_text"]}],
+                "multi_hop": False,
+            })
+        return json.dumps({"source_plan": [{"source_name": "board.edf", "reason": "LLM selection.", "tool_calls": []}], "skipped_sources": []})
+
+
 class AgenticRunnerTests(unittest.TestCase):
+    def test_evaluation_questions_always_plan_indexed_circuit_source(self):
+        dataset = Path(__file__).resolve().parents[1] / "evaluation" / "datasets" / "ai_database_test.jsonl"
+        catalog = {"sources": [{"document_name": "board.edf", "record_id": 7, "processor_kind": "circuit_design", "status": "indexed"}]}
+        for line in dataset.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            with self.subTest(row_id=row["id"]):
+                state = {"kb_name": "ADAS_new", "user_query": row["question"], "catalog": catalog, "trace": []}
+                deterministic = plan_source_selection(analyze_question(state))
+                llm_completed = plan_source_selection_with_llm(analyze_question_with_llm(state, _EvaluationPlannerLLM()), _EvaluationPlannerLLM())
+                for planned in (deterministic, llm_completed):
+                    calls = [call for item in planned["source_plan"]["source_plan"] for call in item["tool_calls"]]
+                    self.assertTrue(any(call["tool_name"] == "circuit_query" for call in calls))
+
     def test_retrieval_does_not_truncate_required_circuit_sources(self):
         calls = []
 

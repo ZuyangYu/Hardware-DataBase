@@ -8,7 +8,7 @@ from src.circuit.graph_store import GraphIndexResult, GraphStore
 from src.circuit.index_service import CircuitIndexService
 from src.circuit.models import CircuitModule, ComponentInstance, Net, Pin, PinRef
 from src.circuit.store import CircuitStore
-from src.circuit.vector_index import CircuitVectorIndexStatus
+from src.circuit.vector_index import CircuitVectorHit, CircuitVectorIndexStatus
 from src.pipelines.document_rag.schemas import RequestContext
 
 
@@ -440,6 +440,69 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertEqual({hit.locator["entity_id"] for hit in mappings}, {"U1500", "U1802", "U1803"})
         self.assertTrue(all("VIN" in hit.content and "ON" in hit.content for hit in mappings))
 
+    def test_exact_component_facts_precede_semantic_evidence_without_semantic_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vector_index = _SemanticVectorIndex()
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=lambda path, progress_callback=None: _EvaluationParser(),
+                vector_index=vector_index,
+            )
+            service.index_file(
+                kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"),
+                original_name="board.edf", department_id="dept_hw",
+            )
+            ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
+
+            for refdes, expected in (("Y900", "20MHz"), ("Y600", "30MHz"), ("R1205", "100K"), ("U1600", "LN10046FSQ1LQR")):
+                with self.subTest(refdes=refdes):
+                    hits = service.query(kb_name="kb_hw", query=f"{refdes} value", ctx=ctx, top_k=5)
+                    direct = next(hit for hit in hits if hit.locator["entity_type"] == "instance" and hit.locator["entity_id"] == refdes)
+                    self.assertIn(expected, direct.content)
+                    self.assertGreater(direct.score, 0.70)
+
+            self.assertEqual(vector_index.search_calls, [])
+
+    def test_graph_relationship_evidence_has_stable_entity_pin_and_net_locators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=lambda path, progress_callback=None: _EvaluationParser(),
+                vector_index=_UnavailableVectorIndex(),
+            )
+            service.index_file(
+                kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"),
+                original_name="board.edf", department_id="dept_hw",
+            )
+            hits = service.query(
+                kb_name="kb_hw", query="U1600 enable signal neighbors", top_k=12,
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+            )
+
+        graph_hits = [hit for hit in hits if hit.locator["entity_type"] == "graph_relationship"]
+        self.assertTrue(graph_hits)
+        self.assertTrue(any("EN_SYNC" in hit.content and "D1611" in hit.content for hit in graph_hits))
+        self.assertTrue(all({"entity_id", "pin", "net"}.issubset(hit.locator) for hit in graph_hits))
+
+    def test_semantic_fallback_ranks_below_direct_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vector_index = _SemanticVectorIndex()
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=lambda path, progress_callback=None: _EvaluationParser(),
+                vector_index=vector_index,
+            )
+            service.index_file(
+                kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"),
+                original_name="board.edf", department_id="dept_hw",
+            )
+            ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
+            direct = service.query(kb_name="kb_hw", query="Y900 value", ctx=ctx)[0]
+            semantic = service.query(kb_name="kb_hw", query="unmatched oscillator intent", ctx=ctx)[0]
+
+        self.assertGreater(direct.score, semantic.score)
+        self.assertEqual(semantic.locator["entity_type"], "semantic_instance")
+
 
 class _Parser:
     warnings = ["parser warning"]
@@ -599,6 +662,41 @@ class _PowerSwitchParser:
             for pin in instance.pins
         ]
         return instances, nets, []
+
+
+class _EvaluationParser:
+    def parse(self):
+        return (
+            [
+                ComponentInstance(refdes="Y900", library_cell="CRYSTAL", value="20MHz"),
+                ComponentInstance(refdes="Y600", library_cell="CRYSTAL", value="30MHz"),
+                ComponentInstance(refdes="R1205", library_cell="RES", value="100K", pins=[Pin(name="1", net="CAN0_RXD"), Pin(name="2", net="VCC3V3")]),
+                ComponentInstance(refdes="U1600", library_cell="LN10046", part_number="LN10046FSQ1LQR", pins=[Pin(name="EN_SYNC", net="ECU_EN")]),
+                ComponentInstance(refdes="D1611", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN")]),
+            ],
+            [
+                Net(name="ECU_EN", connections=[PinRef(refdes="U1600", pin="EN_SYNC"), PinRef(refdes="D1611", pin="K")]),
+                Net(name="CAN0_RXD", connections=[PinRef(refdes="R1205", pin="1")]),
+                Net(name="VCC3V3", connections=[PinRef(refdes="R1205", pin="2")], net_type="power"),
+            ],
+            [],
+        )
+
+
+class _SemanticVectorIndex(_VectorIndex):
+    def __init__(self):
+        super().__init__()
+        self.search_calls = []
+
+    def semantic_search(self, kb_name, query, top_k=20, kinds=None):
+        self.search_calls.append((kb_name, query, top_k, tuple(kinds or ())))
+        return [
+            CircuitVectorHit(
+                kind="instance", design_id="board", natural_id="Y900", score=0.42,
+                metadata={"kind": "instance", "design_id": "board", "natural_id": "Y900"},
+                document="semantic oscillator candidate",
+            )
+        ]
 
 
 class _QueryEngine:

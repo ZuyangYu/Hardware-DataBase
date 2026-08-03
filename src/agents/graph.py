@@ -25,8 +25,8 @@ from src.agents.state import (
     SufficiencyDecision,
     ToolCallPlan,
 )
-from src.agents.query_tokens import _HARDWARE_TERMS
 from src.circuit.question_analysis import analyze_question as analyze_circuit_question
+from src.agents.query_tokens import _HARDWARE_TERMS
 from src.ingestion.parser_registry import PARSER_REGISTRY
 from src.agents.prompts import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
@@ -244,6 +244,9 @@ def _required_candidate_evidence(question: str) -> set[str]:
     )
     protection_terms = ("protection", "tvs", "ocp", "scp", "保护", "过压", "过流", "短路", "反接")
     required: set[str] = set()
+    circuit_plan = analyze_circuit_question(question)
+    if circuit_plan.operations:
+        required.add("circuit_design")
     if (
         has_refdes
         or (has_net_identifier and any(term in lower for term in circuit_terms + protection_terms))
@@ -257,6 +260,11 @@ def _required_candidate_evidence(question: str) -> set[str]:
         for term in ("configuration", "register", "software", "datasheet", "manual", "配置", "寄存器", "软件", "手册", "保护能力") + protection_terms
     ):
         required.add("document_text")
+    if "component_selection" in circuit_plan.operations:
+        # Selection needs direct circuit constraints plus the supporting
+        # specification/documentation; neither source may silently replace
+        # the other in an LLM-proposed plan.
+        required.update({"circuit_design", "document_text"})
     return required
 
 
