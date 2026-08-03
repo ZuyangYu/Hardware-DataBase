@@ -10,6 +10,10 @@ effective Unix UID.  A malicious same-effective-UID process can directly
 modify every importer-accessible artifact and is explicitly out of scope.
 Ordinary races and actors unable to traverse the mode-0700 private staging
 directory remain within scope.
+
+The final target root must be owned by the effective UID and must not be
+group/world writable.  This prevents in-scope cross-UID actors from renaming
+target-root entries; same-effective-UID modification remains out of scope.
 """
 
 from __future__ import annotations
@@ -215,6 +219,20 @@ def _directory_binding(info: os.stat_result) -> DirectoryBinding:
         info.st_gid,
         stat.S_IMODE(info.st_mode),
     )
+
+
+def _validate_target_root_security(fd: int) -> None:
+    info = os.fstat(fd)
+    if info.st_uid != os.geteuid():
+        raise OSError(
+            errno.EPERM,
+            "target root must be owned by the effective UID",
+        )
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise OSError(
+            errno.EPERM,
+            "target root must not be group/world writable",
+        )
 
 
 def _capture_created_directory_binding(parent_fd: int, name: str) -> DirectoryBinding:
@@ -541,6 +559,10 @@ def discover_imports(source_root: str | Path, target_root: str | Path) -> Import
         except OSError as exc:
             raise ValueError(f"target root is not a safe directory: {target_root_path}: {exc}") from exc
         else:
+            try:
+                _validate_target_root_security(target_root_fd)
+            except OSError as exc:
+                raise ValueError(f"target root is unsafe: {exc}") from exc
             target_root_identity = _identity(target_root_fd)
             if target_root_identity == _identity(source_root_fd):
                 raise ValueError(
@@ -697,6 +719,11 @@ def _open_apply_target_root(plan: ImportPlan) -> int:
     if plan.target_root_identity is not None and current_identity != plan.target_root_identity:
         os.close(fd)
         raise ImportApplyError(f"target root identity changed after discovery: {plan.target_root}")
+    try:
+        _validate_target_root_security(fd)
+    except OSError as exc:
+        os.close(fd)
+        raise ImportApplyError(f"target root is unsafe: {exc}") from exc
     return fd
 
 

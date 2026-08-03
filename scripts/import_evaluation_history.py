@@ -26,7 +26,9 @@ def _parser() -> argparse.ArgumentParser:
         epilog=(
             "Threat boundary: same effective Unix UID attacks are out of scope.\n"
             "Ordinary races and actors unable to traverse private mode-0700 staging "
-            "remain in scope."
+            "remain in scope.\n"
+            "Target root must be owned by the effective UID and not group/world writable; "
+            "this blocks in-scope cross-UID entry substitution."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

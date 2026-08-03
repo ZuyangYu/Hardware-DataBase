@@ -143,7 +143,7 @@ def test_dry_run_does_not_mutate_source_or_target(tmp_path: Path):
     source = tmp_path / "source"
     target = tmp_path / "target"
     _write_report(source, "run-1", optional=True, nested=True)
-    target.mkdir()
+    target.mkdir(mode=0o755)
     (target / "existing.txt").write_text("unchanged", encoding="utf-8")
     (target / "existing-directory").mkdir()
     (target / "existing-link").symlink_to("existing.txt")
@@ -178,7 +178,7 @@ def test_equal_content_is_skipped_and_different_content_is_conflict(tmp_path: Pa
     target = tmp_path / "target"
     equal_source = _write_report(source, "same")
     different_source = _write_report(source, "different", sample_ids=("sample-a",))
-    target.mkdir()
+    target.mkdir(mode=0o755)
     equal_target = target / "same"
     equal_target.mkdir()
     for name in ("summary.json", "results.jsonl"):
@@ -401,7 +401,7 @@ def test_apply_rejects_target_root_symlink_redirection(tmp_path: Path):
     target = tmp_path / "target"
     redirected = tmp_path / "redirected"
     _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     redirected.mkdir()
     plan = discover_imports(source, target)
     target.rename(tmp_path / "original-target")
@@ -418,7 +418,8 @@ def test_apply_revalidates_stale_skip_equal_as_conflict(tmp_path: Path):
     target = tmp_path / "target"
     source_run = _write_report(source, "run-1")
     target_run = target / "run-1"
-    target_run.mkdir(parents=True)
+    target.mkdir(mode=0o755)
+    target_run.mkdir(mode=0o755)
     for name in ("summary.json", "results.jsonl"):
         (target_run / name).write_bytes((source_run / name).read_bytes())
     plan = discover_imports(source, target)
@@ -543,7 +544,7 @@ def test_private_staging_parent_prevents_visible_name_substitution(
     source = tmp_path / "source"
     target = tmp_path / "target"
     source_run = _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     plan = discover_imports(source, target)
     original_rename = history_import._rename_noreplace
 
@@ -635,7 +636,7 @@ def test_post_rename_fsync_failure_reports_published_durability_uncertainty(
     source = tmp_path / "source"
     target = tmp_path / "target"
     _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     plan = discover_imports(source, target)
     original_rename = history_import._rename_noreplace
     original_fsync_directory = history_import._fsync_directory_fd
@@ -703,14 +704,14 @@ def test_post_publish_target_root_path_drift_is_reported(
     target = tmp_path / "target"
     moved_target = tmp_path / "moved-target"
     _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     plan = discover_imports(source, target)
     original_rename = history_import._rename_noreplace
 
     def move_target_root_after_publish(*args, **kwargs):
         result = original_rename(*args, **kwargs)
         target.rename(moved_target)
-        target.mkdir()
+        target.mkdir(mode=0o755)
         return result
 
     monkeypatch.setattr(
@@ -738,14 +739,14 @@ def test_target_root_path_is_revalidated_after_staging_cleanup(
     target = tmp_path / "target"
     moved_target = tmp_path / "moved-after-cleanup"
     _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     plan = discover_imports(source, target)
     original_cleanup = history_import._remove_private_staging
 
     def move_target_after_cleanup(*args, **kwargs):
         result = original_cleanup(*args, **kwargs)
         target.rename(moved_target)
-        target.mkdir()
+        target.mkdir(mode=0o755)
         return result
 
     monkeypatch.setattr(
@@ -769,7 +770,7 @@ def test_failed_publication_fsyncs_target_root_after_staging_cleanup(
     source = tmp_path / "source"
     target = tmp_path / "target"
     _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     plan = discover_imports(source, target)
     original_rmtree = history_import.shutil.rmtree
     original_fsync_directory = history_import._fsync_directory_fd
@@ -808,7 +809,7 @@ def test_cleanup_detects_private_parent_substitution_at_rmdir(
     target = tmp_path / "target"
     moved_staging = target / "moved-private-staging"
     _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     plan = discover_imports(source, target)
     original_rmdir = history_import.os.rmdir
     substituted = False
@@ -873,7 +874,7 @@ def test_cleanup_quarantines_and_preserves_substituted_outer_directory(
     target = tmp_path / "target"
     moved_expected = target / "moved-expected-staging"
     _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     plan = discover_imports(source, target)
     original_rename = history_import._rename_noreplace
     original_quarantine = history_import._quarantine_noreplace
@@ -933,7 +934,7 @@ def test_discovery_rejects_target_identity_alias_to_immediate_source_run(
     source = tmp_path / "source"
     target = tmp_path / "target"
     run_dir = _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     before = _snapshot(source)
     run_info = run_dir.stat()
     run_identity = (run_info.st_dev, run_info.st_ino)
@@ -990,7 +991,7 @@ def test_integrated_source_close_failure_is_structured_apply_error(
     source = tmp_path / "source"
     target = tmp_path / "target"
     _write_report(source, "run-1")
-    target.mkdir()
+    target.mkdir(mode=0o755)
     plan = discover_imports(source, target)
     original_close_source_files = history_import._close_source_files
 
@@ -1039,3 +1040,67 @@ def test_cli_help_documents_same_effective_uid_threat_boundary():
     assert result.returncode == 0
     assert "same effective Unix UID" in result.stdout
     assert "out of scope" in result.stdout
+    assert "Target root must be owned by the effective UID" in result.stdout
+    assert "not group/world writable" in result.stdout
+
+
+@pytest.mark.parametrize("unsafe_mode", [0o775, 0o757])
+def test_apply_rejects_group_or_world_writable_target_before_staging(
+    tmp_path: Path, unsafe_mode: int
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_report(source, "run-1")
+    target.mkdir()
+    target.chmod(0o755)
+    plan = discover_imports(source, target)
+    target.chmod(unsafe_mode)
+
+    with pytest.raises(ImportApplyError, match="group/world writable"):
+        apply_import_plan(plan)
+
+    assert not (target / "run-1").exists()
+    assert not any(path.name.startswith(".import-") for path in target.iterdir())
+
+
+def test_apply_rejects_foreign_owned_target_before_staging(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_report(source, "run-1")
+    target.mkdir()
+    target.chmod(0o755)
+    plan = discover_imports(source, target)
+    original_fstat = history_import.os.fstat
+
+    def report_foreign_target_owner(fd):
+        info = original_fstat(fd)
+        try:
+            opened_path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            return info
+        if opened_path != target:
+            return info
+        fields = list(info)
+        fields[4] = os.geteuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(history_import.os, "fstat", report_foreign_target_owner)
+
+    with pytest.raises(ImportApplyError, match="owned by the effective UID"):
+        apply_import_plan(plan)
+
+    assert not (target / "run-1").exists()
+    assert not any(path.name.startswith(".import-") for path in target.iterdir())
+
+
+def test_user_owned_0755_target_remains_supported(tmp_path: Path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_report(source, "run-1")
+    target.mkdir()
+    target.chmod(0o755)
+
+    plan = discover_imports(source, target)
+    result = apply_import_plan(plan)
+
+    assert result.published == [target / "run-1"]
