@@ -575,9 +575,8 @@ class CircuitIndexServiceTests(unittest.TestCase):
             service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
             hits = service.query(kb_name="kb_hw", query="LN10046 的使能信号来源有哪些？请逐项列举。", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}), top_k=20)
 
-        source_nets = {hit.locator.get("net") for hit in hits if hit.locator["entity_type"] == "graph_relationship"}
-        self.assertTrue({"CAN0_INH", "CAN1_INH", "CAN2_INH", "CAN3_INH", "ETH_INH", "L_S_WKUP"}.issubset(source_nets))
-        self.assertNotIn("UNRELATED", source_nets)
+        source_nets = {hit.locator.get("net") for hit in hits if hit.locator["entity_type"] == "graph_relationship"} - {"ECU_EN"}
+        self.assertEqual(source_nets, {"CAN0_INH", "CAN1_INH", "CAN2_INH", "CAN3_INH", "ETH_INH", "L_S_WKUP"})
 
     def test_bias_missing_signal_returns_no_unrelated_topology(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -586,6 +585,17 @@ class CircuitIndexServiceTests(unittest.TestCase):
             hits = service.query(kb_name="kb_hw", query="MISSING_RXD 上拉电阻位号和阻值", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}), top_k=8)
 
         self.assertFalse(any(hit.locator["entity_type"] == "topology" for hit in hits))
+
+    def test_spaced_english_pull_direction_retrieval_ignores_generic_words(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
+            pull_up = service.query(kb_name="kb_hw", query="pull up resistor", ctx=ctx, top_k=8)
+            pull_down = service.query(kb_name="kb_hw", query="pull down resistor", ctx=ctx, top_k=8)
+
+        self.assertEqual({hit.locator["entity_id"] for hit in pull_up if hit.locator["entity_type"] == "topology"}, {"pull_up:R1205", "pull_up:R1210"})
+        self.assertEqual({hit.locator["entity_id"] for hit in pull_down if hit.locator["entity_type"] == "topology"}, {"pull_down:R1211"})
 
     def test_exact_stage_internal_type_error_never_retries_nonempty_query(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -777,7 +787,7 @@ class _EvaluationParser:
                 ComponentInstance(refdes="Y600", library_cell="CRYSTAL", value="30MHz"),
                 ComponentInstance(refdes="R1205", library_cell="RES", value="100K", pins=[Pin(name="1", net="CAN0_RXD"), Pin(name="2", net="VCC3V3")]),
                 ComponentInstance(refdes="R1210", library_cell="RES", value="10K", pins=[Pin(name="1", net="LIN_RXD"), Pin(name="2", net="VCC3V3")]),
-                ComponentInstance(refdes="U1600", library_cell="LN10046", part_number="LN10046FSQ1LQR", pins=[Pin(name="EN_SYNC", net="ECU_EN")]),
+                ComponentInstance(refdes="U1600", library_cell="LN10046", part_number="LN10046FSQ1LQR", pins=[Pin(name="EN_SYNC", net="ECU_EN"), Pin(name="VIN", net="VCC3V3"), Pin(name="GND", net="GND"), Pin(name="FB", net="FB_NODE"), Pin(name="SW", net="SW_NODE"), Pin(name="TIME", net="TIME_CAP")]),
                 ComponentInstance(refdes="D1611", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="CAN0_INH")]),
                 ComponentInstance(refdes="D1612", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="CAN1_INH")]),
                 ComponentInstance(refdes="D1613", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="CAN2_INH")]),
@@ -785,6 +795,7 @@ class _EvaluationParser:
                 ComponentInstance(refdes="D1615", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="ETH_INH")]),
                 ComponentInstance(refdes="D1608", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="L_S_WKUP")]),
                 ComponentInstance(refdes="X1", library_cell="TEST", pins=[Pin(name="IN", net="CAN0_INH"), Pin(name="OUT", net="UNRELATED")]),
+                ComponentInstance(refdes="R1211", library_cell="RES", value="10K", pins=[Pin(name="1", net="LIN_PULLDOWN"), Pin(name="2", net="GND")]),
             ],
             [
                 Net(name="ECU_EN", connections=[PinRef(refdes="U1600", pin="EN_SYNC"), *[PinRef(refdes=refdes, pin="K") for refdes in ("D1608", "D1611", "D1612", "D1613", "D1614", "D1615")]]),
@@ -794,6 +805,11 @@ class _EvaluationParser:
                 Net(name="CAN0_RXD", connections=[PinRef(refdes="R1205", pin="1")]),
                 Net(name="LIN_RXD", connections=[PinRef(refdes="R1210", pin="1")]),
                 Net(name="VCC3V3", connections=[PinRef(refdes="R1205", pin="2")], net_type="power"),
+                Net(name="GND", connections=[PinRef(refdes="U1600", pin="GND"), PinRef(refdes="R1211", pin="2")], net_type="ground"),
+                Net(name="FB_NODE", connections=[PinRef(refdes="U1600", pin="FB")]),
+                Net(name="SW_NODE", connections=[PinRef(refdes="U1600", pin="SW")]),
+                Net(name="TIME_CAP", connections=[PinRef(refdes="U1600", pin="TIME")]),
+                Net(name="LIN_PULLDOWN", connections=[PinRef(refdes="R1211", pin="1")]),
             ],
             [],
         )

@@ -252,6 +252,16 @@ class CircuitIndexService:
             if design is None:
                 continue
             refdes_values, net_names = _graph_targets(design, query)
+            enable_trace = "enable" in analyze_question(query).operations
+            if enable_trace:
+                instance_by_refdes = {instance.refdes: instance for instance in design.instances}
+                net_names = [name for name in net_names if _is_enable_entry("", name)]
+                for refdes in refdes_values:
+                    instance = instance_by_refdes.get(refdes)
+                    if instance is None:
+                        continue
+                    net_names.extend(pin.net for pin in instance.pins if pin.net and _is_enable_entry(pin.name, pin.net))
+                refdes_values = []
             # Bounded component → net → component → net traversal.  It is
             # sufficient for enable diode-OR source tracing while preventing
             # an arbitrary walk across the rest of an authorized design.
@@ -305,6 +315,12 @@ class CircuitIndexService:
                     ))
                 if depth < 3:
                     pending_refdes.extend((str(item.get("refdes") or ""), depth + 1) for item in related if item.get("kind") == "component" and item.get("refdes"))
+                    if enable_trace:
+                        pending_refdes[:] = [
+                            (refdes, ref_depth)
+                            for refdes, ref_depth in pending_refdes
+                            if _is_diode_or_member(design, refdes)
+                        ]
         return self._deduplicate(results)
 
     def _graph_connected(self, graph: Any, **kwargs: str) -> list[dict[str, Any]]:
@@ -459,9 +475,9 @@ class CircuitIndexService:
         if "bias" in plan.operations:
             bias_rows = self.query_engine.search_bias_topologies(kb_name, limit=top_k * 3)
             lowered = query.casefold()
-            if "上拉" in lowered or "pull-up" in lowered or "pullup" in lowered:
+            if "上拉" in lowered or "pull-up" in lowered or "pullup" in lowered or "pull up" in lowered:
                 bias_rows = [row for row in bias_rows if row.get("topology") == "pull_up"]
-            elif "下拉" in lowered or "pull-down" in lowered or "pulldown" in lowered:
+            elif "下拉" in lowered or "pull-down" in lowered or "pulldown" in lowered or "pull down" in lowered:
                 bias_rows = [row for row in bias_rows if row.get("topology") == "pull_down"]
             bias_rows = _filter_bias_rows(bias_rows, query, plan)
             candidates.append(("topology", 0.94, bias_rows))
@@ -646,7 +662,8 @@ def _graph_targets(design: CircuitDesign, query: str) -> tuple[list[str], list[s
 
 
 def _filter_bias_rows(rows: list[dict[str, Any]], query: str, plan: Any) -> list[dict[str, Any]]:
-    identifiers = [value.casefold() for value in _exact_terms(query) if len(value) >= 3]
+    generic_terms = {"pull", "up", "down", "pullup", "pulldown", "resistor", "resistance"}
+    identifiers = [value.casefold() for value in _exact_terms(query) if len(value) >= 3 and value.casefold() not in generic_terms]
     if "i2c" in plan.operations:
         identifiers.extend(["scl", "sda"])
     if not identifiers:
@@ -657,6 +674,20 @@ def _filter_bias_rows(rows: list[dict[str, Any]], query: str, plan: Any) -> list
 
     filtered = [row for row in rows if matches(row)]
     return filtered
+
+
+def _is_enable_entry(pin_name: str, net_name: str) -> bool:
+    pin = re.sub(r"[^a-z0-9]+", "", str(pin_name or "").casefold())
+    net = str(net_name or "").casefold()
+    return pin in {"en", "enable", "ensync", "sync", "ecuen"} or pin.endswith("en") or any(token in net for token in ("ecu_en", "en_sync", "_en", "_inh", "wkup", "wakeup"))
+
+
+def _is_diode_or_member(design: CircuitDesign, refdes: str) -> bool:
+    instance = next((item for item in design.instances if item.refdes == refdes), None)
+    if instance is None:
+        return False
+    descriptor = " ".join(str(value or "") for value in (instance.refdes, instance.library_cell, instance.part_number))
+    return str(instance.refdes or "").upper().startswith("D") or "DIODE" in descriptor.upper()
 
 
 def _matches_terms(haystack: str, terms: list[str]) -> bool:
