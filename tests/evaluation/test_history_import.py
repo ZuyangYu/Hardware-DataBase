@@ -864,3 +864,178 @@ def test_directory_open_closes_fd_when_fstat_fails(monkeypatch):
         history_import._open_directory_at(3, "run")
 
     assert closed == [91]
+
+
+def test_cleanup_quarantines_and_preserves_substituted_outer_directory(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    moved_expected = target / "moved-expected-staging"
+    _write_report(source, "run-1")
+    target.mkdir()
+    plan = discover_imports(source, target)
+    original_rename = history_import._rename_noreplace
+    original_quarantine = history_import._quarantine_noreplace
+    substituted_identity: tuple[int, int] | None = None
+
+    def fail_publish(
+        source_name, target_name, source_parent_fd, target_parent_fd
+    ):
+        if source_name == "payload":
+            raise OSError("injected publication failure")
+        return original_rename(
+            source_name,
+            target_name,
+            source_parent_fd,
+            target_parent_fd,
+        )
+
+    def substitute_cleanup(
+        source_name, target_name, source_parent_fd, target_parent_fd
+    ):
+        nonlocal substituted_identity
+        visible = target / source_name
+        visible.rename(moved_expected)
+        visible.mkdir()
+        info = visible.stat()
+        substituted_identity = (info.st_dev, info.st_ino)
+        return original_quarantine(
+            source_name,
+            target_name,
+            source_parent_fd,
+            target_parent_fd,
+        )
+
+    monkeypatch.setattr(
+        history_import,
+        "_rename_noreplace",
+        fail_publish,
+    )
+    monkeypatch.setattr(
+        history_import,
+        "_quarantine_noreplace",
+        substitute_cleanup,
+    )
+
+    with pytest.raises(ImportApplyError, match="cleanup failed.*identity"):
+        apply_import_plan(plan)
+
+    quarantined = next(path for path in target.iterdir() if "quarantine" in path.name)
+    info = quarantined.stat()
+    assert (info.st_dev, info.st_ino) == substituted_identity
+    assert moved_expected.is_dir()
+
+
+def test_discovery_rejects_target_identity_alias_to_immediate_source_run(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    run_dir = _write_report(source, "run-1")
+    target.mkdir()
+    before = _snapshot(source)
+    run_info = run_dir.stat()
+    run_identity = (run_info.st_dev, run_info.st_ino)
+    original_identity = history_import._identity
+
+    def alias_target_identity(fd):
+        opened_path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if opened_path == target:
+            return run_identity
+        return original_identity(fd)
+
+    monkeypatch.setattr(history_import, "_identity", alias_target_identity)
+
+    with pytest.raises(ValueError, match="overlap.*identity"):
+        discover_imports(source, target)
+
+    assert _snapshot(source) == before
+
+
+def test_created_target_component_is_bound_to_mkdir_identity_and_mode(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "new-parent" / "new-child" / "target"
+    moved_created = tmp_path / "moved-created-parent"
+    _write_report(source, "run-1")
+    plan = discover_imports(source, target)
+    original_fsync_directory = history_import._fsync_directory_fd
+    substituted = False
+
+    def substitute_after_mkdir(fd):
+        nonlocal substituted
+        visible = tmp_path / "new-parent"
+        if visible.is_dir() and not substituted:
+            substituted = True
+            visible.rename(moved_created)
+            visible.mkdir()
+            visible.chmod(0o777)
+        return original_fsync_directory(fd)
+
+    monkeypatch.setattr(history_import, "_fsync_directory_fd", substitute_after_mkdir)
+
+    with pytest.raises(ImportApplyError, match="target root.*(identity|mode|owner)"):
+        apply_import_plan(plan)
+
+    assert not (target / "run-1").exists()
+    assert moved_created.is_dir()
+
+
+@pytest.mark.parametrize("phase", ["prepublish", "postpublish"])
+def test_integrated_source_close_failure_is_structured_apply_error(
+    tmp_path: Path, monkeypatch, phase: str
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_report(source, "run-1")
+    target.mkdir()
+    plan = discover_imports(source, target)
+    original_close_source_files = history_import._close_source_files
+
+    def close_then_fail(run_fd, artifact_fds):
+        original_close_source_files(run_fd, artifact_fds)
+        raise OSError("injected integrated close failure")
+
+    if phase == "prepublish":
+        monkeypatch.setattr(
+            history_import,
+            "_copy_artifact",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                OSError("injected copy failure")
+            ),
+        )
+    monkeypatch.setattr(history_import, "_close_source_files", close_then_fail)
+
+    with pytest.raises(ImportApplyError) as captured:
+        apply_import_plan(plan)
+
+    assert "integrated close failure" in str(captured.value)
+    if phase == "postpublish":
+        assert type(captured.value).__name__ == "ImportPublishedUncertainError"
+        assert getattr(captured.value, "published_path", None) == target / "run-1"
+        assert getattr(captured.value, "cleanup_uncertain", False) is True
+        assert (target / "run-1" / "summary.json").is_file()
+    else:
+        assert "copy failure" in str(captured.value)
+        assert not (target / "run-1").exists()
+
+
+def test_cli_help_documents_same_effective_uid_threat_boundary():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WORKTREE / "scripts" / "import_evaluation_history.py"),
+            "--help",
+        ],
+        cwd=WORKTREE,
+        env={**os.environ, "PYTHONPATH": str(WORKTREE)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "same effective Unix UID" in result.stdout
+    assert "out of scope" in result.stdout

@@ -22,7 +22,13 @@ from src.evaluation.history_import import (  # noqa: E402
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Discover and (with --apply) atomically import complete evaluation history reports."
+        description="Discover and (with --apply) atomically import complete evaluation history reports.",
+        epilog=(
+            "Threat boundary: same effective Unix UID attacks are out of scope.\n"
+            "Ordinary races and actors unable to traverse private mode-0700 staging "
+            "remain in scope."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("source_root", nargs="?", type=Path, help="directory containing historical run directories")
     parser.add_argument("target_root", nargs="?", type=Path, help="directory in which imported runs are published")

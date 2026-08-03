@@ -4,6 +4,12 @@ Discovery is read-only.  Apply reopens every source object through anchored
 directory handles, copies only the four named report artifacts, and publishes
 with Linux ``renameat2(RENAME_NOREPLACE)``.  There is deliberately no unsafe
 check-then-replace fallback when the no-clobber primitive is unavailable.
+
+The race protections assume concurrent actors do not share the importer's
+effective Unix UID.  A malicious same-effective-UID process can directly
+modify every importer-accessible artifact and is explicitly out of scope.
+Ordinary races and actors unable to traverse the mode-0700 private staging
+directory remain within scope.
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     getattr(errno, "EOPNOTSUPP", errno.EINVAL),
 }
 FileIdentity = tuple[int, int]
+DirectoryBinding = tuple[int, int, int, int, int]
 
 
 class ImportApplyError(RuntimeError):
@@ -71,6 +78,36 @@ class ImportPublishedUncertainError(ImportApplyError):
         self.durability_uncertain = durability_uncertain
         self.path_identity_uncertain = path_identity_uncertain
         self.cleanup_uncertain = cleanup_uncertain
+
+
+def _structured_close_error(
+    primary: BaseException | None,
+    close_error: OSError,
+    *,
+    context: str,
+    published_path: Path | None = None,
+) -> ImportApplyError:
+    detail = f"{context}: {close_error}"
+    if isinstance(primary, ImportPublishedUncertainError):
+        return ImportPublishedUncertainError(
+            primary.published_path,
+            durability_uncertain=primary.durability_uncertain,
+            path_identity_uncertain=primary.path_identity_uncertain,
+            cleanup_uncertain=True,
+            details=[str(primary), detail],
+        )
+    if published_path is not None:
+        details = [detail]
+        if primary is not None:
+            details.insert(0, str(primary))
+        return ImportPublishedUncertainError(
+            published_path,
+            cleanup_uncertain=True,
+            details=details,
+        )
+    if primary is not None:
+        return ImportApplyError(f"{primary}; {detail}")
+    return ImportApplyError(detail)
 
 
 @dataclass
@@ -170,6 +207,44 @@ def _identity(fd: int) -> FileIdentity:
     return info.st_dev, info.st_ino
 
 
+def _directory_binding(info: os.stat_result) -> DirectoryBinding:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        info.st_gid,
+        stat.S_IMODE(info.st_mode),
+    )
+
+
+def _capture_created_directory_binding(parent_fd: int, name: str) -> DirectoryBinding:
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    mode = stat.S_IMODE(info.st_mode)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError(errno.ENOTDIR, f"created target component is not a directory: {name}")
+    if info.st_uid != os.geteuid():
+        raise OSError(errno.EPERM, f"created target component has unexpected owner: {name}")
+    if mode & 0o022:
+        raise OSError(errno.EPERM, f"created target component has unsafe mode {mode:o}: {name}")
+    return _directory_binding(info)
+
+
+def _verify_created_directory_binding(
+    fd: int, expected: DirectoryBinding, name: str
+) -> None:
+    try:
+        actual = _directory_binding(os.fstat(fd))
+    except BaseException:
+        os.close(fd)
+        raise
+    if actual != expected:
+        os.close(fd)
+        raise OSError(
+            errno.ESTALE,
+            f"created target component identity, owner, or mode changed: {name}",
+        )
+
+
 def _close_fds(fds: list[int] | tuple[int, ...]) -> None:
     first_error: OSError | None = None
     for fd in fds:
@@ -213,6 +288,7 @@ def _open_directory_path(
                 if not create:
                     raise
                 created = False
+                created_binding: DirectoryBinding | None = None
                 try:
                     os.mkdir(part, mode=0o755, dir_fd=current_fd)
                     created = True
@@ -220,8 +296,15 @@ def _open_directory_path(
                     if is_final and final_must_not_exist:
                         raise
                 if created:
+                    created_binding = _capture_created_directory_binding(
+                        current_fd, part
+                    )
                     _fsync_directory_fd(current_fd)
                 child_fd = os.open(part, flags, dir_fd=current_fd)
+                if created_binding is not None:
+                    _verify_created_directory_binding(
+                        child_fd, created_binding, part
+                    )
             else:
                 if is_final and final_must_not_exist:
                     os.close(child_fd)
@@ -493,7 +576,10 @@ def discover_imports(source_root: str | Path, target_root: str | Path) -> Import
             try:
                 candidate.source_identity = _identity(run_fd)
                 if target_root_identity == candidate.source_identity:
-                    continue
+                    raise ValueError(
+                        f"source and target roots overlap by identity: target root "
+                        f"aliases immediate source run {source_path}"
+                    )
 
                 artifact_fds: dict[str, int] = {}
                 try:
@@ -699,28 +785,53 @@ def _remove_private_staging(
     except FileNotFoundError:
         pass
     _fsync_directory_fd(staging.parent_fd)
-    try:
-        visible = os.stat(
-            staging.name,
-            dir_fd=target_root_fd,
-            follow_symlinks=False,
+
+    quarantine_name: str | None = None
+    for _ in range(16):
+        candidate_name = f".import-quarantine-{secrets.token_hex(8)}"
+        try:
+            _quarantine_noreplace(
+                staging.name,
+                candidate_name,
+                target_root_fd,
+                target_root_fd,
+            )
+        except FileExistsError:
+            continue
+        quarantine_name = candidate_name
+        break
+    if quarantine_name is None:
+        raise OSError(
+            errno.EEXIST,
+            f"unable to allocate private staging cleanup quarantine: {staging.name}",
         )
+    _fsync_directory_fd(target_root_fd)
+
+    try:
+        quarantine_fd = _open_directory_at(target_root_fd, quarantine_name)
     except OSError as exc:
         raise OSError(
             errno.ESTALE,
-            f"private staging parent path changed; refusing cleanup: {staging.name}: {exc}",
+            f"quarantined private staging cannot be verified and was preserved: "
+            f"{quarantine_name}: {exc}",
         ) from exc
-    visible_identity = (visible.st_dev, visible.st_ino)
-    if not stat.S_ISDIR(visible.st_mode) or visible_identity != staging.parent_identity:
+    try:
+        quarantined_identity = _identity(quarantine_fd)
+    finally:
+        os.close(quarantine_fd)
+    if quarantined_identity != staging.parent_identity:
         raise OSError(
             errno.ESTALE,
-            f"private staging parent identity changed; refusing cleanup: {staging.name}",
+            f"quarantined private staging identity changed; preserved at "
+            f"{quarantine_name}",
         )
-    os.rmdir(staging.name, dir_fd=target_root_fd)
+
+    os.rmdir(quarantine_name, dir_fd=target_root_fd)
     if os.fstat(staging.parent_fd).st_nlink != 0:
         raise OSError(
             errno.ESTALE,
-            f"private staging parent identity changed during cleanup: {staging.name}",
+            f"quarantined private staging identity changed during cleanup: "
+            f"{quarantine_name}",
         )
     _fsync_directory_fd(target_root_fd)
 
@@ -728,6 +839,7 @@ def _remove_private_staging(
 def _private_staging(
     target_root: Path, target_root_fd: int, run_name: str
 ) -> _PrivateStaging:
+    _renameat2_callable()
     for _ in range(16):
         name = f".import-{run_name}-{secrets.token_hex(8)}"
         try:
@@ -839,7 +951,17 @@ def _manifest(candidate: ImportCandidate, plan: ImportPlan) -> dict[str, Any]:
     }
 
 
-def _rename_noreplace(
+def _renameat2_callable():
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise ImportApplyError("atomic no-replace publication is unavailable (renameat2 missing)")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    return renameat2
+
+
+def _atomic_rename_noreplace(
     source_name: str,
     target_name: str,
     source_parent_fd: int,
@@ -847,12 +969,7 @@ def _rename_noreplace(
 ) -> None:
     """Atomically rename between anchored parents without replacing target."""
 
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise ImportApplyError("atomic no-replace publication is unavailable (renameat2 missing)")
-    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    renameat2.restype = ctypes.c_int
+    renameat2 = _renameat2_callable()
     result = renameat2(
         source_parent_fd,
         os.fsencode(source_name),
@@ -873,6 +990,38 @@ def _rename_noreplace(
             f"atomic no-replace publication is unavailable: {os.strerror(error_number)}"
         )
     raise OSError(error_number, os.strerror(error_number), target_name)
+
+
+def _rename_noreplace(
+    source_name: str,
+    target_name: str,
+    source_parent_fd: int,
+    target_parent_fd: int,
+) -> None:
+    """Publication seam for atomic no-replace rename."""
+
+    _atomic_rename_noreplace(
+        source_name,
+        target_name,
+        source_parent_fd,
+        target_parent_fd,
+    )
+
+
+def _quarantine_noreplace(
+    source_name: str,
+    target_name: str,
+    source_parent_fd: int,
+    target_parent_fd: int,
+) -> None:
+    """Cleanup seam isolated from injected publication failures."""
+
+    _atomic_rename_noreplace(
+        source_name,
+        target_name,
+        source_parent_fd,
+        target_parent_fd,
+    )
 
 
 def _raise_publish_error(candidate: ImportCandidate, exc: BaseException) -> None:
@@ -1031,10 +1180,13 @@ def apply_import_plan(plan: ImportPlan) -> ImportResult:
 
     source_root_fd = _open_apply_source_root(plan)
     target_root_fd: int | None = None
+    operation_error: BaseException | None = None
     try:
         target_root_fd = _open_apply_target_root(plan)
         for candidate in actionable:
             run_fd, artifact_fds = _open_validated_source_files(source_root_fd, candidate)
+            candidate_error: BaseException | None = None
+            published_path: Path | None = None
             try:
                 if candidate.status == "skip_equal":
                     if _target_matches_at(candidate, target_root_fd):
@@ -1045,22 +1197,65 @@ def apply_import_plan(plan: ImportPlan) -> ImportResult:
                             f"target changed after discovery: {candidate.target_path}"
                         )
                         result.conflicts.append(candidate.target_path)
-                    continue
-
-                published = _publish_candidate(
-                    candidate, plan, target_root_fd, artifact_fds
-                )
-                if candidate.status == "skip_equal":
-                    result.skipped.append(published)
                 else:
-                    result.published.append(published)
-            finally:
+                    published = _publish_candidate(
+                        candidate, plan, target_root_fd, artifact_fds
+                    )
+                    if candidate.status == "skip_equal":
+                        result.skipped.append(published)
+                    else:
+                        result.published.append(published)
+                        published_path = published
+            except BaseException as exc:
+                candidate_error = exc
+            close_error: OSError | None = None
+            try:
                 _close_source_files(run_fd, artifact_fds)
-        return result
-    finally:
+            except OSError as exc:
+                close_error = exc
+            if close_error is not None:
+                if isinstance(candidate_error, ImportPublishedUncertainError):
+                    published_path = candidate_error.published_path
+                structured = _structured_close_error(
+                    candidate_error,
+                    close_error,
+                    context="source FD cleanup failed",
+                    published_path=published_path,
+                )
+                raise structured from candidate_error or close_error
+            if candidate_error is not None:
+                if isinstance(candidate_error, ImportApplyError):
+                    raise candidate_error
+                raise ImportApplyError(
+                    f"unable to apply {candidate.source_path.name}: {candidate_error}"
+                ) from candidate_error
+    except BaseException as exc:
+        operation_error = exc
+
+    root_close_error: OSError | None = None
+    try:
         _close_fds(
             [fd for fd in (target_root_fd, source_root_fd) if fd is not None]
         )
+    except OSError as exc:
+        root_close_error = exc
+
+    if root_close_error is not None:
+        published_path = result.published[-1] if result.published else None
+        if isinstance(operation_error, ImportPublishedUncertainError):
+            published_path = operation_error.published_path
+        structured = _structured_close_error(
+            operation_error,
+            root_close_error,
+            context="root FD cleanup failed",
+            published_path=published_path,
+        )
+        raise structured from operation_error or root_close_error
+    if operation_error is not None:
+        if isinstance(operation_error, ImportApplyError):
+            raise operation_error
+        raise ImportApplyError(f"import apply failed: {operation_error}") from operation_error
+    return result
 
 
 __all__ = [
