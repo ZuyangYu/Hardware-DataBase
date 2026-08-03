@@ -103,108 +103,149 @@ class CircuitIndexService:
         # state, derived indexes, and authorization metadata publish as one
         # reader-visible generation even though they live in separate files.
         with circuit_index_write_lock(self.store.root):
-            design_dir = self.store.design_dir(kb_name, design_id)
-            snapshot_paths = (
-                os.path.join(design_dir, STATE_FILE),
-                os.path.join(design_dir, LEGACY_STATE_FILE),
-                os.path.join(design_dir, META_FILE),
-                os.path.join(design_dir, GRAPH_FILE),
-                os.path.join(self.store.root, INDEX_FILE),
+            return self._publish_design_unlocked(
+                design,
+                {
+                    "record_id": record_id,
+                    "department_id": str(department_id or ""),
+                    "uploaded_by": uploaded_by,
+                    "original_name": original_name,
+                    "file_path": file_path,
+                },
             )
-            snapshot = self._snapshot_files(snapshot_paths)
-            previous_design = self.store.load(kb_name, design_id)
-            try:
-                self.store.save(design)
-                warnings = list(design.parse_warnings)
-                derived_degraded = False
-                graph_index_status = "indexed"
-                graph_node_count = 0
-                graph_edge_count = 0
-                design_dir = self.store.design_dir(kb_name, design_id, create=True)
-                try:
-                    graph_result = self.graph_store.save(design, design_dir)
-                    graph_node_count = graph_result.node_count
-                    graph_edge_count = graph_result.edge_count
-                except Exception:
-                    derived_degraded = True
-                    graph_index_status = "failed"
-                    warnings.append("Graph index persistence failed.")
-                    remove_graph = getattr(self.graph_store, "remove", None)
-                    try:
-                        if callable(remove_graph):
-                            remove_graph(design_dir)
-                        else:
-                            GraphStore.remove(design_dir)
-                    except Exception:
-                        # Cleanup is best-effort; the structured generation and
-                        # explicit degraded status remain authoritative.
-                        pass
 
-                vector_document_count = 0
-                vector_index_status = "unavailable"
+    def _publish_design_unlocked(
+        self,
+        design: CircuitDesign,
+        publication_metadata: dict[str, Any],
+    ) -> CircuitIndexResult:
+        """Publish one complete generation while the caller holds the write lock."""
+        kb_name = design.kb_name
+        design_id = design.design_id
+        original_name = str(publication_metadata.get("original_name") or design_id)
+        design_dir = self.store.design_dir(kb_name, design_id)
+        snapshot_paths = (
+            os.path.join(design_dir, STATE_FILE),
+            os.path.join(design_dir, LEGACY_STATE_FILE),
+            os.path.join(design_dir, META_FILE),
+            os.path.join(design_dir, GRAPH_FILE),
+            os.path.join(self.store.root, INDEX_FILE),
+        )
+        snapshot = self._snapshot_files(snapshot_paths)
+        previous_design = self.store.load(kb_name, design_id)
+        try:
+            self.store.save(design)
+            warnings = list(design.parse_warnings)
+            derived_degraded = False
+            graph_index_status = "indexed"
+            graph_node_count = 0
+            graph_edge_count = 0
+            design_dir = self.store.design_dir(kb_name, design_id, create=True)
+            try:
+                graph_result = self.graph_store.save(design, design_dir)
+                graph_node_count = graph_result.node_count
+                graph_edge_count = graph_result.edge_count
+            except Exception:
+                derived_degraded = True
+                graph_index_status = "failed"
+                warnings.append("Graph index persistence failed.")
+                remove_graph = getattr(self.graph_store, "remove", None)
                 try:
-                    vector_status = self.vector_index.reindex_design_with_status(design)
-                    vector_document_count = vector_status.indexed_count
-                    if vector_status.available and vector_status.error:
-                        vector_index_status = "failed"
-                        derived_degraded = True
-                        warnings.append("Vector index persistence failed.")
-                    elif vector_status.available:
-                        vector_index_status = "indexed"
+                    if callable(remove_graph):
+                        remove_graph(design_dir)
+                    else:
+                        GraphStore.remove(design_dir)
                 except Exception:
+                    pass
+
+            vector_document_count = 0
+            vector_index_status = "unavailable"
+            try:
+                vector_status = self.vector_index.reindex_design_with_status(design)
+                vector_document_count = vector_status.indexed_count
+                if vector_status.available and vector_status.error:
                     vector_index_status = "failed"
                     derived_degraded = True
                     warnings.append("Vector index persistence failed.")
-                stats = {
-                    "instance_count": len(design.instances),
-                    "net_count": len(design.nets),
-                    "module_count": len(design.modules),
-                    "graph_node_count": graph_node_count,
-                    "graph_edge_count": graph_edge_count,
-                    "vector_document_count": vector_document_count,
-                }
-                status = "degraded" if derived_degraded else "indexed"
-                message = f"Indexed circuit design {original_name}"
-                if derived_degraded:
-                    message += " with degraded derived indexes"
-                self._write_metadata(
-                    kb_name,
-                    design_id,
-                    {
-                        "record_id": record_id,
-                        "department_id": str(department_id or ""),
-                        "uploaded_by": uploaded_by,
-                        "original_name": original_name,
-                        "file_path": file_path,
-                        "generation_id": circuit_generation_id(design),
-                        "graph_index_status": graph_index_status,
-                        "vector_index_status": vector_index_status,
-                        "index_status": status,
-                        "index_message": message,
-                        "index_warnings": warnings,
-                        "index_stats": stats,
-                    },
-                )
-                return CircuitIndexResult(
-                    ok=True,
-                    status=status,
-                    message=message,
-                    warnings=warnings,
-                    stats=stats,
-                    design_id=design_id,
-                )
-            except Exception as publication_error:
-                # A failed authoritative publication must not leave a staged
-                # state/index/graph visible under the old authorization file.
-                rollback_error: Exception | None = None
-                try:
-                    self._restore_files(snapshot)
-                except Exception as exc:
-                    rollback_error = exc
-                self._restore_vector_generation(previous_design, design)
-                if rollback_error is not None:
-                    raise RuntimeError("Circuit publication and rollback both failed.") from publication_error
-                raise
+                elif vector_status.available:
+                    vector_index_status = "indexed"
+            except Exception:
+                vector_index_status = "failed"
+                derived_degraded = True
+                warnings.append("Vector index persistence failed.")
+            stats = {
+                "instance_count": len(design.instances),
+                "net_count": len(design.nets),
+                "module_count": len(design.modules),
+                "graph_node_count": graph_node_count,
+                "graph_edge_count": graph_edge_count,
+                "vector_document_count": vector_document_count,
+            }
+            status = "degraded" if derived_degraded else "indexed"
+            message = f"Indexed circuit design {original_name}"
+            if derived_degraded:
+                message += " with degraded derived indexes"
+            self._write_metadata(
+                kb_name,
+                design_id,
+                {
+                    **publication_metadata,
+                    "generation_id": circuit_generation_id(design),
+                    "graph_index_status": graph_index_status,
+                    "vector_index_status": vector_index_status,
+                    "index_status": status,
+                    "index_message": message,
+                    "index_warnings": warnings,
+                    "index_stats": stats,
+                },
+            )
+            return CircuitIndexResult(
+                ok=True,
+                status=status,
+                message=message,
+                warnings=warnings,
+                stats=stats,
+                design_id=design_id,
+            )
+        except Exception as publication_error:
+            rollback_error: Exception | None = None
+            try:
+                self._restore_files(snapshot)
+            except Exception as exc:
+                rollback_error = exc
+            self._restore_vector_generation(previous_design, design)
+            if rollback_error is not None:
+                raise RuntimeError("Circuit publication and rollback both failed.") from publication_error
+            raise
+
+    def reindex_stored_design(self, kb_name: str, design_id: str) -> CircuitIndexResult:
+        """Safely migrate one legacy design to generation-aware derived metadata.
+
+        Deployments can enumerate the circuit registry and call this method for
+        entries whose metadata predates ``graph_index_status``. Retrieval stays
+        fail-closed until each transaction succeeds.
+        """
+        with circuit_index_write_lock(self.store.root):
+            design = self.store.load(kb_name, design_id)
+            if design is None:
+                raise ValueError(f"Circuit design not found: {kb_name}/{design_id}")
+            metadata = self._read_metadata(kb_name, design.design_id)
+            source_file = design.files[0] if design.files else None
+            publication_metadata = {
+                **metadata,
+                "record_id": metadata.get("record_id"),
+                "department_id": str(metadata.get("department_id") or ""),
+                "uploaded_by": str(metadata.get("uploaded_by") or ""),
+                "original_name": str(
+                    metadata.get("original_name")
+                    or (source_file.file_name if source_file is not None else design.design_id)
+                ),
+                "file_path": str(
+                    metadata.get("file_path")
+                    or (source_file.path if source_file is not None else "")
+                ),
+            }
+            return self._publish_design_unlocked(design, publication_metadata)
 
     def query(
         self,
@@ -236,17 +277,7 @@ class CircuitIndexService:
         filters = filters or {}
         top_k = max(1, int(top_k or 5))
         needles = _query_terms(query)
-        department_id = _ctx_department_id(ctx)
-        allowed_designs: dict[str, tuple[dict[str, Any], str]] = {}
-        for design in self.store.list_designs(kb_name):
-            meta = self._read_metadata(kb_name, design.design_id)
-            if department_id and str(meta.get("department_id") or "") != department_id:
-                continue
-            source_name = str(meta.get("original_name") or (design.files[0].file_name if design.files else design.design_id))
-            if not _matches_filters(filters, source_name, meta):
-                continue
-            meta = {**meta, "kb_name": design.kb_name}
-            allowed_designs[design.design_id] = (meta, source_name)
+        allowed_designs = self._allowed_designs_unlocked(kb_name, ctx, filters)
 
         if not allowed_designs:
             return []
@@ -276,6 +307,28 @@ class CircuitIndexService:
             # capacity for relationship context before broad structured rows.
             stages = [[structured_hits[0]], graph_hits, structured_hits[1:], semantic_hits, keyword_hits]
         return self._stage_deduplicate(stages)[:top_k]
+
+    def _allowed_designs_unlocked(
+        self,
+        kb_name: str,
+        ctx: RequestContext | None,
+        filters: dict | None = None,
+    ) -> dict[str, tuple[dict[str, Any], str]]:
+        filters = filters or {}
+        department_id = _ctx_department_id(ctx)
+        allowed_designs: dict[str, tuple[dict[str, Any], str]] = {}
+        for design in self.store.list_designs(kb_name):
+            meta = self._read_metadata(kb_name, design.design_id)
+            if department_id and str(meta.get("department_id") or "") != department_id:
+                continue
+            source_name = str(
+                meta.get("original_name")
+                or (design.files[0].file_name if design.files else design.design_id)
+            )
+            if not _matches_filters(filters, source_name, meta):
+                continue
+            allowed_designs[design.design_id] = ({**meta, "kb_name": design.kb_name}, source_name)
+        return allowed_designs
 
     @staticmethod
     def _deduplicate(hits: list[Evidence]) -> list[Evidence]:
@@ -311,7 +364,10 @@ class CircuitIndexService:
         keywords = _exact_terms(query)
         if not keywords:
             return []
-        parameters = tuple(inspect.signature(method).parameters.values())
+        try:
+            parameters = tuple(inspect.signature(method).parameters.values())
+        except (TypeError, ValueError):
+            return []
         accepts_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
         accepts_keywords = any(parameter.name == "keywords" for parameter in parameters) or accepts_var_kwargs
         # Authorization filters must be an explicit part of the retriever
@@ -336,6 +392,33 @@ class CircuitIndexService:
         except TypeError:
             return []
 
+    def _authorized_retrieval(
+        self,
+        method_name: str,
+        kb_name: str,
+        *,
+        allowed_design_ids: frozenset[str],
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Call a derived retriever only when its auth contract is explicit."""
+        method = getattr(self.query_engine, method_name, None)
+        if not callable(method):
+            return []
+        try:
+            parameters = tuple(inspect.signature(method).parameters.values())
+        except (TypeError, ValueError):
+            return []
+        if not any(parameter.name == "allowed_design_ids" for parameter in parameters):
+            return []
+        try:
+            return method(
+                kb_name,
+                allowed_design_ids=allowed_design_ids,
+                **kwargs,
+            )
+        except TypeError:
+            return []
+
     def _graph_evidence(
         self,
         kb_name: str,
@@ -350,6 +433,11 @@ class CircuitIndexService:
         results: list[Evidence] = []
         traversal_budget = max(top_k * 8, top_k + 8)
         for design_id, (metadata, source_name) in allowed_designs.items():
+            # A failed replacement can leave an old graph behind when backend
+            # cleanup also fails. Publication metadata is the authoritative
+            # generation gate, so never read an unconfirmed graph artifact.
+            if metadata.get("graph_index_status") != "indexed":
+                continue
             try:
                 graph = load(self.store.design_dir(kb_name, design_id))
             except Exception:
@@ -680,7 +768,8 @@ class CircuitIndexService:
             if pin_mapping_rows:
                 candidates.append(("pin_mapping", 0.98, pin_mapping_rows))
         if "bias" in plan.operations:
-            bias_rows = self.query_engine.search_bias_topologies(
+            bias_rows = self._authorized_retrieval(
+                "search_bias_topologies",
                 kb_name,
                 limit=top_k * 3,
                 allowed_design_ids=allowed_design_ids,
@@ -693,13 +782,15 @@ class CircuitIndexService:
             bias_rows = _filter_bias_rows(bias_rows, query, plan)
             candidates.append(("topology", 0.94, bias_rows))
         if "protection" in plan.operations:
-            candidates.append(("topology", 0.90, self.query_engine.search_protection_topologies(
+            candidates.append(("topology", 0.90, self._authorized_retrieval(
+                "search_protection_topologies",
                 kb_name,
                 limit=top_k * 3,
                 allowed_design_ids=allowed_design_ids,
             )))
         if "power_path" in plan.operations and "protection" in plan.operations:
-            candidates.append(("topology", 0.91, self.query_engine.search_power_protection_candidates(
+            candidates.append(("topology", 0.91, self._authorized_retrieval(
+                "search_power_protection_candidates",
                 kb_name,
                 limit=top_k * 3,
                 allowed_design_ids=allowed_design_ids,
@@ -726,6 +817,20 @@ class CircuitIndexService:
         with circuit_index_write_lock(self.store.root):
             self._delete_record_unlocked(record)
 
+    def delete_design(self, kb_name: str, design_id: str) -> bool:
+        """Delete one design while excluding every governed retrieval path."""
+        with circuit_index_write_lock(self.store.root):
+            return self._delete_design_unlocked(kb_name, design_id)
+
+    def _delete_design_unlocked(self, kb_name: str, design_id: str) -> bool:
+        delete_vector = getattr(self.vector_index, "_delete_design", None)
+        if callable(delete_vector):
+            try:
+                delete_vector(kb_name, design_id)
+            except Exception:
+                pass
+        return self.store.delete_design(kb_name, design_id)
+
     def _delete_record_unlocked(self, record: Any) -> None:
         kb_name = getattr(record, "kb_name", "")
         if not kb_name:
@@ -734,11 +839,11 @@ class CircuitIndexService:
         for design in list(self.store.list_designs(kb_name)):
             meta = self._read_metadata(kb_name, design.design_id)
             if record_id is not None and meta.get("record_id") == record_id:
-                self.store.delete_design(kb_name, design.design_id)
+                self._delete_design_unlocked(kb_name, design.design_id)
                 continue
             names = {getattr(record, "document_name", ""), getattr(record, "original_file_name", "")}
             if any(name and make_design_id(name) == design.design_id for name in names):
-                self.store.delete_design(kb_name, design.design_id)
+                self._delete_design_unlocked(kb_name, design.design_id)
 
     def _net_evidence(
         self,

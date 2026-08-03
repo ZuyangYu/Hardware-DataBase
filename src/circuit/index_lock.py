@@ -31,7 +31,7 @@ _LOCKS_GUARD = threading.Lock()
 
 
 def _lock_path(root: str) -> str:
-    root = os.path.abspath(root)
+    root = os.path.normcase(os.path.realpath(os.path.abspath(root)))
     lock_dir = os.path.join(root, ".index-locks")
     os.makedirs(lock_dir, exist_ok=True)
     digest = hashlib.sha256(root.encode("utf-8")).hexdigest()

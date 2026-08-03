@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-from pathlib import Path
+import tempfile
 
 from src.circuit.store import CircuitStore
 
@@ -57,6 +57,22 @@ class ImageCache:
 
         shutil.copy2(source_path, target)
         return target
+
+    def replace_pdf(self, kb_name: str, design_id: str, source_path: str) -> str:
+        """Replace the active PDF generation without ever reusing an old file."""
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(source_path)
+        design_dir = self.store.design_dir(kb_name, design_id, create=True)
+        staging_dir = tempfile.mkdtemp(prefix=".pdf-cache-stage-", dir=design_dir)
+        staged_source = os.path.join(staging_dir, os.path.basename(source_path))
+        cache_dir = self.store.pdf_cache_dir(kb_name, design_id)
+        try:
+            shutil.copy2(source_path, staged_source)
+            if os.path.isdir(cache_dir):
+                shutil.rmtree(cache_dir)
+            return self.cache_pdf(kb_name, design_id, staged_source)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     def get_cached_pdf(self, kb_name: str, design_id: str, filename: str) -> str | None:
         candidate = os.path.join(self.store.pdf_cache_dir(kb_name, design_id), filename)

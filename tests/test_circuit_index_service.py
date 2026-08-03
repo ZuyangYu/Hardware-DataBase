@@ -295,6 +295,76 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertTrue(any(hit.locator["entity_id"] == "U100" for hit in old_department_hits))
         self.assertEqual(new_department_hits, [])
 
+    def test_failed_graph_replacement_never_returns_unremovable_stale_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "generation-a.edf")
+            second = os.path.join(tmp, "generation-b.edf")
+            for path, generation in ((first, "A"), (second, "B")):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(generation)
+            graph_store = _UnremovableFailingGraphStore()
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=_FileGenerationParserFactory(),
+                graph_store=graph_store,
+                vector_index=_UnavailableVectorIndex(),
+            )
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=1,
+                file_path=first,
+                original_name="same_board.edf",
+                department_id="dept_hw",
+            )
+            graph_store.fail = True
+            result = service.index_file(
+                kb_name="kb_hw",
+                record_id=2,
+                file_path=second,
+                original_name="same_board.edf",
+                department_id="dept_hw",
+            )
+
+            hits = service.query(
+                kb_name="kb_hw",
+                query="FANOUT connection",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+            )
+
+        self.assertEqual(result.status, "degraded")
+        self.assertFalse(any(hit.locator["entity_type"] == "graph_relationship" for hit in hits))
+
+    def test_legacy_graph_metadata_can_be_safely_republished_before_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CircuitStore(root=os.path.join(tmp, "circuits"))
+            design = CircuitDesign(
+                design_id="legacy",
+                kb_name="kb_hw",
+                instances=[ComponentInstance(refdes="U1", pins=[Pin(name="1", net="LEGACY_NET")])],
+                nets=[Net(name="LEGACY_NET", connections=[PinRef(refdes="U1", pin="1")])],
+            )
+            store.save(design)
+            GraphStore().save(design, store.design_dir("kb_hw", "legacy"))
+            service = CircuitIndexService(store=store, vector_index=_UnavailableVectorIndex())
+            service._write_metadata(
+                "kb_hw",
+                "legacy",
+                {
+                    "record_id": 1,
+                    "department_id": "dept_hw",
+                    "original_name": "legacy.edf",
+                },
+            )
+            ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
+
+            before = service.query(kb_name="kb_hw", query="LEGACY_NET", ctx=ctx)
+            result = service.reindex_stored_design("kb_hw", "legacy")
+            after = service.query(kb_name="kb_hw", query="LEGACY_NET", ctx=ctx)
+
+        self.assertFalse(any(hit.locator["entity_type"] == "graph_relationship" for hit in before))
+        self.assertEqual(result.status, "indexed")
+        self.assertTrue(any(hit.locator["entity_type"] == "graph_relationship" for hit in after))
+
     def test_query_returns_empty_for_kb_without_indexed_circuits(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"))
@@ -305,7 +375,23 @@ class CircuitIndexServiceTests(unittest.TestCase):
                 ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
             )
 
-        self.assertEqual(hits, [])
+            self.assertEqual(hits, [])
+
+    def test_typed_delete_removes_design_through_locked_service_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = _service(tmp, vector_index=_UnavailableVectorIndex())
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=1,
+                file_path=os.path.join(tmp, "board.edf"),
+                original_name="board.edf",
+                department_id="dept_hw",
+            )
+
+            removed = service.delete_design("kb_hw", "board")
+
+        self.assertTrue(removed)
+        self.assertIsNone(service.store.load("kb_hw", "board"))
 
     def test_pin_to_net_query_returns_compact_pin_mapping_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -782,7 +868,11 @@ class CircuitIndexServiceTests(unittest.TestCase):
             design_dir = store.design_dir("kb_hw", "fanout")
             GraphStore().save(design, design_dir)
             service = CircuitIndexService(store=store, vector_index=_UnavailableVectorIndex())
-            metadata = {"record_id": 1, "department_id": "dept_hw"}
+            metadata = {
+                "record_id": 1,
+                "department_id": "dept_hw",
+                "graph_index_status": "indexed",
+            }
 
             hits = service._graph_evidence(
                 "kb_hw",
@@ -814,7 +904,13 @@ class CircuitIndexServiceTests(unittest.TestCase):
             hits = service._graph_evidence(
                 "kb_hw",
                 "U499 connection",
-                {"fanout": ({"record_id": 1, "department_id": "dept_hw"}, "fanout.edf")},
+                {
+                    "fanout": ({
+                        "record_id": 1,
+                        "department_id": "dept_hw",
+                        "graph_index_status": "indexed",
+                    }, "fanout.edf"),
+                },
                 top_k=1,
             )
 
@@ -936,6 +1032,19 @@ class CircuitIndexServiceTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
         self.assertEqual(engine.calls, [])
+
+    def test_topology_retriever_with_only_kwargs_is_not_treated_as_filter_aware(self):
+        engine = _KwargsIgnoringTopologyQueryEngine()
+        service = CircuitIndexService(query_engine=engine, vector_index=_UnavailableVectorIndex())
+
+        service._structured_evidence(
+            "kb_hw",
+            "pull up resistor",
+            {"z_allowed": ({"record_id": 9, "department_id": "dept_hw"}, "allowed.edf")},
+            1,
+        )
+
+        self.assertEqual(engine.topology_calls, [])
 
     def test_semantic_retriever_with_only_kwargs_is_not_treated_as_filter_aware(self):
         vector_index = _KwargsIgnoringSemanticIndex()
@@ -1145,7 +1254,11 @@ class _FileGenerationParser:
         with open(self.path, encoding="utf-8") as fh:
             generation = fh.read().strip()
         refdes = "U100" if generation == "A" else "U200"
-        return [ComponentInstance(refdes=refdes, value=generation)], [], []
+        return (
+            [ComponentInstance(refdes=refdes, value=generation, pins=[Pin(name="1", net="FANOUT")])],
+            [Net(name="FANOUT", connections=[PinRef(refdes=refdes, pin="1")])],
+            [],
+        )
 
 
 class _FileGenerationParserFactory:
@@ -1165,6 +1278,21 @@ class _BlockingGenerationGraphStore(GraphStore):
             if not self.release_writer.wait(5):
                 raise TimeoutError("writer release timed out")
         return super().save(design, design_dir)
+
+
+class _UnremovableFailingGraphStore(GraphStore):
+    def __init__(self):
+        self.fail = False
+
+    def save(self, design, design_dir):
+        if self.fail:
+            raise OSError("graph write failed")
+        return super().save(design, design_dir)
+
+    def remove(self, design_dir):
+        if self.fail:
+            raise OSError("graph remove failed")
+        return super().remove(design_dir)
 
 
 def _index_generation(root, path, generation, barrier, outcomes):
@@ -1376,6 +1504,36 @@ class _KwargsIgnoringQueryEngine:
     def search_instances(self, kb_name, query="", keywords=None, limit=20, **kwargs):
         self.calls.append((kb_name, query, keywords, limit, kwargs))
         return [{"design_id": "a_disallowed", "refdes": "Y900"}]
+
+
+class _KwargsIgnoringTopologyQueryEngine:
+    def __init__(self):
+        self.topology_calls = []
+
+    def search_net_connections(self, kb_name, query="", limit=20, allowed_design_ids=None):
+        return []
+
+    def search_instances(self, kb_name, query="", limit=20, allowed_design_ids=None):
+        return []
+
+    def search_modules(self, kb_name, query="", limit=20, allowed_design_ids=None):
+        return []
+
+    def search_module_connections(self, kb_name, query="", limit=20, allowed_design_ids=None):
+        return []
+
+    def search_module_power_nets(self, kb_name, query="", limit=20, allowed_design_ids=None):
+        return []
+
+    def search_bias_topologies(self, kb_name, limit=20, **kwargs):
+        self.topology_calls.append((kb_name, limit, kwargs))
+        return [{
+            "design_id": "a_disallowed",
+            "topology": "pull_up",
+            "refdes": "R1",
+            "signal_net": "SDA",
+            "rail_net": "VDD",
+        }]
 
 
 class _KwargsIgnoringSemanticIndex:

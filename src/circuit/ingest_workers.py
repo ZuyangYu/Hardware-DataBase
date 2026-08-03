@@ -9,14 +9,13 @@ from typing import Any, Callable
 
 from llama_index.core.schema import TextNode
 
-from src.circuit.image_cache import ImageCache
 from src.circuit.models import CircuitDesign
 from src.circuit.orchestrator import CircuitOrchestrator
 from src.circuit.parsers.edf_parser import EdfParser
 from src.circuit.parsers.pdf_schematic_parser import PdfSchematicParser
 from src.circuit.store import CircuitStore, make_design_id
 from src.core.logger import error as _error, log as _info
-from src.ingestion.source_groups import NETLIST_GROUP, SCHEMATIC_GROUP
+from src.ingestion.source_groups import SCHEMATIC_GROUP
 
 
 PARSE_LOG_FILENAME = "parse.log"
@@ -117,6 +116,10 @@ def parse_edf_netlist(
     filename: str,
     kb_name: str,
     progress_callback: Callable[[int, str], None] | None = None,
+    *,
+    record_id: int | None = None,
+    department_id: str | None = None,
+    uploaded_by: str = "",
 ) -> list[TextNode]:
     design_id = make_design_id(filename)
     if progress_callback:
@@ -160,6 +163,9 @@ def parse_edf_netlist(
         nets=nets,
         modules=modules,
         warnings=parser.warnings,
+        record_id=record_id,
+        department_id=department_id,
+        uploaded_by=uploaded_by,
     )
     if progress_callback:
         progress_callback(65, f"EDF parsed: {len(instances)} instances, {len(nets)} nets")
@@ -191,6 +197,10 @@ def parse_schematic_pdf(
     filename: str,
     kb_name: str,
     progress_callback: Callable[[int, str], None] | None = None,
+    *,
+    record_id: int | None = None,
+    department_id: str | None = None,
+    uploaded_by: str = "",
 ) -> list[TextNode]:
     design_id = make_design_id(filename)
     if progress_callback:
@@ -230,14 +240,10 @@ def parse_schematic_pdf(
         file_path=file_path,
         pages=pages,
         warnings=parser.warnings,
+        record_id=record_id,
+        department_id=department_id,
+        uploaded_by=uploaded_by,
     )
-    # Mirror the schematic into the design's pdf_cache/ so downstream tools
-    # (ImageCropper, schematic viewer) can find the source without depending on
-    # the volatile circuit_uploads/ archive.
-    try:
-        ImageCache().cache_pdf(kb_name, design.design_id, file_path)
-    except Exception as exc:  # pragma: no cover - cache is best-effort
-        design.parse_warnings = sorted(set(design.parse_warnings + [f"pdf_cache: {exc}"]))
     nodes = []
     for page in pages:
         text = page.text or f"Schematic page {page.page_number} has no extractable text layer."
