@@ -318,6 +318,7 @@ class CircuitVectorIndex:
         query: str,
         top_k: int = 20,
         kinds: Iterable[str] | None = None,
+        allowed_design_ids: Iterable[str] | None = None,
     ) -> list[CircuitVectorHit]:
         """Top-K nearest docs. Returns [] if no embed model, no collection,
         or chroma errors out — callers must treat this as a best-effort
@@ -325,6 +326,11 @@ class CircuitVectorIndex:
         """
         if not query.strip():
             return []
+        allowed = None
+        if allowed_design_ids is not None:
+            allowed = sorted({str(design_id) for design_id in allowed_design_ids if str(design_id)})
+            if not allowed:
+                return []
         embed_model = self._embed_model()
         if embed_model is None:
             return []
@@ -333,9 +339,18 @@ class CircuitVectorIndex:
             if not query_embedding:
                 return []
             collection = self._chroma_collection(kb_name)
-            where: dict[str, Any] | None = None
+            conditions: list[dict[str, Any]] = []
             if kinds:
-                where = {"kind": {"$in": list(kinds)}}
+                conditions.append({"kind": {"$in": list(kinds)}})
+            if allowed is not None:
+                conditions.append({"design_id": {"$in": allowed}})
+            where: dict[str, Any] | None
+            if len(conditions) == 1:
+                where = conditions[0]
+            elif conditions:
+                where = {"$and": conditions}
+            else:
+                where = None
             res = collection.query(
                 query_embeddings=query_embedding,
                 n_results=top_k,

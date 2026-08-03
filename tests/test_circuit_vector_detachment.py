@@ -64,3 +64,37 @@ def test_reindex_status_reports_delete_failure_for_empty_design(monkeypatch):
     result = index.reindex_design_with_status(_design())
 
     assert result == CircuitVectorIndexStatus(available=True, indexed_count=0, error="delete failed")
+
+
+def test_semantic_search_filters_allowed_designs_in_chroma_before_limit(monkeypatch):
+    index = CircuitVectorIndex()
+    collection = Mock()
+    collection.query.return_value = {
+        "ids": [["instance:z_allowed:U1"]],
+        "documents": [["allowed semantic evidence"]],
+        "metadatas": [[{
+            "kind": "instance",
+            "design_id": "z_allowed",
+            "natural_id": "U1",
+        }]],
+        "distances": [[0.1]],
+    }
+    monkeypatch.setattr(index, "_embed_model", Mock(return_value=object()))
+    monkeypatch.setattr(index, "_embed_batch", Mock(return_value=[[0.5, 0.5]]))
+    monkeypatch.setattr(index, "_chroma_collection", Mock(return_value=collection))
+
+    hits = index.semantic_search(
+        "kb_hw",
+        "semantic only question",
+        top_k=1,
+        kinds=("instance", "net"),
+        allowed_design_ids={"z_allowed"},
+    )
+
+    assert [hit.design_id for hit in hits] == ["z_allowed"]
+    assert collection.query.call_args.kwargs["where"] == {
+        "$and": [
+            {"kind": {"$in": ["instance", "net"]}},
+            {"design_id": {"$in": ["z_allowed"]}},
+        ]
+    }

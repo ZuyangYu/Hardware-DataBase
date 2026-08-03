@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,12 +69,30 @@ class GraphStore:
         os.makedirs(design_dir, exist_ok=True)
         graph = self.build_graph(design)
         target = os.path.join(design_dir, _GPICKLE_NAME)
-        with open(target, "wb") as f:
-            pickle.dump(graph, f)
-            f.flush()
-            os.fsync(f.fileno())
+        descriptor, temporary = tempfile.mkstemp(prefix=".graph-", dir=design_dir)
+        try:
+            with os.fdopen(descriptor, "wb") as f:
+                pickle.dump(graph, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, target)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
         node_count, edge_count = self._graph_counts(graph)
         return GraphIndexResult(path=target, node_count=node_count, edge_count=edge_count)
+
+    @staticmethod
+    def remove(design_dir: str) -> None:
+        """Remove a stale graph after a newer structured generation degrades."""
+
+        try:
+            os.unlink(os.path.join(design_dir, _GPICKLE_NAME))
+        except FileNotFoundError:
+            pass
 
     def load(self, design_dir: str):
         target = os.path.join(design_dir, _GPICKLE_NAME)

@@ -1,12 +1,15 @@
+import json
+import multiprocessing
 import os
 import tempfile
+import time
 import unittest
 from hashlib import sha256
 
 from src.agents.state import Evidence
 from src.circuit.graph_store import GraphIndexResult, GraphStore
 from src.circuit.index_service import CircuitIndexService
-from src.circuit.models import CircuitModule, ComponentInstance, Net, Pin, PinRef
+from src.circuit.models import CircuitDesign, CircuitModule, ComponentInstance, Net, Pin, PinRef
 from src.circuit.query_engine import CircuitQueryEngine
 from src.circuit.store import CircuitStore
 from src.circuit.vector_index import CircuitVectorHit, CircuitVectorIndexStatus
@@ -320,6 +323,74 @@ class CircuitIndexServiceTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_exact_search_applies_authorized_designs_before_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CircuitStore(root=os.path.join(tmp, "circuits"))
+            service = CircuitIndexService(store=store, vector_index=_UnavailableVectorIndex())
+            for index in range(6):
+                design_id = f"a_disallowed_{index}"
+                store.save(CircuitDesign(
+                    design_id=design_id,
+                    kb_name="kb_hw",
+                    instances=[ComponentInstance(refdes="Y900", value="stale")],
+                ))
+                service._write_metadata("kb_hw", design_id, {
+                    "record_id": index + 1,
+                    "department_id": "dept_other",
+                    "original_name": f"{design_id}.edf",
+                })
+            store.save(CircuitDesign(
+                design_id="z_allowed",
+                kb_name="kb_hw",
+                instances=[ComponentInstance(refdes="Y900", value="20MHz")],
+            ))
+            service._write_metadata("kb_hw", "z_allowed", {
+                "record_id": 99,
+                "department_id": "dept_hw",
+                "original_name": "z_allowed.edf",
+            })
+
+            hits = service.query(
+                kb_name="kb_hw",
+                query="Y900",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+                top_k=1,
+            )
+
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].source_name, "z_allowed.edf")
+        self.assertEqual(hits[0].score, 0.92)
+        self.assertIn("20MHz", hits[0].content)
+
+    def test_topology_search_applies_authorized_designs_before_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CircuitStore(root=os.path.join(tmp, "circuits"))
+            service = CircuitIndexService(store=store, vector_index=_UnavailableVectorIndex())
+            for index in range(6):
+                design_id = f"a_disallowed_{index}"
+                store.save(_bias_design(design_id, refdes=f"R{index + 1}", value="1K"))
+                service._write_metadata("kb_hw", design_id, {
+                    "record_id": index + 1,
+                    "department_id": "dept_other",
+                    "original_name": f"{design_id}.edf",
+                })
+            store.save(_bias_design("z_allowed", refdes="R99", value="100K"))
+            service._write_metadata("kb_hw", "z_allowed", {
+                "record_id": 99,
+                "department_id": "dept_hw",
+                "original_name": "z_allowed.edf",
+            })
+
+            hits = service.query(
+                kb_name="kb_hw",
+                query="pull up resistor",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+                top_k=1,
+            )
+
+        self.assertEqual([hit.locator["entity_id"] for hit in hits], ["pull_up:R99"])
+        self.assertEqual(hits[0].source_name, "z_allowed.edf")
+
     def test_query_maps_engine_connection_and_power_rows_to_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "main_board.edf")
@@ -559,6 +630,82 @@ class CircuitIndexServiceTests(unittest.TestCase):
 
         self.assertTrue(any(hit.locator["entity_type"] == "graph_relationship" for hit in hits))
 
+    def test_high_fanout_graph_evidence_has_bounded_count_and_aggregate_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CircuitStore(root=os.path.join(tmp, "circuits"))
+            design = CircuitDesign(
+                design_id="fanout",
+                kb_name="kb_hw",
+                instances=[
+                    ComponentInstance(refdes=f"U{index}", pins=[Pin(name="1", net="FANOUT")])
+                    for index in range(500)
+                ],
+                nets=[Net("FANOUT", [PinRef(f"U{index}", "1") for index in range(500)])],
+            )
+            store.save(design)
+            design_dir = store.design_dir("kb_hw", "fanout")
+            GraphStore().save(design, design_dir)
+            service = CircuitIndexService(store=store, vector_index=_UnavailableVectorIndex())
+            metadata = {"record_id": 1, "department_id": "dept_hw"}
+
+            hits = service._graph_evidence(
+                "kb_hw",
+                "U0 connection",
+                {"fanout": (metadata, "fanout.edf")},
+                top_k=5,
+            )
+
+        self.assertLessEqual(len(hits), 5)
+        self.assertLessEqual(sum(len(hit.content) for hit in hits), 2048)
+        self.assertTrue(any("FANOUT" in hit.content and "U0.1" in hit.content for hit in hits))
+
+    def test_concurrent_same_design_publication_is_one_coherent_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "circuits")
+            first = os.path.join(tmp, "generation-a.edf")
+            second = os.path.join(tmp, "generation-b.edf")
+            for path, generation in ((first, "A"), (second, "B")):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(generation)
+            context = multiprocessing.get_context("fork")
+            barrier = context.Barrier(2)
+            outcomes = context.Queue()
+            processes = [
+                context.Process(
+                    target=_index_generation,
+                    args=(root, path, generation, barrier, outcomes),
+                )
+                for path, generation in ((first, "A"), (second, "B"))
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                for process in processes:
+                    process.join(10)
+                self.assertTrue(all(not process.is_alive() for process in processes))
+                self.assertEqual([process.exitcode for process in processes], [0, 0])
+                self.assertEqual(sorted(outcomes.get(timeout=2) for _ in processes), ["A:indexed", "B:indexed"])
+            finally:
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(2)
+
+            store = CircuitStore(root=root)
+            design = store.load("kb_hw", "same_board")
+            design_dir = store.design_dir("kb_hw", "same_board")
+            with open(os.path.join(design_dir, "pipeline_metadata.json"), encoding="utf-8") as fh:
+                metadata = json.load(fh)
+            graph = GraphStore().load(design_dir)
+            graph_nodes = GraphStore._iter_nodes(graph)
+
+        self.assertIsNotNone(design)
+        generation = metadata["uploaded_by"]
+        self.assertIn(generation, {"A", "B"})
+        self.assertEqual(design.instances[0].value, generation)
+        self.assertIn(f"component:U_{generation}", graph_nodes)
+        self.assertEqual(graph_nodes[f"component:U_{generation}"]["value"], generation)
+
     def test_original_crystal_question_returns_both_frequency_facts(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
@@ -705,6 +852,75 @@ class _RaisingParser:
         raise ValueError("invalid EDF")
 
 
+def _bias_design(design_id: str, *, refdes: str, value: str) -> CircuitDesign:
+    return CircuitDesign(
+        design_id=design_id,
+        kb_name="kb_hw",
+        instances=[ComponentInstance(
+            refdes=refdes,
+            library_cell="RES",
+            value=value,
+            pins=[Pin(name="1", net="SIGNAL_RXD"), Pin(name="2", net="VCC3V3")],
+        )],
+        nets=[
+            Net("SIGNAL_RXD", [PinRef(refdes, "1")]),
+            Net("VCC3V3", [PinRef(refdes, "2")], net_type="power"),
+        ],
+    )
+
+
+class _ConcurrentParser:
+    def __init__(self, path, barrier):
+        self.path = path
+        self.barrier = barrier
+
+    def parse(self):
+        with open(self.path, encoding="utf-8") as fh:
+            generation = fh.read().strip()
+        self.barrier.wait(timeout=5)
+        if generation == "B":
+            time.sleep(0.1)
+        refdes = f"U_{generation}"
+        return (
+            [ComponentInstance(refdes=refdes, value=generation, pins=[Pin("1", f"NET_{generation}")])],
+            [Net(f"NET_{generation}", [PinRef(refdes, "1")])],
+            [],
+        )
+
+
+class _ConcurrentParserFactory:
+    def __init__(self, barrier):
+        self.barrier = barrier
+
+    def __call__(self, path, progress_callback=None):
+        return _ConcurrentParser(path, self.barrier)
+
+
+class _DelayedGenerationGraphStore(GraphStore):
+    def save(self, design, design_dir):
+        if design.instances[0].value == "A":
+            time.sleep(0.4)
+        return super().save(design, design_dir)
+
+
+def _index_generation(root, path, generation, barrier, outcomes):
+    service = CircuitIndexService(
+        storage_root=root,
+        parser_factory=_ConcurrentParserFactory(barrier),
+        graph_store=_DelayedGenerationGraphStore(),
+        vector_index=_UnavailableVectorIndex(),
+    )
+    result = service.index_file(
+        kb_name="kb_hw",
+        record_id=1 if generation == "A" else 2,
+        file_path=path,
+        original_name="same_board.edf",
+        department_id="dept_hw",
+        uploaded_by=generation,
+    )
+    outcomes.put(f"{generation}:{result.status}")
+
+
 def _service(tmp, *, graph_store=None, vector_index=None):
     return CircuitIndexService(
         storage_root=os.path.join(tmp, "circuits"),
@@ -820,7 +1036,7 @@ class _SemanticVectorIndex(_VectorIndex):
         super().__init__()
         self.search_calls = []
 
-    def semantic_search(self, kb_name, query, top_k=20, kinds=None):
+    def semantic_search(self, kb_name, query, top_k=20, kinds=None, allowed_design_ids=None):
         self.search_calls.append((kb_name, query, top_k, tuple(kinds or ())))
         return [
             CircuitVectorHit(
@@ -839,22 +1055,22 @@ class _InternalTypeErrorQueryEngine(CircuitQueryEngine):
         super().__init__(store)
         self.net_queries = []
 
-    def search_net_connections(self, kb_name, query="", keywords=None, limit=10):
+    def search_net_connections(self, kb_name, query="", keywords=None, limit=10, allowed_design_ids=None):
         self.net_queries.append((query, tuple(keywords or ())))
         raise TypeError("internal query-engine type error")
 
 
 class _QueryEngine:
-    def search_net_connections(self, kb_name, query, limit):
+    def search_net_connections(self, kb_name, query, limit, allowed_design_ids=None):
         return []
 
-    def search_instances(self, kb_name, query, limit):
+    def search_instances(self, kb_name, query, limit, allowed_design_ids=None):
         return []
 
-    def search_modules(self, kb_name, query, limit):
+    def search_modules(self, kb_name, query, limit, allowed_design_ids=None):
         return []
 
-    def search_module_connections(self, kb_name, query, limit):
+    def search_module_connections(self, kb_name, query, limit, allowed_design_ids=None):
         return [
             {
                 "design_id": "main_board",
@@ -867,7 +1083,7 @@ class _QueryEngine:
             }
         ]
 
-    def search_module_power_nets(self, kb_name, query, limit):
+    def search_module_power_nets(self, kb_name, query, limit, allowed_design_ids=None):
         return [
             {
                 "design_id": "main_board",

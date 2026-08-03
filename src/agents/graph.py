@@ -58,6 +58,8 @@ _LEGACY_PROCESSOR_CAPABILITIES: dict[str, set[str]] = {
     "ragflow": {"entity_lookup", "document_claim_lookup"},
 }
 
+_QUERYABLE_CIRCUIT_STATUSES = {"", "indexed", "degraded"}
+
 
 def _source_capabilities(source: dict[str, Any]) -> set[str]:
     source_group = str(source.get("source_group") or "")
@@ -68,7 +70,7 @@ def _source_capabilities(source: dict[str, Any]) -> set[str]:
 
 
 def _claim_compatible(source: dict[str, Any], claim: Claim) -> bool:
-    if source.get("processor_kind") == "circuit_design" and source.get("status") not in {"", "indexed"}:
+    if source.get("processor_kind") == "circuit_design" and source.get("status") not in _QUERYABLE_CIRCUIT_STATUSES:
         return False
     available = _source_capabilities(source)
     required = set(claim.required_capabilities)
@@ -676,7 +678,7 @@ def _source_matches_analysis(source: dict[str, Any], analysis: dict[str, Any]) -
     if processor == "spreadsheet_table" and "spreadsheet_table" in expected:
         return True, "该文件是结构化 Excel，适合查询 BOM、用量、替代料、参数或测试矩阵等表格事实。"
     if processor == "circuit_design":
-        if str(source.get("status") or "") != "indexed":
+        if str(source.get("status") or "") not in _QUERYABLE_CIRCUIT_STATUSES:
             return False, "电路文件尚未索引成功，跳过结构化电路检索。"
         if "circuit_design" in expected:
             return True, "该文件是结构化电路设计数据，适合查询网表、引脚、网络连接和拓扑事实。"
@@ -736,7 +738,7 @@ def _complete_required_source_plan(state: AgentState, source_plan: SourcePlan) -
     for source in (state.get("catalog") or {}).get("sources") or []:
         processor = str(source.get("processor_kind") or "")
         content_kind = str(source.get("content_kind") or "")
-        is_circuit = processor == "circuit_design" and source.get("status") == "indexed"
+        is_circuit = processor == "circuit_design" and source.get("status") in _QUERYABLE_CIRCUIT_STATUSES
         is_document = content_kind == "document_text" or processor == "ragflow"
         if ("circuit_design" not in expected or not is_circuit) and ("document_text" not in expected or not is_document):
             continue
@@ -1099,7 +1101,7 @@ def _deterministic_circuit_gap_calls(state: AgentState, sources: list[dict[str, 
             source_name not in unsearched
             or source_name in searched
             or source.get("processor_kind") != "circuit_design"
-            or source.get("status") != "indexed"
+            or source.get("status") not in _QUERYABLE_CIRCUIT_STATUSES
         ):
             continue
         filters = {

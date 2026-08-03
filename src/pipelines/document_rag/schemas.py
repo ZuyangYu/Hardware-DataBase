@@ -178,7 +178,7 @@ def normalize_parse_status(raw_status: object, processor_kind: str = "") -> str:
         return TASK_STATUS_QUEUED
     if status in {"1", "running", "parsing", "processing", "started"}:
         return TASK_STATUS_RUNNING
-    if status in {"2", "done", "success", "parsed", "completed", "complete", "finish", "finished", "indexed", "已完成"}:
+    if status in {"2", "done", "success", "parsed", "completed", "complete", "finish", "finished", "indexed", "degraded", "已完成"}:
         return TASK_STATUS_COMPLETED
     if status in {"3", "fail", "failed", "error", "exception", "unsupported"}:
         return TASK_STATUS_FAILED

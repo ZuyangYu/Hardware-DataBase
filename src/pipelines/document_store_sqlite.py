@@ -11,7 +11,7 @@ from src.pipelines.document_rag.schemas import TASK_STATUS_DEAD_LETTER, TASK_STA
 
 WORKER_STALE_SECONDS = 30 * 60
 WORKER_MAX_RETRIES = 3
-TERMINAL_PARSE_STATUSES = {"parsed", "failed", "deleted", "indexed"}
+TERMINAL_PARSE_STATUSES = {"parsed", "failed", "deleted", "indexed", "degraded"}
 
 
 def _require_department_id(department_id: str | int | None, action: str) -> str:

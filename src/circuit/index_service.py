@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import inspect
 import json
 import os
 import re
-import inspect
+import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from src.agents.state import Evidence
 from src.circuit.evidence_mapper import CircuitEvidenceMapper
@@ -21,6 +26,53 @@ from src.pipelines.document_rag.schemas import RequestContext
 
 
 META_FILE = "pipeline_metadata.json"
+GRAPH_EVIDENCE_ENDPOINT_LIMIT = 8
+GRAPH_EVIDENCE_CONTENT_LIMIT = 512
+
+
+@dataclass
+class _DesignLockEntry:
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    active_count: int = 0
+
+
+_DESIGN_LOCKS: dict[str, _DesignLockEntry] = {}
+_DESIGN_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _design_index_lock(root: str, kb_name: str, design_id: str) -> Iterator[None]:
+    """Serialize publication for one design across threads and processes.
+
+    Lock files intentionally remain on disk: unlinking a flock file while
+    another process is waiting on it can split future callers across two
+    inodes. File descriptors and in-process lock entries are always released.
+    """
+
+    lock_dir = os.path.join(os.path.abspath(root), ".index-locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    digest = hashlib.sha256(f"{kb_name}\0{design_id}".encode("utf-8")).hexdigest()
+    lock_path = os.path.join(lock_dir, f"{digest}.lock")
+    with _DESIGN_LOCKS_GUARD:
+        entry = _DESIGN_LOCKS.get(lock_path)
+        if entry is None:
+            entry = _DesignLockEntry()
+            _DESIGN_LOCKS[lock_path] = entry
+        entry.active_count += 1
+    try:
+        with entry.lock:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+    finally:
+        with _DESIGN_LOCKS_GUARD:
+            entry.active_count -= 1
+            if entry.active_count == 0 and _DESIGN_LOCKS.get(lock_path) is entry:
+                del _DESIGN_LOCKS[lock_path]
 
 
 @dataclass
@@ -86,55 +138,79 @@ class CircuitIndexService:
             modules=list(modules or []),
             parse_warnings=list(getattr(parser, "warnings", []) or []),
         )
-        self.store.save(design)
-        self._write_metadata(
-            kb_name,
-            design_id,
-            {
-                "record_id": record_id,
-                "department_id": str(department_id or ""),
-                "uploaded_by": uploaded_by,
-                "original_name": original_name,
-                "file_path": file_path,
-            },
-        )
-        warnings = list(design.parse_warnings)
-        graph_node_count = 0
-        graph_edge_count = 0
-        try:
-            graph_result = self.graph_store.save(
-                design,
-                self.store.design_dir(kb_name, design_id, create=True),
-            )
-            graph_node_count = graph_result.node_count
-            graph_edge_count = graph_result.edge_count
-        except Exception:
-            warnings.append("Graph index persistence failed.")
+        # Parsing is intentionally outside the lock: it is read-only and may
+        # be expensive. Every mutable publication step is serialized as one
+        # same-design generation, including configured vector replacement.
+        with _design_index_lock(self.store.root, kb_name, design_id):
+            self.store.save(design)
+            warnings = list(design.parse_warnings)
+            derived_degraded = False
+            graph_node_count = 0
+            graph_edge_count = 0
+            design_dir = self.store.design_dir(kb_name, design_id, create=True)
+            try:
+                graph_result = self.graph_store.save(design, design_dir)
+                graph_node_count = graph_result.node_count
+                graph_edge_count = graph_result.edge_count
+            except Exception:
+                derived_degraded = True
+                warnings.append("Graph index persistence failed.")
+                remove_graph = getattr(self.graph_store, "remove", None)
+                try:
+                    if callable(remove_graph):
+                        remove_graph(design_dir)
+                    else:
+                        GraphStore.remove(design_dir)
+                except Exception:
+                    # Cleanup is best-effort; the structured generation and
+                    # explicit degraded status remain authoritative.
+                    pass
 
-        vector_document_count = 0
-        try:
-            vector_status = self.vector_index.reindex_design_with_status(design)
-            vector_document_count = vector_status.indexed_count
-            if vector_status.available and vector_status.error:
+            vector_document_count = 0
+            try:
+                vector_status = self.vector_index.reindex_design_with_status(design)
+                vector_document_count = vector_status.indexed_count
+                if vector_status.available and vector_status.error:
+                    derived_degraded = True
+                    warnings.append("Vector index persistence failed.")
+            except Exception:
+                derived_degraded = True
                 warnings.append("Vector index persistence failed.")
-        except Exception:
-            warnings.append("Vector index persistence failed.")
-        stats = {
-            "instance_count": len(design.instances),
-            "net_count": len(design.nets),
-            "module_count": len(design.modules),
-            "graph_node_count": graph_node_count,
-            "graph_edge_count": graph_edge_count,
-            "vector_document_count": vector_document_count,
-        }
-        return CircuitIndexResult(
-            ok=True,
-            status="degraded" if len(warnings) > len(design.parse_warnings) else "indexed",
-            message=f"Indexed circuit design {original_name}",
-            warnings=warnings,
-            stats=stats,
-            design_id=design_id,
-        )
+            stats = {
+                "instance_count": len(design.instances),
+                "net_count": len(design.nets),
+                "module_count": len(design.modules),
+                "graph_node_count": graph_node_count,
+                "graph_edge_count": graph_edge_count,
+                "vector_document_count": vector_document_count,
+            }
+            status = "degraded" if derived_degraded else "indexed"
+            message = f"Indexed circuit design {original_name}"
+            if derived_degraded:
+                message += " with degraded derived indexes"
+            self._write_metadata(
+                kb_name,
+                design_id,
+                {
+                    "record_id": record_id,
+                    "department_id": str(department_id or ""),
+                    "uploaded_by": uploaded_by,
+                    "original_name": original_name,
+                    "file_path": file_path,
+                    "index_status": status,
+                    "index_message": message,
+                    "index_warnings": warnings,
+                    "index_stats": stats,
+                },
+            )
+            return CircuitIndexResult(
+                ok=True,
+                status=status,
+                message=message,
+                warnings=warnings,
+                stats=stats,
+                design_id=design_id,
+            )
 
     def query(
         self,
@@ -167,7 +243,7 @@ class CircuitIndexService:
         # graph expansion adds topology context without replacing them; semantic
         # recall is used only when neither has grounded an answer.
         structured_hits = self._structured_evidence(kb_name, query, allowed_designs, top_k)
-        graph_hits = self._graph_evidence(kb_name, query, allowed_designs)
+        graph_hits = self._graph_evidence(kb_name, query, allowed_designs, top_k=top_k)
         semantic_hits = []
         if not structured_hits and not graph_hits:
             semantic_hits = self._semantic_evidence(kb_name, query, allowed_designs, top_k)
@@ -210,24 +286,39 @@ class CircuitIndexService:
                 results.append(evidence)
         return results
 
-    def _exact_search(self, method_name: str, kb_name: str, query: str, limit: int) -> list[dict[str, Any]]:
+    def _exact_search(
+        self,
+        method_name: str,
+        kb_name: str,
+        query: str,
+        limit: int,
+        allowed_design_ids: set[str] | frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Use CircuitQueryEngine's keyword path without its semantic branch."""
         method = getattr(self.query_engine, method_name)
         keywords = _exact_terms(query)
         if not keywords:
             return []
-        parameters = inspect.signature(method).parameters.values()
-        accepts_keywords = any(parameter.name == "keywords" or parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        parameters = tuple(inspect.signature(method).parameters.values())
+        accepts_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        accepts_keywords = any(parameter.name == "keywords" for parameter in parameters) or accepts_var_kwargs
+        accepts_allowed = any(parameter.name == "allowed_design_ids" for parameter in parameters) or accepts_var_kwargs
+        if allowed_design_ids is not None and not accepts_allowed:
+            return []
+        kwargs: dict[str, Any] = {"limit": limit}
+        if accepts_allowed:
+            kwargs["allowed_design_ids"] = allowed_design_ids
         if accepts_keywords:
+            kwargs["keywords"] = keywords
             try:
-                return method(kb_name, "", keywords=keywords, limit=limit)
+                return method(kb_name, "", **kwargs)
             except TypeError:
                 # An implementation failure is not evidence that the method
                 # lacks keyword support. Never retry it with a nonempty query,
                 # which could activate CircuitQueryEngine semantic recall.
                 return []
         try:
-            return method(kb_name, "", limit=limit)
+            return method(kb_name, "", **kwargs)
         except TypeError:
             return []
 
@@ -236,11 +327,14 @@ class CircuitIndexService:
         kb_name: str,
         query: str,
         allowed_designs: dict[str, tuple[dict[str, Any], str]],
+        *,
+        top_k: int,
     ) -> list[Evidence]:
         load = getattr(self.graph_store, "load", None)
         if not callable(load):
             return []
         results: list[Evidence] = []
+        traversal_budget = max(top_k * 8, top_k + 8)
         for design_id, (metadata, source_name) in allowed_designs.items():
             try:
                 graph = load(self.store.design_dir(kb_name, design_id))
@@ -265,11 +359,19 @@ class CircuitIndexService:
             # Bounded component → net → component → net traversal.  It is
             # sufficient for enable diode-OR source tracing while preventing
             # an arbitrary walk across the rest of an authorized design.
-            pending_refdes = [(refdes, 0) for refdes in refdes_values]
-            pending_nets = [(net_name, 0) for net_name in net_names]
+            pending_refdes = [
+                (refdes, 0)
+                for refdes in list(dict.fromkeys(refdes_values))[:traversal_budget]
+            ]
+            pending_nets = [
+                (net_name, 0)
+                for net_name in list(dict.fromkeys(net_names))[:traversal_budget]
+            ]
             seen_refdes: set[str] = set()
             seen_nets: set[str] = set()
-            while pending_refdes or pending_nets:
+            traversal_steps = 0
+            while (pending_refdes or pending_nets) and len(results) < top_k and traversal_steps < traversal_budget:
+                traversal_steps += 1
                 if pending_refdes:
                     refdes, depth = pending_refdes.pop(0)
                     if depth > 2:
@@ -278,7 +380,19 @@ class CircuitIndexService:
                         continue
                     seen_refdes.add(refdes)
                     neighbors = self._graph_connected(graph, refdes=refdes)
-                    pending_nets.extend((str(item.get("net_name") or item.get("name") or ""), depth + 1) for item in neighbors if item.get("kind") == "net")
+                    remaining = max(
+                        0,
+                        traversal_budget - traversal_steps - len(pending_refdes) - len(pending_nets),
+                    )
+                    next_nets = [
+                        (
+                            str(item.get("net_name") or item.get("name") or ""),
+                            depth + 1,
+                        )
+                        for item in neighbors
+                        if item.get("kind") == "net"
+                    ]
+                    pending_nets.extend(next_nets[:remaining])
                     continue
                 net_name, depth = pending_nets.pop(0)
                 if depth > 3:
@@ -289,22 +403,32 @@ class CircuitIndexService:
                 related = self._graph_connected(graph, net_name=net_name)
                 if not related:
                     continue
-                endpoints = [item for item in related if item.get("kind") == "pin"]
-                components = sorted({str(item.get("refdes") or "") for item in related if item.get("kind") == "component" and item.get("refdes")})
-                endpoint_text = ", ".join(
-                    f"{item.get('refdes')}.{item.get('pin') or item.get('pin_name')}"
-                    for item in endpoints
-                    if item.get("refdes") and (item.get("pin") or item.get("pin_name"))
+                endpoints = sorted(
+                    (
+                        str(item.get("refdes") or ""),
+                        str(item.get("pin") or item.get("pin_name") or ""),
+                    )
+                    for item in related
+                    if item.get("kind") == "pin" and item.get("refdes")
+                    and (item.get("pin") or item.get("pin_name"))
                 )
-                for endpoint in endpoints:
-                    pin = str(endpoint.get("pin") or endpoint.get("pin_name") or "")
-                    endpoint_refdes = str(endpoint.get("refdes") or "")
-                    if not pin or not endpoint_refdes:
-                        continue
-                    content = f"Graph net {net_name}: {endpoint_text}; components: {', '.join(components)}."
+                if endpoints:
+                    endpoint_labels = [
+                        f"{refdes[:48]}.{pin[:32]}"
+                        for refdes, pin in endpoints[:GRAPH_EVIDENCE_ENDPOINT_LIMIT]
+                    ]
+                    omitted = len(endpoints) - len(endpoint_labels)
+                    endpoint_text = ", ".join(endpoint_labels)
+                    if omitted:
+                        endpoint_text += f", +{omitted} more"
+                    content = (
+                        f"Graph net {net_name[:96]} connects {len(endpoints)} pins: "
+                        f"{endpoint_text}."
+                    )[:GRAPH_EVIDENCE_CONTENT_LIMIT]
+                    endpoint_refdes, pin = endpoints[0]
                     record_id = metadata.get("record_id")
                     results.append(Evidence(
-                        id=f"circuit:{record_id or design_id}:graph_relationship:{endpoint_refdes}.{pin}:{net_name}",
+                        id=f"circuit:{record_id or design_id}:graph_relationship:{net_name}",
                         content=content,
                         source_name=source_name,
                         content_kind="circuit_design",
@@ -314,13 +438,25 @@ class CircuitIndexService:
                         metadata={"kb_name": kb_name, "department_id": metadata.get("department_id", ""), "source_group": "circuit_design", "evidence_kind": "graph_relationship"},
                     ))
                 if depth < 3:
-                    pending_refdes.extend((str(item.get("refdes") or ""), depth + 1) for item in related if item.get("kind") == "component" and item.get("refdes"))
+                    next_refdes = [
+                        str(item.get("refdes") or "")
+                        for item in related
+                        if item.get("kind") == "component" and item.get("refdes")
+                    ]
                     if enable_trace:
-                        pending_refdes[:] = [
-                            (refdes, ref_depth)
-                            for refdes, ref_depth in pending_refdes
+                        next_refdes = [
+                            refdes
+                            for refdes in next_refdes
                             if _is_diode_or_member(design, refdes)
                         ]
+                    remaining = max(
+                        0,
+                        traversal_budget - traversal_steps - len(pending_refdes) - len(pending_nets),
+                    )
+                    pending_refdes.extend(
+                        (refdes, depth + 1)
+                        for refdes in next_refdes[:remaining]
+                    )
         return self._deduplicate(results)
 
     def _graph_connected(self, graph: Any, **kwargs: str) -> list[dict[str, Any]]:
@@ -340,7 +476,20 @@ class CircuitIndexService:
         if not callable(search):
             return []
         try:
-            vector_hits = search(kb_name, query, top_k=top_k * 2, kinds=(KIND_INSTANCE, KIND_NET, KIND_MODULE))
+            parameters = tuple(inspect.signature(search).parameters.values())
+            accepts_allowed = any(
+                parameter.name == "allowed_design_ids" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            if not accepts_allowed:
+                return []
+            kwargs: dict[str, Any] = {
+                "top_k": top_k * 2,
+                "kinds": (KIND_INSTANCE, KIND_NET, KIND_MODULE),
+            }
+            if accepts_allowed:
+                kwargs["allowed_design_ids"] = frozenset(allowed_designs)
+            vector_hits = search(kb_name, query, **kwargs)
         except Exception:
             return []
         results: list[Evidence] = []
@@ -429,15 +578,16 @@ class CircuitIndexService:
         top_k: int,
     ) -> list[Evidence]:
         plan = analyze_question(query)
+        allowed_design_ids = frozenset(allowed_designs)
         candidates = [
-            ("net", 0.96, self._exact_search("search_net_connections", kb_name, query, top_k * 3)),
-            ("instance", 0.92, self._exact_search("search_instances", kb_name, query, top_k * 3)),
-            ("module", 0.80, self._exact_search("search_modules", kb_name, query, top_k * 2)),
-            ("module_connection", 0.84, self._exact_search("search_module_connections", kb_name, query, top_k * 2)),
-            ("module_power", 0.82, self._exact_search("search_module_power_nets", kb_name, query, top_k * 2)),
+            ("net", 0.96, self._exact_search("search_net_connections", kb_name, query, top_k * 3, allowed_design_ids)),
+            ("instance", 0.92, self._exact_search("search_instances", kb_name, query, top_k * 3, allowed_design_ids)),
+            ("module", 0.80, self._exact_search("search_modules", kb_name, query, top_k * 2, allowed_design_ids)),
+            ("module_connection", 0.84, self._exact_search("search_module_connections", kb_name, query, top_k * 2, allowed_design_ids)),
+            ("module_power", 0.82, self._exact_search("search_module_power_nets", kb_name, query, top_k * 2, allowed_design_ids)),
         ]
         if "power_switch" in plan.operations:
-            switch_rows = self._exact_search("search_instances", kb_name, query, top_k * 3)
+            switch_rows = self._exact_search("search_instances", kb_name, query, top_k * 3, allowed_design_ids)
             pin_mapping_rows: list[dict[str, Any]] = []
             for row in switch_rows:
                 design_id = str(row.get("design_id") or row.get("circuit_id") or "")
@@ -456,10 +606,10 @@ class CircuitIndexService:
             ]
             candidates.append(("power_topology", 0.99, power_topology_rows))
         if "clock" in plan.operations:
-            candidates.append(("instance", 0.98, self._exact_search("search_instances", kb_name, "CRYSTAL", top_k * 3)))
+            candidates.append(("instance", 0.98, self._exact_search("search_instances", kb_name, "CRYSTAL", top_k * 3, allowed_design_ids)))
         if "mcu" in query.casefold():
             candidates.append(
-                ("instance", 0.97, self._exact_search("search_instances", kb_name, "TC3", top_k * 2))
+                ("instance", 0.97, self._exact_search("search_instances", kb_name, "TC3", top_k * 2, allowed_design_ids))
             )
         refdes_matches = re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d+)(?![A-Za-z0-9])", query)
         if "connection" in plan.operations and refdes_matches:
@@ -473,7 +623,11 @@ class CircuitIndexService:
             if pin_mapping_rows:
                 candidates.append(("pin_mapping", 0.98, pin_mapping_rows))
         if "bias" in plan.operations:
-            bias_rows = self.query_engine.search_bias_topologies(kb_name, limit=top_k * 3)
+            bias_rows = self.query_engine.search_bias_topologies(
+                kb_name,
+                limit=top_k * 3,
+                allowed_design_ids=allowed_design_ids,
+            )
             lowered = query.casefold()
             if "上拉" in lowered or "pull-up" in lowered or "pullup" in lowered or "pull up" in lowered:
                 bias_rows = [row for row in bias_rows if row.get("topology") == "pull_up"]
@@ -482,9 +636,17 @@ class CircuitIndexService:
             bias_rows = _filter_bias_rows(bias_rows, query, plan)
             candidates.append(("topology", 0.94, bias_rows))
         if "protection" in plan.operations:
-            candidates.append(("topology", 0.90, self.query_engine.search_protection_topologies(kb_name, limit=top_k * 3)))
+            candidates.append(("topology", 0.90, self.query_engine.search_protection_topologies(
+                kb_name,
+                limit=top_k * 3,
+                allowed_design_ids=allowed_design_ids,
+            )))
         if "power_path" in plan.operations and "protection" in plan.operations:
-            candidates.append(("topology", 0.91, self.query_engine.search_power_protection_candidates(kb_name, limit=top_k * 3)))
+            candidates.append(("topology", 0.91, self.query_engine.search_power_protection_candidates(
+                kb_name,
+                limit=top_k * 3,
+                allowed_design_ids=allowed_design_ids,
+            )))
         evidence_by_id: dict[str, Evidence] = {}
         for kind, score, rows in candidates:
             for row in rows:
@@ -615,8 +777,21 @@ class CircuitIndexService:
         return os.path.join(self.store.design_dir(kb_name, design_id, create=True), META_FILE)
 
     def _write_metadata(self, kb_name: str, design_id: str, metadata: dict[str, Any]) -> None:
-        with open(self._metadata_path(kb_name, design_id), "w", encoding="utf-8") as fh:
-            json.dump(metadata, fh, ensure_ascii=False, indent=2)
+        target = self._metadata_path(kb_name, design_id)
+        target_dir = os.path.dirname(target)
+        descriptor, temporary = tempfile.mkstemp(prefix=".metadata-", dir=target_dir)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+                json.dump(metadata, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, target)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
     def _read_metadata(self, kb_name: str, design_id: str) -> dict[str, Any]:
         try:
