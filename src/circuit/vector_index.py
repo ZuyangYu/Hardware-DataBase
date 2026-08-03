@@ -48,6 +48,15 @@ class CircuitVectorHit:
     document: str
 
 
+@dataclass(frozen=True)
+class CircuitVectorIndexStatus:
+    """Outcome of indexing one circuit design into the vector collection."""
+
+    available: bool
+    indexed_count: int
+    error: str = ""
+
+
 def _collection_name(kb_name: str) -> str:
     # Keep separate from the main `kb_<kb>` collection so deletion / reindex
     # cycles don't disturb the RAG index.
@@ -200,7 +209,11 @@ class CircuitVectorIndex:
     # ── write path ────────────────────────────────────────────────────────
 
     def reindex_design(self, design: CircuitDesign) -> int:
-        """Re-embed a single design. Returns the row count written.
+        """Compatibility wrapper returning the number of rows written."""
+        return self.reindex_design_with_status(design).indexed_count
+
+    def reindex_design_with_status(self, design: CircuitDesign) -> CircuitVectorIndexStatus:
+        """Re-embed a design and retain availability and failure details.
 
         Strategy: nuke this design's existing entries first, then bulk-write
         the new ones. The collection is per-KB but we scope deletion by
@@ -212,7 +225,7 @@ class CircuitVectorIndex:
             if not self._embed_warning_logged:
                 log("CircuitVectorIndex: embed model 未配置，跳过 circuit 向量索引")
                 self._embed_warning_logged = True
-            return 0
+            return CircuitVectorIndexStatus(available=False, indexed_count=0)
 
         docs: list[tuple[str, str, dict[str, Any]]] = []
         # Collect (id, body, metadata) triples for everything we want indexed.
@@ -231,19 +244,27 @@ class CircuitVectorIndex:
 
         if not docs:
             # No content to index → still remove stale rows for this design.
-            self._delete_design(design.kb_name, design.design_id)
-            return 0
+            delete_error = self._delete_design(design.kb_name, design.design_id)
+            if delete_error:
+                return CircuitVectorIndexStatus(available=True, indexed_count=0, error=delete_error)
+            return CircuitVectorIndexStatus(available=True, indexed_count=0)
 
         with self._lock:
-            self._delete_design(design.kb_name, design.design_id)
-            collection = self._chroma_collection(design.kb_name)
             try:
+                delete_error = self._delete_design(design.kb_name, design.design_id)
+                if delete_error:
+                    return CircuitVectorIndexStatus(available=True, indexed_count=0, error=delete_error)
+                collection = self._chroma_collection(design.kb_name)
                 ids = [d[0] for d in docs]
                 bodies = [d[1] for d in docs]
                 metas = [d[2] for d in docs]
                 embeddings = self._embed_batch(embed_model, bodies)
                 if embeddings is None:
-                    return 0
+                    return CircuitVectorIndexStatus(
+                        available=True,
+                        indexed_count=0,
+                        error="embedding failed",
+                    )
                 collection.add(
                     ids=ids,
                     documents=bodies,
@@ -254,15 +275,19 @@ class CircuitVectorIndex:
                     f"CircuitVectorIndex: reindexed {design.kb_name}/{design.design_id} — "
                     f"{len(docs)} docs"
                 )
-                return len(docs)
+                return CircuitVectorIndexStatus(available=True, indexed_count=len(docs))
             except Exception as exc:
                 error(
                     f"CircuitVectorIndex: reindex_design failed for "
                     f"{design.kb_name}/{design.design_id}: {exc}"
                 )
-                return 0
+                return CircuitVectorIndexStatus(
+                    available=True,
+                    indexed_count=0,
+                    error="reindex failed",
+                )
 
-    def _delete_design(self, kb_name: str, design_id: str) -> None:
+    def _delete_design(self, kb_name: str, design_id: str) -> str:
         """Remove all rows for a design. Safe when the collection is empty
         or doesn't exist yet."""
         try:
@@ -270,6 +295,8 @@ class CircuitVectorIndex:
             collection.delete(where={"design_id": design_id})
         except Exception as exc:
             warn(f"CircuitVectorIndex: delete_design ({kb_name}/{design_id}) failed: {exc}")
+            return "delete failed"
+        return ""
 
     def drop_kb(self, kb_name: str) -> None:
         """Drop the entire circuit vector collection for a KB."""

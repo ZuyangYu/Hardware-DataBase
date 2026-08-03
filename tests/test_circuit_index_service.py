@@ -1,10 +1,14 @@
 import os
 import tempfile
 import unittest
+from hashlib import sha256
 
 from src.agents.state import Evidence
+from src.circuit.graph_store import GraphIndexResult, GraphStore
 from src.circuit.index_service import CircuitIndexService
 from src.circuit.models import CircuitModule, ComponentInstance, Net, Pin, PinRef
+from src.circuit.store import CircuitStore
+from src.circuit.vector_index import CircuitVectorIndexStatus
 from src.pipelines.document_rag.schemas import RequestContext
 
 
@@ -14,9 +18,15 @@ class CircuitIndexServiceTests(unittest.TestCase):
             source = os.path.join(tmp, "main_board.edf")
             with open(source, "w", encoding="utf-8") as fh:
                 fh.write("(edif main_board)")
+            calls = []
+            store = _RecordingStore(os.path.join(tmp, "circuits"), calls)
+            graph_store = _GraphStore(calls)
+            vector_index = _VectorIndex(calls)
             service = CircuitIndexService(
-                storage_root=os.path.join(tmp, "circuits"),
+                store=store,
                 parser_factory=lambda path, progress_callback=None: _Parser(),
+                graph_store=graph_store,
+                vector_index=vector_index,
             )
 
             result = service.index_file(
@@ -33,10 +43,19 @@ class CircuitIndexServiceTests(unittest.TestCase):
                 ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
                 top_k=5,
             )
+            graph_artifact_exists = os.path.exists(calls[1][3])
 
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "indexed")
         self.assertEqual(result.stats["instance_count"], 4)
+        self.assertEqual(result.stats["graph_node_count"], 12)
+        self.assertEqual(result.stats["graph_edge_count"], 14)
+        self.assertEqual(result.stats["vector_document_count"], 9)
+        self.assertEqual([call[0] for call in calls], ["structured", "graph", "vector"])
+        self.assertEqual(calls[1][1].design_id, result.design_id)
+        self.assertEqual(calls[2][1].design_id, result.design_id)
+        self.assertEqual(calls[1][2], store.design_dir("kb_hw", result.design_id))
+        self.assertTrue(graph_artifact_exists)
         self.assertTrue(hits)
         self.assertTrue(all(isinstance(hit, Evidence) for hit in hits))
         self.assertEqual(hits[0].source_name, "main_board.edf")
@@ -46,6 +65,95 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertEqual(hits[0].metadata["department_id"], "dept_hw")
         self.assertEqual(hits[0].locator["record_id"], 7)
         self.assertIn("CAN0", hits[0].content)
+
+    def test_index_file_treats_unconfigured_vector_index_as_explicitly_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = _service(tmp, vector_index=_UnavailableVectorIndex())
+
+            result = service.index_file(
+                kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "main_board.edf"),
+                original_name="main_board.edf", department_id="dept_hw",
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "indexed")
+        self.assertEqual(result.stats["vector_document_count"], 0)
+        self.assertFalse(any("vector" in warning.casefold() for warning in result.warnings))
+
+    def test_index_file_returns_degraded_when_graph_persistence_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = _service(tmp, graph_store=_FailingGraphStore(), vector_index=_VectorIndex())
+
+            result = service.index_file(
+                kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "main_board.edf"),
+                original_name="main_board.edf", department_id="dept_hw",
+            )
+            loaded = service.store.load("kb_hw", result.design_id)
+            metadata = service._read_metadata("kb_hw", result.design_id)
+            hits = service.query(kb_name="kb_hw", query="CAN0", ctx=None)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.stats["graph_node_count"], 0)
+        self.assertTrue(any("graph" in warning.casefold() for warning in result.warnings))
+        self.assertIsNotNone(loaded)
+        self.assertEqual(metadata["record_id"], 7)
+        self.assertTrue(hits)
+
+    def test_index_file_returns_degraded_when_configured_vector_index_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = _service(tmp, vector_index=_FailingVectorIndex())
+
+            result = service.index_file(
+                kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "main_board.edf"),
+                original_name="main_board.edf", department_id="dept_hw",
+            )
+            loaded = service.store.load("kb_hw", result.design_id)
+            metadata = service._read_metadata("kb_hw", result.design_id)
+            hits = service.query(kb_name="kb_hw", query="CAN0", ctx=None)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.stats["vector_document_count"], 0)
+        self.assertTrue(any("vector" in warning.casefold() for warning in result.warnings))
+        self.assertFalse(any("private payload" in warning for warning in result.warnings))
+        self.assertIsNotNone(loaded)
+        self.assertEqual(metadata["record_id"], 7)
+        self.assertTrue(hits)
+
+    def test_parser_failure_preserves_previous_design_and_derived_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parser_factory = _ToggleParserFactory()
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=parser_factory,
+                graph_store=GraphStore(),
+                vector_index=_UnavailableVectorIndex(),
+            )
+            source = os.path.join(tmp, "main_board.edf")
+            service.index_file(
+                kb_name="kb_hw", record_id=7, file_path=source,
+                original_name="main_board.edf", department_id="dept_hw",
+            )
+            design_dir = service.store.design_dir("kb_hw", "main_board")
+            artifact_hashes = {
+                name: _file_hash(os.path.join(design_dir, name))
+                for name in ("circuit_state.json", "pipeline_metadata.json", "connectivity_graph.gpickle")
+            }
+            parser_factory.raise_error = True
+
+            with self.assertRaisesRegex(ValueError, "invalid EDF"):
+                service.index_file(
+                    kb_name="kb_hw", record_id=99, file_path=source,
+                    original_name="main_board.edf", department_id="other",
+                )
+
+            final_hashes = {
+                name: _file_hash(os.path.join(design_dir, name))
+                for name in artifact_hashes
+            }
+
+        self.assertEqual(final_hashes, artifact_hashes)
 
     def test_query_returns_empty_for_kb_without_indexed_circuits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,6 +462,83 @@ class _Parser:
                 CircuitModule(module_id="mcu", name="MCU", strategy="fixture", instances=["U2"], nets=["VDD", "GND"]),
             ],
         )
+
+
+class _RecordingStore(CircuitStore):
+    def __init__(self, root, calls):
+        super().__init__(root=root)
+        self.calls = calls
+
+    def save(self, design):
+        self.calls.append(("structured", design))
+        return super().save(design)
+
+
+class _GraphStore:
+    def __init__(self, calls=None):
+        self.calls = calls
+
+    def save(self, design, design_dir):
+        path = os.path.join(design_dir, "connectivity_graph.gpickle")
+        with open(path, "wb") as fh:
+            fh.write(b"graph")
+        if self.calls is not None:
+            self.calls.append(("graph", design, design_dir, path))
+        return GraphIndexResult(path=path, node_count=12, edge_count=14)
+
+
+class _FailingGraphStore:
+    def save(self, design, design_dir):
+        raise RuntimeError("private payload")
+
+
+class _VectorIndex:
+    def __init__(self, calls=None):
+        self.calls = calls
+
+    def reindex_design_with_status(self, design):
+        if self.calls is not None:
+            self.calls.append(("vector", design))
+        return CircuitVectorIndexStatus(available=True, indexed_count=9)
+
+
+class _UnavailableVectorIndex:
+    def reindex_design_with_status(self, design):
+        return CircuitVectorIndexStatus(available=False, indexed_count=0)
+
+
+class _FailingVectorIndex:
+    def reindex_design_with_status(self, design):
+        return CircuitVectorIndexStatus(available=True, indexed_count=0, error="private payload")
+
+
+class _ToggleParserFactory:
+    def __init__(self):
+        self.raise_error = False
+
+    def __call__(self, path, progress_callback=None):
+        if self.raise_error:
+            return _RaisingParser()
+        return _Parser()
+
+
+class _RaisingParser:
+    def parse(self):
+        raise ValueError("invalid EDF")
+
+
+def _service(tmp, *, graph_store=None, vector_index=None):
+    return CircuitIndexService(
+        storage_root=os.path.join(tmp, "circuits"),
+        parser_factory=lambda path, progress_callback=None: _Parser(),
+        graph_store=graph_store,
+        vector_index=vector_index,
+    )
+
+
+def _file_hash(path):
+    with open(path, "rb") as fh:
+        return sha256(fh.read()).hexdigest()
 
 
 class _PowerPathParser:

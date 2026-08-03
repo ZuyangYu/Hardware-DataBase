@@ -9,11 +9,13 @@ from typing import Any, Callable
 
 from src.agents.state import Evidence
 from src.circuit.evidence_mapper import CircuitEvidenceMapper
+from src.circuit.graph_store import GraphStore
 from src.circuit.models import CircuitDesign, CircuitStatus, DesignFile
 from src.circuit.parsers.edf_parser import EdfParser
 from src.circuit.question_analysis import analyze_question
 from src.circuit.query_engine import CircuitQueryEngine
 from src.circuit.store import CircuitStore, make_design_id
+from src.circuit.vector_index import CircuitVectorIndex, default_circuit_vector_index
 from src.pipelines.document_rag.schemas import RequestContext
 
 
@@ -38,10 +40,14 @@ class CircuitIndexService:
         storage_root: str | None = None,
         parser_factory: Callable[..., Any] | None = None,
         query_engine: CircuitQueryEngine | None = None,
+        graph_store: GraphStore | None = None,
+        vector_index: CircuitVectorIndex | None = None,
     ):
         self.store = store or CircuitStore(root=storage_root)
         self.parser_factory = parser_factory or EdfParser
         self.query_engine = query_engine or CircuitQueryEngine(self.store)
+        self.graph_store = graph_store or GraphStore()
+        self.vector_index = vector_index or default_circuit_vector_index
         self.evidence_mapper = CircuitEvidenceMapper()
 
     def index_file(
@@ -91,16 +97,40 @@ class CircuitIndexService:
                 "file_path": file_path,
             },
         )
+        warnings = list(design.parse_warnings)
+        graph_node_count = 0
+        graph_edge_count = 0
+        try:
+            graph_result = self.graph_store.save(
+                design,
+                self.store.design_dir(kb_name, design_id, create=True),
+            )
+            graph_node_count = graph_result.node_count
+            graph_edge_count = graph_result.edge_count
+        except Exception:
+            warnings.append("Graph index persistence failed.")
+
+        vector_document_count = 0
+        try:
+            vector_status = self.vector_index.reindex_design_with_status(design)
+            vector_document_count = vector_status.indexed_count
+            if vector_status.available and vector_status.error:
+                warnings.append("Vector index persistence failed.")
+        except Exception:
+            warnings.append("Vector index persistence failed.")
         stats = {
             "instance_count": len(design.instances),
             "net_count": len(design.nets),
             "module_count": len(design.modules),
+            "graph_node_count": graph_node_count,
+            "graph_edge_count": graph_edge_count,
+            "vector_document_count": vector_document_count,
         }
         return CircuitIndexResult(
             ok=True,
-            status="indexed",
+            status="degraded" if len(warnings) > len(design.parse_warnings) else "indexed",
             message=f"Indexed circuit design {original_name}",
-            warnings=design.parse_warnings,
+            warnings=warnings,
             stats=stats,
             design_id=design_id,
         )
