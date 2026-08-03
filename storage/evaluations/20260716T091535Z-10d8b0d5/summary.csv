@@ -1,0 +1,2 @@
+﻿sample_id,snapshot_status,question,reference_answer,response,retrieved_contexts,answer_correctness,answer_relevancy,completeness,conflict_disclosure,context_precision,context_recall,evidence_consistency,faithfulness,missing_information_honesty
+hw-v1-joint-can-module,success,文档声明板上有哪些 CAN 相关模块，回答时能否用网表确认其具体连接？,HSI 硬件架构包含 CAN/CAN FD 电路；具体器件和网络连接应以 EDF 检索结果为准，文档能力声明与网表拓扑需分别标注来源。,当前知识库中未找到可支撑回答的证据。,[],failed,failed,0.0,not_applicable,not_applicable,not_applicable,0.0,not_applicable,not_applicable
