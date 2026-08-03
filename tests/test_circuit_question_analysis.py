@@ -40,6 +40,15 @@ class CircuitQuestionAnalysisTests(unittest.TestCase):
                 plan = analyze_question(row["question"])
                 self.assertTrue(expected_operations[row["id"]].issubset(plan.operations))
 
+    def test_bare_refdes_and_net_identifiers_select_connection(self):
+        self.assertIn("entity_lookup", analyze_question("U1600").operations)
+        self.assertIn("connection", analyze_question("ECU_EN").operations)
+
+    def test_generic_substrings_do_not_create_structural_operations(self):
+        for question in ("explain the data model", "nearly complete", "Tuesday status", "muscle test", "value proposition"):
+            with self.subTest(question=question):
+                self.assertEqual(analyze_question(question).operations, ())
+
 
 if __name__ == "__main__":
     unittest.main()

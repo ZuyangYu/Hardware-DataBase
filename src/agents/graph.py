@@ -723,18 +723,22 @@ def _resolve_catalog_source(sources: list[dict[str, Any]], source_name: str) -> 
 
 
 def _complete_required_source_plan(state: AgentState, source_plan: SourcePlan) -> SourcePlan:
-    """Ensure indexed circuit sources are not omitted by an LLM source plan."""
+    """Ensure required catalog evidence types are not omitted by an LLM plan."""
     expected = {
         evidence_type
         for sub_question in (state.get("question_analysis") or {}).get("sub_questions") or []
         for evidence_type in sub_question.get("expected_evidence") or []
     }
-    if "circuit_design" not in expected:
+    if not expected:
         return source_plan
 
     planned = {item.source_name: item for item in source_plan.source_plan}
     for source in (state.get("catalog") or {}).get("sources") or []:
-        if source.get("processor_kind") != "circuit_design" or source.get("status") != "indexed":
+        processor = str(source.get("processor_kind") or "")
+        content_kind = str(source.get("content_kind") or "")
+        is_circuit = processor == "circuit_design" and source.get("status") == "indexed"
+        is_document = content_kind == "document_text" or processor == "ragflow"
+        if ("circuit_design" not in expected or not is_circuit) and ("document_text" not in expected or not is_document):
             continue
         source_name = str(source.get("document_name") or "")
         if not source_name:
@@ -751,18 +755,19 @@ def _complete_required_source_plan(state: AgentState, source_plan: SourcePlan) -
         if item is None:
             item = SourcePlanItem(
                 source_name=source_name,
-                processor_kind="circuit_design",
-                reason="Deterministic circuit evidence requirement.",
+                processor_kind=processor,
+                reason="Deterministic required evidence source.",
             )
             source_plan.source_plan.append(item)
             planned[source_name] = item
-        if any(call.tool_name == "circuit_query" for call in item.tool_calls):
+        tool_name = "circuit_query" if is_circuit else "document_rag"
+        if any(call.tool_name == tool_name for call in item.tool_calls):
             continue
         item.tool_calls.append(
             ToolCallPlan(
-                tool_name="circuit_query",
+                tool_name=tool_name,
                 query=state.get("user_query", ""),
-                reason="Search indexed circuit source for direct evidence.",
+                reason="Search deterministic required evidence source.",
                 top_k=8,
                 filters=filters,
             )

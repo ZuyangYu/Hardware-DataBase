@@ -392,6 +392,23 @@ class AgenticRunnerTests(unittest.TestCase):
                     calls = [call for item in planned["source_plan"]["source_plan"] for call in item["tool_calls"]]
                     self.assertTrue(any(call["tool_name"] == "circuit_query" for call in calls))
 
+    def test_llm_completion_keeps_document_and_circuit_sources_for_component_selection(self):
+        state = {
+            "kb_name": "ADAS_new",
+            "user_query": "输入电压为 9–12V、输出电压为 3.3V 时，可使用哪些芯片型号？",
+            "question_analysis": {"sub_questions": [{"id": "sq_1", "question": "输入电压为 9–12V、输出电压为 3.3V 时，可使用哪些芯片型号？", "expected_evidence": ["circuit_design", "document_text"]}]},
+            "catalog": {"sources": [
+                {"document_name": "board.edf", "record_id": 7, "processor_kind": "circuit_design", "status": "indexed"},
+                {"document_name": "selection-guide.pdf", "record_id": 8, "processor_kind": "ragflow", "content_kind": "document_text", "status": "completed"},
+            ]},
+            "trace": [],
+        }
+        planned = plan_source_selection_with_llm(state, _EvaluationPlannerLLM())
+
+        tools_by_source = {item["source_name"]: {call["tool_name"] for call in item["tool_calls"]} for item in planned["source_plan"]["source_plan"]}
+        self.assertEqual(tools_by_source["board.edf"], {"circuit_query"})
+        self.assertEqual(tools_by_source["selection-guide.pdf"], {"document_rag"})
+
     def test_retrieval_does_not_truncate_required_circuit_sources(self):
         calls = []
 

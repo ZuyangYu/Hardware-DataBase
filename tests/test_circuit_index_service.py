@@ -7,6 +7,7 @@ from src.agents.state import Evidence
 from src.circuit.graph_store import GraphIndexResult, GraphStore
 from src.circuit.index_service import CircuitIndexService
 from src.circuit.models import CircuitModule, ComponentInstance, Net, Pin, PinRef
+from src.circuit.query_engine import CircuitQueryEngine
 from src.circuit.store import CircuitStore
 from src.circuit.vector_index import CircuitVectorHit, CircuitVectorIndexStatus
 from src.pipelines.document_rag.schemas import RequestContext
@@ -503,6 +504,61 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertGreater(direct.score, semantic.score)
         self.assertEqual(semantic.locator["entity_type"], "semantic_instance")
 
+    def test_exact_stage_does_not_use_query_engine_semantic_supplement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vector_index = _SemanticVectorIndex()
+            store = CircuitStore(root=os.path.join(tmp, "circuits"))
+            service = CircuitIndexService(
+                store=store,
+                query_engine=CircuitQueryEngine(store, vector_index=vector_index),
+                parser_factory=lambda path, progress_callback=None: _EvaluationParser(),
+                vector_index=vector_index,
+            )
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            hits = service.query(kb_name="kb_hw", query="Y900", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}))
+
+        self.assertTrue(any(hit.locator["entity_id"] == "Y900" for hit in hits))
+        self.assertEqual(vector_index.search_calls, [])
+
+    def test_original_part_number_and_net_questions_expand_graph_relationships(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
+            by_part = service.query(kb_name="kb_hw", query="LN10046 的使能信号来源有哪些？请逐项列举。", ctx=ctx, top_k=8)
+            by_net = service.query(kb_name="kb_hw", query="ECU_EN 连接到哪里？", ctx=ctx, top_k=8)
+
+        for hits in (by_part, by_net):
+            graph_hits = [hit for hit in hits if hit.locator["entity_type"] == "graph_relationship"]
+            self.assertTrue(graph_hits)
+            self.assertTrue(any("D1611" in hit.content for hit in graph_hits))
+
+    def test_graph_lookup_failure_preserves_structured_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            service.graph_store = _ExplodingLookupGraphStore()
+            hits = service.query(kb_name="kb_hw", query="U1600 enable", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}))
+
+        self.assertTrue(any(hit.locator["entity_type"] == "instance" and hit.locator["entity_id"] == "U1600" for hit in hits))
+
+    def test_bias_retrieval_filters_to_requested_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            hits = service.query(kb_name="kb_hw", query="CAN0 RXD 上拉电阻位号和阻值", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}), top_k=8)
+
+        topology_ids = {hit.locator["entity_id"] for hit in hits if hit.locator["entity_type"] == "topology"}
+        self.assertEqual(topology_ids, {"pull_up:R1205"})
+
+    def test_graph_relationship_survives_small_top_k_before_keyword_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            hits = service.query(kb_name="kb_hw", query="U1600 ECU_EN enable", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}), top_k=2)
+
+        self.assertTrue(any(hit.locator["entity_type"] == "graph_relationship" for hit in hits))
+
 
 class _Parser:
     warnings = ["parser warning"]
@@ -553,6 +609,14 @@ class _GraphStore:
 class _FailingGraphStore:
     def save(self, design, design_dir):
         raise RuntimeError("private payload")
+
+
+class _ExplodingLookupGraphStore:
+    def load(self, design_dir):
+        return {"nodes": {}, "edges": []}
+
+    def connected_entities(self, graph, **kwargs):
+        raise RuntimeError("graph lookup failed")
 
 
 class _VectorIndex:
@@ -671,12 +735,14 @@ class _EvaluationParser:
                 ComponentInstance(refdes="Y900", library_cell="CRYSTAL", value="20MHz"),
                 ComponentInstance(refdes="Y600", library_cell="CRYSTAL", value="30MHz"),
                 ComponentInstance(refdes="R1205", library_cell="RES", value="100K", pins=[Pin(name="1", net="CAN0_RXD"), Pin(name="2", net="VCC3V3")]),
+                ComponentInstance(refdes="R1210", library_cell="RES", value="10K", pins=[Pin(name="1", net="LIN_RXD"), Pin(name="2", net="VCC3V3")]),
                 ComponentInstance(refdes="U1600", library_cell="LN10046", part_number="LN10046FSQ1LQR", pins=[Pin(name="EN_SYNC", net="ECU_EN")]),
                 ComponentInstance(refdes="D1611", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN")]),
             ],
             [
                 Net(name="ECU_EN", connections=[PinRef(refdes="U1600", pin="EN_SYNC"), PinRef(refdes="D1611", pin="K")]),
                 Net(name="CAN0_RXD", connections=[PinRef(refdes="R1205", pin="1")]),
+                Net(name="LIN_RXD", connections=[PinRef(refdes="R1210", pin="1")]),
                 Net(name="VCC3V3", connections=[PinRef(refdes="R1205", pin="2")], net_type="power"),
             ],
             [],
@@ -697,6 +763,9 @@ class _SemanticVectorIndex(_VectorIndex):
                 document="semantic oscillator candidate",
             )
         ]
+
+    def is_available(self):
+        return True
 
 
 class _QueryEngine:

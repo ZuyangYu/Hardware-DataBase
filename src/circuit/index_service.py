@@ -167,17 +167,26 @@ class CircuitIndexService:
         # recall is used only when neither has grounded an answer.
         structured_hits = self._structured_evidence(kb_name, query, allowed_designs, top_k)
         graph_hits = self._graph_evidence(kb_name, query, allowed_designs)
-        hits = self._deduplicate([*structured_hits, *graph_hits])
-        if not hits:
-            hits.extend(self._semantic_evidence(kb_name, query, allowed_designs, top_k))
+        semantic_hits = []
+        if not structured_hits and not graph_hits:
+            semantic_hits = self._semantic_evidence(kb_name, query, allowed_designs, top_k)
+        keyword_hits = []
         for design in self.store.list_designs(kb_name):
             allowed = allowed_designs.get(design.design_id)
             if allowed is None:
                 continue
             meta, source_name = allowed
-            hits.extend(self._net_evidence(design, meta, source_name, needles))
-            hits.extend(self._instance_evidence(design, meta, source_name, needles))
-        return self._deduplicate(hits)[:top_k]
+            keyword_hits.extend(self._net_evidence(design, meta, source_name, needles))
+            keyword_hits.extend(self._instance_evidence(design, meta, source_name, needles))
+        # Stage order, not a cross-stage score sort, determines truncation.
+        # This prevents a lower-priority keyword hit from evicting relationship
+        # evidence merely because its local keyword score is higher.
+        stages = [structured_hits, graph_hits, semantic_hits, keyword_hits]
+        if structured_hits and graph_hits and 1 < top_k <= 2:
+            # Keep the leading direct fact, then reserve remaining small-result
+            # capacity for relationship context before broad structured rows.
+            stages = [[structured_hits[0]], graph_hits, structured_hits[1:], semantic_hits, keyword_hits]
+        return self._stage_deduplicate(stages)[:top_k]
 
     @staticmethod
     def _deduplicate(hits: list[Evidence]) -> list[Evidence]:
@@ -188,6 +197,31 @@ class CircuitIndexService:
                 by_id[hit.id] = hit
         return sorted(by_id.values(), key=lambda item: (-item.score, item.id))
 
+    @staticmethod
+    def _stage_deduplicate(stages: list[list[Evidence]]) -> list[Evidence]:
+        seen: set[str] = set()
+        results: list[Evidence] = []
+        for stage in stages:
+            for evidence in stage:
+                if evidence.id in seen:
+                    continue
+                seen.add(evidence.id)
+                results.append(evidence)
+        return results
+
+    def _exact_search(self, method_name: str, kb_name: str, query: str, limit: int) -> list[dict[str, Any]]:
+        """Use CircuitQueryEngine's keyword path without its semantic branch."""
+        method = getattr(self.query_engine, method_name)
+        keywords = _exact_terms(query)
+        if not keywords:
+            return []
+        try:
+            return method(kb_name, "", keywords=keywords, limit=limit)
+        except TypeError:
+            # Legacy test doubles predate keyword support. Production query
+            # engine supports it; retain compatibility without changing RAG.
+            return method(kb_name, query, limit=limit)
+
     def _graph_evidence(
         self,
         kb_name: str,
@@ -197,9 +231,6 @@ class CircuitIndexService:
         load = getattr(self.graph_store, "load", None)
         if not callable(load):
             return []
-        refdes_values = list(dict.fromkeys(re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d+)(?![A-Za-z0-9])", query)))
-        if not refdes_values:
-            return []
         results: list[Evidence] = []
         for design_id, (metadata, source_name) in allowed_designs.items():
             try:
@@ -208,31 +239,43 @@ class CircuitIndexService:
                 continue
             if graph is None:
                 continue
+            design = self.store.load(kb_name, design_id)
+            if design is None:
+                continue
+            refdes_values, net_names = _graph_targets(design, query)
             for refdes in refdes_values:
-                neighbors = self.graph_store.connected_entities(graph, refdes=refdes)
-                net_names = [str(item.get("net_name") or item.get("name") or "") for item in neighbors if item.get("kind") == "net"]
-                for net_name in net_names:
-                    related = self.graph_store.connected_entities(graph, net_name=net_name)
-                    endpoints = [item for item in related if item.get("kind") == "pin"]
-                    components = sorted({str(item.get("refdes") or "") for item in related if item.get("kind") == "component" and item.get("refdes")})
-                    for endpoint in endpoints:
-                        pin = str(endpoint.get("pin") or endpoint.get("pin_name") or "")
-                        endpoint_refdes = str(endpoint.get("refdes") or "")
-                        if not pin or not endpoint_refdes:
-                            continue
-                        content = f"Graph net {net_name}: {refdes} is related through {endpoint_refdes}.{pin}; components: {', '.join(components)}."
-                        record_id = metadata.get("record_id")
-                        results.append(Evidence(
-                            id=f"circuit:{record_id or design_id}:graph_relationship:{refdes}:{endpoint_refdes}.{pin}:{net_name}",
-                            content=content,
-                            source_name=source_name,
-                            content_kind="circuit_design",
-                            processor_kind="circuit_design",
-                            score=0.88,
-                            locator={"record_id": record_id, "circuit_id": design_id, "entity_type": "graph_relationship", "entity_id": refdes, "pin": pin, "net": net_name},
-                            metadata={"kb_name": kb_name, "department_id": metadata.get("department_id", ""), "source_group": "circuit_design", "evidence_kind": "graph_relationship"},
-                        ))
+                neighbors = self._graph_connected(graph, refdes=refdes)
+                net_names.extend(str(item.get("net_name") or item.get("name") or "") for item in neighbors if item.get("kind") == "net")
+            for net_name in dict.fromkeys(name for name in net_names if name):
+                related = self._graph_connected(graph, net_name=net_name)
+                if not related:
+                    continue
+                endpoints = [item for item in related if item.get("kind") == "pin"]
+                components = sorted({str(item.get("refdes") or "") for item in related if item.get("kind") == "component" and item.get("refdes")})
+                for endpoint in endpoints:
+                    pin = str(endpoint.get("pin") or endpoint.get("pin_name") or "")
+                    endpoint_refdes = str(endpoint.get("refdes") or "")
+                    if not pin or not endpoint_refdes:
+                        continue
+                    content = f"Graph net {net_name}: {endpoint_refdes}.{pin}; components: {', '.join(components)}."
+                    record_id = metadata.get("record_id")
+                    results.append(Evidence(
+                        id=f"circuit:{record_id or design_id}:graph_relationship:{endpoint_refdes}.{pin}:{net_name}",
+                        content=content,
+                        source_name=source_name,
+                        content_kind="circuit_design",
+                        processor_kind="circuit_design",
+                        score=0.88,
+                        locator={"record_id": record_id, "circuit_id": design_id, "entity_type": "graph_relationship", "entity_id": endpoint_refdes, "pin": pin, "net": net_name},
+                        metadata={"kb_name": kb_name, "department_id": metadata.get("department_id", ""), "source_group": "circuit_design", "evidence_kind": "graph_relationship"},
+                    ))
         return self._deduplicate(results)
+
+    def _graph_connected(self, graph: Any, **kwargs: str) -> list[dict[str, Any]]:
+        try:
+            return self.graph_store.connected_entities(graph, **kwargs)
+        except Exception:
+            return []
 
     def _semantic_evidence(
         self,
@@ -335,14 +378,14 @@ class CircuitIndexService:
     ) -> list[Evidence]:
         plan = analyze_question(query)
         candidates = [
-            ("net", 0.96, self.query_engine.search_net_connections(kb_name, query, limit=top_k * 3)),
-            ("instance", 0.92, self.query_engine.search_instances(kb_name, query, limit=top_k * 3)),
-            ("module", 0.80, self.query_engine.search_modules(kb_name, query, limit=top_k * 2)),
-            ("module_connection", 0.84, self.query_engine.search_module_connections(kb_name, query, limit=top_k * 2)),
-            ("module_power", 0.82, self.query_engine.search_module_power_nets(kb_name, query, limit=top_k * 2)),
+            ("net", 0.96, self._exact_search("search_net_connections", kb_name, query, top_k * 3)),
+            ("instance", 0.92, self._exact_search("search_instances", kb_name, query, top_k * 3)),
+            ("module", 0.80, self._exact_search("search_modules", kb_name, query, top_k * 2)),
+            ("module_connection", 0.84, self._exact_search("search_module_connections", kb_name, query, top_k * 2)),
+            ("module_power", 0.82, self._exact_search("search_module_power_nets", kb_name, query, top_k * 2)),
         ]
         if "power_switch" in plan.operations:
-            switch_rows = self.query_engine.search_instances(kb_name, query, limit=top_k * 3)
+            switch_rows = self._exact_search("search_instances", kb_name, query, top_k * 3)
             pin_mapping_rows: list[dict[str, Any]] = []
             for row in switch_rows:
                 design_id = str(row.get("design_id") or row.get("circuit_id") or "")
@@ -362,7 +405,7 @@ class CircuitIndexService:
             candidates.append(("power_topology", 0.99, power_topology_rows))
         if "mcu" in query.casefold():
             candidates.append(
-                ("instance", 0.97, self.query_engine.search_instances(kb_name, "TC3", limit=top_k * 2))
+                ("instance", 0.97, self._exact_search("search_instances", kb_name, "TC3", top_k * 2))
             )
         refdes_matches = re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d+)(?![A-Za-z0-9])", query)
         if "connection" in plan.operations and refdes_matches:
@@ -382,6 +425,7 @@ class CircuitIndexService:
                 bias_rows = [row for row in bias_rows if row.get("topology") == "pull_up"]
             elif "下拉" in lowered or "pull-down" in lowered or "pulldown" in lowered:
                 bias_rows = [row for row in bias_rows if row.get("topology") == "pull_down"]
+            bias_rows = _filter_bias_rows(bias_rows, query, plan)
             candidates.append(("topology", 0.94, bias_rows))
         if "protection" in plan.operations:
             candidates.append(("topology", 0.90, self.query_engine.search_protection_topologies(kb_name, limit=top_k * 3)))
@@ -536,6 +580,45 @@ def _query_terms(query: str) -> list[str]:
         if len(token) >= 2:
             terms.append(token)
     return terms
+
+
+def _exact_terms(query: str) -> list[str]:
+    """Identifiers only: safe input for the query engine's nonsemantic path."""
+    return list(dict.fromkeys(re.findall(r"[A-Za-z][A-Za-z0-9_.-]*", query or "")))
+
+
+def _graph_targets(design: CircuitDesign, query: str) -> tuple[list[str], list[str]]:
+    identifiers = {item.casefold() for item in _exact_terms(query)}
+    query_lower = str(query or "").casefold()
+    refdes: list[str] = []
+    net_names: list[str] = []
+    for instance in design.instances:
+        fields = (instance.refdes, instance.library_cell, instance.part_number, instance.value)
+        if any(identifier and identifier in " ".join(str(field or "") for field in fields).casefold() for identifier in identifiers):
+            refdes.append(instance.refdes)
+        elif any(identifier and identifier == str(pin.name or "").casefold() for pin in instance.pins for identifier in identifiers):
+            refdes.append(instance.refdes)
+    for net in design.nets:
+        net_lower = str(net.name or "").casefold()
+        if any(identifier and identifier in net_lower for identifier in identifiers):
+            net_names.append(net.name)
+        elif ("i2c" in query_lower or "i²c" in query_lower) and ("scl" in net_lower or "sda" in net_lower):
+            net_names.append(net.name)
+    return list(dict.fromkeys(refdes)), list(dict.fromkeys(net_names))
+
+
+def _filter_bias_rows(rows: list[dict[str, Any]], query: str, plan: Any) -> list[dict[str, Any]]:
+    identifiers = [value.casefold() for value in _exact_terms(query) if len(value) >= 3]
+    if "i2c" in plan.operations:
+        identifiers.extend(["scl", "sda"])
+    if not identifiers:
+        return rows
+    def matches(row: dict[str, Any]) -> bool:
+        haystack = " ".join(str(row.get(field) or "") for field in ("refdes", "signal_net", "rail_net", "value")).casefold()
+        return any(identifier in haystack for identifier in identifiers) if "i2c" in plan.operations else all(identifier in haystack for identifier in identifiers)
+
+    filtered = [row for row in rows if matches(row)]
+    return filtered or rows
 
 
 def _matches_terms(haystack: str, terms: list[str]) -> bool:
