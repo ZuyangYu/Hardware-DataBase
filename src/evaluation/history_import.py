@@ -44,6 +44,35 @@ class ImportApplyError(RuntimeError):
     """Raised when an eligible report cannot be published safely."""
 
 
+class ImportPublishedUncertainError(ImportApplyError):
+    """Raised after publication when durability or pathname state is uncertain."""
+
+    def __init__(
+        self,
+        published_path: Path,
+        *,
+        durability_uncertain: bool = False,
+        path_identity_uncertain: bool = False,
+        cleanup_uncertain: bool = False,
+        details: list[str] | None = None,
+    ) -> None:
+        states: list[str] = []
+        if durability_uncertain:
+            states.append("published but durability is uncertain")
+        if path_identity_uncertain:
+            states.append("published but target path identity is uncertain")
+        if cleanup_uncertain:
+            states.append("published but cleanup is uncertain")
+        message = "; ".join(states) or "published with uncertain state"
+        if details:
+            message = f"{message}: {'; '.join(details)}"
+        super().__init__(f"{published_path}: {message}")
+        self.published_path = published_path
+        self.durability_uncertain = durability_uncertain
+        self.path_identity_uncertain = path_identity_uncertain
+        self.cleanup_uncertain = cleanup_uncertain
+
+
 @dataclass
 class ImportCandidate:
     """Discovery result for one immediate child of the source root."""
@@ -127,9 +156,30 @@ class ImportResult:
         return not self.failed
 
 
+@dataclass
+class _PrivateStaging:
+    name: str
+    payload_path: Path
+    parent_fd: int
+    parent_identity: FileIdentity
+    payload_fd: int | None
+
+
 def _identity(fd: int) -> FileIdentity:
     info = os.fstat(fd)
     return info.st_dev, info.st_ino
+
+
+def _close_fds(fds: list[int] | tuple[int, ...]) -> None:
+    first_error: OSError | None = None
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
 
 def _absolute_path(path: str | Path) -> Path:
@@ -162,11 +212,15 @@ def _open_directory_path(
             except FileNotFoundError:
                 if not create:
                     raise
+                created = False
                 try:
                     os.mkdir(part, mode=0o755, dir_fd=current_fd)
+                    created = True
                 except FileExistsError:
                     if is_final and final_must_not_exist:
                         raise
+                if created:
+                    _fsync_directory_fd(current_fd)
                 child_fd = os.open(part, flags, dir_fd=current_fd)
             else:
                 if is_final and final_must_not_exist:
@@ -182,7 +236,12 @@ def _open_directory_path(
 
 def _open_directory_at(parent_fd: int, name: str) -> int:
     fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
-    if not stat.S_ISDIR(os.fstat(fd).st_mode):
+    try:
+        info = os.fstat(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    if not stat.S_ISDIR(info.st_mode):
         os.close(fd)
         raise NotADirectoryError(errno.ENOTDIR, "not a directory", name)
     return fd
@@ -232,14 +291,6 @@ def _sha256_fd(fd: int) -> str:
         digest.update(chunk)
     os.lseek(fd, 0, os.SEEK_SET)
     return digest.hexdigest()
-
-
-def _sha256_file(path: Path) -> str:
-    fd = os.open(path, _regular_open_flags())
-    try:
-        return _sha256_fd(fd)
-    finally:
-        os.close(fd)
 
 
 def _fsync_file(fd: int) -> None:
@@ -388,6 +439,11 @@ def discover_imports(source_root: str | Path, target_root: str | Path) -> Import
 
     source_root_path = _absolute_path(source_root)
     target_root_path = _absolute_path(target_root)
+    if target_root_path == source_root_path or source_root_path in target_root_path.parents:
+        raise ValueError(
+            f"source and target roots overlap; target must be outside source: "
+            f"{source_root_path} -> {target_root_path}"
+        )
     try:
         source_root_fd = _open_directory_path(source_root_path)
     except OSError as exc:
@@ -403,6 +459,11 @@ def discover_imports(source_root: str | Path, target_root: str | Path) -> Import
             raise ValueError(f"target root is not a safe directory: {target_root_path}: {exc}") from exc
         else:
             target_root_identity = _identity(target_root_fd)
+            if target_root_identity == _identity(source_root_fd):
+                raise ValueError(
+                    f"source and target roots overlap by identity: "
+                    f"{source_root_path} -> {target_root_path}"
+                )
 
         candidates: list[ImportCandidate] = []
         try:
@@ -448,14 +509,6 @@ def discover_imports(source_root: str | Path, target_root: str | Path) -> Import
                         candidates.append(candidate)
                         continue
 
-                    try:
-                        summary = _read_summary_bytes(_read_fd(artifact_fds["summary.json"]))
-                        results = _read_results_bytes(_read_fd(artifact_fds["results.jsonl"]))
-                    except ValueError as exc:
-                        candidate.reason = str(exc)
-                        candidates.append(candidate)
-                        continue
-
                     files: list[str] = list(MANDATORY_ARTIFACTS)
                     for artifact in OPTIONAL_ARTIFACTS:
                         try:
@@ -471,11 +524,26 @@ def discover_imports(source_root: str | Path, target_root: str | Path) -> Import
                         continue
 
                     try:
-                        hashes = {artifact: _sha256_fd(artifact_fds[artifact]) for artifact in files}
+                        artifact_payloads = {
+                            artifact: _read_fd(artifact_fds[artifact]) for artifact in files
+                        }
                     except OSError as exc:
-                        candidate.reason = f"unable to hash report artifact: {exc}"
+                        candidate.reason = f"unable to read report artifact: {exc}"
                         candidates.append(candidate)
                         continue
+
+                    try:
+                        summary = _read_summary_bytes(artifact_payloads["summary.json"])
+                        results = _read_results_bytes(artifact_payloads["results.jsonl"])
+                    except ValueError as exc:
+                        candidate.reason = str(exc)
+                        candidates.append(candidate)
+                        continue
+
+                    hashes = {
+                        artifact: hashlib.sha256(artifact_payloads[artifact]).hexdigest()
+                        for artifact in files
+                    }
 
                     sample_ids = sorted({result.sample_id.strip() for result in results})
                     warnings: list[str] = []
@@ -493,8 +561,7 @@ def discover_imports(source_root: str | Path, target_root: str | Path) -> Import
                     _classify_target(candidate, target_root_fd)
                     candidates.append(candidate)
                 finally:
-                    for fd in artifact_fds.values():
-                        os.close(fd)
+                    _close_fds(list(artifact_fds.values()))
             finally:
                 os.close(run_fd)
 
@@ -506,9 +573,9 @@ def discover_imports(source_root: str | Path, target_root: str | Path) -> Import
             target_root_identity=target_root_identity,
         )
     finally:
-        if target_root_fd is not None:
-            os.close(target_root_fd)
-        os.close(source_root_fd)
+        _close_fds(
+            [fd for fd in (target_root_fd, source_root_fd) if fd is not None]
+        )
 
 
 def _open_apply_source_root(plan: ImportPlan) -> int:
@@ -516,7 +583,12 @@ def _open_apply_source_root(plan: ImportPlan) -> int:
         fd = _open_directory_path(plan.source_root)
     except OSError as exc:
         raise ImportApplyError(f"source root is no longer a safe directory: {exc}") from exc
-    if plan.source_root_identity is None or _identity(fd) != plan.source_root_identity:
+    try:
+        current_identity = _identity(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    if plan.source_root_identity is None or current_identity != plan.source_root_identity:
         os.close(fd)
         raise ImportApplyError(f"source root identity changed after discovery: {plan.source_root}")
     return fd
@@ -531,7 +603,12 @@ def _open_apply_target_root(plan: ImportPlan) -> int:
         )
     except OSError as exc:
         raise ImportApplyError(f"target root changed or is not a safe directory: {exc}") from exc
-    if plan.target_root_identity is not None and _identity(fd) != plan.target_root_identity:
+    try:
+        current_identity = _identity(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    if plan.target_root_identity is not None and current_identity != plan.target_root_identity:
         os.close(fd)
         raise ImportApplyError(f"target root identity changed after discovery: {plan.target_root}")
     return fd
@@ -560,7 +637,12 @@ def _open_validated_source_files(
         raise ImportApplyError(
             f"source run directory changed or is not safe: {candidate.source_path}: {exc}"
         ) from exc
-    if _identity(run_fd) != candidate.source_identity:
+    try:
+        run_identity = _identity(run_fd)
+    except BaseException:
+        os.close(run_fd)
+        raise
+    if run_identity != candidate.source_identity:
         os.close(run_fd)
         raise ImportApplyError(
             f"source run directory identity changed after discovery: {candidate.source_path}"
@@ -601,31 +683,119 @@ def _open_validated_source_files(
                 raise ImportApplyError(f"source artifact changed after discovery: {candidate.source_path / name}")
         return run_fd, artifact_fds
     except BaseException:
-        for fd in artifact_fds.values():
-            os.close(fd)
-        os.close(run_fd)
+        _close_source_files(run_fd, artifact_fds)
         raise
 
 
 def _close_source_files(run_fd: int, artifact_fds: dict[str, int]) -> None:
-    for fd in artifact_fds.values():
-        os.close(fd)
-    os.close(run_fd)
+    _close_fds([*artifact_fds.values(), run_fd])
 
 
-def _temp_directory(target_root: Path, target_root_fd: int, run_name: str) -> tuple[str, Path, int]:
+def _remove_private_staging(
+    staging: _PrivateStaging, target_root_fd: int
+) -> None:
+    try:
+        shutil.rmtree("payload", dir_fd=staging.parent_fd)
+    except FileNotFoundError:
+        pass
+    _fsync_directory_fd(staging.parent_fd)
+    try:
+        visible = os.stat(
+            staging.name,
+            dir_fd=target_root_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise OSError(
+            errno.ESTALE,
+            f"private staging parent path changed; refusing cleanup: {staging.name}: {exc}",
+        ) from exc
+    visible_identity = (visible.st_dev, visible.st_ino)
+    if not stat.S_ISDIR(visible.st_mode) or visible_identity != staging.parent_identity:
+        raise OSError(
+            errno.ESTALE,
+            f"private staging parent identity changed; refusing cleanup: {staging.name}",
+        )
+    os.rmdir(staging.name, dir_fd=target_root_fd)
+    if os.fstat(staging.parent_fd).st_nlink != 0:
+        raise OSError(
+            errno.ESTALE,
+            f"private staging parent identity changed during cleanup: {staging.name}",
+        )
+    _fsync_directory_fd(target_root_fd)
+
+
+def _private_staging(
+    target_root: Path, target_root_fd: int, run_name: str
+) -> _PrivateStaging:
     for _ in range(16):
         name = f".import-{run_name}-{secrets.token_hex(8)}"
         try:
             os.mkdir(name, mode=0o700, dir_fd=target_root_fd)
         except FileExistsError:
             continue
+        parent_fd: int | None = None
+        parent_identity: FileIdentity | None = None
+        payload_fd: int | None = None
         try:
-            fd = _open_directory_at(target_root_fd, name)
-        except BaseException:
-            shutil.rmtree(name, dir_fd=target_root_fd)
+            parent_fd = _open_directory_at(target_root_fd, name)
+            parent_identity = _identity(parent_fd)
+            _fsync_directory_fd(target_root_fd)
+            os.mkdir("payload", mode=0o700, dir_fd=parent_fd)
+            _fsync_directory_fd(parent_fd)
+            payload_fd = _open_directory_at(parent_fd, "payload")
+            return _PrivateStaging(
+                name=name,
+                payload_path=target_root / name / "payload",
+                parent_fd=parent_fd,
+                parent_identity=parent_identity,
+                payload_fd=payload_fd,
+            )
+        except BaseException as exc:
+            close_error: OSError | None = None
+            if payload_fd is not None:
+                try:
+                    os.close(payload_fd)
+                except OSError as caught:
+                    close_error = caught
+            if parent_identity is None:
+                if parent_fd is not None:
+                    try:
+                        os.close(parent_fd)
+                    except OSError as caught:
+                        if close_error is None:
+                            close_error = caught
+                detail = f"{exc}; cleanup identity unavailable for {name}"
+                if close_error is not None:
+                    detail += f"; close failed: {close_error}"
+                raise ImportApplyError(detail) from exc
+            cleanup_staging = _PrivateStaging(
+                name=name,
+                payload_path=target_root / name / "payload",
+                parent_fd=parent_fd,
+                parent_identity=parent_identity,
+                payload_fd=None,
+            )
+            try:
+                _remove_private_staging(cleanup_staging, target_root_fd)
+            except BaseException as cleanup_exc:
+                try:
+                    os.close(parent_fd)
+                except OSError as caught:
+                    if close_error is None:
+                        close_error = caught
+                detail = f"{exc}; cleanup failed: {cleanup_exc}"
+                if close_error is not None:
+                    detail += f"; close failed: {close_error}"
+                raise ImportApplyError(detail) from exc
+            try:
+                os.close(parent_fd)
+            except OSError as caught:
+                if close_error is None:
+                    close_error = caught
+            if close_error is not None:
+                raise ImportApplyError(f"{exc}; close failed: {close_error}") from exc
             raise
-        return name, target_root / name, fd
     raise ImportApplyError(f"unable to allocate temporary import directory under {target_root}")
 
 
@@ -669,8 +839,13 @@ def _manifest(candidate: ImportCandidate, plan: ImportPlan) -> dict[str, Any]:
     }
 
 
-def _rename_noreplace(source_name: str, target_name: str, parent_fd: int) -> None:
-    """Atomically rename within *parent_fd* without replacing *target_name*."""
+def _rename_noreplace(
+    source_name: str,
+    target_name: str,
+    source_parent_fd: int,
+    target_parent_fd: int,
+) -> None:
+    """Atomically rename between anchored parents without replacing target."""
 
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
@@ -679,9 +854,9 @@ def _rename_noreplace(source_name: str, target_name: str, parent_fd: int) -> Non
     renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     renameat2.restype = ctypes.c_int
     result = renameat2(
-        parent_fd,
+        source_parent_fd,
         os.fsencode(source_name),
-        parent_fd,
+        target_parent_fd,
         os.fsencode(target_name),
         RENAME_NOREPLACE,
     )
@@ -724,49 +899,116 @@ def _publish_candidate(
         candidate.reason = f"target appeared or changed during import: {candidate.target_path}"
         raise ImportApplyError(candidate.reason)
 
-    temporary_name: str | None = None
-    temporary_fd: int | None = None
+    staging: _PrivateStaging | None = None
+    prepublish_error: BaseException | None = None
+    durability_error: BaseException | None = None
+    path_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    close_error: BaseException | None = None
+    published = False
     try:
-        temporary_name, temporary_path, temporary_fd = _temp_directory(
+        staging = _private_staging(
             plan.target_root, target_root_fd, candidate.source_path.name
         )
+        assert staging.payload_fd is not None
         for name in candidate.files:
-            destination_fd = _copy_artifact(artifact_fds[name], temporary_fd, name)
+            destination_fd = _copy_artifact(
+                artifact_fds[name], staging.payload_fd, name
+            )
             try:
                 copied_hash = _sha256_fd(destination_fd)
             finally:
                 os.close(destination_fd)
             if copied_hash != candidate.source_hashes[name]:
-                raise ImportApplyError(f"copied artifact hash mismatch: {temporary_path / name}")
+                raise ImportApplyError(
+                    f"copied artifact hash mismatch: {staging.payload_path / name}"
+                )
 
-        _write_json_at(temporary_fd, "import_manifest.json", _manifest(candidate, plan))
         _write_json_at(
-            temporary_fd,
+            staging.payload_fd,
+            "import_manifest.json",
+            _manifest(candidate, plan),
+        )
+        _write_json_at(
+            staging.payload_fd,
             "report_complete.json",
             {"run_id": candidate.summary.run_id if candidate.summary else ""},
         )
-        _fsync_directory_fd(temporary_fd)
-        os.close(temporary_fd)
-        temporary_fd = None
+        _fsync_directory_fd(staging.payload_fd)
+        os.close(staging.payload_fd)
+        staging.payload_fd = None
         _validate_target_root_path(plan, target_root_fd)
-        _rename_noreplace(temporary_name, candidate.target_path.name, target_root_fd)
-        temporary_name = None
-        _fsync_directory_fd(target_root_fd)
+        _rename_noreplace(
+            "payload",
+            candidate.target_path.name,
+            staging.parent_fd,
+            target_root_fd,
+        )
+        published = True
         candidate.status = "copy"
-        return candidate.target_path
     except BaseException as exc:
-        if temporary_fd is not None:
+        prepublish_error = exc
+
+    if published:
+        try:
+            _fsync_directory_fd(target_root_fd)
+        except BaseException as exc:
+            durability_error = exc
+
+    if staging is not None:
+        if staging.payload_fd is not None:
             try:
-                os.close(temporary_fd)
+                os.close(staging.payload_fd)
             except OSError as close_exc:
-                exc = ImportApplyError(f"{exc}; staging directory close failed: {close_exc}")
-        if temporary_name is not None:
-            try:
-                shutil.rmtree(temporary_name, dir_fd=target_root_fd)
-            except BaseException as cleanup_exc:
-                raise ImportApplyError(f"{exc}; cleanup failed: {cleanup_exc}") from exc
-        _raise_publish_error(candidate, exc)
-        raise AssertionError("unreachable")
+                close_error = close_exc
+            staging.payload_fd = None
+        try:
+            _remove_private_staging(staging, target_root_fd)
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            os.close(staging.parent_fd)
+        except OSError as exc:
+            if close_error is None:
+                close_error = exc
+
+    if published:
+        try:
+            _validate_target_root_path(plan, target_root_fd)
+        except BaseException as exc:
+            path_error = exc
+        details = [
+            str(error)
+            for error in (
+                durability_error,
+                path_error,
+                cleanup_error,
+                close_error,
+            )
+            if error is not None
+        ]
+        if details:
+            raise ImportPublishedUncertainError(
+                candidate.target_path,
+                durability_uncertain=durability_error is not None,
+                path_identity_uncertain=path_error is not None,
+                cleanup_uncertain=(cleanup_error is not None or close_error is not None),
+                details=details,
+            )
+        return candidate.target_path
+
+    assert prepublish_error is not None
+    if cleanup_error is not None or close_error is not None:
+        cleanup_details = "; ".join(
+            str(error)
+            for error in (cleanup_error, close_error)
+            if error is not None
+        )
+        raise ImportApplyError(
+            f"{prepublish_error}; cleanup failed: {cleanup_details}"
+        ) from prepublish_error
+    _raise_publish_error(candidate, prepublish_error)
+    raise AssertionError("unreachable")
 
 
 def apply_import_plan(plan: ImportPlan) -> ImportResult:
@@ -816,15 +1058,16 @@ def apply_import_plan(plan: ImportPlan) -> ImportResult:
                 _close_source_files(run_fd, artifact_fds)
         return result
     finally:
-        if target_root_fd is not None:
-            os.close(target_root_fd)
-        os.close(source_root_fd)
+        _close_fds(
+            [fd for fd in (target_root_fd, source_root_fd) if fd is not None]
+        )
 
 
 __all__ = [
     "ImportApplyError",
     "ImportCandidate",
     "ImportPlan",
+    "ImportPublishedUncertainError",
     "ImportResult",
     "apply_import_plan",
     "discover_imports",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -534,3 +535,332 @@ def test_missing_renameat2_fails_closed_and_cleans_staging(tmp_path: Path, monke
 
     assert not (target / "run-1").exists()
     assert not any(path.name.startswith(".import-") for path in target.iterdir())
+
+
+def test_private_staging_parent_prevents_visible_name_substitution(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source_run = _write_report(source, "run-1")
+    target.mkdir()
+    plan = discover_imports(source, target)
+    original_rename = history_import._rename_noreplace
+
+    def substitute_visible_staging_name(*args, **kwargs):
+        visible = next(path for path in target.iterdir() if path.name.startswith(".import-"))
+        assert stat.S_IMODE(visible.stat().st_mode) == 0o700
+        visible.rename(target / "moved-private-staging")
+        visible.mkdir()
+        (visible / "attacker-marker").write_text("do not publish", encoding="utf-8")
+        return original_rename(*args, **kwargs)
+
+    monkeypatch.setattr(
+        history_import,
+        "_rename_noreplace",
+        substitute_visible_staging_name,
+    )
+
+    with pytest.raises(ImportApplyError, match="published.*cleanup"):
+        apply_import_plan(plan)
+
+    published = target / "run-1"
+    assert hashlib.sha256((published / "summary.json").read_bytes()).hexdigest() == hashlib.sha256(
+        (source_run / "summary.json").read_bytes()
+    ).hexdigest()
+    assert not (published / "attacker-marker").exists()
+    assert any(
+        path.name.startswith(".import-") and (path / "attacker-marker").exists()
+        for path in target.iterdir()
+    )
+
+
+@pytest.mark.parametrize("overlap", ["equal", "nested"])
+def test_discovery_rejects_source_target_overlap_without_mutation(
+    tmp_path: Path, overlap: str
+):
+    source = tmp_path / "source"
+    _write_report(source, "run-1")
+    target = source if overlap == "equal" else source / "nested" / "target"
+    before = _snapshot(source)
+
+    with pytest.raises(ValueError, match="overlap"):
+        discover_imports(source, target)
+
+    assert _snapshot(source) == before
+
+
+def test_discovery_parses_and_hashes_each_artifact_from_one_read(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    run_dir = _write_report(source, "run-1")
+    summary_path = run_dir / "summary.json"
+    discovered_bytes = summary_path.read_bytes()
+    original_sha256_fd = history_import._sha256_fd
+    mutated = False
+
+    def mutate_between_parse_and_hash(fd):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "mutated-run",
+                        "sample_count": 1,
+                        "successful_samples": 1,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return original_sha256_fd(fd)
+
+    monkeypatch.setattr(history_import, "_sha256_fd", mutate_between_parse_and_hash)
+
+    plan = discover_imports(source, target)
+
+    candidate = _candidate(plan, "run-1")
+    assert candidate.summary is not None
+    assert candidate.summary.run_id == "run-1"
+    assert candidate.source_hashes["summary.json"] == hashlib.sha256(discovered_bytes).hexdigest()
+    assert summary_path.read_bytes() == discovered_bytes
+
+
+def test_post_rename_fsync_failure_reports_published_durability_uncertainty(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_report(source, "run-1")
+    target.mkdir()
+    plan = discover_imports(source, target)
+    original_rename = history_import._rename_noreplace
+    original_fsync_directory = history_import._fsync_directory_fd
+    renamed = False
+
+    def observe_rename(*args, **kwargs):
+        nonlocal renamed
+        result = original_rename(*args, **kwargs)
+        renamed = True
+        return result
+
+    def fail_after_rename(fd):
+        if renamed:
+            raise OSError(errno.EIO, "injected post-rename fsync failure")
+        return original_fsync_directory(fd)
+
+    monkeypatch.setattr(history_import, "_rename_noreplace", observe_rename)
+    monkeypatch.setattr(history_import, "_fsync_directory_fd", fail_after_rename)
+
+    with pytest.raises(ImportApplyError) as captured:
+        apply_import_plan(plan)
+
+    error = captured.value
+    assert type(error).__name__ == "ImportPublishedUncertainError"
+    assert getattr(error, "published_path", None) == target / "run-1"
+    assert getattr(error, "durability_uncertain", False) is True
+    assert "published but durability is uncertain" in str(error)
+    assert (target / "run-1" / "summary.json").is_file()
+
+
+def test_new_target_root_components_fsync_each_parent_after_mkdir(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "new-parent" / "new-child" / "target"
+    _write_report(source, "run-1")
+    plan = discover_imports(source, target)
+    original_mkdir = history_import.os.mkdir
+    original_fsync_directory = history_import._fsync_directory_fd
+    events: list[tuple[str, str]] = []
+
+    def observe_mkdir(name, *args, **kwargs):
+        result = original_mkdir(name, *args, **kwargs)
+        events.append(("mkdir", os.fspath(name)))
+        return result
+
+    def observe_fsync(fd):
+        events.append(("fsync", str(fd)))
+        return original_fsync_directory(fd)
+
+    monkeypatch.setattr(history_import.os, "mkdir", observe_mkdir)
+    monkeypatch.setattr(history_import, "_fsync_directory_fd", observe_fsync)
+
+    apply_import_plan(plan)
+
+    for component in ("new-parent", "new-child", "target"):
+        mkdir_index = events.index(("mkdir", component))
+        assert events[mkdir_index + 1][0] == "fsync", events
+
+
+def test_post_publish_target_root_path_drift_is_reported(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    moved_target = tmp_path / "moved-target"
+    _write_report(source, "run-1")
+    target.mkdir()
+    plan = discover_imports(source, target)
+    original_rename = history_import._rename_noreplace
+
+    def move_target_root_after_publish(*args, **kwargs):
+        result = original_rename(*args, **kwargs)
+        target.rename(moved_target)
+        target.mkdir()
+        return result
+
+    monkeypatch.setattr(
+        history_import,
+        "_rename_noreplace",
+        move_target_root_after_publish,
+    )
+
+    with pytest.raises(ImportApplyError) as captured:
+        apply_import_plan(plan)
+
+    error = captured.value
+    assert type(error).__name__ == "ImportPublishedUncertainError"
+    assert getattr(error, "published_path", None) == target / "run-1"
+    assert getattr(error, "path_identity_uncertain", False) is True
+    assert "published but target path identity is uncertain" in str(error)
+    assert (moved_target / "run-1" / "summary.json").is_file()
+    assert not (target / "run-1").exists()
+
+
+def test_target_root_path_is_revalidated_after_staging_cleanup(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    moved_target = tmp_path / "moved-after-cleanup"
+    _write_report(source, "run-1")
+    target.mkdir()
+    plan = discover_imports(source, target)
+    original_cleanup = history_import._remove_private_staging
+
+    def move_target_after_cleanup(*args, **kwargs):
+        result = original_cleanup(*args, **kwargs)
+        target.rename(moved_target)
+        target.mkdir()
+        return result
+
+    monkeypatch.setattr(
+        history_import,
+        "_remove_private_staging",
+        move_target_after_cleanup,
+    )
+
+    with pytest.raises(ImportApplyError) as captured:
+        apply_import_plan(plan)
+
+    error = captured.value
+    assert type(error).__name__ == "ImportPublishedUncertainError"
+    assert getattr(error, "path_identity_uncertain", False) is True
+    assert (moved_target / "run-1" / "summary.json").is_file()
+
+
+def test_failed_publication_fsyncs_target_root_after_staging_cleanup(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    _write_report(source, "run-1")
+    target.mkdir()
+    plan = discover_imports(source, target)
+    original_rmtree = history_import.shutil.rmtree
+    original_fsync_directory = history_import._fsync_directory_fd
+    cleanup_finished = False
+    cleanup_parent_fsynced = False
+
+    def fail_rename(*args, **kwargs):
+        raise OSError("injected publication failure")
+
+    def observe_cleanup(*args, **kwargs):
+        nonlocal cleanup_finished
+        result = original_rmtree(*args, **kwargs)
+        cleanup_finished = True
+        return result
+
+    def observe_fsync(fd):
+        nonlocal cleanup_parent_fsynced
+        if cleanup_finished:
+            cleanup_parent_fsynced = True
+        return original_fsync_directory(fd)
+
+    monkeypatch.setattr(history_import, "_rename_noreplace", fail_rename)
+    monkeypatch.setattr(history_import.shutil, "rmtree", observe_cleanup)
+    monkeypatch.setattr(history_import, "_fsync_directory_fd", observe_fsync)
+
+    with pytest.raises(ImportApplyError, match="publication failure"):
+        apply_import_plan(plan)
+
+    assert cleanup_parent_fsynced is True
+
+
+def test_cleanup_detects_private_parent_substitution_at_rmdir(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    moved_staging = target / "moved-private-staging"
+    _write_report(source, "run-1")
+    target.mkdir()
+    plan = discover_imports(source, target)
+    original_rmdir = history_import.os.rmdir
+    substituted = False
+
+    def fail_rename(*args, **kwargs):
+        raise OSError("injected publication failure")
+
+    def substitute_before_rmdir(name, *args, **kwargs):
+        nonlocal substituted
+        if os.fspath(name).startswith(".import-") and not substituted:
+            substituted = True
+            visible = target / os.fspath(name)
+            visible.rename(moved_staging)
+            visible.mkdir()
+        return original_rmdir(name, *args, **kwargs)
+
+    monkeypatch.setattr(history_import, "_rename_noreplace", fail_rename)
+    monkeypatch.setattr(history_import.os, "rmdir", substitute_before_rmdir)
+
+    with pytest.raises(ImportApplyError, match="cleanup failed.*identity"):
+        apply_import_plan(plan)
+
+    assert moved_staging.is_dir()
+
+
+def test_source_fd_cleanup_attempts_every_close_after_one_failure(monkeypatch):
+    attempted: list[int] = []
+
+    def flaky_close(fd):
+        attempted.append(fd)
+        if fd == 10:
+            raise OSError("injected close failure")
+
+    monkeypatch.setattr(history_import.os, "close", flaky_close)
+
+    with pytest.raises(OSError, match="close failure"):
+        history_import._close_source_files(12, {"first": 10, "second": 11})
+
+    assert attempted == [10, 11, 12]
+
+
+def test_directory_open_closes_fd_when_fstat_fails(monkeypatch):
+    closed: list[int] = []
+    monkeypatch.setattr(history_import.os, "open", lambda *args, **kwargs: 91)
+    monkeypatch.setattr(
+        history_import.os,
+        "fstat",
+        lambda fd: (_ for _ in ()).throw(OSError("injected fstat failure")),
+    )
+    monkeypatch.setattr(history_import.os, "close", closed.append)
+
+    with pytest.raises(OSError, match="fstat failure"):
+        history_import._open_directory_at(3, "run")
+
+    assert closed == [91]
