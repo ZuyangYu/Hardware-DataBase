@@ -1,26 +1,30 @@
 from __future__ import annotations
 
-import fcntl
-import hashlib
 import inspect
 import json
 import os
 import re
 import tempfile
-import threading
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 from src.agents.state import Evidence
 from src.circuit.evidence_mapper import CircuitEvidenceMapper
 from src.circuit.graph_store import GraphStore
+from src.circuit.index_lock import circuit_index_read_lock, circuit_index_write_lock
 from src.circuit.models import CircuitDesign, CircuitStatus, DesignFile
 from src.circuit.parsers.edf_parser import EdfParser
 from src.circuit.question_analysis import analyze_question
 from src.circuit.query_engine import CircuitQueryEngine
-from src.circuit.store import CircuitStore, make_design_id
+from src.circuit.store import (
+    INDEX_FILE,
+    LEGACY_STATE_FILE,
+    STATE_FILE,
+    CircuitStore,
+    circuit_generation_id,
+    make_design_id,
+)
 from src.circuit.vector_index import KIND_INSTANCE, KIND_MODULE, KIND_NET, CircuitVectorIndex, default_circuit_vector_index
 from src.pipelines.document_rag.schemas import RequestContext
 
@@ -28,51 +32,7 @@ from src.pipelines.document_rag.schemas import RequestContext
 META_FILE = "pipeline_metadata.json"
 GRAPH_EVIDENCE_ENDPOINT_LIMIT = 8
 GRAPH_EVIDENCE_CONTENT_LIMIT = 512
-
-
-@dataclass
-class _DesignLockEntry:
-    lock: threading.RLock = field(default_factory=threading.RLock)
-    active_count: int = 0
-
-
-_DESIGN_LOCKS: dict[str, _DesignLockEntry] = {}
-_DESIGN_LOCKS_GUARD = threading.Lock()
-
-
-@contextmanager
-def _design_index_lock(root: str, kb_name: str, design_id: str) -> Iterator[None]:
-    """Serialize publication for one design across threads and processes.
-
-    Lock files intentionally remain on disk: unlinking a flock file while
-    another process is waiting on it can split future callers across two
-    inodes. File descriptors and in-process lock entries are always released.
-    """
-
-    lock_dir = os.path.join(os.path.abspath(root), ".index-locks")
-    os.makedirs(lock_dir, exist_ok=True)
-    digest = hashlib.sha256(f"{kb_name}\0{design_id}".encode("utf-8")).hexdigest()
-    lock_path = os.path.join(lock_dir, f"{digest}.lock")
-    with _DESIGN_LOCKS_GUARD:
-        entry = _DESIGN_LOCKS.get(lock_path)
-        if entry is None:
-            entry = _DesignLockEntry()
-            _DESIGN_LOCKS[lock_path] = entry
-        entry.active_count += 1
-    try:
-        with entry.lock:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-                yield
-            finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
-    finally:
-        with _DESIGN_LOCKS_GUARD:
-            entry.active_count -= 1
-            if entry.active_count == 0 and _DESIGN_LOCKS.get(lock_path) is entry:
-                del _DESIGN_LOCKS[lock_path]
+GRAPH_FILE = "connectivity_graph.gpickle"
 
 
 @dataclass
@@ -139,80 +99,132 @@ class CircuitIndexService:
             parse_warnings=list(getattr(parser, "warnings", []) or []),
         )
         # Parsing is intentionally outside the lock: it is read-only and may
-        # be expensive. Every mutable publication step is serialized as one
-        # same-design generation, including configured vector replacement.
-        with _design_index_lock(self.store.root, kb_name, design_id):
-            self.store.save(design)
-            warnings = list(design.parse_warnings)
-            derived_degraded = False
-            graph_node_count = 0
-            graph_edge_count = 0
-            design_dir = self.store.design_dir(kb_name, design_id, create=True)
+        # be expensive. The root lock is shared with every retrieval path, so
+        # state, derived indexes, and authorization metadata publish as one
+        # reader-visible generation even though they live in separate files.
+        with circuit_index_write_lock(self.store.root):
+            design_dir = self.store.design_dir(kb_name, design_id)
+            snapshot_paths = (
+                os.path.join(design_dir, STATE_FILE),
+                os.path.join(design_dir, LEGACY_STATE_FILE),
+                os.path.join(design_dir, META_FILE),
+                os.path.join(design_dir, GRAPH_FILE),
+                os.path.join(self.store.root, INDEX_FILE),
+            )
+            snapshot = self._snapshot_files(snapshot_paths)
+            previous_design = self.store.load(kb_name, design_id)
             try:
-                graph_result = self.graph_store.save(design, design_dir)
-                graph_node_count = graph_result.node_count
-                graph_edge_count = graph_result.edge_count
-            except Exception:
-                derived_degraded = True
-                warnings.append("Graph index persistence failed.")
-                remove_graph = getattr(self.graph_store, "remove", None)
+                self.store.save(design)
+                warnings = list(design.parse_warnings)
+                derived_degraded = False
+                graph_index_status = "indexed"
+                graph_node_count = 0
+                graph_edge_count = 0
+                design_dir = self.store.design_dir(kb_name, design_id, create=True)
                 try:
-                    if callable(remove_graph):
-                        remove_graph(design_dir)
-                    else:
-                        GraphStore.remove(design_dir)
+                    graph_result = self.graph_store.save(design, design_dir)
+                    graph_node_count = graph_result.node_count
+                    graph_edge_count = graph_result.edge_count
                 except Exception:
-                    # Cleanup is best-effort; the structured generation and
-                    # explicit degraded status remain authoritative.
-                    pass
+                    derived_degraded = True
+                    graph_index_status = "failed"
+                    warnings.append("Graph index persistence failed.")
+                    remove_graph = getattr(self.graph_store, "remove", None)
+                    try:
+                        if callable(remove_graph):
+                            remove_graph(design_dir)
+                        else:
+                            GraphStore.remove(design_dir)
+                    except Exception:
+                        # Cleanup is best-effort; the structured generation and
+                        # explicit degraded status remain authoritative.
+                        pass
 
-            vector_document_count = 0
-            try:
-                vector_status = self.vector_index.reindex_design_with_status(design)
-                vector_document_count = vector_status.indexed_count
-                if vector_status.available and vector_status.error:
+                vector_document_count = 0
+                vector_index_status = "unavailable"
+                try:
+                    vector_status = self.vector_index.reindex_design_with_status(design)
+                    vector_document_count = vector_status.indexed_count
+                    if vector_status.available and vector_status.error:
+                        vector_index_status = "failed"
+                        derived_degraded = True
+                        warnings.append("Vector index persistence failed.")
+                    elif vector_status.available:
+                        vector_index_status = "indexed"
+                except Exception:
+                    vector_index_status = "failed"
                     derived_degraded = True
                     warnings.append("Vector index persistence failed.")
-            except Exception:
-                derived_degraded = True
-                warnings.append("Vector index persistence failed.")
-            stats = {
-                "instance_count": len(design.instances),
-                "net_count": len(design.nets),
-                "module_count": len(design.modules),
-                "graph_node_count": graph_node_count,
-                "graph_edge_count": graph_edge_count,
-                "vector_document_count": vector_document_count,
-            }
-            status = "degraded" if derived_degraded else "indexed"
-            message = f"Indexed circuit design {original_name}"
-            if derived_degraded:
-                message += " with degraded derived indexes"
-            self._write_metadata(
-                kb_name,
-                design_id,
-                {
-                    "record_id": record_id,
-                    "department_id": str(department_id or ""),
-                    "uploaded_by": uploaded_by,
-                    "original_name": original_name,
-                    "file_path": file_path,
-                    "index_status": status,
-                    "index_message": message,
-                    "index_warnings": warnings,
-                    "index_stats": stats,
-                },
-            )
-            return CircuitIndexResult(
-                ok=True,
-                status=status,
-                message=message,
-                warnings=warnings,
-                stats=stats,
-                design_id=design_id,
-            )
+                stats = {
+                    "instance_count": len(design.instances),
+                    "net_count": len(design.nets),
+                    "module_count": len(design.modules),
+                    "graph_node_count": graph_node_count,
+                    "graph_edge_count": graph_edge_count,
+                    "vector_document_count": vector_document_count,
+                }
+                status = "degraded" if derived_degraded else "indexed"
+                message = f"Indexed circuit design {original_name}"
+                if derived_degraded:
+                    message += " with degraded derived indexes"
+                self._write_metadata(
+                    kb_name,
+                    design_id,
+                    {
+                        "record_id": record_id,
+                        "department_id": str(department_id or ""),
+                        "uploaded_by": uploaded_by,
+                        "original_name": original_name,
+                        "file_path": file_path,
+                        "generation_id": circuit_generation_id(design),
+                        "graph_index_status": graph_index_status,
+                        "vector_index_status": vector_index_status,
+                        "index_status": status,
+                        "index_message": message,
+                        "index_warnings": warnings,
+                        "index_stats": stats,
+                    },
+                )
+                return CircuitIndexResult(
+                    ok=True,
+                    status=status,
+                    message=message,
+                    warnings=warnings,
+                    stats=stats,
+                    design_id=design_id,
+                )
+            except Exception as publication_error:
+                # A failed authoritative publication must not leave a staged
+                # state/index/graph visible under the old authorization file.
+                rollback_error: Exception | None = None
+                try:
+                    self._restore_files(snapshot)
+                except Exception as exc:
+                    rollback_error = exc
+                self._restore_vector_generation(previous_design, design)
+                if rollback_error is not None:
+                    raise RuntimeError("Circuit publication and rollback both failed.") from publication_error
+                raise
 
     def query(
+        self,
+        *,
+        kb_name: str,
+        query: str,
+        ctx: RequestContext | None,
+        top_k: int = 5,
+        filters: dict | None = None,
+    ) -> list[Evidence]:
+        with circuit_index_read_lock(self.store.root):
+            return self._query_unlocked(
+                kb_name=kb_name,
+                query=query,
+                ctx=ctx,
+                top_k=top_k,
+                filters=filters,
+            )
+
+    def _query_unlocked(
         self,
         *,
         kb_name: str,
@@ -302,7 +314,9 @@ class CircuitIndexService:
         parameters = tuple(inspect.signature(method).parameters.values())
         accepts_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
         accepts_keywords = any(parameter.name == "keywords" for parameter in parameters) or accepts_var_kwargs
-        accepts_allowed = any(parameter.name == "allowed_design_ids" for parameter in parameters) or accepts_var_kwargs
+        # Authorization filters must be an explicit part of the retriever
+        # contract. A generic **kwargs sink does not prove they are enforced.
+        accepts_allowed = any(parameter.name == "allowed_design_ids" for parameter in parameters)
         if allowed_design_ids is not None and not accepts_allowed:
             return []
         kwargs: dict[str, Any] = {"limit": limit}
@@ -346,9 +360,17 @@ class CircuitIndexService:
             if design is None:
                 continue
             refdes_values, net_names = _graph_targets(design, query)
+            preferred_refdes_by_net: dict[str, str] = {}
+            instance_by_refdes = {instance.refdes: instance for instance in design.instances}
+            for refdes in refdes_values:
+                instance = instance_by_refdes.get(refdes)
+                if instance is None:
+                    continue
+                for pin in instance.pins:
+                    if pin.net:
+                        preferred_refdes_by_net.setdefault(pin.net, refdes)
             enable_trace = "enable" in analyze_question(query).operations
             if enable_trace:
-                instance_by_refdes = {instance.refdes: instance for instance in design.instances}
                 net_names = [name for name in net_names if _is_enable_entry("", name)]
                 for refdes in refdes_values:
                     instance = instance_by_refdes.get(refdes)
@@ -392,6 +414,9 @@ class CircuitIndexService:
                         for item in neighbors
                         if item.get("kind") == "net"
                     ]
+                    for next_net, _ in next_nets:
+                        if next_net:
+                            preferred_refdes_by_net.setdefault(next_net, refdes)
                     pending_nets.extend(next_nets[:remaining])
                     continue
                 net_name, depth = pending_nets.pop(0)
@@ -412,6 +437,9 @@ class CircuitIndexService:
                     if item.get("kind") == "pin" and item.get("refdes")
                     and (item.get("pin") or item.get("pin_name"))
                 )
+                preferred_refdes = preferred_refdes_by_net.get(net_name)
+                if preferred_refdes:
+                    endpoints.sort(key=lambda endpoint: (endpoint[0] != preferred_refdes, endpoint))
                 if endpoints:
                     endpoint_labels = [
                         f"{refdes[:48]}.{pin[:32]}"
@@ -475,29 +503,42 @@ class CircuitIndexService:
         search = getattr(self.vector_index, "semantic_search", None)
         if not callable(search):
             return []
+        semantic_designs = {
+            design_id: context
+            for design_id, context in allowed_designs.items()
+            if context[0].get("vector_index_status") == "indexed"
+            and context[0].get("generation_id")
+        }
+        if not semantic_designs:
+            return []
         try:
             parameters = tuple(inspect.signature(search).parameters.values())
-            accepts_allowed = any(
-                parameter.name == "allowed_design_ids" or parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
-            if not accepts_allowed:
+            accepts_allowed = any(parameter.name == "allowed_design_ids" for parameter in parameters)
+            accepts_generations = any(parameter.name == "allowed_generations" for parameter in parameters)
+            if not accepts_allowed or not accepts_generations:
                 return []
             kwargs: dict[str, Any] = {
                 "top_k": top_k * 2,
                 "kinds": (KIND_INSTANCE, KIND_NET, KIND_MODULE),
+                "allowed_design_ids": frozenset(semantic_designs),
+                "allowed_generations": {
+                    design_id: str(context[0]["generation_id"])
+                    for design_id, context in semantic_designs.items()
+                },
             }
-            if accepts_allowed:
-                kwargs["allowed_design_ids"] = frozenset(allowed_designs)
             vector_hits = search(kb_name, query, **kwargs)
         except Exception:
             return []
         results: list[Evidence] = []
         for hit in vector_hits:
-            context = allowed_designs.get(str(getattr(hit, "design_id", "")))
+            design_id = str(getattr(hit, "design_id", ""))
+            context = semantic_designs.get(design_id)
             if context is None:
                 continue
             metadata, source_name = context
+            hit_metadata = dict(getattr(hit, "metadata", {}) or {})
+            if str(hit_metadata.get("generation_id") or "") != str(metadata["generation_id"]):
+                continue
             kind = str(getattr(hit, "kind", "") or "instance")
             entity_id = str(getattr(hit, "natural_id", "") or "semantic")
             record_id = metadata.get("record_id")
@@ -516,6 +557,22 @@ class CircuitIndexService:
         return self._deduplicate(results)
 
     def list_pin_mapping_evidence(
+        self,
+        kb_name: str,
+        source_names: list[str],
+        ctx: RequestContext | None,
+        *,
+        refdes: list[str] | None = None,
+    ) -> list[Evidence]:
+        with circuit_index_read_lock(self.store.root):
+            return self._list_pin_mapping_evidence_unlocked(
+                kb_name,
+                source_names,
+                ctx,
+                refdes=refdes,
+            )
+
+    def _list_pin_mapping_evidence_unlocked(
         self,
         kb_name: str,
         source_names: list[str],
@@ -666,6 +723,10 @@ class CircuitIndexService:
         return sorted(evidence_by_id.values(), key=lambda item: (-item.score, item.id))
 
     def delete_record(self, record: Any) -> None:
+        with circuit_index_write_lock(self.store.root):
+            self._delete_record_unlocked(record)
+
+    def _delete_record_unlocked(self, record: Any) -> None:
         kb_name = getattr(record, "kb_name", "")
         if not kb_name:
             return
@@ -773,12 +834,71 @@ class CircuitIndexService:
             },
         )
 
+    @staticmethod
+    def _snapshot_files(paths: tuple[str, ...]) -> dict[str, bytes | None]:
+        snapshot: dict[str, bytes | None] = {}
+        for path in paths:
+            try:
+                with open(path, "rb") as fh:
+                    snapshot[path] = fh.read()
+            except FileNotFoundError:
+                snapshot[path] = None
+        return snapshot
+
+    @staticmethod
+    def _restore_files(snapshot: dict[str, bytes | None]) -> None:
+        errors: list[Exception] = []
+        for target, payload in snapshot.items():
+            try:
+                if payload is None:
+                    try:
+                        os.unlink(target)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                target_dir = os.path.dirname(target) or "."
+                os.makedirs(target_dir, exist_ok=True)
+                descriptor, temporary = tempfile.mkstemp(prefix=".rollback-", dir=target_dir)
+                try:
+                    with os.fdopen(descriptor, "wb") as fh:
+                        fh.write(payload)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(temporary, target)
+                except Exception:
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass
+                    raise
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError("Circuit generation rollback failed.") from errors[0]
+
+    def _restore_vector_generation(
+        self,
+        previous_design: CircuitDesign | None,
+        staged_design: CircuitDesign,
+    ) -> None:
+        """Best-effort vector repair; generation filters remain fail-closed."""
+        try:
+            if previous_design is not None:
+                self.vector_index.reindex_design_with_status(previous_design)
+                return
+            delete_design = getattr(self.vector_index, "_delete_design", None)
+            if callable(delete_design):
+                delete_design(staged_design.kb_name, staged_design.design_id)
+        except Exception:
+            pass
+
     def _metadata_path(self, kb_name: str, design_id: str) -> str:
-        return os.path.join(self.store.design_dir(kb_name, design_id, create=True), META_FILE)
+        return os.path.join(self.store.design_dir(kb_name, design_id), META_FILE)
 
     def _write_metadata(self, kb_name: str, design_id: str, metadata: dict[str, Any]) -> None:
         target = self._metadata_path(kb_name, design_id)
         target_dir = os.path.dirname(target)
+        os.makedirs(target_dir, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(prefix=".metadata-", dir=target_dir)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
@@ -798,7 +918,7 @@ class CircuitIndexService:
             with open(self._metadata_path(kb_name, design_id), "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             return data if isinstance(data, dict) else {}
-        except OSError:
+        except (OSError, ValueError):
             return {}
 
 

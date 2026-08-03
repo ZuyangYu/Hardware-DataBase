@@ -89,6 +89,7 @@ def test_semantic_search_filters_allowed_designs_in_chroma_before_limit(monkeypa
         top_k=1,
         kinds=("instance", "net"),
         allowed_design_ids={"z_allowed"},
+        allowed_generations={"z_allowed": "gen-1"},
     )
 
     assert [hit.design_id for hit in hits] == ["z_allowed"]
@@ -96,5 +97,6 @@ def test_semantic_search_filters_allowed_designs_in_chroma_before_limit(monkeypa
         "$and": [
             {"kind": {"$in": ["instance", "net"]}},
             {"design_id": {"$in": ["z_allowed"]}},
+            {"generation_key": {"$in": ["z_allowed:gen-1"]}},
         ]
     }

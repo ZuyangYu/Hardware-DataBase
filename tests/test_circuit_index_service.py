@@ -2,6 +2,7 @@ import json
 import multiprocessing
 import os
 import tempfile
+import threading
 import time
 import unittest
 from hashlib import sha256
@@ -158,6 +159,141 @@ class CircuitIndexServiceTests(unittest.TestCase):
             }
 
         self.assertEqual(final_hashes, artifact_hashes)
+
+    def test_reader_waits_for_cross_department_publication_before_authorizing_new_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "circuits")
+            first = os.path.join(tmp, "generation-a.edf")
+            second = os.path.join(tmp, "generation-b.edf")
+            for path, generation in ((first, "A"), (second, "B")):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(generation)
+            graph_store = _BlockingGenerationGraphStore()
+            service = CircuitIndexService(
+                storage_root=root,
+                parser_factory=_FileGenerationParserFactory(),
+                graph_store=graph_store,
+                vector_index=_UnavailableVectorIndex(),
+            )
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=1,
+                file_path=first,
+                original_name="same_board.edf",
+                department_id="dept_a",
+                uploaded_by="A",
+            )
+            graph_store.block_generation = "B"
+            writer_outcomes = []
+            writer = threading.Thread(
+                target=lambda: writer_outcomes.append(service.index_file(
+                    kb_name="kb_hw",
+                    record_id=2,
+                    file_path=second,
+                    original_name="same_board.edf",
+                    department_id="dept_b",
+                    uploaded_by="B",
+                )),
+            )
+            writer.start()
+            self.assertTrue(graph_store.writer_blocked.wait(3))
+
+            reader_hits = []
+            reader_finished = threading.Event()
+
+            def read_as_old_department():
+                try:
+                    reader_hits.extend(service.query(
+                        kb_name="kb_hw",
+                        query="U200",
+                        ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_a"}),
+                    ))
+                finally:
+                    reader_finished.set()
+
+            reader = threading.Thread(target=read_as_old_department)
+            reader.start()
+            try:
+                self.assertFalse(reader_finished.wait(0.2))
+            finally:
+                graph_store.release_writer.set()
+                writer.join(5)
+                reader.join(5)
+
+            new_department_hits = service.query(
+                kb_name="kb_hw",
+                query="U200",
+                ctx=RequestContext(user_id="bob", metadata={"department_id": "dept_b"}),
+            )
+
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual([result.status for result in writer_outcomes], ["indexed"])
+        self.assertEqual(reader_hits, [])
+        self.assertTrue(any(hit.locator["entity_id"] == "U200" for hit in new_department_hits))
+
+    def test_metadata_publication_failure_restores_previous_coherent_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "circuits")
+            first = os.path.join(tmp, "generation-a.edf")
+            second = os.path.join(tmp, "generation-b.edf")
+            for path, generation in ((first, "A"), (second, "B")):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(generation)
+            service = CircuitIndexService(
+                storage_root=root,
+                parser_factory=_FileGenerationParserFactory(),
+                graph_store=GraphStore(),
+                vector_index=_UnavailableVectorIndex(),
+            )
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=1,
+                file_path=first,
+                original_name="same_board.edf",
+                department_id="dept_a",
+                uploaded_by="A",
+            )
+            design_dir = service.store.design_dir("kb_hw", "same_board")
+            paths = [
+                service.store.state_path("kb_hw", "same_board"),
+                os.path.join(design_dir, "pipeline_metadata.json"),
+                os.path.join(design_dir, "connectivity_graph.gpickle"),
+                service.store.index_path(),
+            ]
+            before = {path: _file_hash(path) for path in paths}
+            original_write_metadata = service._write_metadata
+            service._write_metadata = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("metadata full"))
+            try:
+                with self.assertRaisesRegex(OSError, "metadata full"):
+                    service.index_file(
+                        kb_name="kb_hw",
+                        record_id=2,
+                        file_path=second,
+                        original_name="same_board.edf",
+                        department_id="dept_b",
+                        uploaded_by="B",
+                    )
+            finally:
+                service._write_metadata = original_write_metadata
+
+            after = {path: _file_hash(path) for path in paths}
+            restored = service.store.load("kb_hw", "same_board")
+            old_department_hits = service.query(
+                kb_name="kb_hw",
+                query="U100",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_a"}),
+            )
+            new_department_hits = service.query(
+                kb_name="kb_hw",
+                query="U200",
+                ctx=RequestContext(user_id="bob", metadata={"department_id": "dept_b"}),
+            )
+
+        self.assertEqual(after, before)
+        self.assertEqual(restored.instances[0].refdes, "U100")
+        self.assertTrue(any(hit.locator["entity_id"] == "U100" for hit in old_department_hits))
+        self.assertEqual(new_department_hits, [])
 
     def test_query_returns_empty_for_kb_without_indexed_circuits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -659,6 +795,35 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertLessEqual(sum(len(hit.content) for hit in hits), 2048)
         self.assertTrue(any("FANOUT" in hit.content and "U0.1" in hit.content for hit in hits))
 
+    def test_high_fanout_graph_evidence_keeps_late_queried_endpoint_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CircuitStore(root=os.path.join(tmp, "circuits"))
+            design = CircuitDesign(
+                design_id="fanout",
+                kb_name="kb_hw",
+                instances=[
+                    ComponentInstance(refdes=f"U{index}", pins=[Pin(name="1", net="FANOUT")])
+                    for index in range(500)
+                ],
+                nets=[Net("FANOUT", [PinRef(f"U{index}", "1") for index in range(500)])],
+            )
+            store.save(design)
+            GraphStore().save(design, store.design_dir("kb_hw", "fanout"))
+            service = CircuitIndexService(store=store, vector_index=_UnavailableVectorIndex())
+
+            hits = service._graph_evidence(
+                "kb_hw",
+                "U499 connection",
+                {"fanout": ({"record_id": 1, "department_id": "dept_hw"}, "fanout.edf")},
+                top_k=1,
+            )
+
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].locator["entity_id"], "U499")
+        self.assertEqual(hits[0].locator["pin"], "1")
+        self.assertEqual(hits[0].locator["net"], "FANOUT")
+        self.assertIn("U499.1", hits[0].content)
+
     def test_concurrent_same_design_publication_is_one_coherent_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, "circuits")
@@ -755,6 +920,75 @@ class CircuitIndexServiceTests(unittest.TestCase):
 
         self.assertTrue(any(hit.locator["entity_id"] == "Y900" for hit in hits))
         self.assertEqual(engine.net_queries, [("", ("Y900",))])
+        self.assertEqual(vector_index.search_calls, [])
+
+    def test_exact_retriever_with_only_kwargs_is_not_treated_as_filter_aware(self):
+        engine = _KwargsIgnoringQueryEngine()
+        service = CircuitIndexService(query_engine=engine, vector_index=_UnavailableVectorIndex())
+
+        rows = service._exact_search(
+            "search_instances",
+            "kb_hw",
+            "Y900",
+            1,
+            frozenset({"z_allowed"}),
+        )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(engine.calls, [])
+
+    def test_semantic_retriever_with_only_kwargs_is_not_treated_as_filter_aware(self):
+        vector_index = _KwargsIgnoringSemanticIndex()
+        service = CircuitIndexService(vector_index=vector_index)
+
+        hits = service._semantic_evidence(
+            "kb_hw",
+            "conceptual",
+            {"z_allowed": ({"record_id": 9, "department_id": "dept_hw"}, "allowed.edf")},
+            1,
+        )
+
+        self.assertEqual(hits, [])
+        self.assertEqual(vector_index.calls, [])
+
+    def test_failed_vector_replacement_never_returns_stale_previous_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "generation-a.edf")
+            second = os.path.join(tmp, "generation-b.edf")
+            for path, generation in ((first, "A"), (second, "B")):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(generation)
+            vector_index = _StaleGenerationVectorIndex()
+            service = CircuitIndexService(
+                storage_root=os.path.join(tmp, "circuits"),
+                parser_factory=_FileGenerationParserFactory(),
+                graph_store=GraphStore(),
+                vector_index=vector_index,
+            )
+            service.index_file(
+                kb_name="kb_hw",
+                record_id=1,
+                file_path=first,
+                original_name="same_board.edf",
+                department_id="dept_hw",
+            )
+            result = service.index_file(
+                kb_name="kb_hw",
+                record_id=2,
+                file_path=second,
+                original_name="same_board.edf",
+                department_id="dept_hw",
+            )
+            vector_index.search_calls.clear()
+
+            hits = service.query(
+                kb_name="kb_hw",
+                query="unmatched conceptual intent",
+                ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
+            )
+
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(hits, [])
         self.assertEqual(vector_index.search_calls, [])
 
 
@@ -903,6 +1137,36 @@ class _DelayedGenerationGraphStore(GraphStore):
         return super().save(design, design_dir)
 
 
+class _FileGenerationParser:
+    def __init__(self, path):
+        self.path = path
+
+    def parse(self):
+        with open(self.path, encoding="utf-8") as fh:
+            generation = fh.read().strip()
+        refdes = "U100" if generation == "A" else "U200"
+        return [ComponentInstance(refdes=refdes, value=generation)], [], []
+
+
+class _FileGenerationParserFactory:
+    def __call__(self, path, progress_callback=None):
+        return _FileGenerationParser(path)
+
+
+class _BlockingGenerationGraphStore(GraphStore):
+    def __init__(self):
+        self.block_generation = ""
+        self.writer_blocked = threading.Event()
+        self.release_writer = threading.Event()
+
+    def save(self, design, design_dir):
+        if design.instances[0].value == self.block_generation:
+            self.writer_blocked.set()
+            if not self.release_writer.wait(5):
+                raise TimeoutError("writer release timed out")
+        return super().save(design, design_dir)
+
+
 def _index_generation(root, path, generation, barrier, outcomes):
     service = CircuitIndexService(
         storage_root=root,
@@ -1036,18 +1300,63 @@ class _SemanticVectorIndex(_VectorIndex):
         super().__init__()
         self.search_calls = []
 
-    def semantic_search(self, kb_name, query, top_k=20, kinds=None, allowed_design_ids=None):
+    def semantic_search(
+        self,
+        kb_name,
+        query,
+        top_k=20,
+        kinds=None,
+        allowed_design_ids=None,
+        allowed_generations=None,
+    ):
         self.search_calls.append((kb_name, query, top_k, tuple(kinds or ())))
+        generation_id = str((allowed_generations or {}).get("board") or "")
         return [
             CircuitVectorHit(
                 kind="instance", design_id="board", natural_id="Y900", score=0.42,
-                metadata={"kind": "instance", "design_id": "board", "natural_id": "Y900"},
+                metadata={
+                    "kind": "instance",
+                    "design_id": "board",
+                    "natural_id": "Y900",
+                    "generation_id": generation_id,
+                },
                 document="semantic oscillator candidate",
             )
         ]
 
     def is_available(self):
         return True
+
+
+class _StaleGenerationVectorIndex:
+    def __init__(self):
+        self.current_hit = None
+        self.search_calls = []
+
+    def reindex_design_with_status(self, design):
+        if design.instances[0].value == "B":
+            return CircuitVectorIndexStatus(available=True, indexed_count=0, error="delete failed")
+        self.current_hit = CircuitVectorHit(
+            kind="instance",
+            design_id=design.design_id,
+            natural_id=design.instances[0].refdes,
+            score=0.6,
+            metadata={"kind": "instance", "design_id": design.design_id},
+            document="stale generation A semantic evidence",
+        )
+        return CircuitVectorIndexStatus(available=True, indexed_count=1)
+
+    def semantic_search(
+        self,
+        kb_name,
+        query,
+        top_k=20,
+        kinds=None,
+        allowed_design_ids=None,
+        allowed_generations=None,
+    ):
+        self.search_calls.append((kb_name, query, allowed_design_ids, allowed_generations))
+        return [self.current_hit] if self.current_hit is not None else []
 
 
 class _InternalTypeErrorQueryEngine(CircuitQueryEngine):
@@ -1058,6 +1367,31 @@ class _InternalTypeErrorQueryEngine(CircuitQueryEngine):
     def search_net_connections(self, kb_name, query="", keywords=None, limit=10, allowed_design_ids=None):
         self.net_queries.append((query, tuple(keywords or ())))
         raise TypeError("internal query-engine type error")
+
+
+class _KwargsIgnoringQueryEngine:
+    def __init__(self):
+        self.calls = []
+
+    def search_instances(self, kb_name, query="", keywords=None, limit=20, **kwargs):
+        self.calls.append((kb_name, query, keywords, limit, kwargs))
+        return [{"design_id": "a_disallowed", "refdes": "Y900"}]
+
+
+class _KwargsIgnoringSemanticIndex:
+    def __init__(self):
+        self.calls = []
+
+    def semantic_search(self, kb_name, query, top_k=20, kinds=None, **kwargs):
+        self.calls.append((kb_name, query, top_k, kinds, kwargs))
+        return [CircuitVectorHit(
+            kind="instance",
+            design_id="a_disallowed",
+            natural_id="U1",
+            score=0.9,
+            metadata={"kind": "instance", "design_id": "a_disallowed"},
+            document="unauthorized semantic evidence",
+        )]
 
 
 class _QueryEngine:
