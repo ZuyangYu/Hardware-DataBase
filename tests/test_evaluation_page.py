@@ -17,6 +17,7 @@ from src.evaluation.schemas import (
 )
 from src.ui.evaluation_page import (
     ACTIVE_EVALUATION_RUN_KEY,
+    TERMINAL_RERUN_GUARD_PREFIX,
     _build_baseline_metric_chart,
     _build_current_metric_chart,
     can_access_evaluation,
@@ -26,6 +27,7 @@ from src.ui.evaluation_page import (
     preflight_scoring,
     render_saved_evaluation_run,
     _render_summary,
+    _render_active_status,
     _render_run_status,
     _run_outcome_message,
     render_evaluation_page,
@@ -271,11 +273,256 @@ class EvaluationPageTests(unittest.TestCase):
         controller = Mock()
         controller.load_for_display.side_effect = ValueError("invalid run_state.json")
 
-        _render_run_status(st, controller, "run-1")
+        self.assertIsNone(_render_run_status(st, controller, "run-1"))
 
         st.error.assert_called_once_with(
             "Unable to load evaluation run state: invalid run_state.json"
         )
+
+    def test_run_status_returns_loaded_state(self):
+        class FakeColumn:
+            def button(self, *_args, **_kwargs):
+                return False
+
+            def metric(self, *_args, **_kwargs):
+                pass
+
+        class FakeStreamlit:
+            def columns(self, count):
+                return [FakeColumn() for _ in range(count)]
+
+            def subheader(self, *_args):
+                pass
+
+            def write(self, *_args):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def caption(self, *_args):
+                pass
+
+            def error(self, *_args):
+                pass
+
+        state = EvaluationRunState.new_online(
+            run_id="run-1",
+            dataset_path="dataset.jsonl",
+            snapshot_path="snapshot.jsonl",
+            total_samples=1,
+            score_enabled=True,
+        )
+        controller = Mock()
+        controller.state_root = Path("/tmp/evaluation-page-test")
+        controller.load_for_display.return_value = state
+
+        self.assertEqual(_render_run_status(FakeStreamlit(), controller, "run-1"), state)
+
+    def test_active_fragment_reruns_app_once_when_terminal_report_is_finalized(self):
+        class FakeColumn:
+            def button(self, *_args, **_kwargs):
+                return False
+
+            def metric(self, *_args, **_kwargs):
+                pass
+
+        class FakeStreamlit:
+            def __init__(self):
+                self.session_state = {}
+                self.rerun_calls = []
+                self.status_panel = None
+                self.fragment_run_every = None
+
+            def columns(self, count):
+                return [FakeColumn() for _ in range(count)]
+
+            def subheader(self, *_args):
+                pass
+
+            def write(self, *_args):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def caption(self, *_args):
+                pass
+
+            def error(self, *_args):
+                pass
+
+            def fragment(self, *, run_every):
+                self.fragment_run_every = run_every
+
+                def decorate(function):
+                    self.status_panel = function
+                    return function
+
+                return decorate
+
+            def rerun(self, **kwargs):
+                self.rerun_calls.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run = root / "run-1"
+            run.mkdir()
+            (run / "summary.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+            (run / "results.jsonl").write_text("", encoding="utf-8")
+            (run / "report_complete.json").write_text("{}\n", encoding="utf-8")
+            state = EvaluationRunState.new_online(
+                run_id="run-1",
+                dataset_path="dataset.jsonl",
+                snapshot_path="snapshot.jsonl",
+                total_samples=1,
+                score_enabled=True,
+            ).model_copy(update={"status": "completed"})
+            (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+            controller = Mock()
+            controller.state_root = root
+            controller.load_for_display.return_value = state
+            st = FakeStreamlit()
+
+            _render_active_status(st, controller, "run-1")
+
+            self.assertEqual(st.fragment_run_every, "2s")
+            self.assertEqual(st.rerun_calls, [{"scope": "app"}])
+            self.assertTrue(
+                st.session_state[f"{TERMINAL_RERUN_GUARD_PREFIX}run-1"]
+            )
+
+    def test_active_fragment_does_not_rerun_for_terminal_state_without_finalized_report(self):
+        class FakeColumn:
+            def button(self, *_args, **_kwargs):
+                return False
+
+            def metric(self, *_args, **_kwargs):
+                pass
+
+        class FakeStreamlit:
+            def __init__(self):
+                self.session_state = {}
+                self.rerun_calls = []
+
+            def columns(self, count):
+                return [FakeColumn() for _ in range(count)]
+
+            def subheader(self, *_args):
+                pass
+
+            def write(self, *_args):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def caption(self, *_args):
+                pass
+
+            def error(self, *_args):
+                pass
+
+            def fragment(self, *, run_every):
+                def decorate(function):
+                    return function
+
+                return decorate
+
+            def rerun(self, **kwargs):
+                self.rerun_calls.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run = root / "run-1"
+            run.mkdir()
+            (run / "summary.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+            (run / "results.jsonl").write_text("", encoding="utf-8")
+            state = EvaluationRunState.new_online(
+                run_id="run-1",
+                dataset_path="dataset.jsonl",
+                snapshot_path="snapshot.jsonl",
+                total_samples=1,
+                score_enabled=True,
+            ).model_copy(update={"status": "completed"})
+            (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+            controller = Mock()
+            controller.state_root = root
+            controller.load_for_display.return_value = state
+            st = FakeStreamlit()
+
+            _render_active_status(st, controller, "run-1")
+
+            self.assertEqual(st.rerun_calls, [])
+            self.assertNotIn(
+                f"{TERMINAL_RERUN_GUARD_PREFIX}run-1", st.session_state
+            )
+
+    def test_active_fragment_terminal_rerun_guard_prevents_loop(self):
+        class FakeColumn:
+            def button(self, *_args, **_kwargs):
+                return False
+
+            def metric(self, *_args, **_kwargs):
+                pass
+
+        class FakeStreamlit:
+            def __init__(self):
+                self.session_state = {}
+                self.rerun_calls = []
+                self.status_panel = None
+
+            def columns(self, count):
+                return [FakeColumn() for _ in range(count)]
+
+            def subheader(self, *_args):
+                pass
+
+            def write(self, *_args):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def caption(self, *_args):
+                pass
+
+            def error(self, *_args):
+                pass
+
+            def fragment(self, *, run_every):
+                def decorate(function):
+                    self.status_panel = function
+                    return function
+
+                return decorate
+
+            def rerun(self, **kwargs):
+                self.rerun_calls.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run = root / "run-1"
+            run.mkdir()
+            (run / "summary.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+            (run / "results.jsonl").write_text("", encoding="utf-8")
+            (run / "report_complete.json").write_text("{}\n", encoding="utf-8")
+            state = EvaluationRunState.new_online(
+                run_id="run-1",
+                dataset_path="dataset.jsonl",
+                snapshot_path="snapshot.jsonl",
+                total_samples=1,
+                score_enabled=True,
+            ).model_copy(update={"status": "completed"})
+            controller = Mock()
+            controller.state_root = root
+            controller.load_for_display.return_value = state
+            st = FakeStreamlit()
+
+            _render_active_status(st, controller, "run-1")
+            st.status_panel()
+
+            self.assertEqual(st.rerun_calls, [{"scope": "app"}])
 
     def test_failed_run_with_summary_does_not_render_completed_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:

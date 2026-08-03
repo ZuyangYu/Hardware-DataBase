@@ -26,6 +26,9 @@ from src.evaluation.service import EvaluationService
 DEFAULT_DATASET = Path("evaluation/datasets/hardware_qa_v1.jsonl")
 DEFAULT_OUTPUT_ROOT = Path("storage/evaluations")
 ACTIVE_EVALUATION_RUN_KEY = "evaluation_active_run_id"
+TERMINAL_RERUN_GUARD_PREFIX = "evaluation_terminal_rerun:"
+
+_TERMINAL_EVALUATION_STATUSES = {"completed", "paused", "cancelled", "failed"}
 
 
 def can_access_evaluation(role: str | None) -> bool:
@@ -392,7 +395,9 @@ def _elapsed_seconds(state: EvaluationRunState) -> float:
     return max(0.0, (finished_at - started_at).total_seconds())
 
 
-def _render_run_status(st, controller: EvaluationRunController, run_id: str) -> None:
+def _render_run_status(
+    st, controller: EvaluationRunController, run_id: str
+) -> EvaluationRunState | None:
     try:
         state = controller.load_for_display(run_id)
     except (OSError, ValueError) as exc:
@@ -431,12 +436,30 @@ def _render_run_status(st, controller: EvaluationRunController, run_id: str) -> 
     if cancel_column.button("取消", key=f"cancel-{state.run_id}", disabled=not actions["cancel"]):
         controller.cancel(state.run_id)
         st.rerun()
+    return state
 
 
 def _render_active_status(st, controller: EvaluationRunController, run_id: str) -> None:
+    run_dir = Path(controller.state_root) / run_id
+    guard_key = f"{TERMINAL_RERUN_GUARD_PREFIX}{run_id}"
+    for key in list(st.session_state):
+        if key.startswith(TERMINAL_RERUN_GUARD_PREFIX) and key != guard_key:
+            st.session_state.pop(key, None)
+
     @st.fragment(run_every="2s")
     def status_panel() -> None:
-        _render_run_status(st, controller, run_id)
+        state = _render_run_status(st, controller, run_id)
+        if state is None:
+            return
+        if state.status not in _TERMINAL_EVALUATION_STATUSES:
+            st.session_state.pop(guard_key, None)
+            return
+        if not should_render_evaluation_summary(run_dir):
+            return
+        if st.session_state.get(guard_key):
+            return
+        st.session_state[guard_key] = True
+        st.rerun(scope="app")
 
     status_panel()
 
