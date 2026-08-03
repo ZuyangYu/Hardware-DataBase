@@ -17,7 +17,7 @@ class CircuitQuestionPlan:
     requires_datasheet: bool = False
 
 
-_BIAS_TERMS = ("上拉", "下拉", "pull-up", "pullup", "pull-down", "pulldown", "默认电平", "偏置")
+_BIAS_TERMS = ("上拉", "下拉", "pull-up", "pullup", "pull up", "pull-down", "pulldown", "pull down", "默认电平", "偏置")
 _CONNECTION_TERMS = ("连接", "连到", "接到", "引脚", "网络", "网表", "路径", "connection", "pin", "net")
 _POWER_TERMS = ("电源输出", "供电路径", "电源路径", "电源树", "power output", "power path", "power tree")
 _POWER_SWITCH_TERMS = ("负载开关", "电源开关", "load switch", "power switch", "tps22918")
@@ -29,7 +29,7 @@ _DATASHEET_TERMS = (
 _PLACEMENT_TERMS = ("靠近", "布局", "摆放", "placement", "layout")
 _VALUE_TERMS = ("阻值", "数值", "参数", "resistance", "频率")
 _CLOCK_TERMS = ("晶振", "晶体", "振荡器", "频率", "时钟", "crystal", "oscillator", "clock", "frequency")
-_ENABLE_TERMS = ("使能", "禁止", "唤醒", "inhibit", "wakeup", "enable", "en_sync", "ecu_en")
+_ENABLE_TERMS = ("使能", "禁止", "唤醒", "inhibit", "wakeup", "wake-up", "enable", "en_sync", "ecu_en")
 _I2C_TERMS = ("i2c", "i²c", "scl", "sda")
 _COMPONENT_SELECTION_TERMS = ("芯片型号", "器件型号", "型号", "选型", "可使用", "part number", "component selection")
 _REFDES_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{1,4}\d+(?![A-Za-z0-9])")
@@ -70,7 +70,7 @@ def analyze_question(question: str) -> CircuitQuestionPlan:
         operations.append("value")
     if _has_term(text, _POWER_TERMS):
         operations.append("power_path")
-    if any(term in text for term in ("输入电压", "输出电压", "输出电流", "vin", "vout")) and "power_path" not in operations:
+    if _has_term(text, ("输入电压", "输出电压", "输出电流", "vin", "vout")) and "power_path" not in operations:
         operations.append("power_path")
     if _has_term(text, _POWER_SWITCH_TERMS) and _has_term(text, _POWER_ROLE_TERMS):
         operations.append("power_switch")

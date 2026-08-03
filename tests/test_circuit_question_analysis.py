@@ -49,6 +49,14 @@ class CircuitQuestionAnalysisTests(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertEqual(analyze_question(question).operations, ())
 
+    def test_power_path_tokens_and_english_variants_are_boundary_safe(self):
+        self.assertIn("power_path", analyze_question("VIN to VOUT power path").operations)
+        self.assertIn("bias", analyze_question("pull up and pull down").operations)
+        self.assertIn("enable", analyze_question("wake-up source").operations)
+        for question in ("saving costs", "devout response"):
+            with self.subTest(question=question):
+                self.assertNotIn("power_path", analyze_question(question).operations)
+
 
 if __name__ == "__main__":
     unittest.main()

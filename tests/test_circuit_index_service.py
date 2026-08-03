@@ -499,7 +499,7 @@ class CircuitIndexServiceTests(unittest.TestCase):
             )
             ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
             direct = service.query(kb_name="kb_hw", query="Y900 value", ctx=ctx)[0]
-            semantic = service.query(kb_name="kb_hw", query="unmatched oscillator intent", ctx=ctx)[0]
+            semantic = service.query(kb_name="kb_hw", query="unmatched conceptual intent", ctx=ctx)[0]
 
         self.assertGreater(direct.score, semantic.score)
         self.assertEqual(semantic.locator["entity_type"], "semantic_instance")
@@ -558,6 +558,47 @@ class CircuitIndexServiceTests(unittest.TestCase):
             hits = service.query(kb_name="kb_hw", query="U1600 ECU_EN enable", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}), top_k=2)
 
         self.assertTrue(any(hit.locator["entity_type"] == "graph_relationship" for hit in hits))
+
+    def test_original_crystal_question_returns_both_frequency_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            hits = service.query(kb_name="kb_hw", query="MCU 和 SOC 使用的晶振频率分别是多少？请给出型号和位号，并判断是否满足手册要求。", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}), top_k=8)
+
+        facts = {hit.locator["entity_id"]: hit.content for hit in hits if hit.locator["entity_type"] == "instance"}
+        self.assertIn("20MHz", facts["Y900"])
+        self.assertIn("30MHz", facts["Y600"])
+
+    def test_original_enable_question_traverses_all_diode_source_nets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            hits = service.query(kb_name="kb_hw", query="LN10046 的使能信号来源有哪些？请逐项列举。", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}), top_k=20)
+
+        source_nets = {hit.locator.get("net") for hit in hits if hit.locator["entity_type"] == "graph_relationship"}
+        self.assertTrue({"CAN0_INH", "CAN1_INH", "CAN2_INH", "CAN3_INH", "ETH_INH", "L_S_WKUP"}.issubset(source_nets))
+        self.assertNotIn("UNRELATED", source_nets)
+
+    def test_bias_missing_signal_returns_no_unrelated_topology(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CircuitIndexService(storage_root=os.path.join(tmp, "circuits"), parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=_UnavailableVectorIndex())
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            hits = service.query(kb_name="kb_hw", query="MISSING_RXD 上拉电阻位号和阻值", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}), top_k=8)
+
+        self.assertFalse(any(hit.locator["entity_type"] == "topology" for hit in hits))
+
+    def test_exact_stage_internal_type_error_never_retries_nonempty_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CircuitStore(root=os.path.join(tmp, "circuits"))
+            engine = _InternalTypeErrorQueryEngine(store)
+            vector_index = _SemanticVectorIndex()
+            service = CircuitIndexService(store=store, query_engine=engine, parser_factory=lambda path, progress_callback=None: _EvaluationParser(), vector_index=vector_index)
+            service.index_file(kb_name="kb_hw", record_id=7, file_path=os.path.join(tmp, "board.edf"), original_name="board.edf", department_id="dept_hw")
+            hits = service.query(kb_name="kb_hw", query="Y900", ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}))
+
+        self.assertTrue(any(hit.locator["entity_id"] == "Y900" for hit in hits))
+        self.assertEqual(engine.net_queries, [("", ("Y900",))])
+        self.assertEqual(vector_index.search_calls, [])
 
 
 class _Parser:
@@ -737,10 +778,19 @@ class _EvaluationParser:
                 ComponentInstance(refdes="R1205", library_cell="RES", value="100K", pins=[Pin(name="1", net="CAN0_RXD"), Pin(name="2", net="VCC3V3")]),
                 ComponentInstance(refdes="R1210", library_cell="RES", value="10K", pins=[Pin(name="1", net="LIN_RXD"), Pin(name="2", net="VCC3V3")]),
                 ComponentInstance(refdes="U1600", library_cell="LN10046", part_number="LN10046FSQ1LQR", pins=[Pin(name="EN_SYNC", net="ECU_EN")]),
-                ComponentInstance(refdes="D1611", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN")]),
+                ComponentInstance(refdes="D1611", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="CAN0_INH")]),
+                ComponentInstance(refdes="D1612", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="CAN1_INH")]),
+                ComponentInstance(refdes="D1613", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="CAN2_INH")]),
+                ComponentInstance(refdes="D1614", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="CAN3_INH")]),
+                ComponentInstance(refdes="D1615", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="ETH_INH")]),
+                ComponentInstance(refdes="D1608", library_cell="DIODE", pins=[Pin(name="K", net="ECU_EN"), Pin(name="A", net="L_S_WKUP")]),
+                ComponentInstance(refdes="X1", library_cell="TEST", pins=[Pin(name="IN", net="CAN0_INH"), Pin(name="OUT", net="UNRELATED")]),
             ],
             [
-                Net(name="ECU_EN", connections=[PinRef(refdes="U1600", pin="EN_SYNC"), PinRef(refdes="D1611", pin="K")]),
+                Net(name="ECU_EN", connections=[PinRef(refdes="U1600", pin="EN_SYNC"), *[PinRef(refdes=refdes, pin="K") for refdes in ("D1608", "D1611", "D1612", "D1613", "D1614", "D1615")]]),
+                *[Net(name=net, connections=[PinRef(refdes=refdes, pin="A")]) for refdes, net in (("D1611", "CAN0_INH"), ("D1612", "CAN1_INH"), ("D1613", "CAN2_INH"), ("D1614", "CAN3_INH"), ("D1615", "ETH_INH"), ("D1608", "L_S_WKUP"))],
+                Net(name="CAN0_INH", connections=[PinRef(refdes="D1611", pin="A"), PinRef(refdes="X1", pin="IN")]),
+                Net(name="UNRELATED", connections=[PinRef(refdes="X1", pin="OUT")]),
                 Net(name="CAN0_RXD", connections=[PinRef(refdes="R1205", pin="1")]),
                 Net(name="LIN_RXD", connections=[PinRef(refdes="R1210", pin="1")]),
                 Net(name="VCC3V3", connections=[PinRef(refdes="R1205", pin="2")], net_type="power"),
@@ -766,6 +816,16 @@ class _SemanticVectorIndex(_VectorIndex):
 
     def is_available(self):
         return True
+
+
+class _InternalTypeErrorQueryEngine(CircuitQueryEngine):
+    def __init__(self, store):
+        super().__init__(store)
+        self.net_queries = []
+
+    def search_net_connections(self, kb_name, query="", keywords=None, limit=10):
+        self.net_queries.append((query, tuple(keywords or ())))
+        raise TypeError("internal query-engine type error")
 
 
 class _QueryEngine:

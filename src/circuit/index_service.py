@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -215,12 +216,20 @@ class CircuitIndexService:
         keywords = _exact_terms(query)
         if not keywords:
             return []
+        parameters = inspect.signature(method).parameters.values()
+        accepts_keywords = any(parameter.name == "keywords" or parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        if accepts_keywords:
+            try:
+                return method(kb_name, "", keywords=keywords, limit=limit)
+            except TypeError:
+                # An implementation failure is not evidence that the method
+                # lacks keyword support. Never retry it with a nonempty query,
+                # which could activate CircuitQueryEngine semantic recall.
+                return []
         try:
-            return method(kb_name, "", keywords=keywords, limit=limit)
+            return method(kb_name, "", limit=limit)
         except TypeError:
-            # Legacy test doubles predate keyword support. Production query
-            # engine supports it; retain compatibility without changing RAG.
-            return method(kb_name, query, limit=limit)
+            return []
 
     def _graph_evidence(
         self,
@@ -243,21 +252,46 @@ class CircuitIndexService:
             if design is None:
                 continue
             refdes_values, net_names = _graph_targets(design, query)
-            for refdes in refdes_values:
-                neighbors = self._graph_connected(graph, refdes=refdes)
-                net_names.extend(str(item.get("net_name") or item.get("name") or "") for item in neighbors if item.get("kind") == "net")
-            for net_name in dict.fromkeys(name for name in net_names if name):
+            # Bounded component → net → component → net traversal.  It is
+            # sufficient for enable diode-OR source tracing while preventing
+            # an arbitrary walk across the rest of an authorized design.
+            pending_refdes = [(refdes, 0) for refdes in refdes_values]
+            pending_nets = [(net_name, 0) for net_name in net_names]
+            seen_refdes: set[str] = set()
+            seen_nets: set[str] = set()
+            while pending_refdes or pending_nets:
+                if pending_refdes:
+                    refdes, depth = pending_refdes.pop(0)
+                    if depth > 2:
+                        continue
+                    if refdes in seen_refdes:
+                        continue
+                    seen_refdes.add(refdes)
+                    neighbors = self._graph_connected(graph, refdes=refdes)
+                    pending_nets.extend((str(item.get("net_name") or item.get("name") or ""), depth + 1) for item in neighbors if item.get("kind") == "net")
+                    continue
+                net_name, depth = pending_nets.pop(0)
+                if depth > 3:
+                    continue
+                if not net_name or net_name in seen_nets:
+                    continue
+                seen_nets.add(net_name)
                 related = self._graph_connected(graph, net_name=net_name)
                 if not related:
                     continue
                 endpoints = [item for item in related if item.get("kind") == "pin"]
                 components = sorted({str(item.get("refdes") or "") for item in related if item.get("kind") == "component" and item.get("refdes")})
+                endpoint_text = ", ".join(
+                    f"{item.get('refdes')}.{item.get('pin') or item.get('pin_name')}"
+                    for item in endpoints
+                    if item.get("refdes") and (item.get("pin") or item.get("pin_name"))
+                )
                 for endpoint in endpoints:
                     pin = str(endpoint.get("pin") or endpoint.get("pin_name") or "")
                     endpoint_refdes = str(endpoint.get("refdes") or "")
                     if not pin or not endpoint_refdes:
                         continue
-                    content = f"Graph net {net_name}: {endpoint_refdes}.{pin}; components: {', '.join(components)}."
+                    content = f"Graph net {net_name}: {endpoint_text}; components: {', '.join(components)}."
                     record_id = metadata.get("record_id")
                     results.append(Evidence(
                         id=f"circuit:{record_id or design_id}:graph_relationship:{endpoint_refdes}.{pin}:{net_name}",
@@ -269,6 +303,8 @@ class CircuitIndexService:
                         locator={"record_id": record_id, "circuit_id": design_id, "entity_type": "graph_relationship", "entity_id": endpoint_refdes, "pin": pin, "net": net_name},
                         metadata={"kb_name": kb_name, "department_id": metadata.get("department_id", ""), "source_group": "circuit_design", "evidence_kind": "graph_relationship"},
                     ))
+                if depth < 3:
+                    pending_refdes.extend((str(item.get("refdes") or ""), depth + 1) for item in related if item.get("kind") == "component" and item.get("refdes"))
         return self._deduplicate(results)
 
     def _graph_connected(self, graph: Any, **kwargs: str) -> list[dict[str, Any]]:
@@ -403,6 +439,8 @@ class CircuitIndexService:
                 if (topology := self.query_engine.build_power_topology(kb_name, design_id))
             ]
             candidates.append(("power_topology", 0.99, power_topology_rows))
+        if "clock" in plan.operations:
+            candidates.append(("instance", 0.98, self._exact_search("search_instances", kb_name, "CRYSTAL", top_k * 3)))
         if "mcu" in query.casefold():
             candidates.append(
                 ("instance", 0.97, self._exact_search("search_instances", kb_name, "TC3", top_k * 2))
@@ -618,7 +656,7 @@ def _filter_bias_rows(rows: list[dict[str, Any]], query: str, plan: Any) -> list
         return any(identifier in haystack for identifier in identifiers) if "i2c" in plan.operations else all(identifier in haystack for identifier in identifiers)
 
     filtered = [row for row in rows if matches(row)]
-    return filtered or rows
+    return filtered
 
 
 def _matches_terms(haystack: str, terms: list[str]) -> bool:
