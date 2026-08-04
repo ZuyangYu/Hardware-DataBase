@@ -17,6 +17,7 @@ from src.evaluation.schemas import (
 )
 from src.ui.evaluation_page import (
     ACTIVE_EVALUATION_RUN_KEY,
+    TERMINAL_RERUN_GUARD_PREFIX,
     _build_baseline_metric_chart,
     _build_current_metric_chart,
     can_access_evaluation,
@@ -26,9 +27,12 @@ from src.ui.evaluation_page import (
     preflight_scoring,
     render_saved_evaluation_run,
     _render_summary,
+    _render_active_status,
     _render_run_status,
+    _run_outcome_message,
     render_evaluation_page,
     run_action_availability,
+    should_render_evaluation_summary,
 )
 
 
@@ -44,6 +48,25 @@ class EvaluationPageTests(unittest.TestCase):
         run = root / name
         run.mkdir()
         (run / "summary.json").write_text(json.dumps({"run_id": name}), encoding="utf-8")
+
+    def _write_history_run(self, root: Path, name: str, sample_ids: list[str]) -> Path:
+        run = root / name
+        run.mkdir()
+        (run / "summary.json").write_text(
+            json.dumps(
+                {
+                    "run_id": name,
+                    "sample_count": len(sample_ids),
+                    "successful_samples": len(sample_ids),
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run / "results.jsonl").write_text(
+            "".join(json.dumps({"sample_id": sample_id}) + "\n" for sample_id in sample_ids),
+            encoding="utf-8",
+        )
+        return run
 
     def test_only_system_admin_can_access(self):
         self.assertTrue(can_access_evaluation("system_admin"))
@@ -97,6 +120,106 @@ class EvaluationPageTests(unittest.TestCase):
 
             self.assertTrue(rendered)
             self.assertEqual(render_summary.call_args.args[1].run_id, "run-1")
+
+    def test_partial_terminal_summary_renders_but_running_summary_stays_active(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for status in ("paused", "cancelled", "failed", "running"):
+                run = root / status
+                run.mkdir()
+                (run / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": status,
+                            "metadata": {
+                                "run_outcome": {
+                                    "kind": "partial_failed",
+                                    "completed_groups": 1,
+                                    "total_groups": 5,
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state = EvaluationRunState.new_online(
+                    run_id=status,
+                    dataset_path="dataset.jsonl",
+                    snapshot_path="snapshot.jsonl",
+                    total_samples=1,
+                    score_enabled=True,
+                ).model_copy(update={"status": status})
+                (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+                (run / "report_complete.json").write_text("{}\n", encoding="utf-8")
+
+            self.assertTrue(should_render_evaluation_summary(root / "paused"))
+            self.assertTrue(should_render_evaluation_summary(root / "cancelled"))
+            self.assertTrue(should_render_evaluation_summary(root / "failed"))
+            self.assertFalse(should_render_evaluation_summary(root / "running"))
+
+    def test_partial_outcome_message_includes_progress(self):
+        message, level = _run_outcome_message(
+            EvaluationSummary(
+                run_id="run-1",
+                metadata={
+                    "run_outcome": {
+                        "kind": "partial_failed",
+                        "completed_groups": 2,
+                        "total_groups": 5,
+                    }
+                },
+            )
+        )
+
+        self.assertEqual(level, "warning")
+        self.assertIn("部分评分", message)
+        self.assertIn("2 / 5", message)
+
+    def test_partial_terminal_summary_without_completion_marker_stays_active(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run = Path(temp_dir) / "run-1"
+            run.mkdir()
+            state = EvaluationRunState.new_online(
+                run_id="run-1", dataset_path="dataset.jsonl", snapshot_path="snapshot.jsonl",
+                total_samples=1, score_enabled=True,
+            ).model_copy(update={"status": "failed"})
+            (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+            (run / "summary.json").write_text(
+                json.dumps({"run_id": "run-1", "metadata": {"run_outcome": {"kind": "partial_failed"}}}),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(should_render_evaluation_summary(run))
+
+    def test_completed_legacy_report_without_marker_renders_when_all_artifacts_exist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run = Path(temp_dir) / "run-1"
+            run.mkdir()
+            state = EvaluationRunState.new_online(
+                run_id="run-1", dataset_path="dataset.jsonl", snapshot_path="snapshot.jsonl",
+                total_samples=1, score_enabled=True,
+            ).model_copy(update={"status": "completed"})
+            (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+            (run / "summary.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+            for name in ("results.jsonl", "summary.csv", "report.html"):
+                (run / name).write_text("report\n", encoding="utf-8")
+
+            self.assertTrue(should_render_evaluation_summary(run))
+
+    def test_completed_legacy_report_without_marker_stays_hidden_when_artifact_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run = Path(temp_dir) / "run-1"
+            run.mkdir()
+            state = EvaluationRunState.new_online(
+                run_id="run-1", dataset_path="dataset.jsonl", snapshot_path="snapshot.jsonl",
+                total_samples=1, score_enabled=True,
+            ).model_copy(update={"status": "completed"})
+            (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+            (run / "summary.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+            for name in ("results.jsonl", "summary.csv"):
+                (run / name).write_text("report\n", encoding="utf-8")
+
+            self.assertFalse(should_render_evaluation_summary(run))
 
     def test_missing_saved_run_is_cleared_and_returns_to_new_form(self):
         st = Mock()
@@ -199,11 +322,256 @@ class EvaluationPageTests(unittest.TestCase):
         controller = Mock()
         controller.load_for_display.side_effect = ValueError("invalid run_state.json")
 
-        _render_run_status(st, controller, "run-1")
+        self.assertIsNone(_render_run_status(st, controller, "run-1"))
 
         st.error.assert_called_once_with(
             "Unable to load evaluation run state: invalid run_state.json"
         )
+
+    def test_run_status_returns_loaded_state(self):
+        class FakeColumn:
+            def button(self, *_args, **_kwargs):
+                return False
+
+            def metric(self, *_args, **_kwargs):
+                pass
+
+        class FakeStreamlit:
+            def columns(self, count):
+                return [FakeColumn() for _ in range(count)]
+
+            def subheader(self, *_args):
+                pass
+
+            def write(self, *_args):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def caption(self, *_args):
+                pass
+
+            def error(self, *_args):
+                pass
+
+        state = EvaluationRunState.new_online(
+            run_id="run-1",
+            dataset_path="dataset.jsonl",
+            snapshot_path="snapshot.jsonl",
+            total_samples=1,
+            score_enabled=True,
+        )
+        controller = Mock()
+        controller.state_root = Path("/tmp/evaluation-page-test")
+        controller.load_for_display.return_value = state
+
+        self.assertEqual(_render_run_status(FakeStreamlit(), controller, "run-1"), state)
+
+    def test_active_fragment_reruns_app_once_when_terminal_report_is_finalized(self):
+        class FakeColumn:
+            def button(self, *_args, **_kwargs):
+                return False
+
+            def metric(self, *_args, **_kwargs):
+                pass
+
+        class FakeStreamlit:
+            def __init__(self):
+                self.session_state = {}
+                self.rerun_calls = []
+                self.status_panel = None
+                self.fragment_run_every = None
+
+            def columns(self, count):
+                return [FakeColumn() for _ in range(count)]
+
+            def subheader(self, *_args):
+                pass
+
+            def write(self, *_args):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def caption(self, *_args):
+                pass
+
+            def error(self, *_args):
+                pass
+
+            def fragment(self, *, run_every):
+                self.fragment_run_every = run_every
+
+                def decorate(function):
+                    self.status_panel = function
+                    return function
+
+                return decorate
+
+            def rerun(self, **kwargs):
+                self.rerun_calls.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run = root / "run-1"
+            run.mkdir()
+            (run / "summary.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+            (run / "results.jsonl").write_text("", encoding="utf-8")
+            (run / "report_complete.json").write_text("{}\n", encoding="utf-8")
+            state = EvaluationRunState.new_online(
+                run_id="run-1",
+                dataset_path="dataset.jsonl",
+                snapshot_path="snapshot.jsonl",
+                total_samples=1,
+                score_enabled=True,
+            ).model_copy(update={"status": "completed"})
+            (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+            controller = Mock()
+            controller.state_root = root
+            controller.load_for_display.return_value = state
+            st = FakeStreamlit()
+
+            _render_active_status(st, controller, "run-1")
+
+            self.assertEqual(st.fragment_run_every, "2s")
+            self.assertEqual(st.rerun_calls, [{"scope": "app"}])
+            self.assertTrue(
+                st.session_state[f"{TERMINAL_RERUN_GUARD_PREFIX}run-1"]
+            )
+
+    def test_active_fragment_does_not_rerun_for_terminal_state_without_finalized_report(self):
+        class FakeColumn:
+            def button(self, *_args, **_kwargs):
+                return False
+
+            def metric(self, *_args, **_kwargs):
+                pass
+
+        class FakeStreamlit:
+            def __init__(self):
+                self.session_state = {}
+                self.rerun_calls = []
+
+            def columns(self, count):
+                return [FakeColumn() for _ in range(count)]
+
+            def subheader(self, *_args):
+                pass
+
+            def write(self, *_args):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def caption(self, *_args):
+                pass
+
+            def error(self, *_args):
+                pass
+
+            def fragment(self, *, run_every):
+                def decorate(function):
+                    return function
+
+                return decorate
+
+            def rerun(self, **kwargs):
+                self.rerun_calls.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run = root / "run-1"
+            run.mkdir()
+            (run / "summary.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+            (run / "results.jsonl").write_text("", encoding="utf-8")
+            state = EvaluationRunState.new_online(
+                run_id="run-1",
+                dataset_path="dataset.jsonl",
+                snapshot_path="snapshot.jsonl",
+                total_samples=1,
+                score_enabled=True,
+            ).model_copy(update={"status": "completed"})
+            (run / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
+            controller = Mock()
+            controller.state_root = root
+            controller.load_for_display.return_value = state
+            st = FakeStreamlit()
+
+            _render_active_status(st, controller, "run-1")
+
+            self.assertEqual(st.rerun_calls, [])
+            self.assertNotIn(
+                f"{TERMINAL_RERUN_GUARD_PREFIX}run-1", st.session_state
+            )
+
+    def test_active_fragment_terminal_rerun_guard_prevents_loop(self):
+        class FakeColumn:
+            def button(self, *_args, **_kwargs):
+                return False
+
+            def metric(self, *_args, **_kwargs):
+                pass
+
+        class FakeStreamlit:
+            def __init__(self):
+                self.session_state = {}
+                self.rerun_calls = []
+                self.status_panel = None
+
+            def columns(self, count):
+                return [FakeColumn() for _ in range(count)]
+
+            def subheader(self, *_args):
+                pass
+
+            def write(self, *_args):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def caption(self, *_args):
+                pass
+
+            def error(self, *_args):
+                pass
+
+            def fragment(self, *, run_every):
+                def decorate(function):
+                    self.status_panel = function
+                    return function
+
+                return decorate
+
+            def rerun(self, **kwargs):
+                self.rerun_calls.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run = root / "run-1"
+            run.mkdir()
+            (run / "summary.json").write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+            (run / "results.jsonl").write_text("", encoding="utf-8")
+            (run / "report_complete.json").write_text("{}\n", encoding="utf-8")
+            state = EvaluationRunState.new_online(
+                run_id="run-1",
+                dataset_path="dataset.jsonl",
+                snapshot_path="snapshot.jsonl",
+                total_samples=1,
+                score_enabled=True,
+            ).model_copy(update={"status": "completed"})
+            controller = Mock()
+            controller.state_root = root
+            controller.load_for_display.return_value = state
+            st = FakeStreamlit()
+
+            _render_active_status(st, controller, "run-1")
+            st.status_panel()
+
+            self.assertEqual(st.rerun_calls, [{"scope": "app"}])
 
     def test_failed_run_with_summary_does_not_render_completed_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -522,13 +890,114 @@ class EvaluationPageTests(unittest.TestCase):
 
             render_summary.assert_called_once()
 
-    def test_history_view_passes_another_completed_run_as_comparison_baseline(self):
+    def test_history_view_only_offers_same_cohort_baselines(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            self._write_summary(root, "20260102T000000Z-current")
-            self._write_summary(root, "20260101T000000Z-baseline")
-            current = root / "20260102T000000Z-current"
-            baseline = root / "20260101T000000Z-baseline"
+            current = self._write_history_run(
+                root, "20260103T000000Z-current", ["q1", "q2"]
+            )
+            matching = self._write_history_run(
+                root, "20260102T000000Z-matching", ["q2", "q1"]
+            )
+            self._write_history_run(root, "20260101T000000Z-different", ["q3"])
+
+            class FakeStreamlit:
+                session_state = {}
+
+                def __init__(self):
+                    self.selectbox_calls = []
+
+                def title(self, *_args, **_kwargs):
+                    pass
+
+                def cache_resource(self, function):
+                    return function
+
+                def radio(self, *_args, **_kwargs):
+                    return "查看历史报告"
+
+                def text_input(self, *_args, **_kwargs):
+                    return temp_dir
+
+                def info(self, *_args, **_kwargs):
+                    pass
+
+                def selectbox(self, label, options, *_args, **kwargs):
+                    self.selectbox_calls.append((label, options, kwargs.get("format_func")))
+                    return current if label == "运行" else matching
+
+            st = FakeStreamlit()
+
+            with (
+                patch.dict(sys.modules, {"streamlit": st}),
+                patch("src.ui.evaluation_page._render_summary") as render_summary,
+            ):
+                render_evaluation_page("system_admin")
+
+            self.assertEqual(render_summary.call_args.args[1].run_id, current.name)
+            self.assertEqual(render_summary.call_args.args[3].run_id, matching.name)
+            baseline_call = next(
+                call for call in st.selectbox_calls if call[0] == "历史对比基线"
+            )
+            self.assertEqual([path.name for path in baseline_call[1]], [matching.name])
+
+    def test_history_selector_labels_show_origin_and_sample_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = self._write_history_run(root, "local-run", ["q1"])
+            imported = self._write_history_run(root, "imported-run", ["q1", "q2"])
+            (imported / "import_manifest.json").write_text(
+                json.dumps({"origin": "imported"}), encoding="utf-8"
+            )
+
+            class FakeStreamlit:
+                session_state = {}
+
+                def __init__(self):
+                    self.labels = []
+
+                def title(self, *_args, **_kwargs):
+                    pass
+
+                def cache_resource(self, function):
+                    return function
+
+                def radio(self, *_args, **_kwargs):
+                    return "查看历史报告"
+
+                def text_input(self, *_args, **_kwargs):
+                    return temp_dir
+
+                def info(self, *_args, **_kwargs):
+                    pass
+
+                def selectbox(self, label, options, *_args, **kwargs):
+                    formatter = kwargs.get("format_func")
+                    if formatter:
+                        self.labels.extend(formatter(option) for option in options)
+                    return imported if label == "运行" else local
+
+            st = FakeStreamlit()
+            with (
+                patch.dict(sys.modules, {"streamlit": st}),
+                patch("src.ui.evaluation_page._render_summary"),
+            ):
+                render_evaluation_page("system_admin")
+
+            self.assertTrue(any("local-run" in label and "本地" in label and "1" in label for label in st.labels))
+            self.assertTrue(any("imported-run" in label and "导入" in label and "2" in label for label in st.labels))
+
+    def test_selected_imported_report_caption_shows_origin_and_sample_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            imported = self._write_history_run(root, "imported-run", ["q1", "q2"])
+            (imported / "import_manifest.json").write_text(
+                json.dumps({"origin": "imported"}), encoding="utf-8"
+            )
+
+            class FakeColumn:
+                def metric(self, *_args, **_kwargs):
+                    pass
 
             class FakeStreamlit:
                 session_state = {}
@@ -548,17 +1017,54 @@ class EvaluationPageTests(unittest.TestCase):
                 def info(self, *_args, **_kwargs):
                     pass
 
-                def selectbox(self, label, *_args, **_kwargs):
-                    return current if label == "运行" else baseline
+                def warning(self, *_args, **_kwargs):
+                    pass
 
-            with (
-                patch.dict(sys.modules, {"streamlit": FakeStreamlit()}),
-                patch("src.ui.evaluation_page._render_summary") as render_summary,
-            ):
+                def error(self, *_args, **_kwargs):
+                    pass
+
+                def columns(self, count):
+                    return [FakeColumn() for _ in range(count)]
+
+                def subheader(self, *_args, **_kwargs):
+                    pass
+
+                def altair_chart(self, *_args, **_kwargs):
+                    pass
+
+                def dataframe(self, *_args, **_kwargs):
+                    pass
+
+                def expander(self, *_args, **_kwargs):
+                    class _Expander:
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *_args):
+                            return False
+
+                    return _Expander()
+
+                def selectbox(self, label, options, *_args, **_kwargs):
+                    return imported if label == "运行" else "全部"
+
+                def caption(self, message):
+                    self.captions.append(message)
+
+                def markdown(self, *_args, **_kwargs):
+                    pass
+
+                def write(self, *_args, **_kwargs):
+                    pass
+
+                def __init__(self):
+                    self.captions = []
+
+            st = FakeStreamlit()
+            with patch.dict(sys.modules, {"streamlit": st}):
                 render_evaluation_page("system_admin")
 
-            self.assertEqual(render_summary.call_args.args[1].run_id, current.name)
-            self.assertEqual(render_summary.call_args.args[3].run_id, baseline.name)
+            self.assertTrue(any("导入" in caption and "2" in caption for caption in st.captions))
 
     def test_preflight_scoring_reports_missing_ragas_dependency(self):
         with patch("src.ui.evaluation_page.importlib.util.find_spec", return_value=None):

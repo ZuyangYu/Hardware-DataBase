@@ -980,11 +980,25 @@ class RAGFlowBackend(RAGBackend):
         }
         top_k = top_k or config.settings.FINAL_TOP_K
         route = route_source_groups(query)
-        routed_source_groups = route.source_groups if route.should_filter else ()
+        # Stage 5 adaptive recovery: balanced_route drops the source_group hard
+        # filter so a query that mis-routed (the frozen evidence lives in a
+        # different group) can still reach frozen sources. The frozen
+        # source_names scope and the local _filter_chunks source_name check
+        # remain, so this never widens the result beyond the frozen source set.
+        balanced_route = bool((filters or {}).get("balanced_route"))
+        if balanced_route:
+            routed_source_groups = ()
+        else:
+            routed_source_groups = route.source_groups if route.should_filter else ()
         if routed_source_groups:
             log(f"RAGFlow source-group route: {route.reason}, filter={routed_source_groups}")
         else:
-            log(f"RAGFlow source-group route: {route.reason}, no hard filter")
+            log(
+                "RAGFlow source-group route: "
+                + route.reason
+                + (", balanced_route" if balanced_route else "")
+                + ", no hard filter"
+            )
         self._ensure_physical_datasets()
         dataset_ids = list(dict.fromkeys(self._dataset_ids.values()))
         metadata_condition = _metadata_condition(kb_name, ctx, routed_source_groups, filters=filters)

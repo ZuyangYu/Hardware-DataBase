@@ -1,0 +1,43 @@
+{
+  "cohort_fingerprint": "fef6a0eae11479642a30213b9173a2f6623fd3e9c44e99103fcfc1be15aee6d9",
+  "file_sha256": {
+    "report.html": "de5f460fc286ebee14793d5312c1fbfb960d23bd97436a5904ae1d018f0bc141",
+    "results.jsonl": "526d2b81f3309fd4dd26353ad1d617331eb38ddd64cbe925b24276d4aeb160ae",
+    "summary.csv": "4f2d7b391e0baa1183ed4a3850b982988a070e9f7595088f4f93c6f9b9925688",
+    "summary.json": "885f06edf8c42fcddf2eaa5bc4e2e8a260b81f0ccd0aa0a3cf325c9e411f5cb6"
+  },
+  "imported_at": "2026-08-03T10:14:39.762207+00:00",
+  "sample_ids": [
+    "hw-v1-circuit-tps22918-enumeration",
+    "hw-v1-circuit-tps22918-paraphrase",
+    "hw-v1-circuit-u1700-pins",
+    "hw-v1-circuit-u1800-control",
+    "hw-v1-circuit-vcc1v8-switch",
+    "hw-v1-circuit-vcc3v3-loads",
+    "hw-v1-circuit-vcc3v3-role",
+    "hw-v1-conflict-main-mcu",
+    "hw-v1-conflict-mcu-paraphrase",
+    "hw-v1-direct-capabilities",
+    "hw-v1-document-hardware-modules",
+    "hw-v1-document-lp87702-section",
+    "hw-v1-joint-can-module",
+    "hw-v1-joint-main-pmic",
+    "hw-v1-joint-main-pmic-paraphrase",
+    "hw-v1-joint-overvoltage",
+    "hw-v1-joint-pmic-noisy-query",
+    "hw-v1-joint-vcc0v75",
+    "hw-v1-missing-bom-paraphrase",
+    "hw-v1-missing-protection-threshold",
+    "hw-v1-missing-u1700-price",
+    "hw-v1-multihop-eth-enable",
+    "hw-v1-multihop-eth-power",
+    "hw-v1-permission-cross-kb-isolation",
+    "hw-v1-permission-empty-scope"
+  ],
+  "schema_version": 1,
+  "source_directory_name": "20260722T015732Z-4feda740",
+  "source_path": "/home/user/workspace/Hardware-DataBase-integrate-develop/storage/evaluations/20260722T015732Z-4feda740",
+  "source_root": "/home/user/workspace/Hardware-DataBase-integrate-develop/storage/evaluations",
+  "summary_run_id": "20260722T015732Z-4feda740",
+  "validation_warnings": []
+}

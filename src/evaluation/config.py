@@ -22,6 +22,16 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _non_negative_int_env(name: str, default: int) -> int:
+    try:
+        value = int(_env(name, str(default)))
+    except ValueError as exc:
+        raise EvaluationConfigurationError(f"{name} must be an integer") from exc
+    if value < 0:
+        raise EvaluationConfigurationError(f"{name} must be at least 0")
+    return value
+
+
 def _fraction_env(name: str, default: float) -> float:
     try:
         value = float(_env(name, str(default)))
@@ -46,15 +56,15 @@ class EvaluationConfig:
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
-    llm_max_tokens: int = 8192
+    llm_max_tokens: int = 4096
     max_contexts_per_sample: int = 4
-    max_context_chars: int = 4000
-    max_context_chars_per_item: int = 1200
-    scoring_max_budget_attempts: int = 3
+    max_context_chars: int = 2000
+    max_context_chars_per_item: int = 800
+    scoring_max_budget_attempts: int = 1
     scoring_context_shrink_factor: float = 0.5
-    timeout_seconds: int = 120
+    timeout_seconds: int = 60
     max_workers: int = 4
-    max_retries: int = 2
+    max_retries: int = 0
     output_root: str = "storage/evaluations"
 
     @classmethod
@@ -91,12 +101,15 @@ class EvaluationConfig:
             raise EvaluationConfigurationError("EVAL_EMBEDDING_BASE_URL is required")
         if not embedding_model:
             raise EvaluationConfigurationError("EVAL_EMBEDDING_MODEL is required")
-        llm_max_tokens = _positive_int_env("EVAL_LLM_MAX_TOKENS", 8192)
+        llm_max_tokens = _positive_int_env("EVAL_LLM_MAX_TOKENS", 4096)
         max_contexts_per_sample = _positive_int_env("EVAL_MAX_CONTEXTS_PER_SAMPLE", 4)
-        max_context_chars = _positive_int_env("EVAL_MAX_CONTEXT_CHARS", 4000)
-        max_context_chars_per_item = _positive_int_env("EVAL_MAX_CONTEXT_CHARS_PER_ITEM", 1200)
-        scoring_max_budget_attempts = _positive_int_env("EVAL_SCORING_MAX_BUDGET_ATTEMPTS", 3)
+        max_context_chars = _positive_int_env("EVAL_MAX_CONTEXT_CHARS", 2000)
+        max_context_chars_per_item = _positive_int_env("EVAL_MAX_CONTEXT_CHARS_PER_ITEM", 800)
+        scoring_max_budget_attempts = _positive_int_env("EVAL_SCORING_MAX_BUDGET_ATTEMPTS", 1)
         scoring_context_shrink_factor = _fraction_env("EVAL_SCORING_CONTEXT_SHRINK_FACTOR", 0.5)
+        timeout_seconds = _positive_int_env("EVAL_TIMEOUT_SECONDS", 60)
+        max_workers = _positive_int_env("EVAL_MAX_WORKERS", 4)
+        max_retries = _non_negative_int_env("EVAL_MAX_RETRIES", 0)
 
         return cls(
             llm_provider=provider,
@@ -112,9 +125,9 @@ class EvaluationConfig:
             max_context_chars_per_item=max_context_chars_per_item,
             scoring_max_budget_attempts=scoring_max_budget_attempts,
             scoring_context_shrink_factor=scoring_context_shrink_factor,
-            timeout_seconds=int(_env("EVAL_TIMEOUT_SECONDS", _env("AGENT_TIMEOUT_SECONDS", "120"))),
-            max_workers=max(1, int(_env("EVAL_MAX_WORKERS", "4"))),
-            max_retries=max(0, int(_env("EVAL_MAX_RETRIES", "2"))),
+            timeout_seconds=timeout_seconds,
+            max_workers=max_workers,
+            max_retries=max_retries,
             output_root=_env("EVAL_OUTPUT_ROOT", "storage/evaluations"),
         )
 

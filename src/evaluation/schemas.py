@@ -163,6 +163,8 @@ class EvaluationRunState(BaseModel):
     completed_samples: int = 0
     successful_samples: int = 0
     failed_samples: int = 0
+    scoring_completed_groups: int = 0
+    scoring_total_groups: int = 0
     current_sample_id: str = ""
     current_question: str = ""
     started_at: str = ""

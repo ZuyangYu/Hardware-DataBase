@@ -1,4 +1,5 @@
 ﻿from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -16,6 +17,19 @@ class RequestContext:
     allowed_kbs: list[str] = field(default_factory=list)
     kb_permissions: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Project scope is deliberately separate from knowledge-base scope. These
+    # values are a short-lived authentication snapshot only; project services
+    # always re-check the persisted ProjectPrincipalBinding before use.
+    tenant_id: str | None = None
+    project_id: str | None = None
+    allowed_projects: list[str] = field(default_factory=list)
+    project_roles: dict[str, str] = field(default_factory=dict)
+    project_capabilities: dict[str, list[str]] = field(default_factory=dict)
+    baseline_id: str | None = None
+    target_revision: str | None = None
+    effective_at: datetime | None = None
+    module_scope: list[str] = field(default_factory=list)
 
     def is_system_admin(self) -> bool:
         return "system_admin" in self.roles
@@ -52,6 +66,30 @@ class Evidence:
     metadata: dict[str, Any] = field(default_factory=dict)
     backend: str = "ragflow"
     retriever: str = ""
+
+
+@dataclass
+class EvidenceEnvelope(Evidence):
+    """Stable evidence exchanged at the project/document domain boundary."""
+
+    project_id: str | None = None
+    baseline_id: str | None = None
+    source_version_id: str | None = None
+    processing_artifact_id: str | None = None
+    document_role: str | None = None
+    module_scope: list[str] = field(default_factory=list)
+    revision: str | None = None
+    approval_status: str | None = None
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
+    locator: dict[str, Any] = field(default_factory=dict)
+    fact_type: str | None = None
+    certainty: str = "retrieved_statement"
+    authority_policy_id: str | None = None
+    content_hash: str = ""
+    quote_span: dict[str, Any] | None = None
+    lineage_group_id: str | None = None
+    retrieved_at: datetime | None = None
 
 
 INGEST_STATUS_SUCCESS = "success"
@@ -140,7 +178,7 @@ def normalize_parse_status(raw_status: object, processor_kind: str = "") -> str:
         return TASK_STATUS_QUEUED
     if status in {"1", "running", "parsing", "processing", "started"}:
         return TASK_STATUS_RUNNING
-    if status in {"2", "done", "success", "parsed", "completed", "complete", "finish", "finished", "indexed", "已完成"}:
+    if status in {"2", "done", "success", "parsed", "completed", "complete", "finish", "finished", "indexed", "degraded", "已完成"}:
         return TASK_STATUS_COMPLETED
     if status in {"3", "fail", "failed", "error", "exception", "unsupported"}:
         return TASK_STATUS_FAILED
@@ -229,4 +267,3 @@ class BackendHealth:
     message: str = ""
     details: dict[str, Any] = field(default_factory=dict)
     backend: str = "ragflow"
-

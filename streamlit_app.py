@@ -20,6 +20,7 @@ from src.pipelines.document_rag.schemas import (
 )
 import config.settings
 from src.ui.evaluation_page import render_evaluation_page
+from src.ui.document_generation_page import render_document_generation_page
 
 AUTH_QUERY_PARAM = "hd_session"
 
@@ -2665,9 +2666,9 @@ def main():
         if role == ROLE_SYSTEM_ADMIN:
             tab_options = ["🧭 知识库治理", "👥 部门管理", "📊 日志中心", "🧪 RAGAS 评估", "⚙️ 系统配置"]
         elif role == ROLE_DEPT_ADMIN:
-            tab_options = ["💬 智能对话", "👥 部门管理", "📚 知识库管理", "📊 日志中心"]
+            tab_options = ["💬 智能对话", "📝 文档生成", "👥 部门管理", "📚 知识库管理", "📊 日志中心"]
         else:
-            tab_options = ["💬 智能对话"]
+            tab_options = ["💬 智能对话", "📝 文档生成"]
 
         selected_tab = st.radio("**🚩 功能切换:**", tab_options, label_visibility="collapsed")
         st.divider()
@@ -2829,6 +2830,13 @@ def main():
             - 切换 Provider 或模型会**清空当前对话**。
             - API Key 使用密码输入，安全存储。
             """)
+        elif selected_tab == "📝 文档生成":
+            st.warning("""
+            **文档生成：**
+            - 仅使用已授权项目、已批准基线和冻结来源集。
+            - 候选产物不等于正式发布；人工审批将绑定候选内容、验证报告和来源快照。
+            - 不会使用当前聊天会话或随意的本地文件路径作为输入。
+            """)
         st.divider()
         st.caption("© 2025 Hardware DataBase Assistant")
 
@@ -2843,6 +2851,11 @@ def main():
             st.error("系统管理员不使用知识库对话，请使用测试部门管理员账号进行功能测试。")
             st.stop()
         render_chat_tab(pipeline)
+    elif selected_tab == "📝 文档生成":
+        if st.session_state.get("role") == ROLE_SYSTEM_ADMIN:
+            st.error("系统管理员没有项目正文的默认访问权限；请使用项目成员账号。")
+            st.stop()
+        render_document_generation_page(st, pipeline, build_request_context(st.session_state))
     elif selected_tab == "🧭 知识库治理":
         if st.session_state.get("role") != ROLE_SYSTEM_ADMIN:
             st.error("当前账号无权访问知识库治理")

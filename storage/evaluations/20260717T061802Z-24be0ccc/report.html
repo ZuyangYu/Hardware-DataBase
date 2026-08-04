@@ -1,0 +1,214 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>Hardware RAG Evaluation</title><style>body{font-family:sans-serif;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:.4rem}th{background:#f5f5f5}</style></head><body><h1>评估报告 20260717T061802Z-24be0ccc</h1><p>样本 1；成功 1；失败 0</p><table><thead><tr><th>sample_id</th><th>snapshot_status</th><th>answer_correctness</th><th>answer_relevancy</th><th>completeness</th><th>conflict_disclosure</th><th>context_precision</th><th>context_recall</th><th>evidence_consistency</th><th>faithfulness</th><th>missing_information_honesty</th></tr></thead><tbody><tr><td>hw-v1-document-lp87702-section</td><td>success</td><td>failed</td><td>0.723</td><td>0.667</td><td>not_applicable</td><td>0.333</td><td>1.000</td><td>0.000</td><td>failed</td><td>not_applicable</td></tr><tr><td colspan='11'><strong>问题：</strong>软件配置 LP87702 应查 HSI 的哪一节？<br><strong>参考答案：</strong>应查 HSI 7.2 节“LP87702 配置”，其中给出软件寄存器和 I²C 配置说明。<br><strong>实际回答：</strong>根据已有证据，关于LP87702软件配置对应的HSI章节，回答如下：
+
+### 1. 在HSI文档中，关于LP87702软件配置的章节是哪一节？
+
+**结论：** 应查阅 **第7章“其他芯片配置”下的7.2节“LP87702配置”**。
+
+**证据来源：**
+- 证据[2]（来自文档`600608964_ADAS_HSI_0506_1952_shoulin.wang.docx`）中明确列出：“LP87702配置 LP87702 Configuration...LP87702运行期间需要MCU通过I2C配置的寄存器如下所示：Table 5-2 LP87702 Configuration”。
+- 证据[3]（来自同一文档的目录部分）中明确列出：“7.2 LP87702配置 LP87702 Configuration”。
+
+**说明：** 该章节（7.2节）详细描述了LP87702在运行期间需要MCU通过I2C进行配置的寄存器内容（如证据[2]中提到的Table 5-2）。
+
+---
+
+### 2. 证据冲突说明
+
+根据提供的`coverage_matrix`，检测到以下证据冲突，这些冲突不涉及“LP87702软件配置章节”这一核心问题，但为保持严谨，特此列出：
+
+1.  **字段`template change history`**：同一文档`600608964_ADAS_HSI_0506_1952_shoulin.wang.docx`中，对“模板变更历史”这一字段给出了从“1”到“5”的多个不同取值（如证据[8]所示）。这是文档模板本身的历史记录，不影响对“LP87702配置”章节的定位。
+2.  **字段`accuracy`**：同一文档中，对“MCU供电电压精度”给出了“1.2-1.35v”和“3.3v”两个不同值（如证据[10]所示）。这属于不同电压轨的精度要求，并非冲突。
+3.  **字段`td colspan` 和 `operation disabled 1b`**：在PDF文档`FF4D6750FC7339E769C3F6246C6F971C.pdf`（TPS62872数据手册）中，存在表格列合并（colspan）和寄存器描述（如“Hiccup”与“SSC”）的多个取值。这些是数据手册中的不同表格或不同寄存器位，不属于逻辑冲突。
+
+**结论：** 以上冲突均不涉及用户所问的“LP87702软件配置章节”问题，不影响主答案的准确性。<br><strong>检索上下文：</strong>Instance U1700: LP87702-Q1, 20200424007, LP87702RRHBRQ1, pqfn50p5x5x90-32. | ADC电压采集阈值 The ADC voltage acquisition thresholdWCCA计算结果如下，软件应按照如下过欠压阈值设置：The WCCA calculation results are as follows. The software should be set according to the following overvoltage and undervoltage thresholds:EQ6L上下电时序要求 EQ6L Power-on and power-off sequence requirements共享和独占的硬件资源 Shared and Exclusive Hardware ResourceECU-MCU信号对应关系 ECU-MCU Signal MappingMCU时钟配置 MCU Clock Configuration存储器配置 Memeory ConfigurationTable 4-5Memory Configuration其他芯片配置 Other IC Configuration其他芯片的通讯机制 Communication Mechanism with Other ICLP87702配置 LP87702 ConfigurationLP87702运行期间需要MCU通过I2C配置的寄存器如下所示：Table 5-2 LP87702 ConfigurationTPS62872配置 TPS62872 ConfigurationTPS62872运行期间需要MCU通过I2C配置的寄存器如下所示：Table 5-3 TPS62872 Configuration安全机制 Safety MechanismsSystem levelHW level硬件安全分析无新增安全机制IC level模板变更历史Template Change History填写说明Filling instructions：变更单号YYYYMM00X为记录顺序号，如：202203002，表示的是2022年03月的第二份此类文档。首次发布不分配变更单号，变更单号处填NA。The change order number YYYYMM00X is the record sequence number, such as 202203002, which represents the second such document in March 2022. No change order number will be allocated for the first release, and Na will be filled in the change order number.变更原因填写以客户审核需要变更为例：由于XX客户在客户审核时发现XX问题，需要调整模板。Fill in the revision note. Take the need for change in customer audit as an example: because XX customer found XX problem during customer audit, the template needs to be adjusted.变更内容填写以客户审核发现问题需要更改为例：由于XX客户在客户审核时发现XX问题，特增加XXX的变更内容。 | 3.3.5 EQ6最小系统 EQ6 minimum system	553.3.6 摄像头最小系统 camera minimum system	593.3.7 看门狗电路 Watchdog circuit	613.3.8 温度采样电路 Temp Sample circuit	623.3.9 ETH电路 ETH circuit	633.3.10 CAN FD电路 CAN FD circuit	654	ADC电压采集阈值 The ADC voltage acquisition threshold	685	EQ6L上下电时序要求 EQ6L Power-on and power-off sequence requirements	686	共享和独占的硬件资源 Shared and Exclusive Hardware Resource	696.1 ECU-MCU信号对应关系 ECU-MCU Signal Mapping	696.2 MCU时钟配置 MCU Clock Configuration	706.3 存储器配置 Memeory Configuration	717	其他芯片配置 Other IC Configuration	717.1 其他芯片的通讯机制 Communication Mechanism with Other IC	717.2 LP87702配置 LP87702 Configuration	727.3 TPS62872配置 TPS62872 Configuration	728	安全机制 Safety Mechanisms	736.1 System level	736.2 HW level	736.3 IC level	73概述 Introduction目的 Purpose软硬接口文档的目的是描述软件和硬件的交互，并且确保软件硬件和TSR的一致性。The goal of the hardware software interface document is to specify the hardware and software interaction and be consistent with the technical safety concept.适用范围 Range of Application此文档适用于奇瑞EQ6L T1G ADAS项目的功能安全开发全过程。This document is applied for the whole functional safety development process of  EQ6L T1G ADAS project.读者对象 TReader项目经理Project Manager项目组成员Project Team Members功能安全经理Functional Safety Manager功能安全工程师Functional Safety System Engineer硬件工程师 Hardware Engineer软件工程师 Software Engineer质量和审查人员QA and Assessor产品测试人员Product Test Engineer | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F13&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;运行模式
+Operation Mode&lt;/td&gt;&lt;td&gt;SHUTDOWN、READ OTP、STANDBY、ACTIVE&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式定义
+Definition of Operation mode&lt;/td&gt;&lt;td&gt;SHUTDOWN
+NRST电压低于阈值。LP87702-Q1器件停止工作。
+READ OTP
+电源电压VANA高于VANAUVLO电平，并且NRST电压高于阈值电平。电压转换器被禁用，LP87702-Q1的参考电平和偏置电路被启用。OTP配置被加载到寄存器。
+STANDBY
+电源电压VANA高于VANAUVLO水平，NRST电压高于阈值水平。电压转换器被禁用，LP87702-Q1的参考电平、控制和偏压电路被启用。所有的寄存器都可以被主机处理器通过系统串口读写。电压转换器可以根据需要进行使能输出。
+ACTIVE
+电源电压VANA高于VANAUVLO水平，NRST电压高于阈值水平。稳压DC/DC变换器处于使能状态。所有的寄存器都可以被MCU通过系统串口读写。
+SHUTDOWN
+After the enable signal MCU_OV75_MIPI_DDR_EN=L, the secondary power stops the 0V75_MIPI_DDR power supply. 
+READY OTP
+The supply voltage VANA is above the VANAUVLO level, and the NRST voltage is above the threshold level. The voltage converter is disabled and the reference level and bias circuits of the LP87702-Q1 are enabled. The OTP configuration is loaded into the register.
+STANDBY
+The supply voltage VANA is above the VANAUVLO level and the NRST voltage is above the threshold level. The voltage converter is disabled and the reference level, control, and bias circuits of the LP87702-Q1 are enabled. All registers can be read and written by the host processor through the system serial port. The voltage converter can perform enabling output as needed.
+ACTIVE
+The supply voltage VANA is above the VANAUVLO level and the NRST voltage is above the threshold level. The regulated DC/DC converter is in the enabled state. All the registers can be read and written by the MCU through the system serial port. &lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式切换接口
+Mode switching interface&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式状态机
+Mode state machine&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式切换条件
+Mode switching condition&lt;/td&gt;&lt;td&gt;参考：
+产品系统需求规格说明
+产品系统方案设计说明书
+Reference: 
+Product system requirement specification 
+Product system scheme design specification.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;备注
+Note&lt;/td&gt;&lt;td&gt;1、VANAUVLO阈值电压
+
+2、NRST阈值电压
+&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;备注
+Note&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F26&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;系统需求MCU外置看门狗，用于监控MCU功能异常时进行复位。
+The system requires MCU external watchdog, used to monitor MCU function abnormal reset.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;窗口看门狗喂狗参数由LP87702的OTP文件进行配置，具体参数为：喂狗长周期600ms，窗口为10~30ms，看门狗输出复位信号低电平持续10ms。用MCU的P13.3引脚喂狗。
+The window watchdog feeding parameters are configured by the OTP file of LP87702, the specific parameters are: feeding the dog for a long period of 600ms, the window is 10~30ms, and the low level of the watchdog output reset signal lasts for 10ms. Feed the dog with P13.3 pin of the MCU. &lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | 
+MCU Component ：F01/ MCU; None：QM; None：E11; None：P12.1; None：P12.1/GTM_TIM4_IN1_6/GTM_TIM3_IN1_6/GETH_MDIOC/GTM_TOUT129/CAN00_TXD/GETH_MDIO; None：GPIO; None：MCU_nINT_PMIC_P12.1; None：/; None：I; None：LP87702的输出中断信号。
+高：无中断信号
+低：输出中断信号; None：HI-Z，硬件外部上拉; None：—; SW Variable Name or SW Function Name：— ——Port1
+HW Interface Component ：QM(B); None：F13/POWER
+F14/POWER; None：MCU配置LP87702、TPS62872; MCU Component ：F01/MCU; None：B; None：E14; None：P15.5; None：P15.5/GTM_TIM3_IN0_4/GTM_TIM2_IN0_4/QSPI2_MTSRA/GTM_TOUT76/QSPI2_MTSR/MSC0_EN0/I2C0_SDA; None：I2C0_SDAC; None：MCU_SDA_P15.5; None：/; None：IO; None：IIC_SDA信号
+
+外挂LP87702和TPS62872
+
+LP87702地址：0x08
+TPS62872地址：0x41; None：HI-Z，硬件外部上拉; None：—; SW Variable Name or SW Function Name：— ——Port1
+MCU Component ：F01/MCU; None：B; None：A17; None：P15.4; None：P15.4/GTM_TIM3_IN7_4/GTM_TIM2_IN7_4/I2C0_SCLC/QSPI2_MRSTA/SCU_E_REQ0_0/GTM_TOUT75/QSPI2_MRST; None：I2C0_SCL; None：MCU_SCL_P15.4; None：/; None：O; None：IIC_CLK信号
+
+外挂LP87702和TPS62872
+
+LP87702地址：0x08
+TPS62872地址：0x41; None：HI-Z，硬件外部上拉; None：—; SW Variable Name or SW Function Name：— ——Port1 | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F13&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;VCC1V8用于EQ6、CAM、DDR、FLASH供电。VCC1V1用于EQ6、DDR供电。VCC50用于CAN收发器供电，现选择LP87702 PMIC方案。
+VCCIV8 is used to power EQ6, CAM, DDR, FLASH.VCC1V1 is used to power EQ6,DDR. VCC50 is used for CAN transceiver power supply, now choose LP87702 PMIC scheme. 
+&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;
+采用LP87702芯片，将VCC3V3转换为VCC1V8、VCC1V1、VCC50，其中VCC1V8用于EQ6、CAM、DDR、FLASH供电，VCC1V1用于EQ6、DDR供电，VCC50用于CAN收发器供电。用MCU的P15.3引脚使能该芯片的5V输出，用MCU_SCL_P15.4，MCU_SDA_P15.5 I2C通信来设置1.8V和1.1输出电压和使能。用MCU的P12.1引脚复位该芯片。
+LP87702 chip is used to convert VCC3V3 into VCC1V8, VCC1V1 and VCC50, in which VCC1V8 is used for EQ6, CAM, DDR and FLASH power supply, VCC1V1 is used for EQ6 and DDR power supply, and VCC50 is used for CAN transceiver power supplyP15.3 pin of MCU is used to enable 5V output of the chip, and MCU_SCL_P15.4, MCU_SDA_P15.5 I2C communication is used to set 1.8V and 1.1 output voltage and enable it. Reset the chip with P12.1 pin of the MCU. &lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | 
+模板变更历史Template Change History：1; None：NA; None：首次发布; None：首次发布; None：01; None：2021-08-26 00:00:00; None：宫明玉; None：王会苹 ——模板变更历史Template change history
+模板变更历史Template Change History：2; None：HR-CIMA-CI-DCR_202210002; None：模板优化调整; None：1. 添加填写说明页与定义页
+2. 封面内容修订，字体字号、底色布局等格式优化; None：02; None：2023-06-10 00:00:00; None：宫明玉; None：王会苹 ——模板变更历史Template change history
+模板变更历史Template Change History：3; None：HR-CIMA-CI-TCR_202312002; None：模板中需增加复用说明; None：增加HSI复用说明列; None：03; None：2023-10-10 00:00:00; None：宫明玉; None：王会苹 ——模板变更历史Template change history
+模板变更历史Template Change History：4; None：HR-CIMA-CI-TCR_202401001; None：功能安全相关模板修订和其他模板修订; None：新增“软件需使能低压复位功能，低压阈值与硬件工程师沟通确认”要求; None：04; None：2024-01-24 00:00:00; None：宫明玉; None：王会苹 ——模板变更历史Template change history
+模板变更历史Template Change History：5; None：HR-CIMA-CI-TCR_202409001; None：一个硬件的接口可能会对应多个软件功能; None：1.增加基于系统开发的角度写的HIS example4
+2.更新HSI模板; None：05; None：2024-09-10 00:00:00; None：宫明玉; None：师明 ——模板变更历史Template change history | &lt;table&gt;&lt;tr&gt;&lt;td&gt;序号&lt;/td&gt;&lt;td&gt;详细说明&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;蓝色斜体文字为相关填写具体要求（例：方法说明、规范要求、覆盖度要求、与其他工作产品的一致性要求等），形成具体工作产品时可删除蓝色斜体部分&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;黑色斜体文字为参考样例，形成具体工作产品时可删除黑色斜体部分&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;3&lt;/td&gt;&lt;td&gt;本文件所列章节原则不允许裁剪，如不涉及本章节内容，在章节内写“无”，如有补充内容可新增章节。当不涉及到功能安全、ASPICE、网络安全等特殊体系要求时，模板正文相关内容可进行裁剪&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F01&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;32位MCU芯片TC377最小系统模块有SAK-TC377TP-96F300S AA主控芯片和晶体、硬件配置组成，实现SAK-TC377TP-96F300S AA最小硬件系统工作单元，功能安全等级最高可达到ASIL-D，满足应用要求。
+32-bit MCU chip TC377 minimum system module has SAK-TC377TP-96F300S AA main control chip and crystal, hardware configuration, to achieve SAK-TC377TP-96F300S AA minimum hardware system work unit, functional safety level up to ASIL-D, meet the application requirements. &lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;处理器
+根据ADAS产品需求，综合评估选型为32位MCU芯片SAK-TC377TP-96F300S AA， MCU接口资源丰富，功能安全等级最高可达到ASIL-D，满足应用要求。
+Processor 
+According to ADAS product requirements, 32-bit MCU chip SAK-TC377TP-96F300S AA is selected through comprehensive evaluation, which has rich MCU interface resources and the highest functional safety level can reach ASIL-D to meet application requirements
+时钟设计
+硬件选型20MHz晶振给MCU提供时钟输入，由其内部PLL等电路完成倍频、分频，供其内核和各模块使用。
+Clock design
+Hardware selection of clock design 20MHz crystal oscillator provides clock input to MCU, and its internal PLL and other circuits complete frequency doubling and frequency division for its kernel and each module.
+复位及watchdog
+系统复位及看门狗芯片采用LP87702内部看门狗，喂狗方式为窗口喂狗，当喂狗窗口无有效喂狗次数超过OTP配置时，将触发整个系统复位。
+a)	上电时，看门狗芯片对MCU启动过程进行监控，同时对MCU的电源VCC3V3电压进行低压监控，异常时主动复位MCU。
+b)	运行过程中由看门狗监控MCU运行状态，当MCU程序跑飞时看门狗超时触发复位信号主动复位MCU。
+Reset and watchdog
+The system reset and watchdog chip adopts LP87702 internal watchdog, and the feeding method is window feeding. When the number of effective dog feeding in the feeding window exceeds the OTP configuration, the whole system reset will be triggered. 
+ When powering on, the watchdog chip monitors the start-up process of MCU, and at the same time, it monitors the low voltage voltage of MCU&#x27;s power supply VCC3V3, and actively resets MCU when abnormal. 
+ MCU running status is monitored by watchdog during operation. When MCU program runs, watchdog timeout triggers reset signal and actively reset MCU.
+电源需求
+MCU需要1路VCC3V3_MCU（精度：3.3V±10%）和1路VCC1V25_MCU（精度：1.2-1.35V）供电。
+4. Power demand
+The MCU needs 1 channel VCC3V3_MCU (accuracy: 3.3V±10%) and 1 channel VCC1V25_MCU (accuracy: 1.2-1.35V) power supply.&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | 
+None：U20; None：P23.2; None：P23.2/GTM_TIM1_IN6_5/GTM_TIM0_IN6_5/GTM_TOUT43/CAN12_TXD; None：GPIO; None：MCU_RST_FLASH_P23.2; None：/; None：O; None：FLASH复位信号
+低：FLASH复位
+高：FLASH进入工作状态; None：HI-Z，硬件外部下拉; None：—; SW Variable Name or SW Function Name：— ——Port1
+None：未使用; MCU Component ：F01/ MCU; None：NA; None：/; None：D7; None：P11.14; None：P11.14/GTM_TIM4_IN7_4/GTM_TIM2_IN7_8/GETH_CRSDVB/GETH_RXDVB/GETH_CRSA/GTM_TOUT126; None：GPIO; None：MCU_ETH_CFG1_P11.14; None：/; None：I; None：CFG1：BOM配置，判断是否有以太网
+高：TBD
+低：TBD; None：HI-Z; None：—; SW Variable Name or SW Function Name：— ——Port1
+None：未使用; MCU Component ：F01/ MCU; None：NA; None：/; None：D6; None：P11.15; None：P11.15/GTM_TIM4_IN7_5/GTM_TIM0_IN7_8/GETH_COLA/GTM_TOUT127; None：GPIO; None：MCU_ETH_CFG2_P11.15; None：/; None：I; None：CFG2：BOM配置，判断以太网接口类型
+高：TBD
+低：TBD; None：HI-Z; None：—; SW Variable Name or SW Function Name：— ——Port1
+HW Interface Component ：QM(B); None：F13/POWER; None：1、LP87702实现VCC3V3转VCC1V8、VCC1V1、VCC50三路电源输出
+2、LP87702的VCC50由MCU的GPIO控制使能和关断，VCC1V8、VCC1V1由MCU的I2C控制使能和关断。
+3、预留中断信号用于MCU辅助监控LP87702的工作状态。
+4、MCU可以通过I2C监控和管理LP87702的状态。; MCU Component ：F01/ MCU; None：QM; None：B17; None：P15.3; None：P15.3/GTM_TIM3_IN6_4/GTM_TIM2_IN6_4/CAN01_RXDA/QSPI2_SCLKA/GTM_TOUT74/QSPI2_SCLK/MSC0_EN1; None：GPIO; None：MCU_5V_EN; None：/; None：O; None：VCC50（LP87702）电源使能控制信号
+高：使能VCC50电压输出
+低：关断VCC50电压输出; None：HI-Z，硬件外部下拉; None：—; SW Variable Name or SW Function Name：— ——Port1 | 
+None：V1.0; None：首次发布; None：张三; None：YYYY-MM-DD; None：XXXXX ——封面Cover
+None：V2.0; None：由于XXX原因，变更XX章节XX部分内容; None：张三; None：YYYY-MM-DD; None：XXXXX ——封面Cover
+None：编制：
+Author：; None：产品硬件设计工程师
+Product hardware design engineer; None：签字Sign：; 文件编号File No：6XXXXXXXX_BBB_HW_IP_00X
+保存期限：产品生命周期加1个日历年；如属安全件，保存15个日历年以上
+Retention period:Product life cycle +1 calendar year.
+If it is a safety part, keep it for more than 15 calendar years
+密级：内部
+Security level：Internal：张三
+Zhang San; None：日期Date：; None：YYYY-MM-DD ——封面Cover
+None：审核：
+Checker:; None：产品硬件架构工程师
+Product hardware architecture engineer; None：签字Sign：; None：日期Date： ——封面Cover
+None：审核：
+Checker:; None：产品软件开发工程师
+Product software development engineer; None：签字Sign：; None：日期Date： ——封面Cover
+None：审核：
+Checker:; None：产品功能安全系统工程师
+Product functional safety  system engineer; None：签字Sign：; None：日期Date： ——封面Cover
+None：批准：
+Approver:; None：产品系统工程师    
+Product system engineer; None：签字Sign：; None：日期Date： ——封面Cover
+None：所 有 权 声 明Statement of proprietary rights ——封面Cover
+None：该文档及其所含信息是经纬恒润的财产。该文档及其所含信息的复制、使用及披露必须得到经纬恒润的书面授权。
+This document and the information it contains are the property of Jingwei Hirain. The reproduction, use and disclosure of this document and the information contained therein must be authorized in writing by Jingwei Hirain. ——封面Cover | &lt;table&gt;&lt;caption&gt; Device Information&lt;/caption&gt;
+&lt;tr&gt;&lt;td colspan=3 rowspan=3 &gt;Part Number Current Rating Package TPS62870-Q1 6A TPS62871-Q1 9A RXS (VQFN-FCRLF, TPS62872-Q1 12 A 16) TPS62873-Q1 15 A&lt;/td&gt;&lt;/tr&gt;
+
+&lt;/table&gt; | &lt;table&gt;&lt;caption&gt; Table9-5.DefaultOutputVoltageSetpoints&lt;/caption&gt;
+&lt;tr&gt;&lt;td  &gt;VSEL Pin(1)&lt;/td&gt;&lt;td  &gt;Device Number&lt;/td&gt;&lt;td  &gt;VSET[7:0]&lt;/td&gt;&lt;td  &gt;Output Voltage Setpoint&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;TPS6287x-Q1&lt;/td&gt;&lt;td  &gt;0x5a&lt;/td&gt;&lt;td  &gt;850 mV&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;TPS6287xY0-Q1&lt;/td&gt;&lt;td  &gt;0x50&lt;/td&gt;&lt;td  &gt;800 mV&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;TPS6287xY1-Q1&lt;/td&gt;&lt;td  &gt;0x14&lt;/td&gt;&lt;td  &gt;500 mV&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;TPS6287xY2-Q1&lt;/td&gt;&lt;td  &gt;0x64&lt;/td&gt;&lt;td  &gt;1800 mV&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;6.2 kQ to GND&lt;/td&gt;&lt;td  &gt;TPS6287xY3-Q1&lt;/td&gt;&lt;td  &gt;0x52&lt;/td&gt;&lt;td  &gt;810 mV&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;TPS6287xN0-Q1&lt;/td&gt;&lt;td  &gt;0x14&lt;/td&gt;&lt;td  &gt;500 mV&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;TPS6287xN1-Q1&lt;/td&gt;&lt;td  &gt;0x50&lt;/td&gt;&lt;td  &gt;800 mV&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;TPS6287xN2-Q1&lt;/td&gt;&lt;td  &gt;0x64&lt;/td&gt;&lt;td  &gt;1800 mV&lt;/td&gt;&lt;/tr&gt;
+&lt;/table&gt; | &lt;table&gt;&lt;caption&gt; Table 6-2. Devices Without I²C Interface (continued) Unless otherwise noted, device variants without I2C operate with the same default settings as device variants with 12C.&lt;/caption&gt;
+&lt;tr&gt;&lt;td  &gt;DeviceNumber&lt;/td&gt;&lt;td  &gt;OutputCurrent&lt;/td&gt;&lt;td  &gt;Start-UpVoltage(2)&lt;/td&gt;&lt;td  &gt;VSEL Settings&lt;/td&gt;&lt;td  &gt; Spread Spectrum Clocking&lt;/td&gt;&lt;td  &gt; Soft-Start Time&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62870N1QWRXSRQ1&lt;/td&gt;&lt;td  &gt;6A&lt;/td&gt;&lt;td  &gt;0.800 V&lt;/td&gt;&lt;td  &gt;6.2kQ to GND&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62871N1QWRXSRQ1&lt;/td&gt;&lt;td  &gt;9A&lt;/td&gt;&lt;td  &gt;0.750V&lt;/td&gt;&lt;td  &gt;Short to GND&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62872N1QWRXSRQ1&lt;/td&gt;&lt;td  &gt;12 A&lt;/td&gt;&lt;td  &gt;0.875V&lt;/td&gt;&lt;td  &gt;Short to VIN&lt;/td&gt;&lt;td  &gt;On&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62873N1QWRXSRQ1&lt;/td&gt;&lt;td  &gt;15 A&lt;/td&gt;&lt;td  &gt;0.840V&lt;/td&gt;&lt;td  &gt;47 kQ to VIN &lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;1 ms&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;1.800 V&lt;/td&gt;&lt;td  &gt;6.2 kQ to GND&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62872N2QWRXSRQ1&lt;/td&gt;&lt;td  &gt;12 A&lt;/td&gt;&lt;td  &gt;1.500 V 1.750 V&lt;/td&gt;&lt;td  &gt;Short to GND Short to VIN &lt;/td&gt;&lt;td  &gt;Off&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;3.300 V&lt;/td&gt;&lt;td  &gt;47kQ to VIN&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;/table&gt; | &lt;table&gt;&lt;caption&gt; Table 9-10. Table 6-2. Devices Without I2C Interface&lt;/caption&gt;
+&lt;tr&gt;&lt;td  &gt; Device Number&lt;/td&gt;&lt;td  &gt;Output Current&lt;/td&gt;&lt;td  &gt;Start-Up Voltage(2)&lt;/td&gt;&lt;td  &gt;VSEL Settings&lt;/td&gt;&lt;td  &gt; Spread Spectrum Clocking&lt;/td&gt;&lt;td  &gt; Soft-Start Time&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62870N0QWRXSRQ1&lt;/td&gt;&lt;td  &gt;6A&lt;/td&gt;&lt;td  &gt;0.500 V&lt;/td&gt;&lt;td  &gt;6.2 kQ to GND&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62871N0QWRXSRQ1&lt;/td&gt;&lt;td  &gt;9A&lt;/td&gt;&lt;td  &gt;0.750V&lt;/td&gt;&lt;td  &gt; Short to GND&lt;/td&gt;&lt;td  &gt;On&lt;/td&gt;&lt;td  &gt;0.5 ms&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62872N0QWRXSRQ1&lt;/td&gt;&lt;td  &gt;12 A&lt;/td&gt;&lt;td  &gt;0.875 V&lt;/td&gt;&lt;td  &gt;Short to VIN &lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;TPS62873N0QWRXSRQ1&lt;/td&gt;&lt;td  &gt;15 A&lt;/td&gt;&lt;td  &gt;1.050 V&lt;/td&gt;&lt;td  &gt;47 kQ to VIN&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;/table&gt; | &lt;table&gt;&lt;caption&gt; Table 7-1. Pin Functions (continued) I = input, O = output, P = power, GND = ground(1)&lt;/caption&gt;
+&lt;tr&gt;&lt;td  &gt;Pin&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;Name&lt;/td&gt;&lt;td  &gt;No.&lt;/td&gt;&lt;td  &gt;Type(1)&lt;/td&gt;&lt;td  &gt;Description&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;Internal clock output pin for synchronization in stacked mode. Leave this pin floating for single &lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;device operation. Connect this pin to the MODE/SYNC pin of the next device in the daisy-chain in &lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;SYNC_OUT&lt;/td&gt;&lt;td  &gt;14&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;stacked operation. Do not use this pin to connect to a non-TPS6287x-Q1 device.  During start-up, this pin is used to identify if a device must operate as a secondary converter in&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;stacked operation. Connect a 47-kQ resistor from this pin to GND to define a secondary converter&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt; in stacked operation. See Section 9.3.17 for a detailed description.&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;VSEL&lt;/td&gt;&lt;td  &gt;15&lt;/td&gt;&lt;td  &gt;一&lt;/td&gt;&lt;td  &gt; Start-up output voltage select pin. A resistor or short circuit to GND or Vin defines the selected output voltage. See Section 9.3.6.2.&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;FSEL&lt;/td&gt;&lt;td  &gt;16&lt;/td&gt;&lt;td  &gt;一&lt;/td&gt;&lt;td  &gt;Frequency select pin. A resistor or a short circuit to GND or Vin determines the free-running switching frequency. See Section 9.3.6.2.&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;Exposed Thermal Pad&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;一&lt;/td&gt;&lt;td  &gt;The thermal pad must be soldered to GND to achieve an appropriate thermal resistance and for mechanical stability.&lt;/td&gt;&lt;/tr&gt;
+&lt;/table&gt; | &lt;table&gt;&lt;caption&gt; Figure 9-22. CONTROL1 Register&lt;/caption&gt;
+&lt;tr&gt;&lt;td colspan=2 &gt;7 6 RESET SSCEN R/W-0b R/W-0b&lt;/td&gt;&lt;td colspan=4 &gt;5 3 2 SWEN FPWMEN DISCHEN HICCUPEN R/W-1b R/W-0b R/W-1b R/W-0b&lt;/td&gt;&lt;td  &gt;VRAMP R/W-10b&lt;/td&gt;&lt;/tr&gt;
+&lt;/table&gt; | &lt;table&gt;&lt;caption&gt; Table 9-15. CONTROL2 Register Field Descriptions&lt;/caption&gt;
+&lt;tr&gt;&lt;td  &gt;Bit&lt;/td&gt;&lt;td  &gt;Field&lt;/td&gt;&lt;td  &gt;Type&lt;/td&gt;&lt;td  &gt;Reset&lt;/td&gt;&lt;td  &gt;Description&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;7-4&lt;/td&gt;&lt;td  &gt;RESERVED&lt;/td&gt;&lt;td  &gt;R&lt;/td&gt;&lt;td  &gt;0000b&lt;/td&gt;&lt;td  &gt;Reserved for future use. For compatibility with future device variants,&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;program these bits to 0.&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;3-2&lt;/td&gt;&lt;td  &gt;VRANGE&lt;/td&gt;&lt;td  &gt;R/W&lt;/td&gt;&lt;td  &gt;10b&lt;/td&gt;&lt;td  &gt;Output voltage range&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;00b = 0.4 V to 0.71875 V in 1.25-mV steps&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;01b = 0.4 V to 1.0375 V in 2.5-mV steps&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;10b = 0.4 V to 1.675 V in 5-mV steps&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;11b = 0.8 V to 3.35 V in 10-mV steps&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td  &gt;1-0&lt;/td&gt;&lt;td  &gt;SSTIME&lt;/td&gt;&lt;td  &gt;R/W&lt;/td&gt;&lt;td  &gt;01b&lt;/td&gt;&lt;td  &gt;Soft-start ramp time &lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;00b = 0.5 ms&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;01b = 1 ms&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;10b = 2 ms&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;td  &gt;11b = 4 ms&lt;/td&gt;&lt;/tr&gt;
+&lt;/table&gt; | &lt;table&gt;&lt;caption&gt; Table 9-14. CONTROL1 Register Field Descriptions&lt;/caption&gt;
+&lt;tr&gt;&lt;td colspan=2 rowspan=3 &gt;Bit Field 7 RESET SSCEN 5 SWEN 4 FPWMEN&lt;/td&gt;&lt;td colspan=3 rowspan=3 &gt;Type Reset Description R/W Ob Reset device Ob = No effect  1b = Resets all registers to their default values Reading this bit always returns 0. R/W Ob Spread spectrum clocking enable Ob = SSC operation disabled  1b = SSC operation enabled R/W 1b Softwareenable Ob = Switching disabled (register values retained)  1b = Switching enabled (without the enable delay) R/W Ob Forced PWM enable Ob = Power-save operation enabled  1b = Forced-PwM operation enabled This bit is logically ORed with the MODE/SYNC pin. If a high level or a synchronization clock is applied to the MODE/SYNC pin, the &lt;/td&gt;&lt;/tr&gt;
+
+
+&lt;tr&gt;&lt;td  &gt;3 2 1-0&lt;/td&gt;&lt;td  &gt;DISCHEN HICCUPEN VRAMP&lt;/td&gt;&lt;td  &gt;R/W R/W R/W&lt;/td&gt;&lt;td  &gt;1b Ob 10b&lt;/td&gt;&lt;td  &gt;device operates in forced-PWM, regardless of the state of this bit. Output discharge enable Ob = Output discharge disabled 1b = Output discharge enabled  Hiccup operation enable Ob = Hiccup operation disabled  1b = Hiccup operation enabled. Do not enable hiccup operation during stacked operation. Output voltage ramp speed when changing from one output voltage setting to another 00b = 10 mV/μs 01b = 5 mV/μs&lt;/td&gt;&lt;/tr&gt;
+&lt;tr&gt;&lt;th&gt;&lt;/th&gt;&lt;th&gt;&lt;/th&gt;&lt;th&gt;&lt;/th&gt;&lt;th&gt;&lt;/th&gt;&lt;th  &gt;10b = 1.25 mV/μs 11b = 0.5 mV/uμs&lt;/th&gt;&lt;/tr&gt;
+&lt;/table&gt;<br><strong>评分上下文：</strong>8/20 段，8577/21224 字符；已裁剪：是</td></tr></tbody></table></body></html>

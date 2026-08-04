@@ -5,6 +5,7 @@ import os
 import streamlit as st
 
 import config.settings
+from src.circuit.index_service import CircuitIndexService
 from src.circuit.query_engine import CircuitQueryEngine
 from src.circuit.store import CircuitStore
 
@@ -87,9 +88,8 @@ def _delete_design(kb_name: str, design_id: str) -> tuple[bool, str]:
     """Delete one circuit design end-to-end: design dir, global index entry,
     archived raw upload files. Returns ``(ok, message)``.
     """
-    store = CircuitStore()
     try:
-        removed = store.delete_design(kb_name, design_id)
+        removed = CircuitIndexService().delete_design(kb_name, design_id)
     except Exception as exc:
         return False, f"删除设计目录失败: {exc}"
     try:

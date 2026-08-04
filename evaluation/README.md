@@ -7,7 +7,7 @@
 主要字段：
 
 - `reference_answer`：用于回答正确性评估。
-- `reference_contexts`：用于上下文召回评估。
+- `reference_contexts`：记录参考证据的来源说明，并用于判断上下文召回指标是否适用。当前 RAGAS `context_recall` 实际使用 `reference_answer` 与检索上下文评分，因此这里不能替代可核验的参考答案。
 - `required_evidence_types`：期望实际命中的证据类型。
 - `rubric.required_facts`：回答必须覆盖的器件、网络或结论。
 - `rubric.forbidden_claims`：回答不得编造或泄露的声明。

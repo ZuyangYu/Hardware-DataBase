@@ -20,6 +20,22 @@ class CircuitEvidenceMapper:
         design_id = str(row.get("design_id") or row.get("circuit_id") or "")
         entity_id, content = self._render(kind, row)
         record_id = metadata.get("record_id")
+        evidence_metadata = {
+            "kb_name": metadata.get("kb_name", ""),
+            "department_id": metadata.get("department_id", ""),
+            "source_group": "circuit_design",
+            "evidence_kind": "derived_topology" if kind in {"topology", "power_topology"} else "circuit_fact",
+            "fact_type": "relationship"
+            if kind in {"net", "module_connection", "module_power", "pin_mapping", "power_topology"}
+            else "entity"
+            if kind in {"instance", "module"}
+            else "topology",
+            "part_numbers": [str(row["part_number"])] if row.get("part_number") else [],
+            "certainty": row.get("certainty", "direct"),
+            "capability_candidate": bool(row.get("capability_candidate")),
+        }
+        if kind == "pin_mapping":
+            evidence_metadata["pin_mappings"] = self._pin_mappings(row)
         return Evidence(
             id=f"circuit:{record_id or design_id}:{kind}:{entity_id}",
             content=content,
@@ -33,21 +49,26 @@ class CircuitEvidenceMapper:
                 "entity_type": kind,
                 "entity_id": entity_id,
             },
-            metadata={
-                "kb_name": metadata.get("kb_name", ""),
-                "department_id": metadata.get("department_id", ""),
-                "source_group": "circuit_design",
-                "evidence_kind": "derived_topology" if kind in {"topology", "power_topology"} else "circuit_fact",
-                "fact_type": "relationship"
-                if kind in {"net", "module_connection", "module_power", "pin_mapping", "power_topology"}
-                else "entity"
-                if kind in {"instance", "module"}
-                else "topology",
-                "part_numbers": [str(row["part_number"])] if row.get("part_number") else [],
-                "certainty": row.get("certainty", "direct"),
-                "capability_candidate": bool(row.get("capability_candidate")),
-            },
+            metadata=evidence_metadata,
         )
+
+    @staticmethod
+    def _pin_mappings(row: dict[str, Any]) -> list[dict[str, Any]]:
+        mappings: list[dict[str, Any]] = []
+        for pin in row.get("pins") or []:
+            raw_pin_name = str(pin.get("name") or "").strip()
+            if not raw_pin_name:
+                continue
+            net_name = str(pin.get("net_name") or "").strip() or None
+            mappings.append(
+                {
+                    "raw_pin_name": raw_pin_name,
+                    "pin_name": raw_pin_name.removeprefix("&"),
+                    "net_name": net_name,
+                    "connection_state": "connected" if net_name else "unconnected",
+                }
+            )
+        return mappings
 
     def _render(self, kind: str, row: dict[str, Any]) -> tuple[str, str]:
         if kind == "power_topology":
@@ -86,9 +107,8 @@ class CircuitEvidenceMapper:
         if kind == "pin_mapping":
             refdes = str(row.get("refdes") or "instance")
             pin_pairs = ", ".join(
-                f"{pin.get('name')} -> {pin.get('net_name')}"
-                for pin in row.get("pins") or []
-                if pin.get("name") and pin.get("net_name")
+                f"{pin['pin_name']} -> {pin['net_name'] or 'NC（源文件未声明网络连接）'}"
+                for pin in self._pin_mappings(row)
             )
             content = f"Pin mapping for {refdes}: {pin_pairs}." if pin_pairs else f"Pin mapping for {refdes} is unavailable."
             return refdes, content

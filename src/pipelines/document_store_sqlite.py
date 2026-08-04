@@ -1,8 +1,9 @@
-﻿import os
+﻿import json
+import os
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import config.settings
 from src.services.document_routing import PROCESSOR_KIND_SPREADSHEET, TABLE_STATUS_ARCHIVED, TABLE_STATUS_PROCESSING
@@ -10,7 +11,7 @@ from src.pipelines.document_rag.schemas import TASK_STATUS_DEAD_LETTER, TASK_STA
 
 WORKER_STALE_SECONDS = 30 * 60
 WORKER_MAX_RETRIES = 3
-TERMINAL_PARSE_STATUSES = {"parsed", "failed", "deleted", "indexed"}
+TERMINAL_PARSE_STATUSES = {"parsed", "failed", "deleted", "indexed", "degraded"}
 
 
 def _require_department_id(department_id: str | int | None, action: str) -> str:
@@ -50,6 +51,20 @@ class PipelineDocumentRecord:
     worker_started_at: str = ""
     worker_heartbeat_at: str = ""
     retry_count: int = 0
+    # Additive P1 scope metadata. The normalized ProjectStore remains the
+    # business source of truth; this keeps the existing pipeline catalog able
+    # to pre-filter by the same identity during the migration.
+    asset_id: str = ""
+    logical_document_id: str = ""
+    source_version_id: str = ""
+    project_id: str = ""
+    document_role: str = ""
+    module_scope: list[str] = field(default_factory=list)
+    revision: str = ""
+    approval_status: str = ""
+    effective_from: str = ""
+    effective_to: str = ""
+    usage_type: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -111,8 +126,8 @@ class PipelineDocumentStore:
                     UNIQUE(kb_name, department_id, document_name, dataset_kind)
                 )
             """)
-            self._ensure_columns(conn)
             self._migrate_department_unique_constraint(conn)
+            self._ensure_columns(conn)
 
     def _ensure_columns(self, conn):
         columns = {
@@ -140,10 +155,32 @@ class PipelineDocumentStore:
             "retry_count": f"{add_column} retry_count INTEGER NOT NULL DEFAULT 0",
             "content_kind": f"{add_column} content_kind TEXT NOT NULL DEFAULT 'document_text'",
             "processor_kind": f"{add_column} processor_kind TEXT NOT NULL DEFAULT 'ragflow'",
+            "asset_id": f"{add_column} asset_id TEXT NOT NULL DEFAULT ''",
+            "logical_document_id": f"{add_column} logical_document_id TEXT NOT NULL DEFAULT ''",
+            "source_version_id": f"{add_column} source_version_id TEXT NOT NULL DEFAULT ''",
+            "project_id": f"{add_column} project_id TEXT NOT NULL DEFAULT ''",
+            "document_role": f"{add_column} document_role TEXT NOT NULL DEFAULT ''",
+            "module_scope_json": f"{add_column} module_scope_json TEXT NOT NULL DEFAULT '[]'",
+            "revision": f"{add_column} revision TEXT NOT NULL DEFAULT ''",
+            "approval_status": f"{add_column} approval_status TEXT NOT NULL DEFAULT ''",
+            "effective_from": f"{add_column} effective_from TEXT NOT NULL DEFAULT ''",
+            "effective_to": f"{add_column} effective_to TEXT NOT NULL DEFAULT ''",
+            "usage_type": f"{add_column} usage_type TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
                 conn.execute(statement)
+
+    @staticmethod
+    def _to_record(row) -> PipelineDocumentRecord:
+        values = dict(row)
+        raw_scope = values.pop("module_scope_json", "[]")
+        try:
+            scope = json.loads(raw_scope or "[]")
+        except (TypeError, json.JSONDecodeError):
+            scope = []
+        values["module_scope"] = [str(item) for item in scope] if isinstance(scope, list) else []
+        return PipelineDocumentRecord(**values)
 
     def _migrate_department_unique_constraint(self, conn):
         row = conn.execute(
@@ -263,6 +300,17 @@ class PipelineDocumentStore:
         processor_kind: str = "ragflow",
         parse_progress: int = 0,
         parse_stage: str = "",
+        asset_id: str = "",
+        logical_document_id: str = "",
+        source_version_id: str = "",
+        project_id: str = "",
+        document_role: str = "",
+        module_scope: list[str] | None = None,
+        revision: str = "",
+        approval_status: str = "",
+        effective_from: str = "",
+        effective_to: str = "",
+        usage_type: str = "",
     ):
         with closing(self._connect()) as conn:
             conn.execute(
@@ -272,9 +320,12 @@ class PipelineDocumentStore:
                     dataset_id, document_id, source_group, department_id,
                     uploaded_by, status, content_kind, processor_kind,
                     local_path, file_size, content_hash, upload_status,
-                    error_message, ragflow_error, parse_progress, parse_stage, parse_started_at
+                    error_message, ragflow_error, parse_progress, parse_stage,
+                    asset_id, logical_document_id, source_version_id, project_id, document_role,
+                    module_scope_json, revision, approval_status, effective_from, effective_to, usage_type,
+                    parse_started_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(kb_name, department_id, document_name, dataset_kind) DO UPDATE SET
                     kb_id = excluded.kb_id,
                     department_id = excluded.department_id,
@@ -294,6 +345,17 @@ class PipelineDocumentStore:
                     ragflow_error = excluded.ragflow_error,
                     parse_progress = excluded.parse_progress,
                     parse_stage = excluded.parse_stage,
+                    asset_id = excluded.asset_id,
+                    logical_document_id = excluded.logical_document_id,
+                    source_version_id = excluded.source_version_id,
+                    project_id = excluded.project_id,
+                    document_role = excluded.document_role,
+                    module_scope_json = excluded.module_scope_json,
+                    revision = excluded.revision,
+                    approval_status = excluded.approval_status,
+                    effective_from = excluded.effective_from,
+                    effective_to = excluded.effective_to,
+                    usage_type = excluded.usage_type,
                     worker_id = '',
                     worker_started_at = '',
                     worker_heartbeat_at = '',
@@ -322,6 +384,17 @@ class PipelineDocumentStore:
                     ragflow_error,
                     max(0, min(100, int(parse_progress or 0))),
                     parse_stage,
+                    asset_id,
+                    logical_document_id,
+                    source_version_id,
+                    project_id,
+                    document_role,
+                    json.dumps(sorted(set(module_scope or [])), ensure_ascii=False),
+                    revision,
+                    approval_status,
+                    effective_from,
+                    effective_to,
+                    usage_type,
                 ),
             )
 
@@ -336,7 +409,7 @@ class PipelineDocumentStore:
                 """,
                 (kb_name, department_id),
             ).fetchall()
-        return [PipelineDocumentRecord(**dict(row)) for row in rows]
+        return [self._to_record(row) for row in rows]
 
     def list_documents_unscoped(self, kb_name: str) -> list[PipelineDocumentRecord]:
         with closing(self._connect()) as conn:
@@ -348,7 +421,7 @@ class PipelineDocumentStore:
                 """,
                 (kb_name,),
             ).fetchall()
-        return [PipelineDocumentRecord(**dict(row)) for row in rows]
+        return [self._to_record(row) for row in rows]
 
     def document_stats_by_kb(self, department_id: str | int | None = None) -> dict[str, dict[str, int]]:
         """按知识库聚合文档/解析状态统计，供治理视图使用。"""
@@ -417,7 +490,7 @@ class PipelineDocumentStore:
                 "SELECT * FROM pipeline_documents WHERE id = ?",
                 (record_id,),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(row)) if row else None
+        return self._to_record(row) if row else None
 
     def get_document_by_id_scoped(self, record_id: int, department_id: str | int | None) -> PipelineDocumentRecord | None:
         department_id = _require_department_id(department_id, "id lookup")
@@ -426,7 +499,7 @@ class PipelineDocumentStore:
                 "SELECT * FROM pipeline_documents WHERE id = ? AND department_id = ?",
                 (record_id, department_id),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(row)) if row else None
+        return self._to_record(row) if row else None
 
     def get_document(
         self,
@@ -445,7 +518,7 @@ class PipelineDocumentStore:
                     """,
                     (kb_name, document_name, dataset_kind, department_id),
                 ).fetchone()
-            return PipelineDocumentRecord(**dict(row)) if row else None
+            return self._to_record(row) if row else None
 
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -455,7 +528,7 @@ class PipelineDocumentStore:
                 """,
                 (kb_name, document_name, department_id),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(row)) if row else None
+        return self._to_record(row) if row else None
 
     def get_document_unscoped(
         self,
@@ -478,7 +551,7 @@ class PipelineDocumentStore:
             ).fetchall()
         if len(rows) > 1:
             raise ValueError(f"Ambiguous pipeline document name in {kb_name}: {document_name}")
-        return PipelineDocumentRecord(**dict(rows[0])) if rows else None
+        return self._to_record(rows[0]) if rows else None
 
     def find_by_hash(
         self,
@@ -500,7 +573,7 @@ class PipelineDocumentStore:
                 """,
                 (kb_name, dataset_kind, content_hash, department_id),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(row)) if row else None
+        return self._to_record(row) if row else None
 
     def delete_document(
         self,
@@ -715,7 +788,7 @@ class PipelineDocumentStore:
                 "SELECT * FROM pipeline_documents WHERE id = ? AND worker_id = ?",
                 (record_id, worker_id),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(claimed)) if claimed else None
+        return self._to_record(claimed) if claimed else None
 
     def release_parse_claim(self, record_id: int):
         with closing(self._connect()) as conn:
@@ -740,5 +813,3 @@ class PipelineDocumentStore:
             error_message=message,
         )
         self.release_parse_claim(record_id)
-
-

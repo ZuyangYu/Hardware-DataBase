@@ -35,6 +35,7 @@ from src.services.document_routing import (
     RAGFLOW_STATUS_DELETED,
     RAGFLOW_STATUS_FAILED,
     TABLE_STATUS_INDEXED,
+    TABLE_STATUS_DEGRADED,
     TABLE_STATUS_ARCHIVED,
     TABLE_STATUS_PROCESSING,
 )
@@ -608,24 +609,44 @@ class CircuitPipelineHandler(PipelineHandler):
                 uploaded_by=scope.uploaded_by,
             )
             warnings.extend(getattr(index_result, "warnings", []) or [])
+            index_status = str(getattr(index_result, "status", "") or TABLE_STATUS_INDEXED)
+            if index_status not in {TABLE_STATUS_INDEXED, TABLE_STATUS_DEGRADED}:
+                index_status = TABLE_STATUS_DEGRADED
+            index_message = str(
+                getattr(index_result, "message", "") or "Circuit design indexed"
+            )
+            index_stats = dict(getattr(index_result, "stats", {}) or {})
             if record_id:
                 self.store.update_document_progress_by_id(
                     record_id,
                     100,
-                    getattr(index_result, "message", "") or "Circuit design indexed",
-                    status=TABLE_STATUS_INDEXED,
+                    index_message,
+                    status=index_status,
                     error_message="",
                 )
             if progress_callback:
-                progress_callback(100, f"{archived.filename}: circuit design indexed")
+                progress_callback(
+                    100,
+                    f"{archived.filename}: circuit design {index_status}; {index_message}",
+                )
+            audit_action = (
+                "circuit_upload_degraded"
+                if index_status == TABLE_STATUS_DEGRADED
+                else "circuit_upload_indexed"
+            )
+            handler_message = (
+                f"[warning] {index_message}: {archived.filename}"
+                if index_status == TABLE_STATUS_DEGRADED
+                else f"[success] Indexed circuit design file: {archived.filename}"
+            )
             return HandlerResult(
                 success=True,
-                message=f"[success] Indexed circuit design file: {archived.filename}",
+                message=handler_message,
                 document_id=document_id,
                 record_id=record_id,
-                status=TABLE_STATUS_INDEXED,
+                status=index_status,
                 warnings=warnings,
-                audit_action="circuit_upload_indexed",
+                audit_action=audit_action,
                 audit_metadata={
                     "store_id": record_id,
                     "kb_id": scope.kb_id,
@@ -635,9 +656,12 @@ class CircuitPipelineHandler(PipelineHandler):
                     "source_group": archived.source_group,
                     "local_path": archived.relative_local_path,
                     "content_hash": archived.content_hash,
-                    "status": TABLE_STATUS_INDEXED,
+                    "status": index_status,
                     "container_inspection": archived.inspection.to_metadata(),
-                    "circuit_stats": getattr(index_result, "stats", {}),
+                    "circuit_index_status": index_status,
+                    "circuit_index_message": index_message,
+                    "circuit_index_warnings": list(getattr(index_result, "warnings", []) or []),
+                    "circuit_stats": index_stats,
                     "circuit_design_id": getattr(index_result, "design_id", ""),
                 },
             )

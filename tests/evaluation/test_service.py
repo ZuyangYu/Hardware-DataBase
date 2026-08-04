@@ -22,6 +22,18 @@ class FakeAdapter:
         ]
 
 
+class GroupedAdapter:
+    def __init__(self):
+        self.metric_batches = []
+
+    def score(self, samples, snapshots, metric_names):
+        self.metric_batches.append(tuple(metric_names))
+        return [
+            MetricResult(sample_id="q1", metric_name=metric_name, score=0.8)
+            for metric_name in metric_names
+        ]
+
+
 class CapturingBackend:
     def __init__(self):
         self.records = []
@@ -127,6 +139,62 @@ class EvaluationServiceTests(unittest.TestCase):
         self.assertEqual(results[0].reference_answer, "A")
         self.assertEqual(results[0].response, "U1700")
         self.assertEqual(results[0].retrieved_contexts, ["context"])
+
+    def test_score_invokes_progress_callback_after_each_ragas_metric_group(self):
+        adapter = GroupedAdapter()
+        progress = []
+        service = EvaluationService(ragas_adapter=adapter)
+
+        summary, results = service.score(
+            [_sample()],
+            [_snapshot()],
+            metric_names=["faithfulness", "answer_correctness"],
+            progress_callback=lambda current_summary, current_results, completed, total: (
+                progress.append(
+                    (completed, total, len(current_results[0].metrics), current_summary.metric_scores)
+                )
+                or True
+            ),
+        )
+
+        self.assertEqual(adapter.metric_batches, [("faithfulness",), ("answer_correctness",)])
+        self.assertEqual([(item[0], item[1]) for item in progress], [(1, 2), (2, 2)])
+        self.assertEqual(
+            {metric.metric_name for metric in results[0].metrics},
+            {
+                "completeness",
+                "evidence_consistency",
+                "missing_information_honesty",
+                "conflict_disclosure",
+                "faithfulness",
+                "answer_correctness",
+            },
+        )
+        self.assertEqual(summary.metric_scores["faithfulness"], 0.8)
+
+    def test_score_stops_after_progress_callback_returns_false(self):
+        adapter = GroupedAdapter()
+        service = EvaluationService(ragas_adapter=adapter)
+
+        summary, results = service.score(
+            [_sample()],
+            [_snapshot()],
+            metric_names=["faithfulness", "answer_correctness"],
+            progress_callback=lambda _summary, _results, completed, _total: completed < 1,
+        )
+
+        self.assertEqual(adapter.metric_batches, [("faithfulness",)])
+        self.assertEqual(
+            [metric.metric_name for metric in results[0].metrics],
+            [
+                "completeness",
+                "evidence_consistency",
+                "missing_information_honesty",
+                "conflict_disclosure",
+                "faithfulness",
+            ],
+        )
+        self.assertEqual(summary.metric_scores["faithfulness"], 0.8)
 
     def test_score_copies_snapshot_retrieval_summary_to_sample_metadata(self):
         snapshot = _snapshot().model_copy(

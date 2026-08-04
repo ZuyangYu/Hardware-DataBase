@@ -1,0 +1,33 @@
+{
+  "cohort_fingerprint": "3fdc861b21e03bf467a0bb03b37ee63d471d1193f650625d48cbb1185888c8ba",
+  "file_sha256": {
+    "report.html": "d386b2cc7c2fa88999894d43081132b1fc09637fa84704a1e7912adfdfc8f976",
+    "results.jsonl": "67977f4c4fd49549e3ff02b76affeb93db1158724ce5e8b27c962cb095a4599c",
+    "summary.csv": "94816f75aba4ee54a422b34b0204e280bf2f404043308b552d6b72714a903d46",
+    "summary.json": "3ee6771ec2e47234ce95708a3358f8368817681971f0b83758d2455e189d5f64"
+  },
+  "imported_at": "2026-08-03T10:14:39.822836+00:00",
+  "sample_ids": [
+    "hw-v1-circuit-tps22918-enumeration",
+    "hw-v1-circuit-tps22918-paraphrase",
+    "hw-v1-circuit-u1700-pins",
+    "hw-v1-circuit-u1800-control",
+    "hw-v1-circuit-vcc1v8-switch",
+    "hw-v1-circuit-vcc3v3-loads",
+    "hw-v1-circuit-vcc3v3-role",
+    "hw-v1-conflict-main-mcu",
+    "hw-v1-joint-can-module",
+    "hw-v1-joint-main-pmic",
+    "hw-v1-joint-overvoltage",
+    "hw-v1-joint-vcc0v75",
+    "hw-v1-missing-u1700-price",
+    "hw-v1-multihop-eth-enable",
+    "hw-v1-multihop-eth-power"
+  ],
+  "schema_version": 1,
+  "source_directory_name": "20260723T061258Z-8a0283c9",
+  "source_path": "/home/user/workspace/Hardware-DataBase-integrate-develop/storage/evaluations/20260723T061258Z-8a0283c9",
+  "source_root": "/home/user/workspace/Hardware-DataBase-integrate-develop/storage/evaluations",
+  "summary_run_id": "20260723T061258Z-8a0283c9",
+  "validation_warnings": []
+}

@@ -10,6 +10,11 @@ import pandas as pd
 from src.core.auth import ROLE_SYSTEM_ADMIN
 from src.evaluation.config import EvaluationConfig
 from src.evaluation.dataset_loader import load_dataset
+from src.evaluation.history import (
+    EvaluationHistoryRun,
+    compatible_baselines,
+    load_history_run,
+)
 from src.evaluation.presentation import (
     build_baseline_chart_rows,
     build_comparison,
@@ -26,6 +31,15 @@ from src.evaluation.service import EvaluationService
 DEFAULT_DATASET = Path("evaluation/datasets/hardware_qa_v1.jsonl")
 DEFAULT_OUTPUT_ROOT = Path("storage/evaluations")
 ACTIVE_EVALUATION_RUN_KEY = "evaluation_active_run_id"
+TERMINAL_RERUN_GUARD_PREFIX = "evaluation_terminal_rerun:"
+
+_TERMINAL_EVALUATION_STATUSES = {"completed", "paused", "cancelled", "failed"}
+_LEGACY_REPORT_ARTIFACT_NAMES = (
+    "summary.json",
+    "results.jsonl",
+    "summary.csv",
+    "report.html",
+)
 
 
 def can_access_evaluation(role: str | None) -> bool:
@@ -78,14 +92,27 @@ def run_action_availability(status: str) -> dict[str, bool]:
     }
 
 
-def _load_results(path: Path) -> list[SampleResult]:
-    if not path.exists():
-        return []
-    return [
-        SampleResult.model_validate_json(line)
-        for line in path.read_text(encoding="utf-8-sig").splitlines()
-        if line.strip()
-    ]
+def _history_selector_label(
+    path: Path,
+    histories: dict[Path, EvaluationHistoryRun],
+) -> str:
+    history = histories.get(path)
+    if history is not None:
+        return f"{path.name} · {history.origin_label} · 样本数：{history.sample_count}"
+    count = "—"
+    state_path = path / "run_state.json"
+    if state_path.is_file():
+        try:
+            count = str(EvaluationRunState.model_validate_json(state_path.read_text(encoding="utf-8")).total_samples)
+        except (OSError, ValueError):
+            pass
+    return f"{path.name} · 本地 · 样本数：{count}"
+
+
+def _render_history_header(st, history: EvaluationHistoryRun) -> None:
+    st.caption(f"报告来源：{history.origin_label}；样本数：{history.sample_count}")
+    if history.validation_warnings:
+        st.warning("导入报告校验警告：" + "；".join(history.validation_warnings))
 
 
 def should_render_evaluation_summary(run_dir: str | Path) -> bool:
@@ -96,7 +123,35 @@ def should_render_evaluation_summary(run_dir: str | Path) -> bool:
     if not state_path.is_file():
         return True
     state = EvaluationRunState.model_validate_json(state_path.read_text(encoding="utf-8"))
-    return state.status == "completed"
+    if not (run_dir / "report_complete.json").is_file():
+        return state.status == "completed" and all(
+            (run_dir / name).is_file() for name in _LEGACY_REPORT_ARTIFACT_NAMES
+        )
+    if state.status == "completed":
+        return True
+    if state.status not in {"paused", "cancelled", "failed"}:
+        return False
+    summary = load_evaluation_summary(run_dir / "summary.json")
+    return str(summary.metadata.get("run_outcome", {}).get("kind", "")).startswith("partial_")
+
+
+def _run_outcome_message(summary: EvaluationSummary) -> tuple[str, str] | None:
+    outcome = summary.metadata.get("run_outcome", {})
+    kind = outcome.get("kind")
+    if kind not in {"partial_cancelled", "partial_paused", "partial_failed"}:
+        return None
+    completed = outcome.get("completed_groups", 0)
+    total = outcome.get("total_groups", 0)
+    labels = {
+        "partial_cancelled": "已取消",
+        "partial_paused": "已暂停",
+        "partial_failed": "发生异常",
+    }
+    return (
+        f"部分评分报告：{labels[kind]}；已完成评分组 {completed} / {total}。"
+        "已完成指标可供查看，未完成指标不应作为结论依据。",
+        "warning",
+    )
 
 
 def _build_current_metric_chart(rows: list[dict[str, object]]):
@@ -204,10 +259,12 @@ def render_saved_evaluation_run(
 
     try:
         if should_render_evaluation_summary(run_dir):
+            history = load_history_run(run_dir)
             _render_summary(
                 st,
-                load_evaluation_summary(run_dir / "summary.json"),
-                _load_results(run_dir / "results.jsonl"),
+                history.summary,
+                history.results,
+                history_run=history,
             )
         else:
             _render_active_status(st, controller, str(run_id))
@@ -221,7 +278,14 @@ def _render_summary(
     summary: EvaluationSummary,
     results: list[SampleResult],
     baseline: EvaluationSummary | None = None,
+    history_run: EvaluationHistoryRun | None = None,
 ) -> None:
+    if history_run is not None:
+        _render_history_header(st, history_run)
+    outcome = _run_outcome_message(summary)
+    if outcome is not None:
+        message, level = outcome
+        getattr(st, level)(message)
     credibility = build_credibility_summary(summary, results)
     columns = st.columns(5)
     columns[0].metric("样本", summary.sample_count)
@@ -362,7 +426,9 @@ def _elapsed_seconds(state: EvaluationRunState) -> float:
     return max(0.0, (finished_at - started_at).total_seconds())
 
 
-def _render_run_status(st, controller: EvaluationRunController, run_id: str) -> None:
+def _render_run_status(
+    st, controller: EvaluationRunController, run_id: str
+) -> EvaluationRunState | None:
     try:
         state = controller.load_for_display(run_id)
     except (OSError, ValueError) as exc:
@@ -373,6 +439,11 @@ def _render_run_status(st, controller: EvaluationRunController, run_id: str) -> 
     st.write(f"状态：{state.status}；阶段：{state.stage}")
     st.write(f"当前样本：{state.current_sample_id or '无'}")
     st.write(f"当前问题：{state.current_question or '无'}")
+    if state.stage == "scoring":
+        st.write(
+            "评分进度："
+            f"{state.scoring_completed_groups} / {state.scoring_total_groups or '—'} 个指标组"
+        )
     progress = state.completed_samples / state.total_samples if state.total_samples else 0.0
     st.progress(progress, text=f"{state.completed_samples} / {state.total_samples}")
     columns = st.columns(3)
@@ -396,12 +467,30 @@ def _render_run_status(st, controller: EvaluationRunController, run_id: str) -> 
     if cancel_column.button("取消", key=f"cancel-{state.run_id}", disabled=not actions["cancel"]):
         controller.cancel(state.run_id)
         st.rerun()
+    return state
 
 
 def _render_active_status(st, controller: EvaluationRunController, run_id: str) -> None:
+    run_dir = Path(controller.state_root) / run_id
+    guard_key = f"{TERMINAL_RERUN_GUARD_PREFIX}{run_id}"
+    for key in list(st.session_state):
+        if key.startswith(TERMINAL_RERUN_GUARD_PREFIX) and key != guard_key:
+            st.session_state.pop(key, None)
+
     @st.fragment(run_every="2s")
     def status_panel() -> None:
-        _render_run_status(st, controller, run_id)
+        state = _render_run_status(st, controller, run_id)
+        if state is None:
+            return
+        if state.status not in _TERMINAL_EVALUATION_STATUSES:
+            st.session_state.pop(guard_key, None)
+            return
+        if not should_render_evaluation_summary(run_dir):
+            return
+        if st.session_state.get(guard_key):
+            return
+        st.session_state[guard_key] = True
+        st.rerun(scope="app")
 
     status_panel()
 
@@ -438,28 +527,51 @@ def render_evaluation_page(current_role: str | None) -> None:
         if not runs:
             st.info("尚无评估运行。")
             return
-        selected = st.selectbox("运行", runs, format_func=lambda path: path.name)
+        histories: dict[Path, EvaluationHistoryRun] = {}
+        for run in runs:
+            try:
+                renderable = should_render_evaluation_summary(run)
+            except (OSError, ValueError):
+                renderable = False
+            if not renderable:
+                continue
+            try:
+                histories[run] = load_history_run(run)
+            except (OSError, ValueError):
+                # Keep malformed/partially written runs selectable so the
+                # existing active-status/error path remains available.
+                continue
+
+        selected = st.selectbox(
+            "运行",
+            runs,
+            format_func=lambda path: _history_selector_label(path, histories),
+        )
         st.session_state[ACTIVE_EVALUATION_RUN_KEY] = selected.name
         try:
             if should_render_evaluation_summary(selected):
-                baseline_candidates = [
-                    run
-                    for run in runs
-                    if run != selected and should_render_evaluation_summary(run)
-                ]
+                selected_history = histories.get(selected) or load_history_run(selected)
+                baseline_histories = compatible_baselines(
+                    selected_history,
+                    [history for path, history in histories.items() if path != selected],
+                )
                 baseline = None
-                if baseline_candidates:
+                if baseline_histories:
+                    baseline_paths = [history.run_dir for history in baseline_histories]
                     selected_baseline = st.selectbox(
                         "历史对比基线",
-                        baseline_candidates,
-                        format_func=lambda path: path.name,
+                        baseline_paths,
+                        format_func=lambda path: _history_selector_label(path, histories),
                     )
-                    baseline = load_evaluation_summary(selected_baseline / "summary.json")
+                    baseline = histories[selected_baseline].summary
+                elif len(histories) > 1:
+                    st.info("没有可比较的基线：其他运行使用不同的样本队列。")
                 _render_summary(
                     st,
-                    load_evaluation_summary(selected / "summary.json"),
-                    _load_results(selected / "results.jsonl"),
+                    selected_history.summary,
+                    selected_history.results,
                     baseline,
+                    history_run=selected_history,
                 )
             else:
                 _render_active_status(st, controller, selected.name)

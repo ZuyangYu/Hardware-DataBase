@@ -186,6 +186,34 @@ class CircuitAgentPlanningTests(unittest.TestCase):
         planned = result["source_plan"]["source_plan"]
         self.assertEqual([item["source_name"] for item in planned], ["good.edf"])
 
+    def test_plan_source_selection_keeps_degraded_circuit_structured_data_queryable(self):
+        state = {
+            "user_query": "CAN0 connection",
+            "question_analysis": {
+                "sub_questions": [{
+                    "id": "sq_1",
+                    "question": "CAN0 connection",
+                    "expected_evidence": ["circuit_design"],
+                }]
+            },
+            "catalog": {
+                "sources": [{
+                    "document_name": "degraded.edf",
+                    "processor_kind": "circuit_design",
+                    "content_kind": "circuit_design",
+                    "status": "degraded",
+                }]
+            },
+            "trace": [],
+        }
+
+        result = plan_source_selection(state)
+
+        self.assertEqual(
+            [item["source_name"] for item in result["source_plan"]["source_plan"]],
+            ["degraded.edf"],
+        )
+
     def test_plan_source_selection_fans_out_circuit_and_document_sources(self):
         state = {
             "user_query": "CAN0 connection design report",

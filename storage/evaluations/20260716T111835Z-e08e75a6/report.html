@@ -1,0 +1,361 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>Hardware RAG Evaluation</title><style>body{font-family:sans-serif;margin:2rem}table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:.4rem}th{background:#f5f5f5}</style></head><body><h1>评估报告 20260716T111835Z-e08e75a6</h1><p>样本 15；成功 2；失败 13</p><table><thead><tr><th>sample_id</th><th>snapshot_status</th><th>answer_correctness</th><th>answer_relevancy</th><th>completeness</th><th>conflict_disclosure</th><th>context_precision</th><th>context_recall</th><th>evidence_consistency</th><th>faithfulness</th><th>missing_information_honesty</th></tr></thead><tbody><tr><td>hw-v1-circuit-u1700-pins</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>U1700 的每个关键引脚分别连接到哪个网络？<br><strong>参考答案：</strong>U1700 是 LP87702-Q1；VIN_B0_1、VIN_B1_1、VANA、VIN_B0_2、VIN_B1_2 接 VCC3V3，FB_B0 接 VCC1V1，FB_B1 接 VCC1V8，VOUT_BST 接 VCC50，EN1 接 MCU_5V_EN。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-circuit-vcc3v3-loads</td><td>success</td><td>failed</td><td>failed</td><td>0.857</td><td>not_applicable</td><td>failed</td><td>failed</td><td>1.000</td><td>failed</td><td>not_applicable</td></tr><tr><td colspan='11'><strong>问题：</strong>网络 VCC3V3 上连接了哪些主要芯片？<br><strong>参考答案：</strong>VCC3V3 有 52 个连接；主要 IC 至少包括 U1700、U1800、U1500、U1802、U1804 和 U1600。<br><strong>实际回答：</strong>根据现有证据，以下是对子问题“在原理图文档中，网络VCC3V3连接了哪些主要芯片？”的回答：
+
+- **主要芯片列表**：网络VCC3V3直接连接了以下主要芯片（IC）：
+  - **U1500**（连接至VIN引脚）
+  - **U1600**（连接至VCCIN引脚）
+  - **U1700**（连接至VIN_B0_1、VIN_B1_1、VANA、VIN_B0_2、VIN_B1_2引脚）
+  - **U1800**（连接至VIN、MODE/SYNC引脚）
+  - **U1802**（连接至VIN引脚）
+  - **U1804**（连接至VIN引脚）
+  - **X2000**（连接至引脚1和3，可能为连接器，非芯片，但已列出）
+
+- **来源说明**：以上信息来源于电路设计文档（825504380_ADAS_SCH_TCN2.EDF），具体为网络VCC3V3的连接列表（证据[1]），其中直接列出了所有连接至该网络的元件及其引脚。
+
+- **缺失信息**：无。该子问题已被完全覆盖，证据中明确列出了所有连接的主要芯片。
+
+**注意**：原理图中还列出了多个衍生网络（如VCC3V3_CAM_ACQ、VCC3V3_CAM_FB、VCC3V3_EQ、VCC3V3_ETH、VCC3V3_MCU、VCC3V3_SW），这些网络与VCC3V3网络存在关系（通常通过电源管理芯片或电感等元件连接），但用户问题仅针对网络VCC3V3本身，因此本回答仅包含直接连接到该网络的芯片，不包括衍生网络上的芯片。<br><strong>检索上下文：</strong>Net VCC3V3 connects C1500.&amp;1, C1617.&amp;1, C1618.&amp;1, C1621.&amp;1, C1633.&amp;2, C1700.&amp;1, C1701.&amp;1, C1702.&amp;1, C1704.&amp;1, C1709.&amp;1, C1710.&amp;1, C1711.&amp;1, C1716.&amp;1, C1800.&amp;1, C1801.&amp;1, C1802.&amp;1, C1803.&amp;1, C1804.&amp;1, C1805.&amp;1, C1811.&amp;1, C1812.&amp;1, C1821.&amp;1, C1823.&amp;1, C1828.&amp;1, L1601.&amp;2, L1701.&amp;1, Q1700.S, R1622.&amp;2, R1701.&amp;1, R1706.&amp;1, R1709.&amp;1, R1710.&amp;1, R1711.&amp;2, R1712.&amp;2, R1800.&amp;2, TP1605.&amp;1, TP1803.&amp;1, U1500.VIN, U1600.VCCIN, U1700.VIN_B0_1, U1700.VIN_B1_1, U1700.VANA, U1700.VIN_B0_2, U1700.VIN_B1_2, U1800.VIN, U1800.VIN, U1800.MODE/SYNC, U1802.VIN, U1804.VIN, U1804.VIN, X2000.&amp;1, X2000.&amp;3. | Net VCC3V3_CAM_ACQ connects C1114.&amp;2, R1143.&amp;2, R1147.&amp;2, TP1146.&amp;1, U900A.AN12/EVADC_G1CH4/EDSADC_EDS0PB. | Net VCC3V3_CAM_FB connects R1143.&amp;1, TP1913.&amp;1, X1903.&amp;4. | Net VCC3V3_EQ connects C1832.&amp;1, C502.&amp;1, C619.&amp;1, C621.&amp;1, C624.&amp;1, C627.&amp;1, C630.&amp;1, R1108.&amp;1, R1122.&amp;1, R506.&amp;2, R507.&amp;2, R549.&amp;2, R554.&amp;2, R555.&amp;2, R556.&amp;2, R558.&amp;2, R580.&amp;2, R581.&amp;2, TP1816.&amp;1, U1802.QOD, U1802.VOUT, U400-2.VDD_RING_8_0-1, U400-2.VDD_RING_8_0-2, U400-2.VDD_RING_8_0-3, U400-2.VDD_RING_9_0, X1903.&amp;10, Y500.VDD. | Net VCC3V3_ETH connects C1404.&amp;1, C1410.&amp;1, C1502.&amp;1, C1503.&amp;1, C1504.&amp;1, L1400.&amp;2, L1401.&amp;2, R1110.&amp;1, R1400.&amp;2, R1401.&amp;2, R1402.&amp;2, R1403.&amp;2, R1404.&amp;2, R1405.&amp;2, R1406.&amp;2, R1407.&amp;2, R1408.&amp;2, R1409.&amp;2, R1410.&amp;2, TP1502.&amp;1, U1500.QOD, U1500.VOUT, U1501.EN, U1501.IN. | Net VCC3V3_MCU connects C1109.&amp;1, C1204.&amp;1, C1221.&amp;1, C1303.&amp;1, C1308.&amp;1, C509.&amp;2, C835.&amp;2, C906.&amp;1, C909.&amp;1, C910.&amp;1, C911.&amp;1, C913.&amp;1, C914.&amp;1, C915.&amp;1, C929.&amp;1, DP907.&amp;1, L1703.&amp;2, L901.&amp;1, L902.&amp;1, L903.&amp;2, R1007.&amp;2, R1009.&amp;2, R1115.&amp;2, R1205.&amp;2, R1218.&amp;2, R1229.&amp;2, R1235.&amp;2, R1240.&amp;2, R1241.&amp;2, R1300.&amp;2, R1301.&amp;2, R1309.&amp;2, R1310.&amp;2, R1322.&amp;2, R1328.&amp;2, R1703.&amp;1, R805.&amp;2, R900.&amp;1, R903.&amp;2, R904.&amp;2, R906.&amp;2, R909.&amp;2, R913.&amp;2, R915.&amp;2, R919.&amp;2, R920.&amp;1, R921.&amp;1, U1200.VI/O, U1203.VI/O, U1204.VI/O, U1205.VI/O, U1302.VI/O, U1303.VI/O, U1304.VI/O, U1305.VI/O, U503.VCCB, U900C.VEVRSB, U900C.VEXT, U900C.VEXT, U900C.VEXT, U900C.VEXT, U900C.VEXT, U900C.VFLEX, Y1100.std-by, Y1100.VCC. | Net VCC3V3_SW connects C1721.&amp;2, C905.&amp;1, L1703.&amp;1, Q1700.D, R1709.&amp;2, TP1714.&amp;1, U901.S2. | Net MCU_nINT_PMIC_P12.1 connects R1703.&amp;2, TP1133.&amp;1, U1700.nINT, U900D.P12.1/GETH_MDIOC/ASCLIN3_ASLSO/CAN00_TXD/GETH_MDIO. | Instance L1701: inductor, 20161026003, 1uH, INDC2520X120.</td></tr><tr><td>hw-v1-joint-main-pmic</td><td>success</td><td>failed</td><td>failed</td><td>0.875</td><td>not_applicable</td><td>failed</td><td>failed</td><td>0.500</td><td>failed</td><td>not_applicable</td></tr><tr><td colspan='11'><strong>问题：</strong>给板子供电的主 PMIC 是哪颗？它输出哪些电压，软件如何配置？<br><strong>参考答案：</strong>主 PMIC 是 U1700，即 LP87702-Q1，输入 VCC3V3，输出包括 VCC1V1、VCC1V8 和 VCC50；软件配置依据 HSI 7.2 节 LP87702 配置说明，通过 I²C 相关信号配置。<br><strong>实际回答：</strong>好的，以下是根据您提供的证据，对您的问题进行的回答。
+
+### 1. 给板子供电的主PMIC是哪颗？
+
+根据电路图证据，主PMIC是 **U1700，型号为 LP87702-Q1（具体型号 LP87702RRHBRQ1）**。
+*   **来源**：电路图文件 `825504380_ADAS_SCH_TCN2.EDF` 中实例 U1700 的标识 [2]。
+*   **补充信息**：该芯片是系统电源方案的一部分，用于将 VCC3V3 转换为所需的电压 [12]。
+
+### 2. 该主PMIC输出哪些电压？
+
+根据文档证据，该主PMIC (LP87702) 输出以下电压：
+*   **VCC1V8**
+*   **VCC1V1**
+*   **VCC50**
+*   **来源**：文档 `600608964_ADAS_HSI_0506_1952_shoulin.wang.docx` 中的模块方案描述 [12] 和模块功能定义表 [18]。
+
+### 3. 软件如何配置该主PMIC？
+
+根据文档证据，软件通过以下方式配置该主PMIC (LP87702)：
+*   **配置接口**：MCU 通过 I2C 总线（使用引脚 MCU_SCL_P15.4 和 MCU_SDA_P15.5）与 LP87702 通信，以设置输出电压和使能输出 [12]。
+*   **使能控制**：MCU 的 **P15.3** 引脚用于使能 LP87702 的 5V 输出 [12]。
+*   **寄存器配置**：LP87702 运行期间，MCU 需要通过 I2C 配置其寄存器，具体寄存器列表在文档 `600608964_ADAS_HSI_0506_1952_shoulin.wang.docx` 的 “LP87702 配置” 章节中有所描述 [14]。
+*   **运行模式**：该芯片支持 SHUTDOWN、READ OTP、STANDBY、ACTIVE 等运行模式，MCU 可通过系统串口（I2C）读写寄存器 [20]。
+
+### 4. 缺失信息与证据冲突
+
+**缺失信息：**
+*   **详细的寄存器配置列表**：虽然证据提到需要配置寄存器，但未提供完整的寄存器配置列表、寄存器地址或具体的配置值，仅提供了部分位定义的示例 [19]。
+*   **ADC电压采集阈值**：文档中提到“软件应按照如下过欠压阈值设置”，但未给出具体的阈值数值 [14]。
+*   **LP87702的配置寄存器表**：文档中提到的“Table 5-2 LP87702 Configuration”未在所提供的证据中展示 [14]。
+
+**证据冲突：**
+在提供的证据中，存在以下冲突，这些冲突值不能合并成确定结论：
+*   **字段 `id`**：证据[17]中，为不同安全机制条目分配了 `86`、`swrs_tc3xx_006`、`swrs_tc3xx_016`、`swrs_tc3xx_018`、`swrs_tc3xx_020`、`swrs_tc3xx_021` 等多个不同的ID值。
+*   **字段 `sm name`**：证据[17]中，安全机制名称在 `common` 和 `processor` 之间变化。
+*   **字段 `sm tsr`、`register`、`symbol`、`description`、`register.1`、`description.1`**：证据[19]中，这些字段在不同行中包含了 `fs_i_ovuv_safe_`、`vmon_ldo1_ov_`、`vmon_ldo1_uv_`、`nan`、`register`、`symbol`、`description`、`reset`、`note` 等不同的值，且未指明具体行列对应关系，导致信息混乱。
+*   **字段 `no.` 和 `alarm name`**：证据[17]中，`no.` 字段既有 `67`、`68`、`69`、`70`、`71`、`72` 等数值，`alarm name` 字段也有 `all`、`cpu0`、`cpu1`、`cpu2`、`external`、`safety` 等多种取值。
+
+**请注意**：以上冲突主要源于文档 `600608964_ADAS_HSI_0506_1952_shoulin.wang.docx` 中原始表格的格式或内容问题，证据本身无法对这些冲突值进行调和。<br><strong>检索上下文：</strong>Net MCU_nINT_PMIC_P12.1 connects R1703.&amp;2, TP1133.&amp;1, U1700.nINT, U900D.P12.1/GETH_MDIOC/ASCLIN3_ASLSO/CAN00_TXD/GETH_MDIO. | Instance U1700: LP87702-Q1, 20200424007, LP87702RRHBRQ1, pqfn50p5x5x90-32. | Module Group 15 · Power/PMIC connects to Group 17 · Power/PMIC through net GND. | Module Group 15 · Power/PMIC connects to Group 18 · Power/PMIC through net GND. | Module Group 15 · Power/PMIC connects to Group 6 · Power/PMIC through net GND. | Module Group 17 · Power/PMIC connects to Group 18 · Power/PMIC through net GND. | Module Group 17 · Power/PMIC connects to Group 18 · Power/PMIC through net MCU_SCL_P15.4. | Module Group 17 · Power/PMIC connects to Group 18 · Power/PMIC through net MCU_SDA_P15.5. | Module Group 17 · Power/PMIC connects to Group 6 · Power/PMIC through net GND. | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F14&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;VCC3V3转VCC0V75应用于EQ6的内核供电，要求输出电流能力大，现选型TI的方案TPS62872。
+VCC3V3 to VCCOV75 is applied to the kernel power supply of EQ6, which requires large output current capacity. TI&#x27;s scheme TPS62872 is selected.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;	采用TPS62872电源芯片，将VCC3V3转换为VCC0V75，提供给EQ6核电供电。用MCU的P22.0引脚使能芯片，用MCU_SDA_P15.5，MCU_SCL_P15.4引脚I2C通信来设置输出电压和通信。
+TPS62872 power chip is used to convert VCC3V3 to VCCOV75, which is supplied to EQ nuclear power supply. P22.0 pin of MCU is used to enable chip, MCU_SDA_P15.5, MCU_SCL_P15.4 pin I2C communication is used to set output voltage and communication. +&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F15&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;VCC3V3转0V75_MIPI_DDR应用于EQ6的IO口供电，现使用矽力杰的SA23002进行设计。
+VCC3V3 to 0V75_MIPI_DDR for EQ6 IO port power supply, Silergy’s SA23002 is designed.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;采用SA23002电源芯片，将VCC3V3转换为0V75_MIPI_DDR，提供给EQ6的IO口供电。用MCU的P22.1引脚使能该芯片。
+SA23002 power chip is used to convert VCC3V3 to 0V75_MIPI_DDR to supply power to the I/O port of EQ6. The P22.1 pin of the MCU is used to enable the chip. 
+&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F11/F12/F13/F14/F15/F16/F17/F18/F19/F25/F27&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;系统使用车载电池12V电压供电，经过EMI电路后输入至电源转换芯片，转换输出系统各模块所需电源。
+The system uses 12V voltage power supply from the vehicle battery, which is input to the power conversion chip through the EMI circuit. Then the power conversion chip convert and output the power required by each module of the system.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;KL30 EMI (ASIL-B)
+KL30供电口处增加EMI电路，用于供电保护和滤波。硬件电路设计在UBD网络增加两个串联ESD电容，PCB布局靠近主连接器引脚处，用于吸收外部ESD信号，后端增加双向TVS管用于瞬态过压保护
+The EMI circuit is added at the KL30 power supply port for power supply protection and filtering. The hardware circuit design adds two series ESD capacitors in the UBD network, the PCB layout is close to the main connector pin for absorbing external ESD signals, and the two-way TVS tube is added at the back end for transient overvoltage protection.
+KL30 to VCC3V3 (ASILB)
+KL30转VCC3V3是系统一级DC-DC，给MCU提供VCC3V3_MCU电源，所以系统要求其满足ASILB，确保MCU功能安全。
+KL30 to VCC3V3 is a system primary DC-DC chip, because the MCU needs VCC3V3_MCU power supply, so the system requires it to meet the ASILB to ensure the functional safety of the MCU.
+VCC3V3_MCU to VCC1V25_MCU(ASILB)
+3V3转1V25_MCU是使用MCU内置控制器进行控制的BUCK电源，用于MCU的核供电，功能安全需求达到ASILB，确保MCU功能安全。
+3V3 to 1V25_MCU is a BUCK power supply controlled by MCU built-in controller, which is used for MCU nuclear power supply. Functional safety requirements meet ASILB to ensure the functional safety of MCU.
+VCC3V3 to VCC0V75(QM(B))
+VCC3V3转VCC0V75应用于EQ6的内核供电，要求输出电流能力大，现选型TI的电源方案TPS62872。用MCU的P22.0引脚使能芯片，用MCU_SDA_P15.5，MCU_SCL_P15.4引脚I2C通信来设置输出电压和通信。
+VCC3V3 to VCC0V75 is applied to the core power supply of EQ6, which requires large output current capacity. The power supply scheme TPS62872 of TI is selected. P22.0 pin of MCU is used to enable the chip, and MCU_SDA_P15.5, MCU_SCL_P15.4 pin I2C communication is used to set the output voltage and communication. 
+VCC3V3 to 0V75_MIPI_DDR(QM(B))
+VCC3V3转0V75_MIPI_DDR用于EQ6的IO口供电，现使用矽力杰的SA23002进行设计。用MCU的P22.1引脚使能该芯片。
+VCC3V3 to 0V75_MIPI_DDR for EQ6 IO port power supply, Silergy’s SA23002 is designed. The P22.1 pin of the MCU is used to enable the chip.
+VCC3V3转VCC1V8、VCC1V1、VCC50(QM(B))
+VCC1V8用于EQ6、CAM、DDR、FLASH供电，VCC1V1用于EQ6、DDR供电，VCC50用于CAN收发器供电，现选择LP87702 PMIC方案。用MCU的P15.3引脚使能该芯片的5V输出，用MCU_SCL_P15.4，MCU_SDA_P15.5 I2C通信来设置1.8V和1.1V输出电压和使能。
+VCC1V8 is used for EQ6, CAM, DDR, FLASH power supply, VCC1V1 is used for EQ6, DDR power supply, VCC50 is used for CAN transceiver  power supply, LP87702 PMIC scheme is selected. P15.3 pin of MCU is used to enable 5V output of the chip, and MCU_SCL_P15.4, MCU_SDA_P15.5 I2C communication is used to set 1.8V and 1.1V output voltage and enable it. 
+VCC3V3 to VCC3V3_EQ(QM(B))
+VCC3V3转VCC3V3_EQ用于EQ6的IO和摄像头供电，现使用负载开关进行设计。用MCU的P20.3引脚使能该芯片。
+VCC3V3 to VCC3V3_EQ for EQ6’s IO and camera power supply, now using the load switch is designed. .The P20.3 pin of the MCU is used to enable the chip.
+	VCC3V3 to VCC3V3_ETH(QM)
+3V3转3V3_ETH用于ETH供电，现选择负载开关方案。用MCU的P21.0引脚使能该芯片。
+3V3 to 3V3_ETH for ETH power supply, the load switch scheme is selected. . The P21.0 pin of the MCU is used to enable the chip.
+	VCC1V8 to VCC1V8_EQ(QM(B))
+VCC1V8转VCC1V8_EQ用于EQ供电，现选择负载开关方案。用MCU的P20.0引脚使能该芯片。
+VCC1V8 to VCC1V8_EQ for EQ power supply, the load switch scheme is selected. . The P20.0 pin of the MCU is used to enable the chip.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td colspan=&#x27;2&#x27;&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F02/F03/F04/F28&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;EYEQ6-L最小系统组成：外部30MHz晶体给EYEQ6-L提供基本时钟输入，外部20MHz有源晶振提供监控时钟，外扩OSPI接口的2Gb NAND FLASH存储程序，外扩1GB的LPDDR4运存。NXB0104是用于MCU的3V3_SPI和NAND FLASH的1V8_SPI进行电平转换，用于MCU读写NAND FLASH。
+EYEQ6-L minimum system components: an external 30MHz crystal provides the basic clock input for EYEQ6-L, an external 20MHz active crystal provides the monitoring clock, an external 2GbNAND FLASH memory program for OSPI interface, and an external 1GB LPDDR4 operation memory. NXB0104 is used for level conversion of 3V3_SPI of MCU and 1V8-SPI of NAND FLASH for MCU to read and write NAND FLASH.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;
+1、处理器
+根据ADAS产品需求图像处理SOC功能安全需要达到ASIL-B，经综合评估选择Mobileye产品EYEQ6-L，最高功能安全可达到ASIL-B，接口资源丰富。
+1.Processor
+According to the requirements of ADAS products, the functional safety of image processing SOC needs to reach ASIL-B. After comprehensive evaluation, Mobileye product EYEQ6-L is selected, and the highest functional safety can reach ASIL-B with abundant interface resources. +
+2、时钟
+硬件选型30MHz晶振给EYEQ6-L提供时钟输入，由其内部PLL等电路完成倍频、分频，供其内核和各模块使用。外部20MHz有源晶振作为内部监控时钟。
+2.Clock
+The 30MHz crystal provides clock input to the EYEQ6-L, and its internal PLL circuit completes frequency multiplication and frequency division for the EyeQ6-L core and each module. The external 20MHz active crystal is energized as an internal monitoring clock.
+3、DDR
+EYEQ6在外扩的DDR中运行程序和存储临时数据，其DDR控制器可支持32bits位宽的LPDDR4 SDRAM，最大读写速率4266 Mb/s/pin 。本设计中选用1片32bit的LPDDR4 SDRAM，型号为车规级器件K4F8E3S4HD-GHCL02V，以充分利用数据带宽，保证EYEQ6的处理速度，LPDDR4工作环境温度为-40℃~105℃，单片总容量1GB。
+3.DDR
+EYEQ6 runs programs and stores temporary data in the extended DDR. Its DDR controller supports LPDDR4 SDRAM with 32bits wide and a maximum read/write rate of 4266Mb/s/pin. In this design, a 32bit LPDDR4 SDRAM is selected, the model is car grade device K4F8E3S4HD-GHCLO2V, in order to make full use of the data bandwidth and ensure the processing speed of EYEQ6. The working environment temperature of LPDDR4 is -40℃-105℃, and the total capacity of a single chip is 1GB.
+
+
+4、NAND FLASH
+选择ME推荐的WinBond公司产品W35N02JWTBKF，容量2Gb，FLASH支持CRC安全机制。
+NXB0104是用于MCU的3V3_ SPI和NAND FLASH的1V8_ SPI进行电平转换，通过MCU_SPI1_CS片选电平转换芯片，实现MCU对NAND FLASH的读写操作，转换芯片在本应用场景下支持最大传输速率80Mbps。
+NAND FLASH
+Choose the WinBond company product W35N02JWTBKF recommended by ME, with a capacity of 2Gb and FLASH supporting CRC security mechanism. 
+NXB0104 is used for the level conversion of 3V3_SPI of MCU and 1V8_SPI of NAND FLASH. The level conversion chip is selected by MCU_SPI1_CS chip to realize the reading and writing operation of MCU to NAND FLASH. The converter chip supports a maximum transmission rate of 80Mbps in this application scenario. 
+5、电源和复位
+EYEQ6-L需要6路电源：VCC3V3_EQ、VCC0V75、0V75_MIPI_DDR、VCC1V8、VCC1V1、VCC1V8_EQ，其中VCC0V75用于给内核供电。复位信号由MCU通过P02.4口进行控制。
+Power and reset
+EYEQ6-L requires six power sources: VCC3V3-EQ, VCCOV75, OV75_MIPI_DDR, VCC1V8, VCC1V1, VCC1V8_EQ, where VCCOV75 is used to power the core. The reset signal is controlled by the MCU through the P02.4 pin.&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | ADC电压采集阈值 The ADC voltage acquisition thresholdWCCA计算结果如下，软件应按照如下过欠压阈值设置：The WCCA calculation results are as follows. The software should be set according to the following overvoltage and undervoltage thresholds:EQ6L上下电时序要求 EQ6L Power-on and power-off sequence requirements共享和独占的硬件资源 Shared and Exclusive Hardware ResourceECU-MCU信号对应关系 ECU-MCU Signal MappingMCU时钟配置 MCU Clock Configuration存储器配置 Memeory ConfigurationTable 4-5Memory Configuration其他芯片配置 Other IC Configuration其他芯片的通讯机制 Communication Mechanism with Other ICLP87702配置 LP87702 ConfigurationLP87702运行期间需要MCU通过I2C配置的寄存器如下所示：Table 5-2 LP87702 ConfigurationTPS62872配置 TPS62872 ConfigurationTPS62872运行期间需要MCU通过I2C配置的寄存器如下所示：Table 5-3 TPS62872 Configuration安全机制 Safety MechanismsSystem levelHW level硬件安全分析无新增安全机制IC level模板变更历史Template Change History填写说明Filling instructions：变更单号YYYYMM00X为记录顺序号，如：202203002，表示的是2022年03月的第二份此类文档。首次发布不分配变更单号，变更单号处填NA。The change order number YYYYMM00X is the record sequence number, such as 202203002, which represents the second such document in March 2022. No change order number will be allocated for the first release, and Na will be filled in the change order number.变更原因填写以客户审核需要变更为例：由于XX客户在客户审核时发现XX问题，需要调整模板。Fill in the revision note. Take the need for change in customer audit as an example: because XX customer found XX problem during customer audit, the template needs to be adjusted.变更内容填写以客户审核发现问题需要更改为例：由于XX客户在客户审核时发现XX问题，特增加XXX的变更内容。 | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F05&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;Camera实现图像采集功能，根据ADAS系统需求，选择图像传感器芯片IMX-728作为camera主芯片。
+The Camera realizes image acquisition function. According to the requirements of ADAS system, the image sensor chip IMX-728 is selected as the camera main chip.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;1、IMX-728芯片
+图像传感器芯片IMX-728工作功耗1W，像素8.3M（3840x 2160），最大支持帧数45fps，实际应用帧数是36fps。
+IMX-728 
+The image sensor chip IMX-728 has a power consumption of 0.45W, a pixel of 8.3M(3840x2160), a maximum frame size of 45fps, and a practical frame size of 36fps. 
+2、时钟和复位
+硬件选型25MHz晶振提供时钟输入，由其内部PLL等电路完成倍频、分频，供其内核和各模块使用。IMX-728的复位信号由主板EYEQ6_L通过GPIO_A20进行控制。
+Clock and reset 
+Hardware selection 25MHz crystal provides clock input, frequency multiplication and frequency division by its internal PLL and other circuits, for the use of its core and each module. The reset signal of IMX-728 is controlled by EYEQ6_L on the motherboard through GPIO_A20. 
+3、电源需求
+IMX-728需求3路电源：VCC3V3、VCC1V8、VCC1V1，其中VCC1V1由SA23002 DCDC通过3.3V转换输出。VCC1V8和VCC3V3电源由主板进行供电。
+
+Power demand
+IMX-728requires 3 power supplies: VCC3V3, VCC1V8, VCC1V1, VCC1V1 by SA23002 DCDC through 3.3V conversion output, VCC1V8 and VCC3V3 are spulied by main board. &lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | 
+Sheet名称：0_Instruction Manual; 内容摘要：使用说明; 项目适配说明：nan ——0_Instruction Manual
+Sheet名称：1_Face; 内容摘要：文档封面页; 项目适配说明：需要根据实际项目更新编号，
+明确并修改xxx的型号 ——0_Instruction Manual
+Sheet名称：2_Sign; 内容摘要：本文档的当前状态、编制、审核和批准人员的信息; 项目适配说明：需要根据具体项目，更新文档
+的当前状态，编制、审核和批准人员的信息等 ——0_Instruction Manual
+Sheet名称：3_Overview; 内容摘要：说明本文档的目的，适用对象和应用范围; 项目适配说明：无须确认和更新，仅用于了解 ——0_Instruction Manual
+Sheet名称：4_Change History1; 内容摘要：本文档模板的变更履历; 项目适配说明：填写本文档模板的变更内容 ——0_Instruction Manual
+Sheet名称：5_Change History2; 内容摘要：结合实际项目，安全机制的变更履历; 项目适配说明：填写本文档安全机制的变更内容 ——0_Instruction Manual
+Sheet名称：6_Reference Document; 内容摘要：导出安全机制的参考文档; 项目适配说明：根据实际项目，需参考最新的
+数据手册和安全手册 ——0_Instruction Manual
+Sheet名称：7_Definition&amp;Arch; 内容摘要：xxx系列产品的定义及架构; 项目适配说明：需要需求开发人员在开发需求之前了解xxx系列产品的定义及架构 ——0_Instruction Manual
+Sheet名称：8_SG&amp;FSR; 内容摘要：xxx系列产品的假设
+安全目标和FSR; 项目适配说明：需要需求开发人员在开发需求
+前了解xxx系列产品的安全目标和FSR ——0_Instruction Manual | 
+数量统计：4; ID：86; SM Name：Processor mechanism for SPF; SM TSR：The ECU shall integrate the processing platform safety mechanism for SPF._x000D_
+When the processor SPF is confirmed, the ECU shall:_x000D_
+1. stop outputing ADAS request and;_x000D_
+2. disable the CAN communication and;_x000D_
+3. reset processing platform._x000D_
+FHTI &lt; 300 ms._x000D_
+When the processor SPF is no longer detected after the processor reset, the ECU shall clear the processor SPF.  ——SYS SM 
+ID：SWRS_TC3XX_006; SM Name：COMMON; SM TSR：In initialization process, the SW shall configure SMU reset type to system reset. ——SYS SM 
+ID：SWRS_TC3XX_018; SM Name：COMMON; SM TSR：The SW shall enable the lockstep. ——SYS SM 
+ID：SWRS_TC3XX_020; SM Name：COMMON; SM TSR：软件应该避免PLFASH中出现全0或者全1。如果可能出现全0情况，软件应该使用0x36填充，不能写全1填充。 ——SYS SM 
+ID：SWRS_TC3XX_021; SM Name：COMMON; SM TSR：软件应保证受CPU0 ENDINIT保护的寄存器被写操作时，正确解开CPU ENDINIT保护，写完寄存器后，再次锁上CPU ENDINIT保护。
+解开CPU ENDINIT保护前，软件应屏蔽中断，防止写寄存器时间超时。
+解开CPU ENDINIT保护后，写寄存器的时间小于1us ——SYS SM 
+ID：SWRS_TC3XX_016; SM Name：COMMON; SM TSR：After SMU reset, the SW shall read the SMU fault status register and store SMU fault DTC and Snapshot in NVM. 
+
+The SW can clear SMU fault DTC and Snapshot by the diagnostic sevice. （备注：恒润下线时清除Snapshot信息）
+
+The SW can clear SMU fault DTC and Snapshot if no SMU fault for consecutive TBD ignition cycle .  ——SYS SM  | &lt;table&gt;&lt;tr&gt;&lt;td&gt;序号&lt;/td&gt;&lt;td&gt;模块序号&lt;/td&gt;&lt;td&gt;模块名称&lt;/td&gt;&lt;td&gt;功能定义&lt;/td&gt;&lt;td&gt;功能安全需求&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;F013&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;LP87702，VCC3V3电压输入，VCC1V1、VCC1V8、VCC50电压输出&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;F01&lt;/td&gt;&lt;td&gt;MCU&lt;/td&gt;&lt;td&gt;SAK-TC377TP-96F300S AA&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;1&lt;/td&gt;&lt;td&gt;F08&lt;/td&gt;&lt;td&gt;EQ system power sample1&lt;/td&gt;&lt;td&gt;EQ6L系统供电电源电压ADC采样滤波、分压电路&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;F14&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;TPS62872，VCC3V3电压输入，VCC0V75电压输出，EQ6L核电供电&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;F01&lt;/td&gt;&lt;td&gt;MCU&lt;/td&gt;&lt;td&gt;SAK-TC377TP-96F300S AA&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;2&lt;/td&gt;&lt;td&gt;F08&lt;/td&gt;&lt;td&gt;EQ system power sample&lt;/td&gt;&lt;td&gt;EQ6L系统供电电源电压ADC采样滤波、分压电路&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;3&lt;/td&gt;&lt;td&gt;F15&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;SA23002，VCC3V3输入，0V75_MIPI_DDR电压输出&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;3&lt;/td&gt;&lt;td&gt;F01&lt;/td&gt;&lt;td&gt;MCU&lt;/td&gt;&lt;td&gt;SAK-TC377TP-96F300S AA&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;3&lt;/td&gt;&lt;td&gt;F08&lt;/td&gt;&lt;td&gt;EQ system power sample&lt;/td&gt;&lt;td&gt;EQ6L系统供电电源电压ADC采样滤波、分压电路&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;4&lt;/td&gt;&lt;td&gt;F16&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;TPS22918负载开关，VCC3V3电压输入，VCC3V3_EQ输出&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;4&lt;/td&gt;&lt;td&gt;F01&lt;/td&gt;&lt;td&gt;MCU&lt;/td&gt;&lt;td&gt;SAK-TC377TP-96F300S AA&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;4&lt;/td&gt;&lt;td&gt;F08&lt;/td&gt;&lt;td&gt;EQ system power sample&lt;/td&gt;&lt;td&gt;EQ6L系统供电电源电压ADC采样滤波、分压电路&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | 
+Register：nan; Symbol：nan; Description：nan; Unnamed: 3：nan; Register.1：nan; Symbol.1：nan; Description.1：111 Closed Window : 50 % / Open Window : 50 % ——13_Registers Bit Description
+Register：Register; Symbol：Symbol; Description：Description; Unnamed: 3：nan; Register.1：nan; Symbol.1：nan; Description.1：Reset on Power On Reset (POR) ——13_Registers Bit Description
+Register：FS_I_OVUV_SAFE_
+REACTION1; Symbol：VMON_LDO1_OV_
+FS_REACTION; Description：00 No effect on RSTB and FS0B; Unnamed: 3：nan; Register.1：nan; Symbol.1：nan; Description.1：nan ——13_Registers Bit Description
+Register：nan; Symbol：nan; Description：01 VMON_LDO1 OV asserts FS0B only; Unnamed: 3：nan; Register.1：nan; Symbol.1：nan; Description.1：nan ——13_Registers Bit Description
+Register：nan; Symbol：nan; Description：10 VMON_LDO1 OV asserts RSTB and FS0B; Unnamed: 3：nan; Register.1：nan; Symbol.1：nan; Description.1：nan ——13_Registers Bit Description
+Register：nan; Symbol：nan; Description：11 VMON_LDO1 OV asserts RSTB and FS0B; Unnamed: 3：nan; Register.1：Note:本页均为配置寄存器，以支持需求开发人员快速确定具体项目需要配置的bits; Symbol.1：nan; Description.1：nan ——13_Registers Bit Description
+Register：nan; Symbol：nan; Description：Reset on Power On Reset (POR); Unnamed: 3：nan; Register.1：nan; Symbol.1：nan; Description.1：nan ——13_Registers Bit Description
+Register：nan; Symbol：VMON_LDO1_UV_
+FS_REACTION; Description：00 No effect on RSTB and FS0B; Unnamed: 3：nan; Register.1：nan; Symbol.1：nan; Description.1：nan ——13_Registers Bit Description
+Register：nan; Symbol：nan; Description：01 VMON_LDO1 OV asserts FS0B only; Unnamed: 3：nan; Register.1：nan; Symbol.1：nan; Description.1：nan ——13_Registers Bit Description | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F13&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;运行模式
+Operation Mode&lt;/td&gt;&lt;td&gt;SHUTDOWN、READ OTP、STANDBY、ACTIVE&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式定义
+Definition of Operation mode&lt;/td&gt;&lt;td&gt;SHUTDOWN
+NRST电压低于阈值。LP87702-Q1器件停止工作。
+READ OTP
+电源电压VANA高于VANAUVLO电平，并且NRST电压高于阈值电平。电压转换器被禁用，LP87702-Q1的参考电平和偏置电路被启用。OTP配置被加载到寄存器。
+STANDBY
+电源电压VANA高于VANAUVLO水平，NRST电压高于阈值水平。电压转换器被禁用，LP87702-Q1的参考电平、控制和偏压电路被启用。所有的寄存器都可以被主机处理器通过系统串口读写。电压转换器可以根据需要进行使能输出。
+ACTIVE
+电源电压VANA高于VANAUVLO水平，NRST电压高于阈值水平。稳压DC/DC变换器处于使能状态。所有的寄存器都可以被MCU通过系统串口读写。
+SHUTDOWN
+After the enable signal MCU_OV75_MIPI_DDR_EN=L, the secondary power stops the 0V75_MIPI_DDR power supply. 
+READY OTP
+The supply voltage VANA is above the VANAUVLO level, and the NRST voltage is above the threshold level. The voltage converter is disabled and the reference level and bias circuits of the LP87702-Q1 are enabled. The OTP configuration is loaded into the register.
+STANDBY
+The supply voltage VANA is above the VANAUVLO level and the NRST voltage is above the threshold level. The voltage converter is disabled and the reference level, control, and bias circuits of the LP87702-Q1 are enabled. All registers can be read and written by the host processor through the system serial port. The voltage converter can perform enabling output as needed.
+ACTIVE
+The supply voltage VANA is above the VANAUVLO level and the NRST voltage is above the threshold level. The regulated DC/DC converter is in the enabled state. All the registers can be read and written by the MCU through the system serial port. &lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式切换接口
+Mode switching interface&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式状态机
+Mode state machine&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式切换条件
+Mode switching condition&lt;/td&gt;&lt;td&gt;参考：
+产品系统需求规格说明
+产品系统方案设计说明书
+Reference: 
+Product system requirement specification 
+Product system scheme design specification.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;备注
+Note&lt;/td&gt;&lt;td&gt;1、VANAUVLO阈值电压
+
+2、NRST阈值电压
+&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;备注
+Note&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | 
+No.：67; Alarm ID：ALM8[9]; Alarm name：External Request Unit Alarm 3; Related SMs：SM[HW]:SCU.ERU:EXT_ALARM_GENERATION; Safety related ?：N; Fault Handling
+(Refer to Note)：• NO ACTION; Status：nan; Person in charge：nan; Comment：nan ——12.1 TC37X_HWSM
+No.：68; Alarm ID：ALM8[10]; Alarm name：CPU0 Watchdog time-out; Related SMs：SM[HW]:SCU:ENDINIT_WATCHDOG; Safety related ?：N; Fault Handling
+(Refer to Note)：• NO ACTION; Status：nan; Person in charge：nan; Comment：1. ENDINIT Timeout：
+1.1 受CPU0 ENDINIT保护的寄存器被写操作时，需要正确解开CPU ENDINIT保护，写完寄存器后，再次锁上CPU ENDINIT保护。
+1.2. 解开CPU ENDINIT保护前，软件应屏蔽中断，防止写寄存器时间超时。
+1.3. 解开CPU ENDINIT保护后，写寄存器的时间小于1us
+2. Watchdog Timeout
+软件应该按照功能要求，在规定时间内进行喂狗操作。 ——12.1 TC37X_HWSM
+No.：69; Alarm ID：ALM8[11]; Alarm name：CPU1 Watchdog time-out; Related SMs：SM[HW]:SCU:ENDINIT_WATCHDOG; Safety related ?：N; Fault Handling
+(Refer to Note)：• NO ACTION; Status：nan; Person in charge：nan; Comment：1. ENDINIT Timeout：
+1.1 受CPU1 ENDINIT保护的寄存器被写操作时，需要正确解开CPU ENDINIT保护，写完寄存器后，再次锁上CPU ENDINIT保护。
+1.2. 解开CPU ENDINIT保护前，软件应屏蔽中断，防止写寄存器时间超时。
+1.3. 解开CPU ENDINIT保护后，写寄存器的时间小于1us
+2. Watchdog Timeout
+软件应该按照功能要求，在规定时间内进行喂狗操作。 ——12.1 TC37X_HWSM | 
+No.：70; Alarm ID：ALM8[12]; Alarm name：CPU2 Watchdog time-out; Related SMs：SM[HW]:SCU:ENDINIT_WATCHDOG; Safety related ?：N; Fault Handling
+(Refer to Note)：• NO ACTION; Status：nan; Person in charge：nan; Comment：1. ENDINIT Timeout：
+1.1 受CPU2 ENDINIT保护的寄存器被写操作时，需要正确解开CPU ENDINIT保护，写完寄存器后，再次锁上CPU ENDINIT保护。
+1.2. 解开CPU ENDINIT保护前，软件应屏蔽中断，防止写寄存器时间超时。
+1.3. 解开CPU ENDINIT保护后，写寄存器的时间小于1us
+2. Watchdog Timeout
+软件应该按照功能要求，在规定时间内进行喂狗操作。 ——12.1 TC37X_HWSM
+No.：71; Alarm ID：ALM8[16]; Alarm name：Safety Watchdog time-out; Related SMs：SM[HW]:SCU:SAFETY_WATCHDOG; Safety related ?：N; Fault Handling
+(Refer to Note)：• NO ACTION; Status：nan; Person in charge：nan; Comment：Safety ENDINIT Timeout：
+1.1 受Safety ENDINIT保护的寄存器被写操作时，需要正确解开Safety ENDINIT保护，写完寄存器后，再次锁上Safety ENDINIT保护。
+1.2. 解开Safety ENDINIT保护前，软件应屏蔽中断，防止写寄存器时间超时。
+1.3. 解开Safety ENDINIT保护后，写寄存器的时间小于1us ——12.1 TC37X_HWSM
+No.：72; Alarm ID：ALM8[17]; Alarm name：All Watchdogs watchdog time-out. This alarm is a logical OR over all watchdog time-out alarms.; Related SMs：SM[HW]:SCU:ENDINIT_WATCHDOG; Safety related ?：N; Fault Handling
+(Refer to Note)：• NO ACTION; Status：nan; Person in charge：nan; Comment：nan ——12.1 TC37X_HWSM | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F20/F21/F22/F23&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;运行模式
+Operation Mode&lt;/td&gt;&lt;td&gt;运行模式、待机模式、Sleep模式、OFF模式、Overtemp模式
+Run mode, standby mode, Sleep mode, OFF mode, Overtemp mode.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式定义
+Definition of Operation mode&lt;/td&gt;&lt;td&gt;TCAN1044A：
+1、	运行模式
+STB设置为低电平使能Normal模式，收发器可以通过总线CANH和CANL发送接收数据。
+2、	待机模式
+STB设置为高电平使能Standby模式，收发器将不再发送接收数据。
+1.Run mode
+The STB is set to low to enable Normal mode, and the transceiver can send and receive data through the bus CANH and CANL. 
+2.Standby mode
+The STB is set to high level enable Standby mode, and the transceiver will no longer send the received data.
+TCAN1145：
+1、Normal模式
+通过SPI3配置寄存器MC=111进入Normal模式，收发器可以通过总线CANH和CANL发送接收数据。
+2、Standby模式
+通过SPI3配置寄存器MC=100，使能Standby模式，收发器将不再发送接收数据，但INH引脚依然有效。
+3、Sleep模式
+   通过SPI3配置寄存器MC=001或者发生欠压事件，CAN收发器进入sleep模式。该模式下INH为高阻态。
+与TJA1145寄存器地址有差别，软件开发需要注意。
+4、Off模式
+当电源电压过低无法为IC供电，收发器进入Off模式，该模式下CAN引脚和INH引脚为高阻态。
+5、Overtemp模式
+当芯片整体温度高于阈值，会进入过温模式，该模式下收发器的发送端和接收端被禁用，INH引脚为高阻态。
+Normal mode
+The Normal mode is entered through SPI3 configuration register MC=111, and the transceiver can send and receive data through buses CANH and CANL. 
+Standby mode
+By configuring the SPI3 register MC=100 to enable the Standby mode, the transceiver will no longer send the received data, but the INH pin will remain active. 
+Sleep mode
+Through SPI3 configuration register MC=001 or an undervoltage event occurs, the CAN transceiver goes into sleep mode. In this mode, INH is in the high impedance state. 
+Off mode
+When the supply voltage is too low to power the IC, the transceiver enters the Of mode, in which the CAN pin and INH pin are in the high resistance state. 
+Overtemp mode
+When the overall chip temperature is higher than the threshold, it will enter the over-temperature mode, in which the transmitter and receiver of the transceiver are disabled, and the INH pin is in the high impedance state. &lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式切换接口
+Mode switching interface&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式状态机
+Mode state machine&lt;/td&gt;&lt;td&gt;TCAN1044A：
+
+TCAN1145：
+
+&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模式切换条件
+Mode switching condition&lt;/td&gt;&lt;td&gt;参考：
+产品系统需求规格说明
+产品系统方案设计说明书
+Reference: 
+Product system requirement specification 
+Product system scheme design specification.&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;备注
+Note&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | 
+HW Interface Component ：QM; None：F15/POWER; None：1、电源转换芯片SA23002，VCC3V3转VCC0V75_MIPI_DDR。
+2、SA23002由MCU进行使能和关断控制。; MCU Component ：F01/MCU; None：QM; None：P19; None：P22.1; None：P22.1/GTM_TIM1_IN0_8/GTM_TIM0_IN0_8/QSPI4_MRSTB/GTM_TOUT48/QSPI4_MRST/QSPI4_SCLKP; None：GPIO; None：MCU_VCC0V75_MIPI_DDR_EN; None：/; None：O; None：VCC0V75_MIPI_DDR电源使能控制信号
+高：使能VCC0V75_MIPI_DDR电源
+低：关断VCC0V75_MIPI_DDR电源; None：HI-Z, 硬件外部下拉; None：—; SW Variable Name or SW Function Name：— ——Port1
+ECU Connector：X2000-54; None：SPI Communction; HW Interface Component ：B; None：F02/EYEQ6L; None：MCU_SPI0（slave）
+EQ6L_SPI0（master）
+速率：10Mbps; MCU Component ：F01/MCU; None：B; None：E20; None：P20.11; None：P20.11/GTM_TIM3_IN7_6/GTM_TIM2_IN7_6/QSPI0_SCLKA/GTM_TOUT67/QSPI0_SCLK; None：QSPI0_SCLKA; None：MCU_SPI0_CLK_P20.11; None：/; None：I; None：EQ发送SPI时钟信号到MCU
+MCU配置为内置下拉（SPI模式配置为：极性CPOL=0，相位CPHA=1）; None：HI-Z; None：—; SW Variable Name or SW Function Name：— ——Port1
+ECU Connector：X2000-57; MCU Component ：F01/MCU; None：B; None：D20; None：P20.13; None：P20.13/GTM_TIM3_IN1_4/GTM_TIM2_IN1_4/QSPI0_SLSIA/GTM_TOUT69/QSPI0_SLSO2/QSPI1_SLSO2/QSPI0_SCLK; None：QSPI0_SLSIA; None：MCU_SPI0_CS_P20.13; None：/; None：I; None：EQ发送SPI片选信号到MCU
+MCU配置为内置上拉（SPI模式配置为：极性CPOL=0，相位CPHA=1）; None：HI-Z; None：—; SW Variable Name or SW Function Name：— ——Port1 | 注：使用本模板时请先阅读填写说明页，形成工作产品时本页不可删除变更历史Change History目  录Table of Contents1	概述 Introduction	81.1 目的 Purpose	81.2 适用范围 Range of Application	81.3 读者对象 TReader	81.4 术语及缩写解释 Terms and Abbreviations	81.5 参考文档 Reference Document	82	硬件架构 Hardware Architecture	92.1 系统概述 System overview	92.2 硬件框图 Hardware block diagram	102.3 模块电路 Module circuit	122.3.1 KL30电源管理电路 KL30 supply management circuit	122.3.2 唤醒电路 Wake Up circuit	132.3.3 电源电路 power circuit	152.3.4 TC377最小系统 TC377 minimum system	232.3.5 EQ6最小系统 EQ6 minimum system	252.3.6 摄像头最小系统 camera minimum system	282.3.7 看门狗电路 Watchdog circuit	302.3.8 温度采样电路 Temp Sample circuit	302.3.9 系统内电源电压采样电源 The power System Voltage Sampling circuit	312.3.10 ETH电路 ETH circuit	332.3.11 CAN/CAN FD电路 CAN/CAN FD circuit	342.3.12 3V3过压保护电路 3V3 overvoltage protection circuit	353	硬件运行模式 Hardware Operation Mode	363.1 硬件运行模式 Hardware Operation Mode	363.2 运行模式定义 Definition of Operation Mode	373.3 运行模式转换条件 Transition Condition of Operation Mode	393.3.1 KL30电源管理电路 KL30 supply management circuit	393.3.2 唤醒电路 Wake Up circuit	413.3.3 电源电路 Power Circuit	423.3.4 TC377最小系统 TC377 minimum system	53 | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F13&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;VCC1V8用于EQ6、CAM、DDR、FLASH供电。VCC1V1用于EQ6、DDR供电。VCC50用于CAN收发器供电，现选择LP87702 PMIC方案。
+VCCIV8 is used to power EQ6, CAM, DDR, FLASH.VCC1V1 is used to power EQ6,DDR. VCC50 is used for CAN transceiver power supply, now choose LP87702 PMIC scheme. 
+&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;
+采用LP87702芯片，将VCC3V3转换为VCC1V8、VCC1V1、VCC50，其中VCC1V8用于EQ6、CAM、DDR、FLASH供电，VCC1V1用于EQ6、DDR供电，VCC50用于CAN收发器供电。用MCU的P15.3引脚使能该芯片的5V输出，用MCU_SCL_P15.4，MCU_SDA_P15.5 I2C通信来设置1.8V和1.1输出电压和使能。用MCU的P12.1引脚复位该芯片。
+LP87702 chip is used to convert VCC3V3 into VCC1V8, VCC1V1 and VCC50, in which VCC1V8 is used for EQ6, CAM, DDR and FLASH power supply, VCC1V1 is used for EQ6 and DDR power supply, and VCC50 is used for CAN transceiver power supplyP15.3 pin of MCU is used to enable 5V output of the chip, and MCU_SCL_P15.4, MCU_SDA_P15.5 I2C communication is used to set 1.8V and 1.1 output voltage and enable it. Reset the chip with P12.1 pin of the MCU. &lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | &lt;table&gt;&lt;tr&gt;&lt;td&gt;模块序号
+Module number&lt;/td&gt;&lt;td&gt;模块名称
+Module name&lt;/td&gt;&lt;td&gt;功能定义
+Function definition.&lt;/td&gt;&lt;td&gt;功能安全需求
+Functional safety requirements&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F01&lt;/td&gt;&lt;td&gt;MCU&lt;/td&gt;&lt;td&gt;SAK-TC377TP-96F300S AA&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F02&lt;/td&gt;&lt;td&gt;EYEQ6-L&lt;/td&gt;&lt;td&gt;EYEQ6-L，用于sensor的视频处理&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F03&lt;/td&gt;&lt;td&gt;EYEQ6_LPDDR4&lt;/td&gt;&lt;td&gt;EQ6的1GB LPDDR4&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F04&lt;/td&gt;&lt;td&gt;EYEQ6_NAND FLASH&lt;/td&gt;&lt;td&gt;EQ6的2Gb NAND FLASH&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F05&lt;/td&gt;&lt;td&gt;CAM SENSOR&lt;/td&gt;&lt;td&gt;Sony 728摄像头模组&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F06&lt;/td&gt;&lt;td&gt;KL30 sample&lt;/td&gt;&lt;td&gt;KL30电压采样&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F07&lt;/td&gt;&lt;td&gt;KL15 sample&lt;/td&gt;&lt;td&gt;KL15电压采样&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F08&lt;/td&gt;&lt;td&gt;EQ system power sample1&lt;/td&gt;&lt;td&gt;EQ6L系统供电电源电压ADC采样滤波、分压电路&lt;/td&gt;&lt;td&gt;B(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F09&lt;/td&gt;&lt;td&gt;ETH and CAN power sample2&lt;/td&gt;&lt;td&gt;CAN和ETH电源电压ADC采样滤波、分压电路&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F10&lt;/td&gt;&lt;td&gt;NTC temp sensor&lt;/td&gt;&lt;td&gt;NTC温度传感器，监控EQ6L/LPDDR4周边环境温度。&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F11&lt;/td&gt;&lt;td&gt;KL30 EMI&lt;/td&gt;&lt;td&gt;KL30供电口EMI滤波电路.&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F12&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;LN10046，KL30电源转VCC3V3电源&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F13&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;LP87702，VCC3V3电压输入，VCC1V1、VCC1V8、VCC50电压输出&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F14&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;TPS62872，VCC3V3电压输入，VCC0V75电压输出&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F15&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;SA23002，VCC3V3输入，VCC0V75电压输出&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F16&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;TPS22918负载开关，VCC3V3电压输入，VCC3V3_EQ输出&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F17&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;TPS22918负载开关，VCC3V3输入，VCC3V3_ETH输出&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F18&lt;/td&gt;&lt;td&gt;overvoltage protect&lt;/td&gt;&lt;td&gt;用于MCU电源VCC3V3_MCU的外部过压保护&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F19&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;TPS22918 负载开关，VCC1V8电压输入，VCC1V8_EQ电压输出&lt;/td&gt;&lt;td&gt;QM(B)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F20&lt;/td&gt;&lt;td&gt;CAN3&lt;/td&gt;&lt;td&gt;基于TCAN1145的CAN通讯，硬件支持特定报文唤醒&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F21&lt;/td&gt;&lt;td&gt;CAN2&lt;/td&gt;&lt;td&gt;基于TCAN1044A的CAN通讯.&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F22&lt;/td&gt;&lt;td&gt;CAN1&lt;/td&gt;&lt;td&gt;基于TCAN1044A的CAN通讯&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F23&lt;/td&gt;&lt;td&gt;CAN0&lt;/td&gt;&lt;td&gt;基于TCAN1044A的CAN通讯.&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F24&lt;/td&gt;&lt;td&gt;ETH&lt;/td&gt;&lt;td&gt;基于DP83TC812R的100BASE-T1通讯&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F25&lt;/td&gt;&lt;td&gt;Wake up&lt;/td&gt;&lt;td&gt;唤醒源和一级电源使能电路设计&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F26&lt;/td&gt;&lt;td&gt;watchdog&lt;/td&gt;&lt;td&gt;LP87702的看门狗功能，用于监控MCU运行状态&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F27&lt;/td&gt;&lt;td&gt;POWER&lt;/td&gt;&lt;td&gt;VCC3V3_MCU转VCC1V25_MCU电压，由MCU的EVRC进行控制。&lt;/td&gt;&lt;td&gt;B&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;F28&lt;/td&gt;&lt;td&gt;level translation&lt;/td&gt;&lt;td&gt;3V3和1V8双向电压转换芯片&lt;/td&gt;&lt;td&gt;QM&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt; | 
+HW Interface Component ：QM（B）; None：F16/POWER; None：1、负载开关TPS22918，VCC3V3转VCC3V3_EQ。
+2、TPS22918由MCU进行使能和关断控制。; MCU Component ：F01/MCU; None：B; None：G20; None：P20.3; None：P20.3/GTM_TIM4_IN5_11/GTM_TIM3_IN4_5/GTM_TIM2_IN4_5/GTM_TOUT61/QSPI0_SLSO9/QSPI2_SLSO9/CAN03_TXD; None：GPIO; None：MCU_3V3_EQ_EN; None：/; None：O; None：VCC3V3_EQ电源使能控制信号
+高：使能VCC3V3_EQ电源
+低：关断VCC3V3_EQ电源; None：HI-Z,硬件外部下拉; None：—; SW Variable Name or SW Function Name：— ——Port1
+HW Interface Component ：QM; None：F17/POWER; None：1、负载开关TPS22918，VCC3V3转VCC3V3_ETH。
+2、TPS22918由MCU进行使能和关断控制。; MCU Component ：F01/MCU; None：QM; None：K17; None：P21.0; None：P21.0/GTM_TIM4_IN0_11/GTM_TIM3_IN4_6/GTM_TIM2_IN4_6/QSPI4_MRSTDN/DMU_FDEST/GTM_TOUT51/HSM_HSM1; None：GPIO; None：MCU_3V3_ETH_EN; None：/; None：O; None：VCC3V3_ETH电源使能控制信号
+高：使能VCC3V3_EQ电源
+低：关断VCC3V3_EQ电源; None：HI-Z, 硬件外部下拉; None：—; SW Variable Name or SW Function Name：— ——Port1
+HW Interface Component ：QM; None：F14/POWER; None：1、电源转换芯片TPS62872，VCC3V3转VCC0V75。
+2、TPS62872由MCU进行使能和关断控制。; MCU Component ：F01/MCU; None：QM; None：P20; None：P22.0; None：P22.0/GTM_TIM1_IN1_7/GTM_TIM0_IN1_7/QSPI4_MTSRB/GTM_TOUT47/QSPI4_MTSR/QSPI4_SCLKN; None：GPIO; None：MCU_VCC0V75_EN; None：/; None：O; None：VCC0V75电源使能控制信号
+高：使能VCC0V75电源
+低：关断VCC0V75电源; None：HI-Z, 硬件外部下拉; None：—; SW Variable Name or SW Function Name：— ——Port1 | 
+None：U20; None：P23.2; None：P23.2/GTM_TIM1_IN6_5/GTM_TIM0_IN6_5/GTM_TOUT43/CAN12_TXD; None：GPIO; None：MCU_RST_FLASH_P23.2; None：/; None：O; None：FLASH复位信号
+低：FLASH复位
+高：FLASH进入工作状态; None：HI-Z，硬件外部下拉; None：—; SW Variable Name or SW Function Name：— ——Port1
+None：未使用; MCU Component ：F01/ MCU; None：NA; None：/; None：D7; None：P11.14; None：P11.14/GTM_TIM4_IN7_4/GTM_TIM2_IN7_8/GETH_CRSDVB/GETH_RXDVB/GETH_CRSA/GTM_TOUT126; None：GPIO; None：MCU_ETH_CFG1_P11.14; None：/; None：I; None：CFG1：BOM配置，判断是否有以太网
+高：TBD
+低：TBD; None：HI-Z; None：—; SW Variable Name or SW Function Name：— ——Port1
+None：未使用; MCU Component ：F01/ MCU; None：NA; None：/; None：D6; None：P11.15; None：P11.15/GTM_TIM4_IN7_5/GTM_TIM0_IN7_8/GETH_COLA/GTM_TOUT127; None：GPIO; None：MCU_ETH_CFG2_P11.15; None：/; None：I; None：CFG2：BOM配置，判断以太网接口类型
+高：TBD
+低：TBD; None：HI-Z; None：—; SW Variable Name or SW Function Name：— ——Port1
+HW Interface Component ：QM(B); None：F13/POWER; None：1、LP87702实现VCC3V3转VCC1V8、VCC1V1、VCC50三路电源输出
+2、LP87702的VCC50由MCU的GPIO控制使能和关断，VCC1V8、VCC1V1由MCU的I2C控制使能和关断。
+3、预留中断信号用于MCU辅助监控LP87702的工作状态。
+4、MCU可以通过I2C监控和管理LP87702的状态。; MCU Component ：F01/ MCU; None：QM; None：B17; None：P15.3; None：P15.3/GTM_TIM3_IN6_4/GTM_TIM2_IN6_4/CAN01_RXDA/QSPI2_SCLKA/GTM_TOUT74/QSPI2_SCLK/MSC0_EN1; None：GPIO; None：MCU_5V_EN; None：/; None：O; None：VCC50（LP87702）电源使能控制信号
+高：使能VCC50电压输出
+低：关断VCC50电压输出; None：HI-Z，硬件外部下拉; None：—; SW Variable Name or SW Function Name：— ——Port1 | &lt;table&gt;&lt;tr&gt;&lt;td&gt;HM ID&lt;/td&gt;&lt;td&gt;F01&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块功能 
+Module Function&lt;/td&gt;&lt;td&gt;32位MCU芯片TC377最小系统模块有SAK-TC377TP-96F300S AA主控芯片和晶体、硬件配置组成，实现SAK-TC377TP-96F300S AA最小硬件系统工作单元，功能安全等级最高可达到ASIL-D，满足应用要求。
+32-bit MCU chip TC377 minimum system module has SAK-TC377TP-96F300S AA main control chip and crystal, hardware configuration, to achieve SAK-TC377TP-96F300S AA minimum hardware system work unit, functional safety level up to ASIL-D, meet the application requirements. &lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块框图
+Module diagram&lt;/td&gt;&lt;td&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;模块方案
+Module solution&lt;/td&gt;&lt;td&gt;处理器
+根据ADAS产品需求，综合评估选型为32位MCU芯片SAK-TC377TP-96F300S AA， MCU接口资源丰富，功能安全等级最高可达到ASIL-D，满足应用要求。
+Processor 
+According to ADAS product requirements, 32-bit MCU chip SAK-TC377TP-96F300S AA is selected through comprehensive evaluation, which has rich MCU interface resources and the highest functional safety level can reach ASIL-D to meet application requirements
+时钟设计
+硬件选型20MHz晶振给MCU提供时钟输入，由其内部PLL等电路完成倍频、分频，供其内核和各模块使用。
+Clock design
+Hardware selection of clock design 20MHz crystal oscillator provides clock input to MCU, and its internal PLL and other circuits complete frequency doubling and frequency division for its kernel and each module.
+复位及watchdog
+系统复位及看门狗芯片采用LP87702内部看门狗，喂狗方式为窗口喂狗，当喂狗窗口无有效喂狗次数超过OTP配置时，将触发整个系统复位。
+a)	上电时，看门狗芯片对MCU启动过程进行监控，同时对MCU的电源VCC3V3电压进行低压监控，异常时主动复位MCU。
+b)	运行过程中由看门狗监控MCU运行状态，当MCU程序跑飞时看门狗超时触发复位信号主动复位MCU。
+Reset and watchdog
+The system reset and watchdog chip adopts LP87702 internal watchdog, and the feeding method is window feeding. When the number of effective dog feeding in the feeding window exceeds the OTP configuration, the whole system reset will be triggered. 
+ When powering on, the watchdog chip monitors the start-up process of MCU, and at the same time, it monitors the low voltage voltage of MCU&#x27;s power supply VCC3V3, and actively resets MCU when abnormal. 
+ MCU running status is monitored by watchdog during operation. When MCU program runs, watchdog timeout triggers reset signal and actively reset MCU.
+电源需求
+MCU需要1路VCC3V3_MCU（精度：3.3V±10%）和1路VCC1V25_MCU（精度：1.2-1.35V）供电。
+4. Power demand
+The MCU needs 1 channel VCC3V3_MCU (accuracy: 3.3V±10%) and 1 channel VCC1V25_MCU (accuracy: 1.2-1.35V) power supply.&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;</td></tr><tr><td>hw-v1-joint-vcc0v75</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>0.75V 电源由哪颗芯片产生，输入是什么，文档有什么配置要求？<br><strong>参考答案：</strong>U1800 是 TPS62872，VIN 接 VCC3V3，VOSNS 对应 VCC0V75；配置要求见 HSI 7.3 节 TPS62872 配置。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-joint-overvoltage</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>3.3V 电源有没有过压保护，是如何实现的？<br><strong>参考答案：</strong>HSI 2.3.12 节声明存在 3V3 过压保护电路；EDF 只能用于说明观察到的二极管或 TVS 连接拓扑，不能在没有数据手册证据时断言具体阈值或保护能力。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-circuit-tps22918-enumeration</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>板上用 TPS22918 做了哪些电源开关？逐个给出输入、输出和使能。<br><strong>参考答案：</strong>U1500：VCC3V3 到 VCC3V3_ETH，使能 MCU_3V3_ETH_EN；U1802：VCC3V3 到 VCC3V3_EQ，使能 MCU_3V3_EQ_EN；U1803：VCC1V8 到 VCC1V8_EQ，使能 MCU_1V8_EQ_EN。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-multihop-eth-power</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>以太网 PHY 的 1.0V 电源如何一级级供出来？<br><strong>参考答案：</strong>供电链路为 VCC3V3 → U1500（TPS22918，ON=MCU_3V3_ETH_EN）→ VCC3V3_ETH → U1501（TPS74501 LDO）→ VCC1V0_ETH。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-missing-u1700-price</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>U1700 的替代料和采购单价是多少？<br><strong>参考答案：</strong>当前知识库只有电路和 HSI 文档，没有 BOM、替代料或价格表证据；只能确认 U1700 的已知料号为 20200424007，不能编造替代料或单价。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-conflict-main-mcu</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>主控 MCU 是哪颗，型号是什么？<br><strong>参考答案：</strong>EDF 中 U900 为 SAK-TC367DP-64F300S，即 AURIX TC367；HSI 章节名称写作 TC377 最小系统。回答应披露 TC367 与 TC377 的来源差异，不能合并为无冲突的单一型号。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-circuit-u1800-control</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>U1800 的输入、输出检测、使能和 I²C 控制网络分别是什么？<br><strong>参考答案：</strong>U1800 是 TPS62872，VIN 为 VCC3V3，VOSNS 为 VCC0V75，EN 接 N19888813，并通过连接到 MCU 的 SDA/SCL 进行 I²C 控制。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-circuit-vcc1v8-switch</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>VCC1V8 到 EQ 的 1.8V 电源经过哪颗负载开关，使能信号是什么？<br><strong>参考答案：</strong>VCC1V8 经 U1803（TPS22918）输出为 VCC1V8_EQ，使能信号为 MCU_1V8_EQ_EN。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-joint-can-module</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>文档声明板上有哪些 CAN 相关模块，回答时能否用网表确认其具体连接？<br><strong>参考答案：</strong>HSI 硬件架构包含 CAN/CAN FD 电路；具体器件和网络连接应以 EDF 检索结果为准，文档能力声明与网表拓扑需分别标注来源。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-circuit-tps22918-paraphrase</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>不要概括，逐颗列出所有 TPS22918 的输入电源、输出电源和 ON 控制。<br><strong>参考答案：</strong>应逐颗列出 U1500、U1802、U1803，分别对应 VCC3V3→VCC3V3_ETH、VCC3V3→VCC3V3_EQ、VCC1V8→VCC1V8_EQ，并给出三个 MCU 使能网络。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-circuit-vcc3v3-role</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>VCC3V3 在板上主要给哪些电源器件供电？不要把电阻电容当成主要负载。<br><strong>参考答案：</strong>VCC3V3 是主要 3.3V 电源轨，供给 U1700、U1800、U1500、U1802、U1804 和 U1600 等 IC；回答应聚焦芯片而非无源器件。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr><tr><td>hw-v1-multihop-eth-enable</td><td>failed</td><td>failed</td><td>failed</td><td>-</td><td>-</td><td>failed</td><td>failed</td><td>-</td><td>failed</td><td>-</td></tr><tr><td colspan='11'><strong>问题：</strong>从 MCU 使能开始，追踪到以太网 PHY 1.0V 电源的完整路径。<br><strong>参考答案：</strong>MCU_3V3_ETH_EN 使能 U1500，VCC3V3 经 U1500 形成 VCC3V3_ETH，再进入 U1501 TPS74501，输出 VCC1V0_ETH。<br><strong>实际回答：</strong><br><strong>检索上下文：</strong></td></tr></tbody></table></body></html>

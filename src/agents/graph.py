@@ -26,9 +26,9 @@ from src.agents.state import (
     SufficiencyDecision,
     ToolCallPlan,
 )
-from src.agents.query_tokens import _HARDWARE_TERMS
 from src.circuit.question_analysis import analyze_question as analyze_circuit_question
 from src.core.cancellation import QueryCancelled
+from src.agents.query_tokens import _HARDWARE_TERMS
 from src.ingestion.parser_registry import PARSER_REGISTRY
 from src.agents.prompts import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
@@ -169,6 +169,8 @@ _LEGACY_PROCESSOR_CAPABILITIES: dict[str, set[str]] = {
     "ragflow": {"entity_lookup", "document_claim_lookup"},
 }
 
+_QUERYABLE_CIRCUIT_STATUSES = {"", "indexed", "degraded"}
+
 
 def _source_capabilities(source: dict[str, Any]) -> set[str]:
     source_group = str(source.get("source_group") or "")
@@ -179,7 +181,7 @@ def _source_capabilities(source: dict[str, Any]) -> set[str]:
 
 
 def _claim_compatible(source: dict[str, Any], claim: Claim) -> bool:
-    if source.get("processor_kind") == "circuit_design" and source.get("status") not in {"", "indexed"}:
+    if source.get("processor_kind") == "circuit_design" and source.get("status") not in _QUERYABLE_CIRCUIT_STATUSES:
         return False
     available = _source_capabilities(source)
     required = set(claim.required_capabilities)
@@ -346,6 +348,9 @@ def _required_candidate_evidence(question: str) -> set[str]:
     )
     protection_terms = ("protection", "tvs", "ocp", "scp", "保护", "过压", "过流", "短路", "反接")
     required: set[str] = set()
+    circuit_plan = analyze_circuit_question(question)
+    if circuit_plan.operations:
+        required.add("circuit_design")
     if (
         has_refdes
         or (has_net_identifier and any(term in lower for term in circuit_terms + protection_terms))
@@ -359,6 +364,11 @@ def _required_candidate_evidence(question: str) -> set[str]:
         for term in ("configuration", "register", "software", "datasheet", "manual", "配置", "寄存器", "软件", "手册", "保护能力") + protection_terms
     ):
         required.add("document_text")
+    if "component_selection" in circuit_plan.operations:
+        # Selection needs direct circuit constraints plus the supporting
+        # specification/documentation; neither source may silently replace
+        # the other in an LLM-proposed plan.
+        required.update({"circuit_design", "document_text"})
     return required
 
 
@@ -777,7 +787,7 @@ def _source_matches_analysis(source: dict[str, Any], analysis: dict[str, Any]) -
     if processor == "spreadsheet_table" and "spreadsheet_table" in expected:
         return True, "该文件是结构化 Excel，适合查询 BOM、用量、替代料、参数或测试矩阵等表格事实。"
     if processor == "circuit_design":
-        if str(source.get("status") or "") != "indexed":
+        if str(source.get("status") or "") not in _QUERYABLE_CIRCUIT_STATUSES:
             return False, "电路文件尚未索引成功，跳过结构化电路检索。"
         if "circuit_design" in expected:
             return True, "该文件是结构化电路设计数据，适合查询网表、引脚、网络连接和拓扑事实。"
@@ -828,60 +838,109 @@ def _complete_required_source_plan(
     source_plan: SourcePlan,
     max_circuit_sources: int | None = None,
 ) -> SourcePlan:
-    """Ensure indexed circuit sources are not omitted by an LLM source plan."""
+    """Ensure required catalog evidence types are not omitted by an LLM plan."""
     expected = {
         evidence_type
         for sub_question in (state.get("question_analysis") or {}).get("sub_questions") or []
         for evidence_type in sub_question.get("expected_evidence") or []
     }
-    if "circuit_design" not in expected:
+    if not expected:
         return source_plan
 
     planned = {item.source_name: item for item in source_plan.source_plan}
-    circuit_sources = [
-        source
-        for source in (state.get("catalog") or {}).get("sources") or []
-        if source.get("processor_kind") == "circuit_design" and source.get("status") == "indexed"
-    ]
-    circuit_sources.sort(key=lambda source: (-_routing_metadata(source)[0], str(source.get("document_name") or "")))
-    planned_circuit_count = sum(
-        1 for item in source_plan.source_plan if item.processor_kind == "circuit_design"
-    )
-    for source in circuit_sources:
-        if max_circuit_sources is not None and planned_circuit_count >= max_circuit_sources:
-            break
-        source_name = str(source.get("document_name") or "")
-        if not source_name:
-            continue
-        filters = {
-            key: value
-            for key, value in {
-                "source_name": source_name,
-                "record_id": source.get("record_id"),
-            }.items()
-            if value not in (None, "")
-        }
-        item = planned.get(source_name)
-        if item is None:
-            item = SourcePlanItem(
-                source_name=source_name,
-                processor_kind="circuit_design",
-                reason="Deterministic circuit evidence requirement.",
-            )
-            source_plan.source_plan.append(item)
-            planned[source_name] = item
-            planned_circuit_count += 1
-        if any(call.tool_name == "circuit_query" for call in item.tool_calls):
-            continue
-        item.tool_calls.append(
-            ToolCallPlan(
-                tool_name="circuit_query",
-                query=state.get("user_query", ""),
-                reason="Search indexed circuit source for direct evidence.",
-                top_k=8,
-                filters=filters,
-            )
+    sources = (state.get("catalog") or {}).get("sources") or []
+    need_circuit = "circuit_design" in expected
+    need_document = "document_text" in expected
+
+    # 电路源：按路由相关度排序并受 max_circuit_sources 上限约束，确定性补全 LLM 计划遗漏的电路源。
+    if need_circuit:
+        circuit_sources = [
+            source
+            for source in sources
+            if source.get("processor_kind") == "circuit_design"
+            and source.get("status") in _QUERYABLE_CIRCUIT_STATUSES
+        ]
+        circuit_sources.sort(
+            key=lambda source: (-_routing_metadata(source)[0], str(source.get("document_name") or ""))
         )
+        planned_circuit_count = sum(
+            1 for item in source_plan.source_plan if item.processor_kind == "circuit_design"
+        )
+        for source in circuit_sources:
+            if max_circuit_sources is not None and planned_circuit_count >= max_circuit_sources:
+                break
+            source_name = str(source.get("document_name") or "")
+            if not source_name:
+                continue
+            filters = {
+                key: value
+                for key, value in {
+                    "source_name": source_name,
+                    "record_id": source.get("record_id"),
+                }.items()
+                if value not in (None, "")
+            }
+            item = planned.get(source_name)
+            if item is None:
+                item = SourcePlanItem(
+                    source_name=source_name,
+                    processor_kind="circuit_design",
+                    reason="Deterministic required circuit evidence source.",
+                )
+                source_plan.source_plan.append(item)
+                planned[source_name] = item
+                planned_circuit_count += 1
+            if any(call.tool_name == "circuit_query" for call in item.tool_calls):
+                continue
+            item.tool_calls.append(
+                ToolCallPlan(
+                    tool_name="circuit_query",
+                    query=state.get("user_query", ""),
+                    reason="Search deterministic required circuit evidence source.",
+                    top_k=8,
+                    filters=filters,
+                )
+            )
+
+    # 文档源：确定性补全 LLM 计划遗漏的文档证据。
+    if need_document:
+        for source in sources:
+            processor = str(source.get("processor_kind") or "")
+            content_kind = str(source.get("content_kind") or "")
+            is_document = content_kind == "document_text" or processor == "ragflow"
+            if not is_document:
+                continue
+            source_name = str(source.get("document_name") or "")
+            if not source_name:
+                continue
+            filters = {
+                key: value
+                for key, value in {
+                    "source_name": source_name,
+                    "record_id": source.get("record_id"),
+                }.items()
+                if value not in (None, "")
+            }
+            item = planned.get(source_name)
+            if item is None:
+                item = SourcePlanItem(
+                    source_name=source_name,
+                    processor_kind=processor,
+                    reason="Deterministic required document evidence source.",
+                )
+                source_plan.source_plan.append(item)
+                planned[source_name] = item
+            if any(call.tool_name == "document_rag" for call in item.tool_calls):
+                continue
+            item.tool_calls.append(
+                ToolCallPlan(
+                    tool_name="document_rag",
+                    query=state.get("user_query", ""),
+                    reason="Search deterministic required document evidence source.",
+                    top_k=8,
+                    filters=filters,
+                )
+            )
     return source_plan
 
 
@@ -1261,7 +1320,7 @@ def _deterministic_circuit_gap_calls(state: AgentState, sources: list[dict[str, 
             source_name not in unsearched
             or source_name in searched
             or source.get("processor_kind") != "circuit_design"
-            or source.get("status") != "indexed"
+            or source.get("status") not in _QUERYABLE_CIRCUIT_STATUSES
         ):
             continue
         filters = {
