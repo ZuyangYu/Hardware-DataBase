@@ -7,6 +7,9 @@ modules. The Streamlit app and any later frontend become HTTP clients of it.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +21,7 @@ from src.api.routes import (
     config,
     conversations,
     departments,
+    document_generation,
     evaluation,
     files,
     governance,
@@ -33,8 +37,55 @@ from src.api.routes import (
 )
 
 
+def _should_spawn_worker() -> bool:
+    """Whether the API server should auto-spawn the background parse worker.
+
+    On is the default so a single `hardware-database-server` command also runs
+    the Excel-parse worker that the spreadsheet pipeline depends on. Multi-host
+    deployments (N API instances) should set HDB_API_SPAWN_WORKER=0 and run the
+    worker as a dedicated service instead, to avoid N workers competing on the
+    shared SQLite claim queue.
+    """
+    return os.getenv("HDB_API_SPAWN_WORKER", "1").lower() not in {"0", "false", "no", "off"}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Co-manage the background parse worker with the API server process.
+
+    The spreadsheet pipeline requires a standalone worker to claim and index
+    queued xlsx records (see ``src/pipelines/runtime.py``). We spawn it here as
+    a child subprocess so a single backend command also runs Excel parsing, while
+    keeping it a separate OS process (crash isolation + DB-level claim queue).
+    """
+    import config.settings
+
+    worker_proc: subprocess.Popen | None = None
+    if _should_spawn_worker():
+        log_dir = os.path.join(config.settings.STORAGE_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "worker.log")
+        log_file = open(log_path, "ab", buffering=0)
+        worker_proc = subprocess.Popen(
+            [sys.executable, "-m", "src.workers.main"],
+            cwd=config.settings.BASE_DIR,
+            stdout=log_file,
+            stderr=log_file,
+        )
+        print(f"[hardware-database] spawned parse worker pid={worker_proc.pid} log={log_path}")
+    try:
+        yield
+    finally:
+        if worker_proc is not None and worker_proc.poll() is None:
+            worker_proc.terminate()
+            try:
+                worker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                worker_proc.kill()
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="Hardware DataBase API", version="0.1.0")
+    app = FastAPI(title="Hardware DataBase API", version="0.1.0", lifespan=lifespan)
     install_error_handlers(app)
 
     # CORS: allow browser-based clients and agent tools to reach the API.
@@ -73,6 +124,7 @@ def create_app() -> FastAPI:
     app.include_router(upload.router, prefix=api_v1)
     app.include_router(users.router, prefix=api_v1)
     app.include_router(departments.router, prefix=api_v1)
+    app.include_router(document_generation.router, prefix=api_v1)
     app.include_router(kb_permissions.router, prefix=api_v1)
     app.include_router(governance.router, prefix=api_v1)
     app.include_router(config.router, prefix=api_v1)

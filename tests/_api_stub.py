@@ -145,6 +145,61 @@ class StubPipeline:
     def apply_settings(self, new_settings):
         self.applied_settings.append(dict(new_settings))
 
+    # Document generation ------------------------------------------------
+    def list_knowledge_base_document_generation_options(self, ctx=None):
+        return {"knowledge_bases": ["shared"], "templates": [], "schemas": []}
+
+    def analyze_document_template(self, ctx, *, filename, content, template_name):
+        return type("A", (), {
+            "analysis_id": "a1", "template_version_id": "tv1", "format": "xlsx",
+            "status": "ready_for_confirmation",
+            "units": [], "suggestions": [],
+        })()
+
+    def get_document_template_sanitization_summary(self, ctx, template_version_id):
+        return {"template_version_id": template_version_id, "sanitized": True}
+
+    def confirm_document_template(self, ctx, *, analysis_id, display_name):
+        return {"template_version_id": "tv1", "analysis_id": analysis_id, "display_name": display_name}
+
+    def list_knowledge_base_document_work_orders(self, ctx, knowledge_base_name):
+        return []
+
+    def get_document_run_status(self, work_order_id, ctx=None):
+        return {"work_order_id": work_order_id, "status": "planned", "scope_type": "knowledge_base",
+                "knowledge_base_name": "shared", "target_format": "xlsx", "unit_statuses": {},
+                "artifacts": []}
+
+    def prepare_knowledge_base_document_generation(self, ctx, *, knowledge_base_name, **kwargs):
+        return {"stage": "ready", "work_order_id": "wo-1"}
+
+    def submit_knowledge_base_document_generation(self, ctx, work_order_id):
+        return "bg-1"
+
+    def get_icd_scope_review(self, ctx, work_order_id):
+        return None
+
+    def submit_icd_scope_resolution(self, ctx, work_order_id, *, resolutions, comment):
+        return {"work_order_id": work_order_id}
+
+    def submit_document_feedback(self, ctx, artifact_id, *, comment):
+        return {"artifact_id": artifact_id, "comment": comment}
+
+    def approve_document_artifact(self, ctx, artifact_id, *, comment=""):
+        return {"artifact_id": artifact_id, "comment": comment}
+
+    def preview_document_artifact(self, ctx, artifact_id):
+        return {"format": "xlsx", "warnings": [], "sheets": [], "truncated": False}
+
+    def download_document_artifact(self, ctx, artifact_id):
+        return b"FILEBYTES"
+
+    def pause_harness_run(self, ctx, harness_run_id):
+        return {"harness_run_id": harness_run_id}
+
+    def cancel_harness_run(self, ctx, harness_run_id):
+        return {"harness_run_id": harness_run_id}
+
 
 def make_auth(db_path: str):
     """Build a temp auth.db: one dept, dept_admin 'admin1', user 'user1', KB 'shared'.

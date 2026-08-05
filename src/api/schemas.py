@@ -541,3 +541,33 @@ class CreateEvaluationRunRequest(BaseModel):
     sample_ids: list[str] | None = None
     tags: list[str] | None = None
     snapshot_path: str | None = None  # required when mode == "offline"
+
+
+# ---------------------------------------------------------------------------
+# Document generation
+# ---------------------------------------------------------------------------
+
+class TemplateUnitView(BaseModel):
+    unit_id: str
+    label: str = ""
+    writable: bool = False
+    blocked_reason: str | None = None
+
+
+class TemplateSuggestionView(BaseModel):
+    semantic_unit_id: str
+    label: str
+    confidence: float
+
+
+class TemplateAnalysisView(BaseModel):
+    analysis_id: str
+    template_version_id: str
+    format: str
+    status: str
+    units: list[TemplateUnitView]
+    suggestions: list[TemplateSuggestionView]
+
+
+class ConfirmTemplateRequest(BaseModel):
+    display_name: str
