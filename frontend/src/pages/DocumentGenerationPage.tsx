@@ -6,7 +6,6 @@ import type {
   DocumentAnalysis,
   GenerationOptions,
   IcdScopeReview,
-  TemplateVersion,
   WorkOrder,
   WorkOrderStatus,
 } from '../api/types';
@@ -221,21 +220,89 @@ function RunsSection() {
 }
 
 function StatusView({ status, kb }: { status: WorkOrderStatus; kb: string }) {
+  const [previews, setPreviews] = useState<Record<string, unknown>>({});
+  const [feedback, setFeedback] = useState<Record<string, string>>({});
+  const [approve, setApprove] = useState<Record<string, string>>({});
+
+  async function loadPreview(artifact_id: string) {
+    if (previews[artifact_id]) return;
+    try {
+      const p = await api.get<Record<string, unknown>>(
+        `/api/v1/document-generation/artifacts/${artifact_id}/preview?kb=${encodeURIComponent(kb)}`,
+      );
+      setPreviews((prev) => ({ ...prev, [artifact_id]: p }));
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '加载预览失败');
+    }
+  }
+
+  function submitFeedback(artifact_id: string) {
+    void api
+      .post(
+        `/api/v1/document-generation/artifacts/${artifact_id}/feedback?kb=${encodeURIComponent(kb)}`,
+        { comment: feedback[artifact_id] ?? '' },
+      )
+      .then(() => notify.success('反馈已保存；候选文件仍未发布。'))
+      .catch((e) => notify.error(e instanceof Error ? e.message : '提交反馈失败'));
+  }
+
+  function submitApprove(artifact_id: string) {
+    void api
+      .post(
+        `/api/v1/document-generation/artifacts/${artifact_id}/approve?kb=${encodeURIComponent(kb)}`,
+        { comment: approve[artifact_id] ?? '' },
+      )
+      .then(() => notify.success('已批准并发布。'))
+      .catch((e) => notify.error(e instanceof Error ? e.message : '批准失败'));
+  }
+
   return (
-    <div className="space-y-2 rounded-md border p-3 text-sm">
+    <div className="space-y-3 rounded-md border p-3 text-sm">
       <p>状态：{status.status}；格式：{status.target_format ?? '-'}</p>
       {status.harness_run && (
         <p>节点：{status.harness_run.current_node ?? '-'}；错误：{status.harness_run.error ?? '-'}</p>
       )}
-      {status.artifacts.map((a) => (
-        <div key={a.artifact_id} className="flex items-center gap-2">
-          <span>{String(a.artifact_id)}</span>
-          <Button size="sm" onClick={() => void apiDownload.blob(
-            `/api/v1/document-generation/artifacts/${a.artifact_id}/download?kb=${encodeURIComponent(kb)}`,
-            `${a.artifact_id}.${status.target_format ?? 'bin'}`,
-          )}>下载</Button>
-        </div>
-      ))}
+      {status.artifacts.map((a) => {
+        const preview = previews[a.artifact_id] as Record<string, unknown> | undefined;
+        return (
+          <div key={a.artifact_id} className="space-y-2 rounded-md border p-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span>{String(a.artifact_id)}（{String(a.stage ?? '')}）</span>
+              <Button size="sm" onClick={() => void loadPreview(a.artifact_id)}>预览</Button>
+              <Button size="sm" onClick={() => void apiDownload.blob(
+                `/api/v1/document-generation/artifacts/${a.artifact_id}/download?kb=${encodeURIComponent(kb)}`,
+                `${a.artifact_id}.${status.target_format ?? 'bin'}`,
+              )}>下载</Button>
+            </div>
+            {preview && (
+              <div className="space-y-1 rounded bg-muted p-2">
+                <p>格式：{String(preview.format ?? '')}</p>
+                {Array.isArray(preview.sheets) &&
+                  (preview.sheets as Array<{ name?: string; rows?: unknown[] }>).map((s, i) => (
+                    <p key={i}>工作表：{s.name ?? ''}（{s.rows?.length ?? 0} 行）</p>
+                  ))}
+                {preview.truncated ? <p>预览已截断；下载候选文件可查看完整内容。</p> : null}
+              </div>
+            )}
+            {String(a.stage ?? '') === 'review_candidate' && (
+              <div className="space-y-2">
+                <Input
+                  placeholder="反馈说明"
+                  value={feedback[a.artifact_id] ?? ''}
+                  onChange={(e) => setFeedback((prev) => ({ ...prev, [a.artifact_id]: e.target.value }))}
+                />
+                <Button size="sm" variant="outline" onClick={() => submitFeedback(a.artifact_id)}>提交反馈</Button>
+                <Input
+                  placeholder="批准说明"
+                  value={approve[a.artifact_id] ?? ''}
+                  onChange={(e) => setApprove((prev) => ({ ...prev, [a.artifact_id]: e.target.value }))}
+                />
+                <Button size="sm" onClick={() => submitApprove(a.artifact_id)}>批准并发布</Button>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
