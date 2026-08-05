@@ -23,6 +23,9 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         cls.server.stop()
 
     def setUp(self):
+        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db_path = __import__("os").path.join(self.tmp.name, "auth.db")
@@ -83,3 +86,40 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         t = self._token("user1")
         r = self.client.get("/api/v1/document-generation/work-orders/wo-1/status?kb=shared", headers=self._auth(t))
         self.assertEqual(r.status_code, 200, r.text)
+
+    def test_create_work_order_permission_denied_403(self):
+        def _raise(ctx, *, knowledge_base_name, **kwargs):
+            raise PermissionError("denied")
+
+        self.stub.prepare_knowledge_base_document_generation = _raise
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders?kb=shared",
+            headers=self._auth(t),
+            json={"template_version_id": "t1", "document_schema_id": "s1", "document_schema_version": "1"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_generate_work_order_value_error_400(self):
+        def _raise(ctx, work_order_id):
+            raise ValueError("bad")
+
+        self.stub.submit_knowledge_base_document_generation = _raise
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders/wo-1/generate?kb=shared",
+            headers=self._auth(t),
+            json={},
+        )
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_status_not_found_404(self):
+        self.stub.get_document_run_status = lambda work_order_id, ctx=None: None
+        t = self._token("user1")
+        r = self.client.get("/api/v1/document-generation/work-orders/wo-missing/status?kb=shared", headers=self._auth(t))
+        self.assertEqual(r.status_code, 404, r.text)
+
+    def test_work_orders_reject_system_admin_403(self):
+        t = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.get("/api/v1/document-generation/work-orders?kb=shared", headers=self._auth(t))
+        self.assertEqual(r.status_code, 403)
