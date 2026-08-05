@@ -7,12 +7,15 @@ Endpoints are thin: they build a RequestContext and delegate to AppPipeline.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import (
     ConfirmTemplateRequest,
     CreateWorkOrderRequest,
+    FeedbackRequest,
+    IcdResolutionRequest,
     TemplateAnalysisView,
     TemplateSuggestionView,
     TemplateUnitView,
@@ -185,3 +188,135 @@ def generate_work_order(
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"work_order_id": work_order_id, "run_id": run_id}
+
+
+@router.get("/document-generation/work-orders/{work_order_id}/icd-scope-review")
+def icd_scope_review(
+    work_order_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    return pipeline.get_icd_scope_review(ctx, work_order_id)
+
+
+@router.post("/document-generation/work-orders/{work_order_id}/icd-scope-resolution")
+def icd_scope_resolution(
+    work_order_id: str,
+    kb: str,
+    payload: IcdResolutionRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        pipeline.submit_icd_scope_resolution(
+            ctx,
+            work_order_id,
+            resolutions=[item.model_dump() for item in payload.resolutions],
+            comment=payload.comment,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    run_id = pipeline.submit_knowledge_base_document_generation(ctx, work_order_id)
+    return {"work_order_id": work_order_id, "run_id": run_id}
+
+
+@router.post("/document-generation/harness-runs/{run_id}/pause")
+def pause_harness(
+    run_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    return pipeline.pause_harness_run(ctx, run_id)
+
+
+@router.post("/document-generation/harness-runs/{run_id}/cancel")
+def cancel_harness(
+    run_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    return pipeline.cancel_harness_run(ctx, run_id)
+
+
+@router.get("/document-generation/artifacts/{artifact_id}/preview")
+def artifact_preview(
+    artifact_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.preview_document_artifact(ctx, artifact_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/document-generation/artifacts/{artifact_id}/download")
+def artifact_download(
+    artifact_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        content = pipeline.download_document_artifact(ctx, artifact_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(content=content, media_type="application/octet-stream")
+
+
+@router.post("/document-generation/artifacts/{artifact_id}/feedback")
+def artifact_feedback(
+    artifact_id: str,
+    kb: str,
+    payload: FeedbackRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.submit_document_feedback(ctx, artifact_id, comment=payload.comment)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/document-generation/artifacts/{artifact_id}/approve")
+def artifact_approve(
+    artifact_id: str,
+    kb: str,
+    payload: FeedbackRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.approve_document_artifact(ctx, artifact_id, comment=payload.comment)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

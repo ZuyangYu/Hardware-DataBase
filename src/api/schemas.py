@@ -577,3 +577,17 @@ class CreateWorkOrderRequest(BaseModel):
     template_version_id: str
     document_schema_id: str
     document_schema_version: str
+
+
+class IcdResolutionItem(BaseModel):
+    exception_id: str
+    action: Literal["include", "exclude"]
+
+
+class IcdResolutionRequest(BaseModel):
+    resolutions: list[IcdResolutionItem]
+    comment: str = ""
+
+
+class FeedbackRequest(BaseModel):
+    comment: str
