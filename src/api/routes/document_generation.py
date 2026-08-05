@@ -71,7 +71,10 @@ def analyze_template(
         analysis = pipeline.analyze_document_template(
             ctx, filename=file.filename or "template", content=content, template_name=template_name,
         )
-    except (PermissionError, ValueError, KeyError) as exc:
+    except PermissionError as exc:
+        # 写操作权限失败应为 403，而非 400（区分"无权"与"请求非法"）。
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _analysis_view(analysis)
 
@@ -219,11 +222,11 @@ def icd_scope_resolution(
             resolutions=[item.model_dump() for item in payload.resolutions],
             comment=payload.comment,
         )
+        run_id = pipeline.submit_knowledge_base_document_generation(ctx, work_order_id)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    run_id = pipeline.submit_knowledge_base_document_generation(ctx, work_order_id)
     return {"work_order_id": work_order_id, "run_id": run_id}
 
 
@@ -236,7 +239,12 @@ def pause_harness(
     auth: AuthService = Depends(get_auth_service),
 ):
     ctx = _ctx(user, auth, kb)
-    return pipeline.pause_harness_run(ctx, run_id)
+    try:
+        return pipeline.pause_harness_run(ctx, run_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/document-generation/harness-runs/{run_id}/cancel")
@@ -248,7 +256,12 @@ def cancel_harness(
     auth: AuthService = Depends(get_auth_service),
 ):
     ctx = _ctx(user, auth, kb)
-    return pipeline.cancel_harness_run(ctx, run_id)
+    try:
+        return pipeline.cancel_harness_run(ctx, run_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/document-generation/artifacts/{artifact_id}/preview")

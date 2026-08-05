@@ -59,6 +59,47 @@ class DocGenArtifactApiTests(unittest.TestCase):
         self.assertEqual(r.json()["run_id"], "bg-9")
         self.assertEqual(submitted["resolutions"][0]["action"], "include")
 
+    def test_icd_scope_resolution_generate_error_400(self):
+        self.stub.submit_icd_scope_resolution = lambda ctx, work_order_id, *, resolutions, comment: None
+
+        def _generate_error(ctx, work_order_id):
+            raise ValueError("bad")
+
+        self.stub.submit_knowledge_base_document_generation = _generate_error
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders/wo-1/icd-scope-resolution?kb=shared",
+            headers=self._auth(t),
+            json={"resolutions": [{"exception_id": "e1", "action": "include"}], "comment": "ok"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("bad", r.text)
+
+    def test_pause_harness_permission_denied_403(self):
+        def _denied(ctx, harness_run_id):
+            raise PermissionError("denied")
+
+        self.stub.pause_harness_run = _denied
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/document-generation/harness-runs/hr-1/pause?kb=shared",
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_cancel_harness_value_error_400(self):
+        def _bad(ctx, harness_run_id):
+            raise ValueError("bad")
+
+        self.stub.cancel_harness_run = _bad
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/document-generation/harness-runs/hr-1/cancel?kb=shared",
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("bad", r.text)
+
     def test_download_artifact_returns_bytes(self):
         self.stub.download_document_artifact = lambda ctx, artifact_id: b"FILEBYTES"
         t = self._token("user1")

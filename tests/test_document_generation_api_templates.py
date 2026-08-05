@@ -84,6 +84,21 @@ class DocGenTemplateApiTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 403)
 
+    def test_template_analyze_permission_denied_403(self):
+        def _denied(ctx, *, filename, content, template_name):
+            raise PermissionError("denied")
+
+        self.stub.analyze_document_template = _denied
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/document-generation/templates/analyze?kb=shared",
+            headers=self._auth(t),
+            files={"file": ("t.xlsx", b"PK", "application/octet-stream")},
+            data={"template_name": "T"},
+        )
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("denied", r.text)
+
     def test_options_require_read_permission(self):
         t = self._token("user1")
         r = self.client.get("/api/v1/document-generation/options?kb=shared", headers=self._auth(t))
