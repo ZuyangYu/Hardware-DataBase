@@ -571,3 +571,9 @@ class TemplateAnalysisView(BaseModel):
 
 class ConfirmTemplateRequest(BaseModel):
     display_name: str
+
+
+class CreateWorkOrderRequest(BaseModel):
+    template_version_id: str
+    document_schema_id: str
+    document_schema_version: str

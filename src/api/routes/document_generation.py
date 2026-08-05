@@ -10,7 +10,13 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
-from src.api.schemas import ConfirmTemplateRequest, TemplateAnalysisView, TemplateSuggestionView, TemplateUnitView
+from src.api.schemas import (
+    ConfirmTemplateRequest,
+    CreateWorkOrderRequest,
+    TemplateAnalysisView,
+    TemplateSuggestionView,
+    TemplateUnitView,
+)
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
 
@@ -109,3 +115,73 @@ def options(
 ):
     ctx = _ctx(user, auth, kb)
     return pipeline.list_knowledge_base_document_generation_options(ctx)
+
+
+@router.post("/document-generation/work-orders")
+def create_work_order(
+    kb: str,
+    payload: CreateWorkOrderRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.prepare_knowledge_base_document_generation(
+            ctx,
+            knowledge_base_name=kb,
+            template_version_id=payload.template_version_id,
+            document_schema_id=payload.document_schema_id,
+            document_schema_version=payload.document_schema_version,
+        )
+    except PermissionError as exc:
+        # 写操作权限失败应为 403，而非 400（区分"无权"与"请求非法"）。
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/document-generation/work-orders")
+def list_work_orders(
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    orders = pipeline.list_knowledge_base_document_work_orders(ctx, kb)
+    return [order.model_dump() if hasattr(order, "model_dump") else dict(vars(order)) for order in orders]
+
+
+@router.get("/document-generation/work-orders/{work_order_id}/status")
+def work_order_status(
+    work_order_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    status = pipeline.get_document_run_status(work_order_id, ctx)
+    if status is None:
+        raise HTTPException(status_code=404, detail="work order not found")
+    return status
+
+
+@router.post("/document-generation/work-orders/{work_order_id}/generate")
+def generate_work_order(
+    work_order_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        run_id = pipeline.submit_knowledge_base_document_generation(ctx, work_order_id)
+    except PermissionError as exc:
+        # 写操作权限失败应为 403，而非 400（区分"无权"与"请求非法"）。
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"work_order_id": work_order_id, "run_id": run_id}
