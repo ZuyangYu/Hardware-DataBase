@@ -93,7 +93,10 @@ def confirm_template(
         return pipeline.confirm_document_template(
             ctx, analysis_id=analysis_id, display_name=payload.display_name,
         )
-    except (PermissionError, ValueError, KeyError) as exc:
+    except PermissionError as exc:
+        # 写操作权限失败应为 403，而非 400（区分"无权"与"请求非法"）。
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
