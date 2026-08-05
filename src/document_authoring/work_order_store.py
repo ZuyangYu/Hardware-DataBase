@@ -839,9 +839,13 @@ class DocumentAuthoringStore:
 
     def save_harness_policy(self, policy: HarnessPolicy) -> HarnessPolicy:
         with closing(self._connect()) as conn:
-            self._put(conn, "harness_policies", {
-                "harness_policy_id": policy.harness_policy_id, "version": policy.version, "status": policy.status,
-            }, policy)
+            conn.execute(
+                """INSERT INTO harness_policies (harness_policy_id, version, status, payload_json)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(harness_policy_id, version) DO UPDATE SET
+                       status = excluded.status, payload_json = excluded.payload_json""",
+                (policy.harness_policy_id, policy.version, policy.status, _json(policy)),
+            )
         return policy
 
     def get_harness_policy(self, policy_id: str, version: str | None = None) -> HarnessPolicy | None:

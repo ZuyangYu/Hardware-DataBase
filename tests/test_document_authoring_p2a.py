@@ -201,6 +201,7 @@ def test_p2a_xlsx_candidate_and_hash_bound_release(tmp_path: Path):
         regions=[WorkbookRegionSchema(
             region_id="network-result", sheet_name="Review", locator={"cell": "A1"},
             role="evidence_derived", write_policy="deterministic_only",
+            allow_nonempty_overwrite=True,
         )],
         bindings=[TemplateUnitBinding(
             binding_id="bind-network-result", template_schema_id="workbook-review", template_schema_version="1",
@@ -312,6 +313,7 @@ def test_internal_harness_writes_only_validated_evidence_draft(tmp_path: Path):
         regions=[WorkbookRegionSchema(
             region_id="controller-cell", sheet_name="Review", locator={"cell": "A1"},
             role="semantic_draft", write_policy="validated_draft",
+            allow_nonempty_overwrite=True,
         )],
         bindings=[TemplateUnitBinding(
             binding_id="controller-binding", template_schema_id="semantic-workbook", template_schema_version="1",
@@ -681,6 +683,7 @@ def test_internal_harness_rewrites_query_on_success_empty(tmp_path: Path, monkey
         regions=[WorkbookRegionSchema(
             region_id="controller-cell", sheet_name="Review", locator={"cell": "A1"},
             role="semantic_draft", write_policy="validated_draft",
+            allow_nonempty_overwrite=True,
         )],
         bindings=[TemplateUnitBinding(
             binding_id="controller-binding", template_schema_id="semantic-workbook", template_schema_version="1",

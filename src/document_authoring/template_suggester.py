@@ -8,9 +8,22 @@ from typing import Protocol
 
 from src.core.llm_client import LLMClient
 from src.document_authoring.template_analysis import TemplateAnalysis, TemplateAnalysisSuggestion
+from src.document_authoring.template_progress import TemplateProgressCallback
 
 
 logger = logging.getLogger(__name__)
+
+
+class TemplateSuggestionTechnicalFailure(Exception):
+    """The automatic template-upload suggestion path failed for a technical reason.
+
+    Raised by the service so the sanitized draft can be preserved for audit
+    instead of being deleted or silently accepted.
+    """
+
+    def __init__(self, message: str, *, template_version_id: str | None = None):
+        super().__init__(message)
+        self.template_version_id = template_version_id
 
 _SUGGESTION_FIELDS = {
     "semantic_unit_id", "label", "target_unit_ids", "retrieval_terms", "confidence",
@@ -32,7 +45,12 @@ class LLMTemplateSuggestionProvider:
     def __init__(self, client: LLMClient):
         self._client = client
 
-    def suggest(self, analysis: TemplateAnalysis) -> list[TemplateAnalysisSuggestion]:
+    def suggest(
+        self,
+        analysis: TemplateAnalysis,
+        *,
+        progress_callback: TemplateProgressCallback | None = None,
+    ) -> list[TemplateAnalysisSuggestion]:
         if analysis.status != "ready_for_confirmation":
             return []
         try:
@@ -45,8 +63,17 @@ class LLMTemplateSuggestionProvider:
             )
             raw_suggestions = json.loads(response)
             suggestions = _parse_suggestions(raw_suggestions)
+            suggestions = _resolve_duplicate_targets(suggestions)
             candidate = analysis.model_copy(update={"suggestions": suggestions})
             candidate.validate_suggestions()
+        except PermissionError as exc:
+            # Suggesting a protected (non-writable) unit is a policy violation,
+            # not a malformed response.  Abort so the sanitized draft is
+            # preserved for audit instead of being silently deferred to review.
+            raise TemplateSuggestionTechnicalFailure(
+                "suggestion targeted a non-writable analysis unit",
+                template_version_id=analysis.template_version_id,
+            ) from exc
         except (Exception,) as exc:
             # The analysis model has a status contract but no free-form error
             # payload.  Emit the actionable reason to the application's
@@ -57,6 +84,33 @@ class LLMTemplateSuggestionProvider:
             return []
         analysis.suggestions = suggestions
         return suggestions
+
+
+def _resolve_duplicate_targets(
+    suggestions: list[TemplateAnalysisSuggestion],
+) -> list[TemplateAnalysisSuggestion]:
+    """Keep at most one suggestion per target unit, preferring higher confidence.
+
+    The LLM may echo the same writable unit in several candidates; binding them
+    all would produce contradictory writes.  A single winner per unit wins, and
+    each kept suggestion is trimmed to the units it actually won so the result
+    stays unique under ``validate_suggestions``.
+    """
+    best_by_unit: dict[str, TemplateAnalysisSuggestion] = {}
+    for suggestion in suggestions:
+        for unit_id in suggestion.target_unit_ids:
+            current = best_by_unit.get(unit_id)
+            if current is None or suggestion.confidence > current.confidence:
+                best_by_unit[unit_id] = suggestion
+    kept: list[TemplateAnalysisSuggestion] = []
+    for suggestion in suggestions:
+        won = [unit_id for unit_id in suggestion.target_unit_ids if best_by_unit[unit_id] is suggestion]
+        if not won:
+            continue
+        if len(won) != len(suggestion.target_unit_ids):
+            suggestion = suggestion.model_copy(update={"target_unit_ids": won})
+        kept.append(suggestion)
+    return kept
 
 
 def _parse_suggestions(value: object) -> list[TemplateAnalysisSuggestion]:

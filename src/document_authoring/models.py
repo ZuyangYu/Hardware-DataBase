@@ -597,6 +597,38 @@ class WorkbookFillPlan(BaseModel):
     fills: list[WorkbookFill] = Field(default_factory=list)
 
 
+class WorkbookTableColumnSchema(BaseModel):
+    """One discovered column of a template-driven workbook table."""
+
+    column_id: str
+    label: str
+    column_letter: str
+
+
+class WorkbookTableSchema(BaseModel):
+    """A discovered table region on a template sheet, with its writable columns."""
+
+    table_region_id: str
+    semantic_unit_id: str
+    sheet_name: str
+    header_row: int
+    first_data_row: int
+    last_template_row: int
+    style_source_row: int
+    max_output_rows: int
+    columns: list[WorkbookTableColumnSchema] = Field(default_factory=list)
+    expected_value_hashes: dict[str, str] = Field(default_factory=dict)
+    allow_example_region_replacement: bool = True
+
+
+class WorkbookTableFill(BaseModel):
+    """A value destined for the data rows of a discovered workbook table."""
+
+    table_region_id: str
+    semantic_unit_id: str
+    rows: list[dict[str, str]] = Field(default_factory=list)
+
+
 class DocxFill(BaseModel):
     """A value destined for one pre-registered DOCX region."""
 
