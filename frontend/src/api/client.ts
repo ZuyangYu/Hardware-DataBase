@@ -77,6 +77,28 @@ export const api = {
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
 };
 
+/** 触发浏览器下载二进制文件(不能走 JSON request()). */
+export async function downloadBlob(path: string, filename: string): Promise<void> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: { ...authHeader() },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new ApiError(response.status, text, response.statusText);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export const apiDownload = { blob: downloadBlob };
+
 /** multipart 上传(不能走 request():浏览器要自己拼 boundary) */
 export async function uploadFiles<T>(path: string, form: FormData): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {

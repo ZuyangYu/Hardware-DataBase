@@ -557,3 +557,92 @@ export interface EvaluationDatasetUploadResponse {
   file_name: string;
   sample_count: number;
 }
+
+export type DocumentUnit = {
+  unit_id: string;
+  label: string;
+  writable: boolean;
+  blocked_reason?: string | null;
+};
+
+export type DocumentSuggestion = {
+  semantic_unit_id: string;
+  label: string;
+  confidence: number;
+};
+
+export type DocumentAnalysis = {
+  analysis_id: string;
+  template_version_id: string;
+  format: string;
+  status: string;
+  units: DocumentUnit[];
+  suggestions: DocumentSuggestion[];
+};
+
+export type TemplateVersion = {
+  template_version_id: string;
+  template_id: string;
+  template_schema_id: string;
+  template_schema_version: string;
+  format: string;
+  status: string;
+};
+
+export type DocumentSchema = {
+  document_schema_id: string;
+  version: string;
+  status: string;
+};
+
+export type GenerationOptions = {
+  knowledge_bases: string[];
+  templates: TemplateVersion[];
+  schemas: DocumentSchema[];
+};
+
+export type WorkOrderStage =
+  | 'ready'
+  | 'scope_review_required'
+  | 'template_contract_review_required';
+
+export type CreateWorkOrderResult = {
+  work_order_id: string;
+  stage: WorkOrderStage;
+  exceptions?: unknown[];
+  issues?: unknown[];
+};
+
+export type WorkOrder = {
+  work_order_id: string;
+  status: string;
+  scope_type: string;
+  target_format?: string;
+  [k: string]: unknown;
+};
+
+export type HarnessRunView = {
+  run_id?: string;
+  status?: string;
+  current_node?: string;
+  error?: string;
+} & Record<string, unknown>;
+
+export type WorkOrderStatus = {
+  work_order_id: string;
+  status: string;
+  scope_type: string;
+  knowledge_base_name?: string;
+  target_format?: string;
+  unit_statuses: Record<string, string>;
+  harness_run?: HarnessRunView;
+  validation?: { status?: string; issues?: unknown[] };
+  artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
+  [k: string]: unknown;
+};
+
+export type IcdScopeReview = {
+  status?: string;
+  exceptions?: Array<{ exception_id?: string; kind?: string; pin?: string }>;
+  [k: string]: unknown;
+} | null;
