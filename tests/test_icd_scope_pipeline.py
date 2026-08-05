@@ -185,6 +185,7 @@ def _pipeline() -> tuple[AppPipeline, RequestContext, Mock, SimpleNamespace]:
     service = Mock()
     service.create_knowledge_base_work_order.return_value = order
     service.resolve_source_snapshot.return_value = snapshot
+    service.get_icd_scope_review.return_value = None
     service._schema.return_value = _relationship_schema()
     service.build_knowledge_base_retrieval_outcome.side_effect = (
         lambda _kb_name, _source_names, evidences, **_kwargs: SimpleNamespace(

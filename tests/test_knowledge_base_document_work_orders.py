@@ -209,6 +209,7 @@ def test_pipeline_auto_generation_uses_created_order_frozen_snapshot(pipeline, c
     )
     service.create_knowledge_base_work_order.return_value = order
     service.resolve_source_snapshot.return_value = snapshot
+    service.get_icd_scope_review.return_value = None
     service.run_internal_harness.return_value = candidate
     pipeline.document_generation = service
     pipeline.list_file_infos = Mock(
@@ -235,7 +236,7 @@ def test_pipeline_auto_generation_uses_created_order_frozen_snapshot(pipeline, c
         document_schema_id="schema-a",
         document_schema_version="1",
     )
-    service.resolve_source_snapshot.assert_called_once_with(order)
+    service.resolve_source_snapshot.assert_any_call(order)
     pipeline._knowledge_base_retriever.assert_called_once_with(
         ctx,
         "hardware",

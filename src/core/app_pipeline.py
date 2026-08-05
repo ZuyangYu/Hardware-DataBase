@@ -725,17 +725,30 @@ class AppPipeline:
             **kwargs,
         )
 
-    def auto_generate_knowledge_base_document(
+    def prepare_knowledge_base_document_generation(
         self,
         ctx: RequestContext,
         *,
         knowledge_base_name: str,
+        template_version_id: str,
+        document_schema_id: str,
+        document_schema_version: str,
         **kwargs,
     ):
-        """Create and run a KB work order using only its frozen source snapshot."""
+        """Create a KB work order and run the fast, non-harness preflight.
+
+        Mirrors the synchronous pre-harness half of ``auto_generate_...``:
+        create the order, resolve its frozen source snapshot, check the ICD
+        template profile, and build the ICD connector-scope decision. Returns a
+        stage dict. The slow harness half is submitted separately via
+        ``submit_knowledge_base_document_generation``.
+        """
         order = self.create_knowledge_base_document_work_order(
             ctx,
             knowledge_base_name=knowledge_base_name,
+            template_version_id=template_version_id,
+            document_schema_id=document_schema_id,
+            document_schema_version=document_schema_version,
             **kwargs,
         )
         snapshot = self.document_generation.resolve_source_snapshot(order)
@@ -807,6 +820,27 @@ class AppPipeline:
                         for exception in scope_review.exceptions
                     ],
                 }
+        return {"stage": "ready", "work_order_id": order.work_order_id}
+
+    def auto_generate_knowledge_base_document(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+        **kwargs,
+    ):
+        """Create and run a KB work order using only its frozen source snapshot."""
+        prepared = self.prepare_knowledge_base_document_generation(
+            ctx,
+            knowledge_base_name=knowledge_base_name,
+            **kwargs,
+        )
+        if prepared.get("stage") != "ready":
+            return prepared
+        work_order_id = prepared["work_order_id"]
+        order = self.document_generation.store.get_work_order(work_order_id)
+        snapshot = self.document_generation.resolve_source_snapshot(order)
+        scope_review = self.document_generation.get_icd_scope_review(ctx, work_order_id)
         retriever_kwargs = {
             "source_set_snapshot_id": snapshot.source_set_snapshot_id,
         }
@@ -818,12 +852,11 @@ class AppPipeline:
             list(snapshot.source_names),
             **retriever_kwargs,
         )
-        candidate = self.document_generation.run_internal_harness(
+        return self.document_generation.run_internal_harness(
             ctx,
-            order.work_order_id,
+            work_order_id,
             retrieve=retrieve,
         )
-        return candidate
 
     def continue_knowledge_base_document_generation(
         self,
@@ -852,6 +885,17 @@ class AppPipeline:
             ctx,
             work_order_id,
             retrieve=retrieve,
+        )
+
+    def submit_knowledge_base_document_generation(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+    ) -> str:
+        """Run an existing KB work order's harness on the background worker."""
+        return self.document_generation.worker.submit(
+            work_order_id,
+            lambda: self.continue_knowledge_base_document_generation(ctx, work_order_id),
         )
 
     def auto_generate_document(self, ctx: RequestContext, **kwargs):
