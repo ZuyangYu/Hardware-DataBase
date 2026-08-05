@@ -29,6 +29,7 @@ import KbListPage from './pages/KbListPage';
 import ChatPage from './pages/chat/ChatPage';
 import KbFilesPage from './pages/KbFilesPage';
 import AssetsPage from './pages/AssetsPage';
+import DocumentGenerationPage from './pages/DocumentGenerationPage';
 import UsersPage from './pages/admin/UsersPage';
 import DepartmentsPage from './pages/admin/DepartmentsPage';
 import KbPermissionsPage from './pages/admin/KbPermissionsPage';
@@ -161,6 +162,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               element={
                 <KbContentRoute auth={auth}>
                   <AssetsPage auth={auth} onLogout={onLogout} kbs={kbs} />
+                </KbContentRoute>
+              }
+            />
+            <Route
+              path="/document-generation"
+              element={
+                <KbContentRoute auth={auth}>
+                  <DocumentGenerationPage auth={auth} onLogout={onLogout} />
                 </KbContentRoute>
               }
             />
