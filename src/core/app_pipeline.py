@@ -1273,6 +1273,47 @@ class AppPipeline:
                             revision=version.revision,
                             approval_status=version.approval_status,
                         ))
+                # Capability-aware circuit dispatch (symmetrical to the
+                # spreadsheet dispatch above and to P1's entity/relationship
+                # retrievers): entity_lookup / relationship_lookup requirements
+                # also query the circuit structured index. Same frozen-source
+                # guard (by document.title) and per-version EvidenceEnvelope
+                # binding so the result passes the scope validation in
+                # ProjectEvidenceRetrievalService.retrieve.
+                if (
+                    getattr(self, "circuit_service", None) is not None
+                    and any(
+                        cap in (requirement.required_capabilities or [])
+                        for cap in ("entity_lookup", "relationship_lookup")
+                    )
+                ):
+                    circuit_tool = CircuitQueryTool(self.circuit_service)
+                    circuit_evidences = circuit_tool.run(
+                        query,
+                        source_kb_name or (kb_names[0] if kb_names else ""),
+                        ctx,
+                        top_k=config.settings.FINAL_TOP_K,
+                        filters=None,
+                    )
+                    for evidence in circuit_evidences:
+                        if evidence.source_name != document.title:
+                            continue
+                        result.append(EvidenceEnvelope(
+                            id=evidence.id,
+                            content=evidence.content,
+                            source_name=evidence.source_name,
+                            source_type=getattr(evidence, "source_type", "circuit_design"),
+                            score=evidence.score,
+                            metadata=dict(evidence.metadata),
+                            backend=getattr(evidence, "backend", "circuit"),
+                            retriever=getattr(evidence, "retriever", "circuit_query"),
+                            project_id=project_id,
+                            source_version_id=version_id,
+                            processing_artifact_id=artifact_ids[0] if len(artifact_ids) == 1 else None,
+                            document_role=document.document_role,
+                            revision=version.revision,
+                            approval_status=version.approval_status,
+                        ))
                 return result
 
             outcome = self.project_retrieval.retrieve(ctx, requirement, snapshot_id, retrieve_one)

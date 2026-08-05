@@ -26,6 +26,8 @@ class CircuitQuestionAnalysisTests(unittest.TestCase):
 
     def test_evaluation_questions_select_structural_operations(self):
         dataset = Path(__file__).resolve().parents[1] / "evaluation" / "datasets" / "ai_database_test.jsonl"
+        if not dataset.exists():
+            self.skipTest(f"missing evaluation dataset: {dataset.name}")
         expected_operations = {
             "ai-db-v1-power-9-12v-to-3v3": {"component_selection", "power_path"},
             "ai-db-v1-i2c-buses-and-pullups": {"i2c", "bias", "connection"},

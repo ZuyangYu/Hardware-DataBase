@@ -11,18 +11,14 @@ from src.agents.graph import (
     _stream_chat_with_usage_stage,
     _write_stream_event,
     analyze_question_with_llm,
-    analyze_question,
     build_multi_source_graph,
     compose_direct_answer,
     judge_sufficiency,
-    merge_evidence,
     plan_next_retrieval,
-    plan_source_selection,
     plan_source_selection_with_llm,
     retrieve_evidence,
     route_query,
     scan_kb_catalog,
-    score_and_compare_evidence,
 )
 from src.agents.prompts import ANSWER_SYSTEM_PROMPT
 from src.agents.tools.circuit_tools import CircuitQueryTool
@@ -334,117 +330,6 @@ class MultiSourceAgentRunner:
             yield final_state.get("final_response") or final_state.get("answer") or "未生成回答。"
             emit_stage("generate", "生成回答", "done", "最终回答已生成")
         return
-
-    def _stream_fast(
-        self,
-        *,
-        query: str,
-        kb_name: str,
-        history: list[tuple[str, str]],
-        ctx: RequestContext | None,
-        thread_id: str,
-        progress_callback: Callable[[str, str, str, str], None] | None,
-        should_cancel: Callable[[], bool] | None,
-    ) -> Generator[str, None, None]:
-        """One-pass multi-source retrieval for the default interactive path.
-
-        It keeps deterministic source planning and evidence constraints while
-        skipping planning LLM calls, draft generation, sufficiency judging and
-        multi-hop retries. That turns the normal chat path into one final model
-        request after parallel retrieval, so time-to-first-token is predictable.
-        """
-        def stage(key: str, label: str, status: str = "running", detail: str = "") -> None:
-            if progress_callback is not None:
-                progress_callback(key, label, status, detail)
-
-        state: dict = {
-            "thread_id": thread_id or f"{ctx.session_id if ctx else 'anonymous'}:{kb_name}",
-            "kb_name": kb_name,
-            "user_query": query,
-            "history": history,
-            "ctx": _ctx_to_dict(ctx),
-            "_ctx_obj": ctx,
-            "retrieval_round": 0,
-            "evidence": [],
-            "trace": [],
-            "_cancel_check": should_cancel,
-        }
-        stage("route", "查询模式", "done", "快速查询：单轮多源召回")
-        stage("analyze", "分析硬件问题")
-        state = analyze_question(state)
-        if should_cancel is not None and should_cancel():
-            return
-        stage("analyze", "分析硬件问题", "done", "已按规则识别实体和证据类型")
-        stage("catalog", "读取数据目录")
-        state = scan_kb_catalog(state, self.catalog_tool)
-        if should_cancel is not None and should_cancel():
-            return
-        stage("catalog", "读取数据目录", "done", "已读取当前知识库可用数据源")
-        stage("plan", "规划检索来源")
-        state = plan_source_selection(state)
-        if should_cancel is not None and should_cancel():
-            return
-        stage("plan", "规划检索来源", "done", "已生成确定性单轮检索计划")
-        stage("retrieve", "多源硬件数据召回")
-        try:
-            state = retrieve_evidence(state, self.tools)
-        except QueryCancelled:
-            return
-        if should_cancel is not None and should_cancel():
-            return
-        stage("retrieve", "多源硬件数据召回", "done", "单轮召回完成")
-        state = merge_evidence(state)
-        state = score_and_compare_evidence(state)
-        evidence = _select_claim_context(state, limit=8)
-        answer_parts: list[str] = []
-        if not evidence:
-            answer = "当前知识库中未找到可支撑回答的证据。"
-            answer_parts.append(answer)
-            stage("generate", "生成回答", "running", "未命中证据，正在输出结果")
-            yield answer
-        else:
-            response_contract = answer_contract(
-                query,
-                list(state.get("claim_coverage") or []),
-                list(state.get("retrieval_ledger") or []),
-                list((state.get("coverage_matrix") or {}).get("conflicts") or []),
-            )
-            context = "\n\n".join(
-                f"[{index}] 来源: {item.get('source_name')} | 类型: {item.get('content_kind')}\n"
-                f"{str(item.get('content') or '')[:1800]}"
-                for index, item in enumerate(evidence, start=1)
-            )
-            recent_history = json.dumps(history[-3:], ensure_ascii=False)
-            prompt = (
-                f"回答约束：\n{response_contract}\n\n"
-                f"最近对话：\n{recent_history}\n\n"
-                f"用户问题：{query}\n\n"
-                f"证据：\n{context}\n\n"
-                "请用中文直接回答，只陈述证据支持的结论；信息不足时明确说明缺口，并给出来源编号。"
-            )
-            stage("generate", "生成回答", "running", "正在流式生成答案正文")
-            for delta in _stream_chat_with_usage_stage(
-                self.llm_client,
-                [{"role": "system", "content": ANSWER_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
-                "fast_answer",
-            ):
-                if should_cancel is not None and should_cancel():
-                    return
-                answer_parts.append(delta)
-                yield delta
-        answer = "".join(answer_parts).strip()
-        state["answer"] = answer
-        state["verification"] = {
-            "grounded": bool(evidence),
-            "unsupported_claims": [],
-            "weak_claims": [],
-            "citation_coverage": 1.0 if evidence else 0.0,
-        }
-        state["sufficiency"] = {"status": "fast_single_pass", "missing": [], "suggested_queries": []}
-        self._last_footer = ""
-        self._last_retrieval_summary = {**self._build_retrieval_summary(state), "query_mode": "fast"}
-        self._last_token_usage_summary = self._get_llm_usage_summary()
-        stage("generate", "生成回答", "done", "快速查询已完成")
 
     def _draft_intermediate_answer(self, state):
         evidence = _select_claim_context(state, limit=12)

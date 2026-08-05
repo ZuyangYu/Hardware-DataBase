@@ -381,6 +381,8 @@ class _EvaluationPlannerLLM:
 class AgenticRunnerTests(unittest.TestCase):
     def test_evaluation_questions_always_plan_indexed_circuit_source(self):
         dataset = Path(__file__).resolve().parents[1] / "evaluation" / "datasets" / "ai_database_test.jsonl"
+        if not dataset.exists():
+            self.skipTest(f"missing evaluation dataset: {dataset.name}")
         catalog = {"sources": [{"document_name": "board.edf", "record_id": 7, "processor_kind": "circuit_design", "status": "indexed"}]}
         for line in dataset.read_text(encoding="utf-8").splitlines():
             row = json.loads(line)

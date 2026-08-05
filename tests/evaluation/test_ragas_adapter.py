@@ -7,6 +7,22 @@ from src.evaluation.ragas_adapter import RAGAS_RESULT_KEYS, RagasAdapter, _Nativ
 from src.evaluation.schemas import AnswerSnapshot, EvaluationSample
 
 
+def _has_native_ragas_deps() -> bool:
+    """Whether the optional ragas/openai/langchain_openai stack is importable.
+
+    Only the three ``_NativeRagasBackend`` tests need the real stack; the rest
+    of the suite uses in-memory fake backends. Missing optional deps skip those
+    three rather than erroring.
+    """
+    try:
+        import langchain_openai  # noqa: F401
+        import openai  # noqa: F401
+        import ragas  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 class FakeBackend:
     def __init__(self):
         self.records = []
@@ -216,12 +232,14 @@ class RagasAdapterTests(unittest.TestCase):
         self.assertEqual(results[0].status, "failed")
         self.assertEqual(backend.records, [])
 
+    @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
     def test_native_backend_uses_langchain_embedding_interface(self):
         embeddings = _NativeRagasBackend(_config())._build_embeddings()
 
         self.assertTrue(callable(embeddings.embed_query))
         self.assertTrue(callable(embeddings.embed_documents))
 
+    @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
     def test_native_backend_passes_limit_and_uses_single_relevancy_sample(self):
         backend = _NativeRagasBackend(_config(llm_max_tokens=2048))
         llm = backend._build_llm()
@@ -231,6 +249,7 @@ class RagasAdapterTests(unittest.TestCase):
         self.assertEqual(llm.model_args["max_tokens"], 2048)
         self.assertEqual(metrics[0].strictness, 1)
 
+    @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
     def test_native_backend_applies_runtime_limits_to_ragas(self):
         backend = _NativeRagasBackend(
             _config(timeout_seconds=23, max_workers=3, max_retries=4)
