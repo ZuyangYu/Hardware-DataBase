@@ -142,11 +142,15 @@ class AuthoringGraph:
                     self._step(state, "rerank_evidence")
                     self.policy.require_tool("rerank_evidence")
                     evidence = self.reranker.rerank(requirement, evidence)
+                evidence, discarded_evidence_ids = _select_field_evidence(
+                    evidence, _max_evidence_items(unit_id, schema)
+                )
                 # Retrieval ledger (P9): per-unit observability row surfaced in
                 # the matrix (for human review) and on the result, so it is no
                 # longer dropped when run() returns.
                 ledger_row = _retrieval_ledger_row(
-                    unit_id, requirement, outcome, evidence, state, recovery_triggered
+                    unit_id, requirement, outcome, evidence, state, recovery_triggered,
+                    discarded_evidence_ids,
                 )
                 result.retrieval_ledger.append(ledger_row)
                 result.matrix_rows.append({
@@ -362,6 +366,37 @@ def _semantic_units(schema: DocumentSchema) -> list[dict[str, Any]]:
     return units
 
 
+def _max_evidence_items(unit_id: str, schema: DocumentSchema) -> int:
+    if unit_id.startswith("field:"):
+        field_id = unit_id.removeprefix("field:")
+        for field in schema.fields:
+            if field.field_id == field_id:
+                return field.max_evidence_items
+    return 5
+
+
+def _select_field_evidence(
+    evidence: list[dict[str, Any]], max_items: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Deduplicate a field's already scoped evidence before applying its budget."""
+    unique: list[dict[str, Any]] = []
+    discarded: list[str] = []
+    seen_content: set[str] = set()
+    for item in evidence:
+        content = str(item.get("content") or "").strip()
+        evidence_id = str(item.get("id") or "")
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if content_hash in seen_content:
+            if evidence_id:
+                discarded.append(evidence_id)
+            continue
+        seen_content.add(content_hash)
+        unique.append(item)
+    selected = unique[:max_items]
+    discarded.extend(str(item.get("id") or "") for item in unique[max_items:] if item.get("id"))
+    return selected, discarded
+
+
 def _requirement_for_unit(
     unit: dict[str, Any],
     work_order: DocumentWorkOrder,
@@ -444,6 +479,7 @@ def _retrieval_ledger_row(
     evidence: list[dict[str, Any]],
     state: DocumentAuthoringState,
     recovery_triggered: bool = False,
+    discarded_evidence_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a per-unit retrieval observability row (P9).
 
@@ -476,7 +512,9 @@ def _retrieval_ledger_row(
             _evidence_fallback(evidence_obj) for evidence_obj in outcome.evidences
         ),
         "final_evidence_ids": [entry["id"] for entry in evidence],
+        "discarded_evidence_ids": list(discarded_evidence_ids or []),
         "recovery_triggered": recovery_triggered,
+        "recovery_reason": "balanced_route_retry" if recovery_triggered else None,
     }
 
 

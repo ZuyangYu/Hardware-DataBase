@@ -235,3 +235,23 @@ def test_matrix_row_embeds_ledger():
     result = _run(graph, retrieve)
 
     assert result.matrix_rows[0]["retrieval_ledger"] == result.retrieval_ledger[0]
+
+
+def test_writer_receives_bounded_deduplicated_evidence_and_ledger_keeps_discards():
+    evidences = [
+        _evidence("a", "alpha"),
+        _evidence("b", "bravo"),
+        _evidence("c", "charlie"),
+        _evidence("d", "delta"),
+        _evidence("e", "echo"),
+        _evidence("f", "foxtrot"),
+        _evidence("duplicate", "alpha"),
+    ]
+    def retrieve(req, attempt, query_override=None):
+        return _outcome(evidences)
+    graph, draft_calls = _graph()
+
+    result = _run(graph, retrieve)
+
+    assert [item["id"] for item in draft_calls[0].evidence] == ["a", "b", "c", "d", "e"]
+    assert result.retrieval_ledger[0]["discarded_evidence_ids"] == ["duplicate", "f"]

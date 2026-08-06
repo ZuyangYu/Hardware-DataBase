@@ -149,6 +149,7 @@ class DocumentFieldSchema(BaseModel):
     retrieval_policy_id: str
     query_terms: list[str] = Field(default_factory=list)
     subject_aliases: list[str] = Field(default_factory=list)
+    max_evidence_items: int = Field(default=5, ge=1, le=10)
     verification_policy_id: str
     value_normalizer_id: str | None = None
     allow_derivation: bool = False

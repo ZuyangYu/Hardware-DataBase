@@ -142,6 +142,7 @@ def test_recovery_fires_on_success_empty_when_enabled():
     assert result.unit_statuses["field:f1"] == "requires_human"
     assert any(i["kind"] == "low_confidence_recovery" for i in result.issues)
     assert result.retrieval_ledger[0]["recovery_triggered"] is True
+    assert result.retrieval_ledger[0]["recovery_reason"] == "balanced_route_retry"
 
 
 def test_recovery_not_fired_when_tool_not_allowed():
