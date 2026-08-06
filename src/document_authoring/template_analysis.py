@@ -55,6 +55,7 @@ class TemplateAnalysisUnit(BaseModel):
         "unknown",
         "fixed_label",
         "placeholder",
+        "sample_value",
         "value",
         "table_header",
         "table_body",
@@ -69,6 +70,7 @@ class TemplateAnalysisSuggestion(BaseModel):
     retrieval_terms: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
     value_shape: Literal["scalar", "repeating_table"] = "scalar"
+    overwrite_basis: Literal["placeholder", "sample_value"] | None = None
 
 
 class TemplateRiskMetrics(BaseModel):

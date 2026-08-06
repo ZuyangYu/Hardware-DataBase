@@ -222,3 +222,146 @@ def test_explicit_placeholders_are_not_counted_as_destructive_targets():
 
     assert decision.status == "auto_accepted"
     assert "destructive_target_ratio" not in decision.reason_codes
+
+
+def test_llm_target_does_not_bypass_layout_or_confidence_checks():
+    analysis = _analysis(unit=TemplateAnalysisUnit(
+        unit_id="sheet:Review!B1", locator={"sheet_name": "Review", "cell": "B1"},
+        writable=True, value_kind="blank", structural_role_hint="layout_blank",
+    ))
+    analysis.approved_overwrite_unit_ids = ["sheet:Review!B1"]
+
+    decision = decide_template_activation(analysis)
+
+    assert decision.status == "requires_human"
+    assert "layout_blank_target" in decision.reason_codes
+
+
+def test_approved_overwrite_does_not_allow_fixed_labels():
+    unit = TemplateAnalysisUnit(
+        unit_id="sheet:Review!A1",
+        locator={"sheet_name": "Review", "cell": "A1"},
+        writable=True,
+        value_preview="Project",
+        value_kind="text",
+        style_fingerprint="style-1",
+        structural_role_hint="fixed_label",
+    )
+    analysis = _analysis(unit=unit)
+    analysis.approved_overwrite_unit_ids = [unit.unit_id]
+
+    decision = decide_template_activation(analysis)
+
+    assert decision.status == "requires_human"
+    assert "fixed_label_target" in decision.reason_codes
+
+
+def test_approved_overwrite_does_not_skip_destructive_target_ratio():
+    units = [
+        TemplateAnalysisUnit(
+            unit_id=f"sheet:Review!A{index}",
+            locator={"sheet_name": "Review", "cell": f"A{index}"},
+            writable=True,
+            value_preview=f"Fixed label {index}",
+            value_kind="text",
+            style_fingerprint="style-1",
+            structural_role_hint="fixed_label",
+        )
+        for index in range(1, 11)
+    ]
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-overwrite",
+        template_version_id="template-overwrite",
+        content_hash="a" * 64,
+        format="xlsx",
+        status="ready_for_confirmation",
+        units=units,
+        suggestions=[
+            TemplateAnalysisSuggestion(
+                semantic_unit_id=f"field-{index}",
+                label=f"Field {index}",
+                target_unit_ids=[unit.unit_id],
+                confidence=0.99,
+            )
+            for index, unit in enumerate(units[:5])
+        ],
+    )
+    analysis.approved_overwrite_unit_ids = [unit.unit_id for unit in units[:5]]
+
+    decision = decide_template_activation(analysis)
+
+    assert decision.status == "requires_human"
+    assert "destructive_target_ratio" in decision.reason_codes
+
+
+def test_approved_sample_values_still_respect_destructive_target_ratio():
+    units = [
+        TemplateAnalysisUnit(
+            unit_id=f"sheet:Review!A{index}",
+            locator={"sheet_name": "Review", "cell": f"A{index}"},
+            writable=True,
+            value_preview=f"Example {index}",
+            value_kind="text",
+            style_fingerprint="style-1",
+            structural_role_hint="sample_value",
+        )
+        for index in range(1, 11)
+    ]
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-samples",
+        template_version_id="template-samples",
+        content_hash="a" * 64,
+        format="xlsx",
+        status="ready_for_confirmation",
+        units=units,
+        suggestions=[
+            TemplateAnalysisSuggestion(
+                semantic_unit_id=f"field-{index}",
+                label=f"Field {index}",
+                target_unit_ids=[unit.unit_id],
+                confidence=0.99,
+                overwrite_basis="sample_value",
+            )
+            for index, unit in enumerate(units)
+        ],
+        approved_overwrite_unit_ids=[unit.unit_id for unit in units],
+    )
+
+    decision = decide_template_activation(analysis)
+
+    assert decision.status == "requires_human"
+    assert "destructive_target_ratio" in decision.reason_codes
+
+
+def test_approved_overwrite_does_not_bypass_low_confidence():
+    suggestion = TemplateAnalysisSuggestion(
+        semantic_unit_id="project_summary",
+        label="Project Summary",
+        target_unit_ids=["sheet:Review!B1"],
+        confidence=0.89,
+    )
+    analysis = _analysis(suggestion=suggestion)
+    analysis.approved_overwrite_unit_ids = ["sheet:Review!B1"]
+
+    decision = decide_template_activation(analysis)
+
+    assert decision.status == "requires_human"
+    assert "low_mapping_confidence" in decision.reason_codes
+
+
+def test_approved_overwrite_does_not_allow_layout_blank_target():
+    unit = TemplateAnalysisUnit(
+        unit_id="sheet:Review!B1",
+        locator={"sheet_name": "Review", "cell": "B1"},
+        writable=True,
+        value_kind="blank",
+        style_fingerprint="style-1",
+        structural_role_hint="layout_blank",
+    )
+    analysis = _analysis(unit=unit)
+    analysis.approved_overwrite_unit_ids = [unit.unit_id]
+
+    decision = decide_template_activation(analysis)
+
+    assert decision.status == "requires_human"
+    assert "layout_blank_target" in decision.reason_codes

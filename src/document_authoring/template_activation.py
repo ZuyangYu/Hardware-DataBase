@@ -79,25 +79,25 @@ def decide_template_activation(
                 continue
             if analysis.format == "docx":
                 continue
-            human_confirmed = unit_id in analysis.human_confirmed_target_unit_ids
-            if (
-                unit.structural_role_hint == "unknown"
-                and unit.value_preview is None
-                and not unit.style_fingerprint
-                and not unit.neighborhood
-                and not human_confirmed
-            ):
-                reject("missing_semantic_context")
-            if unit.structural_role_hint == "layout_blank" and not human_confirmed:
+            if unit.value_kind == "formula":
+                reject("formula_target")
+            if unit.structural_role_hint == "fixed_label":
+                reject("fixed_label_target")
+            if unit.structural_role_hint == "table_header":
+                reject("table_header_target")
+            if unit.structural_role_hint == "layout_blank":
                 reject("layout_blank_target")
-            if (
-                unit.value_kind != "blank"
-                and unit.structural_role_hint != "placeholder"
-                and not (
-                    human_confirmed
+            if unit.structural_role_hint == "unknown":
+                reject("missing_semantic_context")
+            allowed_overwrite = (
+                unit.structural_role_hint == "placeholder"
+                or (
+                    unit.structural_role_hint == "sample_value"
+                    and suggestion.overwrite_basis == "sample_value"
                     and unit_id in analysis.approved_overwrite_unit_ids
                 )
-            ):
+            )
+            if not allowed_overwrite:
                 reject("nonempty_target_not_placeholder")
 
     if analysis.format != "docx" and target_count:
@@ -105,7 +105,6 @@ def decide_template_activation(
             unit
             for unit in target_units
             if unit.structural_role_hint != "placeholder"
-            and unit.unit_id not in analysis.human_confirmed_target_unit_ids
         ]
         risky_target_ratio = (
             len(risky_targets) / total_unit_count if total_unit_count else 0.0

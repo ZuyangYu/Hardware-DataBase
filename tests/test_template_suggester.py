@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from src.document_authoring.template_analysis import TemplateAnalysis, TemplateAnalysisUnit
+import json
+
+from src.document_authoring.template_analysis import (
+    TemplateAnalysis,
+    TemplateAnalysisUnit,
+)
 from src.document_authoring.template_suggester import LLMTemplateSuggestionProvider
 
 
@@ -44,6 +49,48 @@ def test_llm_suggester_only_sends_structural_inventory_and_parses_valid_json():
     assert suggestions[0].semantic_unit_id == "summary"
 
 
+def test_llm_suggester_approves_only_server_confirmed_sample_value_targets():
+    analysis = _safe_docx_analysis()
+    client = RecordingClient(response=(
+        '[{"semantic_unit_id":"summary","label":"摘要","target_unit_ids":["p-1"],'
+        '"retrieval_terms":["summary"],"confidence":0.9}]'
+    ))
+
+    suggestions = LLMTemplateSuggestionProvider(client).suggest(analysis)
+
+    assert suggestions[0].semantic_unit_id == "summary"
+    assert analysis.approved_overwrite_unit_ids == []
+
+
+def test_llm_suggester_marks_only_sample_value_basis_as_approved_overwrite():
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-sample",
+        template_version_id="template-sample",
+        content_hash="a" * 64,
+        format="xlsx",
+        status="ready_for_confirmation",
+        units=[TemplateAnalysisUnit(
+            unit_id="sheet:Review!B1",
+            locator={"sheet_name": "Review", "cell": "B1"},
+            label="Sample value",
+            writable=True,
+            value_preview="Example project",
+            value_kind="text",
+            structural_role_hint="sample_value",
+        )],
+    )
+    client = RecordingClient(response=(
+        '[{"semantic_unit_id":"summary","label":"摘要",'
+        '"target_unit_ids":["sheet:Review!B1"],"retrieval_terms":["summary"],'
+        '"confidence":0.9,"overwrite_basis":"sample_value"}]'
+    ))
+
+    suggestions = LLMTemplateSuggestionProvider(client).suggest(analysis)
+
+    assert suggestions[0].overwrite_basis == "sample_value"
+    assert analysis.approved_overwrite_unit_ids == ["sheet:Review!B1"]
+
+
 def test_llm_suggester_requires_human_review_on_invalid_json_or_invalid_target():
     analysis = _safe_docx_analysis()
 
@@ -69,3 +116,142 @@ def test_llm_suggester_rejects_extra_or_missing_suggestion_fields():
 
     assert suggestions == []
     assert analysis.status == "requires_human"
+
+
+def test_llm_suggester_heals_retrieval_terms_format_drift():
+    """retrieval_terms 输出为单个字符串时归一化为列表，不丢弃整条建议。"""
+    analysis = _safe_docx_analysis()
+    client = RecordingClient(response=(
+        '[{"semantic_unit_id":"summary","label":"摘要","target_unit_ids":["p-1"],'
+        '"retrieval_terms":"summary","confidence":0.9}]'
+    ))
+
+    suggestions = LLMTemplateSuggestionProvider(client).suggest(analysis)
+
+    assert len(suggestions) == 1
+    assert suggestions[0].retrieval_terms == ["summary"]
+    assert analysis.status == "ready_for_confirmation"
+
+
+def test_llm_suggester_filters_non_string_retrieval_terms():
+    """列表里混入非字符串的 retrieval_terms 成员被剔除而非废弃整条。"""
+    analysis = _safe_docx_analysis()
+    client = RecordingClient(response=(
+        '[{"semantic_unit_id":"summary","label":"摘要","target_unit_ids":["p-1"],'
+        '"retrieval_terms":["summary", 42],"confidence":0.9}]'
+    ))
+
+    suggestions = LLMTemplateSuggestionProvider(client).suggest(analysis)
+
+    assert len(suggestions) == 1
+    assert suggestions[0].retrieval_terms == ["summary"]
+
+
+def test_llm_suggester_tolerates_extra_fields():
+    """多余字段被忽略（不再让整批回退人工），缺字段仍跳过该条。"""
+    analysis = _safe_docx_analysis()
+    response = (
+        '[{"semantic_unit_id":"summary","label":"摘要","target_unit_ids":["p-1"],'
+        '"retrieval_terms":["summary"],"confidence":0.9,"extra":true}]'
+    )
+
+    suggestions = LLMTemplateSuggestionProvider(RecordingClient(response)).suggest(analysis)
+
+    assert len(suggestions) == 1
+    assert suggestions[0].semantic_unit_id == "summary"
+    assert analysis.status == "ready_for_confirmation"
+
+
+def test_llm_suggester_chunks_large_template_and_merges():
+    """大模板按 _SUGGESTION_CHUNK_SIZE 分块调用，逐块解析后合并；单块失败不致命。"""
+    units = [
+        TemplateAnalysisUnit(
+            unit_id=f"u-{i}", locator={"cell": f"A{i + 1}"}, label=f"字段{i}", writable=True,
+        )
+        for i in range(60)
+    ]
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-big",
+        template_version_id="template-big",
+        content_hash="b" * 64,
+        format="xlsx",
+        status="ready_for_confirmation",
+        units=units,
+    )
+
+    class SequencingClient:
+        def __init__(self):
+            self.calls = 0
+            self.payloads: list[dict] = []
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            payload = json.loads(messages[1]["content"])
+            self.payloads.append(payload)
+            ids = [unit["unit_id"] for unit in payload["units"]]
+            return json.dumps([
+                {
+                    "semantic_unit_id": uid,
+                    "label": uid,
+                    "target_unit_ids": [uid],
+                    "retrieval_terms": [uid],
+                    "confidence": 0.9,
+                }
+                for uid in ids
+            ])
+
+    client = SequencingClient()
+    suggestions = LLMTemplateSuggestionProvider(client).suggest(analysis)
+
+    assert client.calls == 2  # 60 units / 50 per chunk
+    assert len(suggestions) == 60
+    assert all(len(s.target_unit_ids) == 1 for s in suggestions)
+    assert analysis.status == "ready_for_confirmation"
+    assert analysis.approved_overwrite_unit_ids == []
+
+
+def test_llm_suggester_survives_partial_chunk_failure():
+    """某块返回非法 JSON 时只丢该块，其余块仍能产出可用建议。"""
+    units = [
+        TemplateAnalysisUnit(
+            unit_id=f"u-{i}", locator={"cell": f"A{i + 1}"}, label=f"字段{i}", writable=True,
+        )
+        for i in range(110)  # 3 chunks of 50/50/10
+    ]
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-partial",
+        template_version_id="template-partial",
+        content_hash="c" * 64,
+        format="xlsx",
+        status="ready_for_confirmation",
+        units=units,
+    )
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                return "not json"  # 第二块整体失败
+            payload = json.loads(messages[1]["content"])
+            ids = [unit["unit_id"] for unit in payload["units"]]
+            return json.dumps([
+                {
+                    "semantic_unit_id": uid,
+                    "label": uid,
+                    "target_unit_ids": [uid],
+                    "retrieval_terms": [uid],
+                    "confidence": 0.9,
+                }
+                for uid in ids
+            ])
+
+    client = FlakyClient()
+    suggestions = LLMTemplateSuggestionProvider(client).suggest(analysis)
+
+    assert client.calls == 3
+    # 第一块 50 + 第三块 10 = 60 条建议存活，第二块丢失。
+    assert len(suggestions) == 60
+    assert analysis.status == "ready_for_confirmation"
