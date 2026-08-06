@@ -5,7 +5,12 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from src.evaluation.dataset_loader import DatasetValidationError, load_dataset, validate_dataset
+from src.evaluation.dataset_loader import (
+    DatasetValidationError,
+    load_dataset,
+    load_document_generation_dataset,
+    validate_dataset,
+)
 from src.evaluation.schemas import EvaluationSample
 
 
@@ -69,6 +74,28 @@ class DatasetLoaderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(DatasetValidationError, "reference_contexts"):
             load_dataset(path)
+
+    def test_document_generation_dataset_preserves_expected_value_and_allowed_sources(self):
+        path = self._write([{
+            "id": "doc-1",
+            "template_fixture": "current_review.xlsx",
+            "field_id": "rated_current",
+            "expected_value": "10 A",
+            "allowed_sources": ["power_spec.pdf"],
+        }])
+
+        records = load_document_generation_dataset(path)
+
+        self.assertEqual(records[0].expected_value, "10 A")
+        self.assertEqual(records[0].allowed_sources, ["power_spec.pdf"])
+
+    def test_builtin_document_generation_dataset_loads_independently(self):
+        records = load_document_generation_dataset(
+            Path("evaluation/datasets/document_generation_v1.jsonl")
+        )
+
+        self.assertEqual(len(records), 3)
+        self.assertEqual(records[0].field_id, "rated_current")
 
 
 if __name__ == "__main__":
