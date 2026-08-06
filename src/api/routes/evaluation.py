@@ -25,7 +25,12 @@ import config.settings
 from src.core.auth import AuthUser
 from src.evaluation.dataset_loader import load_dataset, validate_dataset
 from src.evaluation.run_control import EvaluationRunController
-from src.evaluation.schemas import EvaluationSample, EvaluationSummary, EvaluationRunState
+from src.evaluation.schemas import (
+    EvaluationRunState,
+    EvaluationSample,
+    EvaluationSummary,
+    SampleResult,
+)
 from src.ui.evaluation_page import (
     DEFAULT_OUTPUT_ROOT,
     list_evaluation_runs,
@@ -137,6 +142,22 @@ def _state_dict(state: EvaluationRunState) -> dict[str, Any]:
         if key in dump and not isinstance(dump[key], str):
             dump[key] = getattr(dump[key], "value", str(dump[key]))
     return dump
+
+
+def _load_sample_results(run_dir: Path) -> tuple[list[dict[str, Any]], str]:
+    """Load display diagnostics without making the run detail endpoint fragile."""
+    results_path = run_dir / "results.jsonl"
+    if not results_path.is_file():
+        return [], ""
+    try:
+        rows = [
+            SampleResult.model_validate_json(line).model_dump(mode="json")
+            for line in results_path.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValidationError, ValueError) as exc:
+        return [], f"样本诊断不可用：{exc}"
+    return rows, ""
 
 
 @router.get("/evaluation/runs")
@@ -338,6 +359,9 @@ def get_run(
             result["summary"] = None
     else:
         result["summary"] = None
+    result["sample_results"], result["sample_results_error"] = _load_sample_results(
+        Path(output_root) / run_id
+    )
     return result
 
 
