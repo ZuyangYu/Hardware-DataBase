@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from src.document_authoring.validator import DocumentValidator
@@ -31,6 +33,18 @@ def test_single_evidence_verbatim():
     assert draft.assertions[0].evidence_ids == ["e1"]
     assert draft.assertions[0].text == "额定电流为 10A"
     assert draft.validation_status == "pending"  # graph decides, not the writer
+
+
+def test_scalar_writer_extracts_a_typed_value_from_an_explicit_assignment():
+    from src.document_authoring.writers.managed import _deterministic_draft
+
+    draft = _deterministic_draft(_request([_ev("e1", "额定电流为 10A")]))
+
+    assert draft.typed_value is not None
+    assert draft.typed_value.kind == "scalar"
+    assert draft.typed_value.normalized_values == ["10A"]
+    assert draft.typed_value.display_value == "10A"
+    assert draft.typed_value.evidence_ids == ["e1"]
 
 
 def test_multi_evidence_summarizes_all():
@@ -85,3 +99,37 @@ def test_llm_build_user_prompt_includes_all_evidence():
     # not just the first chunk.
     assert "e1" in prompt and "额定电流为 10A" in prompt
     assert "e2" in prompt and "电源拓扑为 buck" in prompt
+
+
+def test_llm_writer_requires_and_returns_a_typed_value():
+    from src.document_authoring.writers.managed import LLMManagedWriter
+
+    class Client:
+        def chat(self, messages, **kwargs):
+            return json.dumps({
+                "unit_id": "field:f1",
+                "run_id": "run-1",
+                "generated_by": "managed_writer",
+                "content": "额定电流为 10A",
+                "proposed_value": "10A",
+                "typed_value": {
+                    "kind": "scalar",
+                    "normalized_values": ["10A"],
+                    "display_value": "10A",
+                    "evidence_ids": ["e1"],
+                },
+                "assertions": [{
+                    "assertion_id": "assertion-1",
+                    "text": "额定电流为 10A",
+                    "claim_id": "claim-f1",
+                    "evidence_ids": ["e1"],
+                }],
+                "evidence_ids": ["e1"],
+                "proposed_status": "draft",
+                "validation_status": "pending",
+                "validation_notes": [],
+            }, ensure_ascii=False)
+
+    draft = LLMManagedWriter(Client()).generate(_request([_ev("e1", "额定电流为 10A")]))
+
+    assert draft.typed_value.display_value == "10A"

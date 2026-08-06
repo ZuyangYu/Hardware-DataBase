@@ -550,12 +550,22 @@ class DraftAssertion(BaseModel):
     ] = "document_statement"
 
 
+class TypedFieldValue(BaseModel):
+    """A compact, evidence-backed value eligible for template filling."""
+
+    kind: Literal["scalar", "enumeration"]
+    normalized_values: list[str] = Field(default_factory=list)
+    display_value: str
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
 class DocumentUnitDraft(BaseModel):
     unit_id: str
     run_id: str
     generated_by: Literal["managed_writer", "external_agent", "deterministic_rule"]
     content: str | None = None
     proposed_value: Any | None = None
+    typed_value: TypedFieldValue | None = None
     assertions: list[DraftAssertion] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     proposed_status: str | None = None

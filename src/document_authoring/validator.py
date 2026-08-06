@@ -79,6 +79,58 @@ class DocumentValidator:
         status = "supported" if not notes else "unsupported"
         return draft.model_copy(update={"validation_status": status, "validation_notes": notes})
 
+    def validate_typed_field_draft(
+        self,
+        draft: DocumentUnitDraft,
+        evidence_by_id: dict[str, dict[str, Any]],
+        *,
+        expected_value_type: str,
+    ) -> DocumentUnitDraft:
+        """Require an evidence-backed, type-compatible value before filling.
+
+        ``content`` remains reviewable prose.  It is intentionally never used
+        as a substitute for ``typed_value`` because a complete evidence chunk
+        is not necessarily a safe value for a scalar template cell.
+        """
+        base = self.validate_unit_draft(draft, evidence_by_id)
+        notes = list(base.validation_notes)
+        typed = base.typed_value
+        if typed is None:
+            notes.append("draft has no typed field value")
+        else:
+            normalized_values = _unique_values(typed.normalized_values)
+            expected_kind = _expected_typed_kind(expected_value_type)
+            if expected_kind is None:
+                notes.append(f"unsupported field value type: {expected_value_type}")
+            elif typed.kind != expected_kind:
+                notes.append(
+                    f"typed value kind {typed.kind} does not match expected {expected_kind}"
+                )
+            if not typed.display_value.strip():
+                notes.append("typed value display value is empty")
+            if not typed.evidence_ids:
+                notes.append("typed value has no evidence ids")
+            unknown = set(typed.evidence_ids) - set(evidence_by_id)
+            if unknown:
+                notes.append(f"typed value references unknown evidence: {sorted(unknown)}")
+            if set(typed.evidence_ids) - set(base.evidence_ids):
+                notes.append("typed value references evidence outside its draft package")
+            for evidence_id in typed.evidence_ids:
+                metadata = evidence_by_id.get(evidence_id, {}).get("metadata") or {}
+                if metadata.get("low_confidence") or metadata.get("reused"):
+                    notes.append(f"typed value uses non-auto-fill evidence: {evidence_id}")
+            if typed.kind == "scalar" and len(normalized_values) != 1:
+                notes.append("scalar typed value requires one unique normalized value")
+            if typed.kind == "enumeration" and not normalized_values:
+                notes.append("enumeration typed value requires at least one normalized value")
+            typed = typed.model_copy(update={"normalized_values": normalized_values})
+
+        return base.model_copy(update={
+            "typed_value": typed,
+            "validation_status": "supported" if not notes else "unsupported",
+            "validation_notes": notes,
+        })
+
     @staticmethod
     def detect_template_contamination(
         draft: DocumentUnitDraft,
@@ -121,3 +173,23 @@ def _has_lexical_anchor(assertion_text: str, evidence_text: str) -> bool:
         for token in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}", evidence_text)
     }
     return bool(assertion_tokens & evidence_tokens)
+
+
+def _expected_typed_kind(value_type: str) -> str | None:
+    normalized = value_type.strip().casefold()
+    if normalized in {"text", "string", "scalar", "number", "integer", "float", "date"}:
+        return "scalar"
+    if normalized in {"enum", "enumeration", "list", "set"}:
+        return "enumeration"
+    return None
+
+
+def _unique_values(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value).strip()
+        if normalized and normalized.casefold() not in seen:
+            result.append(normalized)
+            seen.add(normalized.casefold())
+    return result

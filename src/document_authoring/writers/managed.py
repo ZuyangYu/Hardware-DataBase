@@ -11,10 +11,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from typing import Callable
 
 from src.core.llm_client import LLMClient
-from src.document_authoring.models import DocumentUnitDraft, DraftAssertion
+from src.document_authoring.models import DocumentUnitDraft, DraftAssertion, TypedFieldValue
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.writers.provider import WriterRequest, WriterProvider
 
@@ -72,12 +73,14 @@ def _deterministic_draft(request: WriterRequest) -> DocumentUnitDraft:
     assertion_id = hashlib.sha256(
         f"{request.run_id}|{request.unit_id}|{'|'.join(evidence_ids)}".encode("utf-8")
     ).hexdigest()[:20]
+    typed_value = _extract_typed_value(request, items)
     return DocumentUnitDraft(
         unit_id=request.unit_id,
         run_id=request.run_id,
         generated_by="managed_writer",
         content=body,
         proposed_value=body,
+        typed_value=typed_value,
         evidence_ids=evidence_ids,
         assertions=[DraftAssertion(
             assertion_id=f"assertion-{assertion_id}", text=body,
@@ -86,6 +89,61 @@ def _deterministic_draft(request: WriterRequest) -> DocumentUnitDraft:
         )],
         proposed_status="draft",
     )
+
+
+def _extract_typed_value(
+    request: WriterRequest,
+    items: list[tuple[str, str]],
+) -> TypedFieldValue | None:
+    """Extract only explicit assignments; arbitrary evidence prose is not a value."""
+    value_kind = request.field_value_type.strip().casefold()
+    if value_kind in {"text", "string", "scalar", "number", "integer", "float", "date"}:
+        kind = "scalar"
+    elif value_kind in {"enum", "enumeration", "list", "set"}:
+        kind = "enumeration"
+    else:
+        return None
+
+    extracted: list[tuple[str, str]] = []
+    for evidence_id, text in items:
+        match = re.search(r"(?:[:：=]|为|\bis\b)\s*([^\n。；;.!]+)", text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if value:
+            extracted.append((evidence_id, value))
+    if not extracted:
+        return None
+
+    if kind == "enumeration":
+        values = [
+            candidate.strip()
+            for _, value in extracted
+            for candidate in re.split(r"[,，、/;；]", value)
+            if candidate.strip()
+        ]
+    else:
+        values = [value for _, value in extracted]
+    normalized_values = _unique_values(values)
+    evidence_ids = _unique_values([evidence_id for evidence_id, _ in extracted])
+    display_value = ", ".join(normalized_values) if kind == "enumeration" else " / ".join(normalized_values)
+    return TypedFieldValue(
+        kind=kind,
+        normalized_values=normalized_values,
+        display_value=display_value,
+        evidence_ids=evidence_ids,
+    )
+
+
+def _unique_values(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = value.strip()
+        if normalized and normalized.casefold() not in seen:
+            result.append(normalized)
+            seen.add(normalized.casefold())
+    return result
 
 
 class LLMManagedWriter:
@@ -175,6 +233,7 @@ class LLMManagedWriter:
             draft.generated_by != "managed_writer"
             or not draft.content
             or not draft.assertions
+            or draft.typed_value is None
             or draft.validation_status != "pending"
             or draft.validation_notes
         ):
@@ -194,6 +253,11 @@ class LLMManagedWriter:
                 f"available_evidence_ids={sorted(evidence)})"
             )
         validated = self._validator.validate_unit_draft(draft, evidence)
+        validated = self._validator.validate_typed_field_draft(
+            validated,
+            evidence,
+            expected_value_type=request.field_value_type,
+        )
         if validated.validation_status != "supported":
             raise ValueError(
                 f"managed writer returned an ungrounded draft "
@@ -205,7 +269,7 @@ class LLMManagedWriter:
 
 _DRAFT_FIELDS = {
     "unit_id", "run_id", "generated_by", "content", "proposed_value",
-    "assertions", "evidence_ids", "proposed_status", "validation_status", "validation_notes",
+    "typed_value", "assertions", "evidence_ids", "proposed_status", "validation_status", "validation_notes",
 }
 
 
@@ -213,12 +277,17 @@ _WRITER_SYSTEM_PROMPT = """You are the Managed Writer for a governed document au
 
 Return ONE JSON object, and ONLY that object — no prose, no code fences.
 
-Top-level keys (exactly these ten, no others):
+Top-level keys (exactly these eleven, no others):
   unit_id             string   — copy verbatim from the request
   run_id              string   — copy verbatim from the request
   generated_by        string   — must be exactly "managed_writer"
   content             string   — the drafted body text, non-empty
   proposed_value      string   — usually the same as `content`
+  typed_value         object   — required for automatic filling, with:
+      kind               string — "scalar" or "enumeration", matching field_value_type
+      normalized_values  array of strings — one value for scalar; deduplicated values for enumeration
+      display_value      string — the exact value to fill, never a whole evidence chunk
+      evidence_ids       array of strings — ids that directly support the typed value
   assertions          array    — non-empty; each item is an object with:
       assertion_id       string   — a stable id you generate (e.g. "assertion-<unit_id>-1")
       text               string   — a sentence lexically anchored in the cited evidence
@@ -238,6 +307,9 @@ Rules:
 - Copy `unit_id` and `run_id` verbatim from the request; do NOT invent them.
 - Every `evidence_ids` entry (top-level and inside assertions) must exist in
   the request `evidence[].id`. Do NOT fabricate ids.
+- `typed_value.evidence_ids` must exist in the request evidence and directly
+  support its normalized values. Do not create `typed_value` from an entire
+  evidence paragraph or from low-confidence/reused evidence.
 - Each `assertions[].text` must reuse concrete wording from the cited
   evidence (a subphrase or key noun/number from the evidence content).
 - Do NOT invent facts, tools, locations, sources, or file content.
@@ -284,6 +356,12 @@ def _example_from_request(request: WriterRequest) -> str:
         "generated_by": "managed_writer",
         "content": ev_snippet,
         "proposed_value": ev_snippet,
+        "typed_value": {
+            "kind": "scalar",
+            "normalized_values": [ev_snippet],
+            "display_value": ev_snippet,
+            "evidence_ids": [ev_id] if ev_id else [],
+        },
         "assertions": [{
             "assertion_id": f"assertion-{request.unit_id}-1",
             "text": ev_snippet,

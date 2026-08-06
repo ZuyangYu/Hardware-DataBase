@@ -174,6 +174,7 @@ class AuthoringGraph:
                     unit_id=unit_id,
                     unit_label=_unit_label(unit_id, schema),
                     unit_description=_unit_description(unit_id, schema),
+                    field_value_type=_unit_value_type(unit_id, schema),
                     evidence=evidence,
                     missing_or_conflicts=[],
                     prompt_version=self.policy.policy.prompt_version,
@@ -182,6 +183,12 @@ class AuthoringGraph:
                 self.policy.require_tool("validate_unit_draft")
                 evidence_by_id = {entry["id"]: entry for entry in evidence}
                 validated = self.validator.validate_unit_draft(draft, evidence_by_id)
+                if unit_id.startswith("field:"):
+                    validated = self.validator.validate_typed_field_draft(
+                        validated,
+                        evidence_by_id,
+                        expected_value_type=_unit_value_type(unit_id, schema),
+                    )
                 contamination = []
                 self._step(state, "detect_template_contamination")
                 self.policy.require_tool("detect_template_contamination")
@@ -597,6 +604,7 @@ def _validated_evidence(
             "id": evidence.id, "content": evidence.content,
             "source_version_id": getattr(evidence, "source_version_id", None),
             "processing_artifact_id": getattr(evidence, "processing_artifact_id", None),
+            "metadata": dict(getattr(evidence, "metadata", {}) or {}),
             "locator": dict(getattr(evidence, "locator", {})),
             "fact_type": getattr(evidence, "fact_type", None),
         })
@@ -629,3 +637,13 @@ def _unit_description(unit_id: str, schema: DocumentSchema) -> str:
     if unit_id.startswith("field:"):
         return next(item.description for item in schema.fields if item.field_id == unit_id.removeprefix("field:"))
     return ""
+
+
+def _unit_value_type(unit_id: str, schema: DocumentSchema) -> str:
+    if unit_id.startswith("field:"):
+        return next(
+            item.value_type
+            for item in schema.fields
+            if item.field_id == unit_id.removeprefix("field:")
+        )
+    return "text"

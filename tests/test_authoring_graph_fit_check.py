@@ -98,6 +98,7 @@ def _graph(*, fit_checker=None, validator_status="supported", policy=None) -> Au
     validator.validate_unit_draft.side_effect = lambda draft, ev_by_id: draft.model_copy(
         update={"validation_status": validator_status}
     )
+    validator.validate_typed_field_draft.side_effect = lambda draft, ev_by_id, **kwargs: draft
     validator.detect_template_contamination.return_value = []
     validator.validate_cross_unit_consistency.return_value = []
     return AuthoringGraph(

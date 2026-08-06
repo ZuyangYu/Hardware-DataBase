@@ -13,11 +13,13 @@ from src.document_authoring.models import (
     DocumentFieldSchema,
     DocumentSchema,
     DocumentUnitDraft,
+    DraftAssertion,
     DocumentWorkOrder,
     HarnessPolicy,
     HarnessRun,
     KnowledgeBaseSourceSnapshot,
 )
+from src.document_authoring.validator import DocumentValidator
 
 
 KB = "kb1"
@@ -91,23 +93,26 @@ def _setup():
     return work_order, snapshot, schema, harness_run, manifest
 
 
-def _graph(*, reranker=None, rewriter=None, policy=None, draft_recorder=None) -> tuple[AuthoringGraph, list]:
+def _graph(*, reranker=None, rewriter=None, policy=None, draft_recorder=None,
+           draft_provider=None, validator=None) -> tuple[AuthoringGraph, list]:
     draft_calls: list = []
 
-    def draft_provider(request):
+    def default_draft_provider(request):
         draft_calls.append(request)
         return DocumentUnitDraft(
             unit_id=request.unit_id, run_id=request.run_id,
             generated_by="managed_writer", validation_status="supported",
         )
 
-    validator = Mock()
-    validator.validate_unit_draft.side_effect = lambda draft, ev_by_id: draft
-    validator.detect_template_contamination.return_value = []
-    validator.validate_cross_unit_consistency.return_value = []
+    if validator is None:
+        validator = Mock()
+        validator.validate_unit_draft.side_effect = lambda draft, ev_by_id: draft
+        validator.validate_typed_field_draft.side_effect = lambda draft, ev_by_id, **kwargs: draft
+        validator.detect_template_contamination.return_value = []
+        validator.validate_cross_unit_consistency.return_value = []
     graph = AuthoringGraph(
-        HarnessToolPolicy(policy or _policy()), Mock(),
-        validator=validator, draft_provider=draft_provider, rewriter=rewriter,
+        HarnessToolPolicy(policy or _policy()), Mock(), validator=validator,
+        draft_provider=draft_provider or default_draft_provider, rewriter=rewriter,
         reranker=reranker,
     )
     recorder = draft_recorder if draft_recorder is not None else draft_calls
@@ -255,3 +260,34 @@ def test_writer_receives_bounded_deduplicated_evidence_and_ledger_keeps_discards
 
     assert [item["id"] for item in draft_calls[0].evidence] == ["a", "b", "c", "d", "e"]
     assert result.retrieval_ledger[0]["discarded_evidence_ids"] == ["duplicate", "f"]
+
+
+def test_graph_blocks_a_supported_prose_draft_without_a_typed_value():
+    def draft_provider(request):
+        return DocumentUnitDraft(
+            unit_id=request.unit_id,
+            run_id=request.run_id,
+            generated_by="managed_writer",
+            content="额定电流为 10A",
+            proposed_value="额定电流为 10A",
+            evidence_ids=["a"],
+            assertions=[DraftAssertion(
+                assertion_id="assertion-a",
+                text="额定电流为 10A",
+                claim_id="claim-f1",
+                evidence_ids=["a"],
+            )],
+        )
+
+    def retrieve(req, attempt, query_override=None):
+        return _outcome([_evidence("a", "额定电流为 10A")])
+
+    graph, _ = _graph(
+        validator=DocumentValidator(),
+        draft_provider=draft_provider,
+    )
+    result = _run(graph, retrieve)
+
+    assert result.unit_statuses["field:f1"] == "requires_human"
+    assert result.drafts[0].validation_status == "unsupported"
+    assert "draft has no typed field value" in result.drafts[0].validation_notes

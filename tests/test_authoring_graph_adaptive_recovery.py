@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
+from src.agents.claim_evidence import RetrievalOutcome
 from src.agents.state import Evidence
 from src.document_authoring.harness.graph import AuthoringGraph
 from src.document_authoring.harness.policy import HarnessToolPolicy
@@ -111,6 +111,7 @@ def _graph(policy) -> AuthoringGraph:
         )
     validator = Mock()
     validator.validate_unit_draft.side_effect = lambda draft, ev_by_id: draft
+    validator.validate_typed_field_draft.side_effect = lambda draft, ev_by_id, **kwargs: draft
     validator.detect_template_contamination.return_value = []
     validator.validate_cross_unit_consistency.return_value = []
     return AuthoringGraph(

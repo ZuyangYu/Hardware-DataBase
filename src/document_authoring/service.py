@@ -1805,11 +1805,11 @@ class DocumentGenerationService:
             binding = bindings.get(semantic_unit_id)
             if binding is None:
                 continue
+            if draft.typed_value is None:
+                continue
             if template.format != "docx" and len(binding.target_region_ids) != 1:
                 raise ValueError("workbook scalar bindings require exactly one target")
-            value = draft.proposed_value if draft.proposed_value is not None else draft.content
-            if value is None:
-                continue
+            value = draft.typed_value.display_value
             for region_id in binding.target_region_ids:
                 if template.format == "docx":
                     fills.append(DocxFill(region_id=region_id, value=str(value), semantic_unit_id=semantic_unit_id))

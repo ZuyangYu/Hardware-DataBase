@@ -130,6 +130,7 @@ def test_generic_pin_definition_flow_passes_all_circuit_pins_to_the_writer(
 
     validator = Mock()
     validator.validate_unit_draft.side_effect = lambda draft, _evidence: draft
+    validator.validate_typed_field_draft.side_effect = lambda draft, _evidence, **kwargs: draft
     validator.detect_template_contamination.return_value = []
     validator.validate_cross_unit_consistency.return_value = []
     graph = AuthoringGraph(
