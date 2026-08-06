@@ -44,7 +44,7 @@
 - `title`、`section_header`、`table_header`、`fixed_label`：绝不自动写入。
 - `placeholder`：可自动写入。
 - `sample_value`：仅在模型给出明确覆盖理由且规则验证通过时可写入。
-- `scalar_input`：单值字段候选。
+- `scalar_input`：有确定性标签锚点的空白单值字段候选；可在字段证据、值类型和一致性校验均通过后自动写入。
 - `repeating_table_row`：重复表行候选，首期只登记，不自动扩行。
 - `layout_blank`、`unknown`：不可自动写入。
 
@@ -129,7 +129,7 @@ Writer 只能基于已经筛选的 evidence package 工作。LLM 不可用时，
 
 字段必须同时满足才可自动写入：
 
-- 字段契约为 `auto_if_verified`，目标区域为 placeholder 或合格 sample value。
+- 字段契约为 `auto_if_verified`，目标区域为 placeholder、带确定性标签锚点的空白 scalar input，或合格 sample value。
 - 至少一条来源和能力均匹配的冻结证据。
 - 值能通过对应 `value_schema` 解析、归一化和长度限制。
 - 不存在多来源不一致、模板污染或跨字段一致性冲突。
