@@ -42,6 +42,10 @@ export type MetricRow = {
   failures: number;
 };
 
+export function canLoadSampleDiagnostics(status: string, hasSummary: boolean): boolean {
+  return status === 'completed' && hasSummary;
+}
+
 function metricSort(left: string, right: string): number {
   const leftIndex = METRIC_ORDER.indexOf(left);
   const rightIndex = METRIC_ORDER.indexOf(right);

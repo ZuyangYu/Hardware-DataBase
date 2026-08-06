@@ -359,9 +359,13 @@ def get_run(
             result["summary"] = None
     else:
         result["summary"] = None
-    result["sample_results"], result["sample_results_error"] = _load_sample_results(
-        Path(output_root) / run_id
-    )
+    if state.status == "completed" and result["summary"] is not None:
+        result["sample_results"], result["sample_results_error"] = _load_sample_results(
+            Path(output_root) / run_id
+        )
+    else:
+        result["sample_results"] = []
+        result["sample_results_error"] = ""
     return result
 
 

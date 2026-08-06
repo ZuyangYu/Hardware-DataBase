@@ -30,6 +30,7 @@ import { OUTLINE_ACTION_BUTTON_CLASS, formatDateTime } from '@/lib/enterprise-ui
 import { cn } from '@/lib/utils';
 
 import EvaluationDashboard from './EvaluationDashboard';
+import { canLoadSampleDiagnostics } from './evaluationDashboard';
 
 type Props = {
   auth: AuthSession;
@@ -608,8 +609,8 @@ function RunDetailPanel({
       {run.summary && (
         <EvaluationDashboard
           summary={run.summary}
-          sampleResults={run.sample_results ?? []}
-          sampleResultsError={run.sample_results_error ?? ''}
+          sampleResults={canLoadSampleDiagnostics(run.status, true) ? run.sample_results ?? [] : []}
+          sampleResultsError={canLoadSampleDiagnostics(run.status, true) ? run.sample_results_error ?? '' : ''}
           compare={compare}
         />
       )}

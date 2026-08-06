@@ -101,3 +101,32 @@ def test_get_run_keeps_summary_when_sample_diagnostics_are_unavailable(tmp_path,
     }
     assert payload["sample_results"] == []
     assert "样本诊断不可用" in payload["sample_results_error"]
+
+
+def test_get_run_does_not_read_diagnostics_until_the_run_is_completed_with_summary(tmp_path, monkeypatch):
+    state = EvaluationRunState.new_online(
+        run_id="run-1",
+        dataset_path="dataset.jsonl",
+        snapshot_path="",
+        total_samples=1,
+        score_enabled=True,
+    ).model_copy(update={"status": "running"})
+
+    class Controller:
+        def load_for_display(self, run_id):
+            assert run_id == "run-1"
+            return state
+
+    monkeypatch.setattr(evaluation, "_check_output_root", lambda _value: str(tmp_path))
+    monkeypatch.setattr(evaluation, "_controller", lambda _output_root: Controller())
+    monkeypatch.setattr(
+        evaluation,
+        "_load_sample_results",
+        lambda _run_dir: (_ for _ in ()).throw(AssertionError("must not read active-run diagnostics")),
+    )
+
+    payload = evaluation.get_run("run-1", output_root=str(tmp_path))
+
+    assert payload["summary"] is None
+    assert payload["sample_results"] == []
+    assert payload["sample_results_error"] == ""

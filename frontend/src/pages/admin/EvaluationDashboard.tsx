@@ -128,19 +128,20 @@ function BaselineChart({ compare }: { compare: EvaluationCompareResponse | null 
 }
 
 function DiagnosticDetails({ result }: { result: EvaluationSampleResult }) {
+  const [open, setOpen] = useState(false);
   const retrievalSummary = result.metadata.retrieval_summary;
   const retrievalSummaryText = retrievalSummary == null ? '' : JSON.stringify(retrievalSummary, null, 2);
   return (
-    <details className="group border-t border-[#edf0f4] px-[10px] py-[9px]">
+    <details className="group border-t border-[#edf0f4] px-[10px] py-[9px]" onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary className="cursor-pointer text-[12px] font-medium text-[#464c5e] marker:text-[#858b9c]">展开样本诊断</summary>
-      <div className="mt-[10px] grid gap-[10px] text-[12px] leading-[18px] text-[#464c5e]">
+      {open && <div className="mt-[10px] grid gap-[10px] text-[12px] leading-[18px] text-[#464c5e]">
         <DiagnosticText title="问题" value={result.question} />
         <DiagnosticText title="参考答案" value={result.reference_answer} />
         <DiagnosticText title="实际回答" value={result.response} />
         <DiagnosticText title="检索上下文" value={result.retrieved_contexts.length ? result.retrieved_contexts.join('\n\n') : '无'} />
         {retrievalSummaryText && <DiagnosticText title="检索与证据诊断" value={retrievalSummaryText} mono />}
         {result.metrics.length > 0 && <div><p className="mb-[4px] font-medium text-[#18181a]">单样本指标</p>{result.metrics.map((metric) => <p key={metric.metric_name} className="rounded-[6px] bg-[#fafbfc] px-[8px] py-[5px]"><span className="font-medium text-[#18181a]">{metric.metric_name}</span> · {metric.status}{metric.score == null ? '' : ` · ${scoreText(metric.score)}`}{metric.reason ? ` · ${metric.reason}` : ''}</p>)}</div>}
-      </div>
+      </div>}
     </details>
   );
 }
@@ -156,7 +157,7 @@ function SampleDiagnostics({ results, error }: { results: EvaluationSampleResult
     <section className="rounded-[12px] border border-[#edf0f4] p-[14px]">
       <div className="mb-[10px] flex flex-wrap items-center justify-between gap-[8px]"><div><h4 className="text-[14px] font-semibold text-[#18181a]">样本诊断</h4><p className="mt-[2px] text-[11px] text-[#858b9c]">优先查看采集失败、评分失败和关键待复核样本。</p></div><label className="text-[12px] text-[#464c5e]">状态筛选 <select className="ml-[4px] h-[30px] rounded-[7px] border border-[#e3e7f1] bg-white px-[7px] text-[12px]" value={filter} onChange={(event) => setFilter(event.target.value as SampleStatus | '全部')}>{SAMPLE_FILTERS.map((status) => <option key={status}>{status}</option>)}</select></label></div>
       {error ? <p className="mb-[10px] rounded-[8px] bg-[#fff7e7] px-[10px] py-[8px] text-[12px] text-[#9a610d]">{error}</p> : null}
-      {!error && results.length === 0 ? <p className="py-[20px] text-[12px] text-[#858b9c]">暂无样本诊断数据。</p> : <div className="overflow-hidden rounded-[8px] border border-[#edf0f4]"><div className="grid grid-cols-[minmax(110px,1fr)_100px_70px_90px] gap-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[11px] text-[#858b9c] max-[700px]:grid-cols-[minmax(110px,1fr)_100px_60px]"><span>样本</span><span>状态</span><span className="text-right">证据</span><span className="text-right max-[700px]:hidden">评分指标</span></div>{filtered.map((result) => <div key={result.sample_id}><div className="grid grid-cols-[minmax(110px,1fr)_100px_70px_90px] gap-[8px] px-[10px] py-[8px] text-[12px] max-[700px]:grid-cols-[minmax(110px,1fr)_100px_60px]"><span className="truncate font-medium text-[#18181a]">{result.sample_id}</span><span className="text-[#464c5e]">{classifySampleResult(result)}</span><span className="text-right text-[#464c5e]">{result.retrieved_contexts.length}</span><span className="text-right text-[#464c5e] max-[700px]:hidden">{result.metrics.filter((metric) => metric.status === 'success' && metric.score != null).length}</span></div><DiagnosticDetails result={result} /></div>)}{filtered.length === 0 ? <p className="px-[10px] py-[20px] text-center text-[12px] text-[#858b9c]">没有符合该状态的样本。</p> : null}</div>}
+      {error ? null : results.length === 0 ? <p className="py-[20px] text-[12px] text-[#858b9c]">暂无样本诊断数据。</p> : <div className="overflow-hidden rounded-[8px] border border-[#edf0f4]"><div className="grid grid-cols-[minmax(110px,1fr)_100px_70px_90px] gap-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[11px] text-[#858b9c] max-[700px]:grid-cols-[minmax(110px,1fr)_100px_60px]"><span>样本</span><span>状态</span><span className="text-right">证据</span><span className="text-right max-[700px]:hidden">评分指标</span></div>{filtered.map((result) => <div key={result.sample_id}><div className="grid grid-cols-[minmax(110px,1fr)_100px_70px_90px] gap-[8px] px-[10px] py-[8px] text-[12px] max-[700px]:grid-cols-[minmax(110px,1fr)_100px_60px]"><span className="truncate font-medium text-[#18181a]">{result.sample_id}</span><span className="text-[#464c5e]">{classifySampleResult(result)}</span><span className="text-right text-[#464c5e]">{result.retrieved_contexts.length}</span><span className="text-right text-[#464c5e] max-[700px]:hidden">{result.metrics.filter((metric) => metric.status === 'success' && metric.score != null).length}</span></div><DiagnosticDetails result={result} /></div>)}{filtered.length === 0 ? <p className="px-[10px] py-[20px] text-center text-[12px] text-[#858b9c]">没有符合该状态的样本。</p> : null}</div>}
     </section>
   );
 }

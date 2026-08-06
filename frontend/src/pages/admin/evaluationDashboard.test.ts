@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildCredibility,
+  canLoadSampleDiagnostics,
   classifySampleResult,
   compareMetricRows,
   metricRows,
@@ -52,5 +53,11 @@ describe('evaluation dashboard data', () => {
       { metric_scores: { faithfulness: 0.8, answer_relevancy: 0.7 } },
       { metric_scores: { faithfulness: 0.6, context_recall: 0.9 } },
     )).toEqual([expect.objectContaining({ metric: 'faithfulness', current: 0.8, baseline: 0.6, delta: 0.2 })]);
+  });
+
+  it('shows diagnostics only for completed runs with a summary', () => {
+    expect(canLoadSampleDiagnostics('completed', true)).toBe(true);
+    expect(canLoadSampleDiagnostics('running', true)).toBe(false);
+    expect(canLoadSampleDiagnostics('completed', false)).toBe(false);
   });
 });
