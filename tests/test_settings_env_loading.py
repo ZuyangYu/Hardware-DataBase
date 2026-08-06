@@ -12,7 +12,6 @@ class SettingsEnvLoadingTests(unittest.TestCase):
             "AGENT_RATE_LIMIT_MAX_RETRIES": "2",
             "AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS": "0.25",
             "AGENT_RATE_LIMIT_MAX_DELAY_SECONDS": "3",
-            "AGENT_FALLBACK_MODEL": "deepseek-ai/DeepSeek-V4-Pro",
         }
         with patch.dict(os.environ, values), patch("config.settings.load_dotenv"):
             settings.reload_settings()
@@ -20,7 +19,6 @@ class SettingsEnvLoadingTests(unittest.TestCase):
         self.assertEqual(settings.AGENT_RATE_LIMIT_MAX_RETRIES, 2)
         self.assertEqual(settings.AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS, 0.25)
         self.assertEqual(settings.AGENT_RATE_LIMIT_MAX_DELAY_SECONDS, 3.0)
-        self.assertEqual(settings.AGENT_FALLBACK_MODEL, "deepseek-ai/DeepSeek-V4-Pro")
 
     def test_loads_project_root_env_file_on_import_and_reload(self):
         with patch("dotenv.load_dotenv") as load_dotenv:

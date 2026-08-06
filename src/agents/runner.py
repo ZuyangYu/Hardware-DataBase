@@ -7,7 +7,8 @@ from typing import Callable, Generator
 
 from src.agents.answer_constraints import answer_contract
 from src.agents.graph import (
-    _chat_with_usage_stage,
+    _chat_structured,
+    _response_tool,
     _stream_chat_with_usage_stage,
     _write_stream_event,
     analyze_question_with_llm,
@@ -20,7 +21,7 @@ from src.agents.graph import (
     route_query,
     scan_kb_catalog,
 )
-from src.agents.prompts import ANSWER_SYSTEM_PROMPT
+from src.agents.prompts import ANSWER_SYSTEM_PROMPT, GROUNDING_SYSTEM_PROMPT
 from src.agents.tools.circuit_tools import CircuitQueryTool
 from src.agents.tools.document_rag_tool import DocumentRAGTool
 from src.agents.tools.pipeline_catalog_tool import PipelineCatalogTool
@@ -234,11 +235,16 @@ class MultiSourceAgentRunner:
         history: list[tuple[str, str]],
         ctx: RequestContext | None = None,
         thread_id: str = "",
-        progress_callback: Callable[[str, str, str, str], None] | None = None,
+        event_callback: Callable[[dict], None] | None = None,
         query_mode: str = "deep",
         should_cancel: Callable[[], bool] | None = None,
     ) -> Generator[str, None, None]:
-        """Run the compiled LangGraph agent and stream answer deltas."""
+        """Run the compiled LangGraph agent and stream answer deltas.
+
+        Side-channel events (stage / thought / degraded / tool_result) are
+        forwarded as ``{"type": ..., "payload": {...}}`` dicts via
+        ``event_callback``; answer deltas are yielded as text.
+        """
         # Fresh per-call record so concurrent streams on this singleton each
         # read their own footer/summary/usage instead of clobbering each other.
         _RUN_RECORD.set(_RunRecord())
@@ -261,19 +267,24 @@ class MultiSourceAgentRunner:
             "evidence": [],
             "trace": [],
             "_cancel_check": should_cancel,
+            # KB chat always retrieves: skip the route_query LLM call (Phase 2).
+            "_skip_route_llm": True,
         }
         # The graph owns routing, retrieval, multi-hop replanning, and answer generation.
         final_state = state
         yielded = False
         trace_cursor = 0
 
-        def emit_stage(key: str, label: str, status: str = "running", detail: str = "") -> None:
-            if progress_callback is None:
-                return
-            progress_callback(key, label, status, detail)
+        def emit_event(evt: dict) -> None:
+            if event_callback is not None:
+                event_callback(evt)
 
-        emit_stage("permission", "权限校验", "done", "已完成访问范围检查")
-        emit_stage("route", "识别问题类型", "running", "正在判断是否需要检索知识库")
+        def emit_stage(key: str, label: str, status: str = "running", detail: str = "") -> None:
+            emit_event({"type": "stage", "payload": {"key": key, "label": label, "status": status, "detail": detail}})
+
+        # Permission check is silent (frontend hides it; emitting only adds noise).
+        # Route LLM is skipped for KB chat, so jump straight to analysis feedback.
+        emit_stage("analyze", "分析硬件问题", "running", "正在拆解问题与检索需求")
         try:
             graph_events = self.graph.stream(
                 state,
@@ -297,11 +308,48 @@ class MultiSourceAgentRunner:
                             str(event.get("status") or "running"),
                             str(event.get("detail") or ""),
                         )
+                    elif event.get("type") == "tool_started":
+                        emit_event(
+                            {
+                                "type": "tool_started",
+                                "payload": {
+                                    "tool_name": str(event.get("tool_name") or "检索工具"),
+                                    "query": str(event.get("query") or ""),
+                                },
+                            }
+                        )
                     elif event.get("type") == "tool_result":
                         tool_name = str(event.get("tool_name") or "检索工具")
                         hit_count = int(event.get("hit_count") or 0)
                         status = "error" if event.get("status") == "failed" else "running"
                         emit_stage("retrieve", "多源硬件数据召回", status, f"{tool_name} 返回 {hit_count} 条候选证据")
+                        emit_event(
+                            {
+                                "type": "tool_result",
+                                "payload": {"tool_name": tool_name, "hit_count": hit_count, "status": status},
+                            }
+                        )
+                    elif event.get("type") == "thought":
+                        payload = event.get("payload") or {}
+                        emit_event(
+                            {
+                                "type": "thought",
+                                "payload": {
+                                    "stage": str(payload.get("stage") or ""),
+                                    "delta": str(payload.get("delta") or ""),
+                                },
+                            }
+                        )
+                    elif event.get("type") == "degraded":
+                        emit_event(
+                            {
+                                "type": "degraded",
+                                "payload": {
+                                    "stage": str(event.get("stage") or ""),
+                                    "reason": str(event.get("reason") or ""),
+                                },
+                            }
+                        )
                 elif mode == "values" and isinstance(event, dict):
                     final_state = event
                     trace = list(event.get("trace") or [])
@@ -354,14 +402,17 @@ class MultiSourceAgentRunner:
                 "对缺失或冲突的信息明确标注“缺失”或“冲突”。"
             )
             try:
-                draft = _chat_with_usage_stage(
+                draft_parts: list[str] = []
+                for delta in _stream_chat_with_usage_stage(
                     self.llm_client,
                     [
                         {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                         {"role": "user", "content": prompt},
                     ],
                     "intermediate_draft",
-                )
+                ):
+                    draft_parts.append(delta)
+                draft = "".join(draft_parts).strip()
             except Exception as exc:
                 draft = f"中间草稿生成失败：{exc}"
         return {
@@ -428,6 +479,13 @@ class MultiSourceAgentRunner:
                     _write_stream_event({"type": "answer_delta", "delta": delta})
                 answer = "".join(parts).strip()
             except Exception as exc:
+                _write_stream_event(
+                    {
+                        "type": "degraded",
+                        "stage": "compose_answer",
+                        "reason": f"生成模型调用失败，回退为证据摘要：{str(exc)[:160]}",
+                    }
+                )
                 answer = self._fallback_answer(state, evidence, exc)
                 _write_stream_event({"type": "answer_delta", "delta": answer})
         return {
@@ -437,24 +495,129 @@ class MultiSourceAgentRunner:
         }
 
     def _verify_grounding(self, state):
-        evidence_count = len(state.get("merged_evidence") or [])
+        evidence = list(state.get("merged_evidence") or [])
         coverage = state.get("coverage_matrix") or {}
         conflicts = coverage.get("conflicts") or []
+        answer = str(state.get("answer") or "").strip()
         weak_quality = [
             item
             for item in state.get("evidence_quality") or []
             if float(item.get("score") or 0.0) < 0.45
         ]
-        verification = {
-            "grounded": bool(evidence_count),
-            "unsupported_claims": [],
-            "weak_claims": [
-                {"evidence_id": item.get("evidence_id", ""), "reason": "evidence_quality_below_threshold"}
-                for item in weak_quality[:10]
-            ],
-            "conflicts": conflicts,
-            "citation_coverage": 1.0 if evidence_count else 0.0,
-        }
+        weak_claims = [
+            {"evidence_id": item.get("evidence_id", ""), "reason": "evidence_quality_below_threshold"}
+            for item in weak_quality[:10]
+        ]
+        # No-evidence placeholder / empty evidence -> genuinely ungrounded.
+        if not evidence or not answer or answer.startswith("当前知识库中未找到可支撑回答的证据"):
+            verification = {
+                "grounded": False,
+                "grounding_method": "no_evidence",
+                "unsupported_claims": [],
+                "weak_claims": weak_claims,
+                "conflicts": conflicts,
+                "citation_coverage": 0.0,
+            }
+            self._last_footer = self._format_observability(state, verification)
+            return {**state, "verification": verification, "final_response": answer}
+
+        # Real grounding: LLM splits the answer into atomic claims and maps each
+        # to supporting evidence ids. Replaces the old `bool(evidence_count)`
+        # check that reported grounded=True whenever any chunk existed.
+        evidence_brief = [
+            {
+                "id": str(item.get("id") or item.get("evidence_id") or ""),
+                "source": item.get("source_name", ""),
+                "kind": item.get("content_kind", ""),
+                "content": str(item.get("content") or "")[:400],
+            }
+            for item in evidence[:20]
+        ]
+        grounding_tool = _response_tool(
+            "verify_grounding",
+            "Verify each atomic claim in the answer against the evidence. Call exactly once.",
+            {
+                "assertions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                            "assertion_kind": {
+                                "type": "string",
+                                "enum": [
+                                    "confirmed_fact",
+                                    "document_statement",
+                                    "derived_observation",
+                                    "inference",
+                                    "missing_information",
+                                    "conflict",
+                                ],
+                            },
+                        },
+                    },
+                },
+                "unsupported_claims": {"type": "array", "items": {"type": "string"}},
+            },
+            ["assertions"],
+        )
+        user_prompt = (
+            f"最终答案：\n{answer[:6000]}\n\n"
+            f"证据列表（id + 来源 + 片段）：\n{json.dumps(evidence_brief, ensure_ascii=False, indent=2)}\n\n"
+            "请把答案拆成原子断言，逐条判定支撑情况，调用 verify_grounding 工具返回。"
+        )
+        try:
+            payload = _chat_structured(
+                self.llm_client,
+                [
+                    {"role": "system", "content": GROUNDING_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                grounding_tool,
+                "grounding",
+            )
+            assertions = [a for a in (payload.get("assertions") or []) if isinstance(a, dict)]
+            unsupported = [
+                str(c).strip() for c in (payload.get("unsupported_claims") or []) if str(c).strip()
+            ]
+            total = len(assertions)
+            supported = sum(
+                1
+                for a in assertions
+                if a.get("evidence_ids")
+                and a.get("assertion_kind") not in {"missing_information", "conflict"}
+            )
+            citation_coverage = (supported / total) if total else 0.0
+            verification = {
+                "grounded": len(unsupported) == 0,
+                "grounding_method": "llm_claim_check",
+                "unsupported_claims": unsupported,
+                "assertions": assertions,
+                "weak_claims": weak_claims,
+                "conflicts": conflicts,
+                "citation_coverage": round(citation_coverage, 3),
+            }
+        except Exception as exc:
+            # Grounding LLM failed: NEVER report grounded=True. Mark unverified
+            # and surface the degradation so the user knows the answer was not
+            # citation-checked.
+            _write_stream_event(
+                {
+                    "type": "degraded",
+                    "stage": "verify_grounding",
+                    "reason": f"溯源校验 LLM 失败，答案未校验：{str(exc)[:160]}",
+                }
+            )
+            verification = {
+                "grounded": "unverified",
+                "grounding_method": "llm_fallback_unverified",
+                "unsupported_claims": [],
+                "weak_claims": weak_claims,
+                "conflicts": conflicts,
+                "citation_coverage": 0.0,
+                "error": str(exc)[:300],
+            }
         observability = self._format_observability(state, verification)
         # Observability footer exposed via last_footer for collapsed rendering;
         # final_response carries only the answer body for a clean stream.
@@ -462,7 +625,7 @@ class MultiSourceAgentRunner:
         return {
             **state,
             "verification": verification,
-            "final_response": state.get("answer", "").strip(),
+            "final_response": answer,
         }
 
     def _fallback_answer(self, state, evidence: list[dict], exc: Exception) -> str:

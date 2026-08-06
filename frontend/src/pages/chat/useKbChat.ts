@@ -45,16 +45,12 @@ function normalizeTraceStatus(status: unknown): QueryTraceStatus {
     : 'running';
 }
 
-function createInitialTrace(isGeneralChat: boolean): QueryTraceStep[] {
-  if (isGeneralChat) return [];
-  return [
-    {
-      key: 'route',
-      label: '识别问题类型',
-      status: 'running',
-      detail: '正在判断是否需要检索知识库',
-    },
-  ];
+function createInitialTrace(_isGeneralChat: boolean): QueryTraceStep[] {
+  // Route LLM is skipped for KB chat (deterministic, near-instant), so we must
+  // NOT inject a misleading "正在判断是否需要检索知识库" step at the start of
+  // every conversation — that reads as an auth/judgement preflight. The 3-phase
+  // stepper starts on "思考" as soon as the first analyze thought arrives.
+  return [];
 }
 
 function mergeTraceDetail(current: string | undefined, next: string | undefined): string | undefined {
@@ -93,6 +89,7 @@ export function useKbChat(kbName: string) {
   const [streaming, setStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState('');
   const [traceSteps, setTraceSteps] = useState<QueryTraceStep[]>([]);
+  const [degradedNotes, setDegradedNotes] = useState<Array<{ stage: string; reason: string }>>([]);
   const [evidenceByMessageId, setEvidenceByMessageId] = useState<Record<number, EvidenceItem[]>>({});
   const [forbidden, setForbidden] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -282,6 +279,7 @@ export function useKbChat(kbName: string) {
       setStreaming(true);
       resetStreamingText();
       setTraceSteps(createInitialTrace(turn.kb_name === GENERAL_CHAT_KB_NAME));
+      setDegradedNotes([]);
       let accumulated = '';
       try {
         await api.post(`/api/v1/turns/${turn.id}/start`);
@@ -300,6 +298,9 @@ export function useKbChat(kbName: string) {
               status: normalizeTraceStatus(parsed.status),
               detail: parsed.detail || '',
             });
+          } else if (evt.event === 'degraded') {
+            const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
+            setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
           } else if (evt.event === 'done') {
             const payload = JSON.parse(evt.data) as QueryDonePayload;
             const answer = payload.answer ?? accumulated;
@@ -410,6 +411,7 @@ export function useKbChat(kbName: string) {
     resetStreamingText();
     clearTraceTimer();
     setTraceSteps(createInitialTrace(scopeKbName === GENERAL_CHAT_KB_NAME));
+    setDegradedNotes([]);
 
     let sessionId = activeSessionId;
     try {
@@ -456,6 +458,13 @@ export function useKbChat(kbName: string) {
                 detail: parsed.detail || '',
               });
             }
+          } catch {
+            // 忽略坏帧
+          }
+        } else if (evt.event === 'degraded') {
+          try {
+            const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
+            setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
           } catch {
             // 忽略坏帧
           }
@@ -552,6 +561,7 @@ export function useKbChat(kbName: string) {
     streaming,
     streamingText,
     traceSteps,
+    degradedNotes,
     currentSessionRunning: streaming,
     send,
     abortStream,

@@ -22,6 +22,7 @@ type Props = {
   streaming: boolean;
   streamingText: string;
   traceSteps: QueryTraceStep[];
+  degradedNotes: Array<{ stage: string; reason: string }>;
 };
 
 export default function MessageList({
@@ -35,6 +36,7 @@ export default function MessageList({
   streaming,
   streamingText,
   traceSteps,
+  degradedNotes,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -91,6 +93,7 @@ export default function MessageList({
             streaming
             streamingText={streamingText}
             traceSteps={traceSteps}
+            degradedNotes={degradedNotes}
           />
         )}
       </div>

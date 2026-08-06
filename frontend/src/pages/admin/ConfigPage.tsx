@@ -67,7 +67,6 @@ const GROUPS: Group[] = [
       ['AGENT_CUSTOM_MAX_TOKENS', 'Custom Max Tokens'],
       ['AGENT_TEMPERATURE', 'Temperature'],
       ['AGENT_TIMEOUT_SECONDS', '超时(秒)'],
-      ['AGENT_FALLBACK_MODEL', 'Fallback Model'],
       ['AGENT_RATE_LIMIT_MAX_RETRIES', '限流重试次数'],
       ['AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS', '限流初始延迟(秒)'],
       ['AGENT_RATE_LIMIT_MAX_DELAY_SECONDS', '限流最大延迟(秒)'],

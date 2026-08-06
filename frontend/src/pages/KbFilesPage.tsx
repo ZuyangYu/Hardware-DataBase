@@ -49,9 +49,18 @@ import { cn } from '@/lib/utils';
 
 const STATUS_LABELS: Record<string, string> = {
   completed: '已完成',
-  parsing: '解析中',
-  pending: '待解析',
+  parsed: '已完成',
+  indexed: '已索引',
   failed: '失败',
+  queued: '排队中',
+  pending: '待解析',
+  uploading: '上传中',
+  uploaded: '已上传',
+  ready: '就绪',
+  running: '解析中',
+  parsing: '解析中',
+  processing: '解析中',
+  started: '解析中',
 };
 
 const PROCESSOR_LABELS: Record<string, string> = {
@@ -129,13 +138,20 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   const canWrite = kbMeta?.permission === 'write' || kbMeta?.permission === 'admin';
   const canAdmin = kbMeta?.permission === 'admin';
   const hasActiveTasks = useMemo(
-    () => tasks.some((task) => ['queued', 'running', 'parsing', 'pending'].includes(task.status)),
+    () =>
+      tasks.some((task) =>
+        ['queued', 'pending', 'uploading', 'uploaded', 'ready', 'running', 'parsing', 'processing', 'started'].includes(
+          task.status,
+        ),
+      ),
     [tasks],
   );
 
-  const loadFiles = useCallback(() => {
+  const loadFiles = useCallback((silent = false) => {
     let cancelled = false;
-    setLoaded(false);
+    // silent (background poll) skips flipping the loading state so the page
+    // doesn't jump to skeletons every 3s and flicker.
+    if (!silent) setLoaded(false);
     setForbidden(null);
     api
       .get<FileView[]>(`/api/v1/kbs/${encodeURIComponent(kbName)}/files`)
@@ -158,14 +174,15 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     };
   }, [kbName]);
 
-  const loadTasks = useCallback(() => {
+  const loadTasks = useCallback((silent = false) => {
     if (!canWrite) {
       setTasks([]);
       setTasksLoaded(true);
       return undefined;
     }
     let cancelled = false;
-    setTasksLoaded(false);
+    // silent (background poll) skips flipping the loading state to avoid skeleton flicker.
+    if (!silent) setTasksLoaded(false);
     api
       .get<ParseTaskView[]>(`/api/v1/kbs/${encodeURIComponent(kbName)}/parse-tasks`)
       .then((rows) => {
@@ -210,8 +227,8 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       return undefined;
     }
     const timer = window.setInterval(() => {
-      loadTasks();
-      loadFiles();
+      loadTasks(true);
+      loadFiles(true);
     }, 3000);
     return () => window.clearInterval(timer);
   }, [canWrite, hasActiveTasks, loadTasks, loadFiles]);

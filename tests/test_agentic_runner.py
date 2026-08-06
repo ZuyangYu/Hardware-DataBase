@@ -9,7 +9,7 @@ from src.agents.graph import analyze_question, analyze_question_with_llm, judge_
 from src.agents.query_tokens import tokenize_hardware_query
 from src.agents.runner import MultiSourceAgentRunner
 from src.agents.tools.document_rag_tool import DocumentRAGTool
-from src.core.llm_client import LLMUsageRecord, LLMUsageSummary
+from src.core.llm_client import ChatToolResult, LLMUsageRecord, LLMUsageSummary
 from src.pipelines.document_store_sqlite import PipelineDocumentRecord
 from src.pipelines.document_rag.schemas import (
     BackendHealth,
@@ -206,6 +206,28 @@ class _FakeLLM:
     def stream_chat(self, messages, **kwargs):
         yield self.chat(messages)
 
+    def chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, **kwargs):
+        # Fakes emulate a provider that does NOT support native tool-calling, so
+        # _chat_structured exercises the JSON-text fallback path (the production
+        # degradation path). Subclasses overriding chat() with usage_stage
+        # tracking still get the stage recorded.
+        try:
+            content = self.chat(messages, usage_stage=usage_stage)
+        except TypeError:
+            content = self.chat(messages)
+        return ChatToolResult(content=content, tool_calls=None, tool_call_supported=False)
+
+    def stream_chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, on_delta=None, **kwargs):
+        # Streaming variant: emulate content streamed as one delta, no tool_call,
+        # so _chat_structured_streaming also exercises the JSON-text fallback.
+        try:
+            content = self.chat(messages, usage_stage=usage_stage)
+        except TypeError:
+            content = self.chat(messages)
+        if on_delta is not None:
+            on_delta(content)
+        return ChatToolResult(content=content, tool_calls=None, tool_call_supported=False)
+
 
 class _UsageTrackingLLM(_FakeLLM):
     def __init__(self):
@@ -291,6 +313,15 @@ class _BadLLM:
             return "not json"
         return "fallback answer"
 
+    def chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, **kwargs):
+        return ChatToolResult(content=self.chat(messages), tool_calls=None, tool_call_supported=False)
+
+    def stream_chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, on_delta=None, **kwargs):
+        result = self.chat_with_tools(messages, tools=tools, tool_choice=tool_choice, usage_stage=usage_stage, **kwargs)
+        if on_delta is not None and result.content:
+            on_delta(result.content)
+        return result
+
 
 class _AliasPlannerLLM:
     def __init__(self, *, mode: str):
@@ -333,6 +364,15 @@ class _AliasPlannerLLM:
             ensure_ascii=False,
         )
 
+    def chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, **kwargs):
+        return ChatToolResult(content=self.chat(messages), tool_calls=None, tool_call_supported=False)
+
+    def stream_chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, on_delta=None, **kwargs):
+        result = self.chat_with_tools(messages, tools=tools, tool_choice=tool_choice, usage_stage=usage_stage, **kwargs)
+        if on_delta is not None and result.content:
+            on_delta(result.content)
+        return result
+
 
 class _AliasCatalogTool:
     def scan(self, kb_name, ctx):
@@ -360,6 +400,15 @@ class _PromptCaptureLLM:
     def chat(self, messages):
         self.last_user_prompt = messages[-1]["content"]
         return json.dumps(self.payload, ensure_ascii=False)
+
+    def chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, **kwargs):
+        return ChatToolResult(content=self.chat(messages), tool_calls=None, tool_call_supported=False)
+
+    def stream_chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, on_delta=None, **kwargs):
+        result = self.chat_with_tools(messages, tools=tools, tool_choice=tool_choice, usage_stage=usage_stage, **kwargs)
+        if on_delta is not None and result.content:
+            on_delta(result.content)
+        return result
 
 
 class _EvaluationPlannerLLM:
@@ -542,6 +591,32 @@ class AgenticRunnerTests(unittest.TestCase):
         self.assertIn("执行时间线", footer)
         self.assertIn("检索诊断", footer)
         self.assertTrue(backend.retrieve_calls)
+
+    def test_stream_emits_thought_stage_degraded_tool_result_via_event_callback(self):
+        runner, _ = self._runner(_FakeLLM(first_sufficient=True))
+        events: list[dict] = []
+        out = "".join(
+            runner.stream(
+                query="查 design_report 选用的料号",
+                kb_name="kb",
+                history=[],
+                ctx=self._ctx(),
+                event_callback=events.append,
+            )
+        )
+        self.assertIn("R-123", out)
+        types = {e.get("type") for e in events}
+        # Reasoning (thought) is dropped end-to-end — never emitted.
+        self.assertNotIn("thought", types)
+        self.assertIn("stage", types)
+        self.assertIn("degraded", types)
+        self.assertIn("tool_started", types)
+        self.assertIn("tool_result", types)
+        started = next(e for e in events if e.get("type") == "tool_started")
+        self.assertIn("tool_name", started["payload"])
+        tool = next(e for e in events if e.get("type") == "tool_result")
+        self.assertIn("tool_name", tool["payload"])
+        self.assertIn("hit_count", tool["payload"])
 
     def test_multi_hop_dynamic_requery(self):
         runner, backend = self._runner(_FakeLLM(first_sufficient=False, multi_hop_query="R-123 用量"))

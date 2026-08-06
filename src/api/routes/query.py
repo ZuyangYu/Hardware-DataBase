@@ -43,6 +43,35 @@ def _stage(key: str, label: str, status: str = "running", detail: str = "") -> t
     return ("stage", {"key": key, "label": label, "status": status, "detail": detail})
 
 
+def _make_event_callback(emit_stage, emit):
+    """Adapt the runner's unified ``{"type","payload"}`` event stream to the
+    durable turn-event path: route ``stage`` through the timing-aware emit_stage,
+    and everything else (degraded / tool_result) through emit.
+
+    ``thought`` (model reasoning) is deliberately dropped here — it is
+    display-only and never persisted nor replayed (OpenWorker's
+    ``reasoning_delta`` semantics). The SSE layer polls the DB, so leaving it
+    out of ``turn_events`` is what makes it ephemeral end-to-end.
+    """
+
+    def _on_event(evt: dict) -> None:
+        etype = evt.get("type")
+        if etype == "thought":
+            return
+        if etype == "stage":
+            payload = evt.get("payload") or {}
+            emit_stage(
+                payload.get("key", ""),
+                payload.get("label", ""),
+                payload.get("status", "running"),
+                payload.get("detail", ""),
+            )
+        else:
+            emit(etype, evt.get("payload") or {})
+
+    return _on_event
+
+
 def _conv_service() -> ConversationService:
     return ConversationService()
 
@@ -165,6 +194,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             stage_durations_ms.setdefault(key, []).append(int((now - stage_started.pop(key)) * 1000))
         emit("stage", {"key": key, "label": label, "status": status, "detail": detail})
 
+    # Structural boundary: marks the start of a turn so surfaces can group the
+    # whole user-message → answer span as one unit (OpenWorker's turn_start).
+    emit("turn_start", {"query": turn.query, "query_mode": turn.query_mode})
+
     def metrics(*, failed: bool = False, cancelled: bool = False, summary: dict | None = None) -> dict:
         queue_ms = max(0, int((started_at - _parse_iso_time(turn.created_at)).total_seconds() * 1000))
         tool_latencies = [
@@ -205,7 +238,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         else:
             if pipeline is None:
                 raise RuntimeError("query pipeline is unavailable")
-            emit_stage("permission", "权限校验", "done", "已完成访问范围检查")
             gen = _query_generator(
                 pipeline,
                 turn.query,
@@ -213,7 +245,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 history,
                 ctx,
                 str(turn.session_id),
-                emit_stage,
+                _make_event_callback(emit_stage, emit),
                 turn.query_mode,
                 cancelled,
             )
@@ -237,6 +269,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         if cancelled():
             emit("error", {"message": "已停止生成", "cancelled": True})
             conv.fail_turn(user.id, turn_id, "已停止生成", cancelled=True)
+            emit("turn_end", {"status": "cancelled"})
             return
 
         answer = "".join(answer_parts)
@@ -254,6 +287,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 "footer": footer,
             },
         )
+        emit("turn_end", {"status": "completed"})
         _record_query_trace(
             user=user,
             kb_name="" if turn.kb_name == GENERAL_CHAT_KB_NAME else turn.kb_name,
@@ -280,6 +314,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 status="failed",
                 error_message=str(exc),
             )
+        emit("turn_end", {"status": "failed"})
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1)
@@ -493,7 +528,6 @@ async def query(
         gen = None
         try:
             answer_parts: list[str] = []
-            _put(_stage("permission", "权限校验", "done", "已完成访问范围检查"))
             gen = _query_generator(
                 pipeline,
                 body.query,
@@ -501,7 +535,9 @@ async def query(
                 history,
                 ctx,
                 body.thread_id,
-                lambda key, label, status="running", detail="": _put(_stage(key, label, status, detail)),
+                lambda e: _put((e["type"], e.get("payload") or {})),
+                "deep",
+                None,
             )
             for chunk in gen:
                 if cancel.is_set():
@@ -596,15 +632,15 @@ def _query_generator(
     history,
     ctx,
     thread_id,
-    progress_callback,
+    event_callback,
     query_mode="deep",
     should_cancel=None,
 ):
     params = inspect.signature(pipeline.query).parameters
-    if "progress_callback" in params:
+    if "event_callback" in params:
         kwargs = {
             "agent_thread_id": thread_id,
-            "progress_callback": progress_callback,
+            "event_callback": event_callback,
         }
         if "query_mode" in params:
             kwargs["query_mode"] = query_mode

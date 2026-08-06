@@ -278,6 +278,103 @@ def _stream_chat_with_usage_stage(llm_client: Any, messages: list[dict[str, str]
         yield from llm_client.stream_chat(messages)
 
 
+def _response_tool(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+    """Build an OpenAI-style function-tool schema for structured LLM output."""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
+def _chat_structured(
+    llm_client: Any,
+    messages: list[dict[str, str]],
+    tool_schema: dict[str, Any],
+    stage: str,
+) -> dict[str, Any]:
+    """Get a structured dict from the LLM via native tool-calling.
+
+    Asks the model to call ``tool_schema``'s function (tool_choice=required) and
+    returns the parsed arguments. Falls back to JSON-text parsing of the content
+    when the provider rejects tools or returns no tool call -- emitting a
+    ``degraded`` stream event so the fallback is never silent. Raises on total
+    failure; callers keep their existing fail-open (_partial / _empty / ...).
+    """
+    # "auto" is the most universal across OpenAI-compatible vendors; the client
+    # ladder falls back if a vendor rejects tools entirely.
+    result = llm_client.chat_with_tools(
+        messages,
+        tools=[tool_schema],
+        tool_choice="auto",
+        usage_stage=stage,
+    )
+    if result.tool_calls:
+        for call in result.tool_calls:
+            arguments = call.get("arguments")
+            if isinstance(arguments, dict) and arguments:
+                return arguments
+    if not result.tool_call_supported:
+        _write_stream_event(
+            {"type": "degraded", "stage": stage, "reason": "provider 不支持原生 tool-calling，已回退 JSON 文本解析"}
+        )
+    if result.content:
+        return _extract_json_object(result.content)
+    raise RuntimeError("LLM 未返回工具调用，也未返回可解析内容")
+
+
+def _chat_structured_streaming(
+    llm_client: Any,
+    messages: list[dict[str, str]],
+    tool_schema: dict[str, Any],
+    stage: str,
+    tool_choice: Any = None,
+) -> dict[str, Any]:
+    """Streaming variant of _chat_structured.
+
+    Forwards content deltas as ``thought`` stream events (live reasoning for
+    the frontend thinking panel) while assembling the structured tool_call
+    decision. ``tool_choice`` defaults to required; pass ``"auto"`` for nodes
+    where visible reasoning matters more than forcing the call (the model then
+    tends to reason in content before calling the tool; JSON-text fallback still
+    applies if it returns no tool_call). Same fail-open semantics as
+    _chat_structured; raises on total failure.
+    """
+    # "auto" default works across OpenAI-compatible vendors; the client ladder
+    # falls back if a vendor rejects tools entirely.
+    effective_choice = tool_choice if tool_choice is not None else "auto"
+
+    # Reasoning deltas are not surfaced (OpenWorker: display-only, dropped
+    # end-to-end). The tool_call still streams + accumulates; we just don't
+    # forward a thought event for the reasoning content.
+    result = llm_client.stream_chat_with_tools(
+        messages,
+        tools=[tool_schema],
+        tool_choice=effective_choice,
+        usage_stage=stage,
+        on_delta=None,
+    )
+    if result.tool_calls:
+        for call in result.tool_calls:
+            arguments = call.get("arguments")
+            if isinstance(arguments, dict) and arguments:
+                return arguments
+    if not result.tool_call_supported:
+        _write_stream_event(
+            {"type": "degraded", "stage": stage, "reason": "provider 不支持流式 tool-calling，已回退 JSON 文本解析"}
+        )
+    if result.content:
+        return _extract_json_object(result.content)
+    raise RuntimeError("LLM 未返回工具调用，也未返回可解析内容")
+
+
 def _normalize_expected_evidence(values: Any) -> list[str]:
     allowed = {"document_text", "spreadsheet_table", "circuit_design"}
     if isinstance(values, str):
@@ -538,7 +635,9 @@ def route_query(state: AgentState, llm_client: Any | None = None) -> AgentState:
     """
     query = state.get("user_query", "").strip()
     fallback = _route_query_deterministic(query)
-    if llm_client is None:
+    if llm_client is None or state.get("_skip_route_llm"):
+        # KB-scoped chat always retrieves: skip the routing LLM call and use the
+        # deterministic fallback (conservative-defaults to retrieval).
         decision = fallback
         trace_node = "route_query"
         trace_msg = "Query routed by deterministic fallback"
@@ -673,15 +772,17 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
     history = state.get("history") or []
     system_prompt = (
         "You are the Question Analysis Agent in an enterprise hardware Agentic RAG system. "
-        "Analyze the user's request and return ONLY valid JSON. Do not include chain-of-thought. "
-        "Expose concise, auditable reasoning in reasoning_summary instead."
+        "Analyze the user's request, briefly reason about what entities and evidence are needed, "
+        "then call the analyze_question tool with your structured analysis. "
+        "Your visible reasoning is streamed to the user as a live thought; keep it concise and in Chinese. "
+        "Expose auditable rationale in reasoning_summary."
     )
     user_prompt = (
-        "Return JSON matching this schema:\n"
+        "Call the analyze_question tool with arguments matching this schema:\n"
         "{\n"
         '  "intent": "multi_source_hardware_query|lookup|comparison|troubleshooting|general_question",\n'
         '  "summary": "Chinese summary of what the user wants",\n'
-        '  "reasoning_summary": "Brief visible rationale, not hidden chain-of-thought",\n'
+        '  "reasoning_summary": "Brief visible rationale",\n'
         '  "entities": ["part numbers, document names, hardware terms"],\n'
         '  "sub_questions": [\n'
         '    {"id": "sq_1", "question": "...", "expected_evidence": ["document_text", "spreadsheet_table", "circuit_design"]}\n'
@@ -694,16 +795,40 @@ def analyze_question_with_llm(state: AgentState, llm_client: Any | None = None) 
         f"User query:\n{query}\n\n"
         f"Recent chat history:\n{_json_for_prompt(history[-6:], limit=4000)}"
     )
+    analyze_tool = _response_tool(
+        "analyze_question",
+        "Analyze the user's hardware query into intent, entities, and sub-questions. Call exactly once.",
+        {
+            "intent": {"type": "string"},
+            "summary": {"type": "string"},
+            "reasoning_summary": {"type": "string"},
+            "entities": {"type": "array", "items": {"type": "string"}},
+            "sub_questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "question": {"type": "string"},
+                        "expected_evidence": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "multi_hop": {"type": "boolean"},
+        },
+        ["summary", "sub_questions"],
+    )
     try:
-        raw = _chat_with_usage_stage(
+        payload = _chat_structured_streaming(
             llm_client,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            analyze_tool,
             "question_analysis",
+            tool_choice="auto",
         )
-        payload = _extract_json_object(raw)
         sub_questions = []
         for index, item in enumerate(payload.get("sub_questions") or [], start=1):
             if not isinstance(item, dict):
@@ -825,11 +950,19 @@ def _name_aliases(value: str) -> set[str]:
 
 def _resolve_catalog_source(sources: list[dict[str, Any]], source_name: str) -> dict[str, Any] | None:
     requested_aliases = _name_aliases(source_name)
-    if not requested_aliases:
-        return None
-    for source in sources:
-        if requested_aliases & _source_aliases(source):
-            return source
+    if requested_aliases:
+        for source in sources:
+            if requested_aliases & _source_aliases(source):
+                return source
+    # Lenient fallback: substring / contains match against document_name and
+    # original_file_name, so a weak model that half-remembers a source still resolves.
+    norm = str(source_name or "").strip().lower()
+    if norm:
+        for source in sources:
+            for field in ("document_name", "original_file_name"):
+                candidate = str(source.get(field) or "").strip().lower()
+                if candidate and (norm in candidate or candidate in norm):
+                    return source
     return None
 
 
@@ -1099,8 +1232,8 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
     system_prompt = (
         "You are the Retrieval Planner and Query Rewriter Agent in an enterprise hardware Agentic RAG system. "
         "Follow a Google-style Agentic RAG search-fanout pattern: decompose the request into search tasks, "
-        "select the best corpus/source for each task, and propose parallel tool calls. Return ONLY valid JSON. "
-        "Do not include chain-of-thought; use concise visible reasons."
+        "select the best corpus/source for each task, and propose parallel tool calls. "
+        "Call the emit_retrieval_plan tool with your plan; do not include chain-of-thought; use concise visible reasons."
     )
     user_prompt = (
         "Available tools:\n"
@@ -1113,8 +1246,10 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         "- If different sub_questions need different evidence types or corpora, select multiple sources and tool calls.\n"
         "- When the catalog contains multiple plausible data sources, cover each distinct evidence type/source needed by the sub_questions instead of repeatedly choosing one source.\n"
         "- For spreadsheet_table sources, prefer both spreadsheet_semantic and spreadsheet_cell when exact fields/parts/models may matter.\n"
-        "- Do not add sources by rule; every selected source must be justified by the question analysis and catalog.\n\n"
-        "Return JSON matching this schema:\n"
+        "- Do not add sources by rule; every selected source must be justified by the question analysis and catalog.\n"
+        "- source_name MUST be copied verbatim from the catalog's document_name field — never invent or paraphrase it.\n"
+        "- tool_name MUST be exactly one of: document_rag | spreadsheet_semantic | spreadsheet_cell | circuit_query. Never combine two names.\n\n"
+        "Call the emit_retrieval_plan tool with arguments matching this schema:\n"
         "{\n"
         '  "source_plan": [\n'
         '    {"source_name": "must exactly match catalog document_name", "reason": "visible reason", '
@@ -1127,16 +1262,53 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         f"Question analysis:\n{_json_for_prompt(state.get('question_analysis') or {}, limit=5000)}\n\n"
         f"Catalog:\n{_json_for_prompt(compact_sources, limit=14000)}"
     )
+    plan_tool = _response_tool(
+        "emit_retrieval_plan",
+        "Emit the retrieval source plan and parallel tool calls for this query. Call exactly once.",
+        {
+            "source_plan": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source_name": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "tool_calls": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool_name": {"type": "string"},
+                                    "query": {"type": "string"},
+                                    "reason": {"type": "string"},
+                                    "top_k": {"type": "integer"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "skipped_sources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"source_name": {"type": "string"}, "reason": {"type": "string"}},
+                },
+            },
+        },
+        ["source_plan"],
+    )
     try:
-        raw = _chat_with_usage_stage(
+        payload = _chat_structured_streaming(
             llm_client,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            plan_tool,
             "source_planning",
+            tool_choice="auto",
         )
-        payload = _extract_json_object(raw)
         plan_items = []
         used_sources = set()
         for item in payload.get("source_plan") or []:
@@ -1164,8 +1336,8 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
             for call in item.get("tool_calls") or []:
                 if not isinstance(call, dict):
                     continue
-                tool_name = str(call.get("tool_name") or "").strip()
-                if tool_name not in allowed_tools:
+                tool_name = _normalize_tool_name(call.get("tool_name"), allowed_tools)
+                if not tool_name:
                     continue
                 calls.append(
                     ToolCallPlan(
@@ -1217,6 +1389,9 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
             ),
         }
     except Exception as exc:
+        _write_stream_event(
+            {"type": "degraded", "stage": "plan_source_selection", "reason": f"LLM 规划失败，退回确定性默认计划：{str(exc)[:160]}"}
+        )
         fallback = plan_source_selection(state)
         return {
             **fallback,
@@ -1276,6 +1451,66 @@ def _allowed_tools_for_processor(processor_kind: str) -> set[str]:
     return {"document_rag"}
 
 
+def _normalize_tool_name(name: Any, allowed: set[str]) -> str:
+    """Map a weak model's sloppy tool name to a valid one. E.g. the planner
+    sometimes emits 'spreadsheet_semantic/cell' (concatenated) or 'semantic'."""
+    n = str(name or "").strip().lower()
+    if n in allowed:
+        return n
+    for a in sorted(allowed):
+        if a in n:
+            return a
+    for a in sorted(allowed):
+        if n in a:
+            return a
+    return ""
+
+
+def _tool_for_evidence_type(evidence_type: str) -> str:
+    if evidence_type == "spreadsheet_table":
+        return "spreadsheet_semantic"
+    if evidence_type == "circuit_design":
+        return "circuit_query"
+    return "document_rag"
+
+
+def _retrievable_gap_queries(ledger: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deterministic re-retrieval plan from ledger gaps: an uncovered sub-question
+    with an unsearched source or a missing evidence type becomes a targeted query.
+    Used as a hard guard so a weak judge LLM cannot wrongly skip a needed re-retrieval."""
+    queries: list[dict[str, Any]] = []
+    for item in ledger:
+        if item.get("status") == "covered":
+            continue
+        sq = str(item.get("sub_question") or "").strip()
+        if not sq:
+            continue
+        expected = item.get("expected_evidence") or []
+        default_tool = _tool_for_evidence_type(str(next(iter(expected), "") or ""))
+        for src in (item.get("unsearched_relevant_sources") or [])[:3]:
+            queries.append(
+                {
+                    "query": sq,
+                    "tool_name": default_tool,
+                    "source_name": str(src),
+                    "reason": f"补查未覆盖来源：{src}",
+                }
+            )
+        for etype in (item.get("missing_evidence_types") or [])[:2]:
+            et = str(etype)
+            queries.append(
+                {
+                    "query": sq,
+                    "tool_name": _tool_for_evidence_type(et) if et else default_tool,
+                    "source_name": "",
+                    "reason": f"缺少证据类型：{et}",
+                }
+            )
+        if len(queries) >= 4:
+            break
+    return queries
+
+
 def _dedupe_tool_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     seen = set()
@@ -1291,6 +1526,19 @@ def _dedupe_tool_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(key)
         result.append(call)
     return result
+
+
+def _normalize_sufficiency_status(status: Any) -> str:
+    """Map a weak judge model's status value to the canonical enum, tolerating
+    abbreviations / Chinese variants so its output still counts."""
+    s = str(status or "").strip().lower()
+    if s in {"sufficient", "enough", "yes", "ok", "充分", "充足", "够"}:
+        return "sufficient"
+    if s in {"partial_but_answerable", "partial", "partial_answerable", "can_answer", "部分", "部分可答", "可答"}:
+        return "partial_but_answerable"
+    if s in {"insufficient_need_more", "insufficient", "need_more", "not_enough", "not enough", "不足", "不充分", "不够"}:
+        return "insufficient_need_more"
+    return ""
 
 
 def _deterministic_circuit_gap_calls(state: AgentState, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1369,6 +1617,9 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
     try:
         catalog = catalog_tool.scan(state["kb_name"], state.get("_ctx_obj"))
     except Exception as exc:
+        _write_stream_event(
+            {"type": "degraded", "stage": "plan_next_retrieval", "reason": f"目录扫描失败，终止多跳：{str(exc)[:160]}"}
+        )
         return _empty("目录扫描失败，终止迭代。", error=str(exc)[:300])
     sources = catalog.get("sources") or []
     source_by_name = {str(src.get("document_name") or ""): src for src in sources}
@@ -1386,6 +1637,9 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
                     {"round": round_no, "suggested_queries": [call["query"] for call in deterministic_calls]},
                 ),
             }
+        _write_stream_event(
+            {"type": "degraded", "stage": "plan_next_retrieval", "reason": "重规划 LLM 不可用，终止多跳"}
+        )
         return _empty("重规划 LLM 不可用，终止迭代。", error="no_llm_client")
 
     compact_sources = [
@@ -1438,20 +1692,40 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
         f"历史检索诊断（命中数、是否 scoped）：\n{_json_for_prompt(previous_calls[-16:], limit=5000)}\n\n"
         f"检索账本（按子问题列出 gap feedback 与未查相关来源）：\n{_json_for_prompt(ledger, limit=7000)}\n\n"
         f"知识库目录（全量，可跨语料）：\n{_json_for_prompt(compact_sources, limit=12000)}\n\n"
-        "请按 system prompt 的 JSON schema 产出下一轮 tool_calls。"
+        "请调用 emit_next_retrieval_calls 工具产出下一轮 tool_calls。"
         "若当前缺口需要另一类证据或已有来源反复未补齐，请优先切换到目录中的其他相关数据源；"
         "只有当同一来源确有新查询价值时才继续查同一来源。"
     )
+    next_tool = _response_tool(
+        "emit_next_retrieval_calls",
+        "Emit the next-round retrieval tool calls. Call exactly once; pass an empty tool_calls array if no useful call exists.",
+        {
+            "tool_calls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {"type": "string"},
+                        "query": {"type": "string"},
+                        "source_name": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "top_k": {"type": "integer"},
+                    },
+                },
+            },
+        },
+        ["tool_calls"],
+    )
     try:
-        raw = _chat_with_usage_stage(
+        payload = _chat_structured_streaming(
             llm_client,
             [
                 {"role": "system", "content": PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
+            next_tool,
             "next_retrieval_planning",
         )
-        payload = _extract_json_object(raw)
         calls = []
         for call in payload.get("tool_calls") or []:
             if not isinstance(call, dict):
@@ -1491,6 +1765,9 @@ def plan_next_retrieval(state: AgentState, llm_client: Any | None, catalog_tool:
             ),
         }
     except Exception as exc:
+        _write_stream_event(
+            {"type": "degraded", "stage": "plan_next_retrieval", "reason": f"重规划 LLM 失败，终止多跳：{str(exc)[:160]}"}
+        )
         return _empty("重规划 LLM 失败，终止迭代。", error=str(exc)[:300])
 
 
@@ -1614,7 +1891,18 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
     if bounded_calls:
         max_workers = min(8, len(bounded_calls))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_run_call, call) for call in bounded_calls]
+            futures = []
+            for call in bounded_calls:
+                # Signal the frontend a tool STARTED (spinner) before it finishes.
+                _write_stream_event(
+                    {
+                        "type": "tool_started",
+                        "round": round_no,
+                        "tool_name": call.get("tool_name"),
+                        "query": call.get("query", ""),
+                    }
+                )
+                futures.append(executor.submit(_run_call, call))
             for future in as_completed(futures):
                 diagnostic, hits, failure = future.result()
                 diagnostics.append(diagnostic)
@@ -2081,6 +2369,9 @@ def judge_sufficiency(state: AgentState, llm_client: Any | None = None) -> Agent
     intermediate_answer = state.get("intermediate_answer") or ""
 
     def _partial(reason: str, error: str = "") -> AgentState:
+        _write_stream_event(
+            {"type": "degraded", "stage": "judge_sufficiency", "reason": f"充分性判断降级：{reason}"}
+        )
         decision = SufficiencyDecision(
             status="partial_but_answerable",
             reason=reason,
@@ -2120,21 +2411,43 @@ def judge_sufficiency(state: AgentState, llm_client: Any | None = None) -> Agent
         "请判断中间草稿是否已经被当前证据充分支撑并覆盖所有子问题。"
         "若某个子问题在草稿中缺失，且检索账本显示存在 unsearched_relevant_sources 或 missing_evidence_types，"
         "请返回 insufficient_need_more，并基于对应 gap_feedback 给出 suggested_queries。"
-        "按 system prompt 的 JSON schema 返回。"
+        "请调用 report_sufficiency 工具返回结果。"
+    )
+    sufficiency_tool = _response_tool(
+        "report_sufficiency",
+        "Report whether current evidence is sufficient to answer all sub-questions. Call exactly once.",
+        {
+            "status": {"type": "string", "enum": ["sufficient", "partial_but_answerable", "insufficient_need_more"]},
+            "reason": {"type": "string"},
+            "missing": {"type": "array", "items": {"type": "string"}},
+            "suggested_queries": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "tool_name": {"type": "string"},
+                        "source_name": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+        ["status", "reason"],
     )
     try:
-        raw = _chat_with_usage_stage(
+        payload = _chat_structured_streaming(
             llm_client,
             [
                 {"role": "system", "content": SUFFICIENCY_JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
+            sufficiency_tool,
             "sufficiency_judge",
         )
-        payload = _extract_json_object(raw)
-        status = str(payload.get("status") or "").strip()
+        status = _normalize_sufficiency_status(payload.get("status"))
         if status not in {"sufficient", "partial_but_answerable", "insufficient_need_more"}:
-            return _partial("充分性 LLM 返回状态非法，基于已有证据作答。", error=f"bad_status:{status}")
+            return _partial("充分性 LLM 返回状态非法，基于已有证据作答。", error=f"bad_status:{payload.get('status')}")
         suggested = []
         for item in payload.get("suggested_queries") or []:
             if not isinstance(item, dict):
@@ -2156,6 +2469,19 @@ def judge_sufficiency(state: AgentState, llm_client: Any | None = None) -> Agent
             missing=[str(m) for m in (payload.get("missing") or []) if str(m).strip()],
             suggested_queries=suggested,
         )
+        # 确定性兜底（先查看账本再判断）：「partial_but_answerable」表示有缺口但能答，
+        # 若账本显示存在可补查的缺口（未查来源 / 缺失证据类型），升级为 insufficient，
+        # 强制进入重新检索，保证「证据不足 → 多跳」这条设计成立。完整的 sufficient 尊重 LLM。
+        if decision.status == "partial_but_answerable" and round_no < config.settings.AGENT_MAX_RETRIEVAL_ROUNDS:
+            gap_queries = _retrievable_gap_queries(ledger)
+            if gap_queries:
+                decision = SufficiencyDecision(
+                    status="insufficient_need_more",
+                    reason="账本显示存在可补查的检索缺口，强制进入下一轮检索。",
+                    missing=decision.missing,
+                    suggested_queries=gap_queries,
+                )
+                suggested = gap_queries
         meta = {
             "round": round_no,
             "status": decision.status,

@@ -17,7 +17,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import type { KbView, SessionView } from '@/api/types';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 type Props = {
   kbName: string;
@@ -46,20 +46,75 @@ export default function ChatSessionSidebar({
 }: Props) {
   const navigate = useNavigate();
   const [deleteTarget, setDeleteTarget] = useState<SessionView | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
+  const [width, setWidth] = useState(240);
+  const dragRef = useRef<{ startX: number; startW: number } | null>(null);
+
+  useEffect(() => {
+    function onMove(e: MouseEvent) {
+      if (!dragRef.current) return;
+      const { startX, startW } = dragRef.current;
+      setWidth(Math.min(420, Math.max(180, startW + e.clientX - startX)));
+    }
+    function onUp() {
+      dragRef.current = null;
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, []);
+
   function kbOptionLabel(kb: KbView): string {
     return kb.department_name ? `${kb.name} · ${kb.department_name}` : kb.name;
   }
-  return (
-    <aside className="flex w-[240px] shrink-0 flex-col border-r border-[#f4f4f4] bg-white">
-      <div className="border-b border-[#f4f4f4] p-[12px]">
+  if (collapsed) {
+    return (
+      <aside className="flex w-[44px] shrink-0 flex-col items-center border-r border-[#f4f4f4] bg-white py-[12px]">
         <button
           type="button"
-          onClick={() => navigate('/kbs')}
-          className="flex items-center gap-[6px] text-[12px] text-[#858b9c] transition-colors hover:text-[#18181a]"
+          onClick={() => setCollapsed(false)}
+          aria-label="展开会话侧栏"
+          title="展开会话侧栏"
+          className="inline-grid size-[28px] place-items-center rounded-[8px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
         >
-          <AppIcon name="arrow" size={14} style={{ transform: 'rotate(180deg)' }} />
-          全部知识库
+          <AppIcon name="arrow" size={16} />
         </button>
+      </aside>
+    );
+  }
+  return (
+    <aside className="group relative flex shrink-0 flex-col border-r border-[#f4f4f4] bg-white" style={{ width }}>
+      <div
+        onMouseDown={(e) => {
+          dragRef.current = { startX: e.clientX, startW: width };
+          e.preventDefault();
+        }}
+        className="absolute right-0 top-0 z-10 h-full w-[3px] cursor-col-resize bg-transparent opacity-0 transition-opacity group-hover:bg-[#d0d5dd] group-hover:opacity-100 active:!opacity-100"
+        title="拖动调整宽度"
+      />
+      <div className="border-b border-[#f4f4f4] p-[12px]">
+        <div className="flex items-center justify-between gap-[8px]">
+          <button
+            type="button"
+            onClick={() => navigate('/kbs')}
+            className="flex items-center gap-[6px] text-[12px] text-[#858b9c] transition-colors hover:text-[#18181a]"
+          >
+            <AppIcon name="arrow" size={14} style={{ transform: 'rotate(180deg)' }} />
+            全部知识库
+          </button>
+          <button
+            type="button"
+            onClick={() => setCollapsed(true)}
+            aria-label="收起会话侧栏"
+            title="收起会话侧栏"
+            className="inline-grid size-[24px] shrink-0 place-items-center rounded-[6px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
+          >
+            <AppIcon name="arrow" size={13} style={{ transform: 'rotate(180deg)' }} />
+          </button>
+        </div>
         <div className="mt-[10px] grid gap-[5px]">
           <span className="text-[11px] text-[#858b9c]">挂载知识库</span>
           <Select value={kbName || '__none__'} onValueChange={(value) => onKbChange(value === '__none__' ? '' : value)} disabled={streaming}>
@@ -105,7 +160,7 @@ export default function ChatSessionSidebar({
               <div
                 key={session.id}
                 className={cn(
-                  'group flex items-center gap-[6px] rounded-[8px] px-[10px] py-[8px] text-[13px] transition-colors',
+                  'group flex min-w-0 items-center gap-[6px] overflow-hidden rounded-[8px] px-[10px] py-[8px] text-[13px] transition-colors',
                   !streaming && 'cursor-pointer',
                   active
                     ? 'bg-[#f6f6f6] text-[#18181a]'
@@ -118,13 +173,13 @@ export default function ChatSessionSidebar({
                   type="button"
                   aria-label="删除会话"
                   disabled={streaming}
-                  className="hidden shrink-0 text-[#858b9c] hover:text-[#d20b0b] group-hover:block disabled:cursor-not-allowed disabled:opacity-40"
+                  className="ml-1 mr-[2px] shrink-0 rounded-[6px] bg-[#f0f1f3] p-1 text-[#6b7280] hover:bg-[#fdeaea] hover:text-[#d20b0b] disabled:cursor-not-allowed disabled:opacity-40"
                   onClick={(e) => {
                     e.stopPropagation();
                     setDeleteTarget(session);
                   }}
                 >
-                  <AppIcon name="trash" size={14} />
+                  <AppIcon name="trash" size={15} className="text-[#6b7280]" />
                 </button>
               </div>
             );

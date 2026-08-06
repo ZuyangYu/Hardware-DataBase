@@ -11,7 +11,22 @@ from src.agents.graph import (
     plan_source_selection_with_llm,
 )
 from src.agents.tools.pipeline_catalog_tool import PipelineCatalogTool
+from src.core.llm_client import ChatToolResult
 from src.pipelines.document_rag.schemas import RequestContext
+
+
+class _ToolFallbackLLM:
+    """Fakes emulate a provider without native tool-calling so the agent's
+    structured nodes exercise the JSON-text fallback path."""
+
+    def chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, **kwargs):
+        return ChatToolResult(content=self.chat(messages), tool_calls=None, tool_call_supported=False)
+
+    def stream_chat_with_tools(self, messages, *, tools, tool_choice, usage_stage=None, on_delta=None, **kwargs):
+        result = self.chat_with_tools(messages, tools=tools, tool_choice=tool_choice, usage_stage=usage_stage, **kwargs)
+        if on_delta is not None and result.content:
+            on_delta(result.content)
+        return result
 
 
 @dataclass
@@ -39,12 +54,12 @@ class _SpreadsheetService:
         return {}
 
 
-class _FakeLLM:
+class _FakeLLM(_ToolFallbackLLM):
     def chat(self, messages):
         return '{"tool_calls": [{"tool_name": "circuit_query", "query": "CAN0", "source_name": "manual.pdf", "reason": "bad pairing"}]}'
 
 
-class _DocumentOnlyAnalysisLLM:
+class _DocumentOnlyAnalysisLLM(_ToolFallbackLLM):
     def chat(self, messages):
         return (
             '{"intent":"lookup","summary":"查询器件",'
@@ -54,7 +69,7 @@ class _DocumentOnlyAnalysisLLM:
         )
 
 
-class _DocumentOnlyPlannerLLM:
+class _DocumentOnlyPlannerLLM(_ToolFallbackLLM):
     def chat(self, messages):
         return (
             '{"source_plan":[{"source_name":"manual.pdf",'
@@ -96,7 +111,7 @@ class _CircuitCatalogTool:
         }
 
 
-class _DocumentOnlyNextPlannerLLM:
+class _DocumentOnlyNextPlannerLLM(_ToolFallbackLLM):
     def chat(self, messages):
         return (
             '{"tool_calls":[{"tool_name":"document_rag","query":"U1800功能",'

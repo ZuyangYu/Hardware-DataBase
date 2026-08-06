@@ -207,7 +207,7 @@ class AppPipeline:
         history: List[Tuple[str, str]],
         ctx: RequestContext | None = None,
         agent_thread_id: str = "",
-        progress_callback: Callable[[str, str, str, str], None] | None = None,
+        event_callback: Callable[[dict], None] | None = None,
         query_mode: str = "deep",
         should_cancel: Callable[[], bool] | None = None,
     ) -> Generator[str, None, None]:
@@ -225,7 +225,7 @@ class AppPipeline:
                 history=history,
                 ctx=ctx,
                 thread_id=agent_thread_id,
-                progress_callback=progress_callback,
+                event_callback=event_callback,
                 query_mode=query_mode,
                 should_cancel=should_cancel,
             )
