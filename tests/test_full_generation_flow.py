@@ -313,7 +313,7 @@ def test_full_generation_flow_with_deterministic_writer(tmp_path: Path):
     assert len(auto_policies) == 1, (
         f"Expected 1 auto-generated policy row, got {len(auto_policies)}"
     )
-    print(f"[VERIFY] Auto-generated policy stored exactly once (UNIQUE regression fixed)")
+    print("[VERIFY] Auto-generated policy stored exactly once (UNIQUE regression fixed)")
 
     print("\n=== Full generation flow PASSED ===")
 

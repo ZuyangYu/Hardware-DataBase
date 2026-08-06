@@ -110,7 +110,10 @@ def _graph(*, fit_checker=None, validator_status="supported", policy=None) -> Au
 
 def _run(graph):
     work_order, snapshot, schema, harness_run, manifest = _setup()
-    retrieve = lambda req, attempt, query_override=None: _outcome([_evidence("a", "alpha")])
+
+    def retrieve(req, attempt, query_override=None):
+        return _outcome([_evidence("a", "alpha")])
+
     return graph.run(
         work_order=work_order, harness_run=harness_run, run_manifest=manifest,
         schema=schema, snapshot=snapshot, legacy_claims=[], retrieve=retrieve,

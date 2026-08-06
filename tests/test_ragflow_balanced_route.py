@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """Stage 5 Task 2: RAGFlow ``balanced_route`` filter drops the source_group
 hard filter while keeping the frozen ``source_names`` scope.
 
 Mirrors the ``_Client``/``_Store``/``_backend`` fake pattern in
 ``test_ragflow_metadata_fallback.py``.
 """
+
+from __future__ import annotations
 
 from src.pipelines.document_rag.ragflow_backend import RAGFlowBackend
 from src.pipelines.document_rag.schemas import RequestContext

@@ -138,7 +138,10 @@ def _run(graph, retrieve):
 
 def test_rerank_applied_when_reranker_injected():
     evidences = [_evidence("a", "alpha"), _evidence("b", "bravo")]
-    retrieve = lambda req, attempt, query_override=None: _outcome(evidences)
+
+    def retrieve(req, attempt, query_override=None):
+        return _outcome(evidences)
+
     reranker = Mock()
     reranker.rerank.side_effect = lambda req, ev, top_k=None: list(reversed(ev))
     graph, draft_calls = _graph(reranker=reranker)
@@ -153,7 +156,10 @@ def test_rerank_applied_when_reranker_injected():
 
 def test_rerank_skipped_when_reranker_none():
     evidences = [_evidence("a", "alpha"), _evidence("b", "bravo")]
-    retrieve = lambda req, attempt, query_override=None: _outcome(evidences)
+
+    def retrieve(req, attempt, query_override=None):
+        return _outcome(evidences)
+
     graph_with, draft_with = _graph(reranker=Mock())  # not called -> passthrough identity
     graph_with.reranker = None
     # Use a graph built without reranker for a clean step-count comparison.
@@ -168,7 +174,10 @@ def test_rerank_skipped_when_reranker_none():
 def test_rerank_step_gated_by_require_tool():
     """A policy without rerank_evidence must reject an (mis)injected reranker."""
     evidences = [_evidence("a", "alpha"), _evidence("b", "bravo")]
-    retrieve = lambda req, attempt, query_override=None: _outcome(evidences)
+
+    def retrieve(req, attempt, query_override=None):
+        return _outcome(evidences)
+
     policy = _policy(allowed_tools=[
         "retrieve_evidence", "draft_ready_unit", "validate_unit_draft",
         "detect_template_contamination", "validate_cross_unit", "rewrite_query",
@@ -216,7 +225,10 @@ def test_ledger_records_query_rewrites_per_source_fallback():
 def test_ledger_survived_in_result():
     """The retrieval_ledger must be surfaced on the result (not dropped)."""
     evidences = [_evidence("a", "alpha")]
-    retrieve = lambda req, attempt, query_override=None: _outcome(evidences)
+
+    def retrieve(req, attempt, query_override=None):
+        return _outcome(evidences)
+
     graph, _ = _graph()
 
     result = _run(graph, retrieve)
@@ -243,7 +255,10 @@ def test_ledger_for_empty_unit():
 
 def test_matrix_row_embeds_ledger():
     evidences = [_evidence("a", "alpha"), _evidence("b", "bravo")]
-    retrieve = lambda req, attempt, query_override=None: _outcome(evidences)
+
+    def retrieve(req, attempt, query_override=None):
+        return _outcome(evidences)
+
     graph, _ = _graph()
 
     result = _run(graph, retrieve)
