@@ -523,6 +523,28 @@ export interface EvaluationSummary {
   metadata: Record<string, unknown>;
 }
 
+export interface EvaluationMetricResult {
+  sample_id: string;
+  metric_name: string;
+  score: number | null;
+  status: 'success' | 'failed' | 'not_applicable';
+  reason: string;
+  details: Record<string, unknown>;
+}
+
+export interface EvaluationSampleResult {
+  sample_id: string;
+  question: string;
+  reference_answer: string;
+  response: string;
+  scored_response: string;
+  retrieved_contexts: string[];
+  critical: boolean;
+  snapshot_status: 'success' | 'failed';
+  metrics: EvaluationMetricResult[];
+  metadata: Record<string, unknown>;
+}
+
 export interface EvaluationRunDetail {
   run_id: string;
   dataset_path: string;
@@ -545,6 +567,8 @@ export interface EvaluationRunDetail {
   error_message: string;
   report_path: string;
   summary?: EvaluationSummary | null;
+  sample_results: EvaluationSampleResult[];
+  sample_results_error: string;
 }
 
 export interface EvaluationCompareResponse {
