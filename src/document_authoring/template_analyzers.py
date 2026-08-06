@@ -148,6 +148,7 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                 sheet_units.append((unit, column, row_number))
                 if value_preview:
                     nonempty_values[(column, row_number)] = value_preview
+        enriched_cells: list[tuple[TemplateAnalysisUnit, int, int]] = []
         for unit, column, row_number in sheet_units:
             neighbors = [
                 TemplateNeighbor(
@@ -160,7 +161,12 @@ def _analyze_workbook(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUn
                 if (neighbor_column, neighbor_row) != (column, row_number)
                 if (preview := nonempty_values.get((neighbor_column, neighbor_row))) is not None
             ]
-            units.append(unit.model_copy(update={"neighborhood": neighbors}))
+            enriched_cells.append((
+                unit.model_copy(update={"neighborhood": neighbors}),
+                column,
+                row_number,
+            ))
+        units.extend(_classify_workbook_regions(enriched_cells))
     return units, active_content
 
 
@@ -228,6 +234,93 @@ def _structural_role(
     if value_kind == "text":
         return "fixed_label"
     return "value"
+
+
+def _classify_workbook_regions(
+    cells: list[tuple[TemplateAnalysisUnit, int, int]],
+) -> list[TemplateAnalysisUnit]:
+    """Conservatively identify scalar values beside a fixed row label.
+
+    This classifier intentionally recognizes only a narrow layout pattern.  A
+    cell needs an immediately-left fixed label and may not be part of a wider
+    text header row before it can become a candidate.  All other blanks keep
+    their existing ``layout_blank`` role and remain non-candidates.
+    """
+    by_row: dict[int, list[tuple[TemplateAnalysisUnit, int]]] = {}
+    for unit, column, row in cells:
+        by_row.setdefault(row, []).append((unit, column))
+
+    classified: dict[str, TemplateAnalysisUnit] = {
+        unit.unit_id: unit.model_copy(update={
+            "candidate_for_auto_fill": unit.writable
+            and unit.structural_role_hint == "placeholder",
+        })
+        for unit, _column, _row in cells
+    }
+    for row_cells in by_row.values():
+        ordered = sorted(row_cells, key=lambda item: item[1])
+        text_runs = _contiguous_text_runs(ordered)
+        header_ids = {
+            unit.unit_id
+            for run in text_runs
+            if len(run) >= 3
+            for unit, _column in run
+        }
+        for unit_id in header_ids:
+            unit = classified[unit_id]
+            classified[unit_id] = unit.model_copy(update={
+                "structural_role_hint": "table_header",
+                "candidate_for_auto_fill": False,
+            })
+
+        for index in range(len(ordered) - 1):
+            left_original, left_column = ordered[index]
+            right_original, right_column = ordered[index + 1]
+            if right_column != left_column + 1:
+                continue
+            left = classified[left_original.unit_id]
+            right = classified[right_original.unit_id]
+            if (
+                not right.writable
+                or left.structural_role_hint != "fixed_label"
+                or left.value_kind != "text"
+            ):
+                continue
+            if right.structural_role_hint == "layout_blank":
+                classified[right.unit_id] = right.model_copy(update={
+                    "structural_role_hint": "scalar_input",
+                    "candidate_for_auto_fill": True,
+                })
+            elif right.structural_role_hint == "fixed_label":
+                classified[right.unit_id] = right.model_copy(update={
+                    "structural_role_hint": "sample_value",
+                    "candidate_for_auto_fill": True,
+                })
+    return [classified[unit.unit_id] for unit, _column, _row in cells]
+
+
+def _contiguous_text_runs(
+    ordered: list[tuple[TemplateAnalysisUnit, int]],
+) -> list[list[tuple[TemplateAnalysisUnit, int]]]:
+    runs: list[list[tuple[TemplateAnalysisUnit, int]]] = []
+    current: list[tuple[TemplateAnalysisUnit, int]] = []
+    previous_column: int | None = None
+    for unit, column in ordered:
+        if (
+            unit.writable
+            and unit.value_kind == "text"
+            and unit.structural_role_hint == "fixed_label"
+            and (previous_column is None or column == previous_column + 1)
+        ):
+            current.append((unit, column))
+        else:
+            if current:
+                runs.append(current)
+            current = []
+        previous_column = column
+    if current:
+        runs.append(current)
+    return runs
 
 
 def _workbook_has_active_content(names: set[str], package: zipfile.ZipFile) -> bool:

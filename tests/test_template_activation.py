@@ -365,3 +365,21 @@ def test_approved_overwrite_does_not_allow_layout_blank_target():
 
     assert decision.status == "requires_human"
     assert "layout_blank_target" in decision.reason_codes
+
+
+def test_scalar_input_target_is_auto_accepted_without_nonempty_overwrite_permission():
+    unit = TemplateAnalysisUnit(
+        unit_id="sheet:Review!B2",
+        locator={"sheet_name": "Review", "cell": "B2"},
+        writable=True,
+        value_kind="blank",
+        style_fingerprint="style-1",
+        structural_role_hint="scalar_input",
+        candidate_for_auto_fill=True,
+    )
+    analysis = _analysis(unit=unit)
+
+    decision = decide_template_activation(analysis)
+
+    assert decision.status == "auto_accepted"
+    assert "nonempty_target_not_placeholder" not in decision.reason_codes

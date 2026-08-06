@@ -80,6 +80,34 @@ def _xlsx_with_semantic_cell_context() -> bytes:
     })
 
 
+def _xlsx_with_label_value_pairs() -> bytes:
+    return _package({
+        "xl/workbook.xml": b'''<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Review" sheetId="1" r:id="rId1"/></sheets></workbook>''',
+        "xl/_rels/workbook.xml.rels": b'''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>''',
+        "xl/worksheets/sheet1.xml": b'''<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Project name</t></is></c><c r="B1" t="inlineStr"><is><t>Sample project</t></is></c><c r="C1"/></row>
+<row r="2"><c r="A2" t="inlineStr"><is><t>Project number</t></is></c><c r="B2"/></row>
+</sheetData></worksheet>''',
+    })
+
+
+def _xlsx_with_table_header_row() -> bytes:
+    return _package({
+        "xl/workbook.xml": b'''<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Review" sheetId="1" r:id="rId1"/></sheets></workbook>''',
+        "xl/_rels/workbook.xml.rels": b'''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>''',
+        "xl/worksheets/sheet1.xml": b'''<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Pin</t></is></c><c r="B1" t="inlineStr"><is><t>Signal</t></is></c><c r="C1" t="inlineStr"><is><t>Description</t></is></c></row></sheetData>
+</worksheet>''',
+    })
+
+
 def test_xlsx_analysis_exposes_bounded_content_roles_styles_and_neighborhoods():
     analysis = analyze_template(_xlsx_with_semantic_cell_context(), "xlsx")
 
@@ -100,6 +128,31 @@ def test_xlsx_analysis_exposes_bounded_content_roles_styles_and_neighborhoods():
         neighbor.value_preview == "Project"
         for neighbor in units["sheet:Review!B1"].neighborhood
     )
+
+
+def test_xlsx_analysis_classifies_label_value_candidates_without_promoting_layout_blank():
+    analysis = analyze_template(_xlsx_with_label_value_pairs(), "xlsx")
+
+    units = {unit.unit_id: unit for unit in analysis.units}
+
+    assert units["sheet:Review!A1"].structural_role_hint == "fixed_label"
+    assert units["sheet:Review!B1"].structural_role_hint == "sample_value"
+    assert units["sheet:Review!B1"].candidate_for_auto_fill is True
+    assert units["sheet:Review!B2"].structural_role_hint == "scalar_input"
+    assert units["sheet:Review!B2"].candidate_for_auto_fill is True
+    assert units["sheet:Review!C1"].structural_role_hint == "layout_blank"
+    assert units["sheet:Review!C1"].candidate_for_auto_fill is False
+
+
+def test_xlsx_analysis_never_promotes_contiguous_text_table_headers_to_fill_candidates():
+    analysis = analyze_template(_xlsx_with_table_header_row(), "xlsx")
+
+    units = {unit.unit_id: unit for unit in analysis.units}
+
+    assert [units[f"sheet:Review!{column}1"].structural_role_hint for column in "ABC"] == [
+        "table_header", "table_header", "table_header",
+    ]
+    assert all(not units[f"sheet:Review!{column}1"].candidate_for_auto_fill for column in "ABC")
 
 
 def _docx_with_paragraph_table_and_external_link() -> bytes:

@@ -53,14 +53,17 @@ class TemplateAnalysisUnit(BaseModel):
     neighborhood: list[TemplateNeighbor] = Field(default_factory=list)
     structural_role_hint: Literal[
         "unknown",
+        "section_header",
         "fixed_label",
         "placeholder",
         "sample_value",
+        "scalar_input",
         "value",
         "table_header",
         "table_body",
         "layout_blank",
     ] = "unknown"
+    candidate_for_auto_fill: bool = False
 
 
 class TemplateAnalysisSuggestion(BaseModel):

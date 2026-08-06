@@ -92,6 +92,11 @@ def decide_template_activation(
             allowed_overwrite = (
                 unit.structural_role_hint == "placeholder"
                 or (
+                    unit.structural_role_hint == "scalar_input"
+                    and unit.candidate_for_auto_fill
+                    and unit.value_kind == "blank"
+                )
+                or (
                     unit.structural_role_hint == "sample_value"
                     and suggestion.overwrite_basis == "sample_value"
                     and unit_id in analysis.approved_overwrite_unit_ids
@@ -104,7 +109,14 @@ def decide_template_activation(
         risky_targets = [
             unit
             for unit in target_units
-            if unit.structural_role_hint != "placeholder"
+            if not (
+                unit.structural_role_hint == "placeholder"
+                or (
+                    unit.structural_role_hint == "scalar_input"
+                    and unit.candidate_for_auto_fill
+                    and unit.value_kind == "blank"
+                )
+            )
         ]
         risky_target_ratio = (
             len(risky_targets) / total_unit_count if total_unit_count else 0.0
