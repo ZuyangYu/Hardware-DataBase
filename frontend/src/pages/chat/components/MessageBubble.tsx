@@ -14,12 +14,6 @@ import {
   CHAT_CITATIONS_CLASS,
   CHAT_MESSAGE_ITEM_CLASS,
   CHAT_PLAIN_ANSWER_CLASS,
-  CHAT_STREAM_TRACE_CLASS,
-  CHAT_STREAM_TRACE_ITEM_CLASS,
-  CHAT_STREAM_TRACE_HEAD_CLASS,
-  CHAT_STREAM_TRACE_DOT_CLASS,
-  CHAT_STREAM_TRACE_DOT_RUNNING_CLASS,
-  CHAT_STREAM_TRACE_DETAIL_CLASS,
   chatBubbleClass,
   chatRowClass,
 } from '../chatPageStyles';
@@ -32,71 +26,83 @@ type Props = {
   streaming?: boolean;
   streamingText?: string;
   traceSteps?: QueryTraceStep[];
+  /** 降级提醒(fail-open 发生时)。 */
+  degradedNotes?: Array<{ stage: string; reason: string }>;
 };
 
-const TRACE_DETAIL_FALLBACKS: Record<string, string> = {
-  route: '正在判断是否需要检索知识库',
-  route_query: '正在判断是否需要检索知识库',
-  analyze: '正在拆解问题、实体和子问题',
-  question_analysis_agent: '正在拆解问题、实体和子问题',
-  plan: '正在规划可用来源和检索工具',
-  retrieve: '正在召回相关硬件资料',
-  merge: '正在合并多源证据',
-  draft: '正在生成中间草稿',
-  judge: '正在判断证据是否足够',
-  verify: '正在校验答案来源',
+// Humanize the backend's stage keys into short one-line step labels.
+const STEP_SHORT: Record<string, string> = {
+  route: '识别问题',
+  route_query: '识别问题',
+  analyze: '分析问题',
+  question_analysis_agent: '分析问题',
+  catalog: '读取目录',
+  scan_kb_catalog: '读取目录',
+  plan: '规划来源',
+  retrieval_planner_agent: '规划来源',
+  retrieve: '检索资料',
+  merge: '整理证据',
+  merge_evidence: '整理证据',
+  evaluate: '评估覆盖',
+  score_and_compare_evidence: '评估覆盖',
+  draft: '起草',
+  judge: '判断充分性',
+  judge_sufficiency: '判断充分性',
+  plan_next_retrieval: '规划补检',
+  verify: '校验来源',
+  verify_grounding: '校验来源',
 };
+const HIDDEN_STEPS = new Set(['route', 'route_query', 'generate']);
 
-const HIDDEN_TRACE_KEYS = new Set(['permission', 'generate']);
-
-function fallbackTraceDetail(step: QueryTraceStep): string {
-  if (step.key === 'analyze' && step.status === 'done') {
-    return '已完成问题范围分析';
-  }
-  const detail = step.detail?.trim();
-  if (detail) return detail;
-  return TRACE_DETAIL_FALLBACKS[step.key] || TRACE_DETAIL_FALLBACKS[step.label] || '';
+function stepLabel(key: string, fallback: string): string {
+  return STEP_SHORT[key] || fallback;
 }
 
-function TraceStatus({ status }: { status: QueryTraceStep['status'] }) {
-  if (status === 'done') return null;
-  const text = status === 'running' ? '进行中' : status === 'error' ? '错误' : '等待';
-  const className = cn(
-    'shrink-0 text-[10px] font-medium leading-none',
-    status === 'running' && 'animate-pulse text-[#1d4ed8]',
-    status === 'error' && 'text-[#b42318]',
-    status === 'pending' && 'text-[#858b9c]',
-  );
-  return <span className={className}>{text}</span>;
-}
-
-function StreamingTraceBlock({ traceSteps }: { traceSteps: QueryTraceStep[] }) {
-  const visibleSteps = traceSteps.filter((step) => !HIDDEN_TRACE_KEYS.has(step.key));
-  if (visibleSteps.length === 0) return null;
+/** Agent steps shown inline, no background, always fully visible. */
+function StepGroup({ steps }: { steps: QueryTraceStep[] }) {
+  const visible = steps.filter((s) => !HIDDEN_STEPS.has(s.key));
+  if (visible.length === 0) return null;
   return (
-    <div className={CHAT_STREAM_TRACE_CLASS}>
-      {visibleSteps.map((step, index) => {
-        const isLast = index === visibleSteps.length - 1;
-        const detail = fallbackTraceDetail(step);
-        return (
-          <div key={`${step.key}-${index}`} className={CHAT_STREAM_TRACE_ITEM_CLASS}>
-            <div className={CHAT_STREAM_TRACE_HEAD_CLASS}>
-              <span
-                className={cn(
-                  CHAT_STREAM_TRACE_DOT_CLASS,
-                  step.status === 'running' && CHAT_STREAM_TRACE_DOT_RUNNING_CLASS,
-                )}
-              />
-              <span className="min-w-0 truncate text-[#464c5e]">{step.label}</span>
-              <TraceStatus status={step.status} />
-            </div>
-            {detail && <div className={CHAT_STREAM_TRACE_DETAIL_CLASS}>{detail}</div>}
-            {isLast && step.status === 'running' && !detail && (
-              <div className={CHAT_STREAM_TRACE_DETAIL_CLASS}>正在展开下一步链路…</div>
+    <div className="space-y-[6px]">
+      {visible.map((s, idx) => (
+        <div key={`${s.key}-${idx}`} className="flex items-start gap-[6px] text-[12px]">
+          <span
+            className={cn(
+              'mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full',
+              s.status === 'running' ? 'animate-pulse bg-[#1d4ed8]' : s.status === 'done' ? 'bg-[#16a34a]' : 'bg-[#d1d5db]',
             )}
+          />
+          <div className="min-w-0 flex-1 whitespace-pre-wrap break-words">
+            <span className="text-[#464c5e]">{stepLabel(s.key, s.label)}</span>
+            {s.detail && <span className="text-[#9aa1b1]"> · {s.detail}</span>}
           </div>
-        );
-      })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Quiet spinner while the agent is busy with no visible step yet. */
+function WaitSpinner() {
+  return (
+    <div className="flex items-center gap-[8px] text-[12px] text-[#9aa1b1]">
+      <span className="h-3 w-3 animate-spin rounded-full border-2 border-[#cbd5e1] border-t-[#1d4ed8]" />
+      <span>处理中…</span>
+    </div>
+  );
+}
+
+function DegradedBanner({ notes }: { notes: Array<{ stage: string; reason: string }> }) {
+  if (notes.length === 0) return null;
+  return (
+    <div className="rounded-[8px] border border-[#f0d28a] bg-[#fff8e6] px-[12px] py-[8px] text-[12px] leading-[18px] text-[#8a6a1f]">
+      <div className="mb-[2px] font-semibold">⚠️ 本次回答存在降级</div>
+      {notes.map((n, idx) => (
+        <div key={idx}>
+          · {n.stage ? `${n.stage}：` : ''}
+          {n.reason}
+        </div>
+      ))}
     </div>
   );
 }
@@ -184,18 +190,29 @@ function StreamingText({ content }: { content: string }) {
   return <div className="whitespace-pre-wrap break-words text-[14px] leading-[24px] text-[#2d3140]">{content}</div>;
 }
 
-function MessageBubble({ msg, evidence, streaming, streamingText, traceSteps = [] }: Props) {
+function MessageBubble({
+  msg,
+  evidence,
+  streaming,
+  streamingText,
+  traceSteps = [],
+  degradedNotes = [],
+}: Props) {
   // 流式临时气泡
   if (streaming) {
+    const generating = !!streamingText;
     return (
       <div className={CHAT_MESSAGE_ITEM_CLASS}>
         <div className={chatRowClass('assistant')}>
           <div className={chatBubbleClass('assistant')}>
             <div className="grid gap-[12px]">
-              <StreamingTraceBlock traceSteps={traceSteps} />
-              {streamingText && (
+              {degradedNotes.length > 0 && <DegradedBanner notes={degradedNotes} />}
+              {!generating && traceSteps.length === 0 && <WaitSpinner />}
+              {traceSteps.length > 0 && !generating && <StepGroup steps={traceSteps} />}
+              {generating && (
                 <div data-i18n-ignore>
                   <StreamingText content={streamingText} />
+                  <span className="text-[#1d4ed8]">▍</span>
                 </div>
               )}
             </div>

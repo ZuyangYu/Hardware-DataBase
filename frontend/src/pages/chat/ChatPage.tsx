@@ -72,6 +72,7 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
     streaming,
     streamingText,
     traceSteps,
+    degradedNotes,
     send,
     abortStream,
     forbidden,
@@ -125,6 +126,7 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           streaming={streaming}
           streamingText={streamingText}
           traceSteps={traceSteps}
+          degradedNotes={degradedNotes}
         />
         <Composer
           kbName={mountedKbName}
