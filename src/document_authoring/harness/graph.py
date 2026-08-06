@@ -382,6 +382,9 @@ def _requirement_for_unit(
         predicate = schema.description or None
         missing_policy = schema.missing_policy
         claim_type = "attribute"
+        query_terms = _unique_query_terms(
+            [*schema.subject_aliases, *schema.query_terms, schema.description, schema.label]
+        )
     else:
         capability = _capabilities(schema.required_capabilities)
         source_roles = schema.required_source_roles
@@ -389,12 +392,14 @@ def _requirement_for_unit(
         predicate = "review"
         missing_policy = "mark_tbd"
         claim_type = "requirement"
+        query_terms = _unique_query_terms([schema.label, "review"])
     requirement_id = hashlib.sha256(
         f"{work_order.work_order_id}|{unit['unit_id']}|{work_order.input_fingerprint}".encode("utf-8")
     ).hexdigest()[:24]
     return InformationRequirement(
         requirement_id=f"req-{requirement_id}", semantic_unit_id=unit["unit_id"],
         claim_type=claim_type, subject=subject, predicate=predicate,
+        retrieval_query_terms=query_terms,
         required_capabilities=capability, preferred_source_roles=source_roles,
         project_id=work_order.project_id, baseline_id=work_order.baseline_id,
         source_version_scope=list(
@@ -412,11 +417,24 @@ def _capabilities(values: list[str]) -> list[str]:
 
 
 def _query_string(requirement: InformationRequirement) -> str:
+    if requirement.retrieval_query_terms:
+        return " ".join(requirement.retrieval_query_terms)
     return " ".join(
         value
         for value in (requirement.subject, requirement.predicate, requirement.object_hint)
         if value
     )
+
+
+def _unique_query_terms(values: list[str | None]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if normalized and normalized.casefold() not in seen:
+            result.append(normalized)
+            seen.add(normalized.casefold())
+    return result
 
 
 def _retrieval_ledger_row(

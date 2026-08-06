@@ -64,6 +64,7 @@ class InformationRequirement(BaseModel):
     subject: str
     predicate: str | None = None
     object_hint: str | None = None
+    retrieval_query_terms: list[str] = Field(default_factory=list)
     required_capabilities: list[CapabilityName] = Field(default_factory=list)
     preferred_source_roles: list[str] = Field(default_factory=list)
     project_id: str | None = None

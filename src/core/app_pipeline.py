@@ -1033,14 +1033,8 @@ class AppPipeline:
         )
 
         def retrieve(requirement, _attempt, query_override=None, *, relaxed: bool = False):
-            query = query_override or " ".join(
-                value
-                for value in (
-                    requirement.subject,
-                    requirement.predicate,
-                    requirement.object_hint,
-                )
-                if value
+            query = query_override or " ".join(requirement.retrieval_query_terms) or " ".join(
+                value for value in (requirement.subject, requirement.predicate, requirement.object_hint) if value
             )
             evidences = registry.retrieve(requirement, query, balanced_route=relaxed)
             return self.document_generation.build_knowledge_base_retrieval_outcome(
@@ -1204,7 +1198,7 @@ class AppPipeline:
                 kb_names = [name for name in kb_names if name]
                 if not kb_names:
                     raise SourceUnavailableError(f"knowledge base is not configured for source: {version_id}")
-                query = query_override or " ".join(
+                query = query_override or " ".join(requirement.retrieval_query_terms) or " ".join(
                     value for value in (requirement.subject, requirement.predicate, requirement.object_hint) if value
                 )
                 result: list[EvidenceEnvelope] = []
@@ -1317,7 +1311,7 @@ class AppPipeline:
                 return result
 
             outcome = self.project_retrieval.retrieve(ctx, requirement, snapshot_id, retrieve_one)
-            query = query_override or " ".join(
+            query = query_override or " ".join(requirement.retrieval_query_terms) or " ".join(
                 value for value in (requirement.subject, requirement.predicate, requirement.object_hint) if value
             )
             # Post-process the validated evidence: dedup by content hash (P4

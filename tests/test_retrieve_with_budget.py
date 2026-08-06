@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from src.agents.claim_evidence import InformationRequirement, RetrievalOutcome
-from src.document_authoring.harness.graph import AuthoringGraph, DocumentAuthoringState
+from src.document_authoring.harness.graph import AuthoringGraph, DocumentAuthoringState, _query_string
 from src.document_authoring.harness.policy import HarnessToolPolicy
 from src.document_authoring.models import HarnessPolicy
 from src.document_authoring.writers.managed import DeterministicEvidenceWriter, ManagedWriter
@@ -48,6 +48,19 @@ def _state() -> DocumentAuthoringState:
         "document_schema": None, "source_set_snapshot": None,
         "current_node": "initialize", "step_count": 0, "retrieval_round_count": 0,
     }
+
+
+def test_query_string_uses_field_contract_terms_before_label():
+    requirement = InformationRequirement(
+        requirement_id="req-contract",
+        semantic_unit_id="field:current",
+        claim_type="attribute",
+        subject="额定电流",
+        predicate="电源持续输出电流",
+        retrieval_query_terms=["Iout", "continuous current", "额定电流"],
+    )
+
+    assert _query_string(requirement) == "Iout continuous current 额定电流"
 
 
 def test_uses_rewrite_on_success_empty():
