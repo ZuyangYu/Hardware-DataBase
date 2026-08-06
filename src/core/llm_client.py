@@ -86,7 +86,11 @@ class LLMClientConfig:
     rate_limit_max_retries: int = 4
     rate_limit_initial_delay_seconds: float = 1.0
     rate_limit_max_delay_seconds: float = 16.0
-    fallback_model: str = "deepseek-ai/DeepSeek-V4-Pro"
+    # Vendors differ in tool-calling support. "auto" is the most universal and is
+    # ON by default; the retry ladder falls back to no-tools (structured JSON in
+    # content) only when a vendor rejects tools entirely. Streaming is always on.
+    tool_choice: str = "auto"
+    tool_streaming: bool = True
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,22 @@ class LLMUsageRecord:
     completion_tokens: int = 0
     total_tokens: int = 0
     usage_returned: bool = False
+
+
+@dataclass(frozen=True)
+class ChatToolResult:
+    """Result of a tool-calling chat completion.
+
+    ``tool_calls`` is a list of ``{"id","name","arguments"}`` dicts (arguments
+    parsed to a dict when possible) when the model returned native tool calls.
+    It is ``None`` when the provider rejected ``tools=`` and we fell back to a
+    plain completion -- in that case the caller should parse structured output
+    out of ``content`` itself.
+    """
+
+    content: str
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_supported: bool = True
 
 
 @dataclass(frozen=True)
@@ -181,6 +201,61 @@ class LLMClient:
             return self._stream_chat_openai_compatible(config, messages, **kwargs)
         raise ValueError(f"Unsupported provider: {config.provider}")
 
+    def chat_with_tools(
+        self,
+        messages: list[ChatPayload],
+        *,
+        tools: list[dict[str, Any]],
+        tool_choice: Any = None,
+        usage_stage: Any = None,
+        **kwargs: Any,
+    ) -> ChatToolResult:
+        """Non-streaming chat completion that asks the model to call a function tool.
+
+        Used by the agent's structured-decision nodes (planner / sufficiency
+        judge / next-round planner) so they get native structured output instead
+        of parsing free-text JSON. If the provider rejects ``tools=``, we retry
+        once without tools and return ``tool_calls=None`` so the caller can fall
+        back to JSON-text parsing of ``content`` -- the agent never hard-breaks.
+        """
+        config = self.config or self._from_runtime_settings()
+        self._validate_messages(messages)
+        if config.provider == settings.Provider.OLLAMA:
+            return self._chat_tools_ollama(config, messages, tools, tool_choice, usage_stage, **kwargs)
+        if config.provider == settings.Provider.CUSTOM:
+            return self._chat_tools_openai_compatible(config, messages, tools, tool_choice, usage_stage, **kwargs)
+        raise ValueError(f"Unsupported provider: {config.provider}")
+
+    def stream_chat_with_tools(
+        self,
+        messages: list[ChatPayload],
+        *,
+        tools: list[dict[str, Any]],
+        tool_choice: Any = None,
+        usage_stage: Any = None,
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs: Any,
+    ) -> ChatToolResult:
+        """Streaming variant of chat_with_tools for the agent's reasoning nodes.
+
+        Content deltas are forwarded to ``on_delta`` in real time (so the agent
+        can emit a live ``thought`` stream) while tool_call argument fragments
+        are accumulated across chunks. Returns a ChatToolResult just like
+        chat_with_tools. If the provider rejects streaming+tools, falls back to
+        the non-streaming chat_with_tools (no thought stream, agent still works).
+        """
+        config = self.config or self._from_runtime_settings()
+        self._validate_messages(messages)
+        if config.provider == settings.Provider.OLLAMA:
+            return self._stream_chat_tools_ollama(
+                config, messages, tools, tool_choice, usage_stage, on_delta, **kwargs
+            )
+        if config.provider == settings.Provider.CUSTOM:
+            return self._stream_chat_tools_openai_compatible(
+                config, messages, tools, tool_choice, usage_stage, on_delta, **kwargs
+            )
+        raise ValueError(f"Unsupported provider: {config.provider}")
+
     @staticmethod
     def _from_runtime_settings() -> LLMClientConfig:
         if settings.AGENT_LLM_PROVIDER == settings.Provider.OLLAMA:
@@ -203,7 +278,6 @@ class LLMClient:
             rate_limit_max_retries=settings.AGENT_RATE_LIMIT_MAX_RETRIES,
             rate_limit_initial_delay_seconds=settings.AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS,
             rate_limit_max_delay_seconds=settings.AGENT_RATE_LIMIT_MAX_DELAY_SECONDS,
-            fallback_model=settings.AGENT_FALLBACK_MODEL,
         )
 
     @staticmethod
@@ -396,6 +470,321 @@ class LLMClient:
             raise RuntimeError("Chat API returned an empty streamed response")
         return content
 
+    def _chat_tools_openai_compatible(
+        self,
+        config: LLMClientConfig,
+        messages: list[ChatPayload],
+        tools: list[dict[str, Any]],
+        tool_choice: Any,
+        usage_stage: Any,
+        **kwargs: Any,
+    ) -> ChatToolResult:
+        if not config.base_url:
+            raise ValueError("AGENT_CUSTOM_BASE_URL is required")
+        if not config.model:
+            raise ValueError("AGENT_CUSTOM_MODEL is required")
+        headers = {"Content-Type": "application/json"}
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
+        base_payload = {
+            "messages": messages,
+            "temperature": kwargs.get("temperature", config.temperature),
+            "max_tokens": kwargs.get("max_tokens", config.max_tokens),
+        }
+
+        def _post(payload: dict[str, Any]) -> Any:
+            return requests.post(
+                f"{config.base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=kwargs.get("timeout", config.timeout),
+            )
+
+        def request_choice(choice: Any) -> Callable[[str], Any]:
+            def _req(model: str) -> Any:
+                payload = {"model": model, **base_payload, "tools": tools}
+                if choice is not None:
+                    payload["tool_choice"] = choice
+                return _post(payload)
+
+            return _req
+
+        def request_no_tools(model: str) -> Any:
+            return _post({"model": model, **base_payload})
+
+        # Vendor-agnostic tool_choice ladder: try the preferred choice, then "auto"
+        # (Ark/others reject required/object form), then drop tools entirely so the
+        # caller parses structured JSON out of content. No vendor hardcoding.
+        preferred = tool_choice if tool_choice is not None else config.tool_choice
+        attempts = [request_choice(preferred)]
+        if preferred != "auto":
+            attempts.append(request_choice("auto"))
+        attempts.append(request_no_tools)
+
+        response = None
+        used_no_tools = False
+        for index, attempt in enumerate(attempts):
+            try:
+                response = self._request_openai_compatible_with_rate_limit_fallback(config, attempt)
+                used_no_tools = index == len(attempts) - 1
+                break
+            except requests.HTTPError as exc:
+                if not _is_tools_rejected(getattr(exc, "response", None)):
+                    raise
+        if response is None:
+            raise RuntimeError("all tool-calling attempts rejected by provider")
+
+        data = response.json()
+        self._record_usage(config, usage_stage, _extract_openai_usage(data.get("usage")))
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"Chat API returned no choices: {data}")
+        message = choices[0].get("message") or {}
+        content = (message.get("content") or "").strip()
+        raw_tool_calls = message.get("tool_calls") or []
+        tool_calls = [_parse_tool_call(tc) for tc in raw_tool_calls] if raw_tool_calls else None
+        return ChatToolResult(content=content, tool_calls=tool_calls, tool_call_supported=not used_no_tools)
+
+    def _chat_tools_ollama(
+        self,
+        config: LLMClientConfig,
+        messages: list[ChatPayload],
+        tools: list[dict[str, Any]],
+        tool_choice: Any,
+        usage_stage: Any,
+        **kwargs: Any,
+    ) -> ChatToolResult:
+        if not config.base_url:
+            raise ValueError("AGENT_OLLAMA_BASE_URL is required")
+        if not config.model:
+            raise ValueError("AGENT_OLLAMA_MODEL is required")
+        payload = {
+            "model": config.model,
+            "messages": messages,
+            "stream": False,
+            "tools": tools,
+            "options": {
+                "temperature": kwargs.get("temperature", config.temperature),
+                "num_predict": kwargs.get("max_tokens", config.max_tokens),
+            },
+        }
+        try:
+            response = requests.post(
+                f"{config.base_url.rstrip('/')}/api/chat",
+                json=payload,
+                timeout=kwargs.get("timeout", config.timeout),
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            if _is_tools_rejected(getattr(exc, "response", None)):
+                payload.pop("tools", None)
+                response = requests.post(
+                    f"{config.base_url.rstrip('/')}/api/chat",
+                    json=payload,
+                    timeout=kwargs.get("timeout", config.timeout),
+                )
+                response.raise_for_status()
+                data = response.json()
+                self._record_usage(config, usage_stage, _extract_ollama_usage(data))
+                content = ((data.get("message") or {}).get("content") or "").strip()
+                return ChatToolResult(content=content, tool_calls=None, tool_call_supported=False)
+            raise
+        data = response.json()
+        self._record_usage(config, usage_stage, _extract_ollama_usage(data))
+        message = data.get("message") or {}
+        content = (message.get("content") or "").strip()
+        raw_tool_calls = message.get("tool_calls") or []
+        tool_calls = [_parse_tool_call(tc) for tc in raw_tool_calls] if raw_tool_calls else None
+        return ChatToolResult(content=content, tool_calls=tool_calls)
+
+    def _stream_chat_tools_openai_compatible(
+        self,
+        config: LLMClientConfig,
+        messages: list[ChatPayload],
+        tools: list[dict[str, Any]],
+        tool_choice: Any,
+        usage_stage: Any,
+        on_delta: Callable[[str], None] | None,
+        **kwargs: Any,
+    ) -> ChatToolResult:
+        if not config.base_url:
+            raise ValueError("AGENT_CUSTOM_BASE_URL is required")
+        if not config.model:
+            raise ValueError("AGENT_CUSTOM_MODEL is required")
+        headers = {"Content-Type": "application/json"}
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
+        base_payload = {
+            "messages": messages,
+            "temperature": kwargs.get("temperature", config.temperature),
+            "max_tokens": kwargs.get("max_tokens", config.max_tokens),
+        }
+
+        def _post_stream(payload: dict[str, Any]) -> Any:
+            response = requests.post(
+                f"{config.base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=kwargs.get("timeout", config.timeout),
+                stream=True,
+            )
+            if not _should_retry_without_stream_options(response):
+                return response
+            payload.pop("stream_options", None)
+            return requests.post(
+                f"{config.base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=kwargs.get("timeout", config.timeout),
+                stream=True,
+            )
+
+        def request_choice(choice: Any) -> Callable[[str], Any]:
+            def _req(model: str) -> Any:
+                payload = {
+                    "model": model,
+                    **base_payload,
+                    "tools": tools,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
+                if choice is not None:
+                    payload["tool_choice"] = choice
+                return _post_stream(payload)
+
+            return _req
+
+        def request_no_tools(model: str) -> Any:
+            return _post_stream(
+                {"model": model, **base_payload, "stream": True, "stream_options": {"include_usage": True}}
+            )
+
+        # Same vendor-agnostic ladder as the non-streaming path.
+        preferred = tool_choice if tool_choice is not None else config.tool_choice
+        attempts = [request_choice(preferred)]
+        if preferred != "auto":
+            attempts.append(request_choice("auto"))
+        attempts.append(request_no_tools)
+
+        response = None
+        used_no_tools = False
+        for index, attempt in enumerate(attempts):
+            try:
+                response = self._request_openai_compatible_with_rate_limit_fallback(config, attempt)
+                used_no_tools = index == len(attempts) - 1
+                break
+            except requests.HTTPError as exc:
+                if not _is_tools_rejected(getattr(exc, "response", None)):
+                    raise
+        if response is None:
+            # Streaming+tools rejected entirely: fall back to non-streaming so the
+            # agent still gets a structured decision (JSON-in-content path).
+            return self._chat_tools_openai_compatible(
+                config, messages, tools, tool_choice, usage_stage, **kwargs
+            )
+
+        response.encoding = "utf-8"
+        parts: list[str] = []
+        tool_acc: dict[int, dict[str, str]] = {}
+        usage: dict[str, int] | None = None
+        for event_data in _iter_sse_data_events(response.iter_lines(chunk_size=1, decode_unicode=True)):
+            if event_data == "[DONE]":
+                break
+            data = json.loads(event_data)
+            if data.get("usage"):
+                usage = _extract_openai_usage(data.get("usage"))
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content") or ""
+            if content:
+                parts.append(content)
+                if on_delta is not None:
+                    on_delta(content)
+            for tc in delta.get("tool_calls") or []:
+                index = int(tc.get("index", 0) or 0)
+                acc = tool_acc.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    acc["id"] = str(tc["id"])
+                function = tc.get("function") or {}
+                if function.get("name"):
+                    acc["name"] = str(function["name"])
+                if function.get("arguments"):
+                    acc["arguments"] += str(function["arguments"])
+        self._record_usage(config, usage_stage, usage)
+        content = "".join(parts).strip()
+        tool_calls = (
+            [
+                _parse_tool_call(
+                    {"id": acc["id"], "function": {"name": acc["name"], "arguments": acc["arguments"]}}
+                )
+                for _, acc in sorted(tool_acc.items())
+            ]
+            if tool_acc
+            else None
+        )
+        return ChatToolResult(content=content, tool_calls=tool_calls, tool_call_supported=not used_no_tools)
+
+    def _stream_chat_tools_ollama(
+        self,
+        config: LLMClientConfig,
+        messages: list[ChatPayload],
+        tools: list[dict[str, Any]],
+        tool_choice: Any,
+        usage_stage: Any,
+        on_delta: Callable[[str], None] | None,
+        **kwargs: Any,
+    ) -> ChatToolResult:
+        if not config.base_url:
+            raise ValueError("AGENT_OLLAMA_BASE_URL is required")
+        if not config.model:
+            raise ValueError("AGENT_OLLAMA_MODEL is required")
+        payload = {
+            "model": config.model,
+            "messages": messages,
+            "stream": True,
+            "tools": tools,
+            "options": {
+                "temperature": kwargs.get("temperature", config.temperature),
+                "num_predict": kwargs.get("max_tokens", config.max_tokens),
+            },
+        }
+        try:
+            response = requests.post(
+                f"{config.base_url.rstrip('/')}/api/chat",
+                json=payload,
+                timeout=kwargs.get("timeout", config.timeout),
+                stream=True,
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            if _is_tools_rejected(getattr(exc, "response", None)):
+                return self._chat_tools_ollama(config, messages, tools, tool_choice, usage_stage, **kwargs)
+            raise
+        response.encoding = "utf-8"
+        parts: list[str] = []
+        tool_calls: list[dict[str, Any]] | None = None
+        usage: dict[str, int] | None = None
+        for line in response.iter_lines(chunk_size=1, decode_unicode=True):
+            if not line:
+                continue
+            data = json.loads(line)
+            message = data.get("message") or {}
+            content = message.get("content") or ""
+            if content:
+                parts.append(content)
+                if on_delta is not None:
+                    on_delta(content)
+            if message.get("tool_calls"):
+                tool_calls = [_parse_tool_call(tc) for tc in message["tool_calls"]]
+            if data.get("done"):
+                usage = _extract_ollama_usage(data)
+                break
+        self._record_usage(config, usage_stage, usage)
+        content = "".join(parts).strip()
+        return ChatToolResult(content=content, tool_calls=tool_calls, tool_call_supported=True)
+
     def _request_openai_compatible_with_rate_limit_fallback(
         self,
         config: LLMClientConfig,
@@ -492,6 +881,42 @@ def _should_retry_without_stream_options(response: Any) -> bool:
     return status_code in {400, 422} and "stream_options" in body
 
 
+def _is_tools_rejected(response: Any) -> bool:
+    """True when a 400/422 likely stems from the tools/tool_choice/stream_options params.
+
+    Providers such as Volcengine Ark return a generic ``InvalidParameter`` 400 without
+    naming "tools", so the tool-choice retry ladder treats any 400/422 on a tools request
+    as rejection and advances to the next attempt (choice -> auto -> no-tools). Genuine
+    errors (bad model/key) 400 without tools too, so the no-tools retry still fails and raises.
+    """
+    if response is None:
+        return False
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    return status_code in {400, 422}
+
+
+def _parse_tool_call(tool_call: Any) -> dict[str, Any]:
+    """Normalize an OpenAI/Ollama tool_call into {"id","name","arguments"}."""
+    if not isinstance(tool_call, dict):
+        return {"id": "", "name": "", "arguments": {}}
+    function = tool_call.get("function") or {}
+    raw_args = function.get("arguments")
+    if isinstance(raw_args, str):
+        try:
+            arguments = json.loads(raw_args)
+        except json.JSONDecodeError:
+            arguments = {"_raw": raw_args}
+    elif isinstance(raw_args, dict):
+        arguments = raw_args
+    else:
+        arguments = {}
+    return {
+        "id": str(tool_call.get("id") or ""),
+        "name": str(function.get("name") or ""),
+        "arguments": arguments,
+    }
+
+
 def _is_rate_limited(response: Any) -> bool:
     return int(getattr(response, "status_code", 0) or 0) == 429
 
@@ -517,11 +942,8 @@ def _rate_limit_delay_seconds(config: LLMClientConfig, attempt: int, response: A
 
 
 def _model_attempt_order(config: LLMClientConfig) -> tuple[str, ...]:
-    primary = str(config.model or "").strip()
-    fallback = str(config.fallback_model or "").strip()
-    if fallback and fallback != primary:
-        return primary, fallback
-    return (primary,)
+    # Only the user-configured model is ever used — no cross-model fallback.
+    return (str(config.model or "").strip(),)
 
 
 def _summarize_usage(records: Iterable[LLMUsageRecord]) -> LLMUsageSummary:

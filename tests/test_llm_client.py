@@ -78,7 +78,6 @@ class LLMClientStreamTests(unittest.TestCase):
             base_url="https://example.test/v1",
             model="primary-model",
             rate_limit_max_retries=1,
-            fallback_model="",
         )
         success = _FakeJsonResponse({"choices": [{"message": {"content": "answer"}}]})
 
@@ -91,24 +90,25 @@ class LLMClientStreamTests(unittest.TestCase):
         self.assertEqual(answer, "answer")
         self.assertEqual(post.call_count, 2)
 
-    def test_openai_compatible_chat_uses_fallback_after_primary_429(self):
+    def test_openai_compatible_chat_does_not_switch_model_after_primary_429(self):
+        # No cross-model fallback: only the user-configured model is tried; a
+        # persistent 429 (after max retries) raises instead of switching models.
         config = LLMClientConfig(
             provider=settings.Provider.CUSTOM,
             base_url="https://example.test/v1",
             model="primary-model",
             rate_limit_max_retries=0,
-            fallback_model="deepseek-ai/DeepSeek-V4-Pro",
         )
-        success = _FakeJsonResponse({"choices": [{"message": {"content": "fallback answer"}}]})
 
         with patch(
             "src.core.llm_client.requests.post",
-            side_effect=[_RateLimitedResponse(), success],
+            side_effect=[_RateLimitedResponse()],
         ) as post:
-            answer = LLMClient(config).chat([{"role": "user", "content": "hi"}])
+            with self.assertRaises(requests.HTTPError):
+                LLMClient(config).chat([{"role": "user", "content": "hi"}])
 
-        self.assertEqual(answer, "fallback answer")
-        self.assertEqual(post.call_args_list[1].kwargs["json"]["model"], "deepseek-ai/DeepSeek-V4-Pro")
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args_list[0].kwargs["json"]["model"], "primary-model")
 
     def test_openai_compatible_chat_retries_transient_connection_error(self):
         config = LLMClientConfig(
@@ -116,7 +116,6 @@ class LLMClientStreamTests(unittest.TestCase):
             base_url="https://example.test/v1",
             model="primary-model",
             rate_limit_max_retries=1,
-            fallback_model="",
         )
         success = _FakeJsonResponse({"choices": [{"message": {"content": "answer"}}]})
 
@@ -130,30 +129,23 @@ class LLMClientStreamTests(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         sleep.assert_called_once()
 
-    def test_openai_compatible_stream_uses_fallback_after_pre_stream_429(self):
+    def test_openai_compatible_stream_does_not_switch_model_after_pre_stream_429(self):
         config = LLMClientConfig(
             provider=settings.Provider.CUSTOM,
             base_url="https://example.test/v1",
             model="primary-model",
             rate_limit_max_retries=0,
-            fallback_model="deepseek-ai/DeepSeek-V4-Pro",
-        )
-        success = _FakeStreamResponse(
-            [
-                'data: {"choices":[{"delta":{"content":"ok"}}]}',
-                "",
-                "data: [DONE]",
-            ]
         )
 
         with patch(
             "src.core.llm_client.requests.post",
-            side_effect=[_RateLimitedResponse(), success],
+            side_effect=[_RateLimitedResponse()],
         ) as post:
-            chunks = list(LLMClient(config).stream_chat([{"role": "user", "content": "hi"}]))
+            with self.assertRaises(requests.HTTPError):
+                list(LLMClient(config).stream_chat([{"role": "user", "content": "hi"}]))
 
-        self.assertEqual(chunks, ["ok"])
-        self.assertEqual(post.call_args_list[1].kwargs["json"]["model"], "deepseek-ai/DeepSeek-V4-Pro")
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args_list[0].kwargs["json"]["model"], "primary-model")
 
     def test_sse_parser_buffers_json_split_inside_chinese_string(self):
         events = list(

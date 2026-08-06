@@ -1921,6 +1921,18 @@ def render_chat_tab(pipeline):
             error_occured = None
             agent_footer = ""
             token_usage_footer = ""
+            degraded_notes: list[tuple[str, str]] = []
+            thought_parts: list[str] = []
+
+            def _on_event(evt):
+                etype = evt.get("type")
+                if etype == "degraded":
+                    payload = evt.get("payload") or {}
+                    degraded_notes.append((str(payload.get("stage", "")), str(payload.get("reason", ""))))
+                elif etype == "thought":
+                    payload = evt.get("payload") or {}
+                    thought_parts.append(str(payload.get("delta", "")))
+
             try:
                 ctx = build_request_context(st.session_state)
                 gen = pipeline.query(
@@ -1929,6 +1941,7 @@ def render_chat_tab(pipeline):
                     chat_history[-5:],
                     ctx=ctx,
                     agent_thread_id=agent_thread_id,
+                    event_callback=_on_event,
                 )
             except Exception as e:
                 error_occured = str(e)
@@ -1955,6 +1968,14 @@ def render_chat_tab(pipeline):
                 if not full_response or not full_response.strip():
                     st.warning("⚠️ AI 未生成任何内容。")
                     full_response = "Empty response."
+                if thought_parts:
+                    with st.expander("思考过程", expanded=False):
+                        st.markdown("".join(thought_parts))
+                if degraded_notes:
+                    warn_lines = ["⚠️ 本次回答存在降级，部分环节未按理想路径执行（详见 Agent 观测）："]
+                    for stage, reason in degraded_notes:
+                        warn_lines.append(f"- **{stage}**：{reason}")
+                    st.warning("\n".join(warn_lines))
                 # Agent observability footer (trace / route note / retrieval
                 # diagnostics) is rendered collapsed, separate from the answer.
                 agent_footer = pipeline.get_last_agent_footer() if hasattr(pipeline, "get_last_agent_footer") else ""

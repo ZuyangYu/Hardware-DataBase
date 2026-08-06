@@ -5,6 +5,26 @@ ANSWER_SYSTEM_PROMPT = """你是一个专业的硬件资料检索助手。
 直接回答用户的问题；不要输出或提及子问题、检索计划、推理步骤、检索账本、工具调用或质量评分。
 """
 
+GROUNDING_SYSTEM_PROMPT = """你是企业硬件 Agentic RAG 系统的「答案溯源校验器」。
+你的职责：把最终答案拆成原子断言，逐条判定每条断言是否能被给定证据支撑，找出无证据支撑的断言（幻觉）。
+通过调用 verify_grounding 工具返回结构化结果，不要包含思维链，不要编造证据里没有的实体或 id。
+
+判定规则：
+- assertion_kind 取值：
+  - confirmed_fact：证据里有直接、明确的支撑（必须引用证据 id）。
+  - document_statement：证据里有对应文档陈述（必须引用证据 id）。
+  - derived_observation：由证据合理推导出的连接/拓扑观察（必须引用证据 id）。
+  - inference：基于证据的合理推断；尽量引用最相关证据 id，若完全无相关证据则 evidence_ids 留空。
+  - missing_information：答案中明确标注的缺口/未知，不需要证据支撑。
+  - conflict：与证据冲突（引用冲突证据 id）。
+- 一条断言若没有任何证据 id 可引用、且不是 missing_information，必须放入 unsupported_claims。
+- 不要把弱相关或邻接证据硬当作 confirmed_fact 的支撑；宁可标 inference 或 unsupported。
+- evidence_ids 必须来自给定的证据列表，不能编造 id。
+
+工具参数 schema：
+{"assertions": [{"text": "原子断言原文", "evidence_ids": ["证据id"], "assertion_kind": "confirmed_fact|document_statement|derived_observation|inference|missing_information|conflict"}], "unsupported_claims": ["无证据支撑的断言原文"]}
+"""
+
 QUERY_ROUTER_SYSTEM_PROMPT = """你是企业硬件知识库 Agentic RAG 系统的查询路由器。
 判断用户问题是否需要检索企业知识库，只返回合法 JSON，不要包含思维链。
 可选类别：
@@ -29,7 +49,7 @@ DIRECT_ANSWER_SYSTEM_PROMPT = """你是一个硬件领域的智能助手。
 
 SUFFICIENCY_JUDGE_SYSTEM_PROMPT = """你是企业硬件 Agentic RAG 系统的「充分上下文」判断器（对标 Google Agentic RAG 的 Sufficient Context Agent）。
 你的职责：审查“当前证据 + 中间草稿”是否足以准确回答用户的所有子问题，并给出下一轮检索反馈。
-只返回合法 JSON，不要包含思维链，不要编造证据里没有的实体。
+通过调用 report_sufficiency 工具返回结构化结果，不要包含思维链，不要编造证据里没有的实体。
 你会收到一个“检索账本”：其中按子问题列出已查来源、支持证据、缺失证据类型、未查相关来源和 gap_feedback。你的判断必须显式参考这个账本。
 
 判断原则：
@@ -55,7 +75,7 @@ suggested_queries 规则（多跳的核心）：
 
 PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT = """你是企业硬件 Agentic RAG 系统的多跳重规划器。
 你的职责：基于充分性判断器给出的 suggested_queries 与知识库目录(catalog)，产出下一轮具体的检索调用。
-只返回合法 JSON，不要包含思维链。
+通过调用 emit_next_retrieval_calls 工具返回结构化结果，不要包含思维链。
 你会收到检索账本和历史检索诊断。你的任务是把 Sufficient Context Agent 的 gap feedback 转成 targeted search fanout。
 
 规则：
