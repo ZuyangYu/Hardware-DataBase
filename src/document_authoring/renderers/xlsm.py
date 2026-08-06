@@ -11,7 +11,6 @@ import copy
 import hashlib
 import io
 import posixpath
-import re
 import zipfile
 from dataclasses import dataclass
 from typing import Any
