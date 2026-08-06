@@ -39,14 +39,23 @@ def _policy(*, allowed_tools=None, max_steps: int = 40) -> HarnessPolicy:
     )
 
 
-def _evidence(eid: str, content: str, *, fallback: bool = False) -> Evidence:
+def _evidence(
+    eid: str,
+    content: str,
+    *,
+    fallback: bool = False,
+    score: float = 0.5,
+    preferred_role: bool = False,
+) -> Evidence:
     metadata = {"knowledge_base_name": KB}
     if fallback:
         metadata["ragflow_source_name_fallback"] = True
+    if preferred_role:
+        metadata["preferred_source_role_match"] = "released_design"
     return Evidence(
         id=eid, content=content, source_name=SOURCE,
         content_kind="document_text", processor_kind="ragflow",
-        score=0.5, metadata=metadata,
+        score=score, metadata=metadata,
     )
 
 
@@ -260,6 +269,24 @@ def test_writer_receives_bounded_deduplicated_evidence_and_ledger_keeps_discards
 
     assert [item["id"] for item in draft_calls[0].evidence] == ["a", "b", "c", "d", "e"]
     assert result.retrieval_ledger[0]["discarded_evidence_ids"] == ["duplicate", "f"]
+
+
+def test_non_reranked_evidence_uses_preferred_role_then_score_then_id_order():
+    evidences = [
+        _evidence("high-score", "high", score=0.9),
+        _evidence("preferred", "preferred", score=0.1, preferred_role=True),
+        _evidence("middle-score", "middle", score=0.5),
+    ]
+
+    def retrieve(req, attempt, query_override=None):
+        return _outcome(evidences)
+
+    graph, draft_calls = _graph()
+    _run(graph, retrieve)
+
+    assert [item["id"] for item in draft_calls[0].evidence] == [
+        "preferred", "high-score", "middle-score",
+    ]
 
 
 def test_graph_blocks_a_supported_prose_draft_without_a_typed_value():

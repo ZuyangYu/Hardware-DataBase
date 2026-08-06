@@ -143,7 +143,9 @@ class AuthoringGraph:
                     self.policy.require_tool("rerank_evidence")
                     evidence = self.reranker.rerank(requirement, evidence)
                 evidence, discarded_evidence_ids = _select_field_evidence(
-                    evidence, _max_evidence_items(unit_id, schema)
+                    evidence,
+                    _max_evidence_items(unit_id, schema),
+                    preserve_rerank_order=self.reranker is not None,
                 )
                 # Retrieval ledger (P9): per-unit observability row surfaced in
                 # the matrix (for human review) and on the result, so it is no
@@ -383,13 +385,24 @@ def _max_evidence_items(unit_id: str, schema: DocumentSchema) -> int:
 
 
 def _select_field_evidence(
-    evidence: list[dict[str, Any]], max_items: int,
+    evidence: list[dict[str, Any]],
+    max_items: int,
+    *,
+    preserve_rerank_order: bool,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Deduplicate a field's already scoped evidence before applying its budget."""
+    """Rank, deduplicate, and bound evidence without widening frozen scope."""
+    ranked = list(evidence) if preserve_rerank_order else sorted(
+        evidence,
+        key=lambda item: (
+            0 if (item.get("metadata") or {}).get("preferred_source_role_match") else 1,
+            -float(item.get("score") or 0),
+            str(item.get("id") or ""),
+        ),
+    )
     unique: list[dict[str, Any]] = []
     discarded: list[str] = []
     seen_content: set[str] = set()
-    for item in evidence:
+    for item in ranked:
         content = str(item.get("content") or "").strip()
         evidence_id = str(item.get("id") or "")
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -580,6 +593,7 @@ def _validated_evidence(
                     "id": evidence.id,
                     "content": evidence.content,
                     "source_name": evidence.source_name,
+                    "score": getattr(evidence, "score", 0),
                     "metadata": dict(evidence.metadata),
                     "locator": dict(getattr(evidence, "locator", {})),
                     "fact_type": getattr(evidence, "fact_type", None),
@@ -602,6 +616,7 @@ def _validated_evidence(
             raise PermissionError("harness received evidence outside the frozen source set")
         result.append({
             "id": evidence.id, "content": evidence.content,
+            "score": getattr(evidence, "score", 0),
             "source_version_id": getattr(evidence, "source_version_id", None),
             "processing_artifact_id": getattr(evidence, "processing_artifact_id", None),
             "metadata": dict(getattr(evidence, "metadata", {}) or {}),
