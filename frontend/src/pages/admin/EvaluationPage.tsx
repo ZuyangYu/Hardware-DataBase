@@ -8,7 +8,6 @@ import type {
   EvaluationRunDetail,
   EvaluationRunListItem,
   EvaluationRunStatus,
-  EvaluationSummary,
   OkResponse,
 } from '../../api/types';
 import type { AuthSession } from '../../auth';
@@ -29,6 +28,8 @@ import {
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
+
+import EvaluationDashboard from './EvaluationDashboard';
 
 type Props = {
   auth: AuthSession;
@@ -74,11 +75,6 @@ function outputRootQuery(outputRoot: string): string {
 function progressPercent(run: EvaluationRunDetail | null): number {
   if (!run || run.total_samples <= 0) return 0;
   return Math.max(0, Math.min(100, Math.round((run.completed_samples / run.total_samples) * 100)));
-}
-
-function formatNumber(value: number | undefined): string {
-  if (value == null || Number.isNaN(value)) return '-';
-  return value.toFixed(3);
 }
 
 export default function EvaluationPage({ auth, onLogout }: Props) {
@@ -437,21 +433,6 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         )}
       </section>
 
-      <section className="mt-[16px]">
-        <RunDetailPanel
-          run={detail}
-          loaded={detailLoaded}
-          canStart={canStart}
-          canPause={canPause}
-          canResume={canResume}
-          canCancel={canCancel}
-          onStart={() => void controlRun('start')}
-          onPause={() => void controlRun('pause')}
-          onResume={() => void controlRun('resume')}
-          onCancel={() => void controlRun('cancel')}
-        />
-      </section>
-
       <section className="mt-[16px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
         <div className="mb-[12px] flex flex-wrap items-end gap-[10px]">
           <div className="grid min-w-[240px] gap-[4px]">
@@ -474,10 +455,26 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           </Button>
         </div>
         {compare ? (
-          <SummaryCompare current={compare.current} baseline={compare.baseline} />
+          <p className="text-[12px] text-[#858b9c]">已选择基线；分组柱状图和数值对比显示在下方评估总览中。</p>
         ) : (
           <p className="text-[12px] text-[#858b9c]">选择一个已完成的运行作为基线,可比较当前摘要与历史摘要。</p>
         )}
+      </section>
+
+      <section className="mt-[16px]">
+        <RunDetailPanel
+          run={detail}
+          loaded={detailLoaded}
+          compare={compare}
+          canStart={canStart}
+          canPause={canPause}
+          canResume={canResume}
+          canCancel={canCancel}
+          onStart={() => void controlRun('start')}
+          onPause={() => void controlRun('pause')}
+          onResume={() => void controlRun('resume')}
+          onCancel={() => void controlRun('cancel')}
+        />
       </section>
     </div>
   );
@@ -511,6 +508,7 @@ function StatusPill({ status }: { status: string }) {
 function RunDetailPanel({
   run,
   loaded,
+  compare,
   canStart,
   canPause,
   canResume,
@@ -522,6 +520,7 @@ function RunDetailPanel({
 }: {
   run: EvaluationRunDetail | null;
   loaded: boolean;
+  compare: EvaluationCompareResponse | null;
   canStart: boolean;
   canPause: boolean;
   canResume: boolean;
@@ -606,7 +605,14 @@ function RunDetailPanel({
         {run.report_path && <Meta label="报告" value={run.report_path} />}
       </div>
 
-      {run.summary && <SummaryPanel summary={run.summary} />}
+      {run.summary && (
+        <EvaluationDashboard
+          summary={run.summary}
+          sampleResults={run.sample_results ?? []}
+          sampleResultsError={run.sample_results_error ?? ''}
+          compare={compare}
+        />
+      )}
     </div>
   );
 }
@@ -616,74 +622,6 @@ function Meta({ label, value }: { label: string; value: string }) {
     <div className="grid gap-[3px] rounded-[8px] bg-[#fafbfc] px-[10px] py-[8px]">
       <span className="text-[11px] text-[#858b9c]">{label}</span>
       <span className="break-words text-[12px] text-[#18181a]">{value}</span>
-    </div>
-  );
-}
-
-function SummaryPanel({ summary }: { summary: EvaluationSummary }) {
-  const metricRows = Object.entries(summary.metric_scores).map(([metric, score]) => ({
-    metric,
-    score,
-    count: summary.metric_counts[metric] ?? 0,
-    failures: summary.metric_failures[metric] ?? 0,
-  }));
-
-  return (
-    <div className="border-t border-[#f0f1f4] pt-[14px]">
-      <div className="mb-[12px] flex flex-wrap items-center gap-[10px]">
-        <h3 className="text-[14px] font-semibold text-[#18181a]">评估摘要</h3>
-        {summary.gate && (
-          <span className={cn('rounded-full px-[8px] py-[2px] text-[11px]', summary.gate.passed ? 'bg-[#e6f6ec] text-[#138a55]' : 'bg-[#fce7e7] text-[#d20b0b]')}>
-            Gate {summary.gate.passed ? '通过' : '未通过'}
-          </span>
-        )}
-      </div>
-      <div className="mb-[12px] grid grid-cols-3 gap-[12px] max-[900px]:grid-cols-1">
-        <StatCard label="样本数" value={summary.sample_count} />
-        <StatCard label="成功样本" value={summary.successful_samples} tone="green" />
-        <StatCard label="失败样本" value={summary.failed_samples} tone={summary.failed_samples > 0 ? 'red' : 'green'} />
-      </div>
-      {metricRows.length === 0 ? (
-        <p className="text-[12px] text-[#858b9c]">暂无评分指标。</p>
-      ) : (
-        <div className="grid gap-[8px]">
-          {metricRows.map((row) => (
-            <div key={row.metric} className="grid grid-cols-[minmax(0,1fr)_80px_80px_80px] gap-[8px] rounded-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[12px]">
-              <span className="truncate font-medium text-[#18181a]">{row.metric}</span>
-              <span className="text-right text-[#464c5e]">{formatNumber(row.score)}</span>
-              <span className="text-right text-[#858b9c]">{row.count} 次</span>
-              <span className={cn('text-right', row.failures ? 'text-[#d20b0b]' : 'text-[#858b9c]')}>{row.failures} 失败</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SummaryCompare({ current, baseline }: { current: EvaluationSummary; baseline: EvaluationSummary }) {
-  const metrics = Array.from(new Set([...Object.keys(current.metric_scores), ...Object.keys(baseline.metric_scores)])).sort();
-  return (
-    <div className="grid gap-[8px]">
-      {metrics.length === 0 ? (
-        <p className="text-[12px] text-[#858b9c]">两次运行都没有评分指标。</p>
-      ) : (
-        metrics.map((metric) => {
-          const cur = current.metric_scores[metric];
-          const base = baseline.metric_scores[metric];
-          const delta = cur != null && base != null ? cur - base : null;
-          return (
-            <div key={metric} className="grid grid-cols-[minmax(0,1fr)_90px_90px_90px] gap-[8px] rounded-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[12px]">
-              <span className="truncate font-medium text-[#18181a]">{metric}</span>
-              <span className="text-right text-[#464c5e]">{formatNumber(cur)}</span>
-              <span className="text-right text-[#858b9c]">{formatNumber(base)}</span>
-              <span className={cn('text-right', delta == null ? 'text-[#858b9c]' : delta >= 0 ? 'text-[#138a55]' : 'text-[#d20b0b]')}>
-                {delta == null ? '-' : `${delta >= 0 ? '+' : ''}${delta.toFixed(3)}`}
-              </span>
-            </div>
-          );
-        })
-      )}
     </div>
   );
 }
