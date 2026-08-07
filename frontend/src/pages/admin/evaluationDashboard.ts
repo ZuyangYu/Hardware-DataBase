@@ -43,7 +43,12 @@ export type MetricRow = {
 };
 
 export function canLoadSampleDiagnostics(status: string, hasSummary: boolean): boolean {
-  return status === 'completed' && hasSummary;
+  return hasSummary && status !== 'queued';
+}
+
+/** Background polling must not clear an already-rendered view. */
+export function shouldResetEvaluationLoading(silent: boolean): boolean {
+  return !silent;
 }
 
 function metricSort(left: string, right: string): number {

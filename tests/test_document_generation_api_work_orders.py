@@ -52,7 +52,7 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         self.stub.prepare_knowledge_base_document_generation = (
             lambda ctx, *, knowledge_base_name, **kwargs: {"stage": "ready", "work_order_id": "wo-1"}
         )
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/work-orders?kb=shared",
             headers=self._auth(t),
@@ -64,7 +64,7 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
 
     def test_generate_submits_background(self):
         self.stub.submit_knowledge_base_document_generation = lambda ctx, work_order_id: "bg-7"
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/work-orders/wo-1/generate?kb=shared",
             headers=self._auth(t),
@@ -72,6 +72,40 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["run_id"], "bg-7")
+
+    def test_resume_submits_background(self):
+        self.stub.resume_knowledge_base_document_generation = lambda ctx, work_order_id: "bg-resume"
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders/wo-1/resume?kb=shared",
+            headers=self._auth(t),
+            json={},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["run_id"], "bg-resume")
+
+    def test_delete_requires_write_permission_and_forwards_reason(self):
+        self.stub.delete_knowledge_base_document_work_order = lambda ctx, work_order_id, *, reason: {
+            "work_order_id": work_order_id,
+            "reason": reason,
+        }
+        reader = self._token("user1")
+        denied = self.client.request(
+            "DELETE",
+            "/api/v1/document-generation/work-orders/wo-1?kb=shared",
+            headers=self._auth(reader),
+            json={"reason": "重复任务"},
+        )
+        self.assertEqual(denied.status_code, 403, denied.text)
+        writer = self._token("admin1")
+        allowed = self.client.request(
+            "DELETE",
+            "/api/v1/document-generation/work-orders/wo-1?kb=shared",
+            headers=self._auth(writer),
+            json={"reason": "重复任务"},
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.text)
+        self.assertEqual(allowed.json()["reason"], "重复任务")
 
     def test_list_work_orders(self):
         self.stub.list_knowledge_base_document_work_orders = lambda ctx, knowledge_base_name: [
@@ -92,7 +126,7 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
             raise PermissionError("denied")
 
         self.stub.prepare_knowledge_base_document_generation = _raise
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/work-orders?kb=shared",
             headers=self._auth(t),
@@ -105,7 +139,7 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
             raise ValueError("bad")
 
         self.stub.submit_knowledge_base_document_generation = _raise
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/work-orders/wo-1/generate?kb=shared",
             headers=self._auth(t),

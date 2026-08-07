@@ -30,6 +30,8 @@ from src.document_authoring.icd_scope_decision import (
 from src.document_authoring.icd_generation import connector_refdes_from_front_view_template
 from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.template_progress import TemplateProgressCallback
+from src.document_authoring.generation_sessions import GenerationBrief
+from src.document_authoring.requirement_clarifier import RequirementClarifier
 from src.document_authoring.retriever_registry import (
     CrossUnitEvidenceCache,
     RetrieverRegistry,
@@ -142,6 +144,7 @@ class AppPipeline:
             self.projects = ProjectService()
             self.project_retrieval = ProjectEvidenceRetrievalService(self.projects)
             self.document_generation = DocumentGenerationService(self.projects)
+            self.requirement_clarifier = RequirementClarifier()
             # Spreadsheet structured index (xlsx TableIndexStore). Shared with
             # the query agent; the KB authoring retriever also needs it so
             # frozen .xlsx sources can produce tabular evidence.
@@ -671,6 +674,126 @@ class AppPipeline:
             ctx, analysis_id=analysis_id, display_name=display_name,
         )
 
+    def create_document_generation_session(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+        template_version_id: str,
+        purpose: str = "",
+        output_policy: dict[str, Any] | None = None,
+    ):
+        template = self.document_generation.store.get_template(template_version_id)
+        if template is None:
+            raise KeyError("template not found")
+        self.document_generation._require_template_kb_scope(ctx, template, "read")
+        analysis = self.document_generation.store.get_template_analysis(template_version_id)
+        if analysis is None:
+            raise KeyError("template analysis not found")
+        policy = dict(output_policy or {})
+        policy.setdefault("format", analysis.format)
+        brief = GenerationBrief(purpose=purpose.strip(), output_policy=policy)
+        session = self.document_generation.store.generation_sessions.create_session(
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+            knowledge_base_name=knowledge_base_name,
+            template_version_id=template_version_id,
+            brief=brief,
+        )
+        message = self.requirement_clarifier.next_message(
+            analysis.model_dump(mode="json"),
+            brief,
+        )
+        self.document_generation.store.generation_sessions.append_message(
+            session.session_id,
+            role=message.role,
+            content=message.content,
+            question_id=message.question_id,
+            options=message.options,
+            reason=message.reason,
+        )
+        return self.get_document_generation_session(ctx, session.session_id)
+
+    def get_document_generation_session(self, ctx: RequestContext, session_id: str):
+        session = self.document_generation.store.generation_sessions.get_session(
+            session_id,
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+        )
+        requested_kb = ctx.metadata.get("document_template_kb_name")
+        if requested_kb is not None and session.knowledge_base_name != requested_kb:
+            raise PermissionError("generation session belongs to another knowledge base")
+        return session
+
+    def answer_document_generation_session(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+        *,
+        question_id: str,
+        answer: str,
+    ):
+        session = self.get_document_generation_session(ctx, session_id)
+        if session.status != "needs_clarification":
+            raise ValueError("generation session is not accepting clarification answers")
+        pending = next(
+            (
+                message
+                for message in reversed(session.messages)
+                if message.role == "assistant" and message.question_id
+            ),
+            None,
+        )
+        if pending is None or pending.question_id != question_id:
+            raise ValueError("clarification answer does not match the current question")
+        brief = self.requirement_clarifier.apply_answer(
+            session.brief,
+            question_id=question_id,
+            answer=answer,
+        )
+        sessions = self.document_generation.store.generation_sessions
+        sessions.append_message(
+            session_id,
+            role="user",
+            content=answer.strip(),
+            question_id=question_id,
+            answer=answer.strip(),
+        )
+        sessions.update_brief(session_id, brief.model_dump())
+        analysis = self.document_generation.store.get_template_analysis(
+            session.template_version_id,
+        )
+        if analysis is None:
+            raise KeyError("template analysis not found")
+        message = self.requirement_clarifier.next_message(
+            analysis.model_dump(mode="json"),
+            brief,
+        )
+        sessions.append_message(
+            session_id,
+            role=message.role,
+            content=message.content,
+            question_id=message.question_id,
+            options=message.options,
+            reason=message.reason,
+        )
+        return self.get_document_generation_session(ctx, session_id)
+
+    def confirm_document_generation_session(self, ctx: RequestContext, session_id: str):
+        session = self.get_document_generation_session(ctx, session_id)
+        analysis = self.document_generation.store.get_template_analysis(
+            session.template_version_id,
+        )
+        if analysis is None:
+            raise KeyError("template analysis not found")
+        ready = self.requirement_clarifier.next_message(
+            analysis.model_dump(mode="json"),
+            session.brief,
+        )
+        if ready.reason != "ready_to_generate":
+            raise ValueError("generation brief still has unanswered questions")
+        return self.document_generation.store.generation_sessions.confirm(session_id)
+
     def create_document_work_order(self, ctx: RequestContext, **kwargs):
         return self.document_generation.create_document_work_order(ctx, **kwargs)
 
@@ -733,6 +856,7 @@ class AppPipeline:
         template_version_id: str,
         document_schema_id: str,
         document_schema_version: str,
+        generation_session_id: str | None = None,
         **kwargs,
     ):
         """Create a KB work order and run the fast, non-harness preflight.
@@ -743,6 +867,13 @@ class AppPipeline:
         stage dict. The slow harness half is submitted separately via
         ``submit_knowledge_base_document_generation``.
         """
+        if generation_session_id:
+            kwargs.update(self._generation_session_work_order_inputs(
+                ctx,
+                generation_session_id=generation_session_id,
+                knowledge_base_name=knowledge_base_name,
+                template_version_id=template_version_id,
+            ))
         order = self.create_knowledge_base_document_work_order(
             ctx,
             knowledge_base_name=knowledge_base_name,
@@ -751,6 +882,11 @@ class AppPipeline:
             document_schema_version=document_schema_version,
             **kwargs,
         )
+        if generation_session_id:
+            self.document_generation.store.generation_sessions.bind_work_order(
+                generation_session_id,
+                order.work_order_id,
+            )
         snapshot = self.document_generation.resolve_source_snapshot(order)
         profile = self._icd_template_profile(order)
         if profile is not None and profile.kind == "icd_sample":
@@ -821,6 +957,27 @@ class AppPipeline:
                     ],
                 }
         return {"stage": "ready", "work_order_id": order.work_order_id}
+
+    def _generation_session_work_order_inputs(
+        self,
+        ctx: RequestContext,
+        *,
+        generation_session_id: str,
+        knowledge_base_name: str,
+        template_version_id: str,
+    ) -> dict[str, Any]:
+        session = self.get_document_generation_session(ctx, generation_session_id)
+        if session.status != "ready_to_generate" or not session.brief.confirmed:
+            raise ValueError("generation session must be confirmed before creating a work order")
+        if session.knowledge_base_name != knowledge_base_name:
+            raise PermissionError("generation session belongs to another knowledge base")
+        if session.template_version_id != template_version_id:
+            raise ValueError("generation session template differs from the selected template")
+        return {
+            "generation_session_id": session.session_id,
+            "generation_brief": session.brief.model_dump(mode="json"),
+            "idempotency_key": f"generation-session:{session.session_id}",
+        }
 
     def auto_generate_knowledge_base_document(
         self,
@@ -896,6 +1053,63 @@ class AppPipeline:
         return self.document_generation.worker.submit(
             work_order_id,
             lambda: self.continue_knowledge_base_document_generation(ctx, work_order_id),
+        )
+
+    def resume_knowledge_base_document_generation(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+    ) -> str:
+        """Resume the latest paused KB Harness run using frozen sources."""
+        order = self.document_generation.store.get_work_order(work_order_id)
+        if order is None:
+            raise KeyError("document work order was not found")
+        self.document_generation.require_work_order_capability(
+            ctx, order, "run_deterministic_work_order",
+        )
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("work order is not a knowledge-base document generation")
+        paused_runs = [
+            run for run in self.document_generation.store.list_harness_runs(work_order_id)
+            if run.status == "paused"
+        ]
+        if not paused_runs:
+            raise ValueError("work order has no paused Harness run")
+        paused_run = paused_runs[-1]
+        snapshot = self.document_generation.resolve_source_snapshot(order)
+        scope_review = self.document_generation.get_icd_scope_review(ctx, work_order_id)
+        retrieve = self._knowledge_base_retriever(
+            ctx,
+            order.knowledge_base_name,
+            list(snapshot.source_names),
+            source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            icd_scope_review=scope_review,
+        )
+        return self.document_generation.worker.submit(
+            work_order_id,
+            lambda: self.document_generation.resume_internal_harness(
+                ctx,
+                paused_run.harness_run_id,
+                retrieve=retrieve,
+            ),
+        )
+
+    def delete_knowledge_base_document_work_order(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        reason: str = "",
+    ):
+        order = self.document_generation.store.get_work_order(work_order_id)
+        if order is None:
+            raise KeyError("document work order was not found")
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("work order is not a knowledge-base document generation")
+        return self.document_generation.delete_document_work_order(
+            ctx,
+            work_order_id,
+            reason=reason,
         )
 
     def auto_generate_document(self, ctx: RequestContext, **kwargs):
@@ -1381,16 +1595,30 @@ class AppPipeline:
         status = {
             "work_order_id": order.work_order_id,
             "status": order.status,
+            "phase": {
+                "waiting_human_input": "needs_review",
+                "waiting_human_approval": "needs_review",
+                "ready_to_draft": "generating",
+                "drafting": "generating",
+                "complete": "completed",
+            }.get(order.status, order.status),
             "scope_type": order.scope_type,
             "knowledge_base_name": order.knowledge_base_name,
             "project_id": order.project_id,
             "target_format": order.target_format,
             "unit_statuses": dict(order.unit_statuses),
             "validation_report_id": order.validation_report_id,
+            "clarification_session_id": getattr(order, "generation_session_id", None),
+            "generation_brief": dict(getattr(order, "generation_brief", {}) or {}),
+            "error_code": getattr(order, "error_code", None),
+            "error_message": getattr(order, "error_message", None),
+            "retryable": getattr(order, "retryable", None),
+            "next_actions": list(getattr(order, "next_actions", []) or []),
         }
         if order.run_manifest_id:
             status["run_manifest_id"] = order.run_manifest_id
         harness_runs = self.document_generation.store.list_harness_runs(order.work_order_id)
+        latest_run = None
         if harness_runs:
             latest_run = harness_runs[-1]
             status["harness_run"] = {
@@ -1404,6 +1632,23 @@ class AppPipeline:
                 "fencing_token": latest_run.fencing_token,
                 "error": latest_run.error,
             }
+        has_kb_permission = getattr(ctx, "has_kb_permission", None)
+        can_write = bool(
+            ctx is not None
+            and order.scope_type == "knowledge_base"
+            and order.knowledge_base_name
+            and callable(has_kb_permission)
+            and has_kb_permission(order.knowledge_base_name, "write")
+        )
+        active = latest_run is not None and latest_run.status in {"queued", "running", "retrying"}
+        paused = order.status == "paused" and latest_run is not None and latest_run.status == "paused"
+        terminal = order.status in {"cancelled", "blocked", "failed", "complete"}
+        status.update({
+            "can_pause": active and can_write,
+            "can_resume": paused and can_write,
+            "can_cancel": (active or paused) and can_write,
+            "can_delete": terminal and can_write,
+        })
         if order.validation_report_id:
             report = self.document_generation.store.get_validation_report(order.validation_report_id)
             if report is not None:

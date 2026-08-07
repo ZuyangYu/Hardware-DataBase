@@ -30,7 +30,7 @@ import { OUTLINE_ACTION_BUTTON_CLASS, formatDateTime } from '@/lib/enterprise-ui
 import { cn } from '@/lib/utils';
 
 import EvaluationDashboard from './EvaluationDashboard';
-import { canLoadSampleDiagnostics } from './evaluationDashboard';
+import { canLoadSampleDiagnostics, shouldResetEvaluationLoading } from './evaluationDashboard';
 
 type Props = {
   auth: AuthSession;
@@ -60,6 +60,10 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 const ACTIVE_STATUSES = new Set<EvaluationRunStatus>(['queued', 'running', 'pause_requested', 'cancel_requested']);
+
+type LoadOptions = {
+  silent?: boolean;
+};
 
 function splitList(value: string): string[] | null {
   const items = value
@@ -99,9 +103,10 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const [compare, setCompare] = useState<EvaluationCompareResponse | null>(null);
   const [compareLoading, setCompareLoading] = useState(false);
 
-  const loadRuns = useCallback(() => {
+  const loadRuns = useCallback((options: LoadOptions = {}) => {
+    const silent = options.silent ?? false;
     let cancelled = false;
-    setRunsLoaded(false);
+    if (shouldResetEvaluationLoading(silent)) setRunsLoaded(false);
     api
       .get<EvaluationRunListItem[]>(`/api/v1/evaluation/runs?${outputRootQuery(outputRoot)}`)
       .then((rows) => {
@@ -120,14 +125,15 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     };
   }, [outputRoot]);
 
-  const loadDetail = useCallback((runId = selectedRunId) => {
+  const loadDetail = useCallback((runId = selectedRunId, options: LoadOptions = {}) => {
+    const silent = options.silent ?? false;
     if (!runId) {
       setDetail(null);
       setDetailLoaded(true);
       return undefined;
     }
     let cancelled = false;
-    setDetailLoaded(false);
+    if (shouldResetEvaluationLoading(silent)) setDetailLoaded(false);
     api
       .get<EvaluationRunDetail>(`/api/v1/evaluation/runs/${encodeURIComponent(runId)}?${outputRootQuery(outputRoot)}`)
       .then((run) => {
@@ -158,13 +164,15 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   }, [loadDetail]);
 
   useEffect(() => {
-    if (!detail || !ACTIVE_STATUSES.has(detail.status)) return undefined;
+    const activeRunId = detail?.run_id;
+    const isActive = detail != null && ACTIVE_STATUSES.has(detail.status);
+    if (!activeRunId || !isActive) return undefined;
     const timer = window.setInterval(() => {
-      loadDetail(detail.run_id);
-      loadRuns();
+      void loadDetail(activeRunId, { silent: true });
+      void loadRuns({ silent: true });
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [detail, loadDetail, loadRuns]);
+  }, [detail?.run_id, detail?.status, loadDetail, loadRuns]);
 
   useEffect(() => {
     setCompare(null);
@@ -315,6 +323,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
               event.stopPropagation();
               setSelectedRunId(run.run_id);
               setCompare(null);
+              // 即使该运行已被选中也会强制重新拉取详情，
+              // 避免"评估完成后点击查看没反应"（同一 run_id 不触发 effect 刷新）。
+              loadDetail(run.run_id);
             }}
             className="inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
           >
@@ -323,7 +334,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         ),
       },
     ],
-    [selectedRunId],
+    [selectedRunId, loadDetail],
   );
 
   const completedRuns = runs.filter((run) => run.has_summary && run.run_id !== selectedRunId);
@@ -547,6 +558,9 @@ function RunDetailPanel({
   }
 
   const percent = progressPercent(run);
+  const scoringPercent = run.scoring_total_items > 0
+    ? Math.max(0, Math.min(100, Math.round((run.scoring_completed_items / run.scoring_total_items) * 100)))
+    : 0;
   return (
     <div className="flex flex-col gap-[16px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
       <div className="flex flex-wrap items-start justify-between gap-[12px]">
@@ -596,6 +610,18 @@ function RunDetailPanel({
           <p className="mt-[8px] line-clamp-2 text-[12px] leading-[18px] text-[#464c5e]">{run.current_question}</p>
         )}
       </div>
+
+      {run.score_enabled && run.scoring_total_items > 0 && (
+        <div>
+          <div className="mb-[6px] flex justify-between text-[11px] text-[#858b9c]">
+            <span>评分项进度</span>
+            <span>{run.scoring_completed_items} / {run.scoring_total_items} · {scoringPercent}%</span>
+          </div>
+          <div className="h-[8px] overflow-hidden rounded-full bg-[#f2f3f7]">
+            <div className="h-full rounded-full bg-[#4b63b7] transition-[width]" style={{ width: `${scoringPercent}%` }} />
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-[10px] text-[12px] max-[900px]:grid-cols-1">
         <Meta label="数据集" value={run.dataset_path} />

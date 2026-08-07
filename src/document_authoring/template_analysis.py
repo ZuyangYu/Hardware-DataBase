@@ -130,7 +130,14 @@ class TemplateAnalysis(BaseModel):
     def validate_suggestions(self) -> None:
         self.validate_suggestion_targets()
         seen_targets: set[str] = set()
+        seen_semantic_unit_ids: set[str] = set()
         for suggestion in self.suggestions:
+            if suggestion.semantic_unit_id in seen_semantic_unit_ids:
+                raise ValueError(
+                    "semantic unit may only be suggested once: "
+                    f"{suggestion.semantic_unit_id}"
+                )
+            seen_semantic_unit_ids.add(suggestion.semantic_unit_id)
             for unit_id in suggestion.target_unit_ids:
                 if unit_id in seen_targets:
                     raise ValueError(f"suggestion target may only be used once: {unit_id}")

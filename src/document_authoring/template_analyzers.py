@@ -29,6 +29,10 @@ _PLACEHOLDER_RE = re.compile(
 )
 _MAX_VALUE_PREVIEW = 256
 _NEIGHBOR_RADIUS = 2
+_FILLABLE_TABLE_HEADER_RE = re.compile(
+    r"(?:\\bfunction\\b|\\bdescription\\b|功能描述|功能说明|功能)",
+    re.IGNORECASE,
+)
 
 
 def analyze_template(
@@ -257,7 +261,8 @@ def _classify_workbook_regions(
         })
         for unit, _column, _row in cells
     }
-    for row_cells in by_row.values():
+    table_header_runs: list[tuple[int, list[tuple[str, int]]]] = []
+    for row_number, row_cells in by_row.items():
         ordered = sorted(row_cells, key=lambda item: item[1])
         text_runs = _contiguous_text_runs(ordered)
         header_ids = {
@@ -272,6 +277,14 @@ def _classify_workbook_regions(
                 "structural_role_hint": "table_header",
                 "candidate_for_auto_fill": False,
             })
+        table_header_runs.extend(
+            (
+                row_number,
+                [(unit.unit_id, column) for unit, column in run],
+            )
+            for run in text_runs
+            if len(run) >= 3
+        )
 
         for index in range(len(ordered) - 1):
             left_original, left_column = ordered[index]
@@ -296,6 +309,52 @@ def _classify_workbook_regions(
                     "structural_role_hint": "sample_value",
                     "candidate_for_auto_fill": True,
                 })
+
+    # A table header provides semantic context that a simple left-to-right
+    # label/value heuristic cannot.  Only blank cells below an explicitly
+    # descriptive header are writable; populated body cells are examples or
+    # source values and must never be selected for automatic replacement.
+    for header_row, header_run in table_header_runs:
+        fillable_columns = {
+            column
+            for unit_id, column in header_run
+            if _is_fillable_table_header(classified[unit_id].value_preview)
+        }
+        if not fillable_columns:
+            continue
+        header_columns = {column for _unit_id, column in header_run}
+        for row_number, row_cells in by_row.items():
+            if row_number <= header_row:
+                continue
+            body_cells = {
+                column: classified[unit.unit_id]
+                for unit, column in row_cells
+                if column in header_columns
+            }
+            if sum(unit.value_kind != "blank" for unit in body_cells.values()) < 2:
+                continue
+            if sum(
+                unit.structural_role_hint == "table_header"
+                for unit in body_cells.values()
+            ) >= 3:
+                continue
+            for column, unit in body_cells.items():
+                if unit.structural_role_hint == "placeholder":
+                    continue
+                if unit.value_kind != "blank":
+                    classified[unit.unit_id] = unit.model_copy(update={
+                        "structural_role_hint": "sample_value",
+                        "candidate_for_auto_fill": False,
+                    })
+                elif (
+                    column in fillable_columns
+                    and unit.writable
+                    and unit.structural_role_hint == "layout_blank"
+                ):
+                    classified[unit.unit_id] = unit.model_copy(update={
+                        "structural_role_hint": "scalar_input",
+                        "candidate_for_auto_fill": True,
+                    })
     return [classified[unit.unit_id] for unit, _column, _row in cells]
 
 
@@ -321,6 +380,10 @@ def _contiguous_text_runs(
     if current:
         runs.append(current)
     return runs
+
+
+def _is_fillable_table_header(value_preview: str | None) -> bool:
+    return bool(value_preview and _FILLABLE_TABLE_HEADER_RE.search(value_preview))
 
 
 def _workbook_has_active_content(names: set[str], package: zipfile.ZipFile) -> bool:

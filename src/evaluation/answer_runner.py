@@ -149,7 +149,19 @@ class AnswerRunner:
             evidence = list(safe_summary.get("evidence") or [])
             contexts = [str(item.get("content") or "") for item in evidence if item.get("content")]
             response = "".join(str(part) for part in parts)
-            if safe_summary.get("status") == "failed" or response.lstrip().startswith("系统错误:"):
+            if safe_summary.get("status") == "failed":
+                error_message = str(safe_summary.get("error_message") or "").strip()
+                return self._failed(
+                    sample,
+                    started_at,
+                    started,
+                    str(safe_summary.get("error_stage") or "answer_collection"),
+                    RuntimeError(error_message) if error_message else None,
+                    evidence=evidence,
+                    retrieved_contexts=contexts,
+                    retrieval_summary=safe_summary,
+                )
+            if response.lstrip().startswith("系统错误:"):
                 return self._failed(sample, started_at, started, "answer_collection")
             scored_response, filter_diagnostic = extract_scored_response(response)
             return AnswerSnapshot(
@@ -176,6 +188,10 @@ class AnswerRunner:
         started: float,
         stage: str,
         exc: Exception | None = None,
+        *,
+        evidence: list[dict[str, Any]] | None = None,
+        retrieved_contexts: list[str] | None = None,
+        retrieval_summary: dict[str, Any] | None = None,
     ) -> AnswerSnapshot:
         return AnswerSnapshot(
             sample_id=sample.id,
@@ -184,6 +200,9 @@ class AnswerRunner:
             status="failed",
             error_stage=stage,
             error_message=_safe_error_message(exc),
+            evidence=evidence or [],
+            retrieved_contexts=retrieved_contexts or [],
+            retrieval_summary=retrieval_summary or {},
             started_at=started_at,
             finished_at=_utc_now(),
             duration_seconds=max(0.0, perf_counter() - started),

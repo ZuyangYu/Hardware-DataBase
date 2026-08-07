@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .config import EvaluationConfig
 from .schemas import AnswerSnapshot, EvaluationSample, MetricResult
@@ -60,6 +60,7 @@ class RagasAdapter:
         metric_names: list[str],
         *,
         snapshots_prepared: bool = False,
+        on_result: Callable[[MetricResult], None] | None = None,
     ) -> list[MetricResult]:
         unknown = sorted(set(metric_names) - STANDARD_METRICS)
         if unknown:
@@ -68,13 +69,19 @@ class RagasAdapter:
             snapshots, _ = self.prepare_snapshots_for_scoring(snapshots)
         snapshot_by_id = {snapshot.sample_id: snapshot for snapshot in snapshots}
         results: list[MetricResult] = []
+
+        def emit(result: MetricResult) -> None:
+            results.append(result)
+            if on_result is not None:
+                on_result(result)
+
         grouped: dict[tuple[str, ...], list[tuple[EvaluationSample, AnswerSnapshot]]] = defaultdict(list)
 
         for sample in samples:
             snapshot = snapshot_by_id.get(sample.id)
             if snapshot is None or snapshot.status != "success":
                 for metric_name in metric_names:
-                    results.append(
+                    emit(
                         MetricResult(
                             sample_id=sample.id,
                             metric_name=metric_name,
@@ -90,7 +97,7 @@ class RagasAdapter:
             )
             for metric_name in metric_names:
                 if metric_name not in applicable:
-                    results.append(
+                    emit(
                         MetricResult(
                             sample_id=sample.id,
                             metric_name=metric_name,
@@ -104,6 +111,27 @@ class RagasAdapter:
         backend = self._backend
         if grouped and backend is None:
             backend = _NativeRagasBackend(self.config)
+
+        # A native RAGAS batch does not yield rows until every input finishes.
+        # For a live progress view, evaluate one sample at a time so callers
+        # receive and can persist each metric result immediately.
+        if on_result is not None:
+            for applicable, pairs in grouped.items():
+                for sample, snapshot in pairs:
+                    for result in self.score(
+                        [sample],
+                        [snapshot],
+                        list(applicable),
+                        snapshots_prepared=True,
+                    ):
+                        emit(result)
+            order = {
+                (sample.id, metric_name): index
+                for index, (sample, metric_name) in enumerate(
+                    (sample, metric_name) for sample in samples for metric_name in metric_names
+                )
+            }
+            return sorted(results, key=lambda item: order[(item.sample_id, item.metric_name)])
 
         for applicable, pairs in grouped.items():
             for metric_name in applicable:
@@ -187,7 +215,7 @@ class RagasAdapter:
                             status_code = _error_status_code(value)
                             if status_code is not None:
                                 diagnostic["status_code"] = status_code
-                        results.append(
+                        emit(
                             MetricResult(
                                 sample_id=sample.id,
                                 metric_name=metric_name,
@@ -198,7 +226,7 @@ class RagasAdapter:
                         )
                     else:
                         details = {"evaluator_diagnostic": retry_diagnostic} if retry_diagnostic else {}
-                        results.append(
+                        emit(
                             MetricResult(
                                 sample_id=sample.id,
                                 metric_name=metric_name,
@@ -456,6 +484,11 @@ class _NativeRagasBackend:
             api_key=self.config.embedding_api_key or "not-required",
             base_url=self.config.embedding_base_url,
             request_timeout=self.config.timeout_seconds,
+            # OpenAI-compatible providers, including Volcengine Ark, accept
+            # text inputs but reject the integer token arrays LangChain sends
+            # when its length-safety path is enabled. Evaluation contexts are
+            # already bounded before this backend is called.
+            check_embedding_ctx_length=False,
         )
 
     def _build_run_config(self):

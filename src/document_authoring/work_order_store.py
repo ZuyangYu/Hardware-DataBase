@@ -15,10 +15,12 @@ from typing import Any, TypeVar
 
 import config.settings
 from src.document_authoring.harness.policy import HarnessLeaseLost
+from src.document_authoring.generation_sessions import GenerationSessionStore
 from src.document_authoring.models import (
     DeterministicRuleSpec,
     DocumentUnitDraft,
     DocumentArtifact,
+    DocumentWorkOrderDeletionAudit,
     DocumentHumanEvent,
     IcdScopeReview,
     DocumentOutboxEvent,
@@ -63,6 +65,7 @@ class DocumentAuthoringStore:
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         os.makedirs(self.artifact_root, exist_ok=True)
         self._init_db()
+        self.generation_sessions = GenerationSessionStore(self.db_path)
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
@@ -237,6 +240,13 @@ class DocumentAuthoringStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_document_outbox_events_pending
                     ON document_outbox_events(status, created_at, event_id);
+                CREATE TABLE IF NOT EXISTS document_work_order_deletion_audits (
+                    audit_id TEXT PRIMARY KEY, work_order_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL, deleted_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_document_work_order_deletion_audits_work_order
+                    ON document_work_order_deletion_audits(work_order_id, deleted_at);
                 """
             )
             self._migrate_docx_regions(conn)
@@ -1555,6 +1565,84 @@ class DocumentAuthoringStore:
                 "SELECT payload_json FROM document_artifacts WHERE work_order_id = ? ORDER BY rowid", (work_order_id,)
             ).fetchall()
         return [DocumentArtifact.model_validate(_payload(row)) for row in rows]
+
+    def delete_terminal_work_order(
+        self,
+        work_order_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+    ) -> DocumentWorkOrderDeletionAudit:
+        """Delete a terminal work order and its owned operational data.
+
+        Source snapshots, templates, schemas, and generation sessions remain
+        intact. Artifact file paths are captured before deleting their rows and
+        unlinked only after the SQLite transaction is committed.
+        """
+        artifact_paths: list[str] = []
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM document_work_orders WHERE work_order_id = ?",
+                    (work_order_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"work order not found: {work_order_id}")
+                order = DocumentWorkOrder.model_validate(_payload(row))
+                if order.status not in {"cancelled", "blocked", "failed", "complete"}:
+                    raise ValueError("only terminal work orders may be deleted")
+                artifact_paths = [
+                    str(item["storage_ref"])
+                    for item in conn.execute(
+                        "SELECT json_extract(payload_json, '$.storage_ref') AS storage_ref "
+                        "FROM document_artifacts WHERE work_order_id = ?",
+                        (work_order_id,),
+                    ).fetchall()
+                    if item["storage_ref"]
+                ]
+                audit = DocumentWorkOrderDeletionAudit(
+                    audit_id=f"document-work-order-deletion-{uuid.uuid4().hex}",
+                    work_order_id=order.work_order_id,
+                    tenant_id=order.tenant_id,
+                    actor_id=actor_id,
+                    reason=reason.strip() or "用户确认删除",
+                )
+                self._put(conn, "document_work_order_deletion_audits", {
+                    "audit_id": audit.audit_id,
+                    "work_order_id": audit.work_order_id,
+                    "tenant_id": audit.tenant_id,
+                    "deleted_at": audit.deleted_at.isoformat(),
+                }, audit)
+                conn.execute(
+                    "DELETE FROM document_outbox_events WHERE json_extract(payload_json, '$.work_order_id') = ?",
+                    (work_order_id,),
+                )
+                conn.execute("DELETE FROM document_human_events WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM document_artifacts WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM node_execution_receipts WHERE harness_run_id IN "
+                             "(SELECT harness_run_id FROM harness_runs WHERE work_order_id = ?)", (work_order_id,))
+                conn.execute("DELETE FROM harness_checkpoints WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM document_unit_drafts WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM harness_runs WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM authoring_run_manifests WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM validation_reports WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM evidence_matrices WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM document_icd_scope_reviews WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM document_work_orders WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        root = os.path.abspath(self.artifact_root)
+        for path in artifact_paths:
+            resolved = os.path.abspath(path)
+            if os.path.commonpath([root, resolved]) == root:
+                try:
+                    os.unlink(resolved)
+                except FileNotFoundError:
+                    pass
+        return audit
 
     def save_human_event(self, event: DocumentHumanEvent) -> DocumentHumanEvent:
         fingerprint = event.idempotency_fingerprint or content_hash({

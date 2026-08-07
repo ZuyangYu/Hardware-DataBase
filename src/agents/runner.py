@@ -912,7 +912,15 @@ class MultiSourceAgentRunner:
             None,
         )
         answer = str(state.get("answer") or state.get("final_response") or "")
-        if failed_diagnostic:
+        if answer.startswith("已完成多源检索，但生成模型调用失败"):
+            status = "failed"
+            error_stage = "answer"
+            error_message = answer.splitlines()[0]
+        elif failed_diagnostic and merged:
+            status = "partial_failure"
+            error_stage = "retrieval"
+            error_message = str(failed_diagnostic.get("error") or failed_diagnostic.get("status") or "")
+        elif failed_diagnostic:
             status = "failed"
             error_stage = "retrieval"
             error_message = str(failed_diagnostic.get("error") or failed_diagnostic.get("status") or "")
@@ -920,10 +928,6 @@ class MultiSourceAgentRunner:
             status = "no_evidence"
             error_stage = "retrieval"
             error_message = "no evidence"
-        elif answer.startswith("已完成多源检索，但生成模型调用失败"):
-            status = "failed"
-            error_stage = "answer"
-            error_message = answer.splitlines()[0]
         else:
             status = "success"
             error_stage = ""

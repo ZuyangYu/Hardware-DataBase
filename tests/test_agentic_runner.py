@@ -651,6 +651,25 @@ class AgenticRunnerTests(unittest.TestCase):
         self.assertIn("verification", summary)
         self.assertEqual(summary.get("sufficiency_status"), "sufficient")
 
+    def test_retrieval_summary_degrades_when_some_tools_fail_but_evidence_remains(self):
+        runner, _ = self._runner(_FakeLLM(first_sufficient=True))
+
+        summary = runner._build_retrieval_summary(
+            {
+                "source_plan": {"source_plan": []},
+                "merged_evidence": [{"id": "circuit-1", "content": "VCC3V3", "source_name": "board.edf"}],
+                "sufficiency": {},
+                "retrieval_diagnostics": [
+                    {"tool_name": "document_rag", "status": "failed", "error": "embedding unavailable"}
+                ],
+                "answer": "VCC3V3 是 MCU 的供电网络。",
+            }
+        )
+
+        self.assertEqual(summary["status"], "partial_failure")
+        self.assertEqual(summary["error_stage"], "retrieval")
+        self.assertEqual(summary["error_message"], "embedding unavailable")
+
     def test_runner_exposes_token_usage_summary_by_stage(self):
         llm = _UsageTrackingLLM()
         runner, backend = self._runner(llm)

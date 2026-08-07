@@ -10,7 +10,12 @@ from pathlib import Path
 
 from .dataset_loader import load_dataset
 from .reporters import write_reports
-from .schemas import AnswerSnapshot, EvaluationRunState, EvaluationSample
+from .schemas import (
+    AnswerSnapshot,
+    EvaluationRunState,
+    EvaluationSample,
+    EvaluationSummary,
+)
 from .service import new_run_id
 from .snapshot_store import SnapshotStore
 
@@ -99,14 +104,23 @@ class RunStateStore:
         return self.mutate(lambda state: self._mark_failed(state, error_message))
 
     def update_scoring_progress(
-        self, completed_groups: int, total_groups: int
+        self,
+        completed_groups: int,
+        total_groups: int,
+        *,
+        completed_items: int | None = None,
+        total_items: int | None = None,
     ) -> EvaluationRunState:
+        updates = {
+            "scoring_completed_groups": completed_groups,
+            "scoring_total_groups": total_groups,
+        }
+        if completed_items is not None:
+            updates["scoring_completed_items"] = completed_items
+        if total_items is not None:
+            updates["scoring_total_items"] = total_items
         return self.mutate(
-            lambda state: self._with_update(
-                state,
-                scoring_completed_groups=completed_groups,
-                scoring_total_groups=total_groups,
-            )
+            lambda state: self._with_update(state, **updates)
         )
 
     def publish_partial_report(
@@ -416,8 +430,24 @@ class EvaluationRunController:
                 write_reports(store.path.parent / ".checkpoint", summary, results)
                 return store.load().status not in {"pause_requested", "cancel_requested"}
 
+            def item_checkpoint(summary, results, completed_items, total_items):
+                nonlocal latest_checkpoint
+                latest_checkpoint = (summary, results)
+                state = store.load()
+                store.update_scoring_progress(
+                    state.scoring_completed_groups,
+                    state.scoring_total_groups,
+                    completed_items=completed_items,
+                    total_items=total_items,
+                )
+                write_reports(store.path.parent / ".checkpoint", summary, results)
+
             summary, results = (service if state.mode == "online" else self.service_factory()).score(
-                samples, snapshots, run_id=run_id, progress_callback=checkpoint
+                samples,
+                snapshots,
+                run_id=run_id,
+                progress_callback=checkpoint,
+                item_progress_callback=item_checkpoint,
             )
             state = store.load()
             if state.status in {"pause_requested", "cancel_requested"}:
@@ -534,7 +564,41 @@ class EvaluationRunController:
             thread = self._threads.get(run_id)
             if thread is not None and thread.is_alive():
                 return self._store(run_id).load()
-            return self._store(run_id).mark_orphaned_as_paused()
+            store = self._store(run_id)
+            if not store.path.is_file():
+                # Legacy run (pre-run_state): no run_state.json, only report
+                # artifacts. Synthesise a completed state so it can be opened.
+                return self._legacy_state(run_id)
+            return store.mark_orphaned_as_paused()
+
+    def _legacy_state(self, run_id: str) -> EvaluationRunState:
+        """Build a completed state for a legacy run that has ``summary.json``
+        but no ``run_state.json`` (created before run-state tracking existed)."""
+        summary_path = self.state_root / run_id / "summary.json"
+        if not summary_path.is_file():
+            raise FileNotFoundError(
+                f"evaluation run {run_id!r} has neither run_state.json nor summary.json"
+            )
+        try:
+            summary = EvaluationSummary.model_validate_json(
+                summary_path.read_text(encoding="utf-8-sig")
+            )
+        except Exception as exc:
+            # Corrupt summary is a server-side problem, not "not found".
+            raise ValueError(f"summary invalid: {exc}") from exc
+        return EvaluationRunState(
+            run_id=run_id,
+            dataset_path="",
+            snapshot_path="",
+            mode="offline",
+            score_enabled=False,
+            status="completed",
+            stage="reporting",
+            total_samples=summary.sample_count,
+            completed_samples=summary.sample_count,
+            successful_samples=summary.successful_samples,
+            failed_samples=summary.failed_samples,
+        )
 
     def _store(self, run_id: str) -> RunStateStore:
         return RunStateStore(self.state_root / run_id / "run_state.json")

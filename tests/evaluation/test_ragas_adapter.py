@@ -210,6 +210,33 @@ class RagasAdapterTests(unittest.TestCase):
         self.assertEqual(backend.records[0]["reference"], "参考答案")
         self.assertEqual(results[0].score, 0.8)
 
+    def test_emits_each_metric_result_to_incremental_callback(self):
+        samples = [
+            EvaluationSample(id="q1", question="Q1", reference_answer="A1", kb_name="kb"),
+            EvaluationSample(id="q2", question="Q2", reference_answer="A2", kb_name="kb"),
+        ]
+        snapshots = [
+            AnswerSnapshot(
+                sample_id="q1", question="Q1", kb_name="kb", response="A1", retrieved_contexts=["c1"]
+            ),
+            AnswerSnapshot(
+                sample_id="q2", question="Q2", kb_name="kb", response="A2", retrieved_contexts=["c2"]
+            ),
+        ]
+        emitted = []
+
+        backend = CapturingBackend()
+        RagasAdapter(_config(), backend=backend).score(
+            samples,
+            snapshots,
+            ["faithfulness"],
+            on_result=emitted.append,
+        )
+
+        self.assertEqual([(item.sample_id, item.metric_name) for item in emitted], [("q1", "faithfulness"), ("q2", "faithfulness")])
+        self.assertTrue(all(item.status == "success" for item in emitted))
+        self.assertEqual([len(records) for _metrics, records in backend.calls], [1, 1])
+
     def test_marks_context_recall_not_applicable_without_reference_contexts(self):
         sample = EvaluationSample(id="q1", question="Q", reference_answer="A", kb_name="kb")
         snapshot = AnswerSnapshot(sample_id="q1", question="Q", kb_name="kb", response="A")
@@ -238,6 +265,7 @@ class RagasAdapterTests(unittest.TestCase):
 
         self.assertTrue(callable(embeddings.embed_query))
         self.assertTrue(callable(embeddings.embed_documents))
+        self.assertFalse(embeddings.check_embedding_ctx_length)
 
     @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
     def test_native_backend_passes_limit_and_uses_single_relevancy_sample(self):

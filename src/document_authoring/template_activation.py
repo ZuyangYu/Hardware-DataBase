@@ -16,6 +16,18 @@ class TemplateActivationPolicy:
     min_mapping_confidence: float = 0.90
     max_target_ratio: float = 0.20
     max_nonempty_overwrite_ratio: float = 0.0
+    accept_ai_recommendations: bool = False
+
+
+_AI_REVIEW_REASON_CODES = frozenset({
+    "missing_semantic_context",
+    "low_mapping_confidence",
+    "fixed_label_target",
+    "table_header_target",
+    "layout_blank_target",
+    "nonempty_target_not_placeholder",
+    "destructive_target_ratio",
+})
 
 
 def decide_template_activation(
@@ -132,8 +144,21 @@ def decide_template_activation(
         if risky_nonempty_ratio > effective.max_nonempty_overwrite_ratio:
             reject("destructive_target_ratio")
 
+    has_only_ai_review_reasons = bool(reasons) and set(reasons) <= _AI_REVIEW_REASON_CODES
+    ai_recommendation_is_accepted = (
+        effective.accept_ai_recommendations
+        and bool(analysis.suggestions)
+        and has_only_ai_review_reasons
+    )
     return TemplateActivationDecision(
-        status="requires_human" if reasons else "auto_accepted",
+        # AI-recommendation mode intentionally converts review-only policy
+        # findings into audit warnings. Conflicts, protected targets, malformed
+        # mappings, and unsupported table mappings remain hard failures.
+        status=(
+            "auto_accepted"
+            if not reasons or ai_recommendation_is_accepted
+            else "requires_human"
+        ),
         reason_codes=reasons,
         suggestion_ids=[
             suggestion.semantic_unit_id for suggestion in analysis.suggestions

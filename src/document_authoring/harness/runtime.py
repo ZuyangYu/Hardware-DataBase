@@ -137,6 +137,17 @@ class InternalDocumentHarnessRuntime:
             self.store.heartbeat_harness_run(
                 running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
             )
+            # The status API reads progress from ``harness_runs``. Keep its
+            # cursor in sync with the durable checkpoint so long retrieval or
+            # writer calls do not make the UI appear frozen at step 0.
+            self.store.update_harness_run_owned(
+                running.harness_run_id,
+                lease_owner,
+                running.fencing_token,
+                current_node=checkpoint.current_node,
+                step_count=checkpoint.step_count,
+                retrieval_round_count=checkpoint.retrieval_round_count,
+            )
             self.store.save_harness_checkpoint_owned(checkpoint, lease_owner, running.fencing_token)
 
         def draft_with_receipt(request) -> DocumentUnitDraft:

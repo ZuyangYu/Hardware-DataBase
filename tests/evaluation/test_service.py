@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -32,6 +34,14 @@ class GroupedAdapter:
             MetricResult(sample_id="q1", metric_name=metric_name, score=0.8)
             for metric_name in metric_names
         ]
+
+
+class IncrementalAdapter:
+    def score(self, samples, snapshots, metric_names, *, on_result=None):
+        result = MetricResult(sample_id=samples[0].id, metric_name=metric_names[0], score=0.8)
+        if on_result is not None:
+            on_result(result)
+        return [result]
 
 
 class CapturingBackend:
@@ -122,6 +132,39 @@ class EvaluationServiceTests(unittest.TestCase):
 
         self.assertEqual([item.sample_id for item in snapshots], ["q1"])
 
+    def test_collect_uses_configured_workers_without_callbacks(self):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def collect(sample):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return AnswerSnapshot(
+                sample_id=sample.id,
+                question=sample.question,
+                kb_name=sample.kb_name,
+                response="A",
+            )
+
+        service = EvaluationService(config=_config(max_workers=4))
+        service.answer_runner.collect = collect
+        samples = [_sample(f"q{index}") for index in range(8)]
+
+        snapshots = service.collect(samples, self.snapshot_path)
+
+        self.assertGreater(max_active, 1)
+        self.assertLessEqual(max_active, 4)
+        self.assertEqual(
+            {item.sample_id for item in snapshots},
+            {item.id for item in samples},
+        )
+
     def test_score_keeps_successful_metrics_when_one_fails(self):
         service = EvaluationService(ragas_adapter=FakeAdapter())
 
@@ -171,6 +214,24 @@ class EvaluationServiceTests(unittest.TestCase):
             },
         )
         self.assertEqual(summary.metric_scores["faithfulness"], 0.8)
+
+    def test_score_invokes_item_progress_callback_for_each_metric_result(self):
+        progress = []
+        service = EvaluationService(ragas_adapter=IncrementalAdapter())
+
+        summary, results = service.score(
+            [_sample()],
+            [_snapshot()],
+            metric_names=["faithfulness"],
+            item_progress_callback=lambda current_summary, current_results, completed, total: progress.append(
+                (completed, total, len(current_results[0].metrics), current_summary.scoring_completed_items)
+            ),
+        )
+
+        self.assertEqual(progress, [(1, 1, 5, 1)])
+        self.assertEqual(summary.scoring_completed_items, 1)
+        self.assertEqual(summary.scoring_total_items, 1)
+        self.assertEqual(results[0].metrics[-1].metric_name, "faithfulness")
 
     def test_score_stops_after_progress_callback_returns_false(self):
         adapter = GroupedAdapter()
@@ -234,6 +295,19 @@ class EvaluationServiceTests(unittest.TestCase):
 
         self.assertEqual(summary.failed_samples, 1)
         self.assertEqual(summary.successful_samples, 0)
+
+    def test_score_skips_ragas_when_every_snapshot_failed(self):
+        adapter = GroupedAdapter()
+        snapshot = _snapshot().model_copy(update={"status": "failed"})
+
+        summary, results = EvaluationService(ragas_adapter=adapter).score(
+            [_sample()], [snapshot], metric_names=["answer_correctness"]
+        )
+
+        self.assertEqual(adapter.metric_batches, [])
+        self.assertEqual(summary.metric_failures, {})
+        self.assertEqual(results[0].metrics, [])
+        self.assertEqual(summary.metadata["scoring_skipped"], "no_successful_snapshots")
 
     def test_non_retrieval_sample_skips_ragas_backend_and_marks_metrics_not_applicable(self):
         backend = CapturingBackend()

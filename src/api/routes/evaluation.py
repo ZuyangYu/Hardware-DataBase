@@ -350,7 +350,15 @@ def get_run(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     result = _state_dict(state)
-    summary_path = Path(output_root) / run_id / "summary.json"
+    run_dir = Path(output_root) / run_id
+    summary_path = run_dir / "summary.json"
+    results_dir = run_dir
+    if not summary_path.is_file():
+        checkpoint_dir = run_dir / ".checkpoint"
+        checkpoint_summary = checkpoint_dir / "summary.json"
+        if checkpoint_summary.is_file():
+            summary_path = checkpoint_summary
+            results_dir = checkpoint_dir
     if summary_path.is_file():
         try:
             summary: EvaluationSummary = load_evaluation_summary(summary_path)
@@ -359,10 +367,8 @@ def get_run(
             result["summary"] = None
     else:
         result["summary"] = None
-    if state.status == "completed" and result["summary"] is not None:
-        result["sample_results"], result["sample_results_error"] = _load_sample_results(
-            Path(output_root) / run_id
-        )
+    if result["summary"] is not None:
+        result["sample_results"], result["sample_results_error"] = _load_sample_results(results_dir)
     else:
         result["sample_results"] = []
         result["sample_results_error"] = ""

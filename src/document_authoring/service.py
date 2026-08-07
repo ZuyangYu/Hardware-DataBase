@@ -20,6 +20,7 @@ from typing import Any
 
 import requests
 
+import config.settings
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
@@ -53,7 +54,10 @@ from src.document_authoring.models import (
 )
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
-from src.document_authoring.template_activation import decide_template_activation
+from src.document_authoring.template_activation import (
+    TemplateActivationPolicy,
+    decide_template_activation,
+)
 from src.document_authoring.template_analysis import (
     DocxRegionSchema,
     TemplateAnalysis,
@@ -89,6 +93,45 @@ _MAX_AUTO_HARNESS_RETRIEVAL_ROUNDS = 1_000
 # that is 3002, so the ceiling must leave headroom for the rewrite step.
 _MAX_AUTO_HARNESS_STEPS = 3_600
 _DEFAULT_RETRIEVAL_ATTEMPTS_PER_UNIT = 2
+
+
+def _requires_human_review(
+    unit_statuses: dict[str, str],
+    *,
+    auto_publish_verified: bool,
+) -> bool:
+    """Decide whether generation must stop for an operator.
+
+    A missing optional field (``tbd``) does not make the rendered workbook
+    unsafe.  In the explicit automatic-publication mode it remains visible in
+    the task metadata, while the verified artifact can be delivered without a
+    human gate.  All actual integrity, conflict, retrieval and evidence
+    failures still require intervention.
+    """
+    blocking_statuses = {
+        "requires_human", "blocked", "conflicting", "retrieval_failed",
+        "insufficient_evidence",
+    }
+    if not auto_publish_verified:
+        blocking_statuses.add("tbd")
+    return any(status in blocking_statuses for status in unit_statuses.values())
+
+
+def _automatic_release_allowed(order: DocumentWorkOrder, report: Any, *, requires_review: bool) -> bool:
+    """Allow verified direct work orders as well as confirmed chat sessions.
+
+    The upload-and-generate API is an explicit user action and may not have a
+    clarification session attached.  When automatic publication is enabled,
+    that path is equivalent to a confirmed session; safety still requires a
+    passed report and no blocking unit status.
+    """
+    if not config.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED or requires_review:
+        return False
+    if getattr(report, "status", None) != "passed":
+        return False
+    if not order.generation_session_id:
+        return True
+    return bool(order.generation_brief.get("confirmed"))
 
 
 class TemplateRequiresHumanReview(ValueError):
@@ -131,6 +174,29 @@ class DocumentGenerationService:
         self.worker = worker or DocumentGenerationWorker()
         self.harness_runtime = InternalDocumentHarnessRuntime(self.store, self.validator)
         self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider(LLMClient())
+
+    @staticmethod
+    def _require_template_kb_scope(
+        ctx: RequestContext,
+        template: TemplateVersion,
+        required_permission: str,
+    ) -> None:
+        """Enforce the API-bound KB scope for template review, correction, and activation."""
+        requested_kb = ctx.metadata.get("document_template_kb_name")
+        if requested_kb is None:
+            return
+        requested_department_id = ctx.metadata.get("resource_department_id")
+        requested_kb_id = ctx.metadata.get("kb_id")
+        if (
+            template.knowledge_base_name != requested_kb
+            or template.tenant_id != (ctx.tenant_id or "default")
+            or template.resource_department_id is None
+            or template.knowledge_base_id is None
+            or template.resource_department_id != requested_department_id
+            or template.knowledge_base_id != requested_kb_id
+            or not ctx.has_kb_permission(requested_kb, required_permission)
+        ):
+            raise PermissionError("template does not belong to the selected knowledge base")
 
     # Template and schema registration -------------------------------------------------
 
@@ -268,6 +334,10 @@ class DocumentGenerationService:
             template_schema_id=template_schema_id,
             template_schema_version="1",
             renderer_policy_id=policy.renderer_policy_id,
+            tenant_id=ctx.tenant_id or "default",
+            knowledge_base_name=ctx.metadata.get("document_template_kb_name"),
+            resource_department_id=ctx.metadata.get("resource_department_id"),
+            knowledge_base_id=ctx.metadata.get("kb_id"),
         )
         sanitization_report = TemplateSanitizationReport(
             template_version_id=template_version_id,
@@ -311,7 +381,14 @@ class DocumentGenerationService:
             else:
                 self.template_suggester.suggest(analysis)
             analysis.validate_suggestions()
-            activation_decision = decide_template_activation(analysis)
+            activation_decision = decide_template_activation(
+                analysis,
+                TemplateActivationPolicy(
+                    accept_ai_recommendations=(
+                        config.settings.DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS
+                    ),
+                ),
+            )
             analysis = analysis.model_copy(update={
                 "activation_decision": activation_decision,
                 "status": (
@@ -481,6 +558,7 @@ class DocumentGenerationService:
         analysis = self.store.get_template_analysis_by_id(analysis_id)
         if analysis is None:
             raise KeyError(f"template analysis not found: {analysis_id}")
+        self._require_template_kb_scope(ctx, self._template(analysis.template_version_id), "read")
         return analysis
 
     def correct_template_analysis(
@@ -496,10 +574,12 @@ class DocumentGenerationService:
         analysis = self.store.get_template_analysis_by_id(correction.analysis_id)
         if analysis is None:
             raise KeyError(f"template analysis not found: {correction.analysis_id}")
+        self._require_template_kb_scope(ctx, self._template(analysis.template_version_id), "write")
         current = self.store.get_template_analysis(analysis.template_version_id)
         if current is None or current.analysis_id != analysis.analysis_id:
             raise ValueError("template analysis correction is stale")
         template = self._template(analysis.template_version_id)
+        self._require_template_kb_scope(ctx, template, "write")
         actual_hash = hashlib.sha256(
             self.store.read_template_content(template.template_version_id)
         ).hexdigest()
@@ -564,11 +644,16 @@ class DocumentGenerationService:
         if analysis is None:
             raise KeyError(f"template analysis not found: {analysis_id}")
         if analysis.status != "ready_for_confirmation":
-            raise ValueError("template analysis requires human exception corrections before confirmation")
+            raise ValueError("template analysis is not ready for confirmation")
+        if analysis.activation_decision is None:
+            raise ValueError("template activation decision is required for confirmation")
+        if analysis.activation_decision.status != "auto_accepted":
+            raise ValueError("template activation decision rejects confirmation")
         current = self.store.get_template_analysis(analysis.template_version_id)
         if current is None or current.analysis_id != analysis.analysis_id:
             raise ValueError("template analysis is not the current revision")
         template = self._template(analysis.template_version_id)
+        self._require_template_kb_scope(ctx, template, "write")
         actual_hash = hashlib.sha256(self.store.read_template_content(template.template_version_id)).hexdigest()
         if actual_hash != analysis.content_hash or actual_hash != template.content_hash:
             raise ValueError("template content hash changed since analysis")
@@ -650,6 +735,8 @@ class DocumentGenerationService:
         document_schema_id: str,
         document_schema_version: str,
         idempotency_key: str | None = None,
+        generation_session_id: str | None = None,
+        generation_brief: dict[str, Any] | None = None,
     ) -> DocumentWorkOrder:
         if not ctx.has_kb_permission(knowledge_base_name, "read"):
             raise PermissionError("knowledge base read permission is required")
@@ -680,6 +767,8 @@ class DocumentGenerationService:
                 document_schema_id=document_schema_id,
                 document_schema_version=document_schema_version,
                 idempotency_key=idempotency_key,
+                generation_session_id=generation_session_id,
+                generation_brief=generation_brief,
             )
         except sqlite3.IntegrityError:
             if idempotency_key:
@@ -721,6 +810,8 @@ class DocumentGenerationService:
         knowledge_base_name: str | None = None,
         idempotency_key: str | None = None,
         harness_policy_id: str | None = None,
+        generation_session_id: str | None = None,
+        generation_brief: dict[str, Any] | None = None,
     ) -> DocumentWorkOrder:
         template = self._template(template_version_id)
         schema = self._schema(document_schema_id, document_schema_version)
@@ -774,6 +865,8 @@ class DocumentGenerationService:
             },
             created_by=ctx.user_id,
             idempotency_key=idempotency_key,
+            generation_session_id=generation_session_id,
+            generation_brief=dict(generation_brief or {}),
         )
         return self.store.create_work_order(order)
 
@@ -1091,7 +1184,12 @@ class DocumentGenerationService:
             if current_run is not None and current_run.status == "failed":
                 self._replace_order(order, status="blocked")
             raise
-        return self._finalize_internal_harness_result(order, template, run.harness_run_id, result)
+        return self._finalize_internal_harness_safely(
+            order,
+            template,
+            run.harness_run_id,
+            result,
+        )
 
     def pause_harness_run(self, ctx: RequestContext, harness_run_id: str):
         run = self._harness_run_for_context(ctx, harness_run_id)
@@ -1100,7 +1198,7 @@ class DocumentGenerationService:
             self.store.finalize_harness_checkpoint(paused.checkpoint_id, "paused")
         order = self._order_raw(run.work_order_id)
         if order.status != "cancelled":
-            self._replace_order(order, status="blocked")
+            self._replace_order(order, status="paused")
         return paused
 
     def cancel_harness_run(self, ctx: RequestContext, harness_run_id: str):
@@ -1111,6 +1209,20 @@ class DocumentGenerationService:
         order = self._order_raw(run.work_order_id)
         self._replace_order(order, status="cancelled")
         return cancelled
+
+    def delete_document_work_order(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        reason: str = "",
+    ):
+        order = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        return self.store.delete_terminal_work_order(
+            order.work_order_id,
+            actor_id=ctx.user_id,
+            reason=reason,
+        )
 
     def resume_internal_harness(
         self,
@@ -1165,7 +1277,60 @@ class DocumentGenerationService:
             if current_run is not None and current_run.status == "failed":
                 self._replace_order(order, status="blocked")
             raise
-        return self._finalize_internal_harness_result(order, template, run.harness_run_id, result)
+        return self._finalize_internal_harness_safely(
+            order,
+            template,
+            run.harness_run_id,
+            result,
+        )
+
+    def _finalize_internal_harness_safely(
+        self,
+        order: DocumentWorkOrder,
+        template: TemplateVersion,
+        harness_run_id: str,
+        result,
+    ) -> DocumentArtifact:
+        try:
+            return self._finalize_internal_harness_result(
+                order,
+                template,
+                harness_run_id,
+                result,
+            )
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            normalized = message.casefold()
+            if "duplicate long value fan-out" in normalized:
+                updates = {
+                    "status": "blocked",
+                    "error_code": "renderer_safety_violation",
+                    "error_message": message,
+                    "retryable": False,
+                    "next_actions": ["view_error", "replace_template", "retry_generation"],
+                }
+            elif isinstance(exc, (ValueError, PermissionError)):
+                updates = {
+                    "status": "blocked",
+                    "error_code": "rendering_validation_failed",
+                    "error_message": message,
+                    "retryable": False,
+                    "next_actions": ["view_error", "replace_template"],
+                }
+            else:
+                updates = {
+                    "status": "failed",
+                    "error_code": "finalization_failed",
+                    "error_message": message,
+                    "retryable": True,
+                    "next_actions": ["view_error", "retry_generation"],
+                }
+            self._replace_order(order, **updates)
+            logger.exception(
+                "Document generation finalization failed for work order %s",
+                order.work_order_id,
+            )
+            raise
 
     def _finalize_internal_harness_result(
         self,
@@ -1205,15 +1370,87 @@ class DocumentGenerationService:
             integrity_manifest_id=integrity_manifest["manifest_hash"],
         )
         artifact = self.store.save_artifact(artifact, rendered_content, template.format)
-        next_status = "waiting_human_input" if any(
-            status in {"requires_human", "blocked", "conflicting", "retrieval_failed", "insufficient_evidence", "tbd"}
-            for status in result.unit_statuses.values()
-        ) else "waiting_human_approval"
+        requires_review = _requires_human_review(
+            result.unit_statuses,
+            auto_publish_verified=config.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED,
+        )
+        if (
+            _automatic_release_allowed(order, report, requires_review=requires_review)
+        ):
+            return self._auto_publish_verified_candidate(
+                order,
+                artifact,
+                report,
+                rendered_content,
+                unit_statuses=result.unit_statuses,
+                evidence_matrix_id=f"matrix-{order.work_order_id}",
+                validation_report_id=report.validation_report_id,
+            )
+        next_status = "waiting_human_input" if requires_review else "waiting_human_approval"
         self._replace_order(
             order, status=next_status, unit_statuses=result.unit_statuses,
             evidence_matrix_id=f"matrix-{order.work_order_id}", validation_report_id=report.validation_report_id,
         )
         return artifact
+
+    def _auto_publish_verified_candidate(
+        self,
+        order: DocumentWorkOrder,
+        candidate: DocumentArtifact,
+        report,
+        candidate_content: bytes,
+        *,
+        unit_statuses: dict[str, str],
+        evidence_matrix_id: str,
+        validation_report_id: str,
+    ) -> DocumentArtifact:
+        if not config.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED:
+            return candidate
+        if report.status != "passed" or self._has_icd_blocking_issue(report.issues):
+            return candidate
+        if hashlib.sha256(candidate_content).hexdigest() != candidate.content_hash:
+            raise ValueError("candidate content hash changed before automatic publication")
+        snapshot = self.resolve_source_snapshot(order)
+        subject_hash = _approval_subject_hash(
+            candidate.content_hash,
+            report.content_hash,
+            snapshot.content_hash,
+        )
+        released = DocumentArtifact(
+            artifact_id=f"artifact-{uuid.uuid4().hex}",
+            tenant_id=candidate.tenant_id,
+            work_order_id=candidate.work_order_id,
+            run_id=candidate.run_id,
+            stage="approved_release",
+            content_hash=candidate.content_hash,
+            approval_subject_hash=subject_hash,
+            parent_artifact_id=candidate.artifact_id,
+            validation_report_id=candidate.validation_report_id,
+            approval_event_ids=[],
+            integrity_manifest_id=candidate.integrity_manifest_id,
+            status_reasons=[{
+                "code": "auto_published_verified",
+                "message": "需求、证据、内容和渲染校验全部通过，已按部署策略自动发布。",
+            }],
+            released_at=datetime.now(timezone.utc),
+        )
+        released = self.store.save_artifact(
+            released,
+            candidate_content,
+            order.target_format,
+        )
+        self._replace_order(
+            order,
+            status="complete",
+            error_code=None,
+            error_message=None,
+            retryable=None,
+            next_actions=["view_result"],
+            unit_statuses=unit_statuses,
+            evidence_matrix_id=evidence_matrix_id,
+            validation_report_id=validation_report_id,
+        )
+        return released
 
     def start_document_generation(
         self,
@@ -1553,7 +1790,8 @@ class DocumentGenerationService:
                 if unit_id in seen_targets:
                     raise ValueError("suggested template targets may only be bound once")
                 unit = unit_by_id[unit_id]
-                region_id = f"region-{hashlib.sha256(unit_id.encode('utf-8')).hexdigest()[:16]}"
+                region_key = f"{template.template_version_id}:{unit_id}"
+                region_id = f"region-{hashlib.sha256(region_key.encode('utf-8')).hexdigest()[:16]}"
                 if template.format == "docx":
                     regions.append(DocxRegionSchema(
                         region_id=region_id, locator=dict(unit.locator), role="semantic_draft",
@@ -1574,8 +1812,9 @@ class DocumentGenerationService:
                     ))
                 seen_targets.add(unit_id)
                 target_regions.append(region_id)
+            binding_key = f"{template.template_version_id}:{suggestion.semantic_unit_id}"
             bindings.append(TemplateUnitBinding(
-                binding_id=f"binding-{hashlib.sha256(suggestion.semantic_unit_id.encode('utf-8')).hexdigest()[:16]}",
+                binding_id=f"binding-{hashlib.sha256(binding_key.encode('utf-8')).hexdigest()[:16]}",
                 template_schema_id=template.template_schema_id,
                 template_schema_version=template.template_schema_version,
                 semantic_unit_type="field", semantic_unit_id=suggestion.semantic_unit_id,

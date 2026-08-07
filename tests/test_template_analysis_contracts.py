@@ -107,6 +107,45 @@ def test_template_analysis_rejects_duplicate_suggestion_targets():
         analysis.validate_suggestions()
 
 
+def test_template_analysis_rejects_duplicate_suggestion_semantic_ids():
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-1",
+        template_version_id="template-1",
+        content_hash="a" * 64,
+        format="docx",
+        status="ready_for_confirmation",
+        units=[
+            TemplateAnalysisUnit(
+                unit_id="paragraph-1",
+                locator={"paragraph_index": 1},
+                writable=True,
+            ),
+            TemplateAnalysisUnit(
+                unit_id="paragraph-2",
+                locator={"paragraph_index": 2},
+                writable=True,
+            ),
+        ],
+        suggestions=[
+            TemplateAnalysisSuggestion(
+                semantic_unit_id="summary",
+                label="摘要",
+                target_unit_ids=["paragraph-1"],
+                confidence=0.9,
+            ),
+            TemplateAnalysisSuggestion(
+                semantic_unit_id="summary",
+                label="摘要补充",
+                target_unit_ids=["paragraph-2"],
+                confidence=0.8,
+            ),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="semantic unit may only be suggested once: summary"):
+        analysis.validate_suggestions()
+
+
 def test_template_analysis_rejects_duplicate_targets_within_one_suggestion():
     analysis = TemplateAnalysis(
         analysis_id="analysis-1",

@@ -87,6 +87,27 @@ def test_no_evidence_raises():
         _deterministic_draft(_request([]))
 
 
+def test_llm_transport_or_empty_response_falls_back_to_evidence_copy():
+    from src.document_authoring.writers.managed import LLMManagedWriter
+
+    class EmptyResponseClient:
+        calls = 0
+        timeouts = []
+
+        def chat(self, _messages, **kwargs):
+            self.calls += 1
+            self.timeouts.append(kwargs.get("timeout"))
+            raise RuntimeError("Chat API returned an empty response")
+
+    client = EmptyResponseClient()
+    draft = LLMManagedWriter(client).generate(_request([_ev("e1", "额定电流为 10A")]))
+
+    assert client.calls == 2
+    assert client.timeouts == [60, 60]
+    assert draft.content == "额定电流为 10A"
+    assert draft.validation_status == "pending"
+
+
 def test_llm_build_user_prompt_includes_all_evidence():
     request = _request([
         _ev("e1", "额定电流为 10A"),
@@ -99,6 +120,17 @@ def test_llm_build_user_prompt_includes_all_evidence():
     # not just the first chunk.
     assert "e1" in prompt and "额定电流为 10A" in prompt
     assert "e2" in prompt and "电源拓扑为 buck" in prompt
+
+
+def test_llm_writer_prompt_includes_field_focus_terms():
+    request = _request([_ev("e1", "X1902-3 connects to PGND")]).model_copy(
+        update={"retrieval_query_terms": ["X1902-3", "PGND"]}
+    )
+
+    prompt = _build_user_prompt(request, None)
+
+    assert "X1902-3" in prompt
+    assert "PGND" in prompt
 
 
 def test_llm_writer_requires_and_returns_a_typed_value():
@@ -133,3 +165,45 @@ def test_llm_writer_requires_and_returns_a_typed_value():
     draft = LLMManagedWriter(Client()).generate(_request([_ev("e1", "额定电流为 10A")]))
 
     assert draft.typed_value.display_value == "10A"
+
+
+def test_llm_managed_writer_uses_connector_manual_for_function_fields_without_model_call():
+    from src.document_authoring.writers.managed import LLMManagedWriter
+
+    class Client:
+        def chat(self, *args, **kwargs):
+            raise RuntimeError("connector function should be deterministic")
+
+    request = _request([{
+        "id": "manual-x1900-1",
+        "content": "X1900 pin 1: CAN high differential bus signal.",
+        "source_name": "CONN-1900 datasheet.pdf",
+        "metadata": {"source_role": "datasheet"},
+        "locator": {},
+        "fact_type": None,
+    }]).model_copy(update={
+        "unit_label": "功能描述 Function",
+        "retrieval_query_terms": ["X1900-1", "CAN0H"],
+    })
+
+    draft = LLMManagedWriter(Client()).generate(request)
+
+    assert "CAN high differential bus signal" in draft.content
+    assert "X1900-1" in draft.content
+
+
+def test_connector_function_writer_uses_net_rule_when_manual_has_no_pin_description():
+    from src.document_authoring.writers.managed import LLMManagedWriter
+
+    class Client:
+        def chat(self, *args, **kwargs):
+            raise RuntimeError("connector function should be deterministic")
+
+    request = _request([_ev("circuit-x1903-1", "X1903-1 is connected to MIPI0_DATA0_P")]).model_copy(update={
+        "unit_label": "功能描述 Function",
+        "retrieval_query_terms": ["X1903-1"],
+    })
+
+    draft = LLMManagedWriter(Client()).generate(request)
+
+    assert "MIPI 摄像头高速差分数据信号（规则推断）" in draft.content

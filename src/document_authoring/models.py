@@ -80,6 +80,10 @@ class TemplateVersion(BaseModel):
     template_schema_id: str
     template_schema_version: str
     renderer_policy_id: str
+    tenant_id: str = "default"
+    knowledge_base_name: str | None = None
+    resource_department_id: int | None = None
+    knowledge_base_id: int | None = None
     status: Literal["draft", "approved", "obsolete"] = "draft"
     security_report_id: str | None = None
     storage_ref: str | None = None
@@ -284,8 +288,14 @@ class DocumentWorkOrder(BaseModel):
     status: Literal[
         "planned", "retrieving", "ready_to_draft", "drafting", "waiting_human_input",
         "validating", "waiting_human_approval", "ready_to_render", "rendering", "blocked",
-        "complete", "cancelled",
+        "paused", "complete", "failed", "cancelled",
     ] = "planned"
+    generation_session_id: str | None = None
+    generation_brief: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    error_message: str | None = None
+    retryable: bool | None = None
+    next_actions: list[str] = Field(default_factory=list)
     project_snapshot_version: str | None = None
     evidence_matrix_id: str | None = None
     validation_report_id: str | None = None
@@ -317,12 +327,18 @@ class DocumentWorkOrder(BaseModel):
             raise ValueError("internal-harness work orders require a frozen HarnessPolicy version")
         excluded = {
             "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
-            "evidence_matrix_id", "validation_report_id", "run_manifest_id",
+            "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
+            "error_message", "retryable", "next_actions",
         }
         if self.scope_type == "project":
             # Preserve fingerprints from persisted project work orders created
             # before the explicit scope fields existed.
             excluded.update({"scope_type", "knowledge_base_name"})
+        if self.generation_session_id is None and not self.generation_brief:
+            # Preserve fingerprints created before clarification sessions were
+            # added. New session-backed work orders include both fields as
+            # immutable generation inputs.
+            excluded.update({"generation_session_id", "generation_brief"})
         expected = content_hash(self.model_dump(mode="json", exclude=excluded))
         if self.input_fingerprint and self.input_fingerprint != expected:
             raise ValueError("work order input_fingerprint does not match frozen inputs")
@@ -690,6 +706,17 @@ class DocumentArtifact(BaseModel):
     storage_ref: str = ""
     created_at: datetime = Field(default_factory=utc_now)
     released_at: datetime | None = None
+
+
+class DocumentWorkOrderDeletionAudit(BaseModel):
+    """Minimal immutable trace retained after a user deletes a work order."""
+
+    audit_id: str
+    work_order_id: str
+    tenant_id: str
+    actor_id: str
+    reason: str
+    deleted_at: datetime = Field(default_factory=utc_now)
 
 
 class DocumentHumanEvent(BaseModel):

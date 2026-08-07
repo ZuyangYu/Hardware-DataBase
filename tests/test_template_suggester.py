@@ -5,6 +5,7 @@ import json
 from src.document_authoring.template_analysis import (
     TemplateAnalysis,
     TemplateAnalysisUnit,
+    TemplateNeighbor,
 )
 from src.document_authoring.template_suggester import LLMTemplateSuggestionProvider
 
@@ -19,6 +20,15 @@ class RecordingClient:
         self.messages = messages
         self.usage_stage = str(kwargs.get("usage_stage"))
         return self.response
+
+
+class FailingClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages: list[dict[str, str]], **kwargs: object) -> str:
+        self.calls += 1
+        raise TimeoutError("template analysis timed out")
 
 
 def _safe_docx_analysis() -> TemplateAnalysis:
@@ -77,6 +87,7 @@ def test_llm_suggester_marks_only_sample_value_basis_as_approved_overwrite():
             value_preview="Example project",
             value_kind="text",
             structural_role_hint="sample_value",
+            candidate_for_auto_fill=True,
         )],
     )
     client = RecordingClient(response=(
@@ -255,3 +266,85 @@ def test_llm_suggester_survives_partial_chunk_failure():
     # 第一块 50 + 第三块 10 = 60 条建议存活，第二块丢失。
     assert len(suggestions) == 60
     assert analysis.status == "ready_for_confirmation"
+
+
+def test_llm_suggester_falls_back_to_function_table_cells_when_model_is_unavailable():
+    analysis = TemplateAnalysis(
+        analysis_id="analysis-table-fallback",
+        template_version_id="template-table-fallback",
+        content_hash="d" * 64,
+        format="xlsx",
+        status="ready_for_confirmation",
+        units=[
+            TemplateAnalysisUnit(
+                unit_id="sheet:Pinout!C1",
+                locator={"sheet_name": "Pinout", "cell": "C1"},
+                label="Pinout!C1",
+                writable=True,
+                value_preview="功能描述 Function",
+                value_kind="text",
+                structural_role_hint="table_header",
+                neighborhood=[],
+            ),
+            TemplateAnalysisUnit(
+                unit_id="sheet:Pinout!A2",
+                locator={"sheet_name": "Pinout", "cell": "A2"},
+                label="Pinout!A2",
+                writable=True,
+                value_preview="DP1600-1",
+                value_kind="text",
+                structural_role_hint="sample_value",
+                neighborhood=[],
+            ),
+            TemplateAnalysisUnit(
+                unit_id="sheet:Pinout!B2",
+                locator={"sheet_name": "Pinout", "cell": "B2"},
+                label="Pinout!B2",
+                writable=True,
+                value_preview="UBD",
+                value_kind="text",
+                structural_role_hint="sample_value",
+                neighborhood=[],
+            ),
+            TemplateAnalysisUnit(
+                unit_id="sheet:Pinout!C2",
+                locator={"sheet_name": "Pinout", "cell": "C2"},
+                label="Pinout!C2",
+                writable=True,
+                value_kind="blank",
+                structural_role_hint="scalar_input",
+                candidate_for_auto_fill=True,
+                neighborhood=[
+                    TemplateNeighbor(relative_row=-1, relative_column=0, value_preview="功能描述 Function"),
+                    TemplateNeighbor(relative_row=0, relative_column=-1, value_preview="UBD"),
+                ],
+            ),
+            TemplateAnalysisUnit(
+                unit_id="sheet:Pinout!C8",
+                locator={"sheet_name": "Pinout", "cell": "C8"},
+                label="Pinout!C8",
+                writable=True,
+                value_kind="blank",
+                structural_role_hint="scalar_input",
+                candidate_for_auto_fill=True,
+                neighborhood=[],
+            ),
+        ],
+    )
+
+    client = FailingClient()
+    suggestions = LLMTemplateSuggestionProvider(client).suggest(analysis)
+
+    assert {target for suggestion in suggestions for target in suggestion.target_unit_ids} == {
+        "sheet:Pinout!C2", "sheet:Pinout!C8",
+    }
+    assert "功能描述 Function" in next(
+        suggestion for suggestion in suggestions
+        if suggestion.target_unit_ids == ["sheet:Pinout!C2"]
+    ).retrieval_terms
+    assert "UBD" in next(
+        suggestion for suggestion in suggestions
+        if suggestion.target_unit_ids == ["sheet:Pinout!C2"]
+    ).retrieval_terms
+    assert analysis.status == "ready_for_confirmation"
+    assert client.calls == 0

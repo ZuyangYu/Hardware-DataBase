@@ -12,10 +12,14 @@ import hashlib
 import json
 import logging
 import re
-from typing import Callable
+from typing import Any, Callable
 
 from src.core.llm_client import LLMClient
 from src.document_authoring.models import DocumentUnitDraft, DraftAssertion, TypedFieldValue
+from src.document_authoring.pin_function_inference import (
+    infer_pin_function_from_net,
+    resolve_pin_function,
+)
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.writers.provider import WriterRequest, WriterProvider
 
@@ -174,16 +178,32 @@ class LLMManagedWriter:
         self._validator = DocumentValidator()
 
     def generate(self, request: WriterRequest) -> DocumentUnitDraft:
+        connector_draft = _connector_function_draft(request)
+        if connector_draft is not None:
+            logger.info("Using deterministic connector function resolver for unit %s", request.unit_id)
+            return connector_draft
         last_error: str | None = None
         for attempt in range(1, self._MAX_LLM_ATTEMPTS + 1):
             user_content = _build_user_prompt(request, last_error)
-            response = self._client.chat(
-                [
-                    {"role": "system", "content": _WRITER_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                usage_stage="document_authoring",
-            )
+            try:
+                response = self._client.chat(
+                    [
+                        {"role": "system", "content": _WRITER_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    usage_stage="document_authoring",
+                    # A field writer is recoverable: after this bounded wait
+                    # the evidence-grounded deterministic writer can finish
+                    # the field instead of holding the whole Harness lease.
+                    timeout=60,
+                )
+            except Exception as exc:
+                last_error = f"managed writer provider failed: {exc}"
+                logger.warning(
+                    "LLMManagedWriter attempt %d/%d failed for unit %s: %s",
+                    attempt, self._MAX_LLM_ATTEMPTS, request.unit_id, last_error,
+                )
+                continue
             try:
                 draft = self._parse_and_validate(response, request)
                 return draft
@@ -203,6 +223,7 @@ class LLMManagedWriter:
             request.unit_id, last_error,
         )
         return _deterministic_draft(request)
+
 
     def _parse_and_validate(self, response: str, request: WriterRequest) -> DocumentUnitDraft:
         cleaned = _strip_code_fences(response)
@@ -267,6 +288,76 @@ class LLMManagedWriter:
         return draft
 
 
+_CONNECTOR_PIN_TERM_RE = re.compile(
+    r"^(?P<ref>[XJ]\d+[A-Z0-9_]*)[-_./:](?P<pin>[A-Za-z0-9_.]+)$",
+    re.IGNORECASE,
+)
+
+
+def _connector_function_draft(request: WriterRequest) -> DocumentUnitDraft | None:
+    """Build a grounded function draft without asking the LLM to cross-wire rows."""
+
+    field_text = f"{request.unit_label} {request.unit_description}".casefold()
+    if not any(term in field_text for term in ("功能描述", "功能说明", "function", "pin function")):
+        return None
+    target = next(
+        (match for term in request.retrieval_query_terms
+         if (match := _CONNECTOR_PIN_TERM_RE.fullmatch(str(term).strip()))),
+        None,
+    )
+    if target is None:
+        for item in request.evidence:
+            match = re.search(r"(?<![A-Za-z0-9_])([XJ]\d+[A-Z0-9_]*)\s*[-_./:]\s*&?([A-Za-z0-9_.]+)", str(item.get("content") or ""), re.IGNORECASE)
+            if match:
+                target = _CONNECTOR_PIN_TERM_RE.fullmatch(f"{match.group(1)}-{match.group(2)}")
+                if target:
+                    break
+    if target is None:
+        return None
+    refdes, pin_name = target.group("ref").upper(), target.group("pin")
+    net_name = next(
+        (str(term).strip() for term in request.retrieval_query_terms
+         if str(term).strip() and not _CONNECTOR_PIN_TERM_RE.fullmatch(str(term).strip())
+         and infer_pin_function_from_net(str(term).strip()) is not None),
+        "",
+    )
+    if not net_name:
+        target_text = f"{refdes}-{pin_name}".casefold()
+        for item in request.evidence:
+            text = str(item.get("content") or "")
+            if target_text not in re.sub(r"[.&]", "-", text).casefold() and target_text not in text.casefold():
+                continue
+            candidates = re.findall(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]{2,}(?![A-Za-z0-9_])", text.upper())
+            net_name = next((candidate for candidate in candidates if infer_pin_function_from_net(candidate)), "")
+            if net_name:
+                break
+    resolution = resolve_pin_function(
+        refdes=refdes,
+        pin_name=pin_name,
+        net_name=net_name or "connected",
+        evidence=request.evidence,
+    )
+    if not resolution.function:
+        return None
+    evidence_id = next(iter(resolution.evidence_ids), "")
+    if not evidence_id and request.evidence:
+        evidence_id = str(request.evidence[0].get("id") or "")
+    if not evidence_id:
+        return None
+    prefix = f"{refdes}-{pin_name}"
+    net_clause = f" 网络 {net_name}" if net_name else ""
+    content = f"{prefix}{net_clause}：{resolution.function}"
+    synthetic_evidence: list[dict[str, Any]] = [{
+        "id": evidence_id,
+        "content": content,
+        "source_name": "connector-function-resolver",
+        "metadata": {"derived_from": resolution.source},
+        "locator": {},
+        "fact_type": "connector_pin_function",
+    }]
+    return _deterministic_draft(request.model_copy(update={"evidence": synthetic_evidence}))
+
+
 _DRAFT_FIELDS = {
     "unit_id", "run_id", "generated_by", "content", "proposed_value",
     "typed_value", "assertions", "evidence_ids", "proposed_status", "validation_status", "validation_notes",
@@ -305,6 +396,9 @@ Top-level keys (exactly these eleven, no others):
 
 Rules:
 - Copy `unit_id` and `run_id` verbatim from the request; do NOT invent them.
+- Treat `retrieval_query_terms` as the field's focus. Prefer the smallest
+  evidence-grounded value that answers those terms; do not copy a whole table,
+  page dump, or unrelated long evidence chunk into a cell.
 - Every `evidence_ids` entry (top-level and inside assertions) must exist in
   the request `evidence[].id`. Do NOT fabricate ids.
 - `typed_value.evidence_ids` must exist in the request evidence and directly

@@ -519,6 +519,8 @@ export interface EvaluationSummary {
   metric_scores: Record<string, number>;
   metric_counts: Record<string, number>;
   metric_failures: Record<string, number>;
+  scoring_completed_items: number;
+  scoring_total_items: number;
   gate?: EvaluationGateResult | null;
   metadata: Record<string, unknown>;
 }
@@ -559,6 +561,10 @@ export interface EvaluationRunDetail {
   completed_samples: number;
   successful_samples: number;
   failed_samples: number;
+  scoring_completed_groups: number;
+  scoring_total_groups: number;
+  scoring_completed_items: number;
+  scoring_total_items: number;
   current_sample_id: string;
   current_question: string;
   started_at: string;
@@ -602,6 +608,39 @@ export type DocumentAnalysis = {
   status: string;
   units: DocumentUnit[];
   suggestions: DocumentSuggestion[];
+  reason_codes?: string[];
+  auto_activated?: boolean;
+};
+
+export type TemplateReviewUnit = DocumentUnit & {
+  structural_role_hint: string;
+  candidate_for_auto_fill: boolean;
+};
+
+export type TemplateReviewSuggestion = DocumentSuggestion & {
+  target_unit_ids: string[];
+  retrieval_terms: string[];
+  value_shape: 'scalar' | 'repeating_table';
+  overwrite_basis: 'placeholder' | 'sample_value' | null;
+};
+
+export type TemplateAnalysisReview = {
+  analysis_id: string;
+  template_version_id: string;
+  content_hash: string;
+  format: string;
+  status: string;
+  units: TemplateReviewUnit[];
+  suggestions: TemplateReviewSuggestion[];
+  locked_unit_ids: string[];
+  reason_codes: string[];
+};
+
+export type TemplateCorrectionRequest = {
+  expected_content_hash: string;
+  selected_suggestion_ids: string[];
+  locked_unit_ids: string[];
+  comment: string;
 };
 
 export type TemplateVersion = {
@@ -623,6 +662,37 @@ export type GenerationOptions = {
   knowledge_bases: string[];
   templates: TemplateVersion[];
   schemas: DocumentSchema[];
+};
+
+export type GenerationBriefView = {
+  purpose: string;
+  scope: Record<string, unknown>;
+  source_policy: Record<string, unknown>;
+  output_policy: Record<string, unknown>;
+  missing_data_policy: string | null;
+  inference_policy: string | null;
+  confirmed: boolean;
+  confidence: number;
+  updated_at?: string;
+};
+
+export type ClarificationMessage = {
+  message_id: string;
+  role: 'assistant' | 'user' | 'system';
+  content: string;
+  question_id?: string | null;
+  options?: string[];
+  answer?: string | null;
+  reason?: string | null;
+  created_at?: string;
+};
+
+export type GenerationSession = {
+  session_id: string;
+  status: 'needs_clarification' | 'ready_to_generate' | 'generating' | 'completed' | 'cancelled';
+  brief: GenerationBriefView;
+  messages: ClarificationMessage[];
+  work_order_id?: string | null;
 };
 
 export type WorkOrderStage =
@@ -655,6 +725,20 @@ export type HarnessRunView = {
 export type WorkOrderStatus = {
   work_order_id: string;
   status: string;
+  phase?: string;
+  display_label?: string;
+  progress?: number;
+  current_unit?: string;
+  error_code?: string;
+  error_message?: string;
+  retryable?: boolean;
+  next_actions?: string[];
+  can_pause?: boolean;
+  can_resume?: boolean;
+  can_cancel?: boolean;
+  can_delete?: boolean;
+  generation_brief?: Record<string, unknown>;
+  clarification_session_id?: string;
   scope_type: string;
   knowledge_base_name?: string;
   target_format?: string;
