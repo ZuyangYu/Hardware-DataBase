@@ -8,6 +8,7 @@ Managed Writer; both are checked against HarnessToolPolicy first.
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, TypedDict
 
@@ -122,6 +123,44 @@ class AuthoringGraph:
             for unit in semantic_units:
                 requirement = _requirement_for_unit(unit, work_order, snapshot)
                 result.requirements[unit["unit_id"]] = requirement
+
+            if len(semantic_units) > 1 and self.policy.policy.max_parallel_units > 1:
+                unit_results = self._run_parallel_units(
+                    semantic_units, work_order, harness_run, run_manifest, schema,
+                    snapshot, legacy_claims, retrieve,
+                )
+                for unit in semantic_units:
+                    unit_result = unit_results[unit["unit_id"]]
+                    result.requirements.update(unit_result.requirements)
+                    result.outcomes.update(unit_result.outcomes)
+                    result.matrix_rows.extend(unit_result.matrix_rows)
+                    result.retrieval_ledger.extend(unit_result.retrieval_ledger)
+                    result.drafts.extend(unit_result.drafts)
+                    result.unit_statuses.update(unit_result.unit_statuses)
+                    result.issues.extend(unit_result.issues)
+                    state["step_count"] += unit_result.step_count
+                    state["retrieval_round_count"] += unit_result.retrieval_round_count
+                    self.policy.require_step(state["step_count"])
+                    self.policy.require_retrieval_round(state["retrieval_round_count"])
+                    state["current_node"] = "parallel_units"
+                    if self.on_progress is not None:
+                        self.on_progress(state)
+                self._step(state, "validate_cross_unit")
+                self.policy.require_tool("validate_cross_unit")
+                consistency_issues = self.validator.validate_cross_unit_consistency(result.drafts)
+                if consistency_issues:
+                    result.issues.extend(consistency_issues)
+                    conflicted_units = {
+                        unit_id
+                        for issue in consistency_issues
+                        for units in issue["values"].values()
+                        for unit_id in units
+                    }
+                    for unit_id in conflicted_units:
+                        result.unit_statuses[unit_id] = "conflicting"
+                result.step_count = state["step_count"]
+                result.retrieval_round_count = state["retrieval_round_count"]
+                return result
 
             for unit_id, requirement in result.requirements.items():
                 outcome = self._retrieve_with_budget(state, requirement, retrieve)
@@ -269,6 +308,37 @@ class AuthoringGraph:
             for unit in semantic_units:
                 result.unit_statuses.setdefault(unit["unit_id"], "requires_human")
             return result
+
+    def _run_parallel_units(
+        self,
+        semantic_units: list[dict[str, Any]],
+        work_order: DocumentWorkOrder,
+        harness_run: HarnessRun,
+        run_manifest: AuthoringRunManifest,
+        schema: DocumentSchema,
+        snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
+        legacy_claims: list[LegacyTemplateClaim],
+        retrieve: RetrievalProvider,
+    ) -> dict[str, HarnessExecutionResult]:
+        def run_one(unit: dict[str, Any]) -> tuple[str, HarnessExecutionResult]:
+            unit_schema = schema.model_copy(update={
+                "fields": [unit["schema"]] if unit["kind"] == "field" else [],
+                "review_items": [unit["schema"]] if unit["kind"] == "review" else [],
+            })
+            graph = AuthoringGraph(
+                self.policy, self.writer, self.validator,
+                draft_provider=self.draft_provider, rewriter=self.rewriter,
+                reranker=self.reranker, fit_checker=self.fit_checker,
+            )
+            return unit["unit_id"], graph.run(
+                work_order=work_order, harness_run=harness_run, run_manifest=run_manifest,
+                schema=unit_schema, snapshot=snapshot, legacy_claims=legacy_claims,
+                retrieve=retrieve,
+            )
+
+        workers = min(self.policy.policy.max_parallel_units, len(semantic_units))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="authoring-unit") as executor:
+            return dict(executor.map(run_one, semantic_units))
 
     def _retrieve_with_budget(
         self,
