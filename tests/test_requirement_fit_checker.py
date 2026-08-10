@@ -71,3 +71,4 @@ def test_check_uses_requirement_fit_check_usage_stage():
 
     assert client.chat.call_args.kwargs.get("usage_stage") == "requirement_fit_check"
     assert client.chat.call_args.kwargs.get("timeout") == 20
+    assert client.chat.call_args.kwargs.get("rate_limit_max_retries") == 0

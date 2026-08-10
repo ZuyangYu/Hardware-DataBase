@@ -113,3 +113,4 @@ def test_rerank_uses_evidence_rerank_usage_stage():
 
     assert client.chat.call_args.kwargs.get("usage_stage") == "evidence_rerank"
     assert client.chat.call_args.kwargs.get("timeout") == 20
+    assert client.chat.call_args.kwargs.get("rate_limit_max_retries") == 0

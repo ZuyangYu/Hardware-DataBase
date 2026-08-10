@@ -196,6 +196,10 @@ class LLMManagedWriter:
                     # the evidence-grounded deterministic writer can finish
                     # the field instead of holding the whole Harness lease.
                     timeout=60,
+                    # Under concurrent document generation, retrying a 429
+                    # inside one field can monopolize a worker for minutes.
+                    # A validated-evidence fallback is safer and faster.
+                    rate_limit_max_retries=0,
                 )
             except Exception as exc:
                 last_error = f"managed writer provider failed: {exc}"

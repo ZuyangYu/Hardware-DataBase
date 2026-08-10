@@ -391,6 +391,7 @@ class LLMClient:
                 json={"model": model, **payload},
                 timeout=kwargs.get("timeout", config.timeout),
             ),
+            rate_limit_max_retries=kwargs.get("rate_limit_max_retries"),
         )
         data = response.json()
         self._record_usage(config, kwargs.get("usage_stage"), _extract_openai_usage(data.get("usage")))
@@ -789,10 +790,15 @@ class LLMClient:
         self,
         config: LLMClientConfig,
         request_for_model: Callable[[str], Any],
+        *,
+        rate_limit_max_retries: int | None = None,
     ) -> Any:
         last_rate_limit_error: requests.HTTPError | None = None
         last_connection_error: requests.RequestException | None = None
-        retries = max(0, int(config.rate_limit_max_retries))
+        retries = max(
+            0,
+            int(config.rate_limit_max_retries if rate_limit_max_retries is None else rate_limit_max_retries),
+        )
         for model in _model_attempt_order(config):
             for attempt in range(retries + 1):
                 try:

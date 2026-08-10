@@ -93,10 +93,12 @@ def test_llm_transport_or_empty_response_falls_back_to_evidence_copy():
     class EmptyResponseClient:
         calls = 0
         timeouts = []
+        retry_limits = []
 
         def chat(self, _messages, **kwargs):
             self.calls += 1
             self.timeouts.append(kwargs.get("timeout"))
+            self.retry_limits.append(kwargs.get("rate_limit_max_retries"))
             raise RuntimeError("Chat API returned an empty response")
 
     client = EmptyResponseClient()
@@ -104,6 +106,7 @@ def test_llm_transport_or_empty_response_falls_back_to_evidence_copy():
 
     assert client.calls == 2
     assert client.timeouts == [60, 60]
+    assert client.retry_limits == [0, 0]
     assert draft.content == "额定电流为 10A"
     assert draft.validation_status == "pending"
 

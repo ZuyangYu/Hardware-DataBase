@@ -36,6 +36,7 @@ class QueryRewriter:
                 ],
                 usage_stage="query_rewrite",
                 timeout=20,
+                rate_limit_max_retries=0,
             )
         except Exception as exc:
             logger.warning(

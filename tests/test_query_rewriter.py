@@ -25,6 +25,7 @@ def test_rewriter_returns_rewrite_string_from_json():
     assert result == "额定电压 规格参数 电源电压"
     assert client.chat.call_args.kwargs.get("usage_stage") == "query_rewrite"
     assert client.chat.call_args.kwargs.get("timeout") == 20
+    assert client.chat.call_args.kwargs.get("rate_limit_max_retries") == 0
 
 
 def test_rewriter_returns_text_when_not_json():
