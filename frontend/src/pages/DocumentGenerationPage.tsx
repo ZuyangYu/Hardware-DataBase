@@ -24,6 +24,7 @@ import {
   RunStatusPanel,
 } from './documentGenerationWorkbench';
 import {
+  describeHarnessProgress,
   hasDocumentGenerationWritePermission,
   resolveDocumentPhase,
   type DocumentGenerationPhase,
@@ -581,6 +582,9 @@ export function StatusView({
             <p>当前节点：{status.harness_run.current_node ?? '-'}</p>
             <p>Harness 状态：{status.harness_run.status ?? '-'}</p>
             <p>步骤数：{String(status.harness_run.step_count ?? '-')}</p>
+            {describeHarnessProgress(status.harness_run) && (
+              <p>{describeHarnessProgress(status.harness_run)}</p>
+            )}
           </div>
         </details>
       )}

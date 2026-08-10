@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   describeWorkOrderStatus,
+  describeHarnessProgress,
   hasDocumentGenerationWritePermission,
   nextActionsForStatus,
   resolveDocumentPhase,
@@ -44,5 +45,10 @@ describe('document generation status model', () => {
       tone: 'warning',
       action: '可继续生成或取消任务',
     });
+  });
+
+  it('formats completed parallel units for the technical progress panel', () => {
+    expect(describeHarnessProgress({ completed_units: 7, total_units: 66 })).toBe('已完成单元：7 / 66');
+    expect(describeHarnessProgress({ completed_units: 0, total_units: 0 })).toBeNull();
   });
 });

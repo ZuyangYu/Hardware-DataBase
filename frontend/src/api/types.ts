@@ -719,6 +719,8 @@ export type HarnessRunView = {
   run_id?: string;
   status?: string;
   current_node?: string;
+  completed_units?: number;
+  total_units?: number;
   error?: string;
 } & Record<string, unknown>;
 

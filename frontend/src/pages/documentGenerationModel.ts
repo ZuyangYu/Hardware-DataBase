@@ -1,4 +1,4 @@
-import type { WorkOrderStatus } from '../api/types';
+import type { HarnessRunView, WorkOrderStatus } from '../api/types';
 
 export type DocumentGenerationPhase =
   | 'draft'
@@ -96,6 +96,13 @@ export function nextActionsForStatus(status: string): DocumentNextAction[] {
 
 export function hasDocumentGenerationWritePermission(permission: string | null | undefined): boolean {
   return permission === 'write' || permission === 'admin';
+}
+
+export function describeHarnessProgress(run: HarnessRunView | undefined): string | null {
+  const completed = Number(run?.completed_units ?? 0);
+  const total = Number(run?.total_units ?? 0);
+  if (!Number.isFinite(completed) || !Number.isFinite(total) || total < 1) return null;
+  return `已完成单元：${Math.max(0, completed)} / ${total}`;
 }
 
 export function resolveDocumentPhase(status: WorkOrderStatus): DocumentGenerationPhase {
