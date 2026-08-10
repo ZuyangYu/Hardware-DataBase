@@ -196,6 +196,10 @@ class LLMManagedWriter:
                     # the evidence-grounded deterministic writer can finish
                     # the field instead of holding the whole Harness lease.
                     timeout=60,
+                    # One template cell needs a concise, structured value;
+                    # retaining the global multi-thousand-token ceiling lets
+                    # a congested model hold an entire parallel worker open.
+                    max_tokens=512,
                     # Under concurrent document generation, retrying a 429
                     # inside one field can monopolize a worker for minutes.
                     # A validated-evidence fallback is safer and faster.
