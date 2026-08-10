@@ -461,8 +461,8 @@ class HarnessPolicy(BaseModel):
             raise ValueError("harness policy budgets must be positive")
         if self.max_retries < 0:
             raise ValueError("harness policy max_retries cannot be negative")
-        if not 1 <= self.max_parallel_units <= 4:
-            raise ValueError("max_parallel_units must be between 1 and 4")
+        if not 1 <= self.max_parallel_units <= 8:
+            raise ValueError("max_parallel_units must be between 1 and 8")
         if self.max_adaptive_recovery_rounds < 0:
             raise ValueError("harness policy max_adaptive_recovery_rounds cannot be negative")
         if len(self.allowed_tools) != len(set(self.allowed_tools)):

@@ -853,7 +853,7 @@ class AppPipeline:
         ctx: RequestContext,
         work_order_id: str,
         *,
-        max_parallel_units: int = 4,
+        max_parallel_units: int = 8,
     ):
         return self.document_generation.restart_cancelled_knowledge_base_work_order(
             ctx, work_order_id, max_parallel_units=max_parallel_units,

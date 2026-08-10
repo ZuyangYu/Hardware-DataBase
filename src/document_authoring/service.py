@@ -786,7 +786,7 @@ class DocumentGenerationService:
         ctx: RequestContext,
         work_order_id: str,
         *,
-        max_parallel_units: int = 4,
+        max_parallel_units: int = 8,
     ) -> DocumentWorkOrder:
         original = self._order(ctx, work_order_id, "run_deterministic_work_order")
         if original.status != "cancelled" or original.scope_type != "knowledge_base":

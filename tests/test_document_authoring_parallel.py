@@ -29,7 +29,13 @@ def test_harness_policy_defaults_to_three_parallel_units():
     assert policy.max_parallel_units == 3
 
 
-@pytest.mark.parametrize("parallel_units", [0, 5])
+def test_harness_policy_allows_eight_parallel_units_after_capacity_probe():
+    policy = HarnessPolicy(harness_policy_id="parallel", version="1", max_parallel_units=8)
+
+    assert policy.max_parallel_units == 8
+
+
+@pytest.mark.parametrize("parallel_units", [0, 9])
 def test_harness_policy_rejects_parallelism_outside_measured_limit(parallel_units: int):
     with pytest.raises(ValueError, match="max_parallel_units"):
         HarnessPolicy(
