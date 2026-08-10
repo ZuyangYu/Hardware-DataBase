@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy as _copy
 import hashlib
 import logging
+import threading
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -102,13 +103,15 @@ class CrossUnitEvidenceCache:
     def __init__(self, max_reuse_per_unit: int = 5):
         self.max_reuse_per_unit = max_reuse_per_unit
         self._store: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
 
     def ingest(self, evidences: list[Any], unit_id: str) -> None:
-        for evidence in evidences:
-            key = content_hash(evidence)
-            existing = self._store.get(key)
-            if existing is None or evidence.score > existing["evidence"].score:
-                self._store[key] = {"evidence": evidence, "unit_id": unit_id}
+        with self._lock:
+            for evidence in evidences:
+                key = content_hash(evidence)
+                existing = self._store.get(key)
+                if existing is None or evidence.score > existing["evidence"].score:
+                    self._store[key] = {"evidence": evidence, "unit_id": unit_id}
 
     def offer(
         self,
@@ -119,8 +122,10 @@ class CrossUnitEvidenceCache:
         query_terms = {term for term in str(query).lower().split() if term}
         if not query_terms:
             return []
+        with self._lock:
+            entries = list(self._store.values())
         candidates: list[dict[str, Any]] = []
-        for entry in self._store.values():
+        for entry in entries:
             if entry["unit_id"] == unit_id:
                 # Never offer a unit its own previously-retrieved evidence.
                 continue
