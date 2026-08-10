@@ -24,6 +24,7 @@ def test_rewriter_returns_rewrite_string_from_json():
     result = rewriter.rewrite(_requirement())
     assert result == "额定电压 规格参数 电源电压"
     assert client.chat.call_args.kwargs.get("usage_stage") == "query_rewrite"
+    assert client.chat.call_args.kwargs.get("timeout") == 20
 
 
 def test_rewriter_returns_text_when_not_json():

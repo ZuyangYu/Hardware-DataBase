@@ -35,6 +35,7 @@ class QueryRewriter:
                     {"role": "user", "content": prompt},
                 ],
                 usage_stage="query_rewrite",
+                timeout=20,
             )
         except Exception as exc:
             logger.warning(

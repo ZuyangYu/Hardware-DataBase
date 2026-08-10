@@ -70,3 +70,4 @@ def test_check_uses_requirement_fit_check_usage_stage():
     RequirementFitChecker(client=client).check(_draft(), _requirement())
 
     assert client.chat.call_args.kwargs.get("usage_stage") == "requirement_fit_check"
+    assert client.chat.call_args.kwargs.get("timeout") == 20

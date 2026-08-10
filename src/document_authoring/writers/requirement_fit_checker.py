@@ -42,6 +42,7 @@ class RequirementFitChecker:
                     {"role": "user", "content": _build_prompt(draft, requirement)},
                 ],
                 usage_stage="requirement_fit_check",
+                timeout=20,
             )
             return _parse_verdict(response)
         except Exception as exc:
