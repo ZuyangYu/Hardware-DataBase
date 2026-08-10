@@ -73,18 +73,34 @@ class EvaluationService:
         completed_count = len(completed_ids)
         total = len(samples)
         pending_samples = [sample for sample in samples if sample.id not in completed_ids]
-        if before_sample is None and after_sample is None:
-            max_workers = (self.config or EvaluationConfig.from_environment()).max_workers
-        else:
-            max_workers = 1
+        max_workers = (self.config or EvaluationConfig.from_environment()).max_workers
         if max_workers > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(self.answer_runner.collect, sample): sample
-                    for sample in pending_samples
-                }
-                for future in as_completed(futures):
-                    store.append(future.result())
+                pending_iterator = iter(pending_samples)
+                futures = {}
+                submitting = True
+                while submitting or futures:
+                    while submitting and len(futures) < max_workers:
+                        try:
+                            sample = next(pending_iterator)
+                        except StopIteration:
+                            submitting = False
+                            break
+                        if before_sample is not None and not before_sample(
+                            sample, completed_count, total
+                        ):
+                            submitting = False
+                            break
+                        futures[executor.submit(self.answer_runner.collect, sample)] = sample
+                    if not futures:
+                        continue
+                    future = next(as_completed(futures))
+                    snapshot = future.result()
+                    del futures[future]
+                    store.append(snapshot)
+                    completed_count += 1
+                    if after_sample is not None:
+                        after_sample(snapshot, completed_count, total)
             return store.load_all()
         for sample in samples:
             if sample.id in completed_ids:
