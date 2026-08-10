@@ -148,8 +148,11 @@ def test_harness_progress_mirrors_checkpoint_into_run(monkeypatch):
     )
 
     progress_updates = [call.kwargs for call in store.update_harness_run_owned.call_args_list]
-    assert {
-        "current_node": "rerank_evidence",
-        "step_count": 7,
-        "retrieval_round_count": 2,
-    } in progress_updates
+    assert any(
+        update.get("current_node") == "rerank_evidence"
+        and update.get("step_count") == 7
+        and update.get("retrieval_round_count") == 2
+        and update.get("completed_units") == 0
+        and update.get("total_units") == 0
+        for update in progress_updates
+    )
