@@ -1638,6 +1638,8 @@ class AppPipeline:
                 "current_node": latest_run.current_node,
                 "step_count": latest_run.step_count,
                 "retrieval_round_count": latest_run.retrieval_round_count,
+                "completed_units": latest_run.completed_units,
+                "total_units": latest_run.total_units,
                 "retry_count": latest_run.retry_count,
                 "checkpoint_id": latest_run.checkpoint_id,
                 "fencing_token": latest_run.fencing_token,

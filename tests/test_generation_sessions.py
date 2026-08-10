@@ -156,6 +156,36 @@ def test_document_status_exposes_brief_and_actionable_error_fields():
     assert status["next_actions"] == ["replace_template"]
 
 
+def test_document_status_exposes_parallel_completion_counters():
+    pipeline = object.__new__(AppPipeline)
+    order = SimpleNamespace(
+        work_order_id="wo-1", status="retrieving", scope_type="knowledge_base",
+        knowledge_base_name="hardware", project_id=None, target_format="xlsx",
+        unit_statuses={}, validation_report_id=None, run_manifest_id=None,
+        generation_session_id=None, generation_brief={}, error_code=None,
+        error_message=None, retryable=None, next_actions=[],
+    )
+    run = SimpleNamespace(
+        harness_run_id="harness-1", status="running", current_node="parallel_units",
+        step_count=17, retrieval_round_count=5, completed_units=3, total_units=66,
+        retry_count=0, checkpoint_id="checkpoint-1", fencing_token=1, error=None,
+    )
+    store = SimpleNamespace(
+        get_work_order=Mock(return_value=order),
+        list_harness_runs=Mock(return_value=[run]),
+        list_artifacts=Mock(return_value=[]),
+    )
+    pipeline.document_generation = SimpleNamespace(
+        store=store,
+        require_work_order_capability=Mock(),
+    )
+
+    status = pipeline.get_document_run_status("wo-1", SimpleNamespace())
+
+    assert status["harness_run"]["completed_units"] == 3
+    assert status["harness_run"]["total_units"] == 66
+
+
 def test_legacy_work_order_fingerprint_ignores_absent_generation_brief():
     order = DocumentWorkOrder(
         work_order_id="wo-legacy",
