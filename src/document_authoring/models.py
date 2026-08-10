@@ -292,6 +292,7 @@ class DocumentWorkOrder(BaseModel):
     ] = "planned"
     generation_session_id: str | None = None
     generation_brief: dict[str, Any] = Field(default_factory=dict)
+    restart_of_work_order_id: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     retryable: bool | None = None

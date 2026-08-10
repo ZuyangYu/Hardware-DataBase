@@ -56,9 +56,11 @@ Running Python processes cannot safely turn an already executing serial graph
 into a parallel graph.  Its partial in-memory graph state is not checkpointed
 per unit.  After the parallel implementation is deployed and verified, the
 authorized migration is to cancel the active serial HarnessRun and create a
-new run from the same immutable work order, template, policy inputs, and
-knowledge-base source snapshot.  No source or template data is changed; work
-performed only in memory by the serial run is discarded.
+new, traceable work order from the same immutable template and knowledge-base
+source snapshot. The new work order records the cancelled work order as its
+restart origin and receives a newly approved policy whose parallelism is
+frozen at creation. No source or template data is changed; work performed
+only in memory by the serial run is discarded.
 
 ## Error handling and observability
 

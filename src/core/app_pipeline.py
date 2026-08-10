@@ -848,6 +848,17 @@ class AppPipeline:
             **kwargs,
         )
 
+    def restart_cancelled_knowledge_base_document_generation(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        max_parallel_units: int = 4,
+    ):
+        return self.document_generation.restart_cancelled_knowledge_base_work_order(
+            ctx, work_order_id, max_parallel_units=max_parallel_units,
+        )
+
     def prepare_knowledge_base_document_generation(
         self,
         ctx: RequestContext,

@@ -209,33 +209,45 @@ git add src/document_authoring/retriever_registry.py src/document_authoring/harn
 git commit -m "feat: report safe parallel harness progress"
 ```
 
-### Task 4: Verify deployment and migrate the authorized serial work order
+### Task 4: Traceably restart a cancelled work order and migrate the authorized serial work order
 
 **Files:**
 - Test: `tests/test_document_authoring_parallel.py`
 - Modify: `docs/superpowers/specs/2026-08-10-parallel-document-harness-design.md`
+- Modify: `src/document_authoring/models.py`
+- Modify: `src/document_authoring/service.py`
+- Modify: `src/core/app_pipeline.py`
 
 **Interfaces:**
-- Existing `cancel_harness_run` and `submit_knowledge_base_document_generation` APIs remain the migration mechanism.
+- Produces `DocumentWorkOrder.restart_of_work_order_id: str | None`.
+- Produces `restart_cancelled_knowledge_base_document_generation(ctx, work_order_id)`.
 
 - [ ] **Step 1: Write a failing regression test for restart after cancellation**
 
 ```python
-def test_cancelled_work_order_can_start_a_new_parallel_harness_run():
+def test_cancelled_work_order_restarts_as_a_traceable_parallel_work_order():
     cancelled = service.cancel_harness_run(ctx, old_run.harness_run_id)
     assert cancelled.status == "cancelled"
-    service._replace_order(service._order_raw(order.work_order_id), status="planned")
-    artifact = service.run_internal_harness(ctx, order.work_order_id, retrieve=retrieve)
-    assert store.get_run_manifest(artifact.run_id).max_parallel_units == 3
+    replacement = pipeline.restart_cancelled_knowledge_base_document_generation(ctx, order.work_order_id)
+    assert replacement.restart_of_work_order_id == order.work_order_id
+    assert replacement.source_set_snapshot_id == order.source_set_snapshot_id
 ```
 
 - [ ] **Step 2: Run the regression test and adjust the state transition only if it fails for a valid restart path**
 
-Run: `.venv/bin/pytest tests/test_document_authoring_parallel.py::test_cancelled_work_order_can_start_a_new_parallel_harness_run -q`
+Run: `.venv/bin/pytest tests/test_document_authoring_parallel.py::test_cancelled_work_order_restarts_as_a_traceable_parallel_work_order -q`
 
 - [ ] **Step 3: Perform live migration only after all tests pass**
 
-Use the running work order `wo-9edb44c621534c7ba5887b70fb11f7fd`: request cancellation through the authenticated application service, restart the server and worker to load the deployed code, then submit a new HarnessRun with the existing work order's immutable template and KB snapshot.  Verify the new manifest says `max_parallel_units=3` and the status API reports `parallel_units` before reporting the migration to the user.
+Implement the replacement creator by copying immutable template, schema, target
+format, KB name, and source-snapshot identifiers from the cancelled order. It
+must create a new work-order ID and idempotency key, set
+`restart_of_work_order_id`, and invoke `_schema_harness_policy` so the new
+policy freezes parallelism. Use running work order
+`wo-9edb44c621534c7ba5887b70fb11f7fd`: request cancellation through the
+authenticated application service, restart the server and worker to load the
+deployed code, then submit the replacement work order. Verify the new manifest
+says `max_parallel_units=3` and the status API reports `parallel_units`.
 
 - [ ] **Step 4: Run the complete relevant verification suite**
 
