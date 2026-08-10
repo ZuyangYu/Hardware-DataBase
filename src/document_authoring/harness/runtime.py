@@ -91,6 +91,7 @@ class InternalDocumentHarnessRuntime:
             max_steps=policy.max_steps,
             max_retrieval_rounds=policy.max_retrieval_rounds,
             max_retrieval_attempts_per_unit=policy.max_retrieval_attempts_per_unit,
+            max_parallel_units=policy.max_parallel_units,
         )
 
     def execute(

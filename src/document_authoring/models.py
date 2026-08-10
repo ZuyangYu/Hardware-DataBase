@@ -425,6 +425,7 @@ class HarnessPolicy(BaseModel):
     max_retrieval_rounds: int = 2
     max_retrieval_attempts_per_unit: int = 2
     max_units_per_run: int = 20
+    max_parallel_units: int = 3
     max_retries: int = 1
     lease_seconds: int = 60
     max_query_rewrite_rounds: int = 1
@@ -455,6 +456,8 @@ class HarnessPolicy(BaseModel):
             raise ValueError("harness policy budgets must be positive")
         if self.max_retries < 0:
             raise ValueError("harness policy max_retries cannot be negative")
+        if not 1 <= self.max_parallel_units <= 4:
+            raise ValueError("max_parallel_units must be between 1 and 4")
         if self.max_adaptive_recovery_rounds < 0:
             raise ValueError("harness policy max_adaptive_recovery_rounds cannot be negative")
         if len(self.allowed_tools) != len(set(self.allowed_tools)):
@@ -486,6 +489,7 @@ class AuthoringRunManifest(BaseModel):
     max_steps: int | None = None
     max_retrieval_rounds: int | None = None
     max_retrieval_attempts_per_unit: int | None = None
+    max_parallel_units: int | None = None
     validator_version: str = "p2b-1"
     renderer_version: str = "p2a-1"
     created_at: datetime = Field(default_factory=utc_now)
