@@ -340,6 +340,10 @@ class DocumentWorkOrder(BaseModel):
             # added. New session-backed work orders include both fields as
             # immutable generation inputs.
             excluded.update({"generation_session_id", "generation_brief"})
+        if self.restart_of_work_order_id is None:
+            # Preserve fingerprints for work orders stored before traceable
+            # restart lineage was introduced.
+            excluded.add("restart_of_work_order_id")
         expected = content_hash(self.model_dump(mode="json", exclude=excluded))
         if self.input_fingerprint and self.input_fingerprint != expected:
             raise ValueError("work order input_fingerprint does not match frozen inputs")
