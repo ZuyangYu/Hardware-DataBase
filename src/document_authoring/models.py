@@ -512,6 +512,8 @@ class HarnessRun(BaseModel):
     current_node: str = "initialize"
     step_count: int = 0
     retrieval_round_count: int = 0
+    completed_units: int = 0
+    total_units: int = 0
     retry_count: int = 0
     max_retries: int = 0
     lease_owner: str | None = None
@@ -537,6 +539,8 @@ class HarnessCheckpoint(BaseModel):
     current_node: str = "initialize"
     step_count: int = 0
     retrieval_round_count: int = 0
+    completed_units: int = 0
+    total_units: int = 0
     unit_statuses: dict[str, str] = Field(default_factory=dict)
     evidence_matrix_hash: str | None = None
     draft_ids: list[str] = Field(default_factory=list)

@@ -133,6 +133,8 @@ class InternalDocumentHarnessRuntime:
                 "current_node": state["current_node"],
                 "step_count": state["step_count"],
                 "retrieval_round_count": state["retrieval_round_count"],
+                "completed_units": state.get("completed_units", 0),
+                "total_units": state.get("total_units", 0),
                 "updated_at": datetime.now(timezone.utc),
             })
             self.store.heartbeat_harness_run(
@@ -148,6 +150,8 @@ class InternalDocumentHarnessRuntime:
                 current_node=checkpoint.current_node,
                 step_count=checkpoint.step_count,
                 retrieval_round_count=checkpoint.retrieval_round_count,
+                completed_units=checkpoint.completed_units,
+                total_units=checkpoint.total_units,
             )
             self.store.save_harness_checkpoint_owned(checkpoint, lease_owner, running.fencing_token)
 
