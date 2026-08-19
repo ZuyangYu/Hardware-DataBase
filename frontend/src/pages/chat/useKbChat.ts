@@ -76,6 +76,31 @@ function localAssistantMessage(sessionId: number, content: string): MessageView 
   };
 }
 
+/**
+ * randomUUID() is only exposed by browsers in secure contexts. Direct HTTP
+ * access to the development port (for example http://<server>:5175) may not
+ * provide it, so keep the idempotency key compatible with that deployment.
+ */
+function createClientRequestId(): string {
+  const webCrypto = globalThis.crypto;
+  if (typeof webCrypto?.randomUUID === 'function') {
+    return webCrypto.randomUUID();
+  }
+
+  const bytes = new Uint8Array(16);
+  if (typeof webCrypto?.getRandomValues === 'function') {
+    webCrypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export type UseKbChat = ReturnType<typeof useKbChat>;
 
 export function useKbChat(kbName: string) {
@@ -424,7 +449,7 @@ export function useKbChat(kbName: string) {
       // 2. 后端原子写入 user/assistant 占位消息并创建幂等 turn。
       const created = await api.post<TurnStartResponse>(`/api/v1/conversations/${sessionId}/turns`, {
         query,
-        client_request_id: crypto.randomUUID(),
+        client_request_id: createClientRequestId(),
         query_mode: scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
       });
       setMessages((prev) => [...prev, created.user_message]);
