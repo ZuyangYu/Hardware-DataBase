@@ -1,10 +1,12 @@
 # src/core/logger.py
-import contextvars
 import logging
 import os
+import contextvars
 from datetime import datetime
 
 import config.settings
+from src.observability.context import current_span_id, current_trace_id
+from src.observability.logging import StructuredJsonFormatter, TraceContextFilter
 
 os.makedirs(config.settings.LOG_DIR, exist_ok=True)
 
@@ -13,35 +15,35 @@ LOG_FILE = os.path.join(config.settings.LOG_DIR, f"rag_{datetime.now().strftime(
 logger = logging.getLogger("RAG")
 logger.setLevel(getattr(logging, getattr(config.settings, "LOG_LEVEL", "INFO").upper(), logging.INFO))
 logger.propagate = False
-formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(trace_id)s%(message)s")
+formatter = StructuredJsonFormatter()
 
 
-# ---- per-query 关联上下文 ----
-# trace_id 把一次查询的日志行串起来，并与 query_traces.metadata_json 同值，使 DB 行 ↔ 日志行可 join。
-# query_error 让后端在 except 里把真实错误透传给 streamlit 记录层，避免靠 fallback 字符串前缀误判 status。
-_trace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="")
+# query_error 让后端在 except 里把真实错误透传给记录层，避免靠 fallback
+# 字符串前缀误判 status。Trace ID 本身由 OTel 当前 Span 提供。
 _query_error_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("query_error", default=None)
 
 
 class TraceIdFilter(logging.Filter):
-    """给每条日志注入 [trace_id] 前缀；未设置时不加前缀，启动期日志不受影响。"""
+    """Compatibility alias; the canonical implementation reads OTel context."""
 
     def filter(self, record):
-        tid = _trace_id_var.get("")
-        record.trace_id = f"[{tid}] " if tid else ""
+        record.trace_id = current_trace_id()
+        record.span_id = current_span_id()
+        record.service = config.settings.OTEL_SERVICE_NAME
         return True
 
 
 def set_trace_id(trace_id: str) -> None:
-    _trace_id_var.set(str(trace_id or ""))
+    """Deprecated compatibility shim; OTel remains the source of truth."""
+    return None
 
 
 def get_trace_id() -> str:
-    return _trace_id_var.get("")
+    return current_trace_id()
 
 
 def clear_trace_id() -> None:
-    _trace_id_var.set("")
+    return None
 
 
 def set_query_error(message: str) -> None:
@@ -70,13 +72,13 @@ logger.handlers.clear()
 # 控制台处理器
 ch = logging.StreamHandler()
 ch.setFormatter(formatter)
-ch.addFilter(TraceIdFilter())
+ch.addFilter(TraceContextFilter())
 logger.addHandler(ch)
 
 # 文件处理器
 fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
 fh.setFormatter(formatter)
-fh.addFilter(TraceIdFilter())
+fh.addFilter(TraceContextFilter())
 logger.addHandler(fh)
 
 # 导出函数

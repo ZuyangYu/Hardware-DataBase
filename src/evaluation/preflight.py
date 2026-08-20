@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Callable
 from typing import Any
 
 from .answer_runner import _request_context
+from .config import EvaluationConfig
 from .schemas import EvaluationSample
 
 
@@ -41,4 +43,35 @@ class EvaluationPreflight:
             if catalog_sizes[cache_key] == 0:
                 errors.append(f"{sample.id}: no discoverable sources for {sample.kb_name}")
 
+        return errors
+
+    @staticmethod
+    def validate_scoring(config: EvaluationConfig | None = None) -> list[str]:
+        """Validate native RAGAS dependencies and evaluator configuration.
+
+        The Streamlit page performs an early check for convenience, but runs
+        can also be started through the controller/API. Keep this check in the
+        worker path so a dependency or configuration problem becomes an
+        explicit failed run instead of a batch of misleading zero scores.
+        """
+
+        errors: list[str] = []
+        required_modules = ("ragas", "openai", "langchain_openai")
+        missing = [
+            module
+            for module in required_modules
+            if importlib.util.find_spec(module) is None
+        ]
+        if missing:
+            errors.append(
+                "评分依赖缺失："
+                + ", ".join(missing)
+                + "；请运行 uv sync --group eval"
+            )
+
+        try:
+            if config is None:
+                EvaluationConfig.from_environment()
+        except Exception as exc:
+            errors.append(f"评估配置无效：{exc}")
         return errors

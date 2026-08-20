@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+import time
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import TYPE_CHECKING
@@ -27,6 +28,8 @@ from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.writers.managed import ManagedWriter
 from src.projects.models import SourceSetSnapshot
+from src.observability import observe
+from src.observability.metrics import record_authoring_unit
 
 if TYPE_CHECKING:
     from src.document_authoring.writers.evidence_reranker import EvidenceReranker
@@ -172,9 +175,17 @@ class InternalDocumentHarnessRuntime:
             self.store.heartbeat_harness_run(
                 running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
             )
+            unit_started = time.monotonic()
+            unit_status = "completed"
             try:
-                draft = writer.generate(request)
+                with observe.chain(
+                    "hdb.authoring.draft",
+                    operation="draft_ready_unit",
+                    unit_id=request.unit_id,
+                ):
+                    draft = writer.generate(request)
             except Exception as exc:
+                unit_status = "failed"
                 self.store.fail_node_execution_owned(
                     receipt.receipt_id,
                     running.harness_run_id,
@@ -183,6 +194,12 @@ class InternalDocumentHarnessRuntime:
                     {"type": type(exc).__name__, "message": str(exc)},
                 )
                 raise
+            finally:
+                record_authoring_unit(
+                    operation="draft_ready_unit",
+                    status=unit_status,
+                    duration_s=time.monotonic() - unit_started,
+                )
             # Refresh the lease again after the writer call so the commit is
             # safe even if the writer took most of the lease window.
             self.store.heartbeat_harness_run(
@@ -208,9 +225,25 @@ class InternalDocumentHarnessRuntime:
                 reranker=reranker,
                 fit_checker=fit_checker,
             )
+            def observed_retrieve(*args, **kwargs):
+                started = time.monotonic()
+                status = "success"
+                with observe.retriever("hdb.authoring.retrieve", operation="retrieve"):
+                    try:
+                        return retrieve(*args, **kwargs)
+                    except Exception:
+                        status = "failed"
+                        raise
+                    finally:
+                        record_authoring_unit(
+                            operation="retrieve",
+                            status=status,
+                            duration_s=time.monotonic() - started,
+                        )
+
             result = graph.run(
                 work_order=work_order, harness_run=running, run_manifest=manifest, schema=schema, snapshot=snapshot,
-                legacy_claims=legacy_claims, retrieve=retrieve,
+                legacy_claims=legacy_claims, retrieve=observed_retrieve,
             )
         except HarnessLeaseLost:
             # Pause/cancel or a new worker advanced the fencing token. The

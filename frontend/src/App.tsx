@@ -37,6 +37,7 @@ import GovernancePage from './pages/admin/GovernancePage';
 import LogsPage from './pages/admin/LogsPage';
 import ConfigPage from './pages/admin/ConfigPage';
 import EvaluationPage from './pages/admin/EvaluationPage';
+import SystemStatusPage from './pages/admin/SystemStatusPage';
 
 const SIDEBAR_STORAGE_KEY = 'hdb_sidebar_expanded';
 
@@ -264,6 +265,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               element={
                 <AdminRoute auth={auth} requireSysAdmin>
                   <EvaluationPage auth={auth} onLogout={onLogout} />
+                </AdminRoute>
+              }
+            />
+            <Route
+              path="/admin/status"
+              element={
+                <AdminRoute auth={auth}>
+                  <SystemStatusPage auth={auth} onLogout={onLogout} />
                 </AdminRoute>
               }
             />

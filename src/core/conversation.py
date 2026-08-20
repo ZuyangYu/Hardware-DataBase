@@ -50,6 +50,7 @@ class ChatTurn:
     summary: dict
     footer: str
     metrics: dict
+    trace_context: dict[str, str]
     error_message: str
     worker_id: str
     worker_heartbeat_at: str | None
@@ -134,6 +135,7 @@ class ConversationService:
                     summary_json TEXT NOT NULL DEFAULT '{}',
                     footer TEXT NOT NULL DEFAULT '',
                     metrics_json TEXT NOT NULL DEFAULT '{}',
+                    trace_context_json TEXT NOT NULL DEFAULT '{}',
                     error_message TEXT NOT NULL DEFAULT '',
                     worker_id TEXT NOT NULL DEFAULT '',
                     worker_heartbeat_at TEXT,
@@ -175,6 +177,7 @@ class ConversationService:
             self._ensure_column(conn, "chat_turns", "retry_count", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "chat_turns", "query_mode", "TEXT NOT NULL DEFAULT 'fast'")
             self._ensure_column(conn, "chat_turns", "metrics_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "chat_turns", "trace_context_json", "TEXT NOT NULL DEFAULT '{}'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_turns_status_created ON chat_turns(status, created_at)")
             has_users = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
@@ -384,6 +387,7 @@ class ConversationService:
         query: str,
         client_request_id: str | None = None,
         query_mode: str = "fast",
+        trace_context: dict[str, str] | None = None,
     ) -> ChatTurn:
         """Persist one user request and its assistant placeholder atomically.
 
@@ -432,8 +436,8 @@ class ConversationService:
                     """
                     INSERT INTO chat_turns (
                         id, session_id, user_message_id, assistant_message_id, kb_name, query, query_mode,
-                        department_id, kb_id, status, client_request_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                        department_id, kb_id, status, client_request_id, trace_context_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -446,6 +450,7 @@ class ConversationService:
                         session["department_id"],
                         session["kb_id"],
                         request_id,
+                        json.dumps(trace_context or {}, ensure_ascii=False),
                         now,
                     ),
                 )
@@ -516,6 +521,29 @@ class ConversationService:
                 (max(1, min(int(limit), 64)),),
             ).fetchall()
         return [(row_to_turn(row), int(row["user_id"])) for row in rows]
+
+    def pending_turn_queue_state(self) -> tuple[int, float]:
+        """Return durable chat queue depth and oldest-item age in seconds."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS depth, MIN(created_at) AS oldest_at
+                FROM chat_turns
+                WHERE status = 'pending' AND cancel_requested = 0
+                """
+            ).fetchone()
+        depth = int(row["depth"] or 0)
+        oldest_age = 0.0
+        if row["oldest_at"]:
+            try:
+                oldest = datetime.fromisoformat(str(row["oldest_at"]))
+                if oldest.tzinfo is None:
+                    oldest = oldest.replace(tzinfo=timezone.utc)
+                oldest_age = max(0.0, (datetime.now(timezone.utc) - oldest).total_seconds())
+            except (TypeError, ValueError):
+                oldest_age = 0.0
+        return depth, oldest_age
 
     def claim_turn(
         self,
@@ -867,6 +895,12 @@ def row_to_turn(row) -> ChatTurn:
         metrics = json.loads(row["metrics_json"] or "{}") if "metrics_json" in row.keys() else {}
     except (TypeError, ValueError):
         metrics = {}
+    try:
+        trace_context = json.loads(row["trace_context_json"] or "{}") if "trace_context_json" in row.keys() else {}
+    except (TypeError, ValueError):
+        trace_context = {}
+    if not isinstance(trace_context, dict):
+        trace_context = {}
     return ChatTurn(
         id=row["id"],
         session_id=int(row["session_id"]),
@@ -885,6 +919,7 @@ def row_to_turn(row) -> ChatTurn:
         summary=summary if isinstance(summary, dict) else {},
         footer=row["footer"] or "",
         metrics=metrics if isinstance(metrics, dict) else {},
+        trace_context={str(key): str(value) for key, value in trace_context.items() if value},
         error_message=row["error_message"] or "",
         worker_id=row["worker_id"] or "",
         worker_heartbeat_at=row["worker_heartbeat_at"],

@@ -504,6 +504,11 @@ class QueryTraceView(BaseModel):
     error_message: str = ""
     metadata_json: str = ""
     created_at: str = ""
+    otel_trace_id: str = ""
+    otel_span_id: str = ""
+    turn_id: str = ""
+    grafana_trace_url: str = ""
+    phoenix_trace_url: str = ""
 
 
 class QueryStatsResponse(BaseModel):

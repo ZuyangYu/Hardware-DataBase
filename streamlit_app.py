@@ -19,10 +19,17 @@ from src.pipelines.document_rag.schemas import (
     parse_status_view,
 )
 import config.settings
+from src.observability import init_observability
 from src.ui.evaluation_page import render_evaluation_page
 from src.ui.document_generation_page import render_document_generation_page
 
 AUTH_QUERY_PARAM = "hd_session"
+
+init_observability(
+    "hardware-database-streamlit",
+    service_version=config.settings.OBS_SERVICE_VERSION,
+    environment=config.settings.OBS_ENVIRONMENT,
+)
 
 # ==================== 页面配置 ========================
 st.set_page_config(

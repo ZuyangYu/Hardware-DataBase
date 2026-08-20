@@ -14,6 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from src.observability import observe, submit_with_current_context
+from src.observability.metrics import record_authoring
+
 
 @dataclass
 class BackgroundRun:
@@ -35,7 +38,7 @@ class DocumentGenerationWorker:
         run = BackgroundRun(run_id=f"bg-{uuid.uuid4().hex}", work_order_id=work_order_id)
         with self._lock:
             self._runs[run.run_id] = run
-        future = self._executor.submit(self._execute, run.run_id, operation)
+        future = submit_with_current_context(self._executor, self._execute, run.run_id, operation)
         future.add_done_callback(lambda completed: self._complete(run.run_id, completed))
         return run.run_id
 
@@ -46,8 +49,25 @@ class DocumentGenerationWorker:
 
     def _execute(self, run_id: str, operation: Callable[[], Any]) -> Any:
         with self._lock:
-            self._runs[run_id].status = "running"
-        return operation()
+            run = self._runs[run_id]
+            run.status = "running"
+        started = datetime.now(timezone.utc).timestamp()
+        status = "completed"
+        with observe.agent(
+            "hdb.authoring.run",
+            run_id=run_id,
+            work_order_id=run.work_order_id,
+        ):
+            try:
+                return operation()
+            except Exception:
+                status = "failed"
+                raise
+            finally:
+                record_authoring(
+                    status=status,
+                    duration_s=max(0.0, datetime.now(timezone.utc).timestamp() - started),
+                )
 
     def _complete(self, run_id: str, future: Future) -> None:
         with self._lock:

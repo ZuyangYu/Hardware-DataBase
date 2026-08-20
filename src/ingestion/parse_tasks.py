@@ -9,6 +9,7 @@ from typing import Callable
 
 import config.settings
 from src.core.logger import error, log
+from src.observability import thread_with_current_context
 from src.pipelines.document_rag.schemas import (
     TASK_STATUS_CANCELLED,
     TASK_STATUS_COMPLETED,
@@ -217,7 +218,12 @@ class ParseTaskManager:
             if thread and thread.is_alive():
                 return
             self._cancel_events.setdefault(task_id, threading.Event())
-            thread = threading.Thread(target=self._run_task, args=(task_id,), daemon=True)
+            thread = thread_with_current_context(
+                self._run_task,
+                task_id,
+                daemon=True,
+                name=f"parse-task-{task_id[:12]}",
+            )
             self._threads[task_id] = thread
             thread.start()
 

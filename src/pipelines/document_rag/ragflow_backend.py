@@ -17,6 +17,7 @@ from src.core.app_logs import AppLogService
 from src.core.cancellation import QueryCancelled
 from src.core.logger import error, log
 from src.core.source_group_router import route_source_groups
+from src.observability import start_thread_with_current_context
 from src.ingestion.kb_paths import validate_kb_name
 from src.ingestion.source_groups import (
     DESIGN_GROUP,
@@ -516,8 +517,11 @@ class RAGFlowClient:
             finally:
                 completed.set()
 
-        thread = threading.Thread(target=run_request, name="ragflow-retrieval-request", daemon=True)
-        thread.start()
+        start_thread_with_current_context(
+            run_request,
+            name="ragflow-retrieval-request",
+            daemon=True,
+        )
         while not completed.wait(0.05):
             if should_cancel():
                 cancel_event.set()

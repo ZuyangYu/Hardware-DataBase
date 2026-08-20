@@ -318,6 +318,7 @@ class RagasAdapterTests(unittest.TestCase):
                 "selected_evidence_ids": [],
                 "selected_claim_ids": [],
                 "excluded_evidence_ids": [],
+                "scored_contexts": ["aaaa", "bb"],
             },
         )
 
@@ -439,6 +440,31 @@ class RagasAdapterTests(unittest.TestCase):
 
         self.assertEqual(prepared[0].retrieved_contexts, ["document", "circuit"])
         self.assertEqual(diagnostics["q1"]["selected_evidence_ids"], ["d1", "c1"])
+
+    def test_prioritizes_quality_evidence_when_claim_coverage_is_unavailable(self):
+        snapshot = AnswerSnapshot(
+            sample_id="q1",
+            question="Q",
+            kb_name="kb",
+            response="A",
+            retrieved_contexts=["generic helper text", "supported fact"],
+            evidence=[
+                {"id": "fact-1", "content": "supported fact"},
+            ],
+            retrieval_summary={
+                "evidence_quality": [
+                    {"evidence_id": "fact-1", "score": 0.95},
+                ],
+            },
+        )
+
+        prepared, diagnostics = RagasAdapter(
+            _config(max_contexts_per_sample=2, max_context_chars=100)
+        ).prepare_snapshots_for_scoring([snapshot])
+
+        self.assertEqual(prepared[0].retrieved_contexts, ["supported fact", "generic helper text"])
+        self.assertEqual(diagnostics["q1"]["context_selection"], "evidence_quality")
+        self.assertEqual(diagnostics["q1"]["quality_prioritized_evidence_ids"], ["fact-1"])
 
     def test_isolates_metric_failures_to_the_metric_that_raised(self):
         sample = EvaluationSample(id="q1", question="Q", reference_answer="A", kb_name="kb")

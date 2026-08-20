@@ -72,6 +72,7 @@ def write_reports(
                     "response",
                     "scored_response",
                     "retrieved_contexts",
+                    "scored_contexts",
                     "ragas_scoring",
                     *metric_names,
                 ],
@@ -86,6 +87,12 @@ def write_reports(
                     "response": result.response,
                     "scored_response": result.scored_response,
                     "retrieved_contexts": json.dumps(result.retrieved_contexts, ensure_ascii=False),
+                    "scored_contexts": json.dumps(
+                        (result.metadata.get("ragas_scoring", {}) or {}).get(
+                            "scored_contexts", []
+                        ),
+                        ensure_ascii=False,
+                    ),
                     "ragas_scoring": json.dumps(
                         result.metadata.get("ragas_scoring", {}),
                         ensure_ascii=False,
@@ -112,18 +119,24 @@ def write_reports(
         scoring = result.metadata.get("ragas_scoring", {})
         scoring_detail = ""
         if scoring:
+            scored_contexts = scoring.get("scored_contexts") or []
             scoring_detail = (
                 f"<br><strong>评分上下文：</strong>"
                 f"{scoring.get('scored_context_count', 0)}/{scoring.get('original_context_count', 0)} 段，"
                 f"{scoring.get('scored_context_characters', 0)}/{scoring.get('original_context_characters', 0)} 字符；"
                 f"已裁剪：{'是' if scoring.get('contexts_truncated') else '否'}"
             )
+            if isinstance(scored_contexts, list) and scored_contexts:
+                scoring_detail += (
+                    "<br><strong>实际送入评分的上下文：</strong>"
+                    + html.escape(" | ".join(str(item) for item in scored_contexts))
+                )
         detail = (
             f"<strong>问题：</strong>{html.escape(result.question)}<br>"
             f"<strong>参考答案：</strong>{html.escape(result.reference_answer)}<br>"
             f"<strong>实际回答：</strong>{html.escape(result.response)}<br>"
             f"<strong>评分正文：</strong>{html.escape(result.scored_response)}<br>"
-            f"<strong>检索上下文：</strong>{html.escape(' | '.join(result.retrieved_contexts))}"
+            f"<strong>原始检索上下文：</strong>{html.escape(' | '.join(result.retrieved_contexts))}"
         )
         rows.append(f"<tr><td colspan='{len(headers)}'>{detail}{scoring_detail}</td></tr>")
     html_text = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from typing import Any, Callable, Protocol
 
 from .config import EvaluationConfig
 from .schemas import AnswerSnapshot, EvaluationSample, MetricResult
+from src.observability import observe
 
 
 STANDARD_METRICS = {
@@ -23,6 +25,29 @@ RAGAS_RESULT_KEYS = {
     "context_recall": "context_recall",
 }
 CONTEXT_METRICS = {"faithfulness", "context_precision", "context_recall"}
+
+
+def _scoring_query_tokens(text: str) -> set[str]:
+    """Return small, deterministic tokens for scoring-context reranking."""
+
+    value = str(text or "").casefold()
+    tokens = set(re.findall(r"[a-z][a-z0-9_.+-]{1,}|[0-9][a-z0-9_.+-]{1,}", value))
+    for block in re.findall(r"[\u4e00-\u9fff]{2,}", value):
+        tokens.add(block)
+        for size in (2, 3):
+            tokens.update(block[index : index + size] for index in range(len(block) - size + 1))
+    return {token for token in tokens if len(token) >= 2}
+
+
+def _scoring_context_relevance(question: str, content: str) -> tuple[int, bool]:
+    tokens = _scoring_query_tokens(question)
+    searchable = str(content or "").casefold()
+    overlap = sum(token in searchable for token in tokens)
+    boilerplate = any(
+        marker in searchable
+        for marker in ("填写说明", "template instructions", "封面", "cover", "模板变更历史")
+    )
+    return overlap, boilerplate
 
 
 class RagasBackend(Protocol):
@@ -136,10 +161,17 @@ class RagasAdapter:
         for applicable, pairs in grouped.items():
             for metric_name in applicable:
                 records = [self._record(sample, snapshot, metric_name) for sample, snapshot in pairs]
-                try:
-                    scored_rows = backend.score(records, [metric_name])  # type: ignore[union-attr]
-                except Exception as exc:
-                    scored_rows = [{metric_name: exc} for _ in records]
+                with observe.evaluator(
+                    "hdb.evaluation.metric",
+                    metric=metric_name,
+                    stage="score",
+                    sample_count=len(records),
+                ) as observation:
+                    try:
+                        scored_rows = backend.score(records, [metric_name])  # type: ignore[union-attr]
+                    except Exception as exc:
+                        observation.error(exc)
+                        scored_rows = [{metric_name: exc} for _ in records]
                 for index, ((sample, _), row) in enumerate(zip(pairs, scored_rows, strict=True)):
                     value = row.get(metric_name)
                     attempts = 1
@@ -245,13 +277,18 @@ class RagasAdapter:
     def prepare_snapshots_for_scoring(
         self,
         snapshots: list[AnswerSnapshot],
-    ) -> tuple[list[AnswerSnapshot], dict[str, dict[str, int | bool]]]:
+    ) -> tuple[list[AnswerSnapshot], dict[str, dict[str, Any]]]:
         prepared: list[AnswerSnapshot] = []
-        diagnostics: dict[str, dict[str, int | bool | str]] = {}
+        diagnostics: dict[str, dict[str, Any]] = {}
         for snapshot in snapshots:
             contexts, selection = self._scoring_contexts(snapshot)
             bounded_contexts, diagnostic = self._bounded_contexts(contexts)
             diagnostic.update(selection)
+            # Keep the exact initial context window visible in the report. The
+            # snapshot retains the full retrieval result for auditability, but
+            # these are the strings actually sent to RAGAS before any
+            # per-metric retry shrinks the window further.
+            diagnostic["scored_contexts"] = bounded_contexts
             prepared.append(snapshot.model_copy(update={"retrieved_contexts": bounded_contexts}))
             diagnostics[snapshot.sample_id] = diagnostic
         return prepared, diagnostics
@@ -268,6 +305,28 @@ class RagasAdapter:
             for item in (snapshot.retrieval_summary or {}).get("evidence_quality") or []
             if item.get("evidence_id")
         }
+
+        evidence_relevance = {
+            evidence_id: _scoring_context_relevance(
+                snapshot.question,
+                str(evidence_by_id[evidence_id].get("content") or ""),
+            )
+            for evidence_id in evidence_by_id
+        }
+        quality_ids = sorted(
+            (evidence_id for evidence_id in quality_by_id if evidence_id in evidence_by_id),
+            # Drop boilerplate first because historical runs may contain
+            # quality scores produced by the old source-name matching
+            # heuristic. Quality remains the primary ranking signal, with
+            # lexical overlap breaking ties.
+            key=lambda evidence_id: (
+                not evidence_relevance.get(evidence_id, (0, False))[1],
+                quality_by_id[evidence_id],
+                evidence_relevance.get(evidence_id, (0, False))[0],
+                evidence_id,
+            ),
+            reverse=True,
+        )
         selected_ids: list[str] = []
         selected_claim_ids: list[str] = []
         candidate_ids: list[str] = []
@@ -310,7 +369,32 @@ class RagasAdapter:
                 if selected_id not in selected_ids:
                     selected_ids.append(selected_id)
 
-        if not selected_ids:
+        # ``retrieved_contexts`` is kept in the retriever's original order for
+        # auditability, but that order often starts with generic helper text.
+        # When evidence quality is available, put the highest-quality evidence
+        # ahead of that fallback list so the bounded RAGAS input does not drop
+        # the facts that retrieval already identified as useful.
+        prioritized_ids: list[str] = []
+        if selected_ids and quality_ids:
+            claim_relevance = max(
+                evidence_relevance.get(evidence_id, (0, False))[0]
+                for evidence_id in selected_ids
+            )
+            # A stale claim ledger can contain a technically valid but
+            # question-irrelevant topology row. Let a clearly more relevant
+            # high-quality document row lead the bounded context window, while
+            # preserving claim evidence when relevance is tied or unavailable.
+            prioritized_ids.extend(
+                evidence_id
+                for evidence_id in quality_ids
+                if evidence_relevance.get(evidence_id, (0, False))[0] > claim_relevance
+            )
+        prioritized_ids.extend(selected_ids)
+        for evidence_id in quality_ids:
+            if evidence_id not in prioritized_ids:
+                prioritized_ids.append(evidence_id)
+
+        if not prioritized_ids:
             return list(snapshot.retrieved_contexts), {
                 "context_selection": "original_order",
                 "selected_evidence_ids": [],
@@ -320,7 +404,7 @@ class RagasAdapter:
 
         selected: list[str] = []
         seen: set[str] = set()
-        for evidence_id in selected_ids:
+        for evidence_id in prioritized_ids:
             content = str(evidence_by_id[evidence_id].get("content") or "")
             if content and content not in seen:
                 selected.append(content)
@@ -330,10 +414,17 @@ class RagasAdapter:
                 selected.append(context)
                 seen.add(context)
         return selected, {
-            "context_selection": "claim_coverage",
+            "context_selection": (
+                "claim_coverage+evidence_quality"
+                if selected_ids and quality_ids
+                else "evidence_quality"
+                if quality_ids
+                else "claim_coverage"
+            ),
             "selected_evidence_ids": selected_ids,
             "selected_claim_ids": selected_claim_ids,
             "excluded_evidence_ids": sorted(set(candidate_ids) - set(selected_ids)),
+            "quality_prioritized_evidence_ids": quality_ids,
         }
 
     def _retry_with_smaller_context(

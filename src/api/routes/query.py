@@ -20,6 +20,14 @@ from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
 from src.core.conversation import ChatMessage, ChatTurn, ConversationService
 from src.core.llm_client import LLMClient
+from src.observability import (
+    current_trace_identity,
+    extract_trace_context,
+    inject_trace_context,
+    observe,
+    start_thread_with_current_context,
+)
+from src.observability.metrics import record_chat_turn
 
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
@@ -158,6 +166,19 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     turn = conv.claim_turn(user.id, turn_id, worker_id)
     if turn is None:
         return
+    turn_observation = observe.chain(
+        "hdb.chat.turn",
+        context=extract_trace_context(turn.trace_context),
+        **{
+            "hdb.turn.id": turn.id,
+            "hdb.session.id": str(turn.session_id),
+            "session.id": str(turn.session_id),
+            "user.id": str(user.id),
+            "hdb.query.mode": turn.query_mode,
+            "hdb.query.source": "durable_worker",
+        },
+    ).start()
+    turn_observation.set_input(turn.query, content_kind="query")
     cancel = _turn_cancel_signal(turn_id)
     heartbeat_stop = threading.Event()
     heartbeat_interval = max(2, min(30, config.settings.CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS))
@@ -166,18 +187,19 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         while not heartbeat_stop.wait(heartbeat_interval):
             conv.touch_turn_worker(turn_id, worker_id)
 
-    heartbeat_thread = threading.Thread(
-        target=heartbeat_loop,
+    heartbeat_thread = start_thread_with_current_context(
+        heartbeat_loop,
         daemon=True,
         name=f"turn-heartbeat-{turn_id[:8]}",
     )
-    heartbeat_thread.start()
     start = time.monotonic()
     started_at = datetime.now(timezone.utc)
     answer_parts: list[str] = []
     first_token_ms: int | None = None
     stage_started: dict[str, float] = {}
     stage_durations_ms: dict[str, list[int]] = {}
+    token_usage_summary = None
+    outcome_status = "failed"
 
     def cancelled() -> bool:
         return cancel.is_set() or conv.is_turn_cancel_requested(turn_id)
@@ -235,6 +257,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                     answer_parts.append(delta)
                     emit("delta", {"text": delta})
             summary = {"retriever_type": "direct", "final_top_k": 0, "evidence": []}
+            token_usage_summary = llm.get_usage_summary()
         else:
             if pipeline is None:
                 raise RuntimeError("query pipeline is unavailable")
@@ -265,11 +288,13 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                         close()
             summary = pipeline.get_last_retrieval_summary() or {}
             footer = pipeline.get_last_agent_footer() or ""
+            token_usage_summary = pipeline.get_last_token_usage_summary()
 
         if cancelled():
             emit("error", {"message": "已停止生成", "cancelled": True})
             conv.fail_turn(user.id, turn_id, "已停止生成", cancelled=True)
             emit("turn_end", {"status": "cancelled"})
+            outcome_status = "cancelled"
             return
 
         answer = "".join(answer_parts)
@@ -277,6 +302,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             raise RuntimeError("未生成回答")
         summary = {**summary, "query_mode": turn.query_mode}
         completed = conv.complete_turn(user.id, turn_id, answer, summary, footer, metrics=metrics(summary=summary))
+        turn_observation.set_output(answer, content_kind="llm")
         emit_stage("generate", "生成回答", "done", "最终回答已生成")
         emit(
             "done",
@@ -288,6 +314,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             },
         )
         emit("turn_end", {"status": "completed"})
+        outcome_status = "completed"
         _record_query_trace(
             user=user,
             kb_name="" if turn.kb_name == GENERAL_CHAT_KB_NAME else turn.kb_name,
@@ -296,11 +323,14 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             summary=summary,
             latency_ms=int((time.monotonic() - start) * 1000),
             status="success",
+            turn_id=turn_id,
         )
     except Exception as exc:
+        turn_observation.error(exc)
         if cancelled():
             emit("error", {"message": "已停止生成", "cancelled": True})
             conv.fail_turn(user.id, turn_id, "已停止生成", cancelled=True)
+            outcome_status = "cancelled"
         else:
             conv.fail_turn(user.id, turn_id, str(exc))
             emit("error", {"message": str(exc)})
@@ -313,11 +343,46 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 latency_ms=int((time.monotonic() - start) * 1000),
                 status="failed",
                 error_message=str(exc),
+                turn_id=turn_id,
             )
         emit("turn_end", {"status": "failed"})
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1)
+        duration_s = max(0.0, time.monotonic() - start)
+        queue_s = max(0.0, (started_at - _parse_iso_time(turn.created_at)).total_seconds())
+        record_chat_turn(
+            status=outcome_status,
+            mode=turn.query_mode,
+            duration_s=duration_s,
+            queue_s=queue_s,
+            ttft_s=(first_token_ms / 1000.0) if first_token_ms is not None else None,
+        )
+        turn_observation.set("hdb.chat.status", outcome_status)
+        turn_observation.set("hdb.chat.latency_ms", int(duration_s * 1000))
+        turn_observation.set("hdb.chat.queue_ms", int(queue_s * 1000))
+        turn_observation.set_token_usage(token_usage_summary)
+        if first_token_ms is not None:
+            turn_observation.set("hdb.chat.ttft_ms", int(first_token_ms))
+        turn_observation.set("hdb.retrieval.rounds", int((summary or {}).get("retrieval_rounds") or 0))
+        turn_observation.set("hdb.retrieval.calls", len((summary or {}).get("tool_diagnostics") or []))
+        turn_observation.set(
+            "hdb.retrieval.hits",
+            sum(int(item.get("hit_count") or 0) for item in (summary or {}).get("tool_diagnostics") or []),
+        )
+        turn_observation.set("hdb.retrieval.final_top_k", int((summary or {}).get("final_top_k") or 0))
+        turn_observation.set("hdb.retriever.type", (summary or {}).get("retriever_type") or "direct")
+        turn_observation.set("hdb.evidence.count", len((summary or {}).get("evidence") or []))
+        if (summary or {}).get("rewritten_queries"):
+            turn_observation.set(
+                "hdb.query.rewritten",
+                json.dumps((summary or {}).get("rewritten_queries"), ensure_ascii=False),
+            )
+        if answer_parts and outcome_status != "completed":
+            turn_observation.set_output("".join(answer_parts), content_kind="llm")
+        turn_observation.outcome(outcome_status)
+        turn_observation.set("hdb.agent.retrieval_round", int((summary or {}).get("retrieval_rounds") or 0))
+        turn_observation.end()
         _clear_turn_cancel_signal(turn_id)
 
 
@@ -337,7 +402,14 @@ def create_turn(
     if session.kb_name != GENERAL_CHAT_KB_NAME and not ctx.has_kb_permission(session.kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
     query_mode = "fast" if session.kb_name == GENERAL_CHAT_KB_NAME else "deep"
-    turn = conv.create_turn(user.id, session_id, body.query, body.client_request_id, query_mode)
+    turn = conv.create_turn(
+        user.id,
+        session_id,
+        body.query,
+        body.client_request_id,
+        query_mode,
+        trace_context=inject_trace_context(),
+    )
     messages = conv.list_messages(user.id, session_id)
     user_message = next((message for message in messages if message.id == turn.user_message_id), None)
     if user_message is None:
@@ -366,12 +438,15 @@ def start_turn(
     # production never enters this branch and always relies on the worker.
     if request.app.dependency_overrides.get(get_pipeline) is not None and turn.status in {"pending", "streaming", "cancelling"}:
         pipeline = None if turn.kb_name == GENERAL_CHAT_KB_NAME else _resolve_pipeline(request)
-        threading.Thread(
-            target=_run_turn,
-            kwargs={"turn_id": turn.id, "user": user, "ctx": ctx, "pipeline": pipeline},
+        start_thread_with_current_context(
+            _run_turn,
+            turn_id=turn.id,
+            user=user,
+            ctx=ctx,
+            pipeline=pipeline,
             daemon=True,
             name=f"test-chat-turn-{turn.id[:8]}",
-        ).start()
+        )
     return _turn_view(turn)
 
 
@@ -526,6 +601,17 @@ async def query(
         start = time.monotonic()
         summary: dict = {}
         gen = None
+        observation = observe.chain(
+            "hdb.chat.turn",
+            **{
+                "hdb.session.id": body.thread_id,
+                "session.id": body.thread_id,
+                "hdb.query.mode": "deep",
+                "hdb.query.source": "legacy_api",
+            },
+        ).start()
+        observation.set_input(body.query, content_kind="query")
+        outcome_status = "failed"
         try:
             answer_parts: list[str] = []
             gen = _query_generator(
@@ -547,6 +633,7 @@ async def query(
                     _put(("delta", {"text": chunk}))
             summary = pipeline.get_last_retrieval_summary() or {}
             answer = "".join(answer_parts)
+            observation.set_output(answer, content_kind="llm")
             if not cancel.is_set():
                 q.put(
                     (
@@ -563,6 +650,9 @@ async def query(
             # (same helper Streamlit uses) instead of hardcoding "success" --
             # a failed/partial/no-evidence response is then logged accurately.
             trace_status, trace_error = query_trace_status(answer, summary)
+            outcome_status = "cancelled" if cancel.is_set() else (
+                "completed" if trace_status == "success" else trace_status
+            )
             _record_query_trace(
                 user=user,
                 kb_name=body.kb_name,
@@ -574,6 +664,7 @@ async def query(
                 error_message=("client disconnected" if cancel.is_set() else trace_error),
             )
         except Exception as exc:  # fail-open: surface the error as an SSE event
+            observation.error(exc)
             if not cancel.is_set():
                 _put(_stage("generate", "生成回答", "error", "答案生成失败"))
                 q.put(("error", {"message": str(exc)}))
@@ -597,11 +688,35 @@ async def query(
                         close()
                     except Exception:
                         pass
+            duration_ms = int((time.monotonic() - start) * 1000)
+            observation.set("hdb.chat.status", outcome_status)
+            observation.set("hdb.chat.latency_ms", duration_ms)
+            observation.set("hdb.chat.queue_ms", 0)
+            observation.set_token_usage(pipeline.get_last_token_usage_summary())
+            observation.set("hdb.retrieval.rounds", int(summary.get("retrieval_rounds") or 0))
+            diagnostics = summary.get("tool_diagnostics") or []
+            observation.set("hdb.retrieval.calls", len(diagnostics))
+            observation.set(
+                "hdb.retrieval.hits",
+                sum(int(item.get("hit_count") or 0) for item in diagnostics),
+            )
+            observation.set("hdb.retrieval.final_top_k", int(summary.get("final_top_k") or 0))
+            observation.set("hdb.retriever.type", summary.get("retriever_type") or "multi_source_agent")
+            observation.set("hdb.retrieval.status", summary.get("status") or "")
+            observation.set("hdb.evidence.count", len(summary.get("evidence") or []))
+            if summary.get("rewritten_queries"):
+                observation.set(
+                    "hdb.query.rewritten",
+                    json.dumps(summary.get("rewritten_queries"), ensure_ascii=False),
+                )
+            if answer_parts and outcome_status != "completed":
+                observation.set_output("".join(answer_parts), content_kind="llm")
+            observation.outcome(outcome_status)
+            observation.end()
             q.put(sentinel)
 
     async def event_stream():
-        thread = threading.Thread(target=producer, daemon=True)
-        thread.start()
+        thread = start_thread_with_current_context(producer, daemon=True, name="api-query-producer")
         try:
             while True:
                 item = await run_in_threadpool(q.get)
@@ -686,6 +801,18 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
         start = time.monotonic()
         answer_parts: list[str] = []
         usage_summary = None
+        observation = observe.chain(
+            "hdb.chat.turn",
+            **{
+                "hdb.session.id": body.thread_id,
+                "session.id": body.thread_id,
+                "hdb.query.mode": "fast",
+                "hdb.query.source": "direct_api",
+                "hdb.retriever.type": "direct",
+            },
+        ).start()
+        observation.set_input(body.query, content_kind="query")
+        outcome_status = "failed"
         try:
             llm = LLMClient()
             for delta in llm.stream_chat(_general_messages(body.history, body.query), usage_stage="general_chat"):
@@ -697,6 +824,7 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
             usage_summary = llm.get_usage_summary()
             answer = "".join(answer_parts)
             summary = {"retriever_type": "direct", "final_top_k": 0, "evidence": []}
+            observation.set_output(answer, content_kind="llm")
             if not cancel.is_set():
                 _put(
                     (
@@ -719,7 +847,9 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
                 status="failed" if cancel.is_set() else "success",
                 error_message="client disconnected" if cancel.is_set() else "",
             )
+            outcome_status = "cancelled" if cancel.is_set() else "completed"
         except Exception as exc:
+            observation.error(exc)
             if not cancel.is_set():
                 _put(_stage("generate", "生成通用回答", "error", "通用回答生成失败"))
                 q.put(("error", {"message": str(exc)}))
@@ -734,11 +864,21 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
                 error_message=str(exc),
             )
         finally:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            observation.set("hdb.chat.status", outcome_status)
+            observation.set("hdb.chat.latency_ms", duration_ms)
+            observation.set("hdb.chat.queue_ms", 0)
+            observation.set("hdb.retrieval.rounds", 0)
+            observation.set("hdb.retrieval.calls", 0)
+            observation.set("hdb.retrieval.hits", 0)
+            observation.set("hdb.evidence.count", 0)
+            observation.set_token_usage(usage_summary)
+            observation.outcome(outcome_status)
+            observation.end()
             q.put(sentinel)
 
     def iterator():
-        thread = threading.Thread(target=producer, daemon=True)
-        thread.start()
+        thread = start_thread_with_current_context(producer, daemon=True, name="api-direct-query-producer")
         try:
             while True:
                 item = q.get()
@@ -769,6 +909,7 @@ def _record_query_trace(
     latency_ms: int,
     status: str,
     error_message: str = "",
+    turn_id: str = "",
 ) -> None:
     """Persist a query trace + retrieved evidence, fail-soft. Mirrors the
     Streamlit UI's post-stream logging so the API path is equally observable
@@ -776,6 +917,7 @@ def _record_query_trace(
     try:
         log_service = AppLogService()
         rewritten_query = " | ".join(summary.get("rewritten_queries") or [])[:500]
+        trace_identity = current_trace_identity()
         trace_id = log_service.record_query_trace(
             user=user,
             kb_name=kb_name,
@@ -788,6 +930,9 @@ def _record_query_trace(
             status=status,
             error_message=error_message,
             metadata={"thread_id": thread_id, "source": "api"},
+            otel_trace_id=trace_identity.trace_id,
+            otel_span_id=trace_identity.span_id,
+            turn_id=turn_id,
         )
         log_service.record_retrieved_evidence(trace_id, summary.get("evidence") or [])
     except Exception as trace_error:

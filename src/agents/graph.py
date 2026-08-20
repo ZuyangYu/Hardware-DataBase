@@ -30,6 +30,8 @@ from src.circuit.question_analysis import analyze_question as analyze_circuit_qu
 from src.core.cancellation import QueryCancelled
 from src.agents.query_tokens import _HARDWARE_TERMS
 from src.ingestion.parser_registry import PARSER_REGISTRY
+from src.observability import observe, submit_with_current_context
+from src.observability.metrics import record_retrieval
 from src.agents.prompts import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
     PLAN_NEXT_RETRIEVAL_SYSTEM_PROMPT,
@@ -1838,7 +1840,21 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
         query = call.get("query") or state.get("user_query", "")
         filters = call.get("filters") or {}
         top_k = int(call.get("top_k") or 5)
+        tool_name = str(call.get("tool_name") or "unknown")
+        retriever_name = {
+            "document_rag": "ragflow",
+            "spreadsheet_semantic": "spreadsheet",
+            "spreadsheet_cell": "spreadsheet",
+            "spreadsheet_profile": "spreadsheet",
+            "circuit_query": "circuit",
+        }.get(tool_name, tool_name)
         if tool is None:
+            record_retrieval(
+                retriever=retriever_name,
+                status="failed",
+                duration_s=max(0.0, time.monotonic() - started),
+                hit_count=0,
+            )
             return (
                 {
                     "tool_name": call.get("tool_name"),
@@ -1856,7 +1872,39 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
             run_kwargs = {"top_k": top_k, "filters": filters}
             if cancel_check is not None and getattr(tool, "supports_cancellation", False):
                 run_kwargs["should_cancel"] = cancel_check
-            hits = tool.run(query, state["kb_name"], state.get("_ctx_obj"), **run_kwargs)
+            with observe.retriever(
+                f"hdb.retrieve.{retriever_name}",
+                retriever=retriever_name,
+                **{
+                    "hdb.retrieval.round": round_no,
+                    "hdb.retrieval.top_k": top_k,
+                },
+            ) as observation:
+                observation.set_input(query, content_kind="query")
+                hits = tool.run(query, state["kb_name"], state.get("_ctx_obj"), **run_kwargs)
+                observation.hit_count(len(hits))
+                observation.set("hdb.retrieval.status", "success")
+                observation.set_content(
+                    "retrieval.documents",
+                    [
+                        {
+                            "id": getattr(hit, "id", ""),
+                            "source_name": getattr(hit, "source_name", ""),
+                            "score": getattr(hit, "score", None),
+                            "locator": getattr(hit, "locator", {}) or {},
+                            "content_kind": getattr(hit, "content_kind", ""),
+                            "content": getattr(hit, "content", "") or "",
+                        }
+                        for hit in hits
+                    ],
+                    content_kind="evidence",
+                )
+            record_retrieval(
+                retriever=retriever_name,
+                status="success",
+                duration_s=max(0.0, time.monotonic() - started),
+                hit_count=len(hits),
+            )
             return (
                 {
                     "tool_name": call.get("tool_name"),
@@ -1871,8 +1919,20 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                 None,
             )
         except QueryCancelled:
+            record_retrieval(
+                retriever=retriever_name,
+                status="cancelled",
+                duration_s=max(0.0, time.monotonic() - started),
+                hit_count=0,
+            )
             raise
         except Exception as exc:
+            record_retrieval(
+                retriever=retriever_name,
+                status="failed",
+                duration_s=max(0.0, time.monotonic() - started),
+                hit_count=0,
+            )
             return (
                 {
                     "tool_name": call.get("tool_name"),
@@ -1902,7 +1962,7 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                         "query": call.get("query", ""),
                     }
                 )
-                futures.append(executor.submit(_run_call, call))
+                futures.append(submit_with_current_context(executor, _run_call, call))
             for future in as_completed(futures):
                 diagnostic, hits, failure = future.result()
                 diagnostics.append(diagnostic)
@@ -1936,7 +1996,40 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                 run_kwargs = {"top_k": call["top_k"], "filters": {}}
                 if cancel_check is not None and getattr(tool, "supports_cancellation", False):
                     run_kwargs["should_cancel"] = cancel_check
-                hits = tool.run(call["query"], state["kb_name"], state.get("_ctx_obj"), **run_kwargs)
+                with observe.retriever(
+                    "hdb.retrieve.ragflow.supplemental",
+                    retriever="ragflow",
+                    **{
+                        "hdb.retrieval.round": round_no,
+                        "hdb.retrieval.top_k": call["top_k"],
+                    },
+                ) as observation:
+                    observation.set_input(call["query"], content_kind="query")
+                    hits = tool.run(call["query"], state["kb_name"], state.get("_ctx_obj"), **run_kwargs)
+                    observation.hit_count(len(hits))
+                    observation.set("hdb.retrieval.status", "success")
+                    observation.set_content(
+                        "retrieval.documents",
+                        [
+                            {
+                                "id": getattr(hit, "id", ""),
+                                "source_name": getattr(hit, "source_name", ""),
+                                "score": getattr(hit, "score", None),
+                                "locator": getattr(hit, "locator", {}) or {},
+                                "content_kind": getattr(hit, "content_kind", ""),
+                                "content": getattr(hit, "content", "") or "",
+                            }
+                            for hit in hits
+                        ],
+                        content_kind="evidence",
+                    )
+                record_retrieval(
+                    retriever="ragflow",
+                    status="success",
+                    duration_s=max(0.0, time.monotonic() - started),
+                    hit_count=len(hits),
+                    supplemental=True,
+                )
                 for hit in hits:
                     payload = hit.model_dump()
                     evidence_kind = "datasheet_claim" if _is_matching_datasheet_capability(
@@ -1962,8 +2055,22 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                     }
                 )
             except QueryCancelled:
+                record_retrieval(
+                    retriever="ragflow",
+                    status="cancelled",
+                    duration_s=max(0.0, time.monotonic() - started),
+                    hit_count=0,
+                    supplemental=True,
+                )
                 raise
             except Exception as exc:
+                record_retrieval(
+                    retriever="ragflow",
+                    status="failed",
+                    duration_s=max(0.0, time.monotonic() - started),
+                    hit_count=0,
+                    supplemental=True,
+                )
                 diagnostics.append(
                     {
                         "tool_name": "document_rag",
@@ -2266,6 +2373,23 @@ def _tokens_for_scoring(text: str) -> list[str]:
 
 
 def _score_evidence_quality(state: AgentState, evidence: list[dict[str, Any]]) -> dict[str, EvidenceQuality]:
+    """Score evidence by query relevance, source scope, and evidence type.
+
+    Retriever scores are not comparable across tools in this application.  In
+    particular, spreadsheet-cell retrieval historically returned ``1.0`` for
+    every hit, which made a generic template instruction look as useful as a
+    row containing the requested part number.  Keep the score deterministic
+    and make token overlap depend on the evidence body, not its file name.
+    """
+
+    boilerplate_markers = (
+        "填写说明",
+        "template instructions",
+        "封面",
+        "cover",
+        "模板变更历史",
+        "template change history",
+    )
     analysis = state.get("question_analysis") or {}
     planned_sources = {
         str(item.get("source_name") or "")
@@ -2276,20 +2400,21 @@ def _score_evidence_quality(state: AgentState, evidence: list[dict[str, Any]]) -
     for index, item in enumerate(evidence, start=1):
         evidence_id = str(item.get("id") or f"evidence:{index}")
         source_name = str(item.get("source_name") or "")
-        content = f"{item.get('content', '')} {source_name}".casefold()
+        content = str(item.get("content") or "").casefold()
         reasons = []
         matched_sub_questions = []
-        token_overlap = 0
+        matched_tokens: set[str] = set()
         evidence_type_match = False
         for sq in analysis.get("sub_questions") or []:
             tokens = _tokens_for_scoring(sq.get("question", ""))
             hits = sum(1 for token in tokens if token in content)
             if hits:
                 matched_sub_questions.append(sq.get("id", ""))
-                token_overlap += hits
-            expected = set(sq.get("expected_evidence") or [])
-            if not expected or item.get("content_kind") in expected:
-                evidence_type_match = True
+                matched_tokens.update(token for token in tokens if token in content)
+                expected = set(sq.get("expected_evidence") or [])
+                if not expected or item.get("content_kind") in expected:
+                    evidence_type_match = True
+        token_overlap = len(matched_tokens)
         source_scope_match = (
             not planned_sources
             or source_name in planned_sources
@@ -2301,13 +2426,20 @@ def _score_evidence_quality(state: AgentState, evidence: list[dict[str, Any]]) -
             reasons.append("evidence_type_matches_question")
         if token_overlap:
             reasons.append("question_tokens_overlap")
+        is_boilerplate = any(marker in content for marker in boilerplate_markers)
+        if is_boilerplate:
+            reasons.append("template_boilerplate_penalty")
         base_score = float(item.get("score") or 0.0)
         quality_score = min(
             1.0,
-            (0.35 if source_scope_match else 0.0)
-            + (0.25 if evidence_type_match else 0.0)
-            + min(0.25, token_overlap * 0.05)
-            + min(0.15, max(0.0, base_score) * 0.15),
+            max(
+                0.0,
+                (0.25 if source_scope_match else 0.0)
+                + (0.15 if evidence_type_match else 0.0)
+                + min(0.50, token_overlap * 0.10)
+                + min(0.10, max(0.0, base_score) * 0.10)
+                - (0.25 if is_boilerplate and token_overlap == 0 else 0.10 if is_boilerplate else 0.0),
+            ),
         )
         quality_by_id[evidence_id] = EvidenceQuality(
             evidence_id=evidence_id,

@@ -1,0 +1,50 @@
+groups:
+  - name: hardware-database-slo
+    rules:
+      - alert: HdbChatErrorRateHigh
+        expr: sum(rate(hdb_chat_turns_total{status!="completed"}[5m])) / clamp_min(sum(rate(hdb_chat_turns_total[5m])), 1) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hardware DataBase chat error rate is above 10%"
+
+      - alert: HdbChatLatencyP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(hdb_chat_turn_duration_seconds_bucket[5m]))) > 8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hardware DataBase chat p95 latency is above 8 seconds"
+
+      - alert: HdbQueueBacklogHigh
+        expr: max(hdb_queue_depth) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hardware DataBase durable queue backlog is above 100"
+
+      - alert: HdbWorkerFailures
+        expr: sum(rate(hdb_worker_task_failed_total[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hardware DataBase worker failures are occurring"
+
+      - alert: HdbRetrievalEmptyRateHigh
+        expr: sum(rate(hdb_retrieval_empty_total[10m])) / clamp_min(sum(rate(hdb_retrieval_calls_total[10m])), 1) > 0.30
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Retrieval empty-result rate is above 30%"
+
+      - alert: HdbLlmLatencyP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(hdb_llm_duration_seconds_bucket[5m]))) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM p95 latency is above 20 seconds"

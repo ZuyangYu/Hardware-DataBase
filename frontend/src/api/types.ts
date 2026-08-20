@@ -432,6 +432,11 @@ export interface QueryTraceView {
   error_message: string;
   metadata_json: string;
   created_at: string;
+  otel_trace_id: string;
+  otel_span_id: string;
+  turn_id: string;
+  grafana_trace_url: string;
+  phoenix_trace_url: string;
 }
 
 export interface QueryStatsResponse {

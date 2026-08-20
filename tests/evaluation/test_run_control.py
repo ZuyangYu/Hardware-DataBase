@@ -230,9 +230,13 @@ class FakeEvaluationService:
         self.score_control = None
         self.raise_after_score_checkpoint = False
         self.preflight_errors: list[str] = []
+        self.scoring_preflight_errors: list[str] = []
 
     def preflight_online(self, samples):
         return self.preflight_errors
+
+    def preflight_scoring(self):
+        return self.scoring_preflight_errors
 
     def collect(self, samples, snapshot_path, *, resume, before_sample, after_sample):
         store = SnapshotStore(snapshot_path)
@@ -351,6 +355,34 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertEqual(final.status, "failed")
         self.assertEqual(self.fake_service.collected_ids, [])
         self.assertIn("preflight", final.error_message)
+
+    def test_score_enabled_run_fails_before_collection_when_scoring_preflight_reports_errors(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=True
+        )
+        self.fake_service.scoring_preflight_errors = ["评分依赖缺失：ragas"]
+
+        final = self.controller.execute(state.run_id)
+
+        self.assertEqual(final.status, "failed")
+        self.assertEqual(self.fake_service.collected_ids, [])
+        self.assertIn("scoring preflight", final.error_message)
+        self.assertIn("ragas", final.error_message)
+
+    def test_offline_score_enabled_run_uses_scoring_preflight_before_snapshot_load(self):
+        state = self.controller.create_offline_run(
+            self.dataset,
+            self.root,
+            self.samples,
+            self.snapshot_path,
+        )
+        self.fake_service.scoring_preflight_errors = ["评估配置无效"]
+
+        final = self.controller.execute(state.run_id)
+
+        self.assertEqual(final.status, "failed")
+        self.assertIn("scoring preflight", final.error_message)
+        self.assertIn("评估配置无效", final.error_message)
 
     def test_delete_failed_run_removes_all_run_artifacts(self):
         state = self.controller.create_online_run(

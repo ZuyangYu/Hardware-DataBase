@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildCredibility,
+  buildScoringCaveats,
   canLoadSampleDiagnostics,
   classifySampleResult,
   compareMetricRows,
@@ -59,5 +60,31 @@ describe('evaluation dashboard data', () => {
     expect(canLoadSampleDiagnostics('completed', true)).toBe(true);
     expect(canLoadSampleDiagnostics('running', true)).toBe(true);
     expect(canLoadSampleDiagnostics('completed', false)).toBe(false);
+  });
+
+  it('explains why a completed low score needs technical review first', () => {
+    const result = {
+      snapshot_status: 'success' as const,
+      retrieved_contexts: [],
+      critical: false,
+      metadata: {
+        retrieval_summary: { status: 'partial_failure' },
+        ragas_scoring: { contexts_truncated: true },
+      },
+      metrics: [
+        { sample_id: 'q1', metric_name: 'context_precision', status: 'success' as const, score: 0, reason: '', details: {} },
+        { sample_id: 'q1', metric_name: 'faithfulness', status: 'failed' as const, score: null, reason: '', details: {} },
+      ],
+    };
+
+    const caveats = buildScoringCaveats(
+      { metadata: {}, metric_failures: { faithfulness: 1 } },
+      [result],
+    );
+
+    expect(caveats.status).toBe('technical_failure');
+    expect(caveats.warnings.join(' ')).toContain('没有检索证据');
+    expect(caveats.warnings.join(' ')).toContain('检索状态不是 success');
+    expect(caveats.warnings.join(' ')).toContain('context_precision');
   });
 });

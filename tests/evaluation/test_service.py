@@ -349,9 +349,31 @@ class EvaluationServiceTests(unittest.TestCase):
                 "selected_evidence_ids": [],
                 "selected_claim_ids": [],
                 "excluded_evidence_ids": [],
+                "scored_contexts": ["aaaa", "bb"],
             },
         )
         self.assertEqual(backend.records[0][0]["retrieved_contexts"], ["aaaa", "bb"])
+
+    def test_summary_exposes_scoring_caveats_and_public_config(self):
+        snapshot = _snapshot().model_copy(
+            update={
+                "retrieval_summary": {"status": "partial_failure"},
+            }
+        )
+        service = EvaluationService(ragas_adapter=FakeAdapter(), config=_config())
+
+        summary, _ = service.score(
+            [_sample()],
+            [snapshot],
+            metric_names=["faithfulness", "answer_correctness"],
+        )
+
+        diagnostics = summary.metadata["scoring_diagnostics"]
+        self.assertEqual(diagnostics["metric_failures"], 1)
+        self.assertEqual(diagnostics["retrieval_partial_failures"], 1)
+        self.assertEqual(diagnostics["truncated_context_samples"], 0)
+        self.assertEqual(diagnostics["status"], "technical_failure")
+        self.assertEqual(summary.metadata["scoring_config"]["max_contexts_per_sample"], 2)
 
 
 if __name__ == "__main__":

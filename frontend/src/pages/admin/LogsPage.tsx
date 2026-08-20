@@ -504,6 +504,27 @@ function QueryDetailDialog({
                 value={`final_top_k=${trace.final_top_k ?? '-'}, latency=${trace.latency_ms ?? '-'}ms`}
               />
               <Field label="状态" value={trace.status} />
+              <Field label="Trace ID" value={trace.otel_trace_id || '-'} />
+              {trace.grafana_trace_url && (
+                <a
+                  href={trace.grafana_trace_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[12px] text-[#4f6fd8] hover:underline"
+                >
+                  在 Grafana 中打开 Trace
+                </a>
+              )}
+              {trace.phoenix_trace_url && (
+                <a
+                  href={trace.phoenix_trace_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[12px] text-[#4f6fd8] hover:underline"
+                >
+                  在 Phoenix 中打开 Trace
+                </a>
+              )}
               {trace.error_message && <Field label="错误" value={trace.error_message} />}
 
               <div className="mt-[6px] border-t border-[#f0f1f4] pt-[10px]">

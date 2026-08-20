@@ -28,3 +28,9 @@ uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa
 在线运行可取消勾选“执行 RAGAS 评分”。此时系统只采集回答和检索证据，不需要安装 `eval` 依赖，也不需要配置裁判 LLM 或 Embedding。离线评分和勾选评分的在线运行仍需先执行 `uv sync --group eval`，并完成评估模型配置。
 
 运行目录位于 `storage/evaluations/<run_id>/`，并始终包含 `run_state.json`。在线运行在至少持久化一条采集结果后，才会在该目录生成 `snapshot.jsonl`；离线运行则引用所提供的快照路径，该路径可能位于运行目录之外。仅在评分完整结束后，系统才会生成 `summary.json`、`results.jsonl`、`summary.csv` 和 `report.html`。这使暂停或取消的运行可以安全恢复，同时避免将不完整结果当作最终报告使用。
+
+评分结果解读：
+
+- `评分任务进度`表示评分工作项已完成/总工作项，不等于有效评分数；请同时查看 `确认评分失败`、各指标的适用样本数和 `metric_failures`。
+- `snapshot.jsonl` 中的 `retrieved_contexts` 是完整的原始检索结果；报告结果的 `metadata.ragas_scoring.scored_contexts` 是实际送入 RAGAS 的上下文窗口。两者数量不同表示发生了去重、相关性排序或预算裁剪，不应混为一谈。
+- 在线采集并评分、离线重评都会在后端执行依赖和配置前置检查。离线重评不会重新检索；如果快照本身缺少证据，必须先补充/重新索引资料，再重新在线采集。

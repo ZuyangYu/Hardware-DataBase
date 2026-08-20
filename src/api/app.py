@@ -11,10 +11,11 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.errors import install_error_handlers
+from src.api.deps import require_system_admin
 from src.api.routes import (
     assets,
     auth,
@@ -31,10 +32,13 @@ from src.api.routes import (
     metrics,
     parse_tasks,
     query,
+    status,
     structured,
     upload,
     users,
 )
+from src.observability import init_observability, instrument_fastapi, shutdown_observability
+from src.observability.health import check_dependencies, check_live, check_ready
 
 
 def _should_spawn_worker() -> bool:
@@ -82,10 +86,19 @@ async def lifespan(app: FastAPI):
                 worker_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 worker_proc.kill()
+        shutdown_observability()
 
 
 def create_app() -> FastAPI:
+    import config.settings as settings
+
+    init_observability(
+        "hardware-database-api",
+        service_version=settings.OBS_SERVICE_VERSION,
+        environment=settings.OBS_ENVIRONMENT,
+    )
     app = FastAPI(title="Hardware DataBase API", version="0.1.0", lifespan=lifespan)
+    instrument_fastapi(app)
     install_error_handlers(app)
 
     # CORS: allow browser-based clients and agent tools to reach the API.
@@ -130,12 +143,25 @@ def create_app() -> FastAPI:
     app.include_router(config.router, prefix=api_v1)
     app.include_router(logs.router, prefix=api_v1)
     app.include_router(metrics.router, prefix=api_v1)
+    app.include_router(status.router, prefix=api_v1)
     app.include_router(evaluation.router, prefix=api_v1)
     app.include_router(structured.router, prefix=api_v1)
 
     @app.get("/health", tags=["health"])
     def health() -> dict:
-        return {"ok": True}
+        return {"ok": True, **check_live()}
+
+    @app.get("/health/live", tags=["health"])
+    def health_live() -> dict:
+        return check_live()
+
+    @app.get("/health/ready", tags=["health"])
+    def health_ready() -> dict:
+        return check_ready()
+
+    @app.get("/health/dependencies", tags=["health"])
+    def health_dependencies(_viewer=Depends(require_system_admin)) -> dict:
+        return check_dependencies()
 
     return app
 

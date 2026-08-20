@@ -11,6 +11,8 @@ from typing import Any, Callable, Generator
 import requests
 
 import config.settings as settings
+from src.observability import observe
+from src.observability.metrics import record_llm
 
 
 ChatPayload = dict[str, str]
@@ -185,21 +187,50 @@ class LLMClient:
     def chat(self, messages: list[ChatPayload], **kwargs: Any) -> str:
         config = self.config or self._from_runtime_settings()
         self._validate_messages(messages)
-        if config.provider == settings.Provider.OLLAMA:
-            return self._chat_ollama(config, messages, **kwargs)
-        if config.provider == settings.Provider.CUSTOM:
-            return self._chat_openai_compatible(config, messages, **kwargs)
-        raise ValueError(f"Unsupported provider: {config.provider}")
+        provider = _provider_name(config)
+        started = time.monotonic()
+        before_count = len(self._usage_records)
+        status = "success"
+        with observe.llm(
+            "hdb.llm.chat",
+            provider=provider,
+            model=config.model,
+            stage=kwargs.get("usage_stage", "chat"),
+            streaming=False,
+        ) as observation:
+            _set_llm_input(observation, messages)
+            try:
+                if config.provider == settings.Provider.OLLAMA:
+                    result = self._chat_ollama(config, messages, **kwargs)
+                elif config.provider == settings.Provider.CUSTOM:
+                    result = self._chat_openai_compatible(config, messages, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported provider: {config.provider}")
+                _set_usage_attributes(observation, self._usage_records[before_count:])
+                _set_llm_output(observation, result)
+                return result
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                record_llm(
+                    provider=provider,
+                    status=status,
+                    duration_s=time.monotonic() - started,
+                    streaming=False,
+                )
 
     def stream_chat(self, messages: list[ChatPayload], **kwargs: Any) -> Generator[str, None, str]:
         """Stream chat deltas and return the assembled response when exhausted."""
         config = self.config or self._from_runtime_settings()
         self._validate_messages(messages)
         if config.provider == settings.Provider.OLLAMA:
-            return self._stream_chat_ollama(config, messages, **kwargs)
-        if config.provider == settings.Provider.CUSTOM:
-            return self._stream_chat_openai_compatible(config, messages, **kwargs)
-        raise ValueError(f"Unsupported provider: {config.provider}")
+            stream = self._stream_chat_ollama(config, messages, **kwargs)
+        elif config.provider == settings.Provider.CUSTOM:
+            stream = self._stream_chat_openai_compatible(config, messages, **kwargs)
+        else:
+            raise ValueError(f"Unsupported provider: {config.provider}")
+        return self._observe_stream(stream, config, kwargs, operation="hdb.llm.chat", messages=messages)
 
     def chat_with_tools(
         self,
@@ -220,11 +251,40 @@ class LLMClient:
         """
         config = self.config or self._from_runtime_settings()
         self._validate_messages(messages)
-        if config.provider == settings.Provider.OLLAMA:
-            return self._chat_tools_ollama(config, messages, tools, tool_choice, usage_stage, **kwargs)
-        if config.provider == settings.Provider.CUSTOM:
-            return self._chat_tools_openai_compatible(config, messages, tools, tool_choice, usage_stage, **kwargs)
-        raise ValueError(f"Unsupported provider: {config.provider}")
+        provider = _provider_name(config)
+        started = time.monotonic()
+        before_count = len(self._usage_records)
+        status = "success"
+        with observe.llm(
+            "hdb.llm.chat_with_tools",
+            provider=provider,
+            model=config.model,
+            stage=usage_stage or "tool_call",
+            streaming=False,
+        ) as observation:
+            _set_llm_input(observation, messages, tools=tools)
+            try:
+                if config.provider == settings.Provider.OLLAMA:
+                    result = self._chat_tools_ollama(config, messages, tools, tool_choice, usage_stage, **kwargs)
+                elif config.provider == settings.Provider.CUSTOM:
+                    result = self._chat_tools_openai_compatible(
+                        config, messages, tools, tool_choice, usage_stage, **kwargs
+                    )
+                else:
+                    raise ValueError(f"Unsupported provider: {config.provider}")
+                _set_usage_attributes(observation, self._usage_records[before_count:])
+                _set_llm_output(observation, result)
+                return result
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                record_llm(
+                    provider=provider,
+                    status=status,
+                    duration_s=time.monotonic() - started,
+                    streaming=False,
+                )
 
     def stream_chat_with_tools(
         self,
@@ -246,15 +306,115 @@ class LLMClient:
         """
         config = self.config or self._from_runtime_settings()
         self._validate_messages(messages)
-        if config.provider == settings.Provider.OLLAMA:
-            return self._stream_chat_tools_ollama(
-                config, messages, tools, tool_choice, usage_stage, on_delta, **kwargs
-            )
-        if config.provider == settings.Provider.CUSTOM:
-            return self._stream_chat_tools_openai_compatible(
-                config, messages, tools, tool_choice, usage_stage, on_delta, **kwargs
-            )
-        raise ValueError(f"Unsupported provider: {config.provider}")
+        provider = _provider_name(config)
+        started = time.monotonic()
+        before_count = len(self._usage_records)
+        status = "success"
+        first_delta_at: float | None = None
+
+        def observed_delta(delta: str) -> None:
+            nonlocal first_delta_at
+            if first_delta_at is None:
+                first_delta_at = time.monotonic()
+            if on_delta is not None:
+                on_delta(delta)
+
+        with observe.llm(
+            "hdb.llm.chat_with_tools",
+            provider=provider,
+            model=config.model,
+            stage=usage_stage or "tool_call",
+            streaming=True,
+        ) as observation:
+            _set_llm_input(observation, messages, tools=tools)
+            try:
+                if config.provider == settings.Provider.OLLAMA:
+                    result = self._stream_chat_tools_ollama(
+                        config, messages, tools, tool_choice, usage_stage, observed_delta, **kwargs
+                    )
+                elif config.provider == settings.Provider.CUSTOM:
+                    result = self._stream_chat_tools_openai_compatible(
+                        config, messages, tools, tool_choice, usage_stage, observed_delta, **kwargs
+                    )
+                else:
+                    raise ValueError(f"Unsupported provider: {config.provider}")
+                _set_usage_attributes(observation, self._usage_records[before_count:])
+                _set_llm_output(observation, result)
+                return result
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                record_llm(
+                    provider=provider,
+                    status=status,
+                    duration_s=time.monotonic() - started,
+                    streaming=True,
+                    ttft_s=(first_delta_at - started if first_delta_at is not None else None),
+                )
+
+    def _observe_stream(
+        self,
+        stream: Generator[str, None, Any] | Any,
+        config: LLMClientConfig,
+        kwargs: dict[str, Any],
+        *,
+        operation: str,
+        messages: list[ChatPayload] | None = None,
+        result_stream: bool = True,
+    ) -> Generator[str, None, Any]:
+        """Keep a streaming span open until the provider generator is exhausted."""
+
+        def observed() -> Generator[str, None, Any]:
+            provider = _provider_name(config)
+            started = time.monotonic()
+            first_token_at: float | None = None
+            before_count = len(self._usage_records)
+            status = "success"
+            with observe.llm(
+                operation,
+                provider=provider,
+                model=config.model,
+                stage=kwargs.get("usage_stage", "chat"),
+                streaming=True,
+            ) as observation:
+                _set_llm_input(observation, messages or [])
+                try:
+                    if result_stream:
+                        result: Any = None
+                        while True:
+                            try:
+                                delta = next(stream)
+                            except StopIteration as stop:
+                                result = stop.value
+                                break
+                            if first_token_at is None:
+                                first_token_at = time.monotonic()
+                            yield delta
+                    else:
+                        # Tool streaming uses callbacks internally and returns a
+                        # ChatToolResult rather than yielding content deltas.
+                        result = stream
+                    _set_usage_attributes(observation, self._usage_records[before_count:])
+                    _set_llm_output(observation, result)
+                    return result
+                except Exception:
+                    status = "error"
+                    raise
+                finally:
+                    record_llm(
+                        provider=provider,
+                        status=status,
+                        duration_s=time.monotonic() - started,
+                        streaming=True,
+                        ttft_s=(
+                            first_token_at - started
+                            if first_token_at is not None
+                            else None
+                        ),
+                    )
+
+        return observed()
 
     @staticmethod
     def _from_runtime_settings() -> LLMClientConfig:
@@ -837,6 +997,37 @@ class LLMClient:
                 usage_returned=usage is not None,
             )
         )
+
+
+def _provider_name(config: LLMClientConfig) -> str:
+    return str(config.provider.value if hasattr(config.provider, "value") else config.provider)
+
+
+def _set_usage_attributes(observation: Any, records: Iterable[LLMUsageRecord]) -> None:
+    records = tuple(records)
+    if not records:
+        return
+    observation.tokens(
+        input_tokens=sum(record.prompt_tokens for record in records),
+        output_tokens=sum(record.completion_tokens for record in records),
+    )
+
+
+def _set_llm_input(observation: Any, messages: list[ChatPayload], tools: list[dict[str, Any]] | None = None) -> None:
+    payload: dict[str, Any] = {"messages": messages}
+    if tools:
+        payload["tools"] = tools
+    observation.set_input(payload, content_kind="llm")
+
+
+def _set_llm_output(observation: Any, result: Any) -> None:
+    if isinstance(result, ChatToolResult):
+        result = {
+            "content": result.content,
+            "tool_calls": result.tool_calls or [],
+            "tool_call_supported": result.tool_call_supported,
+        }
+    observation.set_output(result, content_kind="llm")
 
 
 def _extract_openai_usage(usage: Any) -> dict[str, int] | None:

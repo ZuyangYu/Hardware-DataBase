@@ -19,6 +19,8 @@ from .schemas import (
 )
 from .service import new_run_id
 from .snapshot_store import SnapshotStore
+from src.observability import observe, thread_with_current_context
+from src.observability.metrics import record_evaluation
 
 
 _STATE_LOCK = threading.RLock()
@@ -377,12 +379,40 @@ class EvaluationRunController:
             existing = self._threads.get(run_id)
             if existing is not None and existing.is_alive():
                 raise RuntimeError(f"evaluation run {run_id!r} is already running")
-            thread = threading.Thread(target=self.execute, args=(run_id,), daemon=True)
+            thread = thread_with_current_context(
+                self.execute,
+                run_id,
+                daemon=True,
+                name=f"evaluation-{run_id[:16]}",
+            )
             self._threads[run_id] = thread
             thread.start()
             return thread
 
     def execute(self, run_id: str) -> EvaluationRunState:
+        try:
+            initial_state = self._store(run_id).load()
+            mode = initial_state.mode
+        except Exception:
+            mode = "unknown"
+        status = "failed"
+        with observe.evaluator(
+            "hdb.evaluation.run",
+            run_id=run_id,
+            mode=mode,
+        ) as observation:
+            try:
+                result = self._execute_impl(run_id)
+                status = result.status
+                observation.set("hdb.evaluation.status", status)
+                return result
+            except Exception:
+                status = "failed"
+                raise
+            finally:
+                record_evaluation(status=status, mode=mode)
+
+    def _execute_impl(self, run_id: str) -> EvaluationRunState:
         store = self._store(run_id)
         latest_checkpoint: tuple[object, object] | None = None
         try:
@@ -394,8 +424,15 @@ class EvaluationRunController:
 
             samples = self._load_samples(store.load())
             state = store.load()
+            service = self.service_factory()
+            if state.score_enabled:
+                scoring_preflight = getattr(service, "preflight_scoring", None)
+                errors = scoring_preflight() if callable(scoring_preflight) else []
+                if errors:
+                    return store.mark_failed(
+                        f"evaluation scoring preflight failed: {'; '.join(errors)}"
+                    )
             if state.mode == "online":
-                service = self.service_factory()
                 errors = service.preflight_online(samples)
                 if errors:
                     return store.mark_failed(f"evaluation preflight failed: {'; '.join(errors)}")
@@ -444,7 +481,7 @@ class EvaluationRunController:
                 )
                 write_reports(store.path.parent / ".checkpoint", summary, results)
 
-            summary, results = (service if state.mode == "online" else self.service_factory()).score(
+            summary, results = service.score(
                 samples,
                 snapshots,
                 run_id=run_id,

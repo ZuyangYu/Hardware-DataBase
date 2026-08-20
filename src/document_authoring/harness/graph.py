@@ -488,7 +488,12 @@ def _requirement_for_unit(
         missing_policy = schema.missing_policy
         claim_type = "attribute"
         query_terms = _unique_query_terms(
-            [*schema.subject_aliases, *schema.query_terms, schema.description, schema.label]
+            [
+                *getattr(schema, "subject_aliases", []),
+                *schema.query_terms,
+                schema.description,
+                schema.label,
+            ]
         )
     else:
         capability = _capabilities(schema.required_capabilities)

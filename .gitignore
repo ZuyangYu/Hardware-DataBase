@@ -77,6 +77,9 @@ htmlcov/
 /frontend/playwright-report/
 /frontend/test-results/
 
+# Rendered architecture preview; keep the Markdown/SVG sources versioned.
+/deploy/observability/current-architecture.png
+
 # Vendored SpyDrNet: exclude upstream documentation, examples, and tests.
 /src/circuit/vendor/spydrnet/docs/
 /src/circuit/vendor/spydrnet/examples/

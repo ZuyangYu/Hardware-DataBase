@@ -62,6 +62,31 @@ DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = os.getenv("DOCUMENT_AUTO_ACTIVATE_SAFE_T
 DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS = os.getenv("DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS", "false").lower() == "true"
 DOCUMENT_AUTO_PUBLISH_VERIFIED = os.getenv("DOCUMENT_AUTO_PUBLISH_VERIFIED", "false").lower() == "true"
 
+# Cross-cutting observability configuration.  These settings deliberately live
+# here, alongside the rest of the application's single source of truth, so the
+# API, worker, Streamlit process and evaluation threads cannot drift apart.
+OBS_ENABLED = os.getenv("OBS_ENABLED", "true").lower() == "true"
+OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "hardware-database-api")
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+OBS_ENVIRONMENT = os.getenv("OBS_ENVIRONMENT", "development")
+OBS_SERVICE_VERSION = os.getenv("OBS_SERVICE_VERSION", "0.1.0")
+OBS_TRACE_SAMPLE_RATIO = float(os.getenv("OBS_TRACE_SAMPLE_RATIO", "1.0"))
+OBS_CAPTURE_CONTENT = os.getenv("OBS_CAPTURE_CONTENT", "false").lower() == "true"
+OBS_CAPTURE_QUERY = os.getenv("OBS_CAPTURE_QUERY", "false").lower() == "true"
+OBS_CAPTURE_EVIDENCE = os.getenv("OBS_CAPTURE_EVIDENCE", "false").lower() == "true"
+OBS_CAPTURE_LLM_CONTENT = os.getenv("OBS_CAPTURE_LLM_CONTENT", "false").lower() == "true"
+OBS_CONTENT_MAX_CHARS = max(1000, int(os.getenv("OBS_CONTENT_MAX_CHARS", "50000")))
+OBS_LOG_FORMAT = os.getenv("OBS_LOG_FORMAT", "json")
+OBS_METRICS_ENABLED = os.getenv("OBS_METRICS_ENABLED", "true").lower() == "true"
+OBS_TRACES_ENABLED = os.getenv("OBS_TRACES_ENABLED", "true").lower() == "true"
+OBS_LOGS_ENABLED = os.getenv("OBS_LOGS_ENABLED", "true").lower() == "true"
+OBS_PHOENIX_PROJECT = os.getenv("OBS_PHOENIX_PROJECT", "hardware-database")
+OBS_GRAFANA_BASE_URL = os.getenv("OBS_GRAFANA_BASE_URL", "")
+OBS_PHOENIX_BASE_URL = os.getenv("OBS_PHOENIX_BASE_URL", "")
+OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS", "10"))
+OBS_WORKER_STALE_SECONDS = int(os.getenv("OBS_WORKER_STALE_SECONDS", "30"))
+OBS_DEPENDENCY_TIMEOUT_SECONDS = float(os.getenv("OBS_DEPENDENCY_TIMEOUT_SECONDS", "5"))
+
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "你是一个专业的硬件技术助手。请严格基于参考资料回答用户问题。\n"
     "规则：\n"
@@ -119,6 +144,27 @@ DEFAULT_VALUES = {
     "WORKER_PARSE_BATCH_SIZE": "1",
     "CHAT_TURN_HEARTBEAT_TTL_SECONDS": "90",
     "CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS": "10",
+    "OBS_ENABLED": "true",
+    "OTEL_SERVICE_NAME": "hardware-database-api",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector:4317",
+    "OBS_ENVIRONMENT": "development",
+    "OBS_SERVICE_VERSION": "0.1.0",
+    "OBS_TRACE_SAMPLE_RATIO": "1.0",
+    "OBS_CAPTURE_CONTENT": "false",
+    "OBS_CAPTURE_QUERY": "false",
+    "OBS_CAPTURE_EVIDENCE": "false",
+    "OBS_CAPTURE_LLM_CONTENT": "false",
+    "OBS_CONTENT_MAX_CHARS": "50000",
+    "OBS_LOG_FORMAT": "json",
+    "OBS_METRICS_ENABLED": "true",
+    "OBS_TRACES_ENABLED": "true",
+    "OBS_LOGS_ENABLED": "true",
+    "OBS_PHOENIX_PROJECT": "hardware-database",
+    "OBS_GRAFANA_BASE_URL": "",
+    "OBS_PHOENIX_BASE_URL": "",
+    "OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS": "10",
+    "OBS_WORKER_STALE_SECONDS": "30",
+    "OBS_DEPENDENCY_TIMEOUT_SECONDS": "5",
     "DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES": "false",
     "DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS": "false",
     "DOCUMENT_AUTO_PUBLISH_VERIFIED": "false",
@@ -144,6 +190,12 @@ def reload_settings():
     global WORKER_POLL_INTERVAL_SECONDS, WORKER_PARSE_BATCH_SIZE
     global CHAT_TURN_HEARTBEAT_TTL_SECONDS, CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS
     global DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES, DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS, DOCUMENT_AUTO_PUBLISH_VERIFIED
+    global OBS_ENABLED, OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT, OBS_ENVIRONMENT, OBS_SERVICE_VERSION
+    global OBS_TRACE_SAMPLE_RATIO, OBS_CAPTURE_CONTENT, OBS_CAPTURE_QUERY, OBS_CAPTURE_EVIDENCE, OBS_CAPTURE_LLM_CONTENT
+    global OBS_CONTENT_MAX_CHARS
+    global OBS_LOG_FORMAT, OBS_METRICS_ENABLED, OBS_TRACES_ENABLED, OBS_LOGS_ENABLED, OBS_PHOENIX_PROJECT
+    global OBS_GRAFANA_BASE_URL, OBS_PHOENIX_BASE_URL, OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS
+    global OBS_WORKER_STALE_SECONDS, OBS_DEPENDENCY_TIMEOUT_SECONDS
     global SYSTEM_PROMPT, NO_CONTEXT_PROMPT
 
     load_dotenv(dotenv_path=ENV_FILE_PATH, override=True, encoding=ENV_FILE_ENCODING)
@@ -185,6 +237,27 @@ def reload_settings():
     DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = os.getenv("DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES", "false").lower() == "true"
     DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS = os.getenv("DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS", "false").lower() == "true"
     DOCUMENT_AUTO_PUBLISH_VERIFIED = os.getenv("DOCUMENT_AUTO_PUBLISH_VERIFIED", "false").lower() == "true"
+    OBS_ENABLED = os.getenv("OBS_ENABLED", "true").lower() == "true"
+    OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "hardware-database-api")
+    OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+    OBS_ENVIRONMENT = os.getenv("OBS_ENVIRONMENT", "development")
+    OBS_SERVICE_VERSION = os.getenv("OBS_SERVICE_VERSION", "0.1.0")
+    OBS_TRACE_SAMPLE_RATIO = float(os.getenv("OBS_TRACE_SAMPLE_RATIO", "1.0"))
+    OBS_CAPTURE_CONTENT = os.getenv("OBS_CAPTURE_CONTENT", "false").lower() == "true"
+    OBS_CAPTURE_QUERY = os.getenv("OBS_CAPTURE_QUERY", "false").lower() == "true"
+    OBS_CAPTURE_EVIDENCE = os.getenv("OBS_CAPTURE_EVIDENCE", "false").lower() == "true"
+    OBS_CAPTURE_LLM_CONTENT = os.getenv("OBS_CAPTURE_LLM_CONTENT", "false").lower() == "true"
+    OBS_CONTENT_MAX_CHARS = max(1000, int(os.getenv("OBS_CONTENT_MAX_CHARS", "50000")))
+    OBS_LOG_FORMAT = os.getenv("OBS_LOG_FORMAT", "json")
+    OBS_METRICS_ENABLED = os.getenv("OBS_METRICS_ENABLED", "true").lower() == "true"
+    OBS_TRACES_ENABLED = os.getenv("OBS_TRACES_ENABLED", "true").lower() == "true"
+    OBS_LOGS_ENABLED = os.getenv("OBS_LOGS_ENABLED", "true").lower() == "true"
+    OBS_PHOENIX_PROJECT = os.getenv("OBS_PHOENIX_PROJECT", "hardware-database")
+    OBS_GRAFANA_BASE_URL = os.getenv("OBS_GRAFANA_BASE_URL", "")
+    OBS_PHOENIX_BASE_URL = os.getenv("OBS_PHOENIX_BASE_URL", "")
+    OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS", "10"))
+    OBS_WORKER_STALE_SECONDS = int(os.getenv("OBS_WORKER_STALE_SECONDS", "30"))
+    OBS_DEPENDENCY_TIMEOUT_SECONDS = float(os.getenv("OBS_DEPENDENCY_TIMEOUT_SECONDS", "5"))
     SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_VALUES["SYSTEM_PROMPT"])
     NO_CONTEXT_PROMPT = os.getenv("NO_CONTEXT_PROMPT", DEFAULT_VALUES["NO_CONTEXT_PROMPT"])
     ensure_runtime_dirs()

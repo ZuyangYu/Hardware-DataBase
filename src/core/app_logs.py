@@ -50,6 +50,9 @@ class QueryTrace:
     error_message: str
     metadata_json: str
     created_at: str
+    otel_trace_id: str = ""
+    otel_span_id: str = ""
+    turn_id: str = ""
 
 
 @dataclass
@@ -154,6 +157,9 @@ class AppLogService:
                     status TEXT NOT NULL DEFAULT 'success',
                     error_message TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    otel_trace_id TEXT NOT NULL DEFAULT '',
+                    otel_span_id TEXT NOT NULL DEFAULT '',
+                    turn_id TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 )
             """)
@@ -193,6 +199,13 @@ class AppLogService:
         query_columns = {row["name"] for row in conn.execute("PRAGMA table_info(query_traces)").fetchall()}
         if "metadata_json" not in query_columns:
             conn.execute("ALTER TABLE query_traces ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+        if "otel_trace_id" not in query_columns:
+            conn.execute("ALTER TABLE query_traces ADD COLUMN otel_trace_id TEXT NOT NULL DEFAULT ''")
+        if "otel_span_id" not in query_columns:
+            conn.execute("ALTER TABLE query_traces ADD COLUMN otel_span_id TEXT NOT NULL DEFAULT ''")
+        if "turn_id" not in query_columns:
+            conn.execute("ALTER TABLE query_traces ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_query_traces_otel_trace ON query_traces(otel_trace_id)")
 
     def record_audit(
         self,
@@ -284,6 +297,9 @@ class AppLogService:
         status: str = "success",
         error_message: str = "",
         metadata: dict[str, Any] | None = None,
+        otel_trace_id: str = "",
+        otel_span_id: str = "",
+        turn_id: str = "",
     ) -> int:
         effective_backend = backend or "ragflow"
         effective_retriever_type = retriever_type or "ragflow_retrieval"
@@ -296,9 +312,9 @@ class AppLogService:
                     user_message_id, assistant_message_id, kb_name,
                     original_query, rewritten_query, backend, retriever_type,
                     final_top_k, latency_ms,
-                    status, error_message, metadata_json, created_at
+                    status, error_message, metadata_json, otel_trace_id, otel_span_id, turn_id, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user.id if user else None,
@@ -317,6 +333,9 @@ class AppLogService:
                     status,
                     error_message or "",
                     json.dumps(metadata or {}, ensure_ascii=False),
+                    otel_trace_id or "",
+                    otel_span_id or "",
+                    turn_id or "",
                     utc_now(),
                 ),
             )
@@ -738,6 +757,9 @@ def row_to_query_trace(row) -> QueryTrace:
         error_message=row["error_message"],
         metadata_json=row["metadata_json"],
         created_at=row["created_at"],
+        otel_trace_id=row["otel_trace_id"] if "otel_trace_id" in row.keys() else "",
+        otel_span_id=row["otel_span_id"] if "otel_span_id" in row.keys() else "",
+        turn_id=row["turn_id"] if "turn_id" in row.keys() else "",
     )
 
 
@@ -763,6 +785,9 @@ def redact_query_trace(trace: QueryTrace) -> QueryTrace:
         error_message=trace.error_message if not trace.error_message else "[redacted]",
         metadata_json=redact_query_metadata_json(trace.metadata_json),
         created_at=trace.created_at,
+        otel_trace_id=trace.otel_trace_id,
+        otel_span_id=trace.otel_span_id,
+        turn_id=trace.turn_id,
     )
 
 

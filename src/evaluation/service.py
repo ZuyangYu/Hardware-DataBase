@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Callable
 
 from src.core.app_pipeline import AppPipeline
+from src.observability import observe, submit_with_current_context
+from src.observability.metrics import (
+    record_evaluation_sample,
+    record_evaluation_score,
+)
 
 from .answer_runner import AnswerRunner
 from .cohorts import evaluation_cohort, is_ragas_metric
@@ -80,7 +85,7 @@ class EvaluationService:
         if max_workers > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(self.answer_runner.collect, sample): sample
+                    submit_with_current_context(executor, self._collect_sample, sample): sample
                     for sample in pending_samples
                 }
                 for future in as_completed(futures):
@@ -91,15 +96,52 @@ class EvaluationService:
                 continue
             if before_sample is not None and not before_sample(sample, completed_count, total):
                 break
-            snapshot = self.answer_runner.collect(sample)
+            snapshot = self._collect_sample(sample)
             store.append(snapshot)
             completed_count += 1
             if after_sample is not None:
                 after_sample(snapshot, completed_count, total)
         return store.load_all()
 
+    def _collect_sample(self, sample: EvaluationSample) -> AnswerSnapshot:
+        started = datetime.now(timezone.utc).timestamp()
+        status = "success"
+        with observe.evaluator(
+            "hdb.evaluation.sample",
+            sample_id=sample.id,
+            stage="collect",
+        ) as observation:
+            try:
+                snapshot = self.answer_runner.collect(sample)
+                status = snapshot.status
+                observation.set("hdb.evaluation.sample.status", status)
+                return snapshot
+            except Exception:
+                status = "failed"
+                raise
+            finally:
+                record_evaluation_sample(
+                    status=status,
+                    duration_s=max(0.0, datetime.now(timezone.utc).timestamp() - started),
+                    mode="online",
+                )
+
     def preflight_online(self, samples: list[EvaluationSample]) -> list[str]:
         return EvaluationPreflight(self._pipeline_factory).validate(samples)
+
+    def preflight_scoring(self) -> list[str]:
+        """Check native RAGAS prerequisites before a score-enabled run starts."""
+
+        adapter = self.ragas_adapter
+        # Injected adapters are already responsible for their own runtime. In
+        # tests and alternative deployments they may not use the optional
+        # native RAGAS packages at all.
+        if adapter is not None and not (
+            isinstance(adapter, RagasAdapter) and getattr(adapter, "_backend", None) is None
+        ):
+            return []
+        config = adapter.config if isinstance(adapter, RagasAdapter) else self.config
+        return EvaluationPreflight.validate_scoring(config=config)
 
     def score(
         self,
@@ -116,6 +158,9 @@ class EvaluationService:
     ) -> tuple[EvaluationSummary, list[SampleResult]]:
         metric_names = DEFAULT_STANDARD_METRICS if metric_names is None else metric_names
         scoring_skipped_reason = ""
+        scoring_config_metadata: dict[str, str | int | float] = {}
+        if self.config is not None:
+            scoring_config_metadata = self.config.public_metadata()
         if metric_names and samples and not any(snapshot.status == "success" for snapshot in snapshots):
             metric_names = []
             scoring_skipped_reason = "no_successful_snapshots"
@@ -178,6 +223,9 @@ class EvaluationService:
                 if adapter is None:
                     config = self.config or EvaluationConfig.from_environment()
                     adapter = RagasAdapter(config)
+                    scoring_config_metadata = config.public_metadata()
+                elif isinstance(adapter, RagasAdapter):
+                    scoring_config_metadata = adapter.config.public_metadata()
                 scoring_snapshots = retrieval_snapshots
                 total_groups = len(metric_names)
                 total_items = len(retrieval_samples) * len(metric_names)
@@ -297,6 +345,13 @@ class EvaluationService:
         )
         if scoring_skipped_reason:
             summary.metadata["scoring_skipped"] = scoring_skipped_reason
+        if scoring_config_metadata:
+            summary.metadata["scoring_config"] = scoring_config_metadata
+        for metric_name, score in summary.metric_scores.items():
+            try:
+                record_evaluation_score(metric=metric_name, score=float(score))
+            except (TypeError, ValueError):
+                continue
         return summary, ordered_results
 
     @staticmethod
@@ -343,10 +398,112 @@ class EvaluationService:
                     "kind": outcome_kind or "completed",
                     "completed_groups": completed_groups,
                     "total_groups": total_groups,
-                }
+                },
+                "scoring_diagnostics": EvaluationService._build_scoring_diagnostics(
+                    ordered_results
+                ),
             },
         )
         return summary
+
+    @staticmethod
+    def _build_scoring_diagnostics(
+        results: list[SampleResult],
+    ) -> dict[str, object]:
+        """Summarize conditions that can make a score misleading.
+
+        This is deliberately separate from the Gate: a low score is a quality
+        signal, while missing evidence, judge failures, and truncated inputs
+        are execution conditions that must be fixed or acknowledged first.
+        """
+
+        collection_failures = sum(result.snapshot_status == "failed" for result in results)
+        evidence_samples = sum(bool(result.retrieved_contexts) for result in results)
+        no_evidence_samples = sum(
+            result.snapshot_status == "success" and not result.retrieved_contexts
+            for result in results
+        )
+        metric_failures = sum(
+            metric.status == "failed"
+            for result in results
+            for metric in result.metrics
+        )
+        truncated_samples = sum(
+            bool((result.metadata.get("ragas_scoring") or {}).get("contexts_truncated"))
+            for result in results
+        )
+
+        retrieval_status_counts: Counter[str] = Counter()
+        retrieval_partial_failures = 0
+        metric_stats: dict[str, dict[str, int]] = {}
+        for result in results:
+            retrieval_summary = result.metadata.get("retrieval_summary") or {}
+            if retrieval_summary:
+                status = str(retrieval_summary.get("status") or "unknown")
+                retrieval_status_counts[status] += 1
+                if status not in {"success", "unknown"}:
+                    retrieval_partial_failures += 1
+            for metric in result.metrics:
+                stats = metric_stats.setdefault(
+                    metric.metric_name,
+                    {"success": 0, "failed": 0, "not_applicable": 0, "zero_scores": 0},
+                )
+                stats[metric.status] += 1
+                if metric.status == "success" and metric.score == 0:
+                    stats["zero_scores"] += 1
+
+        all_zero_metrics = sorted(
+            name
+            for name, stats in metric_stats.items()
+            if stats["success"] > 0
+            and stats["zero_scores"] == stats["success"]
+        )
+        warnings: list[str] = []
+        if collection_failures:
+            warnings.append(f"{collection_failures} 个样本采集失败，不能用整体分数代表完整数据集。")
+        if no_evidence_samples:
+            warnings.append(
+                f"{no_evidence_samples} 个成功样本没有检索证据；上下文相关指标不应按普通低分解读。"
+            )
+        if retrieval_partial_failures:
+            warnings.append(
+                f"{retrieval_partial_failures} 个样本的检索状态不是 success，可能导致答案和上下文指标被低估。"
+            )
+        if truncated_samples:
+            warnings.append(
+                f"{truncated_samples} 个样本的评分上下文经过了数量或字符裁剪；请结合上下文选择诊断解读分数。"
+            )
+        if metric_failures:
+            warnings.append(f"有 {metric_failures} 条评分任务失败，失败项不应当当作 0 分。")
+        if all_zero_metrics:
+            warnings.append(
+                "以下指标的有效评分样本全部为 0："
+                + "、".join(all_zero_metrics)
+                + "；优先检查参考答案/上下文对齐和评估模型兼容性。"
+            )
+
+        if collection_failures or metric_failures:
+            status = "technical_failure"
+        elif not any(stats["success"] for stats in metric_stats.values()):
+            status = "insufficient_coverage"
+        elif warnings:
+            status = "interpret_with_caution"
+        else:
+            status = "ready"
+
+        return {
+            "status": status,
+            "collection_failures": collection_failures,
+            "evidence_samples": evidence_samples,
+            "no_evidence_samples": no_evidence_samples,
+            "retrieval_status_counts": dict(retrieval_status_counts),
+            "retrieval_partial_failures": retrieval_partial_failures,
+            "truncated_context_samples": truncated_samples,
+            "metric_failures": metric_failures,
+            "metric_stats": metric_stats,
+            "all_zero_metrics": all_zero_metrics,
+            "warnings": warnings,
+        }
 
     def run(
         self,
@@ -386,7 +543,8 @@ class EvaluationService:
                 "dataset": str(dataset_path),
                 "dataset_sha256": digest,
                 "metrics": metric_names or DEFAULT_STANDARD_METRICS,
-                "config": self.config.public_metadata() if self.config else {},
+                "config": summary.metadata.get("scoring_config")
+                or (self.config.public_metadata() if self.config else {}),
             },
         )
         return summary, results, paths

@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils';
 
 import {
   buildCredibility,
+  buildScoringCaveats,
   classifySampleResult,
   compareMetricRows,
   filterSampleResults,
@@ -39,6 +40,16 @@ const SAMPLE_FILTERS: Array<SampleStatus | '全部'> = [
 
 function scoreText(score: number): string {
   return score.toFixed(3);
+}
+
+function metadataRecord(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
 function GatePill({ summary, isFinal }: { summary: EvaluationSummary; isFinal: boolean }) {
@@ -138,6 +149,11 @@ function DiagnosticDetails({ result }: { result: EvaluationSampleResult }) {
   const [open, setOpen] = useState(false);
   const retrievalSummary = result.metadata.retrieval_summary;
   const retrievalSummaryText = retrievalSummary == null ? '' : JSON.stringify(retrievalSummary, null, 2);
+  const scoring = metadataRecord(result.metadata.ragas_scoring);
+  const scoredContexts = stringArray(scoring?.scored_contexts);
+  const scoringDiagnostic = scoring
+    ? JSON.stringify({ ...scoring, scored_contexts: undefined }, null, 2)
+    : '';
   return (
     <details className="group border-t border-[#edf0f4] px-[10px] py-[9px]" onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary className="cursor-pointer text-[12px] font-medium text-[#464c5e] marker:text-[#858b9c]">展开样本诊断</summary>
@@ -145,7 +161,9 @@ function DiagnosticDetails({ result }: { result: EvaluationSampleResult }) {
         <DiagnosticText title="问题" value={result.question} />
         <DiagnosticText title="参考答案" value={result.reference_answer} />
         <DiagnosticText title="实际回答" value={result.response} />
-        <DiagnosticText title="检索上下文" value={result.retrieved_contexts.length ? result.retrieved_contexts.join('\n\n') : '无'} />
+        <DiagnosticText title="原始检索上下文" value={result.retrieved_contexts.length ? result.retrieved_contexts.join('\n\n') : '无'} />
+        {scoredContexts.length > 0 && <DiagnosticText title={`实际送入评分的上下文（${scoredContexts.length}/${result.retrieved_contexts.length}）`} value={scoredContexts.join('\n\n')} />}
+        {scoringDiagnostic && <DiagnosticText title="评分选择诊断" value={scoringDiagnostic} mono />}
         {retrievalSummaryText && <DiagnosticText title="检索与证据诊断" value={retrievalSummaryText} mono />}
         {result.metrics.length > 0 && <div><p className="mb-[4px] font-medium text-[#18181a]">单样本指标</p>{result.metrics.map((metric) => <p key={metric.metric_name} className="rounded-[6px] bg-[#fafbfc] px-[8px] py-[5px]"><span className="font-medium text-[#18181a]">{metric.metric_name}</span> · {metric.status}{metric.score == null ? '' : ` · ${scoreText(metric.score)}`}{metric.reason ? ` · ${metric.reason}` : ''}</p>)}</div>}
       </div>}
@@ -164,7 +182,28 @@ function SampleDiagnostics({ results, error }: { results: EvaluationSampleResult
     <section className="rounded-[12px] border border-[#edf0f4] p-[14px]">
       <div className="mb-[10px] flex flex-wrap items-center justify-between gap-[8px]"><div><h4 className="text-[14px] font-semibold text-[#18181a]">样本诊断</h4><p className="mt-[2px] text-[11px] text-[#858b9c]">优先查看采集失败、评分失败和关键待复核样本。</p></div><label className="text-[12px] text-[#464c5e]">状态筛选 <select className="ml-[4px] h-[30px] rounded-[7px] border border-[#e3e7f1] bg-white px-[7px] text-[12px]" value={filter} onChange={(event) => setFilter(event.target.value as SampleStatus | '全部')}>{SAMPLE_FILTERS.map((status) => <option key={status}>{status}</option>)}</select></label></div>
       {error ? <p className="mb-[10px] rounded-[8px] bg-[#fff7e7] px-[10px] py-[8px] text-[12px] text-[#9a610d]">{error}</p> : null}
-      {error ? null : results.length === 0 ? <p className="py-[20px] text-[12px] text-[#858b9c]">暂无样本诊断数据。</p> : <div className="overflow-hidden rounded-[8px] border border-[#edf0f4]"><div className="grid grid-cols-[minmax(110px,1fr)_100px_70px_90px] gap-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[11px] text-[#858b9c] max-[700px]:grid-cols-[minmax(110px,1fr)_100px_60px]"><span>样本</span><span>状态</span><span className="text-right">证据</span><span className="text-right max-[700px]:hidden">评分指标</span></div>{filtered.map((result) => <div key={result.sample_id}><div className="grid grid-cols-[minmax(110px,1fr)_100px_70px_90px] gap-[8px] px-[10px] py-[8px] text-[12px] max-[700px]:grid-cols-[minmax(110px,1fr)_100px_60px]"><span className="truncate font-medium text-[#18181a]">{result.sample_id}</span><span className="text-[#464c5e]">{classifySampleResult(result)}</span><span className="text-right text-[#464c5e]">{result.retrieved_contexts.length}</span><span className="text-right text-[#464c5e] max-[700px]:hidden">{result.metrics.filter((metric) => metric.status === 'success' && metric.score != null).length}</span></div><DiagnosticDetails result={result} /></div>)}{filtered.length === 0 ? <p className="px-[10px] py-[20px] text-center text-[12px] text-[#858b9c]">没有符合该状态的样本。</p> : null}</div>}
+      {error ? null : results.length === 0 ? <p className="py-[20px] text-[12px] text-[#858b9c]">暂无样本诊断数据。</p> : <div className="overflow-hidden rounded-[8px] border border-[#edf0f4]"><div className="grid grid-cols-[minmax(110px,1fr)_100px_70px_90px] gap-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[11px] text-[#858b9c] max-[700px]:grid-cols-[minmax(110px,1fr)_100px_60px]"><span>样本</span><span>状态</span><span className="text-right">检索证据</span><span className="text-right max-[700px]:hidden">评分指标</span></div>{filtered.map((result) => <div key={result.sample_id}><div className="grid grid-cols-[minmax(110px,1fr)_100px_70px_90px] gap-[8px] px-[10px] py-[8px] text-[12px] max-[700px]:grid-cols-[minmax(110px,1fr)_100px_60px]"><span className="truncate font-medium text-[#18181a]">{result.sample_id}</span><span className="text-[#464c5e]">{classifySampleResult(result)}</span><span className="text-right text-[#464c5e]">{result.retrieved_contexts.length}</span><span className="text-right text-[#464c5e] max-[700px]:hidden">{result.metrics.filter((metric) => metric.status === 'success' && metric.score != null).length}</span></div><DiagnosticDetails result={result} /></div>)}{filtered.length === 0 ? <p className="px-[10px] py-[20px] text-center text-[12px] text-[#858b9c]">没有符合该状态的样本。</p> : null}</div>}
+    </section>
+  );
+}
+
+function ScoringCaveatPanel({
+  summary,
+  results,
+}: {
+  summary: EvaluationSummary;
+  results: EvaluationSampleResult[];
+}) {
+  const caveats = buildScoringCaveats(summary, results);
+  if (caveats.warnings.length === 0) return null;
+  const title = caveats.status === 'technical_failure' ? '评分存在技术问题' : '评分解读提示';
+  return (
+    <section className="rounded-[10px] border border-[#f4dcae] bg-[#fffaf0] px-[12px] py-[10px]">
+      <h4 className="text-[13px] font-semibold text-[#8a5a10]">{title}</h4>
+      <p className="mt-[3px] text-[11px] leading-[17px] text-[#9a610d]">低分需要和以下执行条件一起判断；技术失败或输入不完整时，不宜直接把分数当作系统质量结论。</p>
+      <ul className="mt-[6px] grid list-disc gap-[3px] pl-[18px] text-[12px] leading-[18px] text-[#8a5a10]">
+        {caveats.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+      </ul>
     </section>
   );
 }
@@ -196,6 +235,7 @@ export default function EvaluationDashboard({
     <div className="grid gap-[14px] border-t border-[#f0f1f4] pt-[14px]">
       <section><div className="mb-[10px] flex flex-wrap items-center gap-[8px]"><h3 className="text-[14px] font-semibold text-[#18181a]">评估总览</h3><GatePill summary={summary} isFinal={isFinal} /></div><div className="grid grid-cols-4 gap-[10px] max-[1200px]:grid-cols-3 max-[640px]:grid-cols-1"><StatCard label="样本" value={sampleCount} /><StatCard label="采集成功" value={`${summary.successful_samples} / ${sampleCount}`} tone={summary.failed_samples ? 'default' : 'green'} /><StatCard label="有检索证据" value={`${credibility.evidenceSamples} / ${sampleCount}`} /><StatCard label="评分任务进度" value={scoringTotalItems > 0 ? `${scoringCompletedItems}/${scoringTotalItems}` : '—'} /><StatCard label="已有评分样本" value={`${credibility.scoredSamples} / ${sampleCount}`} /><StatCard label="待评分任务" value={pendingScoringItems == null ? '—' : pendingScoringItems} tone={pendingScoringItems === 0 ? 'green' : 'default'} /><StatCard label="确认评分失败" value={credibility.metricFailures} tone={credibility.metricFailures ? 'red' : 'green'} /></div></section>
       <p className={cn('rounded-[8px] px-[10px] py-[8px] text-[12px]', statusClass)}>{isInProgress ? `结果状态：${displayStatus}；采集失败 ${credibility.collectionFailures} 条，确认评分失败 ${credibility.metricFailures} 条。Gate 将在评分完成后判定。` : !isFinal ? `结果状态：${displayStatus}；采集失败 ${credibility.collectionFailures} 条，确认评分失败 ${credibility.metricFailures} 条。` : `结果状态：${displayStatus}；采集失败 ${credibility.collectionFailures} 条，评分失败 ${credibility.metricFailures} 条。${credibility.status === '存在技术失败' ? '请先排除技术失败，再用分数作结论。' : credibility.status === '评分覆盖不足' ? '当前没有足够的有效评分用于比较。' : '分数仍应结合适用样本数、证据和门禁原因解读。'}`}</p>
+      <ScoringCaveatPanel summary={summary} results={sampleResults} />
       <div className="grid gap-[14px] xl:grid-cols-2"><CurrentMetricChart summary={summary} isInProgress={isInProgress} /><MetricTableAndGate summary={summary} isFinal={isFinal} /></div>
       <BaselineChart compare={compare} />
       <SampleDiagnostics results={sampleResults} error={sampleResultsError} />

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Generator
 
@@ -33,6 +34,8 @@ from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
+from src.observability import observe
+from src.observability.metrics import record_agent, record_agent_stage
 
 
 @dataclass
@@ -50,11 +53,45 @@ class _RunRecord:
     footer: str = ""
     retrieval_summary: dict = field(default_factory=dict)
     token_usage_summary: object = None
+    answer: str = ""
 
 
 _RUN_RECORD: contextvars.ContextVar[_RunRecord | None] = contextvars.ContextVar(
     "agent_run_record", default=None
 )
+
+
+def _observed_node(node_name: str, fn: Callable):
+    """Wrap an existing graph node without changing the LangGraph state flow."""
+
+    def run(state):
+        started = time.monotonic()
+        status = "success"
+        with observe.chain(
+            f"hdb.agent.{node_name}",
+            stage=node_name,
+            **{"hdb.agent.retrieval_round": int(state.get("retrieval_round") or 0)},
+        ) as observation:
+            observation.set_input(state.get("user_query") or "", content_kind="query")
+            try:
+                result = fn(state)
+                observation.set("hdb.agent.stage", node_name)
+                if isinstance(result, dict):
+                    observation.set("hdb.evidence.count", len(result.get("merged_evidence") or []))
+                    output = result.get("final_response") or result.get("answer")
+                    if output:
+                        observation.set_output(output, content_kind="llm")
+                return result
+            except Exception as exc:
+                status = "failed"
+                observation.error(exc)
+                raise
+            finally:
+                observation.set("hdb.agent.status", status)
+                observation.outcome(status)
+                record_agent_stage(stage=node_name, duration_s=max(0.0, time.monotonic() - started), status=status)
+
+    return run
 
 _TRACE_LABELS = {
     "route_query": "识别问题类型",
@@ -156,6 +193,11 @@ def _select_claim_context(state: dict, *, limit: int = 20) -> list[dict]:
 
     evidence = list(state.get("merged_evidence") or [])
     evidence_by_id = {str(item.get("id") or ""): item for item in evidence}
+    quality_by_id = {
+        str(item.get("evidence_id") or ""): float(item.get("score") or 0.0)
+        for item in state.get("evidence_quality") or []
+        if item.get("evidence_id")
+    }
     selected: list[dict] = []
     selected_ids: set[str] = set()
     for coverage in state.get("claim_coverage") or []:
@@ -168,7 +210,15 @@ def _select_claim_context(state: dict, *, limit: int = 20) -> list[dict]:
                 selected_ids.add(str(evidence_id))
                 if len(selected) >= limit:
                     return selected
-    for item in sorted(evidence, key=lambda candidate: float(candidate.get("score") or 0.0), reverse=True):
+    for item in sorted(
+        evidence,
+        key=lambda candidate: (
+            quality_by_id.get(str(candidate.get("id") or ""), 0.0),
+            float(candidate.get("score") or 0.0),
+            str(candidate.get("id") or ""),
+        ),
+        reverse=True,
+    ):
         evidence_id = str(item.get("id") or "")
         if evidence_id not in selected_ids:
             selected.append(item)
@@ -211,23 +261,93 @@ class MultiSourceAgentRunner:
             "spreadsheet_cell": SpreadsheetCellTool(self.spreadsheet_service),
             "spreadsheet_profile": SpreadsheetProfileTool(self.spreadsheet_service),
         }
-        self.graph = build_multi_source_graph(
-            {
-                "analyze_question": lambda state: analyze_question_with_llm(state, self.llm_client),
-                "route_query": lambda state: route_query(state, self.llm_client),
-                "compose_direct_answer": self._compose_direct_answer,
-                "scan_kb_catalog": lambda state: scan_kb_catalog(state, self.catalog_tool),
-                "plan_source_selection": lambda state: plan_source_selection_with_llm(state, self.llm_client),
-                "retrieve_evidence": lambda state: retrieve_evidence(state, self.tools),
-                "draft_intermediate_answer": self._draft_intermediate_answer,
-                "judge_sufficiency": lambda state: judge_sufficiency(state, self.llm_client),
-                "plan_next_retrieval": lambda state: plan_next_retrieval(state, self.llm_client, self.catalog_tool),
-                "compose_answer": self._compose_answer,
-                "verify_grounding": self._verify_grounding,
-            }
-        )
+        nodes = {
+            "analyze_question": lambda state: analyze_question_with_llm(state, self.llm_client),
+            "route_query": lambda state: route_query(state, self.llm_client),
+            "compose_direct_answer": self._compose_direct_answer,
+            "scan_kb_catalog": lambda state: scan_kb_catalog(state, self.catalog_tool),
+            "plan_source_selection": lambda state: plan_source_selection_with_llm(state, self.llm_client),
+            "retrieve_evidence": lambda state: retrieve_evidence(state, self.tools),
+            "draft_intermediate_answer": self._draft_intermediate_answer,
+            "judge_sufficiency": lambda state: judge_sufficiency(state, self.llm_client),
+            "plan_next_retrieval": lambda state: plan_next_retrieval(state, self.llm_client, self.catalog_tool),
+            "compose_answer": self._compose_answer,
+            "verify_grounding": self._verify_grounding,
+        }
+        self.graph = build_multi_source_graph({name: _observed_node(name, fn) for name, fn in nodes.items()})
 
     def stream(
+        self,
+        *,
+        query: str,
+        kb_name: str,
+        history: list[tuple[str, str]],
+        ctx: RequestContext | None = None,
+        thread_id: str = "",
+        event_callback: Callable[[dict], None] | None = None,
+        query_mode: str = "deep",
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> Generator[str, None, None]:
+        started = time.monotonic()
+        status = "success"
+        with observe.agent(
+            "hdb.agent.run",
+            **{
+                "hdb.query.mode": query_mode,
+                "hdb.query.source": "multi_source_agent",
+                "hdb.session.id": thread_id,
+            },
+        ) as observation:
+            observation.set_input(query, content_kind="query")
+            try:
+                yield from self._stream_impl(
+                    query=query,
+                    kb_name=kb_name,
+                    history=history,
+                    ctx=ctx,
+                    thread_id=thread_id,
+                    event_callback=event_callback,
+                    query_mode=query_mode,
+                    should_cancel=should_cancel,
+                )
+            except QueryCancelled:
+                status = "cancelled"
+                raise
+            except Exception as exc:
+                status = "failed"
+                observation.error(exc)
+                raise
+            finally:
+                summary = self.get_last_retrieval_summary()
+                run_record = _current_run()
+                observation.set_token_usage(run_record.token_usage_summary if run_record is not None else None)
+                if run_record.answer:
+                    observation.set_output(run_record.answer, content_kind="llm")
+                observation.set("hdb.agent.retrieval_round", int(summary.get("retrieval_rounds") or 0))
+                observation.set("hdb.evidence.count", len(summary.get("evidence") or []))
+                observation.set("hdb.retrieval.calls", len(summary.get("tool_diagnostics") or []))
+                observation.set(
+                    "hdb.retrieval.hits",
+                    sum(int(item.get("hit_count") or 0) for item in summary.get("tool_diagnostics") or []),
+                )
+                observation.set("hdb.retrieval.final_top_k", int(summary.get("final_top_k") or 0))
+                observation.set("hdb.retriever.type", summary.get("retriever_type") or "")
+                observation.set("hdb.retrieval.status", summary.get("status") or "")
+                if summary.get("rewritten_queries"):
+                    observation.set(
+                        "hdb.query.rewritten",
+                        json.dumps(summary.get("rewritten_queries"), ensure_ascii=False),
+                    )
+                observation.set("hdb.agent.status", status)
+                observation.outcome(status)
+                record_agent(
+                    status=status,
+                    mode=query_mode,
+                    duration_s=max(0.0, time.monotonic() - started),
+                    retrieval_rounds=int(summary.get("retrieval_rounds") or 0),
+                )
+
+    def _stream_impl(
         self,
         *,
         query: str,
@@ -373,9 +493,12 @@ class MultiSourceAgentRunner:
             else {}
         )
         self._last_token_usage_summary = self._get_llm_usage_summary()
+        _current_run().answer = str(final_state.get("final_response") or final_state.get("answer") or "")
         if not yielded:
             emit_stage("generate", "生成回答", "running", "正在生成最终回答")
-            yield final_state.get("final_response") or final_state.get("answer") or "未生成回答。"
+            fallback_answer = final_state.get("final_response") or final_state.get("answer") or "未生成回答。"
+            _current_run().answer = str(fallback_answer)
+            yield fallback_answer
             emit_stage("generate", "生成回答", "done", "最终回答已生成")
         return
 

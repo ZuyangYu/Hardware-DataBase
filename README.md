@@ -208,6 +208,7 @@ uv run hardware-database-eval score --dataset evaluation/datasets/hardware_qa_v1
 - 运行产物：`storage/evaluations/<run_id>/`
 
 - `snapshot.jsonl` 保存回答和检索上下文，可更换裁判模型重复评分。
+- `retrieved_contexts` 保存原始检索结果；`results.jsonl` 中 `metadata.ragas_scoring.scored_contexts` 保存实际送入 RAGAS 的上下文窗口。评分任务进度只表示工作项完成情况，不能替代有效评分数和评分失败数。
 - 每个运行目录都会保存 `run_state.json`。在线运行在至少持久化一条采集结果后，才会在该目录生成 `snapshot.jsonl`；离线运行则引用所提供的快照路径，该路径可能位于运行目录之外。只有完成评分的运行才会生成 `summary.json`、`results.jsonl`、`summary.csv` 和 `report.html`。
 - `summary.json` 是自动化消费的权威汇总，`summary.csv` 用于表格分析，`report.html` 用于人工查看。
 - 单题或单指标失败不会终止整批；`not_applicable` 不计入指标均值。

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from src.agents.claim_evidence import EvidenceCapability, plan_claims
-from src.agents.graph import _claim_compatible, _claim_coverage, _source_capabilities, analyze_question
+from src.agents.graph import (
+    _claim_compatible,
+    _claim_coverage,
+    _score_evidence_quality,
+    _source_capabilities,
+    analyze_question,
+)
 from src.agents.runner import _select_claim_context
 from src.ingestion.parser_registry import DomainManifest, ParserRegistry
 
@@ -97,6 +103,64 @@ def test_claim_context_keeps_required_evidence_when_budget_is_small():
     )
 
     assert {item["id"] for item in selected} == {"relation-1", "document-1"}
+
+
+def test_evidence_quality_prefers_question_fact_over_template_boilerplate():
+    state = {
+        "source_plan": {
+            "source_plan": [{"source_name": "hardware.xlsx"}],
+        },
+        "question_analysis": {
+            "sub_questions": [
+                {
+                    "id": "sq1",
+                    "question": "TPS62872 的 EN 引脚连接到哪个网络？",
+                    "expected_evidence": ["circuit_design"],
+                }
+            ]
+        },
+    }
+    quality = _score_evidence_quality(
+        state,
+        [
+            {
+                "id": "template",
+                "content": "填写说明：模板正文相关内容可以裁剪",
+                "content_kind": "spreadsheet_table",
+                "source_name": "hardware.xlsx",
+                "score": 1.0,
+            },
+            {
+                "id": "fact",
+                "content": "TPS62872 U1800 的 EN 引脚连接至 N19888813",
+                "content_kind": "circuit_design",
+                "source_name": "hardware.xlsx",
+                "score": 1.0,
+            },
+        ],
+    )
+
+    assert quality["fact"].score > quality["template"].score
+    assert quality["fact"].token_overlap > 0
+    assert "template_boilerplate_penalty" in quality["template"].reasons
+
+
+def test_answer_context_uses_quality_before_equal_raw_retriever_scores():
+    selected = _select_claim_context(
+        {
+            "merged_evidence": [
+                {"id": "template", "content": "模板", "score": 1.0},
+                {"id": "fact", "content": "TPS62872 EN", "score": 1.0},
+            ],
+            "evidence_quality": [
+                {"evidence_id": "template", "score": 0.1},
+                {"evidence_id": "fact", "score": 0.9},
+            ],
+        },
+        limit=1,
+    )
+
+    assert [item["id"] for item in selected] == ["fact"]
 
 
 def test_source_selection_uses_claim_capability_not_file_name():

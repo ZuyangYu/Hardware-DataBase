@@ -232,6 +232,14 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   onClick={() => navigate('/admin/logs')}
                   tooltip="日志中心"
                 />
+                <PrimaryNavButton
+                  label="系统状态"
+                  iconName="refresh"
+                  active={location.pathname === '/admin/status'}
+                  collapsed={collapsed}
+                  onClick={() => navigate('/admin/status')}
+                  tooltip="系统状态"
+                />
                 {sysAdmin && (
                   <PrimaryNavButton
                     label="系统配置"

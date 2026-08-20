@@ -7,8 +7,11 @@ by :func:`require_any_admin`).
 """
 from __future__ import annotations
 
+from urllib.parse import quote
+
 from fastapi import APIRouter, Depends, Query
 
+import config.settings as settings
 from src.core.app_logs import AppLogService
 from src.core.auth import AuthUser
 
@@ -22,6 +25,16 @@ from src.api.schemas import (
 )
 
 router = APIRouter(tags=["logs"])
+
+
+def _trace_link(base_url: str, trace_id: str, kind: str) -> str:
+    if not base_url or not trace_id:
+        return ""
+    encoded = quote(trace_id, safe="")
+    base = base_url.rstrip("/")
+    if kind == "grafana":
+        return f"{base}/explore?traceID={encoded}"
+    return f"{base}/projects/{quote(settings.OBS_PHOENIX_PROJECT, safe='')}/traces/{encoded}"
 
 
 def _log_service() -> AppLogService:
@@ -65,6 +78,11 @@ def _trace_view(t) -> QueryTraceView:
         error_message=t.error_message,
         metadata_json=t.metadata_json,
         created_at=t.created_at,
+        otel_trace_id=t.otel_trace_id,
+        otel_span_id=t.otel_span_id,
+        turn_id=t.turn_id,
+        grafana_trace_url=_trace_link(settings.OBS_GRAFANA_BASE_URL, t.otel_trace_id, "grafana"),
+        phoenix_trace_url=_trace_link(settings.OBS_PHOENIX_BASE_URL, t.otel_trace_id, "phoenix"),
     )
 
 

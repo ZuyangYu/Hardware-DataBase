@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import closing
 
@@ -12,8 +13,106 @@ from src.services.kb_scope import kb_scope_from_context
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
 
 
+_DOMAIN_QUERY_TERMS = (
+    "供电",
+    "电源",
+    "网络",
+    "电压",
+    "电流",
+    "功耗",
+    "频率",
+    "地址",
+    "容量",
+    "数量",
+    "用量",
+    "接口",
+    "引脚",
+    "连接",
+    "使能",
+    "唤醒",
+    "看门狗",
+    "复位",
+    "阈值",
+    "滤波",
+    "截止频率",
+    "模块",
+    "芯片",
+    "型号",
+)
+_CJK_STOP_CHARS = frozenset("的是什么有哪些列出如何这该项目前中与和及到从为将或能否可以是否请问多少几片了用名")
+_CJK_NOISY_NGRAMS = frozenset({"电电", "围使", "存容", "源网", "络名"})
+_BOILERPLATE_MARKERS = ("填写说明", "template instructions", "封面", "cover", "模板变更历史")
+
+
 def _tokens(query: str) -> list[str]:
-    return tokenize_hardware_query(query, max_tokens=8, include_cjk_ngrams=False)
+    """Extract searchable hardware terms from mixed Chinese/English queries."""
+
+    value = str(query or "")
+    lowered = value.casefold()
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def add(token: str) -> None:
+        normalized = token.strip().casefold()
+        if len(normalized) < 2 or normalized in seen:
+            return
+        seen.add(normalized)
+        tokens.append(normalized)
+
+    # Preserve exact part numbers, references, buses, and English hardware terms.
+    for token in tokenize_hardware_query(value, max_tokens=32, include_cjk_ngrams=False):
+        add(token)
+    for term in _DOMAIN_QUERY_TERMS:
+        if term.casefold() in lowered:
+            add(term)
+
+    # Add meaningful CJK bigrams while excluding interrogative and
+    # grammatical fragments such as ``的供`` or ``电电``. Exact domain terms
+    # above cover the longer concepts we want to preserve (for example
+    # ``截止频率`` and ``看门狗``), while bigrams avoid noisy fragments such as
+    # ``外围使`` and ``围使``.
+    for block in re.findall(r"[\u4e00-\u9fff]{2,}", value):
+        for size in (2,):
+            for index in range(0, len(block) - size + 1):
+                token = block[index : index + size]
+                if (
+                    len(set(token)) > 1
+                    and token not in _CJK_NOISY_NGRAMS
+                    and not any(char in _CJK_STOP_CHARS for char in token)
+                ):
+                    add(token)
+    return tokens[:24]
+
+
+def _candidate_limit(top_k: int) -> int:
+    requested = max(1, int(top_k))
+    return min(200, max(40, requested * 8))
+
+
+def _row_relevance(text: str, tokens: list[str], confidence: float = 0.0, row_id: int = 0) -> tuple:
+    searchable = str(text or "").casefold()
+    matched = {token for token in tokens if token in searchable}
+    boilerplate = any(marker in searchable for marker in _BOILERPLATE_MARKERS)
+    return (
+        len(matched),
+        sum(len(token) for token in matched),
+        not boilerplate,
+        float(confidence or 0.0),
+        -int(row_id or 0),
+    )
+
+
+def _rank_rows(rows, tokens: list[str], text_getter):
+    return sorted(
+        rows,
+        key=lambda row: _row_relevance(
+            text_getter(row),
+            tokens,
+            float(row["confidence_score"] or 0.0) if "confidence_score" in row.keys() else 0.0,
+            int(row["id"] or 0) if "id" in row.keys() else 0,
+        ),
+        reverse=True,
+    )
 
 
 def _like_clauses(columns: list[str], tokens: list[str]) -> tuple[str, list[str]]:
@@ -28,6 +127,21 @@ def _like_clauses(columns: list[str], tokens: list[str]) -> tuple[str, list[str]
     if not clauses:
         return "1=1", []
     return "(" + " OR ".join(clauses) + ")", params
+
+
+def _token_match_order(columns: list[str], tokens: list[str]) -> tuple[str, list[str]]:
+    """Build a portable SQL relevance expression for the candidate window."""
+
+    expressions: list[str] = []
+    params: list[str] = []
+    for token in tokens:
+        expressions.append(
+            "(CASE WHEN "
+            + " OR ".join(f"LOWER({column}) LIKE ?" for column in columns)
+            + " THEN 1 ELSE 0 END)"
+        )
+        params.extend(f"%{token}%" for _ in columns)
+    return " + ".join(expressions) or "0", params
 
 
 class SpreadsheetSemanticTool:
@@ -51,22 +165,37 @@ class SpreadsheetSemanticTool:
             return []
         record_id = int((filters or {}).get("record_id") or 0)
         tokens = _tokens(query)
-        where, params = _like_clauses(["r.semantic_text", "r.raw_text"], tokens)
+        columns = ["r.semantic_text", "r.raw_text"]
+        where, where_params = _like_clauses(columns, tokens)
+        relevance_order, order_params = _token_match_order(columns, tokens)
+        # SQLite binds placeholders in SQL-text order: WHERE, record filter,
+        # then ORDER BY relevance. Keep the parameter list in that order.
+        params = [*where_params]
+        requested_top_k = max(1, int(top_k))
         record_clause = " AND r.record_id = ?" if record_id else ""
         if record_id:
             params.append(record_id)
-        params.append(max(1, int(top_k)))
+        params.extend(order_params)
+        params.append(_candidate_limit(requested_top_k))
         sql = f"""
             SELECT r.*, d.document_name, d.source_group
             FROM table_semantic_rows r
             JOIN table_documents d ON d.record_id = r.record_id
             WHERE {where}{record_clause}
-            ORDER BY r.confidence_score DESC, r.id ASC
+            ORDER BY {relevance_order} DESC, r.confidence_score DESC, r.id ASC
             LIMIT ?
         """
-        return self._query_rows(db_path, sql, params, query)
+        return self._query_rows(db_path, sql, params, query, tokens, requested_top_k)
 
-    def _query_rows(self, db_path: str, sql: str, params: list, query: str) -> list[Evidence]:
+    def _query_rows(
+        self,
+        db_path: str,
+        sql: str,
+        params: list,
+        query: str,
+        tokens: list[str],
+        top_k: int,
+    ) -> list[Evidence]:
         try:
             conn = sqlite3.connect(db_path, timeout=30)
             conn.row_factory = sqlite3.Row
@@ -77,6 +206,11 @@ class SpreadsheetSemanticTool:
                 rows = conn.execute(sql, params).fetchall()
             except sqlite3.Error:
                 return []
+        rows = _rank_rows(
+            rows,
+            tokens,
+            lambda row: f"{row['semantic_text'] or ''}\n{row['raw_text'] or ''}",
+        )
         evidences = []
         for row in rows:
             values = json.loads(row["values_json"] or "{}")
@@ -106,7 +240,7 @@ class SpreadsheetSemanticTool:
                     },
                 )
             )
-        return evidences
+        return evidences[:top_k]
 
 
 class SpreadsheetCellTool:
@@ -130,17 +264,22 @@ class SpreadsheetCellTool:
             return []
         record_id = int((filters or {}).get("record_id") or 0)
         tokens = _tokens(query)
-        where, params = _like_clauses(["c.value", "c.raw_value", "c.header"], tokens)
+        columns = ["c.value", "c.raw_value", "c.header"]
+        where, where_params = _like_clauses(columns, tokens)
+        relevance_order, order_params = _token_match_order(columns, tokens)
+        params = [*where_params]
+        requested_top_k = max(1, int(top_k))
         record_clause = " AND c.record_id = ?" if record_id else ""
         if record_id:
             params.append(record_id)
-        params.append(max(1, int(top_k)))
+        params.extend(order_params)
+        params.append(_candidate_limit(requested_top_k))
         sql = f"""
             SELECT c.*, d.document_name, d.source_group
             FROM table_cells c
             JOIN table_documents d ON d.record_id = c.record_id
             WHERE {where}{record_clause}
-            ORDER BY c.id ASC
+            ORDER BY {relevance_order} DESC, c.id ASC
             LIMIT ?
         """
         try:
@@ -153,6 +292,11 @@ class SpreadsheetCellTool:
                 rows = conn.execute(sql, params).fetchall()
             except sqlite3.Error:
                 return []
+        rows = _rank_rows(
+            rows,
+            tokens,
+            lambda row: f"{row['header'] or ''}\n{row['value'] or ''}\n{row['raw_value'] or ''}",
+        )
         return [
             Evidence(
                 id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['cell_ref']}:cell",
@@ -177,7 +321,7 @@ class SpreadsheetCellTool:
                     "source_group": row["source_group"],
                 },
             )
-            for row in rows
+            for row in rows[:requested_top_k]
         ]
 
 
