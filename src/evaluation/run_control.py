@@ -481,7 +481,7 @@ class EvaluationRunController:
                 )
                 write_reports(store.path.parent / ".checkpoint", summary, results)
 
-            summary, results = service.score(
+            summary, results = (service if state.mode == "online" else self.service_factory()).score(
                 samples,
                 snapshots,
                 run_id=run_id,

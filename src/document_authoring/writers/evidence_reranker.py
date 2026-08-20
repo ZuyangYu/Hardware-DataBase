@@ -51,6 +51,8 @@ class EvidenceReranker:
                     {"role": "user", "content": _build_prompt(requirement, evidence)},
                 ],
                 usage_stage="evidence_rerank",
+                timeout=20,
+                rate_limit_max_retries=0,
             )
             ordered = _apply_ranking(response, evidence)
         except Exception as exc:

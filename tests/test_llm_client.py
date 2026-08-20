@@ -110,6 +110,22 @@ class LLMClientStreamTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertEqual(post.call_args_list[0].kwargs["json"]["model"], "primary-model")
 
+    def test_openai_compatible_chat_can_disable_rate_limit_retries_per_call(self):
+        config = LLMClientConfig(
+            provider=settings.Provider.CUSTOM,
+            base_url="https://example.test/v1",
+            model="primary-model",
+            rate_limit_max_retries=4,
+        )
+
+        with patch("src.core.llm_client.requests.post", side_effect=[_RateLimitedResponse()]) as post:
+            with self.assertRaises(requests.HTTPError):
+                LLMClient(config).chat(
+                    [{"role": "user", "content": "hi"}], rate_limit_max_retries=0,
+                )
+
+        self.assertEqual(post.call_count, 1)
+
     def test_openai_compatible_chat_retries_transient_connection_error(self):
         config = LLMClientConfig(
             provider=settings.Provider.CUSTOM,

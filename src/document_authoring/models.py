@@ -292,6 +292,7 @@ class DocumentWorkOrder(BaseModel):
     ] = "planned"
     generation_session_id: str | None = None
     generation_brief: dict[str, Any] = Field(default_factory=dict)
+    restart_of_work_order_id: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     retryable: bool | None = None
@@ -339,6 +340,10 @@ class DocumentWorkOrder(BaseModel):
             # added. New session-backed work orders include both fields as
             # immutable generation inputs.
             excluded.update({"generation_session_id", "generation_brief"})
+        if self.restart_of_work_order_id is None:
+            # Preserve fingerprints for work orders stored before traceable
+            # restart lineage was introduced.
+            excluded.add("restart_of_work_order_id")
         expected = content_hash(self.model_dump(mode="json", exclude=excluded))
         if self.input_fingerprint and self.input_fingerprint != expected:
             raise ValueError("work order input_fingerprint does not match frozen inputs")
@@ -425,6 +430,7 @@ class HarnessPolicy(BaseModel):
     max_retrieval_rounds: int = 2
     max_retrieval_attempts_per_unit: int = 2
     max_units_per_run: int = 20
+    max_parallel_units: int = 3
     max_retries: int = 1
     lease_seconds: int = 60
     max_query_rewrite_rounds: int = 1
@@ -455,6 +461,8 @@ class HarnessPolicy(BaseModel):
             raise ValueError("harness policy budgets must be positive")
         if self.max_retries < 0:
             raise ValueError("harness policy max_retries cannot be negative")
+        if not 1 <= self.max_parallel_units <= 8:
+            raise ValueError("max_parallel_units must be between 1 and 8")
         if self.max_adaptive_recovery_rounds < 0:
             raise ValueError("harness policy max_adaptive_recovery_rounds cannot be negative")
         if len(self.allowed_tools) != len(set(self.allowed_tools)):
@@ -486,6 +494,7 @@ class AuthoringRunManifest(BaseModel):
     max_steps: int | None = None
     max_retrieval_rounds: int | None = None
     max_retrieval_attempts_per_unit: int | None = None
+    max_parallel_units: int | None = None
     validator_version: str = "p2b-1"
     renderer_version: str = "p2a-1"
     created_at: datetime = Field(default_factory=utc_now)
@@ -503,6 +512,8 @@ class HarnessRun(BaseModel):
     current_node: str = "initialize"
     step_count: int = 0
     retrieval_round_count: int = 0
+    completed_units: int = 0
+    total_units: int = 0
     retry_count: int = 0
     max_retries: int = 0
     lease_owner: str | None = None
@@ -528,6 +539,8 @@ class HarnessCheckpoint(BaseModel):
     current_node: str = "initialize"
     step_count: int = 0
     retrieval_round_count: int = 0
+    completed_units: int = 0
+    total_units: int = 0
     unit_statuses: dict[str, str] = Field(default_factory=dict)
     evidence_matrix_hash: str | None = None
     draft_ids: list[str] = Field(default_factory=list)

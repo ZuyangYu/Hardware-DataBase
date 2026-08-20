@@ -165,6 +165,44 @@ class EvaluationServiceTests(unittest.TestCase):
             {item.id for item in samples},
         )
 
+    def test_collect_uses_configured_workers_with_progress_callbacks(self):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+        persisted_ids = []
+
+        def collect(sample):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return AnswerSnapshot(
+                sample_id=sample.id,
+                question=sample.question,
+                kb_name=sample.kb_name,
+                response="A",
+            )
+
+        service = EvaluationService(config=_config(max_workers=2))
+        service.answer_runner.collect = collect
+        samples = [_sample(f"q{index}") for index in range(4)]
+
+        snapshots = service.collect(
+            samples,
+            self.snapshot_path,
+            before_sample=lambda _sample, _done, _total: True,
+            after_sample=lambda snapshot, _done, _total: persisted_ids.append(
+                snapshot.sample_id
+            ),
+        )
+
+        self.assertEqual(max_active, 2)
+        self.assertEqual(set(persisted_ids), {item.id for item in samples})
+        self.assertEqual({item.sample_id for item in snapshots}, {item.id for item in samples})
+
     def test_score_keeps_successful_metrics_when_one_fails(self):
         service = EvaluationService(ragas_adapter=FakeAdapter())
 

@@ -7,9 +7,15 @@ import {
   classifySampleResult,
   compareMetricRows,
   metricRows,
+  shouldResetEvaluationLoading,
 } from './evaluationDashboard';
 
 describe('evaluation dashboard data', () => {
+  it('keeps existing content mounted during background refreshes', () => {
+    expect(shouldResetEvaluationLoading(false)).toBe(true);
+    expect(shouldResetEvaluationLoading(true)).toBe(false);
+  });
+
   it('orders known metrics, exposes threshold state, and keeps unknown metrics last', () => {
     const rows = metricRows({
       metric_scores: { unknown: 0.5, faithfulness: 0.8, answer_correctness: 0.7 },

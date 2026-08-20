@@ -8,6 +8,8 @@ Managed Writer; both are checked against HarnessToolPolicy first.
 from __future__ import annotations
 
 import hashlib
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, TypedDict
 
@@ -24,7 +26,7 @@ from src.document_authoring.models import (
     LegacyTemplateClaim,
 )
 from src.document_authoring.validator import DocumentValidator
-from src.document_authoring.writers.managed import ManagedWriter
+from src.document_authoring.writers.managed import DeterministicEvidenceWriter, ManagedWriter
 from src.document_authoring.writers.provider import WriterRequest
 from src.projects.models import SourceSetSnapshot
 
@@ -47,6 +49,8 @@ class DocumentAuthoringState(TypedDict, total=False):
     current_node: str
     step_count: int
     retrieval_round_count: int
+    completed_units: int
+    total_units: int
     last_error: dict[str, Any] | None
 
 
@@ -115,6 +119,8 @@ class AuthoringGraph:
             "current_node": "initialize",
             "step_count": 0,
             "retrieval_round_count": 0,
+            "completed_units": 0,
+            "total_units": len(semantic_units),
         }
 
         try:
@@ -122,6 +128,50 @@ class AuthoringGraph:
             for unit in semantic_units:
                 requirement = _requirement_for_unit(unit, work_order, snapshot)
                 result.requirements[unit["unit_id"]] = requirement
+
+            if len(semantic_units) > 1 and self.policy.policy.max_parallel_units > 1:
+                def publish_completed_unit(
+                    unit_id: str,
+                    unit_result: HarnessExecutionResult,
+                ) -> None:
+                    state["step_count"] += unit_result.step_count
+                    state["retrieval_round_count"] += unit_result.retrieval_round_count
+                    state["completed_units"] += 1
+                    self.policy.require_step(state["step_count"])
+                    self.policy.require_retrieval_round(state["retrieval_round_count"])
+                    state["current_node"] = "parallel_units"
+                    if self.on_progress is not None:
+                        self.on_progress(state)
+
+                unit_results = self._run_parallel_units(
+                    semantic_units, work_order, harness_run, run_manifest, schema,
+                    snapshot, legacy_claims, retrieve, on_completed=publish_completed_unit,
+                )
+                for unit in semantic_units:
+                    unit_result = unit_results[unit["unit_id"]]
+                    result.requirements.update(unit_result.requirements)
+                    result.outcomes.update(unit_result.outcomes)
+                    result.matrix_rows.extend(unit_result.matrix_rows)
+                    result.retrieval_ledger.extend(unit_result.retrieval_ledger)
+                    result.drafts.extend(unit_result.drafts)
+                    result.unit_statuses.update(unit_result.unit_statuses)
+                    result.issues.extend(unit_result.issues)
+                self._step(state, "validate_cross_unit")
+                self.policy.require_tool("validate_cross_unit")
+                consistency_issues = self.validator.validate_cross_unit_consistency(result.drafts)
+                if consistency_issues:
+                    result.issues.extend(consistency_issues)
+                    conflicted_units = {
+                        unit_id
+                        for issue in consistency_issues
+                        for units in issue["values"].values()
+                        for unit_id in units
+                    }
+                    for unit_id in conflicted_units:
+                        result.unit_statuses[unit_id] = "conflicting"
+                result.step_count = state["step_count"]
+                result.retrieval_round_count = state["retrieval_round_count"]
+                return result
 
             for unit_id, requirement in result.requirements.items():
                 outcome = self._retrieve_with_budget(state, requirement, retrieve)
@@ -134,7 +184,27 @@ class AuthoringGraph:
                     for evidence_obj in outcome.evidences
                 )
                 evidence = _validated_evidence(work_order, snapshot, outcome)
-                if evidence and self.reranker is not None:
+                preselected_evidence, preselected_discarded_evidence_ids = _select_field_evidence(
+                    evidence,
+                    _max_evidence_items(unit_id, schema),
+                    preserve_rerank_order=False,
+                    retrieval_query_terms=requirement.retrieval_query_terms,
+                )
+                fast_path = (
+                    not recovery_triggered
+                    and getattr(
+                        getattr(self.writer, "provider", self.writer),
+                        "provider_id",
+                        None,
+                    ) == DeterministicEvidenceWriter.provider_id
+                    and _use_deterministic_evidence_writer(
+                        unit_id, schema, requirement, preselected_evidence,
+                    )
+                )
+                if fast_path:
+                    evidence = preselected_evidence
+                    discarded_evidence_ids = preselected_discarded_evidence_ids
+                elif evidence and self.reranker is not None:
                     # Rerank (P6): reorder validated evidence by requirement
                     # relevance before the writer. Gated by the allowlist; an
                     # old policy without rerank_evidence never injects a
@@ -147,7 +217,7 @@ class AuthoringGraph:
                     _max_evidence_items(unit_id, schema),
                     preserve_rerank_order=self.reranker is not None,
                     retrieval_query_terms=requirement.retrieval_query_terms,
-                )
+                ) if not fast_path else (evidence, discarded_evidence_ids)
                 # Retrieval ledger (P9): per-unit observability row surfaced in
                 # the matrix (for human review) and on the result, so it is no
                 # longer dropped when run() returns.
@@ -171,7 +241,7 @@ class AuthoringGraph:
                     continue
                 self._step(state, "draft_ready_unit")
                 self.policy.require_tool("draft_ready_unit")
-                draft = self.draft_provider(WriterRequest(
+                request = WriterRequest(
                     work_order_id=work_order.work_order_id,
                     run_id=harness_run.harness_run_id,
                     unit_id=unit_id,
@@ -182,7 +252,12 @@ class AuthoringGraph:
                     evidence=evidence,
                     missing_or_conflicts=[],
                     prompt_version=self.policy.policy.prompt_version,
-                ))
+                )
+                draft = (
+                    DeterministicEvidenceWriter().generate(request)
+                    if fast_path
+                    else self.draft_provider(request)
+                )
                 self._step(state, "validate_unit_draft")
                 self.policy.require_tool("validate_unit_draft")
                 evidence_by_id = {entry["id"]: entry for entry in evidence}
@@ -269,6 +344,45 @@ class AuthoringGraph:
             for unit in semantic_units:
                 result.unit_statuses.setdefault(unit["unit_id"], "requires_human")
             return result
+
+    def _run_parallel_units(
+        self,
+        semantic_units: list[dict[str, Any]],
+        work_order: DocumentWorkOrder,
+        harness_run: HarnessRun,
+        run_manifest: AuthoringRunManifest,
+        schema: DocumentSchema,
+        snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
+        legacy_claims: list[LegacyTemplateClaim],
+        retrieve: RetrievalProvider,
+        on_completed: Callable[[str, HarnessExecutionResult], None] | None = None,
+    ) -> dict[str, HarnessExecutionResult]:
+        def run_one(unit: dict[str, Any]) -> tuple[str, HarnessExecutionResult]:
+            unit_schema = schema.model_copy(update={
+                "fields": [unit["schema"]] if unit["kind"] == "field" else [],
+                "review_items": [unit["schema"]] if unit["kind"] == "review" else [],
+            })
+            graph = AuthoringGraph(
+                self.policy, self.writer, self.validator,
+                draft_provider=self.draft_provider, rewriter=self.rewriter,
+                reranker=self.reranker, fit_checker=self.fit_checker,
+            )
+            return unit["unit_id"], graph.run(
+                work_order=work_order, harness_run=harness_run, run_manifest=run_manifest,
+                schema=unit_schema, snapshot=snapshot, legacy_claims=legacy_claims,
+                retrieve=retrieve,
+            )
+
+        workers = min(self.policy.policy.max_parallel_units, len(semantic_units))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="authoring-unit") as executor:
+            futures = [executor.submit(run_one, unit) for unit in semantic_units]
+            results: dict[str, HarnessExecutionResult] = {}
+            for future in as_completed(futures):
+                unit_id, unit_result = future.result()
+                results[unit_id] = unit_result
+                if on_completed is not None:
+                    on_completed(unit_id, unit_result)
+            return results
 
     def _retrieve_with_budget(
         self,
@@ -375,6 +489,52 @@ def _semantic_units(schema: DocumentSchema) -> list[dict[str, Any]]:
         if item.evaluation_mode == "semantic_assisted":
             units.append({"unit_id": f"review:{item.review_item_id}", "kind": "review", "schema": item})
     return units
+
+
+_ELECTRICAL_FACT_TERMS = (
+    "edf", "电路", "原理图", "位号", "管脚", "引脚", "pin", "net", "网络", "连接器",
+    "connector", "器件", "型号", "model", "part number", "datasheet", "数据手册", "mcu", "can",
+)
+_CIRCUIT_METADATA_KEYS = {
+    "pin_mappings", "net_mappings", "device_mappings", "edf_parse_result", "edf_relation",
+}
+
+
+def _use_deterministic_evidence_writer(
+    unit_id: str,
+    schema: DocumentSchema,
+    requirement: InformationRequirement,
+    evidence: list[dict[str, Any]],
+) -> bool:
+    """Return true only for one directly grounded electrical fact.
+
+    This guard is intentionally narrow: evidence must be uniquely selected and
+    either originate from the EDF/circuit structured route or contain a direct
+    assignment tied to a field query anchor.  All ambiguous prose retains the
+    normal rerank-and-managed-writer path.
+    """
+    if not unit_id.startswith("field:") or len(evidence) != 1:
+        return False
+    field_text = " ".join((
+        _unit_label(unit_id, schema),
+        _unit_description(unit_id, schema),
+        *requirement.retrieval_query_terms,
+    )).casefold()
+    if not any(term in field_text for term in _ELECTRICAL_FACT_TERMS):
+        return False
+    item = evidence[0]
+    metadata = item.get("metadata") or {}
+    if (
+        str(metadata.get("source_group") or "").casefold() == "circuit_design"
+        or any(metadata.get(key) for key in _CIRCUIT_METADATA_KEYS)
+    ):
+        return True
+    content = str(item.get("content") or "")
+    anchors = _field_specific_query_terms(list(requirement.retrieval_query_terms))
+    return any(
+        re.search(rf"{re.escape(anchor)}\s*(?:[:：=]|为|\bis\b)", content, re.IGNORECASE)
+        for anchor in anchors
+    )
 
 
 def _max_evidence_items(unit_id: str, schema: DocumentSchema) -> int:

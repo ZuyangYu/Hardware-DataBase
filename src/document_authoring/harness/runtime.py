@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 import time
+import threading
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import TYPE_CHECKING
@@ -94,6 +95,7 @@ class InternalDocumentHarnessRuntime:
             max_steps=policy.max_steps,
             max_retrieval_rounds=policy.max_retrieval_rounds,
             max_retrieval_attempts_per_unit=policy.max_retrieval_attempts_per_unit,
+            max_parallel_units=policy.max_parallel_units,
         )
 
     def execute(
@@ -113,6 +115,11 @@ class InternalDocumentHarnessRuntime:
         fit_checker: "RequirementFitChecker | None" = None,
     ) -> HarnessExecutionResult:
         lease_owner = f"harness-worker-{uuid.uuid4().hex}"
+        # Parallel unit workers persist idempotency receipts while the graph
+        # coordinator persists progress.  SQLite permits one writer at a time;
+        # serialize only these short store transactions, never the external
+        # retrieval/model calls, so progress cannot be starved by receipt I/O.
+        persistence_lock = threading.RLock()
         running = self.store.claim_harness_run(run.harness_run_id, lease_owner, policy.lease_seconds)
         checkpoint = HarnessCheckpoint(
             checkpoint_id=f"checkpoint-{uuid.uuid4().hex}", harness_run_id=running.harness_run_id,
@@ -131,27 +138,32 @@ class InternalDocumentHarnessRuntime:
 
         def save_progress(state) -> None:
             nonlocal checkpoint
-            checkpoint = checkpoint.model_copy(update={
-                "current_node": state["current_node"],
-                "step_count": state["step_count"],
-                "retrieval_round_count": state["retrieval_round_count"],
-                "updated_at": datetime.now(timezone.utc),
-            })
-            self.store.heartbeat_harness_run(
-                running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
-            )
-            # The status API reads progress from ``harness_runs``. Keep its
-            # cursor in sync with the durable checkpoint so long retrieval or
-            # writer calls do not make the UI appear frozen at step 0.
-            self.store.update_harness_run_owned(
-                running.harness_run_id,
-                lease_owner,
-                running.fencing_token,
-                current_node=checkpoint.current_node,
-                step_count=checkpoint.step_count,
-                retrieval_round_count=checkpoint.retrieval_round_count,
-            )
-            self.store.save_harness_checkpoint_owned(checkpoint, lease_owner, running.fencing_token)
+            with persistence_lock:
+                checkpoint = checkpoint.model_copy(update={
+                    "current_node": state["current_node"],
+                    "step_count": state["step_count"],
+                    "retrieval_round_count": state["retrieval_round_count"],
+                    "completed_units": state.get("completed_units", 0),
+                    "total_units": state.get("total_units", 0),
+                    "updated_at": datetime.now(timezone.utc),
+                })
+                self.store.heartbeat_harness_run(
+                    running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
+                )
+                # The status API reads progress from ``harness_runs``. Keep its
+                # cursor in sync with the durable checkpoint so long retrieval or
+                # writer calls do not make the UI appear frozen at step 0.
+                self.store.update_harness_run_owned(
+                    running.harness_run_id,
+                    lease_owner,
+                    running.fencing_token,
+                    current_node=checkpoint.current_node,
+                    step_count=checkpoint.step_count,
+                    retrieval_round_count=checkpoint.retrieval_round_count,
+                    completed_units=checkpoint.completed_units,
+                    total_units=checkpoint.total_units,
+                )
+                self.store.save_harness_checkpoint_owned(checkpoint, lease_owner, running.fencing_token)
 
         def draft_with_receipt(request) -> DocumentUnitDraft:
             receipt = NodeExecutionReceipt(
@@ -163,56 +175,65 @@ class InternalDocumentHarnessRuntime:
                 }),
                 fencing_token=running.fencing_token,
             )
-            receipt = self.store.begin_node_execution_owned(
-                receipt, lease_owner, running.fencing_token,
-            )
+            with persistence_lock:
+                receipt = self.store.begin_node_execution_owned(
+                    receipt, lease_owner, running.fencing_token,
+                )
             if receipt.status == "committed":
                 if receipt.output_payload is None:
                     raise RuntimeError("committed draft receipt has no output payload")
                 return DocumentUnitDraft.model_validate(receipt.output_payload)
             # Refresh the lease right before the (potentially long) writer call
             # so a slow LLM does not silently expire the lease and lose the run.
-            self.store.heartbeat_harness_run(
-                running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
-            )
+            with persistence_lock:
+                self.store.heartbeat_harness_run(
+                    running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
+                )
             unit_started = time.monotonic()
             unit_status = "completed"
             try:
-                with observe.chain(
-                    "hdb.authoring.draft",
-                    operation="draft_ready_unit",
-                    unit_id=request.unit_id,
-                ):
-                    draft = writer.generate(request)
-            except Exception as exc:
-                unit_status = "failed"
-                self.store.fail_node_execution_owned(
-                    receipt.receipt_id,
-                    running.harness_run_id,
-                    lease_owner,
-                    running.fencing_token,
-                    {"type": type(exc).__name__, "message": str(exc)},
-                )
-                raise
+                try:
+                    with observe.chain(
+                        "hdb.authoring.draft",
+                        operation="draft_ready_unit",
+                        unit_id=request.unit_id,
+                    ):
+                        draft = writer.generate(request)
+                except Exception as exc:
+                    unit_status = "failed"
+                    with persistence_lock:
+                        self.store.fail_node_execution_owned(
+                            receipt.receipt_id,
+                            running.harness_run_id,
+                            lease_owner,
+                            running.fencing_token,
+                            {"type": type(exc).__name__, "message": str(exc)},
+                        )
+                    raise
+                # Refresh the lease again after the writer call so the commit is
+                # safe even if the writer took most of the lease window.
+                try:
+                    with persistence_lock:
+                        self.store.heartbeat_harness_run(
+                            running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
+                        )
+                        self.store.commit_node_execution_owned(
+                            receipt.receipt_id,
+                            running.harness_run_id,
+                            lease_owner,
+                            running.fencing_token,
+                            draft.model_dump(mode="json"),
+                        )
+                except Exception:
+                    unit_status = "failed"
+                    raise
+                return draft
             finally:
                 record_authoring_unit(
                     operation="draft_ready_unit",
                     status=unit_status,
                     duration_s=time.monotonic() - unit_started,
                 )
-            # Refresh the lease again after the writer call so the commit is
-            # safe even if the writer took most of the lease window.
-            self.store.heartbeat_harness_run(
-                running.harness_run_id, lease_owner, running.fencing_token, policy.lease_seconds,
-            )
-            self.store.commit_node_execution_owned(
-                receipt.receipt_id,
-                running.harness_run_id,
-                lease_owner,
-                running.fencing_token,
-                draft.model_dump(mode="json"),
-            )
-            return draft
 
         try:
             graph = AuthoringGraph(

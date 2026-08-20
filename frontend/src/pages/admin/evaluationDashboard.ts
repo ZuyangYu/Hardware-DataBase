@@ -48,6 +48,11 @@ export function canLoadSampleDiagnostics(_status: string, hasSummary: boolean): 
   return hasSummary;
 }
 
+/** Background polling must not clear an already-rendered view. */
+export function shouldResetEvaluationLoading(silent: boolean): boolean {
+  return !silent;
+}
+
 function metricSort(left: string, right: string): number {
   const leftIndex = METRIC_ORDER.indexOf(left);
   const rightIndex = METRIC_ORDER.indexOf(right);

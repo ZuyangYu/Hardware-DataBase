@@ -781,6 +781,32 @@ class DocumentGenerationService:
                     return existing
             raise
 
+    def restart_cancelled_knowledge_base_work_order(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        max_parallel_units: int = 8,
+    ) -> DocumentWorkOrder:
+        original = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        if original.status != "cancelled" or original.scope_type != "knowledge_base":
+            raise ValueError("only cancelled knowledge-base work orders may be restarted")
+        snapshot = self.resolve_source_snapshot(original)
+        return self._create_frozen_work_order(
+            ctx,
+            scope_type="knowledge_base",
+            snapshot=snapshot,
+            knowledge_base_name=original.knowledge_base_name,
+            template_version_id=original.template_version_id,
+            document_schema_id=original.document_schema_id,
+            document_schema_version=original.document_schema_version,
+            idempotency_key=f"restart:{original.work_order_id}",
+            generation_session_id=original.generation_session_id,
+            generation_brief=original.generation_brief,
+            restart_of_work_order_id=original.work_order_id,
+            max_parallel_units=max_parallel_units,
+        )
+
     def _find_knowledge_base_work_order_by_idempotency(
         self,
         tenant_id: str,
@@ -812,6 +838,8 @@ class DocumentGenerationService:
         harness_policy_id: str | None = None,
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
+         restart_of_work_order_id: str | None = None,
+         max_parallel_units: int = 3,
     ) -> DocumentWorkOrder:
         template = self._template(template_version_id)
         schema = self._schema(document_schema_id, document_schema_version)
@@ -826,7 +854,7 @@ class DocumentGenerationService:
             if harness_policy_id:
                 harness_policy = self.store.get_harness_policy(harness_policy_id)
             else:
-                harness_policy = self._schema_harness_policy(schema)
+                harness_policy = self._schema_harness_policy(schema, max_parallel_units=max_parallel_units)
                 harness_policy_id = harness_policy.harness_policy_id
             if harness_policy is None or harness_policy.status != "approved":
                 raise ValueError(
@@ -867,6 +895,7 @@ class DocumentGenerationService:
             idempotency_key=idempotency_key,
             generation_session_id=generation_session_id,
             generation_brief=dict(generation_brief or {}),
+             restart_of_work_order_id=restart_of_work_order_id,
         )
         return self.store.create_work_order(order)
 
@@ -1724,7 +1753,7 @@ class DocumentGenerationService:
         )
         return self.store.save_harness_policy(policy)
 
-    def _schema_harness_policy(self, schema: DocumentSchema) -> HarnessPolicy:
+    def _schema_harness_policy(self, schema: DocumentSchema, *, max_parallel_units: int = 3) -> HarnessPolicy:
         """Persist the bounded policy required by one approved semantic schema."""
         unit_count = (
             sum(field.authoring_policy == "managed_writer" for field in schema.fields)
@@ -1745,10 +1774,12 @@ class DocumentGenerationService:
         return self.store.save_harness_policy(HarnessPolicy(
             harness_policy_id=(
                 f"schema-{schema.document_schema_id}-{schema.version}-managed-writer"
+                + ("" if max_parallel_units == 3 else f"-parallel-{max_parallel_units}")
             ),
             version=f"units-{unit_count}-attempts-{attempts}-rewrite",
             status="approved",
             max_units_per_run=max(1, unit_count),
+            max_parallel_units=max_parallel_units,
             max_retrieval_attempts_per_unit=attempts,
             max_retrieval_rounds=retrieval_rounds,
             max_steps=max_steps,
