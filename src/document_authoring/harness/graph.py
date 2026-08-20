@@ -146,6 +146,7 @@ class AuthoringGraph:
                     evidence,
                     _max_evidence_items(unit_id, schema),
                     preserve_rerank_order=self.reranker is not None,
+                    retrieval_query_terms=requirement.retrieval_query_terms,
                 )
                 # Retrieval ledger (P9): per-unit observability row surfaced in
                 # the matrix (for human review) and on the result, so it is no
@@ -177,6 +178,7 @@ class AuthoringGraph:
                     unit_label=_unit_label(unit_id, schema),
                     unit_description=_unit_description(unit_id, schema),
                     field_value_type=_unit_value_type(unit_id, schema),
+                    retrieval_query_terms=list(requirement.retrieval_query_terms),
                     evidence=evidence,
                     missing_or_conflicts=[],
                     prompt_version=self.policy.policy.prompt_version,
@@ -389,8 +391,16 @@ def _select_field_evidence(
     max_items: int,
     *,
     preserve_rerank_order: bool,
+    retrieval_query_terms: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Rank, deduplicate, and bound evidence without widening frozen scope."""
+    """Rank, deduplicate, and bound evidence without widening frozen scope.
+
+    A broad retrieval route can return a whole page or table for several
+    fields.  Such a chunk is not a safe scalar value unless it contains a
+    field-specific query anchor.  Filtering only long, unanchored chunks here
+    keeps short direct facts available while preventing a generic page from
+    being copied into many worksheet cells.
+    """
     ranked = list(evidence) if preserve_rerank_order else sorted(
         evidence,
         key=lambda item: (
@@ -402,9 +412,18 @@ def _select_field_evidence(
     unique: list[dict[str, Any]] = []
     discarded: list[str] = []
     seen_content: set[str] = set()
+    specific_terms = _field_specific_query_terms(retrieval_query_terms or [])
     for item in ranked:
         content = str(item.get("content") or "").strip()
         evidence_id = str(item.get("id") or "")
+        if (
+            len(content) >= 80
+            and specific_terms
+            and not _has_query_anchor(content, specific_terms)
+        ):
+            if evidence_id:
+                discarded.append(evidence_id)
+            continue
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         if content_hash in seen_content:
             if evidence_id:
@@ -415,6 +434,37 @@ def _select_field_evidence(
     selected = unique[:max_items]
     discarded.extend(str(item.get("id") or "") for item in unique[max_items:] if item.get("id"))
     return selected, discarded
+
+
+_GENERIC_RETRIEVAL_TERMS = {
+    "data", "detail", "information", "net", "pin", "power", "signal",
+    "text", "value", "ground", "连接", "信号", "信息", "数据", "引脚",
+    "电源", "网络", "内容", "字段", "详情",
+}
+
+
+def _field_specific_query_terms(query_terms: list[str]) -> list[str]:
+    """Keep discriminating lexical anchors and drop broad routing words."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for term in query_terms:
+        normalized = str(term or "").strip()
+        folded = normalized.casefold()
+        if not normalized or folded in _GENERIC_RETRIEVAL_TERMS or folded in seen:
+            continue
+        # Single ASCII letters and digits are too broad to establish that a
+        # long result belongs to this field.  Identifiers (for example
+        # X1903-22) and meaningful Chinese/word labels are retained.
+        if len(normalized) < 2:
+            continue
+        result.append(normalized)
+        seen.add(folded)
+    return result
+
+
+def _has_query_anchor(content: str, query_terms: list[str]) -> bool:
+    folded_content = content.casefold()
+    return any(term.casefold() in folded_content for term in query_terms)
 
 
 def _requirement_for_unit(

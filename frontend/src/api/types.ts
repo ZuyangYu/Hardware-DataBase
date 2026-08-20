@@ -519,6 +519,8 @@ export interface EvaluationSummary {
   metric_scores: Record<string, number>;
   metric_counts: Record<string, number>;
   metric_failures: Record<string, number>;
+  scoring_completed_items: number;
+  scoring_total_items: number;
   gate?: EvaluationGateResult | null;
   metadata: Record<string, unknown>;
 }
@@ -559,6 +561,10 @@ export interface EvaluationRunDetail {
   completed_samples: number;
   successful_samples: number;
   failed_samples: number;
+  scoring_completed_groups: number;
+  scoring_total_groups: number;
+  scoring_completed_items: number;
+  scoring_total_items: number;
   current_sample_id: string;
   current_question: string;
   started_at: string;

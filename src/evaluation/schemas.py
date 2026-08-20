@@ -193,6 +193,8 @@ class EvaluationSummary(BaseModel):
     metric_scores: dict[str, float] = Field(default_factory=dict)
     metric_counts: dict[str, int] = Field(default_factory=dict)
     metric_failures: dict[str, int] = Field(default_factory=dict)
+    scoring_completed_items: int = 0
+    scoring_total_items: int = 0
     gate: GateResult | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -215,6 +217,8 @@ class EvaluationRunState(BaseModel):
     failed_samples: int = 0
     scoring_completed_groups: int = 0
     scoring_total_groups: int = 0
+    scoring_completed_items: int = 0
+    scoring_total_items: int = 0
     current_sample_id: str = ""
     current_question: str = ""
     started_at: str = ""

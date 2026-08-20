@@ -22,6 +22,10 @@ type Props = {
   sampleResults: EvaluationSampleResult[];
   sampleResultsError: string;
   compare: EvaluationCompareResponse | null;
+  isInProgress: boolean;
+  isFinal: boolean;
+  scoringCompletedItems: number;
+  scoringTotalItems: number;
 };
 
 const SAMPLE_FILTERS: Array<SampleStatus | '全部'> = [
@@ -37,7 +41,8 @@ function scoreText(score: number): string {
   return score.toFixed(3);
 }
 
-function GatePill({ summary }: { summary: EvaluationSummary }) {
+function GatePill({ summary, isFinal }: { summary: EvaluationSummary; isFinal: boolean }) {
+  if (!isFinal) return <span className="rounded-full bg-[#fff7e7] px-[8px] py-[2px] text-[11px] text-[#9a610d]">Gate 暂不判定</span>;
   if (!summary.gate) return <span className="rounded-full bg-[#f3f4f6] px-[8px] py-[2px] text-[11px] text-[#464c5e]">未执行 Gate</span>;
   return (
     <span className={cn('rounded-full px-[8px] py-[2px] text-[11px]', summary.gate.passed ? 'bg-[#e6f6ec] text-[#138a55]' : 'bg-[#fce7e7] text-[#d20b0b]')}>
@@ -74,14 +79,16 @@ function MetricBar({ label, score, threshold, tone = 'current' }: {
   );
 }
 
-function CurrentMetricChart({ summary }: { summary: EvaluationSummary }) {
+function CurrentMetricChart({ summary, isInProgress }: { summary: EvaluationSummary; isInProgress: boolean }) {
   const rows = metricRows(summary);
   return (
     <section className="rounded-[12px] border border-[#edf0f4] p-[14px]">
       <div className="mb-[12px] flex flex-wrap items-center justify-between gap-[8px]">
         <div>
           <h4 className="text-[14px] font-semibold text-[#18181a]">当前评估效果</h4>
-          <p className="mt-[2px] text-[11px] text-[#858b9c]">得分固定在 0–1 区间；竖线表示门禁阈值。</p>
+          <p className="mt-[2px] text-[11px] text-[#858b9c]">
+            {isInProgress ? '以下为已返回指标的阶段性分数，评分完成后再作最终结论。' : '得分固定在 0–1 区间；竖线表示门禁阈值。'}
+          </p>
         </div>
         <div className="flex gap-[9px] text-[11px] text-[#858b9c]">
           <span><i className="mr-[4px] inline-block size-[7px] rounded-full bg-[#138a55]" />达标</span>
@@ -98,7 +105,7 @@ function CurrentMetricChart({ summary }: { summary: EvaluationSummary }) {
   );
 }
 
-function MetricTableAndGate({ summary }: { summary: EvaluationSummary }) {
+function MetricTableAndGate({ summary, isFinal }: { summary: EvaluationSummary; isFinal: boolean }) {
   const rows = metricRows(summary);
   return (
     <section className="rounded-[12px] border border-[#edf0f4] p-[14px]">
@@ -111,7 +118,7 @@ function MetricTableAndGate({ summary }: { summary: EvaluationSummary }) {
           </table>
         </div>
       )}
-      {summary.gate?.failures?.length ? <div className="mt-[12px] rounded-[8px] bg-[#fff7f7] px-[10px] py-[9px]"><p className="mb-[4px] text-[12px] font-medium text-[#d20b0b]">门禁失败原因</p><ul className="grid list-disc gap-[3px] pl-[18px] text-[12px] text-[#8a3030]">{summary.gate.failures.map((failure) => <li key={failure}>{failure}</li>)}</ul></div> : null}
+      {summary.gate?.failures?.length ? <div className="mt-[12px] rounded-[8px] bg-[#fff7f7] px-[10px] py-[9px]"><p className="mb-[4px] text-[12px] font-medium text-[#d20b0b]">{isFinal ? '门禁失败原因' : '阶段性门禁提示'}</p><ul className="grid list-disc gap-[3px] pl-[18px] text-[12px] text-[#8a3030]">{summary.gate.failures.map((failure) => <li key={failure}>{failure}</li>)}</ul></div> : null}
     </section>
   );
 }
@@ -162,14 +169,34 @@ function SampleDiagnostics({ results, error }: { results: EvaluationSampleResult
   );
 }
 
-export default function EvaluationDashboard({ summary, sampleResults, sampleResultsError, compare }: Props) {
+export default function EvaluationDashboard({
+  summary,
+  sampleResults,
+  sampleResultsError,
+  compare,
+  isInProgress,
+  isFinal,
+  scoringCompletedItems,
+  scoringTotalItems,
+}: Props) {
   const credibility = buildCredibility(summary, sampleResults);
-  const statusClass = credibility.status === '结果可解读' ? 'bg-[#eef8f2] text-[#246d4a]' : credibility.status === '存在技术失败' ? 'bg-[#fff1f1] text-[#a63c3c]' : 'bg-[#fff7e7] text-[#9a610d]';
+  const sampleCount = summary.sample_count;
+  const pendingScoringItems = scoringTotalItems > 0
+    ? Math.max(0, scoringTotalItems - scoringCompletedItems)
+    : null;
+  const displayStatus = isInProgress ? '评分进行中' : isFinal ? credibility.status : '结果未完成';
+  const statusClass = isInProgress || !isFinal
+    ? 'bg-[#fff7e7] text-[#9a610d]'
+    : credibility.status === '结果可解读'
+      ? 'bg-[#eef8f2] text-[#246d4a]'
+      : credibility.status === '存在技术失败'
+        ? 'bg-[#fff1f1] text-[#a63c3c]'
+        : 'bg-[#fff7e7] text-[#9a610d]';
   return (
     <div className="grid gap-[14px] border-t border-[#f0f1f4] pt-[14px]">
-      <section><div className="mb-[10px] flex flex-wrap items-center gap-[8px]"><h3 className="text-[14px] font-semibold text-[#18181a]">评估总览</h3><GatePill summary={summary} /></div><div className="grid grid-cols-5 gap-[10px] max-[1000px]:grid-cols-3 max-[640px]:grid-cols-1"><StatCard label="样本" value={summary.sample_count} /><StatCard label="采集成功" value={summary.successful_samples} tone={summary.failed_samples ? 'default' : 'green'} /><StatCard label="有检索证据" value={`${credibility.evidenceSamples} / ${sampleResults.length || summary.sample_count}`} /><StatCard label="已评分" value={`${credibility.scoredSamples} / ${sampleResults.length || summary.sample_count}`} /><StatCard label="评分失败" value={credibility.metricFailures} tone={credibility.metricFailures ? 'red' : 'green'} /></div></section>
-      <p className={cn('rounded-[8px] px-[10px] py-[8px] text-[12px]', statusClass)}>结果状态：{credibility.status}；采集失败 {credibility.collectionFailures} 条，评分失败 {credibility.metricFailures} 条。{credibility.status === '存在技术失败' ? '请先排除技术失败，再用分数作结论。' : credibility.status === '评分覆盖不足' ? '当前没有足够的有效评分用于比较。' : '分数仍应结合适用样本数、证据和门禁原因解读。'}</p>
-      <div className="grid gap-[14px] xl:grid-cols-2"><CurrentMetricChart summary={summary} /><MetricTableAndGate summary={summary} /></div>
+      <section><div className="mb-[10px] flex flex-wrap items-center gap-[8px]"><h3 className="text-[14px] font-semibold text-[#18181a]">评估总览</h3><GatePill summary={summary} isFinal={isFinal} /></div><div className="grid grid-cols-4 gap-[10px] max-[1200px]:grid-cols-3 max-[640px]:grid-cols-1"><StatCard label="样本" value={sampleCount} /><StatCard label="采集成功" value={`${summary.successful_samples} / ${sampleCount}`} tone={summary.failed_samples ? 'default' : 'green'} /><StatCard label="有检索证据" value={`${credibility.evidenceSamples} / ${sampleCount}`} /><StatCard label="评分任务进度" value={scoringTotalItems > 0 ? `${scoringCompletedItems}/${scoringTotalItems}` : '—'} /><StatCard label="已有评分样本" value={`${credibility.scoredSamples} / ${sampleCount}`} /><StatCard label="待评分任务" value={pendingScoringItems == null ? '—' : pendingScoringItems} tone={pendingScoringItems === 0 ? 'green' : 'default'} /><StatCard label="确认评分失败" value={credibility.metricFailures} tone={credibility.metricFailures ? 'red' : 'green'} /></div></section>
+      <p className={cn('rounded-[8px] px-[10px] py-[8px] text-[12px]', statusClass)}>{isInProgress ? `结果状态：${displayStatus}；采集失败 ${credibility.collectionFailures} 条，确认评分失败 ${credibility.metricFailures} 条。Gate 将在评分完成后判定。` : !isFinal ? `结果状态：${displayStatus}；采集失败 ${credibility.collectionFailures} 条，确认评分失败 ${credibility.metricFailures} 条。` : `结果状态：${displayStatus}；采集失败 ${credibility.collectionFailures} 条，评分失败 ${credibility.metricFailures} 条。${credibility.status === '存在技术失败' ? '请先排除技术失败，再用分数作结论。' : credibility.status === '评分覆盖不足' ? '当前没有足够的有效评分用于比较。' : '分数仍应结合适用样本数、证据和门禁原因解读。'}`}</p>
+      <div className="grid gap-[14px] xl:grid-cols-2"><CurrentMetricChart summary={summary} isInProgress={isInProgress} /><MetricTableAndGate summary={summary} isFinal={isFinal} /></div>
       <BaselineChart compare={compare} />
       <SampleDiagnostics results={sampleResults} error={sampleResultsError} />
     </div>

@@ -49,7 +49,7 @@ class DocGenArtifactApiTests(unittest.TestCase):
         submitted = {}
         self.stub.submit_icd_scope_resolution = lambda ctx, work_order_id, *, resolutions, comment: submitted.setdefault("resolutions", resolutions)
         self.stub.submit_knowledge_base_document_generation = lambda ctx, work_order_id: "bg-9"
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/work-orders/wo-1/icd-scope-resolution?kb=shared",
             headers=self._auth(t),
@@ -66,7 +66,7 @@ class DocGenArtifactApiTests(unittest.TestCase):
             raise ValueError("bad")
 
         self.stub.submit_knowledge_base_document_generation = _generate_error
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/work-orders/wo-1/icd-scope-resolution?kb=shared",
             headers=self._auth(t),
@@ -80,7 +80,7 @@ class DocGenArtifactApiTests(unittest.TestCase):
             raise PermissionError("denied")
 
         self.stub.pause_harness_run = _denied
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/harness-runs/hr-1/pause?kb=shared",
             headers=self._auth(t),
@@ -92,7 +92,7 @@ class DocGenArtifactApiTests(unittest.TestCase):
             raise ValueError("bad")
 
         self.stub.cancel_harness_run = _bad
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/harness-runs/hr-1/cancel?kb=shared",
             headers=self._auth(t),
@@ -117,7 +117,7 @@ class DocGenArtifactApiTests(unittest.TestCase):
         self.assertEqual(r.json()["sheets"][0]["name"], "S1")
 
     def test_feedback_and_approve(self):
-        t = self._token("user1")
+        t = self._token("admin1")
         r = self.client.post(
             "/api/v1/document-generation/artifacts/art-1/feedback?kb=shared",
             headers=self._auth(t), json={"comment": "改一下"},

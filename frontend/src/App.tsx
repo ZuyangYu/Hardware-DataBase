@@ -169,7 +169,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               path="/document-generation"
               element={
                 <KbContentRoute auth={auth}>
-                  <DocumentGenerationPage auth={auth} onLogout={onLogout} />
+                  <DocumentGenerationPage auth={auth} onLogout={onLogout} kbs={kbs} />
                 </KbContentRoute>
               }
             />

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Protocol
 
 from src.core.llm_client import LLMClient
@@ -36,6 +37,10 @@ _SUGGESTION_FIELDS = {
 # 进而整体回退到 requires_human。按固定批量分块调用、逐块解析合并，使每块输出
 # 远小于 max_tokens，单块失败只丢该块而非整份分析。
 _SUGGESTION_CHUNK_SIZE = 50
+_FUNCTION_HEADER_RE = re.compile(
+    r"(?:\bfunction\b|\bdescription\b|功能描述|功能说明|功能)",
+    re.IGNORECASE,
+)
 _SYSTEM_PROMPT = """You analyze a safe template structural inventory and decide how each proposed semantic unit will be generated.
 You receive one CHUNK of writable units. For each unit that is a field to be filled during document generation, judge its semantic meaning from its label, value preview, neighborhood, and style.
 Return only a JSON array. Each item must contain exactly these keys:
@@ -68,6 +73,35 @@ class LLMTemplateSuggestionProvider:
         if analysis.status != "ready_for_confirmation":
             return []
         writable_units = [unit for unit in analysis.units if unit.writable]
+        # Layout blanks are intentionally excluded from workbook prompts when
+        # the analyzer has already identified safe fill candidates. This keeps
+        # large sheets within the model budget and prevents the model from
+        # inventing mappings for decorative cells.
+        candidate_units = [
+            unit for unit in writable_units
+            if unit.candidate_for_auto_fill
+            or unit.structural_role_hint == "placeholder"
+            or (
+                unit.structural_role_hint == "sample_value"
+                and unit.candidate_for_auto_fill
+            )
+        ]
+        if analysis.format != "docx" and candidate_units:
+            writable_units = candidate_units
+        restrict_workbook_targets = analysis.format != "docx" and bool(candidate_units)
+        deterministic_table_suggestions = _deterministic_function_table_suggestions(analysis)
+        if (
+            deterministic_table_suggestions
+            and analysis.format != "docx"
+            and not any(unit.structural_role_hint == "placeholder" for unit in candidate_units)
+        ):
+            # A pure table-body template has a deterministic semantic binding;
+            # avoid spending model time rediscovering a column role that the
+            # analyzer already established. The selected model remains used by
+            # retrieval/writing, where it adds value beyond cell coordinates.
+            analysis.suggestions = deterministic_table_suggestions
+            analysis.approved_overwrite_unit_ids = []
+            return deterministic_table_suggestions
         if not writable_units:
             analysis.suggestions = []
             return []
@@ -86,6 +120,11 @@ class LLMTemplateSuggestionProvider:
                         {"role": "user", "content": _chunk_payload(analysis, chunk)},
                     ],
                     usage_stage="template_analysis",
+                    # Template mapping is a bounded, recoverable preflight. Do
+                    # not inherit the long document-generation timeout here;
+                    # a slow model must fall back to the deterministic table
+                    # mapper instead of holding the upload request open.
+                    timeout=60,
                 )
                 parsed = _parse_suggestions(json.loads(response))
                 for suggestion in parsed:
@@ -101,6 +140,13 @@ class LLMTemplateSuggestionProvider:
                             raise PermissionError(
                                 f"suggestion targets non-writable analysis unit: {unit_id}"
                             )
+                        if restrict_workbook_targets and not _safe_workbook_suggestion_target(
+                            unit, suggestion.overwrite_basis
+                        ):
+                            # The model may see a nearby sample or layout cell,
+                            # but only analyzer-confirmed candidates can enter
+                            # a workbook binding.
+                            continue
                         valid_targets.append(unit_id)
                     if not valid_targets:
                         continue
@@ -125,6 +171,17 @@ class LLMTemplateSuggestionProvider:
                 chunk_failures.append(f"chunk {index}: {exc}")
                 continue
         suggestions = _resolve_duplicate_targets(collected)
+        fallback_suggestions = deterministic_table_suggestions
+        covered_targets = {
+            target_id
+            for suggestion in suggestions
+            for target_id in suggestion.target_unit_ids
+        }
+        suggestions.extend(
+            suggestion
+            for suggestion in fallback_suggestions
+            if not set(suggestion.target_unit_ids) & covered_targets
+        )
         if analysis.format != "docx":
             # 工作簿标量映射在 confirm 阶段要求每条建议恰好 1 个 target
             # （_regions_and_bindings），把多目标建议拆成单目标以保证可激活。
@@ -193,6 +250,90 @@ def _resolve_duplicate_targets(
             suggestion = suggestion.model_copy(update={"target_unit_ids": won})
         kept.append(suggestion)
     return kept
+
+
+def _safe_workbook_suggestion_target(
+    unit: TemplateAnalysisUnit,
+    overwrite_basis: str | None,
+) -> bool:
+    if unit.structural_role_hint in {"placeholder"}:
+        return True
+    if unit.structural_role_hint == "scalar_input":
+        return unit.value_kind == "blank" and unit.candidate_for_auto_fill
+    if unit.structural_role_hint == "sample_value":
+        return unit.candidate_for_auto_fill and overwrite_basis == "sample_value"
+    return False
+
+
+def _deterministic_function_table_suggestions(
+    analysis: TemplateAnalysis,
+) -> list[TemplateAnalysisSuggestion]:
+    """Recover safe function-description bindings when the LLM is unavailable.
+
+    This is deliberately narrow: it only handles blank scalar-input cells that
+    the analyzer classified below a header containing Function/Description or
+    its Chinese equivalents. It never targets nonempty sample values or layout
+    blanks, and it derives retrieval terms only from the bounded neighborhood.
+    """
+    if analysis.format == "docx":
+        return []
+    function_headers: dict[tuple[str, int], str] = {}
+    for header in analysis.units:
+        if (
+            header.structural_role_hint != "table_header"
+            or not header.value_preview
+            or not _FUNCTION_HEADER_RE.search(header.value_preview)
+        ):
+            continue
+        sheet_name = str(header.locator.get("sheet_name") or "")
+        column = _cell_column_index(str(header.locator.get("cell") or ""))
+        if sheet_name and column is not None:
+            function_headers[(sheet_name, column)] = header.value_preview
+    suggestions: list[TemplateAnalysisSuggestion] = []
+    for unit in analysis.units:
+        if (
+            not unit.writable
+            or unit.structural_role_hint != "scalar_input"
+            or unit.value_kind != "blank"
+            or not unit.candidate_for_auto_fill
+        ):
+            continue
+        neighborhood_values = [
+            neighbor.value_preview
+            for neighbor in unit.neighborhood
+            if neighbor.value_preview
+        ]
+        headers = [value for value in neighborhood_values if _FUNCTION_HEADER_RE.search(value)]
+        sheet_name = str(unit.locator.get("sheet_name") or "")
+        column = _cell_column_index(str(unit.locator.get("cell") or ""))
+        if not headers and sheet_name and column is not None:
+            header = function_headers.get((sheet_name, column))
+            if header:
+                headers = [header]
+        if not headers:
+            continue
+        terms: list[str] = []
+        for value in [*headers, *neighborhood_values]:
+            if value and value not in terms:
+                terms.append(value)
+        suggestions.append(TemplateAnalysisSuggestion(
+            semantic_unit_id=f"field:{unit.unit_id}",
+            label=unit.label,
+            target_unit_ids=[unit.unit_id],
+            retrieval_terms=terms[:8],
+            confidence=0.90,
+        ))
+    return suggestions
+
+
+def _cell_column_index(cell: str) -> int | None:
+    match = re.match(r"^([A-Z]+)[1-9][0-9]*$", cell.upper())
+    if not match:
+        return None
+    value = 0
+    for character in match.group(1):
+        value = value * 26 + ord(character) - ord("A") + 1
+    return value
 
 
 def _parse_suggestions(value: object) -> list[TemplateAnalysisSuggestion]:

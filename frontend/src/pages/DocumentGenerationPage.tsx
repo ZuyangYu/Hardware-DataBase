@@ -16,8 +16,9 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import type { AuthSession } from '../auth';
+import type { KbView } from '../api/types';
 
-type Props = { auth: AuthSession; onLogout: () => void };
+type Props = { auth: AuthSession; onLogout: () => void; kbs?: KbView[] };
 
 const RUNNING = ['retrieving', 'ready_to_draft', 'drafting', 'validating', 'rendering'];
 

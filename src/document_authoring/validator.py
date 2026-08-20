@@ -157,10 +157,21 @@ class DocumentValidator:
                 value = str(assertion.value if assertion.value is not None else assertion.text).strip()
                 if value:
                     values.setdefault(assertion.consistency_key, {}).setdefault(value, []).append(draft.unit_id)
-        return [
-            {"kind": "cross_unit_conflict", "consistency_key": key, "values": by_value}
-            for key, by_value in values.items() if len(by_value) > 1
-        ]
+        conflicts = []
+        for key, by_value in values.items():
+            if len(by_value) <= 1:
+                continue
+            distinct_values = list(by_value)
+            if all(
+                _consistency_values_compatible(left, right)
+                for index, left in enumerate(distinct_values)
+                for right in distinct_values[index + 1:]
+            ):
+                # Multiple assertions for one field may be complementary
+                # views of the same fact (for example a pin and its net).
+                continue
+            conflicts.append({"kind": "cross_unit_conflict", "consistency_key": key, "values": by_value})
+        return conflicts
 
 
 def _has_lexical_anchor(assertion_text: str, evidence_text: str) -> bool:
@@ -173,6 +184,26 @@ def _has_lexical_anchor(assertion_text: str, evidence_text: str) -> bool:
         for token in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}", evidence_text)
     }
     return bool(assertion_tokens & evidence_tokens)
+
+
+def _consistency_values_compatible(left: str, right: str) -> bool:
+    """Treat assertions sharing a meaningful anchor as complementary facts."""
+    stopwords = {
+        "a", "an", "and", "at", "by", "for", "in", "is", "net", "of",
+        "on", "the", "to", "with", "连接", "位于", "为", "在", "和",
+    }
+    left_tokens = {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}", left)
+        if token.casefold() not in stopwords
+    }
+    right_tokens = {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}", right)
+        if token.casefold() not in stopwords
+    }
+    shared = left_tokens & right_tokens
+    return any(len(token) >= 3 or any(char.isdigit() for char in token) for token in shared)
 
 
 def _expected_typed_kind(value_type: str) -> str | None:

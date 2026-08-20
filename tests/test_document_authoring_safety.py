@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from src.document_authoring.models import (
+    DraftAssertion,
     DocumentUnitDraft,
     TemplateUnitBinding,
     TemplateVersion,
@@ -237,3 +238,28 @@ def test_fill_plan_uses_typed_display_value_instead_of_draft_prose():
     )
 
     assert fills.fills[0].value == "10 A"
+
+
+def test_cross_unit_consistency_ignores_complementary_assertions_sharing_an_anchor():
+    drafts = [
+        DocumentUnitDraft(
+            unit_id="field:pin",
+            run_id="run-1",
+            generated_by="managed_writer",
+            assertions=[DraftAssertion(
+                assertion_id="a1", claim_id="pin", consistency_key="field:pin",
+                text="CAN3H is at X1900-16", value="CAN3H is at X1900-16",
+            )],
+        ),
+        DocumentUnitDraft(
+            unit_id="field:pin",
+            run_id="run-1",
+            generated_by="managed_writer",
+            assertions=[DraftAssertion(
+                assertion_id="a2", claim_id="pin", consistency_key="field:pin",
+                text="TP1307-1 is on net CAN3H", value="TP1307-1 is on net CAN3H",
+            )],
+        ),
+    ]
+
+    assert DocumentValidator.validate_cross_unit_consistency(drafts) == []

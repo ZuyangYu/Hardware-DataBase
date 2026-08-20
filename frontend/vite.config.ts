@@ -15,7 +15,10 @@ export default defineConfig({
   },
   base: '/',
   server: {
-    port: 5174,
+    // Allow direct access from the host network as well as Quick Tunnel.
+    host: '0.0.0.0',
+    port: 5175,
+    allowedHosts: ['.trycloudflare.com'],
     proxy: {
       '/api': {
         target: apiTarget,

@@ -42,8 +42,10 @@ export type MetricRow = {
   failures: number;
 };
 
-export function canLoadSampleDiagnostics(status: string, hasSummary: boolean): boolean {
-  return status === 'completed' && hasSummary;
+export function canLoadSampleDiagnostics(_status: string, hasSummary: boolean): boolean {
+  // The API exposes checkpoint summary/results while a run is active. Those
+  // incremental rows are needed for the live evidence and scored counters.
+  return hasSummary;
 }
 
 function metricSort(left: string, right: string): number {
@@ -111,7 +113,10 @@ export function filterSampleResults<T extends SampleClassificationInput>(results
 }
 
 export function buildCredibility(summary: CredibilitySummary, results: SampleClassificationInput[]) {
-  const collectionFailures = results.filter((result) => result.snapshot_status === 'failed').length;
+  const collectionFailures = Math.max(
+    summary.failed_samples,
+    results.filter((result) => result.snapshot_status === 'failed').length,
+  );
   const metricFailures = results.filter((result) => result.metrics.some((metric) => metric.status === 'failed')).length;
   const evidenceSamples = results.filter((result) => result.retrieved_contexts.length > 0).length;
   const scoredSamples = results.filter((result) => result.metrics.some((metric) => metric.status === 'success' && metric.score != null)).length;

@@ -55,9 +55,9 @@ describe('evaluation dashboard data', () => {
     )).toEqual([expect.objectContaining({ metric: 'faithfulness', current: 0.8, baseline: 0.6, delta: 0.2 })]);
   });
 
-  it('shows diagnostics only for completed runs with a summary', () => {
+  it('shows checkpoint diagnostics while a run is active', () => {
     expect(canLoadSampleDiagnostics('completed', true)).toBe(true);
-    expect(canLoadSampleDiagnostics('running', true)).toBe(false);
+    expect(canLoadSampleDiagnostics('running', true)).toBe(true);
     expect(canLoadSampleDiagnostics('completed', false)).toBe(false);
   });
 });

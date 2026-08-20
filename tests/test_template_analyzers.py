@@ -108,6 +108,22 @@ def _xlsx_with_table_header_row() -> bytes:
     })
 
 
+def _xlsx_with_pin_function_table() -> bytes:
+    return _package({
+        "xl/workbook.xml": b'''<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Pinout" sheetId="1" r:id="rId1"/></sheets></workbook>''',
+        "xl/_rels/workbook.xml.rels": b'''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>''',
+        "xl/worksheets/sheet1.xml": '''<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>管脚号 Pin Number</t></is></c><c r="B1" t="inlineStr"><is><t>管脚定义 Pin Definition</t></is></c><c r="C1" t="inlineStr"><is><t>功能描述 Function</t></is></c><c r="D1" t="inlineStr"><is><t>备注 Notice</t></is></c></row>
+<row r="2"><c r="A2" t="inlineStr"><is><t>1</t></is></c><c r="B2" t="inlineStr"><is><t>UBD</t></is></c><c r="C2"/><c r="D2"/></row>
+<row r="3"><c r="A3" t="inlineStr"><is><t>2</t></is></c><c r="B3" t="inlineStr"><is><t>GND</t></is></c><c r="C3"/><c r="D3"/></row>
+</sheetData></worksheet>'''.encode("utf-8"),
+    })
+
+
 def test_xlsx_analysis_exposes_bounded_content_roles_styles_and_neighborhoods():
     analysis = analyze_template(_xlsx_with_semantic_cell_context(), "xlsx")
 
@@ -153,6 +169,20 @@ def test_xlsx_analysis_never_promotes_contiguous_text_table_headers_to_fill_cand
         "table_header", "table_header", "table_header",
     ]
     assert all(not units[f"sheet:Review!{column}1"].candidate_for_auto_fill for column in "ABC")
+
+
+def test_xlsx_analysis_promotes_empty_function_table_cells_without_overwriting_samples():
+    analysis = analyze_template(_xlsx_with_pin_function_table(), "xlsx")
+
+    units = {unit.unit_id: unit for unit in analysis.units}
+
+    assert units["sheet:Pinout!B2"].structural_role_hint == "sample_value"
+    assert units["sheet:Pinout!B2"].candidate_for_auto_fill is False
+    assert units["sheet:Pinout!C2"].structural_role_hint == "scalar_input"
+    assert units["sheet:Pinout!C2"].candidate_for_auto_fill is True
+    assert units["sheet:Pinout!C3"].candidate_for_auto_fill is True
+    assert units["sheet:Pinout!D2"].structural_role_hint == "layout_blank"
+    assert units["sheet:Pinout!D2"].candidate_for_auto_fill is False
 
 
 def _docx_with_paragraph_table_and_external_link() -> bytes:

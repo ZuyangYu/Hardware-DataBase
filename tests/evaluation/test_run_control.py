@@ -64,6 +64,14 @@ class RunStateStoreTests(unittest.TestCase):
         self.assertEqual(store.load().status, "queued")
         self.assertFalse(store.path.with_suffix(".json.tmp").exists())
 
+    def test_scoring_progress_tracks_groups_and_items(self):
+        store = self._store(status="running")
+
+        state = store.update_scoring_progress(1, 2, completed_items=3, total_items=10)
+
+        self.assertEqual((state.scoring_completed_groups, state.scoring_total_groups), (1, 2))
+        self.assertEqual((state.scoring_completed_items, state.scoring_total_items), (3, 10))
+
     def test_pause_cancel_and_orphan_transitions_are_valid(self):
         store = self._store(status="running")
 
@@ -252,7 +260,15 @@ class FakeEvaluationService:
                 getattr(control[2], control[0])(control[3])
         return store.load_all()
 
-    def score(self, samples, snapshots, *, run_id, progress_callback=None):
+    def score(
+        self,
+        samples,
+        snapshots,
+        *,
+        run_id,
+        progress_callback=None,
+        item_progress_callback=None,
+    ):
         snapshot_ids = {snapshot.sample_id for snapshot in snapshots}
         successful = sum(sample.id in snapshot_ids for sample in samples)
         summary = EvaluationSummary(
@@ -279,6 +295,8 @@ class FakeEvaluationService:
             progress_callback(summary, results, 1, 1)
             if self.raise_after_score_checkpoint:
                 raise RuntimeError("scoring exploded")
+        if item_progress_callback is not None:
+            item_progress_callback(summary, results, 1, 1)
         return summary, results
 
 
@@ -308,6 +326,20 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertEqual((final.completed_samples, final.successful_samples), (2, 2))
         self.assertFalse((self.root / state.run_id / "summary.json").exists())
 
+    def test_scoring_item_checkpoint_is_persisted_during_run(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=True
+        )
+
+        final = self.controller.execute(state.run_id)
+        checkpoint = self.root / state.run_id / ".checkpoint"
+
+        self.assertEqual(final.status, "completed")
+        self.assertTrue((checkpoint / "summary.json").is_file())
+        self.assertTrue((checkpoint / "results.jsonl").is_file())
+        self.assertEqual(final.scoring_completed_items, 1)
+        self.assertEqual(final.scoring_total_items, 1)
+
     def test_online_run_fails_before_collection_when_preflight_reports_errors(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples, score_enabled=False
@@ -319,6 +351,40 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertEqual(final.status, "failed")
         self.assertEqual(self.fake_service.collected_ids, [])
         self.assertIn("preflight", final.error_message)
+
+    def test_delete_failed_run_removes_all_run_artifacts(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=False
+        )
+        store = RunStateStore(self.root / state.run_id / "run_state.json")
+        store.mark_running(stage="collecting")
+        store.mark_failed("preflight failed")
+        (self.root / state.run_id / "extra-artifact.txt").write_text(
+            "artifact", encoding="utf-8"
+        )
+
+        deleted = self.controller.delete(state.run_id)
+
+        self.assertEqual(deleted.status, "failed")
+        self.assertFalse((self.root / state.run_id).exists())
+
+    def test_delete_rejects_non_terminal_or_successful_runs(self):
+        for status in ("queued", "running", "paused", "completed"):
+            with self.subTest(status=status):
+                state = self.controller.create_online_run(
+                    self.dataset, self.root, self.samples, score_enabled=False
+                )
+                store = RunStateStore(self.root / state.run_id / "run_state.json")
+                if status != "queued":
+                    store.mutate(lambda current: current.model_copy(update={"status": status}))
+
+                with self.assertRaises(ValueError):
+                    self.controller.delete(state.run_id)
+                self.assertTrue((self.root / state.run_id).exists())
+
+    def test_delete_rejects_run_id_path_traversal(self):
+        with self.assertRaises(ValueError):
+            self.controller.delete("../outside")
 
     def test_pause_then_resume_skips_existing_successful_snapshot(self):
         state = self.controller.create_online_run(
@@ -495,6 +561,33 @@ class EvaluationRunControllerTests(unittest.TestCase):
 
         self.assertEqual(recovered.status, "paused")
         self.assertFalse((self.root / state.run_id / "summary.json").exists())
+
+    def test_legacy_run_without_run_state_opens_as_completed(self):
+        # Legacy run generated before run-state tracking: report artifacts only,
+        # no run_state.json. load_for_display must not FileNotFoundError.
+        run_dir = self.root / "legacy-20260723"
+        run_dir.mkdir(parents=True)
+        (run_dir / "summary.json").write_text(
+            EvaluationSummary(
+                run_id="legacy-20260723",
+                sample_count=7,
+                successful_samples=6,
+                failed_samples=1,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+
+        state = self.controller.load_for_display("legacy-20260723")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.stage, "reporting")
+        self.assertEqual(state.total_samples, 7)
+        self.assertEqual(state.successful_samples, 6)
+        self.assertEqual(state.failed_samples, 1)
+
+    def test_load_for_display_raises_when_neither_state_nor_summary_exists(self):
+        with self.assertRaises(FileNotFoundError):
+            self.controller.load_for_display("no-such-run")
 
     def test_display_recovery_does_not_pause_a_concurrently_registered_worker(self):
         class StartAfterReleaseLock:

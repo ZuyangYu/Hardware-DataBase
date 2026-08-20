@@ -6,9 +6,18 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
-.venv
+# Virtual environments and local configuration
+.venv/
 .env
+.env.*
+!.env.example
+
+# Local editor settings and temporary files
+.vscode/
+*.swp
+*.swo
+*~
+
 # Ignore all storage/ contents, but keep .gitkeep
 storage/**
 !storage/.gitkeep
@@ -46,6 +55,18 @@ storage/evaluations/
 .coverage
 htmlcov/
 *.log
+*.pid
+*.db-wal
+*.db-shm
+*.db-journal
+*.bak
+*.bak-*
+
+# Local evaluation source documents are not the canonical test datasets.
+# Keep evaluation/datasets/*.jsonl under version control; ignore raw uploads
+# and editor-generated backup copies.
+/evaluation/datasets/*.docx
+/evaluation/datasets/*.jsonl.bak-*
 
 # Frontend generated artifacts
 /frontend/node_modules/
@@ -78,16 +99,13 @@ htmlcov/
 .agents/
 .worktrees/
 
-# Local agent workflow records and development plans/specifications
-.superpowers/
-docs/superpowers/
-docs/diagrams/
-docs/hardware_database_develop_integration_plan.md
-docs/joint_retrieval_test_cases.md
+# Local development materials, planning documents, sample corpora, and tests
+/.superpowers/
+/docs/
+/tests/
 
-# Local agent guidance and feature working notes
+# Local agent guidance
 /CLAUDE.md
-/docs/features/
 
 .tests/
 

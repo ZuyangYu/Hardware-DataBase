@@ -331,6 +331,26 @@ def cancel_run(
     return _state_dict(state)
 
 
+@router.delete("/evaluation/runs/{run_id}")
+def delete_run(
+    run_id: str,
+    output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
+    _actor: AuthUser = Depends(require_system_admin),
+) -> dict[str, Any]:
+    """Delete a failed or cancelled evaluation run and its stored artifacts."""
+    output_root = _check_output_root(output_root)
+    controller = _controller(output_root)
+    try:
+        state = controller.delete(run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"failed to delete evaluation run: {exc}") from exc
+    return {"ok": True, "run_id": run_id, "status": state.status}
+
+
 @router.get("/evaluation/runs/{run_id}")
 def get_run(
     run_id: str,
@@ -350,7 +370,15 @@ def get_run(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     result = _state_dict(state)
-    summary_path = Path(output_root) / run_id / "summary.json"
+    run_dir = Path(output_root) / run_id
+    summary_path = run_dir / "summary.json"
+    results_dir = run_dir
+    if not summary_path.is_file():
+        checkpoint_dir = run_dir / ".checkpoint"
+        checkpoint_summary = checkpoint_dir / "summary.json"
+        if checkpoint_summary.is_file():
+            summary_path = checkpoint_summary
+            results_dir = checkpoint_dir
     if summary_path.is_file():
         try:
             summary: EvaluationSummary = load_evaluation_summary(summary_path)
@@ -359,10 +387,8 @@ def get_run(
             result["summary"] = None
     else:
         result["summary"] = None
-    if state.status == "completed" and result["summary"] is not None:
-        result["sample_results"], result["sample_results_error"] = _load_sample_results(
-            Path(output_root) / run_id
-        )
+    if result["summary"] is not None:
+        result["sample_results"], result["sample_results_error"] = _load_sample_results(results_dir)
     else:
         result["sample_results"] = []
         result["sample_results_error"] = ""

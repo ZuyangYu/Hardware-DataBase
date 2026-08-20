@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from src.document_authoring.template_activation import decide_template_activation
+from src.document_authoring.template_activation import (
+    TemplateActivationPolicy,
+    decide_template_activation,
+)
 from src.document_authoring.template_analysis import (
     TemplateAnalysis,
     TemplateAnalysisSuggestion,
@@ -93,6 +96,38 @@ def test_nonempty_fixed_label_requires_human_review():
     decision = decide_template_activation(_analysis(unit=unit))
 
     assert "nonempty_target_not_placeholder" in decision.reason_codes
+
+
+def test_ai_recommendation_mode_auto_accepts_a_fixed_label_mapping():
+    unit = TemplateAnalysisUnit(
+        unit_id="sheet:Review!A1",
+        locator={"sheet_name": "Review", "cell": "A1"},
+        writable=True,
+        value_preview="Example project",
+        value_kind="text",
+        style_fingerprint="style-1",
+        structural_role_hint="fixed_label",
+    )
+    suggestion = TemplateAnalysisSuggestion(
+        semantic_unit_id="project_name",
+        label="Project Name",
+        target_unit_ids=[unit.unit_id],
+        retrieval_terms=["project name"],
+        confidence=0.60,
+        overwrite_basis="sample_value",
+    )
+
+    decision = decide_template_activation(
+        _analysis(unit=unit, suggestion=suggestion),
+        TemplateActivationPolicy(accept_ai_recommendations=True),
+    )
+
+    assert decision.status == "auto_accepted"
+    assert {
+        "fixed_label_target",
+        "nonempty_target_not_placeholder",
+        "low_mapping_confidence",
+    } <= set(decision.reason_codes)
 
 
 def test_repeating_table_requires_explicit_schema():

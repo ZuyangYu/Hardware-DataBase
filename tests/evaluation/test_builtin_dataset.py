@@ -40,20 +40,20 @@ class BuiltinDatasetTests(unittest.TestCase):
             {},
         )
 
-    def test_builtin_dataset_uses_active_adas_new_scope(self):
+    def test_builtin_dataset_uses_active_adas_scope(self):
         samples = load_dataset(DATASET)
-        self.assertTrue(all(sample.kb_name == "ADAS_new" for sample in samples))
+        self.assertTrue(all(sample.kb_name == "ADAS" for sample in samples))
         standard_scope = [
             sample
             for sample in samples
-            if sample.request_context.get("user_id") == "eval_dept_96"
+            if sample.request_context.get("user_id") == "eval_dept_47"
         ]
         self.assertTrue(
-            all(sample.request_context.get("allowed_kbs") == ["96:ADAS_new"] for sample in standard_scope)
+            all(sample.request_context.get("allowed_kbs") == ["47:ADAS"] for sample in standard_scope)
         )
         self.assertTrue(
             all(
-                sample.request_context.get("kb_permissions") == {"96:ADAS_new": "read"}
+                sample.request_context.get("kb_permissions") == {"47:ADAS": "read"}
                 for sample in standard_scope
             )
         )

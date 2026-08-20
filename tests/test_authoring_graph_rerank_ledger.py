@@ -6,7 +6,7 @@ import pytest
 
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.agents.state import Evidence
-from src.document_authoring.harness.graph import AuthoringGraph
+from src.document_authoring.harness.graph import AuthoringGraph, _select_field_evidence
 from src.document_authoring.harness.policy import HarnessToolPolicy
 from src.document_authoring.models import (
     AuthoringRunManifest,
@@ -284,6 +284,22 @@ def test_writer_receives_bounded_deduplicated_evidence_and_ledger_keeps_discards
 
     assert [item["id"] for item in draft_calls[0].evidence] == ["a", "b", "c", "d", "e"]
     assert result.retrieval_ledger[0]["discarded_evidence_ids"] == ["duplicate", "f"]
+
+
+def test_long_evidence_without_a_field_specific_anchor_is_not_sent_to_writer():
+    long_generic_chunk = "signal information from another connector. " * 8
+    selected, discarded = _select_field_evidence(
+        [
+            {"id": "irrelevant", "content": long_generic_chunk, "score": 0.9},
+            {"id": "matched", "content": "X1903-22 signal is CAN3H.", "score": 0.5},
+        ],
+        max_items=5,
+        preserve_rerank_order=False,
+        retrieval_query_terms=["X1903-22", "signal"],
+    )
+
+    assert [item["id"] for item in selected] == ["matched"]
+    assert discarded == ["irrelevant"]
 
 
 def test_non_reranked_evidence_uses_preferred_role_then_score_then_id_order():

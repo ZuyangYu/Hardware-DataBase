@@ -32,8 +32,10 @@ DEFAULT_DATASET = Path("evaluation/datasets/hardware_qa_v1.jsonl")
 DEFAULT_OUTPUT_ROOT = Path("storage/evaluations")
 ACTIVE_EVALUATION_RUN_KEY = "evaluation_active_run_id"
 TERMINAL_RERUN_GUARD_PREFIX = "evaluation_terminal_rerun:"
+DELETE_CONFIRM_PREFIX = "evaluation_delete_confirm:"
 
 _TERMINAL_EVALUATION_STATUSES = {"completed", "paused", "cancelled", "failed"}
+_DELETABLE_EVALUATION_STATUSES = {"cancelled", "failed"}
 _LEGACY_REPORT_ARTIFACT_NAMES = (
     "summary.json",
     "results.jsonl",
@@ -90,6 +92,40 @@ def run_action_availability(status: str) -> dict[str, bool]:
         "resume": status in {"paused", "cancelled"},
         "cancel": status in {"queued", "running", "pause_requested", "paused"},
     }
+
+
+def _render_delete_control(st, controller: EvaluationRunController, run_id: str, status: str) -> None:
+    """Render a guarded delete action for a terminal failed/cancelled run."""
+    session_state = getattr(st, "session_state", None)
+    if session_state is None:
+        return
+    if status not in _DELETABLE_EVALUATION_STATUSES:
+        session_state.pop(f"{DELETE_CONFIRM_PREFIX}{run_id}", None)
+        return
+
+    confirm_key = f"{DELETE_CONFIRM_PREFIX}{run_id}"
+    if not session_state.get(confirm_key):
+        if st.button("删除此运行", key=f"delete-{run_id}", type="secondary"):
+            session_state[confirm_key] = True
+            st.rerun()
+        return
+
+    st.warning("删除后该运行的状态、快照和评估报告将不可恢复。")
+    confirm_column, cancel_column = st.columns(2)
+    if confirm_column.button("确认删除", key=f"confirm-delete-{run_id}", type="primary"):
+        try:
+            controller.delete(run_id)
+        except (OSError, ValueError) as exc:
+            st.error(f"删除评估运行失败：{exc}")
+        else:
+            session_state.pop(confirm_key, None)
+            if session_state.get(ACTIVE_EVALUATION_RUN_KEY) == run_id:
+                session_state.pop(ACTIVE_EVALUATION_RUN_KEY, None)
+            st.success("评估运行已删除。")
+            st.rerun()
+    if cancel_column.button("取消删除", key=f"cancel-delete-{run_id}"):
+        session_state.pop(confirm_key, None)
+        st.rerun()
 
 
 def _history_selector_label(
@@ -266,6 +302,8 @@ def render_saved_evaluation_run(
                 history.results,
                 history_run=history,
             )
+            state = controller.load_for_display(str(run_id))
+            _render_delete_control(st, controller, str(run_id), state.status)
         else:
             _render_active_status(st, controller, str(run_id))
     except (OSError, ValueError) as exc:
@@ -467,6 +505,7 @@ def _render_run_status(
     if cancel_column.button("取消", key=f"cancel-{state.run_id}", disabled=not actions["cancel"]):
         controller.cancel(state.run_id)
         st.rerun()
+    _render_delete_control(st, controller, state.run_id, state.status)
     return state
 
 
@@ -573,6 +612,8 @@ def render_evaluation_page(current_role: str | None) -> None:
                     baseline,
                     history_run=selected_history,
                 )
+                state = controller.load_for_display(selected.name)
+                _render_delete_control(st, controller, selected.name, state.status)
             else:
                 _render_active_status(st, controller, selected.name)
         except (OSError, ValueError) as exc:

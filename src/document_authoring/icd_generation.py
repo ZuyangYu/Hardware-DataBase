@@ -28,6 +28,7 @@ from src.document_authoring.models import (
     WorkbookTableFill,
     WorkbookTableSchema,
 )
+from src.document_authoring.pin_function_inference import resolve_pin_function
 from src.document_authoring.renderers.xlsm import XlsmRenderer
 from src.document_authoring.template_analysis import workbook_value_hash
 from src.pipelines.spreadsheet.xlsx_parser import ParsedSheet, parse_xlsx
@@ -493,21 +494,33 @@ def build_connector_rows(
     *,
     function_notes: dict[str, str] | None = None,
     reservation_notes: dict[str, str] | None = None,
+    manual_evidence: Iterable[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
     """Make explicit ICD rows from all parsed pins, including NC and grounds."""
 
     function_notes = function_notes or {}
     reservation_notes = reservation_notes or {}
+    manual_evidence = list(manual_evidence or [])
     rows: list[dict[str, str]] = []
     for connector in connectors:
         for pin in connector.pins:
             pin_name = _normalize_pin(pin.name)
             key = _pin_key(connector.refdes, pin_name)
             connected = str(pin.net or "").strip()
+            resolution = resolve_pin_function(
+                refdes=connector.refdes,
+                pin_name=pin_name,
+                net_name=connected,
+                evidence=manual_evidence,
+                part_number=connector.part_number or connector.value,
+            )
+            function = resolution.function if resolution.source == "datasheet" else function_notes.get(key, "")
+            if not function:
+                function = resolution.function or ""
             rows.append({
                 "pin": f"{connector.refdes}-{pin_name}",
                 "definition": connected or "NC",
-                "function": function_notes.get(key, ""),
+                "function": function,
                 "notice": reservation_notes.get(
                     key,
                     "" if connected else "源文件未声明网络连接",
@@ -615,6 +628,7 @@ def generate_icd_workbook(
     connector_refdes: Iterable[str],
     fpt_path: str | Path | None = None,
     requirements_path: str | Path | None = None,
+    manual_evidence: Iterable[dict[str, Any]] | None = None,
 ) -> IcdGenerationResult:
     """Generate an ICD candidate from an ICD-like workbook and project files."""
 
@@ -625,6 +639,7 @@ def generate_icd_workbook(
         connectors,
         function_notes=function_notes,
         reservation_notes=reservation_notes,
+        manual_evidence=manual_evidence,
     )
     metadata = extract_project_metadata(
         connectors,

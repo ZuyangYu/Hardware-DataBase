@@ -15,6 +15,7 @@ import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { StatCard } from '@/components/StatCard';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { Button } from '@/components/ui/button';
 import { Input, Label, Textarea } from '@/components/ui';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -60,6 +61,7 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 const ACTIVE_STATUSES = new Set<EvaluationRunStatus>(['queued', 'running', 'pause_requested', 'cancel_requested']);
+const DELETABLE_STATUSES = new Set<EvaluationRunStatus>(['failed', 'cancelled']);
 
 function splitList(value: string): string[] | null {
   const items = value
@@ -74,8 +76,19 @@ function outputRootQuery(outputRoot: string): string {
 }
 
 function progressPercent(run: EvaluationRunDetail | null): number {
-  if (!run || run.total_samples <= 0) return 0;
+  if (!run) return 0;
+  if (run.stage === 'scoring' && run.scoring_total_items > 0) {
+    return Math.max(0, Math.min(100, Math.round((run.scoring_completed_items / run.scoring_total_items) * 100)));
+  }
+  if (run.total_samples <= 0) return 0;
   return Math.max(0, Math.min(100, Math.round((run.completed_samples / run.total_samples) * 100)));
+}
+
+function progressLabel(run: EvaluationRunDetail): string {
+  if (run.stage === 'scoring' && run.scoring_total_items > 0) {
+    return `评分 ${run.scoring_completed_items}/${run.scoring_total_items}`;
+  }
+  return run.current_sample_id || '当前无运行样本';
 }
 
 export default function EvaluationPage({ auth, onLogout }: Props) {
@@ -85,6 +98,8 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const [selectedRunId, setSelectedRunId] = useState('');
   const [detail, setDetail] = useState<EvaluationRunDetail | null>(null);
   const [detailLoaded, setDetailLoaded] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<EvaluationRunListItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const [datasetPath, setDatasetPath] = useState(DEFAULT_DATASET);
   const [uploadingDataset, setUploadingDataset] = useState(false);
@@ -99,9 +114,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const [compare, setCompare] = useState<EvaluationCompareResponse | null>(null);
   const [compareLoading, setCompareLoading] = useState(false);
 
-  const loadRuns = useCallback(() => {
+  const loadRuns = useCallback((showLoading = true) => {
     let cancelled = false;
-    setRunsLoaded(false);
+    if (showLoading) setRunsLoaded(false);
     api
       .get<EvaluationRunListItem[]>(`/api/v1/evaluation/runs?${outputRootQuery(outputRoot)}`)
       .then((rows) => {
@@ -110,7 +125,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         setSelectedRunId((current) => (rows.some((run) => run.run_id === current) ? current : rows[0]?.run_id || ''));
       })
       .catch((error) => {
-        if (!cancelled) notify.error(error instanceof Error ? error.message : '加载评估运行失败');
+        if (!cancelled && showLoading) {
+          notify.error(error instanceof Error ? error.message : '加载评估运行失败');
+        }
       })
       .finally(() => {
         if (!cancelled) setRunsLoaded(true);
@@ -120,14 +137,14 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     };
   }, [outputRoot]);
 
-  const loadDetail = useCallback((runId = selectedRunId) => {
+  const loadDetail = useCallback((runId = selectedRunId, showLoading = true) => {
     if (!runId) {
       setDetail(null);
       setDetailLoaded(true);
       return undefined;
     }
     let cancelled = false;
-    setDetailLoaded(false);
+    if (showLoading) setDetailLoaded(false);
     api
       .get<EvaluationRunDetail>(`/api/v1/evaluation/runs/${encodeURIComponent(runId)}?${outputRootQuery(outputRoot)}`)
       .then((run) => {
@@ -135,8 +152,13 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       })
       .catch((error) => {
         if (!cancelled) {
-          setDetail(null);
-          notify.error(error instanceof Error ? error.message : '加载评估详情失败');
+          // Keep the last known detail during a background poll failure. A
+          // transient request error should not replace the whole panel with
+          // an empty state (or produce a toast every two seconds).
+          if (showLoading) {
+            setDetail(null);
+            notify.error(error instanceof Error ? error.message : '加载评估详情失败');
+          }
         }
       })
       .finally(() => {
@@ -160,8 +182,11 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   useEffect(() => {
     if (!detail || !ACTIVE_STATUSES.has(detail.status)) return undefined;
     const timer = window.setInterval(() => {
-      loadDetail(detail.run_id);
-      loadRuns();
+      // Background polling must keep the current UI mounted. Toggling the
+      // initial-load flags here replaces the table/detail with Skeletons on
+      // every poll, which looks like page flicker while the run is active.
+      loadDetail(detail.run_id, false);
+      loadRuns(false);
     }, 2000);
     return () => window.clearInterval(timer);
   }, [detail, loadDetail, loadRuns]);
@@ -252,6 +277,31 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     }
   }
 
+  async function handleDeleteRun() {
+    if (!deleteTarget) return;
+    const runId = deleteTarget.run_id;
+    setDeleting(true);
+    try {
+      await api.delete<OkResponse>(
+        `/api/v1/evaluation/runs/${encodeURIComponent(runId)}?${outputRootQuery(outputRoot)}`,
+      );
+      notify.success('评估运行已删除');
+      setDeleteTarget(null);
+      setRuns((current) => current.filter((run) => run.run_id !== runId));
+      setCompare(null);
+      setBaselineRunId('');
+      if (selectedRunId === runId) {
+        setSelectedRunId('');
+        setDetail(null);
+      }
+      loadRuns();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '删除评估运行失败');
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function handleCompare() {
     if (!selectedRunId || !baselineRunId) {
       notify.error('请选择当前运行和基线运行');
@@ -306,20 +356,36 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       {
         key: 'actions',
         title: '操作',
-        width: 90,
+        width: 160,
         align: 'right',
         render: (run) => (
-          <button
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              setSelectedRunId(run.run_id);
-              setCompare(null);
-            }}
-            className="inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
-          >
-            查看
-          </button>
+          <div className="flex justify-end gap-[6px]">
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setSelectedRunId(run.run_id);
+                setCompare(null);
+              }}
+              className="inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
+            >
+              查看
+            </button>
+            {run.status && DELETABLE_STATUSES.has(run.status) && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setDeleteTarget(run);
+                }}
+                className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#f3b0b0] bg-white px-[10px] text-[12px] text-[#d20b0b] transition-colors hover:bg-[#fce7e7]"
+                title="删除失败或已取消的运行"
+              >
+                <AppIcon name="trash" size={13} />
+                删除
+              </button>
+            )}
+          </div>
         ),
       },
     ],
@@ -477,6 +543,19 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           onCancel={() => void controlRun('cancel')}
         />
       </section>
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
+        }}
+        title={<>删除评估运行「{deleteTarget?.run_id}」</>}
+        description="仅失败或已取消的运行可以删除。删除后该运行的状态、快照和评估报告将不可恢复。"
+        confirmText="删除"
+        loading={deleting}
+        destructive
+        onConfirm={() => void handleDeleteRun()}
+      />
     </div>
   );
 }
@@ -579,14 +658,14 @@ function RunDetailPanel({
 
       <div className="grid grid-cols-4 gap-[12px] max-[900px]:grid-cols-2">
         <StatCard label="样本总数" value={run.total_samples} />
-        <StatCard label="已完成" value={run.completed_samples} />
-        <StatCard label="成功" value={run.successful_samples} tone="green" />
-        <StatCard label="失败" value={run.failed_samples} tone={run.failed_samples > 0 ? 'red' : 'green'} />
+        <StatCard label="采集完成" value={`${run.completed_samples}/${run.total_samples}`} />
+        <StatCard label="评分任务" value={!run.score_enabled ? '未启用' : run.scoring_total_items > 0 ? `${run.scoring_completed_items}/${run.scoring_total_items}` : '待开始'} />
+        <StatCard label="待评分" value={!run.score_enabled || run.scoring_total_items <= 0 ? '—' : Math.max(0, run.scoring_total_items - run.scoring_completed_items)} />
       </div>
 
       <div>
         <div className="mb-[6px] flex justify-between text-[11px] text-[#858b9c]">
-          <span>{run.current_sample_id || '当前无运行样本'}</span>
+          <span>{progressLabel(run)}</span>
           <span>{percent}%</span>
         </div>
         <div className="h-[8px] overflow-hidden rounded-full bg-[#f2f3f7]">
@@ -609,9 +688,13 @@ function RunDetailPanel({
       {run.summary && (
         <EvaluationDashboard
           summary={run.summary}
-          sampleResults={canLoadSampleDiagnostics(run.status, true) ? run.sample_results ?? [] : []}
-          sampleResultsError={canLoadSampleDiagnostics(run.status, true) ? run.sample_results_error ?? '' : ''}
+          sampleResults={canLoadSampleDiagnostics(run.status, Boolean(run.summary)) ? run.sample_results ?? [] : []}
+          sampleResultsError={canLoadSampleDiagnostics(run.status, Boolean(run.summary)) ? run.sample_results_error ?? '' : ''}
           compare={compare}
+          isInProgress={ACTIVE_STATUSES.has(run.status)}
+          isFinal={run.status === 'completed'}
+          scoringCompletedItems={run.scoring_completed_items}
+          scoringTotalItems={run.scoring_total_items}
         />
       )}
     </div>
