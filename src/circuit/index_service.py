@@ -1436,6 +1436,8 @@ _STRUCTURE_OPS = frozenset({"structure_overview", "module_list", "visual_structu
 
 
 def _is_role_intent(plan: Any, query: str) -> bool:
+    if not _semantic_queries_enabled():
+        return False
     if not getattr(plan, "role_term", None):
         return False
     if set(plan.operations) & _HIGH_PRIORITY_OPS:
@@ -1444,11 +1446,20 @@ def _is_role_intent(plan: Any, query: str) -> bool:
 
 
 def _is_structure_intent(plan: Any) -> bool:
+    if not _semantic_queries_enabled():
+        return False
     if not set(plan.operations) & _STRUCTURE_OPS:
         return False
     if set(plan.operations) & _HIGH_PRIORITY_OPS:
         return False
     return True
+
+
+def _semantic_queries_enabled() -> bool:
+    """Gray-rollout switch: exact refdes/net queries are always available."""
+    import config.settings as settings
+
+    return bool(getattr(settings, "CIRCUIT_SEMANTIC_QUERY_ENABLED", True))
 
 
 def _is_role_or_structure_intent(query: str) -> bool:

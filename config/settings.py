@@ -23,6 +23,10 @@ RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
 RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
 RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
 
+# Task 7 gray rollout: role/structure read models can be disabled per
+# deployment; exact refdes/net queries always stay available.
+CIRCUIT_SEMANTIC_QUERY_ENABLED = os.getenv("CIRCUIT_SEMANTIC_QUERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
 AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
 AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
