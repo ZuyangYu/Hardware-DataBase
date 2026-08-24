@@ -2042,6 +2042,12 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
 
     if round_no == 1:
         verified_links = list(state.get("_verified_datasheet_links") or [])
+        provider = state.get("_datasheet_link_provider")
+        if not verified_links and callable(provider):
+            try:
+                verified_links = list(provider() or [])
+            except Exception:
+                verified_links = []
         derived_calls = _derived_datasheet_calls(state.get("user_query", ""), circuit_hits, verified_links)
         if not derived_calls:
             # M1 gate: without verified links no supplemental document_rag call

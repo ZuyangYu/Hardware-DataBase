@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import re
 import tempfile
@@ -30,6 +31,8 @@ from src.circuit.store import (
 from src.circuit.vector_index import KIND_INSTANCE, KIND_MODULE, KIND_NET, CircuitVectorIndex, default_circuit_vector_index
 from src.pipelines.document_rag.schemas import RequestContext
 
+
+logger = logging.getLogger(__name__)
 
 META_FILE = "pipeline_metadata.json"
 GRAPH_EVIDENCE_ENDPOINT_LIMIT = 8
@@ -65,6 +68,7 @@ class CircuitIndexService:
         query_engine: CircuitQueryEngine | None = None,
         graph_store: GraphStore | None = None,
         vector_index: CircuitVectorIndex | None = None,
+        document_store: Any | None = None,
     ):
         self.store = store or CircuitStore(root=storage_root)
         self.parser_factory = parser_factory or EdfParser
@@ -72,6 +76,13 @@ class CircuitIndexService:
         self.graph_store = graph_store or GraphStore()
         self.vector_index = vector_index or default_circuit_vector_index
         self.evidence_mapper = CircuitEvidenceMapper()
+        # Governed EDF→datasheet link index; disabled (fail-closed) until a
+        # document store is provided.
+        from src.circuit.datasheet_link_index import ComponentDatasheetLinkIndex
+
+        self.datasheet_link_index = ComponentDatasheetLinkIndex(
+            self.store, document_store=document_store
+        )
 
     def index_file(
         self,
@@ -189,11 +200,30 @@ class CircuitIndexService:
                 vector_index_status = "failed"
                 derived_degraded = True
                 warnings.append("Vector index persistence failed.")
+            status = "degraded" if derived_degraded else "indexed"
+            message = f"Indexed circuit design {original_name}"
+            if derived_degraded:
+                message += " with degraded derived indexes"
+            # Link rebuild is derived, best-effort and isolated: a failure
+            # keeps the previous link artifact and never fails publication.
+            try:
+                datasheet_link_count = self.datasheet_link_index.rebuild_links_for_design(
+                    design,
+                    generation_id=circuit_generation_id(design),
+                )
+            except Exception:
+                logger.warning(
+                    "Datasheet link rebuild failed for %s/%s; keeping previous links.",
+                    kb_name,
+                    design_id,
+                )
+                datasheet_link_count = 0
             stats = {
                 "instance_count": len(design.instances),
                 "net_count": len(design.nets),
                 "module_count": len(design.modules),
                 "identity_count": len(design.component_identities),
+                "datasheet_link_count": datasheet_link_count,
                 "graph_node_count": graph_node_count,
                 "graph_edge_count": graph_edge_count,
                 "vector_document_count": vector_document_count,

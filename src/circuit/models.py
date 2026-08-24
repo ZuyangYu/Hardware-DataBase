@@ -33,6 +33,15 @@ IDENTIFIER_NAMESPACES = (
 
 IDENTIFIER_SOURCE_KINDS = ("edf_property", "bom_field", "curated_catalog")
 
+DATASHEET_MATCH_METHODS = (
+    "exact_mpn",
+    "internal_pdn_catalog",
+    "approved_manual",
+    "candidate_filename",
+)
+
+DATASHEET_LINK_STATUSES = ("verified", "candidate", "revoked")
+
 ROLE_SOURCE_KINDS = (
     "edf_property",
     "bom_field",
@@ -277,6 +286,63 @@ class ComponentIdentity:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ComponentIdentity":
+        known = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in known})
+
+
+@dataclass
+class ComponentDatasheetLink:
+    """Governed EDF-component → datasheet record association (task 5b).
+
+    Carries both-side version stamps; every read re-validates them.
+    """
+
+    circuit_id: str
+    refdes: str
+    datasheet_record_id: int
+    matched_part_number: str
+    manufacturer: str = ""
+    document_revision: str = ""
+    document_fingerprint: str = ""
+    circuit_generation_id: str = ""
+    document_source_version_id: str = ""
+    remote_document_id: str = ""
+    match_method: str = "candidate_filename"
+    link_status: str = "candidate"
+    source_locator: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.0
+
+    def __post_init__(self):
+        _require_text("circuit_id", self.circuit_id)
+        _require_text("refdes", self.refdes)
+        self.datasheet_record_id = int(self.datasheet_record_id)
+        if self.datasheet_record_id <= 0:
+            raise ValueError("datasheet_record_id 必须为正整数")
+        _require_text("matched_part_number", self.matched_part_number)
+        if not isinstance(self.manufacturer, str):
+            raise ValueError("manufacturer 必须是字符串")
+        if not isinstance(self.document_revision, str):
+            raise ValueError("document_revision 必须是字符串")
+        if not isinstance(self.document_fingerprint, str):
+            raise ValueError("document_fingerprint 必须是字符串")
+        if not isinstance(self.circuit_generation_id, str):
+            raise ValueError("circuit_generation_id 必须是字符串")
+        if not isinstance(self.document_source_version_id, str):
+            raise ValueError("document_source_version_id 必须是字符串")
+        if not isinstance(self.remote_document_id, str):
+            raise ValueError("remote_document_id 必须是字符串")
+        _require_choice("match_method", self.match_method, DATASHEET_MATCH_METHODS)
+        _require_choice("link_status", self.link_status, DATASHEET_LINK_STATUSES)
+        _require_json_mapping("source_locator", self.source_locator)
+        self.confidence = float(self.confidence)
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence 必须在 [0, 1] 区间内")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ComponentDatasheetLink":
         known = {item.name for item in fields(cls)}
         return cls(**{key: value for key, value in data.items() if key in known})
 
