@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from src.circuit.question_analysis import extract_role_term
+
 
 CapabilityName = Literal[
     "entity_lookup",
@@ -14,6 +16,12 @@ CapabilityName = Literal[
     "tabular_lookup",
     "document_claim_lookup",
     "revision_lookup",
+    # Circuit read-model capabilities (task 4): role-based connection
+    # conclusions need identity_lookup + relationship_lookup; datasheet-backed
+    # capability conclusions need datasheet_link_lookup + document_claim_lookup.
+    "identity_lookup",
+    "structure_lookup",
+    "datasheet_link_lookup",
 ]
 ClaimOperation = Literal[
     "identity",
@@ -182,6 +190,14 @@ def plan_claims(question: str, expected_evidence: Iterable[str] = ()) -> list[Cl
     expected = {str(item) for item in expected_evidence}
     if "circuit_design" in expected and "relationship_lookup" not in capabilities:
         capabilities.append("relationship_lookup")
+    if (
+        "circuit_design" in expected
+        and extract_role_term(text)
+        and "identity_lookup" not in capabilities
+    ):
+        # A role-based connection conclusion must carry both the identity
+        # evidence (who is the SoC/MCU) and the EDF relationship evidence.
+        capabilities.append("identity_lookup")
     if "spreadsheet_table" in expected and "tabular_lookup" not in capabilities:
         capabilities.append("tabular_lookup")
     if "document_text" in expected and "document_claim_lookup" not in capabilities:

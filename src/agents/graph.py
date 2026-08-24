@@ -166,7 +166,13 @@ def _claims_for_subquestions(sub_questions: list[SubQuestion]) -> list[Claim]:
 
 
 _LEGACY_PROCESSOR_CAPABILITIES: dict[str, set[str]] = {
-    "circuit_design": {"entity_lookup", "relationship_lookup"},
+    "circuit_design": {
+        "entity_lookup",
+        "relationship_lookup",
+        "identity_lookup",
+        "structure_lookup",
+        "datasheet_link_lookup",
+    },
     "spreadsheet_table": {"entity_lookup", "tabular_lookup", "revision_lookup"},
     "ragflow": {"entity_lookup", "document_claim_lookup"},
 }
@@ -222,8 +228,10 @@ def _claim_coverage(claims: list[Claim], evidence: list[dict[str, Any]]) -> list
 def _evidence_supports_capability(evidence: dict[str, Any], capability: str) -> bool:
     content_kind = str(evidence.get("content_kind") or "")
     metadata = evidence.get("metadata") or {}
+    locator = evidence.get("locator") or {}
     certainty = str(metadata.get("certainty") or "")
     fact_type = str(metadata.get("fact_type") or "")
+    entity_type = str(locator.get("entity_type") or "")
     if capability == "relationship_lookup":
         return content_kind == "circuit_design" and certainty == "direct" and fact_type == "relationship"
     if capability == "entity_lookup":
@@ -234,6 +242,20 @@ def _evidence_supports_capability(evidence: dict[str, Any], capability: str) -> 
         return content_kind == "document_text"
     if capability == "revision_lookup":
         return bool(metadata.get("revision") or metadata.get("observed_at"))
+    if capability == "identity_lookup":
+        # Only a unique, evidence-backed identity resolution counts; ambiguous
+        # or no_evidence statuses must never support a role claim.
+        return (
+            content_kind == "circuit_design"
+            and entity_type == "component_identity"
+            and str(metadata.get("resolution_status") or "") == "unique"
+        )
+    if capability == "structure_lookup":
+        return content_kind == "circuit_design" and entity_type in {"circuit_overview", "module_list"}
+    if capability == "datasheet_link_lookup":
+        # Populated only by the governed link index (plan task 5b). Absent in
+        # M1, so datasheet-backed claims stay unsupported — fail closed.
+        return str(metadata.get("datasheet_link_status") or "") == "verified"
     return False
 
 
@@ -449,6 +471,11 @@ def _required_candidate_evidence(question: str) -> set[str]:
     required: set[str] = set()
     circuit_plan = analyze_circuit_question(question)
     if circuit_plan.operations:
+        required.add("circuit_design")
+    # Role/structure intents are explicit circuit read-model questions; the
+    # deterministic plan must include the circuit source even when a weak LLM
+    # plan only proposes documents.
+    if {"entity_role", "structure_overview", "module_list", "visual_structure"} & set(circuit_plan.operations):
         required.add("circuit_design")
     if (
         has_refdes
@@ -1786,10 +1813,27 @@ def _is_matching_datasheet_capability(source_name: str, content: str, part_numbe
     return bool(part and part in searchable and any(term in searchable for term in _CAPABILITY_TERMS))
 
 
-def _derived_datasheet_calls(question: str, circuit_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build bounded manual lookups from part numbers discovered in EDF facts."""
+def _derived_datasheet_calls(
+    question: str,
+    circuit_hits: list[dict[str, Any]],
+    verified_links: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Bounded datasheet lookups gated by VERIFIED component-datasheet links.
+
+    Without a verified link (governed index, plan task 5b) this returns no
+    calls at all — internal part numbers or topology candidates alone must
+    never trigger open-ended ``document_rag`` searches.
+    """
     if not analyze_circuit_question(question).requires_datasheet:
         return []
+    links = [item for item in (verified_links or []) if str(item.get("part_number") or "").strip()]
+    if not links:
+        return []
+    link_by_part = {
+        str(item["part_number"]).strip().casefold(): item
+        for item in links
+        if str(item.get("part_number") or "").strip()
+    }
     part_numbers: list[str] = []
     for hit in circuit_hits:
         metadata = hit.get("metadata") or {}
@@ -1797,23 +1841,33 @@ def _derived_datasheet_calls(question: str, circuit_hits: list[dict[str, Any]]) 
             continue
         for raw in metadata.get("part_numbers") or []:
             part = str(raw or "").strip()
-            if part and part.casefold() not in {item.casefold() for item in part_numbers}:
+            if (
+                part
+                and part.casefold() in link_by_part
+                and part.casefold() not in {item.casefold() for item in part_numbers}
+            ):
                 part_numbers.append(part)
             if len(part_numbers) >= 4:
                 break
         if len(part_numbers) >= 4:
             break
-    return [
-        {
-            "tool_name": "document_rag",
-            "query": f"{part} datasheet short circuit protection OCP SCP short-to-ground short-to-battery thermal shutdown",
-            "reason": f"Verify protection capability claimed for circuit-discovered part {part}.",
-            "top_k": 4,
-            "filters": {},
-            "part_number": part,
-        }
-        for part in part_numbers
-    ]
+    calls = []
+    for part in part_numbers:
+        link = link_by_part[part.casefold()]
+        record_ids = sorted({int(item) for item in link.get("record_ids") or [] if str(item).isdigit()})
+        if not record_ids:
+            continue
+        calls.append(
+            {
+                "tool_name": "document_rag",
+                "query": f"{part} datasheet short circuit protection OCP SCP short-to-ground short-to-battery thermal shutdown",
+                "reason": f"Verified component-datasheet link for {part}; lookup restricted to linked records.",
+                "top_k": 4,
+                "filters": {"allowed_record_ids": record_ids},
+                "part_number": part,
+            }
+        )
+    return calls
 
 
 def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
@@ -1987,13 +2041,27 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                     )
 
     if round_no == 1:
-        for call in _derived_datasheet_calls(state.get("user_query", ""), circuit_hits):
+        verified_links = list(state.get("_verified_datasheet_links") or [])
+        derived_calls = _derived_datasheet_calls(state.get("user_query", ""), circuit_hits, verified_links)
+        if not derived_calls:
+            # M1 gate: without verified links no supplemental document_rag call
+            # is ever issued — even when EDF exposes candidate part numbers.
+            if analyze_circuit_question(state.get("user_query", "")).requires_datasheet and circuit_hits:
+                diagnostics.append(
+                    {
+                        "tool_name": "document_rag",
+                        "status": "skipped_no_verified_datasheet_link",
+                        "hit_count": 0,
+                    }
+                )
+            derived_calls = []
+        for call in derived_calls:
             tool = tools.get("document_rag")
             if tool is None:
                 break
             started = time.monotonic()
             try:
-                run_kwargs = {"top_k": call["top_k"], "filters": {}}
+                run_kwargs = {"top_k": call["top_k"], "filters": dict(call.get("filters") or {})}
                 if cancel_check is not None and getattr(tool, "supports_cancellation", False):
                     run_kwargs["should_cancel"] = cancel_check
                 with observe.retriever(

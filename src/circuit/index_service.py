@@ -36,6 +36,14 @@ GRAPH_EVIDENCE_ENDPOINT_LIMIT = 8
 GRAPH_EVIDENCE_CONTENT_LIMIT = 512
 GRAPH_FILE = "connectivity_graph.gpickle"
 
+# Typed read-model operations exposed through the agent tool contract.
+TYPED_QUERY_OPERATIONS = frozenset({
+    "structure_overview",
+    "module_list",
+    "resolve_identity",
+    "resolved_connections",
+})
+
 
 @dataclass
 class CircuitIndexResult:
@@ -266,13 +274,49 @@ class CircuitIndexService:
         top_k: int = 5,
         filters: dict | None = None,
     ) -> list[Evidence]:
+        filters = dict(filters or {})
+        operation = str(filters.get("query_operation") or "auto")
+        if operation != "auto" and operation not in TYPED_QUERY_OPERATIONS:
+            raise ValueError(f"Unsupported circuit_query.query_operation: {operation!r}")
         with circuit_index_read_lock(self.store.root):
             return self._query_unlocked(
                 kb_name=kb_name,
                 query=query,
                 ctx=ctx,
                 top_k=top_k,
-                filters=filters,
+                filters=filters or {},
+            )
+
+    def typed_query(
+        self,
+        *,
+        kb_name: str,
+        operation: str,
+        query: str,
+        ctx: RequestContext | None,
+        top_k: int = 5,
+    ) -> list[Evidence]:
+        """Typed read-model entry; fail-closed on missing department context."""
+        if operation not in TYPED_QUERY_OPERATIONS:
+            raise ValueError(f"Unsupported circuit_query.query_operation: {operation!r}")
+        if _ctx_department_id(ctx) == "":
+            raise PermissionError(
+                "Typed circuit queries require department context and knowledge-base read permission."
+            )
+        with circuit_index_read_lock(self.store.root):
+            allowed_designs = self._allowed_designs_unlocked(kb_name, ctx, {})
+            plan = analyze_question(query)
+            top_k = max(1, int(top_k or 5))
+            if operation == "structure_overview":
+                return self._structure_overview_evidence(kb_name, plan, allowed_designs, top_k)
+            if operation == "module_list":
+                return self._module_list_evidence(kb_name, plan, allowed_designs, top_k)
+            return self._identity_resolution_evidence(
+                kb_name,
+                plan,
+                allowed_designs,
+                top_k,
+                include_connections=operation == "resolved_connections",
             )
 
     def _query_unlocked(
@@ -977,6 +1021,8 @@ class CircuitIndexService:
         plan: Any,
         allowed_designs: dict[str, tuple[dict[str, Any], str]],
         top_k: int,
+        *,
+        include_connections: bool = True,
     ) -> list[Evidence]:
         resolution = self.query_engine.resolve_component_identity(
             kb_name,
@@ -1031,21 +1077,22 @@ class CircuitIndexService:
                 source_name=source_name,
                 score=0.99,
             ))
-            connections = self.query_engine.get_resolved_instance_connections(
-                kb_name,
-                resolution,
-                allowed_design_ids=frozenset(allowed_designs),
-            )
-            if connections and connections.get("pins"):
-                connections["resolution_status"] = "unique"
-                connections["role_term"] = plan.role_term
-                evidences.append(self.evidence_mapper.build(
-                    kind="pin_mapping",
-                    row=connections,
-                    metadata=metadata,
-                    source_name=source_name,
-                    score=0.98,
-                ))
+            if include_connections:
+                connections = self.query_engine.get_resolved_instance_connections(
+                    kb_name,
+                    resolution,
+                    allowed_design_ids=frozenset(allowed_designs),
+                )
+                if connections and connections.get("pins"):
+                    connections["resolution_status"] = "unique"
+                    connections["role_term"] = plan.role_term
+                    evidences.append(self.evidence_mapper.build(
+                        kind="pin_mapping",
+                        row=connections,
+                        metadata=metadata,
+                        source_name=source_name,
+                        score=0.98,
+                    ))
             if "power_path" in plan.operations:
                 topology = self.query_engine.build_power_topology(kb_name, candidate.design_id)
                 if topology:
