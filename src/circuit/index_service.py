@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from src.agents.state import Evidence
 from src.agents.query_tokens import tokenize_hardware_query
+from src.circuit.component_identity import build_component_identities
 from src.circuit.evidence_mapper import CircuitEvidenceMapper
 from src.circuit.graph_store import GraphStore
 from src.circuit.index_lock import circuit_index_read_lock, circuit_index_write_lock
@@ -135,6 +136,10 @@ class CircuitIndexService:
         snapshot = self._snapshot_files(snapshot_paths)
         previous_design = self.store.load(kb_name, design_id)
         try:
+            # Identity projection is derived data published in the same
+            # transaction as the state file. A failure here must roll the whole
+            # generation back — never publish a half-built index.
+            design.component_identities = build_component_identities(design)
             self.store.save(design)
             warnings = list(design.parse_warnings)
             derived_degraded = False
@@ -178,6 +183,7 @@ class CircuitIndexService:
                 "instance_count": len(design.instances),
                 "net_count": len(design.nets),
                 "module_count": len(design.modules),
+                "identity_count": len(design.component_identities),
                 "graph_node_count": graph_node_count,
                 "graph_edge_count": graph_edge_count,
                 "vector_document_count": vector_document_count,
@@ -192,6 +198,7 @@ class CircuitIndexService:
                 {
                     **publication_metadata,
                     "generation_id": circuit_generation_id(design),
+                    "identity_projection_status": "indexed",
                     "graph_index_status": graph_index_status,
                     "vector_index_status": vector_index_status,
                     "index_status": status,

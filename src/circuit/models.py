@@ -27,6 +27,7 @@ IDENTIFIER_NAMESPACES = (
     "manufacturer_part_number",
     "erp_number",
     "library_cell",
+    "value",
     "curated_alias",
 )
 
