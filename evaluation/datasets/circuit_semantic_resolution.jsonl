@@ -1,0 +1,19 @@
+{"id": "circuit-exact-refdes", "question": "U100 连接", "category": "correct", "expected_evidence_types": ["pin_mapping"], "notes": "精确位号查询保持既有行为"}
+{"id": "circuit-exact-net", "question": "CAN0_TX 网络连接", "category": "correct", "expected_evidence_types": ["net", "graph_relationship"], "notes": "精确网络查询"}
+{"id": "role-unique-soc", "question": "SoC 的连接关系", "category": "correct", "expected_evidence_types": ["component_identity", "pin_mapping"], "expect_resolution_status": "unique", "notes": "唯一 SoC 候选需身份+连接两类来源"}
+{"id": "role-unique-mcu", "question": "MCU 连接", "category": "correct", "expected_evidence_types": ["component_identity", "pin_mapping"], "expect_resolution_status": "unique", "notes": "唯一 MCU 候选，角色保留为 mcu 不得升级 SoC"}
+{"id": "role-controller-family", "question": "主控的供电路径", "category": "needs_clarification", "forbidden_evidence_types": ["component_identity", "pin_mapping"], "expect_resolution_status": "ambiguous", "expect_allowed_evidence_types": ["power_topology"], "notes": "多主控时不得断言谁是主控；设计级电源拓扑可保留但不可归属"}
+{"id": "role-multi-controller", "question": "主控的连接关系", "category": "needs_clarification", "forbidden_evidence_types": ["pin_mapping", "net", "graph_relationship", "module_connection"], "expect_resolution_status": "ambiguous", "notes": "多主控只返回候选澄清，不展开任一连接"}
+{"id": "role-no-evidence", "question": "SoC 连接关系", "department_id": "dept_b", "category": "insufficient_source", "expect_resolution_status": "no_evidence", "notes": "无受控角色证据时明确资料不足并建议补充 BOM/型号/位号"}
+{"id": "module-heuristic-only", "department_id": "dept_b", "question": "MCU 模块的连接", "category": "insufficient_source", "expect_resolution_status": "no_evidence", "forbidden_evidence_types": ["pin_mapping", "instance"], "notes": "模块名含 MCU 不构成角色证据，不得触发 TC3 字符串兜底"}
+{"id": "datasheet-verified-link", "question": "电源输出电路是否有短地保护能力？", "category": "correct", "requires_verified_link": true, "expect_allowed_record_filter": true, "notes": "已验证关联才允许补充数据手册检索且必须带 allowed_record_ids"}
+{"id": "datasheet-candidate-link", "question": "电源输出电路是否有短地保护能力？", "category": "insufficient_source", "link_status": "candidate", "expect_no_document_followup": true, "notes": "候选关联不触发 document_rag 补检索"}
+{"id": "datasheet-revoked-link", "question": "电源输出电路是否有短地保护能力？", "category": "insufficient_source", "link_status": "revoked", "expect_no_document_followup": true, "notes": "撤销关联立即失效"}
+{"id": "datasheet-version-mismatch", "question": "电源输出电路是否有短地保护能力？", "category": "insufficient_source", "link_status": "stale_version", "expect_no_document_followup": true, "notes": "版本戳不一致读取时即拒绝"}
+{"id": "structure-overview", "question": "原理图的结构信息是什么", "category": "correct", "expected_evidence_types": ["circuit_overview"], "notes": "结构概览含实例/网络/模块计数与策略"}
+{"id": "structure-module-list", "question": "列出所有模块", "category": "correct", "expected_evidence_types": ["module_list"], "notes": "模块列表含 strategy"}
+{"id": "structure-no-pages-or-coords", "question": "设计概况", "category": "unsupported_visual_data", "expected_content_fragments": ["不具备"], "notes": "如实声明页面/坐标/标题栏不可用而非零命中"}
+{"id": "isolation-cross-department-refdes", "question": "SoC 的连接关系", "department_id": "dept_b", "category": "correct", "expect_department_isolation": "dept_b", "notes": "跨部门同名器件与断言不可泄露"}
+{"id": "isolation-same-name-document", "question": "datasheet lookup", "category": "correct", "scenario_kind": "document_strict_path", "expect_single_record_only": true, "notes": "同部门同名文档仅返回关联记录 chunk"}
+{"id": "access-no-context", "question": "SoC 的连接关系", "ctx": null, "category": "insufficient_source", "expect_permission_error": true, "notes": "缺少部门上下文 fail-closed 且可区分于未检索到"}
+{"id": "vector-index-unavailable", "question": "SoC 的连接关系", "vector_available": false, "category": "correct", "expect_resolution_status": "unique", "notes": "向量索引不可用时身份解析仍工作"}

@@ -2120,12 +2120,19 @@ def retrieve_evidence(state: AgentState, tools: dict[str, Any]) -> AgentState:
                     {
                         "tool_name": "document_rag",
                         "query": call["query"],
-                        "filters": {},
+                        "filters": dict(call.get("filters") or {}),
                         "top_k": call["top_k"],
                         "hit_count": len(hits),
                         "status": "ok",
                         "latency_ms": int((time.monotonic() - started) * 1000),
                         "derived_from": "circuit_part_number",
+                        # Task 6 observability: bounded fields only — the link
+                        # is verified and record-scoped; no MPN/BOM payloads.
+                        "datasheet_link_status": "verified",
+                        "datasheet_match_method": "exact_mpn",
+                        "allowed_record_ids_count": len(
+                            (call.get("filters") or {}).get("allowed_record_ids") or []
+                        ),
                     }
                 )
             except QueryCancelled:

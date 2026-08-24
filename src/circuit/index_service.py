@@ -69,6 +69,7 @@ class CircuitIndexService:
         graph_store: GraphStore | None = None,
         vector_index: CircuitVectorIndex | None = None,
         document_store: Any | None = None,
+        observability_sink: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.store = store or CircuitStore(root=storage_root)
         self.parser_factory = parser_factory or EdfParser
@@ -83,6 +84,22 @@ class CircuitIndexService:
         self.datasheet_link_index = ComponentDatasheetLinkIndex(
             self.store, document_store=document_store
         )
+        # Structured observability sink (task 6): receives bounded events
+        # without raw BOM/document content. Defaults to structured logging.
+        self.observability_sink = observability_sink
+
+    def emit_observability(self, event: dict[str, Any]) -> None:
+        payload = {
+            "kind": "circuit_observability",
+            **event,
+        }
+        try:
+            if self.observability_sink is not None:
+                self.observability_sink(payload)
+            else:
+                logger.info("circuit_observability %s", json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            logger.warning("circuit observability sink raised; event dropped.")
 
     def index_file(
         self,
@@ -1060,12 +1077,33 @@ class CircuitIndexService:
             allowed_design_ids=frozenset(allowed_designs),
         )
         evidences: list[Evidence] = []
+        if resolution.resolution_status != "unique":
+            # Distinguish "no role evidence" from retrieval errors: the
+            # vocabulary simply had no governed match for this term.
+            self.emit_observability({
+                "event": "role_resolution",
+                "kb_name": kb_name,
+                "role_term": plan.role_term,
+                "resolution_status": resolution.resolution_status,
+                "candidate_count": resolution.candidate_count,
+                "expanded_connections": False,
+            })
         if resolution.resolution_status == "unique":
             candidate = resolution.candidates[0]
             context = allowed_designs.get(candidate.design_id)
             if context is None:
                 return []
             metadata, source_name = context
+            self.emit_observability({
+                "event": "role_resolution",
+                "kb_name": kb_name,
+                "role_term": plan.role_term,
+                "resolution_status": "unique",
+                "candidate_count": 1,
+                "expanded_connections": bool(include_connections),
+                "matched_by": candidate.matched_by,
+                "has_role_assertion": bool(candidate.roles),
+            })
             identity_row = {
                 "design_id": candidate.design_id,
                 "refdes": candidate.refdes,
