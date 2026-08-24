@@ -24,8 +24,9 @@ from __future__ import annotations
 import os
 import re
 from collections import deque
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
+from src.circuit.models import Availability, CircuitStructureCoverage
 from src.circuit.parsers.edf_power import classify_net_name, classify_power_pin_name
 from src.circuit.relations.derivers import RelationDeriver
 from src.circuit.relations.extractor import RelationExtractor
@@ -297,6 +298,118 @@ class CircuitQueryEngine:
         summary["net_count"] = summary.get("nets", 0)
         summary["module_count"] = len(summary.get("modules", []))
         return summary
+
+    @staticmethod
+    def compute_structure_coverage(design):
+        """Derive honest structure coverage from what the sources actually contain."""
+        has_netlist = bool(design.instances) and bool(design.nets)
+        strategies = [module.strategy for module in design.modules]
+        if "orcad_page_name" in strategies:
+            logical_strategy = "source_page"
+        elif strategies:
+            logical_strategy = "refdes_page_heuristic"
+        else:
+            logical_strategy = "none"
+        source_strategy = next((item for item in strategies if item and item != "none"), "none")
+        pages_available = Availability.AVAILABLE if design.schematic_pages else Availability.UNAVAILABLE
+        notes = []
+        if logical_strategy == "refdes_page_heuristic":
+            notes.append("模块划分为 refdes_page 启发式分组，不代表视觉页面。")
+        if pages_available != Availability.AVAILABLE:
+            notes.append("EDF 网表不包含 PDF/CAD 页面、标题栏、坐标或视觉布局数据。")
+        return CircuitStructureCoverage(
+            netlist_connectivity=Availability.AVAILABLE if has_netlist else Availability.UNAVAILABLE,
+            module_partition_strategy=logical_strategy,
+            source_partition_strategy=source_strategy,
+            schematic_pages=pages_available,
+            schematic_page_count=len(design.schematic_pages),
+            title_block=Availability.UNAVAILABLE,
+            coordinates=Availability.UNAVAILABLE,
+            visual_layout=Availability.UNAVAILABLE,
+            notes=notes,
+        )
+
+    def get_structure_overview(
+        self,
+        kb_name: str,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+    ) -> list[dict]:
+        """Per-design structure rows; coverage never extrapolates across designs."""
+        rows = []
+        for design in self._query_designs(kb_name, allowed_design_ids):
+            coverage = (
+                design.structure_coverage
+                if design.structure_coverage.netlist_connectivity != Availability.UNKNOWN
+                else self.compute_structure_coverage(design)
+            )
+            instance_by_refdes = {inst.refdes: inst for inst in design.instances}
+            rows.append(
+                {
+                    "kb_name": kb_name,
+                    "design_id": design.design_id,
+                    "circuit_id": design.design_id,
+                    "status": str(design.status),
+                    "source_files": [file.file_name for file in design.files],
+                    "instance_count": len(design.instances),
+                    "net_count": len(design.nets),
+                    "module_count": len(design.modules),
+                    "modules": [
+                        {
+                            "module_id": module.module_id,
+                            "name": module.name,
+                            "strategy": module.strategy,
+                            "instance_count": len(module.instances),
+                            "net_count": len(module.nets),
+                        }
+                        for module in design.modules
+                    ],
+                    "coverage": coverage.to_dict(),
+                    "notes": list(coverage.notes),
+                    "_design": design,
+                    "_instance_by_refdes": instance_by_refdes,
+                }
+            )
+        return rows
+
+    def resolve_component_identity(
+        self,
+        kb_name: str,
+        mention: str,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+        catalog_entries: Sequence[Any] = (),
+    ):
+        """Resolve one mention against authorized designs only."""
+        from src.circuit.component_identity import resolve_entity_mention
+
+        designs = self._query_designs(kb_name, allowed_design_ids)
+        return resolve_entity_mention(mention, designs, catalog_entries)
+
+    def get_resolved_instance_connections(
+        self,
+        kb_name: str,
+        resolution,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+    ) -> dict | None:
+        """Consume a service-internal unique resolution; never a raw caller refdes."""
+        if getattr(resolution, "resolution_status", "") != "unique":
+            return None
+        candidates = list(getattr(resolution, "candidates", []) or [])
+        if len(candidates) != 1:
+            return None
+        candidate = candidates[0]
+        if allowed_design_ids is not None:
+            allowed = {str(item) for item in allowed_design_ids}
+            if candidate.design_id not in allowed:
+                return None
+        detail = self.get_instance_connections(kb_name, candidate.design_id, candidate.refdes)
+        if detail is None:
+            return None
+        detail["resolved_from"] = {
+            "matched_by": candidate.matched_by,
+            "matched_value": candidate.matched_value,
+            "role_query": getattr(resolution, "role_query", None),
+        }
+        return detail
 
     def get_module_detail(self, kb_name: str, design_id: str, module_id_or_name: str) -> dict | None:
         design = self.store.load(kb_name, design_id)

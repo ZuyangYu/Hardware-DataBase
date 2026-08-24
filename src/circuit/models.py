@@ -47,7 +47,6 @@ ALIAS_ORIGIN_KINDS = ("identifier", "curated_catalog")
 # Logical partition strategies (``source_partition_strategy`` keeps the raw
 # parser value; the logical one must never claim a visual page exists).
 PARTITION_STRATEGIES = ("refdes_page_heuristic", "source_page", "none")
-SOURCE_PARTITION_STRATEGIES = ("refdes_page", "orcad_page_name", "none")
 
 
 def _require_text(name: str, value: Any) -> str:
@@ -312,11 +311,9 @@ class CircuitStructureCoverage:
             self.module_partition_strategy,
             PARTITION_STRATEGIES,
         )
-        _require_choice(
-            "source_partition_strategy",
-            self.source_partition_strategy,
-            SOURCE_PARTITION_STRATEGIES,
-        )
+        # Raw parser strategies are preserved verbatim; new parsers may add
+        # values without touching this model.
+        _require_text("source_partition_strategy", self.source_partition_strategy)
         self.schematic_page_count = int(self.schematic_page_count or 0)
         if not isinstance(self.notes, list) or not all(isinstance(item, str) for item in self.notes):
             raise ValueError("notes 必须是字符串列表")

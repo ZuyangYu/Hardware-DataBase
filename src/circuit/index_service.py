@@ -17,7 +17,7 @@ from src.circuit.graph_store import GraphStore
 from src.circuit.index_lock import circuit_index_read_lock, circuit_index_write_lock
 from src.circuit.models import CircuitDesign, CircuitStatus, DesignFile
 from src.circuit.parsers.edf_parser import EdfParser
-from src.circuit.question_analysis import analyze_question
+from src.circuit.question_analysis import analyze_question, has_explicit_refdes
 from src.circuit.query_engine import CircuitQueryEngine
 from src.circuit.store import (
     INDEX_FILE,
@@ -136,10 +136,12 @@ class CircuitIndexService:
         snapshot = self._snapshot_files(snapshot_paths)
         previous_design = self.store.load(kb_name, design_id)
         try:
-            # Identity projection is derived data published in the same
-            # transaction as the state file. A failure here must roll the whole
-            # generation back — never publish a half-built index.
+            # Identity projection and structure coverage are derived data
+            # published in the same transaction as the state file. A failure
+            # here must roll the whole generation back — never publish a
+            # half-built index.
             design.component_identities = build_component_identities(design)
+            design.structure_coverage = CircuitQueryEngine.compute_structure_coverage(design)
             self.store.save(design)
             warnings = list(design.parse_warnings)
             derived_degraded = False
@@ -294,6 +296,11 @@ class CircuitIndexService:
         # graph expansion adds topology context without replacing them; semantic
         # recall is used only when neither has grounded an answer.
         structured_hits = self._structured_evidence(kb_name, query, allowed_designs, top_k)
+        if _is_role_or_structure_intent(query):
+            # Role and structure intents are read-model queries: identity
+            # status plus (when unique) that identity's connections. Generic
+            # module/vector/keyword/graph fallbacks must not add "facts".
+            return self._stage_deduplicate([structured_hits])[:top_k]
         graph_hits = self._graph_evidence(kb_name, query, allowed_designs, top_k=top_k)
         semantic_hits = []
         if not structured_hits and not graph_hits:
@@ -787,6 +794,67 @@ class CircuitIndexService:
         top_k: int,
     ) -> list[Evidence]:
         plan = analyze_question(query)
+        # Structure and role intents are handled by explicit read models before
+        # any generic search runs; they never fall back to keyword guessing.
+        if _is_structure_intent(plan):
+            if "module_list" in plan.operations:
+                return self._module_list_evidence(kb_name, plan, allowed_designs, top_k)
+            return self._structure_overview_evidence(kb_name, plan, allowed_designs, top_k)
+        role_power_fallback = "power_path" in plan.operations
+        if _is_role_intent(plan, query):
+            identity_evidences = self._identity_resolution_evidence(kb_name, plan, allowed_designs, top_k)
+            resolved_unique = any(
+                item.metadata.get("resolution_status") == "unique" for item in identity_evidences
+            )
+            if resolved_unique or not role_power_fallback:
+                return identity_evidences
+            # No verified role evidence: keep identity status visible, then let
+            # the legacy design-level power pipeline answer the electrical part
+            # without attributing it to any unverified "主控".
+            extra = self._rows_to_evidence(
+                self._legacy_structured_candidates(kb_name, query, plan, allowed_designs, top_k),
+                allowed_designs,
+            )
+            merged: dict[str, Evidence] = {}
+            for item in [*identity_evidences, *extra]:
+                merged.setdefault(item.id, item)
+            return sorted(merged.values(), key=lambda item: (-item.score, item.id))[: max(top_k, 2)]
+        return self._rows_to_evidence(
+            self._legacy_structured_candidates(kb_name, query, plan, allowed_designs, top_k),
+            allowed_designs,
+        )
+
+    def _rows_to_evidence(
+        self,
+        candidates: list[tuple[str, float, list[dict[str, Any]]]],
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+    ) -> list[Evidence]:
+        evidence_by_id: dict[str, Evidence] = {}
+        for kind, score, rows in candidates:
+            for row in rows:
+                design_id = str(row.get("design_id") or row.get("circuit_id") or "")
+                context = allowed_designs.get(design_id)
+                if context is None:
+                    continue
+                metadata, source_name = context
+                evidence = self.evidence_mapper.build(
+                    kind=kind,
+                    row=row,
+                    metadata=metadata,
+                    source_name=source_name,
+                    score=score,
+                )
+                evidence_by_id.setdefault(evidence.id, evidence)
+        return sorted(evidence_by_id.values(), key=lambda item: (-item.score, item.id))
+
+    def _legacy_structured_candidates(
+        self,
+        kb_name: str,
+        query: str,
+        plan: Any,
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+        top_k: int,
+    ) -> list[tuple[str, float, list[dict[str, Any]]]]:
         allowed_design_ids = frozenset(allowed_designs)
         candidates = [
             ("net", 0.96, self._exact_search("search_net_connections", kb_name, query, top_k * 3, allowed_design_ids)),
@@ -816,10 +884,6 @@ class CircuitIndexService:
             candidates.append(("power_topology", 0.99, power_topology_rows))
         if "clock" in plan.operations:
             candidates.append(("instance", 0.98, self._exact_search("search_instances", kb_name, "CRYSTAL", top_k * 3, allowed_design_ids)))
-        if "mcu" in query.casefold():
-            candidates.append(
-                ("instance", 0.97, self._exact_search("search_instances", kb_name, "TC3", top_k * 2, allowed_design_ids))
-            )
         refdes_matches = re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d+)(?![A-Za-z0-9])", query)
         if "connection" in plan.operations and refdes_matches:
             pin_mapping_rows: list[dict[str, Any]] = []
@@ -859,23 +923,171 @@ class CircuitIndexService:
                 limit=top_k * 3,
                 allowed_design_ids=allowed_design_ids,
             )))
-        evidence_by_id: dict[str, Evidence] = {}
-        for kind, score, rows in candidates:
-            for row in rows:
-                design_id = str(row.get("design_id") or row.get("circuit_id") or "")
-                context = allowed_designs.get(design_id)
-                if context is None:
-                    continue
-                metadata, source_name = context
-                evidence = self.evidence_mapper.build(
-                    kind=kind,
-                    row=row,
+        return candidates
+
+    def _structure_overview_evidence(
+        self,
+        kb_name: str,
+        plan: Any,
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+        top_k: int,
+    ) -> list[Evidence]:
+        rows = self.query_engine.get_structure_overview(kb_name, allowed_design_ids=frozenset(allowed_designs))
+        evidences: list[Evidence] = []
+        for row in rows:
+            context = allowed_designs.get(row["design_id"])
+            if context is None:
+                continue
+            metadata, source_name = context
+            evidences.append(self.evidence_mapper.build(
+                kind="circuit_overview",
+                row=row,
+                metadata=metadata,
+                source_name=source_name,
+                score=0.93,
+            ))
+        return sorted(evidences, key=lambda item: (-item.score, item.id))[:top_k]
+
+    def _module_list_evidence(
+        self,
+        kb_name: str,
+        plan: Any,
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+        top_k: int,
+    ) -> list[Evidence]:
+        rows = self.query_engine.get_structure_overview(kb_name, allowed_design_ids=frozenset(allowed_designs))
+        evidences: list[Evidence] = []
+        for row in rows:
+            context = allowed_designs.get(row["design_id"])
+            if context is None:
+                continue
+            metadata, source_name = context
+            evidences.append(self.evidence_mapper.build(
+                kind="module_list",
+                row=row,
+                metadata=metadata,
+                source_name=source_name,
+                score=0.93,
+            ))
+        return sorted(evidences, key=lambda item: (-item.score, item.id))[:top_k]
+
+    def _identity_resolution_evidence(
+        self,
+        kb_name: str,
+        plan: Any,
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+        top_k: int,
+    ) -> list[Evidence]:
+        resolution = self.query_engine.resolve_component_identity(
+            kb_name,
+            plan.role_term or "",
+            allowed_design_ids=frozenset(allowed_designs),
+        )
+        evidences: list[Evidence] = []
+        if resolution.resolution_status == "unique":
+            candidate = resolution.candidates[0]
+            context = allowed_designs.get(candidate.design_id)
+            if context is None:
+                return []
+            metadata, source_name = context
+            identity_row = {
+                "design_id": candidate.design_id,
+                "refdes": candidate.refdes,
+                "matched_by": candidate.matched_by,
+                "matched_value": candidate.matched_value,
+                "resolution_status": "unique",
+                "candidate_count": 1,
+                "role_term": plan.role_term,
+                "source_kind": candidate.roles[0].source_kind if candidate.roles else (
+                    candidate.identifiers[0].source_kind if candidate.identifiers else "edf_property"
+                ),
+                "confidence": candidate.roles[0].confidence if candidate.roles else (
+                    min((item.confidence for item in candidate.identifiers), default=1.0)
+                ),
+                "roles": [
+                    {
+                        "role_id": role.role_id,
+                        "display_name": role.display_name,
+                        "source_kind": role.source_kind,
+                        "source_file": role.source_file,
+                        "source_locator": role.source_locator,
+                        "confidence": role.confidence,
+                        "assertion_mode": role.assertion_mode,
+                    }
+                    for role in candidate.roles
+                ],
+                "identifiers": [
+                    {
+                        "namespace": identifier.namespace,
+                        "raw_value": identifier.raw_value,
+                    }
+                    for identifier in candidate.identifiers
+                ],
+            }
+            evidences.append(self.evidence_mapper.build(
+                kind="component_identity",
+                row=identity_row,
+                metadata=metadata,
+                source_name=source_name,
+                score=0.99,
+            ))
+            connections = self.query_engine.get_resolved_instance_connections(
+                kb_name,
+                resolution,
+                allowed_design_ids=frozenset(allowed_designs),
+            )
+            if connections and connections.get("pins"):
+                connections["resolution_status"] = "unique"
+                connections["role_term"] = plan.role_term
+                evidences.append(self.evidence_mapper.build(
+                    kind="pin_mapping",
+                    row=connections,
                     metadata=metadata,
                     source_name=source_name,
-                    score=score,
-                )
-                evidence_by_id.setdefault(evidence.id, evidence)
-        return sorted(evidence_by_id.values(), key=lambda item: (-item.score, item.id))
+                    score=0.98,
+                ))
+            if "power_path" in plan.operations:
+                topology = self.query_engine.build_power_topology(kb_name, candidate.design_id)
+                if topology:
+                    evidences.append(self.evidence_mapper.build(
+                        kind="power_topology",
+                        row=topology,
+                        metadata=metadata,
+                        source_name=source_name,
+                        score=0.97,
+                    ))
+        else:
+            status_rows = []
+            for design_id in sorted(allowed_designs):
+                metadata, source_name = allowed_designs[design_id]
+                status_rows.append((metadata, source_name, design_id))
+            for metadata, source_name, design_id in status_rows:
+                candidate_summary = [
+                    {
+                        "design_id": item.design_id,
+                        "refdes": item.refdes,
+                        "roles": list(item.matched_role_ids),
+                    }
+                    for item in resolution.candidates
+                ]
+                status_row = {
+                    "design_id": design_id,
+                    "circuit_id": design_id,
+                    "term": plan.role_term,
+                    "role_term": plan.role_term,
+                    "resolution_status": resolution.resolution_status,
+                    "candidate_count": resolution.candidate_count,
+                    "candidates": candidate_summary,
+                    "coverage": {},
+                }
+                evidences.append(self.evidence_mapper.build(
+                    kind="resolution_status",
+                    row=status_row,
+                    metadata=metadata,
+                    source_name=source_name,
+                    score=0.9,
+                ))
+        return sorted(evidences, key=lambda item: (-item.score, item.id))[:max(top_k, 2)]
 
     def delete_record(self, record: Any) -> None:
         with circuit_index_write_lock(self.store.root):
@@ -1089,6 +1301,50 @@ class CircuitIndexService:
             return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
+
+
+# Domain operations that outrank a bare role mention: a crystal/power/protection
+# question merely containing "MCU" keeps its precise legacy path.
+_HIGH_PRIORITY_OPS = frozenset({
+    "clock",
+    "bias",
+    "i2c",
+    "enable",
+    "power_switch",
+    "protection",
+    "component_selection",
+    "value",
+    "placement",
+})
+
+_STRUCTURE_OPS = frozenset({"structure_overview", "module_list", "visual_structure"})
+
+
+def _is_role_intent(plan: Any, query: str) -> bool:
+    if not getattr(plan, "role_term", None):
+        return False
+    if set(plan.operations) & _HIGH_PRIORITY_OPS:
+        return False
+    return not has_explicit_refdes(query)
+
+
+def _is_structure_intent(plan: Any) -> bool:
+    if not set(plan.operations) & _STRUCTURE_OPS:
+        return False
+    if set(plan.operations) & _HIGH_PRIORITY_OPS:
+        return False
+    return True
+
+
+def _is_role_or_structure_intent(query: str) -> bool:
+    plan = analyze_question(query)
+    if _is_structure_intent(plan):
+        return True
+    if not _is_role_intent(plan, query):
+        return False
+    # Role + power path keeps the legacy design-level pipeline when the role
+    # itself cannot be verified; only the resolved-unique case is gated.
+    return "power_path" not in plan.operations
 
 
 def _query_terms(query: str) -> list[str]:
