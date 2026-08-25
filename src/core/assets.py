@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import config.settings
-from src.core.llm_client import LLMClient
+from src.core.model_factory import create_chat_model
 
 
 ASSET_TYPES = {"device", "board", "component", "firmware", "other"}
@@ -437,14 +437,18 @@ class AssetService:
             f"资料片段：\n{source.excerpt[:12000]}"
         )
         try:
-            raw = LLMClient().chat(
+            response = create_chat_model().invoke(
                 [{"role": "system", "content": "输出严格 JSON，不解释。"}, {"role": "user", "content": prompt}],
                 max_tokens=600,
                 temperature=0,
                 timeout=30,
-                usage_stage="asset_candidate_extraction",
             )
-            parsed = self._parse_model_json(raw)
+            raw = getattr(response, "content", "")
+            if isinstance(raw, list):
+                raw = "".join(
+                    str(block.get("text") or "") for block in raw if isinstance(block, dict)
+                )
+            parsed = self._parse_model_json(str(raw))
             if parsed is not None:
                 return self._normalise_payload(parsed, fallback), "llm"
         except Exception:

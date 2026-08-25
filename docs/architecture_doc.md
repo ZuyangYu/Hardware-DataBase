@@ -111,7 +111,7 @@ Storage / External Systems
 
 - 封装 agent 最终答案生成模型。
 - 支持 Ollama 和 OpenAI-compatible API（`AGENT_LLM_PROVIDER`）。
-- HTTP 429 退避重试，并回退到 `AGENT_FALLBACK_MODEL`。
+- HTTP 429 指数退避重试（重试耗尽后抛出原始错误，无跨模型回退）。
 - 与 RAGFlow、LangGraph 等检索/编排框架解耦。
 
 ### Spreadsheet Pipeline
@@ -232,7 +232,6 @@ AGENT_CUSTOM_MAX_TOKENS=4096
 AGENT_TEMPERATURE=0.2
 AGENT_TIMEOUT_SECONDS=120
 AGENT_RATE_LIMIT_MAX_RETRIES=4
-AGENT_FALLBACK_MODEL=deepseek-ai/DeepSeek-V4-Pro
 
 FINAL_TOP_K=5
 AGENT_MAX_RETRIEVAL_ROUNDS=3

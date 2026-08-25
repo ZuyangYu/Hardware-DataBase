@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 from src.circuit.index_service import CircuitIndexService
 from src.circuit.models import CircuitModule, ComponentInstance, Net, Pin, PinRef
 from src.pipelines.document_rag.schemas import RequestContext

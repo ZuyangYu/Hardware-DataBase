@@ -27,7 +27,7 @@ def governance_stats(
 
     - system_admin: keyed by stable KB identity across all departments
     - dept_admin: keyed by KB name, scoped to their department
-    - plain users: rejected (mirrors Streamlit's system_admin-only governance tab)
+    - plain users: rejected (mirrors the former Streamlit governance tab, now the React admin GovernancePage)
     """
     ctx = build_context_for_user(user, auth=auth)
     raw = pipeline.governance_stats(ctx=ctx) or {}
@@ -45,7 +45,7 @@ def governance_stats(
 
 def _kb_identity_stats_key(kb_id: int | str | None, department_id: int | str | None, kb_name: str) -> str:
     """Same key governance_stats uses to bucket per-KB document counts, so we
-    can join stats onto summaries. Mirrors streamlit_app._kb_identity_stats_key."""
+    can join stats onto summaries. Mirrors the former streamlit_app._kb_identity_stats_key."""
     kb_id_value = int(kb_id or 0) if str(kb_id or "").isdigit() else 0
     if kb_id_value:
         return f"kb_id:{kb_id_value}"
@@ -53,7 +53,7 @@ def _kb_identity_stats_key(kb_id: int | str | None, department_id: int | str | N
 
 
 def _issue_flags(s, stats: dict) -> list[str]:
-    """Replicate the Streamlit governance panel's 5 anomaly checks."""
+    """Replicate the former Streamlit governance panel's 5 anomaly checks (now the React admin GovernancePage)."""
     failed = int(stats.get("failed", 0) or 0)
     flags: list[str] = []
     if not s.registered:

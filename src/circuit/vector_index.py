@@ -22,6 +22,7 @@ caller never has to special-case "is the vector index up?"
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -168,9 +169,12 @@ class CircuitVectorIndex:
     _lock = threading.RLock()
 
     def __init__(self):
-        # Log "no embed model" exactly once per process so test runs and
-        # RAGFlow-mode deploys (no Ollama) don't spam the audit log.
+        # Log "no embed model / no chroma" exactly once per process so test
+        # runs and RAGFlow-mode deploys don't spam the audit log.
         self._embed_warning_logged = False
+        self._chroma_warning_logged = False
+        self._client_cache = None
+        self._client_resolved = False
 
     # ── plumbing ──────────────────────────────────────────────────────────
 
@@ -186,16 +190,63 @@ class CircuitVectorIndex:
             return None
         return getattr(Settings, "_embed_model", None)
 
-    def _chroma_collection(self, kb_name: str):
-        from src.core.resource_manager import resource_manager
+    def _chroma_client(self):
+        """Resolve a Chroma client, or None when the vector stack is absent.
 
-        client = resource_manager.chroma_client
-        return client.get_or_create_collection(_collection_name(kb_name))
+        The local chroma stack was removed from the runtime dependencies
+        (retrieval is RAGFlow-only now), so in a default deployment this
+        returns None and the whole index degrades to an explicit no-op —
+        instead of raising ModuleNotFoundError from deep inside a query.
+        Precedence: legacy ``src.core.resource_manager`` singleton if someone
+        restores it, else a persistent client under storage/ when chromadb
+        happens to be installed.
+        """
+        if self._client_resolved:
+            return self._client_cache
+        self._client_resolved = True
+        client = None
+        try:
+            from src.core.resource_manager import resource_manager  # type: ignore
+
+            client = getattr(resource_manager, "chroma_client", None)
+        except ImportError:
+            try:
+                import chromadb
+
+                import config.settings as _settings
+
+                path = os.path.join(_settings.STORAGE_DIR, "circuit_vector_index")
+                os.makedirs(path, exist_ok=True)
+                client = chromadb.PersistentClient(path=path)
+            except ImportError:
+                pass
+            except Exception as exc:
+                warn(f"CircuitVectorIndex: chroma client init failed: {exc}")
+        except Exception as exc:
+            warn(f"CircuitVectorIndex: resource_manager unavailable: {exc}")
+        if client is None and not self._chroma_warning_logged:
+            log("CircuitVectorIndex: 本地向量栈未安装（chromadb），电路语义索引保持停用")
+            self._chroma_warning_logged = True
+        self._client_cache = client
+        return client
+
+    def _chroma_collection(self, kb_name: str):
+        client = self._chroma_client()
+        if client is None:
+            raise RuntimeError("chroma vector stack is not available")
+        # Cosine space so distances are cosine distances in [0,2] and
+        # `score = max(0, 1 - distance)` is a real similarity in [0,1]
+        # comparable with keyword-match scores downstream.
+        return client.get_or_create_collection(
+            _collection_name(kb_name),
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def is_available(self) -> bool:
-        """True when an embedding model is bound. Index becomes a no-op
-        otherwise; callers don't need to gate every call."""
-        return self._embed_model() is not None
+        """True only when BOTH an embedding model and a chroma client are
+        available. Otherwise the index is an explicit no-op and callers skip
+        it entirely."""
+        return self._embed_model() is not None and self._chroma_client() is not None
 
     # ── write path ────────────────────────────────────────────────────────
 
@@ -212,6 +263,8 @@ class CircuitVectorIndex:
             if not self._embed_warning_logged:
                 log("CircuitVectorIndex: embed model 未配置，跳过 circuit 向量索引")
                 self._embed_warning_logged = True
+            return 0
+        if self._chroma_client() is None:
             return 0
 
         docs: list[tuple[str, str, dict[str, Any]]] = []
@@ -263,8 +316,8 @@ class CircuitVectorIndex:
                 return 0
 
     def _delete_design(self, kb_name: str, design_id: str) -> None:
-        """Remove all rows for a design. Safe when the collection is empty
-        or doesn't exist yet."""
+        """Remove all rows for a design. Safe when the collection is empty,
+        doesn't exist yet, or the vector stack is unavailable."""
         try:
             collection = self._chroma_collection(kb_name)
             collection.delete(where={"design_id": design_id})
@@ -273,10 +326,10 @@ class CircuitVectorIndex:
 
     def drop_kb(self, kb_name: str) -> None:
         """Drop the entire circuit vector collection for a KB."""
-        from src.core.resource_manager import resource_manager
-
+        client = self._chroma_client()
+        if client is None:
+            return
         try:
-            client = resource_manager.chroma_client
             client.delete_collection(name=_collection_name(kb_name))
         except Exception:
             # Either the collection didn't exist (fine) or chroma raised
@@ -299,7 +352,7 @@ class CircuitVectorIndex:
         if not query.strip():
             return []
         embed_model = self._embed_model()
-        if embed_model is None:
+        if embed_model is None or self._chroma_client() is None:
             return []
         try:
             query_embedding = self._embed_batch(embed_model, [query])

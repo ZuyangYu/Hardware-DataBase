@@ -45,7 +45,7 @@ export default function MessageList({
   useEffect(() => {
     const el = scrollRef.current;
     if (el && shouldAutoScrollRef.current) el.scrollTop = el.scrollHeight;
-  }, [messages.length, streamingText, streaming, traceSteps]);
+    }, [messages.length, streamingText, streaming, traceSteps, degradedNotes]);
 
   if (showEmpty) {
     return (
@@ -79,7 +79,7 @@ export default function MessageList({
             evidence={msg.role === 'assistant' ? evidenceByMessageId[msg.id] : undefined}
           />
         ))}
-        {streaming && (streamingText || traceSteps.length > 0) && (
+        {streaming && (
           <MessageBubble
             msg={
               {

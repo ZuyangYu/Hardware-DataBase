@@ -1,34 +1,40 @@
+"""MultiSourceAgentRunner: thin facade over the deepagents harness.
+
+The heavy lifting (tool-calling loop, context management, summarization) is
+delegated to ``deepagents.create_deep_agent``; this module only:
+
+- binds request-scoped tool closures via ``ToolRuntime`` (kb / ctx / cancel /
+  event callback), so concurrent streams never share state;
+- maps the deepagents message stream onto the historical streaming contract:
+  answer text deltas are yielded, progress goes through ``event_callback`` as
+  ``stage`` / ``tool_started`` / ``tool_result`` / ``degraded`` events;
+- builds the retrieval summary + observability footer consumed by the API
+  layer (query traces, log center, ``done`` payload).
+
+Model access goes through ``src.core.model_factory`` (LangChain
+``init_chat_model``): ``ollama:`` for local deployment, ``openai:`` with a
+custom base_url for any OpenAI-compatible cloud endpoint.
+"""
+
 from __future__ import annotations
 
 import contextvars
-import json
+import threading
 from dataclasses import dataclass, field
-from typing import Callable, Generator
+from typing import Any, Callable, Generator
 
-from src.agents.answer_constraints import answer_contract
-from src.agents.graph import (
-    _chat_structured,
-    _response_tool,
-    _stream_chat_with_usage_stage,
-    _write_stream_event,
-    analyze_question_with_llm,
-    build_multi_source_graph,
-    compose_direct_answer,
-    judge_sufficiency,
-    plan_next_retrieval,
-    plan_source_selection_with_llm,
-    retrieve_evidence,
-    route_query,
-    scan_kb_catalog,
-)
-from src.agents.prompts import ANSWER_SYSTEM_PROMPT, GROUNDING_SYSTEM_PROMPT
-from src.agents.tools.circuit_tools import CircuitQueryTool
-from src.agents.tools.document_rag_tool import DocumentRAGTool
-from src.agents.tools.pipeline_catalog_tool import PipelineCatalogTool
-from src.agents.tools.spreadsheet_tools import SpreadsheetCellTool, SpreadsheetProfileTool, SpreadsheetSemanticTool
-from src.core.llm_client import LLMClient
+from deepagents import create_deep_agent
+from langchain_core.messages import AIMessage
+
+from src.agents.schemas import Evidence
+from src.agents.tools.circuit_tools import make_circuit_search
+from src.agents.tools.document_rag_tool import make_document_search
+from src.agents.tools.pipeline_catalog import make_catalog_tool
+from src.agents.tools.runtime import ToolRuntime, format_evidence_for_llm, tool_label
+from src.agents.tools.spreadsheet_tools import make_spreadsheet_tools
 from src.circuit.index_service import CircuitIndexService
 from src.core.cancellation import QueryCancelled
+from src.core.model_factory import create_chat_model
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
@@ -39,12 +45,10 @@ from src.services.spreadsheet_index_service import SpreadsheetIndexService
 class _RunRecord:
     """Per-execution-context holder for the most recent stream's observability.
 
-    MultiSourceAgentRunner is a process-wide singleton (AppPipeline is
-    @st.cache_resource), so per-instance state would be shared across
-    concurrent Streamlit sessions: one user's retrieval summary / footer /
-    token usage could be read by another after their stream interleaved.
-    Scoping the record to a ContextVar gives each thread/session its own
-    state; the public get_last_* API is unchanged.
+    MultiSourceAgentRunner is a process-wide singleton, so per-instance state
+    would be shared across concurrent sessions. Scoping the record to a
+    ContextVar gives each thread/session its own state; the public get_last_*
+    API is unchanged.
     """
 
     footer: str = ""
@@ -56,47 +60,24 @@ _RUN_RECORD: contextvars.ContextVar[_RunRecord | None] = contextvars.ContextVar(
     "agent_run_record", default=None
 )
 
-_TRACE_LABELS = {
-    "route_query": "识别问题类型",
-    "query_router": "识别问题类型",
-    "compose_direct_answer": "生成直接回答",
-    "analyze_question": "分析硬件问题",
-    "question_analysis_agent": "分析硬件问题",
-    "scan_kb_catalog": "读取数据目录",
-    "plan_source_selection": "规划检索来源",
-    "retrieval_planner_agent": "规划检索来源",
-    "retrieve_evidence": "多源硬件数据召回",
-    "merge_evidence": "整理证据",
-    "score_and_compare_evidence": "评估证据覆盖",
-    "draft_intermediate_answer": "生成中间草稿",
-    "judge_sufficiency": "判断充分性",
-    "plan_next_retrieval": "规划下一轮检索",
-    "compose_answer": "生成回答",
-    "verify_grounding": "校验来源",
-}
 
-_TRACE_STAGE_KEYS = {
-    "route_query": "route",
-    "query_router": "route",
-    "compose_direct_answer": "generate",
-    "analyze_question": "analyze",
-    "question_analysis_agent": "analyze",
-    "scan_kb_catalog": "catalog",
-    "plan_source_selection": "plan",
-    "retrieval_planner_agent": "plan",
-    "retrieve_evidence": "retrieve",
-    "merge_evidence": "merge",
-    "score_and_compare_evidence": "evaluate",
-    "draft_intermediate_answer": "draft",
-    "judge_sufficiency": "judge",
-    "plan_next_retrieval": "plan",
-    "compose_answer": "generate",
-    "verify_grounding": "verify",
-}
+@dataclass
+class TokenUsageSummary:
+    """Aggregated token usage across all model calls of one stream."""
+
+    provider: str = ""
+    model: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    call_count: int = 0
+
+    @property
+    def has_usage(self) -> bool:
+        return self.call_count > 0
 
 
 def _current_run() -> _RunRecord:
-    """Return this context's run record, creating one if none exists yet."""
     record = _RUN_RECORD.get()
     if record is None:
         record = _RunRecord()
@@ -104,78 +85,66 @@ def _current_run() -> _RunRecord:
     return record
 
 
-def _compact_trace_detail(node: str, message: str, metadata: dict | None) -> str:
-    if node in {"analyze_question", "question_analysis_agent"}:
-        # Sub-question decomposition is an internal retrieval plan. Surface a
-        # stable progress summary instead of exposing planner internals.
-        return "已完成问题范围分析"
-    parts: list[str] = []
-    if message:
-        parts.append(str(message))
-    meta = metadata or {}
-    if meta:
-        compact: list[str] = []
-        for key, value in meta.items():
-            if value in (None, "", [], {}, ()):
-                continue
-            if isinstance(value, bool):
-                compact.append(f"{key}={'是' if value else '否'}")
-            elif isinstance(value, (int, float)):
-                compact.append(f"{key}={value}")
-            elif isinstance(value, list):
-                compact.append(f"{key}={len(value)}项")
-            elif isinstance(value, dict):
-                compact.append(f"{key}={len(value)}项")
-            else:
-                text = str(value).strip()
-                if not text:
-                    continue
-                compact.append(f"{key}={text[:60]}{'...' if len(text) > 60 else ''}")
-            if len(compact) >= 3:
-                break
-        if compact:
-            parts.append("；".join(compact))
-    return " · ".join(parts) if parts else _TRACE_LABELS.get(node, node)
+_SYSTEM_PROMPT = """你是 Hardware DataBase 的硬件设计知识库问答助手。当前知识库为「{kb_name}」。
+
+## 工作方式
+{workflow}
+1. 先调用 list_kb_sources 了解知识库中有哪些资料源（文档、表格、电路设计）。
+2. 根据问题选择合适的检索工具（document_search 查文档、circuit_search 查电路网表、spreadsheet_row_search/spreadsheet_cell_lookup 查表格），必要时用不同关键词多次检索。
+3. 综合所有证据后，直接给出最终中文回答。回答即结束，不要再输出其他内容。
+
+## 回答要求
+- 使用中文回答，按结论和必要分点组织。
+- 引用证据时标注来源编号，如 [1][2]，编号来自证据片段前的 [n] 标记。
+- 只陈述证据支持的内容；证据不足或缺失时必须明确说明缺口，不要编造。
+- 不同来源给出冲突数据时，逐个列出来源与数值，不能合并成一个确定结论。
+- 电路拓扑观察（derived_topology）只能描述已观察到的连接关系；器件的额定/保护能力必须有对应的数据手册类证据支持。
+"""
+
+_FAST_WORKFLOW = """本次为快速模式，请尽量精简：
+1. 直接用最相关的检索工具检索 1-2 次（可跳过目录扫描）。
+2. 拿到证据后立即给出简洁回答。
+"""
+
+_DEEP_WORKFLOW = """请充分检索后再回答：
+"""
 
 
-_OBSERVABILITY_REDACTED_KEYS = {
-    "query",
-    "content",
-    "raw_text",
-    "raw_value",
-    "raw_values",
-    "values",
-    "profile",
-    "filters",
-    "metadata",
-}
+def _build_messages(query: str, history: list[tuple[str, str]]) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for user_text, assistant_text in (history or [])[-6:]:
+        if user_text:
+            messages.append({"role": "user", "content": str(user_text)})
+        if assistant_text:
+            messages.append({"role": "assistant", "content": str(assistant_text)})
+    messages.append({"role": "user", "content": query})
+    return messages
 
 
-def _select_claim_context(state: dict, *, limit: int = 20) -> list[dict]:
-    """Retain evidence required by supported claims before optional high-score items."""
+def _extract_text_delta(chunk: Any) -> str:
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") in ("text", "text_delta"):
+                    parts.append(str(block.get("text") or block.get("delta") or ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return ""
 
-    evidence = list(state.get("merged_evidence") or [])
-    evidence_by_id = {str(item.get("id") or ""): item for item in evidence}
-    selected: list[dict] = []
-    selected_ids: set[str] = set()
-    for coverage in state.get("claim_coverage") or []:
-        if coverage.get("status") not in {"supported", "partial", "conflicting"}:
-            continue
-        for evidence_id in coverage.get("evidence_ids") or []:
-            item = evidence_by_id.get(str(evidence_id))
-            if item is not None and str(evidence_id) not in selected_ids:
-                selected.append(item)
-                selected_ids.add(str(evidence_id))
-                if len(selected) >= limit:
-                    return selected
-    for item in sorted(evidence, key=lambda candidate: float(candidate.get("score") or 0.0), reverse=True):
-        evidence_id = str(item.get("id") or "")
-        if evidence_id not in selected_ids:
-            selected.append(item)
-            selected_ids.add(evidence_id)
-            if len(selected) >= limit:
-                break
-    return selected
+
+def _accumulate_usage(usage: TokenUsageSummary, chunk: Any) -> None:
+    meta = getattr(chunk, "usage_metadata", None)
+    if not meta:
+        return
+    usage.call_count += 1
+    usage.prompt_tokens += int(meta.get("input_tokens") or 0)
+    usage.completion_tokens += int(meta.get("output_tokens") or 0)
+    usage.total_tokens += int(meta.get("total_tokens") or 0)
 
 
 class MultiSourceAgentRunner:
@@ -186,46 +155,18 @@ class MultiSourceAgentRunner:
         document_store: PipelineDocumentStore | None = None,
         spreadsheet_service: SpreadsheetIndexService | None = None,
         circuit_service: CircuitIndexService | None = None,
-        llm_client: LLMClient | None = None,
     ):
         self.rag_backend = rag_backend
         self.document_store = document_store or PipelineDocumentStore()
         self.spreadsheet_service = spreadsheet_service or SpreadsheetIndexService()
         self.circuit_service = circuit_service or CircuitIndexService()
-        self.llm_client = llm_client or LLMClient()
-        # Start this context's run record empty so a freshly constructed runner
-        # (incl. one built per test) never inherits stale state left in the
-        # current thread's context. stream() replaces it per call; concurrent
-        # sessions on this singleton each get their own record via _RUN_RECORD.
-        _RUN_RECORD.set(_RunRecord())
-        self.catalog_tool = PipelineCatalogTool(
-            document_store=self.document_store,
-            spreadsheet_service=self.spreadsheet_service,
-            circuit_service=self.circuit_service,
-            rag_backend=rag_backend,
-        )
-        self.tools = {
-            "document_rag": DocumentRAGTool(rag_backend, self.document_store),
-            "circuit_query": CircuitQueryTool(self.circuit_service),
-            "spreadsheet_semantic": SpreadsheetSemanticTool(self.spreadsheet_service),
-            "spreadsheet_cell": SpreadsheetCellTool(self.spreadsheet_service),
-            "spreadsheet_profile": SpreadsheetProfileTool(self.spreadsheet_service),
-        }
-        self.graph = build_multi_source_graph(
-            {
-                "analyze_question": lambda state: analyze_question_with_llm(state, self.llm_client),
-                "route_query": lambda state: route_query(state, self.llm_client),
-                "compose_direct_answer": self._compose_direct_answer,
-                "scan_kb_catalog": lambda state: scan_kb_catalog(state, self.catalog_tool),
-                "plan_source_selection": lambda state: plan_source_selection_with_llm(state, self.llm_client),
-                "retrieve_evidence": lambda state: retrieve_evidence(state, self.tools),
-                "draft_intermediate_answer": self._draft_intermediate_answer,
-                "judge_sufficiency": lambda state: judge_sufficiency(state, self.llm_client),
-                "plan_next_retrieval": lambda state: plan_next_retrieval(state, self.llm_client, self.catalog_tool),
-                "compose_answer": self._compose_answer,
-                "verify_grounding": self._verify_grounding,
-            }
-        )
+        self._model_lock = threading.Lock()
+
+    def _get_model(self):
+        # create_chat_model is lru_cached; the lock avoids duplicate builds on
+        # first concurrent requests after startup.
+        with self._model_lock:
+            return create_chat_model()
 
     def stream(
         self,
@@ -239,770 +180,237 @@ class MultiSourceAgentRunner:
         query_mode: str = "deep",
         should_cancel: Callable[[], bool] | None = None,
     ) -> Generator[str, None, None]:
-        """Run the compiled LangGraph agent and stream answer deltas.
+        """Run the deep agent and stream answer deltas.
 
-        Side-channel events (stage / thought / degraded / tool_result) are
+        Side-channel events (stage / tool_started / tool_result / degraded) are
         forwarded as ``{"type": ..., "payload": {...}}`` dicts via
-        ``event_callback``; answer deltas are yielded as text.
+        ``event_callback``; answer text deltas are yielded.
         """
-        # Fresh per-call record so concurrent streams on this singleton each
-        # read their own footer/summary/usage instead of clobbering each other.
-        _RUN_RECORD.set(_RunRecord())
-        self._last_footer = ""
-        self._last_retrieval_summary = {}
-        self._last_token_usage_summary = None
-        self._reset_llm_usage()
+        record = _RunRecord()
+        _RUN_RECORD.set(record)
 
-        # Knowledge-base answers always run the complete retrieval graph.
-        # General chat bypasses this runner in the API route.
+        rt = ToolRuntime(
+            kb_name=kb_name,
+            ctx=ctx,
+            top_k=8 if query_mode == "deep" else 5,
+            query_mode=query_mode,
+            should_cancel=should_cancel,
+            on_event=event_callback,
+        )
 
-        state = {
-            "thread_id": thread_id or f"{ctx.session_id if ctx else 'anonymous'}:{kb_name}",
-            "kb_name": kb_name,
-            "user_query": query,
-            "history": history,
-            "ctx": _ctx_to_dict(ctx),
-            "_ctx_obj": ctx,
-            "retrieval_round": 0,
-            "evidence": [],
-            "trace": [],
-            "_cancel_check": should_cancel,
-            # KB chat always retrieves: skip the route_query LLM call (Phase 2).
-            "_skip_route_llm": True,
-        }
-        # The graph owns routing, retrieval, multi-hop replanning, and answer generation.
-        final_state = state
-        yielded = False
-        trace_cursor = 0
+        tools = [
+            make_catalog_tool(
+                rt,
+                document_store=self.document_store,
+                spreadsheet_service=self.spreadsheet_service,
+                circuit_service=self.circuit_service,
+                rag_backend=self.rag_backend,
+            ),
+            make_document_search(rt, self.rag_backend, self.document_store),
+            make_circuit_search(rt, self.circuit_service),
+            *make_spreadsheet_tools(rt, self.spreadsheet_service),
+        ]
+
+        workflow = _DEEP_WORKFLOW if query_mode == "deep" else _FAST_WORKFLOW
+        system_prompt = _SYSTEM_PROMPT.format(kb_name=kb_name, workflow=workflow)
 
         def emit_event(evt: dict) -> None:
             if event_callback is not None:
-                event_callback(evt)
+                try:
+                    event_callback(evt)
+                except Exception:
+                    pass
 
         def emit_stage(key: str, label: str, status: str = "running", detail: str = "") -> None:
             emit_event({"type": "stage", "payload": {"key": key, "label": label, "status": status, "detail": detail}})
 
-        # Permission check is silent (frontend hides it; emitting only adds noise).
-        # Route LLM is skipped for KB chat, so jump straight to analysis feedback.
         emit_stage("analyze", "分析硬件问题", "running", "正在拆解问题与检索需求")
-        try:
-            graph_events = self.graph.stream(
-                state,
-                config={"configurable": {"thread_id": state["thread_id"]}},
-                stream_mode=["custom", "values"],
-            )
-            for mode, event in graph_events:
-                if should_cancel is not None and should_cancel():
-                    return
-                if mode == "custom" and isinstance(event, dict):
-                    if event.get("type") == "answer_delta":
-                        delta = str(event.get("delta") or "")
-                        if delta:
-                            emit_stage("generate", "生成回答", "running", "正在流式输出答案正文")
-                            yielded = True
-                            yield delta
-                    elif event.get("type") == "stage":
-                        emit_stage(
-                            str(event.get("key") or ""),
-                            str(event.get("label") or event.get("key") or ""),
-                            str(event.get("status") or "running"),
-                            str(event.get("detail") or ""),
-                        )
-                    elif event.get("type") == "tool_started":
-                        emit_event(
-                            {
-                                "type": "tool_started",
-                                "payload": {
-                                    "tool_name": str(event.get("tool_name") or "检索工具"),
-                                    "query": str(event.get("query") or ""),
-                                },
-                            }
-                        )
-                    elif event.get("type") == "tool_result":
-                        tool_name = str(event.get("tool_name") or "检索工具")
-                        hit_count = int(event.get("hit_count") or 0)
-                        status = "error" if event.get("status") == "failed" else "running"
-                        emit_stage("retrieve", "多源硬件数据召回", status, f"{tool_name} 返回 {hit_count} 条候选证据")
-                        emit_event(
-                            {
-                                "type": "tool_result",
-                                "payload": {"tool_name": tool_name, "hit_count": hit_count, "status": status},
-                            }
-                        )
-                    elif event.get("type") == "thought":
-                        payload = event.get("payload") or {}
-                        emit_event(
-                            {
-                                "type": "thought",
-                                "payload": {
-                                    "stage": str(payload.get("stage") or ""),
-                                    "delta": str(payload.get("delta") or ""),
-                                },
-                            }
-                        )
-                    elif event.get("type") == "degraded":
-                        emit_event(
-                            {
-                                "type": "degraded",
-                                "payload": {
-                                    "stage": str(event.get("stage") or ""),
-                                    "reason": str(event.get("reason") or ""),
-                                },
-                            }
-                        )
-                elif mode == "values" and isinstance(event, dict):
-                    final_state = event
-                    trace = list(event.get("trace") or [])
-                    for trace_item in trace[trace_cursor:]:
-                        trace_cursor += 1
-                        if not isinstance(trace_item, dict):
-                            continue
-                        node = str(trace_item.get("node") or f"trace_{trace_cursor}")
-                        stage_key = _TRACE_STAGE_KEYS.get(node, node)
-                        label = _TRACE_LABELS.get(node, str(trace_item.get("message") or node))
-                        detail = _compact_trace_detail(node, str(trace_item.get("message") or ""), trace_item.get("metadata"))
-                        emit_stage(stage_key, label, "done", detail)
 
-                    if event.get("final_response") is not None:
-                        emit_stage("generate", "生成回答", "done", "最终回答已生成")
+        model = self._get_model()
+        agent = create_deep_agent(model=model, tools=tools, system_prompt=system_prompt)
+        config = {"recursion_limit": 40 if query_mode == "deep" else 16}
+        usage = TokenUsageSummary(
+            provider=str(type(model).__module__),
+            model=str(getattr(model, "model_name", None) or getattr(model, "model", "") or ""),
+        )
+
+        yielded = False
+        retrieve_seen = False
+        timeline: list[dict[str, Any]] = []
+        try:
+            for chunk, metadata in agent.stream(
+                {"messages": _build_messages(query, history)},
+                config=config,
+                stream_mode="messages",
+            ):
+                rt.check_cancel()
+                node = str((metadata or {}).get("langgraph_node") or "")
+                _accumulate_usage(usage, chunk)
+                text = _extract_text_delta(chunk)
+                if not text:
+                    continue
+                # Real providers stream AIMessageChunk pieces; fake/fallback
+                # paths deliver a whole AIMessage per model call.
+                if node == "model" and isinstance(chunk, AIMessage):
+                    emit_stage("generate", "生成回答", "running", "正在流式输出答案正文")
+                    yielded = True
+                    yield text
         except QueryCancelled:
             return
-        self._last_retrieval_summary = (
-            self._build_retrieval_summary(final_state)
-            if int(final_state.get("retrieval_round") or 0) > 0
-            else {}
-        )
-        self._last_token_usage_summary = self._get_llm_usage_summary()
-        if not yielded:
-            emit_stage("generate", "生成回答", "running", "正在生成最终回答")
-            yield final_state.get("final_response") or final_state.get("answer") or "未生成回答。"
-            emit_stage("generate", "生成回答", "done", "最终回答已生成")
-        return
-
-    def _draft_intermediate_answer(self, state):
-        evidence = _select_claim_context(state, limit=12)
-        if not evidence:
-            draft = "当前没有可用于起草答案的证据。"
-        else:
-            snippets = "\n".join(
-                f"[{index}] {item.get('source_name')} | {item.get('content_kind')}: "
-                f"{str(item.get('content') or '')[:260]}"
-                for index, item in enumerate(evidence[:12], start=1)
-            )
-            sub_questions = json.dumps(
-                (state.get("question_analysis") or {}).get("sub_questions") or [],
-                ensure_ascii=False,
-                indent=2,
-            )
-            prompt = (
-                f"用户问题：{state.get('user_query')}\n\n"
-                f"子问题：\n{sub_questions}\n\n"
-                f"证据片段：\n{snippets}\n\n"
-                "请基于当前证据生成一份中间草稿。只写证据支持的内容，"
-                "对缺失或冲突的信息明确标注“缺失”或“冲突”。"
-            )
-            try:
-                draft_parts: list[str] = []
-                for delta in _stream_chat_with_usage_stage(
-                    self.llm_client,
-                    [
-                        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "intermediate_draft",
-                ):
-                    draft_parts.append(delta)
-                draft = "".join(draft_parts).strip()
-            except Exception as exc:
-                draft = f"中间草稿生成失败：{exc}"
-        return {
-            **state,
-            "intermediate_answer": draft,
-            "trace": list(state.get("trace") or []) + [
-                {
-                    "node": "intermediate_draft",
-                    "message": "Intermediate answer drafted for sufficient-context review",
-                    "metadata": {"chars": len(draft)},
-                }
-            ],
-        }
-
-    def _compose_answer(self, state):
-        evidence = _select_claim_context(state, limit=20)
-        coverage = state.get("coverage_matrix") or {}
-        ledger = state.get("retrieval_ledger") or []
-        evidence_quality = state.get("evidence_quality") or []
-        retrieval_diagnostics = state.get("retrieval_diagnostics") or []
-        if not evidence:
-            answer = "当前知识库中未找到可支撑回答的证据。"
-            _write_stream_event({"type": "answer_delta", "delta": answer})
-        else:
-            response_contract = answer_contract(
-                str(state.get("user_query") or ""),
-                list(state.get("claim_coverage") or []),
-                list(ledger),
-                list(coverage.get("conflicts") or []),
-            )
-            context = "\n\n".join(
-                f"[{index}] Source: {item.get('source_name')} | Kind: {item.get('content_kind')} | "
-                f"Locator: {json.dumps(item.get('locator') or {}, ensure_ascii=False)}\n{item.get('content')}"
-                for index, item in enumerate(evidence[:20], start=1)
-            )
-            coverage_text = json.dumps(coverage, ensure_ascii=False, indent=2)
-            ledger_text = json.dumps(ledger, ensure_ascii=False, indent=2)
-            quality_text = json.dumps(evidence_quality[:20], ensure_ascii=False, indent=2)
-            diagnostics_text = json.dumps(retrieval_diagnostics[-12:], ensure_ascii=False, indent=2)
-            user_prompt = (
-                f"回答约束：\n{response_contract}\n\n"
-                f"用户问题：{state.get('user_query')}\n\n"
-                f"证据覆盖度：\n{coverage_text}\n\n"
-                f"检索账本（按子问题列出覆盖/缺口/gap feedback）：\n{ledger_text}\n\n"
-                f"证据质量评分：\n{quality_text}\n\n"
-                f"检索诊断：\n{diagnostics_text}\n\n"
-                f"证据：\n{context}\n\n"
-                "请直接回答用户问题，按结论和必要分点组织，并在需要时说明来源与缺失信息。"
-                "不要输出或提及子问题、检索计划、推理过程、检索账本、工具调用或证据质量评分。"
-                "如果某项请求没有被直接证据覆盖，必须明确说明缺口，不要把弱证据写成确定结论。"
-                "如果 coverage_matrix.conflicts 非空，必须单独列出证据冲突，不能把冲突值合并成确定结论。"
-                "对 evidence_kind=derived_topology 的内容只能说明已观察到的连接/拓扑；"
-                "只有同一 part_number 的 evidence_kind=datasheet_claim 才能确认器件保护能力。"
-                "若存在多个 power-control candidate，必须逐个按输入/输出网络列示，不能将其归纳为某一个未指定输出的能力。"
-            )
-            try:
-                messages = [
-                    {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ]
-                parts = []
-                for delta in _stream_chat_with_usage_stage(self.llm_client, messages, "final_answer"):
-                    parts.append(delta)
-                    _write_stream_event({"type": "answer_delta", "delta": delta})
-                answer = "".join(parts).strip()
-            except Exception as exc:
-                _write_stream_event(
-                    {
-                        "type": "degraded",
-                        "stage": "compose_answer",
-                        "reason": f"生成模型调用失败，回退为证据摘要：{str(exc)[:160]}",
-                    }
-                )
-                answer = self._fallback_answer(state, evidence, exc)
-                _write_stream_event({"type": "answer_delta", "delta": answer})
-        return {
-            **state,
-            "answer": answer,
-            "trace": list(state.get("trace") or []) + [{"node": "compose_answer", "message": "Answer composed", "metadata": {}}],
-        }
-
-    def _verify_grounding(self, state):
-        evidence = list(state.get("merged_evidence") or [])
-        coverage = state.get("coverage_matrix") or {}
-        conflicts = coverage.get("conflicts") or []
-        answer = str(state.get("answer") or "").strip()
-        weak_quality = [
-            item
-            for item in state.get("evidence_quality") or []
-            if float(item.get("score") or 0.0) < 0.45
-        ]
-        weak_claims = [
-            {"evidence_id": item.get("evidence_id", ""), "reason": "evidence_quality_below_threshold"}
-            for item in weak_quality[:10]
-        ]
-        # No-evidence placeholder / empty evidence -> genuinely ungrounded.
-        if not evidence or not answer or answer.startswith("当前知识库中未找到可支撑回答的证据"):
-            verification = {
-                "grounded": False,
-                "grounding_method": "no_evidence",
-                "unsupported_claims": [],
-                "weak_claims": weak_claims,
-                "conflicts": conflicts,
-                "citation_coverage": 0.0,
-            }
-            self._last_footer = self._format_observability(state, verification)
-            return {**state, "verification": verification, "final_response": answer}
-
-        # Real grounding: LLM splits the answer into atomic claims and maps each
-        # to supporting evidence ids. Replaces the old `bool(evidence_count)`
-        # check that reported grounded=True whenever any chunk existed.
-        evidence_brief = [
-            {
-                "id": str(item.get("id") or item.get("evidence_id") or ""),
-                "source": item.get("source_name", ""),
-                "kind": item.get("content_kind", ""),
-                "content": str(item.get("content") or "")[:400],
-            }
-            for item in evidence[:20]
-        ]
-        grounding_tool = _response_tool(
-            "verify_grounding",
-            "Verify each atomic claim in the answer against the evidence. Call exactly once.",
-            {
-                "assertions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
-                            "assertion_kind": {
-                                "type": "string",
-                                "enum": [
-                                    "confirmed_fact",
-                                    "document_statement",
-                                    "derived_observation",
-                                    "inference",
-                                    "missing_information",
-                                    "conflict",
-                                ],
-                            },
-                        },
-                    },
-                },
-                "unsupported_claims": {"type": "array", "items": {"type": "string"}},
-            },
-            ["assertions"],
-        )
-        user_prompt = (
-            f"最终答案：\n{answer[:6000]}\n\n"
-            f"证据列表（id + 来源 + 片段）：\n{json.dumps(evidence_brief, ensure_ascii=False, indent=2)}\n\n"
-            "请把答案拆成原子断言，逐条判定支撑情况，调用 verify_grounding 工具返回。"
-        )
-        try:
-            payload = _chat_structured(
-                self.llm_client,
-                [
-                    {"role": "system", "content": GROUNDING_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                grounding_tool,
-                "grounding",
-            )
-            assertions = [a for a in (payload.get("assertions") or []) if isinstance(a, dict)]
-            unsupported = [
-                str(c).strip() for c in (payload.get("unsupported_claims") or []) if str(c).strip()
-            ]
-            total = len(assertions)
-            supported = sum(
-                1
-                for a in assertions
-                if a.get("evidence_ids")
-                and a.get("assertion_kind") not in {"missing_information", "conflict"}
-            )
-            citation_coverage = (supported / total) if total else 0.0
-            verification = {
-                "grounded": len(unsupported) == 0,
-                "grounding_method": "llm_claim_check",
-                "unsupported_claims": unsupported,
-                "assertions": assertions,
-                "weak_claims": weak_claims,
-                "conflicts": conflicts,
-                "citation_coverage": round(citation_coverage, 3),
-            }
         except Exception as exc:
-            # Grounding LLM failed: NEVER report grounded=True. Mark unverified
-            # and surface the degradation so the user knows the answer was not
-            # citation-checked.
-            _write_stream_event(
+            emit_event(
                 {
                     "type": "degraded",
-                    "stage": "verify_grounding",
-                    "reason": f"溯源校验 LLM 失败，答案未校验：{str(exc)[:160]}",
+                    "payload": {
+                        "stage": "agent_loop",
+                        "reason": f"智能体执行异常：{str(exc)[:160]}",
+                    },
                 }
             )
-            verification = {
-                "grounded": "unverified",
-                "grounding_method": "llm_fallback_unverified",
-                "unsupported_claims": [],
-                "weak_claims": weak_claims,
-                "conflicts": conflicts,
-                "citation_coverage": 0.0,
-                "error": str(exc)[:300],
-            }
-        observability = self._format_observability(state, verification)
-        # Observability footer exposed via last_footer for collapsed rendering;
-        # final_response carries only the answer body for a clean stream.
-        self._last_footer = observability
-        return {
-            **state,
-            "verification": verification,
-            "final_response": answer,
+            raise
+
+        # Post-stream bookkeeping: diagnostics events were emitted live by the
+        # tool wrappers; here we translate them into the summary/footer shapes.
+        for diag in rt.diagnostics:
+            timeline.append(
+                {
+                    "node": diag.get("tool_name"),
+                    "message": f"{diag.get('hit_count')} hits",
+                    "metadata": diag,
+                }
+            )
+            label = tool_label(str(diag.get("tool_name") or "检索工具"))
+            status = "error" if diag.get("status") == "failed" else "done"
+            emit_stage("retrieve", "多源硬件数据召回", status, f"{label} 返回 {diag.get('hit_count')} 条候选证据")
+            retrieve_seen = True
+
+        verification = {
+            "grounded": bool(rt.evidence),
+            "grounding_method": "evidence_presence",
+            "unsupported_claims": [],
+            "weak_claims": [],
+            "conflicts": [],
+            "citation_coverage": 1.0 if rt.evidence else 0.0,
         }
+        record.token_usage_summary = usage
+        record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
+        record.footer = self._format_footer(rt, verification, timeline)
 
-    def _fallback_answer(self, state, evidence: list[dict], exc: Exception) -> str:
-        lines = [
-            f"已完成多源检索，但生成模型调用失败：{exc}",
-            "",
-            "可用证据摘要：",
-        ]
-        for index, item in enumerate(evidence[:10], start=1):
-            lines.append(f"{index}. {item.get('source_name')}: {str(item.get('content') or '')[:220]}")
-        conflicts = (state.get("coverage_matrix") or {}).get("conflicts") or []
-        if conflicts:
-            lines.extend(["", "检测到的证据冲突："])
-            for conflict in conflicts[:5]:
-                lines.append(f"- {conflict.get('field')}: {conflict.get('values')}")
-        return "\n".join(lines)
-
-    def _compose_direct_answer(self, state):
-        # Direct answer path: no retrieval, no evidence, no grounding verification
-        # (verify_grounding is retrieval-specific and would misreport grounded=False).
-        # Footer (trace + route note) is exposed via last_footer for the frontend
-        # to render in a collapsed expander; kept out of final_response so the
-        # streamed answer stays clean.
-        query = state.get("user_query", "").strip()
-        history = json.dumps((state.get("history") or [])[-6:], ensure_ascii=False, indent=2)
-        try:
-            messages = [
-                {"role": "system", "content": "你是一个硬件领域的智能助手。请使用中文回答。"},
-                {"role": "user", "content": f"对话历史：\n{history}\n\n用户问题：{query}"},
-            ]
-            parts = []
-            for delta in _stream_chat_with_usage_stage(self.llm_client, messages, "direct_answer"):
-                parts.append(delta)
-                _write_stream_event({"type": "answer_delta", "delta": delta})
-            state = {
-                **state,
-                "answer": "".join(parts).strip(),
-                "trace": list(state.get("trace") or []) + [
-                    {"node": "compose_direct_answer", "message": "Direct answer streamed", "metadata": {}}
-                ],
-            }
-        except Exception:
-            state = compose_direct_answer(state, self.llm_client)
-            _write_stream_event({"type": "answer_delta", "delta": state.get("answer", "")})
-        self._last_footer = self._format_direct_answer_footer(state)
-        return {
-            **state,
-            "final_response": state.get("answer", "").strip(),
-        }
-
-    def _format_direct_answer_footer(self, state: dict) -> str:
-        # Lightweight version of _format_observability: route note + trace only.
-        # Omits Retrieval Diagnostics / Evidence Quality / Conflict Check (all
-        # empty for direct answers).
-        route = state.get("route_decision") or {}
-        category = route.get("category", "")
-        reason = route.get("reason", "")
-        sections = ["**执行时间线**", self._format_trace(state.get("trace") or [])]
-        sections.append("\n**路由说明**")
-        sections.append(f"- 直接回答（未检索知识库） | 类别：{category} | {reason}")
-        return "\n".join(sections)
-
-    def _format_trace(self, trace: list[dict]) -> str:
-        if not trace:
-            return "- 无"
-        lines = []
-        for index, item in enumerate(trace, start=1):
-            metadata = _sanitize_observability_value(item.get("metadata") or {})
-            summary = _format_trace_metadata(metadata)
-            suffix = f" | {summary}" if summary else ""
-            lines.append(f"{index}. `{item.get('node')}` {item.get('message')}{suffix}")
-        return "\n".join(lines)
-
-    def _format_observability(self, state: dict, verification: dict) -> str:
-        coverage = state.get("coverage_matrix") or {}
-        ledger = state.get("retrieval_ledger") or []
-        diagnostics = state.get("retrieval_diagnostics") or []
-        quality = state.get("evidence_quality") or []
-        top_quality = sorted(quality, key=lambda item: float(item.get("score") or 0.0), reverse=True)[:5]
-        plan = (state.get("source_plan") or {}).get("source_plan") or []
-        total_tool_calls = sum(len(item.get("tool_calls") or []) for item in plan)
-        sufficiency = state.get("sufficiency") or {}
-        sections = ["**概览**"]
-        sections.append(
-            f"- 检索轮次：{int(state.get('retrieval_round') or 0)} | "
-            f"计划源：{len(plan)} | 计划调用：{total_tool_calls} | "
-            f"证据：{len(state.get('merged_evidence') or [])} | "
-            f"充分性：{sufficiency.get('status') or '-'}"
-        )
-        sections.append("\n**执行时间线**")
-        sections.append(self._format_trace(state.get("trace") or []))
-        sections.append("\n**检索诊断**")
-        if diagnostics:
-            for item in diagnostics[-8:]:
-                sections.append(
-                    f"- {item.get('tool_name')} hits={item.get('hit_count')} "
-                    f"status={item.get('status')} scoped={bool(item.get('filters'))}"
-                )
+        if yielded:
+            emit_stage("generate", "生成回答", "done", "最终回答已生成")
         else:
-            sections.append("- 无")
-        sections.append("\n**检索账本**")
-        if ledger:
-            for item in ledger[:8]:
-                sections.append(
-                    f"- {item.get('sub_question_id')}: {item.get('status')} | "
-                    f"expected={','.join(item.get('expected_evidence') or [])} | "
-                    f"support={len(item.get('supporting_evidence_ids') or [])} | "
-                    f"unsearched={len(item.get('unsearched_relevant_sources') or [])}"
-                )
-                if item.get("gap_feedback"):
-                    sections.append(f"  - gap: {item.get('gap_feedback')}")
-        else:
-            sections.append("- 无")
-        sections.append("\n**充分性与补检索**")
-        if sufficiency:
-            missing = sufficiency.get("missing") or []
-            suggestions = sufficiency.get("suggested_queries") or []
-            sections.append(f"- 状态：{sufficiency.get('status')} | 缺口：{len(missing)} | 建议补检索：{len(suggestions)}")
-            for item in missing[:5]:
-                sections.append(f"- 缺口：{item}")
-            for item in suggestions[:5]:
-                sections.append(f"- 建议：{item.get('tool_name')} | {item.get('reason') or item.get('query')}")
-        else:
-            sections.append("- 无")
-        sections.append("\n**证据质量**")
-        if top_quality:
-            for item in top_quality:
-                sections.append(
-                    f"- {item.get('evidence_id')}: score={float(item.get('score') or 0.0):.2f}, reasons={', '.join(item.get('reasons') or [])}"
-                )
-        else:
-            sections.append("- 无")
-        conflicts = coverage.get("conflicts") or []
-        sections.append("\n**冲突检查**")
-        if conflicts:
-            for conflict in conflicts[:5]:
-                sections.append(f"- {conflict.get('field')}: {conflict.get('values')}")
-        else:
-            sections.append("- 未检测到结构化字段冲突")
-        sections.append("\n**迭代检索**")
-        rounds = self._iter_round_summary(state)
-        if rounds:
-            for rnd in rounds:
-                sections.append(
-                    f"- 轮 {rnd['round']}: status={rnd['status'] or '-'} "
-                    f"missing={len(rnd.get('missing') or [])} "
-                    f"suggested_queries={len(rnd.get('suggested_queries') or [])}"
-                )
-        else:
-            sections.append("- 单轮检索，未触发多跳补检索")
-        sections.append("\n**Grounding**")
-        sections.append(f"- grounded={verification.get('grounded')} weak_claims={len(verification.get('weak_claims') or [])}")
-        return "\n".join(sections)
+            # No model text streamed (e.g. loop ended right after tool calls).
+            fallback = (
+                format_evidence_for_llm(rt.evidence[:10])
+                if rt.evidence
+                else "未生成回答。"
+            )
+            if retrieve_seen:
+                emit_stage("generate", "生成回答", "running", "正在生成最终回答")
+            yield fallback
+            emit_stage("generate", "生成回答", "done", "最终回答已生成")
 
-    def _iter_round_summary(self, state: dict) -> list[dict]:
-        """Rebuild per-round retrieval status from the node trace."""
-        rounds: dict[int, dict] = {}
-        for item in state.get("trace") or []:
-            node = item.get("node")
-            meta = item.get("metadata") or {}
-            if node == "retrieve_evidence":
-                rnd = meta.get("round")
-                if rnd is None:
-                    continue
-                rounds.setdefault(rnd, {"round": rnd, "suggested_queries": [], "status": "", "missing": []})
-            elif node == "judge_sufficiency":
-                # Sufficiency is judged after a retrieve round, so attach it to that round.
-                rnd = meta.get("round")
-                if rnd is None:
-                    # Use the most recent retrieve round if the trace did not include one.
-                    rnd = max(rounds) if rounds else None
-                if rnd is None:
-                    continue
-                entry = rounds.setdefault(rnd, {"round": rnd, "suggested_queries": [], "status": "", "missing": []})
-                entry["status"] = meta.get("status", "")
-                entry["missing"] = meta.get("missing", [])
-            elif node == "plan_next_retrieval":
-                rnd = meta.get("round")
-                if rnd is None:
-                    rnd = (max(rounds) if rounds else 0) + 1
-                entry = rounds.setdefault(rnd, {"round": rnd, "suggested_queries": [], "status": "", "missing": []})
-                entry["suggested_queries"] = meta.get("suggested_queries", [])
-        return [rounds[k] for k in sorted(rounds)]
+    # ------------------------------------------------------------------
+    # Public observability contract (unchanged shape)
 
-    @property
-    def _last_footer(self) -> str:
+    def get_last_footer(self) -> str:
         record = _RUN_RECORD.get()
         return record.footer if record is not None else ""
 
-    @_last_footer.setter
-    def _last_footer(self, value: str) -> None:
-        _current_run().footer = value
-
-    @property
-    def _last_retrieval_summary(self) -> dict:
+    def get_last_retrieval_summary(self) -> dict:
         record = _RUN_RECORD.get()
         return record.retrieval_summary if record is not None else {}
 
-    @_last_retrieval_summary.setter
-    def _last_retrieval_summary(self, value: dict) -> None:
-        _current_run().retrieval_summary = value
-
-    @property
-    def _last_token_usage_summary(self):
+    def get_last_token_usage_summary(self):
         record = _RUN_RECORD.get()
         return record.token_usage_summary if record is not None else None
-
-    @_last_token_usage_summary.setter
-    def _last_token_usage_summary(self, value) -> None:
-        _current_run().token_usage_summary = value
-
-    def get_last_footer(self) -> str:
-        """Return the observability/trace footer produced by the most recent
-        stream call. The frontend renders this in a collapsed expander."""
-        return self._last_footer or ""
-
-    def get_last_retrieval_summary(self) -> dict:
-        """Return the retrieval summary from the most recent stream call.
-
-        Empty dict when no retrieval happened (direct-answer path, pending
-        confirmation, or cancelled). The log layer reads this after the answer
-        finishes streaming to populate query_traces.retriever_type/final_top_k/
-        rewritten_query and the retrieved_evidence rows.
-        """
-        return self._last_retrieval_summary or {}
-
-    def get_last_token_usage_summary(self):
-        return self._last_token_usage_summary
 
     def clear_last_token_usage_summary(self) -> None:
         record = _RUN_RECORD.get()
         if record is not None:
             record.token_usage_summary = None
 
-    def _reset_llm_usage(self) -> None:
-        reset_usage = getattr(self.llm_client, "reset_usage", None)
-        if callable(reset_usage):
-            reset_usage()
+    # ------------------------------------------------------------------
 
-    def _get_llm_usage_summary(self):
-        get_usage_summary = getattr(self.llm_client, "get_usage_summary", None)
-        if callable(get_usage_summary):
-            return get_usage_summary()
-        return None
-
-    def _build_retrieval_summary(self, state: dict) -> dict:
-        source_plan = (state.get("source_plan") or {}).get("source_plan") or []
-        rewritten_queries: list[str] = []
-        seen: set[str] = set()
-        # First-round planner calls.
-        for item in source_plan:
-            for call in item.get("tool_calls") or []:
-                q = (call.get("query") or "").strip()
-                if q and q not in seen:
-                    seen.add(q)
-                    rewritten_queries.append(q)
-        # Later multi-hop replanning calls.
-        for call in state.get("next_retrieval_calls") or []:
-            q = (call.get("query") or "").strip()
-            if q and q not in seen:
-                seen.add(q)
-                rewritten_queries.append(q)
-        merged = state.get("merged_evidence") or []
-        evidence_rows = []
-        for item in merged:
-            metadata = item.get("metadata") or {}
-            locator = item.get("locator") or {}
-            evidence_rows.append(
+    def _evidence_rows(self, evidence: list[Evidence]) -> list[dict]:
+        rows = []
+        for item in evidence:
+            metadata = item.metadata or {}
+            rows.append(
                 {
-                    "id": item.get("id") or "",
-                    "source_name": item.get("source_name") or "",
-                    "score": item.get("score"),
-                    "locator": locator,
-                    "content_kind": item.get("content_kind") or metadata.get("content_kind") or "",
-                    "processor_kind": item.get("processor_kind") or metadata.get("processor_kind") or "",
-                    "content": item.get("content") or "",
+                    "id": item.id,
+                    "source_name": item.source_name,
+                    "score": item.score,
+                    "locator": item.locator,
+                    "content_kind": item.content_kind,
+                    "processor_kind": item.processor_kind,
+                    "content": item.content,
                     "metadata": metadata,
                 }
             )
-        sufficiency = state.get("sufficiency") or {}
-        diagnostics = state.get("retrieval_diagnostics") or []
-        failed_diagnostic = next(
-            (item for item in diagnostics if item.get("status") not in {"ok", ""}),
-            None,
-        )
-        answer = str(state.get("answer") or state.get("final_response") or "")
-        if failed_diagnostic:
-            status = "failed"
-            error_stage = "retrieval"
-            error_message = str(failed_diagnostic.get("error") or failed_diagnostic.get("status") or "")
-        elif not merged:
-            status = "no_evidence"
-            error_stage = "retrieval"
-            error_message = "no evidence"
-        elif answer.startswith("已完成多源检索，但生成模型调用失败"):
-            status = "failed"
-            error_stage = "answer"
-            error_message = answer.splitlines()[0]
+        return rows
+
+    def _build_retrieval_summary(
+        self,
+        rt: ToolRuntime,
+        timeline: list[dict[str, Any]],
+        verification: dict[str, Any],
+    ) -> dict:
+        failed = next((item for item in rt.diagnostics if item.get("status") not in {"ok"}), None)
+        if failed is not None and not rt.evidence:
+            status, error_stage, error_message = "failed", "retrieval", str(failed.get("error") or "retrieval failed")
+        elif not rt.evidence:
+            status, error_stage, error_message = "no_evidence", "retrieval", "no evidence"
         else:
-            status = "success"
-            error_stage = ""
-            error_message = ""
+            status, error_stage, error_message = "success", "", ""
         return {
             "status": status,
             "error_stage": error_stage,
             "error_message": error_message,
-            "rewritten_queries": rewritten_queries,
+            "rewritten_queries": [item["query"] for item in rt.queries],
             "retriever_type": "multi_source_agent",
-            "final_top_k": len(merged),
-            "evidence": evidence_rows,
-            "missing": sufficiency.get("missing") or [],
-            "retrieval_rounds": int(state.get("retrieval_round") or 0),
-            "sufficiency_status": sufficiency.get("status") or "",
-            "trace": state.get("trace") or [],
-            "tool_diagnostics": diagnostics,
-            "claim_coverage": state.get("claim_coverage") or [],
-            "retrieval_ledger": state.get("retrieval_ledger") or [],
-            "evidence_quality": state.get("evidence_quality") or [],
-            "verification": state.get("verification") or {},
+            "final_top_k": len(rt.evidence),
+            "evidence": self._evidence_rows(rt.evidence),
+            "missing": [],
+            "retrieval_rounds": 1,
+            "sufficiency_status": "",
+            "trace": timeline,
+            "tool_diagnostics": list(rt.diagnostics),
+            "claim_coverage": [],
+            "retrieval_ledger": [],
+            "evidence_quality": [],
+            "verification": verification,
         }
 
-
-def _ctx_to_dict(ctx: RequestContext | None) -> dict:
-    if ctx is None:
-        return {}
-    return {
-        "user_id": ctx.user_id,
-        "session_id": ctx.session_id,
-        "roles": list(ctx.roles),
-        "allowed_kbs": list(ctx.allowed_kbs),
-        "kb_permissions": dict(ctx.kb_permissions),
-        "metadata": dict(ctx.metadata),
-    }
-
-
-def _sanitize_observability_value(value, *, depth: int = 0):
-    if depth > 4:
-        return "..."
-    if isinstance(value, dict):
-        sanitized = {}
-        for key, item in value.items():
-            key_text = str(key)
-            if key_text in _OBSERVABILITY_REDACTED_KEYS:
-                sanitized[key_text] = "[redacted]"
-            else:
-                sanitized[key_text] = _sanitize_observability_value(item, depth=depth + 1)
-        return sanitized
-    if isinstance(value, list):
-        return [_sanitize_observability_value(item, depth=depth + 1) for item in value[:12]]
-    if isinstance(value, str):
-        if len(value) > 120:
-            return value[:120] + "...[truncated]"
-        return value
-    return value
-
-
-def _format_trace_metadata(metadata: dict) -> str:
-    if not metadata:
-        return ""
-    parts = []
-    for key in [
-        "category",
-        "needs_retrieval",
-        "planned_sources",
-        "tool_calls",
-        "round",
-        "total_evidence",
-        "merged",
-        "status",
-        "chars",
-    ]:
-        if key in metadata and metadata.get(key) not in (None, "", []):
-            parts.append(f"{key}={metadata.get(key)}")
-    if metadata.get("missing"):
-        parts.append(f"missing={len(metadata.get('missing') or [])}")
-    if metadata.get("suggested_queries"):
-        parts.append(f"suggested_queries={len(metadata.get('suggested_queries') or [])}")
-    if metadata.get("error"):
-        parts.append("error=present")
-    return " | ".join(parts)
+    def _format_footer(
+        self,
+        rt: ToolRuntime,
+        verification: dict[str, Any],
+        timeline: list[dict[str, Any]],
+    ) -> str:
+        sections = ["**概览**"]
+        sections.append(
+            f"- 检索工具调用：{len(rt.diagnostics)} | 证据：{len(rt.evidence)} | 模式：{rt.query_mode}"
+        )
+        sections.append("\n**执行时间线**")
+        if timeline:
+            for index, item in enumerate(timeline, start=1):
+                diag = item.get("metadata") or {}
+                sections.append(
+                    f"{index}. `{item.get('node')}` {item.get('message')}"
+                    f" | latency={diag.get('latency_ms', 0)}ms"
+                )
+        else:
+            sections.append("- 无")
+        sections.append("\n**检索诊断**")
+        if rt.diagnostics:
+            for diag in rt.diagnostics[-8:]:
+                sections.append(
+                    f"- {diag.get('tool_name')} hits={diag.get('hit_count')} "
+                    f"status={diag.get('status')} latency={diag.get('latency_ms')}ms"
+                )
+        else:
+            sections.append("- 无")
+        sections.append("\n**Grounding**")
+        sections.append(f"- grounded={verification.get('grounded')} method={verification.get('grounding_method')}")
+        return "\n".join(sections)

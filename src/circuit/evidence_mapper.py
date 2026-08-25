@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 
 
 class CircuitEvidenceMapper:

@@ -16,6 +16,8 @@ export default defineConfig({
   base: '/',
   server: {
     port: 5174,
+    // 允许通过 cloudflared 等隧道域名访问 dev server(公网演示用)
+    allowedHosts: true,
     proxy: {
       '/api': {
         target: apiTarget,
