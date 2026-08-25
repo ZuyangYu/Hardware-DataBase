@@ -123,12 +123,11 @@ def health_ragflow(_actor: AuthUser = Depends(require_system_admin)):
 def health_llm(_actor: AuthUser = Depends(require_system_admin)):
     """Probe the configured LLM provider with a 1-token ping. Mirrors the
     Streamlit sidebar AI-status indicator."""
-    from src.core.llm_client import LLMClient
+    from src.core.model_factory import create_chat_model
 
     provider_value = getattr(settings.AGENT_LLM_PROVIDER, "value", settings.AGENT_LLM_PROVIDER)
     try:
-        client = LLMClient()
-        client.chat([{"role": "user", "content": "ping"}])
+        create_chat_model().invoke([{"role": "user", "content": "ping"}], max_tokens=1)
         return LlmHealthResponse(reachable=True, message="LLM 连接正常", provider=str(provider_value))
     except Exception as exc:
         return LlmHealthResponse(reachable=False, message=f"LLM 连接失败: {exc}", provider=str(provider_value))

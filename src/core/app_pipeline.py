@@ -276,8 +276,20 @@ class AppPipeline:
 
     @staticmethod
     def apply_settings(new_settings: dict) -> None:
-        config.settings.save_settings_to_env(new_settings)
-        config.settings.reload_settings()
+        # Validate BEFORE persisting and hold the .env write lock across the
+        # whole validate -> save -> reload cycle: reload_settings (and module
+        # import) parse numeric/enum settings eagerly, so a bad value written
+        # to .env first would brick the server on the next boot. Concurrent
+        # PUT /config requests serialise here instead of losing updates.
+        with config.settings._ENV_WRITE_LOCK:
+            config.settings.validate_settings_values(new_settings)
+            config.settings.save_settings_to_env(new_settings)
+            config.settings.reload_settings()
+            # create_chat_model 是 lru_cache 的:不清缓存的话,管理页改完
+            # AGENT_LLM_* 后旧模型实例会一直用到进程重启。
+            from src.core.model_factory import create_chat_model
+
+            create_chat_model.cache_clear()
 
     def delete_document(self, filename: str, kb_name: str, ctx: RequestContext | None = None) -> str:
         try:

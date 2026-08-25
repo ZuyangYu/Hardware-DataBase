@@ -44,24 +44,6 @@ class PipelineRuntime:
         """Compatibility no-op; process lifetime is controlled by the worker."""
         return None
 
-    def parse_worker_loop(self):
-        processor_kinds = self.background_processor_kinds()
-        while True:
-            record = self.store.claim_next_parse_record(self._worker_id, processor_kinds=processor_kinds)
-            if not record:
-                return
-            try:
-                self.process_record(record)
-            except Exception as exc:
-                error(f"Parse worker failed for {record.document_name}: {exc}")
-                try:
-                    handler = self.handlers.get(record.processor_kind)
-                    if handler is not None:
-                        handler.cleanup_failed_process(record)
-                    self.store.mark_document_failed_by_id(record.id, str(exc))
-                except Exception as mark_error:
-                    error(f"Failed to mark parse task failed for {record.id}: {mark_error}")
-
     def run_once(self) -> bool:
         """Process one durable parse record. Used by the standalone worker."""
         record = self.store.claim_next_parse_record(

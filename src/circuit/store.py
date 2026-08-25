@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,41 @@ INDEX_FILE = "index.json"
 def make_design_id(filename: str) -> str:
     stem = Path(filename).stem.strip() or "circuit"
     return _DESIGN_ID_RE.sub("_", stem)[:128]
+
+
+def make_content_addressed_design_id(filename: str, content_hash: str | None) -> str:
+    """Derive a collision-resistant design id from filename + content hash.
+
+    ``make_design_id`` alone maps distinct files to the same id (spaces and
+    CJK characters normalise to ``_``, long stems truncate at 128 chars), so a
+    re-upload with different content would silently overwrite the earlier
+    design. Appending 8 hex chars of the content hash makes the id unique per
+    file content while keeping the human-readable stem prefix.
+    """
+    base = make_design_id(filename)
+    if not content_hash:
+        return base
+    digest = re.sub(r"[^a-f0-9]", "", str(content_hash).lower())[:8]
+    if not digest:
+        return base
+    return f"{base[:119]}-{digest}"
+
+
+def design_id_matches_file(design_id: str, filename: str) -> bool:
+    """Whether ``design_id`` could have been derived from ``filename``.
+
+    Accepts both legacy plain-stem ids and content-addressed
+    ``<stem>-<8hex>`` ids, so alias resolution / record cleanup keeps working
+    for designs stored before the hash suffix was introduced.
+    """
+    if not design_id or not filename:
+        return False
+    base = make_design_id(filename)
+    if design_id == base:
+        return True
+    if design_id.startswith(f"{base}-"):
+        return re.fullmatch(r"[0-9a-f]{8}", design_id[len(base) + 1:]) is not None
+    return False
 
 
 def derive_circuit_aliases(design_id: str, file_names: list[str]) -> list[str]:
@@ -116,6 +152,12 @@ class CircuitStore:
     Layout helpers (``design_dir``, ``module_screenshot_dir``, ``pdf_cache_dir``)
     centralise path resolution so other components never compute paths by hand.
     """
+
+    # Serialises global index.json read-modify-write cycles. Store instances
+    # are frequently created per call site, so this must be class-level:
+    # concurrent uploads each reading the index then writing it back would
+    # otherwise lose the earlier design's registry entry.
+    _INDEX_LOCK = threading.RLock()
 
     def __init__(self, root: str | None = None):
         self.root = root or os.path.join(config.settings.STORAGE_DIR, "circuits")
@@ -244,32 +286,34 @@ class CircuitStore:
             return {"version": 1, "designs": []}
 
     def _update_index(self, design: CircuitDesign) -> None:
-        os.makedirs(self.root, exist_ok=True)
-        index = self._read_index()
-        entry = self._index_entry(design)
-        designs: list[dict[str, Any]] = [
-            item for item in index.get("designs", [])
-            if not (item.get("kb_name") == design.kb_name and item.get("design_id") == design.design_id)
-        ]
-        designs.append(entry)
-        designs.sort(key=lambda item: (item.get("kb_name", ""), item.get("design_id", "")))
-        index["designs"] = designs
-        index["updated_at"] = _utcnow_iso()
-        _atomic_write(self.index_path(), json.dumps(index, ensure_ascii=False, indent=2))
+        with self._INDEX_LOCK:
+            os.makedirs(self.root, exist_ok=True)
+            index = self._read_index()
+            entry = self._index_entry(design)
+            designs: list[dict[str, Any]] = [
+                item for item in index.get("designs", [])
+                if not (item.get("kb_name") == design.kb_name and item.get("design_id") == design.design_id)
+            ]
+            designs.append(entry)
+            designs.sort(key=lambda item: (item.get("kb_name", ""), item.get("design_id", "")))
+            index["designs"] = designs
+            index["updated_at"] = _utcnow_iso()
+            _atomic_write(self.index_path(), json.dumps(index, ensure_ascii=False, indent=2))
 
     def read_index(self) -> dict[str, Any]:
         """Public accessor for the global registry (UI / observability)."""
         return self._read_index()
 
     def remove_from_index(self, kb_name: str, design_id: str) -> None:
-        index = self._read_index()
-        designs = [
-            item for item in index.get("designs", [])
-            if not (item.get("kb_name") == kb_name and item.get("design_id") == design_id)
-        ]
-        index["designs"] = designs
-        index["updated_at"] = _utcnow_iso()
-        _atomic_write(self.index_path(), json.dumps(index, ensure_ascii=False, indent=2))
+        with self._INDEX_LOCK:
+            index = self._read_index()
+            designs = [
+                item for item in index.get("designs", [])
+                if not (item.get("kb_name") == kb_name and item.get("design_id") == design_id)
+            ]
+            index["designs"] = designs
+            index["updated_at"] = _utcnow_iso()
+            _atomic_write(self.index_path(), json.dumps(index, ensure_ascii=False, indent=2))
 
     # ── deletion helpers ──────────────────────────────────────────────────
 
@@ -307,9 +351,14 @@ class CircuitStore:
         before = index.get("designs", [])
         kept = [item for item in before if item.get("kb_name") != kb_name]
         if len(kept) != len(before):
-            index["designs"] = kept
-            index["updated_at"] = _utcnow_iso()
-            _atomic_write(self.index_path(), json.dumps(index, ensure_ascii=False, indent=2))
+            with self._INDEX_LOCK:
+                index = self._read_index()
+                before = index.get("designs", [])
+                kept = [item for item in before if item.get("kb_name") != kb_name]
+                if len(kept) != len(before):
+                    index["designs"] = kept
+                    index["updated_at"] = _utcnow_iso()
+                    _atomic_write(self.index_path(), json.dumps(index, ensure_ascii=False, indent=2))
             removed = True
         return removed
 

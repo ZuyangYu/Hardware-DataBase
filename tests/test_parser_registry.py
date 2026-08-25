@@ -39,7 +39,7 @@ class ParserRegistryCapabilityTests(unittest.TestCase):
         # Live path: agents.graph calls capabilities_for *after* a domain
         # manifest has been registered. Registering a manifest must make its
         # capabilities and parser retrievable, while unknown groups stay empty.
-        from src.agents.claim_evidence import EvidenceCapability
+        from src.ingestion.evidence_capability import EvidenceCapability
         from src.ingestion.parser_registry import DomainManifest, ParserRegistry
 
         def _fake_parser(path, kb, group, progress):

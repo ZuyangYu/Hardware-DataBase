@@ -4,13 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-Hardware DataBase (package name `hardware-database`) is a Streamlit-based multi-source Q&A
+Hardware DataBase (package name `hardware-database`) is a multi-source Q&A
 system for hardware design assets. It answers questions over **documents**
 (Word/PDF via RAGFlow), **spreadsheets** (Excel structured index), and **circuit
 designs** (EDIF/EDF netlists + schematic PDFs), orchestrated by a bounded
 LangGraph agent that does question analysis, source planning, multi-round
 retrieval, evidence-coverage judging, and grounded answer synthesis. It also
 ships a RAGAS evaluation subsystem. Python >= 3.12.
+
+The UI is a React + TypeScript SPA in `frontend/` talking to the FastAPI
+backend in `src/api/`. The former Streamlit app (`streamlit_app.py`, `src/ui/`)
+has been removed; `frontend/` + `src/api/` are the only UI path now.
 
 `docs/architecture_doc.md` is the live whole-system architecture doc (v0.1.0,
 2026-07) - read it first for the big picture. Other design notes in `docs/`:
@@ -33,7 +37,8 @@ by default; the `eval` group (ragas/openai) is opt-in.
 
 ```bash
 uv sync                                    # create venv + install locked deps (incl. dev)
-uv run streamlit run streamlit_app.py      # launch the app
+uv run hardware-database-server            # start the FastAPI backend (default 127.0.0.1:8000)
+# frontend dev server: cd frontend && npm install && npm run dev
 
 # Tests (pytest; tests are unittest.TestCase classes; vendor/spydrnet excluded via norecursedirs)
 uv run python -m pytest                     # full suite
@@ -66,16 +71,16 @@ Tests import via the `src.` package path and run from the repo root.
 
 `config/settings.py` is the single source of truth for all config constants and
 path roots. It loads `.env` with `utf-8-sig` (BOM-tolerant). Most settings are
-also editable live in the Streamlit sidebar ("⚙️ 系统配置"), which persists back
-to `.env` via `AppPipeline.apply_settings` -> `save_settings_to_env` ->
-`reload_settings`.
+also editable live in the frontend admin "系统配置" page (`frontend/src/pages/admin/ConfigPage.tsx`
+via `PUT /api/v1/config`), which persists back to `.env` via
+`AppPipeline.apply_settings` -> `save_settings_to_env` -> `reload_settings`.
 
 Two axes matter most:
 
 - `AGENT_LLM_PROVIDER` (`ollama` | `custom`) - the model provider for the agent's
   `LLMClient` (`src/core/llm_client.py`). `custom` covers any OpenAI-compatible
   API (OpenRouter, DeepSeek, SiliconFlow, …). On HTTP 429 it retries with backoff
-  then falls back to `AGENT_FALLBACK_MODEL`. This is the **live** provider axis;
+  retries with backoff (no cross-model fallback exists). This is the **live** provider axis;
   the old `PROVIDER` variable is dead.
 - Retrieval backend is **fixed to RAGFlow** - there is no local vector backend and
   no `RAG_BACKEND` switch. Embedding/parse happen RAGFlow-side; the project no
@@ -92,8 +97,9 @@ is read by `src/evaluation/config.py`, not `settings.py`.
 
 ## Architecture
 
-Request flow: **Streamlit UI -> `AppPipeline.query` -> `MultiSourceAgentRunner`
--> LangGraph graph -> tool adapters -> `LLMClient` -> streamed answer.**
+Request flow: **React frontend -> FastAPI (`src/api/`) -> `AppPipeline.query` ->
+`MultiSourceAgentRunner` -> LangGraph graph -> tool adapters -> `LLMClient` ->
+streamed answer.**
 
 `AppPipeline` (`src/core/app_pipeline.py`) is the central orchestrator the UI
 talks to. It owns a `RAGFlowBackend` (the retrieval/ingest backend), a
@@ -170,23 +176,19 @@ live.**
   `CircuitEvidenceMapper`.
 - `vector_index.py` (`CircuitVectorIndex`) - per-KB ChromaDB collection
   `circuit_kb_{kb}` over module/instance/net docs (deliberately separate from any
-  doc index), used as a semantic supplement by `CircuitQueryEngine`. No-op when no
-  embedding model is bound.
+  doc index), used as a semantic supplement by `CircuitQueryEngine`. Explicitly
+  disabled (clean no-op) when no embedding model or no chroma client is
+  available; collections use cosine space.
 - `parsers/`: `edf_parser.py` wraps the vendored SpyDrNet checkout for EDIF
   (monkey-patches SpyDrNet's parser, falls back to `edif_lite_parser.py`);
-  `pdf_schematic_parser.py` (pypdf) for schematic PDFs.
-- `relations/` (connectivity + derived power relations) and `analyzers/`
-  (`module_analyzer`, `image_cropper`) support the full-fusion path.
-- **Dormant full path** (present but not wired into the app): `CircuitOrchestrator`
-  (`orchestrator.py`) + `ingest_workers.py` / `upload_service.py` / `manifest.py`
-  do EDF+PDF fusion, connectivity graph (`graph_store.py` -> `.gpickle`), module
-  screenshots, and cross-reference; the bounded `CircuitQueryAgent`
-  (`query_agent.py` + `query_planner.py` / `llm_controlled_planner.py` /
-  `recovery_manager.py` / `answer_synthesizer.py` / `response_policy.py` /
-  `circuit_scope_resolver.py` / `entity_resolver.py` / `query_context.py` /
-  `session_context_store.py` / `intent_parser.py`) is a richer Plan-and-Execute
-  agent kept for future migration onto the shared `LLMClient`. **Do not assume
-  these are called by the main flow.**
+  `edf_partition.py` groups instances into page-based modules.
+- `relations/` (connectivity + derived power relations) feed the live
+  `CircuitQueryEngine`.
+- **Note**: an earlier dormant "full-fusion" path (EDF+PDF orchestrator, graph
+  store, module screenshots) and the richer bounded `CircuitQueryAgent` family
+  (~5.7k lines, zero live references / zero tests) were removed in favor of the
+  live `CircuitIndexService` path. Recover from git history if PDF fusion is
+  ever revisited.
 
 ### Ingestion (`src/ingestion/`)
 `source_groups.py` defines the 10-group taxonomy (文档资料 / 物料数据 / 设计数据 /
@@ -206,31 +208,29 @@ RAGAS subsystem exposed via the `hardware-database-eval` CLI (`cli.py`):
 rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 (`--fail-on-threshold`), and writes `summary.json` / `results.jsonl` /
 `summary.csv` / `report.html` to `storage/evaluations/<run_id>/`. Built-in
-25-sample dataset at `evaluation/datasets/hardware_qa_v1.jsonl`; the Streamlit
-"🧪 RAGAS 评估" tab is system-admin-only and wraps `EvaluationService`.
+25-sample dataset at `evaluation/datasets/hardware_qa_v1.jsonl`; the frontend
+"RAGAS 评估" admin page is system-admin-only and wraps `EvaluationService` via
+`src/api/routes/evaluation.py`.
 
 ### API 层 (`src/api/`)
-前后端分离的后端,长期资产。`src/api/` 是 FastAPI 服务(**就是未来的后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务。所有业务路由挂在 `/api/v1` 前缀下(`/health` 保留根路径探针)。CORS 由 `HDB_API_CORS_ORIGINS`(逗号分隔)配置,默认放行本地开发 origin(8501/3000/5173),**生产部署必须显式设为前端实际域名**。RAGFlow key / `.env` / `auth.db` 只在服务侧。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:普通用户只能检索,部门管理员才能上传/建库/删除。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。`POST /query` 走 SSE(delta/done/error 事件);上传 `POST /kbs/{kb}/files`(multipart,分片写盘 + 大小上限 `HDB_API_MAX_UPLOAD_BYTES`)。
+前后端分离的后端。`src/api/` 是 FastAPI 服务(**就是后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务。所有业务路由挂在 `/api/v1` 前缀下(`/health` 保留根路径探针)。CORS 由 `HDB_API_CORS_ORIGINS`(逗号分隔)配置,默认放行本地开发 origin(5173/5174/3000),**生产部署必须显式设为前端实际域名**。RAGFlow key / `.env` / `auth.db` 只在服务侧。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:普通用户只能检索,部门管理员才能上传/建库/删除。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。查询走 **turns 执行模型**:`POST /conversations/{id}/turns` 创建轮次(服务端自动落库 user 消息)-> `POST /turns/{turn_id}/start` 由 worker 轮询执行 -> `GET /turns/{turn_id}/events` SSE 流式返回;旧的直连 `POST /query`(SSE delta/done/error)仍保留。上传 `POST /kbs/{kb}/files`(multipart,分片写盘 + 大小上限 `HDB_API_MAX_UPLOAD_BYTES`)。
 
-**审计下沉**:管理写操作的 `record_audit` 住在 `AuthService._audit` / `AppPipeline._audit` 内部(fail-soft),Streamlit 与 API 两条路径自动覆盖、无双写。唯一例外是 `change_settings`(`apply_settings` 是 staticmethod 无 actor),由 `PUT /config` 路由层与 Streamlit 设置页各自记一次。
+**审计下沉**:管理写操作的 `record_audit` 住在 `AuthService._audit` / `AppPipeline._audit` 内部(fail-soft),所有入口自动覆盖、无双写。唯一例外是 `change_settings`(`apply_settings` 是 staticmethod 无 actor),由 `PUT /config` 路由层记一次。
 
-**角色权力分离**(三个角色的可达范围与 Streamlit tab 严格对齐):
+**角色权力分离**(三个角色的可达范围与前端 admin 页面严格对齐):
 - `system_admin` = **治理角色**,只碰元数据。可用:部门/用户/KB 挂载(`assign_kb`)/权限清单查看/系统配置/日志中心/RAGAS 评估/治理面板。**不能**访问任何 KB 内容(检索、上传、看文件、删文件、看解析任务)。`RequestContext.has_kb_permission` 对 sysadmin 恒返回 False;API 路由用 `deps.reject_system_admin_kb_access(ctx)` 提前拒并给明确错误信息("system_admin 是治理角色,不能访问知识库内容")。这条铁律的目的是防"平台管理员静默窥视各部门私有数据"。
 - `dept_admin` = **部门治理 + 部门内容**。可用:本部门用户管理、本部门 KB 建/删/权限授予撤销、本部门文件上传/删除/查看、检索。
 - `user` = **纯消费**。可用:对已被授权的 KB 检索、查看文件、看自己的会话。
 
-**API 查询不自动持久化会话**:`POST /query` 只流式返回答案并写 query trace + 证据到日志中心,**不**自动把 user/assistant 消息写入 `conversations`。前端须在 `done` 事件后手动 `POST /conversations/{id}/messages` 追加两条消息,否则历史会话拿不到 API 产生的问答(这是有意职责划分,与 Streamlit 自动落库不同)。
+**会话持久化**:查询走 turns 执行模型时,服务端自动把 user/assistant 消息写入 `conversations`(见 `src/api/routes/query.py`);旧的直连 `POST /query` 只流式返回答案并写 query trace + 证据到日志中心,**不**落库消息。
 
-**注**:`src/cli/` 与 `src/mcp/` 已随「移除主项目内置 CLI/MCP」提交删除,本段历史描述的 CLI/MCP 客户端不再存在;API 是当前唯一的后端入口。Streamlit 暂作为 demo 期 UI 与 API 并存,后续被真正的前端取代。
+**注**:`src/cli/` 与 `src/mcp/` 已随「移除主项目内置 CLI/MCP」提交删除,本段历史描述的 CLI/MCP 客户端不再存在;API 是当前唯一的后端入口。
 
 
 ### Other subsystems
 - `src/test_data/` - structured test-data domain (CSV/JSON ->
   `storage/test_data/`). **Ingest-only** today (registered via `parser_registry`);
-  browsable via `src/ui/test_data_browser.py` but **not** queryable through the agent.
-- `src/ui/` - Streamlit page components. Only `evaluation_page.py` is wired into
-  `streamlit_app.py`; `circuit_browser` / `module_tree` / `schematic_viewer` /
-  `test_data_browser` / `mermaid_topology` are prepared but not yet integrated.
+  not yet queryable through the agent.
 - `src/core/` - `app_pipeline.py` (orchestrator), `llm_client.py` (provider-neutral
   chat client), `auth.py` (role-based access: system_admin / dept_admin / user,
   backed by `storage/auth.db`; `build_request_context`), `conversation.py` (chat

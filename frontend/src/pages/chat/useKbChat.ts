@@ -1,9 +1,9 @@
 /**
  * useKbChat -- 单 KB 聊天会话的数据层 hook(lean 版,对齐 UseChatSession 的渲染字段)。
  *
- * 封装:会话列表 CRUD、消息加载、SSE 流式查询(`/api/v1/query`)、done 后落库 assistant 消息
- * (API 有意不自动持久化会话,前端负责)、证据累积、流式中断。不搬 agent/trace/
- * 定时任务/附件/点赞业务。
+ * 封装:会话列表 CRUD、消息加载、turns 执行模型(创建轮次 -> start -> SSE 订阅持久化
+ * 事件,服务端自动落库 user/assistant 消息,刷新可凭 Last-Event-ID 重放)、证据累积、
+ * 流式中断。不搬 agent/trace/定时任务/附件/点赞业务。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -24,6 +24,17 @@ const HISTORY_PAIRS = 5; // 与后端保持一致:只带最近 5 轮对话
 const GENERAL_CHAT_KB_NAME = '__general__';
 const QUERY_TRACE_HIDE_DELAY_MS = 1400;
 const STREAMING_RENDER_INTERVAL_MS = 64;
+
+/** crypto.randomUUID 仅在安全上下文(HTTPS/localhost)存在;HTTP+IP 访问时回退到手动拼 UUID。 */
+function requestUuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
 
 function buildHistory(messages: MessageView[]): string[][] {
   const pairs: string[][] = [];
@@ -316,6 +327,14 @@ export function useKbChat(kbName: string) {
                   created_at: turn.created_at,
                 },
               ]);
+              // 刷新恢复时同样回填证据面板,否则引用标号 [n] 没有来源可看
+              const recoveredEvidence = payload.summary?.evidence ?? [];
+              if (recoveredEvidence.length > 0 && turn.assistant_message_id != null) {
+                setEvidenceByMessageId((prev) => ({
+                  ...prev,
+                  [turn.assistant_message_id as number]: recoveredEvidence,
+                }));
+              }
             }
             finishTrace('done', '已完成输出');
           } else if (evt.event === 'error') {
@@ -414,6 +433,19 @@ export function useKbChat(kbName: string) {
     setDegradedNotes([]);
 
     let sessionId = activeSessionId;
+    // 乐观更新:点发送立即上屏,不等建会话/建 turn 的两个往返(否则"思考中"
+    // 会先于自己的消息出现,体感像页面卡了一下)。turn 建好后用服务端记录对账替换。
+    const optimisticId = -Date.now();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: optimisticId,
+        session_id: sessionId ?? -1,
+        role: 'user',
+        content: query,
+        created_at: new Date().toISOString(),
+      },
+    ]);
     try {
       // 1. 确保会话存在(首次提问自动建会话,标题取问题前 20 字)
       if (sessionId == null) {
@@ -424,10 +456,10 @@ export function useKbChat(kbName: string) {
       // 2. 后端原子写入 user/assistant 占位消息并创建幂等 turn。
       const created = await api.post<TurnStartResponse>(`/api/v1/conversations/${sessionId}/turns`, {
         query,
-        client_request_id: crypto.randomUUID(),
+        client_request_id: requestUuid(),
         query_mode: scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
       });
-      setMessages((prev) => [...prev, created.user_message]);
+      setMessages((prev) => prev.map((m) => (m.id === optimisticId ? created.user_message : m)));
 
       // 3. 后端任务独立执行; SSE 只订阅持久化事件，刷新可从事件序号重放。
       const controller = new AbortController();
@@ -512,8 +544,19 @@ export function useKbChat(kbName: string) {
         });
       } else if (errorMessage && activeSessionRef.current === sessionId) {
         setMessages((prev) => [...prev, localAssistantMessage(sessionId!, `⚠️ ${errorMessage}`)]);
+      } else if (!finalPayload) {
+        // 流在 done/error 之前中断(网络断开、服务重启):明确提示,不能静默吞掉
+        if (activeSessionRef.current === sessionId) {
+          setMessages((prev) => [
+            ...prev,
+            localAssistantMessage(sessionId!, '⚠️ 连接中断，回答可能未完成；刷新页面可尝试恢复。'),
+          ]);
+        }
+        finishTrace('error', '连接中断');
       }
     } catch (error) {
+      // 乐观消息还没被服务端记录对账过:撤回,避免发送失败后残留一条"幽灵消息"
+      setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
       if (error instanceof DOMException && error.name === 'AbortError') {
         finishTrace('error', '已停止生成');
       } else {

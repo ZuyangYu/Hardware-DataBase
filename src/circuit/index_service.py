@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -7,14 +8,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from src.agents.state import Evidence
-from src.agents.query_tokens import tokenize_hardware_query
+from src.agents.schemas import Evidence
+from src.core.query_tokens import tokenize_hardware_query
 from src.circuit.evidence_mapper import CircuitEvidenceMapper
 from src.circuit.models import CircuitDesign, CircuitStatus, DesignFile
 from src.circuit.parsers.edf_parser import EdfParser
 from src.circuit.question_analysis import analyze_question
 from src.circuit.query_engine import CircuitQueryEngine
-from src.circuit.store import CircuitStore, make_design_id
+from src.circuit.store import (
+    CircuitStore,
+    design_id_matches_file,
+    make_content_addressed_design_id,
+)
 from src.pipelines.document_rag.schemas import RequestContext
 
 
@@ -55,7 +60,18 @@ class CircuitIndexService:
         department_id: str | None = None,
         uploaded_by: str = "",
     ) -> CircuitIndexResult:
-        design_id = make_design_id(original_name)
+        # Content-addressed id: distinct files sharing a normalised stem no
+        # longer overwrite each other (make_design_id alone collides on
+        # spaces/CJK → '_' and 128-char truncation).
+        try:
+            hasher = hashlib.sha256()
+            with open(file_path, "rb") as fh:
+                for block in iter(lambda: fh.read(1024 * 1024), b""):
+                    hasher.update(block)
+            content_hash = hasher.hexdigest()
+        except OSError:
+            content_hash = None
+        design_id = make_content_addressed_design_id(original_name, content_hash)
         parser = self.parser_factory(file_path)
         parsed = parser.parse()
         if len(parsed) == 2:
@@ -268,8 +284,8 @@ class CircuitIndexService:
         evidence_by_id: dict[str, Evidence] = {}
         for kind, score, rows in candidates:
             for row in rows:
-                design_id = str(row.get("design_id") or row.get("circuit_id") or "")
-                context = allowed_designs.get(design_id)
+                row_design_id = str(row.get("design_id") or row.get("circuit_id") or "")
+                context = self._resolve_allowed_design(allowed_designs, row_design_id)
                 if context is None:
                     continue
                 metadata, source_name = context
@@ -283,6 +299,28 @@ class CircuitIndexService:
                 evidence_by_id.setdefault(evidence.id, evidence)
         return sorted(evidence_by_id.values(), key=lambda item: (-item.score, item.id))
 
+    @staticmethod
+    def _resolve_allowed_design(
+        allowed_designs: dict[str, tuple[dict[str, Any], str]],
+        row_design_id: str,
+    ) -> tuple[dict[str, Any], str] | None:
+        """Join an engine row to its allowed design.
+
+        Exact match first; falls back to content-addressed ids
+        (``<stem>-<8hex>``) when the row still carries the legacy plain-stem
+        id (dormant ingest path / older stores).
+        """
+        if not row_design_id:
+            return None
+        direct = allowed_designs.get(row_design_id)
+        if direct is not None:
+            return direct
+        prefix = f"{row_design_id}-"
+        for key, value in allowed_designs.items():
+            if key.startswith(prefix) and re.fullmatch(r"[0-9a-f]{8}", key[len(prefix):]):
+                return value
+        return None
+
     def delete_record(self, record: Any) -> None:
         kb_name = getattr(record, "kb_name", "")
         if not kb_name:
@@ -294,7 +332,7 @@ class CircuitIndexService:
                 self.store.delete_design(kb_name, design.design_id)
                 continue
             names = {getattr(record, "document_name", ""), getattr(record, "original_file_name", "")}
-            if any(name and make_design_id(name) == design.design_id for name in names):
+            if any(name and design_id_matches_file(design.design_id, name) for name in names):
                 self.store.delete_design(kb_name, design.design_id)
 
     def _net_evidence(

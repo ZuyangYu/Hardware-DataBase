@@ -94,6 +94,7 @@ class AnswerRunnerTests(unittest.TestCase):
         sample = _sample(
             request_context={
                 "user_id": "evaluator",
+                "roles": ["dept_admin"],
                 "department_id": 96,
                 "allowed_kbs": ["96:ADAS"],
                 "kb_permissions": {"96:ADAS": "read"},
@@ -102,8 +103,13 @@ class AnswerRunnerTests(unittest.TestCase):
 
         AnswerRunner(lambda: pipeline).collect(sample)
 
-        self.assertEqual(pipeline.received_ctx.user_id, "evaluator")
+        # Security posture: dataset-supplied identity is untrusted. user_id is
+        # pinned to "evaluation", roles are pinned to plain user, and the
+        # declared identity survives only as metadata.
+        self.assertEqual(pipeline.received_ctx.user_id, "evaluation")
+        self.assertEqual(pipeline.received_ctx.roles, ["user"])
         self.assertEqual(pipeline.received_ctx.metadata["department_id"], 96)
+        self.assertEqual(pipeline.received_ctx.metadata.get("declared_user"), "evaluator")
 
     def test_collect_returns_failed_snapshot_when_pipeline_raises(self):
         class BrokenPipeline(FakePipeline):

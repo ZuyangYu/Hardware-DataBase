@@ -1,5 +1,7 @@
 # config/settings.py
 import os
+import stat
+import threading
 from enum import Enum
 
 from dotenv import load_dotenv
@@ -8,6 +10,13 @@ from dotenv import load_dotenv
 ENV_FILE_ENCODING = "utf-8-sig"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
+
+# Serialises .env read-modify-write cycles (save_settings_to_env). Sync API
+# routes run in Starlette's threadpool, so two concurrent PUT /config requests
+# would otherwise interleave read/modify/write and lose updates. RLock because
+# AppPipeline.apply_settings holds it across validate -> save -> reload while
+# save_settings_to_env acquires it again.
+_ENV_WRITE_LOCK = threading.RLock()
 
 load_dotenv(dotenv_path=ENV_FILE_PATH, encoding=ENV_FILE_ENCODING)
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
@@ -217,46 +226,126 @@ def _env_value_quote_closed(value: str) -> bool:
 
 
 def save_settings_to_env(settings_dict: dict, env_path: str = None):
-    """Update .env keys while preserving comments and unrelated settings."""
+    """Update .env keys while preserving comments and unrelated settings.
+
+    Atomic + lock-guarded: writes to a temp file in the same directory and
+    ``os.replace``s it over the target so a crash mid-write can never leave a
+    truncated .env (which holds the live API keys). Callers should hold this
+    via the module-level lock; concurrent PUT /config requests serialise here.
+    """
     if env_path is None:
         env_path = os.path.join(BASE_DIR, ".env")
 
-    lines = []
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding=ENV_FILE_ENCODING) as f:
-            lines = f.readlines()
+    with _ENV_WRITE_LOCK:
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding=ENV_FILE_ENCODING) as f:
+                lines = f.readlines()
 
-    updated_keys = set()
-    new_lines = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            new_lines.append(line)
-            i += 1
-            continue
-
-        if "=" in stripped:
-            key = stripped.split("=", 1)[0].strip()
-            if key in settings_dict:
-                new_lines.append(f"{key}={_format_env_value(settings_dict[key])}\n")
-                updated_keys.add(key)
-                value = stripped.split("=", 1)[1]
+        updated_keys = set()
+        new_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                new_lines.append(line)
                 i += 1
-                while i < len(lines) and not _env_value_quote_closed(value):
-                    value += "\n" + lines[i].rstrip("\n")
-                    i += 1
                 continue
-            new_lines.append(line)
+
+            if "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                if key in settings_dict:
+                    new_lines.append(f"{key}={_format_env_value(settings_dict[key])}\n")
+                    updated_keys.add(key)
+                    value = stripped.split("=", 1)[1]
+                    i += 1
+                    while i < len(lines) and not _env_value_quote_closed(value):
+                        value += "\n" + lines[i].rstrip("\n")
+                        i += 1
+                    continue
+                new_lines.append(line)
+                i += 1
+                continue
+
             i += 1
-            continue
 
-        i += 1
+        for key, value in settings_dict.items():
+            if key not in updated_keys:
+                new_lines.append(f"{key}={_format_env_value(value)}\n")
 
+        import tempfile
+
+        env_dir = os.path.dirname(os.path.abspath(env_path)) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".env.tmp-", dir=env_dir)
+        try:
+            with os.fdopen(fd, "w", encoding=ENV_FILE_ENCODING) as f:
+                f.writelines(new_lines)
+                f.flush()
+                os.fsync(f.fileno())
+            # mkstemp creates the temp file 0600; os.replace would silently
+            # tighten the .env mode and lock out other-user processes
+            # (e.g. workers). Preserve the target's existing permissions.
+            try:
+                mode = stat.S_IMODE(os.stat(env_path).st_mode)
+            except OSError:
+                mode = None
+            if mode is not None:
+                os.chmod(tmp_path, mode)
+            os.replace(tmp_path, env_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+
+# Keys parsed as numbers or an enum at import/reload time. A value that cannot
+# be converted would brick the server on next boot (module-level parse raises),
+# so callers must validate BEFORE persisting anything to .env.
+_INT_SETTING_KEYS = frozenset({
+    "RAGFLOW_TIMEOUT_SECONDS",
+    "AUTH_SESSION_TTL_HOURS",
+    "AGENT_CUSTOM_MAX_TOKENS",
+    "AGENT_TIMEOUT_SECONDS",
+    "AGENT_RATE_LIMIT_MAX_RETRIES",
+    "FINAL_TOP_K",
+    "AGENT_MAX_RETRIEVAL_ROUNDS",
+    "WORKER_PARSE_BATCH_SIZE",
+    "CHAT_TURN_HEARTBEAT_TTL_SECONDS",
+    "CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS",
+})
+_FLOAT_SETTING_KEYS = frozenset({
+    "RAGFLOW_SIMILARITY_THRESHOLD",
+    "RAGFLOW_VECTOR_WEIGHT",
+    "AGENT_TEMPERATURE",
+    "AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS",
+    "AGENT_RATE_LIMIT_MAX_DELAY_SECONDS",
+    "WORKER_POLL_INTERVAL_SECONDS",
+})
+
+
+def validate_settings_values(settings_dict: dict) -> None:
+    """Validate candidate .env values against their expected types.
+
+    Raises ``ValueError`` naming the offending key when a value cannot be
+    parsed the way ``reload_settings`` (and module import) will parse it.
+    """
     for key, value in settings_dict.items():
-        if key not in updated_keys:
-            new_lines.append(f"{key}={_format_env_value(value)}\n")
-
-    with open(env_path, "w", encoding=ENV_FILE_ENCODING) as f:
-        f.writelines(new_lines)
+        text = "" if value is None else str(value)
+        if key in _INT_SETTING_KEYS:
+            try:
+                int(text)
+            except ValueError as exc:
+                raise ValueError(f"{key} 必须是整数，当前值: {text!r}") from exc
+        elif key in _FLOAT_SETTING_KEYS:
+            try:
+                float(text)
+            except ValueError as exc:
+                raise ValueError(f"{key} 必须是数字，当前值: {text!r}") from exc
+        elif key == "AGENT_LLM_PROVIDER":
+            valid = ", ".join(p.value for p in Provider)
+            lowered = text.strip().lower()
+            if lowered not in {p.value for p in Provider}:
+                raise ValueError(f"AGENT_LLM_PROVIDER 必须是以下之一: {valid}，当前值: {text!r}")

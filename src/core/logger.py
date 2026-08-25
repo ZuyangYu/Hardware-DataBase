@@ -18,7 +18,7 @@ formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(trace_id)s%(mes
 
 # ---- per-query 关联上下文 ----
 # trace_id 把一次查询的日志行串起来，并与 query_traces.metadata_json 同值，使 DB 行 ↔ 日志行可 join。
-# query_error 让后端在 except 里把真实错误透传给 streamlit 记录层，避免靠 fallback 字符串前缀误判 status。
+# query_error 让后端在 except 里把真实错误透传给 API 记录层，避免靠 fallback 字符串前缀误判 status。
 _trace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="")
 _query_error_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("query_error", default=None)
 

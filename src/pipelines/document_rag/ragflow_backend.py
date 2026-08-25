@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Callable
 
 import httpx
-import requests
 
 import config.settings
 from src.core.auth import AuthService
@@ -433,13 +432,13 @@ class RAGFlowClient:
         return f"{self.base_url}{path}"
 
     def request(self, method: str, path: str, **kwargs) -> dict:
-        response = requests.request(
-            method,
-            self._url(path),
-            headers={**self.headers, **kwargs.pop("headers", {})},
-            timeout=self.timeout,
-            **kwargs,
-        )
+        with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+            response = client.request(
+                method,
+                self._url(path),
+                headers={**self.headers, **kwargs.pop("headers", {})},
+                **kwargs,
+            )
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict) and data.get("code") not in {None, 0}:
@@ -799,12 +798,6 @@ class RAGFlowBackend(RAGBackend):
                 return True
             log(f"RAGFlow duplicate check could not verify remote document {record.document_id}: {exc}")
             return False
-
-    def _ensure_parse_worker_running(self):
-        self.runtime.ensure_worker_running()
-
-    def _parse_worker_loop(self):
-        self.runtime.parse_worker_loop()
 
     def _process_parse_record(self, record):
         self.runtime.process_record(record)
