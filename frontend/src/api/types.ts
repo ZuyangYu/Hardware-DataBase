@@ -256,6 +256,40 @@ export interface StructuredRowsResponse<T = Record<string, unknown>> {
   rows: T[];
 }
 
+export interface ExternalConversationListItem {
+  conversation_id: string;
+  title: string;
+  source_file: string;
+  origin: string;
+  source_group: string;
+  turn_count: number;
+  block_count: number;
+  status: string;
+  created_at: string;
+  summary?: string;
+  key_points?: string[];
+  summary_generated_at?: string;
+}
+
+export interface ExternalConversationsResponse {
+  items: ExternalConversationListItem[];
+  totals: { count: number };
+}
+
+export interface ExternalConversationTurn {
+  role: string;
+  content: string;
+  ts?: string;
+  start_offset?: number;
+  end_offset?: number;
+}
+
+export interface ExternalConversationDetailResponse extends ExternalConversationListItem {
+  turns: ExternalConversationTurn[];
+  blocks: Record<string, unknown>[];
+  preview: string;
+}
+
 export interface SchematicDesignRow {
   design_id: string;
   status: string;

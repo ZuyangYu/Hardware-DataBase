@@ -5,16 +5,34 @@ from src.agents.state import Evidence
 
 
 class CircuitDatasheetFollowupTests(unittest.TestCase):
-    def test_protection_question_generates_part_number_document_query(self):
+    def test_protection_question_generates_no_document_query_without_verified_links(self):
         calls = _derived_datasheet_calls(
             "电源输出电路是否有短地保护？",
             [{"metadata": {"evidence_kind": "derived_topology", "capability_candidate": True, "part_numbers": ["TPS22919", "TPS22919"]}}],
         )
 
+        self.assertEqual(calls, [])
+
+    def test_verified_links_unlock_record_filtered_part_lookup(self):
+        calls = _derived_datasheet_calls(
+            "电源输出电路是否有短地保护？",
+            [{"metadata": {"evidence_kind": "derived_topology", "capability_candidate": True, "part_numbers": ["TPS22919"]}}],
+            verified_links=[{"refdes": "U1", "part_number": "TPS22919", "record_ids": [42]}],
+        )
+
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["tool_name"], "document_rag")
         self.assertIn("TPS22919", calls[0]["query"])
-        self.assertIn("short", calls[0]["query"].lower())
+        self.assertEqual(calls[0]["filters"], {"allowed_record_ids": [42]})
+
+    def test_parts_without_verified_links_are_never_looked_up(self):
+        calls = _derived_datasheet_calls(
+            "电源输出电路是否有短地保护？",
+            [{"metadata": {"evidence_kind": "derived_topology", "capability_candidate": True, "part_numbers": ["TPS22919"]}}],
+            verified_links=[{"refdes": "U9", "part_number": "OTHER-123", "record_ids": [7]}],
+        )
+
+        self.assertEqual(calls, [])
 
     def test_bias_question_does_not_generate_manual_followup(self):
         calls = _derived_datasheet_calls(
@@ -29,7 +47,7 @@ class CircuitDatasheetFollowupTests(unittest.TestCase):
         self.assertFalse(_is_matching_datasheet_capability("unrelated.pdf", "Current limit is available.", "TPS22919"))
         self.assertFalse(_is_matching_datasheet_capability("TPS22919.pdf", "Pin description and package dimensions.", "TPS22919"))
 
-    def test_retrieval_runs_derived_document_lookup_after_circuit_topology_hit(self):
+    def test_retrieval_skips_derived_lookup_without_verified_links(self):
         document = _DocumentTool()
         state = {
             "kb_name": "kb_hw",
@@ -41,11 +59,30 @@ class CircuitDatasheetFollowupTests(unittest.TestCase):
 
         result = retrieve_evidence(state, {"circuit_query": _CircuitTool(), "document_rag": document})
 
+        self.assertEqual(document.queries, [])
+        self.assertTrue(
+            any(
+                item.get("status") == "skipped_no_verified_datasheet_link"
+                for item in result["retrieval_diagnostics"]
+            )
+        )
+
+    def test_retrieval_runs_record_filtered_lookup_with_verified_links(self):
+        document = _DocumentTool()
+        state = {
+            "kb_name": "kb_hw",
+            "user_query": "电源输出电路是否有短地保护？",
+            "source_plan": {"source_plan": [{"tool_calls": [{"tool_name": "circuit_query", "query": "电源输出电路是否有短地保护？"}]}]},
+            "evidence": [],
+            "trace": [],
+            "_verified_datasheet_links": [{"refdes": "U1", "part_number": "TPS22919", "record_ids": [42]}],
+        }
+
+        retrieve_evidence(state, {"circuit_query": _CircuitTool(), "document_rag": document})
+
         self.assertEqual(len(document.queries), 1)
         self.assertIn("TPS22919", document.queries[0])
-        self.assertEqual(len(result["evidence"]), 2)
-        self.assertEqual(result["evidence"][-1]["metadata"]["evidence_kind"], "datasheet_claim")
-        self.assertEqual(result["retrieval_diagnostics"][-1]["derived_from"], "circuit_part_number")
+        self.assertEqual(document.filters[-1], {"allowed_record_ids": [42]})
 
 
 class _CircuitTool:
@@ -65,9 +102,11 @@ class _CircuitTool:
 class _DocumentTool:
     def __init__(self):
         self.queries = []
+        self.filters = []
 
-    def run(self, query, *args, **kwargs):
+    def run(self, query, *args, filters=None, **kwargs):
         self.queries.append(query)
+        self.filters.append(filters)
         return [
             Evidence(
                 id="document:manual:1",

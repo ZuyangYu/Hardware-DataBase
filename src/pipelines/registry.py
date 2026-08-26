@@ -5,12 +5,15 @@ from typing import Iterable
 
 DATASET_TABLE = "table"
 DATASET_CIRCUIT = "circuit"
+DATASET_CONVERSATION = "external_conversation"
 CONTENT_KIND_DOCUMENT = "document_text"
 CONTENT_KIND_SPREADSHEET = "spreadsheet_table"
 CONTENT_KIND_CIRCUIT = "circuit_design"
+CONTENT_KIND_EXTERNAL_CONVERSATION = "external_conversation"
 PROCESSOR_KIND_RAGFLOW = "ragflow"
 PROCESSOR_KIND_SPREADSHEET = "spreadsheet_table"
 PROCESSOR_KIND_CIRCUIT = "circuit_design"
+PROCESSOR_KIND_EXTERNAL_CONVERSATION = "external_conversation"
 
 PIPELINE_STAGE_RETRIEVAL = "retrieval"
 PIPELINE_STAGE_STRUCTURED = "structured"
@@ -81,8 +84,19 @@ class PipelineRegistry:
                 return spec
         return None
 
-    def route_file(self, file_path: str) -> PipelineRoute:
+    def route_file(self, file_path: str, source_group: str | None = None) -> PipelineRoute:
         extension = normalize_extension(os.path.splitext(file_path)[1])
+        # (source_group, extension) override for text-like files: the 外部数据
+        # group goes to the local conversation pipeline, every other group
+        # (or an unknown group) keeps document semantics via RAGFlow.
+        if extension in TEXT_ROUTABLE_EXTENSIONS:
+            if source_group == EXTERNAL_SOURCE_GROUP:
+                conversation_spec = self.by_processor_kind(PROCESSOR_KIND_EXTERNAL_CONVERSATION)
+                if conversation_spec is not None:
+                    return PipelineRoute(extension=extension, spec=conversation_spec)
+            document_spec = self.by_processor_kind(PROCESSOR_KIND_RAGFLOW)
+            if document_spec is not None:
+                return PipelineRoute(extension=extension, spec=document_spec)
         for spec in self._specs.values():
             if spec.supports_extension(extension):
                 return PipelineRoute(extension=extension, spec=spec)
@@ -148,11 +162,31 @@ PIPELINE_REGISTRY = PipelineRegistry([
         dataset_kind=DATASET_CIRCUIT,
         description="Circuit design netlists archived into the scoped circuit pipeline.",
     ),
+    PipelineSpec(
+        key="external_conversation",
+        label="External Conversation",
+        processor_kind=PROCESSOR_KIND_EXTERNAL_CONVERSATION,
+        content_kind=CONTENT_KIND_EXTERNAL_CONVERSATION,
+        supported_extensions=frozenset({".txt", ".md", ".markdown"}),
+        stage=PIPELINE_STAGE_STRUCTURED,
+        dataset_kind=DATASET_CONVERSATION,
+        description=(
+            "External conversation records (txt/markdown) parsed and indexed "
+            "locally; routed only for the 外部数据 source group."
+        ),
+    ),
 ])
 
+# Text-like extensions are routed by (source_group, extension): only the
+# 外部数据 group goes to the conversation pipeline, everything else keeps
+# document semantics via RAGFlow. The override is consulted before the plain
+# extension loop in route_file.
+TEXT_ROUTABLE_EXTENSIONS = frozenset({".txt", ".md", ".markdown"})
+EXTERNAL_SOURCE_GROUP = "外部数据"
 
-def route_file(file_path: str) -> PipelineRoute:
-    return PIPELINE_REGISTRY.route_file(file_path)
+
+def route_file(file_path: str, source_group: str | None = None) -> PipelineRoute:
+    return PIPELINE_REGISTRY.route_file(file_path, source_group=source_group)
 
 
 def pipeline_for_file(file_path: str) -> PipelineSpec | None:

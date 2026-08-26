@@ -2,10 +2,10 @@
   "annotations": {"list": []},
   "editable": false,
   "panels": [
-    {"type": "timeseries", "title": "Chat turns by status", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "targets": [{"expr": "sum by (status) (rate(hdb_chat_turns_total[$__rate_interval]))", "legendFormat": "{{status}}"}]},
-    {"type": "timeseries", "title": "Chat p95 latency", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "targets": [{"expr": "histogram_quantile(0.95, sum by (le) (rate(hdb_chat_turn_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95"}]},
-    {"type": "timeseries", "title": "Queue depth", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "targets": [{"expr": "max by (queue) (hdb_queue_depth)", "legendFormat": "{{queue}}"}]},
-    {"type": "timeseries", "title": "LLM p95 latency", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "targets": [{"expr": "histogram_quantile(0.95, sum by (le, provider) (rate(hdb_llm_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "{{provider}}"}]}
+    {"type": "timeseries", "title": "Chat turns by status", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "targets": [{"expr": "sum by (status) (increase(hdb_chat_turns_total[$__range]))", "legendFormat": "{{status}}"}]},
+    {"type": "timeseries", "title": "Chat p95 latency", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "targets": [{"expr": "histogram_quantile(0.95, sum by (le) (increase(hdb_chat_turn_duration_seconds_bucket[$__range])))", "legendFormat": "p95"}]},
+    {"type": "timeseries", "title": "Queue depth", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "targets": [{"expr": "max by (queue) (hdb_queue_depth)", "legendFormat": "{{queue}}"}]},
+    {"type": "timeseries", "title": "LLM p95 latency", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "targets": [{"expr": "histogram_quantile(0.95, sum by (le, provider) (rate(hdb_llm_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "{{provider}}"}]}
   ],
   "schemaVersion": 39,
   "style": "dark",

@@ -59,13 +59,70 @@ class CircuitTopologyQueryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hits = self._service(tmp).query(kb_name="kb_hw", query="电源输出电路是否有短地保护？", ctx=None, top_k=10)
 
-        calls = _derived_datasheet_calls("电源输出电路是否有短地保护？", [hit.model_dump() for hit in hits])
         candidate = next(hit for hit in hits if hit.locator["entity_id"] == "power_control_candidate:U1")
         self.assertIn("VCC3V3", candidate.content)
         self.assertIn("VOUT_A", candidate.content)
-        self.assertEqual(len(calls), 1)
-        self.assertIn("TPS22919", calls[0]["query"])
+        # M1 gate: without a verified component-datasheet link no document
+        # lookup is derived from the topology candidate.
+        calls = _derived_datasheet_calls("电源输出电路是否有短地保护？", [hit.model_dump() for hit in hits])
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LinkObservabilityTests(unittest.TestCase):
+    def test_verified_link_followup_diagnostics_are_bounded_and_scoped(self):
+        from src.agents.graph import retrieve_evidence
+
+        class _Doc:
+            def __init__(self):
+                self.filters = []
+
+            def run(self, query, *args, filters=None, **kwargs):
+                self.filters.append(filters)
+                return []
+
+        class _Stub:
+            def run(self, *args, **kwargs):
+                from src.agents.state import Evidence
+
+                return [
+                    Evidence(
+                        id="circuit:7:topology:t:U1",
+                        content="Observed candidate.",
+                        source_name="board.edf",
+                        content_kind="circuit_design",
+                        processor_kind="circuit_design",
+                        metadata={
+                            "evidence_kind": "derived_topology",
+                            "capability_candidate": True,
+                            "part_numbers": ["TPS22919"],
+                        },
+                    )
+                ]
+
+        state = {
+            "kb_name": "kb_hw",
+            "user_query": "电源输出电路是否有短地保护？",
+            "source_plan": {"source_plan": [{"tool_calls": [{"tool_name": "circuit_query", "query": "x"}]}]},
+            "evidence": [],
+            "trace": [],
+            "_verified_datasheet_links": [
+                {"refdes": "U1", "part_number": "TPS22919", "record_ids": [42]}
+            ],
+        }
+        document = _Doc()
+        result = retrieve_evidence(state, {"circuit_query": _Stub(), "document_rag": document})
+
+        followups = [
+            item
+            for item in result["retrieval_diagnostics"]
+            if item.get("derived_from") == "circuit_part_number"
+        ]
+        self.assertEqual(len(followups), 1)
+        item = followups[0]
+        self.assertEqual(item["datasheet_link_status"], "verified")
+        self.assertEqual(item["datasheet_match_method"], "exact_mpn")
+        self.assertEqual(item["allowed_record_ids_count"], 1)

@@ -601,6 +601,8 @@ async def query(
         start = time.monotonic()
         summary: dict = {}
         gen = None
+        answer_parts: list[str] = []
+        first_token_ms: int | None = None
         observation = observe.chain(
             "hdb.chat.turn",
             **{
@@ -613,7 +615,6 @@ async def query(
         observation.set_input(body.query, content_kind="query")
         outcome_status = "failed"
         try:
-            answer_parts: list[str] = []
             gen = _query_generator(
                 pipeline,
                 body.query,
@@ -629,6 +630,8 @@ async def query(
                 if cancel.is_set():
                     break
                 if chunk:
+                    if first_token_ms is None:
+                        first_token_ms = int((time.monotonic() - start) * 1000)
                     answer_parts.append(chunk)
                     _put(("delta", {"text": chunk}))
             summary = pipeline.get_last_retrieval_summary() or {}
@@ -665,6 +668,7 @@ async def query(
             )
         except Exception as exc:  # fail-open: surface the error as an SSE event
             observation.error(exc)
+            outcome_status = "cancelled" if cancel.is_set() else "failed"
             if not cancel.is_set():
                 _put(_stage("generate", "生成回答", "error", "答案生成失败"))
                 q.put(("error", {"message": str(exc)}))
@@ -689,6 +693,13 @@ async def query(
                     except Exception:
                         pass
             duration_ms = int((time.monotonic() - start) * 1000)
+            record_chat_turn(
+                status=outcome_status,
+                mode="deep",
+                duration_s=max(0.0, duration_ms / 1000.0),
+                queue_s=0.0,
+                ttft_s=(first_token_ms / 1000.0) if first_token_ms is not None else None,
+            )
             observation.set("hdb.chat.status", outcome_status)
             observation.set("hdb.chat.latency_ms", duration_ms)
             observation.set("hdb.chat.queue_ms", 0)
@@ -800,6 +811,7 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
     def producer() -> None:
         start = time.monotonic()
         answer_parts: list[str] = []
+        first_token_ms: int | None = None
         usage_summary = None
         observation = observe.chain(
             "hdb.chat.turn",
@@ -819,6 +831,8 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
                 if cancel.is_set():
                     break
                 if delta:
+                    if first_token_ms is None:
+                        first_token_ms = int((time.monotonic() - start) * 1000)
                     answer_parts.append(delta)
                     q.put(("delta", {"text": delta}))
             usage_summary = llm.get_usage_summary()
@@ -850,6 +864,7 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
             outcome_status = "cancelled" if cancel.is_set() else "completed"
         except Exception as exc:
             observation.error(exc)
+            outcome_status = "cancelled" if cancel.is_set() else "failed"
             if not cancel.is_set():
                 _put(_stage("generate", "生成通用回答", "error", "通用回答生成失败"))
                 q.put(("error", {"message": str(exc)}))
@@ -865,6 +880,13 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
             )
         finally:
             duration_ms = int((time.monotonic() - start) * 1000)
+            record_chat_turn(
+                status=outcome_status,
+                mode="fast",
+                duration_s=max(0.0, duration_ms / 1000.0),
+                queue_s=0.0,
+                ttft_s=(first_token_ms / 1000.0) if first_token_ms is not None else None,
+            )
             observation.set("hdb.chat.status", outcome_status)
             observation.set("hdb.chat.latency_ms", duration_ms)
             observation.set("hdb.chat.queue_ms", 0)

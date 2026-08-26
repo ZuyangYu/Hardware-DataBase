@@ -79,9 +79,19 @@ class CircuitAgentToolTests(unittest.TestCase):
         self.assertEqual(index.calls[0]["top_k"], 3)
         self.assertEqual(index.calls[0]["filters"], {"source_name": "main_board.edf"})
 
-    def test_circuit_query_tool_returns_empty_when_no_indexed_data_exists(self):
+    def test_circuit_query_tool_fails_closed_without_department_context(self):
+        import pytest as _pytest
+
+        from src.pipelines.document_rag.schemas import RequestContext as _RequestContext
+
         tool = CircuitQueryTool(index_service=_CircuitIndex())
-        hits = tool.run("U1200 CAN connection", "kb_hw", RequestContext(user_id="alice"), top_k=3)
+        with _pytest.raises(PermissionError):
+            tool.run("U1200 CAN connection", "kb_hw", _RequestContext(user_id="alice"), top_k=3)
+
+    def test_circuit_query_tool_returns_empty_for_authorized_empty_index(self):
+        ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
+        tool = CircuitQueryTool(index_service=_CircuitIndex())
+        hits = tool.run("U1200 CAN connection", "kb_hw", ctx, top_k=3)
         self.assertEqual(hits, [])
 
     def test_runner_uses_injected_circuit_service(self):

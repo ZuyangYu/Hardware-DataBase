@@ -697,6 +697,8 @@ class RAGFlowBackend(RAGBackend):
         self.store = runtime_bundle.store
         self.spreadsheet_indexes = runtime_bundle.spreadsheet_indexes
         self.circuit_indexes = runtime_bundle.circuit_indexes
+        self.conversations = runtime_bundle.conversations
+        self.conversation_indexes = runtime_bundle.conversation_indexes
         self.archive = runtime_bundle.archive
         self.ingestion = runtime_bundle.ingestion
         self.runtime = runtime_bundle.runtime

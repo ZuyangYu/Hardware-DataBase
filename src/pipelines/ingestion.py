@@ -18,10 +18,13 @@ from src.pipelines.document_rag.schemas import (
 from src.pipelines.registry import (
     CONTENT_KIND_CIRCUIT,
     CONTENT_KIND_DOCUMENT,
+    CONTENT_KIND_EXTERNAL_CONVERSATION,
     CONTENT_KIND_SPREADSHEET,
     DATASET_CIRCUIT,
+    DATASET_CONVERSATION,
     PIPELINE_REGISTRY,
     PROCESSOR_KIND_CIRCUIT,
+    PROCESSOR_KIND_EXTERNAL_CONVERSATION,
     PROCESSOR_KIND_RAGFLOW,
     PROCESSOR_KIND_SPREADSHEET,
     PipelineRoute,
@@ -49,6 +52,10 @@ class _IngestLockEntry:
 
 _INGEST_LOCKS: dict[str, _IngestLockEntry] = {}
 _INGEST_LOCKS_GUARD = threading.Lock()
+
+# Single-flight guard for background LLM post-processing per conversation id.
+_EXTERNAL_CONVERSATION_LLM_LOCK = threading.Lock()
+_EXTERNAL_CONVERSATION_LLM_INFLIGHT: set[str] = set()
 
 
 def _noop_audit(*args, **kwargs):
@@ -217,7 +224,7 @@ class IngestionOrchestrator:
 
         for file_path in files:
             filename = os.path.basename(file_path)
-            route = route_file(file_path)
+            route = route_file(file_path, source_group=scope.source_group)
             handler = self._handler_for_route(route)
             archived: ArchivedFile | None = None
             handler_result: HandlerResult | None = None
@@ -721,6 +728,321 @@ class CircuitPipelineHandler(PipelineHandler):
             ok=True,
             message=f"Deleted circuit design archive: {record.document_name}",
             audit_action="circuit_delete_document",
+        )
+
+class ExternalConversationHandler(PipelineHandler):
+    """Synchronous local pipeline for 外部数据 txt/markdown conversation records.
+
+    Write order per design contract C4: archive (done by the orchestrator)
+    -> conversation.json (source of truth) -> index.db -> ledger upsert.
+    Deletion runs in reverse. Terminal status reuses the existing local
+    ``indexed`` enum; failures use ``failed``.
+    """
+
+    def __init__(
+        self,
+        *,
+        spec: PipelineSpec,
+        store: PipelineDocumentStore,
+        conversation_store=None,
+        conversation_indexes=None,
+        vector_index=None,
+        parser=None,
+        llm_client=None,
+    ):
+        self.spec = spec
+        self.store = store
+        if conversation_store is None:
+            from src.external_conversations.store import ExternalConversationStore
+
+            conversation_store = ExternalConversationStore()
+        self.conversation_store = conversation_store
+        if conversation_indexes is None:
+            from src.external_conversations.query_engine import ExternalConversationQueryEngine
+
+            conversation_indexes = ExternalConversationQueryEngine(root=self.conversation_store.root)
+        self.conversation_indexes = conversation_indexes
+        if vector_index is None:
+            from src.external_conversations.vector_index import default_external_conversation_vector_index
+
+            vector_index = default_external_conversation_vector_index
+        self.vector_index = vector_index
+        if parser is None:
+            from src.external_conversations.parsers import parse_external_conversation
+
+            parser = parse_external_conversation
+        self._parser = parser
+        self._llm_client = llm_client
+
+    def _postprocess_llm(self, conversation):
+        """Background LLM refinement: structure inference for marker-less text,
+        then summary extraction. Runs off the upload critical path; persists
+        results back to json + index. Strictly fail-open."""
+        try:
+            from datetime import date
+
+            from src.external_conversations import llm_structure
+
+            if self._llm_client is None:
+                from src.core.llm_client import LLMClient
+
+                self._llm_client = LLMClient()
+
+            changed = False
+            if not conversation.turns and conversation.blocks:
+                inferred = llm_structure.infer_structure(
+                    "\n\n".join(conversation.blocks),
+                    llm_client=self._llm_client,
+                )
+                if inferred:
+                    conversation.turns = inferred["turns"]
+                    conversation.blocks = []
+                    if inferred.get("title"):
+                        conversation.title = inferred["title"]
+                    changed = True
+                    # turns changed -> refresh the keyword index too
+                    self.conversation_indexes.index_conversation(conversation)
+
+            body = "\n".join(t.content for t in conversation.turns) or "\n".join(conversation.blocks)
+            result = llm_structure.summarize_content(body, llm_client=self._llm_client)
+            if result:
+                conversation.summary = result["summary"]
+                conversation.key_points = result["key_points"]
+                conversation.summary_generated_at = date.today().isoformat()
+                changed = True
+
+            if changed or (conversation.summary and not conversation.summary_generated_at):
+                self.conversation_store.save(
+                    conversation,
+                    raw_bytes=None,
+                    raw_ext=os.path.splitext(conversation.source_file)[1] or ".md",
+                )
+        except Exception as exc:
+            from src.core.logger import warn
+
+            warn(f"External conversation LLM post-processing skipped: {exc}")
+
+    def _spawn_postprocess(self, conversation):
+        """Fire-and-forget background refinement, single-flight per id."""
+        with _EXTERNAL_CONVERSATION_LLM_LOCK:
+            if conversation.conversation_id in _EXTERNAL_CONVERSATION_LLM_INFLIGHT:
+                return
+            _EXTERNAL_CONVERSATION_LLM_INFLIGHT.add(conversation.conversation_id)
+
+        def _run():
+            try:
+                self._postprocess_llm(conversation)
+            finally:
+                with _EXTERNAL_CONVERSATION_LLM_LOCK:
+                    _EXTERNAL_CONVERSATION_LLM_INFLIGHT.discard(conversation.conversation_id)
+
+        threading.Thread(target=_run, name="ext-conv-postprocess", daemon=True).start()
+
+    def existing_record_dataset_kind(self, default_dataset_kind: str) -> str:
+        return self.spec.dataset_kind or DATASET_CONVERSATION
+
+    def reuse_message(self, record: PipelineDocumentRecord) -> str:
+        return f"[success] Conversation already indexed: {record.document_name}"
+
+    def submit(
+        self,
+        scope: IngestionScope,
+        archived: ArchivedFile,
+        default_dataset_kind: str,
+        default_dataset_id: str,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> HandlerResult:
+        dataset_kind = self.spec.dataset_kind or DATASET_CONVERSATION
+        document_id = f"conversation:{archived.content_hash[:16]}"
+        self.store.upsert_document(
+            kb_name=scope.kb_name,
+            document_name=archived.filename,
+            dataset_kind=dataset_kind,
+            dataset_id="",
+            document_id=document_id,
+            source_group=archived.source_group,
+            department_id=scope.department_id,
+            uploaded_by=scope.uploaded_by,
+            kb_id=scope.kb_id,
+            status=RAGFLOW_STATUS_PARSING,
+            original_file_name=os.path.basename(archived.original_path),
+            local_path=archived.relative_local_path,
+            file_size=archived.file_size,
+            content_hash=archived.content_hash,
+            upload_status=TABLE_STATUS_ARCHIVED,
+            content_kind=CONTENT_KIND_EXTERNAL_CONVERSATION,
+            processor_kind=PROCESSOR_KIND_EXTERNAL_CONVERSATION,
+            parse_progress=10,
+            parse_stage="解析外部对话记录",
+        )
+        record = self.store.get_document(
+            scope.kb_name,
+            archived.filename,
+            dataset_kind,
+            department_id=scope.department_id,
+        )
+        record_id = record.id if record else None
+        warnings: list[str] = []
+        warning = archived.inspection.to_warning_message()
+        if warning:
+            warnings.append(warning)
+        try:
+            if progress_callback:
+                progress_callback(40, f"{archived.filename}: 解析对话结构")
+            with open(archived.archived_path, "rb") as f:
+                raw_bytes = f.read()
+            conversation = self._parser(
+                archived.archived_path,
+                archived.filename,
+                scope.kb_name,
+                department_id=scope.department_id,
+                kb_id=scope.kb_id,
+                origin="upload",
+                source_group=archived.source_group,
+            )
+            if progress_callback:
+                progress_callback(70, f"{archived.filename}: 写入存储与索引")
+            self.conversation_store.save(conversation, raw_bytes=raw_bytes, raw_ext=os.path.splitext(archived.filename)[1])
+            self.conversation_indexes.index_conversation(conversation)
+            # vector supplement is a no-op without an embed model; never fatal
+            try:
+                self.vector_index.reindex_conversation(conversation)
+            except Exception as exc:
+                from src.core.logger import warn
+
+                warn(f"External conversation vector indexing skipped: {exc}")
+            # LLM refinement (structure inference + summary) runs in the
+            # background so the upload request returns immediately.
+            self._spawn_postprocess(conversation)
+            turn_count = len(conversation.turns) or len(conversation.blocks)
+            message = f"[success] 已解析并索引外部对话: {archived.filename}（{turn_count} 条）"
+            if record_id:
+                # Re-point the ledger row at the real conversation_id so later
+                # deletion can map document -> stored directory 1:1.
+                self.store.upsert_document(
+                    kb_name=scope.kb_name,
+                    document_name=archived.filename,
+                    dataset_kind=dataset_kind,
+                    dataset_id="",
+                    document_id=conversation.conversation_id,
+                    source_group=archived.source_group,
+                    department_id=scope.department_id,
+                    uploaded_by=scope.uploaded_by,
+                    kb_id=scope.kb_id,
+                    status=TABLE_STATUS_INDEXED,
+                    original_file_name=os.path.basename(archived.original_path),
+                    local_path=archived.relative_local_path,
+                    file_size=archived.file_size,
+                    content_hash=archived.content_hash,
+                    upload_status=TABLE_STATUS_ARCHIVED,
+                    content_kind=CONTENT_KIND_EXTERNAL_CONVERSATION,
+                    processor_kind=PROCESSOR_KIND_EXTERNAL_CONVERSATION,
+                    parse_progress=100,
+                    parse_stage=message,
+                )
+                refreshed = self.store.get_document(
+                    scope.kb_name,
+                    archived.filename,
+                    dataset_kind,
+                    department_id=scope.department_id,
+                )
+                record_id = refreshed.id if refreshed else record_id
+            if progress_callback:
+                progress_callback(100, message)
+            return HandlerResult(
+                success=True,
+                message=message,
+                document_id=document_id,
+                record_id=record_id,
+                status=TABLE_STATUS_INDEXED,
+                warnings=warnings,
+                audit_action="external_conversation_indexed",
+                audit_metadata={
+                    "store_id": record_id,
+                    "kb_id": scope.kb_id,
+                    "dataset_kind": dataset_kind,
+                    "content_kind": CONTENT_KIND_EXTERNAL_CONVERSATION,
+                    "processor_kind": PROCESSOR_KIND_EXTERNAL_CONVERSATION,
+                    "source_group": archived.source_group,
+                    "local_path": archived.relative_local_path,
+                    "content_hash": archived.content_hash,
+                    "status": TABLE_STATUS_INDEXED,
+                    "conversation_id": conversation.conversation_id,
+                    "turn_count": len(conversation.turns),
+                    "block_count": len(conversation.blocks),
+                    "container_inspection": archived.inspection.to_metadata(),
+                },
+            )
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            if record_id:
+                self.store.update_document_progress_by_id(
+                    record_id,
+                    100,
+                    "外部对话解析失败",
+                    status=RAGFLOW_STATUS_FAILED,
+                    error_message=error_message,
+                )
+            if progress_callback:
+                progress_callback(100, f"{archived.filename}: 外部对话解析失败")
+            return HandlerResult(
+                success=False,
+                message=f"[failed] 外部对话解析失败: {archived.filename}: {exc}",
+                document_id=document_id,
+                record_id=record_id,
+                status=RAGFLOW_STATUS_FAILED,
+                warnings=warnings,
+                audit_action="external_conversation_failed",
+                audit_metadata={
+                    "store_id": record_id,
+                    "kb_id": scope.kb_id,
+                    "dataset_kind": dataset_kind,
+                    "content_kind": CONTENT_KIND_EXTERNAL_CONVERSATION,
+                    "processor_kind": PROCESSOR_KIND_EXTERNAL_CONVERSATION,
+                    "source_group": archived.source_group,
+                    "status": RAGFLOW_STATUS_FAILED,
+                    "error_message": error_message,
+                },
+                preserve_failed_record=True,
+            )
+
+    def rollback(self, result: HandlerResult, scope: IngestionScope):
+        if result.record_id:
+            self.store.delete_document_by_id(result.record_id)
+
+    def delete_record(self, record: PipelineDocumentRecord, archive: DocumentArchiveManager) -> HandlerDeleteResult:
+        errors: list[str] = []
+        # reverse write order: index first, then store directory, then
+        # archive, then the ledger row.
+        try:
+            self.vector_index.delete_conversation(record.kb_name, record.document_id, record.department_id)
+        except Exception as exc:
+            errors.append(f"vector: {exc}")
+        try:
+            self.conversation_indexes.delete_conversation(record.department_id, record.kb_name, record.document_id)
+        except Exception as exc:
+            errors.append(f"index: {exc}")
+        try:
+            # document_id equals the parser conversation_id after submit's re-point
+            self.conversation_store.delete_conversation(record.department_id, record.kb_name, record.document_id)
+        except Exception as exc:
+            errors.append(f"store: {exc}")
+        try:
+            archive.remove_record_archive(record)
+        except Exception as exc:
+            errors.append(f"archive: {exc}")
+        if errors:
+            return HandlerDeleteResult(
+                ok=False,
+                message=f"External conversation cleanup failed for {record.document_name}",
+                errors=errors,
+                audit_action="external_conversation_delete_failed",
+            )
+        self.store.delete_document_by_id(record.id)
+        return HandlerDeleteResult(
+            ok=True,
+            message=f"Deleted external conversation: {record.document_name}",
+            audit_action="external_conversation_delete_document",
         )
 
 class SpreadsheetPipelineHandler(PipelineHandler):

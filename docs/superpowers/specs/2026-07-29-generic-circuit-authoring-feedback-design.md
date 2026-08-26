@@ -116,3 +116,13 @@ Harness 中已有的能力白名单继续允许上述两个能力。
 - 无网络和 OrCAD 前缀情况可见、可追溯、且有测试覆盖。
 - 生成的文档在发布前可预览并可提交反馈。
 - 测试同时证明 ICD 场景和无关项目场景均可用。
+
+## 后续项（2026-08-24 追加）：DSN/原生原理图/PDF 页面解析
+
+依据 `2026-08-24-circuit-semantic-entity-resolution.md` 任务 7：
+
+- EDF 的 `refdes_page` 分组是启发式模块划分，`orcad_page_name` 仅代表源页归属；
+  二者均不得冒充 CAD/PDF 页面实体。
+- 只有在接入真正的页面实体、标题栏或坐标解析后，才允许将对应
+  `CircuitStructureCoverage` 字段标为 `available`；当前一律为 `unavailable`，
+  查询层如实回答"不具备该数据"。

@@ -295,6 +295,44 @@ class SpreadsheetLedgerResponse(BaseModel):
     rows: list[dict] = Field(default_factory=list)
 
 
+class ExternalConversationListItem(BaseModel):
+    conversation_id: str
+    title: str = ""
+    source_file: str = ""
+    origin: str = "upload"
+    source_group: str = ""
+    turn_count: int = 0
+    block_count: int = 0
+    status: str = ""
+    created_at: str = ""
+    summary: str = ""
+    key_points: list[str] = Field(default_factory=list)
+    summary_generated_at: str = ""
+
+
+class ExternalConversationsResponse(BaseModel):
+    items: list[ExternalConversationListItem] = Field(default_factory=list)
+    totals: dict = Field(default_factory=dict)
+
+
+class ExternalConversationDetailResponse(BaseModel):
+    conversation_id: str
+    title: str = ""
+    source_file: str = ""
+    origin: str = "upload"
+    source_group: str = ""
+    turn_count: int = 0
+    block_count: int = 0
+    status: str = ""
+    created_at: str = ""
+    turns: list[dict] = Field(default_factory=list)
+    blocks: list[dict] = Field(default_factory=list)
+    preview: str = ""
+    summary: str = ""
+    key_points: list[str] = Field(default_factory=list)
+    summary_generated_at: str = ""
+
+
 class CircuitDesignsResponse(BaseModel):
     designs: list[dict] = Field(default_factory=list)
     failed_logs: list[dict] = Field(default_factory=list)

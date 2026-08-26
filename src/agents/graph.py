@@ -175,6 +175,9 @@ _LEGACY_PROCESSOR_CAPABILITIES: dict[str, set[str]] = {
     },
     "spreadsheet_table": {"entity_lookup", "tabular_lookup", "revision_lookup"},
     "ragflow": {"entity_lookup", "document_claim_lookup"},
+    # External conversations are free-text Q&A records: they behave like
+    # text documents for claim support purposes.
+    "external_conversation": {"entity_lookup", "document_claim_lookup"},
 }
 
 _QUERYABLE_CIRCUIT_STATUSES = {"", "indexed", "degraded"}
@@ -945,6 +948,8 @@ def _source_matches_analysis(source: dict[str, Any], analysis: dict[str, Any]) -
             return False, "电路文件尚未索引成功，跳过结构化电路检索。"
         if "circuit_design" in expected:
             return True, "该文件是结构化电路设计数据，适合查询网表、引脚、网络连接和拓扑事实。"
+    if processor == "external_conversation":
+        return True, "该文件是外部对话记录，适合检索历史问答、经验结论和参数细节。"
     if content_kind == "document_text" and "document_text" in expected:
         return True, "该文件是文本文档，适合查询设计说明、测试报告、规格说明和上下文解释。"
     entity_hit = any(str(entity).casefold() in name.casefold() for entity in analysis.get("entities", []))
@@ -1205,6 +1210,16 @@ def plan_source_selection(state: AgentState) -> AgentState:
                     filters=compact_filters,
                 )
             )
+        elif processor == "external_conversation":
+            calls.append(
+                ToolCallPlan(
+                    tool_name="conversation_search",
+                    query=query,
+                    reason="检索外部对话记录，覆盖历史问答与经验结论。",
+                    top_k=8,
+                    filters=compact_filters,
+                )
+            )
         else:
             calls.append(
                 ToolCallPlan(
@@ -1270,6 +1285,7 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         "- spreadsheet_semantic: use for spreadsheet_table row-level facts\n"
         "- spreadsheet_cell: use for spreadsheet_table exact cells, part numbers, quantities, parameters\n\n"
         "- circuit_query: use for circuit_design netlist/schematic connection facts\n\n"
+        "- conversation_search: use for external_conversation sources (外部数据 txt/markdown 对话记录,历史问答与经验结论)\n\n"
         "Planning requirements:\n"
         "- Build search fanout from the sub_questions, not a single best source.\n"
         "- If different sub_questions need different evidence types or corpora, select multiple sources and tool calls.\n"
@@ -1277,12 +1293,12 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
         "- For spreadsheet_table sources, prefer both spreadsheet_semantic and spreadsheet_cell when exact fields/parts/models may matter.\n"
         "- Do not add sources by rule; every selected source must be justified by the question analysis and catalog.\n"
         "- source_name MUST be copied verbatim from the catalog's document_name field — never invent or paraphrase it.\n"
-        "- tool_name MUST be exactly one of: document_rag | spreadsheet_semantic | spreadsheet_cell | circuit_query. Never combine two names.\n\n"
+        "- tool_name MUST be exactly one of: document_rag | spreadsheet_semantic | spreadsheet_cell | circuit_query | conversation_search. Never combine two names. external_conversation 类源必须用 conversation_search。\n\n"
         "Call the emit_retrieval_plan tool with arguments matching this schema:\n"
         "{\n"
         '  "source_plan": [\n'
         '    {"source_name": "must exactly match catalog document_name", "reason": "visible reason", '
-        '"tool_calls": [{"tool_name": "document_rag|spreadsheet_semantic|spreadsheet_cell|circuit_query", '
+        '"tool_calls": [{"tool_name": "document_rag|spreadsheet_semantic|spreadsheet_cell|circuit_query|conversation_search", '
         '"query": "rewritten retrieval query", "reason": "visible reason", "top_k": 8}]}\n'
         "  ],\n"
         '  "skipped_sources": [{"source_name": "...", "reason": "..."}]\n'
@@ -1354,6 +1370,8 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
                 if processor == "spreadsheet_table"
                 else {"circuit_query"}
                 if processor == "circuit_design"
+                else {"conversation_search"}
+                if processor == "external_conversation"
                 else {"document_rag"}
             )
             filters = {
@@ -1391,6 +1409,41 @@ def plan_source_selection_with_llm(state: AgentState, llm_client: Any | None = N
 
         if not plan_items:
             raise ValueError("LLM planner returned no usable source_plan items")
+
+        # Guarantee: external conversation records are always searched — the
+        # local index query is cheap and these records carry history that the
+        # question analysis cannot anticipate. Never let the LLM skip them.
+        for source in visible_sources:
+            if source.get("processor_kind") != "external_conversation":
+                continue
+            source_name = str(source.get("document_name") or "")
+            if not source_name or source_name in used_sources:
+                continue
+            compact_filters = {
+                key: value
+                for key, value in {
+                    "source_name": source_name,
+                    "record_id": source.get("record_id"),
+                }.items()
+                if value
+            }
+            plan_items.append(
+                SourcePlanItem(
+                    source_name=source_name,
+                    processor_kind="external_conversation",
+                    reason="外部对话记录保底召回：本地索引检索历史问答与经验结论。",
+                    tool_calls=[
+                        ToolCallPlan(
+                            tool_name="conversation_search",
+                            query=str(state.get("user_query") or ""),
+                            reason="检索外部对话中的历史问答与经验结论。",
+                            top_k=8,
+                            filters=compact_filters,
+                        )
+                    ],
+                )
+            )
+            used_sources.add(source_name)
 
         skipped = []
         for item in payload.get("skipped_sources") or []:
@@ -1477,6 +1530,8 @@ def _allowed_tools_for_processor(processor_kind: str) -> set[str]:
         return {"spreadsheet_semantic", "spreadsheet_cell"}
     if processor_kind == "circuit_design":
         return {"circuit_query"}
+    if processor_kind == "external_conversation":
+        return {"conversation_search"}
     return {"document_rag"}
 
 
@@ -1500,6 +1555,8 @@ def _tool_for_evidence_type(evidence_type: str) -> str:
         return "spreadsheet_semantic"
     if evidence_type == "circuit_design":
         return "circuit_query"
+    if evidence_type == "external_conversation":
+        return "conversation_search"
     return "document_rag"
 
 

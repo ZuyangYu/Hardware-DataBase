@@ -137,6 +137,7 @@ class AppPipeline:
                 document_store=getattr(self.backend, "store", None),
                 spreadsheet_service=getattr(self.backend, "spreadsheet_indexes", None),
                 circuit_service=getattr(self.backend, "circuit_indexes", None),
+                conversation_service=getattr(self.backend, "conversation_indexes", None),
             )
             # Authoring is deliberately a sibling of the query agent.  It
             # shares source/evidence services but never stores WorkOrder state
@@ -481,6 +482,80 @@ class AppPipeline:
 
     def list_file_infos(self, kb_name: str, ctx: RequestContext | None = None):
         return self.documents.list_file_infos(kb_name, ctx=ctx)
+
+    # ---- external conversations (外部对话) ------------------------------
+    def list_external_conversations(self, kb_name: str, ctx: RequestContext | None = None):
+        scope = kb_scope_from_context(kb_name, ctx).require_department("list external conversations in")
+        return self.backend.conversation_indexes.list_conversations(scope.department_id, kb_name)
+
+    def get_external_conversation(self, kb_name: str, conversation_id: str, ctx: RequestContext | None = None):
+        scope = kb_scope_from_context(kb_name, ctx).require_department("read an external conversation in")
+        meta = self.backend.conversation_indexes.get_conversation(scope.department_id, kb_name, conversation_id)
+        if meta is None:
+            return None
+        preview = ""
+        conversation = self.backend.conversations.load(scope.department_id, kb_name, conversation_id)
+        if conversation is not None:
+            turns = [
+                {
+                    "role": t.role,
+                    "content": t.content,
+                    "ts": t.ts,
+                    "start_offset": t.start_offset,
+                    "end_offset": t.end_offset,
+                }
+                for t in conversation.turns
+            ]
+            blocks = [{"index": i, "content": block} for i, block in enumerate(conversation.blocks)]
+        else:
+            turns, blocks = [], []
+            try:
+                raw_path = os.path.join(
+                    self.backend.conversations.conversation_dir(scope.department_id, kb_name, conversation_id),
+                    "original.md",
+                )
+                with open(raw_path, "r", encoding="utf-8", errors="replace") as f:
+                    preview = f.read(4000)
+            except OSError:
+                preview = ""
+        return {**meta, "turns": turns, "blocks": blocks, "preview": preview}
+
+    def delete_external_conversation(self, kb_name: str, conversation_id: str, ctx: RequestContext | None = None) -> bool:
+        scope = kb_scope_from_context(kb_name, ctx).require_department("delete an external conversation in")
+        removed_index = self.backend.conversation_indexes.delete_conversation(scope.department_id, kb_name, conversation_id)
+        removed_store = self.backend.conversations.delete_conversation(scope.department_id, kb_name, conversation_id)
+        return bool(removed_index or removed_store)
+
+    def regenerate_external_conversation_summary(self, kb_name: str, conversation_id: str, ctx: RequestContext | None = None):
+        """(Re)generate AI extraction for one conversation; returns updated detail or None."""
+        from src.external_conversations import llm_structure
+        from datetime import date
+
+        scope = kb_scope_from_context(kb_name, ctx).require_department("summarize an external conversation in")
+        conversation = self.backend.conversations.load(scope.department_id, kb_name, conversation_id)
+        if conversation is None:
+            return None
+        body = "\n".join(t.content for t in conversation.turns) or "\n".join(conversation.blocks)
+        result = llm_structure.summarize_content(body)
+        if result is None:
+            return None
+        conversation.summary = result["summary"]
+        conversation.key_points = result["key_points"]
+        conversation.summary_generated_at = date.today().isoformat()
+        self.backend.conversations.save(
+            conversation,
+            raw_bytes=None,
+            raw_ext=os.path.splitext(conversation.source_file)[1] or ".md",
+        )
+        self.backend.conversation_indexes.update_summary(
+            scope.department_id,
+            kb_name,
+            conversation_id,
+            conversation.summary,
+            conversation.key_points,
+            conversation.summary_generated_at,
+        )
+        return self.get_external_conversation(kb_name, conversation_id, ctx=ctx)
 
     def list_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
         return self.documents.list_parse_tasks(kb_name, ctx=ctx)

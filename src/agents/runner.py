@@ -25,6 +25,7 @@ from src.agents.graph import (
 from src.agents.prompts import ANSWER_SYSTEM_PROMPT, GROUNDING_SYSTEM_PROMPT
 from src.agents.tools.circuit_tools import CircuitQueryTool
 from src.agents.tools.document_rag_tool import DocumentRAGTool
+from src.agents.tools.external_conversation_tools import ExternalConversationSearchTool
 from src.agents.tools.pipeline_catalog_tool import PipelineCatalogTool
 from src.agents.tools.spreadsheet_tools import SpreadsheetCellTool, SpreadsheetProfileTool, SpreadsheetSemanticTool
 from src.core.llm_client import LLMClient
@@ -236,12 +237,18 @@ class MultiSourceAgentRunner:
         document_store: PipelineDocumentStore | None = None,
         spreadsheet_service: SpreadsheetIndexService | None = None,
         circuit_service: CircuitIndexService | None = None,
+        conversation_service=None,
         llm_client: LLMClient | None = None,
     ):
         self.rag_backend = rag_backend
         self.document_store = document_store or PipelineDocumentStore()
         self.spreadsheet_service = spreadsheet_service or SpreadsheetIndexService()
         self.circuit_service = circuit_service or CircuitIndexService()
+        if conversation_service is None:
+            from src.external_conversations.query_engine import ExternalConversationQueryEngine
+
+            conversation_service = ExternalConversationQueryEngine()
+        self.conversation_service = conversation_service
         self.llm_client = llm_client or LLMClient()
         # Start this context's run record empty so a freshly constructed runner
         # (incl. one built per test) never inherits stale state left in the
@@ -260,6 +267,7 @@ class MultiSourceAgentRunner:
             "spreadsheet_semantic": SpreadsheetSemanticTool(self.spreadsheet_service),
             "spreadsheet_cell": SpreadsheetCellTool(self.spreadsheet_service),
             "spreadsheet_profile": SpreadsheetProfileTool(self.spreadsheet_service),
+            "conversation_search": ExternalConversationSearchTool(self.conversation_service),
         }
         nodes = {
             "analyze_question": lambda state: analyze_question_with_llm(state, self.llm_client),

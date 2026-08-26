@@ -20,6 +20,7 @@ from src.pipelines.document_rag.schemas import (
 )
 import config.settings
 from src.observability import init_observability
+from src.observability.metrics import record_chat_turn
 from src.ui.evaluation_page import render_evaluation_page
 from src.ui.document_generation_page import render_document_generation_page
 
@@ -2009,6 +2010,13 @@ def render_chat_tab(pipeline):
         assistant_message = persist_chat_message("assistant", persisted_response)
         latency_ms = int((time.perf_counter() - query_started_at) * 1000)
         query_status, query_error_message = query_trace_status(full_response)
+        record_chat_turn(
+            status="completed" if query_status == "success" else "failed",
+            mode="deep",
+            duration_s=max(0.0, latency_ms / 1000.0),
+            queue_s=0.0,
+            ttft_s=None,
+        )
         retrieval_summary = (
             pipeline.get_last_retrieval_summary()
             if hasattr(pipeline, "get_last_retrieval_summary")

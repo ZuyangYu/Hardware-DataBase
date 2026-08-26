@@ -666,7 +666,7 @@ class CircuitIndexServiceTests(unittest.TestCase):
 
             hits = service.query(
                 kb_name="kb_hw",
-                query="Power MCU connection",
+                query="Power module connection",
                 ctx=RequestContext(user_id="alice", metadata={"department_id": "dept_hw"}),
                 top_k=10,
             )

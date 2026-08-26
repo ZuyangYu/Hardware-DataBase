@@ -12,6 +12,7 @@ export type AppIconName =
   | 'history'
   | 'logout'
   | 'lock'
+  | 'message'
   | 'plus'
   | 'refresh'
   | 'search'
@@ -42,6 +43,7 @@ const iconPaths: Record<AppIconName, string[]> = {
   history: ['M4 7v5h5', 'M4.8 12a7.2 7.2 0 1 0 2.1-5.1L4 9.8', 'M12 8v4l3 2'],
   logout: ['M9 5H6.5A2.5 2.5 0 0 0 4 7.5v9A2.5 2.5 0 0 0 6.5 19H9', 'M14 8l4 4-4 4', 'M18 12H9'],
   lock: ['M7 11h10v9H7v-9Z', 'M9 11V8a3 3 0 0 1 6 0v3'],
+  message: ['M4 6h16v10H9l-5 4V6Z', 'M8 10h8', 'M8 13h5'],
   plus: ['M12 5v14', 'M5 12h14'],
   refresh: ['M19 8a7 7 0 0 0-12.2-2.4L5 8', 'M5 5v3h3', 'M5 16a7 7 0 0 0 12.2 2.4L19 16', 'M19 19v-3h-3'],
   search: ['M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z', 'M16.5 16.5 21 21'],

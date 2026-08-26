@@ -60,5 +60,45 @@ class CircuitQuestionAnalysisTests(unittest.TestCase):
                 self.assertNotIn("power_path", analyze_question(question).operations)
 
 
+class StructureAndRoleIntentTests(unittest.TestCase):
+    def test_structure_questions_select_overview_and_module_operations(self):
+        overview = analyze_question("原理图的结构信息是什么")
+        profile = analyze_question("查看设计概况")
+        modules = analyze_question("列出所有模块")
+
+        for plan in (overview, profile):
+            self.assertIn("structure_overview", plan.operations)
+        self.assertIn("module_list", modules.operations)
+        # Analysis describes capability only; it never names a device.
+        self.assertIsNone(overview.role_term)
+
+    def test_visual_structure_capability_is_described_not_asserted(self):
+        plan = analyze_question("原理图页面和坐标数据有哪些")
+
+        self.assertIn("visual_structure", plan.operations)
+        self.assertNotIn("structure_overview", plan.operations)
+
+    def test_role_terms_map_to_entity_role_with_term_capture(self):
+        soc = analyze_question("SoC 的连接关系")
+        mcu = analyze_question("MCU 连接")
+        controller = analyze_question("主控的供电路径")
+
+        self.assertIn("entity_role", soc.operations)
+        self.assertEqual(soc.role_term.casefold(), "soc")
+        self.assertIn("entity_role", mcu.operations)
+        self.assertEqual(mcu.role_term.casefold(), "mcu")
+        self.assertIn("entity_role", controller.operations)
+        self.assertEqual(controller.role_term, "主控")
+        # Family words are retrieval intent only.
+        self.assertFalse(controller.requires_datasheet)
+
+    def test_non_role_words_do_not_trigger_entity_role(self):
+        for question in ("CAN0 连接到哪里", "U900D 引脚", "上拉电阻阻值"):
+            with self.subTest(question=question):
+                plan = analyze_question(question)
+                self.assertNotIn("entity_role", plan.operations)
+                self.assertIsNone(plan.role_term)
+
+
 if __name__ == "__main__":
     unittest.main()
