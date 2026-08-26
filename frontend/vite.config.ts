@@ -17,8 +17,9 @@ export default defineConfig({
   server: {
     // Allow direct access from the host network as well as cloudflared 隧道域名(公网演示用)。
     // 保持域名白名单而非 allowedHosts: true,避免任意 Host 头访问 dev server。
+    // 端口与 scripts/hdb.sh 的 FRONT_PORT 保持一致(5174)。
     host: '0.0.0.0',
-    port: 5175,
+    port: 5174,
     allowedHosts: ['.trycloudflare.com'],
     proxy: {
       '/api': {

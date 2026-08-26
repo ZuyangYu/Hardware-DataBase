@@ -9,6 +9,7 @@ annotated-doc==0.0.4
 annotated-types==0.7.0
 anthropic==0.125.0
 anyio==4.11.0
+asgiref==3.12.1
 attrs==25.4.0
 banks==2.4.5
 bracex==3.0.1
@@ -33,10 +34,12 @@ fsspec==2026.4.0
 google-auth==2.57.0
 google-genai==2.8.0 ; python_full_version < '3.14'
 google-genai==2.19.0 ; python_full_version >= '3.14'
+googleapis-common-protos==1.75.2
 greenlet==3.5.3
 griffe==2.1.0
 griffecli==2.1.0
 griffelib==2.1.0
+grpcio==1.83.0
 h11==0.16.0
 httpcore==1.0.9
 httptools==0.8.0
@@ -72,6 +75,22 @@ nltk==3.10.0
 numpy==2.3.5
 ollama==0.6.2
 openai==2.45.0
+openinference-instrumentation==0.1.59
+openinference-semantic-conventions==0.1.33
+opentelemetry-api==1.44.0
+opentelemetry-exporter-otlp==1.44.0
+opentelemetry-exporter-otlp-proto-common==1.44.0
+opentelemetry-exporter-otlp-proto-grpc==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-instrumentation==0.65b0
+opentelemetry-instrumentation-asgi==0.65b0
+opentelemetry-instrumentation-fastapi==0.65b0
+opentelemetry-instrumentation-httpx==0.65b0
+opentelemetry-instrumentation-requests==0.65b0
+opentelemetry-proto==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-semantic-conventions==0.65b0
+opentelemetry-util-http==0.65b0
 orjson==3.11.9
 ormsgpack==1.12.2
 packaging==25.0
@@ -79,6 +98,7 @@ pandas==2.3.3
 pillow==11.3.0
 platformdirs==4.10.0
 propcache==0.5.2
+protobuf==7.36.0
 pyasn1==0.6.4
 pyasn1-modules==0.4.2
 pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
