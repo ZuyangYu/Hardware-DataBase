@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 
 import config.settings
 
+# Sentinel kb_name persisted in chat sessions/turns for general (non-KB) chat.
+# The literal value is part of the durable schema; never change it.
+GENERAL_CHAT_KB_NAME = "__general__"
+
 
 @dataclass
 class ChatSession:

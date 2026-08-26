@@ -50,6 +50,8 @@ import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 
+// Mirrors backend canonical labels (src/pipelines/document_rag/schemas.py
+// TASK_STATUS_LABELS); cross-language, so keep both in sync manually.
 const STATUS_LABELS: Record<string, string> = {
   completed: '已完成',
   parsed: '已完成',

@@ -109,6 +109,19 @@ TASK_STATUS_DEAD_LETTER = "dead_letter"
 
 _PROCESSOR_SPREADSHEET = "spreadsheet_table"
 
+# Canonical Chinese display labels for normalized parse statuses. Single source
+# shared by parse_status_view / parse_status_label (backend) — the frontend
+# keeps a mirrored copy in KbFilesPage.tsx STATUS_LABELS; update both together.
+TASK_STATUS_LABELS = {
+    TASK_STATUS_QUEUED: "排队中",
+    TASK_STATUS_RUNNING: "解析中",
+    TASK_STATUS_PAUSED: "已暂停",
+    TASK_STATUS_COMPLETED: "已解析",
+    TASK_STATUS_FAILED: "解析失败",
+    TASK_STATUS_CANCELLED: "已停止",
+    TASK_STATUS_UNKNOWN: "状态未知",
+}
+
 
 @dataclass
 class IngestResult:
@@ -189,20 +202,27 @@ def normalize_parse_status(raw_status: object, processor_kind: str = "") -> str:
     return TASK_STATUS_UNKNOWN
 
 
+def parse_status_label(raw_status: object) -> str:
+    """Chinese display label for any raw parse status string."""
+    normalized = normalize_parse_status(raw_status)
+    return TASK_STATUS_LABELS.get(normalized, str(raw_status or "").strip() or "-")
+
+
 def parse_status_view(raw_status: object, processor_kind: str = "") -> ParseStatusView:
     raw = str(raw_status or "").strip().lower()
     normalized = normalize_parse_status(raw, processor_kind)
     is_spreadsheet = str(processor_kind or "").strip().lower() == _PROCESSOR_SPREADSHEET
-    labels = {
-        TASK_STATUS_QUEUED: ("排队中", "等待解析"),
-        TASK_STATUS_RUNNING: ("解析中", "暂不可检索"),
-        TASK_STATUS_PAUSED: ("已暂停", "暂不可检索"),
-        TASK_STATUS_COMPLETED: ("已解析", "结构化解析" if is_spreadsheet else "可检索"),
-        TASK_STATUS_FAILED: ("解析失败", "不可检索"),
-        TASK_STATUS_CANCELLED: ("已停止", "不可检索"),
-        TASK_STATUS_UNKNOWN: ("状态未知", "状态待确认"),
+    searchability_map = {
+        TASK_STATUS_QUEUED: "等待解析",
+        TASK_STATUS_RUNNING: "暂不可检索",
+        TASK_STATUS_PAUSED: "暂不可检索",
+        TASK_STATUS_COMPLETED: "结构化解析" if is_spreadsheet else "可检索",
+        TASK_STATUS_FAILED: "不可检索",
+        TASK_STATUS_CANCELLED: "不可检索",
+        TASK_STATUS_UNKNOWN: "状态待确认",
     }
-    label, searchability = labels.get(normalized, (normalized, "状态待确认"))
+    label = TASK_STATUS_LABELS.get(normalized, normalized)
+    searchability = searchability_map.get(normalized, "状态待确认")
     is_success = normalized == TASK_STATUS_COMPLETED
     is_failed = normalized == TASK_STATUS_FAILED
     is_terminal = normalized in {TASK_STATUS_COMPLETED, TASK_STATUS_FAILED, TASK_STATUS_CANCELLED}

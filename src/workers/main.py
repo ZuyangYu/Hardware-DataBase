@@ -6,10 +6,10 @@ import uuid
 
 import config.settings
 from src.api.context import build_context_for_user
-from src.api.routes.query import GENERAL_CHAT_KB_NAME, _run_turn
+from src.api.routes.query import _run_turn
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService
-from src.core.conversation import ConversationService
+from src.core.conversation import GENERAL_CHAT_KB_NAME, ConversationService
 from src.core.logger import error, log
 from src.observability import init_observability, shutdown_observability
 from src.observability.metrics import record_worker, set_queue_state
