@@ -31,8 +31,8 @@ from src.document_authoring.writers.managed import LLMManagedWriter
 from src.document_authoring.writers.provider import WriterRequest
 from src.core.app_pipeline import AppPipeline
 from src.pipelines.document_rag.schemas import RequestContext
-from test_document_authoring_p2a import _prepare_project
-from test_template_sanitizer import _workbook_with_vba_external_link_and_embedded_object
+from tests.test_document_authoring_p2a import _prepare_project
+from tests.test_template_sanitizer import _workbook_with_vba_external_link_and_embedded_object
 
 
 def _docx_with_text(text: str) -> bytes:
