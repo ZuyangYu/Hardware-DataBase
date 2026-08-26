@@ -64,6 +64,14 @@ class RunStateStoreTests(unittest.TestCase):
         self.assertEqual(store.load().status, "queued")
         self.assertFalse(store.path.with_suffix(".json.tmp").exists())
 
+    def test_scoring_progress_tracks_groups_and_items(self):
+        store = self._store(status="running")
+
+        state = store.update_scoring_progress(1, 2, completed_items=3, total_items=10)
+
+        self.assertEqual((state.scoring_completed_groups, state.scoring_total_groups), (1, 2))
+        self.assertEqual((state.scoring_completed_items, state.scoring_total_items), (3, 10))
+
     def test_pause_cancel_and_orphan_transitions_are_valid(self):
         store = self._store(status="running")
 
@@ -219,10 +227,16 @@ class FakeEvaluationService:
     def __init__(self):
         self.collected_ids: list[str] = []
         self.control_after_id = None
+        self.score_control = None
+        self.raise_after_score_checkpoint = False
         self.preflight_errors: list[str] = []
+        self.scoring_preflight_errors: list[str] = []
 
     def preflight_online(self, samples):
         return self.preflight_errors
+
+    def preflight_scoring(self):
+        return self.scoring_preflight_errors
 
     def collect(self, samples, snapshot_path, *, resume, before_sample, after_sample):
         store = SnapshotStore(snapshot_path)
@@ -250,28 +264,44 @@ class FakeEvaluationService:
                 getattr(control[2], control[0])(control[3])
         return store.load_all()
 
-    def score(self, samples, snapshots, *, run_id):
+    def score(
+        self,
+        samples,
+        snapshots,
+        *,
+        run_id,
+        progress_callback=None,
+        item_progress_callback=None,
+    ):
         snapshot_ids = {snapshot.sample_id for snapshot in snapshots}
         successful = sum(sample.id in snapshot_ids for sample in samples)
-        return (
-            EvaluationSummary(
-                run_id=run_id,
-                sample_count=len(samples),
-                successful_samples=successful,
-                failed_samples=len(samples) - successful,
-            ),
-            [
-                SampleResult(
-                    sample_id=sample.id,
-                    question=sample.question,
-                    reference_answer=sample.reference_answer,
-                    snapshot_status="success"
-                    if sample.id in snapshot_ids
-                    else "failed",
-                )
-                for sample in samples
-            ],
+        summary = EvaluationSummary(
+            run_id=run_id,
+            sample_count=len(samples),
+            successful_samples=successful,
+            failed_samples=len(samples) - successful,
         )
+        results = [
+            SampleResult(
+                sample_id=sample.id,
+                question=sample.question,
+                reference_answer=sample.reference_answer,
+                snapshot_status="success"
+                if sample.id in snapshot_ids
+                else "failed",
+            )
+            for sample in samples
+        ]
+        if progress_callback is not None:
+            if self.score_control is not None:
+                getattr(self.score_control[0], self.score_control[1])(self.score_control[2])
+                self.score_control = None
+            progress_callback(summary, results, 1, 1)
+            if self.raise_after_score_checkpoint:
+                raise RuntimeError("scoring exploded")
+        if item_progress_callback is not None:
+            item_progress_callback(summary, results, 1, 1)
+        return summary, results
 
 
 class EvaluationRunControllerTests(unittest.TestCase):
@@ -300,6 +330,20 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertEqual((final.completed_samples, final.successful_samples), (2, 2))
         self.assertFalse((self.root / state.run_id / "summary.json").exists())
 
+    def test_scoring_item_checkpoint_is_persisted_during_run(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=True
+        )
+
+        final = self.controller.execute(state.run_id)
+        checkpoint = self.root / state.run_id / ".checkpoint"
+
+        self.assertEqual(final.status, "completed")
+        self.assertTrue((checkpoint / "summary.json").is_file())
+        self.assertTrue((checkpoint / "results.jsonl").is_file())
+        self.assertEqual(final.scoring_completed_items, 1)
+        self.assertEqual(final.scoring_total_items, 1)
+
     def test_online_run_fails_before_collection_when_preflight_reports_errors(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples, score_enabled=False
@@ -311,6 +355,68 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertEqual(final.status, "failed")
         self.assertEqual(self.fake_service.collected_ids, [])
         self.assertIn("preflight", final.error_message)
+
+    def test_score_enabled_run_fails_before_collection_when_scoring_preflight_reports_errors(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=True
+        )
+        self.fake_service.scoring_preflight_errors = ["评分依赖缺失：ragas"]
+
+        final = self.controller.execute(state.run_id)
+
+        self.assertEqual(final.status, "failed")
+        self.assertEqual(self.fake_service.collected_ids, [])
+        self.assertIn("scoring preflight", final.error_message)
+        self.assertIn("ragas", final.error_message)
+
+    def test_offline_score_enabled_run_uses_scoring_preflight_before_snapshot_load(self):
+        state = self.controller.create_offline_run(
+            self.dataset,
+            self.root,
+            self.samples,
+            self.snapshot_path,
+        )
+        self.fake_service.scoring_preflight_errors = ["评估配置无效"]
+
+        final = self.controller.execute(state.run_id)
+
+        self.assertEqual(final.status, "failed")
+        self.assertIn("scoring preflight", final.error_message)
+        self.assertIn("评估配置无效", final.error_message)
+
+    def test_delete_failed_run_removes_all_run_artifacts(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=False
+        )
+        store = RunStateStore(self.root / state.run_id / "run_state.json")
+        store.mark_running(stage="collecting")
+        store.mark_failed("preflight failed")
+        (self.root / state.run_id / "extra-artifact.txt").write_text(
+            "artifact", encoding="utf-8"
+        )
+
+        deleted = self.controller.delete(state.run_id)
+
+        self.assertEqual(deleted.status, "failed")
+        self.assertFalse((self.root / state.run_id).exists())
+
+    def test_delete_rejects_non_terminal_or_successful_runs(self):
+        for status in ("queued", "running", "paused", "completed"):
+            with self.subTest(status=status):
+                state = self.controller.create_online_run(
+                    self.dataset, self.root, self.samples, score_enabled=False
+                )
+                store = RunStateStore(self.root / state.run_id / "run_state.json")
+                if status != "queued":
+                    store.mutate(lambda current: current.model_copy(update={"status": status}))
+
+                with self.assertRaises(ValueError):
+                    self.controller.delete(state.run_id)
+                self.assertTrue((self.root / state.run_id).exists())
+
+    def test_delete_rejects_run_id_path_traversal(self):
+        with self.assertRaises(ValueError):
+            self.controller.delete("../outside")
 
     def test_pause_then_resume_skips_existing_successful_snapshot(self):
         state = self.controller.create_online_run(
@@ -333,23 +439,37 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertEqual(resumed.status, "completed")
         self.assertEqual(self.fake_service.collected_ids, ["q1", "q2"])
 
-    def test_cancelled_run_writes_no_report_and_can_resume(self):
+    def test_cancelled_run_publishes_partial_report_and_can_resume(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples, score_enabled=True
         )
-        self.fake_service.control_after_id = (
-            "cancel",
-            "q1",
-            self.controller,
-            state.run_id,
-        )
+        self.fake_service.score_control = (self.controller, "cancel", state.run_id)
 
-        self.assertEqual(self.controller.execute(state.run_id).status, "cancelled")
-        self.assertFalse((self.root / state.run_id / "summary.json").exists())
+        final = self.controller.execute(state.run_id)
+        self.assertEqual(final.status, "cancelled")
+        self.assertTrue((self.root / state.run_id / "summary.json").exists())
+        partial = EvaluationSummary.model_validate_json(
+            (self.root / state.run_id / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(partial.metadata["run_outcome"]["kind"], "partial_cancelled")
         resumed_state = self.controller.resume(state.run_id)
         self.assertEqual(
             self.controller.execute(resumed_state.run_id).status, "completed"
         )
+
+    def test_scoring_exception_publishes_latest_checkpoint(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=True
+        )
+        self.fake_service.raise_after_score_checkpoint = True
+
+        final = self.controller.execute(state.run_id)
+
+        self.assertEqual(final.status, "failed")
+        summary = EvaluationSummary.model_validate_json(
+            (self.root / state.run_id / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary.metadata["run_outcome"]["kind"], "partial_failed")
 
     def test_offline_score_writes_report_path(self):
         SnapshotStore(self.snapshot_path).append(
@@ -365,15 +485,19 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertTrue(Path(final.report_path).is_file())
         self.assertEqual(Path(final.report_path).parent, self.root / state.run_id)
 
-    def test_pause_requested_during_report_write_pauses_without_report_artifacts(self):
+    def test_pause_requested_during_report_write_publishes_partial_report(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples, score_enabled=True
         )
         original_write_reports = write_reports
+        requested = False
 
         def write_then_request_pause(*args, **kwargs):
+            nonlocal requested
             paths = original_write_reports(*args, **kwargs)
-            self.controller.pause(state.run_id)
+            if Path(args[0]) == self.root / state.run_id and not requested:
+                self.controller.pause(state.run_id)
+                requested = True
             return paths
 
         with patch(
@@ -383,18 +507,24 @@ class EvaluationRunControllerTests(unittest.TestCase):
             final = self.controller.execute(state.run_id)
 
         self.assertEqual(final.status, "paused")
-        for name in ("summary.json", "results.jsonl", "summary.csv", "report.html"):
-            self.assertFalse((self.root / state.run_id / name).exists())
+        summary = EvaluationSummary.model_validate_json(
+            (self.root / state.run_id / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary.metadata["run_outcome"]["kind"], "partial_paused")
 
-    def test_cancel_requested_during_report_write_cancels_without_report_artifacts(self):
+    def test_cancel_requested_during_report_write_publishes_partial_report(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples, score_enabled=True
         )
         original_write_reports = write_reports
+        requested = False
 
         def write_then_request_cancel(*args, **kwargs):
+            nonlocal requested
             paths = original_write_reports(*args, **kwargs)
-            self.controller.cancel(state.run_id)
+            if Path(args[0]) == self.root / state.run_id and not requested:
+                self.controller.cancel(state.run_id)
+                requested = True
             return paths
 
         with patch(
@@ -404,8 +534,10 @@ class EvaluationRunControllerTests(unittest.TestCase):
             final = self.controller.execute(state.run_id)
 
         self.assertEqual(final.status, "cancelled")
-        for name in ("summary.json", "results.jsonl", "summary.csv", "report.html"):
-            self.assertFalse((self.root / state.run_id / name).exists())
+        summary = EvaluationSummary.model_validate_json(
+            (self.root / state.run_id / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary.metadata["run_outcome"]["kind"], "partial_cancelled")
 
     def test_report_write_failure_removes_published_report_artifacts(self):
         state = self.controller.create_online_run(
@@ -448,6 +580,46 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertEqual(
             self.controller.load_for_display(state.run_id).status, "paused"
         )
+
+    def test_orphaned_scoring_run_without_checkpoint_does_not_fabricate_report(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples, score_enabled=True
+        )
+        RunStateStore(self.root / state.run_id / "run_state.json").mark_running(
+            stage="scoring"
+        )
+
+        recovered = self.controller.load_for_display(state.run_id)
+
+        self.assertEqual(recovered.status, "paused")
+        self.assertFalse((self.root / state.run_id / "summary.json").exists())
+
+    def test_legacy_run_without_run_state_opens_as_completed(self):
+        # Legacy run generated before run-state tracking: report artifacts only,
+        # no run_state.json. load_for_display must not FileNotFoundError.
+        run_dir = self.root / "legacy-20260723"
+        run_dir.mkdir(parents=True)
+        (run_dir / "summary.json").write_text(
+            EvaluationSummary(
+                run_id="legacy-20260723",
+                sample_count=7,
+                successful_samples=6,
+                failed_samples=1,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+
+        state = self.controller.load_for_display("legacy-20260723")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.stage, "reporting")
+        self.assertEqual(state.total_samples, 7)
+        self.assertEqual(state.successful_samples, 6)
+        self.assertEqual(state.failed_samples, 1)
+
+    def test_load_for_display_raises_when_neither_state_nor_summary_exists(self):
+        with self.assertRaises(FileNotFoundError):
+            self.controller.load_for_display("no-such-run")
 
     def test_display_recovery_does_not_pause_a_concurrently_registered_worker(self):
         class StartAfterReleaseLock:

@@ -24,8 +24,9 @@ from __future__ import annotations
 import os
 import re
 from collections import deque
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
+from src.circuit.models import Availability, CircuitStructureCoverage
 from src.circuit.parsers.edf_power import classify_net_name, classify_power_pin_name
 from src.circuit.relations.derivers import RelationDeriver
 from src.circuit.relations.extractor import RelationExtractor
@@ -221,6 +222,19 @@ class CircuitQueryEngine:
         # no-op when no embedding model is bound, so leaving it on is safe.
         self.vector_index = vector_index or default_circuit_vector_index
 
+    def _query_designs(
+        self,
+        kb_name: str,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+    ) -> list:
+        designs = self.store.list_designs(kb_name)
+        if allowed_design_ids is None:
+            return designs
+        allowed = {str(design_id) for design_id in allowed_design_ids if str(design_id)}
+        if not allowed:
+            return []
+        return [design for design in designs if design.design_id in allowed]
+
     def list_designs(self, kb_name: str) -> list[dict]:
         return [
             {
@@ -284,6 +298,118 @@ class CircuitQueryEngine:
         summary["net_count"] = summary.get("nets", 0)
         summary["module_count"] = len(summary.get("modules", []))
         return summary
+
+    @staticmethod
+    def compute_structure_coverage(design):
+        """Derive honest structure coverage from what the sources actually contain."""
+        has_netlist = bool(design.instances) and bool(design.nets)
+        strategies = [module.strategy for module in design.modules]
+        if "orcad_page_name" in strategies:
+            logical_strategy = "source_page"
+        elif strategies:
+            logical_strategy = "refdes_page_heuristic"
+        else:
+            logical_strategy = "none"
+        source_strategy = next((item for item in strategies if item and item != "none"), "none")
+        pages_available = Availability.AVAILABLE if design.schematic_pages else Availability.UNAVAILABLE
+        notes = []
+        if logical_strategy == "refdes_page_heuristic":
+            notes.append("模块划分为 refdes_page 启发式分组，不代表视觉页面。")
+        if pages_available != Availability.AVAILABLE:
+            notes.append("EDF 网表不包含 PDF/CAD 页面、标题栏、坐标或视觉布局数据。")
+        return CircuitStructureCoverage(
+            netlist_connectivity=Availability.AVAILABLE if has_netlist else Availability.UNAVAILABLE,
+            module_partition_strategy=logical_strategy,
+            source_partition_strategy=source_strategy,
+            schematic_pages=pages_available,
+            schematic_page_count=len(design.schematic_pages),
+            title_block=Availability.UNAVAILABLE,
+            coordinates=Availability.UNAVAILABLE,
+            visual_layout=Availability.UNAVAILABLE,
+            notes=notes,
+        )
+
+    def get_structure_overview(
+        self,
+        kb_name: str,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+    ) -> list[dict]:
+        """Per-design structure rows; coverage never extrapolates across designs."""
+        rows = []
+        for design in self._query_designs(kb_name, allowed_design_ids):
+            coverage = (
+                design.structure_coverage
+                if design.structure_coverage.netlist_connectivity != Availability.UNKNOWN
+                else self.compute_structure_coverage(design)
+            )
+            instance_by_refdes = {inst.refdes: inst for inst in design.instances}
+            rows.append(
+                {
+                    "kb_name": kb_name,
+                    "design_id": design.design_id,
+                    "circuit_id": design.design_id,
+                    "status": str(design.status),
+                    "source_files": [file.file_name for file in design.files],
+                    "instance_count": len(design.instances),
+                    "net_count": len(design.nets),
+                    "module_count": len(design.modules),
+                    "modules": [
+                        {
+                            "module_id": module.module_id,
+                            "name": module.name,
+                            "strategy": module.strategy,
+                            "instance_count": len(module.instances),
+                            "net_count": len(module.nets),
+                        }
+                        for module in design.modules
+                    ],
+                    "coverage": coverage.to_dict(),
+                    "notes": list(coverage.notes),
+                    "_design": design,
+                    "_instance_by_refdes": instance_by_refdes,
+                }
+            )
+        return rows
+
+    def resolve_component_identity(
+        self,
+        kb_name: str,
+        mention: str,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+        catalog_entries: Sequence[Any] = (),
+    ):
+        """Resolve one mention against authorized designs only."""
+        from src.circuit.component_identity import resolve_entity_mention
+
+        designs = self._query_designs(kb_name, allowed_design_ids)
+        return resolve_entity_mention(mention, designs, catalog_entries)
+
+    def get_resolved_instance_connections(
+        self,
+        kb_name: str,
+        resolution,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+    ) -> dict | None:
+        """Consume a service-internal unique resolution; never a raw caller refdes."""
+        if getattr(resolution, "resolution_status", "") != "unique":
+            return None
+        candidates = list(getattr(resolution, "candidates", []) or [])
+        if len(candidates) != 1:
+            return None
+        candidate = candidates[0]
+        if allowed_design_ids is not None:
+            allowed = {str(item) for item in allowed_design_ids}
+            if candidate.design_id not in allowed:
+                return None
+        detail = self.get_instance_connections(kb_name, candidate.design_id, candidate.refdes)
+        if detail is None:
+            return None
+        detail["resolved_from"] = {
+            "matched_by": candidate.matched_by,
+            "matched_value": candidate.matched_value,
+            "role_query": getattr(resolution, "role_query", None),
+        }
+        return detail
 
     def get_module_detail(self, kb_name: str, design_id: str, module_id_or_name: str) -> dict | None:
         design = self.store.load(kb_name, design_id)
@@ -385,9 +511,16 @@ class CircuitQueryEngine:
         query: str = "",
         keywords: Sequence[str] | None = None,
         limit: int = 10,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     ) -> list[dict]:
         rows = []
-        for hit in self.search_nets(kb_name, query, keywords=keywords, limit=limit):
+        for hit in self.search_nets(
+            kb_name,
+            query,
+            keywords=keywords,
+            limit=limit,
+            allowed_design_ids=allowed_design_ids,
+        ):
             row = self.get_net_connections(kb_name, hit.get("design_id"), hit.get("name"))
             if row:
                 rows.append(row)
@@ -539,6 +672,7 @@ class CircuitQueryEngine:
         query: str = "",
         limit: int = 20,
         keywords: Sequence[str] | None = None,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     ) -> list[dict]:
         # Instance fields are refdes/library_cell/MPN/footprint/value/erp — a
         # mix of Latin identifiers ("STM32F407") and free text. The legacy
@@ -549,7 +683,7 @@ class CircuitQueryEngine:
             query,
             r"[A-Za-z]+\d+(?:-\d+)?|[A-Za-z0-9_.-]{3,}",
         )
-        designs = self.store.list_designs(kb_name)
+        designs = self._query_designs(kb_name, allowed_design_ids)
         results: list[dict] = []
         seen_refdes: set[tuple[str, str]] = set()
         has_filter_query = bool((query or "").strip() or keywords)
@@ -584,7 +718,13 @@ class CircuitQueryEngine:
         # already filled `limit`. We restrict to instance docs so module/net
         # neighbours don't pollute the result type.
         if query and len(results) < limit:
-            hits = self._semantic_supplement(kb_name, query, [KIND_INSTANCE], limit)
+            hits = self._semantic_supplement(
+                kb_name,
+                query,
+                [KIND_INSTANCE],
+                limit,
+                allowed_design_ids=allowed_design_ids,
+            )
             for hit in hits:
                 key = (hit.design_id, hit.natural_id)
                 if key in seen_refdes:
@@ -604,12 +744,13 @@ class CircuitQueryEngine:
         query: str = "",
         limit: int = 20,
         keywords: Sequence[str] | None = None,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     ) -> list[dict]:
         # Net names are short Latin identifiers (VOUT, GND, USB_DP, CLK_24M).
         # The fallback tokenizer allows ./+- so net names like "3.3V" or
         # "USB+" survive intact.
         needles = _prepare_needles(keywords, query, r"[A-Za-z0-9_./+-]{2,}")
-        designs = self.store.list_designs(kb_name)
+        designs = self._query_designs(kb_name, allowed_design_ids)
         results: list[dict] = []
         seen: set[tuple[str, str]] = set()
         has_filter_query = bool((query or "").strip() or keywords)
@@ -627,7 +768,13 @@ class CircuitQueryEngine:
                         return results
 
         if query and len(results) < limit:
-            hits = self._semantic_supplement(kb_name, query, [KIND_NET], limit)
+            hits = self._semantic_supplement(
+                kb_name,
+                query,
+                [KIND_NET],
+                limit,
+                allowed_design_ids=allowed_design_ids,
+            )
             for hit in hits:
                 key = (hit.design_id, hit.natural_id)
                 if key in seen:
@@ -678,7 +825,12 @@ class CircuitQueryEngine:
                     return results
         return results
 
-    def search_bias_topologies(self, kb_name: str, limit: int = 20) -> list[dict]:
+    def search_bias_topologies(
+        self,
+        kb_name: str,
+        limit: int = 20,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+    ) -> list[dict]:
         """Return grounded external pull-up and pull-down resistor facts.
 
         This intentionally recognises only a two-pin, non-zero resistor whose
@@ -686,7 +838,7 @@ class CircuitQueryEngine:
         Dividers, feedbacks and links are therefore not relabelled as bias.
         """
         rows: list[dict] = []
-        for design in self.store.list_designs(kb_name):
+        for design in self._query_designs(kb_name, allowed_design_ids):
             for inst in design.instances:
                 descriptor = " ".join(str(value or "") for value in (inst.library_cell, inst.part_number, inst.value))
                 if not inst.refdes.upper().startswith("R") and "RES" not in descriptor.upper():
@@ -727,14 +879,19 @@ class CircuitQueryEngine:
                     return rows
         return rows
 
-    def search_protection_topologies(self, kb_name: str, limit: int = 20) -> list[dict]:
+    def search_protection_topologies(
+        self,
+        kb_name: str,
+        limit: int = 20,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+    ) -> list[dict]:
         """Find directly connected protection-component candidates.
 
         A returned row proves a component-to-net topology only.  Its presence
         must not be interpreted as an IC short-circuit capability.
         """
         rows: list[dict] = []
-        for design in self.store.list_designs(kb_name):
+        for design in self._query_designs(kb_name, allowed_design_ids):
             for inst in design.instances:
                 descriptor = " ".join(str(value or "") for value in (inst.library_cell, inst.part_number, inst.value)).upper()
                 refdes = inst.refdes.upper()
@@ -769,14 +926,19 @@ class CircuitQueryEngine:
                     return rows
         return rows
 
-    def search_power_protection_candidates(self, kb_name: str, limit: int = 20) -> list[dict]:
+    def search_power_protection_candidates(
+        self,
+        kb_name: str,
+        limit: int = 20,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
+    ) -> list[dict]:
         """Find power-control ICs on a concrete input-to-output rail path.
 
         These rows nominate a part number for datasheet lookup; they do not
         establish that the component implements any particular protection.
         """
         rows: list[dict] = []
-        for design in self.store.list_designs(kb_name):
+        for design in self._query_designs(kb_name, allowed_design_ids):
             rail_names = {
                 net.name
                 for net in design.nets
@@ -823,6 +985,7 @@ class CircuitQueryEngine:
         limit: int = 10,
         max_instances: int = 50,
         keywords: Sequence[str] | None = None,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     ) -> list[dict]:
         """Search EDF/schematic modules by name.
 
@@ -854,7 +1017,7 @@ class CircuitQueryEngine:
                 if len(token) >= MIN_NEEDLE_LEN and token not in needles:
                     needles.append(token)
 
-        designs = self.store.list_designs(kb_name)
+        designs = self._query_designs(kb_name, allowed_design_ids)
         results: list[dict] = []
         seen: set[tuple[str, str]] = set()
         has_filter_query = bool((query or "").strip() or keywords)
@@ -873,7 +1036,13 @@ class CircuitQueryEngine:
                         return results
 
         if query and len(results) < limit:
-            hits = self._semantic_supplement(kb_name, query, [KIND_MODULE], limit)
+            hits = self._semantic_supplement(
+                kb_name,
+                query,
+                [KIND_MODULE],
+                limit,
+                allowed_design_ids=allowed_design_ids,
+            )
             for hit in hits:
                 key = (hit.design_id, hit.natural_id)
                 if key in seen:
@@ -910,12 +1079,19 @@ class CircuitQueryEngine:
         query: str = "",
         keywords: Sequence[str] | None = None,
         limit: int = 10,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     ) -> list[dict]:
         """Return supply and reference-ground nets for matching modules."""
-        module_hits = self.search_modules(kb_name, query, keywords=keywords, limit=limit)
+        module_hits = self.search_modules(
+            kb_name,
+            query,
+            keywords=keywords,
+            limit=limit,
+            allowed_design_ids=allowed_design_ids,
+        )
         if not module_hits:
             return []
-        designs = self.store.list_designs(kb_name)
+        designs = self._query_designs(kb_name, allowed_design_ids)
         results: list[dict] = []
         seen: set[tuple[str, str]] = set()
         for hit in module_hits:
@@ -1215,6 +1391,7 @@ class CircuitQueryEngine:
         query: str = "",
         keywords: Sequence[str] | None = None,
         limit: int = 10,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     ) -> list[dict]:
         """Find nets that connect matching modules.
 
@@ -1225,11 +1402,17 @@ class CircuitQueryEngine:
         - MCU 模块和电源模块之间有哪些连接？
         - USB 模块和 MCU 之间有哪些信号？
         """
-        modules = self.search_modules(kb_name, query, keywords=keywords, limit=limit)
+        modules = self.search_modules(
+            kb_name,
+            query,
+            keywords=keywords,
+            limit=limit,
+            allowed_design_ids=allowed_design_ids,
+        )
         if not modules:
             return []
         results: list[dict] = []
-        designs = self.store.list_designs(kb_name)
+        designs = self._query_designs(kb_name, allowed_design_ids)
         for design in designs:
             net_by_name = {net.name: net for net in design.nets}
             modules_in_design = [m for m in modules if m.get("design_id") == design.design_id]
@@ -1985,6 +2168,7 @@ class CircuitQueryEngine:
         query: str,
         kinds: Sequence[str],
         limit: int,
+        allowed_design_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     ):
         """Run the vector index for additional candidates. Empty on failure
         or when no embed model is bound — keyword path is unaffected."""
@@ -1993,11 +2177,12 @@ class CircuitQueryEngine:
                 return []
             # Slightly over-fetch so that after de-dup against keyword hits
             # we still have something useful to add.
-            return self.vector_index.semantic_search(
-                kb_name,
-                query,
-                top_k=max(limit, 8),
-                kinds=kinds,
-            )
+            kwargs = {
+                "top_k": max(limit, 8),
+                "kinds": kinds,
+            }
+            if allowed_design_ids is not None:
+                kwargs["allowed_design_ids"] = allowed_design_ids
+            return self.vector_index.semantic_search(kb_name, query, **kwargs)
         except Exception:
             return []

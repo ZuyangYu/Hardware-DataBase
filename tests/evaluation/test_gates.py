@@ -76,6 +76,22 @@ class GateTests(unittest.TestCase):
         self.assertNotIn("answer_relevancy", gate.metric_scores)
         self.assertEqual(gate.metric_scores["completeness"], 1.0)
 
+    def test_document_generation_hard_zero_metrics_fail_on_any_violation(self):
+        result = SampleResult(
+            sample_id="doc-1",
+            metrics=[
+                MetricResult(sample_id="doc-1", metric_name="fixed_content_overwrite_rate", score=0.1),
+                MetricResult(sample_id="doc-1", metric_name="source_scope_violation_count", score=0.0),
+                MetricResult(sample_id="doc-1", metric_name="unsupported_required_field_fill_count", score=0.0),
+            ],
+        )
+
+        gate = evaluate_gate([result], fail_on_threshold=True)
+
+        self.assertFalse(gate.passed)
+        self.assertEqual(gate.exit_code, 2)
+        self.assertIn("fixed_content_overwrite_rate", " ".join(gate.failures))
+
 
 if __name__ == "__main__":
     unittest.main()

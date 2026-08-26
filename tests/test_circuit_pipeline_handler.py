@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 
+from src.circuit.index_service import CircuitIndexResult
 from src.pipelines.ingestion import ArchivedFile, CircuitPipelineHandler, IngestionScope
 from src.pipelines.registry import CONTENT_KIND_CIRCUIT, DATASET_CIRCUIT, PIPELINE_REGISTRY, PROCESSOR_KIND_CIRCUIT
 
@@ -42,8 +43,9 @@ class _Store:
 
 
 class _CircuitIndex:
-    def __init__(self, *, fail=False):
+    def __init__(self, *, fail=False, result=None):
         self.fail = fail
+        self.result = result
         self.index_calls = []
         self.deleted = []
 
@@ -51,7 +53,7 @@ class _CircuitIndex:
         self.index_calls.append(kwargs)
         if self.fail:
             raise ValueError("parse boom")
-        return type("Result", (), {"warnings": ["weak net name"], "stats": {"net_count": 1}})()
+        return self.result or type("Result", (), {"warnings": ["weak net name"], "stats": {"net_count": 1}})()
 
     def delete_record(self, record):
         self.deleted.append(record)
@@ -133,6 +135,47 @@ class CircuitPipelineHandlerTests(unittest.TestCase):
         self.assertEqual(store.progress_updates[-1]["status"], "failed")
         self.assertEqual(store.progress_updates[-1]["progress"], 100)
         self.assertIn("parse boom", store.progress_updates[-1]["error_message"])
+
+    def test_submit_persists_and_exposes_degraded_derived_index_status(self):
+        store = _Store()
+        circuit_index = _CircuitIndex(result=CircuitIndexResult(
+            ok=True,
+            status="degraded",
+            message="Indexed circuit design with graph index unavailable",
+            warnings=["Graph index persistence failed."],
+            stats={"instance_count": 3, "graph_node_count": 0},
+            design_id="main_board",
+        ))
+        handler = CircuitPipelineHandler(
+            spec=PIPELINE_REGISTRY.by_processor_kind(PROCESSOR_KIND_CIRCUIT),
+            store=store,
+            circuit_index=circuit_index,
+        )
+        progress = []
+        tmp, archived = self._archived_file()
+        with tmp:
+            result = handler.submit(
+                IngestionScope(kb_name="kb_hw", department_id="dept_hw", uploaded_by="alice", kb_id=3),
+                archived,
+                default_dataset_kind="design",
+                default_dataset_id="ragflow-dataset",
+                progress_callback=lambda percent, message: progress.append((percent, message)),
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.status, "degraded")
+        self.assertEqual(result.warnings, ["Graph index persistence failed."])
+        self.assertIn("graph index unavailable", result.message)
+        self.assertEqual(store.progress_updates[-1]["status"], "degraded")
+        self.assertIn("graph index unavailable", store.progress_updates[-1]["stage"])
+        self.assertEqual(progress[-1][0], 100)
+        self.assertIn("degraded", progress[-1][1])
+        self.assertEqual(result.audit_action, "circuit_upload_degraded")
+        self.assertEqual(result.audit_metadata["status"], "degraded")
+        self.assertEqual(result.audit_metadata["circuit_index_status"], "degraded")
+        self.assertEqual(result.audit_metadata["circuit_index_message"], circuit_index.result.message)
+        self.assertEqual(result.audit_metadata["circuit_index_warnings"], circuit_index.result.warnings)
+        self.assertEqual(result.audit_metadata["circuit_stats"], circuit_index.result.stats)
 
     def test_delete_record_calls_circuit_index_cleanup_before_store_delete(self):
         store = _Store()

@@ -19,7 +19,9 @@ custom base_url for any OpenAI-compatible cloud endpoint.
 from __future__ import annotations
 
 import contextvars
+import json
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generator
 
@@ -29,12 +31,15 @@ from langchain_core.messages import AIMessage
 from src.agents.schemas import Evidence
 from src.agents.tools.circuit_tools import make_circuit_search
 from src.agents.tools.document_rag_tool import make_document_search
+from src.agents.tools.external_conversation_tools import make_conversation_search
 from src.agents.tools.pipeline_catalog import make_catalog_tool
 from src.agents.tools.runtime import ToolRuntime, format_evidence_for_llm, tool_label
 from src.agents.tools.spreadsheet_tools import make_spreadsheet_tools
 from src.circuit.index_service import CircuitIndexService
 from src.core.cancellation import QueryCancelled
 from src.core.model_factory import create_chat_model
+from src.observability import observe
+from src.observability.metrics import record_agent, record_agent_stage
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
@@ -54,6 +59,7 @@ class _RunRecord:
     footer: str = ""
     retrieval_summary: dict = field(default_factory=dict)
     token_usage_summary: object = None
+    answer: str = ""
 
 
 _RUN_RECORD: contextvars.ContextVar[_RunRecord | None] = contextvars.ContextVar(
@@ -89,8 +95,8 @@ _SYSTEM_PROMPT = """你是 Hardware DataBase 的硬件设计知识库问答助�
 
 ## 工作方式
 {workflow}
-1. 先调用 list_kb_sources 了解知识库中有哪些资料源（文档、表格、电路设计）。
-2. 根据问题选择合适的检索工具（document_search 查文档、circuit_search 查电路网表、spreadsheet_row_search/spreadsheet_cell_lookup 查表格），必要时用不同关键词多次检索。
+1. 先调用 list_kb_sources 了解知识库中有哪些资料源（文档、表格、电路设计、外部对话记录）。
+2. 根据问题选择合适的检索工具（document_search 查文档、circuit_search 查电路网表、spreadsheet_row_search/spreadsheet_cell_lookup 查表格、conversation_search 查外部对话记录），必要时用不同关键词多次检索。
 3. 综合所有证据后，直接给出最终中文回答。回答即结束，不要再输出其他内容。
 
 ## 回答要求
@@ -155,11 +161,17 @@ class MultiSourceAgentRunner:
         document_store: PipelineDocumentStore | None = None,
         spreadsheet_service: SpreadsheetIndexService | None = None,
         circuit_service: CircuitIndexService | None = None,
+        conversation_service=None,
     ):
         self.rag_backend = rag_backend
         self.document_store = document_store or PipelineDocumentStore()
         self.spreadsheet_service = spreadsheet_service or SpreadsheetIndexService()
         self.circuit_service = circuit_service or CircuitIndexService()
+        if conversation_service is None:
+            from src.external_conversations.query_engine import ExternalConversationQueryEngine
+
+            conversation_service = ExternalConversationQueryEngine()
+        self.conversation_service = conversation_service
         self._model_lock = threading.Lock()
 
     def _get_model(self):
@@ -169,6 +181,78 @@ class MultiSourceAgentRunner:
             return create_chat_model()
 
     def stream(
+        self,
+        *,
+        query: str,
+        kb_name: str,
+        history: list[tuple[str, str]],
+        ctx: RequestContext | None = None,
+        thread_id: str = "",
+        event_callback: Callable[[dict], None] | None = None,
+        query_mode: str = "deep",
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> Generator[str, None, None]:
+        """Observability wrapper: one agent span + metrics per run."""
+        started = time.monotonic()
+        status = "success"
+        with observe.agent(
+            "hdb.agent.run",
+            **{
+                "hdb.query.mode": query_mode,
+                "hdb.query.source": "multi_source_agent",
+                "hdb.session.id": thread_id,
+            },
+        ) as observation:
+            observation.set_input(query, content_kind="query")
+            try:
+                yield from self._stream_impl(
+                    query=query,
+                    kb_name=kb_name,
+                    history=history,
+                    ctx=ctx,
+                    thread_id=thread_id,
+                    event_callback=event_callback,
+                    query_mode=query_mode,
+                    should_cancel=should_cancel,
+                )
+            except QueryCancelled:
+                status = "cancelled"
+                raise
+            except Exception as exc:
+                status = "failed"
+                observation.error(exc)
+                raise
+            finally:
+                summary = self.get_last_retrieval_summary()
+                run_record = _current_run()
+                observation.set_token_usage(run_record.token_usage_summary if run_record is not None else None)
+                if run_record.answer:
+                    observation.set_output(run_record.answer, content_kind="llm")
+                observation.set("hdb.agent.retrieval_round", int(summary.get("retrieval_rounds") or 0))
+                observation.set("hdb.evidence.count", len(summary.get("evidence") or []))
+                observation.set("hdb.retrieval.calls", len(summary.get("tool_diagnostics") or []))
+                observation.set(
+                    "hdb.retrieval.hits",
+                    sum(int(item.get("hit_count") or 0) for item in summary.get("tool_diagnostics") or []),
+                )
+                observation.set("hdb.retrieval.final_top_k", int(summary.get("final_top_k") or 0))
+                observation.set("hdb.retriever.type", summary.get("retriever_type") or "")
+                observation.set("hdb.retrieval.status", summary.get("status") or "")
+                if summary.get("rewritten_queries"):
+                    observation.set(
+                        "hdb.query.rewritten",
+                        json.dumps(summary.get("rewritten_queries"), ensure_ascii=False),
+                    )
+                observation.set("hdb.agent.status", status)
+                observation.outcome(status)
+                record_agent(
+                    status=status,
+                    mode=query_mode,
+                    duration_s=max(0.0, time.monotonic() - started),
+                    retrieval_rounds=int(summary.get("retrieval_rounds") or 0),
+                )
+
+    def _stream_impl(
         self,
         *,
         query: str,
@@ -209,6 +293,7 @@ class MultiSourceAgentRunner:
             make_document_search(rt, self.rag_backend, self.document_store),
             make_circuit_search(rt, self.circuit_service),
             *make_spreadsheet_tools(rt, self.spreadsheet_service),
+            make_conversation_search(rt, self.conversation_service),
         ]
 
         workflow = _DEEP_WORKFLOW if query_mode == "deep" else _FAST_WORKFLOW
@@ -237,6 +322,7 @@ class MultiSourceAgentRunner:
         yielded = False
         retrieve_seen = False
         timeline: list[dict[str, Any]] = []
+        answer_parts: list[str] = []
         try:
             for chunk, metadata in agent.stream(
                 {"messages": _build_messages(query, history)},
@@ -254,6 +340,7 @@ class MultiSourceAgentRunner:
                 if node == "model" and isinstance(chunk, AIMessage):
                     emit_stage("generate", "生成回答", "running", "正在流式输出答案正文")
                     yielded = True
+                    answer_parts.append(text)
                     yield text
         except QueryCancelled:
             return
@@ -282,6 +369,11 @@ class MultiSourceAgentRunner:
             label = tool_label(str(diag.get("tool_name") or "检索工具"))
             status = "error" if diag.get("status") == "failed" else "done"
             emit_stage("retrieve", "多源硬件数据召回", status, f"{label} 返回 {diag.get('hit_count')} 条候选证据")
+            record_agent_stage(
+                stage=str(diag.get("tool_name") or "tool"),
+                duration_s=max(0.0, float(diag.get("latency_ms") or 0) / 1000.0),
+                status="success" if diag.get("status") != "failed" else "failed",
+            )
             retrieve_seen = True
 
         verification = {
@@ -293,6 +385,7 @@ class MultiSourceAgentRunner:
             "citation_coverage": 1.0 if rt.evidence else 0.0,
         }
         record.token_usage_summary = usage
+        record.answer = "".join(answer_parts)
         record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
         record.footer = self._format_footer(rt, verification, timeline)
 
@@ -307,6 +400,7 @@ class MultiSourceAgentRunner:
             )
             if retrieve_seen:
                 emit_stage("generate", "生成回答", "running", "正在生成最终回答")
+            record.answer = str(fallback)
             yield fallback
             emit_stage("generate", "生成回答", "done", "最终回答已生成")
 
@@ -357,7 +451,16 @@ class MultiSourceAgentRunner:
         verification: dict[str, Any],
     ) -> dict:
         failed = next((item for item in rt.diagnostics if item.get("status") not in {"ok"}), None)
-        if failed is not None and not rt.evidence:
+        answer_text = _current_run().answer
+        if answer_text.startswith("已完成多源检索，但生成模型调用失败"):
+            status, error_stage, error_message = "failed", "answer", answer_text.splitlines()[0]
+        elif failed is not None and rt.evidence:
+            status, error_stage, error_message = (
+                "partial_failure",
+                "retrieval",
+                str(failed.get("error") or failed.get("status") or ""),
+            )
+        elif failed is not None and not rt.evidence:
             status, error_stage, error_message = "failed", "retrieval", str(failed.get("error") or "retrieval failed")
         elif not rt.evidence:
             status, error_stage, error_message = "no_evidence", "retrieval", "no evidence"

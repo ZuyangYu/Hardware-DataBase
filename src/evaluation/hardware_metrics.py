@@ -3,7 +3,13 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from .schemas import AnswerSnapshot, EvaluationSample, MetricResult
+from .schemas import (
+    AnswerSnapshot,
+    DocumentGenerationEvalRecord,
+    DocumentGenerationSnapshot,
+    EvaluationSample,
+    MetricResult,
+)
 
 
 _MISSING_MARKERS = (
@@ -103,3 +109,50 @@ def score_hardware_rules(sample: EvaluationSample, snapshot: AnswerSnapshot) -> 
         conflict = _result(sample, "conflict_disclosure", None)
 
     return [completeness, evidence_consistency, honesty, conflict]
+
+
+def score_document_generation(
+    record: DocumentGenerationEvalRecord,
+    snapshot: DocumentGenerationSnapshot,
+) -> list[MetricResult]:
+    """Score a generated field and its governed retrieval/fill diagnostics."""
+    if snapshot.sample_id != record.id:
+        raise ValueError("document generation snapshot id does not match record")
+    mapping_ok = (
+        snapshot.template_fixture == record.template_fixture
+        and snapshot.mapped_field_id == record.field_id
+    )
+    expected_value = _normalized(record.expected_value)
+    filled_value = _normalized(snapshot.filled_value or "")
+    retrieved_sources = set(snapshot.retrieved_evidence_sources)
+    evidence_sources = set(snapshot.evidence_sources)
+    allowed_sources = set(record.allowed_sources)
+    field_recall = len(retrieved_sources & allowed_sources) / len(allowed_sources)
+    evidence_supported = bool(
+        snapshot.filled_value
+        and evidence_sources
+        and evidence_sources <= allowed_sources
+        and filled_value == expected_value
+    )
+    overwrite_rate = snapshot.fixed_content_overwrite_count / max(1, snapshot.attempted_fill_count)
+
+    def result(name: str, score: float, **details) -> MetricResult:
+        return MetricResult(
+            sample_id=record.id,
+            metric_name=name,
+            score=score,
+            details=details,
+        )
+
+    return [
+        result("template_mapping_precision", float(mapping_ok), expected_field_id=record.field_id),
+        result("fixed_content_overwrite_rate", overwrite_rate),
+        result("field_recall_at_k", field_recall, allowed_sources=record.allowed_sources),
+        result("evidence_support_rate", float(evidence_supported), evidence_sources=sorted(evidence_sources)),
+        result("auto_approval_rate", float(snapshot.auto_approved)),
+        result("source_scope_violation_count", float(snapshot.source_scope_violation_count)),
+        result(
+            "unsupported_required_field_fill_count",
+            float(snapshot.unsupported_required_field_fill_count if record.required else 0),
+        ),
+    ]

@@ -24,7 +24,7 @@ from src.core.auth import AuthUser
 from src.core.app_logs import AppLogService
 from src.evaluation.dataset_loader import load_dataset, validate_dataset
 from src.evaluation.run_control import EvaluationRunController
-from src.evaluation.schemas import EvaluationSample, EvaluationSummary, EvaluationRunState
+from src.evaluation.schemas import EvaluationSample, EvaluationSummary, EvaluationRunState, SampleResult
 
 from src.api.deps import get_auth_service, require_system_admin
 from src.api.schemas import CreateEvaluationRunRequest
@@ -156,6 +156,22 @@ def _state_dict(state: EvaluationRunState) -> dict[str, Any]:
         if key in dump and not isinstance(dump[key], str):
             dump[key] = getattr(dump[key], "value", str(dump[key]))
     return dump
+
+
+def _load_sample_results(run_dir: Path) -> tuple[list[dict[str, Any]], str]:
+    """Load display diagnostics without making the run detail endpoint fragile."""
+    results_path = run_dir / "results.jsonl"
+    if not results_path.is_file():
+        return [], ""
+    try:
+        rows = [
+            SampleResult.model_validate_json(line).model_dump(mode="json")
+            for line in results_path.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValidationError, ValueError) as exc:
+        return [], f"样本诊断不可用：{exc}"
+    return rows, ""
 
 
 @router.get("/evaluation/runs")
@@ -355,6 +371,26 @@ def cancel_run(
     return _state_dict(state)
 
 
+@router.delete("/evaluation/runs/{run_id}")
+def delete_run(
+    run_id: str,
+    output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
+    _actor: AuthUser = Depends(require_system_admin),
+) -> dict[str, Any]:
+    """Delete a failed or cancelled evaluation run and its stored artifacts."""
+    output_root = _check_output_root(output_root)
+    controller = _controller(output_root)
+    try:
+        state = controller.delete(run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"failed to delete evaluation run: {exc}") from exc
+    return {"ok": True, "run_id": run_id, "status": state.status}
+
+
 @router.get("/evaluation/runs/{run_id}")
 def get_run(
     run_id: str,
@@ -374,7 +410,15 @@ def get_run(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     result = _state_dict(state)
-    summary_path = Path(output_root) / run_id / "summary.json"
+    run_dir = Path(output_root) / run_id
+    summary_path = run_dir / "summary.json"
+    results_dir = run_dir
+    if not summary_path.is_file():
+        checkpoint_dir = run_dir / ".checkpoint"
+        checkpoint_summary = checkpoint_dir / "summary.json"
+        if checkpoint_summary.is_file():
+            summary_path = checkpoint_summary
+            results_dir = checkpoint_dir
     if summary_path.is_file():
         try:
             summary: EvaluationSummary = load_evaluation_summary(summary_path)
@@ -383,6 +427,11 @@ def get_run(
             result["summary"] = None
     else:
         result["summary"] = None
+    if result["summary"] is not None:
+        result["sample_results"], result["sample_results_error"] = _load_sample_results(results_dir)
+    else:
+        result["sample_results"] = []
+        result["sample_results_error"] = ""
     return result
 
 

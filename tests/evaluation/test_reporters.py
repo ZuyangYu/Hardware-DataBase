@@ -39,6 +39,7 @@ class ReporterTests(unittest.TestCase):
                         "scored_context_characters": 80,
                         "contexts_truncated": True,
                         "selected_claim_ids": ["c1"],
+                        "scored_contexts": ["评分证据"],
                     }
                 },
                 metrics=[
@@ -66,6 +67,7 @@ class ReporterTests(unittest.TestCase):
         self.assertIn("ragas_scoring", rows[0])
         self.assertEqual(rows[0]["scored_response"], "正文回答")
         self.assertIn('"scored_context_count": 2', rows[0]["ragas_scoring"])
+        self.assertEqual(rows[0]["scored_contexts"], '["评分证据"]')
         html = paths.report_html.read_text(encoding="utf-8")
         self.assertIn("评分上下文", html)
         self.assertIn("2/3", html)
@@ -75,11 +77,33 @@ class ReporterTests(unittest.TestCase):
         self.assertIn("评分正文", html)
         self.assertIn("正文回答", html)
         self.assertIn("检索上下文", html)
+        self.assertIn("实际送入评分的上下文", html)
 
     def test_report_write_leaves_no_temp_files(self):
         summary = EvaluationSummary(run_id="run-1")
         write_reports(self.run_dir, summary, [])
         self.assertEqual(list(self.run_dir.glob("*.tmp")), [])
+        self.assertTrue((self.run_dir / "report_complete.json").is_file())
+
+    def test_report_writer_adds_run_outcome_metadata(self):
+        summary = EvaluationSummary(run_id="run-1")
+
+        paths = write_reports(
+            self.run_dir,
+            summary,
+            [],
+            metadata={
+                "run_outcome": {
+                    "kind": "partial_cancelled",
+                    "completed_groups": 1,
+                    "total_groups": 5,
+                }
+            },
+        )
+
+        loaded = json.loads(paths.summary_json.read_text(encoding="utf-8"))
+        self.assertEqual(loaded["metadata"]["run_outcome"]["kind"], "partial_cancelled")
+        self.assertIn("partial_cancelled", paths.report_html.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

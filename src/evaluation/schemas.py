@@ -76,6 +76,38 @@ class EvaluationSample(BaseModel):
         return self
 
 
+class DocumentGenerationEvalRecord(BaseModel):
+    """One expected field result for a controlled document template."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    template_fixture: str = Field(min_length=1)
+    field_id: str = Field(min_length=1)
+    expected_value: str = Field(min_length=1)
+    allowed_sources: list[str] = Field(min_length=1)
+    required: bool = True
+    critical: bool = True
+
+    @field_validator("id", "template_fixture", "field_id", "expected_value")
+    @classmethod
+    def strip_document_generation_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("allowed_sources")
+    @classmethod
+    def validate_allowed_sources(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value if item.strip()]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("allowed_sources must be unique")
+        if not normalized:
+            raise ValueError("allowed_sources must not be empty")
+        return normalized
+
+
 class AnswerSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -94,6 +126,24 @@ class AnswerSnapshot(BaseModel):
     finished_at: str = ""
     duration_seconds: float = 0.0
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentGenerationSnapshot(BaseModel):
+    """Observed output needed to score a document-generation eval record."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_id: str
+    template_fixture: str
+    mapped_field_id: str | None = None
+    filled_value: str | None = None
+    evidence_sources: list[str] = Field(default_factory=list)
+    retrieved_evidence_sources: list[str] = Field(default_factory=list)
+    attempted_fill_count: int = Field(default=0, ge=0)
+    fixed_content_overwrite_count: int = Field(default=0, ge=0)
+    source_scope_violation_count: int = Field(default=0, ge=0)
+    unsupported_required_field_fill_count: int = Field(default=0, ge=0)
+    auto_approved: bool = False
 
 
 class MetricResult(BaseModel):
@@ -143,6 +193,8 @@ class EvaluationSummary(BaseModel):
     metric_scores: dict[str, float] = Field(default_factory=dict)
     metric_counts: dict[str, int] = Field(default_factory=dict)
     metric_failures: dict[str, int] = Field(default_factory=dict)
+    scoring_completed_items: int = 0
+    scoring_total_items: int = 0
     gate: GateResult | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -163,6 +215,10 @@ class EvaluationRunState(BaseModel):
     completed_samples: int = 0
     successful_samples: int = 0
     failed_samples: int = 0
+    scoring_completed_groups: int = 0
+    scoring_total_groups: int = 0
+    scoring_completed_items: int = 0
+    scoring_total_items: int = 0
     current_sample_id: str = ""
     current_question: str = ""
     started_at: str = ""

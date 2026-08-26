@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import httpx
 
@@ -16,6 +16,7 @@ from src.core.app_logs import AppLogService
 from src.core.cancellation import QueryCancelled
 from src.core.logger import error, log
 from src.core.source_group_router import route_source_groups
+from src.observability import start_thread_with_current_context
 from src.ingestion.kb_paths import validate_kb_name
 from src.ingestion.source_groups import (
     DESIGN_GROUP,
@@ -225,6 +226,38 @@ def _source_name_filters(filters: dict | None) -> list[str]:
     if not source_names:
         source_names = _as_non_empty_strings((filters or {}).get("source_name"))
     return source_names
+
+
+def _as_allowed_record_ids(filters: dict | None) -> list[int] | None:
+    """Return normalized ``allowed_record_ids`` or ``None`` when absent.
+
+    An empty list is meaningful (strict allow-nothing) and stays distinct
+    from an absent filter.
+    """
+    raw = (filters or {}).get("allowed_record_ids")
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple, set, frozenset)):
+        return []
+    values: list[int] = []
+    for item in raw:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            return []
+        values.append(value)
+    return sorted(set(values))
+
+
+def _as_link_stamps(filters: dict | None) -> dict[str, dict[str, Any]]:
+    raw = (filters or {}).get("link_stamps")
+    if not isinstance(raw, dict):
+        return {}
+    stamps: dict[str, dict[str, Any]] = {}
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            stamps[str(key)] = value
+    return stamps
 
 
 def _metadata_condition(
@@ -515,8 +548,11 @@ class RAGFlowClient:
             finally:
                 completed.set()
 
-        thread = threading.Thread(target=run_request, name="ragflow-retrieval-request", daemon=True)
-        thread.start()
+        start_thread_with_current_context(
+            run_request,
+            name="ragflow-retrieval-request",
+            daemon=True,
+        )
         while not completed.wait(0.05):
             if should_cancel():
                 cancel_event.set()
@@ -660,6 +696,8 @@ class RAGFlowBackend(RAGBackend):
         self.store = runtime_bundle.store
         self.spreadsheet_indexes = runtime_bundle.spreadsheet_indexes
         self.circuit_indexes = runtime_bundle.circuit_indexes
+        self.conversations = runtime_bundle.conversations
+        self.conversation_indexes = runtime_bundle.conversation_indexes
         self.archive = runtime_bundle.archive
         self.ingestion = runtime_bundle.ingestion
         self.runtime = runtime_bundle.runtime
@@ -973,11 +1011,69 @@ class RAGFlowBackend(RAGBackend):
         }
         top_k = top_k or config.settings.FINAL_TOP_K
         route = route_source_groups(query)
-        routed_source_groups = route.source_groups if route.should_filter else ()
+        # Task 5a strict path: when the caller supplies ``allowed_record_ids``
+        # retrieval is restricted to exactly those local records, verified by
+        # remote document_id at chunk read-back. Any unknown/unauthorized/
+        # stale id fails closed to an empty result — never a broad search.
+        allowed_record_ids = _as_allowed_record_ids(filters)
+        link_stamps = _as_link_stamps(filters)
+        strict_allowed = allowed_record_ids is not None
+        if strict_allowed:
+            if not allowed_record_ids:
+                return []
+            allowed_id_set = set(allowed_record_ids)
+            # Same authorization gates as the regular path: ragflow processor,
+            # remote id present and parse completed — anything else fails closed.
+            authorized = [
+                record
+                for record in scoped_records
+                if record.id in allowed_id_set
+                and record.processor_kind == PROCESSOR_KIND_RAGFLOW
+                and record.document_id
+                and normalize_parse_status(record.status, record.processor_kind) == TASK_STATUS_COMPLETED
+            ]
+            if len(authorized) != len(allowed_id_set):
+                log(
+                    "RAGFlow strict record filter failed closed: "
+                    f"requested={sorted(allowed_id_set)} authorized={sorted(r.id for r in authorized)}"
+                )
+                return []
+            scoped_records = authorized
+            if link_stamps:
+                for record in scoped_records:
+                    stamp = link_stamps.get(str(record.id)) or {}
+                    if (
+                        str(stamp.get("content_hash") or "") != str(record.content_hash or "")
+                        or str(stamp.get("source_version_id") or "") != str(record.source_version_id or "")
+                        or str(stamp.get("revision") or "") != str(record.revision or "")
+                    ):
+                        log(f"RAGFlow strict record filter: version stamp mismatch for record {record.id}.")
+                        return []
+            records_by_remote_id = {
+                str(record.document_id): record
+                for record in scoped_records
+                if record.processor_kind == PROCESSOR_KIND_RAGFLOW
+                and record.document_id
+            }
+        # Stage 5 adaptive recovery: balanced_route drops the source_group hard
+        # filter so a query that mis-routed (the frozen evidence lives in a
+        # different group) can still reach frozen sources. The frozen
+        # source_names scope and the local _filter_chunks source_name check
+        # remain, so this never widens the result beyond the frozen source set.
+        balanced_route = bool((filters or {}).get("balanced_route"))
+        if balanced_route:
+            routed_source_groups = ()
+        else:
+            routed_source_groups = route.source_groups if route.should_filter else ()
         if routed_source_groups:
             log(f"RAGFlow source-group route: {route.reason}, filter={routed_source_groups}")
         else:
-            log(f"RAGFlow source-group route: {route.reason}, no hard filter")
+            log(
+                "RAGFlow source-group route: "
+                + route.reason
+                + (", balanced_route" if balanced_route else "")
+                + ", no hard filter"
+            )
         self._ensure_physical_datasets()
         dataset_ids = list(dict.fromkeys(self._dataset_ids.values()))
         metadata_condition = _metadata_condition(kb_name, ctx, routed_source_groups, filters=filters)
@@ -994,21 +1090,28 @@ class RAGFlowBackend(RAGBackend):
 
         chunks = retrieve_chunks(metadata_condition)
         source_names = _source_name_filters(filters)
-        # An explicit file selection is a stronger scope than keyword routing.
-        # It remains constrained by the locally scoped document mapping below,
-        # so a mismatched route must not suppress the selected source.
-        apply_routed_source_groups = bool(routed_source_groups) and not source_names
-        source_name_fallback = False
-        metadata_condition_fallback = False
-        if not chunks:
-            chunks = retrieve_chunks(None)
-            metadata_condition_fallback = True
-            source_name_fallback = bool(source_names)
-            log(
-                "RAGFlow metadata-scoped retrieve returned 0; retried without "
-                f"metadata conditions and received {len(chunks)} raw chunks. "
-                f"source_names={source_names}"
-            )
+        if strict_allowed:
+            # The strict linked-record path never widens: no unconditioned
+            # retry, no filename fallback, no route-based group widening.
+            apply_routed_source_groups = False
+            metadata_condition_fallback = False
+            source_name_fallback = False
+        else:
+            # An explicit file selection is a stronger scope than keyword routing.
+            # It remains constrained by the locally scoped document mapping below,
+            # so a mismatched route must not suppress the selected source.
+            apply_routed_source_groups = bool(routed_source_groups) and not source_names
+            source_name_fallback = False
+            metadata_condition_fallback = False
+            if not chunks:
+                chunks = retrieve_chunks(None)
+                metadata_condition_fallback = True
+                source_name_fallback = bool(source_names)
+                log(
+                    "RAGFlow metadata-scoped retrieve returned 0; retried without "
+                    f"metadata conditions and received {len(chunks)} raw chunks. "
+                    f"source_names={source_names}"
+                )
 
         # RAGFlow retrieval chunks may omit document-level metadata. Resolve
         # their scope through our local, department-scoped document mapping so
@@ -1082,6 +1185,7 @@ class RAGFlowBackend(RAGBackend):
                             "query_route_source_groups": list(routed_source_groups),
                             "ragflow_source_name_fallback": source_name_fallback,
                             "ragflow_metadata_condition_fallback": metadata_condition_fallback,
+                            **({"local_record_id": record.id} if strict_allowed else {}),
                         },
                         backend=self.name,
                         retriever="ragflow_retrieval",

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from src.pipelines.document_store import PipelineDocumentStore
 from src.pipelines.ingestion import (
     CircuitPipelineHandler,
+    ExternalConversationHandler,
     IngestionOrchestrator,
     RAGFlowDocumentHandler,
     SpreadsheetPipelineHandler,
@@ -10,11 +11,15 @@ from src.pipelines.ingestion import (
 from src.pipelines.registry import (
     PIPELINE_REGISTRY,
     PROCESSOR_KIND_CIRCUIT,
+    PROCESSOR_KIND_EXTERNAL_CONVERSATION,
     PROCESSOR_KIND_RAGFLOW,
     PROCESSOR_KIND_SPREADSHEET,
 )
 from src.pipelines.runtime import PipelineRuntime
 from src.circuit.index_service import CircuitIndexService
+from src.external_conversations.query_engine import ExternalConversationQueryEngine
+from src.external_conversations.store import ExternalConversationStore
+from src.external_conversations.vector_index import default_external_conversation_vector_index
 from src.services.document_archive import DocumentArchiveManager
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
 
@@ -27,6 +32,8 @@ class PipelineRuntimeBundle:
     circuit_indexes: CircuitIndexService
     ingestion: IngestionOrchestrator
     runtime: PipelineRuntime
+    conversations: ExternalConversationStore | None = None
+    conversation_indexes: ExternalConversationQueryEngine | None = None
 
 
 class PipelineRuntimeFactory:
@@ -45,6 +52,8 @@ class PipelineRuntimeFactory:
         archive: DocumentArchiveManager | None = None,
         spreadsheet_indexes: SpreadsheetIndexService | None = None,
         circuit_indexes: CircuitIndexService | None = None,
+        conversations: ExternalConversationStore | None = None,
+        conversation_indexes: ExternalConversationQueryEngine | None = None,
     ):
         self.backend_name = backend_name
         self.submit_remote = submit_remote_callback
@@ -58,11 +67,16 @@ class PipelineRuntimeFactory:
         self.archive = archive or DocumentArchiveManager()
         self.spreadsheet_indexes = spreadsheet_indexes or SpreadsheetIndexService()
         self.circuit_indexes = circuit_indexes or CircuitIndexService()
+        self.conversations = conversations or ExternalConversationStore()
+        self.conversation_indexes = conversation_indexes or ExternalConversationQueryEngine(
+            root=self.conversations.root
+        )
 
     def build(self) -> PipelineRuntimeBundle:
         rag_spec = PIPELINE_REGISTRY.by_processor_kind(PROCESSOR_KIND_RAGFLOW)
         spreadsheet_spec = PIPELINE_REGISTRY.by_processor_kind(PROCESSOR_KIND_SPREADSHEET)
         circuit_spec = PIPELINE_REGISTRY.by_processor_kind(PROCESSOR_KIND_CIRCUIT)
+        conversation_spec = PIPELINE_REGISTRY.by_processor_kind(PROCESSOR_KIND_EXTERNAL_CONVERSATION)
         if rag_spec is None or spreadsheet_spec is None or circuit_spec is None:
             raise RuntimeError("Required ingestion pipeline specs are not registered.")
 
@@ -95,6 +109,19 @@ class PipelineRuntimeFactory:
                     store=self.store,
                     circuit_index=self.circuit_indexes,
                 ),
+                **(
+                    {
+                        PROCESSOR_KIND_EXTERNAL_CONVERSATION: ExternalConversationHandler(
+                            spec=conversation_spec,
+                            store=self.store,
+                            conversation_store=self.conversations,
+                            conversation_indexes=self.conversation_indexes,
+                            vector_index=default_external_conversation_vector_index,
+                        )
+                    }
+                    if conversation_spec is not None
+                    else {}
+                ),
             },
             audit_callback=self.audit,
             content_hash_callback=self.content_hash,
@@ -115,4 +142,6 @@ class PipelineRuntimeFactory:
             circuit_indexes=self.circuit_indexes,
             ingestion=ingestion,
             runtime=runtime,
+            conversations=self.conversations,
+            conversation_indexes=self.conversation_indexes,
         )

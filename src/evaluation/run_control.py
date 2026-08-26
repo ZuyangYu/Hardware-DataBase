@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -10,9 +11,16 @@ from pathlib import Path
 
 from .dataset_loader import load_dataset
 from .reporters import write_reports
-from .schemas import AnswerSnapshot, EvaluationRunState, EvaluationSample
+from .schemas import (
+    AnswerSnapshot,
+    EvaluationRunState,
+    EvaluationSample,
+    EvaluationSummary,
+)
 from .service import new_run_id
 from .snapshot_store import SnapshotStore
+from src.observability import observe, thread_with_current_context
+from src.observability.metrics import record_evaluation
 
 
 _STATE_LOCK = threading.RLock()
@@ -22,7 +30,9 @@ _REPORT_ARTIFACT_NAMES = (
     "results.jsonl",
     "summary.csv",
     "report.html",
+    "report_complete.json",
 )
+_DELETABLE_RUN_STATUSES = frozenset({"failed", "cancelled"})
 
 
 def _now() -> str:
@@ -96,6 +106,47 @@ class RunStateStore:
 
     def mark_failed(self, error_message: str = "") -> EvaluationRunState:
         return self.mutate(lambda state: self._mark_failed(state, error_message))
+
+    def update_scoring_progress(
+        self,
+        completed_groups: int,
+        total_groups: int,
+        *,
+        completed_items: int | None = None,
+        total_items: int | None = None,
+    ) -> EvaluationRunState:
+        updates = {
+            "scoring_completed_groups": completed_groups,
+            "scoring_total_groups": total_groups,
+        }
+        if completed_items is not None:
+            updates["scoring_completed_items"] = completed_items
+        if total_items is not None:
+            updates["scoring_total_items"] = total_items
+        return self.mutate(
+            lambda state: self._with_update(state, **updates)
+        )
+
+    def publish_partial_report(
+        self,
+        *,
+        report_path: str,
+        error_message: str = "",
+    ) -> EvaluationRunState:
+        with self._lock:
+            state = self.load()
+            if state.status == "pause_requested":
+                return self._write(self._finish(state, "paused", report_path=report_path))
+            if state.status == "cancel_requested":
+                return self._write(self._finish(state, "cancelled", report_path=report_path))
+            return self._write(
+                self._finish(
+                    state,
+                    "failed",
+                    report_path=report_path,
+                    error_message=error_message or "evaluation worker failed; see application logs",
+                )
+            )
 
     def remove_report_artifacts(self) -> None:
         with self._lock:
@@ -328,13 +379,42 @@ class EvaluationRunController:
             existing = self._threads.get(run_id)
             if existing is not None and existing.is_alive():
                 raise RuntimeError(f"evaluation run {run_id!r} is already running")
-            thread = threading.Thread(target=self.execute, args=(run_id,), daemon=True)
+            thread = thread_with_current_context(
+                self.execute,
+                run_id,
+                daemon=True,
+                name=f"evaluation-{run_id[:16]}",
+            )
             self._threads[run_id] = thread
             thread.start()
             return thread
 
     def execute(self, run_id: str) -> EvaluationRunState:
+        try:
+            initial_state = self._store(run_id).load()
+            mode = initial_state.mode
+        except Exception:
+            mode = "unknown"
+        status = "failed"
+        with observe.evaluator(
+            "hdb.evaluation.run",
+            run_id=run_id,
+            mode=mode,
+        ) as observation:
+            try:
+                result = self._execute_impl(run_id)
+                status = result.status
+                observation.set("hdb.evaluation.status", status)
+                return result
+            except Exception:
+                status = "failed"
+                raise
+            finally:
+                record_evaluation(status=status, mode=mode)
+
+    def _execute_impl(self, run_id: str) -> EvaluationRunState:
         store = self._store(run_id)
+        latest_checkpoint: tuple[object, object] | None = None
         try:
             state = self._refresh_progress(store)
             if state.status == "queued":
@@ -344,8 +424,15 @@ class EvaluationRunController:
 
             samples = self._load_samples(store.load())
             state = store.load()
+            service = self.service_factory()
+            if state.score_enabled:
+                scoring_preflight = getattr(service, "preflight_scoring", None)
+                errors = scoring_preflight() if callable(scoring_preflight) else []
+                if errors:
+                    return store.mark_failed(
+                        f"evaluation scoring preflight failed: {'; '.join(errors)}"
+                    )
             if state.mode == "online":
-                service = self.service_factory()
                 errors = service.preflight_online(samples)
                 if errors:
                     return store.mark_failed(f"evaluation preflight failed: {'; '.join(errors)}")
@@ -375,21 +462,104 @@ class EvaluationRunController:
             store.mutate(
                 lambda current: RunStateStore._with_update(current, stage="scoring")
             )
-            summary, results = (service if state.mode == "online" else self.service_factory()).score(
-                samples, snapshots, run_id=run_id
-            )
-            if not self._checkpoint(store):
-                return store.load()
+            def checkpoint(summary, results, completed_groups, total_groups):
+                nonlocal latest_checkpoint
+                latest_checkpoint = (summary, results)
+                store.update_scoring_progress(completed_groups, total_groups)
+                write_reports(store.path.parent / ".checkpoint", summary, results)
+                return store.load().status not in {"pause_requested", "cancel_requested"}
 
+            def item_checkpoint(summary, results, completed_items, total_items):
+                nonlocal latest_checkpoint
+                latest_checkpoint = (summary, results)
+                state = store.load()
+                store.update_scoring_progress(
+                    state.scoring_completed_groups,
+                    state.scoring_total_groups,
+                    completed_items=completed_items,
+                    total_items=total_items,
+                )
+                write_reports(store.path.parent / ".checkpoint", summary, results)
+
+            summary, results = (service if state.mode == "online" else self.service_factory()).score(
+                samples,
+                snapshots,
+                run_id=run_id,
+                progress_callback=checkpoint,
+                item_progress_callback=item_checkpoint,
+            )
+            state = store.load()
+            if state.status in {"pause_requested", "cancel_requested"}:
+                outcome_kind = (
+                    "partial_paused" if state.status == "pause_requested" else "partial_cancelled"
+                )
+                paths = write_reports(
+                    store.path.parent,
+                    summary,
+                    results,
+                    metadata={
+                        "run_outcome": {
+                            "kind": outcome_kind,
+                            "completed_groups": state.scoring_completed_groups,
+                            "total_groups": state.scoring_total_groups,
+                        }
+                    },
+                )
+                return store.publish_partial_report(report_path=str(paths.report_html))
             store.mutate(
                 lambda current: RunStateStore._with_update(current, stage="reporting")
             )
-            paths = write_reports(store.path.parent, summary, results)
-            return store.complete_report_or_handle_control(
-                report_path=str(paths.report_html),
+            paths = write_reports(
+                store.path.parent,
+                summary,
+                results,
+                metadata={
+                    "run_outcome": {
+                        "kind": "completed",
+                        "completed_groups": store.load().scoring_completed_groups,
+                        "total_groups": store.load().scoring_total_groups,
+                    }
+                },
             )
+            state = store.load()
+            if state.status in {"pause_requested", "cancel_requested"}:
+                outcome_kind = (
+                    "partial_paused" if state.status == "pause_requested" else "partial_cancelled"
+                )
+                paths = write_reports(
+                    store.path.parent,
+                    summary,
+                    results,
+                    metadata={
+                        "run_outcome": {
+                            "kind": outcome_kind,
+                            "completed_groups": state.scoring_completed_groups,
+                            "total_groups": state.scoring_total_groups,
+                        }
+                    },
+                )
+                return store.publish_partial_report(report_path=str(paths.report_html))
+            return store.complete_report_or_handle_control(report_path=str(paths.report_html))
         except Exception:
             logging.getLogger(__name__).exception("evaluation worker failed")
+            if latest_checkpoint is not None:
+                summary, results = latest_checkpoint
+                try:
+                    paths = write_reports(
+                        store.path.parent,
+                        summary,
+                        results,
+                        metadata={
+                            "run_outcome": {
+                                "kind": "partial_failed",
+                                "completed_groups": store.load().scoring_completed_groups,
+                                "total_groups": store.load().scoring_total_groups,
+                            }
+                        },
+                    )
+                    return store.publish_partial_report(report_path=str(paths.report_html))
+                except Exception:
+                    logging.getLogger(__name__).exception("failed to publish partial evaluation report")
             try:
                 store.remove_report_artifacts()
             except OSError:
@@ -408,6 +578,32 @@ class EvaluationRunController:
 
     def cancel(self, run_id: str) -> EvaluationRunState:
         return self._store(run_id).request_cancel()
+
+    def delete(self, run_id: str) -> EvaluationRunState:
+        """Delete a failed or cancelled run after confirming no worker is live."""
+        run_dir = (self.state_root / run_id).resolve()
+        state_root = self.state_root.resolve()
+        if run_dir.parent != state_root:
+            raise ValueError("invalid evaluation run id")
+
+        with self._threads_lock:
+            thread = self._threads.get(run_id)
+            if thread is not None and thread.is_alive():
+                raise ValueError(f"evaluation run {run_id!r} is still running")
+
+            state_path = run_dir / "run_state.json"
+            if not run_dir.is_dir() or not state_path.is_file():
+                raise FileNotFoundError(f"evaluation run {run_id!r} was not found")
+
+            state = RunStateStore(state_path).load()
+            if state.status not in _DELETABLE_RUN_STATUSES:
+                raise ValueError(
+                    f"evaluation run {run_id!r} can only be deleted from a failed or cancelled state"
+                )
+
+            shutil.rmtree(run_dir)
+            self._threads.pop(run_id, None)
+            return state
 
     def resume(self, run_id: str) -> EvaluationRunState:
         def queue(state: EvaluationRunState) -> EvaluationRunState:
@@ -433,7 +629,41 @@ class EvaluationRunController:
             thread = self._threads.get(run_id)
             if thread is not None and thread.is_alive():
                 return self._store(run_id).load()
-            return self._store(run_id).mark_orphaned_as_paused()
+            store = self._store(run_id)
+            if not store.path.is_file():
+                # Legacy run (pre-run_state): no run_state.json, only report
+                # artifacts. Synthesise a completed state so it can be opened.
+                return self._legacy_state(run_id)
+            return store.mark_orphaned_as_paused()
+
+    def _legacy_state(self, run_id: str) -> EvaluationRunState:
+        """Build a completed state for a legacy run that has ``summary.json``
+        but no ``run_state.json`` (created before run-state tracking existed)."""
+        summary_path = self.state_root / run_id / "summary.json"
+        if not summary_path.is_file():
+            raise FileNotFoundError(
+                f"evaluation run {run_id!r} has neither run_state.json nor summary.json"
+            )
+        try:
+            summary = EvaluationSummary.model_validate_json(
+                summary_path.read_text(encoding="utf-8-sig")
+            )
+        except Exception as exc:
+            # Corrupt summary is a server-side problem, not "not found".
+            raise ValueError(f"summary invalid: {exc}") from exc
+        return EvaluationRunState(
+            run_id=run_id,
+            dataset_path="",
+            snapshot_path="",
+            mode="offline",
+            score_enabled=False,
+            status="completed",
+            stage="reporting",
+            total_samples=summary.sample_count,
+            completed_samples=summary.sample_count,
+            successful_samples=summary.successful_samples,
+            failed_samples=summary.failed_samples,
+        )
 
     def _store(self, run_id: str) -> RunStateStore:
         return RunStateStore(self.state_root / run_id / "run_state.json")

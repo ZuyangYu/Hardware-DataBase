@@ -1,8 +1,10 @@
-﻿import os
+﻿import json
+import os
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from typing import Any
+from dataclasses import dataclass, field
 
 import config.settings
 from src.services.document_routing import PROCESSOR_KIND_SPREADSHEET, TABLE_STATUS_ARCHIVED, TABLE_STATUS_PROCESSING
@@ -10,7 +12,7 @@ from src.pipelines.document_rag.schemas import TASK_STATUS_DEAD_LETTER, TASK_STA
 
 WORKER_STALE_SECONDS = 30 * 60
 WORKER_MAX_RETRIES = 3
-TERMINAL_PARSE_STATUSES = {"parsed", "failed", "deleted", "indexed"}
+TERMINAL_PARSE_STATUSES = {"parsed", "failed", "deleted", "indexed", "degraded"}
 
 
 def _require_department_id(department_id: str | int | None, action: str) -> str:
@@ -50,6 +52,20 @@ class PipelineDocumentRecord:
     worker_started_at: str = ""
     worker_heartbeat_at: str = ""
     retry_count: int = 0
+    # Additive P1 scope metadata. The normalized ProjectStore remains the
+    # business source of truth; this keeps the existing pipeline catalog able
+    # to pre-filter by the same identity during the migration.
+    asset_id: str = ""
+    logical_document_id: str = ""
+    source_version_id: str = ""
+    project_id: str = ""
+    document_role: str = ""
+    module_scope: list[str] = field(default_factory=list)
+    revision: str = ""
+    approval_status: str = ""
+    effective_from: str = ""
+    effective_to: str = ""
+    usage_type: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -73,6 +89,33 @@ class PipelineDocumentStore:
                     dataset_id TEXT NOT NULL,
                     dataset_name TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pipeline_document_profiles (
+                    record_id INTEGER PRIMARY KEY,
+                    kb_name TEXT NOT NULL DEFAULT '',
+                    department_id TEXT NOT NULL DEFAULT '',
+                    remote_document_id TEXT NOT NULL DEFAULT '',
+                    parse_status TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    source_version_id TEXT NOT NULL DEFAULT '',
+                    revision TEXT NOT NULL DEFAULT '',
+                    mpn_values TEXT NOT NULL DEFAULT '[]',
+                    manufacturer TEXT NOT NULL DEFAULT '',
+                    identity_origin TEXT NOT NULL DEFAULT '{}',
+                    confirmed_at TEXT DEFAULT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pipeline_profile_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER,
+                    event_kind TEXT NOT NULL,
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    processed_at TEXT DEFAULT NULL
                 )
             """)
             conn.execute("""
@@ -111,8 +154,8 @@ class PipelineDocumentStore:
                     UNIQUE(kb_name, department_id, document_name, dataset_kind)
                 )
             """)
-            self._ensure_columns(conn)
             self._migrate_department_unique_constraint(conn)
+            self._ensure_columns(conn)
 
     def _ensure_columns(self, conn):
         columns = {
@@ -140,10 +183,32 @@ class PipelineDocumentStore:
             "retry_count": f"{add_column} retry_count INTEGER NOT NULL DEFAULT 0",
             "content_kind": f"{add_column} content_kind TEXT NOT NULL DEFAULT 'document_text'",
             "processor_kind": f"{add_column} processor_kind TEXT NOT NULL DEFAULT 'ragflow'",
+            "asset_id": f"{add_column} asset_id TEXT NOT NULL DEFAULT ''",
+            "logical_document_id": f"{add_column} logical_document_id TEXT NOT NULL DEFAULT ''",
+            "source_version_id": f"{add_column} source_version_id TEXT NOT NULL DEFAULT ''",
+            "project_id": f"{add_column} project_id TEXT NOT NULL DEFAULT ''",
+            "document_role": f"{add_column} document_role TEXT NOT NULL DEFAULT ''",
+            "module_scope_json": f"{add_column} module_scope_json TEXT NOT NULL DEFAULT '[]'",
+            "revision": f"{add_column} revision TEXT NOT NULL DEFAULT ''",
+            "approval_status": f"{add_column} approval_status TEXT NOT NULL DEFAULT ''",
+            "effective_from": f"{add_column} effective_from TEXT NOT NULL DEFAULT ''",
+            "effective_to": f"{add_column} effective_to TEXT NOT NULL DEFAULT ''",
+            "usage_type": f"{add_column} usage_type TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
                 conn.execute(statement)
+
+    @staticmethod
+    def _to_record(row) -> PipelineDocumentRecord:
+        values = dict(row)
+        raw_scope = values.pop("module_scope_json", "[]")
+        try:
+            scope = json.loads(raw_scope or "[]")
+        except (TypeError, json.JSONDecodeError):
+            scope = []
+        values["module_scope"] = [str(item) for item in scope] if isinstance(scope, list) else []
+        return PipelineDocumentRecord(**values)
 
     def _migrate_department_unique_constraint(self, conn):
         row = conn.execute(
@@ -263,6 +328,17 @@ class PipelineDocumentStore:
         processor_kind: str = "ragflow",
         parse_progress: int = 0,
         parse_stage: str = "",
+        asset_id: str = "",
+        logical_document_id: str = "",
+        source_version_id: str = "",
+        project_id: str = "",
+        document_role: str = "",
+        module_scope: list[str] | None = None,
+        revision: str = "",
+        approval_status: str = "",
+        effective_from: str = "",
+        effective_to: str = "",
+        usage_type: str = "",
     ):
         with closing(self._connect()) as conn:
             conn.execute(
@@ -272,9 +348,12 @@ class PipelineDocumentStore:
                     dataset_id, document_id, source_group, department_id,
                     uploaded_by, status, content_kind, processor_kind,
                     local_path, file_size, content_hash, upload_status,
-                    error_message, ragflow_error, parse_progress, parse_stage, parse_started_at
+                    error_message, ragflow_error, parse_progress, parse_stage,
+                    asset_id, logical_document_id, source_version_id, project_id, document_role,
+                    module_scope_json, revision, approval_status, effective_from, effective_to, usage_type,
+                    parse_started_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(kb_name, department_id, document_name, dataset_kind) DO UPDATE SET
                     kb_id = excluded.kb_id,
                     department_id = excluded.department_id,
@@ -294,6 +373,17 @@ class PipelineDocumentStore:
                     ragflow_error = excluded.ragflow_error,
                     parse_progress = excluded.parse_progress,
                     parse_stage = excluded.parse_stage,
+                    asset_id = excluded.asset_id,
+                    logical_document_id = excluded.logical_document_id,
+                    source_version_id = excluded.source_version_id,
+                    project_id = excluded.project_id,
+                    document_role = excluded.document_role,
+                    module_scope_json = excluded.module_scope_json,
+                    revision = excluded.revision,
+                    approval_status = excluded.approval_status,
+                    effective_from = excluded.effective_from,
+                    effective_to = excluded.effective_to,
+                    usage_type = excluded.usage_type,
                     worker_id = '',
                     worker_started_at = '',
                     worker_heartbeat_at = '',
@@ -322,6 +412,17 @@ class PipelineDocumentStore:
                     ragflow_error,
                     max(0, min(100, int(parse_progress or 0))),
                     parse_stage,
+                    asset_id,
+                    logical_document_id,
+                    source_version_id,
+                    project_id,
+                    document_role,
+                    json.dumps(sorted(set(module_scope or [])), ensure_ascii=False),
+                    revision,
+                    approval_status,
+                    effective_from,
+                    effective_to,
+                    usage_type,
                 ),
             )
 
@@ -336,7 +437,7 @@ class PipelineDocumentStore:
                 """,
                 (kb_name, department_id),
             ).fetchall()
-        return [PipelineDocumentRecord(**dict(row)) for row in rows]
+        return [self._to_record(row) for row in rows]
 
     def list_documents_unscoped(self, kb_name: str) -> list[PipelineDocumentRecord]:
         with closing(self._connect()) as conn:
@@ -348,7 +449,7 @@ class PipelineDocumentStore:
                 """,
                 (kb_name,),
             ).fetchall()
-        return [PipelineDocumentRecord(**dict(row)) for row in rows]
+        return [self._to_record(row) for row in rows]
 
     def document_stats_by_kb(self, department_id: str | int | None = None) -> dict[str, dict[str, int]]:
         """按知识库聚合文档/解析状态统计，供治理视图使用。"""
@@ -417,7 +518,7 @@ class PipelineDocumentStore:
                 "SELECT * FROM pipeline_documents WHERE id = ?",
                 (record_id,),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(row)) if row else None
+        return self._to_record(row) if row else None
 
     def get_document_by_id_scoped(self, record_id: int, department_id: str | int | None) -> PipelineDocumentRecord | None:
         department_id = _require_department_id(department_id, "id lookup")
@@ -426,7 +527,7 @@ class PipelineDocumentStore:
                 "SELECT * FROM pipeline_documents WHERE id = ? AND department_id = ?",
                 (record_id, department_id),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(row)) if row else None
+        return self._to_record(row) if row else None
 
     def get_document(
         self,
@@ -445,7 +546,7 @@ class PipelineDocumentStore:
                     """,
                     (kb_name, document_name, dataset_kind, department_id),
                 ).fetchone()
-            return PipelineDocumentRecord(**dict(row)) if row else None
+            return self._to_record(row) if row else None
 
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -455,7 +556,7 @@ class PipelineDocumentStore:
                 """,
                 (kb_name, document_name, department_id),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(row)) if row else None
+        return self._to_record(row) if row else None
 
     def get_document_unscoped(
         self,
@@ -478,7 +579,7 @@ class PipelineDocumentStore:
             ).fetchall()
         if len(rows) > 1:
             raise ValueError(f"Ambiguous pipeline document name in {kb_name}: {document_name}")
-        return PipelineDocumentRecord(**dict(rows[0])) if rows else None
+        return self._to_record(rows[0]) if rows else None
 
     def find_by_hash(
         self,
@@ -500,7 +601,7 @@ class PipelineDocumentStore:
                 """,
                 (kb_name, dataset_kind, content_hash, department_id),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(row)) if row else None
+        return self._to_record(row) if row else None
 
     def delete_document(
         self,
@@ -529,6 +630,7 @@ class PipelineDocumentStore:
     def delete_document_by_id(self, record_id: int):
         with closing(self._connect()) as conn:
             conn.execute("DELETE FROM pipeline_documents WHERE id = ?", (record_id,))
+            self._write_profile_event(conn, record_id, "deleted")
 
     def delete_document_by_id_scoped(self, record_id: int, department_id: str | int | None):
         department_id = _require_department_id(department_id, "id deletion")
@@ -537,6 +639,7 @@ class PipelineDocumentStore:
                 "DELETE FROM pipeline_documents WHERE id = ? AND department_id = ?",
                 (record_id, department_id),
             )
+            self._write_profile_event(conn, record_id, "deleted")
 
     def delete_document_by_remote_id(self, dataset_id: str, document_id: str):
         with closing(self._connect()) as conn:
@@ -544,19 +647,37 @@ class PipelineDocumentStore:
                 "DELETE FROM pipeline_documents WHERE dataset_id = ? AND document_id = ?",
                 (dataset_id, document_id),
             )
+            self._write_profile_event(conn, None, "deleted", {"document_id": document_id})
 
     def delete_documents_by_kb(self, kb_name: str, department_id: str):
         if department_id in (None, ""):
             raise ValueError("department_id is required for scoped knowledge-base document deletion")
         with closing(self._connect()) as conn:
+            ids = [
+                item["id"]
+                for item in conn.execute(
+                    "SELECT id FROM pipeline_documents WHERE kb_name = ? AND department_id = ?",
+                    (kb_name, department_id),
+                ).fetchall()
+            ]
             conn.execute(
                 "DELETE FROM pipeline_documents WHERE kb_name = ? AND department_id = ?",
                 (kb_name, department_id),
             )
+            for record_id in ids:
+                self._write_profile_event(conn, record_id, "deleted")
 
     def delete_documents_by_kb_unscoped(self, kb_name: str):
         with closing(self._connect()) as conn:
+            ids = [
+                item["id"]
+                for item in conn.execute(
+                    "SELECT id FROM pipeline_documents WHERE kb_name = ?", (kb_name,)
+                ).fetchall()
+            ]
             conn.execute("DELETE FROM pipeline_documents WHERE kb_name = ?", (kb_name,))
+            for record_id in ids:
+                self._write_profile_event(conn, record_id, "deleted")
 
     def update_document_status(self, dataset_id: str, document_id: str, status: str, error_message: str = ""):
         completed_expr = "CURRENT_TIMESTAMP" if status in TERMINAL_PARSE_STATUSES else "parse_completed_at"
@@ -575,6 +696,12 @@ class PipelineDocumentStore:
                 """,
                 (status, status, error_message, error_message, dataset_id, document_id),
             )
+            row = conn.execute(
+                "SELECT id FROM pipeline_documents WHERE dataset_id = ? AND document_id = ?",
+                (dataset_id, document_id),
+            ).fetchone()
+            record_id = row["id"] if row is not None else None
+            self._write_profile_event(conn, record_id, "parse_status", {"status": status})
 
     def update_document_status_by_id(self, record_id: int, status: str, error_message: str = ""):
         completed_expr = "CURRENT_TIMESTAMP" if status in TERMINAL_PARSE_STATUSES else "parse_completed_at"
@@ -593,6 +720,7 @@ class PipelineDocumentStore:
                 """,
                 (status, status, error_message, error_message, record_id),
             )
+            self._write_profile_event(conn, record_id, "parse_status", {"status": status})
 
     def update_document_progress_by_id(
         self,
@@ -715,7 +843,7 @@ class PipelineDocumentStore:
                 "SELECT * FROM pipeline_documents WHERE id = ? AND worker_id = ?",
                 (record_id, worker_id),
             ).fetchone()
-        return PipelineDocumentRecord(**dict(claimed)) if claimed else None
+        return self._to_record(claimed) if claimed else None
 
     def release_parse_claim(self, record_id: int):
         with closing(self._connect()) as conn:
@@ -741,4 +869,170 @@ class PipelineDocumentStore:
         )
         self.release_parse_claim(record_id)
 
+    # ── governed document profiles + invalidation outbox (task 5a) ────────
 
+    def _profile_row_to_dict(self, row) -> dict[str, Any]:
+        try:
+            mpn_values = json.loads(row["mpn_values"] or "[]")
+            identity_origin = json.loads(row["identity_origin"] or "{}")
+        except ValueError:
+            mpn_values, identity_origin = [], {}
+        return {
+            "record_id": row["record_id"],
+            "kb_name": row["kb_name"],
+            "department_id": row["department_id"],
+            "remote_document_id": row["remote_document_id"],
+            "parse_status": row["parse_status"],
+            "content_hash": row["content_hash"],
+            "source_version_id": row["source_version_id"],
+            "revision": row["revision"],
+            "mpn_values": mpn_values if isinstance(mpn_values, list) else [],
+            "manufacturer": row["manufacturer"],
+            "identity_origin": identity_origin if isinstance(identity_origin, dict) else {},
+            "confirmed_at": row["confirmed_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _sync_profile_snapshot(self, conn, record_id: int) -> None:
+        """Re-derive the governed stamps for one profile from the record."""
+        row = conn.execute(
+            """
+            SELECT kb_name, department_id, document_id, status, content_hash,
+                   source_version_id, revision
+            FROM pipeline_documents WHERE id = ?
+            """,
+            (record_id,),
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute(
+            """
+            UPDATE pipeline_document_profiles
+            SET kb_name = ?, department_id = ?, remote_document_id = ?,
+                parse_status = ?, content_hash = ?, source_version_id = ?,
+                revision = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE record_id = ?
+            """,
+            (
+                row["kb_name"], row["department_id"], row["document_id"],
+                row["status"], row["content_hash"], row["source_version_id"],
+                row["revision"], record_id,
+            ),
+        )
+
+    def confirm_document_identity(
+        self,
+        record_id: int,
+        mpn_values: list[str] | None = None,
+        manufacturer: str = "",
+        origin: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a governed identity snapshot; only explicit/confirmed data."""
+        record = self.get_document_by_id(record_id)
+        if record is None:
+            raise ValueError(f"document record not found: {record_id}")
+        payload = json.dumps(list(mpn_values or []), ensure_ascii=False)
+        origin_payload = json.dumps(origin or {}, ensure_ascii=False)
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO pipeline_document_profiles (
+                    record_id, kb_name, department_id, remote_document_id,
+                    parse_status, content_hash, source_version_id, revision,
+                    mpn_values, manufacturer, identity_origin, confirmed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(record_id) DO UPDATE SET
+                    kb_name = excluded.kb_name,
+                    department_id = excluded.department_id,
+                    remote_document_id = excluded.remote_document_id,
+                    parse_status = excluded.parse_status,
+                    content_hash = excluded.content_hash,
+                    source_version_id = excluded.source_version_id,
+                    revision = excluded.revision,
+                    mpn_values = excluded.mpn_values,
+                    manufacturer = excluded.manufacturer,
+                    identity_origin = excluded.identity_origin,
+                    confirmed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    record_id, record.kb_name, record.department_id, record.document_id,
+                    record.status, record.content_hash, record.source_version_id,
+                    record.revision, payload, str(manufacturer or ""), origin_payload,
+                ),
+            )
+            self._write_profile_event(conn, record_id, "identity_confirmed")
+
+    def get_document_profile(self, record_id: int) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM pipeline_document_profiles WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+        return self._profile_row_to_dict(row) if row is not None else None
+
+    def rebuild_document_profiles(self) -> int:
+        """Re-derive every stored profile's stamps from lifecycle records.
+
+        Confirmed MPN/manufacturer identity is preserved; the version stamps
+        are always copied fresh from ``pipeline_documents``.
+        """
+        with closing(self._connect()) as conn:
+            ids = [
+                item["record_id"]
+                for item in conn.execute("SELECT record_id FROM pipeline_document_profiles").fetchall()
+            ]
+            for record_id in ids:
+                self._sync_profile_snapshot(conn, record_id)
+        return len(ids)
+
+    def _write_profile_event(self, conn, record_id: int | None, event_kind: str, payload: dict[str, Any] | None = None) -> None:
+        conn.execute(
+            """
+            INSERT INTO pipeline_profile_outbox (record_id, event_kind, payload)
+            VALUES (?, ?, ?)
+            """,
+            (record_id, event_kind, json.dumps(payload or {}, ensure_ascii=False)),
+        )
+
+    def record_profile_event(self, record_id: int | None, event_kind: str, payload: dict[str, Any] | None = None) -> None:
+        with closing(self._connect()) as conn:
+            self._write_profile_event(conn, record_id, event_kind, payload)
+
+    def list_pending_profile_events(self, limit: int = 200) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, record_id, event_kind, payload, created_at
+                FROM pipeline_profile_outbox
+                WHERE processed_at IS NULL
+                ORDER BY id LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        events = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except ValueError:
+                payload = {}
+            events.append(
+                {
+                    "id": row["id"],
+                    "record_id": row["record_id"],
+                    "event_kind": row["event_kind"],
+                    "payload": payload,
+                    "created_at": row["created_at"],
+                }
+            )
+        return events
+
+    def mark_profile_event_processed(self, event_id: int) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE pipeline_profile_outbox SET processed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (event_id,),
+            )

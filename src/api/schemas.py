@@ -6,7 +6,7 @@ not redefine business schemas here.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -295,6 +295,44 @@ class SpreadsheetLedgerResponse(BaseModel):
     rows: list[dict] = Field(default_factory=list)
 
 
+class ExternalConversationListItem(BaseModel):
+    conversation_id: str
+    title: str = ""
+    source_file: str = ""
+    origin: str = "upload"
+    source_group: str = ""
+    turn_count: int = 0
+    block_count: int = 0
+    status: str = ""
+    created_at: str = ""
+    summary: str = ""
+    key_points: list[str] = Field(default_factory=list)
+    summary_generated_at: str = ""
+
+
+class ExternalConversationsResponse(BaseModel):
+    items: list[ExternalConversationListItem] = Field(default_factory=list)
+    totals: dict = Field(default_factory=dict)
+
+
+class ExternalConversationDetailResponse(BaseModel):
+    conversation_id: str
+    title: str = ""
+    source_file: str = ""
+    origin: str = "upload"
+    source_group: str = ""
+    turn_count: int = 0
+    block_count: int = 0
+    status: str = ""
+    created_at: str = ""
+    turns: list[dict] = Field(default_factory=list)
+    blocks: list[dict] = Field(default_factory=list)
+    preview: str = ""
+    summary: str = ""
+    key_points: list[str] = Field(default_factory=list)
+    summary_generated_at: str = ""
+
+
 class CircuitDesignsResponse(BaseModel):
     designs: list[dict] = Field(default_factory=list)
     failed_logs: list[dict] = Field(default_factory=list)
@@ -504,6 +542,11 @@ class QueryTraceView(BaseModel):
     error_message: str = ""
     metadata_json: str = ""
     created_at: str = ""
+    otel_trace_id: str = ""
+    otel_span_id: str = ""
+    turn_id: str = ""
+    grafana_trace_url: str = ""
+    phoenix_trace_url: str = ""
 
 
 class QueryStatsResponse(BaseModel):
@@ -541,3 +584,104 @@ class CreateEvaluationRunRequest(BaseModel):
     sample_ids: list[str] | None = None
     tags: list[str] | None = None
     snapshot_path: str | None = None  # required when mode == "offline"
+
+
+# ---------------------------------------------------------------------------
+# Document generation
+# ---------------------------------------------------------------------------
+
+class TemplateUnitView(BaseModel):
+    unit_id: str
+    label: str = ""
+    writable: bool = False
+    blocked_reason: str | None = None
+
+
+class TemplateSuggestionView(BaseModel):
+    semantic_unit_id: str
+    label: str
+    confidence: float
+
+
+class TemplateAnalysisView(BaseModel):
+    analysis_id: str
+    template_version_id: str
+    format: str
+    status: str
+    units: list[TemplateUnitView]
+    suggestions: list[TemplateSuggestionView]
+    reason_codes: list[str] = Field(default_factory=list)
+    auto_activated: bool = False
+
+
+class TemplateReviewUnitView(TemplateUnitView):
+    """Safe unit metadata used only by the human mapping-correction screen."""
+
+    structural_role_hint: str
+    candidate_for_auto_fill: bool = False
+
+
+class TemplateReviewSuggestionView(TemplateSuggestionView):
+    target_unit_ids: list[str]
+    retrieval_terms: list[str] = Field(default_factory=list)
+    value_shape: Literal["scalar", "repeating_table"] = "scalar"
+    overwrite_basis: Literal["placeholder", "sample_value"] | None = None
+
+
+class TemplateAnalysisReviewView(BaseModel):
+    analysis_id: str
+    template_version_id: str
+    content_hash: str
+    format: str
+    status: str
+    units: list[TemplateReviewUnitView]
+    suggestions: list[TemplateReviewSuggestionView]
+    locked_unit_ids: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+
+
+class TemplateMappingCorrectionRequest(BaseModel):
+    expected_content_hash: str = Field(min_length=64, max_length=64)
+    selected_suggestion_ids: list[str] = Field(min_length=1)
+    locked_unit_ids: list[str] = Field(default_factory=list)
+    comment: str = Field(min_length=1)
+
+
+class ConfirmTemplateRequest(BaseModel):
+    display_name: str
+
+
+class CreateWorkOrderRequest(BaseModel):
+    template_version_id: str
+    document_schema_id: str
+    document_schema_version: str
+    generation_session_id: str | None = None
+
+
+class DeleteDocumentWorkOrderRequest(BaseModel):
+    reason: str = ""
+
+
+class CreateGenerationSessionRequest(BaseModel):
+    template_version_id: str = Field(min_length=1)
+    purpose: str = ""
+    output_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class AnswerGenerationSessionRequest(BaseModel):
+    question_id: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+
+
+class IcdResolutionItem(BaseModel):
+    exception_id: str
+    action: Literal["include", "exclude"]
+
+
+class IcdResolutionRequest(BaseModel):
+    resolutions: list[IcdResolutionItem]
+    comment: str = ""
+
+
+class FeedbackRequest(BaseModel):
+    comment: str

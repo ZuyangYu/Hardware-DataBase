@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .schemas import EvaluationSample
+from .schemas import DocumentGenerationEvalRecord, EvaluationSample
 
 
 class DatasetValidationError(ValueError):
@@ -45,6 +45,41 @@ def _parse_dataset(path: Path) -> tuple[list[EvaluationSample], list[str]]:
     return samples, errors
 
 
+def _parse_document_generation_dataset(
+    path: Path,
+) -> tuple[list[DocumentGenerationEvalRecord], list[str]]:
+    records: list[DocumentGenerationEvalRecord] = []
+    errors: list[str] = []
+    seen: dict[str, int] = {}
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        return [], [f"cannot read dataset {path}: {exc}"]
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            payload = json.loads(raw_line)
+            if not isinstance(payload, dict):
+                raise ValueError("record must be a JSON object")
+            record = DocumentGenerationEvalRecord.model_validate(payload)
+        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            errors.append(f"line {line_number}: {exc}")
+            continue
+        if record.id in seen:
+            errors.append(
+                f"duplicate record id '{record.id}' at line {line_number} "
+                f"(first seen at line {seen[record.id]})"
+            )
+            continue
+        seen[record.id] = line_number
+        records.append(record)
+    if not records and not errors:
+        errors.append("dataset contains no records")
+    return records, errors
+
+
 def validate_dataset(path: str | Path) -> list[str]:
     """Return every validation error without raising."""
     _, errors = _parse_dataset(Path(path))
@@ -57,3 +92,11 @@ def load_dataset(path: str | Path) -> list[EvaluationSample]:
     if errors:
         raise DatasetValidationError("; ".join(errors))
     return samples
+
+
+def load_document_generation_dataset(path: str | Path) -> list[DocumentGenerationEvalRecord]:
+    """Load document-generation records without changing the QA JSONL contract."""
+    records, errors = _parse_document_generation_dataset(Path(path))
+    if errors:
+        raise DatasetValidationError("; ".join(errors))
+    return records

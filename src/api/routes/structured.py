@@ -19,6 +19,9 @@ from src.api.schemas import (
     CircuitDesignDetailResponse,
     CircuitDesignsResponse,
     CircuitParseLogResponse,
+    ExternalConversationDetailResponse,
+    ExternalConversationListItem,
+    ExternalConversationsResponse,
     OkResponse,
     SchematicDesignsResponse,
     SchematicPageResponse,
@@ -238,6 +241,67 @@ def list_test_reports(
 ):
     _require_kb_permission(user, kb_name, "read", auth)
     return StructuredRowsResponse(rows=TestDataQueryEngine().list_reports(kb_name))
+
+
+# ---- 外部对话 (external conversations) ---------------------------------
+
+
+@router.get("/kbs/{kb_name}/external-conversations", response_model=ExternalConversationsResponse)
+def list_external_conversations(
+    kb_name: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _require_kb_permission(user, kb_name, "read", auth)
+    items = pipeline.list_external_conversations(kb_name, ctx=ctx)
+    return ExternalConversationsResponse(
+        items=[ExternalConversationListItem(**item) for item in items],
+        totals={"count": len(items)},
+    )
+
+
+@router.get("/kbs/{kb_name}/external-conversations/{conversation_id}", response_model=ExternalConversationDetailResponse)
+def get_external_conversation(
+    kb_name: str,
+    conversation_id: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _require_kb_permission(user, kb_name, "read", auth)
+    detail = pipeline.get_external_conversation(kb_name, conversation_id, ctx=ctx)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="外部对话不存在")
+    return ExternalConversationDetailResponse(**detail)
+
+
+@router.delete("/kbs/{kb_name}/external-conversations/{conversation_id}", response_model=OkResponse)
+def delete_external_conversation(
+    kb_name: str,
+    conversation_id: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _require_kb_permission(user, kb_name, "write", auth)
+    removed = pipeline.delete_external_conversation(kb_name, conversation_id, ctx=ctx)
+    return OkResponse(ok=True, message="已删除" if removed else "未找到对应记录")
+
+
+@router.post("/kbs/{kb_name}/external-conversations/{conversation_id}/summary", response_model=ExternalConversationDetailResponse)
+def regenerate_external_conversation_summary(
+    kb_name: str,
+    conversation_id: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _require_kb_permission(user, kb_name, "write", auth)
+    detail = pipeline.regenerate_external_conversation_summary(kb_name, conversation_id, ctx=ctx)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="外部对话不存在或摘要生成不可用")
+    return ExternalConversationDetailResponse(**detail)
 
 
 @router.get("/kbs/{kb_name}/structured/test-measurements", response_model=StructuredRowsResponse)

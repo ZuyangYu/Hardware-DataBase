@@ -1,7 +1,7 @@
 import unittest
 
 from src.agents.schemas import Evidence
-from src.agents.tools.circuit_tools import make_circuit_search
+from src.agents.tools.circuit_tools import CircuitQueryTool, make_circuit_search
 from src.agents.tools.runtime import ToolRuntime
 from src.pipelines.document_rag.schemas import RequestContext
 
@@ -48,9 +48,25 @@ class CircuitAgentToolTests(unittest.TestCase):
         self.assertEqual(call["ctx"], ctx)
         self.assertEqual(call["top_k"], 3)
 
+    def test_circuit_query_tool_fails_closed_without_department_context(self):
+        import pytest as _pytest
+
+        from src.pipelines.document_rag.schemas import RequestContext as _RequestContext
+
+        tool = CircuitQueryTool(index_service=_CircuitIndex())
+        with _pytest.raises(PermissionError):
+            tool.run("U1200 CAN connection", "kb_hw", _RequestContext(user_id="alice"), top_k=3)
+
+    def test_circuit_query_tool_returns_empty_for_authorized_empty_index(self):
+        ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
+        tool = CircuitQueryTool(index_service=_CircuitIndex())
+        hits = tool.run("U1200 CAN connection", "kb_hw", ctx, top_k=3)
+        self.assertEqual(hits, [])
+
     def test_circuit_search_returns_empty_marker_when_no_indexed_data_exists(self):
         index = _CircuitIndex()
-        rt = _runtime(index)
+        ctx = RequestContext(user_id="alice", metadata={"department_id": "dept_hw"})
+        rt = _runtime(index, ctx=ctx)
         circuit_search = make_circuit_search(rt, index)
 
         result = circuit_search("U1200 CAN connection")

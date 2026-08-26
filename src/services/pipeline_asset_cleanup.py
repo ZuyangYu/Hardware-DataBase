@@ -24,9 +24,15 @@ class PipelineAssetCleanupService:
         self,
         archive: DocumentArchiveManager | None = None,
         spreadsheets: SpreadsheetIndexService | None = None,
+        conversations=None,
     ):
         self.archive = archive or DocumentArchiveManager()
         self.spreadsheets = spreadsheets or SpreadsheetIndexService()
+        if conversations is None:
+            from src.external_conversations.store import ExternalConversationStore
+
+            conversations = ExternalConversationStore()
+        self.conversations = conversations
 
     def cleanup_knowledge_base(self, kb_name: str, department_id: str | int | None = None) -> PipelineAssetCleanupResult:
         result = PipelineAssetCleanupResult()
@@ -41,6 +47,11 @@ class PipelineAssetCleanupService:
                 "spreadsheet index",
                 result.errors,
             )
+            try:
+                conversation_scope = self.conversations.scope_dir(department_id, kb_name, create=False)
+            except Exception:
+                conversation_scope = None
+            self._remove_tree(conversation_scope, "external conversations", result.errors)
 
         self._remove_tree(
             os.path.join(config.settings.PIPELINE_ARCHIVE_ROOT, kb_name),

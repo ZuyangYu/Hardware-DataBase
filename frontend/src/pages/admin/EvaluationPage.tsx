@@ -8,7 +8,6 @@ import type {
   EvaluationRunDetail,
   EvaluationRunListItem,
   EvaluationRunStatus,
-  EvaluationSummary,
   OkResponse,
 } from '../../api/types';
 import type { AuthSession } from '../../auth';
@@ -16,6 +15,7 @@ import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { StatCard } from '@/components/StatCard';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { Button } from '@/components/ui/button';
 import { Input, Label, Textarea } from '@/components/ui';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -29,6 +29,9 @@ import {
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
+
+import EvaluationDashboard from './EvaluationDashboard';
+import { canLoadSampleDiagnostics, shouldResetEvaluationLoading } from './evaluationDashboard';
 
 type Props = {
   auth: AuthSession;
@@ -58,6 +61,11 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 const ACTIVE_STATUSES = new Set<EvaluationRunStatus>(['queued', 'running', 'pause_requested', 'cancel_requested']);
+const DELETABLE_STATUSES = new Set<EvaluationRunStatus>(['failed', 'cancelled']);
+
+type LoadOptions = {
+  silent?: boolean;
+};
 
 function splitList(value: string): string[] | null {
   const items = value
@@ -72,13 +80,19 @@ function outputRootQuery(outputRoot: string): string {
 }
 
 function progressPercent(run: EvaluationRunDetail | null): number {
-  if (!run || run.total_samples <= 0) return 0;
+  if (!run) return 0;
+  if (run.stage === 'scoring' && run.scoring_total_items > 0) {
+    return Math.max(0, Math.min(100, Math.round((run.scoring_completed_items / run.scoring_total_items) * 100)));
+  }
+  if (run.total_samples <= 0) return 0;
   return Math.max(0, Math.min(100, Math.round((run.completed_samples / run.total_samples) * 100)));
 }
 
-function formatNumber(value: number | undefined): string {
-  if (value == null || Number.isNaN(value)) return '-';
-  return value.toFixed(3);
+function progressLabel(run: EvaluationRunDetail): string {
+  if (run.stage === 'scoring' && run.scoring_total_items > 0) {
+    return `评分 ${run.scoring_completed_items}/${run.scoring_total_items}`;
+  }
+  return run.current_sample_id || '当前无运行样本';
 }
 
 export default function EvaluationPage({ auth, onLogout }: Props) {
@@ -88,6 +102,8 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const [selectedRunId, setSelectedRunId] = useState('');
   const [detail, setDetail] = useState<EvaluationRunDetail | null>(null);
   const [detailLoaded, setDetailLoaded] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<EvaluationRunListItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const [datasetPath, setDatasetPath] = useState(DEFAULT_DATASET);
   const [uploadingDataset, setUploadingDataset] = useState(false);
@@ -102,9 +118,10 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const [compare, setCompare] = useState<EvaluationCompareResponse | null>(null);
   const [compareLoading, setCompareLoading] = useState(false);
 
-  const loadRuns = useCallback(() => {
+  const loadRuns = useCallback((options: LoadOptions = {}) => {
+    const silent = options.silent ?? false;
     let cancelled = false;
-    setRunsLoaded(false);
+    if (shouldResetEvaluationLoading(silent)) setRunsLoaded(false);
     api
       .get<EvaluationRunListItem[]>(`/api/v1/evaluation/runs?${outputRootQuery(outputRoot)}`)
       .then((rows) => {
@@ -113,7 +130,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         setSelectedRunId((current) => (rows.some((run) => run.run_id === current) ? current : rows[0]?.run_id || ''));
       })
       .catch((error) => {
-        if (!cancelled) notify.error(error instanceof Error ? error.message : '加载评估运行失败');
+        if (!cancelled && !silent) {
+          notify.error(error instanceof Error ? error.message : '加载评估运行失败');
+        }
       })
       .finally(() => {
         if (!cancelled) setRunsLoaded(true);
@@ -123,14 +142,15 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     };
   }, [outputRoot]);
 
-  const loadDetail = useCallback((runId = selectedRunId) => {
+  const loadDetail = useCallback((runId = selectedRunId, options: LoadOptions = {}) => {
+    const silent = options.silent ?? false;
     if (!runId) {
       setDetail(null);
       setDetailLoaded(true);
       return undefined;
     }
     let cancelled = false;
-    setDetailLoaded(false);
+    if (shouldResetEvaluationLoading(silent)) setDetailLoaded(false);
     api
       .get<EvaluationRunDetail>(`/api/v1/evaluation/runs/${encodeURIComponent(runId)}?${outputRootQuery(outputRoot)}`)
       .then((run) => {
@@ -138,8 +158,13 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       })
       .catch((error) => {
         if (!cancelled) {
-          setDetail(null);
-          notify.error(error instanceof Error ? error.message : '加载评估详情失败');
+          // Keep the last known detail during a background poll failure. A
+          // transient request error should not replace the whole panel with
+          // an empty state (or produce a toast every two seconds).
+          if (!silent) {
+            setDetail(null);
+            notify.error(error instanceof Error ? error.message : '加载评估详情失败');
+          }
         }
       })
       .finally(() => {
@@ -161,13 +186,15 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   }, [loadDetail]);
 
   useEffect(() => {
-    if (!detail || !ACTIVE_STATUSES.has(detail.status)) return undefined;
+    const activeRunId = detail?.run_id;
+    const isActive = detail != null && ACTIVE_STATUSES.has(detail.status);
+    if (!activeRunId || !isActive) return undefined;
     const timer = window.setInterval(() => {
-      loadDetail(detail.run_id);
-      loadRuns();
+      void loadDetail(activeRunId, { silent: true });
+      void loadRuns({ silent: true });
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [detail, loadDetail, loadRuns]);
+  }, [detail?.run_id, detail?.status, loadDetail, loadRuns]);
 
   useEffect(() => {
     setCompare(null);
@@ -255,6 +282,31 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     }
   }
 
+  async function handleDeleteRun() {
+    if (!deleteTarget) return;
+    const runId = deleteTarget.run_id;
+    setDeleting(true);
+    try {
+      await api.delete<OkResponse>(
+        `/api/v1/evaluation/runs/${encodeURIComponent(runId)}?${outputRootQuery(outputRoot)}`,
+      );
+      notify.success('评估运行已删除');
+      setDeleteTarget(null);
+      setRuns((current) => current.filter((run) => run.run_id !== runId));
+      setCompare(null);
+      setBaselineRunId('');
+      if (selectedRunId === runId) {
+        setSelectedRunId('');
+        setDetail(null);
+      }
+      loadRuns();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '删除评估运行失败');
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function handleCompare() {
     if (!selectedRunId || !baselineRunId) {
       notify.error('请选择当前运行和基线运行');
@@ -309,24 +361,41 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       {
         key: 'actions',
         title: '操作',
-        width: 90,
+        width: 160,
         align: 'right',
         render: (run) => (
-          <button
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              setSelectedRunId(run.run_id);
-              setCompare(null);
-            }}
-            className="inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
-          >
-            查看
-          </button>
+          <div className="flex justify-end gap-[6px]">
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setSelectedRunId(run.run_id);
+                setCompare(null);
+                loadDetail(run.run_id);
+              }}
+              className="inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
+            >
+              查看
+            </button>
+            {run.status && DELETABLE_STATUSES.has(run.status) && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setDeleteTarget(run);
+                }}
+                className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#f3b0b0] bg-white px-[10px] text-[12px] text-[#d20b0b] transition-colors hover:bg-[#fce7e7]"
+                title="删除失败或已取消的运行"
+              >
+                <AppIcon name="trash" size={13} />
+                删除
+              </button>
+            )}
+          </div>
         ),
       },
     ],
-    [selectedRunId],
+    [selectedRunId, loadDetail],
   );
 
   const completedRuns = runs.filter((run) => run.has_summary && run.run_id !== selectedRunId);
@@ -437,21 +506,6 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         )}
       </section>
 
-      <section className="mt-[16px]">
-        <RunDetailPanel
-          run={detail}
-          loaded={detailLoaded}
-          canStart={canStart}
-          canPause={canPause}
-          canResume={canResume}
-          canCancel={canCancel}
-          onStart={() => void controlRun('start')}
-          onPause={() => void controlRun('pause')}
-          onResume={() => void controlRun('resume')}
-          onCancel={() => void controlRun('cancel')}
-        />
-      </section>
-
       <section className="mt-[16px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
         <div className="mb-[12px] flex flex-wrap items-end gap-[10px]">
           <div className="grid min-w-[240px] gap-[4px]">
@@ -474,11 +528,40 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           </Button>
         </div>
         {compare ? (
-          <SummaryCompare current={compare.current} baseline={compare.baseline} />
+          <p className="text-[12px] text-[#858b9c]">已选择基线；分组柱状图和数值对比显示在下方评估总览中。</p>
         ) : (
           <p className="text-[12px] text-[#858b9c]">选择一个已完成的运行作为基线,可比较当前摘要与历史摘要。</p>
         )}
       </section>
+
+      <section className="mt-[16px]">
+        <RunDetailPanel
+          run={detail}
+          loaded={detailLoaded}
+          compare={compare}
+          canStart={canStart}
+          canPause={canPause}
+          canResume={canResume}
+          canCancel={canCancel}
+          onStart={() => void controlRun('start')}
+          onPause={() => void controlRun('pause')}
+          onResume={() => void controlRun('resume')}
+          onCancel={() => void controlRun('cancel')}
+        />
+      </section>
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
+        }}
+        title={<>删除评估运行「{deleteTarget?.run_id}」</>}
+        description="仅失败或已取消的运行可以删除。删除后该运行的状态、快照和评估报告将不可恢复。"
+        confirmText="删除"
+        loading={deleting}
+        destructive
+        onConfirm={() => void handleDeleteRun()}
+      />
     </div>
   );
 }
@@ -511,6 +594,7 @@ function StatusPill({ status }: { status: string }) {
 function RunDetailPanel({
   run,
   loaded,
+  compare,
   canStart,
   canPause,
   canResume,
@@ -522,6 +606,7 @@ function RunDetailPanel({
 }: {
   run: EvaluationRunDetail | null;
   loaded: boolean;
+  compare: EvaluationCompareResponse | null;
   canStart: boolean;
   canPause: boolean;
   canResume: boolean;
@@ -547,6 +632,9 @@ function RunDetailPanel({
   }
 
   const percent = progressPercent(run);
+  const scoringPercent = run.scoring_total_items > 0
+    ? Math.max(0, Math.min(100, Math.round((run.scoring_completed_items / run.scoring_total_items) * 100)))
+    : 0;
   return (
     <div className="flex flex-col gap-[16px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
       <div className="flex flex-wrap items-start justify-between gap-[12px]">
@@ -579,14 +667,14 @@ function RunDetailPanel({
 
       <div className="grid grid-cols-4 gap-[12px] max-[900px]:grid-cols-2">
         <StatCard label="样本总数" value={run.total_samples} />
-        <StatCard label="已完成" value={run.completed_samples} />
-        <StatCard label="成功" value={run.successful_samples} tone="green" />
-        <StatCard label="失败" value={run.failed_samples} tone={run.failed_samples > 0 ? 'red' : 'green'} />
+        <StatCard label="采集完成" value={`${run.completed_samples}/${run.total_samples}`} />
+        <StatCard label="评分任务" value={!run.score_enabled ? '未启用' : run.scoring_total_items > 0 ? `${run.scoring_completed_items}/${run.scoring_total_items}` : '待开始'} />
+        <StatCard label="待评分" value={!run.score_enabled || run.scoring_total_items <= 0 ? '—' : Math.max(0, run.scoring_total_items - run.scoring_completed_items)} />
       </div>
 
       <div>
         <div className="mb-[6px] flex justify-between text-[11px] text-[#858b9c]">
-          <span>{run.current_sample_id || '当前无运行样本'}</span>
+          <span>{progressLabel(run)}</span>
           <span>{percent}%</span>
         </div>
         <div className="h-[8px] overflow-hidden rounded-full bg-[#f2f3f7]">
@@ -597,6 +685,18 @@ function RunDetailPanel({
         )}
       </div>
 
+      {run.score_enabled && run.scoring_total_items > 0 && (
+        <div>
+          <div className="mb-[6px] flex justify-between text-[11px] text-[#858b9c]">
+            <span>评分项进度</span>
+            <span>{run.scoring_completed_items} / {run.scoring_total_items} · {scoringPercent}%</span>
+          </div>
+          <div className="h-[8px] overflow-hidden rounded-full bg-[#f2f3f7]">
+            <div className="h-full rounded-full bg-[#4b63b7] transition-[width]" style={{ width: `${scoringPercent}%` }} />
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-[10px] text-[12px] max-[900px]:grid-cols-1">
         <Meta label="数据集" value={run.dataset_path} />
         <Meta label="快照" value={run.snapshot_path || '-'} />
@@ -606,7 +706,18 @@ function RunDetailPanel({
         {run.report_path && <Meta label="报告" value={run.report_path} />}
       </div>
 
-      {run.summary && <SummaryPanel summary={run.summary} />}
+      {run.summary && (
+        <EvaluationDashboard
+          summary={run.summary}
+          sampleResults={canLoadSampleDiagnostics(run.status, Boolean(run.summary)) ? run.sample_results ?? [] : []}
+          sampleResultsError={canLoadSampleDiagnostics(run.status, Boolean(run.summary)) ? run.sample_results_error ?? '' : ''}
+          compare={compare}
+          isInProgress={ACTIVE_STATUSES.has(run.status)}
+          isFinal={run.status === 'completed'}
+          scoringCompletedItems={run.scoring_completed_items}
+          scoringTotalItems={run.scoring_total_items}
+        />
+      )}
     </div>
   );
 }
@@ -616,74 +727,6 @@ function Meta({ label, value }: { label: string; value: string }) {
     <div className="grid gap-[3px] rounded-[8px] bg-[#fafbfc] px-[10px] py-[8px]">
       <span className="text-[11px] text-[#858b9c]">{label}</span>
       <span className="break-words text-[12px] text-[#18181a]">{value}</span>
-    </div>
-  );
-}
-
-function SummaryPanel({ summary }: { summary: EvaluationSummary }) {
-  const metricRows = Object.entries(summary.metric_scores).map(([metric, score]) => ({
-    metric,
-    score,
-    count: summary.metric_counts[metric] ?? 0,
-    failures: summary.metric_failures[metric] ?? 0,
-  }));
-
-  return (
-    <div className="border-t border-[#f0f1f4] pt-[14px]">
-      <div className="mb-[12px] flex flex-wrap items-center gap-[10px]">
-        <h3 className="text-[14px] font-semibold text-[#18181a]">评估摘要</h3>
-        {summary.gate && (
-          <span className={cn('rounded-full px-[8px] py-[2px] text-[11px]', summary.gate.passed ? 'bg-[#e6f6ec] text-[#138a55]' : 'bg-[#fce7e7] text-[#d20b0b]')}>
-            Gate {summary.gate.passed ? '通过' : '未通过'}
-          </span>
-        )}
-      </div>
-      <div className="mb-[12px] grid grid-cols-3 gap-[12px] max-[900px]:grid-cols-1">
-        <StatCard label="样本数" value={summary.sample_count} />
-        <StatCard label="成功样本" value={summary.successful_samples} tone="green" />
-        <StatCard label="失败样本" value={summary.failed_samples} tone={summary.failed_samples > 0 ? 'red' : 'green'} />
-      </div>
-      {metricRows.length === 0 ? (
-        <p className="text-[12px] text-[#858b9c]">暂无评分指标。</p>
-      ) : (
-        <div className="grid gap-[8px]">
-          {metricRows.map((row) => (
-            <div key={row.metric} className="grid grid-cols-[minmax(0,1fr)_80px_80px_80px] gap-[8px] rounded-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[12px]">
-              <span className="truncate font-medium text-[#18181a]">{row.metric}</span>
-              <span className="text-right text-[#464c5e]">{formatNumber(row.score)}</span>
-              <span className="text-right text-[#858b9c]">{row.count} 次</span>
-              <span className={cn('text-right', row.failures ? 'text-[#d20b0b]' : 'text-[#858b9c]')}>{row.failures} 失败</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SummaryCompare({ current, baseline }: { current: EvaluationSummary; baseline: EvaluationSummary }) {
-  const metrics = Array.from(new Set([...Object.keys(current.metric_scores), ...Object.keys(baseline.metric_scores)])).sort();
-  return (
-    <div className="grid gap-[8px]">
-      {metrics.length === 0 ? (
-        <p className="text-[12px] text-[#858b9c]">两次运行都没有评分指标。</p>
-      ) : (
-        metrics.map((metric) => {
-          const cur = current.metric_scores[metric];
-          const base = baseline.metric_scores[metric];
-          const delta = cur != null && base != null ? cur - base : null;
-          return (
-            <div key={metric} className="grid grid-cols-[minmax(0,1fr)_90px_90px_90px] gap-[8px] rounded-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[12px]">
-              <span className="truncate font-medium text-[#18181a]">{metric}</span>
-              <span className="text-right text-[#464c5e]">{formatNumber(cur)}</span>
-              <span className="text-right text-[#858b9c]">{formatNumber(base)}</span>
-              <span className={cn('text-right', delta == null ? 'text-[#858b9c]' : delta >= 0 ? 'text-[#138a55]' : 'text-[#d20b0b]')}>
-                {delta == null ? '-' : `${delta >= 0 ? '+' : ''}${delta.toFixed(3)}`}
-              </span>
-            </div>
-          );
-        })
-      )}
     </div>
   );
 }

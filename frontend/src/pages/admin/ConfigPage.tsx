@@ -80,6 +80,32 @@ const GROUPS: Group[] = [
     ],
   },
   {
+    title: '可观测性',
+    fields: [
+      ['OBS_ENABLED', '启用观测'],
+      ['OTEL_SERVICE_NAME', '服务名'],
+      ['OTEL_EXPORTER_OTLP_ENDPOINT', 'OTLP Endpoint'],
+      ['OBS_ENVIRONMENT', '环境'],
+      ['OBS_SERVICE_VERSION', '服务版本'],
+      ['OBS_TRACE_SAMPLE_RATIO', 'Trace 采样率'],
+      ['OBS_CAPTURE_CONTENT', '允许采集内容'],
+      ['OBS_CAPTURE_QUERY', '允许采集问题'],
+      ['OBS_CAPTURE_EVIDENCE', '允许采集证据'],
+      ['OBS_CAPTURE_LLM_CONTENT', '允许采集 LLM 内容'],
+      ['OBS_CONTENT_MAX_CHARS', '内容最大长度'],
+      ['OBS_LOG_FORMAT', '日志格式'],
+      ['OBS_METRICS_ENABLED', '启用 Metrics'],
+      ['OBS_TRACES_ENABLED', '启用 Traces'],
+      ['OBS_LOGS_ENABLED', '启用 Logs'],
+      ['OBS_PHOENIX_PROJECT', 'Phoenix 项目'],
+      ['OBS_GRAFANA_BASE_URL', 'Grafana 地址'],
+      ['OBS_PHOENIX_BASE_URL', 'Phoenix 地址'],
+      ['OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS', 'Worker 心跳间隔(秒)'],
+      ['OBS_WORKER_STALE_SECONDS', 'Worker 过期阈值(秒)'],
+      ['OBS_DEPENDENCY_TIMEOUT_SECONDS', '依赖探测超时(秒)'],
+    ],
+  },
+  {
     title: '系统提示词',
     textarea: true,
     fields: [
@@ -103,6 +129,11 @@ const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: number; 
   AGENT_RATE_LIMIT_MAX_DELAY_SECONDS: { min: 0, max: 600 },
   FINAL_TOP_K: { min: 1, max: 50, integer: true },
   AGENT_MAX_RETRIEVAL_ROUNDS: { min: 1, max: 20, integer: true },
+  OBS_TRACE_SAMPLE_RATIO: { min: 0, max: 1, step: 0.05 },
+  OBS_CONTENT_MAX_CHARS: { min: 1000, max: 200000, integer: true },
+  OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS: { min: 1, max: 300 },
+  OBS_WORKER_STALE_SECONDS: { min: 5, max: 3600, integer: true },
+  OBS_DEPENDENCY_TIMEOUT_SECONDS: { min: 0.1, max: 60 },
 };
 
 export default function ConfigPage({ auth, onLogout }: Props) {

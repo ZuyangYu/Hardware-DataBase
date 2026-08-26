@@ -158,6 +158,28 @@ class AnswerRunnerTests(unittest.TestCase):
         self.assertEqual(snapshot.error_stage, "answer_collection")
         self.assertEqual(snapshot.response, "")
 
+    def test_collect_preserves_sanitized_failed_retrieval_diagnostics(self):
+        class FailedSummaryPipeline(FakePipeline):
+            def get_last_retrieval_summary(self):
+                return {
+                    "status": "failed",
+                    "error_stage": "answer",
+                    "error_message": "api_key=secret-value",
+                    "evidence": [{"content": "partial evidence"}],
+                    "tool_diagnostics": [{"status": "failed", "error": "timeout"}],
+                }
+
+        snapshot = AnswerRunner(lambda: FailedSummaryPipeline()).collect(_sample())
+
+        self.assertEqual(snapshot.status, "failed")
+        self.assertEqual(snapshot.error_stage, "answer")
+        self.assertIn("api_key=[redacted]", snapshot.error_message)
+        self.assertNotIn("secret-value", snapshot.error_message)
+        self.assertEqual(snapshot.evidence, [{"content": "partial evidence"}])
+        self.assertEqual(snapshot.retrieved_contexts, ["partial evidence"])
+        self.assertEqual(snapshot.retrieval_summary["tool_diagnostics"][0]["error"], "timeout")
+        self.assertEqual(snapshot.response, "")
+
     def test_collect_reports_pipeline_initialization_failure(self):
         def broken_factory():
             raise RuntimeError("cannot initialize")

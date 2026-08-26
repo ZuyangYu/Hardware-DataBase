@@ -114,7 +114,7 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _content_hash(design: CircuitDesign) -> str:
+def circuit_generation_id(design: CircuitDesign) -> str:
     """Stable hash of a design's structured content (plan §4.6 version stamp).
 
     Only the structured payload matters — ``updated_at`` is excluded so
@@ -125,6 +125,11 @@ def _content_hash(design: CircuitDesign) -> str:
     payload.pop("parse_warnings", None)  # warnings are non-structural
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def _content_hash(design: CircuitDesign) -> str:
+    """Backward-compatible internal name for the public generation stamp."""
+    return circuit_generation_id(design)
 
 
 def _atomic_write(path: str, payload: str) -> None:

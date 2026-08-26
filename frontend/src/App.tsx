@@ -29,6 +29,7 @@ import KbListPage from './pages/KbListPage';
 import ChatPage from './pages/chat/ChatPage';
 import KbFilesPage from './pages/KbFilesPage';
 import AssetsPage from './pages/AssetsPage';
+import DocumentGenerationPage from './pages/DocumentGenerationPage';
 import UsersPage from './pages/admin/UsersPage';
 import DepartmentsPage from './pages/admin/DepartmentsPage';
 import KbPermissionsPage from './pages/admin/KbPermissionsPage';
@@ -36,6 +37,7 @@ import GovernancePage from './pages/admin/GovernancePage';
 import LogsPage from './pages/admin/LogsPage';
 import ConfigPage from './pages/admin/ConfigPage';
 import EvaluationPage from './pages/admin/EvaluationPage';
+import SystemStatusPage from './pages/admin/SystemStatusPage';
 
 const SIDEBAR_STORAGE_KEY = 'hdb_sidebar_expanded';
 
@@ -165,6 +167,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               }
             />
             <Route
+              path="/document-generation"
+              element={
+                <KbContentRoute auth={auth}>
+                  <DocumentGenerationPage auth={auth} onLogout={onLogout} kbs={kbs} />
+                </KbContentRoute>
+              }
+            />
+            <Route
               path="/kbs"
               element={
                 <KbContentRoute auth={auth}>
@@ -255,6 +265,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               element={
                 <AdminRoute auth={auth} requireSysAdmin>
                   <EvaluationPage auth={auth} onLogout={onLogout} />
+                </AdminRoute>
+              }
+            />
+            <Route
+              path="/admin/status"
+              element={
+                <AdminRoute auth={auth}>
+                  <SystemStatusPage auth={auth} onLogout={onLogout} />
                 </AdminRoute>
               }
             />

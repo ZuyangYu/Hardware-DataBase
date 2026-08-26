@@ -107,6 +107,7 @@ def scan_kb_sources(
             "documents": sum(1 for item in sources if item.content_kind == "document_text"),
             "spreadsheets": sum(1 for item in sources if item.processor_kind == "spreadsheet_table"),
             "circuits": sum(1 for item in sources if item.processor_kind == "circuit_design"),
+            "conversations": sum(1 for item in sources if item.processor_kind == "external_conversation"),
         },
         "errors": errors,
     }

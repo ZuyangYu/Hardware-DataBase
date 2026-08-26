@@ -244,7 +244,8 @@ def _format_value(raw: str, format_code: str) -> str:
     return raw
 
 
-def parse_xlsx(file_path: str) -> ParsedWorkbook:
+def parse_xlsx(file_path: str | os.PathLike[str] | object) -> ParsedWorkbook:
+    """Parse an XLSX package from a path or a seekable binary stream."""
     if not zipfile.is_zipfile(file_path):
         raise ValueError("Not a valid .xlsx package")
 
@@ -268,8 +269,13 @@ def parse_xlsx(file_path: str) -> ParsedWorkbook:
                     merged_ranges=merged_ranges,
                 )
             )
+    source_name = (
+        os.path.basename(os.fspath(file_path))
+        if isinstance(file_path, (str, os.PathLike))
+        else str(getattr(file_path, "name", "workbook.xlsx"))
+    )
     return ParsedWorkbook(
-        file_name=os.path.basename(file_path),
+        file_name=source_name,
         sheets=sheets,
         embedded_object_count=sum(name.startswith("xl/embeddings/") for name in names),
         media_object_count=sum(name.startswith("xl/media/") for name in names),

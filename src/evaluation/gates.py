@@ -19,6 +19,12 @@ DEFAULT_THRESHOLDS: dict[str, float] = {
     "conflict_disclosure": 0.90,
 }
 
+DOCUMENT_GENERATION_HARD_ZERO_METRICS = {
+    "fixed_content_overwrite_rate",
+    "source_scope_violation_count",
+    "unsupported_required_field_fill_count",
+}
+
 
 def evaluate_gate(
     results: list[SampleResult],
@@ -47,6 +53,10 @@ def evaluate_gate(
             if metric.status != "success" or metric.score is None:
                 continue
             scores[metric.metric_name].append(metric.score)
+            if metric.metric_name in DOCUMENT_GENERATION_HARD_ZERO_METRICS and metric.score != 0.0:
+                failures.append(
+                    f"{sample.sample_id}: {metric.metric_name} must be 0.0, got {metric.score:.3f}"
+                )
             if sample.critical and threshold is not None and metric.score < threshold:
                 failures.append(
                     f"critical sample {sample.sample_id}: {metric.metric_name} "

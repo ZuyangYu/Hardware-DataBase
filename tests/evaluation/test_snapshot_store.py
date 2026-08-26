@@ -1,4 +1,5 @@
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
 
@@ -43,6 +44,18 @@ class SnapshotStoreTests(unittest.TestCase):
         store.append(_snapshot("q1"))
 
         self.assertFalse(self.path.with_suffix(self.path.suffix + ".tmp").exists())
+
+    def test_concurrent_appends_preserve_every_snapshot(self):
+        store = SnapshotStore(self.path)
+        snapshots = [_snapshot(f"q{index}") for index in range(8)]
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(executor.map(store.append, snapshots))
+
+        self.assertEqual(
+            {item.sample_id for item in store.load_all()},
+            {item.sample_id for item in snapshots},
+        )
 
 
 if __name__ == "__main__":

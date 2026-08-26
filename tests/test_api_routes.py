@@ -3,6 +3,7 @@ import os
 from contextlib import closing
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import config.settings
 import httpx
@@ -226,6 +227,45 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertIn("event: done", body)
         self.assertIn('"answer": "第一段第二段"', body)
         self.assertIn('"status": "success"', body)
+
+    def test_legacy_query_records_chat_metrics(self):
+        t = self._token("user1")
+        with patch("src.api.routes.query.record_chat_turn") as record:
+            with self.client.stream(
+                "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
+            ) as r:
+                self.assertEqual(r.status_code, 200)
+                b"".join(r.iter_bytes())
+
+        record.assert_called_once()
+        self.assertEqual(record.call_args.kwargs["status"], "completed")
+        self.assertEqual(record.call_args.kwargs["mode"], "deep")
+        self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
+
+    def test_direct_query_records_chat_metrics(self):
+        class _FakeChunk:
+            def __init__(self, text):
+                self.content = text
+                self.usage_metadata = None
+
+        class FakeModel:
+            def stream(self, _messages):
+                yield _FakeChunk("通用回答")
+
+        t = self._token("user1")
+        with patch("src.api.routes.query.create_chat_model", return_value=FakeModel()), patch(
+            "src.api.routes.query.record_chat_turn"
+        ) as record:
+            with self.client.stream(
+                "POST", "/api/v1/query", json={"kb_name": "", "query": "问"}, headers=self._auth(t)
+            ) as r:
+                self.assertEqual(r.status_code, 200)
+                b"".join(r.iter_bytes())
+
+        record.assert_called_once()
+        self.assertEqual(record.call_args.kwargs["status"], "completed")
+        self.assertEqual(record.call_args.kwargs["mode"], "fast")
+        self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
 
     def test_turn_persists_messages_and_replays_sse_events(self):
         t = self._token("user1")

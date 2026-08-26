@@ -1,0 +1,3 @@
+{"id":"docgen-v1-rated-current","template_fixture":"rated_current_review.xlsx","field_id":"rated_current","expected_value":"10 A","allowed_sources":["power_spec.pdf"],"required":true,"critical":true}
+{"id":"docgen-v1-controller","template_fixture":"controller_review.docx","field_id":"controller_model","expected_value":"STM32H743","allowed_sources":["released_design.docx"],"required":true,"critical":true}
+{"id":"docgen-v1-interface-modes","template_fixture":"interface_review.xlsx","field_id":"supported_modes","expected_value":"Normal, Sleep","allowed_sources":["interface_spec.pdf"],"required":false,"critical":false}

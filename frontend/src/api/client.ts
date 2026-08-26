@@ -74,8 +74,33 @@ export const api = {
   post: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
   put: <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
-  delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
+  delete: <T>(path: string, body?: unknown) => request<T>(path, {
+    method: 'DELETE',
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }),
 };
+
+/** 触发浏览器下载二进制文件(不能走 JSON request()). */
+export async function downloadBlob(path: string, filename: string): Promise<void> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: { ...authHeader() },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new ApiError(response.status, text, response.statusText);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export const apiDownload = { blob: downloadBlob };
 
 /** multipart 上传(不能走 request():浏览器要自己拼 boundary) */
 export async function uploadFiles<T>(path: string, form: FormData): Promise<T> {
@@ -92,7 +117,7 @@ export async function uploadFiles<T>(path: string, form: FormData): Promise<T> {
 }
 
 /** SSE 流式请求(POST /query):fetch + ReadableStream 自解析 event/data 帧 */
-export type SseEvent = { event: string; data: string };
+export type SseEvent = { event: string; data: string; id?: number };
 
 async function* parseSseResponse(response: Response): AsyncGenerator<SseEvent, void, unknown> {
   if (!response.ok) {
@@ -115,12 +140,17 @@ async function* parseSseResponse(response: Response): AsyncGenerator<SseEvent, v
         const frame = buffer.slice(0, sepIndex);
         buffer = buffer.slice(sepIndex + 2);
         let event = 'message';
+        let id: number | undefined;
         const dataLines: string[] = [];
         for (const line of frame.split('\n')) {
           if (line.startsWith('event:')) event = line.slice(6).trim();
+          else if (line.startsWith('id:')) {
+            const parsed = Number(line.slice(3).trim());
+            if (Number.isFinite(parsed)) id = parsed;
+          }
           else if (line.startsWith('data:')) dataLines.push(line.startsWith('data: ') ? line.slice(6) : line.slice(5));
         }
-        if (dataLines.length > 0) yield { event, data: dataLines.join('\n') };
+        if (dataLines.length > 0) yield { event, data: dataLines.join('\n'), ...(id === undefined ? {} : { id }) };
       }
     }
   } finally {
@@ -148,13 +178,62 @@ export async function* sseStream(
 
 /** 可重放的 turn SSE 订阅; 后端会根据 Last-Event-ID 补发持久化事件。 */
 export async function* sseGetStream(path: string, signal?: AbortSignal, lastEventId?: number): AsyncGenerator<SseEvent, void, unknown> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    headers: {
-      Accept: 'text/event-stream',
-      ...authHeader(),
-      ...(lastEventId ? { 'Last-Event-ID': String(lastEventId) } : {}),
-    },
-    signal,
-  });
-  yield* parseSseResponse(response);
+  let cursor = lastEventId || 0;
+  let retryAttempt = 0;
+  const retryDelaysMs = [500, 1000, 2000, 4000, 8000, 12000, 20000];
+
+  const isAbortError = (error: unknown) =>
+    (error instanceof DOMException && error.name === 'AbortError') || signal?.aborted === true;
+
+  const waitForRetry = (delayMs: number): Promise<void> => {
+    if (!signal) return new Promise((resolve) => setTimeout(resolve, delayMs));
+    if (signal.aborted) return Promise.reject(new DOMException('SSE stream aborted', 'AbortError'));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', abort);
+        resolve();
+      }, delayMs);
+      const abort = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', abort);
+        reject(new DOMException('SSE stream aborted', 'AbortError'));
+      };
+      signal.addEventListener('abort', abort, { once: true });
+    });
+  };
+
+  for (;;) {
+    try {
+      const response = await fetch(`${API_BASE}${path}`, {
+        headers: {
+          Accept: 'text/event-stream',
+          ...authHeader(),
+          ...(cursor ? { 'Last-Event-ID': String(cursor) } : {}),
+        },
+        signal,
+      });
+      for await (const evt of parseSseResponse(response)) {
+        if (evt.id !== undefined) cursor = evt.id;
+        retryAttempt = 0;
+        yield evt;
+        // A terminal event ends the durable subscription. If the connection
+        // drops before it arrives, the loop below reconnects from `cursor`.
+        if (evt.event === 'done' || evt.event === 'error') return;
+      }
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      // Authentication, authorization, and missing-turn errors will not be
+      // fixed by retrying. Network errors and 5xx responses are retryable.
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429) {
+        throw error;
+      }
+    }
+
+    if (signal?.aborted) throw new DOMException('SSE stream aborted', 'AbortError');
+    if (retryAttempt >= retryDelaysMs.length) {
+      throw new Error('流式连接中断，自动重连失败，请刷新页面继续接收结果');
+    }
+    await waitForRetry(retryDelaysMs[retryAttempt]);
+    retryAttempt += 1;
+  }
 }

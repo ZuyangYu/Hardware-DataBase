@@ -163,6 +163,14 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 onClick={() => navigate('/chat')}
                 tooltip="对话"
               />
+              <PrimaryNavButton
+                label="文档生成"
+                iconName="file"
+                active={location.pathname === '/document-generation'}
+                collapsed={collapsed}
+                onClick={() => navigate('/document-generation')}
+                tooltip="文档生成"
+              />
             </SidebarMenu>
           )}
 
@@ -223,6 +231,14 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   collapsed={collapsed}
                   onClick={() => navigate('/admin/logs')}
                   tooltip="日志中心"
+                />
+                <PrimaryNavButton
+                  label="系统状态"
+                  iconName="refresh"
+                  active={location.pathname === '/admin/status'}
+                  collapsed={collapsed}
+                  onClick={() => navigate('/admin/status')}
+                  tooltip="系统状态"
                 />
                 {sysAdmin && (
                   <PrimaryNavButton

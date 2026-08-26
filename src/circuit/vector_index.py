@@ -25,10 +25,11 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from src.circuit.models import CircuitDesign
 from src.circuit.parsers.edf_power import classify_net_name
+from src.circuit.store import circuit_generation_id
 from src.core.logger import error, log, warn
 
 
@@ -39,6 +40,14 @@ KIND_INSTANCE = "instance"
 KIND_NET = "net"
 
 
+def _generation_metadata(design: CircuitDesign) -> dict[str, str]:
+    generation_id = circuit_generation_id(design)
+    return {
+        "generation_id": generation_id,
+        "generation_key": f"{design.design_id}:{generation_id}",
+    }
+
+
 @dataclass(frozen=True)
 class CircuitVectorHit:
     kind: str
@@ -47,6 +56,15 @@ class CircuitVectorHit:
     score: float               # 1 - distance, higher is more similar
     metadata: dict[str, Any]
     document: str
+
+
+@dataclass(frozen=True)
+class CircuitVectorIndexStatus:
+    """Outcome of indexing one circuit design into the vector collection."""
+
+    available: bool
+    indexed_count: int
+    error: str = ""
 
 
 def _collection_name(kb_name: str) -> str:
@@ -112,6 +130,7 @@ def _module_doc(design: CircuitDesign, module) -> tuple[str, dict[str, Any]]:
         "module_name": module.name,
         "instance_count": len(module.instances),
         "net_count": len(module.nets),
+        **_generation_metadata(design),
     }
     return body, metadata
 
@@ -133,6 +152,7 @@ def _instance_doc(design: CircuitDesign, inst) -> tuple[str, dict[str, Any]]:
         "natural_id": inst.refdes,
         "library_cell": inst.library_cell or "",
         "part_number": inst.part_number or "",
+        **_generation_metadata(design),
     }
     return body, metadata
 
@@ -153,6 +173,7 @@ def _net_doc(design: CircuitDesign, net) -> tuple[str, dict[str, Any]]:
         "natural_id": net.name,
         "net_type": net.net_type,
         "connection_count": len(net.connections),
+        **_generation_metadata(design),
     }
     return body, metadata
 
@@ -251,7 +272,11 @@ class CircuitVectorIndex:
     # ── write path ────────────────────────────────────────────────────────
 
     def reindex_design(self, design: CircuitDesign) -> int:
-        """Re-embed a single design. Returns the row count written.
+        """Compatibility wrapper returning the number of rows written."""
+        return self.reindex_design_with_status(design).indexed_count
+
+    def reindex_design_with_status(self, design: CircuitDesign) -> CircuitVectorIndexStatus:
+        """Re-embed a design and retain availability and failure details.
 
         Strategy: nuke this design's existing entries first, then bulk-write
         the new ones. The collection is per-KB but we scope deletion by
@@ -263,9 +288,9 @@ class CircuitVectorIndex:
             if not self._embed_warning_logged:
                 log("CircuitVectorIndex: embed model 未配置，跳过 circuit 向量索引")
                 self._embed_warning_logged = True
-            return 0
+            return CircuitVectorIndexStatus(available=False, indexed_count=0)
         if self._chroma_client() is None:
-            return 0
+            return CircuitVectorIndexStatus(available=False, indexed_count=0)
 
         docs: list[tuple[str, str, dict[str, Any]]] = []
         # Collect (id, body, metadata) triples for everything we want indexed.
@@ -284,19 +309,27 @@ class CircuitVectorIndex:
 
         if not docs:
             # No content to index → still remove stale rows for this design.
-            self._delete_design(design.kb_name, design.design_id)
-            return 0
+            delete_error = self._delete_design(design.kb_name, design.design_id)
+            if delete_error:
+                return CircuitVectorIndexStatus(available=True, indexed_count=0, error=delete_error)
+            return CircuitVectorIndexStatus(available=True, indexed_count=0)
 
         with self._lock:
-            self._delete_design(design.kb_name, design.design_id)
-            collection = self._chroma_collection(design.kb_name)
             try:
+                delete_error = self._delete_design(design.kb_name, design.design_id)
+                if delete_error:
+                    return CircuitVectorIndexStatus(available=True, indexed_count=0, error=delete_error)
+                collection = self._chroma_collection(design.kb_name)
                 ids = [d[0] for d in docs]
                 bodies = [d[1] for d in docs]
                 metas = [d[2] for d in docs]
                 embeddings = self._embed_batch(embed_model, bodies)
                 if embeddings is None:
-                    return 0
+                    return CircuitVectorIndexStatus(
+                        available=True,
+                        indexed_count=0,
+                        error="embedding failed",
+                    )
                 collection.add(
                     ids=ids,
                     documents=bodies,
@@ -307,22 +340,31 @@ class CircuitVectorIndex:
                     f"CircuitVectorIndex: reindexed {design.kb_name}/{design.design_id} — "
                     f"{len(docs)} docs"
                 )
-                return len(docs)
+                return CircuitVectorIndexStatus(available=True, indexed_count=len(docs))
             except Exception as exc:
                 error(
                     f"CircuitVectorIndex: reindex_design failed for "
                     f"{design.kb_name}/{design.design_id}: {exc}"
                 )
-                return 0
+                return CircuitVectorIndexStatus(
+                    available=True,
+                    indexed_count=0,
+                    error="reindex failed",
+                )
 
-    def _delete_design(self, kb_name: str, design_id: str) -> None:
+    def _delete_design(self, kb_name: str, design_id: str) -> str:
         """Remove all rows for a design. Safe when the collection is empty,
-        doesn't exist yet, or the vector stack is unavailable."""
+        doesn't exist yet, or the vector stack is unavailable.
+
+        Returns an error description on failure, "" on success (the reindex
+        status path surfaces delete failures to callers)."""
         try:
             collection = self._chroma_collection(kb_name)
             collection.delete(where={"design_id": design_id})
         except Exception as exc:
             warn(f"CircuitVectorIndex: delete_design ({kb_name}/{design_id}) failed: {exc}")
+            return "delete failed"
+        return ""
 
     def drop_kb(self, kb_name: str) -> None:
         """Drop the entire circuit vector collection for a KB."""
@@ -344,6 +386,8 @@ class CircuitVectorIndex:
         query: str,
         top_k: int = 20,
         kinds: Iterable[str] | None = None,
+        allowed_design_ids: Iterable[str] | None = None,
+        allowed_generations: Mapping[str, str] | None = None,
     ) -> list[CircuitVectorHit]:
         """Top-K nearest docs. Returns [] if no embed model, no collection,
         or chroma errors out — callers must treat this as a best-effort
@@ -351,6 +395,20 @@ class CircuitVectorIndex:
         """
         if not query.strip():
             return []
+        allowed = None
+        if allowed_design_ids is not None:
+            allowed = sorted({str(design_id) for design_id in allowed_design_ids if str(design_id)})
+            if not allowed:
+                return []
+        generation_keys = None
+        if allowed_generations is not None:
+            generation_keys = sorted(
+                f"{design_id}:{generation_id}"
+                for design_id, generation_id in allowed_generations.items()
+                if str(design_id) and str(generation_id)
+            )
+            if not generation_keys:
+                return []
         embed_model = self._embed_model()
         if embed_model is None or self._chroma_client() is None:
             return []
@@ -359,9 +417,20 @@ class CircuitVectorIndex:
             if not query_embedding:
                 return []
             collection = self._chroma_collection(kb_name)
-            where: dict[str, Any] | None = None
+            conditions: list[dict[str, Any]] = []
             if kinds:
-                where = {"kind": {"$in": list(kinds)}}
+                conditions.append({"kind": {"$in": list(kinds)}})
+            if allowed is not None:
+                conditions.append({"design_id": {"$in": allowed}})
+            if generation_keys is not None:
+                conditions.append({"generation_key": {"$in": generation_keys}})
+            where: dict[str, Any] | None
+            if len(conditions) == 1:
+                where = conditions[0]
+            elif conditions:
+                where = {"$and": conditions}
+            else:
+                where = None
             res = collection.query(
                 query_embeddings=query_embedding,
                 n_results=top_k,

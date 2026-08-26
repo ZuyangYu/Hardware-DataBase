@@ -94,6 +94,25 @@ class PipelineAssetCleanupServiceTests(unittest.TestCase):
             self.assertFalse(os.path.exists(department_archive))
             self.assertFalse(os.path.exists(spreadsheet_index))
 
+    def test_cleanup_knowledge_base_removes_conversation_assets_scoped_by_department(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root = config.settings.STORAGE_DIR
+            try:
+                config.settings.STORAGE_DIR = os.path.join(tmp, "storage")
+                from src.external_conversations.store import ExternalConversationStore
+
+                store = ExternalConversationStore()
+                dept_a_dir = store.scope_dir("dept_a", "kb", create=True)
+                dept_b_dir = store.scope_dir("dept_b", "kb", create=True)
+
+                result = PipelineAssetCleanupService().cleanup_knowledge_base("kb", "dept_a")
+
+                self.assertTrue(result.ok, result.errors)
+                self.assertFalse(os.path.exists(dept_a_dir))
+                self.assertTrue(os.path.exists(dept_b_dir))
+            finally:
+                config.settings.STORAGE_DIR = old_root
+
     def test_document_archive_uses_pipeline_archive_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_root = config.settings.PIPELINE_ARCHIVE_ROOT

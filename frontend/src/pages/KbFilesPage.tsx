@@ -7,6 +7,9 @@ import type {
   CircuitDesignRow,
   CircuitDesignsResponse,
   CircuitParseLogResponse,
+  ExternalConversationDetailResponse,
+  ExternalConversationListItem,
+  ExternalConversationsResponse,
   FileView,
   KbView,
   OkResponse,
@@ -68,9 +71,11 @@ const PROCESSOR_LABELS: Record<string, string> = {
   spreadsheet: '表格',
   spreadsheet_table: '表格',
   circuit_design: '电路',
+  external_conversation: '外部对话',
 };
 
 const SOURCE_GROUPS = ['设计数据', '物料数据', '文档资料', '测试数据', '项目管理数据', '外部数据', '人员与组织数据'];
+const EXTERNAL_DATA_GROUP = '外部数据';
 const WORKSPACE_TABS = [
   { key: 'files', label: '文件', icon: 'file' },
   { key: 'spreadsheets', label: 'Excel 台账', icon: 'grid' },
@@ -78,6 +83,7 @@ const WORKSPACE_TABS = [
   { key: 'modules', label: '模块树', icon: 'folder' },
   { key: 'tests', label: '测试数据', icon: 'tool' },
   { key: 'schematics', label: '原理图', icon: 'eye' },
+  { key: 'chats', label: '外部对话', icon: 'message' },
 ] as const;
 
 type WorkspaceTab = (typeof WORKSPACE_TABS)[number]['key'];
@@ -134,6 +140,15 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   const [selectedPageNumber, setSelectedPageNumber] = useState<number | null>(null);
   const [schematicPage, setSchematicPage] = useState<SchematicPageResponse | null>(null);
   const [schematicPageLoading, setSchematicPageLoading] = useState(false);
+  const [chats, setChats] = useState<ExternalConversationListItem[]>([]);
+  const [chatsLoading, setChatsLoading] = useState(false);
+  const [chatsLoaded, setChatsLoaded] = useState(false);
+  const [selectedChatId, setSelectedChatId] = useState('');
+  const [chatDetail, setChatDetail] = useState<ExternalConversationDetailResponse | null>(null);
+  const [chatDetailLoading, setChatDetailLoading] = useState(false);
+  const [deleteChatTarget, setDeleteChatTarget] = useState<ExternalConversationListItem | null>(null);
+  const [deletingChat, setDeletingChat] = useState(false);
+  const [summaryGenerating, setSummaryGenerating] = useState(false);
 
   const canWrite = kbMeta?.permission === 'write' || kbMeta?.permission === 'admin';
   const canAdmin = kbMeta?.permission === 'admin';
@@ -375,14 +390,54 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     }
   }, [kbName, selectedPageNumber, selectedSchematicId]);
 
+  const loadChats = useCallback(async () => {
+    setChatsLoading(true);
+    try {
+      const result = await api.get<ExternalConversationsResponse>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/external-conversations`,
+      );
+      setChats(result.items);
+      setSelectedChatId((current) =>
+        result.items.some((item) => item.conversation_id === current) ? current : result.items[0]?.conversation_id ?? '',
+      );
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '加载外部对话失败');
+    } finally {
+      setChatsLoaded(true);
+      setChatsLoading(false);
+    }
+  }, [kbName]);
+
+  const loadChatDetail = useCallback(async () => {
+    if (!selectedChatId) {
+      setChatDetail(null);
+      return;
+    }
+    setChatDetailLoading(true);
+    try {
+      const result = await api.get<ExternalConversationDetailResponse>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/external-conversations/${encodeURIComponent(selectedChatId)}`,
+      );
+      setChatDetail(result);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '加载对话内容失败');
+    } finally {
+      setChatDetailLoading(false);
+    }
+  }, [kbName, selectedChatId]);
+
   useEffect(() => {
     if (activeTab === 'spreadsheets' && !spreadsheetLedger && !spreadsheetsLoading) void loadSpreadsheets();
     if (activeTab === 'circuits' && !circuitList && !circuitsLoading) void loadCircuitList();
     if (activeTab === 'modules' && !modulesLoaded && !modulesLoading) void loadModules();
     if (activeTab === 'tests' && !testsLoaded && !testsLoading) void loadTests();
     if (activeTab === 'schematics' && !schematics && !schematicsLoading) void loadSchematics();
+    if (activeTab === 'chats' && !chatsLoaded && !chatsLoading) void loadChats();
   }, [
     activeTab,
+    chatDetail,
+    chatsLoaded,
+    chatsLoading,
     circuitList,
     circuitsLoading,
     loadCircuitList,
@@ -410,6 +465,10 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   useEffect(() => {
     if (activeTab === 'schematics') void loadSchematicPage();
   }, [activeTab, loadSchematicPage]);
+
+  useEffect(() => {
+    if (activeTab === 'chats') void loadChatDetail();
+  }, [activeTab, loadChatDetail]);
 
   async function handleViewChunks(file: FileView) {
     setParseLoading(true);
@@ -489,6 +548,41 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       notify.error(error instanceof Error ? error.message : '删除电路设计失败');
     } finally {
       setDeletingDesign(false);
+    }
+  }
+
+  async function handleRegenerateSummary() {
+    if (!selectedChatId || summaryGenerating) return;
+    setSummaryGenerating(true);
+    try {
+      const result = await api.post<ExternalConversationDetailResponse>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/external-conversations/${encodeURIComponent(selectedChatId)}/summary`,
+        {},
+      );
+      setChatDetail(result);
+      notify.success('AI 摘要已生成');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '摘要生成失败');
+    } finally {
+      setSummaryGenerating(false);
+    }
+  }
+
+  async function handleDeleteChat() {    if (!deleteChatTarget) return;
+    setDeletingChat(true);
+    try {
+      await api.delete<OkResponse>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/external-conversations/${encodeURIComponent(deleteChatTarget.conversation_id)}`,
+      );
+      notify.success('外部对话已删除');
+      setDeleteChatTarget(null);
+      setSelectedChatId('');
+      setChatDetail(null);
+      await loadChats();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '删除外部对话失败');
+    } finally {
+      setDeletingChat(false);
     }
   }
 
@@ -634,7 +728,11 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".pdf,.doc,.docx,.xls,.xlsx,.edf,.edif"
+              accept={
+                sourceGroup === EXTERNAL_DATA_GROUP
+                  ? '.txt,.md,.markdown'
+                  : '.pdf,.doc,.docx,.xls,.xlsx,.edf,.edif'
+              }
               onChange={(event) => setSelectedFiles(event.target.files)}
               className="h-[34px] rounded-[10px] border border-[#e3e7f1] bg-white px-[10px] py-[5px] text-[12px] text-[#464c5e] file:mr-[10px] file:rounded-[8px] file:border-0 file:bg-[#f3f4f6] file:px-[10px] file:py-[4px] file:text-[12px] file:text-[#464c5e]"
             />
@@ -773,6 +871,20 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
               }}
             />
           )}
+          {activeTab === 'chats' && (
+            <ChatsPanel
+              items={chats}
+              loading={chatsLoading || chatDetailLoading}
+              selectedId={selectedChatId}
+              detail={chatDetail}
+              canWrite={canWrite}
+              summaryGenerating={summaryGenerating}
+              onSelectedIdChange={setSelectedChatId}
+              onRefresh={() => void loadChats()}
+              onDelete={setDeleteChatTarget}
+              onRegenerateSummary={() => void handleRegenerateSummary()}
+            />
+          )}
         </div>
       </div>
 
@@ -834,6 +946,18 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
         loading={deletingDesign}
         destructive
         onConfirm={handleDeleteDesign}
+      />
+      <ConfirmDialog
+        open={deleteChatTarget !== null}
+        onOpenChange={(open: boolean) => {
+          if (!open) setDeleteChatTarget(null);
+        }}
+        title={<>删除外部对话「{deleteChatTarget?.title}」</>}
+        description="删除后该对话的解析结果、索引和归档文件会被清理。"
+        confirmText="删除"
+        loading={deletingChat}
+        destructive
+        onConfirm={handleDeleteChat}
       />
     </div>
   );
@@ -1134,11 +1258,177 @@ function TestDataPanel({
   );
 }
 
+export const MESSAGE_COLLAPSE_THRESHOLD = 120;
+
+/** One conversation message. Long content collapses by default; click to toggle. */
+export function ChatMessageBubble({ role, content, ts }: { role: string; content: string; ts?: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const isLong = content.length > MESSAGE_COLLAPSE_THRESHOLD;
+  const showFull = expanded || !isLong;
+  return (
+    <div
+      className={cn(
+        'max-w-[86%] rounded-[10px] border px-[12px] py-[8px] text-[12px] leading-[18px]',
+        role === 'user'
+          ? 'justify-self-start cursor-pointer border-[#e3e7f1] bg-white text-[#18181a]'
+          : role === 'assistant'
+            ? 'justify-self-end cursor-pointer border-[#dcebdd] bg-[#f2f9f3] text-[#1f3a26]'
+            : 'justify-self-start border-[#e3e7f1] bg-white text-[#464c5e]',
+      )}
+      onClick={isLong ? () => setExpanded((v) => !v) : undefined}
+      title={isLong ? (expanded ? '点击收起' : '点击展开') : undefined}
+    >
+      {ts && <div className="mb-[2px] text-[11px] text-[#757f9c]">{ts}</div>}
+      <div
+        className={cn(
+          'whitespace-pre-wrap break-words',
+          !showFull && 'line-clamp-3',
+        )}
+      >
+        {content}
+      </div>
+      {isLong && (
+        <div className="mt-[2px] text-right text-[11px] text-[#757f9c]">
+          {expanded ? '收起 ▴' : `展开 ▾ (${content.length} 字)`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function ChatsPanel({
+  items,
+  loading,
+  selectedId,
+  detail,
+  canWrite,
+  summaryGenerating,
+  onSelectedIdChange,
+  onRefresh,
+  onDelete,
+  onRegenerateSummary,
+}: {
+  items: ExternalConversationListItem[];
+  loading: boolean;
+  selectedId: string;
+  detail: ExternalConversationDetailResponse | null;
+  canWrite: boolean;
+  summaryGenerating: boolean;
+  onSelectedIdChange: (value: string) => void;
+  onRefresh: () => void;
+  onDelete: (item: ExternalConversationListItem) => void;
+  onRegenerateSummary: () => void;
+}) {
+  const columns: DataTableColumn<ExternalConversationListItem>[] = [
+    { key: 'title', title: '会话', render: (row) => <TextCell value={row.title} strong /> },
+    { key: 'source_file', title: '来源文件', render: (row) => <TextCell value={row.source_file} /> },
+    { key: 'origin', title: '来源', width: 90, render: (row) => (row.origin === 'chat_deposit' ? '对话沉淀' : '上传') },
+    { key: 'turns', title: '消息数', width: 80, align: 'right', render: (row) => row.turn_count || row.block_count },
+    {
+      key: 'actions',
+      title: '',
+      width: 70,
+      render: (row) =>
+        canWrite ? (
+          <button
+            type="button"
+            className="text-[12px] text-[#c0392b] hover:underline"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDelete(row);
+            }}
+          >
+            删除
+          </button>
+        ) : null,
+    },
+  ];
+  const turns = detail?.turns ?? [];
+  return (
+    <div className="grid gap-[16px]">
+      <PanelToolbar title="外部对话浏览" onRefresh={onRefresh} loading={loading} />
+      <DataTable
+        columns={columns}
+        data={items}
+        rowKey={(row) => row.conversation_id}
+        size="compact"
+        onRowClick={(row) => onSelectedIdChange(row.conversation_id)}
+        emptyText="当前知识库尚未上传外部对话记录"
+      />
+      {selectedId && (
+        <div className="grid gap-[10px] rounded-[12px] border border-[#e3e7f1] bg-[#fafbfc] p-[14px]">
+          <div className="text-[12px] font-semibold text-[#464c5e]">
+            对话内容{detail ? ` · ${detail.title}` : ''}
+            {canWrite && detail && (
+              <button
+                type="button"
+                disabled={summaryGenerating}
+                onClick={onRegenerateSummary}
+                className="ml-[10px] text-[11px] font-normal text-[#2563eb] hover:underline disabled:text-[#858b9c]"
+              >
+                {summaryGenerating ? '生成中…' : '生成/刷新 AI 摘要'}
+              </button>
+            )}
+          </div>
+          {detail?.summary && (
+            <div className="rounded-[10px] border border-[#dcebdd] bg-[#f2f9f3] px-[12px] py-[10px]">
+              <div className="mb-[4px] flex items-center justify-between">
+                <span className="text-[11px] font-semibold text-[#1f3a26]">AI 提取摘要</span>
+                {detail.summary_generated_at && (
+                  <span className="text-[11px] text-[#757f9c]">{detail.summary_generated_at}</span>
+                )}
+              </div>
+              <div className="whitespace-pre-wrap break-words text-[12px] leading-[18px] text-[#1f3a26]">
+                {detail.summary}
+              </div>
+              {(detail.key_points?.length ?? 0) > 0 && (
+                <ul className="mt-[6px] grid gap-[2px]">
+                  {detail.key_points!.map((point, i) => (
+                    <li key={i} className="list-inside list-disc text-[12px] leading-[18px] text-[#2c4633]">
+                      {point}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {!detail && loading && <PanelSkeleton rows={2} />}
+          {detail && turns.length === 0 && (detail.blocks?.length ?? 0) > 0 && (
+            <EmptyState text="该文件未解析出对话轮次,以下为按话题分块的内容" />
+          )}
+          {detail && turns.length === 0 && (detail.blocks?.length ?? 0) === 0 && (
+            <EmptyState text="该文件暂无可展示的内容" />
+          )}
+          {(detail?.blocks ?? []).map((block) => (
+            <ChatMessageBubble
+              key={`${detail?.conversation_id ?? 'd'}:b${String(block?.index ?? '')}`}
+              role="document"
+              content={String(block?.content ?? '')}
+            />
+          ))}
+          {turns.map((turn, index) => (
+            <ChatMessageBubble
+              key={`${detail?.conversation_id ?? 'd'}:t${index}`}
+              role={turn.role}
+              content={turn.content}
+              ts={turn.ts}
+            />
+          ))}
+          {detail?.preview && turns.length === 0 && (
+            <pre className="max-h-[240px] overflow-auto whitespace-pre-wrap break-words rounded-[8px] bg-white p-[10px] text-[12px] leading-[18px] text-[#464c5e]">
+              {detail.preview}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SchematicPanel({
   data,
   loading,
-  selectedDesignId,
-  onSelectedDesignIdChange,
+  selectedDesignId,  onSelectedDesignIdChange,
   selectedPageNumber,
   onSelectedPageNumberChange,
   page,

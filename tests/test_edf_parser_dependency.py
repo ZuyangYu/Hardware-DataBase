@@ -90,3 +90,17 @@ class EdfParserDependencyTests(unittest.TestCase):
             sys.modules.update(original_modules)
 
         self.assertTrue(loaded_path.is_relative_to(_repo_spydrnet_path()))
+
+
+class ComponentIdentityDependencyTests(unittest.TestCase):
+    def test_identity_module_has_no_network_or_vector_dependencies(self):
+        module_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "circuit"
+            / "component_identity.py"
+        )
+        source = module_path.read_text(encoding="utf-8")
+
+        for banned in ("requests", "urllib", "httpx", "socket", "vector_index", "ragflow"):
+            self.assertNotIn(banned, source)
