@@ -3,7 +3,7 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 from src.agents.claim_evidence import RetrievalOutcome
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 from src.document_authoring.harness.graph import AuthoringGraph
 from src.document_authoring.harness.policy import HarnessToolPolicy
 from src.document_authoring.models import (

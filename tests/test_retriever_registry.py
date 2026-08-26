@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from src.agents.claim_evidence import InformationRequirement
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 from src.document_authoring.retriever_registry import (
     CrossUnitEvidenceCache,
     RetrieverRegistry,

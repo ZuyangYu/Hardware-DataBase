@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from src.agents.query_tokens import tokenize_hardware_query
-from src.agents.state import Evidence
+from src.core.query_tokens import tokenize_hardware_query
+from src.agents.schemas import Evidence
 from src.pipelines.document_rag.schemas import RequestContext
 from src.services.kb_scope import kb_scope_from_context
 
@@ -86,3 +86,23 @@ class ExternalConversationSearchTool:
                 )
             )
         return evidences[: max(1, int(top_k))]
+
+
+def make_conversation_search(rt, conversation_service):
+    """Return a ``conversation_search(query, top_k)`` tool closure."""
+    tool = ExternalConversationSearchTool(conversation_service)
+
+    def conversation_search(query: str, top_k: int = rt.top_k) -> str:
+        """在知识库中检索外部 AI 对话记录（外部数据 txt/markdown）：历史问答、经验结论、参数与踩坑细节。"""
+        from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
+
+        items = timed_tool_call(
+            rt,
+            "conversation_search",
+            query,
+            None,
+            lambda: tool.run(query, rt.kb_name, rt.ctx, max(1, min(int(top_k), 20))),
+        )
+        return format_evidence_for_llm(items)
+
+    return conversation_search

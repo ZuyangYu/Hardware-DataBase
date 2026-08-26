@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 from src.document_authoring.harness.graph import AuthoringGraph, _select_field_evidence
 from src.document_authoring.harness.policy import HarnessToolPolicy
 from src.document_authoring.models import (

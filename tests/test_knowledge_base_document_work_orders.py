@@ -9,7 +9,7 @@ from unittest.mock import ANY, Mock
 import pytest
 
 from src.agents.claim_evidence import InformationRequirement, RetrievalOutcome
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 from src.core.app_pipeline import AppPipeline
 from src.document_authoring.models import (
     DocumentFieldSchema,

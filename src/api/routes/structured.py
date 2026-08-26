@@ -422,7 +422,13 @@ def _delete_circuit_upload_archive(kb_name: str, design_id: str) -> None:
         for filename in os.listdir(group_dir):
             stem, _ext = os.path.splitext(filename)
             normalized = make_design_id(stem)
-            if normalized == safe_design_id or normalized.startswith(f"{safe_design_id}_"):
+            # Match legacy plain ids, dedup-renamed `<stem>_<n>` uploads and
+            # content-addressed `<stem>-<8hex>` design ids.
+            if (
+                normalized == safe_design_id
+                or normalized.startswith(f"{safe_design_id}_")
+                or safe_design_id.startswith(f"{normalized}-")
+            ):
                 try:
                     os.remove(os.path.join(group_dir, filename))
                 except OSError:

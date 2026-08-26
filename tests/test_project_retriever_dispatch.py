@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from src.agents.claim_evidence import InformationRequirement
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 from src.core.app_pipeline import AppPipeline
 from src.pipelines.document_rag.schemas import RequestContext
 from src.projects.models import (

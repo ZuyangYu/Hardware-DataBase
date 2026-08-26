@@ -274,6 +274,32 @@ select,
   }
 }
 
+/* 思考等待态:文字流光扫过(opencode 风格的"正在思考"渲染) */
+.thinking-shimmer {
+  background: linear-gradient(
+    90deg,
+    #9aa1b1 0%,
+    #9aa1b1 35%,
+    #1d4ed8 50%,
+    #9aa1b1 65%,
+    #9aa1b1 100%
+  );
+  background-size: 220% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: thinking-sweep 1.8s linear infinite;
+}
+
+@keyframes thinking-sweep {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+
 .login-data-flow {
   --login-graph-ink: rgba(54, 60, 70, 0.74);
   --login-graph-line: rgba(54, 60, 70, 0.16);

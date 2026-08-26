@@ -5,14 +5,16 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from hashlib import sha256
+from unittest.mock import patch
 
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 from src.circuit.graph_store import GraphIndexResult, GraphStore
 from src.circuit.index_service import CircuitIndexService
 from src.circuit.models import CircuitDesign, CircuitModule, ComponentInstance, Net, Pin, PinRef
 from src.circuit.query_engine import CircuitQueryEngine
-from src.circuit.store import CircuitStore
+from src.circuit.store import CircuitStore, make_design_id
 from src.circuit.vector_index import CircuitVectorHit, CircuitVectorIndexStatus
 from src.pipelines.document_rag.schemas import RequestContext
 
@@ -233,6 +235,8 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertTrue(any(hit.locator["entity_id"] == "U200" for hit in new_department_hits))
 
     def test_metadata_publication_failure_restores_previous_coherent_generation(self):
+        _ids = _legacy_design_ids()
+        self.addCleanup(_ids.close)
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, "circuits")
             first = os.path.join(tmp, "generation-a.edf")
@@ -296,6 +300,8 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertEqual(new_department_hits, [])
 
     def test_failed_graph_replacement_never_returns_unremovable_stale_graph(self):
+        _ids = _legacy_design_ids()
+        self.addCleanup(_ids.close)
         with tempfile.TemporaryDirectory() as tmp:
             first = os.path.join(tmp, "generation-a.edf")
             second = os.path.join(tmp, "generation-b.edf")
@@ -921,6 +927,8 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertIn("U499.1", hits[0].content)
 
     def test_concurrent_same_design_publication_is_one_coherent_generation(self):
+        _ids = _legacy_design_ids()
+        self.addCleanup(_ids.close)
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, "circuits")
             first = os.path.join(tmp, "generation-a.edf")
@@ -1061,6 +1069,8 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertEqual(vector_index.calls, [])
 
     def test_failed_vector_replacement_never_returns_stale_previous_generation(self):
+        _ids = _legacy_design_ids()
+        self.addCleanup(_ids.close)
         with tempfile.TemporaryDirectory() as tmp:
             first = os.path.join(tmp, "generation-a.edf")
             second = os.path.join(tmp, "generation-b.edf")
@@ -1099,6 +1109,27 @@ class CircuitIndexServiceTests(unittest.TestCase):
         self.assertEqual(result.status, "degraded")
         self.assertEqual(hits, [])
         self.assertEqual(vector_index.search_calls, [])
+
+
+
+def _legacy_design_ids():
+    """Pin tests onto legacy plain-stem design ids.
+
+    Content-addressed ids (make_content_addressed_design_id) intentionally give
+    same-named files with different bytes distinct designs, which dissolves the
+    same-design republication scenario these generation tests cover. Legacy
+    stores (and re-uploads that only revise metadata) still hit that path, so
+    keep it covered by pinning the id function.
+    """
+
+    stack = ExitStack()
+    stack.enter_context(
+        patch(
+            "src.circuit.index_service.make_content_addressed_design_id",
+            lambda name, content_hash=None: make_design_id(name),
+        )
+    )
+    return stack
 
 
 class _Parser:

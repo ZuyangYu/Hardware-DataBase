@@ -2,7 +2,7 @@ import asyncio
 import time
 import unittest
 
-from src.agents.graph import retrieve_evidence
+from src.agents.tools.runtime import ToolRuntime, timed_tool_call
 from src.core.cancellation import QueryCancelled
 from src.pipelines.document_rag.ragflow_backend import RAGFlowClient
 
@@ -48,30 +48,14 @@ class CancellableRAGFlowRetrievalTests(unittest.TestCase):
         self.assertTrue(slow_client.cancelled)
         self.assertLess(time.monotonic() - started, 1.0)
 
-    def test_graph_propagates_cancellation_instead_of_recording_tool_failure(self):
-        class _CancelledDocumentTool:
-            name = "document_rag"
-            supports_cancellation = True
+    def test_tool_runtime_propagates_cancellation_instead_of_recording_tool_failure(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None, should_cancel=lambda: True)
 
-            def run(self, *_args, **_kwargs):
-                raise QueryCancelled()
-
-        state = {
-            "kb_name": "kb",
-            "user_query": "find regulator",
-            "source_plan": {
-                "source_plan": [
-                    {"tool_calls": [{"tool_name": "document_rag", "query": "find regulator", "top_k": 5}]}
-                ]
-            },
-            "retrieval_round": 0,
-            "evidence": [],
-            "trace": [],
-            "_cancel_check": lambda: True,
-        }
+        def _cancelled_tool(*_args, **_kwargs):
+            raise QueryCancelled()
 
         with self.assertRaises(QueryCancelled):
-            retrieve_evidence(state, {"document_rag": _CancelledDocumentTool()})
+            timed_tool_call(rt, "document_search", "find regulator", None, _cancelled_tool)
 
 
 if __name__ == "__main__":

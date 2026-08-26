@@ -243,16 +243,17 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
 
     def test_direct_query_records_chat_metrics(self):
-        class FakeLLM:
-            def stream_chat(self, _messages, **_kwargs):
-                yield "通用回答"
+        class _FakeChunk:
+            def __init__(self, text):
+                self.content = text
+                self.usage_metadata = None
 
-            @staticmethod
-            def get_usage_summary():
-                return {"total_tokens": 1}
+        class FakeModel:
+            def stream(self, _messages):
+                yield _FakeChunk("通用回答")
 
         t = self._token("user1")
-        with patch("src.api.routes.query.LLMClient", return_value=FakeLLM()), patch(
+        with patch("src.api.routes.query.create_chat_model", return_value=FakeModel()), patch(
             "src.api.routes.query.record_chat_turn"
         ) as record:
             with self.client.stream(

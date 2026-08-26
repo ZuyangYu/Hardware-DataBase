@@ -3,7 +3,7 @@ from unittest.mock import Mock
 from io import BytesIO
 import zipfile
 
-from src.agents.state import Evidence
+from src.agents.schemas import Evidence
 from src.agents.claim_evidence import InformationRequirement
 from src.core.app_pipeline import AppPipeline
 from src.document_authoring.models import (

@@ -3,7 +3,7 @@ import re
 from typing import Any
 
 import config.settings
-from src.agents.query_tokens import tokenize_hardware_query
+from src.core.query_tokens import tokenize_hardware_query
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
 from src.pipelines.spreadsheet.pipeline import SpreadsheetIndexRequest, SpreadsheetIndexResult, SpreadsheetPipeline
 from src.pipelines.spreadsheet.table_store import TableIndexStore

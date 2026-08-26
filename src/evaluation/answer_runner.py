@@ -109,13 +109,27 @@ def _safe_error_message(exc: Exception | None) -> str:
 
 
 def _request_context(sample: EvaluationSample) -> RequestContext:
+    """Build a bounded evaluation context from the sample.
+
+    Security: the dataset JSONL is untrusted input. Roles are pinned to plain
+    ``user`` (a dataset claiming ``dept_admin``/``system_admin`` is ignored)
+    and ``user_id`` is fixed to ``evaluation`` so audit attribution cannot be
+    spoofed; the dataset's declared user_id is kept in metadata only.
+    KB scoping fields (department_id / allowed_kbs / kb_permissions) are still
+    honored — they are required to reach dept-scoped structured indexes — but
+    the run creator must authorize every referenced KB at run-creation time
+    (see routes/evaluation.py::create_run), which also writes an audit record.
+    """
     raw = sample.request_context
     department_id = raw.get("department_id")
     metadata = {"department_id": department_id} if department_id not in (None, "") else {}
+    declared_user = str(raw.get("user_id") or "").strip()
+    if declared_user:
+        metadata["declared_user"] = declared_user
     return RequestContext(
-        user_id=str(raw.get("user_id") or "evaluation"),
+        user_id="evaluation",
         session_id=str(raw.get("session_id") or f"eval-{sample.id}"),
-        roles=list(raw.get("roles") or []),
+        roles=["user"],
         allowed_kbs=[str(value) for value in raw.get("allowed_kbs") or []],
         kb_permissions={str(key): str(value) for key, value in (raw.get("kb_permissions") or {}).items()},
         metadata=metadata,

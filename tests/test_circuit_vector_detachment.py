@@ -59,6 +59,8 @@ def test_reindex_design_compatibility_wrapper_returns_status_count(monkeypatch):
 def test_reindex_status_reports_delete_failure_for_empty_design(monkeypatch):
     index = CircuitVectorIndex()
     monkeypatch.setattr(index, "_embed_model", Mock(return_value=object()))
+    # chroma 栈在测试环境未安装；桩掉客户端解析以到达删除失败分支。
+    monkeypatch.setattr(index, "_chroma_client", Mock(return_value=object()))
     monkeypatch.setattr(index, "_delete_design", Mock(return_value="delete failed"))
 
     result = index.reindex_design_with_status(_design())
@@ -68,6 +70,7 @@ def test_reindex_status_reports_delete_failure_for_empty_design(monkeypatch):
 
 def test_semantic_search_filters_allowed_designs_in_chroma_before_limit(monkeypatch):
     index = CircuitVectorIndex()
+    monkeypatch.setattr(index, "_chroma_client", Mock(return_value=object()))
     collection = Mock()
     collection.query.return_value = {
         "ids": [["instance:z_allowed:U1"]],

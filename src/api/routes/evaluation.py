@@ -1,13 +1,11 @@
 """RAGAS evaluation run endpoints (system_admin only).
 
-Mirrors the Streamlit evaluation tab so a future frontend can fully own
-evaluation: list/create/control runs and read summaries + baseline comparison.
+List/create/control runs and read summaries + baseline comparison.
 All endpoints require system_admin. Runs execute on a background thread; the
-client polls ``GET /evaluation/runs/{run_id}`` for status (the UI used a 2s
-``@st.fragment`` auto-refresh -- the API is pull-based instead).
+client polls ``GET /evaluation/runs/{run_id}`` for status (pull-based).
 
-This route is a thin HTTP wrapper over :class:`EvaluationRunController` and the
-pure helpers in :mod:`src.ui.evaluation_page` (``list_evaluation_runs`` /
+This route is a thin HTTP wrapper over :class:`EvaluationRunController` and a
+few pure helpers defined below (``list_evaluation_runs`` /
 ``load_evaluation_summary``). It holds no evaluation logic of its own.
 """
 from __future__ import annotations
@@ -23,24 +21,40 @@ from pydantic import ValidationError
 import config.settings
 
 from src.core.auth import AuthUser
+from src.core.app_logs import AppLogService
 from src.evaluation.dataset_loader import load_dataset, validate_dataset
 from src.evaluation.run_control import EvaluationRunController
-from src.evaluation.schemas import (
-    EvaluationRunState,
-    EvaluationSample,
-    EvaluationSummary,
-    SampleResult,
-)
-from src.ui.evaluation_page import (
-    DEFAULT_OUTPUT_ROOT,
-    list_evaluation_runs,
-    load_evaluation_summary,
-)
+from src.evaluation.schemas import EvaluationSample, EvaluationSummary, EvaluationRunState, SampleResult
 
-from src.api.deps import require_system_admin
+from src.api.deps import get_auth_service, require_system_admin
 from src.api.schemas import CreateEvaluationRunRequest
 
 router = APIRouter(tags=["evaluation"])
+
+DEFAULT_OUTPUT_ROOT = Path("storage/evaluations")
+
+
+def load_evaluation_summary(path: str | Path) -> EvaluationSummary:
+    return EvaluationSummary.model_validate_json(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def list_evaluation_runs(root: str | Path = DEFAULT_OUTPUT_ROOT) -> list[Path]:
+    root = Path(root)
+    if not root.exists():
+        return []
+    return sorted(
+        [
+            path
+            for path in root.iterdir()
+            if path.is_dir()
+            and (
+                (path / "summary.json").is_file()
+                or (path / "run_state.json").is_file()
+            )
+        ],
+        key=lambda path: path.name,
+        reverse=True,
+    )
 
 # Runs live under the evaluations storage root; dataset/snapshot inputs must
 # also stay under a known root. Anchor these to STORAGE_DIR / BASE_DIR (both
@@ -125,12 +139,12 @@ def _controller(output_root: str) -> EvaluationRunController:
         cached = _controllers.get(output_root)
         if cached is not None:
             return cached
-        # evaluation_service_factory() returns the EvaluationService class; the
-        # controller instantiates services lazily per run. Imported inline so the
-        # module stays importable without the eval extras installed at import time.
-        from src.ui.evaluation_page import evaluation_service_factory
+        # EvaluationService is imported inline so the module stays importable
+        # without the eval extras installed at import time; the controller
+        # instantiates services lazily per run.
+        from src.evaluation.service import EvaluationService as _EvaluationService
 
-        controller = EvaluationRunController(evaluation_service_factory(), output_root)
+        controller = EvaluationRunController(_EvaluationService, output_root)
         _controllers[output_root] = controller
         return controller
 
@@ -194,6 +208,7 @@ def create_run(
     body: CreateEvaluationRunRequest,
     output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
     _actor: AuthUser = Depends(require_system_admin),
+    auth=Depends(get_auth_service),
 ) -> dict[str, Any]:
     """Create an evaluation run. ``dataset_path`` is required; ``mode`` selects
     online (default) vs offline (requires ``snapshot_path``). ``score_enabled``
@@ -204,6 +219,31 @@ def create_run(
     if errors:
         raise HTTPException(status_code=400, detail="; ".join(errors))
     samples = _filter_samples(load_dataset(dataset_path), body.sample_ids, body.tags)
+
+    # Explicit KB authorization boundary: online samples run pipeline queries,
+    # so every referenced KB must be registered and the access is audited.
+    # This replaces silent dataset-driven access with a declared, reviewed
+    # allow-list (system_admin is a governance role and must not browse KB
+    # content interactively; a batch evaluation run is the sanctioned exception).
+    if body.mode == "online":
+        referenced_kbs = sorted({str(s.kb_name) for s in samples if getattr(s, "kb_name", "")})
+        registered = set(auth.list_registered_knowledge_bases())
+        unknown = [kb for kb in referenced_kbs if kb not in registered]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"数据集引用了未注册的知识库: {', '.join(unknown)}",
+            )
+        try:
+            AppLogService().record_audit(
+                action="evaluation_run_authorize_kbs",
+                actor=_actor,
+                target_type="evaluation_run",
+                target_id=dataset_path,
+                metadata={"kb_names": referenced_kbs, "source": "api"},
+            )
+        except Exception:
+            pass  # fail-soft: audit must not block run creation
 
     if body.mode == "offline":
         if not body.snapshot_path:

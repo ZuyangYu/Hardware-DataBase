@@ -87,7 +87,7 @@ function WaitSpinner() {
   return (
     <div className="flex items-center gap-[8px] text-[12px] text-[#9aa1b1]">
       <span className="h-3 w-3 animate-spin rounded-full border-2 border-[#cbd5e1] border-t-[#1d4ed8]" />
-      <span>处理中…</span>
+      <span className="thinking-shimmer">正在思考…</span>
     </div>
   );
 }

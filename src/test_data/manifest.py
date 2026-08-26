@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.agents.claim_evidence import EvidenceCapability
+from src.ingestion.evidence_capability import EvidenceCapability
 from src.ingestion.parser_registry import DomainManifest, PARSER_REGISTRY
 from src.ingestion.source_groups import TEST_GROUP
 from src.test_data.parsers import parse_test_data

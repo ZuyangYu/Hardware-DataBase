@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from src.agents.claim_evidence import EvidenceCapability
+from src.ingestion.evidence_capability import EvidenceCapability
 
 
 # ParserFactory previously returned list[llama_index.core.schema.BaseNode],

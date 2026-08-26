@@ -36,10 +36,11 @@ Hardware-DataBase/
 │   ├── pipelines/              # 多源 pipeline（document_rag/、spreadsheet/、registry、runtime）
 │   ├── services/               # 文档治理、路由、归档、KB scope、资产清理
 │   ├── test_data/              # 测试数据结构化域（ingest-only）
-│   └── ui/                     # Streamlit 页面组件（评估页等）
+├── frontend/                     # React + TypeScript 前端（对接 src/api 的 FastAPI 服务）
+│   └── ...
 ├── storage/                    # (自动生成) 归档、索引、日志与鉴权库
 ├── tests/                      # 单元与集成测试（unittest.TestCase）
-├── streamlit_app.py            # 前端启动入口
+├── src/api/                    # FastAPI 后端（唯一后端入口，见 src/api/routes/）
 ├── pyproject.toml
 ├── requirements.txt
 └── README.md
@@ -66,12 +67,22 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-同步环境并启动（`uv run` 会自动加载虚拟环境，无需手动 activate）：
+同步环境并启动后端 API（`uv run` 会自动加载虚拟环境，无需手动 activate）：
 
 ```bash
 uv sync
-uv run streamlit run streamlit_app.py
+uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8000（HDB_API_HOST/PORT 可改）
 ```
+
+另开终端启动前端（Node.js >= 18）：
+
+```bash
+cd frontend
+npm install
+npm run dev                       # Vite dev server，默认 127.0.0.1:5174，经 proxy 转发 /api 到后端
+```
+
+生产部署用 `npm run build` 产出 `frontend/dist/` 静态文件。
 
 ### 方式二：使用 pip
 
@@ -83,18 +94,18 @@ venv\Scripts\activate
 source venv/bin/activate
 
 pip install -r requirements.txt
-streamlit run streamlit_app.py
+uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
 ## 配置说明
 
-支持两种配置方式：**页面配置**（推荐）和 **`.env` 文件配置**。
+支持两种配置方式：**管理页面配置**（推荐）和 **`.env` 文件配置**。
 
 > 注意：仓库根目录的 `.env` 已提交且包含**真实 API Key**，并残留若干旧架构变量（`RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE` 等，`config/settings.py` 已忽略）。请以 `.env.example` 为模板，以下方变量为准。
 
-### 方式一：页面配置（推荐）
+### 方式一：管理页面配置（推荐）
 
-启动应用后，进入侧边栏的 **「⚙️ 系统配置」**，可在页面上直接修改模型、RAGFlow、检索等配置，点击「🔄 应用配置」立即生效，配置会持久化保存到 `.env` 文件。
+启动前后端后，用系统管理员登录前端，进入 **「系统配置」** 页面，可直接修改模型、RAGFlow、检索等配置并立即生效，配置会持久化保存到 `.env` 文件。
 
 ### 方式二：`.env` 文件配置
 
@@ -118,11 +129,10 @@ AGENT_OLLAMA_MODEL=qwen2.5:32b
 AGENT_TEMPERATURE=0.2
 AGENT_TIMEOUT_SECONDS=120
 
-# HTTP 429 重试与模型回退（仅 custom 提供商生效；备用模型复用其 URL 与 API Key）
+# HTTP 429 重试（仅 custom 提供商生效；重试耗尽后抛出原始错误）
 AGENT_RATE_LIMIT_MAX_RETRIES=4
 AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS=1
 AGENT_RATE_LIMIT_MAX_DELAY_SECONDS=16
-AGENT_FALLBACK_MODEL=deepseek-ai/DeepSeek-V4-Pro
 
 # 或使用 OpenAI-compatible API（provider=custom 时生效）
 AGENT_CUSTOM_API_KEY=
@@ -152,7 +162,8 @@ NO_CONTEXT_PROMPT=
 ## 查询流程
 
 ```text
-Streamlit
+前端 (React)
+  -> FastAPI (/api/v1)
   -> AppPipeline
   -> MultiSourceAgentRunner
   -> LangGraph
@@ -169,16 +180,16 @@ Streamlit
 A: 通常发生在手动修改了 `pyproject.toml` 之后。运行 `uv lock` 更新锁定文件，再执行 `uv sync`。
 
 **Q: 启动时提示 `ModuleNotFoundError`？**
-A: 使用 uv 时必须用 `uv run streamlit run streamlit_app.py` 启动，或先 `source .venv/bin/activate` 再运行；使用 pip 时请确认已激活虚拟环境并安装依赖。
+A: 使用 uv 时必须用 `uv run` 启动命令，或先 `source .venv/bin/activate` 再运行；使用 pip 时请确认已激活虚拟环境并安装依赖。
 
 **Q: 上传文件后在问答中搜不到内容？**
-A: 当前检索后端为 RAGFlow，请按顺序排查：1) RAGFlow 服务是否可达、`RAGFLOW_API_KEY` 是否正确；2) `RAGFLOW_GOVERNANCE_DATASET_NAME` / `RAGFLOW_DESIGN_DATASET_NAME` 对应的 dataset 是否存在；3) 在「📊 日志中心」或文件处理状态中确认 RAGFlow 解析任务是否完成。
+A: 当前检索后端为 RAGFlow，请按顺序排查：1) RAGFlow 服务是否可达、`RAGFLOW_API_KEY` 是否正确；2) `RAGFLOW_GOVERNANCE_DATASET_NAME` / `RAGFLOW_DESIGN_DATASET_NAME` 对应的 dataset 是否存在；3) 在「日志中心」或知识库文件页确认 RAGFlow 解析任务是否完成。
 
 **Q: Agent 响应很慢或超时？**
 A: 可适当调大 `AGENT_TIMEOUT_SECONDS`；检查 `AGENT_MAX_RETRIEVAL_ROUNDS` 是否过大导致多轮补检索；确认 LLM 模型（Ollama 或 custom API）的响应速度。
 
 **Q: 首次启动后无法使用问答？**
-A: 请先进入「⚙️ 系统配置」检查并补全 RAGFlow 与 Agent 模型配置，点击「应用配置」生效。
+A: 请先以系统管理员进入「系统配置」检查并补全 RAGFlow 与 Agent 模型配置，保存后生效。
 
 ## RAGAS 回答质量评估
 
@@ -200,7 +211,7 @@ uv run hardware-database-eval score --dataset evaluation/datasets/hardware_qa_v1
 
 默认只生成 JSON、CSV 和 HTML 报告。需要在 CI 中启用阈值门禁时添加 `--fail-on-threshold`。可用 `--tag`、`--sample-id`、`--metric` 和 `--threshold faithfulness=0.8` 过滤或覆盖评分设置。
 
-裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。Streamlit 中仅系统管理员可见“RAGAS 评估”页面。
+裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。前端「RAGAS 评估」页面仅系统管理员可见。
 
 管理员可在该页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”均为协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效；“取消”不会删除 `snapshot.jsonl`；“继续”会跳过其中已成功的样本。未勾选“执行 RAGAS 评分”时，系统只采集回答和检索证据，无需安装 `eval` 依赖或配置裁判 Embedding。
 
