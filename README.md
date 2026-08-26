@@ -10,6 +10,12 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化�
 - **权限与治理**：支持部门、用户、知识库权限、审计日志、查询 trace 和文件处理状态。
 - **独立模型配置**：Agent 最终答案生成使用项目自有 `LLMClient`，支持 Ollama 或 OpenAI-compatible API，不再复用旧 RAG 框架模型封装。
 
+## 界面示例
+
+![知识库问答](assets/chat_example.png)
+
+![知识资产治理](assets/kap_example.png)
+
 ## 项目结构
 
 ```text

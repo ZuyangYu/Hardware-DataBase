@@ -47,9 +47,6 @@ class SpreadsheetIndexService:
     def delete_record(self, record: Any):
         self._pipeline(record.department_id, record.kb_name).delete(record.id)
 
-    def delete_document(self, record_id: int, department_id: str | int | None, kb_name: str):
-        self._pipeline(department_id, kb_name).delete(record_id)
-
     def db_path(self, department_id: str | int | None, kb_name: str, create: bool = True) -> str:
         return os.path.join(self.kb_index_path(department_id, kb_name, create=create), "table_indexes.db")
 
