@@ -6,7 +6,7 @@ from contextlib import closing
 from typing import Any
 from dataclasses import dataclass, field
 
-import config.settings
+import src.settings
 from src.services.document_routing import PROCESSOR_KIND_SPREADSHEET, TABLE_STATUS_ARCHIVED, TABLE_STATUS_PROCESSING
 from src.pipelines.document_rag.schemas import TASK_STATUS_DEAD_LETTER, TASK_STATUS_QUEUED
 
@@ -72,7 +72,7 @@ class PipelineDocumentRecord:
 
 class PipelineDocumentStore:
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or os.path.join(config.settings.STORAGE_DIR, "pipeline_documents.db")
+        self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "pipeline_documents.db")
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
 

@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query
 
-import config.settings as settings
+import src.settings as settings
 from src.core.app_logs import AppLogService
 from src.core.auth import AuthUser
 

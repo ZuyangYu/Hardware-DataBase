@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import config.settings
+import src.settings
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.template_analysis import (
     TemplateAnalysisSuggestion,
@@ -305,7 +305,7 @@ def test_ai_recommendation_mode_activates_without_manual_template_review(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
-        config.settings,
+        src.settings,
         "DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS",
         True,
         raising=False,

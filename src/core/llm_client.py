@@ -10,7 +10,7 @@ from typing import Any, Callable, Generator
 
 import requests
 
-import config.settings as settings
+import src.settings as settings
 from src.observability import observe
 from src.observability.metrics import record_llm
 

@@ -4,7 +4,7 @@
 - ``PUT /config`` — write whitelisted keys to ``.env`` and hot-reload
 - ``GET /health/ragflow`` — probe the configured RAGFlow instance
 
-Only keys present in ``config.settings.DEFAULT_VALUES`` may be written — this
+Only keys present in ``src.settings.DEFAULT_VALUES`` may be written — this
 is the same whitelist the Streamlit settings panel uses, and it prevents
 arbitrary environment variables from being injected via the API.
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-import config.settings as settings
+import src.settings as settings
 
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthUser

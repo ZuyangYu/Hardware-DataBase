@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 import httpx
 
 from src.api.app import create_app
@@ -25,15 +25,15 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         cls.server.stop()
 
     def setUp(self):
-        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
-        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         auth_db = os.path.join(self.tmp.name, "auth.db")
-        old_auth_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = auth_db
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", old_auth_db)
+        old_auth_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = auth_db
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", old_auth_db)
         self.auth, _, _, _ = make_auth(auth_db)
         self.stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.stub

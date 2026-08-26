@@ -234,7 +234,7 @@ class CircuitVectorIndex:
             try:
                 import chromadb
 
-                import config.settings as _settings
+                import src.settings as _settings
 
                 path = os.path.join(_settings.STORAGE_DIR, "circuit_vector_index")
                 os.makedirs(path, exist_ok=True)

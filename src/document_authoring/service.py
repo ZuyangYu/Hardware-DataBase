@@ -20,7 +20,7 @@ from typing import Any
 
 import requests
 
-import config.settings
+import src.settings
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
@@ -125,7 +125,7 @@ def _automatic_release_allowed(order: DocumentWorkOrder, report: Any, *, require
     that path is equivalent to a confirmed session; safety still requires a
     passed report and no blocking unit status.
     """
-    if not config.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED or requires_review:
+    if not src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED or requires_review:
         return False
     if getattr(report, "status", None) != "passed":
         return False
@@ -385,7 +385,7 @@ class DocumentGenerationService:
                 analysis,
                 TemplateActivationPolicy(
                     accept_ai_recommendations=(
-                        config.settings.DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS
+                        src.settings.DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS
                     ),
                 ),
             )
@@ -1401,7 +1401,7 @@ class DocumentGenerationService:
         artifact = self.store.save_artifact(artifact, rendered_content, template.format)
         requires_review = _requires_human_review(
             result.unit_statuses,
-            auto_publish_verified=config.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED,
+            auto_publish_verified=src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED,
         )
         if (
             _automatic_release_allowed(order, report, requires_review=requires_review)
@@ -1433,7 +1433,7 @@ class DocumentGenerationService:
         evidence_matrix_id: str,
         validation_report_id: str,
     ) -> DocumentArtifact:
-        if not config.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED:
+        if not src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED:
             return candidate
         if report.status != "passed" or self._has_icd_blocking_issue(report.issues):
             return candidate

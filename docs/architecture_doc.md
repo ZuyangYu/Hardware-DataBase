@@ -210,7 +210,7 @@ hardware-database-server
 
 安装包重新安装后也可使用 `hardware-database-worker`。Worker 通过 `WORKER_POLL_INTERVAL_SECONDS` 控制空队列轮询间隔，`WORKER_PARSE_BATCH_SIZE` 控制每轮最多处理的表格任务数。当前 SQLite worker 用于本地单机和开发验证；生产多实例部署应将同一领取接口迁移至 PostgreSQL，并以 Redis 队列承担唤醒和调度。
 
-核心配置集中在 `config/settings.py`（单一事实来源，`.env` 以 `utf-8-sig` 加载，UI「⚙️ 系统配置」可在线修改并回写 `.env`）：
+核心配置集中在 `src/settings.py`（单一事实来源，`.env` 以 `utf-8-sig` 加载，UI「⚙️ 系统配置」可在线修改并回写 `.env`）：
 
 ```env
 RAGFLOW_BASE_URL=http://localhost:9380

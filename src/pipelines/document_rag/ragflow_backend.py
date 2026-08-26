@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 import httpx
 
-import config.settings
+import src.settings
 from src.core.auth import AuthService
 from src.core.app_logs import AppLogService
 from src.core.cancellation import QueryCancelled
@@ -450,9 +450,9 @@ class RAGFlowClient:
         timeout: int | float | None = None,
         async_client_factory: Callable[..., httpx.AsyncClient] | None = None,
     ):
-        self.base_url = (base_url or config.settings.RAGFLOW_BASE_URL).rstrip("/")
-        self.api_key = api_key if api_key is not None else config.settings.RAGFLOW_API_KEY
-        self.timeout = timeout if timeout is not None else config.settings.RAGFLOW_TIMEOUT_SECONDS
+        self.base_url = (base_url or src.settings.RAGFLOW_BASE_URL).rstrip("/")
+        self.api_key = api_key if api_key is not None else src.settings.RAGFLOW_API_KEY
+        self.timeout = timeout if timeout is not None else src.settings.RAGFLOW_TIMEOUT_SECONDS
         self._async_client_factory = async_client_factory or httpx.AsyncClient
         if not self.api_key:
             raise ValueError("RAGFLOW_API_KEY is not configured.")
@@ -642,8 +642,8 @@ class RAGFlowClient:
             "dataset_ids": dataset_ids,
             "page": 1,
             "page_size": top_k,
-            "similarity_threshold": config.settings.RAGFLOW_SIMILARITY_THRESHOLD,
-            "vector_similarity_weight": config.settings.RAGFLOW_VECTOR_WEIGHT,
+            "similarity_threshold": src.settings.RAGFLOW_SIMILARITY_THRESHOLD,
+            "vector_similarity_weight": src.settings.RAGFLOW_VECTOR_WEIGHT,
             "top_k": top_k,
         }
         if metadata_condition:
@@ -723,8 +723,8 @@ class RAGFlowBackend(RAGBackend):
 
     def _ensure_physical_datasets(self):
         dataset_specs = {
-            DATASET_GOVERNANCE: config.settings.RAGFLOW_GOVERNANCE_DATASET_NAME,
-            DATASET_DESIGN: config.settings.RAGFLOW_DESIGN_DATASET_NAME,
+            DATASET_GOVERNANCE: src.settings.RAGFLOW_GOVERNANCE_DATASET_NAME,
+            DATASET_DESIGN: src.settings.RAGFLOW_DESIGN_DATASET_NAME,
         }
         dataset_ids = getattr(self, "_dataset_ids", None)
         if not isinstance(dataset_ids, dict):
@@ -1009,7 +1009,7 @@ class RAGFlowBackend(RAGBackend):
             and record.document_id
             and normalize_parse_status(record.status, record.processor_kind) == TASK_STATUS_COMPLETED
         }
-        top_k = top_k or config.settings.FINAL_TOP_K
+        top_k = top_k or src.settings.FINAL_TOP_K
         route = route_source_groups(query)
         # Task 5a strict path: when the caller supplies ``allowed_record_ids``
         # retrieval is restricted to exactly those local records, verified by
@@ -1708,8 +1708,8 @@ class RAGFlowBackend(RAGBackend):
             details = self._client().health()
             details["physical_datasets"] = self._dataset_ids
             details["dataset_names"] = {
-                DATASET_GOVERNANCE: config.settings.RAGFLOW_GOVERNANCE_DATASET_NAME,
-                DATASET_DESIGN: config.settings.RAGFLOW_DESIGN_DATASET_NAME,
+                DATASET_GOVERNANCE: src.settings.RAGFLOW_GOVERNANCE_DATASET_NAME,
+                DATASET_DESIGN: src.settings.RAGFLOW_DESIGN_DATASET_NAME,
             }
             return BackendHealth(ok=True, details=details, backend=self.name)
         except Exception as exc:

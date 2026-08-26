@@ -9,7 +9,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-import config.settings
+import src.settings
 from src.pipelines.document_rag.schemas import RequestContext, kb_scope_key
 
 
@@ -75,7 +75,7 @@ class AuthSession:
 
 class AuthService:
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or config.settings.AUTH_DB_PATH
+        self.db_path = db_path or src.settings.AUTH_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
         self._ensure_default_admin()
@@ -289,8 +289,8 @@ class AuthService:
             conn.execute("PRAGMA foreign_keys=ON")
 
     def _ensure_default_admin(self):
-        username = config.settings.AUTH_DEFAULT_ADMIN_USERNAME
-        password = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        username = src.settings.AUTH_DEFAULT_ADMIN_USERNAME
+        password = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
         if not password or password == "admin123":
             raise RuntimeError("AUTH_DEFAULT_ADMIN_PASSWORD must be set to a non-default strong password.")
         with closing(self._connect()) as conn:
@@ -427,7 +427,7 @@ class AuthService:
 
             token = secrets.token_urlsafe(32)
             now_dt = datetime.now(timezone.utc)
-            expires_dt = now_dt + timedelta(hours=config.settings.AUTH_SESSION_TTL_HOURS)
+            expires_dt = now_dt + timedelta(hours=src.settings.AUTH_SESSION_TTL_HOURS)
             conn.execute(
                 """
                 INSERT INTO auth_sessions (token_hash, user_id, created_at, expires_at)

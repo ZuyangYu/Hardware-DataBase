@@ -4,16 +4,16 @@ import os
 import contextvars
 from datetime import datetime
 
-import config.settings
+import src.settings
 from src.observability.context import current_span_id, current_trace_id
 from src.observability.logging import StructuredJsonFormatter, TraceContextFilter
 
-os.makedirs(config.settings.LOG_DIR, exist_ok=True)
+os.makedirs(src.settings.LOG_DIR, exist_ok=True)
 
-LOG_FILE = os.path.join(config.settings.LOG_DIR, f"rag_{datetime.now().strftime('%Y-%m-%d')}.log")
+LOG_FILE = os.path.join(src.settings.LOG_DIR, f"rag_{datetime.now().strftime('%Y-%m-%d')}.log")
 
 logger = logging.getLogger("RAG")
-logger.setLevel(getattr(logging, getattr(config.settings, "LOG_LEVEL", "INFO").upper(), logging.INFO))
+logger.setLevel(getattr(logging, getattr(src.settings, "LOG_LEVEL", "INFO").upper(), logging.INFO))
 logger.propagate = False
 formatter = StructuredJsonFormatter()
 
@@ -29,7 +29,7 @@ class TraceIdFilter(logging.Filter):
     def filter(self, record):
         record.trace_id = current_trace_id()
         record.span_id = current_span_id()
-        record.service = config.settings.OTEL_SERVICE_NAME
+        record.service = src.settings.OTEL_SERVICE_NAME
         return True
 
 
@@ -62,7 +62,7 @@ def clear_query_error() -> None:
 
 def apply_log_level() -> None:
     """reload_settings 后热更新日志级别。"""
-    level = getattr(logging, getattr(config.settings, "LOG_LEVEL", "INFO").upper(), logging.INFO)
+    level = getattr(logging, getattr(src.settings, "LOG_LEVEL", "INFO").upper(), logging.INFO)
     logger.setLevel(level)
 
 

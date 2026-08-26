@@ -1492,7 +1492,7 @@ def _is_structure_intent(plan: Any) -> bool:
 
 def _semantic_queries_enabled() -> bool:
     """Gray-rollout switch: exact refdes/net queries are always available."""
-    import config.settings as settings
+    import src.settings as settings
 
     return bool(getattr(settings, "CIRCUIT_SEMANTIC_QUERY_ENABLED", True))
 

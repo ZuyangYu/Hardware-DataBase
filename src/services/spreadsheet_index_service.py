@@ -2,7 +2,7 @@ import os
 import re
 from typing import Any
 
-import config.settings
+import src.settings
 from src.core.query_tokens import tokenize_hardware_query
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
 from src.pipelines.spreadsheet.pipeline import SpreadsheetIndexRequest, SpreadsheetIndexResult, SpreadsheetPipeline
@@ -52,7 +52,7 @@ class SpreadsheetIndexService:
 
     def kb_index_path(self, department_id: str | int | None, kb_name: str, create: bool = True) -> str:
         return safe_child_path(
-            config.settings.STORAGE_DIR,
+            src.settings.STORAGE_DIR,
             "table_indexes",
             "departments",
             _safe_scope_part(department_id),

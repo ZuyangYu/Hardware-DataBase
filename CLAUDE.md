@@ -69,7 +69,7 @@ Tests import via the `src.` package path and run from the repo root.
 
 ## Configuration
 
-`config/settings.py` is the single source of truth for all config constants and
+`src/settings.py` is the single source of truth for all config constants and
 path roots. It loads `.env` with `utf-8-sig` (BOM-tolerant). Most settings are
 also editable live in the frontend admin "系统配置" page (`frontend/src/pages/admin/ConfigPage.tsx`
 via `PUT /api/v1/config`), which persists back to `.env` via

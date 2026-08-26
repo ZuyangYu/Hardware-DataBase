@@ -3,19 +3,19 @@ import os
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 from src.core.assets import AssetService, AssetSource, classify_asset_source
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN
 
 
 class AssetServiceTests(unittest.TestCase):
     def setUp(self):
-        self.old_password = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self.old_password = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp.name, "auth.db")
         self.auth = AuthService(db_path=self.db_path)
-        system_admin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        system_admin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         self.department = self.auth.create_department("hardware")
         self.admin = self.auth.create_user_as(system_admin, "hardware_admin", "password123", ROLE_DEPT_ADMIN, self.department.id)
         self.auth.register_knowledge_base("hardware-kb", owner=self.admin)
@@ -23,7 +23,7 @@ class AssetServiceTests(unittest.TestCase):
         self.service = AssetService(db_path=self.db_path)
 
     def tearDown(self):
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = self.old_password
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = self.old_password
         self.tmp.cleanup()
         gc.collect()
 

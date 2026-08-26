@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import config.settings as settings
+import src.settings as settings
 
 
 _ALWAYS_REDACTED = {

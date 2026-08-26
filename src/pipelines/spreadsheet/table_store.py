@@ -6,7 +6,7 @@ import hashlib
 from contextlib import closing
 from dataclasses import dataclass, field
 
-import config.settings
+import src.settings
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
 from src.pipelines.spreadsheet.xlsx_parser import ParsedWorkbook, _row_col_from_ref, parse_xlsx
 
@@ -890,7 +890,7 @@ def _sheet_row_index(sheet, one_based_position: int) -> int:
 def _legacy_department_kb_index_dir(department_id: str, kb_name: str) -> str:
     department_part = _safe_scope_part(department_id or "unknown")
     kb_part = validate_kb_name(kb_name)
-    root = safe_child_path(config.settings.STORAGE_DIR, "excel_indexes", "departments")
+    root = safe_child_path(src.settings.STORAGE_DIR, "excel_indexes", "departments")
     return safe_child_path(root, department_part, "kbs", kb_part)
 
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import config.settings as settings
+import src.settings as settings
 from langchain.chat_models import init_chat_model
 
 

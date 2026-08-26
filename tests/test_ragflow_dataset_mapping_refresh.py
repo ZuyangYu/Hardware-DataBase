@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-import config.settings
+import src.settings
 from src.pipelines.document_rag.ragflow_backend import RAGFlowBackend
 
 
@@ -45,8 +45,8 @@ class RAGFlowDatasetMappingRefreshTests(unittest.TestCase):
         backend._dataset_ids = {}
         return backend
 
-    @patch.object(config.settings, "RAGFLOW_GOVERNANCE_DATASET_NAME", "ADAS_new")
-    @patch.object(config.settings, "RAGFLOW_DESIGN_DATASET_NAME", "ADAS_new")
+    @patch.object(src.settings, "RAGFLOW_GOVERNANCE_DATASET_NAME", "ADAS_new")
+    @patch.object(src.settings, "RAGFLOW_DESIGN_DATASET_NAME", "ADAS_new")
     def test_refreshes_stale_persisted_mapping_when_dataset_name_changes(self):
         backend = self._backend({
             "governance": ("id-ADAS", "ADAS"),
@@ -65,8 +65,8 @@ class RAGFlowDatasetMappingRefreshTests(unittest.TestCase):
             ("design", "id-ADAS_new", "ADAS_new"),
         ])
 
-    @patch.object(config.settings, "RAGFLOW_GOVERNANCE_DATASET_NAME", "ADAS_new")
-    @patch.object(config.settings, "RAGFLOW_DESIGN_DATASET_NAME", "ADAS_new")
+    @patch.object(src.settings, "RAGFLOW_GOVERNANCE_DATASET_NAME", "ADAS_new")
+    @patch.object(src.settings, "RAGFLOW_DESIGN_DATASET_NAME", "ADAS_new")
     def test_reuses_matching_persisted_mapping_without_remote_resolution(self):
         backend = self._backend({
             "governance": ("id-ADAS_new", "ADAS_new"),
@@ -82,8 +82,8 @@ class RAGFlowDatasetMappingRefreshTests(unittest.TestCase):
         self.assertEqual(backend.client.ensure_calls, [])
         self.assertEqual(backend.store.saved, [])
 
-    @patch.object(config.settings, "RAGFLOW_GOVERNANCE_DATASET_NAME", "ADAS_new")
-    @patch.object(config.settings, "RAGFLOW_DESIGN_DATASET_NAME", "ADAS_new")
+    @patch.object(src.settings, "RAGFLOW_GOVERNANCE_DATASET_NAME", "ADAS_new")
+    @patch.object(src.settings, "RAGFLOW_DESIGN_DATASET_NAME", "ADAS_new")
     def test_keeps_stale_mapping_when_replacement_cannot_be_resolved(self):
         backend = self._backend({
             "governance": ("id-ADAS", "ADAS"),

@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 from src.core.auth import ROLE_DEPT_ADMIN
 from src.api.context import build_context_for_user
 
@@ -12,15 +12,15 @@ from tests._api_stub import make_auth
 
 class BuildContextForUserTests(unittest.TestCase):
     def setUp(self):
-        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.db_path = os.path.join(self.tmp.name, "auth.db")
-        self._old_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = self.db_path
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", self._old_db)
+        self._old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", self._old_db)
         self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
         self.addCleanup(gc.collect)
 

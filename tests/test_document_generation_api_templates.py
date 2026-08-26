@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 import httpx
 
 from src.api.app import create_app
@@ -80,15 +80,15 @@ class DocGenTemplateApiTests(unittest.TestCase):
         cls.server.stop()
 
     def setUp(self):
-        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
-        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db_path = os.path.join(self.tmp.name, "auth.db")
-        old_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = self.db_path
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", old_db)
+        old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", old_db)
         self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
         self.stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.stub
@@ -122,7 +122,7 @@ class DocGenTemplateApiTests(unittest.TestCase):
         self.assertNotIn("PK", str(body))  # 绝不回传上传字节
 
     def test_template_analyze_system_admin_blocked(self):
-        t = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        t = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.post(
             "/api/v1/document-generation/templates/analyze?kb=shared",
             headers=self._auth(t),
@@ -147,11 +147,11 @@ class DocGenTemplateApiTests(unittest.TestCase):
         self.assertIn("denied", r.text)
 
     def test_template_analyze_does_not_auto_confirm_a_rejected_decision(self):
-        old_enabled = config.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES
-        config.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = True
+        old_enabled = src.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES
+        src.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = True
         self.addCleanup(
             setattr,
-            config.settings,
+            src.settings,
             "DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES",
             old_enabled,
         )
@@ -172,11 +172,11 @@ class DocGenTemplateApiTests(unittest.TestCase):
         self.assertEqual(confirmed, [])
 
     def test_template_analyze_does_not_auto_confirm_without_a_decision(self):
-        old_enabled = config.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES
-        config.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = True
+        old_enabled = src.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES
+        src.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = True
         self.addCleanup(
             setattr,
-            config.settings,
+            src.settings,
             "DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES",
             old_enabled,
         )

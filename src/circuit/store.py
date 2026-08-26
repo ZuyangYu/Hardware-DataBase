@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import config.settings
+import src.settings
 from src.circuit.models import CircuitDesign
 from src.ingestion.kb_paths import validate_kb_name
 
@@ -165,7 +165,7 @@ class CircuitStore:
     _INDEX_LOCK = threading.RLock()
 
     def __init__(self, root: str | None = None):
-        self.root = root or os.path.join(config.settings.STORAGE_DIR, "circuits")
+        self.root = root or os.path.join(src.settings.STORAGE_DIR, "circuits")
 
     # ── path helpers ──────────────────────────────────────────────────────
 

@@ -5,7 +5,7 @@ import time
 import uuid
 from typing import Any
 
-import config.settings
+import src.settings
 from src.core.logger import error
 from src.ingestion.container_inspector import inspect_container_file
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
@@ -16,7 +16,7 @@ class DocumentArchiveManager:
     """Manage archived source files for document processing pipelines."""
 
     def archive_root(self, create: bool = False) -> str:
-        root = os.path.abspath(config.settings.PIPELINE_ARCHIVE_ROOT)
+        root = os.path.abspath(src.settings.PIPELINE_ARCHIVE_ROOT)
         if create:
             os.makedirs(root, exist_ok=True)
         return root

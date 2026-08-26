@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import config.settings
+import src.settings
 from src.core.auth import ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER, AuthUser
 
 
@@ -101,7 +101,7 @@ class AppLogService:
     _initialized_paths: set[str] = set()
 
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or config.settings.AUTH_DB_PATH
+        self.db_path = db_path or src.settings.AUTH_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         if self.db_path not in AppLogService._initialized_paths:
             self._init_db()

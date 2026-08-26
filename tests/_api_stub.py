@@ -3,7 +3,7 @@ import socket
 import threading
 import time
 
-import config.settings
+import src.settings
 import httpx
 import uvicorn
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_USER
@@ -208,7 +208,7 @@ def make_auth(db_path: str):
     value by the caller's setUp.
     """
     auth = AuthService(db_path=db_path)
-    sysadmin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+    sysadmin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
     dept = auth.create_department("hw")
     admin = auth.create_user_as(sysadmin, "admin1", "pw123456", ROLE_DEPT_ADMIN, dept.id)
     user = auth.create_user_as(admin, "user1", "pw123456", ROLE_USER, dept.id)

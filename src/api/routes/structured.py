@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-import config.settings
+import src.settings
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.circuit.query_engine import CircuitQueryEngine
@@ -402,7 +402,7 @@ def _list_design_dirs_with_log(kb_name: str) -> list[tuple[str, str]]:
 def _delete_circuit_upload_archive(kb_name: str, design_id: str) -> None:
     safe_kb_name = validate_kb_name(kb_name)
     safe_design_id = make_design_id(design_id)
-    archive_root = os.path.join(config.settings.STORAGE_DIR, "circuit_uploads", safe_kb_name)
+    archive_root = os.path.join(src.settings.STORAGE_DIR, "circuit_uploads", safe_kb_name)
     if not os.path.isdir(archive_root):
         return
     for group_name in os.listdir(archive_root):

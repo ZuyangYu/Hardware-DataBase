@@ -6,7 +6,7 @@ import hashlib
 
 import pytest
 
-import config.settings
+import src.settings
 from src.document_authoring.service import (
     DocumentGenerationService,
     _automatic_release_allowed,
@@ -89,7 +89,7 @@ def test_unexpected_finalize_error_persists_failed_status():
 
 
 def test_verified_candidate_is_auto_published_without_human_event(monkeypatch):
-    monkeypatch.setattr(config.settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
+    monkeypatch.setattr(src.settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
     service = object.__new__(DocumentGenerationService)
     content = b"verified workbook"
     candidate = SimpleNamespace(
@@ -153,7 +153,7 @@ def test_auto_publish_policy_does_not_route_missing_tbd_fields_to_human_review()
 
 
 def test_direct_verified_work_order_can_be_auto_released_without_chat_session(monkeypatch):
-    monkeypatch.setattr(config.settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
+    monkeypatch.setattr(src.settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
     order = SimpleNamespace(generation_session_id=None, generation_brief={})
     report = SimpleNamespace(status="passed")
 

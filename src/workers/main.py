@@ -4,7 +4,7 @@ import signal
 import time
 import uuid
 
-import config.settings
+import src.settings
 from src.api.context import build_context_for_user
 from src.api.routes.query import _run_turn
 from src.core.app_pipeline import AppPipeline
@@ -61,7 +61,7 @@ class HardwareWorker:
         depth, oldest_age_s = self.conversations.pending_turn_queue_state()
         set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
         if self.runtime is not None:
-            batch = max(1, config.settings.WORKER_PARSE_BATCH_SIZE)
+            batch = max(1, src.settings.WORKER_PARSE_BATCH_SIZE)
             for _ in range(batch):
                 started = time.monotonic()
                 heartbeat(self.worker_id, task_kind="parse")
@@ -81,15 +81,15 @@ class HardwareWorker:
         log("Hardware DataBase worker started")
         while self.running:
             if not self.run_once():
-                time.sleep(max(0.1, config.settings.WORKER_POLL_INTERVAL_SECONDS))
+                time.sleep(max(0.1, src.settings.WORKER_POLL_INTERVAL_SECONDS))
         log("Hardware DataBase worker stopped")
 
 
 def main() -> None:
     init_observability(
         "hardware-database-worker",
-        service_version=config.settings.OBS_SERVICE_VERSION,
-        environment=config.settings.OBS_ENVIRONMENT,
+        service_version=src.settings.OBS_SERVICE_VERSION,
+        environment=src.settings.OBS_ENVIRONMENT,
     )
     worker = HardwareWorker()
     signal.signal(signal.SIGTERM, worker.stop)

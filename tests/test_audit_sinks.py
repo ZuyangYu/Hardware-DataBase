@@ -10,7 +10,7 @@ import os
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 import httpx
 
 from src.api.app import create_app
@@ -34,15 +34,15 @@ class AuditSinkTests(unittest.TestCase):
         cls.server.stop()
 
     def setUp(self):
-        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.db_path = os.path.join(self.tmp.name, "auth.db")
-        self._old_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = self.db_path
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", self._old_db)
+        self._old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", self._old_db)
         self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
         self.stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.stub
@@ -52,7 +52,7 @@ class AuditSinkTests(unittest.TestCase):
         self.client = httpx.Client(base_url=self.url, timeout=30)
         self.addCleanup(self.client.close)
         self.logs = AppLogService()
-        self.sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        self.sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
 
     def _token(self, username: str, password: str = "pw123456") -> str:
         r = self.client.post("/api/v1/login", json={"username": username, "password": password})
@@ -110,7 +110,7 @@ class AuditSinkTests(unittest.TestCase):
         self.assertEqual(r.status_code, 401)
 
     def test_create_user_records_audit_no_double_write(self):
-        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.create_user_as(sysadmin, "newuser", "pw123456", ROLE_DEPT_ADMIN, self.dept.id)
         new_events = self._new_actions(before)
@@ -119,7 +119,7 @@ class AuditSinkTests(unittest.TestCase):
         self.assertEqual(new_events.count("create_user"), 1)
 
     def test_create_department_records_audit(self):
-        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.create_department_as(sysadmin, "newdept")
         self.assertIn("create_department", self._new_actions(before))
@@ -132,13 +132,13 @@ class AuditSinkTests(unittest.TestCase):
         self.assertEqual(new_events.count("grant_kb_permission"), 1)
 
     def test_set_user_active_records_audit(self):
-        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.set_user_active_as(sysadmin, self.user.id, False)
         self.assertIn("set_user_active", self._new_actions(before))
 
     def test_reset_password_records_audit(self):
-        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.reset_user_password_as(sysadmin, self.user.id, "newpass12345")
         self.assertIn("reset_user_password", self._new_actions(before))
@@ -146,7 +146,7 @@ class AuditSinkTests(unittest.TestCase):
     def test_assign_kb_records_audit(self):
         # assign_knowledge_base_as strips cross-department perms and must be
         # audited (was a silent gap before the fix).
-        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.assign_knowledge_base_as(sysadmin, "shared", self.dept.id)
         new_events = self._new_actions(before)
@@ -161,7 +161,7 @@ class AuditSinkTests(unittest.TestCase):
         # Permission checks now live inside the audit-sunk try block (aligned
         # with grant_kb_permission_as), so a denied attempt IS recorded with
         # success=False -- useful for spotting a stolen token probing endpoints.
-        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         with self.assertRaises(PermissionError):
             self.auth.create_user_as(sysadmin, "should_fail", "pw123456", ROLE_USER)
@@ -184,15 +184,15 @@ class DepartmentPermissionTests(unittest.TestCase):
         cls.server.stop()
 
     def setUp(self):
-        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.db_path = os.path.join(self.tmp.name, "auth.db")
-        self._old_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = self.db_path
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", self._old_db)
+        self._old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", self._old_db)
         self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
         self.stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.stub
@@ -226,9 +226,9 @@ class DepartmentPermissionTests(unittest.TestCase):
     def test_change_settings_records_audit(self):
         # PUT /config must record a change_settings audit (was missing on the
         # API path because apply_settings is a stateless staticmethod).
-        sysadmin = self.auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         logs = AppLogService()
-        token = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.put(
             "/api/v1/config",
             json={"settings": {"RAGFLOW_TIMEOUT_SECONDS": "90"}},
@@ -252,7 +252,7 @@ class DepartmentPermissionTests(unittest.TestCase):
         # GET /kbs must branch to list_all_knowledge_bases_for_admin for
         # system_admin (was returning [] because list_accessible_kbs is empty
         # for system_admin).
-        token = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.get("/api/v1/kbs", headers=self._auth(token))
         self.assertEqual(r.status_code, 200)
         names = [k["name"] for k in r.json()]
@@ -277,7 +277,7 @@ class DepartmentPermissionTests(unittest.TestCase):
     def test_kb_summaries_carry_anomaly_fields(self):
         # KbSummaryView must expose files/failed/parsing/issue_flags so the
         # frontend can render the governance panel from one endpoint.
-        token = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.get("/api/v1/governance/kb-summaries", headers=self._auth(token))
         self.assertEqual(r.status_code, 200)
         body = r.json()
@@ -314,7 +314,7 @@ class DepartmentPermissionTests(unittest.TestCase):
 
     def test_evaluation_create_run_validates_body(self):
         # create_run now uses a pydantic model: invalid mode -> 422.
-        token = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.post(
             "/api/v1/evaluation/runs",
             json={"dataset_path": "evaluation/datasets/hardware_qa_v1.jsonl", "mode": "bogus"},
@@ -326,7 +326,7 @@ class DepartmentPermissionTests(unittest.TestCase):
         # system_admin is a governance role by design (see CLAUDE.md > 角色权力
         # 分离). KB content endpoints must reject sysadmin with a specific
         # message so a frontend can differentiate this from "no permission".
-        token = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         h = self._auth(token)
         for path in (
             "/api/v1/kbs/shared/files",
@@ -342,7 +342,7 @@ class DepartmentPermissionTests(unittest.TestCase):
     def test_sysadmin_can_access_governance_endpoints(self):
         # Positive side of the split: sysadmin's governance endpoints must
         # still work (KB list, permissions list, logs, config, etc.).
-        token = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         h = self._auth(token)
         for path in (
             "/api/v1/kbs",
@@ -359,7 +359,7 @@ class DepartmentPermissionTests(unittest.TestCase):
 
     def test_config_rejects_non_scalar_values(self):
         # UpdateConfigRequest.settings now typed to scalar-only; list/dict -> 422.
-        token = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.put(
             "/api/v1/config",
             json={"settings": {"RAGFLOW_TIMEOUT_SECONDS": [1, 2, 3]}},
@@ -450,15 +450,15 @@ class SchemaValidationTests(unittest.TestCase):
         cls.server.stop()
 
     def setUp(self):
-        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.db_path = os.path.join(self.tmp.name, "auth.db")
-        self._old_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = self.db_path
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", self._old_db)
+        self._old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", self._old_db)
         self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
         self.stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.stub
@@ -479,7 +479,7 @@ class SchemaValidationTests(unittest.TestCase):
     def test_invalid_role_rejected(self):
         # Log in as system_admin to pass the require_any_admin guard, then try
         # to create a user with an invalid role -> 422 from pydantic Literal.
-        admin_token = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.post(
             "/api/v1/users",
             json={"username": "x", "password": "pw123456", "role": "superuser"},
@@ -512,15 +512,15 @@ class QueryTraceTests(unittest.TestCase):
         cls.server.stop()
 
     def setUp(self):
-        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.db_path = os.path.join(self.tmp.name, "auth.db")
-        self._old_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = self.db_path
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", self._old_db)
+        self._old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", self._old_db)
         self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
         self.stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.stub

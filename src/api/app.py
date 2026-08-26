@@ -62,17 +62,17 @@ async def lifespan(app: FastAPI):
     a child subprocess so a single backend command also runs Excel parsing, while
     keeping it a separate OS process (crash isolation + DB-level claim queue).
     """
-    import config.settings
+    import src.settings
 
     worker_proc: subprocess.Popen | None = None
     if _should_spawn_worker():
-        log_dir = os.path.join(config.settings.STORAGE_DIR, "logs")
+        log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "worker.log")
         log_file = open(log_path, "ab", buffering=0)
         worker_proc = subprocess.Popen(
             [sys.executable, "-m", "src.workers.main"],
-            cwd=config.settings.BASE_DIR,
+            cwd=src.settings.BASE_DIR,
             stdout=log_file,
             stderr=log_file,
         )
@@ -90,7 +90,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    import config.settings as settings
+    import src.settings as settings
 
     init_observability(
         "hardware-database-api",

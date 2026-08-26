@@ -19,7 +19,7 @@ _QUEUE_GAUGES: dict[str, Any] = {}
 
 def _enabled() -> bool:
     try:
-        import config.settings as settings
+        import src.settings as settings
 
         return bool(settings.OBS_ENABLED and settings.OBS_METRICS_ENABLED)
     except Exception:

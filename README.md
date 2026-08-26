@@ -21,9 +21,6 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化�
 ```text
 Hardware-DataBase/
 ├── assets/                     # 应用示例图片
-├── config/
-│   └── settings.py             # 全局配置与 .env 加载（单一事实来源）
-├── data/                       # (自动生成) 原始文档存储
 ├── docs/                       # 架构与设计文档
 │   ├── architecture_doc.md     # 当前整体架构
 │   ├── pipeline_contract.md    # pipeline 隔离契约
@@ -34,7 +31,8 @@ Hardware-DataBase/
 │   ├── datasets/hardware_qa_v1.jsonl
 │   └── README.md
 ├── src/
-│   ├── agents/                 # LangGraph 查询编排（graph/runner/state/prompts + tools/）
+│   ├── settings.py             # 全局配置与 .env 加载（单一事实来源）
+│   ├── agents/                 # deepagents 查询编排（runner + tools/）
 │   ├── circuit/                # 电路网表/原理图解析与结构化检索
 │   ├── core/                   # AppPipeline、鉴权、LLMClient、会话、source group 路由
 │   ├── evaluation/             # RAGAS 评估子系统（CLI、service、metrics、gates）
@@ -107,7 +105,7 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
 支持两种配置方式：**管理页面配置**（推荐）和 **`.env` 文件配置**。
 
-> 注意：仓库根目录的 `.env` 已提交且包含**真实 API Key**，并残留若干旧架构变量（`RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE` 等，`config/settings.py` 已忽略）。请以 `.env.example` 为模板，以下方变量为准。
+> 注意：仓库根目录的 `.env` 已提交且包含**真实 API Key**，并残留若干旧架构变量（`RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE` 等，`src/settings.py` 已忽略）。请以 `.env.example` 为模板，以下方变量为准。
 
 ### 方式一：管理页面配置（推荐）
 
@@ -115,7 +113,7 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
 ### 方式二：`.env` 文件配置
 
-在项目根目录创建 `.env`，按需填写（以下为 `config/settings.py` 实际读取的变量及默认值）：
+在项目根目录创建 `.env`，按需填写（以下为 `src/settings.py` 实际读取的变量及默认值）：
 
 ```env
 # ==================== RAGFlow 后端 ====================
