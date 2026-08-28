@@ -46,6 +46,25 @@ def make_document_search(rt, rag_backend: RAGBackend, document_store: PipelineDo
         backend_filters = _backend_filters(rt.kb_name, rt.ctx, None, document_store)
         retrieve_kwargs: dict[str, Any] = {"top_k": top_k, "ctx": rt.ctx, "filters": backend_filters}
         raw = rag_backend.retrieve(rt.kb_name, query, **retrieve_kwargs)
+        if not raw and not backend_filters.get("source_names") and not backend_filters.get("record_id"):
+            # M2: source_group 朴素子串路由可能把查询锁进错误来源组。全库检索
+            # 零命中时做一次 fail-open 恢复——放开来源组硬过滤重查（冻结的
+            # source_names 范围仍在时跳过，避免对定向检索误报）。
+            retry_filters = dict(backend_filters)
+            retry_filters["balanced_route"] = True
+            raw = rag_backend.retrieve(
+                rt.kb_name, query, top_k=top_k, ctx=rt.ctx, filters=retry_filters
+            )
+            if raw:
+                rt.emit(
+                    "stage",
+                    {
+                        "key": "balanced_route_retry",
+                        "label": "来源路由降级重试",
+                        "status": "done",
+                        "detail": f"首次 0 命中，放开来源组过滤后补回 {len(raw)} 条",
+                    },
+                )
         evidences: list[Evidence] = []
         for item in raw:
             metadata = dict(item.metadata or {})

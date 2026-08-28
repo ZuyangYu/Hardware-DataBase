@@ -95,3 +95,42 @@ class GateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_low_coverage_metric_skips_threshold_check(self):
+        """1/25 样本有效的 context_recall=1.0 不应触发门禁阈值。"""
+
+        results = [
+            SampleResult(
+                sample_id=f"s{i}",
+                metrics=[
+                    MetricResult(sample_id=f"s{i}", metric_name="completeness", score=0.9)
+                    for _ in range(0)
+                ] or [MetricResult(sample_id=f"s{i}", metric_name="completeness", score=0.9)],
+            )
+            for i in range(25)
+        ]
+        results[0].metrics.append(
+            MetricResult(sample_id="s0", metric_name="context_recall", score=1.0)
+        )
+
+        gate = evaluate_gate(results)
+
+        self.assertTrue(gate.passed)
+        self.assertEqual(gate.metric_counts.get("context_recall"), 1)
+
+    def test_high_coverage_metric_below_threshold_fails(self):
+        results = [
+            SampleResult(
+                sample_id=f"s{i}",
+                metrics=[
+                    MetricResult(sample_id=f"s{i}", metric_name="completeness", score=0.9),
+                    MetricResult(sample_id=f"s{i}", metric_name="context_recall", score=0.5),
+                ],
+            )
+            for i in range(25)
+        ]
+
+        gate = evaluate_gate(results)
+
+        self.assertFalse(gate.passed)
+        self.assertIn("context_recall", " ".join(gate.failures))

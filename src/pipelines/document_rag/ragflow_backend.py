@@ -153,6 +153,15 @@ def _is_ragflow_not_owner_error(exc: Exception) -> bool:
     return isinstance(exc, RAGFlowAPIError) and exc.code == 102
 
 
+def _is_ragflow_not_found_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 404
+    if isinstance(exc, RAGFlowAPIError):
+        text = str(getattr(exc, "message", "") or "").lower()
+        return "not found" in text or "does not exist" in text or "doesn't exist" in text
+    return False
+
+
 def _ragflow_status_unavailable_message(document_name: str) -> str:
     return f"{document_name}: RAGFlow parse submitted; realtime progress is not readable by the current API key."
 
@@ -827,15 +836,24 @@ class RAGFlowBackend(RAGBackend):
         except Exception as cleanup_error:
             log(f"RAGFlow remote cleanup failed for {document_id}: {cleanup_error}")
 
-    def _remote_document_exists(self, record) -> bool:
+    def _remote_document_exists(self, record) -> bool | None:
+        """Three-state remote lookup: True (exists), False (definitively absent), None (undetermined).
+
+        Only an authoritative miss from RAGFlow may return False. Transport-level
+        failures (connection errors, timeouts, 5xx, any other exception) return
+        None so callers never tear down records on inconclusive evidence.
+        """
         try:
             return bool(self._client().list_documents(record.dataset_id, record.document_id))
         except Exception as exc:
             if _is_ragflow_not_owner_error(exc):
                 log(f"RAGFlow duplicate check cannot read status for {record.document_id}; keeping local mapping: {exc}")
                 return True
+            if _is_ragflow_not_found_error(exc):
+                log(f"RAGFlow duplicate check found no usable remote document {record.document_id}: {exc}")
+                return False
             log(f"RAGFlow duplicate check could not verify remote document {record.document_id}: {exc}")
-            return False
+            return None
 
     def _process_parse_record(self, record):
         self.runtime.process_record(record)

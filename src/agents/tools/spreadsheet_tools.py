@@ -118,14 +118,19 @@ def _rank_rows(rows, tokens: list[str], text_getter):
         reverse=True,
     )
 
+def _escape_like(token: str) -> str:
+    return token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _like_clauses(columns: list[str], tokens: list[str]) -> tuple[str, list[str]]:
     clauses = []
     params: list[str] = []
     for token in tokens:
+        escaped = _escape_like(str(token))
         token_clauses = []
         for column in columns:
-            token_clauses.append(f"LOWER({column}) LIKE ?")
-            params.append(f"%{token}%")
+            token_clauses.append(f"LOWER({column}) LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
         clauses.append("(" + " OR ".join(token_clauses) + ")")
     if not clauses:
         return "1=1", []
@@ -316,10 +321,11 @@ def _like_clauses(columns: list[str], tokens: list[str]) -> tuple[str, list[str]
     clauses = []
     params: list[str] = []
     for token in tokens:
+        escaped = _escape_like(str(token))
         token_clauses = []
         for column in columns:
-            token_clauses.append(f"LOWER({column}) LIKE ?")
-            params.append(f"%{token}%")
+            token_clauses.append(f"LOWER({column}) LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
         clauses.append("(" + " OR ".join(token_clauses) + ")")
     if not clauses:
         return "1=1", []
@@ -332,12 +338,13 @@ def _token_match_order(columns: list[str], tokens: list[str]) -> tuple[str, list
     expressions: list[str] = []
     params: list[str] = []
     for token in tokens:
+        escaped = _escape_like(str(token))
         expressions.append(
             "(CASE WHEN "
-            + " OR ".join(f"LOWER({column}) LIKE ?" for column in columns)
+            + " OR ".join(f"LOWER({column}) LIKE ? ESCAPE '\\'" for column in columns)
             + " THEN 1 ELSE 0 END)"
         )
-        params.extend(f"%{token}%" for _ in columns)
+        params.extend(f"%{escaped}%" for _ in columns)
     return " + ".join(expressions) or "0", params
 
 
@@ -521,55 +528,3 @@ class SpreadsheetCellTool:
             for row in rows[:requested_top_k]
         ]
 
-
-class SpreadsheetProfileTool:
-    name = "spreadsheet_profile"
-    description = "Read Excel workbook and sheet profiles for source planning."
-
-    def __init__(self, spreadsheet_service: SpreadsheetIndexService):
-        self.spreadsheet_service = spreadsheet_service
-
-    def run(
-        self,
-        query: str,
-        kb_name: str,
-        ctx: RequestContext | None,
-        top_k: int = 5,
-        filters: dict | None = None,
-    ) -> list[Evidence]:
-        record_id = int((filters or {}).get("record_id") or 0)
-        if not record_id:
-            return []
-        scope = kb_scope_from_context(kb_name, ctx).require_department("read spreadsheet profile in")
-        db_path = self.spreadsheet_service.db_path(scope.department_id, scope.kb_name, create=False)
-        if not os.path.exists(db_path):
-            return []
-        try:
-            from src.pipelines.spreadsheet.table_store import TableIndexStore
-
-            profile = TableIndexStore(db_path).get_document_profile(record_id)
-        except Exception:
-            return []
-        if not profile:
-            return []
-        source_name = profile.get("document_name", f"record:{record_id}")
-        sheet_lines = []
-        for sheet in profile.get("sheets", []):
-            headers = ", ".join(str(item.get("header") or "") for item in sheet.get("headers", [])[:12])
-            sheet_lines.append(
-                f"Sheet {sheet.get('sheet_name')}: rows={sheet.get('row_count')}, "
-                f"semantic_rows={sheet.get('semantic_row_count')}, headers={headers}"
-            )
-        content = "\n".join(sheet_lines) or json.dumps(profile, ensure_ascii=False)
-        return [
-            Evidence(
-                id=f"xlsx:{record_id}:profile",
-                content=content,
-                source_name=source_name,
-                content_kind="spreadsheet_table",
-                processor_kind="spreadsheet_table",
-                score=1.0,
-                locator={"record_id": record_id},
-                metadata={"tool": self.name, "query": query, "profile": profile},
-            )
-        ]

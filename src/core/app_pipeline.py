@@ -238,7 +238,8 @@ class AppPipeline:
         except Exception as exc:
             error(f"查询出错: {exc}")
             traceback.print_exc()
-            yield f"系统错误: {str(exc)}"
+            from src.core.error_friendly import friendly_error_message
+            yield friendly_error_message(exc)
 
     def get_last_agent_footer(self) -> str:
         return self.agent.get_last_footer()
@@ -686,10 +687,8 @@ class AppPipeline:
         knowledge_base_name: str,
     ):
         """List work orders only while the caller retains KB read permission."""
-        if not ctx.has_kb_permission(knowledge_base_name, "read"):
-            raise PermissionError("knowledge base read permission is required")
-        return self.document_generation.store.list_work_orders_for_knowledge_base(
-            ctx.tenant_id or "default",
+        return self.document_generation.list_knowledge_base_work_orders_for_context(
+            ctx,
             knowledge_base_name,
         )
 

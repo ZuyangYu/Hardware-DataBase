@@ -110,7 +110,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
         key: 'name',
         title: '名称',
         render: (kb) => (
-          <div className="flex min-w-0 flex-col gap-[2px]">
+          <div className="flex max-w-[320px] min-w-0 flex-col gap-[2px]">
             <span className="truncate font-medium text-[#18181a]">{kb.name}</span>
             {(kb.permission || deptAdmin) && kb.department_name && (
               <span className="truncate text-[11px] text-[#858b9c]">{kb.department_name}</span>
@@ -145,14 +145,15 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
       {
         key: 'actions',
         title: '操作',
-        width: 220,
+        width: 240,
         align: 'right',
+        className: 'min-w-[230px]',
         render: (kb) => (
-          <div className="flex justify-end gap-[8px]">
+          <div className="flex flex-nowrap justify-end gap-[8px]">
             <button
               type="button"
               onClick={() => openKb(kb, 'chat')}
-              className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] bg-[#18181a] px-[12px] text-[12px] text-white transition-colors hover:bg-[#303030]"
+              className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] bg-[#18181a] px-[12px] text-[12px] text-white transition-colors hover:bg-[#303030]"
             >
               对话
             </button>
@@ -160,7 +161,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
               <button
                 type="button"
                 onClick={() => openKb(kb, 'content')}
-                className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
+                className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
               >
                 内容管理
               </button>
@@ -173,7 +174,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
                 setDeleteTarget(kb);
               }}
               className={cn(
-                'inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7]',
+                'inline-flex h-[28px] items-center whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7]',
                 (kb.permission !== 'admin' || sysAdmin) && 'cursor-not-allowed opacity-40',
               )}
               title={kb.permission === 'admin' && !sysAdmin ? '删除知识库' : '需要知识库 admin 权限'}

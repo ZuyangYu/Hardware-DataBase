@@ -746,6 +746,7 @@ class DocumentGenerationService:
                 tenant_id,
                 knowledge_base_name,
                 idempotency_key,
+                department_id=self._ctx_department_id(ctx),
             )
             if existing is not None:
                 return existing
@@ -776,6 +777,7 @@ class DocumentGenerationService:
                     tenant_id,
                     knowledge_base_name,
                     idempotency_key,
+                    department_id=self._ctx_department_id(ctx),
                 )
                 if existing is not None:
                     return existing
@@ -812,6 +814,7 @@ class DocumentGenerationService:
         tenant_id: str,
         knowledge_base_name: str,
         idempotency_key: str,
+        department_id: str | None = None,
     ) -> DocumentWorkOrder | None:
         return next(
             (
@@ -820,6 +823,7 @@ class DocumentGenerationService:
                     tenant_id, knowledge_base_name
                 )
                 if order.idempotency_key == idempotency_key
+                and (order.resource_department_id is None or order.resource_department_id == department_id)
             ),
             None,
         )
@@ -870,6 +874,10 @@ class DocumentGenerationService:
             tenant_id=snapshot.tenant_id,
             scope_type=scope_type,
             knowledge_base_name=knowledge_base_name if is_knowledge_base else None,
+            resource_department_id=(
+                self._ctx_department_id(ctx) if is_knowledge_base else None
+            ),
+            knowledge_base_id=self._ctx_kb_id(ctx) if is_knowledge_base else None,
             project_id=None if is_knowledge_base else snapshot.project_id,
             baseline_id=None if is_knowledge_base else snapshot.baseline_id,
             baseline_content_hash=(
@@ -1908,6 +1916,22 @@ class DocumentGenerationService:
         self.require_work_order_capability(ctx, order, capability)
         return order
 
+    @staticmethod
+    def _ctx_department_id(ctx: RequestContext) -> str | None:
+        department_id = ctx.metadata.get("resource_department_id")
+        if department_id in (None, ""):
+            department_id = ctx.metadata.get("department_id")
+        if department_id in (None, ""):
+            return None
+        return str(department_id)
+
+    @staticmethod
+    def _ctx_kb_id(ctx: RequestContext) -> str | None:
+        kb_id = ctx.metadata.get("kb_id")
+        if kb_id in (None, ""):
+            return None
+        return str(kb_id)
+
     def require_work_order_capability(
         self,
         ctx: RequestContext,
@@ -1915,10 +1939,12 @@ class DocumentGenerationService:
         capability: str,
     ) -> None:
         if order.scope_type == "knowledge_base":
+            owner_department = order.resource_department_id
             if (
-                order.tenant_id != (ctx.tenant_id or "default")
-                or not order.knowledge_base_name
+                not order.knowledge_base_name
                 or not ctx.has_kb_permission(order.knowledge_base_name, "read")
+                or owner_department is None
+                or owner_department != self._ctx_department_id(ctx)
             ):
                 raise PermissionError(
                     "knowledge base access is required for this work order"
@@ -2038,9 +2064,27 @@ class DocumentGenerationService:
 
     def _artifact_for_context(self, ctx: RequestContext, artifact_id: str) -> DocumentArtifact:
         artifact = self.store.get_artifact(artifact_id)
-        if artifact is None or artifact.tenant_id != (ctx.tenant_id or "default"):
+        if artifact is None:
             raise KeyError("artifact not found")
         return artifact
+
+    def list_knowledge_base_work_orders_for_context(
+        self,
+        ctx: RequestContext,
+        knowledge_base_name: str,
+    ) -> list[DocumentWorkOrder]:
+        if not ctx.has_kb_permission(knowledge_base_name, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        department_id = self._ctx_department_id(ctx)
+        orders = self.store.list_work_orders_for_knowledge_base(
+            ctx.tenant_id or "default", knowledge_base_name
+        )
+        return [
+            order
+            for order in orders
+            if order.resource_department_id is not None
+            and order.resource_department_id == department_id
+        ]
 
     def _harness_run_for_context(self, ctx: RequestContext, harness_run_id: str):
         run = self.store.get_harness_run(harness_run_id)

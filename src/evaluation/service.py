@@ -171,8 +171,12 @@ class EvaluationService:
         progress_callback: Callable[[EvaluationSummary, list[SampleResult], int, int], bool] | None = None,
         item_progress_callback: Callable[[EvaluationSummary, list[SampleResult], int, int], None]
         | None = None,
+        completed_groups: set[str] | None = None,
+        seeded_metrics: dict[str, list[MetricResult]] | None = None,
     ) -> tuple[EvaluationSummary, list[SampleResult]]:
         metric_names = DEFAULT_STANDARD_METRICS if metric_names is None else metric_names
+        resume_done_groups = completed_groups or set()
+        seeded_metrics = seeded_metrics or {}
         scoring_skipped_reason = ""
         scoring_config_metadata: dict[str, str | int | float] = {}
         if self.config is not None:
@@ -187,6 +191,12 @@ class EvaluationService:
             snapshot = snapshot_by_id.get(sample.id)
             status = snapshot.status if snapshot is not None else "failed"
             metrics = score_hardware_rules(sample, snapshot) if snapshot is not None and status == "success" else []
+            existing_names = {item.metric_name for item in metrics}
+            metrics.extend(
+                item
+                for item in seeded_metrics.get(sample.id, [])
+                if item.metric_name not in existing_names
+            )
             sample_results[sample.id] = SampleResult(
                 sample_id=sample.id,
                 question=sample.question,
@@ -255,6 +265,27 @@ class EvaluationService:
                 else:
                     scoring_snapshots = retrieval_snapshots
                 for metric_name in metric_names:
+                    if metric_name in resume_done_groups:
+                        completed_items += len(retrieval_samples)
+                        completed_groups += 1
+                        ordered_results = [sample_results[sample.id] for sample in samples]
+                        summary = self._build_summary(
+                            samples,
+                            ordered_results,
+                            thresholds=thresholds,
+                            fail_on_threshold=fail_on_threshold,
+                            run_id=run_id,
+                            completed_groups=completed_groups,
+                            total_groups=total_groups,
+                            completed_items=completed_items,
+                            total_items=total_items,
+                            outcome_kind="in_progress",
+                        )
+                        if progress_callback is not None:
+                            progress_callback(
+                                summary, ordered_results, completed_groups, total_groups
+                            )
+                        continue
                     emitted_keys: set[tuple[str, str]] = set()
 
                     def on_metric_result(metric: MetricResult) -> None:

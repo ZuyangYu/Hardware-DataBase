@@ -696,7 +696,9 @@ class ConversationService:
                     UPDATE chat_turns
                     SET status = 'completed', answer = ?, summary_json = ?, footer = ?, metrics_json = ?, finished_at = ?,
                         worker_id = '', worker_heartbeat_at = NULL
-                    WHERE id = ?
+                    -- completed/cancelled 为终态不可复活；failed(SSE stale 临时标记)
+                    -- 允许被 worker 真实的完成结果收编（见 test_stale_turn_is_reclaimed）。
+                    WHERE id = ? AND status NOT IN ('completed', 'cancelled')
                     """,
                     (answer, json.dumps(summary, ensure_ascii=False, default=str), footer,
                      json.dumps(metrics or {}, ensure_ascii=False, default=str), now, turn_id),
@@ -730,7 +732,7 @@ class ConversationService:
                 """
                 UPDATE chat_turns SET status = ?, error_message = ?, finished_at = ?,
                     worker_id = '', worker_heartbeat_at = NULL
-                WHERE id = ? AND session_id IN (
+                WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled') AND session_id IN (
                     SELECT id FROM chat_sessions
                     WHERE user_id = ?
                 )

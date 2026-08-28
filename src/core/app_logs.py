@@ -1,10 +1,11 @@
 import json
 import os
+import re
 import sqlite3
 import hashlib
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import src.settings
@@ -78,15 +79,81 @@ QUERY_FAILURE_PREFIXES = (
     "RAGFlow retrieved relevant context, but answer generation failed:",
 )
 
+# 失败原因聚合（query_failure_top）只输出稳定短类目，绝不回传 error_message 原文。
+_FAILURE_PREFIX_LABELS = {
+    "Error:": "generation error",
+    "系统错误:": "系统错误",
+    "RAGFlow retrieved relevant context, but answer generation failed:": "ragflow answer generation failed",
+}
+
+# 由查询管线写入的固定文案 → 稳定类目
+_FIXED_MESSAGE_CATEGORY = {
+    "client disconnected": "client_disconnected",
+}
+_FAILURE_CONSTANTS = frozenset({
+    "retrieval failed",
+    "no evidence",
+    # friendly_error_message (src/core/error_friendly.py) 的五条稳定文案
+    "model_rate_limited",
+    "model_timeout",
+    "model_unreachable",
+    "permission_denied",
+    "system_error",
+})
+
+# friendly_error_message 文案 → 安全类目（用户可见文案本身含标点，
+# 不适合作为 reason 原样返回，经此映射收口）。
+_FRIENDLY_ERROR_CATEGORY = {
+    "模型服务调用过于频繁或额度受限，请稍后重试。": "model_rate_limited",
+    "模型服务响应超时，请稍后重试。": "model_timeout",
+    "无法连接模型服务，请检查网络或稍后重试。": "model_unreachable",
+    "没有执行该操作的权限。": "permission_denied",
+    "系统错误，请稍后重试；若持续出现请联系管理员。": "system_error",
+}
+_EXCEPTION_TOKEN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,79}$")
+
+
+def failure_category(message: str) -> str:
+    """归一化失败原因为安全类目；无法归类的统一收口，不暴露原文。"""
+    text = (message or "").strip()
+    if not text:
+        return "(空)"
+    for prefix, label in _FAILURE_PREFIX_LABELS.items():
+        if text.startswith(prefix):
+            return label
+    mapped = _FRIENDLY_ERROR_CATEGORY.get(text) or _FIXED_MESSAGE_CATEGORY.get(text)
+    if mapped:
+        return mapped
+    if text in _FAILURE_CONSTANTS:
+        return text
+    head = re.split(r"[:：（(]", text, maxsplit=1)[0].strip()
+    if head and len(head) <= 80 and _EXCEPTION_TOKEN_RE.match(head):
+        return head
+    return "[unclassified]"
+
+# 检索摘要状态 → 日志中心 trace 状态。
+# runner 产出: success / partial_failure / failed / no_evidence；
+# "partial" 是旧 LangGraph 图时代的写法，仅为兼容历史落库数据保留。
+_TRACE_STATUS_MAP = {
+    "success": "success",
+    "partial_failure": "partial",
+    "partial": "partial",
+    "failed": "failed",
+    "no_evidence": "no_evidence",
+}
+
 
 def query_trace_status(response: object, retrieval_summary: dict[str, Any] | None = None) -> tuple[str, str]:
     summary = retrieval_summary or {}
     status = str(summary.get("status") or "").strip()
-    if status in {"success", "failed", "partial", "no_evidence"}:
-        if status == "success":
+    mapped = _TRACE_STATUS_MAP.get(status)
+    if mapped is not None:
+        if mapped == "success":
             return "success", ""
-        error_message = str(summary.get("error_message") or summary.get("error_stage") or status).strip()
-        return "failed", error_message
+        error_message = str(summary.get("error_message") or summary.get("error_stage") or "").strip()
+        if not error_message and mapped == "failed":
+            error_message = status
+        return mapped, error_message
 
     text = str(response or "").strip()
     if any(text.startswith(prefix) for prefix in QUERY_FAILURE_PREFIXES):
@@ -625,20 +692,36 @@ class AppLogService:
         keyword: str | None = None,
         limit: int = 5,
     ) -> list[tuple[str, int]]:
-        """失败查询的错误原因 Top-N（error_message 截断后分组），按 count 降序。部门管理员只看本部门。
+        """失败查询的原因 Top-N，按归一化安全类目分组，按 count 降序。部门管理员只看本部门。
 
-        固定 status='failed'，不含 status 过滤参数（避免与“只看失败”语义冲突）。
+        固定 status='failed'。reason 永远是 failure_category 的输出（异常标识或
+        [unclassified]），不含 error_message 原文——失败信息常带用户查询原文。
         """
         where, params = _query_where(viewer, kb_name, "failed", keyword)
-        params.append(max(1, min(limit, 20)))
         sql = (
-            f"SELECT substr(error_message, 1, 120) AS reason, COUNT(*) "
-            f"FROM query_traces WHERE {' AND '.join(where)} "
-            f"GROUP BY reason ORDER BY COUNT(*) DESC, reason ASC LIMIT ?"
+            f"SELECT substr(error_message, 1, 300) AS message "
+            f"FROM query_traces WHERE {' AND '.join(where)}"
         )
         with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [(row[0] or "(空)", int(row[1])) for row in rows]
+        counts: dict[str, int] = {}
+        for row in rows:
+            reason = failure_category(row["message"])
+            counts[reason] = counts.get(reason, 0) + 1
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return [(reason, count) for reason, count in ranked[: max(1, min(limit, 20))]]
+
+    def prune_query_traces(self, retention_days: int = 30) -> tuple[int, int]:
+        """删除超过保留期的查询痕迹及其证据切片，返回 (traces_deleted, evidence_deleted)。"""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, retention_days))).isoformat()
+        with closing(self._connect()) as conn:
+            evidence_deleted = conn.execute(
+                "DELETE FROM retrieved_evidence WHERE created_at < ?", (cutoff,)
+            ).rowcount
+            traces_deleted = conn.execute(
+                "DELETE FROM query_traces WHERE created_at < ?", (cutoff,)
+            ).rowcount
+        return int(traces_deleted), int(evidence_deleted)
 
 
 

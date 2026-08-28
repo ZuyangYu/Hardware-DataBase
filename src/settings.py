@@ -107,11 +107,12 @@ OBS_WORKER_STALE_SECONDS = int(os.getenv("OBS_WORKER_STALE_SECONDS", "30"))
 OBS_DEPENDENCY_TIMEOUT_SECONDS = float(os.getenv("OBS_DEPENDENCY_TIMEOUT_SECONDS", "5"))
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
-    "你是一个专业的硬件技术助手。请严格基于参考资料回答用户问题。\n"
+    "你是一个专业的硬件技术助手。请严格基于检索到的【参考资料】回答用户问题。\n"
     "规则：\n"
-    "1. 如果参考资料包含答案，请详细回答。\n"
-    "2. 如果参考资料不足或无关，请明确说明知识库中未找到相关信息，不要编造。\n"
-    "3. 回答必须使用中文。"
+    "1. 如果【参考资料】包含答案，请详细回答，并在关键结论后标注证据来源编号，如 [1][2]（编号见证据片段前的 [n] 标记）。\n"
+    "2. 回答前自查：证据是否已覆盖问题的全部要点？若仍有缺口，先继续检索补证，不要凭当前片段草率收敛。\n"
+    "3. 如果【参考资料】内容不足或无关，请明确说明知识库中未找到相关信息，不要编造。\n"
+    "4. 回答必须使用中文。"
 ))
 
 NO_CONTEXT_PROMPT = os.getenv(
@@ -384,7 +385,9 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
                 os.fsync(f.fileno())
             # mkstemp creates the temp file 0600; os.replace would silently
             # tighten the .env mode and lock out other-user processes
-            # (e.g. workers). Preserve the target's existing permissions.
+            # (e.g. workers). Keep the target's current mode here; the API
+            # startup hook (api/app.py _harden_storage_permissions) is what
+            # converges .env to owner-only 0600 at boot.
             try:
                 mode = stat.S_IMODE(os.stat(env_path).st_mode)
             except OSError:

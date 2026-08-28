@@ -20,12 +20,18 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generator
 
-from deepagents import create_deep_agent
+from deepagents import (
+    GeneralPurposeSubagentProfile,
+    HarnessProfile,
+    create_deep_agent,
+    register_harness_profile,
+)
 from langchain_core.messages import AIMessage
 
 from src.agents.schemas import Evidence
@@ -33,17 +39,90 @@ from src.agents.tools.circuit_tools import make_circuit_search
 from src.agents.tools.document_rag_tool import make_document_search
 from src.agents.tools.external_conversation_tools import make_conversation_search
 from src.agents.tools.pipeline_catalog import make_catalog_tool
-from src.agents.tools.runtime import ToolRuntime, format_evidence_for_llm, tool_label
+from src.agents.tools.runtime import ToolRuntime
 from src.agents.tools.spreadsheet_tools import make_spreadsheet_tools
 from src.circuit.index_service import CircuitIndexService
 from src.core.cancellation import QueryCancelled
 from src.core.model_factory import create_chat_model
+from src import settings
 from src.observability import observe
 from src.observability.metrics import record_agent, record_agent_stage
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
+
+# M9: 收窄 deepagents 默认能力面。禁用框架自动装配的 general-purpose 子代理
+# (task 工具随之移除)，并剥离与 SYSTEM_PROMPT 声明不符的文件系统/命令执行工具，
+# 仅保留业务检索工具。FilesystemMiddleware 为框架必需脚手架无法摘除，
+# 但其注入的工具经 excluded_tools 从模型可见集合中移除。
+_APP_AGENT_EXCLUDED_TOOLS = frozenset({
+    "ls", "read_file", "write_file", "edit_file", "glob", "grep", "delete", "execute",
+})
+for _provider_key in ("openai", "ollama"):
+    try:
+        register_harness_profile(
+            _provider_key,
+            HarnessProfile(
+                general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+                excluded_tools=_APP_AGENT_EXCLUDED_TOOLS,
+            ),
+        )
+    except Exception:
+        break
+
+
+class _PromptDict(dict):
+    """dict that leaves unknown ``{placeholder}`` untouched on str.format_map."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+_CITATION_RE = re.compile(r"\[(\d+)\]")
+
+
+def _build_evidence_quality(evidence: list[Evidence]) -> list[dict]:
+    quality: list[dict] = []
+    for item in evidence:
+        try:
+            score = float(item.score) if item.score is not None else 0.0
+        except (TypeError, ValueError):
+            score = 0.0
+        quality.append({"evidence_id": item.id, "score": score})
+    return quality
+
+
+def _build_claim_coverage(answer_text: str, evidence: list[Evidence]) -> list[dict]:
+    """Map ``[n]`` citation markers in the answer to the evidence actually cited.
+
+    Returns one entry per distinct cited index with status ``"supported"`` and
+    the matching evidence id. This is a lexical proxy for claim grounding (no
+    LLM claim extraction) and feeds RAGAS' claim-aware context selection.
+    """
+    by_citation: dict[int, str] = {}
+    for item in evidence:
+        raw = (item.metadata or {}).get("citation_number")
+        try:
+            num = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            num = None
+        if num is not None and num not in by_citation:
+            by_citation[num] = item.id
+    coverage: list[dict] = []
+    for match in _CITATION_RE.findall(answer_text or ""):
+        num = int(match)
+        evidence_id = by_citation.get(num)
+        if evidence_id is None:
+            continue
+        coverage.append(
+            {
+                "claim_id": f"cite-{num}",
+                "status": "supported",
+                "evidence_ids": [evidence_id],
+            }
+        )
+    return coverage
 
 
 @dataclass
@@ -141,6 +220,35 @@ def _extract_text_delta(chunk: Any) -> str:
                 parts.append(block)
         return "".join(parts)
     return ""
+
+
+def _split_answer_segments(chunks: list[tuple[str, Any]]) -> tuple[str, str]:
+    """Split a deepagents message stream into (final answer, narration).
+
+    The agent loop continues only while the model calls tools, so the LAST
+    model message is the answer and every earlier message is interim
+    narration ("让我再检索…"). Tool-call metadata is not reliably present on
+    streamed chunks across providers, so classification is positional.
+    """
+
+    order: list[str] = []
+    segments: dict[str, dict[str, Any]] = {}
+    for key, chunk in chunks:
+        seg_key = str(getattr(chunk, "id", "") or "")
+        if not seg_key:
+            seg_key = order[-1] if order else "seg-0"
+        if seg_key not in segments:
+            segments[seg_key] = {"text": ""}
+            order.append(seg_key)
+        text = _extract_text_delta(chunk)
+        if text:
+            segments[seg_key]["text"] += text
+
+    if not order:
+        return "", ""
+    final_parts = [segments[order[-1]]["text"]]
+    narration_parts = [segments[seg]["text"] for seg in order[:-1]]
+    return "".join(final_parts), "".join(narration_parts).strip()
 
 
 def _accumulate_usage(usage: TokenUsageSummary, chunk: Any) -> None:
@@ -297,7 +405,8 @@ class MultiSourceAgentRunner:
         ]
 
         workflow = _DEEP_WORKFLOW if query_mode == "deep" else _FAST_WORKFLOW
-        system_prompt = _SYSTEM_PROMPT.format(kb_name=kb_name, workflow=workflow)
+        base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
+        system_prompt = base_prompt.format_map(_PromptDict(kb_name=kb_name, workflow=workflow))
 
         def emit_event(evt: dict) -> None:
             if event_callback is not None:
@@ -306,23 +415,23 @@ class MultiSourceAgentRunner:
                 except Exception:
                     pass
 
-        def emit_stage(key: str, label: str, status: str = "running", detail: str = "") -> None:
-            emit_event({"type": "stage", "payload": {"key": key, "label": label, "status": status, "detail": detail}})
-
-        emit_stage("analyze", "分析硬件问题", "running", "正在拆解问题与检索需求")
-
         model = self._get_model()
         agent = create_deep_agent(model=model, tools=tools, system_prompt=system_prompt)
-        config = {"recursion_limit": 40 if query_mode == "deep" else 16}
+        rounds = max(1, int(settings.AGENT_MAX_RETRIEVAL_ROUNDS))
+        config = {
+            "recursion_limit": (
+                max(12, rounds * 12) if query_mode == "deep" else max(8, rounds * 6)
+            )
+        }
         usage = TokenUsageSummary(
             provider=str(type(model).__module__),
             model=str(getattr(model, "model_name", None) or getattr(model, "model", "") or ""),
         )
 
         yielded = False
-        retrieve_seen = False
         timeline: list[dict[str, Any]] = []
         answer_parts: list[str] = []
+        stream_chunks: list[tuple[str, Any]] = []
         try:
             for chunk, metadata in agent.stream(
                 {"messages": _build_messages(query, history)},
@@ -338,23 +447,31 @@ class MultiSourceAgentRunner:
                 # Real providers stream AIMessageChunk pieces; fake/fallback
                 # paths deliver a whole AIMessage per model call.
                 if node == "model" and isinstance(chunk, AIMessage):
-                    emit_stage("generate", "生成回答", "running", "正在流式输出答案正文")
-                    yielded = True
-                    answer_parts.append(text)
-                    yield text
+                    stream_chunks.append((f"seg-{len(stream_chunks)}", chunk))
         except QueryCancelled:
             return
         except Exception as exc:
+            from src.core.error_friendly import friendly_error_message
             emit_event(
                 {
                     "type": "degraded",
                     "payload": {
                         "stage": "agent_loop",
-                        "reason": f"智能体执行异常：{str(exc)[:160]}",
+                        "reason": friendly_error_message(exc),
                     },
                 }
             )
             raise
+
+        answer_text, narration_text = _split_answer_segments(stream_chunks)
+        if narration_text:
+            emit_event({"type": "narration", "payload": {"text": narration_text}})
+        if answer_text:
+            record.answer = answer_text
+            _current_run().answer = answer_text
+            answer_parts.append(answer_text)
+            yielded = True
+            yield answer_text
 
         # Post-stream bookkeeping: diagnostics events were emitted live by the
         # tool wrappers; here we translate them into the summary/footer shapes.
@@ -366,43 +483,47 @@ class MultiSourceAgentRunner:
                     "metadata": diag,
                 }
             )
-            label = tool_label(str(diag.get("tool_name") or "检索工具"))
-            status = "error" if diag.get("status") == "failed" else "done"
-            emit_stage("retrieve", "多源硬件数据召回", status, f"{label} 返回 {diag.get('hit_count')} 条候选证据")
             record_agent_stage(
                 stage=str(diag.get("tool_name") or "tool"),
                 duration_s=max(0.0, float(diag.get("latency_ms") or 0) / 1000.0),
                 status="success" if diag.get("status") != "failed" else "failed",
             )
-            retrieve_seen = True
 
+        record.token_usage_summary = usage
+        record.answer = "".join(answer_parts)
+        answer_text = _current_run().answer
+        claim_coverage = _build_claim_coverage(answer_text, rt.evidence)
+        cited_ids = {c["evidence_ids"][0] for c in claim_coverage if c.get("evidence_ids")}
         verification = {
             "grounded": bool(rt.evidence),
-            "grounding_method": "evidence_presence",
+            "grounding_method": "citation_presence",
             "unsupported_claims": [],
             "weak_claims": [],
             "conflicts": [],
-            "citation_coverage": 1.0 if rt.evidence else 0.0,
+            "citation_coverage": (len(cited_ids) / len(rt.evidence)) if rt.evidence else 0.0,
         }
-        record.token_usage_summary = usage
-        record.answer = "".join(answer_parts)
         record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
         record.footer = self._format_footer(rt, verification, timeline)
 
-        if yielded:
-            emit_stage("generate", "生成回答", "done", "最终回答已生成")
-        else:
+        if not yielded:
             # No model text streamed (e.g. loop ended right after tool calls).
-            fallback = (
-                format_evidence_for_llm(rt.evidence[:10])
-                if rt.evidence
-                else "未生成回答。"
-            )
-            if retrieve_seen:
-                emit_stage("generate", "生成回答", "running", "正在生成最终回答")
+            if rt.evidence:
+                source_names = [
+                    name
+                    for name in dict.fromkeys(
+                        str(item.source_name or "") for item in rt.evidence
+                    )
+                    if name
+                ]
+                listed = ", ".join(source_names[:8]) + (" 等" if len(source_names) > 8 else "")
+                fallback = (
+                    f"本轮未能生成带引用标注的回答，仅检索到候选证据来源：{listed}。"
+                    "建议换个问法或补充更具体的关键词后重试。"
+                )
+            else:
+                fallback = settings.NO_CONTEXT_PROMPT or "未生成回答。"
             record.answer = str(fallback)
             yield fallback
-            emit_stage("generate", "生成回答", "done", "最终回答已生成")
 
     # ------------------------------------------------------------------
     # Public observability contract (unchanged shape)
@@ -452,9 +573,7 @@ class MultiSourceAgentRunner:
     ) -> dict:
         failed = next((item for item in rt.diagnostics if item.get("status") not in {"ok"}), None)
         answer_text = _current_run().answer
-        if answer_text.startswith("已完成多源检索，但生成模型调用失败"):
-            status, error_stage, error_message = "failed", "answer", answer_text.splitlines()[0]
-        elif failed is not None and rt.evidence:
+        if failed is not None and rt.evidence:
             status, error_stage, error_message = (
                 "partial_failure",
                 "retrieval",
@@ -475,13 +594,13 @@ class MultiSourceAgentRunner:
             "final_top_k": len(rt.evidence),
             "evidence": self._evidence_rows(rt.evidence),
             "missing": [],
-            "retrieval_rounds": 1,
-            "sufficiency_status": "",
+            "retrieval_rounds": len(rt.diagnostics),
+            "sufficiency_status": "insufficient" if not rt.evidence else "sufficient",
             "trace": timeline,
             "tool_diagnostics": list(rt.diagnostics),
-            "claim_coverage": [],
-            "retrieval_ledger": [],
-            "evidence_quality": [],
+            "claim_coverage": _build_claim_coverage(answer_text, rt.evidence),
+            "retrieval_ledger": list(rt.queries),
+            "evidence_quality": _build_evidence_quality(rt.evidence),
             "verification": verification,
         }
 
@@ -494,6 +613,11 @@ class MultiSourceAgentRunner:
         sections = ["**概览**"]
         sections.append(
             f"- 检索工具调用：{len(rt.diagnostics)} | 证据：{len(rt.evidence)} | 模式：{rt.query_mode}"
+        )
+        distinct_tools = len({str(d.get("tool_name") or "") for d in rt.diagnostics if d.get("tool_name")})
+        distinct_queries = len(rt.queries)
+        sections.append(
+            f"- 多跳深度：{len(rt.diagnostics)} 次调用 · {distinct_queries} 个不同查询 · 涉及 {distinct_tools} 类工具"
         )
         sections.append("\n**执行时间线**")
         if timeline:
@@ -515,5 +639,10 @@ class MultiSourceAgentRunner:
         else:
             sections.append("- 无")
         sections.append("\n**Grounding**")
-        sections.append(f"- grounded={verification.get('grounded')} method={verification.get('grounding_method')}")
+        sections.append(
+            "- grounded={grounded} · 引用覆盖率={cov:.0%} · 校验方式=仅核对回答中的 [n] 引用是否落在证据上（未做逐句归因）".format(
+                grounded=verification.get("grounded"),
+                cov=float(verification.get("citation_coverage") or 0.0),
+            )
+        )
         return "\n".join(sections)

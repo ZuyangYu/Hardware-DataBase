@@ -92,6 +92,7 @@ def _work_order() -> DocumentWorkOrder:
         tenant_id="tenant-1",
         scope_type="knowledge_base",
         knowledge_base_name="hardware",
+        resource_department_id="hw",
         project_id=None,
         baseline_id=None,
         baseline_content_hash="",

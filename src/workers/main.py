@@ -80,6 +80,9 @@ class HardwareWorker:
     def run_forever(self) -> None:
         log("Hardware DataBase worker started")
         while self.running:
+            # H6: 即使队列为空也要刷新进程注册表心跳，
+            # 否则上游无法区分「空闲」与「已死」。
+            heartbeat(self.worker_id)
             if not self.run_once():
                 time.sleep(max(0.1, src.settings.WORKER_POLL_INTERVAL_SECONDS))
         log("Hardware DataBase worker stopped")

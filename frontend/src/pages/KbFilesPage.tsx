@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { api, isForbiddenError, uploadFiles } from '../api/client';
+import { api, ApiError, isForbiddenError, uploadFilesWithProgress } from '../api/client';
 import type {
   CircuitDesignDetailResponse,
   CircuitDesignRow,
@@ -109,6 +109,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   const [selectedFiles, setSelectedFiles] = useState<FileList | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadPercent, setUploadPercent] = useState(0);
   const [deleteTarget, setDeleteTarget] = useState<FileView | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [tasks, setTasks] = useState<ParseTaskView[]>([]);
@@ -494,12 +495,38 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       notify.error('请选择文件');
       return;
     }
+    // M15: 提交前逐文件预检(扩展名/总大小)，避免整批到服务器才被 413 拒收。
+    const supportedExts =
+      sourceGroup === EXTERNAL_DATA_GROUP
+        ? ['.txt', '.md', '.markdown']
+        : ['.pdf', '.doc', '.docx', '.xlsx', '.edf', '.edif'];
+    const maxTotalBytes = 512 * 1024 * 1024; // 与后端 upload.py MAX_UPLOAD_BYTES 默认一致
+    let totalBytes = 0;
+    const rejected: string[] = [];
+    for (const file of Array.from(selectedFiles)) {
+      totalBytes += file.size;
+      const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
+      if (!supportedExts.includes(ext)) rejected.push(`${file.name}（不支持 ${ext || '无扩展名'}）`);
+    }
+    if (rejected.length > 0) {
+      notify.error(`以下文件类型不被支持，已取消上传：${rejected.join('、')}`);
+      return;
+    }
+    if (totalBytes > maxTotalBytes) {
+      notify.error(`批次总大小 ${(totalBytes / 1024 / 1024).toFixed(1)}MB 超过 ${maxTotalBytes / 1024 / 1024}MB 上限，请分批上传`);
+      return;
+    }
     setUploading(true);
+    setUploadPercent(0);
     try {
       const form = new FormData();
       Array.from(selectedFiles).forEach((file) => form.append('files', file));
       form.append('source_group', sourceGroup);
-      const result = await uploadFiles<UploadAck>(`/api/v1/kbs/${encodeURIComponent(kbName)}/files`, form);
+      const result = await uploadFilesWithProgress<UploadAck>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/files`,
+        form,
+        (percent) => setUploadPercent(percent),
+      );
       const message = result.messages[0] || `成功 ${result.success_count}/${result.total_count}`;
       if (result.failed_count > 0 || result.skipped_count > 0) {
         notify.warning(message);
@@ -510,9 +537,14 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       if (fileInputRef.current) fileInputRef.current.value = '';
       await Promise.all([loadFiles(), loadTasks()]);
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '上传失败');
+      if (error instanceof ApiError && error.status === 413) {
+        notify.error(`批次超过服务器上传大小上限，已被拒收；请减小批量后重试（${error.message.slice(0, 80)}）`);
+      } else {
+        notify.error(error instanceof Error ? error.message : '上传失败');
+      }
     } finally {
       setUploading(false);
+      setUploadPercent(0);
     }
   }
 
@@ -733,7 +765,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
               accept={
                 sourceGroup === EXTERNAL_DATA_GROUP
                   ? '.txt,.md,.markdown'
-                  : '.pdf,.doc,.docx,.xls,.xlsx,.edf,.edif'
+                  : '.pdf,.doc,.docx,.xlsx,.edf,.edif'
               }
               onChange={(event) => setSelectedFiles(event.target.files)}
               className="h-[34px] rounded-[10px] border border-[#e3e7f1] bg-white px-[10px] py-[5px] text-[12px] text-[#464c5e] file:mr-[10px] file:rounded-[8px] file:border-0 file:bg-[#f3f4f6] file:px-[10px] file:py-[4px] file:text-[12px] file:text-[#464c5e]"
@@ -745,7 +777,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
             className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] text-white hover:bg-[#303030]"
           >
             <AppIcon name="plus" size={14} />
-            {uploading ? '上传中' : '开始上传'}
+            {uploading ? `上传中 ${uploadPercent}%` : '开始上传'}
           </Button>
         </div>
       )}

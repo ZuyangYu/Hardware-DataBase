@@ -8,9 +8,9 @@ Hardware DataBase (package name `hardware-database`) is a multi-source Q&A
 system for hardware design assets. It answers questions over **documents**
 (Word/PDF via RAGFlow), **spreadsheets** (Excel structured index), and **circuit
 designs** (EDIF/EDF netlists + schematic PDFs), orchestrated by a bounded
-LangGraph agent that does question analysis, source planning, multi-round
-retrieval, evidence-coverage judging, and grounded answer synthesis. It also
-ships a RAGAS evaluation subsystem. Python >= 3.12.
+`deepagents` (`create_deep_agent`) agent loop that dynamically plans tool calls
+for multi-source retrieval and grounded answer synthesis. It also ships a RAGAS
+evaluation subsystem. Python >= 3.12.
 
 The UI is a React + TypeScript SPA in `frontend/` talking to the FastAPI
 backend in `src/api/`. The former Streamlit app (`streamlit_app.py`, `src/ui/`)
@@ -98,8 +98,8 @@ is read by `src/evaluation/config.py`, not `settings.py`.
 ## Architecture
 
 Request flow: **React frontend -> FastAPI (`src/api/`) -> `AppPipeline.query` ->
-`MultiSourceAgentRunner` -> LangGraph graph -> tool adapters -> `LLMClient` ->
-streamed answer.**
+`MultiSourceAgentRunner` -> deepagents agent loop (`create_deep_agent`) -> tool
+adapters -> streamed answer (model via `src.core.model_factory`).**
 
 `AppPipeline` (`src/core/app_pipeline.py`) is the central orchestrator the UI
 talks to. It owns a `RAGFlowBackend` (the retrieval/ingest backend), a
@@ -107,38 +107,40 @@ talks to. It owns a `RAGFlowBackend` (the retrieval/ingest backend), a
 agent). `query` streams answer deltas; `upload_files` routes by `source_group`
 (see Ingestion) into the circuit pipeline or the RAGFlow backend.
 
-### LangGraph agent (`src/agents/`)
-`MultiSourceAgentRunner` (`runner.py`) builds and runs the graph
-(`graph.py::build_multi_source_graph`) over `AgentState` (`state.py`). It is a
-**bounded Plan-and-Execute** agent (not an open ReAct loop), with deterministic
-fail-open fallbacks at every LLM node:
+### Agent loop (`src/agents/`)
+`MultiSourceAgentRunner` (`runner.py`) wraps `deepagents.create_deep_agent`
+(a compiled LangGraph graph under the hood, but with a fixed general agent loop —
+no hand-written nodes). It is **OpenAI-agents-style ReAct**, not a bounded
+Plan-and-Execute graph: the model decides which retrieval tools to call, in what
+order, and how many hops, inside the tool-calling loop. Every tool call emits
+`tool_started` / `tool_result` events that drive the frontend's live trace.
 
-`route_query` -> (needs retrieval?) -> `analyze_question` -> `scan_kb_catalog`
--> `plan_source_selection` -> `retrieve_evidence` -> `merge_evidence` ->
-`score_and_compare_evidence` -> `draft_intermediate_answer` -> `judge_sufficiency`
--> (insufficient & round < `AGENT_MAX_RETRIEVAL_ROUNDS`) -> `plan_next_retrieval`
--> back to `retrieve_evidence`; otherwise -> `compose_answer` -> `verify_grounding`
--> END. Small-talk / general-knowledge routes short-circuit to
-`compose_direct_answer`.
+Multi-hop retrieval is **agentic by design** (the 2026-08 bounded-graph with the
+deterministic gap-ledger forced re-retrieval was removed in `9db28ca`). Guardrails
+are observational only, never planner-style: (1) a pre-answer self-check rule in
+`SYSTEM_PROMPT` ("证据是否覆盖全部要点，不足先补证"); (2) multi-hop depth stats in the
+footer (`rt.diagnostics` / `rt.queries`); (3) a fail-open `balanced_route` retry in
+`document_search` when full-KB retrieval yields zero hits (drops the naive
+source_group hard filter, keeps frozen `source_names` scope — see M2 in the
+2026-08-27 audit).
 
-`retrieve_evidence` runs the planner's finite `ToolCallPlan`s in parallel
-(`ThreadPoolExecutor`); after round 1 it may append bounded datasheet lookups for
-part numbers discovered in circuit evidence. `score_and_compare_evidence` builds a
-per-sub-question coverage matrix, detects conflicts, and scores evidence quality;
-`judge_sufficiency` (LLM) decides `sufficient | partial_but_answerable |
-insufficient_need_more`; `plan_next_retrieval` (LLM) proposes follow-up tool calls
-validated against an allow-list and the KB catalog. `verify_grounding` is
-rule-based (grounded iff evidence exists). Prompts in `prompts.py`; hardware
-tokenizer for scoring in `query_tokens.py`.
+`AGENT_MAX_RETRIEVAL_ROUNDS` (settings) maps to the loop's `recursion_limit`
+budget (`deep` → `rounds*12`, `fast` → `rounds*6`); it is NOT a hard cap on a
+planner. `SYSTEM_PROMPT` / `NO_CONTEXT_PROMPT` (settings, editable in system
+config) override the default agent prompt and the no-evidence fallback answer.
+Fail-open: tool errors are swallowed (return empty, emit a `degraded` event),
+and a trace/footer is always produced.
 
 ### Tools (`src/agents/tools/`)
-`AgentTool` Protocol (`base.py`): `run(query, kb_name, ctx, top_k, filters) ->
-list[Evidence]`. Registered in `runner.py`:
-- `DocumentRAGTool` ("document_rag") - `RAGBackend.retrieve` (RAGFlow).
-- `CircuitQueryTool` ("circuit_query") - `CircuitIndexService.query` -> structured circuit `Evidence`.
-- `SpreadsheetSemanticTool` / `SpreadsheetCellTool` - SQL over the per-KB spreadsheet index.
-- `SpreadsheetProfileTool` - registered but never emitted by the planner (dormant).
-- `PipelineCatalogTool` - `scan(kb)` lists available doc/spreadsheet/circuit sources for planning; not a retrieval tool.
+Tools are plain factory closures `make_*_tool(rt, ...)` returning a LangChain
+tool; they share one per-request `ToolRuntime` (`runtime.py`) that scopes
+`kb_name` / `ctx` / cancellation / event callback so concurrent sessions never
+leak state. Registered in `runner.py`:
+- `document_search` (`make_document_search`) - `RAGBackend.retrieve` (RAGFlow).
+- `circuit_search` (`make_circuit_search`) - `CircuitIndexService.query` -> structured circuit `Evidence`.
+- `spreadsheet_row_search` / `spreadsheet_cell_lookup` (`make_spreadsheet_tools`) - SQL over the per-KB spreadsheet index.
+- `conversation_search` (`make_conversation_search`) - external conversation records.
+- `list_kb_sources` (`make_catalog_tool`) - lists available doc/spreadsheet/circuit sources; not a retrieval tool.
 
 ### Backend layer (`src/pipelines/document_rag/`)
 `RAGBackend` ABC (`base.py`); `factory.create_rag_backend()` returns the sole
@@ -249,12 +251,13 @@ space.
   flat** - one `tests/test_<topic>.py` per module, `unittest.TestCase`-based, with
   `tests/evaluation/` as the only subsystem subdir. Mirror that when adding tests.
 - Cross-layer data passes as the dataclasses/schemas defined per layer
-  (`src/pipelines/document_rag/schemas.py`, `src/agents/state.py`,
+  (`src/pipelines/document_rag/schemas.py`, `src/agents/schemas.py`,
   `src/circuit/models.py`, `src/evaluation/schemas.py`) - extend those rather than
   passing ad-hoc dicts across boundaries.
-- The agent is **bounded and fail-open**: every LLM node has a deterministic
-  fallback; tool errors are swallowed rather than propagated; multi-hop is
-  hard-capped by `AGENT_MAX_RETRIEVAL_ROUNDS`. Preserve this when editing nodes.
+- The agent is **fail-open**: tool errors are swallowed (empty result + a
+  `degraded` event) rather than propagated, and a trace/footer is always produced.
+  Loop budget is set by `AGENT_MAX_RETRIEVAL_ROUNDS` (→ `recursion_limit`); there
+  is no hand-written graph to edit.
 - User-facing strings and answers are Chinese; keep that for prompts and UI text.
 
 ## Vendored dependency: `src/circuit/vendor/spydrnet/`

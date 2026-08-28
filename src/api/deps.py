@@ -14,6 +14,9 @@ from src.api.context import build_context_for_user
 _pipeline: AppPipeline | None = None
 _pipeline_lock = threading.Lock()
 
+_auth_service: AuthService | None = None
+_auth_service_lock = threading.Lock()
+
 
 def get_pipeline() -> AppPipeline:
     """Process-wide AppPipeline singleton (mirrors Streamlit's @st.cache_resource).
@@ -55,7 +58,19 @@ def reset_pipeline() -> None:
 
 
 def get_auth_service() -> AuthService:
-    return AuthService()
+    """Process-wide AuthService singleton (mirrors get_pipeline).
+
+    FastAPI caches dependency results per-request, but every request still
+    built a fresh AuthService before this singleton existed -- redoing schema
+    bootstrap work each time. Lock-guarded like get_pipeline because sync
+    routes run in Starlette's threadpool.
+    """
+    global _auth_service
+    if _auth_service is None:
+        with _auth_service_lock:
+            if _auth_service is None:
+                _auth_service = AuthService()
+    return _auth_service
 
 
 def bearer_token(authorization: str | None) -> str:

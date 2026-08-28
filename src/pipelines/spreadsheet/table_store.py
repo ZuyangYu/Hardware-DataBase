@@ -39,6 +39,9 @@ class TableIndexStore:
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
@@ -195,7 +198,7 @@ class TableIndexStore:
         if progress_callback:
             progress_callback(35, f"分析工作表结构（{len(workbook.sheets)} 个 sheet）")
         with closing(self._connect()) as conn:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute("DELETE FROM table_cells WHERE record_id = ?", (record_id,))
                 conn.execute("DELETE FROM table_rows WHERE record_id = ?", (record_id,))
