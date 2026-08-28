@@ -37,4 +37,13 @@ METRIC_LABEL_KEYS = {
     "metric",
     "provider",
     "streaming",
+    # Memory labels are intentionally limited to bounded enumerations.  IDs,
+    # query text and exception messages must never become metric dimensions.
+    "backend",
+    "enabled",
+    "kind",
+    "job_kind",
+    "projection_kind",
+    "scope",
+    "semantic_index",
 }

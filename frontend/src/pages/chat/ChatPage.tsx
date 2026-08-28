@@ -8,15 +8,19 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import type { AuthSession } from '../../auth';
-import type { KbView } from '@/api/types';
+import { api } from '@/api/client';
+import type { KbView, MessageView } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { CHAT_MAIN_CLASS } from './chatPageStyles';
 import { useKbChat } from './useKbChat';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
 import Composer from './components/Composer';
+import EditMessageDialog from './EditMessageDialog';
+import { notify } from '@/components/ui/app-toast';
 
 type Props = {
   auth: AuthSession;
@@ -67,6 +71,13 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
     messages,
     messagesLoaded,
     evidenceByMessageId,
+    memorySummary,
+    refreshMemorySummary,
+    updateAutoExtract,
+    sessionConsents,
+    refreshSessionConsents,
+    revokeSessionConsent,
+    updateMessage,
     input,
     setInput,
     streaming,
@@ -77,6 +88,82 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
     abortStream,
     forbidden,
   } = chat;
+
+  // ---- 消息编辑 ----
+  const [editTarget, setEditTarget] = useState<MessageView | null>(null);
+  const [editSubmitting, setEditSubmitting] = useState(false);
+
+  function openEditMessage(messageId: number) {
+    const target = messages.find((m) => m.id === messageId);
+    if (target && target.role === 'user' && !target.redacted) setEditTarget(target);
+  }
+
+  async function submitMessageEdit(payload: { content?: string | null; redact?: boolean }) {
+    if (!editTarget) return;
+    setEditSubmitting(true);
+    try {
+      const updated = await api.patch<MessageView>(
+        `/api/v1/conversations/${editTarget.session_id}/messages/${editTarget.id}`,
+        { ...payload, request_id: `chat-message-${Date.now()}` },
+      );
+      updateMessage(updated);
+      setEditTarget(null);
+      notify.success('消息已更新');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '消息更新失败');
+    } finally {
+      setEditSubmitting(false);
+    }
+  }
+
+  // ---- 确认弹窗(单例 state,替代 window.confirm) ----
+  const [extractConfirmOpen, setExtractConfirmOpen] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [userMemoryTarget, setUserMemoryTarget] = useState<number | null>(null);
+
+  async function runProjectExtraction() {
+    if (activeSessionId == null || !mountedKbName) return;
+    setExtracting(true);
+    try {
+      await api.post(`/api/v1/conversations/${activeSessionId}/extract-memory`, {
+        reason: '对话页面请求重新提炼项目记忆',
+        request_id: `chat-memory-${Date.now()}`,
+      });
+      notify.success('重新提炼请求已提交');
+      void refreshMemorySummary();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '重新提炼失败');
+    } finally {
+      setExtracting(false);
+      setExtractConfirmOpen(false);
+    }
+  }
+
+  async function runUserMemoryConsent(messageId: number) {
+    if (activeSessionId == null) return;
+    try {
+      await api.post(`/api/v1/conversations/${activeSessionId}/memory-consents`, {
+        message_ids: [messageId],
+        reason: '对话页面明确创建个人记忆',
+        request_id: `chat-consent-${Date.now()}`,
+      });
+      notify.success('个人记忆授权已创建，提炼将在后台执行');
+      void refreshSessionConsents();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '创建个人记忆授权失败');
+    }
+  }
+
+  async function handleToggleAutoExtract(enabled: boolean): Promise<boolean> {
+    try {
+      await updateAutoExtract(enabled);
+      notify.success(enabled ? '已开启自动提炼' : '已关闭自动提炼');
+      return true;
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '更新记忆设置失败');
+      return false;
+    }
+  }
 
   // 403 整页提示(system_admin 或无权限)
   if (forbidden) {
@@ -114,6 +201,12 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           kbName={mountedKbName || '未挂载'}
           userName={auth.user.username}
           onLogout={onLogout}
+          onExtractMemory={mountedKbName ? () => setExtractConfirmOpen(true) : undefined}
+          extractDisabled={activeSessionId == null || streaming || extracting}
+          memorySummary={memorySummary}
+          onToggleAutoExtract={handleToggleAutoExtract}
+          sessionConsents={sessionConsents}
+          onRevokeConsent={revokeSessionConsent}
         />
         <MessageList
           messages={messages}
@@ -127,6 +220,8 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           streamingText={streamingText}
           traceSteps={traceSteps}
           degradedNotes={degradedNotes}
+          onCreateMemory={(messageId) => setUserMemoryTarget(messageId)}
+          onEditMessage={openEditMessage}
         />
         <Composer
           kbName={mountedKbName}
@@ -137,6 +232,44 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           onStop={abortStream}
         />
       </main>
+      <ConfirmDialog
+        open={extractConfirmOpen}
+        onOpenChange={(next) => {
+          if (!next) setExtractConfirmOpen(false);
+        }}
+        title="重新提炼本项目记忆？"
+        description="将基于当前会话历史重新生成项目记忆，结果先进入 Candidate，仍需审核。"
+        confirmText="重新提炼"
+        destructive={false}
+        loading={extracting}
+        onConfirm={() => void runProjectExtraction()}
+      />
+      <ConfirmDialog
+        open={userMemoryTarget !== null}
+        onOpenChange={(next) => {
+          if (!next) setUserMemoryTarget(null);
+        }}
+        title="创建个人记忆"
+        description="记录所选消息为授权来源，提交后会生成可撤销的授权事件。"
+        confirmText="创建个人记忆"
+        destructive={false}
+        onConfirm={() => {
+          if (userMemoryTarget == null) return;
+          const target = userMemoryTarget;
+          setUserMemoryTarget(null);
+          void runUserMemoryConsent(target);
+        }}
+      />
+      <EditMessageDialog
+        open={editTarget !== null}
+        message={editTarget}
+        submitting={editSubmitting}
+        onClose={() => setEditTarget(null)}
+        onSaveEdit={(content, reason) =>
+          void submitMessageEdit({ content, ...(reason ? { reason } : {}) })
+        }
+        onRedact={(reason) => void submitMessageEdit({ redact: true, ...(reason ? { reason } : {}) })}
+      />
     </div>
   );
 }

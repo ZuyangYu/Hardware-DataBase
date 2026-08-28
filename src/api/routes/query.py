@@ -49,6 +49,7 @@ _TURN_EVENT_QUEUES_LOCK = threading.Lock()
 
 _DELTA_FLUSH_CHARS = 240
 _DELTA_FLUSH_SECONDS = 0.12
+_SHORT_TERM_HISTORY_LIMIT = 5
 
 
 def _publish_turn_event(turn_id: str, seq: int | None, event_type: str, payload: dict) -> None:
@@ -88,6 +89,62 @@ def _stage(key: str, label: str, status: str = "running", detail: str = "") -> t
     return ("stage", {"key": key, "label": label, "status": status, "detail": detail})
 
 
+def _short_term_memory_summary(
+    history: list[tuple[str, str]],
+    *,
+    source: str,
+    status: str | None = None,
+) -> dict[str, object]:
+    """Return privacy-safe observability for the bounded chat history window.
+
+    Short-term memory is the canonical conversation history, not the semantic
+    MemoryService. Only counts and the source path are recorded; prior user or
+    assistant text is never copied into an event or metric.
+    """
+    turn_count = len(history)
+    message_count = sum(
+        1
+        for user_text, assistant_text in history
+        for text in (user_text, assistant_text)
+        if str(text or "").strip()
+    )
+    return {
+        "source": source,
+        "status": status or ("hit" if turn_count > 0 else "empty"),
+        "hit": turn_count > 0,
+        "hit_count": turn_count,
+        "turn_count": turn_count,
+        "message_count": message_count,
+        "window_turns": _SHORT_TERM_HISTORY_LIMIT,
+    }
+
+
+def _set_short_term_memory_observation(observation, summary: dict[str, object]) -> None:
+    """Attach low-cardinality short-term-memory fields to a turn span."""
+    observation.set("hdb.chat.short_term_memory.status", str(summary.get("status") or ""))
+    observation.set("hdb.chat.short_term_memory.hit", bool(summary.get("hit")))
+    observation.set("hdb.chat.short_term_memory.hit_count", int(summary.get("hit_count") or 0))
+    observation.set("hdb.chat.short_term_memory.turn_count", int(summary.get("turn_count") or 0))
+    observation.set("hdb.chat.short_term_memory.message_count", int(summary.get("message_count") or 0))
+    observation.set("hdb.chat.short_term_memory.window_turns", int(summary.get("window_turns") or 0))
+
+
+def _append_short_term_memory_source(footer: str, summary: dict[str, object]) -> str:
+    """Explain when the answer had access to same-session conversation context.
+
+    Conversation history is useful context but is not formal knowledge-base
+    evidence, so it is shown as a separate data-source note.
+    """
+    if summary.get("status") == "error":
+        note = "**数据来源**\n- 对话上文（短期记忆）：上文内容读取失败"
+    elif summary.get("hit"):
+        hit_count = int(summary.get("hit_count") or summary.get("turn_count") or 0)
+        note = f"**数据来源**\n- 对话上文（短期记忆）：来源于上文内容（命中 {hit_count} 轮历史）"
+    else:
+        return footer
+    return f"{footer.rstrip()}\n\n{note}" if footer.strip() else note
+
+
 def _general_chat_stream(messages: list[dict[str, str]], usage_out: dict | None = None) -> Generator[str, None, None]:
     """Stream a direct (no-retrieval) chat completion via the shared model factory.
 
@@ -115,7 +172,7 @@ def _general_chat_stream(messages: list[dict[str, str]], usage_out: dict | None 
 def _make_event_callback(emit_stage, emit):
     """Adapt the runner's unified ``{"type","payload"}`` event stream to the
     durable turn-event path: route ``stage`` through the timing-aware emit_stage,
-    and everything else (degraded / tool_result) through emit.
+    and everything else (degraded / tool_result / short-term-memory) through emit.
 
     ``thought`` (model reasoning) is deliberately dropped here — it is
     display-only and never persisted nor replayed (OpenWorker's
@@ -176,6 +233,7 @@ def _message_view(message: ChatMessage) -> MessageView:
         content=message.content,
         footer=message.footer,
         created_at=message.created_at,
+        memory_context=getattr(message, "memory_context", []),
     )
 
 
@@ -261,6 +319,11 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     stage_durations_ms: dict[str, list[int]] = {}
     token_usage_summary = None
     outcome_status = "failed"
+    short_term_memory = _short_term_memory_summary(
+        [],
+        source="server_conversation_history",
+        status="not_checked",
+    )
 
     def cancelled() -> bool:
         return cancel.is_set() or conv.is_turn_cancel_requested(turn_id)
@@ -333,6 +396,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "total_ms": int((time.monotonic() - start) * 1000),
             "stage_durations_ms": stage_durations_ms,
             "tool_calls": tool_latencies,
+            "short_term_memory": dict(short_term_memory),
             "failed": failed,
             "cancelled": cancelled,
         }
@@ -340,7 +404,23 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     summary: dict = {}
     footer = ""
     try:
-        history = conv.history_before_turn(user.id, turn_id)
+        try:
+            history = conv.history_before_turn(user.id, turn_id)
+        except Exception:
+            short_term_memory = _short_term_memory_summary(
+                [],
+                source="server_conversation_history",
+                status="error",
+            )
+            _set_short_term_memory_observation(turn_observation, short_term_memory)
+            emit("short_term_memory", short_term_memory)
+            raise
+        short_term_memory = _short_term_memory_summary(
+            history,
+            source="server_conversation_history",
+        )
+        _set_short_term_memory_observation(turn_observation, short_term_memory)
+        emit("short_term_memory", short_term_memory)
         if turn.kb_name in ("", GENERAL_CHAT_KB_NAME):
             usage_acc: dict = {}
             for delta in _general_chat_stream(_general_messages(history, turn.query), usage_out=usage_acc):
@@ -381,10 +461,14 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                     close = getattr(gen, "close", None)
                     if callable(close):
                         close()
-            summary = pipeline.get_last_retrieval_summary() or {}
+            summary = {
+                **(pipeline.get_last_retrieval_summary() or {}),
+                "short_term_memory": short_term_memory,
+            }
             footer = pipeline.get_last_agent_footer() or ""
             token_usage_summary = pipeline.get_last_token_usage_summary()
 
+        footer = _append_short_term_memory_source(footer, short_term_memory)
         _flush_deltas()
         if cancelled():
             emit("error", {"message": "已停止生成", "cancelled": True})
@@ -396,7 +480,11 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         answer = "".join(answer_parts)
         if not answer:
             raise RuntimeError("未生成回答")
-        summary = {**summary, "query_mode": turn.query_mode}
+        summary = {
+            **summary,
+            "query_mode": turn.query_mode,
+            "short_term_memory": short_term_memory,
+        }
         completed = conv.complete_turn(user.id, turn_id, answer, summary, footer, metrics=metrics(summary=summary))
         turn_observation.set_output(answer, content_kind="llm")
         emit_stage("generate", "生成回答", "done", "最终回答已生成")
@@ -430,6 +518,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         else:
             conv.fail_turn(user.id, turn_id, str(exc))
             emit("error", {"message": str(exc)})
+            summary = {
+                **summary,
+                "short_term_memory": short_term_memory,
+            }
             _record_query_trace(
                 user=user,
                 kb_name="" if turn.kb_name == GENERAL_CHAT_KB_NAME else turn.kb_name,
@@ -457,6 +549,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         turn_observation.set("hdb.chat.status", outcome_status)
         turn_observation.set("hdb.chat.latency_ms", int(duration_s * 1000))
         turn_observation.set("hdb.chat.queue_ms", int(queue_s * 1000))
+        _set_short_term_memory_observation(turn_observation, short_term_memory)
         turn_observation.set_token_usage(token_usage_summary)
         if first_token_ms is not None:
             turn_observation.set("hdb.chat.ttft_ms", int(first_token_ms))
@@ -713,7 +806,7 @@ async def query(
     pipeline = _resolve_pipeline(request)
     # Keep only the most recent 5 history turns -- Streamlit slices [-5:] and
     # the agent prompt isn't sized for unbounded history.
-    history = [tuple(h) for h in body.history[-5:]]
+    history = [tuple(h) for h in body.history[-_SHORT_TERM_HISTORY_LIMIT:]]
 
     # pipeline.query is a *sync* generator whose _RUN_RECORD ContextVar is set
     # inside the generator body. If we iterated it via run_in_threadpool the
@@ -740,6 +833,10 @@ async def query(
     def producer() -> None:
         start = time.monotonic()
         summary: dict = {}
+        short_term_memory = _short_term_memory_summary(
+            history,
+            source="client_history",
+        )
         gen = None
         observation = observe.chain(
             "hdb.chat.turn",
@@ -751,6 +848,8 @@ async def query(
             },
         ).start()
         observation.set_input(body.query, content_kind="query")
+        _set_short_term_memory_observation(observation, short_term_memory)
+        _put(("short_term_memory", short_term_memory))
         outcome_status = "failed"
         try:
             answer_parts: list[str] = []
@@ -771,7 +870,10 @@ async def query(
                 if chunk:
                     answer_parts.append(chunk)
                     _put(("delta", {"text": chunk}))
-            summary = pipeline.get_last_retrieval_summary() or {}
+            summary = {
+                **(pipeline.get_last_retrieval_summary() or {}),
+                "short_term_memory": short_term_memory,
+            }
             answer = "".join(answer_parts)
             observation.set_output(answer, content_kind="llm")
             if not cancel.is_set():
@@ -781,7 +883,10 @@ async def query(
                         {
                             "answer": answer,
                             "summary": summary,
-                            "footer": pipeline.get_last_agent_footer(),
+                            "footer": _append_short_term_memory_source(
+                                pipeline.get_last_agent_footer() or "",
+                                short_term_memory,
+                            ),
                             "token_usage": pipeline.get_last_token_usage_summary(),
                         },
                     )
@@ -808,12 +913,16 @@ async def query(
             if not cancel.is_set():
                 _put(_stage("generate", "生成回答", "error", "答案生成失败"))
                 q.put(("error", {"message": str(exc)}))
+            summary = {
+                **(pipeline.get_last_retrieval_summary() or {}),
+                "short_term_memory": short_term_memory,
+            }
             _record_query_trace(
                 user=user,
                 kb_name=body.kb_name,
                 original_query=body.query,
                 thread_id=body.thread_id,
-                summary=pipeline.get_last_retrieval_summary() or {},
+                summary=summary,
                 latency_ms=int((time.monotonic() - start) * 1000),
                 status="failed",
                 error_message=str(exc),
@@ -839,6 +948,7 @@ async def query(
             observation.set("hdb.chat.status", outcome_status)
             observation.set("hdb.chat.latency_ms", duration_ms)
             observation.set("hdb.chat.queue_ms", 0)
+            _set_short_term_memory_observation(observation, short_term_memory)
             observation.set_token_usage(pipeline.get_last_token_usage_summary())
             observation.set("hdb.retrieval.rounds", int(summary.get("retrieval_rounds") or 0))
             diagnostics = summary.get("tool_diagnostics") or []
@@ -935,6 +1045,7 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
     q: queue.Queue = queue.Queue(maxsize=64)
     sentinel = object()
     cancel = threading.Event()
+    history = [tuple(h) for h in body.history[-_SHORT_TERM_HISTORY_LIMIT:]]
 
     def _put(item) -> None:
         while not cancel.is_set():
@@ -948,6 +1059,10 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
         start = time.monotonic()
         answer_parts: list[str] = []
         usage_summary: dict = {}
+        short_term_memory = _short_term_memory_summary(
+            history,
+            source="client_history",
+        )
         observation = observe.chain(
             "hdb.chat.turn",
             **{
@@ -959,16 +1074,23 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
             },
         ).start()
         observation.set_input(body.query, content_kind="query")
+        _set_short_term_memory_observation(observation, short_term_memory)
+        _put(("short_term_memory", short_term_memory))
         outcome_status = "failed"
         try:
-            for delta in _general_chat_stream(_general_messages(body.history, body.query), usage_out=usage_summary):
+            for delta in _general_chat_stream(_general_messages(history, body.query), usage_out=usage_summary):
                 if cancel.is_set():
                     break
                 if delta:
                     answer_parts.append(delta)
                     q.put(("delta", {"text": delta}))
             answer = "".join(answer_parts)
-            summary = {"retriever_type": "direct", "final_top_k": 0, "evidence": []}
+            summary = {
+                "retriever_type": "direct",
+                "final_top_k": 0,
+                "evidence": [],
+                "short_term_memory": short_term_memory,
+            }
             observation.set_output(answer, content_kind="llm")
             if not cancel.is_set():
                 _put(
@@ -977,7 +1099,7 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
                         {
                             "answer": answer,
                             "summary": summary,
-                            "footer": "",
+                            "footer": _append_short_term_memory_source("", short_term_memory),
                             "token_usage": _jsonable_usage(usage_summary),
                         },
                     )
@@ -1003,7 +1125,12 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
                 kb_name="",
                 original_query=body.query,
                 thread_id=body.thread_id,
-                summary={"retriever_type": "direct", "final_top_k": 0, "evidence": []},
+                summary={
+                    "retriever_type": "direct",
+                    "final_top_k": 0,
+                    "evidence": [],
+                    "short_term_memory": short_term_memory,
+                },
                 latency_ms=int((time.monotonic() - start) * 1000),
                 status="failed",
                 error_message=str(exc),
@@ -1020,6 +1147,7 @@ def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
             observation.set("hdb.chat.status", outcome_status)
             observation.set("hdb.chat.latency_ms", duration_ms)
             observation.set("hdb.chat.queue_ms", 0)
+            _set_short_term_memory_observation(observation, short_term_memory)
             observation.set("hdb.retrieval.rounds", 0)
             observation.set("hdb.retrieval.calls", 0)
             observation.set("hdb.retrieval.hits", 0)

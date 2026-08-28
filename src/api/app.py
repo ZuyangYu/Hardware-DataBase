@@ -29,6 +29,7 @@ from src.api.routes import (
     kb_permissions,
     kbs,
     logs,
+    memories,
     metrics,
     parse_tasks,
     query,
@@ -53,6 +54,15 @@ def _should_spawn_worker() -> bool:
     return os.getenv("HDB_API_SPAWN_WORKER", "1").lower() not in {"0", "false", "no", "off"}
 
 
+def _should_spawn_memory_worker() -> bool:
+    """Keep Memory reflection in a separately deployable process.
+
+    It is opt-in for the API process because a production deployment normally
+    runs ``hardware-database-memory-worker`` as its own low-priority service.
+    """
+    return os.getenv("HDB_API_SPAWN_MEMORY_WORKER", "0").lower() not in {"0", "false", "no", "off"}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Co-manage the background parse worker with the API server process.
@@ -65,18 +75,33 @@ async def lifespan(app: FastAPI):
     import config.settings
 
     worker_proc: subprocess.Popen | None = None
+    memory_worker_proc: subprocess.Popen | None = None
+    worker_log_file = None
+    memory_log_file = None
     if _should_spawn_worker():
         log_dir = os.path.join(config.settings.STORAGE_DIR, "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "worker.log")
-        log_file = open(log_path, "ab", buffering=0)
+        worker_log_file = open(log_path, "ab", buffering=0)
         worker_proc = subprocess.Popen(
             [sys.executable, "-m", "src.workers.main"],
             cwd=config.settings.BASE_DIR,
-            stdout=log_file,
-            stderr=log_file,
+            stdout=worker_log_file,
+            stderr=worker_log_file,
         )
         print(f"[hardware-database] spawned parse worker pid={worker_proc.pid} log={log_path}")
+    if _should_spawn_memory_worker():
+        log_dir = os.path.join(config.settings.STORAGE_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        memory_log_path = os.path.join(log_dir, "memory-worker.log")
+        memory_log_file = open(memory_log_path, "ab", buffering=0)
+        memory_worker_proc = subprocess.Popen(
+            [sys.executable, "-m", "src.memory.worker"],
+            cwd=config.settings.BASE_DIR,
+            stdout=memory_log_file,
+            stderr=memory_log_file,
+        )
+        print(f"[hardware-database] spawned memory worker pid={memory_worker_proc.pid} log={memory_log_path}")
     try:
         yield
     finally:
@@ -86,6 +111,16 @@ async def lifespan(app: FastAPI):
                 worker_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 worker_proc.kill()
+        if memory_worker_proc is not None and memory_worker_proc.poll() is None:
+            memory_worker_proc.terminate()
+            try:
+                memory_worker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                memory_worker_proc.kill()
+        if worker_log_file is not None:
+            worker_log_file.close()
+        if memory_log_file is not None:
+            memory_log_file.close()
         shutdown_observability()
 
 
@@ -142,6 +177,7 @@ def create_app() -> FastAPI:
     app.include_router(governance.router, prefix=api_v1)
     app.include_router(config.router, prefix=api_v1)
     app.include_router(logs.router, prefix=api_v1)
+    app.include_router(memories.router, prefix=api_v1)
     app.include_router(metrics.router, prefix=api_v1)
     app.include_router(status.router, prefix=api_v1)
     app.include_router(evaluation.router, prefix=api_v1)

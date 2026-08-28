@@ -15,6 +15,9 @@ _COUNTERS: dict[str, Any] = {}
 _HISTOGRAMS: dict[str, Any] = {}
 _QUEUE_STATE: dict[str, dict[str, float]] = {}
 _QUEUE_GAUGES: dict[str, Any] = {}
+_MEMORY_INDEX_STATE: dict[str, dict[str, int | str]] = {}
+_MEMORY_PROJECTION_STATE: dict[str, float] = {"pending": 0.0, "lag_seconds": 0.0}
+_MEMORY_GAUGES: dict[str, Any] = {}
 
 
 def _enabled() -> bool:
@@ -105,6 +108,65 @@ def set_queue_state(queue: str, *, depth: int, oldest_age_s: float) -> None:
                     for key, value in _QUEUE_STATE.items()
                 ]],
                 description="Age of the oldest durable queue item",
+                unit="s",
+            )
+    except Exception:
+        pass
+
+
+def set_memory_index_health(*, backend: str, healthy: bool, semantic_index: bool) -> None:
+    """Publish the latest rebuildable-memory Store health as an OTel gauge."""
+
+    if not _enabled():
+        return
+    key = f"{str(backend)}:{str(bool(semantic_index)).lower()}"
+    _MEMORY_INDEX_STATE[key] = {
+        "backend": str(backend),
+        "semantic_index": str(bool(semantic_index)).lower(),
+        "healthy": 1 if healthy else 0,
+    }
+    try:
+        if "index_health" not in _MEMORY_GAUGES:
+            _MEMORY_GAUGES["index_health"] = _meter().create_observable_gauge(
+                "hdb.memory.index_health",
+                callbacks=[lambda _options: [
+                    GaugeObservation(
+                        value["healthy"],
+                        {"backend": value["backend"], "semantic_index": value["semantic_index"]},
+                    )
+                    for value in _MEMORY_INDEX_STATE.values()
+                ]],
+                description="Health of the configured long-term memory projection store",
+                unit="1",
+            )
+    except Exception:
+        pass
+
+
+def set_memory_projection_state(*, pending: int, oldest_age_s: float) -> None:
+    """Publish pending projection/deletion outbox depth and oldest-item lag."""
+
+    if not _enabled():
+        return
+    _MEMORY_PROJECTION_STATE["pending"] = max(0.0, float(pending))
+    _MEMORY_PROJECTION_STATE["lag_seconds"] = max(0.0, float(oldest_age_s))
+    try:
+        if "projection_pending" not in _MEMORY_GAUGES:
+            _MEMORY_GAUGES["projection_pending"] = _meter().create_observable_gauge(
+                "hdb.memory.projection_outbox_pending",
+                callbacks=[lambda _options: [
+                    GaugeObservation(_MEMORY_PROJECTION_STATE["pending"], {"queue": "memory_projection"})
+                ]],
+                description="Pending memory projection and deletion outbox entries",
+                unit="{tasks}",
+            )
+        if "projection_lag" not in _MEMORY_GAUGES:
+            _MEMORY_GAUGES["projection_lag"] = _meter().create_observable_gauge(
+                "hdb.memory.projection_lag_seconds",
+                callbacks=[lambda _options: [
+                    GaugeObservation(_MEMORY_PROJECTION_STATE["lag_seconds"], {"queue": "memory_projection"})
+                ]],
+                description="Age of the oldest pending memory projection/deletion outbox entry",
                 unit="s",
             )
     except Exception:

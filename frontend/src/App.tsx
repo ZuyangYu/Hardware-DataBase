@@ -38,6 +38,7 @@ import LogsPage from './pages/admin/LogsPage';
 import ConfigPage from './pages/admin/ConfigPage';
 import EvaluationPage from './pages/admin/EvaluationPage';
 import SystemStatusPage from './pages/admin/SystemStatusPage';
+import MemoryPage from './pages/MemoryPage';
 
 const SIDEBAR_STORAGE_KEY = 'hdb_sidebar_expanded';
 
@@ -195,6 +196,10 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
                   <ChatRoute auth={auth} onLogout={onLogout} kbs={kbs} />
                 </KbContentRoute>
               }
+            />
+            <Route
+              path="/memory"
+              element={<MemoryPage auth={auth} onLogout={onLogout} kbs={kbs} />}
             />
             <Route
               path="/kbs/:kbName/chat/*"

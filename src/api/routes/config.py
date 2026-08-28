@@ -33,6 +33,8 @@ router = APIRouter(tags=["config"])
 _SECRET_KEYS = {
     "RAGFLOW_API_KEY",
     "AGENT_CUSTOM_API_KEY",
+    "MEMORY_MODEL_API_KEY",
+    "MEMORY_EMBEDDING_API_KEY",
     "AUTH_DEFAULT_ADMIN_PASSWORD",
 }
 

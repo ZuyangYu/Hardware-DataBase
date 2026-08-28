@@ -1,11 +1,11 @@
 /**
  * 消息气泡(对齐 MessageBubble 结构,裁掉业务件)。
  * 保留:用户气泡(plain text)、助手气泡(MarkdownMessage)、流式无文本时流光占位、
- * 参考来源(证据)面板。删掉:ExecutionRecord(trace)、ScheduledDraftCard、attachments、feedback。
+ * 参考来源(证据)与记忆上下文面板。删掉:ExecutionRecord(trace)、ScheduledDraftCard、attachments、feedback。
  */
 import { memo, useState } from 'react';
 
-import type { EvidenceItem, MessageView, QueryTraceStep } from '@/api/types';
+import type { EvidenceItem, MemoryContextItem, MessageView, QueryTraceStep } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { MarkdownMessage, citationDisplayTitle } from '../chatHelpers';
@@ -28,10 +28,15 @@ type Props = {
   traceSteps?: QueryTraceStep[];
   /** 降级提醒(fail-open 发生时)。 */
   degradedNotes?: Array<{ stage: string; reason: string }>;
+  /** 为当前用户把一条已完成消息提交到明确的个人记忆授权确认流。 */
+  onCreateMemory?: (messageId: number) => void;
+  /** 打开消息编辑对话框(仅本人 user 消息)。 */
+  onEditMessage?: (messageId: number) => void;
 };
 
 // Humanize the backend's stage keys into short one-line step labels.
 const STEP_SHORT: Record<string, string> = {
+  short_term_memory: '短期记忆',
   route: '识别问题',
   route_query: '识别问题',
   analyze: '分析问题',
@@ -157,6 +162,70 @@ function EvidenceBlock({ evidence }: { evidence: EvidenceItem[] }) {
   );
 }
 
+function memoryScopeLabel(scope?: string): string {
+  if (scope === 'user') return '个人记忆';
+  if (scope === 'project') return '项目记忆';
+  return scope || '长期记忆';
+}
+
+function memoryStatusLabel(status?: string): string {
+  if (status === 'verified') return '已验证';
+  if (status === 'verification_pending') return '待审核';
+  if (status === 'candidate') return '候选';
+  return status || '候选';
+}
+
+/** 长期记忆上下文面板:与正式参考来源分开,只展示检索到的历史线索。 */
+function MemoryContextBlock({ memories }: { memories: MemoryContextItem[] }) {
+  const [open, setOpen] = useState(false);
+  const visible = memories.filter((item) => item && (item.title || item.content));
+  if (visible.length === 0) return null;
+
+  return (
+    <div className="border-t border-[#e3e7f1] pt-[10px]">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="flex w-full cursor-pointer items-center gap-[6px] text-left text-[12px] font-semibold text-[#464c5e]"
+      >
+        <AppIcon name="history" size={14} />
+        <span>记忆上下文（长期记忆 {visible.length}）</span>
+        <span className="ml-auto text-[11px] font-normal text-[#858b9c]">{open ? '收起' : '展开'}</span>
+      </button>
+      {open && (
+        <div className="mt-[8px] grid gap-[8px]">
+          <div className="text-[11px] leading-[16px] text-[#858b9c]">
+            本次检索到的记忆上下文可用于辅助回答；它不是正式知识库证据，未必全部被最终回答采用。
+          </div>
+          {visible.map((item, index) => (
+            <div
+              key={String(item.id || `${item.scope}-${item.title}-${index}`)}
+              className="rounded-[8px] border border-[#e3e7f1] bg-[#fafbfc] px-[10px] py-[8px]"
+            >
+              <div className="mb-[4px] flex items-center gap-[6px] text-[12px] font-semibold text-[#18181a]">
+                <span className="text-[#757f9c]">[M{index + 1}]</span>
+                <span className="min-w-0 truncate">{item.title || '未命名记忆'}</span>
+                <span className="ml-auto shrink-0 text-[11px] font-normal text-[#858b9c]">
+                  {memoryScopeLabel(item.scope)} · {memoryStatusLabel(item.status)}
+                </span>
+              </div>
+              {item.content && (
+                <div className="whitespace-pre-wrap break-words text-[12px] leading-[18px] text-[#858b9c]">
+                  {item.content}
+                </div>
+              )}
+              {!!item.source_count && (
+                <div className="mt-[5px] text-[11px] leading-[16px] text-[#9aa1b1]">关联来源 {item.source_count} 条</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function citationPreview(item: EvidenceItem): string {
   const metadata = item.metadata ?? {};
   const candidates = [
@@ -197,6 +266,8 @@ function MessageBubble({
   streamingText,
   traceSteps = [],
   degradedNotes = [],
+  onCreateMemory,
+  onEditMessage,
 }: Props) {
   // 流式临时气泡
   if (streaming) {
@@ -235,9 +306,42 @@ function MessageBubble({
                   <MarkdownMessage content={msg.footer} />
                 </div>
               )}
+              {msg.memory_context && msg.memory_context.length > 0 && (
+                <MemoryContextBlock memories={msg.memory_context} />
+              )}
             </div>
           ) : (
-            <div className={CHAT_PLAIN_ANSWER_CLASS}>{msg.content}</div>
+            <div className="grid gap-[7px]">
+              {msg.redacted ? (
+                <div className="flex flex-col items-end whitespace-pre-wrap">
+                  <span className="italic text-[#9aa1b1]">{msg.content || '[已脱敏]'}</span>
+                </div>
+              ) : (
+                <div className={CHAT_PLAIN_ANSWER_CLASS}>{msg.content}</div>
+              )}
+              {msg.role === 'user' && msg.id > 0 && !msg.redacted && (
+                <div className="flex items-center justify-end gap-[10px]">
+                  {onEditMessage && (
+                    <button
+                      type="button"
+                      onClick={() => onEditMessage(msg.id)}
+                      className="w-fit text-[11px] text-[#858b9c] underline-offset-2 transition-colors hover:text-[#1d4ed8] hover:underline"
+                    >
+                      编辑
+                    </button>
+                  )}
+                  {onCreateMemory && (
+                    <button
+                      type="button"
+                      onClick={() => onCreateMemory(msg.id)}
+                      className="w-fit text-[11px] text-[#858b9c] underline-offset-2 transition-colors hover:text-[#1d4ed8] hover:underline"
+                    >
+                      创建个人记忆
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           )}
           {msg.role === 'assistant' && evidence && evidence.length > 0 && (
             <EvidenceBlock evidence={evidence} />

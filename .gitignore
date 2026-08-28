@@ -102,7 +102,7 @@ htmlcov/
 .agents/
 .worktrees/
 
-# Local development materials, planning documents, sample corpora, and tests
+# Local-only documentation, planning materials, sample corpora, and tests
 /.superpowers/
 /docs/
 /tests/

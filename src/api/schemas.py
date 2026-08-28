@@ -193,6 +193,20 @@ class SessionView(BaseModel):
     updated_at: str
 
 
+class MemoryContextView(BaseModel):
+    """A retrieved long-term-memory row shown outside formal evidence."""
+
+    id: str = ""
+    scope: str = ""
+    status: str = "candidate"
+    type: str = ""
+    title: str = ""
+    content: str = ""
+    source_count: int = 0
+    has_provenance: bool = False
+    score: float | None = None
+
+
 class MessageView(BaseModel):
     id: int
     session_id: int
@@ -200,11 +214,32 @@ class MessageView(BaseModel):
     content: str
     footer: str = ""
     created_at: str
+    edited_at: str | None = None
+    redacted: bool = False
+    memory_context: list[MemoryContextView] = Field(default_factory=list)
 
 
 class AddMessageRequest(BaseModel):
     role: str
     content: str
+
+
+class EditMessageRequest(BaseModel):
+    """Raw-message edit/redaction with §43 provenance protection."""
+
+    content: str | None = Field(default=None, max_length=20_000)
+    redact: bool = False
+    reason: str = Field(default="", max_length=500)
+    request_id: str = Field(default="", max_length=128)
+
+
+class SessionMemorySummary(BaseModel):
+    auto_extract_enabled: bool
+    extracted_memories: int
+
+
+class SessionMemorySettingsUpdate(BaseModel):
+    auto_extract: bool
 
 
 class CreateTurnRequest(BaseModel):
@@ -239,6 +274,141 @@ class TurnView(BaseModel):
 class TurnStartResponse(BaseModel):
     turn: TurnView
     user_message: MessageView
+
+
+# ---------------------------------------------------------------------------
+# Long-term memory governance
+# ---------------------------------------------------------------------------
+
+MemoryScope = Literal["project", "user"]
+MemoryListScope = Literal["all", "project", "user"]
+MemoryStatus = Literal[
+    "candidate",
+    "verification_pending",
+    "supersede_pending",
+    "needs_rebuild",
+    "verified",
+    "superseded",
+    "rejected",
+    "deleted",
+    "provenance_missing",
+]
+
+
+class MemorySourceView(BaseModel):
+    """Sanitized provenance returned by the Catalog-backed service."""
+
+    source_id: str = ""
+    source_kind: str = ""
+    session_id: int | None = None
+    turn_id: str | None = None
+    message_id: int | None = None
+    content_hash: str = ""
+    valid: bool = True
+
+
+class MemoryView(BaseModel):
+    """Public memory representation; namespace and Store keys are excluded."""
+
+    memory_id: str
+    revision: int = 0
+    status: MemoryStatus
+    scope: MemoryScope
+    kind: str = ""
+    content: dict[str, Any] = Field(default_factory=dict)
+    source_count: int = 0
+    sources: list[MemorySourceView] = Field(default_factory=list)
+    audit: dict[str, Any] = Field(default_factory=dict)
+    projection_status: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class MemoryListResponse(BaseModel):
+    items: list[MemoryView] = Field(default_factory=list)
+    next_cursor: str | None = None
+    total: int | None = None
+
+
+class MemoryOperationResponse(BaseModel):
+    """Accepted governance operation; projection work may complete async."""
+
+    operation_id: str = ""
+    memory_id: str = ""
+    status: str = "accepted"
+    revision: int | None = None
+    message: str = ""
+
+
+class MemoryActionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=2_000)
+    request_id: str = Field(min_length=1, max_length=128)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
+
+
+class MemoryDraftRequest(BaseModel):
+    """Validated semantic replacement for an editable Candidate."""
+
+    content: dict[str, Any] = Field(min_length=1)
+    expected_revision: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=2_000)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class MemoryExtractionRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2_000)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class VerifyMemoryRequest(MemoryActionRequest):
+    evidence_refs: list[str] = Field(min_length=1, max_length=100)
+
+
+class SupersedeMemoryRequest(MemoryActionRequest):
+    successor_memory_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class UserMemorySettingsView(BaseModel):
+    opt_in: bool = False
+    policy_version: str = ""
+    revoke_generation: int = 0
+    updated_at: str = ""
+
+
+class UserMemorySettingsRequest(BaseModel):
+    opt_in: bool
+    reason: str = Field(min_length=1, max_length=2_000)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class MemoryConsentCreateRequest(BaseModel):
+    """Explicit source message selection; identity/scope/policy are server-owned."""
+
+    message_ids: list[int] = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=2_000)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class MemoryConsentView(BaseModel):
+    consent_event_id: str
+    session_id: int
+    source_count: int = 0
+    manifest_hash: str = ""
+    policy_version: str = ""
+    revoke_generation: int = 0
+    status: str = "active"
+    granted_at: str = ""
+    revoked_at: str | None = None
+
+
+class MemoryConsentListResponse(BaseModel):
+    items: list[MemoryConsentView] = Field(default_factory=list)
+
+
+class RevokeMemoryConsentRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2_000)
+    request_id: str = Field(min_length=1, max_length=128)
 
 
 # ---------------------------------------------------------------------------
