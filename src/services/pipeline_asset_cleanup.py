@@ -2,7 +2,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 
-import config.settings
+import src.settings
 from src.core.logger import log
 from src.services.document_archive import DocumentArchiveManager
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
@@ -54,12 +54,12 @@ class PipelineAssetCleanupService:
             self._remove_tree(conversation_scope, "external conversations", result.errors)
 
         self._remove_tree(
-            os.path.join(config.settings.PIPELINE_ARCHIVE_ROOT, kb_name),
+            os.path.join(src.settings.PIPELINE_ARCHIVE_ROOT, kb_name),
             "legacy pipeline archive",
             result.errors,
         )
-        legacy_ragflow_root = getattr(config.settings, "RAGFLOW_FILE_ROOT", "")
-        if legacy_ragflow_root and os.path.abspath(legacy_ragflow_root) != os.path.abspath(config.settings.PIPELINE_ARCHIVE_ROOT):
+        legacy_ragflow_root = getattr(src.settings, "RAGFLOW_FILE_ROOT", "")
+        if legacy_ragflow_root and os.path.abspath(legacy_ragflow_root) != os.path.abspath(src.settings.PIPELINE_ARCHIVE_ROOT):
             self._remove_tree(
                 os.path.join(legacy_ragflow_root, kb_name),
                 "legacy ragflow archive",

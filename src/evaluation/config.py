@@ -56,6 +56,9 @@ class EvaluationConfig:
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
+    llm_fallback_base_url: str = ""
+    llm_fallback_api_key: str = ""
+    llm_fallback_model: str = ""
     llm_max_tokens: int = 4096
     max_contexts_per_sample: int = 4
     max_context_chars: int = 2000
@@ -66,6 +69,10 @@ class EvaluationConfig:
     max_workers: int = 4
     max_retries: int = 0
     output_root: str = "storage/evaluations"
+
+    @property
+    def fallback_ready(self) -> bool:
+        return bool(self.llm_fallback_base_url and self.llm_fallback_model)
 
     @classmethod
     def from_environment(cls) -> "EvaluationConfig":
@@ -119,6 +126,9 @@ class EvaluationConfig:
             embedding_base_url=embedding_base_url,
             embedding_api_key=_env("EVAL_EMBEDDING_API_KEY"),
             embedding_model=embedding_model,
+            llm_fallback_base_url=_env("EVAL_LLM_FALLBACK_BASE_URL"),
+            llm_fallback_api_key=_env("EVAL_LLM_FALLBACK_API_KEY"),
+            llm_fallback_model=_env("EVAL_LLM_FALLBACK_MODEL"),
             llm_max_tokens=llm_max_tokens,
             max_contexts_per_sample=max_contexts_per_sample,
             max_context_chars=max_context_chars,
@@ -136,6 +146,7 @@ class EvaluationConfig:
             "llm_provider": self.llm_provider,
             "llm_base_url": self.llm_base_url,
             "llm_model": self.llm_model,
+            "llm_fallback_model": self.llm_fallback_model,
             "embedding_base_url": self.embedding_base_url,
             "embedding_model": self.embedding_model,
             "llm_max_tokens": self.llm_max_tokens,

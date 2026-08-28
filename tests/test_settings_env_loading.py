@@ -6,14 +6,14 @@ from unittest.mock import patch
 
 class SettingsEnvLoadingTests(unittest.TestCase):
     def test_reload_settings_reads_llm_rate_limit_configuration(self):
-        import config.settings as settings
+        import src.settings as settings
 
         values = {
             "AGENT_RATE_LIMIT_MAX_RETRIES": "2",
             "AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS": "0.25",
             "AGENT_RATE_LIMIT_MAX_DELAY_SECONDS": "3",
         }
-        with patch.dict(os.environ, values), patch("config.settings.load_dotenv"):
+        with patch.dict(os.environ, values), patch("src.settings.load_dotenv"):
             settings.reload_settings()
 
         self.assertEqual(settings.AGENT_RATE_LIMIT_MAX_RETRIES, 2)
@@ -22,7 +22,7 @@ class SettingsEnvLoadingTests(unittest.TestCase):
 
     def test_loads_project_root_env_file_on_import_and_reload(self):
         with patch("dotenv.load_dotenv") as load_dotenv:
-            import config.settings as settings
+            import src.settings as settings
 
             settings = importlib.reload(settings)
             settings.reload_settings()

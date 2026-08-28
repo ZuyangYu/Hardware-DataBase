@@ -6,7 +6,7 @@ import tempfile
 import traceback
 from typing import Any, Callable, Generator, List, Tuple
 
-import config.settings
+import src.settings
 from src.agents.runner import MultiSourceAgentRunner
 from src.agents.schemas import Evidence
 from src.agents.tools.circuit_tools import CircuitQueryTool
@@ -238,7 +238,8 @@ class AppPipeline:
         except Exception as exc:
             error(f"查询出错: {exc}")
             traceback.print_exc()
-            yield f"系统错误: {str(exc)}"
+            from src.core.error_friendly import friendly_error_message
+            yield friendly_error_message(exc)
 
     def get_last_agent_footer(self) -> str:
         return self.agent.get_last_footer()
@@ -381,10 +382,10 @@ class AppPipeline:
         # import) parse numeric/enum settings eagerly, so a bad value written
         # to .env first would brick the server on the next boot. Concurrent
         # PUT /config requests serialise here instead of losing updates.
-        with config.settings._ENV_WRITE_LOCK:
-            config.settings.validate_settings_values(new_settings)
-            config.settings.save_settings_to_env(new_settings)
-            config.settings.reload_settings()
+        with src.settings._ENV_WRITE_LOCK:
+            src.settings.validate_settings_values(new_settings)
+            src.settings.save_settings_to_env(new_settings)
+            src.settings.reload_settings()
             # create_chat_model 是 lru_cache 的:不清缓存的话,管理页改完
             # AGENT_LLM_* 后旧模型实例会一直用到进程重启。
             from src.core.model_factory import create_chat_model
@@ -686,10 +687,8 @@ class AppPipeline:
         knowledge_base_name: str,
     ):
         """List work orders only while the caller retains KB read permission."""
-        if not ctx.has_kb_permission(knowledge_base_name, "read"):
-            raise PermissionError("knowledge base read permission is required")
-        return self.document_generation.store.list_work_orders_for_knowledge_base(
-            ctx.tenant_id or "default",
+        return self.document_generation.list_knowledge_base_work_orders_for_context(
+            ctx,
             knowledge_base_name,
         )
 
@@ -1003,7 +1002,7 @@ class AppPipeline:
             supporting_evidences = self.backend.retrieve(
                 knowledge_base_name,
                 "ICD connector pin mapping",
-                top_k=config.settings.FINAL_TOP_K,
+                top_k=src.settings.FINAL_TOP_K,
                 ctx=ctx,
                 filters={"source_names": list(snapshot.source_names)},
             )
@@ -1277,7 +1276,7 @@ class AppPipeline:
                 self.backend.retrieve(
                     kb_name,
                     query,
-                    top_k=config.settings.FINAL_TOP_K,
+                    top_k=src.settings.FINAL_TOP_K,
                     ctx=ctx,
                     filters=filters,
                 )
@@ -1290,7 +1289,7 @@ class AppPipeline:
                     query,
                     kb_name,
                     ctx,
-                    top_k=config.settings.FINAL_TOP_K,
+                    top_k=src.settings.FINAL_TOP_K,
                     filters=None,
                 )
                 # Drop anything outside the frozen source set before it reaches
@@ -1308,7 +1307,7 @@ class AppPipeline:
                     query,
                     kb_name,
                     ctx,
-                    top_k=config.settings.FINAL_TOP_K,
+                    top_k=src.settings.FINAL_TOP_K,
                     filters=None,
                 )
                 # Same frozen-set guard as the tabular retriever: circuit
@@ -1521,7 +1520,7 @@ class AppPipeline:
                     evidences = self.backend.retrieve(
                         kb_name,
                         query,
-                        top_k=config.settings.FINAL_TOP_K,
+                        top_k=src.settings.FINAL_TOP_K,
                         ctx=ctx,
                         filters=version_filters,
                     )
@@ -1557,7 +1556,7 @@ class AppPipeline:
                         query,
                         source_kb_name or (kb_names[0] if kb_names else ""),
                         ctx,
-                        top_k=config.settings.FINAL_TOP_K,
+                        top_k=src.settings.FINAL_TOP_K,
                         filters=None,
                     )
                     for evidence in sp_evidences:
@@ -1598,7 +1597,7 @@ class AppPipeline:
                         query,
                         source_kb_name or (kb_names[0] if kb_names else ""),
                         ctx,
-                        top_k=config.settings.FINAL_TOP_K,
+                        top_k=src.settings.FINAL_TOP_K,
                         filters=None,
                     )
                     for evidence in circuit_evidences:

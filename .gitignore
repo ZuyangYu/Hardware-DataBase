@@ -22,10 +22,6 @@ wheels/
 storage/**
 !storage/.gitkeep
 
-# Ignore all data/ contents, but keep .gitkeep
-data/**
-!data/.gitkeep
-
 .idea/
 
 # Ruff cache
@@ -49,7 +45,6 @@ evaluation/reports/
 evaluation/results/
 evaluation/snapshots/
 evaluation/.cache/
-storage/evaluations/
 
 # Local test and coverage artifacts
 .coverage
@@ -102,13 +97,8 @@ htmlcov/
 .agents/
 .worktrees/
 
-# Local development materials, planning documents, sample corpora, and tests
+# Local superpowers workflow artifacts (plans/reports stay out of the repo)
 /.superpowers/
-/docs/
-/tests/
-
-# Local agent guidance
-/CLAUDE.md
 
 .tests/
 
@@ -127,3 +117,7 @@ htmlcov/
 AAA/
 ingest_aaa_test.py
 verify_recall.py
+
+AAA/
+# 本地运行残留
+run_state.json

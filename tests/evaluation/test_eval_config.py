@@ -89,6 +89,7 @@ class EvaluationConfigTests(unittest.TestCase):
                 "llm_provider": "custom",
                 "llm_base_url": "https://judge.test/v1",
                 "llm_model": "judge",
+                "llm_fallback_model": "",
                 "embedding_base_url": "https://embed.test/v1",
                 "embedding_model": "embed",
                 "llm_max_tokens": 4096,

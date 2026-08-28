@@ -4,17 +4,17 @@ import sqlite3
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER
 
 
 class AuthKnowledgeBaseScopeTests(unittest.TestCase):
     def setUp(self):
-        self._old_admin_password = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self._old_admin_password = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
 
     def tearDown(self):
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = self._old_admin_password
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = self._old_admin_password
         gc.collect()
 
     def _service(self, tmp):
@@ -23,7 +23,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
     def test_same_kb_name_is_scoped_by_department_and_kb_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)
-            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department("dept_a")
             dept_b = auth.create_department("dept_b")
             admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
@@ -59,7 +59,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
     def test_department_scoped_delete_does_not_remove_other_department_kb(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)
-            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department("dept_a")
             dept_b = auth.create_department("dept_b")
             admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
@@ -87,7 +87,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
     def test_assign_kb_rejects_system_department(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)
-            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             system_dept = next(dept for dept in auth.list_departments() if dept.name == "system")
             dept_a = auth.create_department("dept_a")
             admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
@@ -102,7 +102,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
     def test_assign_kb_blocks_cross_department_move_until_assets_can_migrate(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)
-            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department("dept_a")
             dept_b = auth.create_department("dept_b")
             admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
@@ -123,7 +123,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
     def test_assign_kb_rejects_target_duplicate_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)
-            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department("dept_a")
             dept_b = auth.create_department("dept_b")
             admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
@@ -183,7 +183,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
                 conn.executemany(
                     "INSERT INTO users (id, username, password_hash, role, department_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [
-                        (1, config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "placeholder", ROLE_SYSTEM_ADMIN, 1, now, now),
+                        (1, src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "placeholder", ROLE_SYSTEM_ADMIN, 1, now, now),
                         (2, "user_a", "placeholder", ROLE_USER, 2, now, now),
                         (3, "user_b", "placeholder", ROLE_USER, 3, now, now),
                     ],
@@ -222,7 +222,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
     def test_admin_management_requires_actor_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)
-            system_admin = auth.get_user_by_username(config.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department_as(system_admin, "dept_a")
             dept_b = auth.create_department_as(system_admin, "dept_b")
             empty_dept = auth.create_department_as(system_admin, "empty_dept")

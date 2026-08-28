@@ -58,9 +58,9 @@ class ExternalConversationVectorIndex:
         try:
             import chromadb
 
-            import config.settings
+            import src.settings
 
-            client = chromadb.PersistentClient(path=str(config.settings.STORAGE_DIR) + "/chroma")
+            client = chromadb.PersistentClient(path=str(src.settings.STORAGE_DIR) + "/chroma")
             return client
         except Exception:
             return None

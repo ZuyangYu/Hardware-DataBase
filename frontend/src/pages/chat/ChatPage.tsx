@@ -50,11 +50,6 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
     setMountedKbName(kbName);
   }, [kbName]);
 
-  function handleKbChange(nextKbName: string) {
-    setMountedKbName(nextKbName);
-    navigate(nextKbName ? `/chat?kb=${encodeURIComponent(nextKbName)}` : '/chat', { replace: true });
-  }
-
   const chat = useKbChat(mountedKbName);
   const {
     sessions,
@@ -72,11 +67,20 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
     streaming,
     streamingText,
     traceSteps,
+    traceByMessageId,
     degradedNotes,
     send,
     abortStream,
     forbidden,
   } = chat;
+
+  // M17: 与 selectSession 同等门禁——回答生成中不允许切换知识库，
+  // 避免旧会话在后端跑完后结果因会话比对被静默丢弃。
+  function handleKbChange(nextKbName: string) {
+    if (streaming) return;
+    setMountedKbName(nextKbName);
+    navigate(nextKbName ? `/chat?kb=${encodeURIComponent(nextKbName)}` : '/chat', { replace: true });
+  }
 
   // 403 整页提示(system_admin 或无权限)
   if (forbidden) {
@@ -126,6 +130,7 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           streaming={streaming}
           streamingText={streamingText}
           traceSteps={traceSteps}
+          traceByMessageId={traceByMessageId}
           degradedNotes={degradedNotes}
         />
         <Composer

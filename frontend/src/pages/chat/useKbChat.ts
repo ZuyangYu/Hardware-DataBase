@@ -22,7 +22,7 @@ import type {
 
 const HISTORY_PAIRS = 5; // 与后端保持一致:只带最近 5 轮对话
 const GENERAL_CHAT_KB_NAME = '__general__';
-const QUERY_TRACE_HIDE_DELAY_MS = 1400;
+const QUERY_TRACE_HIDE_DELAY_MS = 5000;
 const STREAMING_RENDER_INTERVAL_MS = 64;
 
 /** crypto.randomUUID 仅在安全上下文(HTTPS/localhost)存在;HTTP+IP 访问时回退到手动拼 UUID。 */
@@ -59,9 +59,56 @@ function normalizeTraceStatus(status: unknown): QueryTraceStatus {
 function createInitialTrace(_isGeneralChat: boolean): QueryTraceStep[] {
   // Route LLM is skipped for KB chat (deterministic, near-instant), so we must
   // NOT inject a misleading "正在判断是否需要检索知识库" step at the start of
-  // every conversation — that reads as an auth/judgement preflight. The 3-phase
-  // stepper starts on "思考" as soon as the first analyze thought arrives.
+  // every conversation — that reads as an auth/judgement preflight. The stepper
+  // only appears once the agent emits tool_started / tool_result events.
   return [];
+}
+
+// Tool names emitted by the agent loop, mirrored from the backend ToolRuntime.
+const TOOL_LABELS: Record<string, string> = {
+  document_search: '文档检索',
+  circuit_search: '电路检索',
+  spreadsheet_row_search: '表格行检索',
+  spreadsheet_cell_lookup: '单元格检索',
+  list_kb_sources: '读取知识库目录',
+  conversation_search: '外部对话检索',
+};
+
+function toolLabel(name: string): string {
+  return TOOL_LABELS[name] || name;
+}
+
+/** Translate a backend tool/trace event into a UI step, or null if irrelevant. */
+function traceStepFromToolEvent(etype: string, raw: string): QueryTraceStep | null {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (etype === 'tool_started') {
+    const name = String(parsed.tool_name ?? '');
+    return { key: name, label: toolLabel(name), status: 'running', detail: String(parsed.query ?? '') };
+  }
+  if (etype === 'tool_result') {
+    const name = String(parsed.tool_name ?? '');
+    const status: QueryTraceStatus = parsed.status === 'failed' ? 'error' : 'done';
+    const hits = Number(parsed.hit_count ?? 0);
+    const latency = Number(parsed.latency_ms ?? NaN);
+    const latencyText = Number.isFinite(latency) ? ` · ${latency}ms` : '';
+    return { key: name, label: toolLabel(name), status, detail: `${hits} 条命中${latencyText}` };
+  }
+  if (etype === 'stage') {
+    const key = parsed.key ? String(parsed.key) : '';
+    if (!key) return null;
+    return {
+      key,
+      label: parsed.label ? String(parsed.label) : key,
+      status: normalizeTraceStatus(parsed.status),
+      detail: parsed.detail ? String(parsed.detail) : '',
+    };
+  }
+  return null;
 }
 
 function mergeTraceDetail(current: string | undefined, next: string | undefined): string | undefined {
@@ -107,10 +154,33 @@ export function useKbChat(kbName: string) {
   const currentTurnRef = useRef<string | null>(null);
   const sendingRef = useRef(false);
   const activeSessionRef = useRef<number | null>(null);
+  // opencode 风格轨迹:同一工具的多次调用各自占一行。
+  // toolCallSeqRef 生成单调序号;toolActiveKeyRef 记录"工具名 -> 最近一次 running 的 step key",
+  // 使 tool_result 能挂回正确的调用条目(流式恢复场景下退化为按工具名合并)。
+  const toolCallSeqRef = useRef(0);
+  const toolActiveKeyRef = useRef<Map<string, string>>(new Map());
+
+  const stepFromToolEvent = useCallback((etype: string, raw: string): QueryTraceStep | null => {
+    const step = traceStepFromToolEvent(etype, raw);
+    if (!step) return null;
+    if (etype === 'tool_started') {
+      toolCallSeqRef.current += 1;
+      const key = `${step.key}#${toolCallSeqRef.current}`;
+      toolActiveKeyRef.current.set(step.key, key);
+      return { ...step, key };
+    }
+    if (etype === 'tool_result') {
+      const activeKey = toolActiveKeyRef.current.get(step.key);
+      return { ...step, key: activeKey ?? step.key };
+    }
+    return step;
+  }, []);
   const pendingStreamingTextRef = useRef('');
   const streamingFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastStreamingFlushAtRef = useRef(0);
   const traceClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const traceRef = useRef<QueryTraceStep[]>([]);
+  const [traceByMessageId, setTraceByMessageId] = useState<Record<number, QueryTraceStep[]>>({});
 
   const flushStreamingText = useCallback((force = false) => {
     if (streamingFlushTimerRef.current && !force) return;
@@ -240,6 +310,8 @@ export function useKbChat(kbName: string) {
     clearTraceTimer();
     traceClearTimerRef.current = setTimeout(() => {
       setTraceSteps([]);
+      toolCallSeqRef.current = 0;
+      toolActiveKeyRef.current.clear();
       traceClearTimerRef.current = null;
     }, QUERY_TRACE_HIDE_DELAY_MS);
   }, [clearTraceTimer]);
@@ -247,21 +319,27 @@ export function useKbChat(kbName: string) {
   const upsertTraceStep = useCallback((next: QueryTraceStep) => {
     if (next.key === 'permission' || next.key === 'generate') return;
     setTraceSteps((prev) => {
-      if (prev.length === 0) return [next];
-      const index = prev.findIndex((step) => step.key === next.key);
-      if (index >= 0) {
-        return prev.map((step, stepIndex) =>
-          stepIndex === index
-            ? { ...step, ...next, detail: mergeTraceDetail(step.detail, next.detail) }
-            : step,
-        );
+      let updated: QueryTraceStep[];
+      if (prev.length === 0) {
+        updated = [next];
+      } else {
+        const index = prev.findIndex((step) => step.key === next.key);
+        if (index >= 0) {
+          updated = prev.map((step, stepIndex) =>
+            stepIndex === index
+              ? { ...step, ...next, detail: mergeTraceDetail(step.detail, next.detail) }
+              : step,
+          );
+        } else {
+          updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.status === 'running' && last.key !== next.key) {
+            updated[updated.length - 1] = { ...last, status: 'done' };
+          }
+          updated.push(next);
+        }
       }
-      const updated = [...prev];
-      const last = updated[updated.length - 1];
-      if (last?.status === 'running' && last.key !== next.key) {
-        updated[updated.length - 1] = { ...last, status: 'done' };
-      }
-      updated.push(next);
+      traceRef.current = updated;
       return updated;
     });
   }, []);
@@ -289,6 +367,8 @@ export function useKbChat(kbName: string) {
       abortRef.current = controller;
       setStreaming(true);
       resetStreamingText();
+      toolCallSeqRef.current = 0;
+      toolActiveKeyRef.current.clear();
       setTraceSteps(createInitialTrace(turn.kb_name === GENERAL_CHAT_KB_NAME));
       setDegradedNotes([]);
       let accumulated = '';
@@ -301,14 +381,9 @@ export function useKbChat(kbName: string) {
             const parsed = JSON.parse(evt.data) as { text?: string };
             accumulated += parsed.text ?? '';
             queueStreamingText(accumulated);
-          } else if (evt.event === 'stage') {
-            const parsed = JSON.parse(evt.data) as { key?: string; label?: string; status?: unknown; detail?: string };
-            if (parsed.key) upsertTraceStep({
-              key: parsed.key,
-              label: parsed.label || parsed.key,
-              status: normalizeTraceStatus(parsed.status),
-              detail: parsed.detail || '',
-            });
+          } else if (evt.event === 'stage' || evt.event === 'tool_started' || evt.event === 'tool_result') {
+            const step = stepFromToolEvent(evt.event, evt.data);
+            if (step) upsertTraceStep(step);
           } else if (evt.event === 'degraded') {
             const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
             setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
@@ -337,6 +412,9 @@ export function useKbChat(kbName: string) {
               }
             }
             finishTrace('done', '已完成输出');
+            if (turn.assistant_message_id != null) {
+              setTraceByMessageId((prev) => ({ ...prev, [turn.assistant_message_id as number]: traceRef.current }));
+            }
           } else if (evt.event === 'error') {
             const parsed = JSON.parse(evt.data) as { message?: string };
             finishTrace('error', parsed.message || '查询失败');
@@ -429,6 +507,8 @@ export function useKbChat(kbName: string) {
     setStreaming(true);
     resetStreamingText();
     clearTraceTimer();
+    toolCallSeqRef.current = 0;
+    toolActiveKeyRef.current.clear();
     setTraceSteps(createInitialTrace(scopeKbName === GENERAL_CHAT_KB_NAME));
     setDegradedNotes([]);
 
@@ -479,17 +559,10 @@ export function useKbChat(kbName: string) {
           } catch {
             // 忽略坏帧
           }
-        } else if (evt.event === 'stage') {
+        } else if (evt.event === 'stage' || evt.event === 'tool_started' || evt.event === 'tool_result') {
           try {
-            const parsed = JSON.parse(evt.data) as { key?: string; label?: string; status?: unknown; detail?: string };
-            if (parsed.key) {
-              upsertTraceStep({
-                key: parsed.key,
-                label: parsed.label || parsed.key,
-                status: normalizeTraceStatus(parsed.status),
-                detail: parsed.detail || '',
-              });
-            }
+            const step = stepFromToolEvent(evt.event, evt.data);
+            if (step) upsertTraceStep(step);
           } catch {
             // 忽略坏帧
           }
@@ -503,6 +576,7 @@ export function useKbChat(kbName: string) {
         } else if (evt.event === 'done') {
           finalPayload = JSON.parse(evt.data) as QueryDonePayload;
           finishTrace('done', '已完成输出');
+          setTraceByMessageId((prev) => ({ ...prev, [created.turn.assistant_message_id]: traceRef.current }));
         } else if (evt.event === 'error') {
           try {
             errorMessage = (JSON.parse(evt.data) as { message?: string }).message ?? '查询失败';
@@ -604,6 +678,7 @@ export function useKbChat(kbName: string) {
     streaming,
     streamingText,
     traceSteps,
+    traceByMessageId,
     degradedNotes,
     currentSessionRunning: streaming,
     send,

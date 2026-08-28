@@ -18,7 +18,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import ValidationError
 
-import config.settings
+import src.settings
 
 from src.core.auth import AuthUser
 from src.core.app_logs import AppLogService
@@ -61,10 +61,10 @@ def list_evaluation_runs(root: str | Path = DEFAULT_OUTPUT_ROOT) -> list[Path]:
 # absolute, derived from __file__) instead of resolving relative paths at
 # import time -- otherwise a server launched from a non-repo cwd would compute
 # roots that no longer match the runtime `Path.resolve()` in _check_output_root.
-_EVAL_ROOT = (Path(config.settings.STORAGE_DIR) / "evaluations").resolve()
-_DATASET_ROOT = (Path(config.settings.BASE_DIR) / "evaluation" / "datasets").resolve()
+_EVAL_ROOT = (Path(src.settings.STORAGE_DIR) / "evaluations").resolve()
+_DATASET_ROOT = (Path(src.settings.BASE_DIR) / "evaluation" / "datasets").resolve()
 _SNAPSHOT_ROOT = _EVAL_ROOT
-_BASE_DIR = Path(config.settings.BASE_DIR).resolve()
+_BASE_DIR = Path(src.settings.BASE_DIR).resolve()
 
 
 def _within(child: Path, parent: Path) -> bool:

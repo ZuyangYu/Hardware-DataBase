@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
-import config.settings
+import src.settings
 from src.document_authoring.harness.policy import HarnessLeaseLost
 from src.document_authoring.generation_sessions import GenerationSessionStore
 from src.document_authoring.models import (
@@ -60,8 +60,8 @@ def _payload(row) -> dict[str, Any]:
 
 class DocumentAuthoringStore:
     def __init__(self, db_path: str | None = None, artifact_root: str | None = None):
-        self.db_path = db_path or os.path.join(config.settings.STORAGE_DIR, "document_authoring.db")
-        self.artifact_root = artifact_root or os.path.join(config.settings.STORAGE_DIR, "document_authoring")
+        self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "document_authoring.db")
+        self.artifact_root = artifact_root or os.path.join(src.settings.STORAGE_DIR, "document_authoring")
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         os.makedirs(self.artifact_root, exist_ok=True)
         self._init_db()

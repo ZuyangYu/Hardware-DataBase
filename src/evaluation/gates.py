@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from collections.abc import Mapping
 
@@ -32,10 +33,12 @@ def evaluate_gate(
     *,
     fail_on_threshold: bool = False,
     sample_cohorts: Mapping[str, str] | None = None,
+    min_coverage: float = 0.8,
 ) -> GateResult:
     active_thresholds = dict(DEFAULT_THRESHOLDS if thresholds is None else thresholds)
     scores: dict[str, list[float]] = defaultdict(list)
     failures: list[str] = []
+    sample_total = len(results)
 
     for sample in results:
         for metric in sample.metrics:
@@ -69,8 +72,14 @@ def evaluate_gate(
         if values
     }
     metric_counts = {name: len(values) for name, values in scores.items()}
+    needed = max(1, math.ceil(min_coverage * sample_total)) if sample_total else 0
+    low_coverage = {
+        name for name, count in metric_counts.items() if sample_total and count < needed
+    }
     for name, threshold in active_thresholds.items():
-        if name in metric_scores and metric_scores[name] < threshold:
+        if name not in metric_scores or name in low_coverage:
+            continue
+        if metric_scores[name] < threshold:
             failures.append(f"{name}: {metric_scores[name]:.3f} < {threshold:.3f}")
 
     passed = not failures

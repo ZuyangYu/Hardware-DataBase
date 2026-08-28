@@ -5,8 +5,8 @@
 > - 文档：`600608964_ADAS_HSI_0506_1952_shoulin.wang.docx`（奇瑞 EQ6L T1G ADAS 软硬件接口文档 HSI，V1.0，2025-02-24，经纬恒润；状态 parsed）
 > - PDF `FF4D6750...pdf` 解析超时 failed，不参与检索。
 >
-> 联合检索路径：`MultiSourceAgentRunner`（LangGraph）→ 并行 `circuit_query` + `document_rag` → merge/score → judge_sufficiency → 多跳补检索 → compose_answer。
-> 每题请同时看三处：**最终答案** / footer 的**检索诊断**（哪些工具真的被调用、hit 数）/ **检索账本+充分性**（子问题 status、是否触发多跳、有无冲突）。
+> 联合检索路径：`MultiSourceAgentRunner`（`deepagents` agent loop）→ 模型自主调用 `circuit_search` / `document_search` / `spreadsheet_*` / `conversation_search` 等工具（跳数与顺序由模型决定）→ 综合证据生成 grounded answer。
+> 每题请同时看三处：**最终答案** / footer 的**检索诊断**（哪些工具真的被调用、hit 数、耗时）/ **执行时间线**（前端实时轨迹）。注：当前框架不再输出「检索账本 / 充分性判定 / 多跳补检」等旧字段——`claim_coverage` 改为基于回答中 `[n]` 引用映射、「引用覆盖率」反映证据落地情况。
 
 ---
 

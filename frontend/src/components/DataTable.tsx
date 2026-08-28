@@ -141,6 +141,7 @@ export function DataTable<T>({
                   {columns.map((column) => (
                     <TableCell
                       key={column.key}
+                      style={column.width ? { width: column.width } : undefined}
                       className={cn(
                         BODY_CELL_CLASS,
                         BODY_HEIGHT[size],

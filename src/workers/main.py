@@ -4,12 +4,12 @@ import signal
 import time
 import uuid
 
-import config.settings
+import src.settings
 from src.api.context import build_context_for_user
-from src.api.routes.query import GENERAL_CHAT_KB_NAME, _run_turn
+from src.api.routes.query import _run_turn
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService
-from src.core.conversation import ConversationService
+from src.core.conversation import GENERAL_CHAT_KB_NAME, ConversationService
 from src.core.logger import error, log
 from src.observability import init_observability, shutdown_observability
 from src.observability.metrics import record_worker, set_queue_state
@@ -61,7 +61,7 @@ class HardwareWorker:
         depth, oldest_age_s = self.conversations.pending_turn_queue_state()
         set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
         if self.runtime is not None:
-            batch = max(1, config.settings.WORKER_PARSE_BATCH_SIZE)
+            batch = max(1, src.settings.WORKER_PARSE_BATCH_SIZE)
             for _ in range(batch):
                 started = time.monotonic()
                 heartbeat(self.worker_id, task_kind="parse")
@@ -80,16 +80,19 @@ class HardwareWorker:
     def run_forever(self) -> None:
         log("Hardware DataBase worker started")
         while self.running:
+            # H6: 即使队列为空也要刷新进程注册表心跳，
+            # 否则上游无法区分「空闲」与「已死」。
+            heartbeat(self.worker_id)
             if not self.run_once():
-                time.sleep(max(0.1, config.settings.WORKER_POLL_INTERVAL_SECONDS))
+                time.sleep(max(0.1, src.settings.WORKER_POLL_INTERVAL_SECONDS))
         log("Hardware DataBase worker stopped")
 
 
 def main() -> None:
     init_observability(
         "hardware-database-worker",
-        service_version=config.settings.OBS_SERVICE_VERSION,
-        environment=config.settings.OBS_ENVIRONMENT,
+        service_version=src.settings.OBS_SERVICE_VERSION,
+        environment=src.settings.OBS_ENVIRONMENT,
     )
     worker = HardwareWorker()
     signal.signal(signal.SIGTERM, worker.stop)

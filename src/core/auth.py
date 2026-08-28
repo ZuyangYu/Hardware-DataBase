@@ -4,12 +4,13 @@ import hmac
 import os
 import secrets
 import sqlite3
+import threading
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-import config.settings
+import src.settings
 from src.pipelines.document_rag.schemas import RequestContext, kb_scope_key
 
 
@@ -18,6 +19,19 @@ ROLE_SYSTEM_ADMIN = "system_admin"
 ROLE_DEPT_ADMIN = "dept_admin"
 ROLE_USER = "user"
 VALID_ROLES = {ROLE_SYSTEM_ADMIN, ROLE_DEPT_ADMIN, ROLE_USER}
+
+# M3: schema bootstrap + default-admin provisioning are process-level one-shot.
+# All AuthService instances share this guard so later instances skip both steps.
+_AUTH_INIT_LOCK = threading.Lock()
+_AUTH_INITIALIZED_DBS: set[str] = set()
+
+# H3: login brute-force protection per (username, client_ip).
+# Exponential back-off: 5 failures -> 30s lock, doubling per further failure,
+# capped at 15 minutes. Cleared on successful login.
+LOGIN_MAX_FAILURES = 5
+LOGIN_BASE_LOCK_SECONDS = 30
+LOGIN_MAX_LOCK_SECONDS = 15 * 60
+_LOGIN_TRACKER_LOCK = threading.Lock()
 
 
 @dataclass
@@ -75,10 +89,20 @@ class AuthSession:
 
 class AuthService:
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or config.settings.AUTH_DB_PATH
+        self.db_path = db_path or src.settings.AUTH_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._init_db()
-        self._ensure_default_admin()
+        init_key = os.path.abspath(self.db_path)
+        if init_key in _AUTH_INITIALIZED_DBS:
+            return
+        # Double-checked locking: sync routes run in Starlette's threadpool, so
+        # two concurrent constructions must not both run the migration and the
+        # full-price default-admin PBKDF2 checks.
+        with _AUTH_INIT_LOCK:
+            if init_key in _AUTH_INITIALIZED_DBS:
+                return
+            self._init_db()
+            self._ensure_default_admin()
+            _AUTH_INITIALIZED_DBS.add(init_key)
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
@@ -160,6 +184,16 @@ class AuthService:
                     expires_at TEXT NOT NULL,
                     revoked_at TEXT,
                     FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    key TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    client_ip TEXT NOT NULL DEFAULT '',
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    locked_until TEXT,
+                    last_failure_at TEXT
                 )
             """)
             conn.execute("""
@@ -289,8 +323,8 @@ class AuthService:
             conn.execute("PRAGMA foreign_keys=ON")
 
     def _ensure_default_admin(self):
-        username = config.settings.AUTH_DEFAULT_ADMIN_USERNAME
-        password = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        username = src.settings.AUTH_DEFAULT_ADMIN_USERNAME
+        password = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
         if not password or password == "admin123":
             raise RuntimeError("AUTH_DEFAULT_ADMIN_PASSWORD must be set to a non-default strong password.")
         with closing(self._connect()) as conn:
@@ -403,8 +437,86 @@ class AuthService:
             row = self._get_user_row(conn, username)
         return row_to_user(row)
 
-    def authenticate(self, username: str, password: str) -> AuthSession | None:
+    @staticmethod
+    def _login_attempt_key(username: str, client_ip: str | None) -> str:
+        return f"{username.strip().lower()}|{client_ip or ''}"
+
+    def _login_lock_remaining(self, conn, key: str) -> int | None:
+        """Seconds left in the current lock window, or None when unlocked."""
+        row = conn.execute(
+            "SELECT locked_until FROM login_attempts WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None or not row["locked_until"]:
+            return None
+        try:
+            locked_until = datetime.fromisoformat(row["locked_until"])
+        except ValueError:
+            return None
+        remaining = (locked_until - datetime.now(timezone.utc)).total_seconds()
+        return int(remaining) if remaining > 0 else None
+
+    def _record_login_failure(self, key: str, username: str, client_ip: str | None) -> None:
+        with closing(self._connect()) as conn:
+            with _LOGIN_TRACKER_LOCK:
+                conn.execute(
+                    """
+                    INSERT INTO login_attempts (key, username, client_ip, failed_count, locked_until, last_failure_at)
+                    VALUES (?, ?, ?, 1, NULL, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        failed_count = login_attempts.failed_count + 1,
+                        last_failure_at = excluded.last_failure_at
+                    """,
+                    (key, username, client_ip or "", utc_now()),
+                )
+                count = int(
+                    conn.execute(
+                        "SELECT failed_count FROM login_attempts WHERE key = ?",
+                        (key,),
+                    ).fetchone()["failed_count"]
+                )
+                if count >= LOGIN_MAX_FAILURES:
+                    delay = min(
+                        LOGIN_BASE_LOCK_SECONDS * (2 ** (count - LOGIN_MAX_FAILURES)),
+                        LOGIN_MAX_LOCK_SECONDS,
+                    )
+                    conn.execute(
+                        "UPDATE login_attempts SET locked_until = ? WHERE key = ?",
+                        (
+                            (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(),
+                            key,
+                        ),
+                    )
+
+    def _clear_login_failures(self, key: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM login_attempts WHERE key = ?", (key,))
+
+    def authenticate(self, username: str, password: str, ip: str | None = None) -> AuthSession | None:
         clean_username = username.strip()
+        attempt_key = self._login_attempt_key(clean_username, ip)
+
+        # H3 brute-force guard: short-circuit before the full-price PBKDF2
+        # verify while this (username, ip) pair sits in a back-off lock window.
+        # Degrade to no counting on tracker errors -- never block valid logins.
+        lock_remaining: int | None = None
+        try:
+            with closing(self._connect()) as conn:
+                with _LOGIN_TRACKER_LOCK:
+                    lock_remaining = self._login_lock_remaining(conn, attempt_key)
+        except Exception:
+            lock_remaining = None
+        if lock_remaining is not None:
+            self._audit(
+                "login_failed",
+                target_type="user",
+                target_id=clean_username,
+                success=False,
+                error_message=f"登录失败次数过多，账号已临时锁定，请约 {lock_remaining} 秒后重试",
+                metadata={"client_ip": ip or "", "locked_remaining_seconds": lock_remaining},
+            )
+            return None
+
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """
@@ -416,18 +528,23 @@ class AuthService:
                 (clean_username,),
             ).fetchone()
             if row is None or not verify_password(password, row["password_hash"]):
+                try:
+                    self._record_login_failure(attempt_key, clean_username, ip)
+                except Exception:
+                    pass
                 self._audit(
                     "login_failed",
                     target_type="user",
                     target_id=clean_username,
                     success=False,
                     error_message="用户名或密码错误",
+                    metadata={"client_ip": ip or ""},
                 )
                 return None
 
             token = secrets.token_urlsafe(32)
             now_dt = datetime.now(timezone.utc)
-            expires_dt = now_dt + timedelta(hours=config.settings.AUTH_SESSION_TTL_HOURS)
+            expires_dt = now_dt + timedelta(hours=src.settings.AUTH_SESSION_TTL_HOURS)
             conn.execute(
                 """
                 INSERT INTO auth_sessions (token_hash, user_id, created_at, expires_at)
@@ -435,6 +552,11 @@ class AuthService:
                 """,
                 (hash_token(token), row["id"], now_dt.isoformat(), expires_dt.isoformat()),
             )
+
+        try:
+            self._clear_login_failures(attempt_key)
+        except Exception:
+            pass
         user = row_to_user(row)
         self._audit(
             "login_success",

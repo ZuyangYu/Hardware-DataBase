@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 from src.pipelines.ingestion import (
     HandlerResult,
     IngestionOrchestrator,
@@ -96,9 +96,9 @@ class PipelineAssetCleanupServiceTests(unittest.TestCase):
 
     def test_cleanup_knowledge_base_removes_conversation_assets_scoped_by_department(self):
         with tempfile.TemporaryDirectory() as tmp:
-            old_root = config.settings.STORAGE_DIR
+            old_root = src.settings.STORAGE_DIR
             try:
-                config.settings.STORAGE_DIR = os.path.join(tmp, "storage")
+                src.settings.STORAGE_DIR = os.path.join(tmp, "storage")
                 from src.external_conversations.store import ExternalConversationStore
 
                 store = ExternalConversationStore()
@@ -111,25 +111,25 @@ class PipelineAssetCleanupServiceTests(unittest.TestCase):
                 self.assertFalse(os.path.exists(dept_a_dir))
                 self.assertTrue(os.path.exists(dept_b_dir))
             finally:
-                config.settings.STORAGE_DIR = old_root
+                src.settings.STORAGE_DIR = old_root
 
     def test_document_archive_uses_pipeline_archive_root(self):
         with tempfile.TemporaryDirectory() as tmp:
-            old_root = config.settings.PIPELINE_ARCHIVE_ROOT
+            old_root = src.settings.PIPELINE_ARCHIVE_ROOT
             try:
-                config.settings.PIPELINE_ARCHIVE_ROOT = os.path.join(tmp, "pipeline_archives")
+                src.settings.PIPELINE_ARCHIVE_ROOT = os.path.join(tmp, "pipeline_archives")
                 archive = DocumentArchiveManager()
                 path = archive.kb_path("kb", department_id="dept_a", create=True)
-                self.assertTrue(path.startswith(os.path.abspath(config.settings.PIPELINE_ARCHIVE_ROOT)))
+                self.assertTrue(path.startswith(os.path.abspath(src.settings.PIPELINE_ARCHIVE_ROOT)))
                 self.assertTrue(path.endswith(os.path.join("departments", "dept_a", "kbs", "kb")))
             finally:
-                config.settings.PIPELINE_ARCHIVE_ROOT = old_root
+                src.settings.PIPELINE_ARCHIVE_ROOT = old_root
 
     def test_document_archive_allocates_unique_name_without_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
-            old_root = config.settings.PIPELINE_ARCHIVE_ROOT
+            old_root = src.settings.PIPELINE_ARCHIVE_ROOT
             try:
-                config.settings.PIPELINE_ARCHIVE_ROOT = os.path.join(tmp, "pipeline_archives")
+                src.settings.PIPELINE_ARCHIVE_ROOT = os.path.join(tmp, "pipeline_archives")
                 source = os.path.join(tmp, "same.pdf")
                 with open(source, "wb") as file_obj:
                     file_obj.write(b"first")
@@ -147,7 +147,7 @@ class PipelineAssetCleanupServiceTests(unittest.TestCase):
                 with open(second_path, "rb") as file_obj:
                     self.assertEqual(file_obj.read(), b"second")
             finally:
-                config.settings.PIPELINE_ARCHIVE_ROOT = old_root
+                src.settings.PIPELINE_ARCHIVE_ROOT = old_root
 
     def test_ingest_lock_is_removed_after_context_exits(self):
         _INGEST_LOCKS.clear()
@@ -160,9 +160,9 @@ class PipelineAssetCleanupServiceTests(unittest.TestCase):
 
     def test_failed_submission_removes_archived_source(self):
         with tempfile.TemporaryDirectory() as tmp:
-            old_root = config.settings.PIPELINE_ARCHIVE_ROOT
+            old_root = src.settings.PIPELINE_ARCHIVE_ROOT
             try:
-                config.settings.PIPELINE_ARCHIVE_ROOT = os.path.join(tmp, "pipeline_archives")
+                src.settings.PIPELINE_ARCHIVE_ROOT = os.path.join(tmp, "pipeline_archives")
                 source = os.path.join(tmp, "broken.pdf")
                 with open(source, "wb") as file_obj:
                     file_obj.write(b"broken")
@@ -195,7 +195,7 @@ class PipelineAssetCleanupServiceTests(unittest.TestCase):
                 ]
                 self.assertEqual(archived_files, [])
             finally:
-                config.settings.PIPELINE_ARCHIVE_ROOT = old_root
+                src.settings.PIPELINE_ARCHIVE_ROOT = old_root
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import config.settings
+import src.settings
 from src.core.model_factory import create_chat_model
 
 
@@ -82,7 +82,7 @@ class AssetService:
     """SQLite-backed asset domain, colocated with auth/KB ownership data."""
 
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or config.settings.AUTH_DB_PATH
+        self.db_path = db_path or src.settings.AUTH_DB_PATH
         directory = os.path.dirname(self.db_path)
         if directory:
             os.makedirs(directory, exist_ok=True)

@@ -416,3 +416,43 @@ class EvaluationServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_score_resume_skips_completed_groups_and_seeds_metrics(self):
+        adapter = GroupedAdapter()
+        service = EvaluationService(ragas_adapter=adapter)
+        seeded = [
+            MetricResult(sample_id="q1", metric_name="faithfulness", score=0.7),
+        ]
+
+        summary, results = service.score(
+            [_sample()],
+            [_snapshot()],
+            metric_names=["faithfulness", "answer_correctness"],
+            completed_groups={"faithfulness"},
+            seeded_metrics={"q1": seeded},
+            progress_callback=lambda *_: True,
+        )
+
+        self.assertEqual(adapter.metric_batches, [("answer_correctness",)])
+        names = {metric.metric_name for metric in results[0].metrics}
+        self.assertIn("faithfulness", names)
+        self.assertIn("answer_correctness", names)
+        faith = next(m for m in results[0].metrics if m.metric_name == "faithfulness")
+        self.assertEqual(faith.score, 0.7)
+        self.assertEqual(summary.scoring_completed_groups, 2)
+
+    def test_score_resume_does_not_duplicate_rule_metrics(self):
+        service = EvaluationService(ragas_adapter=GroupedAdapter())
+        rule_like = [
+            MetricResult(sample_id="q1", metric_name="completeness", score=1.0),
+        ]
+
+        _, results = service.score(
+            [_sample()],
+            [_snapshot()],
+            metric_names=["answer_correctness"],
+            seeded_metrics={"q1": rule_like},
+        )
+
+        comp = [m for m in results[0].metrics if m.metric_name == "completeness"]
+        self.assertEqual(len(comp), 1)

@@ -13,7 +13,7 @@ import json
 import sqlite3
 from contextlib import closing
 
-import config.settings
+import src.settings
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
 from src.external_conversations.models import ExternalConversation
 
@@ -115,7 +115,7 @@ _ROLE_WEIGHT_SQL = "(CASE WHEN m.role = 'assistant' THEN 3 WHEN m.role = 'user' 
 
 class ExternalConversationQueryEngine:
     def __init__(self, root: str | None = None):
-        self.root = root or os.path.join(config.settings.STORAGE_DIR, "external_conversations")
+        self.root = root or os.path.join(src.settings.STORAGE_DIR, "external_conversations")
 
     # ---- paths / schema -------------------------------------------------
     def db_path(self, department_id: str | int | None, kb_name: str, create: bool = True) -> str:

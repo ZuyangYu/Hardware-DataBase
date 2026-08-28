@@ -11,7 +11,7 @@ import json
 import os
 import shutil
 
-import config.settings
+import src.settings
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
 from src.external_conversations.models import ExternalConversation
 
@@ -38,7 +38,7 @@ def _safe_conversation_id(conversation_id: str) -> str:
 
 class ExternalConversationStore:
     def __init__(self, root: str | None = None):
-        self.root = root or os.path.join(config.settings.STORAGE_DIR, "external_conversations")
+        self.root = root or os.path.join(src.settings.STORAGE_DIR, "external_conversations")
 
     def scope_dir(self, department_id: str | int | None, kb_name: str, create: bool = False) -> str:
         dept = _require_department_id(department_id, "locating")

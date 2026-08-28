@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
-import config.settings as settings
+import src.settings as settings
 
 from .context import current_span_id, current_trace_id
 from .privacy import redact_text

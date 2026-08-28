@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 import httpx
 
 from src.api.app import create_app
@@ -26,9 +26,9 @@ class DocGenArtifactApiTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db_path = __import__("os").path.join(self.tmp.name, "auth.db")
-        old_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = self.db_path
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", old_db)
+        old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", old_db)
         self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
         self.stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.stub

@@ -4,9 +4,14 @@ import importlib.util
 from collections.abc import Callable
 from typing import Any
 
+import httpx
+
 from .answer_runner import _request_context
 from .config import EvaluationConfig
 from .schemas import EvaluationSample
+
+
+_PING_TIMEOUT = 20.0
 
 
 class EvaluationPreflight:
@@ -68,10 +73,64 @@ class EvaluationPreflight:
                 + ", ".join(missing)
                 + "；请运行 uv sync --group eval"
             )
+            return errors
 
         try:
             if config is None:
-                EvaluationConfig.from_environment()
+                config = EvaluationConfig.from_environment()
         except Exception as exc:
             errors.append(f"评估配置无效：{exc}")
+            return errors
+        errors.extend(_ping_endpoints(config))
         return errors
+
+
+def _ping_endpoints(config: EvaluationConfig) -> list[str]:
+    """Probe the judge LLM and embeddings endpoints with a minimal request.
+
+    A run that starts against a quota-exhausted or misconfigured evaluator
+    would otherwise burn the whole collection/scoring window producing
+    batches of failed metrics.
+    """
+
+    errors: list[str] = []
+    headers_llm = {}
+    if config.llm_api_key:
+        headers_llm["Authorization"] = f"Bearer {config.llm_api_key}"
+    try:
+        response = httpx.post(
+            config.llm_base_url.rstrip("/") + "/chat/completions",
+            headers=headers_llm,
+            json={
+                "model": config.llm_model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            },
+            timeout=_PING_TIMEOUT,
+        )
+        if response.status_code != 200:
+            errors.append(
+                f"裁判 LLM 预检失败：HTTP {response.status_code} "
+                f"{response.text[:120]}（{config.llm_model} @ {config.llm_base_url}）"
+            )
+    except Exception as exc:
+        errors.append(f"裁判 LLM 预检不可达：{type(exc).__name__}: {exc}")
+
+    headers_emb = {}
+    if config.embedding_api_key:
+        headers_emb["Authorization"] = f"Bearer {config.embedding_api_key}"
+    try:
+        response = httpx.post(
+            config.embedding_base_url.rstrip("/") + "/embeddings",
+            headers=headers_emb,
+            json={"model": config.embedding_model, "input": ["ping"]},
+            timeout=_PING_TIMEOUT,
+        )
+        if response.status_code != 200:
+            errors.append(
+                f"Embeddings 预检失败：HTTP {response.status_code} "
+                f"{response.text[:120]}（{config.embedding_model} @ {config.embedding_base_url}）"
+            )
+    except Exception as exc:
+        errors.append(f"Embeddings 预检不可达：{type(exc).__name__}: {exc}")
+    return errors

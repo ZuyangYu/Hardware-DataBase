@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-import config.settings
+import src.settings
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.circuit.query_engine import CircuitQueryEngine
@@ -11,6 +11,7 @@ from src.core.app_logs import AppLogService
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
 from src.ingestion.kb_paths import validate_kb_name
+from src.pipelines.document_rag.schemas import parse_status_label
 from src.test_data.query_engine import TestDataQueryEngine
 
 from src.api.context import build_context_for_user
@@ -57,17 +58,6 @@ def _profile_summary(metadata: dict | None) -> dict:
     }
 
 
-def _spreadsheet_status(status: str) -> str:
-    return {
-        "completed": "已解析",
-        "failed": "失败",
-        "parsing": "解析中",
-        "pending": "待解析",
-        "uploaded": "待解析",
-        "cancelled": "已取消",
-    }.get(status or "", status or "-")
-
-
 @router.get("/kbs/{kb_name}/structured/spreadsheets", response_model=SpreadsheetLedgerResponse)
 def list_spreadsheets(
     kb_name: str,
@@ -89,7 +79,7 @@ def list_spreadsheets(
                 "file_id": info.id,
                 "file_name": info.name,
                 "status": getattr(info, "status", ""),
-                "status_label": _spreadsheet_status(getattr(info, "status", "")),
+                "status_label": parse_status_label(getattr(info, "status", "")),
                 "sheet_count": summary["sheet_count"],
                 "row_count": summary["row_count"],
                 "cell_count": summary["cell_count"],
@@ -412,7 +402,7 @@ def _list_design_dirs_with_log(kb_name: str) -> list[tuple[str, str]]:
 def _delete_circuit_upload_archive(kb_name: str, design_id: str) -> None:
     safe_kb_name = validate_kb_name(kb_name)
     safe_design_id = make_design_id(design_id)
-    archive_root = os.path.join(config.settings.STORAGE_DIR, "circuit_uploads", safe_kb_name)
+    archive_root = os.path.join(src.settings.STORAGE_DIR, "circuit_uploads", safe_kb_name)
     if not os.path.isdir(archive_root):
         return
     for group_name in os.listdir(archive_root):

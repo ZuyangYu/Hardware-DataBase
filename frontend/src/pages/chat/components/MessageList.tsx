@@ -22,6 +22,7 @@ type Props = {
   streaming: boolean;
   streamingText: string;
   traceSteps: QueryTraceStep[];
+  traceByMessageId: Record<number, QueryTraceStep[]>;
   degradedNotes: Array<{ stage: string; reason: string }>;
 };
 
@@ -36,6 +37,7 @@ export default function MessageList({
   streaming,
   streamingText,
   traceSteps,
+  traceByMessageId,
   degradedNotes,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -77,6 +79,7 @@ export default function MessageList({
             key={msg.id}
             msg={msg}
             evidence={msg.role === 'assistant' ? evidenceByMessageId[msg.id] : undefined}
+            traceSteps={msg.role === 'assistant' ? (traceByMessageId[msg.id] ?? []) : []}
           />
         ))}
         {streaming && (

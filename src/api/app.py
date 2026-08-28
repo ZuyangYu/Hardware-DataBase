@@ -53,6 +53,38 @@ def _should_spawn_worker() -> bool:
     return os.getenv("HDB_API_SPAWN_WORKER", "1").lower() not in {"0", "false", "no", "off"}
 
 
+def _harden_storage_permissions() -> None:
+    """Converge .env / storage/*.db to owner-only mode at boot.
+
+    .env holds provider API keys; storage/*.db (plus -wal/-shm) hold raw user
+    queries and evidence text. Default umasks leave them 0664/0644, readable
+    by every local account — deployment shape is single-user, so 0600 is safe.
+    """
+    import src.settings
+
+    for path in [src.settings.ENV_FILE_PATH] + [
+        os.path.join(src.settings.STORAGE_DIR, name)
+        for name in (os.listdir(src.settings.STORAGE_DIR) if os.path.isdir(src.settings.STORAGE_DIR) else [])
+        if name.endswith((".db", "-wal", "-shm"))
+    ]:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            print(f"[hardware-database] chmod 600 failed for {path}: {exc}")
+
+
+def _prune_query_traces_once(retention_days: int = 30) -> None:
+    """Best-effort retention sweep of query_traces / retrieved_evidence at boot."""
+    from src.core.app_logs import AppLogService
+
+    try:
+        traces_deleted, evidence_deleted = AppLogService().prune_query_traces(retention_days)
+        if traces_deleted or evidence_deleted:
+            print(f"[hardware-database] pruned {traces_deleted} traces / {evidence_deleted} evidence rows (>{retention_days}d)")
+    except Exception as exc:
+        print(f"[hardware-database] query trace prune skipped: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Co-manage the background parse worker with the API server process.
@@ -62,17 +94,20 @@ async def lifespan(app: FastAPI):
     a child subprocess so a single backend command also runs Excel parsing, while
     keeping it a separate OS process (crash isolation + DB-level claim queue).
     """
-    import config.settings
+    import src.settings
+
+    _harden_storage_permissions()
+    _prune_query_traces_once()
 
     worker_proc: subprocess.Popen | None = None
     if _should_spawn_worker():
-        log_dir = os.path.join(config.settings.STORAGE_DIR, "logs")
+        log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "worker.log")
         log_file = open(log_path, "ab", buffering=0)
         worker_proc = subprocess.Popen(
             [sys.executable, "-m", "src.workers.main"],
-            cwd=config.settings.BASE_DIR,
+            cwd=src.settings.BASE_DIR,
             stdout=log_file,
             stderr=log_file,
         )
@@ -90,7 +125,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    import config.settings as settings
+    import src.settings as settings
 
     init_observability(
         "hardware-database-api",

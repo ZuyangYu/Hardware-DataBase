@@ -7,7 +7,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Callable
 
-import config.settings
+import src.settings
 from src.core.logger import error, log
 from src.observability import thread_with_current_context
 from src.pipelines.document_rag.schemas import (
@@ -53,7 +53,7 @@ class ParseTaskManager:
 
     def __init__(self, worker: Callable[[str, str, str, Callable[[int, str], None], Callable[[], None]], str]):
         self.worker = worker
-        self.task_dir = os.path.join(config.settings.STORAGE_DIR, "parse_tasks")
+        self.task_dir = os.path.join(src.settings.STORAGE_DIR, "parse_tasks")
         self.upload_dir = os.path.join(self.task_dir, "uploads")
         self.task_file = os.path.join(self.task_dir, "tasks.json")
         os.makedirs(self.upload_dir, exist_ok=True)

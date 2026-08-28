@@ -6,7 +6,11 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-import config.settings
+import src.settings
+
+# Sentinel kb_name persisted in chat sessions/turns for general (non-KB) chat.
+# The literal value is part of the durable schema; never change it.
+GENERAL_CHAT_KB_NAME = "__general__"
 
 
 @dataclass
@@ -71,7 +75,7 @@ class ChatTurnEvent:
 
 class ConversationService:
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or config.settings.AUTH_DB_PATH
+        self.db_path = db_path or src.settings.AUTH_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
 
@@ -489,7 +493,7 @@ class ConversationService:
 
     def requeue_stale_turns(self, stale_after_seconds: int | None = None) -> int:
         """Make abandoned worker claims available to an independent worker again."""
-        stale_after_seconds = max(30, int(stale_after_seconds or config.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
+        stale_after_seconds = max(30, int(stale_after_seconds or src.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
         with closing(self._connect()) as conn:
             cursor = conn.execute(
                 """
@@ -554,7 +558,7 @@ class ConversationService:
     ) -> ChatTurn | None:
         """Claim a pending turn once; concurrent start requests are harmless."""
         now = utc_now()
-        stale_after_seconds = max(30, int(stale_after_seconds or config.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
+        stale_after_seconds = max(30, int(stale_after_seconds or src.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -692,7 +696,9 @@ class ConversationService:
                     UPDATE chat_turns
                     SET status = 'completed', answer = ?, summary_json = ?, footer = ?, metrics_json = ?, finished_at = ?,
                         worker_id = '', worker_heartbeat_at = NULL
-                    WHERE id = ?
+                    -- completed/cancelled 为终态不可复活；failed(SSE stale 临时标记)
+                    -- 允许被 worker 真实的完成结果收编（见 test_stale_turn_is_reclaimed）。
+                    WHERE id = ? AND status NOT IN ('completed', 'cancelled')
                     """,
                     (answer, json.dumps(summary, ensure_ascii=False, default=str), footer,
                      json.dumps(metrics or {}, ensure_ascii=False, default=str), now, turn_id),
@@ -726,7 +732,7 @@ class ConversationService:
                 """
                 UPDATE chat_turns SET status = ?, error_message = ?, finished_at = ?,
                     worker_id = '', worker_heartbeat_at = NULL
-                WHERE id = ? AND session_id IN (
+                WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled') AND session_id IN (
                     SELECT id FROM chat_sessions
                     WHERE user_id = ?
                 )
@@ -749,7 +755,7 @@ class ConversationService:
                 raise
 
     def is_turn_worker_stale(self, user_id: int, turn_id: str, stale_after_seconds: int | None = None) -> bool:
-        stale_after_seconds = max(30, int(stale_after_seconds or config.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
+        stale_after_seconds = max(30, int(stale_after_seconds or src.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """

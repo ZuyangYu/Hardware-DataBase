@@ -7,15 +7,15 @@
 
 Hardware DataBase 当前是一个面向硬件设计资料、项目文档、结构化表格和电路设计（EDF 网表/原理图）的硬件数据平台。系统保留“知识库”作为业务隔离、权限治理和资产归属单元；对话只是外接检索入口之一，平台核心是硬件资产管理、解析、召回与治理。
 
-文档检索统一由 RAGFlow 承担；查询编排由 LangGraph agent 承担；Excel 与 EDF 网表等结构化资产由独立 pipeline 建立结构化索引，并通过 agent tool 参与检索。
+文档检索统一由 RAGFlow 承担；查询编排由 `deepagents`（`create_deep_agent`）agent loop 承担；Excel 与 EDF 网表等结构化资产由独立 pipeline 建立结构化索引，并通过 agent tool 参与检索。
 
 ## 2. 核心原则
 
 1. RAGFlow 是唯一文档检索后端。
-2. LangGraph 只负责查询流程编排，不实现底层检索算法。
-3. Agent 最终答案生成使用项目自有 `LLMClient`，不依赖检索框架的全局模型配置。
+2. `deepagents` agent loop 负责查询流程编排（动态工具调用），不实现底层检索算法。
+3. 答案生成与工具决策统一走 `src.core.model_factory`（`init_chat_model`），不依赖检索框架的全局模型配置；`SYSTEM_PROMPT` / `NO_CONTEXT_PROMPT` 可在系统配置中覆盖。
 4. Word/PDF、Excel、EDF 网表等多源资产由 pipeline 分别处理，再在 agent 层统一调度。
-5. Agent 是**有界且 fail-open** 的：每个 LLM 节点都有确定性回退，工具错误被吞掉而非上抛，多跳检索受 `AGENT_MAX_RETRIEVAL_ROUNDS` 硬上限约束。
+5. Agent 是 **fail-open** 的：工具错误被吞掉（空结果 + `degraded` 事件）而非上抛，循环预算由 `AGENT_MAX_RETRIEVAL_ROUNDS` 决定（→ `recursion_limit`）。
 
 ## 3. 分层架构
 
@@ -31,25 +31,18 @@ AppPipeline
   |
   v
 MultiSourceAgentRunner
-  - LangGraph thread/session
-  - Tool adapter 调度
-  - 答案生成与 trace 输出
+  - deepagents agent loop (create_deep_agent)
+  - 每步 tool_started / tool_result 事件驱动前端实时轨迹
+  - 答案生成与 trace 输出（模型统一走 src.core.model_factory）
   |
   v
-LangGraph Query Graph
-  - route_query                 # 路由：需要检索 / 闲聊直答
-  - analyze_question            # 问题拆解
-  - scan_kb_catalog             # 扫描知识库可用来源
-  - plan_source_selection       # 检索范围规划
-  - retrieve_evidence           # 并行执行 tool 调用
-  - merge_evidence              # 去重 / 截断
-  - score_and_compare_evidence  # 覆盖度矩阵 / 冲突 / 质量评分
-  - draft_intermediate_answer   # 草稿
-  - judge_sufficiency           # 证据是否充分（多跳判断）
-  - plan_next_retrieval         # 必要时规划补检索
-  - compose_answer              # grounded answer
-  - verify_grounding            # 规则校验是否有证据支撑
-  - compose_direct_answer       # 闲聊 / 通用知识直答（旁路）
+Agent tool 调用循环（模型自主决策调用哪些工具、几次、什么顺序）
+  - list_kb_sources             # 读取知识库可用来源
+  - document_search             # RAGFlow 文档检索
+  - circuit_search             # 电路网表结构化检索
+  - spreadsheet_row_search / spreadsheet_cell_lookup  # 表格检索
+  - conversation_search         # 外部对话记录检索
+  - （无写死的「拆解→规划→补检」节点；跳数与顺序由模型在 loop 内决定）
   |
   v
 Tools / Services
@@ -98,10 +91,10 @@ Storage / External Systems
 
 职责:
 
-- 驱动 LangGraph 查询流程（`src/agents/graph.py::build_multi_source_graph`）。
+- 驱动 `deepagents` 查询流程（`create_deep_agent`，底层仍是 LangGraph 的固定 agent loop，无手写节点）。
 - 注册并调度文档检索、电路检索、表格检索等 tool adapter。
-- 使用 `LLMClient` 流式生成最终答案，并输出 Agent trace / token 用量。
-- 每个 LLM 节点失败时走确定性回退（fail-open）。
+- 答案生成与工具决策统一走 `src.core.model_factory`（`init_chat_model`），并输出 Agent trace / token 用量。
+- 工具调用失败时走 fail-open 回退（空结果 + `degraded` 事件）。
 
 ### LLMClient
 
@@ -134,8 +127,8 @@ Storage / External Systems
 - `CircuitIndexService`（`index_service.py`）将解析结果存入 `CircuitStore`（`storage/circuits/{kb}/{design_id}/circuit_state.json`），并在保存时触发 `CircuitVectorIndex` 的 fail-soft 重建索引。
 - `CircuitQueryEngine`（`query_engine.py`）提供网络、实例、模块、模块连接、电源/偏置/保护拓扑等结构化检索。
 - `CircuitVectorIndex`（`vector_index.py`）是 per-KB 的 ChromaDB 语义索引（`circuit_kb_{kb}`），作为关键词匹配的语义补充；未绑定 embedding 模型时为 no-op。
-- 查询入口为 `CircuitQueryTool`（`src/agents/tools/circuit_tools.py`）-> `CircuitIndexService.query`。
-- `orchestrator.py` / `ingest_workers.py` / `query_agent.py` 等是 EDF+PDF 融合与有界 Plan-and-Execute agent 的完整路径，目前**未接入主流程**，保留待迁移到共享 `LLMClient`。
+- 查询入口为 `circuit_search`（`make_circuit_search`，`src/agents/tools/circuit_tools.py`）-> `CircuitIndexService.query`。
+- （历史上曾有 EDF+PDF 融合与 Plan-and-Execute agent 的独立路径，现已不保留；当前查询统一走 `deepagents` loop。）
 
 ### Pipelines 与 Services
 
@@ -210,7 +203,7 @@ hardware-database-server
 
 安装包重新安装后也可使用 `hardware-database-worker`。Worker 通过 `WORKER_POLL_INTERVAL_SECONDS` 控制空队列轮询间隔，`WORKER_PARSE_BATCH_SIZE` 控制每轮最多处理的表格任务数。当前 SQLite worker 用于本地单机和开发验证；生产多实例部署应将同一领取接口迁移至 PostgreSQL，并以 Redis 队列承担唤醒和调度。
 
-核心配置集中在 `config/settings.py`（单一事实来源，`.env` 以 `utf-8-sig` 加载，UI「⚙️ 系统配置」可在线修改并回写 `.env`）：
+核心配置集中在 `src/settings.py`（单一事实来源，`.env` 以 `utf-8-sig` 加载，UI「⚙️ 系统配置」可在线修改并回写 `.env`）：
 
 ```env
 RAGFLOW_BASE_URL=http://localhost:9380
@@ -254,8 +247,8 @@ RAGAS 评估相关变量（`EVAL_LLM_*` / `EVAL_EMBEDDING_*`）由 `src/evaluati
 
 ## 9. 验收重点
 
-- 查询前必须有问题拆解与检索范围规划。
-- 文档证据来自 RAGFlow；Excel 证据来自 spreadsheet pipeline；电路证据来自 circuit 结构化检索。
-- 多跳检索受 `AGENT_MAX_RETRIEVAL_ROUNDS` 约束，证据不足时走 fail-open 回退而非无限循环。
-- 最终答案必须基于 evidence，并能说明缺失信息；`verify_grounding` 以规则校验证据支撑。
+- 查询由 `deepagents` loop 动态决定工具调用，无需写死的「问题拆解 / 检索规划」节点。
+- 文档证据来自 RAGFlow；Excel 证据来自 spreadsheet pipeline；电路证据来自 circuit 结构化检索；外部对话来自 conversation pipeline。
+- agent 循环预算由 `AGENT_MAX_RETRIEVAL_ROUNDS` 决定（→ `recursion_limit`），证据不足时走 fail-open 回退而非无限循环。
+- 最终答案必须基于 evidence，并能在 footer 中说明引用覆盖率；`verify_grounding`（规则校验：回答中的 [n] 引用是否落在证据上）反映证据支撑。
 - 代码中不应重新引入本地文档向量检索或 LlamaIndex 依赖。

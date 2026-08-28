@@ -6,7 +6,7 @@ import re
 import shutil
 from pathlib import Path
 
-import config.settings
+import src.settings
 from src.ingestion.kb_paths import validate_kb_name
 from src.test_data.models import TestReport
 
@@ -21,7 +21,7 @@ def make_report_id(filename: str) -> str:
 
 class TestDataStore:
     def __init__(self, root: str | None = None):
-        self.root = root or os.path.join(config.settings.STORAGE_DIR, "test_data")
+        self.root = root or os.path.join(src.settings.STORAGE_DIR, "test_data")
 
     def report_dir(self, kb_name: str, report_id: str, create: bool = False) -> str:
         kb_name = validate_kb_name(kb_name)

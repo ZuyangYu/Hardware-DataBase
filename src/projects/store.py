@@ -13,7 +13,7 @@ from contextlib import closing
 from datetime import datetime
 from typing import Any, TypeVar
 
-import config.settings
+import src.settings
 from src.projects.models import (
     LogicalDocument,
     ProcessingArtifact,
@@ -50,7 +50,7 @@ class ProjectStore:
     """Durable project/source records with explicit immutable boundaries."""
 
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or os.path.join(config.settings.STORAGE_DIR, "projects.db")
+        self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "projects.db")
         parent = os.path.dirname(self.db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)

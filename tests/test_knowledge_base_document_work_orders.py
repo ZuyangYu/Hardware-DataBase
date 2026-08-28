@@ -25,7 +25,7 @@ from src.document_authoring.harness.graph import _validated_evidence
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.writers.managed import DeterministicEvidenceWriter
 from src.pipelines.document_rag.schemas import EvidenceEnvelope, RequestContext
-from test_document_authoring_p2a import _xlsx_template
+from tests.test_document_authoring_p2a import _xlsx_template
 
 
 @pytest.fixture

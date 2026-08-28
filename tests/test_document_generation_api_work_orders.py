@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 
-import config.settings
+import src.settings
 import httpx
 
 from src.api.app import create_app
@@ -23,15 +23,15 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         cls.server.stop()
 
     def setUp(self):
-        self._old_pw = config.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        config.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
-        self.addCleanup(setattr, config.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db_path = __import__("os").path.join(self.tmp.name, "auth.db")
-        old_db = config.settings.AUTH_DB_PATH
-        config.settings.AUTH_DB_PATH = self.db_path
-        self.addCleanup(setattr, config.settings, "AUTH_DB_PATH", old_db)
+        old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", old_db)
         self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
         self.stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.stub
@@ -154,6 +154,6 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 404, r.text)
 
     def test_work_orders_reject_system_admin_403(self):
-        t = self._token(config.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        t = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.get("/api/v1/document-generation/work-orders?kb=shared", headers=self._auth(t))
         self.assertEqual(r.status_code, 403)

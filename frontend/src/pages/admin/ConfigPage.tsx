@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { notify } from '@/components/ui/app-toast';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 
@@ -144,6 +145,7 @@ export default function ConfigPage({ auth, onLogout }: Props) {
   const [ragflowHealth, setRagflowHealth] = useState<RagflowHealthResponse | null>(null);
   const [llmHealth, setLlmHealth] = useState<LlmHealthResponse | null>(null);
   const [probing, setProbing] = useState<string | null>(null);
+  const [confirmResetOpen, setConfirmResetOpen] = useState(false);
 
   const load = useCallback(() => {
     let cancelled = false;
@@ -249,8 +251,15 @@ export default function ConfigPage({ auth, onLogout }: Props) {
     setSaving(true);
     try {
       await api.put<OkResponse>('/api/v1/config', { settings: changes });
+      // 只把本次提交的键同步进快照与草稿(密钥回显为 *** 与服务端一致)，
+      // 其余分组未保存的草稿保持不动，不再整页重拉覆盖。
+      const applied: Record<string, string> = { ...changes };
+      for (const key of Object.keys(applied)) {
+        if (SECRET_KEYS.has(key)) applied[key] = '***';
+      }
+      setSnapshot((prev) => ({ ...prev, ...applied }));
+      setDraft((prev) => ({ ...prev, ...applied }));
       notify.success('配置已保存并热加载');
-      load(); // 重新拉快照(secrets 又变回 ***)
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '保存失败');
     } finally {
@@ -305,7 +314,7 @@ export default function ConfigPage({ auth, onLogout }: Props) {
           </Button>
         </div>
         <div className="flex items-center gap-[8px]">
-          <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')} onClick={() => load()}>
+          <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')} onClick={() => setConfirmResetOpen(true)}>
             重置
           </Button>
           <Button
@@ -400,6 +409,17 @@ export default function ConfigPage({ auth, onLogout }: Props) {
           ))}
         </div>
       )}
+      <ConfirmDialog
+        open={confirmResetOpen}
+        onOpenChange={setConfirmResetOpen}
+        title="重置配置编辑"
+        description="将放弃所有分组中未保存的修改，恢复为服务器当前配置。此操作无法撤销。"
+        confirmText="重置"
+        onConfirm={() => {
+          setConfirmResetOpen(false);
+          load();
+        }}
+      />
     </div>
   );
 }
