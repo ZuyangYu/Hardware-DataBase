@@ -27,8 +27,52 @@ TOOL_LABELS = {
     "circuit_search": "电路检索",
     "spreadsheet_row_search": "表格行检索",
     "spreadsheet_cell_lookup": "单元格检索",
+    "memory_search": "长期记忆检索",
     "list_kb_sources": "读取知识库目录",
 }
+
+MAX_MEMORY_CONTEXT_CONTENT_CHARS = 2_000
+
+
+def memory_context_item(row: dict[str, Any]) -> dict[str, Any]:
+    """Return the privacy-safe fields shown for a retrieved memory.
+
+    Long-term memory is intentionally kept separate from formal evidence. A
+    response may still expose a compact, user-visible record of the memory
+    context that was available to the agent, without leaking Store namespaces
+    or the full Catalog record.
+    """
+
+    raw_content = row.get("content")
+    if isinstance(raw_content, dict):
+        title = str(
+            row.get("title") or raw_content.get("title") or row.get("subject") or "未命名记忆"
+        ).strip()
+        content = str(raw_content.get("content") or raw_content.get("title") or "").strip()
+        memory_type = str(
+            row.get("type") or raw_content.get("memory_type") or row.get("kind") or ""
+        ).strip()
+    else:
+        title = str(row.get("title") or row.get("subject") or "未命名记忆").strip()
+        content = str(raw_content or "").strip()
+        memory_type = str(row.get("type") or row.get("kind") or "").strip()
+
+    try:
+        source_count = max(0, int(row.get("source_count") or 0))
+    except (TypeError, ValueError):
+        source_count = 0
+
+    return {
+        "id": str(row.get("id") or row.get("memory_id") or ""),
+        "scope": str(row.get("scope") or "").strip(),
+        "status": str(row.get("status") or "candidate").strip(),
+        "type": memory_type,
+        "title": title[:200],
+        "content": content[:MAX_MEMORY_CONTEXT_CONTENT_CHARS],
+        "source_count": source_count,
+        "has_provenance": bool(row.get("has_provenance")),
+        "score": row.get("score"),
+    }
 
 
 def tool_label(tool_name: str) -> str:
@@ -56,6 +100,8 @@ class ToolRuntime:
 
     evidence: list[Evidence] = field(default_factory=list)
     evidence_index: dict[str, int] = field(default_factory=dict)
+    memory_context: list[dict[str, Any]] = field(default_factory=list)
+    memory_context_index: set[str] = field(default_factory=set)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     queries: list[dict[str, Any]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -89,6 +135,24 @@ class ToolRuntime:
                 self.evidence_index[key] = len(self.evidence)
                 numbers.append(len(self.evidence))
         return numbers
+
+    def add_memory_context(self, items: list[dict[str, Any]]) -> None:
+        """Keep unique long-term memory rows for the final UI summary."""
+
+        with self._lock:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("id") or "").strip()
+                if not key:
+                    key = "|".join(
+                        str(item.get(field) or "")
+                        for field in ("scope", "title", "content")
+                    )
+                if key in self.memory_context_index:
+                    continue
+                self.memory_context_index.add(key)
+                self.memory_context.append(dict(item))
 
     def record_diagnostic(self, diag: ToolDiagnostics) -> None:
         self.diagnostics.append(

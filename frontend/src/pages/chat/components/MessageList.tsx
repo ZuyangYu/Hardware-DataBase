@@ -24,6 +24,8 @@ type Props = {
   traceSteps: QueryTraceStep[];
   traceByMessageId: Record<number, QueryTraceStep[]>;
   degradedNotes: Array<{ stage: string; reason: string }>;
+  onCreateMemory?: (messageId: number) => void;
+  onEditMessage?: (messageId: number) => void;
 };
 
 export default function MessageList({
@@ -39,6 +41,8 @@ export default function MessageList({
   traceSteps,
   traceByMessageId,
   degradedNotes,
+  onCreateMemory,
+  onEditMessage,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -79,6 +83,8 @@ export default function MessageList({
             key={msg.id}
             msg={msg}
             evidence={msg.role === 'assistant' ? evidenceByMessageId[msg.id] : undefined}
+            onCreateMemory={onCreateMemory}
+            onEditMessage={onEditMessage}
             traceSteps={msg.role === 'assistant' ? (traceByMessageId[msg.id] ?? []) : []}
           />
         ))}

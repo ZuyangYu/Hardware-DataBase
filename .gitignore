@@ -97,8 +97,12 @@ htmlcov/
 .agents/
 .worktrees/
 
-# Local superpowers workflow artifacts (plans/reports stay out of the repo)
+# Local-only documentation and planning materials (stay out of the repo)
 /.superpowers/
+/docs/
+
+# Local agent guidance
+/CLAUDE.md
 
 .tests/
 
@@ -118,6 +122,5 @@ AAA/
 ingest_aaa_test.py
 verify_recall.py
 
-AAA/
 # 本地运行残留
 run_state.json

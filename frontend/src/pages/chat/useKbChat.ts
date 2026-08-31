@@ -10,17 +10,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, isForbiddenError, sseGetStream } from '@/api/client';
 import type {
   EvidenceItem,
+  MemoryConsentListResponse,
+  MemoryConsentView,
+  MemoryOperationResponse,
   MessageView,
   OkResponse,
   QueryDonePayload,
   QueryTraceStatus,
   QueryTraceStep,
+  SessionMemorySummary,
   SessionView,
   TurnStartResponse,
   TurnView,
 } from '@/api/types';
+import { notify } from '@/components/ui/app-toast';
 
-const HISTORY_PAIRS = 5; // 与后端保持一致:只带最近 5 轮对话
 const GENERAL_CHAT_KB_NAME = '__general__';
 const QUERY_TRACE_HIDE_DELAY_MS = 5000;
 const STREAMING_RENDER_INTERVAL_MS = 64;
@@ -36,24 +40,32 @@ function requestUuid(): string {
   });
 }
 
-function buildHistory(messages: MessageView[]): string[][] {
-  const pairs: string[][] = [];
-  let pendingUser: string | null = null;
-  for (const msg of messages) {
-    if (msg.role === 'user') {
-      pendingUser = msg.content;
-    } else if (msg.role === 'assistant' && pendingUser != null) {
-      pairs.push([pendingUser, msg.content]);
-      pendingUser = null;
-    }
-  }
-  return pairs.slice(-HISTORY_PAIRS);
-}
-
 function normalizeTraceStatus(status: unknown): QueryTraceStatus {
   return status === 'pending' || status === 'running' || status === 'done' || status === 'error'
     ? status
     : 'running';
+}
+
+function shortTermMemoryTraceStep(data: string): QueryTraceStep | null {
+  try {
+    const parsed = JSON.parse(data) as {
+      status?: unknown;
+      hit_count?: unknown;
+      turn_count?: unknown;
+      message_count?: unknown;
+    };
+    const turnCount = Math.max(0, Number(parsed.turn_count ?? parsed.hit_count ?? 0) || 0);
+    const messageCount = Math.max(0, Number(parsed.message_count ?? turnCount * 2) || 0);
+    const status: QueryTraceStatus = parsed.status === 'error' ? 'error' : 'done';
+    const detail = status === 'error'
+      ? '读取会话历史失败'
+      : turnCount > 0
+        ? `命中 ${turnCount} 轮历史（${messageCount} 条消息）`
+        : '未命中历史';
+    return { key: 'short_term_memory', label: '短期记忆', status, detail };
+  } catch {
+    return null;
+  }
 }
 
 function createInitialTrace(_isGeneralChat: boolean): QueryTraceStep[] {
@@ -149,6 +161,8 @@ export function useKbChat(kbName: string) {
   const [traceSteps, setTraceSteps] = useState<QueryTraceStep[]>([]);
   const [degradedNotes, setDegradedNotes] = useState<Array<{ stage: string; reason: string }>>([]);
   const [evidenceByMessageId, setEvidenceByMessageId] = useState<Record<number, EvidenceItem[]>>({});
+  const [memorySummary, setMemorySummary] = useState<SessionMemorySummary | null>(null);
+  const [sessionConsents, setSessionConsents] = useState<MemoryConsentView[] | null>(null);
   const [forbidden, setForbidden] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const currentTurnRef = useRef<string | null>(null);
@@ -286,7 +300,125 @@ export function useKbChat(kbName: string) {
     activeSessionRef.current = activeSessionId;
   }, [activeSessionId]);
 
-  // 离开页面时同时取消服务端 turn，不能只断开浏览器 SSE。
+  // ---- 会话记忆摘要(无 session 不拉;切换会话时重新拉取) ----
+  useEffect(() => {
+    if (activeSessionId == null) {
+      setMemorySummary(null);
+      return undefined;
+    }
+    let cancelled = false;
+    api
+      .get<SessionMemorySummary>(`/api/v1/conversations/${activeSessionId}/memory-summary`)
+      .then((summary) => {
+        if (!cancelled) setMemorySummary(summary);
+      })
+      .catch(() => {
+        // 摘要获取失败不打断聊天主流程
+        if (!cancelled) setMemorySummary(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId]);
+
+  const refreshMemorySummary = useCallback(async () => {
+    const sessionId = activeSessionId;
+    if (sessionId == null) {
+      setMemorySummary(null);
+      return;
+    }
+    try {
+      const summary = await api.get<SessionMemorySummary>(`/api/v1/conversations/${sessionId}/memory-summary`);
+      if (activeSessionRef.current !== sessionId) return;
+      setMemorySummary(summary);
+    } catch {
+      // 摘要刷新失败保持旧值即可
+    }
+  }, [activeSessionId]);
+
+  const updateAutoExtract = useCallback(
+    async (autoExtract: boolean): Promise<SessionMemorySummary> => {
+      const sessionId = activeSessionId;
+      if (sessionId == null) throw new Error('当前没有选中会话');
+      const summary = await api.put<SessionMemorySummary>(
+        `/api/v1/conversations/${sessionId}/memory-settings`,
+        { auto_extract: autoExtract },
+      );
+      if (activeSessionRef.current === sessionId) setMemorySummary(summary);
+      return summary;
+    },
+    [activeSessionId],
+  );
+
+  // ---- 本会话授权台账(无 session 置 null;切换会话时重新拉取) ----
+  useEffect(() => {
+    if (activeSessionId == null) {
+      setSessionConsents(null);
+      return undefined;
+    }
+    let cancelled = false;
+    setSessionConsents(null);
+    api
+      .get<MemoryConsentListResponse>(`/api/v1/memory-consents?session_id=${activeSessionId}`)
+      .then((response) => {
+        if (!cancelled) setSessionConsents(response.items ?? []);
+      })
+      .catch(() => {
+        // 台账获取失败不打断聊天主流程
+        if (!cancelled) setSessionConsents(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId]);
+
+  const refreshSessionConsents = useCallback(async () => {
+    const sessionId = activeSessionId;
+    if (sessionId == null) {
+      setSessionConsents(null);
+      return;
+    }
+    try {
+      const response = await api.get<MemoryConsentListResponse>(
+        `/api/v1/memory-consents?session_id=${sessionId}`,
+      );
+      if (activeSessionRef.current !== sessionId) return;
+      setSessionConsents(response.items ?? []);
+    } catch {
+      // 刷新失败保持旧值即可
+    }
+  }, [activeSessionId]);
+
+  const revokeSessionConsent = useCallback(
+    async (consentEventId: string, reason: string): Promise<boolean> => {
+      const sessionId = activeSessionId;
+      try {
+        await api.delete<MemoryOperationResponse>(
+          `/api/v1/memory-consents/${encodeURIComponent(consentEventId)}`,
+          { reason, request_id: requestUuid() },
+        );
+        if (sessionId != null && activeSessionRef.current === sessionId) {
+          setSessionConsents((prev) =>
+            prev?.some((item) => item.consent_event_id === consentEventId)
+              ? prev.map((item) =>
+                  item.consent_event_id === consentEventId
+                    ? { ...item, status: 'revoked' as const, revoked_at: new Date().toISOString() }
+                    : item,
+                )
+              : prev,
+          );
+        }
+        notify.success('个人记忆授权已撤销，相关记忆已下线');
+        void refreshMemorySummary();
+        return true;
+      } catch (error) {
+        notify.error(error instanceof Error ? error.message : '撤销个人记忆授权失败');
+        return false;
+      }
+    },
+    [activeSessionId, refreshMemorySummary],
+  );
+
   useEffect(() => {
     return () => {
       const turnId = currentTurnRef.current;
@@ -381,6 +513,9 @@ export function useKbChat(kbName: string) {
             const parsed = JSON.parse(evt.data) as { text?: string };
             accumulated += parsed.text ?? '';
             queueStreamingText(accumulated);
+          } else if (evt.event === 'short_term_memory') {
+            const step = shortTermMemoryTraceStep(evt.data);
+            if (step) upsertTraceStep(step);
           } else if (evt.event === 'stage' || evt.event === 'tool_started' || evt.event === 'tool_result') {
             const step = stepFromToolEvent(evt.event, evt.data);
             if (step) upsertTraceStep(step);
@@ -399,6 +534,7 @@ export function useKbChat(kbName: string) {
                   role: 'assistant',
                   content: answer,
                   footer: (payload.footer ?? '').trim(),
+                  memory_context: payload.summary?.memory_context ?? [],
                   created_at: turn.created_at,
                 },
               ]);
@@ -412,6 +548,7 @@ export function useKbChat(kbName: string) {
               }
             }
             finishTrace('done', '已完成输出');
+            void refreshMemorySummary();
             if (turn.assistant_message_id != null) {
               setTraceByMessageId((prev) => ({ ...prev, [turn.assistant_message_id as number]: traceRef.current }));
             }
@@ -437,7 +574,7 @@ export function useKbChat(kbName: string) {
       disposed = true;
       controller?.abort();
     };
-  }, [activeSessionId, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep]);
+  }, [activeSessionId, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep, refreshMemorySummary]);
 
   const createSession = useCallback(
     async (title: string): Promise<SessionView> => {
@@ -486,6 +623,11 @@ export function useKbChat(kbName: string) {
     if (streaming) return;
     setActiveSessionId(sessionId);
   }, [streaming]);
+
+  /** 用服务端返回的 MessageView 替换本地消息(编辑/脱敏回写)。 */
+  const updateMessage = useCallback((updated: MessageView) => {
+    setMessages((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+  }, []);
 
   const abortStream = useCallback(async () => {
     const turnId = currentTurnRef.current;
@@ -559,6 +701,9 @@ export function useKbChat(kbName: string) {
           } catch {
             // 忽略坏帧
           }
+        } else if (evt.event === 'short_term_memory') {
+          const step = shortTermMemoryTraceStep(evt.data);
+          if (step) upsertTraceStep(step);
         } else if (evt.event === 'stage' || evt.event === 'tool_started' || evt.event === 'tool_result') {
           try {
             const step = stepFromToolEvent(evt.event, evt.data);
@@ -597,6 +742,7 @@ export function useKbChat(kbName: string) {
           role: 'assistant',
           content: answer,
           footer: (payload.footer ?? '').trim(),
+          memory_context: payload.summary?.memory_context ?? [],
           created_at: new Date().toISOString(),
         };
         if (activeSessionRef.current === sessionId) {
@@ -616,6 +762,7 @@ export function useKbChat(kbName: string) {
           };
           return [updated, ...prev.filter((s) => s.id !== sessionId)];
         });
+        void refreshMemorySummary();
       } else if (errorMessage && activeSessionRef.current === sessionId) {
         setMessages((prev) => [...prev, localAssistantMessage(sessionId!, `⚠️ ${errorMessage}`)]);
       } else if (!finalPayload) {
@@ -650,7 +797,7 @@ export function useKbChat(kbName: string) {
       setStreaming(false);
       resetStreamingText();
     }
-  }, [input, streaming, activeSessionId, createSession, scopeKbName, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace]);
+  }, [input, streaming, activeSessionId, createSession, scopeKbName, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary]);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
@@ -667,10 +814,18 @@ export function useKbChat(kbName: string) {
     selectSession,
     newConversation,
     deleteSession,
+    updateMessage,
     // 消息
     messages,
     messagesLoaded,
     evidenceByMessageId,
+    // 记忆
+    memorySummary,
+    refreshMemorySummary,
+    updateAutoExtract,
+    sessionConsents,
+    refreshSessionConsents,
+    revokeSessionConsent,
     // 输入
     input,
     setInput,

@@ -10,8 +10,11 @@ from src.api.deps import current_user, get_auth_service, reject_system_admin_kb_
 from src.api.schemas import (
     AddMessageRequest,
     CreateSessionRequest,
+    EditMessageRequest,
     MessageView,
     OkResponse,
+    SessionMemorySettingsUpdate,
+    SessionMemorySummary,
     SessionView,
 )
 
@@ -41,6 +44,9 @@ def _message_view(m) -> MessageView:
         content=m.content,
         footer=m.footer,
         created_at=m.created_at,
+        edited_at=getattr(m, "edited_at", None),
+        redacted=bool(getattr(m, "redacted", False)),
+        memory_context=getattr(m, "memory_context", []),
     )
 
 
@@ -169,3 +175,76 @@ def add_message(
     except PermissionError:
         raise HTTPException(status_code=404, detail="session not found")
     return _message_view(m)
+
+
+@router.patch("/conversations/{session_id}/messages/{message_id}", response_model=MessageView)
+def edit_message(
+    session_id: int,
+    message_id: int,
+    body: EditMessageRequest,
+    user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+    conv: ConversationService = Depends(_conv_service),
+):
+    """Edit or redact a raw message; invalidates sourced memory atomically."""
+    if not body.redact and not (body.content and body.content.strip()):
+        raise HTTPException(status_code=400, detail="content is required unless redact=true")
+    s = conv.get_session(user.id, session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    _ensure_history_access(user, auth)
+    try:
+        m = conv.edit_message(
+            user.id,
+            session_id,
+            message_id,
+            content=None if body.redact else body.content,
+            redact=body.redact,
+            reason=body.reason,
+            request_id=body.request_id,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=404, detail="session not found")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="message not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _message_view(m)
+
+
+@router.get("/conversations/{session_id}/memory-summary", response_model=SessionMemorySummary)
+def get_session_memory_summary(
+    session_id: int,
+    user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+    conv: ConversationService = Depends(_conv_service),
+):
+    s = conv.get_session(user.id, session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    _ensure_history_access(user, auth)
+    try:
+        summary = conv.get_session_memory_settings(user.id, session_id)
+    except PermissionError:
+        raise HTTPException(status_code=404, detail="session not found")
+    return SessionMemorySummary(**summary)
+
+
+@router.put("/conversations/{session_id}/memory-settings", response_model=SessionMemorySummary)
+def put_session_memory_settings(
+    session_id: int,
+    body: SessionMemorySettingsUpdate,
+    user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+    conv: ConversationService = Depends(_conv_service),
+):
+    """Toggle per-session automatic Project Memory extraction."""
+    s = conv.get_session(user.id, session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    _ensure_history_access(user, auth)
+    try:
+        summary = conv.set_session_auto_extract(user.id, session_id, body.auto_extract)
+    except PermissionError:
+        raise HTTPException(status_code=404, detail="session not found")
+    return SessionMemorySummary(**summary)

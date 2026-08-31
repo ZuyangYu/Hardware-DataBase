@@ -1,10 +1,11 @@
 import os
 import json
+import hashlib
 import sqlite3
 import uuid
 from contextlib import closing
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 import src.settings
 
@@ -33,6 +34,9 @@ class ChatMessage:
     content: str
     footer: str
     created_at: str
+    edited_at: str | None = None
+    redacted: bool = False
+    memory_context: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -172,6 +176,20 @@ class ConversationService:
                     FOREIGN KEY(turn_id) REFERENCES chat_turns(id) ON DELETE CASCADE
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_message_edits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL,
+                    editor_user_id INTEGER NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('edit', 'redact')),
+                    previous_content TEXT,
+                    previous_content_hash TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    request_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+                )
+            """)
             self._ensure_column(conn, "chat_sessions", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "kb_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "department_id", "INTEGER")
@@ -182,6 +200,9 @@ class ConversationService:
             self._ensure_column(conn, "chat_turns", "query_mode", "TEXT NOT NULL DEFAULT 'fast'")
             self._ensure_column(conn, "chat_turns", "metrics_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "chat_turns", "trace_context_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "chat_messages", "edited_at", "TEXT")
+            self._ensure_column(conn, "chat_messages", "redacted", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "chat_sessions", "auto_memory", "INTEGER NOT NULL DEFAULT 1")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_turns_status_created ON chat_turns(status, created_at)")
             has_users = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
@@ -204,6 +225,12 @@ class ConversationService:
                     WHERE department_id IS NULL
                     """
                 )
+            # Long-term memory control-plane tables share this SQLite
+            # connection boundary with Conversation.  The import is deferred
+            # to keep the auth/conversation modules independently importable.
+            from src.memory.catalog import ensure_memory_schema
+
+            ensure_memory_schema(conn)
 
     @staticmethod
     def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
@@ -317,7 +344,8 @@ class ConversationService:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
-                SELECT m.*, COALESCE(t.footer, '') AS footer
+                SELECT m.*, COALESCE(t.footer, '') AS footer,
+                       COALESCE(t.summary_json, '{}') AS turn_summary
                 FROM chat_messages m
                 LEFT JOIN chat_turns t ON t.assistant_message_id = m.id
                 WHERE m.session_id = ?
@@ -360,11 +388,20 @@ class ConversationService:
             return
         now = utc_now()
         with closing(self._connect()) as conn:
-            conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
-            conn.execute(
-                "UPDATE chat_sessions SET title = '新对话', updated_at = ? WHERE id = ? AND user_id = ?",
-                (now, session_id, user_id),
-            )
+            from src.memory.jobs import invalidate_session_memory_in_connection
+
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                invalidate_session_memory_in_connection(conn, session_id, reason="session_cleared")
+                conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+                conn.execute(
+                    "UPDATE chat_sessions SET title = '新对话', updated_at = ? WHERE id = ? AND user_id = ?",
+                    (now, session_id, user_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def delete_session(self, user_id: int, session_id: int) -> bool:
         """Hard-delete a chat session (messages cascade via FK).
@@ -376,13 +413,224 @@ class ConversationService:
         if not self.get_session(user_id, session_id):
             return False
         with closing(self._connect()) as conn:
-            # `chat_messages.session_id` has ON DELETE CASCADE, so deleting the
-            # session row drops its messages atomically.
-            conn.execute(
-                "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
-                (session_id, user_id),
-            )
+            from src.memory.jobs import invalidate_session_memory_in_connection
+
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Invalidate sources and freeze deletion outbox before the
+                # chat rows cascade; memory_sources intentionally has no FK
+                # cascade to raw messages.
+                invalidate_session_memory_in_connection(conn, session_id, reason="session_deleted")
+                conn.execute(
+                    "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
+                    (session_id, user_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         return True
+
+    def edit_message(
+        self,
+        user_id: int,
+        session_id: int,
+        message_id: int,
+        *,
+        content: str | None = None,
+        redact: bool = False,
+        reason: str = "",
+        request_id: str = "",
+    ) -> ChatMessage:
+        """Edit or redact a raw message with memory provenance protection.
+
+        Per LangMem V2 §43 the old source must be invalidated and its hash
+        frozen in the same transaction that writes the new content; derived
+        memories queue rebuild/deletion before the new text is visible.
+        """
+        if not redact and not (content and content.strip()):
+            raise ValueError("edit_message requires new content or redact=True")
+        if redact:
+            # Redaction removes user personal data; the replacement keeps the
+            # message anchor without retaining the original payload.
+            content = "[已脱敏]"
+
+        from src.memory.jobs import invalidate_message_memory_in_connection
+        from src.memory.catalog import ensure_memory_schema
+
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                ensure_memory_schema(conn)
+                session = conn.execute(
+                    "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?",
+                    (session_id, user_id),
+                ).fetchone()
+                if session is None:
+                    raise PermissionError("chat session does not belong to current user")
+                message = conn.execute(
+                    "SELECT * FROM chat_messages WHERE id = ? AND session_id = ?",
+                    (message_id, int(session["id"])),
+                ).fetchone()
+                if message is None:
+                    raise KeyError("message not found")
+
+                invalidate_message_memory_in_connection(
+                    conn,
+                    int(session["id"]),
+                    int(message_id),
+                    reason=reason or ("message_redacted" if redact else "message_edited"),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO chat_message_edits
+                        (message_id, editor_user_id, action, previous_content,
+                         previous_content_hash, reason, request_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(message_id),
+                        int(user_id),
+                        "redact" if redact else "edit",
+                        None if redact else str(message["content"]),
+                        hashlib.sha256(str(message["content"]).encode("utf-8")).hexdigest(),
+                        reason or "",
+                        request_id or "",
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE chat_messages SET content = ?, edited_at = ?, redacted = ? WHERE id = ?
+                    """,
+                    (content, now, 1 if redact else 0, int(message_id)),
+                )
+                conn.execute(
+                    "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+                    (now, int(session["id"])),
+                )
+                if int(session["auto_memory"] or 0) == 1:
+                    self._enqueue_project_reflection_guarded(conn, session=session)
+                row = conn.execute("SELECT * FROM chat_messages WHERE id = ?", (int(message_id),)).fetchone()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return row_to_message(row)
+
+    def _enqueue_project_reflection_guarded(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        session: sqlite3.Row,
+    ) -> None:
+        """Enqueue a project reflection Job for the latest completed Turn.
+
+        Used by ``edit_message`` so invalidated memories are rebuilt from the
+        remaining valid sources without waiting for further chat activity.
+        The caller owns the surrounding BEGIN IMMEDIATE transaction and the
+        chat_sessions row must carry non-empty department/kb scope.
+        """
+        if not getattr(src.settings, "MEMORY_ENABLED", True) or not getattr(
+            src.settings, "MEMORY_EXTRACTION_ENABLED", True
+        ):
+            return
+        department_id = session["department_id"]
+        kb_id = session["kb_id"]
+        if department_id in (None, "") or kb_id in (None, ""):
+            return
+        turn_row = conn.execute(
+            """
+            SELECT id, assistant_message_id FROM chat_turns
+            WHERE session_id = ? AND status = 'completed'
+            ORDER BY finished_at DESC, created_at DESC LIMIT 1
+            """,
+            (int(session["id"]),),
+        ).fetchone()
+        if turn_row is None:
+            return
+        from src.memory.catalog import scope_fingerprint
+        from src.memory.jobs import enqueue_project_reflection_in_connection
+
+        debounce = max(0, int(getattr(src.settings, "MEMORY_DEBOUNCE_SECONDS", 300)))
+        available_at = (
+            datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=debounce)
+        ).isoformat()
+        enqueue_project_reflection_in_connection(
+            conn,
+            session_id=int(session["id"]),
+            scope_fingerprint=scope_fingerprint(scope="project", department_id=department_id, kb_id=kb_id),
+            target_turn_id=str(turn_row["id"]),
+            target_message_id=int(turn_row["assistant_message_id"]),
+            available_at=available_at,
+            force=True,
+        )
+
+    def get_session_memory_settings(self, user_id: int, session_id: int) -> dict[str, object]:
+        if not self.get_session(user_id, session_id):
+            raise PermissionError("chat session does not belong to current user")
+        with closing(self._connect()) as conn:
+            extracted = conn.execute(
+                """
+                SELECT COUNT(DISTINCT ms.memory_id) AS count
+                FROM memory_sources ms
+                JOIN memory_records mr ON mr.memory_id = ms.memory_id
+                WHERE ms.session_id = ? AND ms.source_valid = 1
+                  AND mr.status IN ('candidate', 'verified')
+                """,
+                (session_id,),
+            ).fetchone()["count"]
+            auto = conn.execute(
+                "SELECT auto_memory FROM chat_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()["auto_memory"]
+        return {"auto_extract_enabled": bool(auto), "extracted_memories": int(extracted)}
+
+    def set_session_auto_extract(self, user_id: int, session_id: int, enabled: bool) -> dict[str, object]:
+        """Toggle per-session automatic Project Memory extraction.
+
+        Disabling cancels pending reflection work in the same transaction so
+        no Job created under auto-memory survives an explicit opt-out.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                session = conn.execute(
+                    "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?",
+                    (session_id, user_id),
+                ).fetchone()
+                if session is None:
+                    raise PermissionError("chat session does not belong to current user")
+                conn.execute(
+                    "UPDATE chat_sessions SET auto_memory = ?, updated_at = ? WHERE id = ?",
+                    (1 if enabled else 0, utc_now(), int(session["id"])),
+                )
+                if not enabled:
+                    conn.execute(
+                        """UPDATE memory_jobs SET status = 'cancelled', generation = generation + 1,
+                            last_error = 'session_auto_extract_disabled',
+                            lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+                        WHERE session_id = ? AND job_kind = 'project_reflection'
+                          AND status IN ('pending', 'retrying', 'running')""",
+                        (int(session["id"]),),
+                    )
+                    audit_now = utc_now()
+                    conn.execute(
+                        "INSERT INTO memory_audit_events (audit_event_id, event_type, metadata_json, created_at)"
+                        " VALUES (?, ?, ?, ?)",
+                        (
+                            str(uuid.uuid4()),
+                            "session_auto_extract_disabled",
+                            json.dumps({"session_id": int(session["id"])}),
+                            audit_now,
+                        ),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return self.get_session_memory_settings(user_id, session_id)
 
     def create_turn(
         self,
@@ -683,7 +931,8 @@ class ConversationService:
             try:
                 row = conn.execute(
                     """
-                    SELECT t.* FROM chat_turns t JOIN chat_sessions s ON s.id = t.session_id
+                    SELECT t.*, s.auto_memory AS session_auto_memory
+                    FROM chat_turns t JOIN chat_sessions s ON s.id = t.session_id
                     WHERE t.id = ? AND s.user_id = ?
                     """,
                     (turn_id, user_id),
@@ -704,6 +953,40 @@ class ConversationService:
                      json.dumps(metrics or {}, ensure_ascii=False, default=str), now, turn_id),
                 )
                 conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (now, row["session_id"]))
+                # Project Reflection is deliberately outside the realtime
+                # query path, but its durable outbox entry is part of the
+                # same transaction as the completed turn.  Generic chats and
+                # incomplete scopes never map to a shared namespace.
+                session_auto_memory = (
+                    int(row["session_auto_memory"] or 0) if "session_auto_memory" in row.keys() else 1
+                )
+                if (
+                    getattr(src.settings, "MEMORY_ENABLED", True)
+                    and getattr(src.settings, "MEMORY_EXTRACTION_ENABLED", True)
+                    and session_auto_memory == 1
+                    and row["department_id"] not in (None, "")
+                    and row["kb_id"] not in (None, "")
+                ):
+                    from src.memory.catalog import scope_fingerprint
+                    from src.memory.jobs import enqueue_project_reflection_in_connection
+
+                    debounce = max(0, int(getattr(src.settings, "MEMORY_DEBOUNCE_SECONDS", 300)))
+                    available_at = (
+                        datetime.now(timezone.utc).replace(microsecond=0)
+                        + timedelta(seconds=debounce)
+                    ).isoformat()
+                    enqueue_project_reflection_in_connection(
+                        conn,
+                        session_id=int(row["session_id"]),
+                        scope_fingerprint=scope_fingerprint(
+                            scope="project",
+                            department_id=row["department_id"],
+                            kb_id=row["kb_id"],
+                        ),
+                        target_turn_id=turn_id,
+                        target_message_id=int(row["assistant_message_id"]),
+                        available_at=available_at,
+                    )
                 completed = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
                 conn.execute("COMMIT")
                 return row_to_turn(completed)
@@ -879,6 +1162,15 @@ def row_to_session(row) -> ChatSession:
 def row_to_message(row) -> ChatMessage:
     content = row["content"]
     footer = row["footer"] if "footer" in row.keys() else ""
+    memory_context: list[dict] = []
+    if "turn_summary" in row.keys():
+        try:
+            summary = json.loads(row["turn_summary"] or "{}")
+        except (TypeError, ValueError):
+            summary = {}
+        candidate = summary.get("memory_context") if isinstance(summary, dict) else None
+        if isinstance(candidate, list):
+            memory_context = [item for item in candidate if isinstance(item, dict)]
     legacy_suffix = f"\n\n---\n{footer}" if footer else ""
     if legacy_suffix and content.endswith(legacy_suffix):
         content = content[:-len(legacy_suffix)]
@@ -889,6 +1181,9 @@ def row_to_message(row) -> ChatMessage:
         content=content,
         footer=footer,
         created_at=row["created_at"],
+        edited_at=row["edited_at"] if "edited_at" in row.keys() else None,
+        redacted=bool(row["redacted"]) if "redacted" in row.keys() else False,
+        memory_context=memory_context,
     )
 
 

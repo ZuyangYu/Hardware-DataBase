@@ -527,4 +527,3 @@ class SpreadsheetCellTool:
             )
             for row in rows[:requested_top_k]
         ]
-

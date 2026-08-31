@@ -124,13 +124,34 @@ export interface SessionView {
   updated_at: string;
 }
 
+export interface MemoryContextItem {
+  id?: string;
+  scope?: string;
+  status?: string;
+  type?: string;
+  title?: string;
+  content?: string;
+  source_count?: number;
+  has_provenance?: boolean;
+  score?: number | null;
+  [key: string]: unknown;
+}
+
 export interface MessageView {
   id: number;
   session_id: number;
   role: 'user' | 'assistant' | 'system';
   content: string;
   footer?: string;
+  redacted?: boolean;
+  edited_at?: string | null;
   created_at: string;
+  memory_context?: MemoryContextItem[];
+}
+
+export interface SessionMemorySummary {
+  auto_extract_enabled: boolean;
+  extracted_memories: number;
 }
 
 export interface TurnView {
@@ -157,6 +178,79 @@ export interface TurnView {
 export interface TurnStartResponse {
   turn: TurnView;
   user_message: MessageView;
+}
+
+export type MemoryStatus =
+  | 'candidate'
+  | 'verification_pending'
+  | 'supersede_pending'
+  | 'needs_rebuild'
+  | 'verified'
+  | 'superseded'
+  | 'rejected'
+  | 'deleted'
+  | 'provenance_missing';
+
+export interface MemorySourceView {
+  source_id: string;
+  source_kind: string;
+  session_id: number | null;
+  turn_id: string | null;
+  message_id: number | null;
+  content_hash: string;
+  valid: boolean;
+}
+
+export interface MemoryView {
+  memory_id: string;
+  revision: number;
+  status: MemoryStatus;
+  scope: 'project' | 'user';
+  kind: string;
+  content: Record<string, unknown>;
+  source_count: number;
+  sources: MemorySourceView[];
+  audit: Record<string, unknown>;
+  projection_status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryListResponse {
+  items: MemoryView[];
+  next_cursor: string | null;
+  total: number | null;
+}
+
+export interface MemoryConsentView {
+  consent_event_id: string;
+  session_id: number;
+  source_count: number;
+  manifest_hash: string;
+  policy_version: string;
+  revoke_generation: number;
+  status: 'active' | 'revoked';
+  granted_at: string;
+  revoked_at: string | null;
+}
+
+export interface MemoryConsentListResponse {
+  items: MemoryConsentView[];
+}
+
+export interface MemoryOperationResponse {
+  operation_id: string;
+  memory_id: string;
+  status: string;
+  revision: number | null;
+  message: string;
+}
+
+export interface UserMemorySettingsView {
+  opt_in: boolean;
+  policy_version: string;
+  revoke_generation: number;
+  updated_at: string;
 }
 
 export interface ChunkView {
@@ -345,6 +439,7 @@ export interface QueryDonePayload {
     retriever_type?: string;
     final_top_k?: number;
     evidence?: EvidenceItem[];
+    memory_context?: MemoryContextItem[];
     [key: string]: unknown;
   } | null;
   footer?: string;

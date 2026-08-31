@@ -164,6 +164,14 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 tooltip="对话"
               />
               <PrimaryNavButton
+                label="长期记忆"
+                iconName="history"
+                active={location.pathname === '/memory'}
+                collapsed={collapsed}
+                onClick={() => navigate('/memory')}
+                tooltip="长期记忆"
+              />
+              <PrimaryNavButton
                 label="文档生成"
                 iconName="file"
                 active={location.pathname === '/document-generation'}

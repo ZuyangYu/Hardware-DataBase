@@ -163,6 +163,16 @@ SYSTEM_PROMPT=
 NO_CONTEXT_PROMPT=
 ```
 
+### LangMem 长期记忆
+
+长期记忆由 `hardware-database-memory-worker` 独立低优先级消费。Conversation 的原始消息仍保留在会话库；记忆 Catalog、来源、consent、revision 和 Outbox 位于 `AUTH_DB_PATH`，LangGraph `SqliteStore` 只保存可重建的 Candidate/Verified 投影。
+
+```bash
+uv run hardware-database-memory-worker
+```
+
+默认 User Memory 为 opt-out，只有用户在 API/前端明确开启并针对具体消息创建 consent event 后才会提炼。选定知识库的 Agent 查询会在模型创建前自动预取当前用户可见的 User/Project Memory，并以有界的 `<untrusted_memory>` 上下文注入；`memory_search` 仍保留为按需补查工具。若部署为单机并希望 API 自动拉起该 Worker，可设置 `HDB_API_SPAWN_MEMORY_WORKER=true`；多实例部署应只运行一个独立 Worker，Phase 1 保持 `MEMORY_SINGLE_WRITER=true`。未配置 embedding 时 Candidate 检索会安全跳过，正式知识库证据和 Datasheet 始终优先于记忆线索。完整配置见 `.env.example`，治理接口见 `GET /api/v1/memories` 及其 action endpoints。
+
 ## 查询流程
 
 ```text
@@ -172,6 +182,7 @@ NO_CONTEXT_PROMPT=
   -> MultiSourceAgentRunner
   -> deepagents agent loop (create_deep_agent)
        - 动态工具调用: 文档检索 / 表格检索 / 电路检索 / 外部对话检索
+       - Catalog-first LangMem memory search（仅作为不可信历史线索）
        - 每步 tool_started / tool_result 事件驱动前端实时轨迹
   -> 统一模型封装 (src.core.model_factory)
 ```
