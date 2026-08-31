@@ -1,0 +1,159 @@
+import tempfile
+import unittest
+
+import src.settings
+import httpx
+
+from src.api.app import create_app
+from src.api.deps import get_auth_service, get_pipeline
+
+from tests._api_stub import Server, StubPipeline, make_auth
+
+
+class DocGenWorkOrderApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = create_app()
+        cls.server = Server(cls.app)
+        cls.server.start()
+        cls.url = cls.server.url
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+
+    def setUp(self):
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = __import__("os").path.join(self.tmp.name, "auth.db")
+        old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", old_db)
+        self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
+        self.stub = StubPipeline()
+        self.app.dependency_overrides[get_pipeline] = lambda: self.stub
+        self.app.dependency_overrides[get_auth_service] = lambda: self.auth
+        self.addCleanup(self.app.dependency_overrides.clear)
+        self.client = httpx.Client(base_url=self.url, timeout=30)
+        self.addCleanup(self.client.close)
+
+    def _token(self, username, password="pw123456"):
+        r = self.client.post("/api/v1/login", json={"username": username, "password": password})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["token"]
+
+    def _auth(self, token):
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_create_returns_ready_stage(self):
+        self.stub.prepare_knowledge_base_document_generation = (
+            lambda ctx, *, knowledge_base_name, **kwargs: {"stage": "ready", "work_order_id": "wo-1"}
+        )
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders?kb=shared",
+            headers=self._auth(t),
+            json={"template_version_id": "t1", "document_schema_id": "s1", "document_schema_version": "1"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["stage"], "ready")
+        self.assertEqual(r.json()["work_order_id"], "wo-1")
+
+    def test_generate_submits_background(self):
+        self.stub.submit_knowledge_base_document_generation = lambda ctx, work_order_id: "bg-7"
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders/wo-1/generate?kb=shared",
+            headers=self._auth(t),
+            json={},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["run_id"], "bg-7")
+
+    def test_resume_submits_background(self):
+        self.stub.resume_knowledge_base_document_generation = lambda ctx, work_order_id: "bg-resume"
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders/wo-1/resume?kb=shared",
+            headers=self._auth(t),
+            json={},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["run_id"], "bg-resume")
+
+    def test_delete_requires_write_permission_and_forwards_reason(self):
+        self.stub.delete_knowledge_base_document_work_order = lambda ctx, work_order_id, *, reason: {
+            "work_order_id": work_order_id,
+            "reason": reason,
+        }
+        reader = self._token("user1")
+        denied = self.client.request(
+            "DELETE",
+            "/api/v1/document-generation/work-orders/wo-1?kb=shared",
+            headers=self._auth(reader),
+            json={"reason": "重复任务"},
+        )
+        self.assertEqual(denied.status_code, 403, denied.text)
+        writer = self._token("admin1")
+        allowed = self.client.request(
+            "DELETE",
+            "/api/v1/document-generation/work-orders/wo-1?kb=shared",
+            headers=self._auth(writer),
+            json={"reason": "重复任务"},
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.text)
+        self.assertEqual(allowed.json()["reason"], "重复任务")
+
+    def test_list_work_orders(self):
+        self.stub.list_knowledge_base_document_work_orders = lambda ctx, knowledge_base_name: [
+            type("WO", (), {"work_order_id": "wo-1", "status": "planned", "model_dump": lambda self: {"work_order_id": self.work_order_id, "status": self.status}})()
+        ]
+        t = self._token("user1")
+        r = self.client.get("/api/v1/document-generation/work-orders?kb=shared", headers=self._auth(t))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()[0]["work_order_id"], "wo-1")
+
+    def test_status_requires_permission(self):
+        t = self._token("user1")
+        r = self.client.get("/api/v1/document-generation/work-orders/wo-1/status?kb=shared", headers=self._auth(t))
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_create_work_order_permission_denied_403(self):
+        def _raise(ctx, *, knowledge_base_name, **kwargs):
+            raise PermissionError("denied")
+
+        self.stub.prepare_knowledge_base_document_generation = _raise
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders?kb=shared",
+            headers=self._auth(t),
+            json={"template_version_id": "t1", "document_schema_id": "s1", "document_schema_version": "1"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_generate_work_order_value_error_400(self):
+        def _raise(ctx, work_order_id):
+            raise ValueError("bad")
+
+        self.stub.submit_knowledge_base_document_generation = _raise
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders/wo-1/generate?kb=shared",
+            headers=self._auth(t),
+            json={},
+        )
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_status_not_found_404(self):
+        self.stub.get_document_run_status = lambda work_order_id, ctx=None: None
+        t = self._token("user1")
+        r = self.client.get("/api/v1/document-generation/work-orders/wo-missing/status?kb=shared", headers=self._auth(t))
+        self.assertEqual(r.status_code, 404, r.text)
+
+    def test_work_orders_reject_system_admin_403(self):
+        t = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.get("/api/v1/document-generation/work-orders?kb=shared", headers=self._auth(t))
+        self.assertEqual(r.status_code, 403)

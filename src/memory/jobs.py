@@ -102,7 +102,7 @@ class MemoryJobRepository:
 
     def __init__(self, db_path: str | None = None):
         if not db_path:
-            import config.settings as settings
+            import src.settings as settings
 
             db_path = settings.AUTH_DB_PATH
         self.db_path = db_path

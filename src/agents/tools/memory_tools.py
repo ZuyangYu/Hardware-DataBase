@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Callable
+from typing import Callable
 
 from src.agents.tools.runtime import memory_context_item
 from src.memory.service import MemoryAuthorizationError, MemoryService

@@ -22,6 +22,7 @@ type Props = {
   streaming: boolean;
   streamingText: string;
   traceSteps: QueryTraceStep[];
+  traceByMessageId: Record<number, QueryTraceStep[]>;
   degradedNotes: Array<{ stage: string; reason: string }>;
   onCreateMemory?: (messageId: number) => void;
   onEditMessage?: (messageId: number) => void;
@@ -38,6 +39,7 @@ export default function MessageList({
   streaming,
   streamingText,
   traceSteps,
+  traceByMessageId,
   degradedNotes,
   onCreateMemory,
   onEditMessage,
@@ -83,6 +85,7 @@ export default function MessageList({
             evidence={msg.role === 'assistant' ? evidenceByMessageId[msg.id] : undefined}
             onCreateMemory={onCreateMemory}
             onEditMessage={onEditMessage}
+            traceSteps={msg.role === 'assistant' ? (traceByMessageId[msg.id] ?? []) : []}
           />
         ))}
         {streaming && (

@@ -8,7 +8,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 
-import config.settings as settings
+import src.settings as settings
 
 
 def _now() -> str:

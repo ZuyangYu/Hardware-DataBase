@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from src.core.auth import AuthService, AuthUser
-from src.core.conversation import ConversationService
+from src.core.conversation import GENERAL_CHAT_KB_NAME, ConversationService
 
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, reject_system_admin_kb_access
@@ -19,7 +19,6 @@ from src.api.schemas import (
 )
 
 router = APIRouter(tags=["conversations"])
-GENERAL_CHAT_KB_NAME = "__general__"
 
 
 def _conv_service() -> ConversationService:

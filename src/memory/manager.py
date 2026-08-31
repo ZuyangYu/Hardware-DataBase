@@ -93,7 +93,7 @@ class LangMemAdapter:
         self.runtime = runtime
         self.catalog = catalog
         if settings is None:
-            import config.settings as settings_module
+            import src.settings as settings_module
 
             settings = settings_module
         self.settings = settings

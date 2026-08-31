@@ -4,20 +4,23 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化�
 
 ## 核心特性
 
-- **Agentic 查询流程**：问题拆解、知识库文件扫描、检索范围规划、多源检索、证据覆盖度判断、必要时自动补检索、最终 grounded answer。
-- **多源 pipeline**：普通文档进入 RAGFlow 检索链路；Excel 进入结构化表格索引；EDF 网表进入电路结构化索引；均由 agent 统一调度。
+- **Agentic 查询流程**：基于 `deepagents`（`create_deep_agent`）的自主工具调用循环，由模型按问题动态选择多源检索工具、决定检索跳数与顺序，最终给出 grounded answer；不再有写死的「拆解→规划→补检」固定流程。
+- **多源 pipeline**：普通文档进入 RAGFlow 检索链路；Excel 进入结构化表格索引；EDF 网表进入电路结构化索引；外部对话记录单独索引；均由 agent 统一调度。
 - **RAGFlow 后端固定化**：文档上传、解析任务、检索、删除和知识库治理都通过 RAGFlow 后端适配层完成。
 - **权限与治理**：支持部门、用户、知识库权限、审计日志、查询 trace 和文件处理状态。
-- **独立模型配置**：Agent 最终答案生成使用项目自有 `LLMClient`，支持 Ollama 或 OpenAI-compatible API，不再复用旧 RAG 框架模型封装。
+- **统一模型配置**：答案生成与工具决策统一走 `src.core.model_factory`（`init_chat_model`），支持 Ollama 或 OpenAI-compatible API。提示词 `SYSTEM_PROMPT` / `NO_CONTEXT_PROMPT` 可在系统配置中覆盖。
+
+## 界面示例
+
+![知识库问答](assets/chat_example.png)
+
+![知识资产治理](assets/kap_example.png)
 
 ## 项目结构
 
 ```text
 Hardware-DataBase/
 ├── assets/                     # 应用示例图片
-├── config/
-│   └── settings.py             # 全局配置与 .env 加载（单一事实来源）
-├── data/                       # (自动生成) 原始文档存储
 ├── docs/                       # 架构与设计文档
 │   ├── architecture_doc.md     # 当前整体架构
 │   ├── pipeline_contract.md    # pipeline 隔离契约
@@ -28,9 +31,10 @@ Hardware-DataBase/
 │   ├── datasets/hardware_qa_v1.jsonl
 │   └── README.md
 ├── src/
-│   ├── agents/                 # LangGraph 查询编排（graph/runner/state/prompts + tools/）
+│   ├── settings.py             # 全局配置与 .env 加载（单一事实来源）
+│   ├── agents/                 # deepagents 查询编排（runner + tools/）
 │   ├── circuit/                # 电路网表/原理图解析与结构化检索
-│   ├── core/                   # AppPipeline、鉴权、LLMClient、会话、source group 路由
+│   ├── core/                   # AppPipeline、鉴权、model_factory、会话、source group 路由
 │   ├── evaluation/             # RAGAS 评估子系统（CLI、service、metrics、gates）
 │   ├── ingestion/              # source group 分类、KB 路径、解析任务、容器检查
 │   ├── pipelines/              # 多源 pipeline（document_rag/、spreadsheet/、registry、runtime）
@@ -101,7 +105,7 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
 支持两种配置方式：**管理页面配置**（推荐）和 **`.env` 文件配置**。
 
-> 注意：仓库根目录的 `.env` 已提交且包含**真实 API Key**，并残留若干旧架构变量（`RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE` 等，`config/settings.py` 已忽略）。请以 `.env.example` 为模板，以下方变量为准。
+> 注意：仓库根目录的 `.env` 已提交且包含**真实 API Key**，并残留若干旧架构变量（`RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE` 等，`src/settings.py` 已忽略）。请以 `.env.example` 为模板，以下方变量为准。
 
 ### 方式一：管理页面配置（推荐）
 
@@ -109,7 +113,7 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
 ### 方式二：`.env` 文件配置
 
-在项目根目录创建 `.env`，按需填写（以下为 `config/settings.py` 实际读取的变量及默认值）：
+在项目根目录创建 `.env`，按需填写（以下为 `src/settings.py` 实际读取的变量及默认值）：
 
 ```env
 # ==================== RAGFlow 后端 ====================
@@ -173,16 +177,14 @@ uv run hardware-database-memory-worker
 
 ```text
 前端 (React)
-  -> FastAPI (/api/v1)
+  -> FastAPI (/api/v1)  SSE 持久化 turn 事件
   -> AppPipeline
   -> MultiSourceAgentRunner
-  -> LangGraph
-  -> Tool adapters
-     - RAGFlow document retrieval
-     - Spreadsheet semantic/cell search
-     - Circuit structured query (netlist)
-     - Catalog-first LangMem memory search (untrusted context only)
-  -> LLMClient 生成最终答案
+  -> deepagents agent loop (create_deep_agent)
+       - 动态工具调用: 文档检索 / 表格检索 / 电路检索 / 外部对话检索
+       - Catalog-first LangMem memory search（仅作为不可信历史线索）
+       - 每步 tool_started / tool_result 事件驱动前端实时轨迹
+  -> 统一模型封装 (src.core.model_factory)
 ```
 
 ## 常见问题
@@ -197,7 +199,7 @@ A: 使用 uv 时必须用 `uv run` 启动命令，或先 `source .venv/bin/activ
 A: 当前检索后端为 RAGFlow，请按顺序排查：1) RAGFlow 服务是否可达、`RAGFLOW_API_KEY` 是否正确；2) `RAGFLOW_GOVERNANCE_DATASET_NAME` / `RAGFLOW_DESIGN_DATASET_NAME` 对应的 dataset 是否存在；3) 在「日志中心」或知识库文件页确认 RAGFlow 解析任务是否完成。
 
 **Q: Agent 响应很慢或超时？**
-A: 可适当调大 `AGENT_TIMEOUT_SECONDS`；检查 `AGENT_MAX_RETRIEVAL_ROUNDS` 是否过大导致多轮补检索；确认 LLM 模型（Ollama 或 custom API）的响应速度。
+A: 可适当调大 `AGENT_TIMEOUT_SECONDS`；`AGENT_MAX_RETRIEVAL_ROUNDS` 现在直接决定 agent 循环的 `recursion_limit` 预算——调大检索会更充分但更慢，调小则更快但可能检索不足；确认 LLM 模型（Ollama 或 custom API）的响应速度。
 
 **Q: 首次启动后无法使用问答？**
 A: 请先以系统管理员进入「系统配置」检查并补全 RAGFlow 与 Agent 模型配置，保存后生效。
@@ -228,7 +230,6 @@ uv run hardware-database-eval score --dataset evaluation/datasets/hardware_qa_v1
 
 - 评估数据集格式与扩展方式：`evaluation/README.md`
 - 运行产物：`storage/evaluations/<run_id>/`
-
 - `snapshot.jsonl` 保存回答和检索上下文，可更换裁判模型重复评分。
 - `retrieved_contexts` 保存原始检索结果；`results.jsonl` 中 `metadata.ragas_scoring.scored_contexts` 保存实际送入 RAGAS 的上下文窗口。评分任务进度只表示工作项完成情况，不能替代有效评分数和评分失败数。
 - 每个运行目录都会保存 `run_state.json`。在线运行在至少持久化一条采集结果后，才会在该目录生成 `snapshot.jsonl`；离线运行则引用所提供的快照路径，该路径可能位于运行目录之外。只有完成评分的运行才会生成 `summary.json`、`results.jsonl`、`summary.csv` 和 `report.html`。

@@ -6,7 +6,7 @@ from contextlib import closing
 from typing import Any
 from dataclasses import dataclass, field
 
-import config.settings
+import src.settings
 from src.services.document_routing import PROCESSOR_KIND_SPREADSHEET, TABLE_STATUS_ARCHIVED, TABLE_STATUS_PROCESSING
 from src.pipelines.document_rag.schemas import TASK_STATUS_DEAD_LETTER, TASK_STATUS_QUEUED
 
@@ -72,13 +72,16 @@ class PipelineDocumentRecord:
 
 class PipelineDocumentStore:
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or os.path.join(config.settings.STORAGE_DIR, "pipeline_documents.db")
+        self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "pipeline_documents.db")
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_db(self):
@@ -451,6 +454,25 @@ class PipelineDocumentStore:
             ).fetchall()
         return [self._to_record(row) for row in rows]
 
+    def last_parse_worker_heartbeat_age_seconds(self) -> float | None:
+        """最近一次解析 worker 心跳距今的秒数；从未有过心跳时返回 None。
+
+        H6: 表格解析的唯一执行者是外部 worker，此处给上传路径一个
+        低成本存活性探测依据，避免 worker 缺位时任务静默滞留队列。
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(strftime('%s', worker_heartbeat_at)) AS last_seen,
+                       strftime('%s', 'now') AS now_ts
+                FROM pipeline_documents
+                WHERE worker_heartbeat_at != ''
+                """
+            ).fetchone()
+            if row is None or row["last_seen"] is None:
+                return None
+            return max(0.0, float(row["now_ts"]) - float(row["last_seen"]))
+
     def document_stats_by_kb(self, department_id: str | int | None = None) -> dict[str, dict[str, int]]:
         """按知识库聚合文档/解析状态统计，供治理视图使用。"""
         department_id = _require_department_id(department_id, "statistics")
@@ -734,6 +756,9 @@ class PipelineDocumentStore:
         assignments = [
             "parse_progress = ?",
             "parse_stage = ?",
+            # H5: 每次进度推进都滑动重置超时基准，避免按上传时刻计时的
+            # 静态窗口把仍在缓慢推进的长解析误杀。
+            "parse_started_at = CURRENT_TIMESTAMP",
             "worker_heartbeat_at = CURRENT_TIMESTAMP",
             "updated_at = CURRENT_TIMESTAMP",
         ]
@@ -829,6 +854,7 @@ class PipelineDocumentStore:
                 SET worker_id = ?,
                     worker_started_at = CURRENT_TIMESTAMP,
                     worker_heartbeat_at = CURRENT_TIMESTAMP,
+                    parse_started_at = CURRENT_TIMESTAMP,
                     retry_count = retry_count + 1,
                     status = '{TABLE_STATUS_PROCESSING}',
                     upload_status = '{TABLE_STATUS_PROCESSING}',

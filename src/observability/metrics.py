@@ -22,7 +22,7 @@ _MEMORY_GAUGES: dict[str, Any] = {}
 
 def _enabled() -> bool:
     try:
-        import config.settings as settings
+        import src.settings as settings
 
         return bool(settings.OBS_ENABLED and settings.OBS_METRICS_ENABLED)
     except Exception:
@@ -191,18 +191,7 @@ def record_agent(*, status: str, mode: str, duration_s: float, retrieval_rounds:
 
 
 def record_agent_stage(*, stage: str, duration_s: float, status: str = "success") -> None:
-    histogram("hdb.agent.stage.duration", duration_s, attributes={"stage": stage, "status": status})
-
-
-def record_retrieval(*, retriever: str, status: str, duration_s: float, hit_count: int, supplemental: bool = False) -> None:
-    attrs = {"retriever": retriever, "status": status}
-    counter("hdb.retrieval.calls", attributes=attrs, description="Retriever calls")
-    histogram("hdb.retrieval.duration", duration_s, attributes={"retriever": retriever, "status": status})
-    histogram("hdb.retrieval.hits", hit_count, attributes={"retriever": retriever}, unit="{hits}")
-    if hit_count == 0:
-        counter("hdb.retrieval.empty", attributes={"retriever": retriever}, description="Empty retrievals")
-    if supplemental:
-        counter("hdb.retrieval.supplemental", attributes={"retriever": retriever}, description="Supplemental retrievals")
+    pass
 
 
 def record_llm(*, provider: str, status: str, duration_s: float, streaming: bool, ttft_s: float | None = None) -> None:

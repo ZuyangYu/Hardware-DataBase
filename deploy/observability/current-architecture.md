@@ -15,16 +15,14 @@ flowchart LR
 
     subgraph workload[业务入口与被监测进程]
         react["React 前端<br/>HTTP / SSE"]:::workload
-        streamlit["Streamlit UI<br/>进程内调用"]:::workload
         api["FastAPI API<br/>hardware-database-api"]:::app
         worker["Durable Worker<br/>hardware-database-worker"]:::app
-        domain["Agent / LangGraph /<br/>检索工具 / 文档生成 / 评测"]:::app
+        domain["deepagents Agent loop /<br/>检索工具 / 文档生成 / 评测"]:::app
         deps["RAGFlow<br/>Ollama 或 OpenAI-compatible LLM"]:::workload
         business[("SQLite + 本地存储<br/>auth.db / pipeline / logs")]:::store
     end
 
     react -->|REST / SSE| api
-    streamlit --> domain
     api --> domain
     worker --> domain
     domain -->|HTTP| deps

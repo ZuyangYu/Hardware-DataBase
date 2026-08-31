@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import config.settings as settings
+import src.settings as settings
 from langchain.chat_models import init_chat_model
 
 
@@ -35,12 +35,14 @@ def create_chat_model(
     timeout = int(settings.AGENT_TIMEOUT_SECONDS)
 
     if provider == "ollama":
+        # ChatOllama has no max_retries/timeout fields (langchain_ollama
+        # silently drops them); reach the backend via the httpx client's
+        # request timeout instead.
         return init_chat_model(
             f"ollama:{model or settings.AGENT_OLLAMA_MODEL}",
             base_url=str(settings.AGENT_OLLAMA_BASE_URL),
             temperature=temperature,
-            max_retries=max_retries,
-            timeout=timeout,
+            client_kwargs={"timeout": timeout},
         )
 
     return init_chat_model(

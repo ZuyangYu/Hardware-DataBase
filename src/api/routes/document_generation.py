@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
-import config.settings
+import src.settings
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import (
@@ -132,7 +132,7 @@ def analyze_template(
         auto_activated = False
         decision = getattr(analysis, "activation_decision", None)
         if (
-            config.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES
+            src.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES
             and analysis.status == "ready_for_confirmation"
             and decision is not None
             and decision.status == "auto_accepted"

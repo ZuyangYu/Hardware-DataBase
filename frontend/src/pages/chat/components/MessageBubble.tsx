@@ -3,7 +3,7 @@
  * 保留:用户气泡(plain text)、助手气泡(MarkdownMessage)、流式无文本时流光占位、
  * 参考来源(证据)与记忆上下文面板。删掉:ExecutionRecord(trace)、ScheduledDraftCard、attachments、feedback。
  */
-import { memo, useState } from 'react';
+import { memo, useState, type ReactNode } from 'react';
 
 import type { EvidenceItem, MemoryContextItem, MessageView, QueryTraceStep } from '@/api/types';
 import { cn } from '@/lib/utils';
@@ -34,56 +34,64 @@ type Props = {
   onEditMessage?: (messageId: number) => void;
 };
 
-// Humanize the backend's stage keys into short one-line step labels.
-const STEP_SHORT: Record<string, string> = {
-  short_term_memory: '短期记忆',
-  route: '识别问题',
-  route_query: '识别问题',
-  analyze: '分析问题',
-  question_analysis_agent: '分析问题',
-  catalog: '读取目录',
-  scan_kb_catalog: '读取目录',
-  plan: '规划来源',
-  retrieval_planner_agent: '规划来源',
-  retrieve: '检索资料',
-  merge: '整理证据',
-  merge_evidence: '整理证据',
-  evaluate: '评估覆盖',
-  score_and_compare_evidence: '评估覆盖',
-  draft: '起草',
-  judge: '判断充分性',
-  judge_sufficiency: '判断充分性',
-  plan_next_retrieval: '规划补检',
-  verify: '校验来源',
-  verify_grounding: '校验来源',
-};
-const HIDDEN_STEPS = new Set(['route', 'route_query', 'generate']);
-
-function stepLabel(key: string, fallback: string): string {
-  return STEP_SHORT[key] || fallback;
+function CollapsibleSection({
+  title,
+  badge,
+  defaultOpen = false,
+  className,
+  children,
+}: {
+  title: string;
+  badge?: string;
+  defaultOpen?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className={className}>
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className="flex items-center gap-[6px] text-[11px] text-[#9aa1b1] hover:text-[#464c5e]"
+      >
+        <span className={cn('inline-block transition-transform', open && 'rotate-90')}>▸</span>
+        <span>{title}</span>
+        {badge != null && <span className="text-[#c3c8d4]">{badge}</span>}
+      </button>
+      {open && <div className="mt-[6px] space-y-[6px]">{children}</div>}
+    </div>
+  );
 }
 
-/** Agent steps shown inline, no background, always fully visible. */
-function StepGroup({ steps }: { steps: QueryTraceStep[] }) {
-  const visible = steps.filter((s) => !HIDDEN_STEPS.has(s.key));
-  if (visible.length === 0) return null;
+// Agent steps from the agent loop's tool_started / tool_result events (keyed
+// by tool name; label already humanized on the hook side). Collapsible and
+// collapsed by default on completed messages; open while streaming so live
+// progress stays visible.
+function StepGroup({ steps, defaultOpen = false }: { steps: QueryTraceStep[]; defaultOpen?: boolean }) {
+  if (steps.length === 0) return null;
+  const runningCount = steps.filter((s) => s.status === 'running').length;
   return (
-    <div className="space-y-[6px]">
-      {visible.map((s, idx) => (
+    <CollapsibleSection
+      title="执行轨迹"
+      badge={`(${steps.length}${runningCount > 0 ? ` · ${runningCount} running` : ''})`}
+      defaultOpen={defaultOpen}
+    >
+      {steps.map((s, idx) => (
         <div key={`${s.key}-${idx}`} className="flex items-start gap-[6px] text-[12px]">
           <span
             className={cn(
               'mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full',
-              s.status === 'running' ? 'animate-pulse bg-[#1d4ed8]' : s.status === 'done' ? 'bg-[#16a34a]' : 'bg-[#d1d5db]',
+              s.status === 'running' ? 'animate-pulse bg-[#1d4ed8]' : s.status === 'done' ? 'bg-[#16a34a]' : s.status === 'error' ? 'bg-[#d20b0b]' : 'bg-[#d1d5db]',
             )}
           />
           <div className="min-w-0 flex-1 whitespace-pre-wrap break-words">
-            <span className="text-[#464c5e]">{stepLabel(s.key, s.label)}</span>
+            <span className={cn(s.status === 'error' ? 'text-[#d20b0b]' : 'text-[#464c5e]')}>{s.label}</span>
             {s.detail && <span className="text-[#9aa1b1]"> · {s.detail}</span>}
           </div>
         </div>
       ))}
-    </div>
+    </CollapsibleSection>
   );
 }
 
@@ -279,7 +287,7 @@ function MessageBubble({
             <div className="grid gap-[12px]">
               {degradedNotes.length > 0 && <DegradedBanner notes={degradedNotes} />}
               {!generating && traceSteps.length === 0 && <WaitSpinner />}
-              {traceSteps.length > 0 && !generating && <StepGroup steps={traceSteps} />}
+              {traceSteps.length > 0 && <StepGroup steps={traceSteps} defaultOpen />}
               {generating && (
                 <div data-i18n-ignore>
                   <StreamingText content={streamingText} />
@@ -300,11 +308,12 @@ function MessageBubble({
         <div className={chatBubbleClass(msg.role, isError)}>
           {msg.role === 'assistant' ? (
             <div className="grid gap-[12px]" data-i18n-ignore>
+              {traceSteps.length > 0 && <StepGroup steps={traceSteps} />}
               <MarkdownMessage content={msg.content} />
               {msg.footer && (
-                <div className="border-t border-[#e3e7f1] pt-[10px] text-[13px] text-[#646b7d]">
+                <CollapsibleSection title="检索概览" className="border-t border-[#e3e7f1] pt-[10px]">
                   <MarkdownMessage content={msg.footer} />
-                </div>
+                </CollapsibleSection>
               )}
               {msg.memory_context && msg.memory_context.length > 0 && (
                 <MemoryContextBlock memories={msg.memory_context} />

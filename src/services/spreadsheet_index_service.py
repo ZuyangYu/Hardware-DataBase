@@ -2,7 +2,7 @@ import os
 import re
 from typing import Any
 
-import config.settings
+import src.settings
 from src.core.query_tokens import tokenize_hardware_query
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
 from src.pipelines.spreadsheet.pipeline import SpreadsheetIndexRequest, SpreadsheetIndexResult, SpreadsheetPipeline
@@ -47,15 +47,12 @@ class SpreadsheetIndexService:
     def delete_record(self, record: Any):
         self._pipeline(record.department_id, record.kb_name).delete(record.id)
 
-    def delete_document(self, record_id: int, department_id: str | int | None, kb_name: str):
-        self._pipeline(department_id, kb_name).delete(record_id)
-
     def db_path(self, department_id: str | int | None, kb_name: str, create: bool = True) -> str:
         return os.path.join(self.kb_index_path(department_id, kb_name, create=create), "table_indexes.db")
 
     def kb_index_path(self, department_id: str | int | None, kb_name: str, create: bool = True) -> str:
         return safe_child_path(
-            config.settings.STORAGE_DIR,
+            src.settings.STORAGE_DIR,
             "table_indexes",
             "departments",
             _safe_scope_part(department_id),

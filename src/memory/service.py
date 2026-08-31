@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-import config.settings as settings
+import src.settings as settings
 from langgraph.store.base import SearchItem
 
 from src.core.auth import ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, AuthService, AuthUser

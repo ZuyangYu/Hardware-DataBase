@@ -269,6 +269,10 @@ class DocumentWorkOrder(BaseModel):
     tenant_id: str = "default"
     scope_type: Literal["project", "knowledge_base"] = "project"
     knowledge_base_name: str | None = None
+    # KB 工单归属戳：tenant_id 历史上恒为 "default" 不可作为归属判据，
+    # 以创建者部门与具体 KB 行为准（与 TemplateVersion.resource_department_id 同口径）。
+    resource_department_id: str | None = None
+    knowledge_base_id: str | None = None
     project_id: str | None
     baseline_id: str | None
     baseline_content_hash: str

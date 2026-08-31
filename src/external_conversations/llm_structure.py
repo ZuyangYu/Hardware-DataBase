@@ -13,7 +13,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 
-import config.settings
+import src.settings
 from src.external_conversations.models import ConversationTurn
 
 # Single-worker pool: LLM sockets cannot be force-killed on timeout, but the
@@ -39,18 +39,18 @@ _MAX_TURNS = 200
 
 
 def llm_structure_enabled() -> bool:
-    return bool(getattr(config.settings, "EXTERNAL_CONVERSATION_LLM_STRUCTURE", False))
+    return bool(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_STRUCTURE", False))
 
 
 def llm_summary_enabled() -> bool:
-    return bool(getattr(config.settings, "EXTERNAL_CONVERSATION_LLM_SUMMARY", False))
+    return bool(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_SUMMARY", False))
 
 
 def _chat_with_timeout(llm_client, prompt: str) -> str | None:
     """One LLM round-trip bounded by EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS.
 
     Returns raw text or None on timeout/error."""
-    timeout = float(getattr(config.settings, "EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS", 60))
+    timeout = float(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS", 60))
     try:
         future = _EXECUTOR.submit(
             llm_client.chat,
@@ -96,7 +96,7 @@ def infer_structure(text: str, llm_client=None) -> dict | None:
     body = str(text or "").strip()
     if len(body) < 80:
         return None  # too short to be worth a model call; blocks fallback is fine
-    body = body[: int(getattr(config.settings, "EXTERNAL_CONVERSATION_LLM_MAX_CHARS", 12000))]
+    body = body[: int(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_MAX_CHARS", 12000))]
 
     if llm_client is None:
         try:
@@ -150,7 +150,7 @@ def summarize_content(text: str, llm_client=None, min_chars: int = 10) -> dict |
     body = str(text or "").strip()
     if len(body) < min_chars:
         return None
-    body = body[: int(getattr(config.settings, "EXTERNAL_CONVERSATION_LLM_MAX_CHARS", 12000))]
+    body = body[: int(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_MAX_CHARS", 12000))]
 
     if llm_client is None:
         try:

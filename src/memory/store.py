@@ -189,7 +189,7 @@ class MemoryStoreRuntime:
 def _resolve_settings(settings=None):
     if settings is not None:
         return settings
-    import config.settings as settings_module
+    import src.settings as settings_module
 
     return settings_module
 

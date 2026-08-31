@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import closing
 from typing import Any, Iterable
 
-import config.settings as settings
+import src.settings as settings
 
 from src.memory.catalog import (
     MemoryCatalogRepository,

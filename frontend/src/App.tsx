@@ -9,7 +9,7 @@ import {
   useSearchParams,
 } from 'react-router-dom';
 
-import { api, isAuthError } from './api/client';
+import { api, isAuthError, onUnauthorized } from './api/client';
 import type { KbView, OkResponse, UserInfo } from './api/types';
 import {
   clearAuthSession,
@@ -17,6 +17,7 @@ import {
   isAnyAdmin,
   isSystemAdmin,
   setAuthSession,
+  subscribeAuthCrossTab,
   type AuthSession,
 } from './auth';
 import AppSidebar from './components/AppSidebar';
@@ -341,6 +342,24 @@ export default function App() {
     clearAuthSession();
     setAuth(null);
     setAuthChecked(true);
+  }, []);
+
+  // 全局 401(token 失效/被撤销)与其他 tab 登出:清本地会话并回到登录页。
+  // auth 置 null 后由 catch-all 路由直接渲染 LoginPage(与登出一致的渲染路径,无需命令式 navigate)。
+  useEffect(() => {
+    const forceRelogin = () => {
+      // 有意不复用 handleLogout:这里不能再调 /api/v1/logout,
+      // 否则该请求自身的 401 会再次触发处理器造成死循环
+      clearAuthSession();
+      setAuth(null);
+      setAuthChecked(true);
+    };
+    onUnauthorized(forceRelogin);
+    const unsubscribeCrossTab = subscribeAuthCrossTab(forceRelogin);
+    return () => {
+      onUnauthorized(null);
+      unsubscribeCrossTab();
+    };
   }, []);
 
   return (

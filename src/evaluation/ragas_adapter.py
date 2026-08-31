@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import random
 import re
+import time
 from collections import defaultdict
 from typing import Any, Callable, Protocol
 
@@ -50,6 +52,26 @@ def _scoring_context_relevance(question: str, content: str) -> tuple[int, bool]:
     return overlap, boilerplate
 
 
+_MARKUP_TAG_RE = re.compile(r"<[^>]+>")
+_MARKUP_SPACE_RE = re.compile(r"[ \t\u3000]{2,}")
+_MARKUP_HINT_RE = re.compile(r"<(table|tr|td|th|br|p|div|span|ul|ol|li)[\s>/]", re.IGNORECASE)
+
+
+def strip_markup(text: str) -> str:
+    """Convert HTML-ish chunks (spreadsheet tables) into plain text for scoring.
+
+    Tag characters would otherwise consume the bounded scoring-character
+    budget without contributing any judge-readable content. Only inputs that
+    actually look like HTML are rewritten; comparisons such as ``a < b > c``
+    in plain text are left untouched.
+    """
+
+    value = str(text or "")
+    if "<" not in value or not _MARKUP_HINT_RE.search(value):
+        return value
+    return _MARKUP_SPACE_RE.sub(" ", _MARKUP_TAG_RE.sub(" ", value)).strip()
+
+
 class RagasBackend(Protocol):
     def score(self, records: list[dict[str, Any]], metric_names: list[str]) -> list[dict[str, Any]]: ...
 
@@ -67,6 +89,33 @@ def _error_status_code(exc: Exception) -> int | None:
     if status_code is None:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
     return status_code if isinstance(status_code, int) else None
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    raw = headers.get("Retry-After") if headers else None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_rate_or_server_error(exc: Exception) -> bool:
+    status = _error_status_code(exc)
+    return status is not None and (status == 429 or status >= 500)
+
+
+def _backoff_sleep(attempt: int, exc: Exception | None = None) -> None:
+    """Exponential backoff before a scoring retry; honors Retry-After."""
+
+    delay = _retry_after_seconds(exc) if exc is not None else None
+    if delay is None:
+        base = min(30.0, 2.0 ** max(1, attempt))
+        delay = base * (0.5 + random.random())
+    time.sleep(min(delay, 60.0))
 
 
 def _is_retryable_context_error(exc: Exception) -> bool:
@@ -191,8 +240,9 @@ class RagasAdapter:
                         )
                     while isinstance(value, float) and math.isnan(value) and attempts <= self.config.max_retries:
                         attempts += 1
+                        _backoff_sleep(attempts)
                         try:
-                            retry_rows = backend.score([records[index]], [metric_name])  # type: ignore[union-attr]
+                            retry_rows = backend.score([records[index]], [metric_name])
                             value = retry_rows[0].get(metric_name)
                         except Exception as exc:
                             value = exc
@@ -453,6 +503,7 @@ class RagasAdapter:
             contexts, _ = self._bounded_contexts(snapshot.retrieved_contexts, max_context_chars=budget)
             attempts += 1
             context_budget_attempts += 1
+            _backoff_sleep(attempts, initial_error if isinstance(initial_error, Exception) else None)
             try:
                 rows = backend.score(
                     [self._record(sample, snapshot, metric_name, retrieved_contexts=contexts)],
@@ -501,12 +552,18 @@ class RagasAdapter:
         total_budget = max_context_chars or self.config.max_context_chars
 
         seen: set[str] = set()
+        seen_prefixes: set[str] = set()
         for context in contexts:
             if len(bounded) >= self.config.max_contexts_per_sample:
                 break
+            context = strip_markup(context)
             if not context or context in seen:
                 continue
+            prefix = re.sub(r"\s+", "", context.casefold())[:120]
+            if len(prefix) >= 24 and prefix in seen_prefixes:
+                continue
             seen.add(context)
+            seen_prefixes.add(prefix)
             remaining = total_budget - scored_characters
             if remaining <= 0:
                 break
@@ -552,17 +609,21 @@ class _NativeRagasBackend:
     def __init__(self, config: EvaluationConfig):
         self.config = config
 
-    def _build_llm(self):
+    def _build_llm(self, *, base_url: str | None = None, api_key: str | None = None,
+                   model: str | None = None):
         from openai import AsyncOpenAI
         from ragas.llms import llm_factory
 
+        use_base = base_url or self.config.llm_base_url
+        use_key = api_key or self.config.llm_api_key
+        use_model = model or self.config.llm_model
         llm_client = AsyncOpenAI(
-            api_key=self.config.llm_api_key or "not-required",
-            base_url=self.config.llm_base_url,
+            api_key=use_key or "not-required",
+            base_url=use_base,
             timeout=self.config.timeout_seconds,
         )
         return llm_factory(
-            self.config.llm_model,
+            use_model,
             client=llm_client,
             max_tokens=self.config.llm_max_tokens,
         )
@@ -638,7 +699,66 @@ class _NativeRagasBackend:
             show_progress=False,
         )
         frame = evaluated.to_pandas()
-        return [
+        rows = [
             {name: row.get(RAGAS_RESULT_KEYS[name]) for name in metric_names}
             for row in frame.to_dict(orient="records")
         ]
+        return self._fill_with_fallback(records, metric_names, rows, llm, embeddings)
+
+    def _fill_with_fallback(self, records, metric_names, rows, primary_llm, primary_embeddings):
+        """Re-run failed entries against a fallback judge when one is configured.
+
+        Primary-judge failures (quota, 5xx, timeouts) leave NaN/exception cells;
+        the fallback judge only fills those cells so healthy primary scores
+        stay untouched.
+        """
+
+        if not self.config.fallback_ready or not rows:
+            return rows
+        failed_positions = [
+            (row_idx, name)
+            for row_idx, row in enumerate(rows)
+            for name in metric_names
+            if self._is_failed_value(row.get(name))
+        ]
+        if not failed_positions:
+            return rows
+        try:
+            from ragas import EvaluationDataset, evaluate
+
+            fallback_llm = self._build_llm(
+                base_url=self.config.llm_fallback_base_url,
+                api_key=self.config.llm_fallback_api_key or None,
+                model=self.config.llm_fallback_model,
+            )
+            evaluated = evaluate(
+                dataset=EvaluationDataset.from_list(
+                    [{k: v for k, v in rec.items() if k != "sample_id"} for rec in records]
+                ),
+                metrics=self._build_metrics(metric_names),
+                llm=fallback_llm,
+                embeddings=primary_embeddings,
+                run_config=self._build_run_config(),
+                raise_exceptions=False,
+                show_progress=False,
+            )
+            frame = evaluated.to_pandas()
+            fallback_rows = [
+                {name: row.get(RAGAS_RESULT_KEYS[name]) for name in metric_names}
+                for row in frame.to_dict(orient="records")
+            ]
+        except Exception:
+            return rows
+        for row_idx, name in failed_positions:
+            if row_idx >= len(fallback_rows):
+                continue
+            value = fallback_rows[row_idx].get(name)
+            if not self._is_failed_value(value):
+                rows[row_idx][name] = value
+        return rows
+
+    @staticmethod
+    def _is_failed_value(value: Any) -> bool:
+        if value is None or isinstance(value, Exception):
+            return True
+        return isinstance(value, float) and math.isnan(value)

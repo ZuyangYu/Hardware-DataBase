@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .dataset_loader import DatasetValidationError, load_dataset, validate_dataset
 from .reporters import write_reports
+from .schemas import MetricResult
 from .service import EvaluationService, new_run_id
 from .snapshot_store import SnapshotStore
+
+
+CHECKPOINT_FILE = ".score_checkpoint.json"
 
 
 def parse_thresholds(values: list[str] | None) -> dict[str, float] | None:
@@ -86,6 +91,125 @@ def _filtered_samples(args) -> list:
     return samples
 
 
+def _load_checkpoint(path: Path) -> dict:
+    if not path.is_file():
+        return {"done_groups": [], "metrics": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"done_groups": [], "metrics": {}}
+    data.setdefault("done_groups", [])
+    data.setdefault("metrics", {})
+    return data
+
+
+def _write_checkpoint(path: Path, done_groups: list[str], ordered_results) -> None:
+    payload = {
+        "done_groups": done_groups,
+        "metrics": {
+            result.sample_id: [metric.model_dump(mode="json") for metric in result.metrics]
+            for result in ordered_results
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _run_score(args, service: EvaluationService) -> int:
+    samples = _filtered_samples(args)
+    snapshots = SnapshotStore(args.snapshot).load_all()
+    run_dir = args.output / new_run_id()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = run_dir / CHECKPOINT_FILE
+    checkpoint = _load_checkpoint(checkpoint_path)
+    done_groups = list(checkpoint.get("done_groups") or [])
+    seeded_metrics = {
+        sample_id: [MetricResult.model_validate(item) for item in items]
+        for sample_id, items in (checkpoint.get("metrics") or {}).items()
+    }
+
+    def on_group_done(summary, ordered_results, completed, total) -> bool:
+        done = sorted(
+            {
+                *done_groups,
+                *{
+                    metric.metric_name
+                    for result in ordered_results
+                    for metric in result.metrics
+                },
+            }
+        )
+        _write_checkpoint(checkpoint_path, done, ordered_results)
+        return True
+
+    thresholds = parse_thresholds(args.threshold)
+    summary, results = service.score(
+        samples,
+        snapshots,
+        metric_names=args.metric,
+        thresholds=thresholds,
+        fail_on_threshold=args.fail_on_threshold,
+        completed_groups=set(done_groups),
+        seeded_metrics=seeded_metrics,
+        progress_callback=on_group_done,
+    )
+    paths = write_reports(run_dir, summary, results)
+    checkpoint_path.unlink(missing_ok=True)
+    _write_run_state(
+        run_dir,
+        run_id=summary.run_id,
+        dataset_path=str(args.dataset),
+        mode="offline",
+        summary=summary,
+        total_samples=len(samples),
+        metrics=args.metric,
+        report_path=str(paths.report_html),
+    )
+    print(f"report: {paths.report_html}")
+    return summary.gate.exit_code if summary.gate else 0
+
+
+def _write_run_state(
+    run_dir: Path,
+    *,
+    run_id: str,
+    dataset_path: str,
+    mode: str,
+    summary,
+    total_samples: int,
+    metrics: list[str] | None,
+    report_path: str,
+) -> None:
+    from .schemas import EvaluationRunState
+
+    state = EvaluationRunState(
+        run_id=run_id,
+        dataset_path=dataset_path,
+        snapshot_path="",
+        mode=mode,
+        score_enabled=bool(metrics),
+        status="completed",
+        total_samples=total_samples,
+        completed_samples=total_samples,
+        successful_samples=summary.successful_samples,
+        failed_samples=summary.failed_samples,
+        scoring_completed_groups=summary.metadata.get("run_outcome", {}).get(
+            "completed_groups", len(metrics or [])
+        ),
+        scoring_total_groups=summary.metadata.get("run_outcome", {}).get(
+            "total_groups", len(metrics or [])
+        ),
+        scoring_completed_items=summary.scoring_completed_items,
+        scoring_total_items=summary.scoring_total_items,
+        finished_at=summary.created_at,
+        updated_at=summary.created_at,
+        report_path=report_path,
+    )
+    (run_dir / "run_state.json").write_text(
+        state.model_dump_json(indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -113,19 +237,7 @@ def main(
 
         thresholds = parse_thresholds(args.threshold)
         if args.command == "score":
-            samples = _filtered_samples(args)
-            snapshots = SnapshotStore(args.snapshot).load_all()
-            run_dir = args.output / new_run_id()
-            summary, results = service.score(
-                samples,
-                snapshots,
-                metric_names=args.metric,
-                thresholds=thresholds,
-                fail_on_threshold=args.fail_on_threshold,
-            )
-            paths = write_reports(run_dir, summary, results)
-            print(f"report: {paths.report_html}")
-            return summary.gate.exit_code if summary.gate else 0
+            return _run_score(args, service)
 
         summary, _, paths = service.run(
             args.dataset,
@@ -135,6 +247,16 @@ def main(
             fail_on_threshold=args.fail_on_threshold,
             sample_ids=set(args.sample_id),
             tags=set(args.tag),
+        )
+        _write_run_state(
+            paths.report_html.parent,
+            run_id=summary.run_id,
+            dataset_path=str(args.dataset),
+            mode="online",
+            summary=summary,
+            total_samples=summary.sample_count,
+            metrics=args.metric,
+            report_path=str(paths.report_html),
         )
         print(f"report: {paths.report_html}")
         return summary.gate.exit_code if summary.gate else 0

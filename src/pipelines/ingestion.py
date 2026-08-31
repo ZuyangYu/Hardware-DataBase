@@ -221,6 +221,7 @@ class IngestionOrchestrator:
         success_count = 0
         failed_count = 0
         skipped_count = 0
+        table_task_touched = False
 
         for file_path in files:
             filename = os.path.basename(file_path)
@@ -267,9 +268,19 @@ class IngestionOrchestrator:
                         scope.department_id,
                     )
                     if existing and existing.status not in {RAGFLOW_STATUS_FAILED, RAGFLOW_STATUS_DELETED}:
-                        if self._existing_record_is_reusable(existing, handler):
+                        reusable = self._existing_record_is_reusable(existing, handler)
+                        if reusable is None:
+                            # Remote status could not be verified; keep the old
+                            # record and remote document untouched rather than
+                            # risk destroying them on inconclusive evidence.
+                            raise RuntimeError(
+                                f"Cannot verify existing document {existing.document_name}; "
+                                "keeping the current mapping. Please retry later."
+                            )
+                        if reusable:
                             messages.append(handler.reuse_message(existing))
                             success_count += 1
+                            table_task_touched = True
                             continue
                         log(f"Mapping for {existing.document_name} is stale; re-processing.")
                         handler.on_stale_existing(existing)
@@ -284,6 +295,8 @@ class IngestionOrchestrator:
                         default_dataset_id,
                         progress_callback=progress_callback,
                     )
+                    if route.spec and route.spec.processor_kind == PROCESSOR_KIND_SPREADSHEET:
+                        table_task_touched = True
                 if handler_result.audit_action:
                     self.audit(
                         handler_result.audit_action,
@@ -333,6 +346,11 @@ class IngestionOrchestrator:
                 )
                 messages.append(f"[failed] {filename}: {exc}")
 
+        if table_task_touched:
+            worker_warning = self._worker_liveness_warning()
+            if worker_warning:
+                messages.append(worker_warning)
+
         return IngestResult(
             success_count=success_count,
             total_count=len(files),
@@ -340,6 +358,23 @@ class IngestionOrchestrator:
             backend=self.backend_name,
             failed_count=failed_count,
             skipped_count=skipped_count,
+        )
+
+    def _worker_liveness_warning(self) -> str | None:
+        """H6: 表格任务提交后探测 worker 进程注册表；缺位时给用户可见告警。"""
+        from src.settings import OBS_WORKER_STALE_SECONDS
+
+        try:
+            from src.observability.worker_registry import list_workers
+
+            alive = list_workers(stale_after_seconds=int(OBS_WORKER_STALE_SECONDS) * 3)
+        except Exception:
+            return None
+        if alive:
+            return None
+        return (
+            "[warning] 未检测到活跃的解析 worker（注册表心跳已过期）。"
+            "表格任务会停留在队列，请确认已启动 hardware-database-worker。"
         )
 
     def _cleanup_failed_submission(
@@ -389,11 +424,16 @@ class IngestionOrchestrator:
             inspection=inspection,
         )
 
-    def _existing_record_is_reusable(self, record: PipelineDocumentRecord, handler: PipelineHandler) -> bool:
+    def _existing_record_is_reusable(self, record: PipelineDocumentRecord, handler: PipelineHandler) -> bool | None:
+        """Tri-state reuse decision: True (reuse), False (stale, safe to rebuild), None (undetermined)."""
         if not self.archive.record_archive_exists(record):
             return False
-        if record.processor_kind == PROCESSOR_KIND_RAGFLOW and not self.remote_document_exists(record):
-            return False
+        if record.processor_kind == PROCESSOR_KIND_RAGFLOW:
+            remote_exists = self.remote_document_exists(record)
+            if remote_exists is None:
+                return None
+            if not remote_exists:
+                return False
         return handler.can_reuse_existing(record)
 
     def _handler_for_route(self, route: PipelineRoute) -> PipelineHandler | None:

@@ -10,6 +10,7 @@ footer after the stream finishes.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -182,6 +183,8 @@ def timed_tool_call(
     except QueryCancelled:
         raise
     except Exception as exc:
+        from src.core.error_friendly import friendly_error_message
+
         rt.record_diagnostic(
             ToolDiagnostics(
                 tool_name=tool_name,
@@ -191,8 +194,22 @@ def timed_tool_call(
                 filters=dict(filters or {}),
             )
         )
-        rt.emit("stage", {"key": "retrieve", "label": "多源硬件数据召回", "status": "error", "detail": f"{tool_label(tool_name)} 检索失败"})
-        rt.emit("tool_result", {"tool_name": tool_name, "hit_count": 0, "status": "failed"})
+        rt.emit(
+            "tool_result",
+            {
+                "tool_name": tool_name,
+                "hit_count": 0,
+                "status": "failed",
+                "latency_ms": int((time.monotonic() - started) * 1000),
+            },
+        )
+        rt.emit(
+            "degraded",
+            {
+                "stage": f"tool_{tool_name}",
+                "reason": friendly_error_message(exc),
+            },
+        )
         return []
     latency_ms = int((time.monotonic() - started) * 1000)
     rt.log_query(tool_name, query)
@@ -206,17 +223,13 @@ def timed_tool_call(
     )
     numbers = rt.add_evidence(items)
     rt.emit(
-        "stage",
-        {
-            "key": "retrieve",
-            "label": "多源硬件数据召回",
-            "status": "running",
-            "detail": f"{tool_label(tool_name)} 返回 {len(items)} 条候选证据",
-        },
-    )
-    rt.emit(
         "tool_result",
-        {"tool_name": tool_name, "hit_count": len(items), "status": "running"},
+        {
+            "tool_name": tool_name,
+            "hit_count": len(items),
+            "status": "done",
+            "latency_ms": latency_ms,
+        },
     )
     # Citation numbers follow registration order so the LLM can cite [n].
     for item, number in zip(items, numbers):
@@ -224,17 +237,33 @@ def timed_tool_call(
     return items
 
 
+_LEADING_CITATION_RE = re.compile(r"(?m)^(\[\d+\])")
+
+
 def format_evidence_for_llm(items: list[Evidence]) -> str:
+    """Render evidence as explicitly delimited blocks for the model.
+
+    Each block is wrapped in ``<evidence id=... source=...>`` tags so chunk
+    text can't be mistaken for scaffolding, and content-internal line-leading
+    ``[n] 来源`` patterns are neutralised with backticks so forged citation
+    numbers can't be confused with our own ``[n]`` numbering.
+    """
     if not items:
         return "（未找到相关内容）"
     blocks = []
     for item in items:
         number = int(item.metadata.get("citation_number") or 0)
         content = str(item.content or "")[:MAX_EVIDENCE_CONTENT_CHARS]
+        content = _LEADING_CITATION_RE.sub(r"`\1`", content)
         locator = item.locator or {}
         locator_text = ", ".join(f"{k}={v}" for k, v in locator.items() if v not in (None, ""))
         header = f"[{number}] 来源：{item.source_name} | 类型：{item.content_kind}"
         if locator_text:
             header += f" | 位置：{locator_text}"
-        blocks.append(f"{header}\n{content}")
+        blocks.append(
+            f'<evidence id="{number}" source="{item.source_name}">\n'
+            f"{header}\n"
+            f"{content}\n"
+            f"</evidence>"
+        )
     return "\n\n".join(blocks)

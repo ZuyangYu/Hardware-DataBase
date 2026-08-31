@@ -30,6 +30,15 @@ export function isForbiddenError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 403;
 }
 
+type UnauthorizedHandler = () => void;
+
+let unauthorizedHandler: UnauthorizedHandler | null = null;
+
+/** 注册全局 401 处理器(token 失效时统一回登录页);传 null 取消注册。 */
+export function onUnauthorized(handler: UnauthorizedHandler | null): void {
+  unauthorizedHandler = handler;
+}
+
 function parseErrorMessage(body: string): string {
   if (!body) return '';
   try {
@@ -49,6 +58,8 @@ function parseErrorMessage(body: string): string {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  // 记录本次请求是否携带了本地 token:登录等无凭据请求的 401(如密码错误)不应触发全局登出
+  const hasCredentials = Boolean(getAuthSession()?.token);
   const response = await fetch(`${API_BASE}${path}`, {
     headers: {
       'Content-Type': 'application/json',
@@ -59,6 +70,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   });
   if (!response.ok) {
     const text = await response.text();
+    if (response.status === 401 && hasCredentials) unauthorizedHandler?.();
     throw new ApiError(response.status, text, response.statusText);
   }
   return response.json() as Promise<T>;
@@ -115,6 +127,43 @@ export async function uploadFiles<T>(path: string, form: FormData): Promise<T> {
     throw new ApiError(response.status, text, response.statusText);
   }
   return response.json() as Promise<T>;
+}
+
+/** 带上传进度回调的 multipart 上传(XHR 才有 upload.onprogress)。 */
+export function uploadFilesWithProgress<T>(
+  path: string,
+  form: FormData,
+  onProgress?: (percent: number) => void,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE}${path}`);
+    for (const [key, value] of Object.entries(authHeader())) {
+      xhr.setRequestHeader(key, value);
+    }
+    xhr.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable && onProgress) {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    });
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as T);
+        } catch {
+          resolve(xhr.responseText as unknown as T);
+        }
+      } else {
+        let detail = xhr.responseText;
+        try {
+          detail = JSON.parse(xhr.responseText)?.detail ?? xhr.responseText;
+        } catch { /* 保持原文 */ }
+        reject(new ApiError(xhr.status, detail, xhr.statusText));
+      }
+    });
+    xhr.addEventListener('error', () => reject(new Error('网络错误，上传失败')));
+    xhr.send(form);
+  });
 }
 
 /** SSE 流式请求(POST /query):fetch + ReadableStream 自解析 event/data 帧 */

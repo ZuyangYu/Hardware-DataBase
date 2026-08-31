@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from src.core.auth import AuthService
 
@@ -11,8 +11,13 @@ router = APIRouter(tags=["auth"])
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(body: LoginRequest, auth: AuthService = Depends(get_auth_service)) -> LoginResponse:
-    session = auth.authenticate(body.username, body.password)
+def login(
+    body: LoginRequest,
+    request: Request,
+    auth: AuthService = Depends(get_auth_service),
+) -> LoginResponse:
+    client_ip = request.client.host if request.client else None
+    session = auth.authenticate(body.username, body.password, ip=client_ip)
     if session is None:
         raise HTTPException(status_code=401, detail="invalid credentials")
     u = session.user

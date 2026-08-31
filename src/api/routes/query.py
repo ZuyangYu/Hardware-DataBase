@@ -15,11 +15,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-import config.settings
+import src.settings
 from src.core.app_logs import AppLogService, query_trace_status
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
-from src.core.conversation import ChatMessage, ChatTurn, ConversationService
+from src.core.conversation import (
+    GENERAL_CHAT_KB_NAME,
+    ChatMessage,
+    ChatTurn,
+    ConversationService,
+)
 from src.core.model_factory import create_chat_model
 from src.observability import (
     current_trace_identity,
@@ -35,7 +40,6 @@ from src.api.deps import current_user, get_auth_service, get_pipeline, reject_sy
 from src.api.schemas import CreateTurnRequest, MessageView, QueryRequest, TurnStartResponse, TurnView
 
 router = APIRouter(tags=["query"])
-GENERAL_CHAT_KB_NAME = "__general__"
 _TURN_CANCEL_SIGNALS: dict[str, threading.Event] = {}
 _TURN_CANCEL_LOCK = threading.Lock()
 _TERMINAL_TURN_STATUSES = {"completed", "cancelled", "failed"}
@@ -300,7 +304,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     turn_observation.set_input(turn.query, content_kind="query")
     cancel = _turn_cancel_signal(turn_id)
     heartbeat_stop = threading.Event()
-    heartbeat_interval = max(2, min(30, config.settings.CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS))
+    heartbeat_interval = max(2, min(30, src.settings.CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS))
 
     def heartbeat_loop() -> None:
         while not heartbeat_stop.wait(heartbeat_interval):

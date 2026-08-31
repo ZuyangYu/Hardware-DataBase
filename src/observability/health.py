@@ -9,7 +9,7 @@ from typing import Any
 
 import requests
 
-import config.settings as settings
+import src.settings as settings
 
 from .worker_registry import list_workers
 
