@@ -1,32 +1,22 @@
 /**
- * 聊天会话侧栏(对齐 chat 全屏布局左侧的会话列:回链 + KB 名 + 新建 + 会话列表 + 删除)。
+ * 聊天会话侧栏(布局在聊天主区右侧:KB 名 + 新建 + 会话列表 + 删除)。
  * 会话侧栏本绑定 agent 业务;我们裁成纯会话 CRUD。
+ * 挂载知识库下拉框在输入区左下角(Composer)。
  */
-import { useNavigate } from 'react-router-dom';
-
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { cn } from '@/lib/utils';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
-import type { KbView, SessionView } from '@/api/types';
+import type { SessionView } from '@/api/types';
 import { useEffect, useRef, useState } from 'react';
 
 type Props = {
   kbName: string;
-  availableKbs: KbView[];
   sessions: SessionView[];
   sessionsLoaded: boolean;
   activeSessionId: number | null;
   streaming: boolean;
-  onKbChange: (kbName: string) => void;
   onSelect: (sessionId: number) => void;
   onNew: () => void;
   onDelete: (sessionId: number) => void;
@@ -34,17 +24,14 @@ type Props = {
 
 export default function ChatSessionSidebar({
   kbName,
-  availableKbs,
   sessions,
   sessionsLoaded,
   activeSessionId,
   streaming,
-  onKbChange,
   onSelect,
   onNew,
   onDelete,
 }: Props) {
-  const navigate = useNavigate();
   const [deleteTarget, setDeleteTarget] = useState<SessionView | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [width, setWidth] = useState(240);
@@ -54,7 +41,8 @@ export default function ChatSessionSidebar({
     function onMove(e: MouseEvent) {
       if (!dragRef.current) return;
       const { startX, startW } = dragRef.current;
-      setWidth(Math.min(420, Math.max(180, startW + e.clientX - startX)));
+      // 侧栏在右侧:向左拖动加宽。
+      setWidth(Math.min(420, Math.max(180, startW + startX - e.clientX)));
     }
     function onUp() {
       dragRef.current = null;
@@ -67,12 +55,9 @@ export default function ChatSessionSidebar({
     };
   }, []);
 
-  function kbOptionLabel(kb: KbView): string {
-    return kb.department_name ? `${kb.name} · ${kb.department_name}` : kb.name;
-  }
   if (collapsed) {
     return (
-      <aside className="flex w-[44px] shrink-0 flex-col items-center border-r border-[#f4f4f4] bg-white py-[12px]">
+      <aside className="flex w-[44px] shrink-0 flex-col items-center border-l border-[#f4f4f4] bg-white py-[12px]">
         <button
           type="button"
           onClick={() => setCollapsed(false)}
@@ -80,70 +65,46 @@ export default function ChatSessionSidebar({
           title="展开会话侧栏"
           className="inline-grid size-[28px] place-items-center rounded-[8px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
         >
-          <AppIcon name="arrow" size={16} />
+          <AppIcon name="arrow" size={16} style={{ transform: 'rotate(180deg)' }} />
         </button>
       </aside>
     );
   }
   return (
-    <aside className="group relative flex shrink-0 flex-col border-r border-[#f4f4f4] bg-white" style={{ width }}>
+    <aside className="group relative flex shrink-0 flex-col border-l border-[#f4f4f4] bg-white" style={{ width }}>
       <div
         onMouseDown={(e) => {
           dragRef.current = { startX: e.clientX, startW: width };
           e.preventDefault();
         }}
-        className="absolute right-0 top-0 z-10 h-full w-[3px] cursor-col-resize bg-transparent opacity-0 transition-opacity group-hover:bg-[#d0d5dd] group-hover:opacity-100 active:!opacity-100"
+        className="absolute left-0 top-0 z-10 h-full w-[3px] cursor-col-resize bg-transparent opacity-0 transition-opacity group-hover:bg-[#d0d5dd] group-hover:opacity-100 active:!opacity-100"
         title="拖动调整宽度"
       />
       <div className="border-b border-[#f4f4f4] p-[12px]">
         <div className="flex items-center justify-between gap-[8px]">
-          <button
-            type="button"
-            onClick={() => navigate('/kbs')}
-            className="flex items-center gap-[6px] text-[12px] text-[#858b9c] transition-colors hover:text-[#18181a]"
-          >
-            <AppIcon name="arrow" size={14} style={{ transform: 'rotate(180deg)' }} />
-            全部知识库
-          </button>
-          <button
-            type="button"
-            onClick={() => setCollapsed(true)}
-            aria-label="收起会话侧栏"
-            title="收起会话侧栏"
-            className="inline-grid size-[24px] shrink-0 place-items-center rounded-[6px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
-          >
-            <AppIcon name="arrow" size={13} style={{ transform: 'rotate(180deg)' }} />
-          </button>
-        </div>
-        <div className="mt-[10px] grid gap-[5px]">
-          <span className="text-[11px] text-[#858b9c]">挂载知识库</span>
-          <Select value={kbName || '__none__'} onValueChange={(value) => onKbChange(value === '__none__' ? '' : value)} disabled={streaming}>
-            <SelectTrigger className="h-[32px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[12px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__none__">不挂载</SelectItem>
-              {availableKbs.map((kb) => (
-                <SelectItem key={kb.kb_id ?? `${kb.department_id ?? 'none'}:${kb.name}`} value={kb.name}>
-                  {kbOptionLabel(kb)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="mt-[10px] flex items-center justify-between gap-[8px]">
           <span className="min-w-0 truncate text-[14px] font-semibold text-[#18181a]">
             {kbName || '通用对话'}
           </span>
-          <button
-            type="button"
-            onClick={onNew}
-            disabled={streaming}
-            aria-label="新对话"
-            className="inline-grid size-[28px] shrink-0 place-items-center rounded-[8px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
-          >
-            <AppIcon name="plus" size={16} />
-          </button>
+          <div className="flex shrink-0 items-center gap-[4px]">
+            <button
+              type="button"
+              onClick={() => setCollapsed(true)}
+              aria-label="收起会话侧栏"
+              title="收起会话侧栏"
+              className="inline-grid size-[24px] shrink-0 place-items-center rounded-[6px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
+            >
+              <AppIcon name="arrow" size={13} />
+            </button>
+            <button
+              type="button"
+              onClick={onNew}
+              disabled={streaming}
+              aria-label="新对话"
+              className="inline-grid size-[28px] shrink-0 place-items-center rounded-[8px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
+            >
+              <AppIcon name="plus" size={16} />
+            </button>
+          </div>
         </div>
       </div>
       <ScrollArea className="min-h-0 flex-1">

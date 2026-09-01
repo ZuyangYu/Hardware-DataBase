@@ -7,9 +7,8 @@ import inspect
 import threading
 import time
 import uuid
-from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Callable, Generator
+from typing import Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -25,7 +24,6 @@ from src.core.conversation import (
     ChatTurn,
     ConversationService,
 )
-from src.core.model_factory import create_chat_model
 from src.observability import (
     current_trace_identity,
     extract_trace_context,
@@ -149,30 +147,6 @@ def _append_short_term_memory_source(footer: str, summary: dict[str, object]) ->
     return f"{footer.rstrip()}\n\n{note}" if footer.strip() else note
 
 
-def _general_chat_stream(messages: list[dict[str, str]], usage_out: dict | None = None) -> Generator[str, None, None]:
-    """Stream a direct (no-retrieval) chat completion via the shared model factory.
-
-    ``usage_out`` optionally receives aggregated token usage after the stream.
-    """
-    model = create_chat_model()
-    for chunk in model.stream(messages):
-        content = getattr(chunk, "content", "")
-        if isinstance(content, list):
-            content = "".join(
-                str(block.get("text") or "") for block in content if isinstance(block, dict)
-            )
-        if content:
-            yield content
-        meta = getattr(chunk, "usage_metadata", None)
-        if usage_out is not None and meta:
-            usage_out["call_count"] = int(usage_out.get("call_count") or 0) + 1
-            usage_out["prompt_tokens"] = int(usage_out.get("prompt_tokens") or 0) + int(meta.get("input_tokens") or 0)
-            usage_out["completion_tokens"] = int(usage_out.get("completion_tokens") or 0) + int(
-                meta.get("output_tokens") or 0
-            )
-            usage_out["total_tokens"] = int(usage_out.get("total_tokens") or 0) + int(meta.get("total_tokens") or 0)
-
-
 def _make_event_callback(emit_stage, emit):
     """Adapt the runner's unified ``{"type","payload"}`` event stream to the
     durable turn-event path: route ``stage`` through the timing-aware emit_stage,
@@ -258,24 +232,6 @@ def _existing_turn_cancel_signal(turn_id: str) -> threading.Event | None:
 def _clear_turn_cancel_signal(turn_id: str) -> None:
     with _TURN_CANCEL_LOCK:
         _TURN_CANCEL_SIGNALS.pop(turn_id, None)
-
-
-def _general_messages(history: list[tuple[str, str]], query: str) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = [
-        {
-            "role": "system",
-            "content": (
-                "你是 Hardware DataBase 的通用对话助手。当前未挂载知识库,不要声称"
-                "读取了任何私有文档、表格或电路数据。可以回答通用问题;如果用户需要"
-                "基于知识库资料回答,请提示先挂载知识库。"
-            ),
-        }
-    ]
-    for user_text, assistant_text in history[-5:]:
-        messages.append({"role": "user", "content": str(user_text or "")})
-        messages.append({"role": "assistant", "content": str(assistant_text or "")})
-    messages.append({"role": "user", "content": query})
-    return messages
 
 
 def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None) -> None:
@@ -425,52 +381,41 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         )
         _set_short_term_memory_observation(turn_observation, short_term_memory)
         emit("short_term_memory", short_term_memory)
-        if turn.kb_name in ("", GENERAL_CHAT_KB_NAME):
-            usage_acc: dict = {}
-            for delta in _general_chat_stream(_general_messages(history, turn.query), usage_out=usage_acc):
+        # 统一执行路径：通用对话（未挂载/`__general__`）与知识库问答都走
+        # deepagents agent 循环，不存在单独的直连模型旁路。
+        if pipeline is None:
+            raise RuntimeError("query pipeline is unavailable")
+        gen = _query_generator(
+            pipeline,
+            turn.query,
+            turn.kb_name,
+            history,
+            ctx,
+            str(turn.session_id),
+            _make_event_callback(emit_stage, emit),
+            turn.query_mode,
+            cancelled,
+        )
+        try:
+            for chunk in gen:
                 if cancelled():
                     break
-                if delta:
+                if chunk:
                     if first_token_ms is None:
                         first_token_ms = int((time.monotonic() - start) * 1000)
-                    answer_parts.append(delta)
-                    emit("delta", {"text": delta})
-            summary = {"retriever_type": "direct", "final_top_k": 0, "evidence": [], "token_usage": usage_acc}
-            token_usage_summary = usage_acc
-        else:
-            if pipeline is None:
-                raise RuntimeError("query pipeline is unavailable")
-            gen = _query_generator(
-                pipeline,
-                turn.query,
-                turn.kb_name,
-                history,
-                ctx,
-                str(turn.session_id),
-                _make_event_callback(emit_stage, emit),
-                turn.query_mode,
-                cancelled,
-            )
-            try:
-                for chunk in gen:
-                    if cancelled():
-                        break
-                    if chunk:
-                        if first_token_ms is None:
-                            first_token_ms = int((time.monotonic() - start) * 1000)
-                        answer_parts.append(chunk)
-                        emit("delta", {"text": chunk})
-            finally:
-                if cancelled():
-                    close = getattr(gen, "close", None)
-                    if callable(close):
-                        close()
-            summary = {
-                **(pipeline.get_last_retrieval_summary() or {}),
-                "short_term_memory": short_term_memory,
-            }
-            footer = pipeline.get_last_agent_footer() or ""
-            token_usage_summary = pipeline.get_last_token_usage_summary()
+                    answer_parts.append(chunk)
+                    emit("delta", {"text": chunk})
+        finally:
+            if cancelled():
+                close = getattr(gen, "close", None)
+                if callable(close):
+                    close()
+        summary = {
+            **(pipeline.get_last_retrieval_summary() or {}),
+            "short_term_memory": short_term_memory,
+        }
+        footer = pipeline.get_last_agent_footer() or ""
+        token_usage_summary = pipeline.get_last_token_usage_summary()
 
         footer = _append_short_term_memory_source(footer, short_term_memory)
         _flush_deltas()
@@ -630,13 +575,12 @@ def start_turn(
     # A dependency-overridden pipeline is only used by in-process API tests;
     # production never enters this branch and always relies on the worker.
     if request.app.dependency_overrides.get(get_pipeline) is not None and turn.status in {"pending", "streaming", "cancelling"}:
-        pipeline = None if turn.kb_name == GENERAL_CHAT_KB_NAME else _resolve_pipeline(request)
         start_thread_with_current_context(
             _run_turn,
             turn_id=turn.id,
             user=user,
             ctx=ctx,
-            pipeline=pipeline,
+            pipeline=_resolve_pipeline(request),
             daemon=True,
             name=f"test-chat-turn-{turn.id[:8]}",
         )
@@ -794,17 +738,9 @@ async def query(
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ):
-    if body.kb_name in ("", GENERAL_CHAT_KB_NAME):
-        ctx = build_context_for_user(user, body.kb_name, auth=auth)
-        reject_system_admin_kb_access(ctx)
-        return StreamingResponse(
-            _direct_event_stream(user=user, body=body),
-            media_type="text/event-stream",
-        )
-
     ctx = build_context_for_user(user, body.kb_name, auth=auth)
     reject_system_admin_kb_access(ctx)
-    if not ctx.has_kb_permission(body.kb_name, "read"):
+    if body.kb_name not in ("", GENERAL_CHAT_KB_NAME) and not ctx.has_kb_permission(body.kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
 
     pipeline = _resolve_pipeline(request)
@@ -1044,143 +980,6 @@ def _parse_iso_time(value: str) -> datetime:
     except (TypeError, ValueError):
         return datetime.now(timezone.utc)
 
-
-def _direct_event_stream(*, user: AuthUser, body: QueryRequest):
-    q: queue.Queue = queue.Queue(maxsize=64)
-    sentinel = object()
-    cancel = threading.Event()
-    history = [tuple(h) for h in body.history[-_SHORT_TERM_HISTORY_LIMIT:]]
-
-    def _put(item) -> None:
-        while not cancel.is_set():
-            try:
-                q.put(item, timeout=0.5)
-                return
-            except queue.Full:
-                continue
-
-    def producer() -> None:
-        start = time.monotonic()
-        answer_parts: list[str] = []
-        usage_summary: dict = {}
-        short_term_memory = _short_term_memory_summary(
-            history,
-            source="client_history",
-        )
-        observation = observe.chain(
-            "hdb.chat.turn",
-            **{
-                "hdb.session.id": body.thread_id,
-                "session.id": body.thread_id,
-                "hdb.query.mode": "fast",
-                "hdb.query.source": "direct_api",
-                "hdb.retriever.type": "direct",
-            },
-        ).start()
-        observation.set_input(body.query, content_kind="query")
-        _set_short_term_memory_observation(observation, short_term_memory)
-        _put(("short_term_memory", short_term_memory))
-        outcome_status = "failed"
-        try:
-            for delta in _general_chat_stream(_general_messages(history, body.query), usage_out=usage_summary):
-                if cancel.is_set():
-                    break
-                if delta:
-                    answer_parts.append(delta)
-                    q.put(("delta", {"text": delta}))
-            answer = "".join(answer_parts)
-            summary = {
-                "retriever_type": "direct",
-                "final_top_k": 0,
-                "evidence": [],
-                "short_term_memory": short_term_memory,
-            }
-            observation.set_output(answer, content_kind="llm")
-            if not cancel.is_set():
-                _put(
-                    (
-                        "done",
-                        {
-                            "answer": answer,
-                            "summary": summary,
-                            "footer": _append_short_term_memory_source("", short_term_memory),
-                            "token_usage": _jsonable_usage(usage_summary),
-                        },
-                    )
-                )
-            _record_query_trace(
-                user=user,
-                kb_name="",
-                original_query=body.query,
-                thread_id=body.thread_id,
-                summary=summary,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                status="failed" if cancel.is_set() else "success",
-                error_message="client disconnected" if cancel.is_set() else "",
-            )
-            outcome_status = "cancelled" if cancel.is_set() else "completed"
-        except Exception as exc:
-            observation.error(exc)
-            if not cancel.is_set():
-                _put(_stage("generate", "生成通用回答", "error", "通用回答生成失败"))
-                q.put(("error", {"message": str(exc)}))
-            _record_query_trace(
-                user=user,
-                kb_name="",
-                original_query=body.query,
-                thread_id=body.thread_id,
-                summary={
-                    "retriever_type": "direct",
-                    "final_top_k": 0,
-                    "evidence": [],
-                    "short_term_memory": short_term_memory,
-                },
-                latency_ms=int((time.monotonic() - start) * 1000),
-                status="failed",
-                error_message=str(exc),
-            )
-        finally:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            record_chat_turn(
-                status=outcome_status,
-                mode="fast",
-                duration_s=max(0.0, duration_ms / 1000.0),
-                queue_s=0.0,
-                ttft_s=None,
-            )
-            observation.set("hdb.chat.status", outcome_status)
-            observation.set("hdb.chat.latency_ms", duration_ms)
-            observation.set("hdb.chat.queue_ms", 0)
-            _set_short_term_memory_observation(observation, short_term_memory)
-            observation.set("hdb.retrieval.rounds", 0)
-            observation.set("hdb.retrieval.calls", 0)
-            observation.set("hdb.retrieval.hits", 0)
-            observation.set("hdb.evidence.count", 0)
-            observation.set_token_usage(usage_summary)
-            observation.outcome(outcome_status)
-            observation.end()
-            q.put(sentinel)
-
-    def iterator():
-        thread = start_thread_with_current_context(producer, daemon=True, name="api-direct-query-producer")
-        try:
-            while True:
-                item = q.get()
-                if item is sentinel:
-                    break
-                event, payload = item
-                yield _sse(event, payload)
-        finally:
-            cancel.set()
-            thread.join(timeout=2.0)
-
-    return iterator()
-
-
-def _jsonable_usage(value):
-    if is_dataclass(value):
-        return asdict(value)
-    return value
 
 
 def _record_query_trace(

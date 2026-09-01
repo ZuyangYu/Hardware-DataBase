@@ -1,0 +1,992 @@
+{
+  "ingest_stats": {
+    "600606894_ADAS_产品硬件架构设计说明书ProductHardwareArchitectureDesignSpecification.xlsx": {
+      "sheet_count": 6,
+      "cell_count": 1742,
+      "semantic_row_count": 177,
+      "warnings": [
+        "Excel 已按原貌结构建立文档、工作表、行、单元格和块级记录。",
+        "检测到 17 个嵌入对象, 23 个媒体对象, 12 个绘图对象；当前记录对象数量，嵌入文档、图片和绘图内容暂未展开。"
+      ]
+    },
+    "600608964_ADAS_FPT_0506_1954_shoulin.wang.xlsx": {
+      "sheet_count": 7,
+      "cell_count": 3633,
+      "semantic_row_count": 319,
+      "warnings": [
+        "Excel 已按原貌结构建立文档、工作表、行、单元格和块级记录。",
+        "检测到 2 个媒体对象, 16 个绘图对象；当前记录对象数量，嵌入文档、图片和绘图内容暂未展开。"
+      ]
+    },
+    "600608964_ADAS_ICD_0506_1957_shoulin.wang.xlsx": {
+      "sheet_count": 8,
+      "cell_count": 340,
+      "semantic_row_count": 58,
+      "warnings": [
+        "Excel 已按原貌结构建立文档、工作表、行、单元格和块级记录。",
+        "检测到 13 个媒体对象, 17 个绘图对象；当前记录对象数量，嵌入文档、图片和绘图内容暂未展开。"
+      ]
+    },
+    "600608964_ADAS_Testcoverage_0506_1958_shoulin.wang.xlsx": {
+      "sheet_count": 6,
+      "cell_count": 25316,
+      "semantic_row_count": 813,
+      "warnings": [
+        "Excel 已按原貌结构建立文档、工作表、行、单元格和块级记录。",
+        "检测到 2 个媒体对象, 4 个绘图对象；当前记录对象数量，嵌入文档、图片和绘图内容暂未展开。"
+      ]
+    },
+    "600608964_ADAS_产品硬件需求规格说明书ProductHardwareRequirementSpecification.xlsx": {
+      "sheet_count": 11,
+      "cell_count": 5466,
+      "semantic_row_count": 460,
+      "warnings": [
+        "Excel 已按原貌结构建立文档、工作表、行、单元格和块级记录。",
+        "检测到 6 个媒体对象, 19 个绘图对象；当前记录对象数量，嵌入文档、图片和绘图内容暂未展开。"
+      ]
+    },
+    "845506811_ADAS_HWDebug.xlsx": {
+      "sheet_count": 25,
+      "cell_count": 1368,
+      "semantic_row_count": 363,
+      "warnings": [
+        "Excel 已按原貌结构建立文档、工作表、行、单元格和块级记录。",
+        "检测到 4 个媒体对象, 13 个绘图对象；当前记录对象数量，嵌入文档、图片和绘图内容暂未展开。"
+      ]
+    },
+    "845506811_ADAS_SpecificationForDefectParts_0506_1956_shoulin.wang.xlsx": {
+      "sheet_count": 7,
+      "cell_count": 315,
+      "semantic_row_count": 66,
+      "warnings": [
+        "Excel 已按原貌结构建立文档、工作表、行、单元格和块级记录。",
+        "检测到 5 个媒体对象, 14 个绘图对象；当前记录对象数量，嵌入文档、图片和绘图内容暂未展开。"
+      ]
+    }
+  },
+  "parse_layer": {
+    "PL01": {
+      "groups_total": 1,
+      "groups_hit": 0
+    },
+    "PL02": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "PL03": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "PL04": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "PL05": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "PL06": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "PL07": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "PL08": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "FL01": {
+      "groups_total": 6,
+      "groups_hit": 6
+    },
+    "FL02": {
+      "groups_total": 9,
+      "groups_hit": 9
+    },
+    "FL03": {
+      "groups_total": 10,
+      "groups_hit": 10
+    },
+    "FL04": {
+      "groups_total": 6,
+      "groups_hit": 6
+    },
+    "FL05": {
+      "groups_total": 7,
+      "groups_hit": 7
+    },
+    "FL06": {
+      "groups_total": 8,
+      "groups_hit": 8
+    },
+    "FL07": {
+      "groups_total": 6,
+      "groups_hit": 6
+    },
+    "CP01": {
+      "groups_total": 2,
+      "groups_hit": 2
+    },
+    "CP02": {
+      "groups_total": 2,
+      "groups_hit": 2
+    },
+    "CP03": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "CP04": {
+      "groups_total": 2,
+      "groups_hit": 2
+    },
+    "CP05": {
+      "groups_total": 2,
+      "groups_hit": 2
+    },
+    "AG01": {
+      "groups_total": 9,
+      "groups_hit": 9
+    },
+    "AG02": {
+      "groups_total": 8,
+      "groups_hit": 8
+    },
+    "AG03": {
+      "groups_total": 3,
+      "groups_hit": 3
+    },
+    "AG04": {
+      "groups_total": 2,
+      "groups_hit": 2
+    },
+    "AG05": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "MC01": {
+      "groups_total": 4,
+      "groups_hit": 4
+    },
+    "MC02": {
+      "groups_total": 10,
+      "groups_hit": 10
+    },
+    "MC03": {
+      "groups_total": 1,
+      "groups_hit": 1
+    },
+    "MC04": {
+      "groups_total": 6,
+      "groups_hit": 6
+    },
+    "MC05": {
+      "groups_total": 1,
+      "groups_hit": 1
+    }
+  },
+  "parse_anchor_coverage": {
+    "hit": 113,
+    "total": 114
+  },
+  "retrieval_detail": {
+    "PL01": {
+      "question": {
+        "group_ranks": {
+          "0": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      }
+    },
+    "PL02": {
+      "question": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "PL03": {
+      "question": {
+        "group_ranks": {
+          "0": 6
+        },
+        "recall@5": 0.0,
+        "recall@10": 1.0,
+        "mrr": 0.1667
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 4
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.25
+      }
+    },
+    "PL04": {
+      "question": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "PL05": {
+      "question": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "PL06": {
+      "question": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "PL07": {
+      "question": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "PL08": {
+      "question": {
+        "group_ranks": {
+          "0": 3
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.3333
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "FL01": {
+      "question": {
+        "group_ranks": {
+          "0": 2,
+          "1": 3,
+          "2": 1,
+          "3": 4,
+          "4": 6,
+          "5": 5
+        },
+        "recall@5": 0.8333,
+        "recall@10": 1.0,
+        "mrr": 0.4083
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 2,
+          "1": 3,
+          "2": 1,
+          "3": 4,
+          "4": 6,
+          "5": 5
+        },
+        "recall@5": 0.8333,
+        "recall@10": 1.0,
+        "mrr": 0.4083
+      }
+    },
+    "FL02": {
+      "question": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4,
+          "4": 5,
+          "5": 6,
+          "6": 7,
+          "7": 8,
+          "8": 9
+        },
+        "recall@5": 0.5556,
+        "recall@10": 1.0,
+        "mrr": 0.3143
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4,
+          "4": 5,
+          "5": 6,
+          "6": 7,
+          "7": 8,
+          "8": 9
+        },
+        "recall@5": 0.5556,
+        "recall@10": 1.0,
+        "mrr": 0.3143
+      }
+    },
+    "FL03": {
+      "question": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4,
+          "4": 5,
+          "5": 6,
+          "6": 7,
+          "7": 9,
+          "8": 10,
+          "9": 8
+        },
+        "recall@5": 0.5,
+        "recall@10": 1.0,
+        "mrr": 0.2929
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4,
+          "4": 5,
+          "5": 6,
+          "6": 7,
+          "7": 9,
+          "8": 10,
+          "9": 8
+        },
+        "recall@5": 0.5,
+        "recall@10": 1.0,
+        "mrr": 0.2929
+      }
+    },
+    "FL04": {
+      "question": {
+        "group_ranks": {
+          "0": null,
+          "1": null,
+          "2": null,
+          "3": null,
+          "4": null,
+          "5": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": null,
+          "1": null,
+          "2": null,
+          "3": null,
+          "4": null,
+          "5": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      }
+    },
+    "FL05": {
+      "question": {
+        "group_ranks": {
+          "0": null,
+          "1": null,
+          "2": null,
+          "3": null,
+          "4": null,
+          "5": null,
+          "6": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": null,
+          "1": null,
+          "2": null,
+          "3": null,
+          "4": null,
+          "5": null,
+          "6": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      }
+    },
+    "FL06": {
+      "question": {
+        "group_ranks": {
+          "0": 5,
+          "1": 7,
+          "2": 9,
+          "3": 10,
+          "4": null,
+          "5": null,
+          "6": null,
+          "7": null
+        },
+        "recall@5": 0.125,
+        "recall@10": 0.5,
+        "mrr": 0.0692
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 5,
+          "1": 7,
+          "2": 9,
+          "3": 10,
+          "4": null,
+          "5": null,
+          "6": null,
+          "7": null
+        },
+        "recall@5": 0.125,
+        "recall@10": 0.5,
+        "mrr": 0.0692
+      }
+    },
+    "FL07": {
+      "question": {
+        "group_ranks": {
+          "0": 2,
+          "1": 10,
+          "2": null,
+          "3": null,
+          "4": null,
+          "5": 3
+        },
+        "recall@5": 0.3333,
+        "recall@10": 0.5,
+        "mrr": 0.1556
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4,
+          "4": 5,
+          "5": 6
+        },
+        "recall@5": 0.8333,
+        "recall@10": 1.0,
+        "mrr": 0.4083
+      }
+    },
+    "CP01": {
+      "question": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.75
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.75
+      }
+    },
+    "CP02": {
+      "question": {
+        "group_ranks": {
+          "0": null,
+          "1": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": null,
+          "1": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      }
+    },
+    "CP03": {
+      "question": {
+        "group_ranks": {
+          "0": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      }
+    },
+    "CP04": {
+      "question": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.75
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.75
+      }
+    },
+    "CP05": {
+      "question": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.75
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.75
+      }
+    },
+    "AG01": {
+      "question": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4,
+          "4": 5,
+          "5": 6,
+          "6": 7,
+          "7": 8,
+          "8": 9
+        },
+        "recall@5": 0.5556,
+        "recall@10": 1.0,
+        "mrr": 0.3143
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4,
+          "4": 5,
+          "5": 6,
+          "6": 7,
+          "7": 8,
+          "8": 9
+        },
+        "recall@5": 0.5556,
+        "recall@10": 1.0,
+        "mrr": 0.3143
+      }
+    },
+    "AG02": {
+      "question": {
+        "group_ranks": {
+          "0": 3,
+          "1": 4,
+          "2": null,
+          "3": 5,
+          "4": 6,
+          "5": 7,
+          "6": 8,
+          "7": null
+        },
+        "recall@5": 0.375,
+        "recall@10": 0.75,
+        "mrr": 0.1522
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 3,
+          "1": 4,
+          "2": null,
+          "3": 5,
+          "4": 6,
+          "5": 7,
+          "6": 8,
+          "7": null
+        },
+        "recall@5": 0.375,
+        "recall@10": 0.75,
+        "mrr": 0.1522
+      }
+    },
+    "AG03": {
+      "question": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.6111
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.6111
+      }
+    },
+    "AG04": {
+      "question": {
+        "group_ranks": {
+          "0": null,
+          "1": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": null,
+          "1": null
+        },
+        "recall@5": 0.0,
+        "recall@10": 0.0,
+        "mrr": 0.0
+      }
+    },
+    "AG05": {
+      "question": {
+        "group_ranks": {
+          "0": 4
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.25
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 4
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.25
+      }
+    },
+    "MC01": {
+      "question": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.5208
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 0.5208
+      }
+    },
+    "MC02": {
+      "question": {
+        "group_ranks": {
+          "0": 6,
+          "1": 7,
+          "2": 8,
+          "3": 9,
+          "4": 10,
+          "5": null,
+          "6": null,
+          "7": 1,
+          "8": 2,
+          "9": 3
+        },
+        "recall@5": 0.3,
+        "recall@10": 0.8,
+        "mrr": 0.2479
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 6,
+          "1": 7,
+          "2": 8,
+          "3": 9,
+          "4": 10,
+          "5": null,
+          "6": null,
+          "7": 1,
+          "8": 2,
+          "9": 3
+        },
+        "recall@5": 0.3,
+        "recall@10": 0.8,
+        "mrr": 0.2479
+      }
+    },
+    "MC03": {
+      "question": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "MC04": {
+      "question": {
+        "group_ranks": {
+          "0": 4,
+          "1": 5,
+          "2": 6,
+          "3": 7,
+          "4": 8,
+          "5": 9
+        },
+        "recall@5": 0.3333,
+        "recall@10": 1.0,
+        "mrr": 0.1659
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1,
+          "1": 2,
+          "2": 3,
+          "3": 4,
+          "4": 5,
+          "5": 6
+        },
+        "recall@5": 0.8333,
+        "recall@10": 1.0,
+        "mrr": 0.4083
+      }
+    },
+    "MC05": {
+      "question": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      },
+      "keywords": {
+        "group_ranks": {
+          "0": 1
+        },
+        "recall@5": 1.0,
+        "recall@10": 1.0,
+        "mrr": 1.0
+      }
+    }
+  },
+  "retrieval_summary": {
+    "point_lookup": {
+      "question": {
+        "recall@5": 0.75,
+        "recall@10": 0.875,
+        "mrr": 0.6875
+      },
+      "keywords": {
+        "recall@5": 0.875,
+        "recall@10": 0.875,
+        "mrr": 0.7812
+      }
+    },
+    "filter": {
+      "question": {
+        "recall@5": 0.3353,
+        "recall@10": 0.5714,
+        "mrr": 0.1772
+      },
+      "keywords": {
+        "recall@5": 0.4067,
+        "recall@10": 0.6429,
+        "mrr": 0.2133
+      }
+    },
+    "comparison": {
+      "question": {
+        "recall@5": 0.6,
+        "recall@10": 0.6,
+        "mrr": 0.45
+      },
+      "keywords": {
+        "recall@5": 0.6,
+        "recall@10": 0.6,
+        "mrr": 0.45
+      }
+    },
+    "aggregation": {
+      "question": {
+        "recall@5": 0.5861,
+        "recall@10": 0.75,
+        "mrr": 0.2655
+      },
+      "keywords": {
+        "recall@5": 0.5861,
+        "recall@10": 0.75,
+        "mrr": 0.2655
+      }
+    },
+    "multi_condition": {
+      "question": {
+        "recall@5": 0.7267,
+        "recall@10": 0.96,
+        "mrr": 0.5869
+      },
+      "keywords": {
+        "recall@5": 0.8267,
+        "recall@10": 0.96,
+        "mrr": 0.6354
+      }
+    },
+    "overall": {
+      "question": {
+        "recall@5": 0.597,
+        "recall@10": 0.7517,
+        "mrr": 0.4417
+      },
+      "keywords": {
+        "recall@5": 0.6637,
+        "recall@10": 0.7683,
+        "mrr": 0.4833
+      }
+    }
+  },
+  "golden_meta": {
+    "name": "AAA_ADAS_excel_qa_baseline",
+    "version": "1.0",
+    "created": "2026-08-31",
+    "note": "ground truth 全部来自对 AAA 原始 xlsx 的逐格核对; anchors 中 regex 字段用于规避 HW-REQ-2 误匹配 HW-REQ-20 这类前缀问题",
+    "file_keys": {
+      "arch": "600606894_ADAS_产品硬件架构设计说明书",
+      "fpt": "600608964_ADAS_FPT_0506_1954",
+      "icd": "600608964_ADAS_ICD_0506_1957",
+      "testcov": "600608964_ADAS_Testcoverage_0506_1958",
+      "req": "600608964_ADAS_产品硬件需求规格说明书",
+      "debug": "845506811_ADAS_HWDebug",
+      "defect": "845506811_ADAS_SpecificationForDefectParts"
+    }
+  }
+}

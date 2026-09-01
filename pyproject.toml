@@ -34,6 +34,8 @@ dependencies = [
     "pydantic>=2.11.10,<3",
     "python-dotenv>=1.2.1,<2",
     "python-multipart>=0.0.9,<1",
+    # spreadsheet_sql_query: LLM 生成 SQL 的只读校验(单条 SELECT/表白名单)
+    "sqlglot>=27,<29",
     # kept: vendored SpyDrNet imports requests at module top level
     "requests>=2.32.3,<3",
     "uvicorn[standard]>=0.30,<1",

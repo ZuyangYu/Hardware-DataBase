@@ -1,0 +1,261 @@
+{
+  "meta": {
+    "name": "AAA_ADAS_excel_qa_baseline",
+    "version": "1.0",
+    "created": "2026-08-31",
+    "note": "ground truth 全部来自对 AAA 原始 xlsx 的逐格核对; anchors 中 regex 字段用于规避 HW-REQ-2 误匹配 HW-REQ-20 这类前缀问题",
+    "file_keys": {
+      "arch": "600606894_ADAS_产品硬件架构设计说明书",
+      "fpt": "600608964_ADAS_FPT_0506_1954",
+      "icd": "600608964_ADAS_ICD_0506_1957",
+      "testcov": "600608964_ADAS_Testcoverage_0506_1958",
+      "req": "600608964_ADAS_产品硬件需求规格说明书",
+      "debug": "845506811_ADAS_HWDebug",
+      "defect": "845506811_ADAS_SpecificationForDefectParts"
+    }
+  },
+  "questions": [
+    {
+      "id": "PL01", "category": "point_lookup",
+      "question": "ICD 文件里 X1900 连接器的板端接插件供应商/型号是什么？",
+      "query_keywords": "X1900 板端接插件供应商 型号",
+      "expected_answer": "TE/1318382-8",
+      "source": {"file": "icd", "sheet": "Pin Definition"},
+      "anchor_groups": [["1318382-8"]]
+    },
+    {
+      "id": "PL02", "category": "point_lookup",
+      "question": "X1902 连接器的板端接插件型号是什么？",
+      "query_keywords": "X1902 板端接插件 型号",
+      "expected_answer": "E6S20A-40MT5-C",
+      "source": {"file": "icd", "sheet": "Pin Definition"},
+      "anchor_groups": [["E6S20A-40MT5-C"]]
+    },
+    {
+      "id": "PL03", "category": "point_lookup",
+      "question": "X1900 连接器管脚 1 的管脚定义是什么？",
+      "query_keywords": "X1900 管脚1 管脚定义",
+      "expected_answer": "I_S_WKUP",
+      "source": {"file": "icd", "sheet": "Pin Definition"},
+      "anchor_groups": [["I_S_WKUP"]]
+    },
+    {
+      "id": "PL04", "category": "point_lookup",
+      "question": "X1900 管脚 14（UBD）的功能描述是什么？",
+      "query_keywords": "UBD 管脚 功能描述",
+      "expected_answer": "系统供电9~16V",
+      "source": {"file": "icd", "sheet": "Pin Definition"},
+      "anchor_groups": [["UBD", "系统供电9~16V"]]
+    },
+    {
+      "id": "PL05", "category": "point_lookup",
+      "question": "调试文件里 MCU 20MHz 时钟的测试点是哪个？",
+      "query_keywords": "MCU 20MHz 时钟 测试点",
+      "expected_answer": "Y900",
+      "source": {"file": "debug", "sheet": "5.晶振"},
+      "anchor_groups": [["MCU 20MHz", "Y900"]]
+    },
+    {
+      "id": "PL06", "category": "point_lookup",
+      "question": "架构说明书里 HW-SOL-004（MCU 模块）的 ASIL 等级是多少？",
+      "query_keywords": "HW-SOL-004 ASIL 等级",
+      "expected_answer": "ASIL B",
+      "source": {"file": "arch", "sheet": "硬件架构 Hardware Architecture"},
+      "anchor_groups": [["HW-SOL-004", "ASIL B"]]
+    },
+    {
+      "id": "PL07", "category": "point_lookup",
+      "question": "缺陷件制作说明里拆除 L1200 是为了验证什么？",
+      "query_keywords": "L1200 拆除 功能 状态",
+      "expected_answer": "CAN0通讯功能测试，CAN无法发送报文",
+      "source": {"file": "defect", "sheet": "Standard parts"},
+      "anchor_groups": [["L1200", "CAN0通讯功能测试"]]
+    },
+    {
+      "id": "PL08", "category": "point_lookup",
+      "question": "需求规格书里 HW-REQ-1 追溯的系统需求编号是什么？",
+      "query_keywords": "HW-REQ-1 系统需求编号",
+      "expected_answer": "ID_SYS_RE_006",
+      "source": {"file": "req", "sheet": "硬件需求Hardware Requirement"},
+      "anchor_groups": [["HW-REQ-1\\b", "ID_SYS_RE_006"]]
+    },
+    {
+      "id": "FL01", "category": "filter",
+      "question": "X1900 连接器中备注为「预留」的 CAN 管脚定义有哪些？",
+      "query_keywords": "CAN 预留 管脚",
+      "expected_answer": "CAN1H/CAN1L/CAN2H/CAN2L/CAN3H/CAN3L（CAN0 非预留）",
+      "source": {"file": "icd", "sheet": "Pin Definition"},
+      "anchor_groups": [["CAN1H", "预留"], ["CAN1L", "预留"], ["CAN2H", "预留"], ["CAN2L", "预留"], ["CAN3H", "预留"], ["CAN3L", "预留"]]
+    },
+    {
+      "id": "FL02", "category": "filter",
+      "question": "测试覆盖分析里 GND 和 PGND 网络之间的并联电阻有哪些？",
+      "query_keywords": "GND PGND 电阻 并联",
+      "expected_answer": "23 行连接、9 个位号：R1921/R1917/R1912/R1914/R1920/R1919/R1918/R1907/R1906（R1921/R1917 在多个并联组重复出现）",
+      "source": {"file": "testcov", "sheet": "Page2"},
+      "anchor_groups": [["R1921"], ["R1917"], ["R1912"], ["R1914"], ["R1920"], ["R1919"], ["R1918"], ["R1907"], ["R1906"]]
+    },
+    {
+      "id": "FL03", "category": "filter",
+      "question": "Page2 里 VCC3V3 网络上容值为 100nF 的电容有哪些？",
+      "query_keywords": "VCC3V3 电容 100nF",
+      "expected_answer": "C1621/C1701/C1702/C1704/C1710/C1811/C1823/C1804/C1716/C1633",
+      "source": {"file": "testcov", "sheet": "Page2"},
+      "anchor_groups": [["C1621", "100nF"], ["C1701", "100nF"], ["C1702", "100nF"], ["C1704", "100nF"], ["C1710", "100nF"], ["C1811", "100nF"], ["C1823", "100nF"], ["C1804", "100nF"], ["C1716", "100nF"], ["C1633", "100nF"]]
+    },
+    {
+      "id": "FL04", "category": "filter",
+      "question": "缺陷件表里哪些拆除项属于标准件 2？",
+      "query_keywords": "标准件2 拆除器件",
+      "expected_answer": "L1200/L1201/L1300/L1301/L1405/连接摄像头的FPC",
+      "source": {"file": "defect", "sheet": "Standard parts"},
+      "anchor_groups": [["L1200", "标准件2"], ["L1201", "标准件2"], ["L1300", "标准件2"], ["L1301", "标准件2"], ["L1405", "标准件2"], ["FPC", "标准件2"]]
+    },
+    {
+      "id": "FL05", "category": "filter",
+      "question": "Debug List 里 Memory（存储）类别下有哪些调试子项？",
+      "query_keywords": "Memory 调试子项",
+      "expected_answer": "RAM时序/DDR压力测试/EEPROM/Norflash/Nandflash/SD card/Sim card 时钟频率",
+      "source": {"file": "debug", "sheet": "Debug List"},
+      "anchor_groups": [["RAM 时序波形"], ["DDR 压力测试"], ["EEPROM 时钟频率"], ["Norflash 时钟频率"], ["Nandflash 时钟频率"], ["SD card/eMMC/SSD"], ["Sim card 时钟频率"]]
+    },
+    {
+      "id": "FL06", "category": "filter",
+      "question": "DFT Matrix 里 Polarity（极性缺陷）可检测的器件类型有哪些？",
+      "query_keywords": "DFT Polarity 器件类型 Matrix",
+      "expected_answer": "SOD/SOP/OSC/CONNECTOR SMD/QFN/BGA/SON/CONNECTOR TH",
+      "source": {"file": "testcov", "sheet": "Page3"},
+      "anchor_groups": [["SOD"], ["SOP"], ["OSC"], ["CONNECTOR SMD"], ["QFN"], ["BGA"], ["SON"], ["CONNECTOR TH"]]
+    },
+    {
+      "id": "FL07", "category": "filter",
+      "question": "需求规格书中 HW-REQ-2 到 HW-REQ-7 这几条通信需求，哪些标记了网络安全相关？",
+      "query_keywords": "HW-REQ 通信需求 网络安全",
+      "expected_answer": "HW-REQ-2~HW-REQ-7 全部为「是Yes」",
+      "source": {"file": "req", "sheet": "硬件需求Hardware Requirement"},
+      "anchor_groups": [["HW-REQ-2(?![0-9])", "是Yes"], ["HW-REQ-3(?![0-9])", "是Yes"], ["HW-REQ-4(?![0-9])", "是Yes"], ["HW-REQ-5(?![0-9])", "是Yes"], ["HW-REQ-6(?![0-9])", "是Yes"], ["HW-REQ-7(?![0-9])", "是Yes"]]
+    },
+    {
+      "id": "CP01", "category": "comparison",
+      "question": "AOI 和 AXI 两种检测设备，对 Missing 缺陷的覆盖率哪个更高？",
+      "query_keywords": "AOI AXI Missing 覆盖率",
+      "expected_answer": "AXI（100.00%）高于 AOI（99.82%）",
+      "source": {"file": "testcov", "sheet": "Page4"},
+      "anchor_groups": [["AOI Coverage", "99.82"], ["AXI Coverage", "100.00"]]
+    },
+    {
+      "id": "CP02", "category": "comparison",
+      "question": "ICT 和 EOL 对 Polarity 缺陷的覆盖率哪个更高？",
+      "query_keywords": "ICT EOL Polarity 覆盖率",
+      "expected_answer": "EOL（62.96%）高于 ICT（44.44%）",
+      "source": {"file": "testcov", "sheet": "Page4"},
+      "anchor_groups": [["ICT Coverage", "44.44"], ["EOL Coverage", "62.96"]]
+    },
+    {
+      "id": "CP03", "category": "comparison",
+      "question": "Summary 表里哪个测试设备对 Wrong 缺陷的覆盖率最低？",
+      "query_keywords": "Wrong 覆盖率 最低 设备",
+      "expected_answer": "AXI（0.00%，AXI 完全无法检测 Wrong 类缺陷；EOL 为 5.26%）",
+      "source": {"file": "testcov", "sheet": "Page4"},
+      "anchor_groups": [["AXI Coverage", "0 (0.00%)"]],
+      "truth_note": "2026-08-31 全量核对修正: 初版误答 EOL(5.26%), AXI Wrong=0 (0.00%) 才是最低"
+    },
+    {
+      "id": "CP04", "category": "comparison",
+      "question": "Page2 里 C1618 和 C1700 哪个容值更大？",
+      "query_keywords": "C1618 C1700 容值",
+      "expected_answer": "C1618（22uF）大于 C1700（10uF）",
+      "source": {"file": "testcov", "sheet": "Page2"},
+      "anchor_groups": [["C1618", "22uF"], ["C1700", "10uF"]]
+    },
+    {
+      "id": "CP05", "category": "comparison",
+      "question": "架构书里 HW-SOL-004 和 HW-SOL-005 的实现方式有什么区别？",
+      "query_keywords": "HW-SOL-004 HW-SOL-005 实现方式",
+      "expected_answer": "HW-SOL-004 有修改的复用，HW-SOL-005 完全复用",
+      "source": {"file": "arch", "sheet": "硬件架构 Hardware Architecture"},
+      "anchor_groups": [["HW-SOL-004", "有修改的复用"], ["HW-SOL-005", "完全复用"]]
+    },
+    {
+      "id": "AG01", "category": "aggregation",
+      "question": "Page2 里 GND 到 PGND 网络的并联电阻一共有几个？",
+      "query_keywords": "GND PGND 并联电阻 数量",
+      "expected_answer": "23 行连接、9 个位号（R1921/R1917 各 8 次, R1912/R1914/R1920/R1919/R1918/R1907/R1906 各 1 次）",
+      "source": {"file": "testcov", "sheet": "Page2"},
+      "anchor_groups": [["R1921"], ["R1917"], ["R1912"], ["R1914"], ["R1920"], ["R1919"], ["R1918"], ["R1907"], ["R1906"]],
+      "truth_note": "2026-08-31 全量核对修正: 初版只数了首个并联组(9), 完整数据 23 行"
+    },
+    {
+      "id": "AG02", "category": "aggregation",
+      "question": "Debug List 里 power（序号 2）下面一共有几个子调试项？",
+      "query_keywords": "power 调试项 数量",
+      "expected_answer": "8 个（编号 1-7 和 9，无 8 号，存在跳号）",
+      "source": {"file": "debug", "sheet": "Debug List"},
+      "anchor_groups": [["各个电源静态阻抗记录"], ["上下电、复位时序"], ["电源各个工况"], ["带载/轻载/负载变换"], ["DDR参考电压"], ["VBAT入口电源最小工作电压"], ["带保护的电源输出电流能力"], ["工作电流"]]
+    },
+    {
+      "id": "AG03", "category": "aggregation",
+      "question": "晶振调试一共要测几路时钟？分别是什么？",
+      "query_keywords": "晶振 时钟 测试网络",
+      "expected_answer": "3 路：MCU 20MHz / ETH 25MHz / EYEQ6L 30MHz",
+      "source": {"file": "debug", "sheet": "5.晶振"},
+      "anchor_groups": [["MCU 20MHz"], ["ETH 25MHz"], ["EYEQ6L 30MHz"]]
+    },
+    {
+      "id": "AG04", "category": "aggregation",
+      "question": "缺陷件表里标准件 4 和标准件 5 各包含哪些拆除项？",
+      "query_keywords": "标准件4 标准件5 拆除器件",
+      "expected_answer": "标准件4：R538（SPI0）；标准件5：R1000（SPI2）",
+      "source": {"file": "defect", "sheet": "Standard parts"},
+      "anchor_groups": [["R538", "标准件4"], ["R1000", "标准件5"]]
+    },
+    {
+      "id": "AG05", "category": "aggregation",
+      "question": "架构说明书里 HW-REQ-2 这条需求对应哪个方案编号？",
+      "query_keywords": "HW-REQ-2 方案编号 追溯",
+      "expected_answer": "HW-SOL-009（5.5.1 CAN0~3 总线模块）",
+      "source": {"file": "arch", "sheet": "硬件架构 Hardware Architecture"},
+      "anchor_groups": [["HW-REQ-2(?![0-9])", "HW-SOL-009"]]
+    },
+    {
+      "id": "MC01", "category": "multi_condition",
+      "question": "缺陷件表里哪些拆除项会导致 CAN 无法发送报文？",
+      "query_keywords": "拆除 CAN 无法发送报文",
+      "expected_answer": "L1200/L1201/L1300/L1301",
+      "source": {"file": "defect", "sheet": "Standard parts"},
+      "anchor_groups": [["L1200"], ["L1201"], ["L1300"], ["L1301"]]
+    },
+    {
+      "id": "MC02", "category": "multi_condition",
+      "question": "Page2 里 VCC3V3 网络上容值不小于 10uF 的电容有哪些？",
+      "query_keywords": "VCC3V3 电容 10uF",
+      "expected_answer": "C1618/C1821/C1800/C1801/C1802/C1803(22uF)、C1617(47uF)、C1700/C1709/C1711(10uF)",
+      "source": {"file": "testcov", "sheet": "Page2"},
+      "anchor_groups": [["C1618", "22uF"], ["C1821", "22uF"], ["C1800", "22uF"], ["C1801", "22uF"], ["C1802", "22uF"], ["C1803", "22uF"], ["C1617", "47uF"], ["C1700", "10uF"], ["C1709", "10uF"], ["C1711", "10uF"]]
+    },
+    {
+      "id": "MC03", "category": "multi_condition",
+      "question": "X1900 的 CAN0H 管脚连接整车什么网络？功能描述是什么？",
+      "query_keywords": "CAN0H 管脚 功能",
+      "expected_answer": "车身CAN0高",
+      "source": {"file": "icd", "sheet": "Pin Definition"},
+      "anchor_groups": [["CAN0H", "车身CAN0高"]]
+    },
+    {
+      "id": "MC04", "category": "multi_condition",
+      "question": "需求规格书 3.1.2 章节下的需求编号有哪些？",
+      "query_keywords": "3.1.2 通信 需求编号",
+      "expected_answer": "HW-REQ-2 ~ HW-REQ-7",
+      "source": {"file": "req", "sheet": "硬件需求Hardware Requirement"},
+      "anchor_groups": [["HW-REQ-2(?![0-9])", "3.1.2"], ["HW-REQ-3(?![0-9])", "3.1.2"], ["HW-REQ-4(?![0-9])", "3.1.2"], ["HW-REQ-5(?![0-9])", "3.1.2"], ["HW-REQ-6(?![0-9])", "3.1.2"], ["HW-REQ-7(?![0-9])", "3.1.2"]]
+    },
+    {
+      "id": "MC05", "category": "multi_condition",
+      "question": "架构书里实现方式为完全复用的方案有哪些？",
+      "query_keywords": "完全复用 方案",
+      "expected_answer": "HW-SOL-005（5.2 EQ6L模块）",
+      "source": {"file": "arch", "sheet": "硬件架构 Hardware Architecture"},
+      "anchor_groups": [["HW-SOL-005", "完全复用"]]
+    }
+  ]
+}

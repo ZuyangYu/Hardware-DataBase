@@ -242,29 +242,22 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(record.call_args.kwargs["mode"], "deep")
         self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
 
-    def test_direct_query_records_chat_metrics(self):
-        class _FakeChunk:
-            def __init__(self, text):
-                self.content = text
-                self.usage_metadata = None
-
-        class FakeModel:
-            def stream(self, _messages):
-                yield _FakeChunk("通用回答")
-
+    def test_general_query_unified_through_pipeline(self):
+        # 未挂载知识库的通用对话不再有直连模型旁路，与 KB 问答一样走统一
+        # 的 pipeline（deepagents agent 链路）。
         t = self._token("user1")
-        with patch("src.api.routes.query.create_chat_model", return_value=FakeModel()), patch(
-            "src.api.routes.query.record_chat_turn"
-        ) as record:
+        with patch("src.api.routes.query.record_chat_turn") as record:
             with self.client.stream(
                 "POST", "/api/v1/query", json={"kb_name": "", "query": "问"}, headers=self._auth(t)
             ) as r:
                 self.assertEqual(r.status_code, 200)
-                b"".join(r.iter_bytes())
+                body = b"".join(r.iter_bytes()).decode("utf-8")
+        self.assertIn("event: delta", body)
+        self.assertIn("第一段", body)
 
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["status"], "completed")
-        self.assertEqual(record.call_args.kwargs["mode"], "fast")
+        self.assertEqual(record.call_args.kwargs["mode"], "deep")
         self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
 
     def test_turn_persists_messages_and_replays_sse_events(self):

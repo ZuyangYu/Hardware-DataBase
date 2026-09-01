@@ -9,7 +9,6 @@ footer after the stream finishes.
 """
 
 from __future__ import annotations
-
 import re
 import threading
 import time
@@ -28,6 +27,8 @@ TOOL_LABELS = {
     "spreadsheet_row_search": "表格行检索",
     "spreadsheet_cell_lookup": "单元格检索",
     "memory_search": "长期记忆检索",
+    "spreadsheet_schema_lookup": "表格SQL结构",
+    "spreadsheet_sql_query": "表格SQL查询",
     "list_kb_sources": "读取知识库目录",
 }
 

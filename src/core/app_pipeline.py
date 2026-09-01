@@ -13,6 +13,7 @@ from src.agents.tools.circuit_tools import CircuitQueryTool
 from src.agents.tools.spreadsheet_tools import SpreadsheetSemanticTool
 from src.core.auth import AuthService
 from src.core.cancellation import QueryCancelled
+from src.core.conversation import GENERAL_CHAT_KB_NAME
 from src.core.logger import error, log, warn
 from src.ingestion.kb_paths import InvalidKnowledgeBaseName, validate_kb_name
 from src.pipelines.document_rag.factory import create_rag_backend
@@ -219,9 +220,8 @@ class AppPipeline:
         if not msg.strip():
             yield "请输入有效问题"
             return
-        if not kb_name:
-            yield "未选择知识库"
-            return
+        if kb_name == GENERAL_CHAT_KB_NAME:
+            kb_name = ""
         try:
             yield from self.agent.stream(
                 query=msg,

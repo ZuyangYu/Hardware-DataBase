@@ -187,18 +187,6 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
 
   return (
     <div className="flex h-full min-h-0 bg-[#fcfcfc] text-[#18181a]" style={sidebarProviderStyle}>
-      <ChatSessionSidebar
-        kbName={mountedKbName}
-        availableKbs={visibleKbs}
-        sessions={sessions}
-        sessionsLoaded={sessionsLoaded}
-        activeSessionId={activeSessionId}
-        streaming={streaming}
-        onKbChange={handleKbChange}
-        onSelect={selectSession}
-        onNew={() => void newConversation()}
-        onDelete={(id) => void deleteSession(id)}
-      />
       <main className={cn(CHAT_MAIN_CLASS, 'flex-1')}>
         <ChatHeader
           title={activeSession?.title || '新对话'}
@@ -230,13 +218,25 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
         />
         <Composer
           kbName={mountedKbName}
+          availableKbs={visibleKbs}
           input={input}
           setInput={setInput}
           streaming={streaming}
+          onKbChange={handleKbChange}
           onSend={() => void send()}
           onStop={abortStream}
         />
       </main>
+      <ChatSessionSidebar
+        kbName={mountedKbName}
+        sessions={sessions}
+        sessionsLoaded={sessionsLoaded}
+        activeSessionId={activeSessionId}
+        streaming={streaming}
+        onSelect={selectSession}
+        onNew={() => void newConversation()}
+        onDelete={(id) => void deleteSession(id)}
+      />
       <ConfirmDialog
         open={extractConfirmOpen}
         onOpenChange={(next) => {

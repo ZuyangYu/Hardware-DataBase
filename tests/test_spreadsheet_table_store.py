@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from src.pipelines.spreadsheet.table_store import TableIndexStore, _infer_headers
+from src.pipelines.spreadsheet.table_store import TableIndexStore, _infer_headers, _sheet_semantic_rows
 from src.pipelines.spreadsheet.pipeline import SpreadsheetPipeline
 
 
@@ -105,6 +105,54 @@ class SpreadsheetTableStoreTests(unittest.TestCase):
         headers = _infer_headers(rows)
 
         self.assertEqual([item["header"] for item in headers], ["Part", "Voltage", "Current", "Power"])
+
+    def test_pre_header_data_rows_produce_semantic_rows(self):
+        # PL01: the X1900 connector info row sits above the inferred header and
+        # must still produce a semantic row.
+        sheet = _FakeSheet(
+            name="Connectors",
+            rows=[
+                ["X1900", "Connector", "12-pin", ""],
+                ["Part", "Type", "Pins", "Notes"],
+                ["A1", "Header", "8", "Main"],
+            ],
+        )
+
+        semantic_rows = _sheet_semantic_rows(sheet)
+
+        self.assertEqual(len(semantic_rows), 2)
+        first = semantic_rows[0]
+        self.assertEqual(first["row_index"], 1)
+        self.assertEqual(first["inference_type"], "pre_header_row")
+        self.assertEqual(first["raw_values"], {"Part": "X1900", "Type": "Connector", "Pins": "12-pin"})
+        self.assertIn("row_above_inferred_header", first["confidence_reasons"])
+        # The pre-header row must not seed forward-fill context.
+        self.assertEqual(semantic_rows[1]["inherited"], {})
+
+    def test_pre_header_banner_rows_are_filtered(self):
+        # 横幅行(同一值重复所有列, 如 "Matrix"/"Summary")不是数据, 不应产出语义行。
+        sheet = _FakeSheet(
+            name="DFT",
+            rows=[
+                ["Banner", "Banner", "Banner"],
+                ["Part", "Type", "Count"],
+                ["A1", "Header", "8"],
+            ],
+        )
+
+        semantic_rows = _sheet_semantic_rows(sheet)
+
+        self.assertEqual(len(semantic_rows), 1)
+        self.assertEqual(semantic_rows[0]["row_index"], 3)
+        self.assertEqual(semantic_rows[0]["inference_type"], "forward_fill_context")
+
+
+class _FakeSheet:
+    def __init__(self, name: str, rows: list[list[str]]):
+        self.name = name
+        self.rows = rows
+        self.row_indices = list(range(1, len(rows) + 1))
+        self.merged_ranges: list[str] = []
 
 
 if __name__ == "__main__":
