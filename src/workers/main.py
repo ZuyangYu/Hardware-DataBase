@@ -9,7 +9,7 @@ from src.api.context import build_context_for_user
 from src.api.routes.query import _run_turn
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService
-from src.core.conversation import GENERAL_CHAT_KB_NAME, ConversationService
+from src.core.conversation import ConversationService
 from src.core.logger import error, log
 from src.observability import init_observability, shutdown_observability
 from src.observability.metrics import record_worker, set_queue_state
@@ -49,8 +49,7 @@ class HardwareWorker:
                 started = time.monotonic()
                 heartbeat(self.worker_id, task_kind="chat", task_id=str(turn.id))
                 ctx = build_context_for_user(user, turn.kb_name, auth=self.auth)
-                pipeline = None if turn.kb_name in ("", GENERAL_CHAT_KB_NAME) else self.pipeline
-                _run_turn(turn_id=turn.id, user=user, ctx=ctx, pipeline=pipeline)
+                _run_turn(turn_id=turn.id, user=user, ctx=ctx, pipeline=self.pipeline)
                 did_work = True
                 record_worker(status="success", duration_s=time.monotonic() - started)
             except Exception as exc:

@@ -48,6 +48,7 @@ from src.agents.tools.runtime import (
 from src.agents.tools.spreadsheet_tools import make_spreadsheet_sql_tools, make_spreadsheet_tools
 from src.circuit.index_service import CircuitIndexService
 from src.core.cancellation import QueryCancelled
+from src.core.conversation import GENERAL_CHAT_KB_NAME
 from src.core.model_factory import create_chat_model
 from src import settings
 from src.observability import observe
@@ -176,7 +177,7 @@ def _current_run() -> _RunRecord:
     return record
 
 
-_SYSTEM_PROMPT = """你是 Hardware DataBase 的硬件设计知识库问答助手。当前知识库为「{kb_name}」。
+_SYSTEM_PROMPT = """你是 Hardware DataBase 的硬件设计知识库问答助手。
 
 ## 工作方式
 {workflow}
@@ -468,8 +469,24 @@ class MultiSourceAgentRunner:
         record = _RunRecord()
         _RUN_RECORD.set(record)
 
+        kb_label = str(kb_name or "").strip()
+        is_general = (not kb_label) or kb_label == GENERAL_CHAT_KB_NAME
+        if is_general:
+            # 通用对话与知识库问答共用同一个 deepagents agent 循环、同一个模型
+            # 接口和同一个系统提示词来源；唯一差异是不注册检索工具。
+            scope_kb = ""
+            kb_scope_line = (
+                "当前未挂载知识库，进行通用对话。不要声称读取了任何私有文档、表格或电路"
+                "数据；如用户需要基于知识库资料回答，请提示先在对话侧栏挂载知识库。"
+            )
+            workflow = ""
+        else:
+            scope_kb = kb_label
+            kb_scope_line = f"当前知识库为「{kb_label}」。"
+            workflow = _DEEP_WORKFLOW if query_mode == "deep" else _FAST_WORKFLOW
+
         rt = ToolRuntime(
-            kb_name=kb_name,
+            kb_name=scope_kb,
             ctx=ctx,
             top_k=8 if query_mode == "deep" else 5,
             query_mode=query_mode,
@@ -477,7 +494,7 @@ class MultiSourceAgentRunner:
             on_event=event_callback,
         )
 
-        tools = [
+        tools = [] if is_general else [
             make_catalog_tool(
                 rt,
                 document_store=self.document_store,
@@ -490,15 +507,14 @@ class MultiSourceAgentRunner:
             *make_spreadsheet_tools(rt, self.spreadsheet_service),
             *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
             make_conversation_search(rt, self.conversation_service),
-            make_memory_search(rt, memory_service_factory=self.memory_service_factory),
         ]
+        tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
 
-        workflow = _DEEP_WORKFLOW if query_mode == "deep" else _FAST_WORKFLOW
         base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
-        system_prompt = base_prompt.format_map(_PromptDict(kb_name=kb_name, workflow=workflow))
+        system_prompt = f"{kb_scope_line}\n\n{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}"
         memory_context = self._prefetch_memory_context(
             query=query,
-            kb_name=kb_name,
+            kb_name=scope_kb,
             ctx=ctx,
             rt=rt,
         )

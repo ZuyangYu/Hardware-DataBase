@@ -74,6 +74,47 @@ def test_stream_wrapper_marks_failure_status(monkeypatch):
     assert record_agent.call_args.kwargs["status"] == "failed"
 
 
+def test_general_chat_runs_through_agent_without_retrieval_tools(monkeypatch):
+    """未挂载知识库的通用对话与 KB 问答共用同一条 deepagents 链路：
+    同一个模型接口与系统提示词来源，只是不注册知识库检索工具。"""
+    from src.agents import runner as runner_mod
+
+    captured: dict = {}
+
+    def _fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+
+        class _Agent:
+            def stream(self, *args, **kwargs):
+                return iter(())
+
+        return _Agent()
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", _fake_create_deep_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend())
+    def _tool_name(tool) -> str:
+        return str(getattr(tool, "name", None) or getattr(tool, "__name__", ""))
+
+    for kb_name in ("", "__general__"):
+        captured.clear()
+        list(runner.stream(query="你好", kb_name=kb_name, history=[], thread_id="t1"))
+
+        tool_names = [_tool_name(tool) for tool in captured["tools"]]
+        assert tool_names == ["memory_search"]
+        assert "当前未挂载知识库" in captured["system_prompt"]
+
+    # 挂载知识库时仍然注册全部检索工具。
+    captured.clear()
+    list(runner.stream(query="问题", kb_name="kb_hw", history=[], thread_id="t1"))
+    tool_names = [_tool_name(tool) for tool in captured["tools"]]
+    assert "document_search" in tool_names
+    assert "circuit_search" in tool_names
+    assert "当前未挂载知识库" not in captured["system_prompt"]
+
+
 def test_runner_prefetches_bounded_memory_context_before_agent_creation():
     from src.agents.tools.runtime import ToolRuntime
     from src.pipelines.document_rag.schemas import RequestContext
