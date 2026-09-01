@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 
 import src.settings
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
+from src.pipelines.spreadsheet.sql_materializer import (
+    drop_record_tables,
+    ensure_registry_table,
+    materialize_sheet,
+)
 from src.pipelines.spreadsheet.xlsx_parser import ParsedWorkbook, _row_col_from_ref, parse_xlsx
 
 
@@ -137,6 +142,7 @@ class TableIndexStore:
                 )
             """)
             self._ensure_columns(conn)
+            ensure_registry_table(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_table_rows_lookup ON table_rows(record_id, sheet_name, row_index)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_table_rows_text ON table_rows(row_text)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_table_cells_lookup ON table_cells(record_id, sheet_name, row_index, col_index)")
@@ -205,6 +211,7 @@ class TableIndexStore:
                 conn.execute("DELETE FROM table_text_blocks WHERE record_id = ?", (record_id,))
                 conn.execute("DELETE FROM table_semantic_rows WHERE record_id = ?", (record_id,))
                 conn.execute("DELETE FROM table_sheets WHERE record_id = ?", (record_id,))
+                drop_record_tables(conn, record_id)
                 conn.execute(
                     """
                     INSERT INTO table_documents (
@@ -321,6 +328,13 @@ class TableIndexStore:
                         """,
                         semantic_row_records,
                     )
+                    materialize_sheet(
+                        conn,
+                        record_id,
+                        sheet.name,
+                        semantic_rows,
+                        table_seq=sheet_number,
+                    )
                     if progress_callback:
                         progress = 35 + int((sheet_number / total_sheets) * 50)
                         progress_callback(progress, f"完成工作表 {sheet_number}/{total_sheets}: {sheet.name}")
@@ -346,6 +360,7 @@ class TableIndexStore:
                 conn.execute("DELETE FROM table_text_blocks WHERE record_id = ?", (record_id,))
                 conn.execute("DELETE FROM table_semantic_rows WHERE record_id = ?", (record_id,))
                 conn.execute("DELETE FROM table_sheets WHERE record_id = ?", (record_id,))
+                drop_record_tables(conn, record_id)
                 conn.execute("DELETE FROM table_documents WHERE record_id = ?", (record_id,))
                 conn.execute("COMMIT")
             except Exception:
@@ -693,6 +708,62 @@ def _sheet_semantic_rows(sheet, profile: dict | None = None) -> list[dict]:
 
     for row_position, row in enumerate(sheet.rows, start=1):
         if row_position <= header_row_position:
+            # Rows above the inferred header are usually titles/banners, but can be
+            # real data rows (e.g. PL01: the X1900 connector info row sits above the
+            # inferred header). After filtering empty/title/header-repeat rows, emit
+            # them as standalone semantic rows; they must not seed forward-fill context.
+            pre_text = _row_to_text(row)
+            if not pre_text or _looks_like_header_repeat(row, header_by_col) or _is_title_like_row(row):
+                continue
+
+            pre_raw_values = _row_header_values(row, header_by_col)
+            # Banner rows repeat one value across every column ("Matrix", "Summary"...);
+            # they are decorations above the table, not data.
+            pre_value_list = list(pre_raw_values.values())
+            if len(pre_value_list) >= 2 and len(set(pre_value_list)) == 1:
+                continue
+            if not pre_raw_values:
+                continue
+
+            pre_row_index = _sheet_row_index(sheet, row_position)
+            pre_header_row_index = _sheet_row_index(sheet, header_row_position)
+            pre_confidence = _semantic_row_confidence(
+                raw_values=pre_raw_values,
+                inherited={},
+                header_count=len(header_by_col),
+                section_title="",
+            )
+            pre_score = round(max(0.0, pre_confidence["score"] - 0.1), 2)
+            pre_label = "high" if pre_score >= 0.82 else ("medium" if pre_score >= 0.68 else "low")
+            pre_reasons = pre_confidence["reasons"] + ["row_above_inferred_header"]
+            semantic_rows.append({
+                "sheet_name": sheet.name,
+                "row_index": pre_row_index,
+                "header_row_index": pre_header_row_index,
+                "layer": "inference",
+                "is_inferred": True,
+                "inference_type": "pre_header_row",
+                "confidence": pre_label,
+                "confidence_score": pre_score,
+                "confidence_reasons": pre_reasons,
+                "evidence_policy": "Row precedes the inferred header; column mapping is positional and unverified.",
+                "section_title": "",
+                "raw_text": pre_text,
+                "semantic_text": _format_semantic_row_text("", pre_raw_values),
+                "values": dict(pre_raw_values),
+                "raw_values": dict(pre_raw_values),
+                "inherited": {},
+                "source": {
+                    "row_index": pre_row_index,
+                    "header_row_index": pre_header_row_index,
+                    "evidence_layer": "fact",
+                    "raw_row_text": pre_text,
+                    "raw_headers": sorted(pre_raw_values),
+                    "inherited_headers": [],
+                    "inherited_from_rows": {},
+                    "structural_fill": {},
+                },
+            })
             continue
 
         raw_text = _row_to_text(row)

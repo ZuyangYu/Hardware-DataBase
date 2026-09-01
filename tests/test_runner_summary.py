@@ -120,3 +120,14 @@ class RetrievalSummaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SystemPromptDualPathTests(unittest.TestCase):
+    """守护双路校验协议: SQL 失败回退文本检索 + 交叉验证规则必须在提示词中."""
+
+    def test_prompt_contains_dual_path_protocol(self):
+        from src.agents.runner import _SYSTEM_PROMPT
+
+        self.assertIn("回退用 spreadsheet_row_search/spreadsheet_cell_lookup", _SYSTEM_PROMPT)
+        self.assertIn("交叉验证", _SYSTEM_PROMPT)
+        self.assertIn("不能合并成一个确定结论", _SYSTEM_PROMPT)

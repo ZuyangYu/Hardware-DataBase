@@ -1,9 +1,7 @@
-# config/settings.py
 import os
 import stat
 import threading
 from enum import Enum
-
 from dotenv import load_dotenv
 
 

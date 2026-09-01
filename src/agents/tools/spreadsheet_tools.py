@@ -253,7 +253,9 @@ def make_spreadsheet_tools(rt, spreadsheet_service: SpreadsheetIndexService):
     """Return the two spreadsheet tool closures bound to this run."""
 
     def spreadsheet_row_search(query: str, top_k: int = rt.top_k) -> str:
-        """按语义检索 Excel 表格行（BOM 物料、参数、替代料、测试记录等整行业务数据）。"""
+        """按语义检索 Excel 表格行, 只适合取"具体某行/某个值"这类单点信息。
+        注意: 统计数量、求和、最值、均值、按条件筛选多行、数值比较等问题用本工具会漏行漏列,
+        必须改用 spreadsheet_schema_lookup + spreadsheet_sql_query 一次完成。"""
         from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
 
         items = timed_tool_call(
@@ -527,3 +529,257 @@ class SpreadsheetCellTool:
             )
             for row in rows[:requested_top_k]
         ]
+
+
+# ---- SQL 只读查询工具(物化表 + sqlglot 校验, TableRAG 式混合检索的 SQL 路) ----
+
+_SQL_MAX_ROWS = 200
+_SQL_RESULT_CHAR_BUDGET = 2000
+
+
+def _load_sql_registry(db_path: str) -> list[dict]:
+    """读取全部 sql_table_registry 行(schema_json 已解码)."""
+    if not os.path.exists(db_path):
+        return []
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT r.table_name, r.sheet_name, r.column_count, r.row_count,
+                       r.schema_json, d.document_name
+                FROM sql_table_registry r
+                JOIN table_documents d ON d.record_id = r.record_id
+                ORDER BY d.document_name, r.sheet_name
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+    registry = []
+    for row in rows:
+        try:
+            schema = json.loads(row["schema_json"] or "{}")
+        except (TypeError, ValueError):
+            schema = {}
+        registry.append(
+            {
+                "table_name": row["table_name"],
+                "sheet_name": row["sheet_name"],
+                "document_name": row["document_name"],
+                "columns": schema.get("columns", []),
+                "row_count": schema.get("row_count", row["row_count"]),
+                "note": schema.get("note", ""),
+            }
+        )
+    return registry
+
+
+def _format_schema_entry(entry: dict) -> str:
+    columns = "; ".join(
+        f"{col['column']}={col['header']}({col['dtype']})"
+        + (f" 样本:{col['samples'][:3]}" if col.get("samples") else "")
+        for col in entry.get("columns", [])
+    )
+    return (
+        f"表 {entry['table_name']} | 文档 {entry['document_name']} | sheet「{entry['sheet_name']}」"
+        f" | {entry.get('row_count', '?')} 行\n  列: {columns}"
+        + (f"\n  说明: {entry['note']}" if entry.get("note") else "")
+    )
+
+
+def _validate_readonly_sql(sql_text: str, allowed_tables: set[str]) -> tuple[Any, str | None]:
+    """sqlglot 静态校验: 单条 SELECT、表白名单、自动补/收 LIMIT.
+
+    返回 (ast, 错误消息); 成功时错误消息为 None.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        statements = sqlglot.parse(sql_text, read="sqlite")
+    except sqlglot.errors.ParseError as e:
+        return None, f"SQL 语法错误: {e}"
+    statements = [s for s in statements if s is not None]
+    if len(statements) != 1:
+        return None, "只允许一条 SELECT 语句"
+    root = statements[0]
+    if not isinstance(root, exp.Select):
+        return None, f"只允许 SELECT 查询(检测到 {root.key.upper()})"
+    cte_names = {cte.alias_or_name for cte in root.find_all(exp.CTE)}
+    used_tables = {table.name for table in root.find_all(exp.Table)} - cte_names
+    unknown = used_tables - allowed_tables
+    if unknown:
+        return None, (
+            "引用了未登记的表: " + ", ".join(sorted(unknown))
+            + f"(可用表: {', '.join(sorted(allowed_tables))})"
+        )
+    # LIMIT 收敛: 已有限值取 min(200), 否则补 200
+    limit_node = root.args.get("limit")
+    if limit_node is not None and limit_node.expression is not None:
+        try:
+            current = int(limit_node.expression.this)
+        except (AttributeError, ValueError, TypeError):
+            current = None
+        if current is None or current > _SQL_MAX_ROWS:
+            root = root.limit(_SQL_MAX_ROWS)
+    else:
+        root = root.limit(_SQL_MAX_ROWS)
+    return root, None
+
+
+def _execute_readonly_sql(db_path: str, sql_text: str) -> tuple[list[dict] | None, str | None]:
+    """mode=ro + query_only 双保险执行; 返回 (行列表, 错误消息), 成功时错误消息为 None."""
+    uri = f"file:{db_path}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=30)
+    except sqlite3.Error as e:
+        return None, f"数据库连接失败: {e}"
+    with closing(conn):
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            cursor = conn.execute(sql_text)
+            columns = [desc[0] for desc in cursor.description or []]
+            rows = cursor.fetchmany(_SQL_MAX_ROWS + 1)
+        except sqlite3.Error as e:
+            return None, f"SQL 执行失败: {e}"
+    if len(rows) > _SQL_MAX_ROWS:
+        rows = rows[:_SQL_MAX_ROWS]
+    records = [dict(zip(columns, row)) for row in rows]
+    return records, None
+
+
+def _format_sql_result(records: list[dict]) -> str:
+    if not records:
+        return "SQL 执行成功, 但结果为空(0 行)。请检查筛选条件是否过严或值拼写是否与 schema 样本一致。"
+    lines = []
+    used = 0
+    for index, record in enumerate(records, start=1):
+        cells = ", ".join(f"{k}={v}" for k, v in record.items())
+        line = f"行{index}: {cells}"
+        if used + len(line) > _SQL_RESULT_CHAR_BUDGET and index > 1:
+            lines.append(f"(结果已截断, 共 {len(records)} 行, 仅显示前 {index - 1} 行)")
+            break
+        lines.append(line)
+        used += len(line)
+    return "\n".join(lines)
+
+
+def make_spreadsheet_sql_tools(rt, spreadsheet_service):
+    """返回 SQL 查询两件套: 先查 schema 再执行只读 SQL."""
+
+    def spreadsheet_schema_lookup(query: str = "", top_k: int = 8) -> str:
+        """列出可执行 SQL 的物化表 schema(表名/中文表头/类型/样本值), 写 SQL 前必查。"""
+        from src.agents.tools.runtime import timed_tool_call
+
+        scope = kb_scope_from_context(rt.kb_name, rt.ctx).require_department("lookup spreadsheet sql schema in")
+        db_path = spreadsheet_service.db_path(scope.department_id, scope.kb_name, create=False)
+
+        def _run() -> list[Evidence]:
+            registry = _load_sql_registry(db_path)
+            if not registry:
+                return []
+            tokens = _tokens(query) if query else []
+
+            def searchable(entry: dict) -> str:
+                headers = " ".join(col.get("header", "") for col in entry.get("columns", []))
+                return f"{entry['document_name']} {entry['sheet_name']} {headers}".casefold()
+
+            if tokens:
+                scored = [
+                    entry for entry in registry
+                    if any(token in searchable(entry) for token in tokens)
+                ]
+                if not scored:
+                    scored = registry
+            else:
+                scored = registry
+            scored.sort(key=lambda entry: -sum(1 for token in tokens if token in searchable(entry)))
+            selected = scored[: max(1, min(int(top_k), 20))]
+            return [
+                Evidence(
+                    id=f"xlsx-schema:{entry['table_name']}",
+                    content=_format_schema_entry(entry),
+                    source_name=entry["document_name"],
+                    content_kind="spreadsheet_schema",
+                    processor_kind="spreadsheet_table",
+                    score=1.0,
+                    locator={"table_name": entry["table_name"], "sheet_name": entry["sheet_name"]},
+                    metadata={"tool": "spreadsheet_schema_lookup", "query": query},
+                )
+                for entry in selected
+            ]
+
+        items = timed_tool_call(rt, "spreadsheet_schema_lookup", query, None, _run)
+        if not items:
+            return "当前知识库没有可用的 SQL 物化表。"
+        from src.agents.tools.runtime import format_evidence_for_llm
+
+        return format_evidence_for_llm(items)
+
+    def spreadsheet_sql_query(sql: str) -> str:
+        """执行只读 SQL 查询物化表(仅 SELECT, 自动 LIMIT)。筛选/聚合/比较/统计类问题优先用本工具。
+
+        出错时按错误信息修正 SQL 后重试, 最多 2 次; 表名与列结构先用 spreadsheet_schema_lookup 查询。
+        """
+        from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
+
+        scope = kb_scope_from_context(rt.kb_name, rt.ctx).require_department("query spreadsheet sql in")
+        db_path = spreadsheet_service.db_path(scope.department_id, scope.kb_name, create=False)
+
+        def _run() -> list[Evidence]:
+            registry = _load_sql_registry(db_path)
+            if not registry:
+                return []
+            allowed = {entry["table_name"]: entry for entry in registry}
+            ast, error = _validate_readonly_sql(str(sql or ""), set(allowed))
+            if error:
+                return [
+                    Evidence(
+                        id="xlsx-sql:invalid",
+                        content=f"SQL 校验未通过: {error}\n请用 spreadsheet_schema_lookup 确认表名/列名后修正重试(最多 2 次)。",
+                        source_name="spreadsheet_sql",
+                        content_kind="spreadsheet_sql_result",
+                        processor_kind="spreadsheet_table",
+                        score=0.0,
+                        locator={},
+                        metadata={"tool": "spreadsheet_sql_query", "sql": sql, "status": "invalid"},
+                    )
+                ]
+            table_names = sorted({table.name for table in ast.find_all(__import__("sqlglot").exp.Table)})
+            source_names = list(dict.fromkeys(
+                allowed[name]["document_name"] for name in table_names if name in allowed
+            ))
+            records, exec_error = _execute_readonly_sql(db_path, ast.sql(dialect="sqlite"))
+            if exec_error:
+                return [
+                    Evidence(
+                        id="xlsx-sql:error",
+                        content=(
+                            f"{exec_error}\n请根据 schema(可用 spreadsheet_schema_lookup 查看)修正 SQL 后重试, 最多 2 次。"
+                        ),
+                        source_name=source_names[0] if source_names else "spreadsheet_sql",
+                        content_kind="spreadsheet_sql_result",
+                        processor_kind="spreadsheet_table",
+                        score=0.0,
+                        locator={"tables": ", ".join(table_names)},
+                        metadata={"tool": "spreadsheet_sql_query", "sql": sql, "status": "error"},
+                    )
+                ]
+            return [
+                Evidence(
+                    id="xlsx-sql:result",
+                    content=_format_sql_result(records),
+                    source_name=source_names[0] if source_names else "spreadsheet_sql",
+                    content_kind="spreadsheet_sql_result",
+                    processor_kind="spreadsheet_table",
+                    score=1.0,
+                    locator={"tables": ", ".join(table_names)},
+                    metadata={"tool": "spreadsheet_sql_query", "sql": sql, "row_count": len(records)},
+                )
+            ]
+
+        items = timed_tool_call(rt, "spreadsheet_sql_query", sql, None, _run)
+        return format_evidence_for_llm(items)
+
+    return spreadsheet_schema_lookup, spreadsheet_sql_query
+
