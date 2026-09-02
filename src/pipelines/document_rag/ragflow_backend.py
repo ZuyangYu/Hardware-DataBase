@@ -1093,18 +1093,54 @@ class RAGFlowBackend(RAGBackend):
                 + ", no hard filter"
             )
         self._ensure_physical_datasets()
-        dataset_ids = list(dict.fromkeys(self._dataset_ids.values()))
+        # Shared read-only records may point at a physical Dataset owned by
+        # observability rather than the develop instance's upload Dataset.
+        # Include those mapped Dataset IDs in the remote search, while the
+        # local records_by_remote_id filter below still limits results to this
+        # department's registered documents.
+        mapped_dataset_ids = [
+            record.dataset_id
+            for record in scoped_records
+            if record.shared_read_only
+            and record.processor_kind == PROCESSOR_KIND_RAGFLOW
+            and record.dataset_id
+        ]
+        dataset_ids = list(dict.fromkeys([*self._dataset_ids.values(), *mapped_dataset_ids]))
+        shared_dataset_ids = {
+            record.dataset_id
+            for record in scoped_records
+            if record.shared_read_only
+            and record.processor_kind == PROCESSOR_KIND_RAGFLOW
+            and record.dataset_id
+        }
+        retrieval_dataset_groups = (
+            [[dataset_id] for dataset_id in dataset_ids]
+            if shared_dataset_ids
+            else [dataset_ids]
+        )
         metadata_condition = _metadata_condition(kb_name, ctx, routed_source_groups, filters=filters)
 
         def retrieve_chunks(condition: dict | None) -> list[dict]:
-            retrieve_kwargs = {
-                "dataset_ids": dataset_ids,
-                "top_k": top_k,
-                "metadata_condition": condition,
-            }
-            if should_cancel is not None:
-                retrieve_kwargs["should_cancel"] = should_cancel
-            return self._client().retrieve(query, **retrieve_kwargs)
+            chunks: list[dict] = []
+            for retrieval_dataset_ids in retrieval_dataset_groups:
+                retrieve_kwargs = {
+                    "dataset_ids": retrieval_dataset_ids,
+                    "top_k": top_k,
+                    "metadata_condition": condition,
+                }
+                if should_cancel is not None:
+                    retrieve_kwargs["should_cancel"] = should_cancel
+                chunks.extend(self._client().retrieve(query, **retrieve_kwargs))
+            if len(retrieval_dataset_groups) > 1:
+                def _chunk_score(chunk: dict) -> float:
+                    value = chunk.get("similarity") or chunk.get("score") or chunk.get("vector_similarity") or 0.0
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return 0.0
+
+                chunks.sort(key=_chunk_score, reverse=True)
+            return chunks
 
         chunks = retrieve_chunks(metadata_condition)
         source_names = _source_name_filters(filters)
@@ -1249,6 +1285,26 @@ class RAGFlowBackend(RAGBackend):
                 error_message=str(exc),
             )
             return BackendResult(ok=False, message=str(exc), backend=self.name)
+        if record.shared_read_only:
+            self._audit(
+                "shared_document_mutation_denied",
+                ctx,
+                kb_name=kb_name,
+                target_type="document",
+                target_id=record.document_name,
+                success=False,
+                error_message="shared document is read-only",
+                metadata={
+                    "store_id": record.id,
+                    "dataset_id": record.dataset_id,
+                    "ragflow_document_id": record.document_id,
+                },
+            )
+            return BackendResult(
+                ok=False,
+                message=f"共享文档为只读，develop 实例不能删除或重新解析: {record.document_name}",
+                backend=self.name,
+            )
         try:
             if record.processor_kind == PROCESSOR_KIND_RAGFLOW:
                 delete_result = self._delete_pipeline_record(record)
@@ -1320,6 +1376,12 @@ class RAGFlowBackend(RAGBackend):
         except PermissionError as exc:
             return BackendResult(ok=False, message=str(exc), backend=self.name)
         records = self.store.list_documents(scope.kb_name, department_id=scope.department_id)
+        if any(record.shared_read_only for record in records):
+            return BackendResult(
+                ok=False,
+                message="知识库包含 observability 拥有的共享只读文档，develop 实例不能删除该知识库。",
+                backend=self.name,
+            )
         errors = []
         deleted_record_ids = []
         for record in records:
@@ -1380,6 +1442,8 @@ class RAGFlowBackend(RAGBackend):
         远端不可达时 cleanup 失败仅 log,仍标记本地 failed,避免记录无限停在 parsing。
         返回给 UI 显示的超时消息。
         """
+        if record.shared_read_only:
+            return f"共享文档由 observability 实例负责解析，develop 仅同步只读状态: {record.document_name}"
         timeout_msg = (
             f"解析超时(已等待超过 {int(RAGFLOW_PARSE_PROGRESS_TIMEOUT_SECONDS)}s 未完成),"
             "已终止并标记失败,请重新上传或检查 RAGFlow 服务状态"
@@ -1398,6 +1462,12 @@ class RAGFlowBackend(RAGBackend):
         records = self.store.list_documents(kb_name, department_id=department_id) if kb_name else []
         tasks = []
         for record in records:
+            if record.shared_read_only:
+                # Parse-task controls are mutating operations.  Shared
+                # documents remain visible through list_documents, while
+                # their source-owned parse task is intentionally not exposed
+                # to the develop instance.
+                continue
             if record.processor_kind == PROCESSOR_KIND_SPREADSHEET:
                 if normalize_parse_status(record.status) == TASK_STATUS_COMPLETED:
                     continue
@@ -1530,6 +1600,13 @@ class RAGFlowBackend(RAGBackend):
         except PermissionError as exc:
             return BackendResult(ok=False, message=str(exc), backend=self.name)
 
+        if record.shared_read_only:
+            return BackendResult(
+                ok=False,
+                message=f"共享文档为只读，develop 实例不能停止、删除或重新解析: {record.document_name}",
+                backend=self.name,
+            )
+
         if record.processor_kind != PROCESSOR_KIND_RAGFLOW:
             # spreadsheet：索引+归档+store 行原子化清理，避免孤儿
             delete_result = self._delete_pipeline_record(record)
@@ -1634,6 +1711,7 @@ class RAGFlowBackend(RAGBackend):
                 if (
                     refreshed_status is not None
                     and normalize_parse_status(refreshed_status) == TASK_STATUS_RUNNING
+                    and not record.shared_read_only
                     and _ragflow_parse_timed_out(record)
                 ):
                     error_message = self._mark_ragflow_parse_timed_out(record)
@@ -1661,6 +1739,7 @@ class RAGFlowBackend(RAGBackend):
                         "status": status,
                         "content_kind": record.content_kind,
                         "processor_kind": record.processor_kind,
+                        "shared_read_only": record.shared_read_only,
                         "local_path": record.local_path,
                         "file_size": record.file_size,
                         "content_hash": record.content_hash,

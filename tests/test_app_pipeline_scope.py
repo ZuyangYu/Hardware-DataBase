@@ -31,7 +31,7 @@ from unittest.mock import MagicMock, patch
 
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthUser, ROLE_DEPT_ADMIN
-from src.pipelines.document_rag.schemas import BackendResult, RequestContext
+from src.pipelines.document_rag.schemas import BackendResult, DocumentInfo, RequestContext
 
 
 class _Backend:
@@ -133,6 +133,43 @@ class AppPipelineScopeTests(unittest.TestCase):
         self.assertTrue(response)
         self.assertIsNone(pipeline.get_last_token_usage_summary())
         self.assertEqual(pipeline.agent.clear_calls, 1)
+
+    def test_scan_kb_sources_exposes_application_layer_catalog_contract(self):
+        class Store:
+            def list_documents(self, kb_name, department_id=None):
+                return []
+
+        class CatalogBackend(_Backend):
+            def __init__(self):
+                super().__init__()
+                self.store = Store()
+                self.list_calls = []
+
+            def list_documents(self, kb_name, ctx=None):
+                self.list_calls.append((kb_name, ctx))
+                return [
+                    DocumentInfo(
+                        id="ragflow:1",
+                        name="adas-spec.pdf",
+                        metadata={"content_kind": "document_text"},
+                    )
+                ]
+
+        pipeline = object.__new__(AppPipeline)
+        pipeline.backend = CatalogBackend()
+        pipeline.spreadsheet_service = None
+        pipeline.circuit_service = None
+        ctx = RequestContext(
+            user_id="evaluation",
+            allowed_kbs=["47:ADAS"],
+            kb_permissions={"47:ADAS": "read"},
+            metadata={"department_id": 47},
+        )
+
+        catalog = pipeline.scan_kb_sources("ADAS", ctx)
+
+        self.assertEqual([item["document_name"] for item in catalog["sources"]], ["adas-spec.pdf"])
+        self.assertEqual(pipeline.backend.list_calls, [("ADAS", ctx)])
 
     def test_delete_document_audit_success_from_backend_ok(self):
         """AppPipeline.delete_document must use BackendResult.ok to determine

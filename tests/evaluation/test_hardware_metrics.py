@@ -91,6 +91,24 @@ class HardwareMetricTests(unittest.TestCase):
         self.assertEqual(metric.score, 0.5)
         self.assertEqual(metric.details["missing_evidence_types"], ["document"])
 
+    def test_evidence_consistency_normalizes_document_text_alias(self):
+        sample = EvaluationSample(
+            id="q1",
+            question="Q",
+            reference_answer="A",
+            kb_name="ADAS",
+            required_evidence_types=["document"],
+        )
+        evidence = [{"content_kind": "document_text", "content": "document evidence"}]
+
+        metric = _by_name(
+            score_hardware_rules(sample, _snapshot("answer", evidence)),
+            "evidence_consistency",
+        )
+
+        self.assertEqual(metric.score, 1.0)
+        self.assertEqual(metric.details["missing_evidence_types"], [])
+
     def test_document_generation_metrics_measure_mapping_evidence_and_safety(self):
         record = DocumentGenerationEvalRecord(
             id="doc-1",

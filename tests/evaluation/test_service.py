@@ -1,8 +1,10 @@
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.evaluation.config import EvaluationConfig
 from src.evaluation.ragas_adapter import RagasAdapter
@@ -120,6 +122,20 @@ class EvaluationServiceTests(unittest.TestCase):
 
         self.assertEqual([item.sample_id for item in snapshots], ["q1", "q2"])
         self.assertEqual(progress, [("q1", 1, 2), ("q2", 2, 2)])
+
+    def test_collection_only_does_not_require_scoring_configuration(self):
+        service = EvaluationService(pipeline_factory=lambda: FakePipeline())
+        with patch.dict(
+            os.environ,
+            {
+                "EVAL_EMBEDDING_BASE_URL": "",
+                "EVAL_EMBEDDING_MODEL": "",
+            },
+            clear=False,
+        ):
+            snapshots = service.collect([_sample()], self.snapshot_path)
+
+        self.assertEqual([item.sample_id for item in snapshots], ["q1"])
 
     def test_collect_preserves_completed_snapshot_when_callback_stops(self):
         service = EvaluationService(pipeline_factory=lambda: FakePipeline())
@@ -364,6 +380,58 @@ class EvaluationServiceTests(unittest.TestCase):
         ]
         self.assertTrue(all(metric.status == "not_applicable" for metric in ragas_metrics))
         self.assertNotIn("answer_correctness", summary.metric_scores)
+
+    def test_denied_access_sample_skips_ragas_backend_and_preserves_access_check(self):
+        backend = CapturingBackend()
+        service = EvaluationService(ragas_adapter=RagasAdapter(_config(), backend=backend))
+        sample = _sample().model_copy(update={"expected_access": "denied"})
+        snapshot = _snapshot().model_copy(
+            update={"access_check": {"expected": "denied", "observed": "denied", "reason": "permission"}}
+        )
+
+        summary, results = service.score(
+            [sample],
+            [snapshot],
+            metric_names=["answer_correctness", "faithfulness"],
+        )
+
+        self.assertEqual(backend.records, [])
+        self.assertEqual(results[0].access_check["observed"], "denied")
+        self.assertTrue(
+            all(metric.status == "not_applicable" for metric in results[0].metrics)
+        )
+        self.assertNotIn("answer_correctness", summary.metric_scores)
+
+    def test_scoring_diagnostics_exclude_denied_and_non_retrieval_samples(self):
+        service = EvaluationService(ragas_adapter=FakeAdapter())
+        denied = _sample().model_copy(update={"expected_access": "denied"})
+        denied_snapshot = _snapshot().model_copy(
+            update={
+                "retrieved_contexts": [],
+                "retrieval_summary": {"status": "permission_denied"},
+                "access_check": {
+                    "expected": "denied",
+                    "observed": "denied",
+                    "reason": "permission",
+                },
+            }
+        )
+        direct = _sample("direct").model_copy(update={"tags": ["direct"]})
+        direct_snapshot = _snapshot().model_copy(
+            update={"sample_id": "direct", "retrieved_contexts": []}
+        )
+
+        summary, _ = service.score(
+            [denied, direct],
+            [denied_snapshot, direct_snapshot],
+            metric_names=[],
+        )
+
+        diagnostics = summary.metadata["scoring_diagnostics"]
+        self.assertEqual(diagnostics["evidence_samples"], 0)
+        self.assertEqual(diagnostics["no_evidence_samples"], 0)
+        self.assertEqual(diagnostics["retrieval_partial_failures"], 0)
+        self.assertNotIn("permission_denied", diagnostics["retrieval_status_counts"])
 
     def test_score_preserves_original_contexts_and_records_scoring_budget(self):
         backend = CapturingBackend()

@@ -2,6 +2,8 @@ import unittest
 
 from src.evaluation import answer_runner
 from src.evaluation.answer_runner import AnswerRunner
+from src.evaluation.access import normalize_sample_for_binding, resolve_knowledge_base
+from src.core.auth import KnowledgeBaseSummary
 from src.evaluation.schemas import EvaluationSample
 
 
@@ -88,6 +90,36 @@ class AnswerRunnerTests(unittest.TestCase):
         self.assertEqual(snapshot.response, "第一段第二段")
         self.assertEqual(snapshot.retrieved_contexts, ["电路上下文", "文档上下文"])
         self.assertEqual(len(snapshot.evidence), 2)
+
+    def test_collect_records_structured_access_check_for_normalized_denial(self):
+        sample = _sample(
+            expected_access="denied",
+            request_context={
+                "department_id": 47,
+                "allowed_kbs": ["47:ADAS"],
+                "kb_permissions": {"47:ADAS": "read"},
+            },
+        )
+        binding = resolve_knowledge_base(
+            [KnowledgeBaseSummary(name="ADAS", kb_id=1, department_id=47, registered=True)],
+            kb_id=1,
+            kb_name="ADAS",
+        )
+        normalized = normalize_sample_for_binding(sample, binding)
+        factory_calls = []
+
+        def pipeline_factory():
+            factory_calls.append(True)
+            raise AssertionError("denied samples must not initialize the retrieval pipeline")
+
+        snapshot = AnswerRunner(pipeline_factory).collect(normalized)
+
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(snapshot.status, "success")
+        self.assertEqual(snapshot.evidence, [])
+        self.assertEqual(snapshot.access_check["expected"], "denied")
+        self.assertEqual(snapshot.access_check["observed"], "denied")
+        self.assertEqual(snapshot.retrieval_summary["status"], "permission_denied")
 
     def test_collect_maps_department_to_request_metadata(self):
         pipeline = FakePipeline()

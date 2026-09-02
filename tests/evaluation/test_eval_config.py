@@ -6,6 +6,22 @@ from src.evaluation.config import EvaluationConfig, EvaluationConfigurationError
 
 
 class EvaluationConfigTests(unittest.TestCase):
+    def test_embedding_dimensions_are_loaded_and_exposed(self):
+        env = {
+            "AGENT_LLM_PROVIDER": "custom",
+            "AGENT_CUSTOM_BASE_URL": "https://example.test/v1",
+            "AGENT_CUSTOM_API_KEY": "agent-key",
+            "AGENT_CUSTOM_MODEL": "judge",
+            "EVAL_EMBEDDING_BASE_URL": "https://embed.test/v1",
+            "EVAL_EMBEDDING_MODEL": "embed",
+            "EVAL_EMBEDDING_DIMS": "2048",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = EvaluationConfig.from_environment()
+
+        self.assertEqual(config.embedding_dims, 2048)
+        self.assertEqual(config.public_metadata()["embedding_dims"], 2048)
+
     def test_eval_llm_falls_back_to_agent_custom_configuration(self):
         env = {
             "AGENT_LLM_PROVIDER": "custom",
@@ -76,13 +92,14 @@ class EvaluationConfigTests(unittest.TestCase):
             config = EvaluationConfig.from_environment()
 
         self.assertEqual(config.llm_max_tokens, 4096)
+        self.assertIsNone(config.embedding_dims)
         self.assertEqual(config.max_contexts_per_sample, 4)
-        self.assertEqual(config.max_context_chars, 2000)
-        self.assertEqual(config.max_context_chars_per_item, 800)
-        self.assertEqual(config.scoring_max_budget_attempts, 1)
+        self.assertEqual(config.max_context_chars, 4000)
+        self.assertEqual(config.max_context_chars_per_item, 1200)
+        self.assertEqual(config.scoring_max_budget_attempts, 3)
         self.assertEqual(config.scoring_context_shrink_factor, 0.5)
         self.assertEqual(config.timeout_seconds, 60)
-        self.assertEqual(config.max_retries, 0)
+        self.assertEqual(config.max_retries, 2)
         self.assertEqual(
             config.public_metadata(),
             {
@@ -92,15 +109,16 @@ class EvaluationConfigTests(unittest.TestCase):
                 "llm_fallback_model": "",
                 "embedding_base_url": "https://embed.test/v1",
                 "embedding_model": "embed",
+                "embedding_dims": None,
                 "llm_max_tokens": 4096,
                 "max_contexts_per_sample": 4,
-                "max_context_chars": 2000,
-                "max_context_chars_per_item": 800,
-                "scoring_max_budget_attempts": 1,
+                "max_context_chars": 4000,
+                "max_context_chars_per_item": 1200,
+                "scoring_max_budget_attempts": 3,
                 "scoring_context_shrink_factor": 0.5,
                 "timeout_seconds": 60,
                 "max_workers": 4,
-                "max_retries": 0,
+                "max_retries": 2,
             },
         )
 

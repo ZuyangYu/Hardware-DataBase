@@ -27,6 +27,15 @@ RAGAS_RESULT_KEYS = {
     "context_recall": "context_recall",
 }
 CONTEXT_METRICS = {"faithfulness", "context_precision", "context_recall"}
+_RETRYABLE_EXCEPTION_NAMES = {
+    "APITimeoutError",
+    "APIConnectionError",
+    "ConnectTimeout",
+    "NetworkError",
+    "ReadTimeout",
+    "RemoteProtocolError",
+    "TimeoutException",
+}
 
 
 def _scoring_query_tokens(text: str) -> set[str]:
@@ -47,7 +56,15 @@ def _scoring_context_relevance(question: str, content: str) -> tuple[int, bool]:
     overlap = sum(token in searchable for token in tokens)
     boilerplate = any(
         marker in searchable
-        for marker in ("填写说明", "template instructions", "封面", "cover", "模板变更历史")
+        for marker in (
+            "填写说明",
+            "template instructions",
+            "封面",
+            "cover",
+            "模板变更历史",
+            "资料源目录",
+            "模板说明",
+        )
     )
     return overlap, boilerplate
 
@@ -105,7 +122,7 @@ def _retry_after_seconds(exc: Exception) -> float | None:
 
 def _is_rate_or_server_error(exc: Exception) -> bool:
     status = _error_status_code(exc)
-    return status is not None and (status == 429 or status >= 500)
+    return status is not None and (status in {408, 429} or status >= 500)
 
 
 def _backoff_sleep(attempt: int, exc: Exception | None = None) -> None:
@@ -120,6 +137,17 @@ def _backoff_sleep(attempt: int, exc: Exception | None = None) -> None:
 
 def _is_retryable_context_error(exc: Exception) -> bool:
     return isinstance(exc, (TimeoutError, ConnectionError)) or _error_status_code(exc) == 400
+
+
+def _is_retryable_evaluator_error(exc: Exception) -> bool:
+    """Identify transient judge failures without importing optional clients."""
+
+    if isinstance(exc, (TimeoutError, ConnectionError)) or _is_rate_or_server_error(exc):
+        return True
+    return any(
+        name in _RETRYABLE_EXCEPTION_NAMES
+        for name in (base.__name__ for base in type(exc).__mro__)
+    )
 
 
 class RagasAdapter:
@@ -260,6 +288,25 @@ class RagasAdapter:
                             initial_error=value,
                             initial_attempts=attempts,
                         )
+                    if (
+                        isinstance(value, Exception)
+                        and metric_name not in CONTEXT_METRICS
+                        and _is_retryable_evaluator_error(value)
+                    ):
+                        value, attempts, transient_diagnostic = self._retry_transient_metric(
+                            backend,  # type: ignore[arg-type]
+                            records[index],
+                            metric_name,
+                            initial_error=value,
+                            initial_attempts=attempts,
+                        )
+                        if transient_diagnostic is not None:
+                            if retry_diagnostic is not None:
+                                transient_diagnostic = {
+                                    **retry_diagnostic,
+                                    **transient_diagnostic,
+                                }
+                            retry_diagnostic = transient_diagnostic
                     if isinstance(value, Exception) or value is None or (
                         isinstance(value, float) and math.isnan(value)
                     ):
@@ -282,13 +329,13 @@ class RagasAdapter:
                             ),
                         }
                         if retry_diagnostic:
-                            diagnostic.update(
-                                {
-                                    "context_count": retry_diagnostic["final_context_count"],
-                                    "context_characters": retry_diagnostic["final_context_characters"],
-                                    "context_budget_attempts": retry_diagnostic["context_budget_attempts"],
-                                }
-                            )
+                            for source_key, diagnostic_key in (
+                                ("final_context_count", "context_count"),
+                                ("final_context_characters", "context_characters"),
+                                ("context_budget_attempts", "context_budget_attempts"),
+                            ):
+                                if source_key in retry_diagnostic:
+                                    diagnostic[diagnostic_key] = retry_diagnostic[source_key]
                         if isinstance(value, Exception):
                             diagnostic["error_type"] = type(value).__name__
                             diagnostic["error_message"] = (
@@ -367,12 +414,13 @@ class RagasAdapter:
             (evidence_id for evidence_id in quality_by_id if evidence_id in evidence_by_id),
             # Drop boilerplate first because historical runs may contain
             # quality scores produced by the old source-name matching
-            # heuristic. Quality remains the primary ranking signal, with
-            # lexical overlap breaking ties.
+            # heuristic. Question relevance is considered before the quality
+            # score so a highly rated catalog/template chunk cannot displace
+            # a lower-rated chunk containing the answer facts.
             key=lambda evidence_id: (
                 not evidence_relevance.get(evidence_id, (0, False))[1],
-                quality_by_id[evidence_id],
                 evidence_relevance.get(evidence_id, (0, False))[0],
+                quality_by_id[evidence_id],
                 evidence_id,
             ),
             reverse=True,
@@ -476,6 +524,41 @@ class RagasAdapter:
             "excluded_evidence_ids": sorted(set(candidate_ids) - set(selected_ids)),
             "quality_prioritized_evidence_ids": quality_ids,
         }
+
+    def _retry_transient_metric(
+        self,
+        backend: RagasBackend,
+        record: dict[str, Any],
+        metric_name: str,
+        *,
+        initial_error: Exception,
+        initial_attempts: int,
+    ) -> tuple[Any, int, dict[str, int | str] | None]:
+        """Retry transient judge failures for metrics without context fallback."""
+
+        attempts = initial_attempts
+        value: Any = initial_error
+        if self.config.max_retries <= 0:
+            return value, attempts, None
+
+        while attempts <= self.config.max_retries and isinstance(value, Exception):
+            if not _is_retryable_evaluator_error(value):
+                break
+            attempts += 1
+            _backoff_sleep(attempts, value)
+            try:
+                retry_rows = backend.score([record], [metric_name])
+                value = retry_rows[0].get(metric_name)
+            except Exception as exc:
+                value = exc
+
+        diagnostic = {
+            "kind": "recovered_after_retry" if not isinstance(value, Exception) else "retry_exhausted",
+            "attempts": attempts,
+            "sample_id": str(record.get("sample_id") or ""),
+            "metric_name": metric_name,
+        }
+        return value, attempts, diagnostic
 
     def _retry_with_smaller_context(
         self,
@@ -631,16 +714,21 @@ class _NativeRagasBackend:
     def _build_embeddings(self):
         from langchain_openai import OpenAIEmbeddings
 
-        return OpenAIEmbeddings(
-            model=self.config.embedding_model,
-            api_key=self.config.embedding_api_key or "not-required",
-            base_url=self.config.embedding_base_url,
-            request_timeout=self.config.timeout_seconds,
+        kwargs = {
+            "model": self.config.embedding_model,
+            "api_key": self.config.embedding_api_key or "not-required",
+            "base_url": self.config.embedding_base_url,
+            "request_timeout": self.config.timeout_seconds,
             # OpenAI-compatible providers, including Volcengine Ark, accept
             # text inputs but reject the integer token arrays LangChain sends
             # when its length-safety path is enabled. Evaluation contexts are
             # already bounded before this backend is called.
-            check_embedding_ctx_length=False,
+            "check_embedding_ctx_length": False,
+        }
+        if self.config.embedding_dims is not None:
+            kwargs["dimensions"] = self.config.embedding_dims
+        return OpenAIEmbeddings(
+            **kwargs,
         )
 
     def _build_run_config(self):

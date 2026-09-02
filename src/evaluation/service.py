@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,6 +43,23 @@ DEFAULT_STANDARD_METRICS = [
 ]
 
 
+def _collection_worker_count(config: EvaluationConfig | None) -> int:
+    """Read only the collection setting when scoring is not configured.
+
+    Collection-only runs intentionally do not require the optional RAGAS
+    stack, evaluator LLM, or embedding settings.  Loading the full
+    ``EvaluationConfig`` here would make an otherwise valid answer snapshot
+    depend on scoring-only environment variables.
+    """
+
+    if config is not None:
+        return max(1, config.max_workers)
+    try:
+        return max(1, int(os.getenv("EVAL_MAX_WORKERS", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
 def new_run_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
@@ -78,7 +96,7 @@ class EvaluationService:
         completed_count = len(completed_ids)
         total = len(samples)
         pending_samples = [sample for sample in samples if sample.id not in completed_ids]
-        max_workers = (self.config or EvaluationConfig.from_environment()).max_workers
+        max_workers = _collection_worker_count(self.config)
         if max_workers > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 pending_iterator = iter(pending_samples)
@@ -190,7 +208,13 @@ class EvaluationService:
         for sample in samples:
             snapshot = snapshot_by_id.get(sample.id)
             status = snapshot.status if snapshot is not None else "failed"
-            metrics = score_hardware_rules(sample, snapshot) if snapshot is not None and status == "success" else []
+            metrics = (
+                score_hardware_rules(sample, snapshot)
+                if sample.expected_access == "allowed"
+                and snapshot is not None
+                and status == "success"
+                else []
+            )
             existing_names = {item.metric_name for item in metrics}
             metrics.extend(
                 item
@@ -207,8 +231,11 @@ class EvaluationService:
                 critical=sample.critical,
                 snapshot_status=status,
                 metrics=metrics,
+                access_check=snapshot.access_check if snapshot is not None else None,
             )
             sample_results[sample.id].metadata["evaluation_cohort"] = sample_cohorts[sample.id]
+            if snapshot is not None and snapshot.access_check is not None:
+                sample_results[sample.id].metadata["access_check"] = snapshot.access_check
             if snapshot is not None and snapshot.retrieval_summary:
                 sample_results[sample.id].metadata["retrieval_summary"] = (
                     snapshot.retrieval_summary
@@ -225,15 +252,22 @@ class EvaluationService:
         stopped = False
         if metric_names:
             retrieval_samples = [
-                sample for sample in samples if sample_cohorts[sample.id] == "retrieval"
+                sample
+                for sample in samples
+                if sample.expected_access == "allowed"
+                and sample_cohorts[sample.id] == "retrieval"
             ]
             retrieval_ids = {sample.id for sample in retrieval_samples}
             retrieval_snapshots = [
                 snapshot for snapshot in snapshots if snapshot.sample_id in retrieval_ids
             ]
             for sample in samples:
-                if sample_cohorts[sample.id] != "non_retrieval":
+                if sample.expected_access == "denied":
+                    reason = "sample validates access denial instead of normal retrieval"
+                elif sample_cohorts[sample.id] != "non_retrieval":
                     continue
+                else:
+                    reason = "sample intentionally does not use knowledge-base retrieval"
                 for metric_name in metric_names:
                     if is_ragas_metric(metric_name):
                         sample_results[sample.id].metrics.append(
@@ -241,14 +275,16 @@ class EvaluationService:
                                 sample_id=sample.id,
                                 metric_name=metric_name,
                                 status="not_applicable",
-                                reason="sample intentionally does not use knowledge-base retrieval",
+                                reason=reason,
                             )
                         )
             if retrieval_samples:
                 adapter = self.ragas_adapter
                 if adapter is None:
                     config = self.config or EvaluationConfig.from_environment()
+                    self.config = config
                     adapter = RagasAdapter(config)
+                    self.ragas_adapter = adapter
                     scoring_config_metadata = config.public_metadata()
                 elif isinstance(adapter, RagasAdapter):
                     scoring_config_metadata = adapter.config.public_metadata()
@@ -464,11 +500,18 @@ class EvaluationService:
         are execution conditions that must be fixed or acknowledged first.
         """
 
+        def is_normal_retrieval(result: SampleResult) -> bool:
+            access_check = result.access_check or result.metadata.get("access_check") or {}
+            if str(access_check.get("expected") or "").casefold() == "denied":
+                return False
+            return result.metadata.get("evaluation_cohort", "retrieval") != "non_retrieval"
+
+        normal_retrieval_results = [result for result in results if is_normal_retrieval(result)]
         collection_failures = sum(result.snapshot_status == "failed" for result in results)
-        evidence_samples = sum(bool(result.retrieved_contexts) for result in results)
+        evidence_samples = sum(bool(result.retrieved_contexts) for result in normal_retrieval_results)
         no_evidence_samples = sum(
             result.snapshot_status == "success" and not result.retrieved_contexts
-            for result in results
+            for result in normal_retrieval_results
         )
         metric_failures = sum(
             metric.status == "failed"
@@ -477,13 +520,13 @@ class EvaluationService:
         )
         truncated_samples = sum(
             bool((result.metadata.get("ragas_scoring") or {}).get("contexts_truncated"))
-            for result in results
+            for result in normal_retrieval_results
         )
 
         retrieval_status_counts: Counter[str] = Counter()
         retrieval_partial_failures = 0
         metric_stats: dict[str, dict[str, int]] = {}
-        for result in results:
+        for result in normal_retrieval_results:
             retrieval_summary = result.metadata.get("retrieval_summary") or {}
             if retrieval_summary:
                 status = str(retrieval_summary.get("status") or "unknown")

@@ -56,18 +56,19 @@ class EvaluationConfig:
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
+    embedding_dims: int | None = None
     llm_fallback_base_url: str = ""
     llm_fallback_api_key: str = ""
     llm_fallback_model: str = ""
     llm_max_tokens: int = 4096
     max_contexts_per_sample: int = 4
-    max_context_chars: int = 2000
-    max_context_chars_per_item: int = 800
-    scoring_max_budget_attempts: int = 1
+    max_context_chars: int = 4000
+    max_context_chars_per_item: int = 1200
+    scoring_max_budget_attempts: int = 3
     scoring_context_shrink_factor: float = 0.5
     timeout_seconds: int = 60
     max_workers: int = 4
-    max_retries: int = 0
+    max_retries: int = 2
     output_root: str = "storage/evaluations"
 
     @property
@@ -108,15 +109,19 @@ class EvaluationConfig:
             raise EvaluationConfigurationError("EVAL_EMBEDDING_BASE_URL is required")
         if not embedding_model:
             raise EvaluationConfigurationError("EVAL_EMBEDDING_MODEL is required")
+        embedding_dims_raw = _env("EVAL_EMBEDDING_DIMS")
+        embedding_dims = (
+            _positive_int_env("EVAL_EMBEDDING_DIMS", 1) if embedding_dims_raw else None
+        )
         llm_max_tokens = _positive_int_env("EVAL_LLM_MAX_TOKENS", 4096)
         max_contexts_per_sample = _positive_int_env("EVAL_MAX_CONTEXTS_PER_SAMPLE", 4)
-        max_context_chars = _positive_int_env("EVAL_MAX_CONTEXT_CHARS", 2000)
-        max_context_chars_per_item = _positive_int_env("EVAL_MAX_CONTEXT_CHARS_PER_ITEM", 800)
-        scoring_max_budget_attempts = _positive_int_env("EVAL_SCORING_MAX_BUDGET_ATTEMPTS", 1)
+        max_context_chars = _positive_int_env("EVAL_MAX_CONTEXT_CHARS", 4000)
+        max_context_chars_per_item = _positive_int_env("EVAL_MAX_CONTEXT_CHARS_PER_ITEM", 1200)
+        scoring_max_budget_attempts = _positive_int_env("EVAL_SCORING_MAX_BUDGET_ATTEMPTS", 3)
         scoring_context_shrink_factor = _fraction_env("EVAL_SCORING_CONTEXT_SHRINK_FACTOR", 0.5)
         timeout_seconds = _positive_int_env("EVAL_TIMEOUT_SECONDS", 60)
         max_workers = _positive_int_env("EVAL_MAX_WORKERS", 4)
-        max_retries = _non_negative_int_env("EVAL_MAX_RETRIES", 0)
+        max_retries = _non_negative_int_env("EVAL_MAX_RETRIES", 2)
 
         return cls(
             llm_provider=provider,
@@ -126,6 +131,7 @@ class EvaluationConfig:
             embedding_base_url=embedding_base_url,
             embedding_api_key=_env("EVAL_EMBEDDING_API_KEY"),
             embedding_model=embedding_model,
+            embedding_dims=embedding_dims,
             llm_fallback_base_url=_env("EVAL_LLM_FALLBACK_BASE_URL"),
             llm_fallback_api_key=_env("EVAL_LLM_FALLBACK_API_KEY"),
             llm_fallback_model=_env("EVAL_LLM_FALLBACK_MODEL"),
@@ -141,7 +147,7 @@ class EvaluationConfig:
             output_root=_env("EVAL_OUTPUT_ROOT", "storage/evaluations"),
         )
 
-    def public_metadata(self) -> dict[str, str | int | float]:
+    def public_metadata(self) -> dict[str, str | int | float | None]:
         return {
             "llm_provider": self.llm_provider,
             "llm_base_url": self.llm_base_url,
@@ -149,6 +155,7 @@ class EvaluationConfig:
             "llm_fallback_model": self.llm_fallback_model,
             "embedding_base_url": self.embedding_base_url,
             "embedding_model": self.embedding_model,
+            "embedding_dims": self.embedding_dims,
             "llm_max_tokens": self.llm_max_tokens,
             "max_contexts_per_sample": self.max_contexts_per_sample,
             "max_context_chars": self.max_context_chars,

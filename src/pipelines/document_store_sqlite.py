@@ -37,6 +37,7 @@ class PipelineDocumentRecord:
     kb_id: int = 0
     content_kind: str = "document_text"
     processor_kind: str = "ragflow"
+    shared_read_only: bool = False
     local_path: str = ""
     file_size: int = 0
     content_hash: str = ""
@@ -137,6 +138,7 @@ class PipelineDocumentStore:
                     status TEXT NOT NULL DEFAULT 'uploaded',
                     content_kind TEXT NOT NULL DEFAULT 'document_text',
                     processor_kind TEXT NOT NULL DEFAULT 'ragflow',
+                    shared_read_only INTEGER NOT NULL DEFAULT 0,
                     local_path TEXT NOT NULL DEFAULT '',
                     file_size INTEGER NOT NULL DEFAULT 0,
                     content_hash TEXT NOT NULL DEFAULT '',
@@ -186,6 +188,7 @@ class PipelineDocumentStore:
             "retry_count": f"{add_column} retry_count INTEGER NOT NULL DEFAULT 0",
             "content_kind": f"{add_column} content_kind TEXT NOT NULL DEFAULT 'document_text'",
             "processor_kind": f"{add_column} processor_kind TEXT NOT NULL DEFAULT 'ragflow'",
+            "shared_read_only": f"{add_column} shared_read_only INTEGER NOT NULL DEFAULT 0",
             "asset_id": f"{add_column} asset_id TEXT NOT NULL DEFAULT ''",
             "logical_document_id": f"{add_column} logical_document_id TEXT NOT NULL DEFAULT ''",
             "source_version_id": f"{add_column} source_version_id TEXT NOT NULL DEFAULT ''",
@@ -211,6 +214,7 @@ class PipelineDocumentStore:
         except (TypeError, json.JSONDecodeError):
             scope = []
         values["module_scope"] = [str(item) for item in scope] if isinstance(scope, list) else []
+        values["shared_read_only"] = bool(values.get("shared_read_only", 0))
         return PipelineDocumentRecord(**values)
 
     def _migrate_department_unique_constraint(self, conn):
@@ -238,6 +242,7 @@ class PipelineDocumentStore:
                 status TEXT NOT NULL DEFAULT 'uploaded',
                 content_kind TEXT NOT NULL DEFAULT 'document_text',
                 processor_kind TEXT NOT NULL DEFAULT 'ragflow',
+                shared_read_only INTEGER NOT NULL DEFAULT 0,
                 local_path TEXT NOT NULL DEFAULT '',
                 file_size INTEGER NOT NULL DEFAULT 0,
                 content_hash TEXT NOT NULL DEFAULT '',
@@ -263,6 +268,7 @@ class PipelineDocumentStore:
                 id, kb_id, kb_name, document_name, original_file_name, dataset_kind,
                 dataset_id, document_id, source_group, department_id, uploaded_by,
                 status, content_kind, processor_kind, local_path, file_size,
+                shared_read_only,
                 content_hash, upload_status, error_message, ragflow_error, last_status_checked_at,
                 parse_started_at, parse_completed_at, parse_progress, parse_stage,
                 worker_id, worker_started_at, worker_heartbeat_at, retry_count,
@@ -272,6 +278,7 @@ class PipelineDocumentStore:
                 id, 0, kb_name, document_name, original_file_name, dataset_kind,
                 dataset_id, document_id, source_group, department_id, uploaded_by,
                 status, 'document_text', 'ragflow', local_path, file_size,
+                0,
                 content_hash, upload_status, ragflow_error, ragflow_error, last_status_checked_at,
                 parse_started_at, parse_completed_at, 0, '', '', '', '', 0,
                 created_at, updated_at
@@ -329,6 +336,7 @@ class PipelineDocumentStore:
         ragflow_error: str = "",
         content_kind: str = "document_text",
         processor_kind: str = "ragflow",
+        shared_read_only: bool = False,
         parse_progress: int = 0,
         parse_stage: str = "",
         asset_id: str = "",
@@ -344,19 +352,32 @@ class PipelineDocumentStore:
         usage_type: str = "",
     ):
         with closing(self._connect()) as conn:
+            existing = conn.execute(
+                """
+                SELECT shared_read_only
+                FROM pipeline_documents
+                WHERE kb_name = ? AND department_id = ? AND document_name = ? AND dataset_kind = ?
+                """,
+                (kb_name, department_id, document_name, dataset_kind),
+            ).fetchone()
+            if existing and bool(existing["shared_read_only"]) and not shared_read_only:
+                raise PermissionError(
+                    f"共享只读文档 '{document_name}' 不能被 develop 实例覆盖，请使用新文件名上传。"
+                )
             conn.execute(
                 """
                 INSERT INTO pipeline_documents (
                     kb_id, kb_name, document_name, original_file_name, dataset_kind,
                     dataset_id, document_id, source_group, department_id,
                     uploaded_by, status, content_kind, processor_kind,
+                    shared_read_only,
                     local_path, file_size, content_hash, upload_status,
                     error_message, ragflow_error, parse_progress, parse_stage,
                     asset_id, logical_document_id, source_version_id, project_id, document_role,
                     module_scope_json, revision, approval_status, effective_from, effective_to, usage_type,
                     parse_started_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(kb_name, department_id, document_name, dataset_kind) DO UPDATE SET
                     kb_id = excluded.kb_id,
                     department_id = excluded.department_id,
@@ -368,6 +389,7 @@ class PipelineDocumentStore:
                     status = excluded.status,
                     content_kind = excluded.content_kind,
                     processor_kind = excluded.processor_kind,
+                    shared_read_only = excluded.shared_read_only,
                     local_path = excluded.local_path,
                     file_size = excluded.file_size,
                     content_hash = excluded.content_hash,
@@ -407,6 +429,7 @@ class PipelineDocumentStore:
                     status,
                     content_kind,
                     processor_kind,
+                    int(bool(shared_read_only)),
                     local_path,
                     file_size,
                     content_hash,

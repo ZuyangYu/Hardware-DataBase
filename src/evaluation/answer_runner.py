@@ -8,6 +8,7 @@ from typing import Any
 
 from src.pipelines.document_rag.schemas import RequestContext
 
+from .access import assess_access, build_evaluation_context
 from .schemas import AnswerSnapshot, EvaluationSample
 
 
@@ -109,31 +110,9 @@ def _safe_error_message(exc: Exception | None) -> str:
 
 
 def _request_context(sample: EvaluationSample) -> RequestContext:
-    """Build a bounded evaluation context from the sample.
+    """Build a bounded evaluation context from a normalized sample."""
 
-    Security: the dataset JSONL is untrusted input. Roles are pinned to plain
-    ``user`` (a dataset claiming ``dept_admin``/``system_admin`` is ignored)
-    and ``user_id`` is fixed to ``evaluation`` so audit attribution cannot be
-    spoofed; the dataset's declared user_id is kept in metadata only.
-    KB scoping fields (department_id / allowed_kbs / kb_permissions) are still
-    honored — they are required to reach dept-scoped structured indexes — but
-    the run creator must authorize every referenced KB at run-creation time
-    (see routes/evaluation.py::create_run), which also writes an audit record.
-    """
-    raw = sample.request_context
-    department_id = raw.get("department_id")
-    metadata = {"department_id": department_id} if department_id not in (None, "") else {}
-    declared_user = str(raw.get("user_id") or "").strip()
-    if declared_user:
-        metadata["declared_user"] = declared_user
-    return RequestContext(
-        user_id="evaluation",
-        session_id=str(raw.get("session_id") or f"eval-{sample.id}"),
-        roles=["user"],
-        allowed_kbs=[str(value) for value in raw.get("allowed_kbs") or []],
-        kb_permissions={str(key): str(value) for key, value in (raw.get("kb_permissions") or {}).items()},
-        metadata=metadata,
-    )
+    return build_evaluation_context(sample)
 
 
 class AnswerRunner:
@@ -143,10 +122,20 @@ class AnswerRunner:
     def collect(self, sample: EvaluationSample) -> AnswerSnapshot:
         started_at = _utc_now()
         started = perf_counter()
+        context = _request_context(sample)
+        if sample.expected_access == "denied":
+            return self._access_denied(sample, started_at, started, context)
         try:
             pipeline = self._pipeline_factory()
         except Exception as exc:
-            return self._failed(sample, started_at, started, "pipeline_initialization", exc)
+            return self._failed(
+                sample,
+                started_at,
+                started,
+                "pipeline_initialization",
+                exc,
+                context=context,
+            )
 
         try:
             parts = list(
@@ -154,7 +143,7 @@ class AnswerRunner:
                     sample.question,
                     sample.kb_name,
                     [],
-                    ctx=_request_context(sample),
+                    ctx=context,
                     agent_thread_id=f"eval-{sample.id}",
                 )
             )
@@ -174,10 +163,27 @@ class AnswerRunner:
                     evidence=evidence,
                     retrieved_contexts=contexts,
                     retrieval_summary=safe_summary,
+                    context=context,
                 )
             if response.lstrip().startswith("系统错误:"):
-                return self._failed(sample, started_at, started, "answer_collection")
+                return self._failed(
+                    sample,
+                    started_at,
+                    started,
+                    "answer_collection",
+                    context=context,
+                    retrieval_summary=safe_summary,
+                    evidence=evidence,
+                    retrieved_contexts=contexts,
+                )
             scored_response, filter_diagnostic = extract_scored_response(response)
+            access_check = assess_access(
+                sample,
+                context,
+                safe_summary,
+                response=response,
+                evidence=evidence,
+            )
             return AnswerSnapshot(
                 sample_id=sample.id,
                 question=sample.question,
@@ -191,9 +197,62 @@ class AnswerRunner:
                 finished_at=_utc_now(),
                 duration_seconds=max(0.0, perf_counter() - started),
                 metadata={"scored_response_filter": filter_diagnostic},
+                access_check=access_check,
             )
         except Exception as exc:
-            return self._failed(sample, started_at, started, "answer_collection", exc)
+            return self._failed(
+                sample,
+                started_at,
+                started,
+                "answer_collection",
+                exc,
+                context=context,
+            )
+
+    @staticmethod
+    def _access_denied(
+        sample: EvaluationSample,
+        started_at: str,
+        started: float,
+        context: RequestContext,
+    ) -> AnswerSnapshot:
+        """Record an expected authorization denial without running retrieval.
+
+        Denial samples are negative authorization controls, not answer-quality
+        prompts.  Keeping them out of the agent pipeline also prevents tools
+        that use a different local index from accidentally returning content
+        before the primary RAG backend can reject the request.
+        """
+        retrieval_summary = {
+            "status": "permission_denied",
+            "error_stage": "authorization",
+            "error_message": "expected_access=denied; normal retrieval was skipped",
+            "access_decision": "denied",
+            "evidence": [],
+        }
+        response = "权限拒绝：该评估样本不具备所选知识库的读取权限。"
+        access_check = assess_access(
+            sample,
+            context,
+            retrieval_summary,
+            response=response,
+            evidence=[],
+        )
+        return AnswerSnapshot(
+            sample_id=sample.id,
+            question=sample.question,
+            kb_name=sample.kb_name,
+            response=response,
+            scored_response=response,
+            retrieved_contexts=[],
+            evidence=[],
+            retrieval_summary=retrieval_summary,
+            started_at=started_at,
+            finished_at=_utc_now(),
+            duration_seconds=max(0.0, perf_counter() - started),
+            metadata={"collection_mode": "access_check_only"},
+            access_check=access_check,
+        )
 
     @staticmethod
     def _failed(
@@ -206,7 +265,22 @@ class AnswerRunner:
         evidence: list[dict[str, Any]] | None = None,
         retrieved_contexts: list[str] | None = None,
         retrieval_summary: dict[str, Any] | None = None,
+        context: RequestContext | None = None,
     ) -> AnswerSnapshot:
+        access_check = (
+            assess_access(
+                sample,
+                context,
+                retrieval_summary,
+                evidence=evidence,
+            )
+            if context is not None
+            else {
+                "expected": sample.expected_access,
+                "observed": "unknown",
+                "reason": "access could not be evaluated because collection failed",
+            }
+        )
         return AnswerSnapshot(
             sample_id=sample.id,
             question=sample.question,
@@ -220,4 +294,5 @@ class AnswerRunner:
             started_at=started_at,
             finished_at=_utc_now(),
             duration_seconds=max(0.0, perf_counter() - started),
+            access_check=access_check,
         )

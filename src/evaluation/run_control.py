@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import threading
@@ -10,6 +11,7 @@ import logging
 from pathlib import Path
 
 from .dataset_loader import load_dataset
+from .history import cohort_fingerprint
 from .reporters import write_reports
 from .schemas import (
     AnswerSnapshot,
@@ -18,6 +20,7 @@ from .schemas import (
     EvaluationSummary,
 )
 from .service import new_run_id
+from .snapshot_manifest import write_snapshot_manifest
 from .snapshot_store import SnapshotStore
 from src.observability import observe, thread_with_current_context
 from src.observability.metrics import record_evaluation
@@ -32,11 +35,44 @@ _REPORT_ARTIFACT_NAMES = (
     "report.html",
     "report_complete.json",
 )
-_DELETABLE_RUN_STATUSES = frozenset({"failed", "cancelled"})
+_DELETABLE_RUN_STATUSES = frozenset({"failed", "cancelled", "completed"})
+_EXECUTION_DATASET_NAME = "execution_dataset.jsonl"
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with Path(path).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def _freeze_execution_dataset(
+    dataset_path: str | Path,
+    run_dir: str | Path,
+    samples: list[EvaluationSample],
+) -> tuple[str, str, str]:
+    """Write the normalized sample list used by a run and return its hashes."""
+
+    run_path = Path(run_dir)
+    run_path.mkdir(parents=True, exist_ok=True)
+    execution_path = run_path / _EXECUTION_DATASET_NAME
+    execution_path.write_text(
+        "".join(sample.model_dump_json() + "\n" for sample in samples),
+        encoding="utf-8",
+    )
+    return (
+        str(execution_path),
+        _sha256_file(dataset_path),
+        _sha256_file(execution_path),
+    )
 
 
 class RunStateStore:
@@ -338,16 +374,54 @@ class EvaluationRunController:
         score_enabled: bool,
         sample_ids: set[str] | list[str] | None = None,
         tags: set[str] | list[str] | None = None,
+        kb_id: int | None = None,
+        kb_name: str = "",
+        department_id: int | None = None,
+        created_by: str = "",
+        dataset_total_count: int | None = None,
+        matched_sample_count: int | None = None,
+        filtered_sample_count: int = 0,
+        cohort_fingerprint_value: str = "",
+        validation_warnings: list[str] | None = None,
+        snapshot_ownership_verified: bool = False,
+        evaluation_config: dict[str, object] | None = None,
     ) -> EvaluationRunState:
         run_id = new_run_id()
+        run_dir = self.state_root / run_id
+        execution_path, source_digest, execution_digest = _freeze_execution_dataset(
+            dataset_path,
+            run_dir,
+            samples,
+        )
+        denied_count = sum(sample.expected_access == "denied" for sample in samples)
+        metadata = {
+            "kb_id": kb_id,
+            "kb_name": kb_name,
+            "department_id": department_id,
+            "created_by": created_by,
+            "source_dataset_path": str(dataset_path),
+            "dataset_sha256": source_digest,
+            "execution_dataset_sha256": execution_digest,
+            "dataset_total_count": dataset_total_count if dataset_total_count is not None else len(samples),
+            "dataset_sample_count": len(samples),
+            "matched_sample_count": matched_sample_count if matched_sample_count is not None else len(samples),
+            "filtered_sample_count": filtered_sample_count,
+            "normal_sample_count": len(samples) - denied_count,
+            "expected_denied_sample_count": denied_count,
+            "cohort_fingerprint": cohort_fingerprint_value or cohort_fingerprint(sample.id for sample in samples),
+            "snapshot_ownership_verified": snapshot_ownership_verified,
+            "validation_warnings": list(validation_warnings or []),
+            "evaluation_config": dict(evaluation_config or {}),
+        }
         state = EvaluationRunState.new_online(
             run_id=run_id,
-            dataset_path=str(dataset_path),
+            dataset_path=execution_path,
             snapshot_path=str(Path(output_root) / run_id / "snapshot.jsonl"),
             total_samples=len(samples),
             score_enabled=score_enabled,
             sample_ids=sorted(sample_ids or []),
             tags=sorted(tags or []),
+            metadata=metadata,
         )
         return self._store(run_id).create(state)
 
@@ -358,21 +432,61 @@ class EvaluationRunController:
         samples: list[EvaluationSample],
         snapshot_path: str | Path,
         *,
+        score_enabled: bool = True,
         sample_ids: set[str] | list[str] | None = None,
         tags: set[str] | list[str] | None = None,
+        kb_id: int | None = None,
+        kb_name: str = "",
+        department_id: int | None = None,
+        created_by: str = "",
+        dataset_total_count: int | None = None,
+        matched_sample_count: int | None = None,
+        filtered_sample_count: int = 0,
+        cohort_fingerprint_value: str = "",
+        validation_warnings: list[str] | None = None,
+        snapshot_ownership_verified: bool = False,
+        evaluation_config: dict[str, object] | None = None,
     ) -> EvaluationRunState:
         run_id = new_run_id()
+        run_dir = self.state_root / run_id
+        execution_path, source_digest, execution_digest = _freeze_execution_dataset(
+            dataset_path,
+            run_dir,
+            samples,
+        )
+        denied_count = sum(sample.expected_access == "denied" for sample in samples)
         state = EvaluationRunState(
             run_id=run_id,
-            dataset_path=str(dataset_path),
+            dataset_path=execution_path,
             snapshot_path=str(snapshot_path),
             mode="offline",
-            score_enabled=True,
+            score_enabled=score_enabled,
+            kb_id=kb_id,
+            kb_name=kb_name,
+            department_id=department_id,
+            created_by=created_by,
+            source_dataset_path=str(dataset_path),
+            dataset_sha256=source_digest,
+            execution_dataset_sha256=execution_digest,
+            dataset_total_count=dataset_total_count if dataset_total_count is not None else len(samples),
+            dataset_sample_count=len(samples),
+            matched_sample_count=matched_sample_count if matched_sample_count is not None else len(samples),
+            filtered_sample_count=filtered_sample_count,
+            normal_sample_count=len(samples) - denied_count,
+            expected_denied_sample_count=denied_count,
+            cohort_fingerprint=cohort_fingerprint_value or cohort_fingerprint(sample.id for sample in samples),
+            snapshot_ownership_verified=snapshot_ownership_verified,
+            validation_warnings=list(validation_warnings or []),
+            evaluation_config=dict(evaluation_config or {}),
             total_samples=len(samples),
             sample_ids=sorted(sample_ids or []),
             tags=sorted(tags or []),
         )
-        return self._store(run_id).create(state)
+        stored = self._store(run_id).create(state)
+        if stored.kb_id is not None and Path(stored.snapshot_path).is_file():
+            self._record_snapshot_manifest(self._store(run_id))
+            stored = self._store(run_id).load()
+        return stored
 
     def start(self, run_id: str) -> threading.Thread:
         with self._threads_lock:
@@ -388,6 +502,99 @@ class EvaluationRunController:
             self._threads[run_id] = thread
             thread.start()
             return thread
+
+    def _record_snapshot_manifest(self, store: RunStateStore) -> EvaluationRunState:
+        state = store.load()
+        if state.kb_id is None or not Path(state.snapshot_path).is_file():
+            return state
+        manifest = write_snapshot_manifest(
+            store.path.parent,
+            snapshot_path=state.snapshot_path,
+            kb_id=state.kb_id,
+            kb_name=state.kb_name,
+            department_id=state.department_id,
+            cohort_fingerprint=state.cohort_fingerprint,
+            ownership_verified=state.mode == "online" or state.snapshot_ownership_verified,
+        )
+        return store.mutate(
+            lambda current: RunStateStore._with_update(
+                current,
+                snapshot_sha256=str(manifest["snapshot_sha256"]),
+                snapshot_ownership_verified=bool(manifest["ownership_verified"]),
+            )
+        )
+
+    @staticmethod
+    def _service_public_metadata(service: object) -> dict[str, object]:
+        candidates = [getattr(service, "config", None)]
+        adapter = getattr(service, "ragas_adapter", None)
+        candidates.append(getattr(adapter, "config", None))
+        for config in candidates:
+            public_metadata = getattr(config, "public_metadata", None)
+            if callable(public_metadata):
+                try:
+                    value = public_metadata()
+                except Exception:
+                    continue
+                if isinstance(value, dict):
+                    return dict(value)
+        return {}
+
+    def _record_service_metadata(
+        self, store: RunStateStore, service: object
+    ) -> EvaluationRunState:
+        state = store.load()
+        public = self._service_public_metadata(service)
+        if not public:
+            return state
+        evaluation_config = {**state.evaluation_config, **public}
+        return store.mutate(
+            lambda current: RunStateStore._with_update(
+                current,
+                evaluation_config=evaluation_config,
+                llm_model=str(public.get("llm_model") or current.llm_model),
+                embedding_model=str(public.get("embedding_model") or current.embedding_model),
+            )
+        )
+
+    @staticmethod
+    def _decorate_summary(
+        summary: EvaluationSummary, state: EvaluationRunState
+    ) -> EvaluationSummary:
+        fields = (
+            "created_at",
+            "kb_id",
+            "kb_name",
+            "department_id",
+            "created_by",
+            "source_dataset_path",
+            "dataset_sha256",
+            "execution_dataset_sha256",
+            "dataset_total_count",
+            "dataset_sample_count",
+            "matched_sample_count",
+            "filtered_sample_count",
+            "normal_sample_count",
+            "expected_denied_sample_count",
+            "cohort_fingerprint",
+            "snapshot_sha256",
+            "snapshot_ownership_verified",
+            "validation_warnings",
+            "llm_model",
+            "embedding_model",
+            "evaluation_config",
+        )
+        updates = {field: getattr(state, field) for field in fields}
+        metadata = {
+            **summary.metadata,
+            "evaluation_run": {
+                field: getattr(state, field)
+                for field in fields
+                if getattr(state, field) not in (None, "", {}, [], 0)
+            },
+        }
+        updates["metadata"] = metadata
+        return summary.model_copy(update=updates)
 
     def execute(self, run_id: str) -> EvaluationRunState:
         try:
@@ -425,6 +632,7 @@ class EvaluationRunController:
             samples = self._load_samples(store.load())
             state = store.load()
             service = self.service_factory()
+            state = self._record_service_metadata(store, service)
             if state.score_enabled:
                 scoring_preflight = getattr(service, "preflight_scoring", None)
                 errors = scoring_preflight() if callable(scoring_preflight) else []
@@ -450,6 +658,8 @@ class EvaluationRunController:
             else:
                 snapshots = SnapshotStore(state.snapshot_path).load_all()
 
+            self._record_snapshot_manifest(store)
+
             if not self._checkpoint(store):
                 return store.load()
             if store.load().status in {"paused", "cancelled"}:
@@ -466,7 +676,11 @@ class EvaluationRunController:
                 nonlocal latest_checkpoint
                 latest_checkpoint = (summary, results)
                 store.update_scoring_progress(completed_groups, total_groups)
-                write_reports(store.path.parent / ".checkpoint", summary, results)
+                write_reports(
+                    store.path.parent / ".checkpoint",
+                    self._decorate_summary(summary, store.load()),
+                    results,
+                )
                 return store.load().status not in {"pause_requested", "cancel_requested"}
 
             def item_checkpoint(summary, results, completed_items, total_items):
@@ -479,23 +693,31 @@ class EvaluationRunController:
                     completed_items=completed_items,
                     total_items=total_items,
                 )
-                write_reports(store.path.parent / ".checkpoint", summary, results)
+                write_reports(
+                    store.path.parent / ".checkpoint",
+                    self._decorate_summary(summary, store.load()),
+                    results,
+                )
 
-            summary, results = (service if state.mode == "online" else self.service_factory()).score(
+            scoring_service = service if state.mode == "online" else self.service_factory()
+            summary, results = scoring_service.score(
                 samples,
                 snapshots,
                 run_id=run_id,
                 progress_callback=checkpoint,
                 item_progress_callback=item_checkpoint,
             )
-            state = store.load()
+            # RAGAS may lazily construct its public config during score().
+            # Persist that config after scoring as well as before collection so
+            # completed reports can be compared reproducibly.
+            state = self._record_service_metadata(store, scoring_service)
             if state.status in {"pause_requested", "cancel_requested"}:
                 outcome_kind = (
                     "partial_paused" if state.status == "pause_requested" else "partial_cancelled"
                 )
                 paths = write_reports(
                     store.path.parent,
-                    summary,
+                    self._decorate_summary(summary, state),
                     results,
                     metadata={
                         "run_outcome": {
@@ -511,7 +733,7 @@ class EvaluationRunController:
             )
             paths = write_reports(
                 store.path.parent,
-                summary,
+                self._decorate_summary(summary, store.load()),
                 results,
                 metadata={
                     "run_outcome": {
@@ -528,7 +750,7 @@ class EvaluationRunController:
                 )
                 paths = write_reports(
                     store.path.parent,
-                    summary,
+                    self._decorate_summary(summary, state),
                     results,
                     metadata={
                         "run_outcome": {
@@ -547,7 +769,7 @@ class EvaluationRunController:
                 try:
                     paths = write_reports(
                         store.path.parent,
-                        summary,
+                        self._decorate_summary(summary, store.load()),
                         results,
                         metadata={
                             "run_outcome": {
@@ -580,7 +802,7 @@ class EvaluationRunController:
         return self._store(run_id).request_cancel()
 
     def delete(self, run_id: str) -> EvaluationRunState:
-        """Delete a failed or cancelled run after confirming no worker is live."""
+        """Delete an allowed terminal run after confirming no worker is live."""
         run_dir = (self.state_root / run_id).resolve()
         state_root = self.state_root.resolve()
         if run_dir.parent != state_root:
@@ -598,7 +820,7 @@ class EvaluationRunController:
             state = RunStateStore(state_path).load()
             if state.status not in _DELETABLE_RUN_STATUSES:
                 raise ValueError(
-                    f"evaluation run {run_id!r} can only be deleted from a failed or cancelled state"
+                    f"evaluation run {run_id!r} can only be deleted from a failed, cancelled, or completed state"
                 )
 
             shutil.rmtree(run_dir)

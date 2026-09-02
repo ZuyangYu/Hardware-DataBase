@@ -257,3 +257,132 @@ def compatible_baselines(
             if candidate.cohort_fingerprint == fingerprint:
                 compatible.append(candidate)
     return compatible
+
+
+def _summary_metric_names(history: EvaluationHistoryRun) -> list[str]:
+    names = set(history.summary.metric_scores)
+    names.update(history.summary.metric_counts)
+    if not names:
+        for result in history.results:
+            names.update(metric.metric_name for metric in result.metrics)
+    return sorted(str(name) for name in names)
+
+
+def _model_config(history: EvaluationHistoryRun) -> dict[str, Any]:
+    """Return only the public evaluator configuration used for comparison."""
+
+    config = dict(history.summary.evaluation_config or {})
+    if history.summary.llm_model:
+        config["llm_model"] = history.summary.llm_model
+    if history.summary.embedding_model:
+        config["embedding_model"] = history.summary.embedding_model
+    return config
+
+
+def _comparison_item(current: Any, baseline: Any, *, reason: str = "") -> dict[str, Any]:
+    return {
+        "match": current == baseline,
+        "current": current,
+        "baseline": baseline,
+        "reason": reason,
+    }
+
+
+def compatibility_report(
+    selected: EvaluationHistoryRun,
+    baseline: EvaluationHistoryRun,
+) -> dict[str, Any]:
+    """Explain whether two immutable reports are safe for strict comparison.
+
+    Missing metadata is intentionally a mismatch.  This keeps pre-metadata
+    legacy reports viewable while preventing them from being presented as a
+    reproducible baseline by accident.
+    """
+
+    current_summary = selected.summary
+    baseline_summary = baseline.summary
+    current_kb = current_summary.kb_id
+    baseline_kb = baseline_summary.kb_id
+    kb_match = current_kb is not None and baseline_kb is not None and current_kb == baseline_kb
+
+    current_cohort = current_summary.cohort_fingerprint
+    baseline_cohort = baseline_summary.cohort_fingerprint
+    cohort_match = bool(current_cohort and baseline_cohort and current_cohort == baseline_cohort)
+
+    current_metrics = _summary_metric_names(selected)
+    baseline_metrics = _summary_metric_names(baseline)
+    metrics_match = current_metrics == baseline_metrics
+
+    current_config = _model_config(selected)
+    baseline_config = _model_config(baseline)
+    model_match = bool(current_config and baseline_config) and current_config == baseline_config
+
+    current_snapshot_verified = bool(current_summary.snapshot_ownership_verified)
+    baseline_snapshot_verified = bool(baseline_summary.snapshot_ownership_verified)
+
+    current_ownership = {
+        "kb_id": current_kb,
+        "cohort_fingerprint": current_cohort,
+        "verified": current_snapshot_verified,
+    }
+    baseline_ownership = {
+        "kb_id": baseline_kb,
+        "cohort_fingerprint": baseline_cohort,
+        "verified": baseline_snapshot_verified,
+    }
+    ownership_match = (
+        current_kb is not None
+        and baseline_kb is not None
+        and bool(current_cohort)
+        and bool(baseline_cohort)
+        and current_snapshot_verified
+        and baseline_snapshot_verified
+        and current_ownership == baseline_ownership
+    )
+
+    compatibility = {
+        "kb_id": _comparison_item(
+            current_kb,
+            baseline_kb,
+            reason="两次运行必须绑定同一个 kb_id" if not kb_match else "",
+        ),
+        "cohort_fingerprint": _comparison_item(
+            current_cohort,
+            baseline_cohort,
+            reason="样本集指纹缺失或不一致" if not cohort_match else "",
+        ),
+        "metrics": _comparison_item(
+            current_metrics,
+            baseline_metrics,
+            reason="指标集合缺失或不一致" if not metrics_match else "",
+        ),
+        "model_config": _comparison_item(
+            current_config,
+            baseline_config,
+            reason="评估模型配置缺失或不一致" if not model_match else "",
+        ),
+        "snapshot_ownership": _comparison_item(
+            current_ownership,
+            baseline_ownership,
+            reason="快照归属缺失或与知识库/样本集不一致" if not ownership_match else "",
+        ),
+    }
+    warnings = [
+        f"{key}: {item['reason']}"
+        for key, item in compatibility.items()
+        if not item["match"] and item["reason"]
+    ]
+    return {
+        "compatible": all(
+            compatibility[key]["match"]
+            for key in (
+                "kb_id",
+                "cohort_fingerprint",
+                "metrics",
+                "model_config",
+                "snapshot_ownership",
+            )
+        ),
+        "warnings": warnings,
+        "compatibility": compatibility,
+    }

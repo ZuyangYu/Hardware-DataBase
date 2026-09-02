@@ -77,6 +77,23 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual([k["name"] for k in kbs], ["shared"])
         self.assertEqual(kbs[0]["permission"], "read")
 
+    def test_evaluation_knowledge_base_list_is_system_admin_only(self):
+        user_token = self._token("user1")
+        response = self.client.get(
+            "/api/v1/evaluation/knowledge-bases",
+            headers=self._auth(user_token),
+        )
+        self.assertEqual(response.status_code, 403)
+
+        admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        response = self.client.get(
+            "/api/v1/evaluation/knowledge-bases",
+            headers=self._auth(admin_token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[0]["kb_name"], "shared")
+        self.assertIsInstance(response.json()[0]["kb_id"], int)
+
     def test_list_files_user_read_ok(self):
         t = self._token("user1")
         r = self.client.get("/api/v1/kbs/shared/files", headers=self._auth(t))

@@ -6,6 +6,7 @@ from pathlib import Path
 from src.evaluation.history import (
     cohort_fingerprint,
     compatible_baselines,
+    compatibility_report,
     load_history_run,
 )
 
@@ -147,6 +148,90 @@ class EvaluationHistoryTests(unittest.TestCase):
             baselines = compatible_baselines(selected, [selected, matching, different, empty])
 
             self.assertEqual([run.run_name for run in baselines], ["matching"])
+
+    def test_compatibility_report_requires_kb_cohort_metrics_and_model_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fingerprint = cohort_fingerprint(["sample-a"])
+
+            def write(name: str, **updates):
+                run_dir = self._write_run(root, name, ["sample-a"])
+                summary = {
+                    "run_id": name,
+                    "sample_count": 1,
+                    "successful_samples": 1,
+                    "kb_id": 7,
+                    "kb_name": "shared",
+                    "department_id": 47,
+                    "cohort_fingerprint": fingerprint,
+                    "metric_scores": {"faithfulness": 0.8},
+                    "llm_model": "judge-a",
+                    "embedding_model": "embed-a",
+                    "evaluation_config": {"llm_model": "judge-a", "embedding_model": "embed-a"},
+                    "snapshot_sha256": f"snapshot-{name}",
+                    "snapshot_ownership_verified": True,
+                }
+                summary.update(updates)
+                (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+                return load_history_run(run_dir)
+
+            selected = write("selected")
+            matching = write("matching")
+            different_kb = write("different-kb", kb_id=8)
+            different_model = write("different-model", llm_model="judge-b")
+
+            result = compatibility_report(selected, matching)
+            self.assertTrue(result["compatible"])
+            self.assertTrue(result["compatibility"]["snapshot_ownership"]["match"])
+
+            kb_result = compatibility_report(selected, different_kb)
+            self.assertFalse(kb_result["compatible"])
+            self.assertFalse(kb_result["compatibility"]["kb_id"]["match"])
+            self.assertTrue(kb_result["warnings"])
+
+            model_result = compatibility_report(selected, different_model)
+            self.assertFalse(model_result["compatible"])
+            self.assertFalse(model_result["compatibility"]["model_config"]["match"])
+
+    def test_unverified_snapshot_cannot_be_a_strict_baseline(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fingerprint = cohort_fingerprint(["sample-a"])
+
+            def write(name: str, verified: bool):
+                run_dir = self._write_run(root, name, ["sample-a"])
+                (run_dir / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": name,
+                            "sample_count": 1,
+                            "successful_samples": 1,
+                            "kb_id": 7,
+                            "kb_name": "shared",
+                            "department_id": 47,
+                            "cohort_fingerprint": fingerprint,
+                            "metric_scores": {"faithfulness": 0.8},
+                            "llm_model": "judge-a",
+                            "embedding_model": "embed-a",
+                            "evaluation_config": {
+                                "llm_model": "judge-a",
+                                "embedding_model": "embed-a",
+                            },
+                            "snapshot_ownership_verified": verified,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return load_history_run(run_dir)
+
+            verified = write("verified", True)
+            legacy = write("legacy", False)
+
+            result = compatibility_report(verified, legacy)
+
+            self.assertFalse(result["compatible"])
+            self.assertFalse(result["compatibility"]["snapshot_ownership"]["match"])
+            self.assertTrue(any("快照归属" in warning for warning in result["warnings"]))
 
 
 if __name__ == "__main__":
