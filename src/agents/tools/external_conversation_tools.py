@@ -94,15 +94,15 @@ def make_conversation_search(rt, conversation_service):
 
     def conversation_search(query: str, top_k: int = rt.top_k) -> str:
         """在知识库中检索外部 AI 对话记录（外部数据 txt/markdown）：历史问答、经验结论、参数与踩坑细节。"""
-        from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
+        from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
-        items = timed_tool_call(
+        items, adds_nothing = timed_tool_call(
             rt,
             "conversation_search",
             query,
             None,
             lambda: tool.run(query, rt.kb_name, rt.ctx, max(1, min(int(top_k), 20))),
         )
-        return format_evidence_for_llm(items)
+        return format_tool_result(rt, adds_nothing, items)
 
     return conversation_search

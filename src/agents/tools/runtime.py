@@ -120,8 +120,25 @@ class ToolRuntime:
 
     def log_query(self, tool_name: str, query: str) -> None:
         q = str(query or "").strip()
-        if q and not any(item["tool_name"] == tool_name and item["query"] == q for item in self.queries):
-            self.queries.append({"tool_name": tool_name, "query": q})
+        if not q:
+            return
+        with self._lock:
+            if not any(
+                item["tool_name"] == tool_name and item["query"] == q
+                for item in self.queries
+            ):
+                self.queries.append({"tool_name": tool_name, "query": q})
+
+    def has_query(self, tool_name: str, query: str) -> bool:
+        """Whether this exact (tool, query) pair was already executed this run."""
+        q = str(query or "").strip()
+        if not q:
+            return False
+        with self._lock:
+            return any(
+                item["tool_name"] == tool_name and item["query"] == q
+                for item in self.queries
+            )
 
     def add_evidence(self, items: list[Evidence]) -> list[int]:
         """Register evidence rows and return their 1-based citation numbers."""
@@ -156,16 +173,17 @@ class ToolRuntime:
                 self.memory_context.append(dict(item))
 
     def record_diagnostic(self, diag: ToolDiagnostics) -> None:
-        self.diagnostics.append(
-            {
-                "tool_name": diag.tool_name,
-                "hit_count": diag.hit_count,
-                "status": diag.status,
-                "error": diag.error,
-                "latency_ms": diag.latency_ms,
-                "filters": diag.filters,
-            }
-        )
+        with self._lock:
+            self.diagnostics.append(
+                {
+                    "tool_name": diag.tool_name,
+                    "hit_count": diag.hit_count,
+                    "status": diag.status,
+                    "error": diag.error,
+                    "latency_ms": diag.latency_ms,
+                    "filters": diag.filters,
+                }
+            )
 
 
 def timed_tool_call(
@@ -174,9 +192,20 @@ def timed_tool_call(
     query: str,
     filters: dict[str, Any] | None,
     fn: Callable[[], list[Evidence]],
-) -> list[Evidence]:
-    """Shared wrapper: cancel-check, timing, diagnostics and event emission."""
+) -> tuple[list[Evidence], bool]:
+    """Shared wrapper: cancel-check, timing, diagnostics and event emission.
+
+    Returns ``(items, adds_nothing)`` — ``adds_nothing`` marks a call that is
+    an exact (tool, query) repeat AND returned only evidence ids that were
+    already registered before this call, i.e. the rendered output would be a
+    byte-for-byte repeat of something already in the message history. The
+    snapshot is taken before ``add_evidence`` registers this call's items, so
+    genuinely new evidence always falls through to a full render.
+    """
     rt.check_cancel()
+    was_repeat = rt.has_query(tool_name, query)
+    with rt._lock:
+        pre_registered = set(rt.evidence_index)
     rt.emit("tool_started", {"tool_name": tool_name, "query": query})
     started = time.monotonic()
     try:
@@ -211,7 +240,7 @@ def timed_tool_call(
                 "reason": friendly_error_message(exc),
             },
         )
-        return []
+        return [], False
     latency_ms = int((time.monotonic() - started) * 1000)
     rt.log_query(tool_name, query)
     rt.record_diagnostic(
@@ -235,7 +264,10 @@ def timed_tool_call(
     # Citation numbers follow registration order so the LLM can cite [n].
     for item, number in zip(items, numbers):
         item.metadata = {**item.metadata, "citation_number": number}
-    return items
+    adds_nothing = bool(items) and all(
+        item.id and item.id in pre_registered for item in items
+    )
+    return items, was_repeat and adds_nothing
 
 
 _LEADING_CITATION_RE = re.compile(r"(?m)^(\[\d+\])")
@@ -268,3 +300,25 @@ def format_evidence_for_llm(items: list[Evidence]) -> str:
             f"</evidence>"
         )
     return "\n\n".join(blocks)
+
+
+def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence]) -> str:
+    """Render a tool result for the model, collapsing no-op repeat calls.
+
+    A repeated (tool, query) that returned only already-registered evidence
+    adds no information — the full evidence blocks are already in the message
+    history — so a short hint is returned instead of re-sending every block.
+    This keeps per-round context growth bounded when the model re-issues
+    identical retrieval calls. Any new evidence id falls through to the full
+    render so fresh content always reaches the model.
+    """
+    if adds_nothing and items:
+        with rt._lock:
+            numbers = sorted({int(rt.evidence_index[item.id]) for item in items})
+        cited = " ".join(f"[{number}]" for number in numbers)
+        # 事实陈述，不带指令：是否继续引用 [n]、换关键词还是再次检索，
+        # 由模型根据当前对话自行判断（策略在 SYSTEM_PROMPT，不在这里）。
+        return (
+            f"本次调用返回的证据与历史消息中已注册的 {cited} 完全相同，无新增内容。"
+        )
+    return format_evidence_for_llm(items)

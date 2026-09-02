@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import signal
+import os
 import time
 import uuid
 
@@ -32,11 +33,41 @@ class HardwareWorker:
         self.conversations = ConversationService()
         self.pipeline = AppPipeline()
         self.runtime = getattr(getattr(self.pipeline, "backend", None), "runtime", None)
+        self._env_mtime_ns = self._settings_mtime_ns()
+
+    @staticmethod
+    def _settings_mtime_ns() -> int:
+        try:
+            return os.stat(src.settings.ENV_FILE_PATH).st_mtime_ns
+        except OSError:
+            return -1
+
+    def _reload_runtime_settings_if_changed(self) -> None:
+        """Reload live config in the standalone worker.
+
+        The API and chat worker are separate processes. The API config route
+        can clear its own model cache, but cannot clear the worker's cache;
+        watching the shared .env file keeps queued turns on the new model
+        without requiring a worker restart.
+        """
+        current_mtime_ns = self._settings_mtime_ns()
+        if current_mtime_ns == self._env_mtime_ns:
+            return
+        try:
+            src.settings.reload_settings()
+            from src.core.model_factory import create_chat_model
+
+            create_chat_model.cache_clear()
+            self._env_mtime_ns = current_mtime_ns
+            log("Worker reloaded runtime settings")
+        except Exception as exc:
+            error(f"Worker failed to reload runtime settings: {exc}")
 
     def stop(self, *_args) -> None:
         self.running = False
 
     def run_once(self) -> bool:
+        self._reload_runtime_settings_if_changed()
         did_work = False
         self.conversations.requeue_stale_turns()
         depth, oldest_age_s = self.conversations.pending_turn_queue_state()

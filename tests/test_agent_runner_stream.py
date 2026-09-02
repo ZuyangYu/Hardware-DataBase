@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 from src.agents.runner import MultiSourceAgentRunner
 
@@ -47,6 +47,67 @@ def test_stream_wrapper_emits_deltas_and_records_answer(monkeypatch):
     assert runner.get_last_footer()
     record_agent.assert_called_once()
     assert record_agent.call_args.kwargs["mode"] == "deep"
+
+
+def test_stream_retracts_narration_without_tool_metadata(monkeypatch):
+    """真实观测形态：工具调用信息不在流式 chunk 上，后续消息开始才知道前一段是叙述。
+
+    叙述文本先被乐观下发为答案增量，再通过 narration 事件回收；
+    record.answer 只含最终回答。
+    """
+    from src.agents import runner as runner_mod
+
+    chunks = [
+        AIMessageChunk(content="让我先检索电源方案。", id="m1"),
+        AIMessageChunk(content="根据知识库证据，最终结论是 A。", id="m2"),
+    ]
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter((chunk, {"langgraph_node": "model"}) for chunk in chunks)
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(query="问题", kb_name="kb_hw", history=[], thread_id="t1", event_callback=events.append)
+    )
+
+    assert deltas == ["让我先检索电源方案。", "根据知识库证据，最终结论是 A。"]
+    assert [e for e in events if e["type"] == "narration"] == [
+        {"type": "narration", "payload": {"text": "让我先检索电源方案。"}}
+    ]
+    assert runner_mod._current_run().answer == "根据知识库证据，最终结论是 A。"
+
+
+def test_stream_classifies_whole_message_narration_without_retraction(monkeypatch):
+    """整条 AIMessage 的伪流式路径：叙述消息自带 tool_calls，文本从未下发，无需回收。"""
+    from src.agents import runner as runner_mod
+
+    chunks = [
+        AIMessage(
+            content="让我先检索电源方案。",
+            tool_calls=[{"name": "document_search", "args": {"query": "电源"}, "id": "t1", "type": "tool_call"}],
+        ),
+        AIMessage(content="根据知识库证据，最终结论是 A。"),
+    ]
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter((chunk, {"langgraph_node": "model"}) for chunk in chunks)
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(query="问题", kb_name="kb_hw", history=[], thread_id="t1", event_callback=events.append)
+    )
+
+    assert deltas == ["根据知识库证据，最终结论是 A。"]
+    assert [e for e in events if e["type"] == "narration"] == []
+    assert runner_mod._current_run().answer == "根据知识库证据，最终结论是 A。"
 
 
 def test_stream_wrapper_marks_failure_status(monkeypatch):
@@ -111,8 +172,55 @@ def test_general_chat_runs_through_agent_without_retrieval_tools(monkeypatch):
     list(runner.stream(query="问题", kb_name="kb_hw", history=[], thread_id="t1"))
     tool_names = [_tool_name(tool) for tool in captured["tools"]]
     assert "document_search" in tool_names
+    assert "document_search_batch" in tool_names
     assert "circuit_search" in tool_names
     assert "当前未挂载知识库" not in captured["system_prompt"]
+
+
+def test_general_chat_hides_memory_trace_and_retrieval_footer(monkeypatch):
+    from src.agents import runner as runner_mod
+    from src.pipelines.document_rag.schemas import RequestContext
+
+    class _MemoryService:
+        def search(self, query, **kwargs):
+            return [{"id": "m1", "scope": "user", "status": "verified", "content": "历史线索"}]
+
+        def format_context(self, rows):
+            return "<untrusted_memory>历史线索</untrusted_memory>"
+
+        def close(self):
+            pass
+
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter(
+        ((AIMessage(content="通用回答"), {"langgraph_node": "model"}),)
+    )
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(
+        rag_backend=_FakeRAGBackend(),
+        memory_service_factory=_MemoryService,
+    )
+    deltas = list(
+        runner.stream(
+            query="问题",
+            kb_name="",
+            history=[],
+            ctx=RequestContext(user_id="engineer"),
+            thread_id="general-1",
+            event_callback=events.append,
+        )
+    )
+
+    assert deltas == ["通用回答"]
+    assert not any(event["type"] in {"tool_started", "tool_result", "stage", "narration"} for event in events)
+    assert runner.get_last_footer() == ""
+    summary = runner.get_last_retrieval_summary()
+    assert summary["memory_context"][0]["id"] == "m1"
+    assert summary["tool_diagnostics"][0]["tool_name"] == "memory_search"
 
 
 def test_runner_prefetches_bounded_memory_context_before_agent_creation():

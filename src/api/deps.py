@@ -55,6 +55,12 @@ def reset_pipeline() -> None:
                 stop()
             except Exception:
                 pass
+        close = getattr(getattr(old, "backend", None), "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
 
 def get_auth_service() -> AuthService:

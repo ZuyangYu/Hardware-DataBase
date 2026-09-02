@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
 from contextlib import closing
+from typing import Any
 
 from src.agents.schemas import Evidence
 from src.core.query_tokens import tokenize_hardware_query
@@ -256,29 +258,29 @@ def make_spreadsheet_tools(rt, spreadsheet_service: SpreadsheetIndexService):
         """按语义检索 Excel 表格行, 只适合取"具体某行/某个值"这类单点信息。
         注意: 统计数量、求和、最值、均值、按条件筛选多行、数值比较等问题用本工具会漏行漏列,
         必须改用 spreadsheet_schema_lookup + spreadsheet_sql_query 一次完成。"""
-        from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
+        from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
-        items = timed_tool_call(
+        items, adds_nothing = timed_tool_call(
             rt,
             "spreadsheet_row_search",
             query,
             None,
             lambda: _semantic_rows(rt, spreadsheet_service, query, max(1, min(int(top_k), 20))),
         )
-        return format_evidence_for_llm(items)
+        return format_tool_result(rt, adds_nothing, items)
 
     def spreadsheet_cell_lookup(query: str, top_k: int = rt.top_k) -> str:
         """按精确值检索单元格（表头/原始值匹配），适合查找具体参数值、型号、数量等。"""
-        from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
+        from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
-        items = timed_tool_call(
+        items, adds_nothing = timed_tool_call(
             rt,
             "spreadsheet_cell_lookup",
             query,
             None,
             lambda: _cell_rows(rt, spreadsheet_service, query, max(1, min(int(top_k), 20))),
         )
-        return format_evidence_for_llm(items)
+        return format_tool_result(rt, adds_nothing, items)
 
     return spreadsheet_row_search, spreadsheet_cell_lookup
 
@@ -664,6 +666,18 @@ def _format_sql_result(records: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _sql_evidence_id(sql: str, kind: str) -> str:
+    """Content-derived evidence id for SQL results.
+
+    Two different SQL statements must never share an evidence id: the shared
+    static ``xlsx-sql:result`` id made the second query's rows inherit the
+    first query's citation number, so the answer's [n] markers pointed at the
+    wrong evidence content.
+    """
+    digest = hashlib.sha1(str(sql or "").encode("utf-8")).hexdigest()[:12]
+    return f"xlsx-sql:{kind}:{digest}"
+
+
 def make_spreadsheet_sql_tools(rt, spreadsheet_service):
     """返回 SQL 查询两件套: 先查 schema 再执行只读 SQL."""
 
@@ -709,19 +723,19 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
                 for entry in selected
             ]
 
-        items = timed_tool_call(rt, "spreadsheet_schema_lookup", query, None, _run)
+        items, adds_nothing = timed_tool_call(rt, "spreadsheet_schema_lookup", query, None, _run)
         if not items:
             return "当前知识库没有可用的 SQL 物化表。"
-        from src.agents.tools.runtime import format_evidence_for_llm
+        from src.agents.tools.runtime import format_tool_result
 
-        return format_evidence_for_llm(items)
+        return format_tool_result(rt, adds_nothing, items)
 
     def spreadsheet_sql_query(sql: str) -> str:
         """执行只读 SQL 查询物化表(仅 SELECT, 自动 LIMIT)。筛选/聚合/比较/统计类问题优先用本工具。
 
         出错时按错误信息修正 SQL 后重试, 最多 2 次; 表名与列结构先用 spreadsheet_schema_lookup 查询。
         """
-        from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
+        from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
         scope = kb_scope_from_context(rt.kb_name, rt.ctx).require_department("query spreadsheet sql in")
         db_path = spreadsheet_service.db_path(scope.department_id, scope.kb_name, create=False)
@@ -735,7 +749,7 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
             if error:
                 return [
                     Evidence(
-                        id="xlsx-sql:invalid",
+                        id=_sql_evidence_id(sql, "invalid"),
                         content=f"SQL 校验未通过: {error}\n请用 spreadsheet_schema_lookup 确认表名/列名后修正重试(最多 2 次)。",
                         source_name="spreadsheet_sql",
                         content_kind="spreadsheet_sql_result",
@@ -753,7 +767,7 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
             if exec_error:
                 return [
                     Evidence(
-                        id="xlsx-sql:error",
+                        id=_sql_evidence_id(sql, "error"),
                         content=(
                             f"{exec_error}\n请根据 schema(可用 spreadsheet_schema_lookup 查看)修正 SQL 后重试, 最多 2 次。"
                         ),
@@ -767,7 +781,7 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
                 ]
             return [
                 Evidence(
-                    id="xlsx-sql:result",
+                    id=_sql_evidence_id(sql, "result"),
                     content=_format_sql_result(records),
                     source_name=source_names[0] if source_names else "spreadsheet_sql",
                     content_kind="spreadsheet_sql_result",
@@ -778,8 +792,8 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
                 )
             ]
 
-        items = timed_tool_call(rt, "spreadsheet_sql_query", sql, None, _run)
-        return format_evidence_for_llm(items)
+        items, adds_nothing = timed_tool_call(rt, "spreadsheet_sql_query", sql, None, _run)
+        return format_tool_result(rt, adds_nothing, items)
 
     return spreadsheet_schema_lookup, spreadsheet_sql_query
 

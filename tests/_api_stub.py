@@ -44,6 +44,7 @@ class StubPipeline:
         self.paused_tasks: list = []
         self.resumed_tasks: list = []
         self.cleared_kbs: list = []
+        self.forgotten_threads: list = []
         self.applied_settings: list = []
         self.query_chunks = ["第一段", "第二段"]
 
@@ -117,6 +118,9 @@ class StubPipeline:
         )
 
     # Query --------------------------------------------------------------
+    def forget_agent_thread(self, thread_id):
+        self.forgotten_threads.append(thread_id)
+
     def query(self, msg, kb_name, history, ctx, agent_thread_id=""):
         # ``agent_thread_id`` is the LangGraph thread id; the stub just records
         # it via a side attribute so tests can assert on it if they care.

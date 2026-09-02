@@ -115,7 +115,9 @@ def scan_kb_sources(
 
 def make_catalog_tool(rt, *, document_store: PipelineDocumentStore, spreadsheet_service, circuit_service, rag_backend):
     def list_kb_sources(query: str = "") -> str:
-        """列出当前知识库中所有可用资料源（文档/表格/电路），含各资料的类型与状态。回答前先用它了解有哪些资料可查。"""
+        """按需列出当前知识库的资料源（文档/表格/电路）及其状态。
+        仅在用户询问资料目录、或无法判断应使用哪类来源时调用；普通技术问题
+        直接调用最相关的检索工具，避免为目录扫描额外增加一轮 agent 往返。"""
         from src.agents.tools.runtime import timed_tool_call
 
         def run(_: str, __: int):
@@ -160,9 +162,9 @@ def make_catalog_tool(rt, *, document_store: PipelineDocumentStore, spreadsheet_
                 )
             ]
 
-        items = timed_tool_call(rt, "list_kb_sources", query, None, lambda: run("", 1))
-        from src.agents.tools.runtime import format_evidence_for_llm
+        items, adds_nothing = timed_tool_call(rt, "list_kb_sources", query, None, lambda: run("", 1))
+        from src.agents.tools.runtime import format_tool_result
 
-        return format_evidence_for_llm(items)
+        return format_tool_result(rt, adds_nothing, items)
 
     return list_kb_sources

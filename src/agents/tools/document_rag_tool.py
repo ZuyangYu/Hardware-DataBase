@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from src.agents.schemas import Evidence
@@ -94,9 +95,41 @@ def make_document_search(rt, rag_backend: RAGBackend, document_store: PipelineDo
 
     def document_search(query: str, top_k: int = rt.top_k) -> str:
         """在知识库中检索文档资料（Word/PDF/文本等），返回与查询最相关的证据片段。支持硬件设计文档、规范、说明书的语义检索。"""
-        from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
+        from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
-        items = timed_tool_call(rt, "document_search", query, None, lambda: run(query, max(1, min(int(top_k), 20))))
-        return format_evidence_for_llm(items)
+        items, adds_nothing = timed_tool_call(rt, "document_search", query, None, lambda: run(query, max(1, min(int(top_k), 20))))
+        return format_tool_result(rt, adds_nothing, items)
 
     return document_search
+
+
+def make_document_search_batch(
+    rt, rag_backend: RAGBackend, document_store: PipelineDocumentStore | None
+):
+    """Return a model-controlled fan-out document retrieval tool.
+
+    The model chooses independent query variants; only their backend calls are
+    parallelized here. Each child uses the normal document-search path, so
+    authorization, cancellation, evidence registration and citations remain
+    shared with single-query retrieval.
+    """
+    search = make_document_search(rt, rag_backend, document_store)
+
+    def document_search_batch(queries: list[str], top_k: int = rt.top_k) -> str:
+        """并发检索多个相互独立的文档查询。适合中文/英文、型号/标题等查询变体；不要把有前后依赖的查询放在同一批。"""
+        normalized = []
+        for query in queries or []:
+            value = str(query or "").strip()
+            if value and value not in normalized:
+                normalized.append(value)
+        normalized = normalized[:4]
+        if not normalized:
+            return "（未提供有效的文档查询）"
+        safe_top_k = max(1, min(int(top_k), 20))
+        with ThreadPoolExecutor(
+            max_workers=len(normalized), thread_name_prefix="hdb-document-search"
+        ) as executor:
+            results = list(executor.map(lambda query: search(query, safe_top_k), normalized))
+        return "\n\n".join(result for result in results if result)
+
+    return document_search_batch
