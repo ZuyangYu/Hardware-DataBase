@@ -465,6 +465,10 @@ class RAGFlowClient:
         self._async_client_factory = async_client_factory or httpx.AsyncClient
         if not self.api_key:
             raise ValueError("RAGFLOW_API_KEY is not configured.")
+        # RAGFlowBackend reuses one client for the process. Keep the sync
+        # connection pool alive across retrievals instead of creating a new
+        # TCP client for every request.
+        self._sync_client = httpx.Client(timeout=self.timeout, follow_redirects=True)
 
     @property
     def headers(self) -> dict[str, str]:
@@ -474,18 +478,21 @@ class RAGFlowClient:
         return f"{self.base_url}{path}"
 
     def request(self, method: str, path: str, **kwargs) -> dict:
-        with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
-            response = client.request(
-                method,
-                self._url(path),
-                headers={**self.headers, **kwargs.pop("headers", {})},
-                **kwargs,
-            )
+        response = self._sync_client.request(
+            method,
+            self._url(path),
+            headers={**self.headers, **kwargs.pop("headers", {})},
+            **kwargs,
+        )
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict) and data.get("code") not in {None, 0}:
             raise RAGFlowAPIError(data)
         return data
+
+    def close(self) -> None:
+        """Close the process-level sync connection pool during pipeline reset."""
+        self._sync_client.close()
 
     async def _async_request_until_cancelled(
         self,
@@ -729,6 +736,11 @@ class RAGFlowBackend(RAGBackend):
             return legacy_client
         self._client_instance = RAGFlowClient()
         return self._client_instance
+
+    def close(self) -> None:
+        client = getattr(self, "_client_instance", None)
+        if client is not None:
+            client.close()
 
     def _ensure_physical_datasets(self):
         dataset_specs = {

@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 import src.settings
+from src.agents.runner import strip_narration_segments
 from src.core.app_logs import AppLogService, query_trace_status
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
@@ -129,22 +130,6 @@ def _set_short_term_memory_observation(observation, summary: dict[str, object]) 
     observation.set("hdb.chat.short_term_memory.turn_count", int(summary.get("turn_count") or 0))
     observation.set("hdb.chat.short_term_memory.message_count", int(summary.get("message_count") or 0))
     observation.set("hdb.chat.short_term_memory.window_turns", int(summary.get("window_turns") or 0))
-
-
-def _append_short_term_memory_source(footer: str, summary: dict[str, object]) -> str:
-    """Explain when the answer had access to same-session conversation context.
-
-    Conversation history is useful context but is not formal knowledge-base
-    evidence, so it is shown as a separate data-source note.
-    """
-    if summary.get("status") == "error":
-        note = "**数据来源**\n- 对话上文（短期记忆）：上文内容读取失败"
-    elif summary.get("hit"):
-        hit_count = int(summary.get("hit_count") or summary.get("turn_count") or 0)
-        note = f"**数据来源**\n- 对话上文（短期记忆）：来源于上文内容（命中 {hit_count} 轮历史）"
-    else:
-        return footer
-    return f"{footer.rstrip()}\n\n{note}" if footer.strip() else note
 
 
 def _make_event_callback(emit_stage, emit):
@@ -274,6 +259,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     start = time.monotonic()
     started_at = datetime.now(timezone.utc)
     answer_parts: list[str] = []
+    # Provisional answer deltas of narration segments were already streamed;
+    # the narration events carry the retracted text in stream order and it is
+    # stripped from the joined answer before persistence/done.
+    narrated: list[str] = []
     first_token_ms: int | None = None
     stage_started: dict[str, float] = {}
     stage_durations_ms: dict[str, list[int]] = {}
@@ -323,6 +312,8 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 _flush_deltas()
             return
         _flush_deltas()
+        if event_type == "narration":
+            narrated.append(str(payload.get("text") or ""))
         event = conv.append_turn_event(turn_id, event_type, payload)
         _publish_turn_event(turn_id, event.seq, event_type, payload)
 
@@ -373,14 +364,12 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 status="error",
             )
             _set_short_term_memory_observation(turn_observation, short_term_memory)
-            emit("short_term_memory", short_term_memory)
             raise
         short_term_memory = _short_term_memory_summary(
             history,
             source="server_conversation_history",
         )
         _set_short_term_memory_observation(turn_observation, short_term_memory)
-        emit("short_term_memory", short_term_memory)
         # 统一执行路径：通用对话（未挂载/`__general__`）与知识库问答都走
         # deepagents agent 循环，不存在单独的直连模型旁路。
         if pipeline is None:
@@ -395,6 +384,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             _make_event_callback(emit_stage, emit),
             turn.query_mode,
             cancelled,
+            persist_thread=True,
         )
         try:
             for chunk in gen:
@@ -417,7 +407,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         footer = pipeline.get_last_agent_footer() or ""
         token_usage_summary = pipeline.get_last_token_usage_summary()
 
-        footer = _append_short_term_memory_source(footer, short_term_memory)
         _flush_deltas()
         if cancelled():
             emit("error", {"message": "已停止生成", "cancelled": True})
@@ -426,7 +415,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             outcome_status = "cancelled"
             return
 
-        answer = "".join(answer_parts)
+        answer = strip_narration_segments("".join(answer_parts), narrated)
         if not answer:
             raise RuntimeError("未生成回答")
         summary = {
@@ -789,10 +778,16 @@ async def query(
         ).start()
         observation.set_input(body.query, content_kind="query")
         _set_short_term_memory_observation(observation, short_term_memory)
-        _put(("short_term_memory", short_term_memory))
         outcome_status = "failed"
         try:
             answer_parts: list[str] = []
+            narrated: list[str] = []
+
+            def _forward_event(e: dict) -> None:
+                if e.get("type") == "narration":
+                    narrated.append(str((e.get("payload") or {}).get("text") or ""))
+                _put((e["type"], e.get("payload") or {}))
+
             gen = _query_generator(
                 pipeline,
                 body.query,
@@ -800,7 +795,7 @@ async def query(
                 history,
                 ctx,
                 body.thread_id,
-                lambda e: _put((e["type"], e.get("payload") or {})),
+                _forward_event,
                 "deep",
                 None,
             )
@@ -814,7 +809,7 @@ async def query(
                 **(pipeline.get_last_retrieval_summary() or {}),
                 "short_term_memory": short_term_memory,
             }
-            answer = "".join(answer_parts)
+            answer = strip_narration_segments("".join(answer_parts), narrated)
             observation.set_output(answer, content_kind="llm")
             if not cancel.is_set():
                 q.put(
@@ -823,10 +818,7 @@ async def query(
                         {
                             "answer": answer,
                             "summary": summary,
-                            "footer": _append_short_term_memory_source(
-                                pipeline.get_last_agent_footer() or "",
-                                short_term_memory,
-                            ),
+                            "footer": pipeline.get_last_agent_footer() or "",
                             "token_usage": pipeline.get_last_token_usage_summary(),
                         },
                     )
@@ -947,6 +939,7 @@ def _query_generator(
     event_callback,
     query_mode="deep",
     should_cancel=None,
+    persist_thread=False,
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -958,6 +951,8 @@ def _query_generator(
             kwargs["query_mode"] = query_mode
         if "should_cancel" in params:
             kwargs["should_cancel"] = should_cancel
+        if persist_thread and "persist_thread" in params:
+            kwargs["persist_thread"] = True
         return pipeline.query(
             query,
             kb_name,
@@ -970,6 +965,8 @@ def _query_generator(
         kwargs["query_mode"] = query_mode
     if "should_cancel" in params:
         kwargs["should_cancel"] = should_cancel
+    if persist_thread and "persist_thread" in params:
+        kwargs["persist_thread"] = True
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 

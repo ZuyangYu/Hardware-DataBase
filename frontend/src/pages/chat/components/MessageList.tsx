@@ -46,6 +46,7 @@ export default function MessageList({
 }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
+  const showDiagnostics = Boolean(kbName && kbName !== '__general__');
 
   // 只在用户仍停留在底部附近时跟随输出，避免每个 token 触发平滑动画。
   useEffect(() => {
@@ -85,7 +86,8 @@ export default function MessageList({
             evidence={msg.role === 'assistant' ? evidenceByMessageId[msg.id] : undefined}
             onCreateMemory={onCreateMemory}
             onEditMessage={onEditMessage}
-            traceSteps={msg.role === 'assistant' ? (traceByMessageId[msg.id] ?? []) : []}
+            showDiagnostics={showDiagnostics}
+            traceSteps={msg.role === 'assistant' && showDiagnostics ? (traceByMessageId[msg.id] ?? []) : []}
           />
         ))}
         {streaming && (
@@ -101,7 +103,8 @@ export default function MessageList({
             }
             streaming
             streamingText={streamingText}
-            traceSteps={traceSteps}
+            showDiagnostics={showDiagnostics}
+            traceSteps={showDiagnostics ? traceSteps : []}
             degradedNotes={degradedNotes}
           />
         )}

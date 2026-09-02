@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+import inspect
 import re
 from time import perf_counter
 from typing import Any
 
+from src.agents.runner import strip_narration_segments
 from src.pipelines.document_rag.schemas import RequestContext
 
 from .access import assess_access, build_evaluation_context
@@ -138,6 +140,19 @@ class AnswerRunner:
             )
 
         try:
+            # The agent streams provisional answer deltas live; narration
+            # segments (model messages that carry tool calls) are announced
+            # via events and must be stripped from the joined response so the
+            # scored text is the authoritative answer only.
+            narrated: list[str] = []
+
+            def _on_event(evt: dict) -> None:
+                if evt.get("type") == "narration":
+                    narrated.append(str((evt.get("payload") or {}).get("text") or ""))
+
+            kwargs: dict[str, Any] = {}
+            if "event_callback" in inspect.signature(pipeline.query).parameters:
+                kwargs["event_callback"] = _on_event
             parts = list(
                 pipeline.query(
                     sample.question,
@@ -145,13 +160,16 @@ class AnswerRunner:
                     [],
                     ctx=context,
                     agent_thread_id=f"eval-{sample.id}",
+                    **kwargs,
                 )
             )
             summary = pipeline.get_last_retrieval_summary() or {}
             safe_summary = _sanitize(summary)
             evidence = list(safe_summary.get("evidence") or [])
             contexts = [str(item.get("content") or "") for item in evidence if item.get("content")]
-            response = "".join(str(part) for part in parts)
+            response = strip_narration_segments(
+                "".join(str(part) for part in parts), narrated
+            )
             if safe_summary.get("status") == "failed":
                 error_message = str(safe_summary.get("error_message") or "").strip()
                 return self._failed(

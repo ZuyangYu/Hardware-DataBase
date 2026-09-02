@@ -6,7 +6,7 @@ from src.core.auth import AuthService, AuthUser
 from src.core.conversation import GENERAL_CHAT_KB_NAME, ConversationService
 
 from src.api.context import build_context_for_user
-from src.api.deps import current_user, get_auth_service, reject_system_admin_kb_access
+from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import (
     AddMessageRequest,
     CreateSessionRequest,
@@ -118,12 +118,14 @@ def delete_session(
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
+    pipeline=Depends(get_pipeline),
 ):
     s = conv.get_session(user.id, session_id)
     if s is None:
         raise HTTPException(status_code=404, detail="session not found")
     _ensure_history_access(user, auth)
     conv.delete_session(user.id, session_id)
+    pipeline.forget_agent_thread(str(session_id))
     return OkResponse(ok=True, message="session deleted")
 
 
@@ -133,12 +135,14 @@ def clear_session(
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
+    pipeline=Depends(get_pipeline),
 ):
     s = conv.get_session(user.id, session_id)
     if s is None:
         raise HTTPException(status_code=404, detail="session not found")
     _ensure_history_access(user, auth)
     conv.clear_session(user.id, session_id)
+    pipeline.forget_agent_thread(str(session_id))
     return OkResponse(ok=True, message="session cleared")
 
 

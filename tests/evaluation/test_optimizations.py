@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import patch
 
-from src.agents.runner import _split_answer_segments
+from src.agents.runner import _AnswerSplitter, strip_narration_segments
 from src.evaluation.config import EvaluationConfig
 from src.evaluation.gates import DEFAULT_THRESHOLDS, evaluate_gate
 from src.evaluation.ragas_adapter import RagasAdapter, _NativeRagasBackend, strip_markup
@@ -18,56 +18,92 @@ class _FakeChunk:
         self.tool_call_chunks = []
 
 
-class SplitAnswerSegmentsTests(unittest.TestCase):
+class AnswerSplitterTests(unittest.TestCase):
+    """增量 narration/answer 分类：叙述外的文本实时下发，叙述文本经事件回收。"""
+
+    def _run(self, chunks):
+        narrations = []
+        splitter = _AnswerSplitter(on_narration=narrations.append)
+        deltas = []
+        for chunk in chunks:
+            delta = splitter.feed(chunk, chunk.content)
+            if delta:
+                deltas.append(delta)
+        return deltas, narrations, splitter.finish()
+
     def test_interim_narration_with_tool_calls_is_not_answer(self):
         chunks = [
-            ("a", _FakeChunk("我来帮您查找资料。", tid="m1")),
-            ("b", _FakeChunk("", tid="m1", tool_calls=[{"name": "search"}])),
-            ("c", _FakeChunk("MCU 的供电为 VCC3V3_MCU。", tid="m2")),
+            _FakeChunk("我来帮您查找资料。", tid="m1"),
+            _FakeChunk("", tid="m1", tool_calls=[{"name": "search"}]),
+            _FakeChunk("MCU 的供电为 VCC3V3_MCU。", tid="m2"),
         ]
-        answer, narration = _split_answer_segments(chunks)
+        deltas, narrations, answer = self._run(chunks)
+        self.assertEqual(deltas, ["我来帮您查找资料。", "MCU 的供电为 VCC3V3_MCU。"])
+        self.assertEqual(narrations, ["我来帮您查找资料。"])
         self.assertEqual(answer, "MCU 的供电为 VCC3V3_MCU。")
-        self.assertIn("我来帮您查找资料", narration)
 
     def test_text_then_tool_call_then_answer(self):
         chunks = [
-            ("a", _FakeChunk("让我确认一下引脚。", tid="m1")),
-            ("b", _FakeChunk("调用网表检索。", tid="m2", tool_calls=[{"name": "circuit"}])),
-            ("c", _FakeChunk("最终答案。", tid="m3")),
+            _FakeChunk("让我确认一下引脚。", tid="m1"),
+            _FakeChunk("调用网表检索。", tid="m2", tool_calls=[{"name": "circuit"}]),
+            _FakeChunk("最终答案。", tid="m3"),
         ]
-        answer, narration = _split_answer_segments(chunks)
+        deltas, narrations, answer = self._run(chunks)
+        self.assertEqual(deltas, ["让我确认一下引脚。", "最终答案。"])
+        # m2 的文本与工具调用同块到达，从未下发，无需回收。
+        self.assertEqual(narrations, ["让我确认一下引脚。"])
         self.assertEqual(answer, "最终答案。")
-        self.assertIn("让我确认一下引脚", narration)
-        self.assertIn("调用网表检索", narration)
 
     def test_plain_answer_without_tools_kept_whole(self):
-        chunks = [("a", _FakeChunk("直接回答。", tid="m1"))]
-        answer, narration = _split_answer_segments(chunks)
+        deltas, narrations, answer = self._run([_FakeChunk("直接回答。", tid="m1")])
+        self.assertEqual(deltas, ["直接回答。"])
+        self.assertEqual(narrations, [])
         self.assertEqual(answer, "直接回答。")
-        self.assertEqual(narration, "")
 
-    def test_positional_split_without_tool_metadata(self):
-        """真实观测形态：工具调用信息不在 chunk 上，只有消息序列。"""
+    def test_positional_classification_without_tool_metadata(self):
+        """真实观测形态：工具调用信息不在 chunk 上，只有后续消息开始了才知道前一段是叙述。"""
 
         chunks = [
-            ("a", _FakeChunk("我先了解知识库中有哪些资料源。", tid="m1")),
-            ("b", _FakeChunk("初步检索发现…证据不够完整。", tid="m2")),
-            ("c", _FakeChunk("我再检索一次。", tid="m3")),
-            ("d", _FakeChunk("基于知识库检索，最终结论是 VCC3V3_MCU。", tid="m4")),
+            _FakeChunk("我先了解知识库中有哪些资料源。", tid="m1"),
+            _FakeChunk("初步检索发现…证据不够完整。", tid="m2"),
+            _FakeChunk("我再检索一次。", tid="m3"),
+            _FakeChunk("基于知识库检索，最终结论是 VCC3V3_MCU。", tid="m4"),
         ]
-        answer, narration = _split_answer_segments(chunks)
+        deltas, narrations, answer = self._run(chunks)
+        self.assertEqual(deltas, [chunk.content for chunk in chunks])
+        self.assertEqual(narrations, [chunk.content for chunk in chunks[:3]])
         self.assertEqual(answer, "基于知识库检索，最终结论是 VCC3V3_MCU。")
-        for w in ("我先了解", "初步检索", "我再检索"):
-            self.assertIn(w, narration)
-        self.assertNotIn("最终结论", narration)
 
     def test_chunks_without_id_join_last_segment(self):
         chunks = [
-            ("a", _FakeChunk("最终答案", tid=None)),
-            ("b", _FakeChunk(" continued。", tid=None)),
+            _FakeChunk("最终答案", tid=None),
+            _FakeChunk(" continued。", tid=None),
         ]
-        answer, _ = _split_answer_segments(chunks)
+        deltas, narrations, answer = self._run(chunks)
+        self.assertEqual(deltas, ["最终答案", " continued。"])
+        self.assertEqual(narrations, [])
         self.assertEqual(answer, "最终答案 continued。")
+
+    def test_text_after_tool_calls_starts_new_segment(self):
+        """跨调用复用同一 id（或无 id）时，叙述后的文本必须开新段成为答案。"""
+        chunks = [
+            _FakeChunk("让我检索。", tid="m1", tool_calls=[{"name": "search"}]),
+            _FakeChunk("最终结论。", tid="m1"),
+        ]
+        deltas, narrations, answer = self._run(chunks)
+        self.assertEqual(deltas, ["最终结论。"])
+        self.assertEqual(narrations, [])
+        self.assertEqual(answer, "最终结论。")
+
+    def test_strip_narration_segments_recovers_authoritative_answer(self):
+        joined = "我先了解…初步检索发现…最终结论是 VCC3V3_MCU。"
+        self.assertEqual(
+            strip_narration_segments(joined, ["我先了解…", "初步检索发现…"]),
+            "最终结论是 VCC3V3_MCU。",
+        )
+        # 顺序位置找不到时退化为全局首次出现；完全找不到则原样保留。
+        self.assertEqual(strip_narration_segments("最终结论", ["不存在文本"]), "最终结论")
+        self.assertEqual(strip_narration_segments("叙述最终", ["叙述"]), "最终")
 
 
 class StripMarkupDedupTests(unittest.TestCase):

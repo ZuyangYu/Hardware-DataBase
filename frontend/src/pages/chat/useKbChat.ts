@@ -46,28 +46,6 @@ function normalizeTraceStatus(status: unknown): QueryTraceStatus {
     : 'running';
 }
 
-function shortTermMemoryTraceStep(data: string): QueryTraceStep | null {
-  try {
-    const parsed = JSON.parse(data) as {
-      status?: unknown;
-      hit_count?: unknown;
-      turn_count?: unknown;
-      message_count?: unknown;
-    };
-    const turnCount = Math.max(0, Number(parsed.turn_count ?? parsed.hit_count ?? 0) || 0);
-    const messageCount = Math.max(0, Number(parsed.message_count ?? turnCount * 2) || 0);
-    const status: QueryTraceStatus = parsed.status === 'error' ? 'error' : 'done';
-    const detail = status === 'error'
-      ? '读取会话历史失败'
-      : turnCount > 0
-        ? `命中 ${turnCount} 轮历史（${messageCount} 条消息）`
-        : '未命中历史';
-    return { key: 'short_term_memory', label: '短期记忆', status, detail };
-  } catch {
-    return null;
-  }
-}
-
 function createInitialTrace(_isGeneralChat: boolean): QueryTraceStep[] {
   // Route LLM is skipped for KB chat (deterministic, near-instant), so we must
   // NOT inject a misleading "正在判断是否需要检索知识库" step at the start of
@@ -88,6 +66,23 @@ const TOOL_LABELS: Record<string, string> = {
 
 function toolLabel(name: string): string {
   return TOOL_LABELS[name] || name;
+}
+
+/**
+ * 模型"过程话"(工具调用前的临时文本)会先被乐观下发为答案增量;后端随后把它归类为
+ * 叙述并发 narration 事件携带原文。这里从累计答案中回收该文本(后缀优先,其次原位剔除),
+ * 使答案面板只保留最终回答;done 事件仍携带权威答案兜底。
+ */
+function stripNarrationText(accumulated: string, text: string): string {
+  if (!text) return accumulated;
+  if (accumulated.endsWith(text)) {
+    return accumulated.slice(0, accumulated.length - text.length);
+  }
+  const idx = accumulated.indexOf(text);
+  if (idx >= 0) {
+    return accumulated.slice(0, idx) + accumulated.slice(idx + text.length);
+  }
+  return accumulated;
 }
 
 /** Translate a backend tool/trace event into a UI step, or null if irrelevant. */
@@ -513,9 +508,10 @@ export function useKbChat(kbName: string) {
             const parsed = JSON.parse(evt.data) as { text?: string };
             accumulated += parsed.text ?? '';
             queueStreamingText(accumulated);
-          } else if (evt.event === 'short_term_memory') {
-            const step = shortTermMemoryTraceStep(evt.data);
-            if (step) upsertTraceStep(step);
+          } else if (evt.event === 'narration') {
+            const parsed = JSON.parse(evt.data) as { text?: string };
+            accumulated = stripNarrationText(accumulated, parsed.text ?? '');
+            queueStreamingText(accumulated);
           } else if (evt.event === 'stage' || evt.event === 'tool_started' || evt.event === 'tool_result') {
             const step = stepFromToolEvent(evt.event, evt.data);
             if (step) upsertTraceStep(step);
@@ -701,9 +697,14 @@ export function useKbChat(kbName: string) {
           } catch {
             // 忽略坏帧
           }
-        } else if (evt.event === 'short_term_memory') {
-          const step = shortTermMemoryTraceStep(evt.data);
-          if (step) upsertTraceStep(step);
+        } else if (evt.event === 'narration') {
+          try {
+            const parsed = JSON.parse(evt.data) as { text?: string };
+            accumulated = stripNarrationText(accumulated, parsed.text ?? '');
+            queueStreamingText(accumulated);
+          } catch {
+            // 忽略坏帧
+          }
         } else if (evt.event === 'stage' || evt.event === 'tool_started' || evt.event === 'tool_result') {
           try {
             const step = stepFromToolEvent(evt.event, evt.data);

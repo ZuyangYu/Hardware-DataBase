@@ -43,6 +43,10 @@ RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
 CIRCUIT_SEMANTIC_QUERY_ENABLED = os.getenv("CIRCUIT_SEMANTIC_QUERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
+# LangGraph checkpointer：agent 会话状态（thread 级完整消息历史）的持久化库。
+AGENT_CHECKPOINT_DB_PATH = os.getenv(
+    "AGENT_CHECKPOINT_DB_PATH", os.path.join(STORAGE_DIR, "agent_checkpoints.db")
+)
 AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
 AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
 AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
@@ -65,6 +69,11 @@ AGENT_CUSTOM_API_KEY = os.getenv("AGENT_CUSTOM_API_KEY", "")
 AGENT_CUSTOM_BASE_URL = os.getenv("AGENT_CUSTOM_BASE_URL", "")
 AGENT_CUSTOM_MODEL = os.getenv("AGENT_CUSTOM_MODEL", "")
 AGENT_CUSTOM_MAX_TOKENS = int(os.getenv("AGENT_CUSTOM_MAX_TOKENS", "4096"))
+# 声明模型上下文窗口（输入侧），激活 deepagents SummarizationMiddleware 的
+# 主动压缩（85% 触发 / 保留 10%）。OpenAI 兼容中转（OpenRouter/DeepSeek/
+# SiliconFlow）不暴露模型 profile，需要部署方显式给出；模型自带已知 profile
+# 时以已知值为准。0 = 不声明。
+AGENT_MODEL_MAX_INPUT_TOKENS = int(os.getenv("AGENT_MODEL_MAX_INPUT_TOKENS", "65536"))
 AGENT_TEMPERATURE = float(os.getenv("AGENT_TEMPERATURE", "0.2"))
 AGENT_TIMEOUT_SECONDS = int(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))
 AGENT_RATE_LIMIT_MAX_RETRIES = int(os.getenv("AGENT_RATE_LIMIT_MAX_RETRIES", "4"))
@@ -161,7 +170,8 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "1. 如果【参考资料】包含答案，请详细回答，并在关键结论后标注证据来源编号，如 [1][2]（编号见证据片段前的 [n] 标记）。\n"
     "2. 回答前自查：证据是否已覆盖问题的全部要点？若仍有缺口，先继续检索补证，不要凭当前片段草率收敛。\n"
     "3. 如果【参考资料】内容不足或无关，请明确说明知识库中未找到相关信息，不要编造。\n"
-    "4. 回答必须使用中文。"
+    "4. 多次检索时不要用完全相同的查询原样重复调用；重复前先确认已有证据是否覆盖问题，需要新信息时换关键词或换检索工具。\n"
+    "5. 回答必须使用中文。"
 ))
 
 NO_CONTEXT_PROMPT = os.getenv(
@@ -192,6 +202,7 @@ DEFAULT_VALUES = {
     "PIPELINE_ARCHIVE_ROOT": os.path.join(STORAGE_DIR, "pipeline_archives"),
     "RAGFLOW_FILE_ROOT": os.path.join(STORAGE_DIR, "pipeline_archives"),
     "AUTH_DB_PATH": os.path.join(STORAGE_DIR, "auth.db"),
+    "AGENT_CHECKPOINT_DB_PATH": os.path.join(STORAGE_DIR, "agent_checkpoints.db"),
     "AUTH_DEFAULT_ADMIN_USERNAME": "admin",
     "AUTH_DEFAULT_ADMIN_PASSWORD": "",
     "AUTH_SESSION_TTL_HOURS": "24",
@@ -202,6 +213,7 @@ DEFAULT_VALUES = {
     "AGENT_CUSTOM_BASE_URL": "",
     "AGENT_CUSTOM_MODEL": "",
     "AGENT_CUSTOM_MAX_TOKENS": "4096",
+    "AGENT_MODEL_MAX_INPUT_TOKENS": "65536",
     "AGENT_TEMPERATURE": "0.2",
     "AGENT_TIMEOUT_SECONDS": "120",
     "AGENT_RATE_LIMIT_MAX_RETRIES": "4",
@@ -287,11 +299,13 @@ def reload_settings():
     global RAGFLOW_GOVERNANCE_DATASET_NAME, RAGFLOW_DESIGN_DATASET_NAME
     global RAGFLOW_TIMEOUT_SECONDS, RAGFLOW_SIMILARITY_THRESHOLD, RAGFLOW_VECTOR_WEIGHT
     global AUTH_DB_PATH, AUTH_DEFAULT_ADMIN_USERNAME, AUTH_DEFAULT_ADMIN_PASSWORD, AUTH_SESSION_TTL_HOURS
+    global AGENT_CHECKPOINT_DB_PATH
     global PIPELINE_ARCHIVE_ROOT, RAGFLOW_FILE_ROOT
     global AGENT_LLM_PROVIDER
     global AGENT_OLLAMA_BASE_URL, AGENT_OLLAMA_MODEL
     global AGENT_CUSTOM_API_KEY, AGENT_CUSTOM_BASE_URL, AGENT_CUSTOM_MODEL
     global AGENT_CUSTOM_MAX_TOKENS, AGENT_TEMPERATURE, AGENT_TIMEOUT_SECONDS
+    global AGENT_MODEL_MAX_INPUT_TOKENS
     global AGENT_RATE_LIMIT_MAX_RETRIES, AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS
     global AGENT_RATE_LIMIT_MAX_DELAY_SECONDS
     global FINAL_TOP_K, AGENT_MAX_RETRIEVAL_ROUNDS
@@ -333,6 +347,9 @@ def reload_settings():
     RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
 
     AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
+    AGENT_CHECKPOINT_DB_PATH = os.getenv(
+        "AGENT_CHECKPOINT_DB_PATH", os.path.join(STORAGE_DIR, "agent_checkpoints.db")
+    )
     AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
     AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
     AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
@@ -344,6 +361,7 @@ def reload_settings():
     AGENT_CUSTOM_BASE_URL = os.getenv("AGENT_CUSTOM_BASE_URL", "")
     AGENT_CUSTOM_MODEL = os.getenv("AGENT_CUSTOM_MODEL", "")
     AGENT_CUSTOM_MAX_TOKENS = int(os.getenv("AGENT_CUSTOM_MAX_TOKENS", "4096"))
+    AGENT_MODEL_MAX_INPUT_TOKENS = int(os.getenv("AGENT_MODEL_MAX_INPUT_TOKENS", "65536"))
     AGENT_TEMPERATURE = float(os.getenv("AGENT_TEMPERATURE", "0.2"))
     AGENT_TIMEOUT_SECONDS = int(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))
     AGENT_RATE_LIMIT_MAX_RETRIES = int(os.getenv("AGENT_RATE_LIMIT_MAX_RETRIES", "4"))

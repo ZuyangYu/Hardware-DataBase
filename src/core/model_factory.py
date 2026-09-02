@@ -38,14 +38,16 @@ def create_chat_model(
         # ChatOllama has no max_retries/timeout fields (langchain_ollama
         # silently drops them); reach the backend via the httpx client's
         # request timeout instead.
-        return init_chat_model(
+        model = init_chat_model(
             f"ollama:{model or settings.AGENT_OLLAMA_MODEL}",
             base_url=str(settings.AGENT_OLLAMA_BASE_URL),
             temperature=temperature,
             client_kwargs={"timeout": timeout},
         )
+        _apply_model_profile(model)
+        return model
 
-    return init_chat_model(
+    model = init_chat_model(
         f"openai:{model or settings.AGENT_CUSTOM_MODEL}",
         base_url=str(settings.AGENT_CUSTOM_BASE_URL) or None,
         api_key=str(settings.AGENT_CUSTOM_API_KEY),
@@ -54,3 +56,30 @@ def create_chat_model(
         max_retries=max_retries,
         timeout=timeout,
     )
+    _apply_model_profile(model)
+    return model
+
+
+def _apply_model_profile(model: "object") -> None:
+    """Declare the model's context window so deepagents' SummarizationMiddleware
+    computes proactive compaction thresholds (85% trigger / keep 10%).
+
+    OpenAI-compatible relays (OpenRouter/DeepSeek/SiliconFlow) don't expose a
+    model profile, so AGENT_MODEL_MAX_INPUT_TOKENS supplies it. A profile the
+    provider/registry already declared wins. Fail-soft: a setting or assignment
+    failure must never break model construction.
+    """
+    try:
+        max_input = int(settings.AGENT_MODEL_MAX_INPUT_TOKENS or 0)
+    except (TypeError, ValueError):
+        return
+    if max_input <= 0:
+        return
+    existing = getattr(model, "profile", None)
+    if isinstance(existing, dict) and existing.get("max_input_tokens"):
+        return
+    try:
+        model.profile = {"max_input_tokens": max_input}
+    except Exception:
+        # 老版本 langchain-core 不允许该字段赋值时，压缩退回被动兜底。
+        pass

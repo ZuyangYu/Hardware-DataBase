@@ -50,7 +50,7 @@ def make_circuit_search(rt, circuit_service: CircuitIndexService):
     def circuit_search(query: str, top_k: int = rt.top_k, query_operation: str = "auto") -> str:
         """在知识库中检索电路设计（EDF/EDIF 网表）的结构化信息：网络、器件实例、模块、模块间连接、电源/偏置/保护拓扑等。
         query_operation 可选：structure_overview | module_list | resolve_identity | resolved_connections，默认 auto。"""
-        from src.agents.tools.runtime import format_evidence_for_llm, timed_tool_call
+        from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
         def run(query: str, top_k: int):
             return _authorized_circuit_query(
@@ -63,8 +63,8 @@ def make_circuit_search(rt, circuit_service: CircuitIndexService):
                 filters={},
             )
 
-        items = timed_tool_call(rt, "circuit_search", query, None, lambda: run(query, max(1, min(int(top_k), 20))))
-        return format_evidence_for_llm(items)
+        items, adds_nothing = timed_tool_call(rt, "circuit_search", query, None, lambda: run(query, max(1, min(int(top_k), 20))))
+        return format_tool_result(rt, adds_nothing, items)
 
     return circuit_search
 

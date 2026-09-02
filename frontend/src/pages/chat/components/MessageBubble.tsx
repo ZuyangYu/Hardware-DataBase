@@ -28,6 +28,8 @@ type Props = {
   traceSteps?: QueryTraceStep[];
   /** 降级提醒(fail-open 发生时)。 */
   degradedNotes?: Array<{ stage: string; reason: string }>;
+  /** 通用对话不展示内部执行轨迹和检索概要。 */
+  showDiagnostics?: boolean;
   /** 为当前用户把一条已完成消息提交到明确的个人记忆授权确认流。 */
   onCreateMemory?: (messageId: number) => void;
   /** 打开消息编辑对话框(仅本人 user 消息)。 */
@@ -274,6 +276,7 @@ function MessageBubble({
   streamingText,
   traceSteps = [],
   degradedNotes = [],
+  showDiagnostics = true,
   onCreateMemory,
   onEditMessage,
 }: Props) {
@@ -286,8 +289,8 @@ function MessageBubble({
           <div className={chatBubbleClass('assistant')}>
             <div className="grid gap-[12px]">
               {degradedNotes.length > 0 && <DegradedBanner notes={degradedNotes} />}
-              {!generating && traceSteps.length === 0 && <WaitSpinner />}
-              {traceSteps.length > 0 && <StepGroup steps={traceSteps} defaultOpen />}
+              {!generating && (!showDiagnostics || traceSteps.length === 0) && <WaitSpinner />}
+              {showDiagnostics && traceSteps.length > 0 && <StepGroup steps={traceSteps} defaultOpen />}
               {generating && (
                 <div data-i18n-ignore>
                   <StreamingText content={streamingText} />
@@ -308,9 +311,9 @@ function MessageBubble({
         <div className={chatBubbleClass(msg.role, isError)}>
           {msg.role === 'assistant' ? (
             <div className="grid gap-[12px]" data-i18n-ignore>
-              {traceSteps.length > 0 && <StepGroup steps={traceSteps} />}
+              {showDiagnostics && traceSteps.length > 0 && <StepGroup steps={traceSteps} />}
               <MarkdownMessage content={msg.content} />
-              {msg.footer && (
+              {showDiagnostics && msg.footer && (
                 <CollapsibleSection title="检索概览" className="border-t border-[#e3e7f1] pt-[10px]">
                   <MarkdownMessage content={msg.footer} />
                 </CollapsibleSection>

@@ -7,7 +7,7 @@ import traceback
 from typing import Any, Callable, Generator, List, Tuple
 
 import src.settings
-from src.agents.runner import MultiSourceAgentRunner
+from src.agents.runner import MultiSourceAgentRunner, forget_thread
 from src.agents.schemas import Evidence
 from src.agents.tools.pipeline_catalog import scan_kb_sources as scan_pipeline_kb_sources
 from src.agents.tools.circuit_tools import CircuitQueryTool
@@ -245,6 +245,7 @@ class AppPipeline:
         event_callback: Callable[[dict], None] | None = None,
         query_mode: str = "deep",
         should_cancel: Callable[[], bool] | None = None,
+        persist_thread: bool = False,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -262,6 +263,7 @@ class AppPipeline:
                 event_callback=event_callback,
                 query_mode=query_mode,
                 should_cancel=should_cancel,
+                persist_thread=persist_thread,
             )
         except QueryCancelled:
             return
@@ -270,6 +272,10 @@ class AppPipeline:
             traceback.print_exc()
             from src.core.error_friendly import friendly_error_message
             yield friendly_error_message(exc)
+
+    def forget_agent_thread(self, thread_id: str) -> None:
+        """Drop the persisted agent thread state (session cleared/deleted)."""
+        forget_thread(thread_id)
 
     def get_last_agent_footer(self) -> str:
         return self.agent.get_last_footer()
