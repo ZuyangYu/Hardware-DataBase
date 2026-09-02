@@ -38,7 +38,10 @@ class _CatalogTool:
 
 class _Pipeline:
     def __init__(self, sources):
-        self.agent = type("Agent", (), {"catalog_tool": _CatalogTool(sources)})()
+        self.sources = sources
+
+    def scan_kb_sources(self, kb_name, ctx):
+        return {"sources": self.sources}
 
 
 class _SpreadsheetService:
@@ -62,6 +65,22 @@ class EvaluationPreflightTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_uses_application_pipeline_scanner_contract(self):
+        class ApplicationPipeline:
+            def __init__(self):
+                self.calls = []
+
+            def scan_kb_sources(self, kb_name, ctx):
+                self.calls.append((kb_name, ctx))
+                return {"sources": [{"document_name": "schematic"}]}
+
+        pipeline = ApplicationPipeline()
+
+        errors = EvaluationPreflight(lambda: pipeline).validate([_sample()])
+
+        self.assertEqual(errors, [])
+        self.assertEqual([call[0] for call in pipeline.calls], ["ADAS_new"])
+
     def test_rejects_required_evidence_sample_without_scoped_read_permission(self):
         sample = _sample(
             request_context={
@@ -84,6 +103,58 @@ class EvaluationPreflightTests(unittest.TestCase):
         errors = EvaluationPreflight(lambda: _Pipeline([])).validate([sample])
 
         self.assertEqual(errors, [])
+
+    def test_rejects_allowed_sample_with_explicit_context_that_cannot_read(self):
+        sample = _sample(request_context={})
+
+        errors = EvaluationPreflight(lambda: _Pipeline([])).validate([sample])
+
+        self.assertEqual(errors, ["q1: request context cannot read ADAS_new"])
+
+    def test_denied_sample_does_not_scan_catalog_or_require_read_permission(self):
+        class TrackingPipeline(_Pipeline):
+            def __init__(self):
+                super().__init__([{"document_name": "must not be scanned"}])
+                self.scanned = False
+
+            def scan_kb_sources(self, *args, **kwargs):
+                self.scanned = True
+                return {"sources": [{"document_name": "leak"}]}
+
+        pipeline = TrackingPipeline()
+        sample = _sample(
+            expected_access="denied",
+            required_evidence_types=[],
+            request_context={"department_id": 96, "allowed_kbs": [], "kb_permissions": {}},
+        )
+
+        errors = EvaluationPreflight(lambda: pipeline).validate([sample])
+
+        self.assertEqual(errors, [])
+        self.assertFalse(pipeline.scanned)
+
+    def test_denied_sample_rejects_retrieval_requirements(self):
+        sample = _sample(expected_access="denied")
+
+        errors = EvaluationPreflight(lambda: _Pipeline([])).validate([sample])
+
+        self.assertTrue(any("expected_access" in error for error in errors))
+
+    def test_offline_validation_can_skip_source_scan(self):
+        class TrackingPipeline(_Pipeline):
+            def __init__(self):
+                super().__init__([{"document_name": "must not be scanned"}])
+                self.scanned = False
+
+            def scan_kb_sources(self, *args, **kwargs):
+                self.scanned = True
+                return {"sources": []}
+
+        pipeline = TrackingPipeline()
+        errors = EvaluationPreflight(lambda: pipeline).validate([_sample()], scan_sources=False)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(pipeline.scanned)
 
     def test_scoring_preflight_reports_missing_optional_stack(self):
         def find_spec(name):

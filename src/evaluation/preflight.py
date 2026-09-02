@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 from collections.abc import Callable
 from typing import Any
 
 import httpx
 
-from .answer_runner import _request_context
+from .access import build_evaluation_context
 from .config import EvaluationConfig
 from .schemas import EvaluationSample
 
 
 _PING_TIMEOUT = 20.0
+logger = logging.getLogger(__name__)
 
 
 class EvaluationPreflight:
@@ -20,28 +22,66 @@ class EvaluationPreflight:
     def __init__(self, pipeline_factory: Callable[[], Any]):
         self._pipeline_factory = pipeline_factory
 
-    def validate(self, samples: list[EvaluationSample]) -> list[str]:
+    def validate(
+        self,
+        samples: list[EvaluationSample],
+        *,
+        scan_sources: bool = True,
+    ) -> list[str]:
+        """Validate sample contexts and, for online runs, source discovery.
+
+        Offline scoring reuses an already-collected snapshot and must not touch
+        the live knowledge-base catalog.  ``scan_sources=False`` retains the
+        same context/negative-access checks while making that boundary explicit.
+        """
         errors: list[str] = []
         catalog_sizes: dict[tuple[str, int | str], int] = {}
+        catalog_failures: set[tuple[str, int | str]] = set()
 
         for sample in samples:
+            context = build_evaluation_context(sample)
+            if sample.expected_access == "denied":
+                if sample.required_evidence_types or sample.metrics:
+                    errors.append(
+                        f"{sample.id}: expected_access=denied 不能声明正常检索证据或评分指标"
+                    )
+                    continue
+                if context.has_kb_permission(sample.kb_name, "read"):
+                    errors.append(
+                        f"{sample.id}: expected_access=denied 的上下文仍具有 {sample.kb_name} 读取权限"
+                    )
+                continue
             if not sample.required_evidence_types:
                 continue
-            context = _request_context(sample)
             if not context.has_kb_permission(sample.kb_name, "read"):
                 errors.append(f"{sample.id}: request context cannot read {sample.kb_name}")
+                continue
+            if not scan_sources:
                 continue
 
             department_id = context.metadata.get("resource_department_id") or context.metadata.get(
                 "department_id"
             )
             cache_key = (sample.kb_name, department_id or "")
+            if cache_key in catalog_failures:
+                errors.append(f"{sample.id}: unable to scan sources for {sample.kb_name}")
+                continue
             if cache_key not in catalog_sizes:
                 try:
                     pipeline = self._pipeline_factory()
-                    catalog = pipeline.agent.catalog_tool.scan(sample.kb_name, context) or {}
+                    scanner = getattr(pipeline, "scan_kb_sources", None)
+                    if not callable(scanner):
+                        raise AttributeError("pipeline does not expose scan_kb_sources")
+                    catalog = scanner(sample.kb_name, context) or {}
                     catalog_sizes[cache_key] = len(catalog.get("sources") or [])
-                except Exception:
+                except Exception as exc:
+                    catalog_failures.add(cache_key)
+                    logger.error(
+                        "evaluation preflight source scan failed for kb=%s department=%s (%s)",
+                        sample.kb_name,
+                        department_id or "",
+                        type(exc).__name__,
+                    )
                     errors.append(f"{sample.id}: unable to scan sources for {sample.kb_name}")
                     continue
 

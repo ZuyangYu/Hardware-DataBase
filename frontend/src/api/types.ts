@@ -621,19 +621,67 @@ export type EvaluationRunStatus =
   | 'invalid';
 export type EvaluationRunStage = 'idle' | 'collecting' | 'scoring' | 'reporting';
 
+export interface EvaluationKnowledgeBase {
+  kb_id: number;
+  kb_name: string;
+  department_id: number | null;
+  department_name: string | null;
+  physical_exists: boolean;
+  registered: boolean;
+}
+
 export interface EvaluationRunListItem {
   run_id: string;
   status: EvaluationRunStatus | '';
   has_summary: boolean;
+  legacy: boolean;
+  kb_id: number | null;
+  kb_name: string;
+  department_id: number | null;
+  created_by: string;
+  created_at: string;
+  dataset_path: string;
+  source_dataset_path: string;
+  mode: string;
+  score_enabled: boolean;
+  report_path: string;
+  dataset_sample_count: number;
+  normal_sample_count: number;
+  expected_denied_sample_count: number;
+  cohort_fingerprint: string;
+  llm_model: string;
+  embedding_model: string;
+  snapshot_ownership_verified: boolean;
+  validation_warnings: string[];
 }
 
 export interface CreateEvaluationRunPayload {
   dataset_path: string;
+  kb_id: number;
+  kb_name: string;
   mode: EvaluationMode;
   score_enabled: boolean;
   sample_ids?: string[] | null;
   tags?: string[] | null;
   snapshot_path?: string | null;
+}
+
+export interface EvaluationPreflightResponse {
+  dataset_path: string;
+  mode: EvaluationMode;
+  kb_id: number | null;
+  kb_name: string;
+  department_id: number | null;
+  dataset_total_count: number;
+  matched_sample_count: number;
+  filtered_sample_count: number;
+  dataset_sample_count: number;
+  normal_sample_count: number;
+  expected_denied_sample_count: number;
+  cohort_fingerprint: string;
+  warnings: string[];
+  errors: string[];
+  can_create: boolean;
 }
 
 export interface EvaluationGateResult {
@@ -657,6 +705,26 @@ export interface EvaluationSummary {
   scoring_total_items: number;
   gate?: EvaluationGateResult | null;
   metadata: Record<string, unknown>;
+  kb_id: number | null;
+  kb_name: string;
+  department_id: number | null;
+  created_by: string;
+  source_dataset_path: string;
+  dataset_sha256: string;
+  execution_dataset_sha256: string;
+  dataset_total_count: number;
+  dataset_sample_count: number;
+  matched_sample_count: number;
+  filtered_sample_count: number;
+  normal_sample_count: number;
+  expected_denied_sample_count: number;
+  cohort_fingerprint: string;
+  snapshot_sha256: string;
+  snapshot_ownership_verified: boolean;
+  validation_warnings: string[];
+  llm_model: string;
+  embedding_model: string;
+  evaluation_config: Record<string, unknown>;
 }
 
 export interface EvaluationMetricResult {
@@ -679,6 +747,11 @@ export interface EvaluationSampleResult {
   snapshot_status: 'success' | 'failed';
   metrics: EvaluationMetricResult[];
   metadata: Record<string, unknown>;
+  access_check?: {
+    expected: 'allowed' | 'denied';
+    observed: 'allowed' | 'denied' | 'unknown';
+    reason: string;
+  } | null;
 }
 
 export interface EvaluationRunDetail {
@@ -706,12 +779,42 @@ export interface EvaluationRunDetail {
   finished_at: string;
   error_message: string;
   report_path: string;
+  kb_id: number | null;
+  kb_name: string;
+  department_id: number | null;
+  created_by: string;
+  created_at: string;
+  source_dataset_path: string;
+  dataset_sha256: string;
+  execution_dataset_sha256: string;
+  dataset_total_count: number;
+  dataset_sample_count: number;
+  matched_sample_count: number;
+  filtered_sample_count: number;
+  normal_sample_count: number;
+  expected_denied_sample_count: number;
+  cohort_fingerprint: string;
+  snapshot_sha256: string;
+  snapshot_ownership_verified: boolean;
+  validation_warnings: string[];
+  llm_model: string;
+  embedding_model: string;
+  evaluation_config: Record<string, unknown>;
   summary?: EvaluationSummary | null;
   sample_results: EvaluationSampleResult[];
   sample_results_error: string;
 }
 
 export interface EvaluationCompareResponse {
+  strict: boolean;
+  compatible: boolean;
+  warnings: string[];
+  compatibility: Record<string, {
+    match: boolean;
+    current: unknown;
+    baseline: unknown;
+    reason: string;
+  }>;
   current: EvaluationSummary;
   baseline: EvaluationSummary;
 }

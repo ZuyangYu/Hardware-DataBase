@@ -74,16 +74,16 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 同步环境并启动后端 API（`uv run` 会自动加载虚拟环境，无需手动 activate）：
 
 ```bash
-uv sync
-uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8000（HDB_API_HOST/PORT 可改）
+uv sync --all-groups
+uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8003（HDB_API_HOST/PORT 可改）
 ```
 
 另开终端启动前端（Node.js >= 18）：
 
 ```bash
 cd frontend
-npm install
-npm run dev                       # Vite dev server，默认 127.0.0.1:5174，经 proxy 转发 /api 到后端
+npm ci
+npm run dev                       # Vite dev server，默认 127.0.0.1:5175，经 proxy 转发 /api 到后端
 ```
 
 生产部署用 `npm run build` 产出 `frontend/dist/` 静态文件。
@@ -224,9 +224,9 @@ uv run hardware-database-eval score --dataset evaluation/datasets/hardware_qa_v1
 
 默认只生成 JSON、CSV 和 HTML 报告。需要在 CI 中启用阈值门禁时添加 `--fail-on-threshold`。可用 `--tag`、`--sample-id`、`--metric` 和 `--threshold faithfulness=0.8` 过滤或覆盖评分设置。
 
-裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。前端「RAGAS 评估」页面仅系统管理员可见。
+裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。前端「RAGAS 评估」页面仅系统管理员可见。页面创建评估时会先选择已登记知识库并执行预检，服务端按稳定 `kb_id` 绑定知识库，部门管理员和普通用户仍没有 RAGAS 入口。
 
-管理员可在该页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”均为协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效；“取消”不会删除 `snapshot.jsonl`；“继续”会跳过其中已成功的样本。未勾选“执行 RAGAS 评分”时，系统只采集回答和检索证据，无需安装 `eval` 依赖或配置裁判 Embedding。
+管理员可在该页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”均为协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效；“取消”不会删除 `snapshot.jsonl`；“继续”会跳过其中已成功的样本。已完成、失败和已取消的历史运行可以删除，运行目录外的共享快照不受影响。历史对比默认严格校验知识库、样本集和模型配置，也可以明确选择带警告的“仅查看对比”。未勾选“执行 RAGAS 评分”时，系统只采集回答和检索证据，无需安装 `eval` 依赖或配置裁判 Embedding。
 
 - 评估数据集格式与扩展方式：`evaluation/README.md`
 - 运行产物：`storage/evaluations/<run_id>/`

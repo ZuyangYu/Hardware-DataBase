@@ -9,6 +9,7 @@ from typing import Any, Callable, Generator, List, Tuple
 import src.settings
 from src.agents.runner import MultiSourceAgentRunner
 from src.agents.schemas import Evidence
+from src.agents.tools.pipeline_catalog import scan_kb_sources as scan_pipeline_kb_sources
 from src.agents.tools.circuit_tools import CircuitQueryTool
 from src.agents.tools.spreadsheet_tools import SpreadsheetSemanticTool
 from src.core.auth import AuthService
@@ -204,6 +205,35 @@ class AppPipeline:
         if ctx is None or not ctx.is_system_admin():
             return []
         return self.backend.list_knowledge_bases()
+
+    def scan_kb_sources(
+        self,
+        kb_name: str,
+        ctx: RequestContext | None = None,
+        query: str = "",
+    ) -> dict[str, Any]:
+        """List scoped KB sources through the application layer.
+
+        The agent-facing catalog is a per-request tool closure.  Evaluation
+        preflight must not reach into that closure, so expose the underlying
+        read-only scanner as a stable application boundary instead.
+        """
+        document_store = getattr(self.backend, "store", None)
+        if document_store is None:
+            raise RuntimeError("pipeline document store is not configured")
+        if ctx is not None and not ctx.has_kb_permission(kb_name, "read"):
+            raise PermissionError(
+                f"User {ctx.user_id} lacks read permission for knowledge base {kb_name}"
+            )
+        return scan_pipeline_kb_sources(
+            kb_name,
+            ctx,
+            query,
+            document_store=document_store,
+            spreadsheet_service=getattr(self, "spreadsheet_service", None),
+            circuit_service=getattr(self, "circuit_service", None),
+            rag_backend=self.backend,
+        )
 
     def query(
         self,

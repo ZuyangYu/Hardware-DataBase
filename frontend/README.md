@@ -9,15 +9,15 @@
 ## 开发
 
 ```bash
-# 1. 起后端(本仓根目录;使用 127.0.0.1:8002)
-HDB_API_PORT=8002 uv run hardware-database-server
+# 1. 起后端(本仓根目录;使用 127.0.0.1:8003)
+HDB_API_PORT=8003 uv run hardware-database-server
 
 # 2. 起前端(本目录;默认 127.0.0.1:5175)
 npm install
-HDB_API_PORT=8002 npm run dev
+HDB_API_PORT=8003 npm run dev
 
 # 也可以显式指定代理目标:
-VITE_API_PROXY_TARGET=http://127.0.0.1:8002 npm run dev
+VITE_API_PROXY_TARGET=http://127.0.0.1:8003 npm run dev
 ```
 
 打开 `http://127.0.0.1:5175`,用后端账号登录(`storage/auth.db` 里的用户)。Quick Tunnel 可将该前端端口临时发布到公网。

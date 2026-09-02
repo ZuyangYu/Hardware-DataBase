@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 MetricStatus = Literal["success", "failed", "not_applicable"]
 SnapshotStatus = Literal["success", "failed"]
+ExpectedAccess = Literal["allowed", "denied"]
+ObservedAccess = Literal["allowed", "denied", "unknown"]
 RunStatus = Literal[
     "queued",
     "running",
@@ -44,6 +46,7 @@ class EvaluationSample(BaseModel):
     rubric: SampleRubric = Field(default_factory=SampleRubric)
     request_context: dict[str, Any] = Field(default_factory=dict)
     critical: bool = False
+    expected_access: ExpectedAccess = "allowed"
 
     @field_validator("id", "question", "reference_answer", "kb_name")
     @classmethod
@@ -126,6 +129,7 @@ class AnswerSnapshot(BaseModel):
     finished_at: str = ""
     duration_seconds: float = 0.0
     metadata: dict[str, Any] = Field(default_factory=dict)
+    access_check: dict[str, str] | None = None
 
 
 class DocumentGenerationSnapshot(BaseModel):
@@ -170,6 +174,7 @@ class SampleResult(BaseModel):
     snapshot_status: SnapshotStatus = "success"
     metrics: list[MetricResult] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    access_check: dict[str, str] | None = None
 
 
 class GateResult(BaseModel):
@@ -197,6 +202,26 @@ class EvaluationSummary(BaseModel):
     scoring_total_items: int = 0
     gate: GateResult | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    kb_id: int | None = None
+    kb_name: str = ""
+    department_id: int | None = None
+    created_by: str = ""
+    source_dataset_path: str = ""
+    dataset_sha256: str = ""
+    execution_dataset_sha256: str = ""
+    dataset_total_count: int = 0
+    dataset_sample_count: int = 0
+    matched_sample_count: int = 0
+    filtered_sample_count: int = 0
+    normal_sample_count: int = 0
+    expected_denied_sample_count: int = 0
+    cohort_fingerprint: str = ""
+    snapshot_sha256: str = ""
+    snapshot_ownership_verified: bool = False
+    validation_warnings: list[str] = Field(default_factory=list)
+    llm_model: str = ""
+    embedding_model: str = ""
+    evaluation_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvaluationRunState(BaseModel):
@@ -207,6 +232,27 @@ class EvaluationRunState(BaseModel):
     snapshot_path: str
     mode: Literal["online", "offline"]
     score_enabled: bool
+    kb_id: int | None = None
+    kb_name: str = ""
+    department_id: int | None = None
+    created_by: str = ""
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    source_dataset_path: str = ""
+    dataset_sha256: str = ""
+    execution_dataset_sha256: str = ""
+    dataset_total_count: int = 0
+    dataset_sample_count: int = 0
+    matched_sample_count: int = 0
+    filtered_sample_count: int = 0
+    normal_sample_count: int = 0
+    expected_denied_sample_count: int = 0
+    cohort_fingerprint: str = ""
+    snapshot_sha256: str = ""
+    snapshot_ownership_verified: bool = False
+    validation_warnings: list[str] = Field(default_factory=list)
+    llm_model: str = ""
+    embedding_model: str = ""
+    evaluation_config: dict[str, Any] = Field(default_factory=dict)
     sample_ids: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     status: RunStatus = "queued"
@@ -238,6 +284,7 @@ class EvaluationRunState(BaseModel):
         score_enabled: bool,
         sample_ids: list[str] | None = None,
         tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> "EvaluationRunState":
         return cls(
             run_id=run_id,
@@ -248,4 +295,5 @@ class EvaluationRunState(BaseModel):
             total_samples=total_samples,
             sample_ids=sample_ids or [],
             tags=tags or [],
+            **(metadata or {}),
         )

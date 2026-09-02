@@ -23,6 +23,9 @@ _MISSING_MARKERS = (
     "不能确定",
 )
 _CONFLICT_MARKERS = ("冲突", "不一致", "差异", "分别", "一处", "另一处")
+_EVIDENCE_TYPE_ALIASES = {
+    "document_text": "document",
+}
 
 
 def _normalized(value: str) -> str:
@@ -37,6 +40,13 @@ def _contains(text: str, token: str) -> bool:
     compact_token = re.sub(r"\s+", "", normalized_token)
     compact_text = re.sub(r"\s+", "", normalized_text)
     return bool(compact_token and compact_token in compact_text)
+
+
+def _canonical_evidence_type(value: object) -> str:
+    """Normalize storage-specific evidence kinds to dataset vocabulary."""
+
+    normalized = str(value or "").strip().casefold()
+    return _EVIDENCE_TYPE_ALIASES.get(normalized, normalized)
 
 
 def _result(sample: EvaluationSample, name: str, score: float | None, **kwargs) -> MetricResult:
@@ -57,11 +67,13 @@ def score_hardware_rules(sample: EvaluationSample, snapshot: AnswerSnapshot) -> 
     )
 
     actual_types = {
-        str(item.get("content_kind") or (item.get("metadata") or {}).get("content_kind") or "")
+        _canonical_evidence_type(
+            item.get("content_kind") or (item.get("metadata") or {}).get("content_kind") or ""
+        )
         for item in snapshot.evidence
     }
     actual_types.discard("")
-    expected_types = sample.required_evidence_types
+    expected_types = [_canonical_evidence_type(kind) for kind in sample.required_evidence_types]
     missing_types = [kind for kind in expected_types if kind not in actual_types]
     evidence_score = (
         (len(expected_types) - len(missing_types)) / len(expected_types)

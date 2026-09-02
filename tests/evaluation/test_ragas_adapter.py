@@ -1,6 +1,7 @@
 import unittest
 from dataclasses import replace
 from math import nan
+from unittest.mock import patch
 
 from src.evaluation.config import EvaluationConfig
 from src.evaluation.ragas_adapter import RAGAS_RESULT_KEYS, RagasAdapter, _NativeRagasBackend
@@ -100,6 +101,17 @@ class NanThenContextBudgetBackend:
 class AlwaysFailingContextBackend:
     def score(self, records, metric_names):
         raise TimeoutError("judge timed out")
+
+
+class RecoveringTimeoutBackend:
+    def __init__(self):
+        self.calls = 0
+
+    def score(self, records, metric_names):
+        self.calls += 1
+        if self.calls == 1:
+            raise TimeoutError("judge timed out")
+        return [{metric_names[0]: 0.8}]
 
 
 def _config(**overrides):
@@ -268,6 +280,14 @@ class RagasAdapterTests(unittest.TestCase):
         self.assertFalse(embeddings.check_embedding_ctx_length)
 
     @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
+    def test_native_backend_passes_configured_embedding_dimensions(self):
+        config = replace(_config(), embedding_dims=2048)
+
+        embeddings = _NativeRagasBackend(config)._build_embeddings()
+
+        self.assertEqual(embeddings.dimensions, 2048)
+
+    @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
     def test_native_backend_passes_limit_and_uses_single_relevancy_sample(self):
         backend = _NativeRagasBackend(_config(llm_max_tokens=2048))
         llm = backend._build_llm()
@@ -406,6 +426,32 @@ class RagasAdapterTests(unittest.TestCase):
         self.assertEqual(diagnostics["q1"]["selected_claim_ids"], ["c1", "c2"])
         self.assertEqual(diagnostics["q1"]["selected_evidence_ids"], ["e2", "e3"])
 
+    def test_prioritizes_question_relevant_evidence_over_generic_high_quality_evidence(self):
+        snapshot = AnswerSnapshot(
+            sample_id="q1",
+            question="TPS62872 最大输出电流是多少？",
+            kb_name="kb",
+            response="12 A",
+            retrieved_contexts=["资料源目录与模板说明", "TPS62872 最大输出电流为 12 A"],
+            evidence=[
+                {"id": "catalog", "content": "资料源目录与模板说明"},
+                {"id": "fact", "content": "TPS62872 最大输出电流为 12 A"},
+            ],
+            retrieval_summary={
+                "evidence_quality": [
+                    {"evidence_id": "catalog", "score": 0.99},
+                    {"evidence_id": "fact", "score": 0.70},
+                ]
+            },
+        )
+
+        prepared, diagnostics = RagasAdapter(
+            _config(max_contexts_per_sample=1, max_context_chars=100)
+        ).prepare_snapshots_for_scoring([snapshot])
+
+        self.assertEqual(prepared[0].retrieved_contexts, ["TPS62872 最大输出电流为 12 A"])
+        self.assertEqual(diagnostics["q1"]["quality_prioritized_evidence_ids"][0], "fact")
+
     def test_prepares_best_evidence_from_each_content_kind_for_joint_claim(self):
         snapshot = AnswerSnapshot(
             sample_id="q1",
@@ -486,6 +532,29 @@ class RagasAdapterTests(unittest.TestCase):
         self.assertEqual(backend.calls, [["answer_correctness"], ["faithfulness"]])
         self.assertEqual(results[0].status, "failed")
         self.assertEqual(results[1].score, 0.7)
+
+    @patch("src.evaluation.ragas_adapter._backoff_sleep")
+    def test_retries_transient_exception_for_answer_correctness(self, backoff_sleep):
+        sample = EvaluationSample(id="q1", question="Q", reference_answer="A", kb_name="kb")
+        snapshot = AnswerSnapshot(
+            sample_id="q1",
+            question="Q",
+            kb_name="kb",
+            response="A",
+            retrieved_contexts=["source"],
+        )
+        backend = RecoveringTimeoutBackend()
+
+        result = RagasAdapter(_config(max_retries=1), backend=backend).score(
+            [sample], [snapshot], ["answer_correctness"]
+        )[0]
+
+        self.assertEqual(backend.calls, 2)
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.score, 0.8)
+        self.assertEqual(result.details["evaluator_diagnostic"]["kind"], "recovered_after_retry")
+        self.assertEqual(result.details["evaluator_diagnostic"]["attempts"], 2)
+        backoff_sleep.assert_called_once()
 
     def test_retries_context_metric_with_a_smaller_context_budget_after_timeout(self):
         sample = EvaluationSample(id="q1", question="Q", reference_answer="A", kb_name="kb")

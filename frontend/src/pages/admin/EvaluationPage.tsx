@@ -5,6 +5,8 @@ import type {
   CreateEvaluationRunPayload,
   EvaluationCompareResponse,
   EvaluationDatasetUploadResponse,
+  EvaluationKnowledgeBase,
+  EvaluationPreflightResponse,
   EvaluationRunDetail,
   EvaluationRunListItem,
   EvaluationRunStatus,
@@ -61,7 +63,7 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 const ACTIVE_STATUSES = new Set<EvaluationRunStatus>(['queued', 'running', 'pause_requested', 'cancel_requested']);
-const DELETABLE_STATUSES = new Set<EvaluationRunStatus>(['failed', 'cancelled']);
+const DELETABLE_STATUSES = new Set<EvaluationRunStatus>(['failed', 'cancelled', 'completed']);
 
 type LoadOptions = {
   silent?: boolean;
@@ -73,10 +75,6 @@ function splitList(value: string): string[] | null {
     .map((item) => item.trim())
     .filter(Boolean);
   return items.length > 0 ? items : null;
-}
-
-function outputRootQuery(outputRoot: string): string {
-  return `output_root=${encodeURIComponent(outputRoot.trim() || DEFAULT_OUTPUT_ROOT)}`;
 }
 
 function progressPercent(run: EvaluationRunDetail | null): number {
@@ -96,7 +94,6 @@ function progressLabel(run: EvaluationRunDetail): string {
 }
 
 export default function EvaluationPage({ auth, onLogout }: Props) {
-  const [outputRoot, setOutputRoot] = useState(DEFAULT_OUTPUT_ROOT);
   const [runs, setRuns] = useState<EvaluationRunListItem[]>([]);
   const [runsLoaded, setRunsLoaded] = useState(false);
   const [selectedRunId, setSelectedRunId] = useState('');
@@ -113,17 +110,46 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const [tags, setTags] = useState('');
   const [snapshotPath, setSnapshotPath] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [knowledgeBases, setKnowledgeBases] = useState<EvaluationKnowledgeBase[]>([]);
+  const [knowledgeBasesLoaded, setKnowledgeBasesLoaded] = useState(false);
+  const [selectedKbId, setSelectedKbId] = useState<number | null>(null);
+  const [preflight, setPreflight] = useState<EvaluationPreflightResponse | null>(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
 
   const [baselineRunId, setBaselineRunId] = useState('');
   const [compare, setCompare] = useState<EvaluationCompareResponse | null>(null);
   const [compareLoading, setCompareLoading] = useState(false);
+
+  const selectedKnowledgeBase = knowledgeBases.find((item) => item.kb_id === selectedKbId) ?? null;
+
+  const loadKnowledgeBases = useCallback(() => {
+    let cancelled = false;
+    api
+      .get<EvaluationKnowledgeBase[]>(`/api/v1/evaluation/knowledge-bases`)
+      .then((rows) => {
+        if (cancelled) return;
+        setKnowledgeBases(rows);
+        setSelectedKbId((current) => (
+          current != null && rows.some((item) => item.kb_id === current) ? current : rows[0]?.kb_id ?? null
+        ));
+      })
+      .catch((error) => {
+        if (!cancelled) notify.error(error instanceof Error ? error.message : '加载评估知识库失败');
+      })
+      .finally(() => {
+        if (!cancelled) setKnowledgeBasesLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loadRuns = useCallback((options: LoadOptions = {}) => {
     const silent = options.silent ?? false;
     let cancelled = false;
     if (shouldResetEvaluationLoading(silent)) setRunsLoaded(false);
     api
-      .get<EvaluationRunListItem[]>(`/api/v1/evaluation/runs?${outputRootQuery(outputRoot)}`)
+      .get<EvaluationRunListItem[]>('/api/v1/evaluation/runs')
       .then((rows) => {
         if (cancelled) return;
         setRuns(rows);
@@ -140,7 +166,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [outputRoot]);
+  }, []);
 
   const loadDetail = useCallback((runId = selectedRunId, options: LoadOptions = {}) => {
     const silent = options.silent ?? false;
@@ -152,7 +178,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     let cancelled = false;
     if (shouldResetEvaluationLoading(silent)) setDetailLoaded(false);
     api
-      .get<EvaluationRunDetail>(`/api/v1/evaluation/runs/${encodeURIComponent(runId)}?${outputRootQuery(outputRoot)}`)
+      .get<EvaluationRunDetail>(`/api/v1/evaluation/runs/${encodeURIComponent(runId)}`)
       .then((run) => {
         if (!cancelled) setDetail(run);
       })
@@ -173,7 +199,12 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [outputRoot, selectedRunId]);
+  }, [selectedRunId]);
+
+  useEffect(() => {
+    const cancel = loadKnowledgeBases();
+    return cancel;
+  }, [loadKnowledgeBases]);
 
   useEffect(() => {
     const cancel = loadRuns();
@@ -199,7 +230,11 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   useEffect(() => {
     setCompare(null);
     setBaselineRunId('');
-  }, [selectedRunId, outputRoot]);
+  }, [selectedRunId]);
+
+  useEffect(() => {
+    setPreflight(null);
+  }, [selectedKbId, datasetPath, mode, scoreEnabled, sampleIds, tags, snapshotPath]);
 
   async function handleDatasetUpload(fileList: FileList | null) {
     const file = fileList?.[0];
@@ -213,7 +248,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       const form = new FormData();
       form.append('file', file);
       const result = await uploadFiles<EvaluationDatasetUploadResponse>(
-        `/api/v1/evaluation/datasets?${outputRootQuery(outputRoot)}`,
+        '/api/v1/evaluation/datasets',
         form,
       );
       setDatasetPath(result.dataset_path);
@@ -225,7 +260,57 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     }
   }
 
+  async function handlePreflight() {
+    if (selectedKnowledgeBase == null) {
+      notify.error('请选择评估知识库');
+      return;
+    }
+    if (!datasetPath.trim()) {
+      notify.error('请输入数据集路径');
+      return;
+    }
+    if (mode === 'offline' && !snapshotPath.trim()) {
+      notify.error('离线重评需要快照 JSONL 路径');
+      return;
+    }
+    setPreflightLoading(true);
+    try {
+      const payload: CreateEvaluationRunPayload = {
+        dataset_path: datasetPath.trim(),
+        kb_id: selectedKnowledgeBase.kb_id,
+        kb_name: selectedKnowledgeBase.kb_name,
+        mode,
+        score_enabled: mode === 'online' ? scoreEnabled : true,
+        sample_ids: splitList(sampleIds),
+        tags: splitList(tags),
+        snapshot_path: mode === 'offline' ? snapshotPath.trim() : null,
+      };
+      const result = await api.post<EvaluationPreflightResponse>(
+        '/api/v1/evaluation/preflight',
+        payload,
+      );
+      setPreflight(result);
+      if (result.can_create) {
+        notify.success(`预检通过：${result.dataset_sample_count} 条样本`);
+      } else {
+        notify.error(`预检未通过：${result.errors.join('；') || '请检查返回详情'}`);
+      }
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '评估预检失败');
+    } finally {
+      setPreflightLoading(false);
+    }
+  }
+
   async function handleCreateAndStart() {
+    if (!preflight?.can_create) {
+      notify.error('请先执行并通过预检；修改数据集或知识库后需要重新预检');
+      return;
+    }
+    if (selectedKnowledgeBase == null) {
+      notify.error('评估知识库不可用，请重新加载后再试');
+      return;
+    }
     if (!datasetPath.trim()) {
       notify.error('请输入数据集路径');
       return;
@@ -238,6 +323,8 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     try {
       const payload: CreateEvaluationRunPayload = {
         dataset_path: datasetPath.trim(),
+        kb_id: selectedKnowledgeBase.kb_id,
+        kb_name: selectedKnowledgeBase.kb_name,
         mode,
         score_enabled: mode === 'online' ? scoreEnabled : true,
         sample_ids: splitList(sampleIds),
@@ -245,11 +332,11 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         snapshot_path: mode === 'offline' ? snapshotPath.trim() : null,
       };
       const run = await api.post<EvaluationRunDetail>(
-        `/api/v1/evaluation/runs?${outputRootQuery(outputRoot)}`,
+        '/api/v1/evaluation/runs',
         payload,
       );
       await api.post<OkResponse>(
-        `/api/v1/evaluation/runs/${encodeURIComponent(run.run_id)}/start?${outputRootQuery(outputRoot)}`,
+        `/api/v1/evaluation/runs/${encodeURIComponent(run.run_id)}/start`,
       );
       notify.success('评估已创建并开始运行');
       setSelectedRunId(run.run_id);
@@ -265,7 +352,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     if (!selectedRunId) return;
     try {
       await api.post<OkResponse | EvaluationRunDetail>(
-        `/api/v1/evaluation/runs/${encodeURIComponent(selectedRunId)}/${action}?${outputRootQuery(outputRoot)}`,
+        `/api/v1/evaluation/runs/${encodeURIComponent(selectedRunId)}/${action}`,
       );
       notify.success(
         action === 'start'
@@ -288,7 +375,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     setDeleting(true);
     try {
       await api.delete<OkResponse>(
-        `/api/v1/evaluation/runs/${encodeURIComponent(runId)}?${outputRootQuery(outputRoot)}`,
+        `/api/v1/evaluation/runs/${encodeURIComponent(runId)}`,
       );
       notify.success('评估运行已删除');
       setDeleteTarget(null);
@@ -307,7 +394,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     }
   }
 
-  async function handleCompare() {
+  async function handleCompare(strict: boolean) {
     if (!selectedRunId || !baselineRunId) {
       notify.error('请选择当前运行和基线运行');
       return;
@@ -316,7 +403,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     setCompare(null);
     try {
       const result = await api.get<EvaluationCompareResponse>(
-        `/api/v1/evaluation/runs/${encodeURIComponent(selectedRunId)}/compare?baseline=${encodeURIComponent(baselineRunId)}&${outputRootQuery(outputRoot)}`,
+        `/api/v1/evaluation/runs/${encodeURIComponent(selectedRunId)}/compare?baseline=${encodeURIComponent(baselineRunId)}&strict=${strict}`,
       );
       setCompare(result);
     } catch (error) {
@@ -347,6 +434,23 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         title: '状态',
         width: 100,
         render: (run) => <StatusPill status={run.status || 'queued'} />,
+      },
+      {
+        key: 'knowledge_base',
+        title: '知识库',
+        width: 180,
+        render: (run) => (
+          <div className="min-w-0">
+            <div className="truncate text-[12px] text-[#18181a]">{run.kb_name || '旧版任务'}</div>
+            {run.kb_name && <div className="truncate text-[10px] text-[#858b9c]">{run.department_id == null ? '未分配部门' : `部门 ${run.department_id}`} · ID {run.kb_id ?? '-'}</div>}
+          </div>
+        ),
+      },
+      {
+        key: 'samples',
+        title: '样本',
+        width: 90,
+        render: (run) => run.dataset_sample_count > 0 ? `${run.dataset_sample_count}（拒绝 ${run.expected_denied_sample_count}）` : '-',
       },
       {
         key: 'summary',
@@ -385,7 +489,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
                   setDeleteTarget(run);
                 }}
                 className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#f3b0b0] bg-white px-[10px] text-[12px] text-[#d20b0b] transition-colors hover:bg-[#fce7e7]"
-                title="删除失败或已取消的运行"
+                title="删除已完成、失败或已取消的运行"
               >
                 <AppIcon name="trash" size={13} />
                 删除
@@ -417,18 +521,46 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       <section className="mt-[20px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
         <div className="mb-[14px] flex flex-wrap items-center justify-between gap-[12px]">
           <h3 className="text-[14px] font-semibold text-[#18181a]">新建评估</h3>
-          <Button
-            onClick={handleCreateAndStart}
-            disabled={submitting}
-            className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] text-white hover:bg-[#303030]"
-          >
-            <AppIcon name="plus" size={14} />
-            {submitting ? '创建中' : '创建并开始'}
-          </Button>
+          <div className="flex flex-wrap gap-[8px]">
+            <Button
+              variant="outline"
+              onClick={() => void handlePreflight()}
+              disabled={preflightLoading || submitting || !knowledgeBasesLoaded}
+              className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')}
+            >
+              {preflightLoading ? '预检中' : '执行预检'}
+            </Button>
+            <Button
+              onClick={() => void handleCreateAndStart()}
+              disabled={submitting || preflightLoading || !preflight?.can_create}
+              className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] text-white hover:bg-[#303030]"
+            >
+              <AppIcon name="plus" size={14} />
+              {submitting ? '创建中' : '创建并开始'}
+            </Button>
+          </div>
         </div>
         <div className="grid grid-cols-4 gap-[12px] max-[1200px]:grid-cols-2 max-[720px]:grid-cols-1">
-              <Field label="输出目录">
-                <Input value={outputRoot} onChange={(e) => setOutputRoot(e.target.value)} className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
+              <Field label="评估知识库">
+                {!knowledgeBasesLoaded ? (
+                  <Skeleton className="h-[36px] rounded-[10px]" />
+                ) : (
+                  <Select
+                    value={selectedKbId == null ? '' : String(selectedKbId)}
+                    onValueChange={(value) => setSelectedKbId(Number(value))}
+                  >
+                    <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] text-[13px]">
+                      <SelectValue placeholder="选择知识库" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {knowledgeBases.map((item) => (
+                        <SelectItem key={item.kb_id} value={String(item.kb_id)}>
+                          {item.kb_name} · {item.department_name || `部门 ${item.department_id ?? '-'}`}（ID {item.kb_id}）
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
               </Field>
               <Field label="数据集 JSONL">
                 <Input value={datasetPath} onChange={(e) => setDatasetPath(e.target.value)} className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
@@ -477,6 +609,28 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
                 <Textarea value={tags} onChange={(e) => setTags(e.target.value)} placeholder="可选,逗号或换行分隔" className="min-h-[68px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
               </Field>
         </div>
+        <div className="mt-[10px] flex flex-wrap items-center gap-x-[14px] gap-y-[4px] text-[11px] text-[#858b9c]">
+          <span>输出目录固定为 {DEFAULT_OUTPUT_ROOT}</span>
+          {selectedKnowledgeBase && (
+            <span>当前绑定：{selectedKnowledgeBase.kb_name} · {selectedKnowledgeBase.department_name || `部门 ${selectedKnowledgeBase.department_id ?? '-'}`}（ID {selectedKnowledgeBase.kb_id}）</span>
+          )}
+        </div>
+        {preflight && (
+          <div className={cn(
+            'mt-[12px] rounded-[10px] border px-[12px] py-[10px] text-[12px]',
+            preflight.can_create ? 'border-[#b7e5c8] bg-[#f2fbf5] text-[#176b3c]' : 'border-[#f3b0b0] bg-[#fff7f7] text-[#a10b0b]',
+          )}>
+            <div className="flex flex-wrap gap-x-[14px] gap-y-[4px] font-medium">
+              <span>匹配样本 {preflight.matched_sample_count}</span>
+              <span>本次样本 {preflight.dataset_sample_count}</span>
+              <span>被过滤 {preflight.filtered_sample_count}</span>
+              <span>正常检索 {preflight.normal_sample_count}</span>
+              <span>拒绝样本 {preflight.expected_denied_sample_count}</span>
+            </div>
+            {preflight.errors.length > 0 && <p className="mt-[6px] whitespace-pre-wrap">错误：{preflight.errors.join('；')}</p>}
+            {preflight.warnings.length > 0 && <p className="mt-[6px] whitespace-pre-wrap">提示：{preflight.warnings.join('；')}</p>}
+          </div>
+        )}
       </section>
 
       <section className="mt-[16px] flex flex-col gap-[16px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
@@ -523,14 +677,36 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
               </SelectContent>
             </Select>
           </div>
-          <Button variant="outline" className={OUTLINE_ACTION_BUTTON_CLASS} onClick={handleCompare} disabled={compareLoading || !baselineRunId || !detail?.summary}>
-            对比
-          </Button>
+          <div className="flex flex-wrap gap-[8px]">
+            <Button
+              variant="outline"
+              className={OUTLINE_ACTION_BUTTON_CLASS}
+              onClick={() => void handleCompare(true)}
+              disabled={compareLoading || !baselineRunId || !detail?.summary}
+            >
+              严格对比
+            </Button>
+            <Button
+              variant="outline"
+              className={OUTLINE_ACTION_BUTTON_CLASS}
+              onClick={() => void handleCompare(false)}
+              disabled={compareLoading || !baselineRunId || !detail?.summary}
+            >
+              仅查看对比
+            </Button>
+          </div>
         </div>
         {compare ? (
-          <p className="text-[12px] text-[#858b9c]">已选择基线；分组柱状图和数值对比显示在下方评估总览中。</p>
+          <div className="text-[12px] text-[#858b9c]">
+            <p>已选择基线；分组柱状图和数值对比显示在下方评估总览中。当前模式：{compare.strict ? '严格对比' : '仅查看对比'}。</p>
+            {compare.warnings.length > 0 && (
+              <div className="mt-[8px] rounded-[8px] border border-[#f1d59a] bg-[#fffaf0] px-[10px] py-[8px] text-[#8a5a00]">
+                {compare.warnings.join('；')}
+              </div>
+            )}
+          </div>
         ) : (
-          <p className="text-[12px] text-[#858b9c]">选择一个已完成的运行作为基线,可比较当前摘要与历史摘要。</p>
+          <p className="text-[12px] text-[#858b9c]">选择一个已完成的运行作为基线。严格对比校验知识库、样本集、指标和模型配置；仅查看对比会保留差异警告。</p>
         )}
       </section>
 
@@ -556,7 +732,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           if (!open) setDeleteTarget(null);
         }}
         title={<>删除评估运行「{deleteTarget?.run_id}」</>}
-        description="仅失败或已取消的运行可以删除。删除后该运行的状态、快照和评估报告将不可恢复。"
+        description="仅已完成、失败或已取消的运行可以删除。删除后该运行的状态、快照和评估报告将不可恢复；运行目录外的共享快照不会被删除。"
         confirmText="删除"
         loading={deleting}
         destructive
@@ -698,7 +874,11 @@ function RunDetailPanel({
       )}
 
       <div className="grid grid-cols-2 gap-[10px] text-[12px] max-[900px]:grid-cols-1">
+        <Meta label="知识库" value={run.kb_name ? `${run.kb_name}（ID ${run.kb_id ?? '-'} · 部门 ${run.department_id ?? '-'}）` : '旧版任务，未记录知识库'} />
+        <Meta label="样本范围" value={`${run.dataset_sample_count || run.total_samples} 条 · 正常 ${run.normal_sample_count || Math.max(0, run.total_samples - run.expected_denied_sample_count)} · 拒绝 ${run.expected_denied_sample_count}`} />
         <Meta label="数据集" value={run.dataset_path} />
+        {run.source_dataset_path && <Meta label="原始数据集" value={run.source_dataset_path} />}
+        {run.created_by && <Meta label="创建人" value={run.created_by} />}
         <Meta label="快照" value={run.snapshot_path || '-'} />
         <Meta label="开始时间" value={run.started_at ? formatDateTime(run.started_at) : '-'} />
         <Meta label="更新时间" value={run.updated_at ? formatDateTime(run.updated_at) : '-'} />

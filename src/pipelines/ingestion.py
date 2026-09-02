@@ -426,6 +426,17 @@ class IngestionOrchestrator:
 
     def _existing_record_is_reusable(self, record: PipelineDocumentRecord, handler: PipelineHandler) -> bool | None:
         """Tri-state reuse decision: True (reuse), False (stale, safe to rebuild), None (undetermined)."""
+        if record.shared_read_only:
+            # A shared record is owned by the observability instance.  The
+            # develop instance may reuse its remote RAGFlow mapping, but it
+            # must not require or rebuild a local archive copy.
+            if record.processor_kind == PROCESSOR_KIND_RAGFLOW:
+                remote_exists = self.remote_document_exists(record)
+                if remote_exists is None:
+                    return None
+                if not remote_exists:
+                    return False
+            return handler.can_reuse_existing(record)
         if not self.archive.record_archive_exists(record):
             return False
         if record.processor_kind == PROCESSOR_KIND_RAGFLOW:
@@ -482,9 +493,16 @@ class RAGFlowDocumentHandler(PipelineHandler):
         return default_dataset_kind
 
     def reuse_message(self, record: PipelineDocumentRecord) -> str:
+        if record.shared_read_only:
+            return f"[success] 已复用 observability 的共享 RAGFlow 文档（只读）: {record.document_name}"
         return f"[success] Already submitted to RAGFlow: {record.document_name}"
 
     def on_stale_existing(self, record: PipelineDocumentRecord):
+        if record.shared_read_only:
+            # The remote owner is responsible for remote cleanup.  If its
+            # mapping disappeared, the orchestrator may replace only the
+            # local mapping with a new develop-owned upload.
+            return None
         self.cleanup_remote(record.dataset_id, record.document_id)
 
     def submit(
@@ -578,6 +596,12 @@ class RAGFlowDocumentHandler(PipelineHandler):
             self.store.delete_document_by_id(result.record_id)
 
     def delete_record(self, record: PipelineDocumentRecord, archive: DocumentArchiveManager) -> HandlerDeleteResult:
+        if record.shared_read_only:
+            return HandlerDeleteResult(
+                ok=False,
+                message=f"共享文档为只读，develop 实例不能删除或重新解析: {record.document_name}",
+                audit_action="shared_document_mutation_denied",
+            )
         self.delete_remote(record.dataset_id, record.document_id)
         archive.remove_record_archive(record)
         self.store.delete_document_by_id(record.id)

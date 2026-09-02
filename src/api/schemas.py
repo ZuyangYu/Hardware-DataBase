@@ -747,13 +747,87 @@ class EvidenceView(BaseModel):
 
 class CreateEvaluationRunRequest(BaseModel):
     """Body for POST /evaluation/runs. Replaces the loose dict so pydantic
-    validates types (mode enum, score_enabled bool, sample_ids/tags lists)."""
+    validates types (mode enum, score_enabled bool, sample_ids/tags lists).
+
+    ``kb_id`` is the authoritative binding for new callers. ``kb_name`` is
+    retained as a display/redundant consistency field and for the short
+    compatibility window where a legacy caller only supplies a unique name.
+    """
     dataset_path: str
+    kb_id: int | None = None
+    kb_name: str | None = None
     mode: Literal["online", "offline"] = "online"
     score_enabled: bool = True
     sample_ids: list[str] | None = None
     tags: list[str] | None = None
     snapshot_path: str | None = None  # required when mode == "offline"
+
+
+class EvaluationKnowledgeBaseView(BaseModel):
+    """A selectable KB identity; no KB content is exposed."""
+
+    kb_id: int
+    kb_name: str
+    department_id: int | None = None
+    department_name: str | None = None
+    physical_exists: bool = False
+    registered: bool = True
+
+
+class EvaluationPreflightResponse(BaseModel):
+    """Detailed, side-effect-free validation result for a new run."""
+
+    dataset_path: str
+    mode: Literal["online", "offline"]
+    kb_id: int | None = None
+    kb_name: str = ""
+    department_id: int | None = None
+    dataset_total_count: int = 0
+    matched_sample_count: int = 0
+    filtered_sample_count: int = 0
+    dataset_sample_count: int = 0
+    normal_sample_count: int = 0
+    expected_denied_sample_count: int = 0
+    cohort_fingerprint: str = ""
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    can_create: bool = False
+
+
+class EvaluationRunListItemView(BaseModel):
+    """History row returned without requiring clients to read local files."""
+
+    run_id: str
+    status: str = ""
+    has_summary: bool = False
+    legacy: bool = False
+    kb_id: int | None = None
+    kb_name: str = ""
+    department_id: int | None = None
+    created_by: str = ""
+    created_at: str = ""
+    dataset_path: str = ""
+    source_dataset_path: str = ""
+    mode: str = ""
+    score_enabled: bool = True
+    report_path: str = ""
+    dataset_sample_count: int = 0
+    normal_sample_count: int = 0
+    expected_denied_sample_count: int = 0
+    cohort_fingerprint: str = ""
+    llm_model: str = ""
+    embedding_model: str = ""
+    snapshot_ownership_verified: bool = False
+    validation_warnings: list[str] = Field(default_factory=list)
+
+
+class EvaluationCompareResponse(BaseModel):
+    strict: bool = True
+    compatible: bool = False
+    warnings: list[str] = Field(default_factory=list)
+    compatibility: dict[str, Any] = Field(default_factory=dict)
+    current: dict[str, Any] = Field(default_factory=dict)
+    baseline: dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

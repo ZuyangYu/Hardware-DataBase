@@ -44,6 +44,14 @@ function parseErrorMessage(body: string): string {
   try {
     const parsed = JSON.parse(body) as { detail?: unknown };
     if (typeof parsed.detail === 'string') return parsed.detail;
+    if (parsed.detail && typeof parsed.detail === 'object') {
+      const detail = parsed.detail as { message?: unknown; warnings?: unknown };
+      const message = typeof detail.message === 'string' ? detail.message : '';
+      const warnings = Array.isArray(detail.warnings)
+        ? detail.warnings.filter((item): item is string => typeof item === 'string')
+        : [];
+      return [message, ...warnings].filter(Boolean).join('；');
+    }
     if (Array.isArray(parsed.detail)) {
       // FastAPI 422: detail 是 {loc,msg} 列表
       return parsed.detail

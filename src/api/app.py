@@ -185,8 +185,8 @@ def create_app() -> FastAPI:
             "http://127.0.0.1:8501",
             "http://localhost:3000",
             "http://127.0.0.1:3000",
-            "http://localhost:5174",
-            "http://127.0.0.1:5174",
+            "http://localhost:5175",
+            "http://127.0.0.1:5175",
         ]
     app.add_middleware(
         CORSMiddleware,
@@ -245,5 +245,5 @@ def main() -> None:
     import uvicorn
 
     host = os.getenv("HDB_API_HOST", "127.0.0.1")
-    port = int(os.getenv("HDB_API_PORT", "8001"))
+    port = int(os.getenv("HDB_API_PORT", "8003"))
     uvicorn.run("src.api.app:app", host=host, port=port)

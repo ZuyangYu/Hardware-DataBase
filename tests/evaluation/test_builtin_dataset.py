@@ -58,6 +58,22 @@ class BuiltinDatasetTests(unittest.TestCase):
             )
         )
 
+    def test_permission_isolation_samples_are_explicit_denials(self):
+        samples = load_dataset(DATASET)
+        denied = {
+            sample.id: sample.expected_access
+            for sample in samples
+            if "permission" in sample.tags
+        }
+
+        self.assertEqual(
+            denied,
+            {
+                "hw-v1-permission-empty-scope": "denied",
+                "hw-v1-permission-cross-kb-isolation": "denied",
+            },
+        )
+
     def test_noisy_pmic_reference_answer_contains_only_verifiable_facts(self):
         sample = next(
             sample

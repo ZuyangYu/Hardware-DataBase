@@ -20,6 +20,7 @@ from src.evaluation.schemas import (
     SampleResult,
 )
 from src.evaluation.snapshot_store import SnapshotStore
+from src.evaluation.snapshot_manifest import load_snapshot_manifest
 
 
 def _state(status: str = "queued") -> EvaluationRunState:
@@ -330,6 +331,40 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertEqual((final.completed_samples, final.successful_samples), (2, 2))
         self.assertFalse((self.root / state.run_id / "summary.json").exists())
 
+    def test_create_run_freezes_normalized_input_and_records_binding_metadata(self):
+        state = self.controller.create_online_run(
+            self.dataset,
+            self.root,
+            self.samples,
+            score_enabled=False,
+            kb_id=7,
+            kb_name="hardware",
+            department_id=47,
+            created_by="admin",
+            matched_sample_count=2,
+            filtered_sample_count=1,
+        )
+
+        execution_dataset = Path(state.dataset_path)
+        self.assertNotEqual(execution_dataset, self.dataset)
+        self.assertTrue(execution_dataset.is_file())
+        self.assertEqual(state.source_dataset_path, str(self.dataset))
+        self.assertEqual((state.kb_id, state.kb_name, state.department_id), (7, "hardware", 47))
+        self.assertEqual(state.created_by, "admin")
+        self.assertEqual(state.dataset_sample_count, 2)
+        self.assertEqual(state.matched_sample_count, 2)
+        self.assertEqual(state.filtered_sample_count, 1)
+        self.assertTrue(state.dataset_sha256)
+        self.assertTrue(state.execution_dataset_sha256)
+        self.assertTrue(state.cohort_fingerprint)
+
+        self.dataset.write_text("this source was changed after creation", encoding="utf-8")
+
+        final = self.controller.execute(state.run_id)
+
+        self.assertEqual(final.status, "completed")
+        self.assertEqual(self.fake_service.collected_ids, ["q1", "q2"])
+
     def test_scoring_item_checkpoint_is_persisted_during_run(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples, score_enabled=True
@@ -401,7 +436,7 @@ class EvaluationRunControllerTests(unittest.TestCase):
         self.assertFalse((self.root / state.run_id).exists())
 
     def test_delete_rejects_non_terminal_or_successful_runs(self):
-        for status in ("queued", "running", "paused", "completed"):
+        for status in ("queued", "running", "paused"):
             with self.subTest(status=status):
                 state = self.controller.create_online_run(
                     self.dataset, self.root, self.samples, score_enabled=False
@@ -413,6 +448,60 @@ class EvaluationRunControllerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.controller.delete(state.run_id)
                 self.assertTrue((self.root / state.run_id).exists())
+
+    def test_delete_completed_run_preserves_external_snapshot(self):
+        external_snapshot = Path(self.temp_dir.name) / "shared" / "snapshot.jsonl"
+        external_snapshot.parent.mkdir()
+        external_snapshot.write_text('{"sample_id":"q1"}\n', encoding="utf-8")
+        state = self.controller.create_offline_run(
+            self.dataset,
+            self.root,
+            self.samples,
+            external_snapshot,
+        )
+        RunStateStore(self.root / state.run_id / "run_state.json").mutate(
+            lambda current: current.model_copy(update={"status": "completed"})
+        )
+
+        deleted = self.controller.delete(state.run_id)
+
+        self.assertEqual(deleted.status, "completed")
+        self.assertFalse((self.root / state.run_id).exists())
+        self.assertTrue(external_snapshot.exists())
+
+    def test_offline_legacy_snapshot_remains_unverified_for_strict_comparison(self):
+        external_snapshot = Path(self.temp_dir.name) / "legacy" / "snapshot.jsonl"
+        external_snapshot.parent.mkdir()
+        external_snapshot.write_text(
+            "\n".join(
+                AnswerSnapshot(
+                    sample_id=sample.id,
+                    question=sample.question,
+                    kb_name=sample.kb_name,
+                    response=sample.reference_answer,
+                ).model_dump_json()
+                for sample in self.samples
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        state = self.controller.create_offline_run(
+            self.dataset,
+            self.root,
+            self.samples,
+            external_snapshot,
+            kb_id=7,
+            kb_name="hardware",
+            department_id=47,
+            snapshot_ownership_verified=False,
+            validation_warnings=["legacy snapshot"],
+        )
+
+        manifest = load_snapshot_manifest(self.root / state.run_id)
+        self.assertFalse(state.snapshot_ownership_verified)
+        self.assertEqual(state.validation_warnings, ["legacy snapshot"])
+        self.assertFalse(manifest["ownership_verified"])
 
     def test_delete_rejects_run_id_path_traversal(self):
         with self.assertRaises(ValueError):
