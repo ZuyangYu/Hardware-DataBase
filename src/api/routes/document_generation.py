@@ -1,6 +1,6 @@
 """Document-generation API: governed authoring over the shared AppPipeline.
 
-Mirrors the Streamlit document_generation_page (upload template / create task
+Mirrors the frontend/src/pages/DocumentGenerationPage.tsx (upload template / create task
 / runs & download). system_admin is rejected (governance role, no KB content).
 Endpoints are thin: they build a RequestContext and delegate to AppPipeline.
 """
@@ -13,6 +13,7 @@ import src.settings
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import (
+    AgentHumanDecisionRequest,
     AnswerGenerationSessionRequest,
     ConfirmTemplateRequest,
     CreateGenerationSessionRequest,
@@ -257,9 +258,10 @@ def confirm_template(
 ):
     ctx = _ctx(user, auth, kb)
     try:
-        return pipeline.confirm_document_template(
-            ctx, analysis_id=analysis_id, display_name=payload.display_name,
-        )
+        kwargs = {"analysis_id": analysis_id, "display_name": payload.display_name}
+        if payload.execution_mode is not None:
+            kwargs["execution_mode"] = payload.execution_mode
+        return pipeline.confirm_document_template(ctx, **kwargs)
     except PermissionError as exc:
         # 写操作权限失败应为 403，而非 400（区分"无权"与"请求非法"）。
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -374,13 +376,18 @@ def create_work_order(
 ):
     ctx = _write_ctx(user, auth, kb)
     try:
+        kwargs = {
+            "template_version_id": payload.template_version_id,
+            "document_schema_id": payload.document_schema_id,
+            "document_schema_version": payload.document_schema_version,
+            "generation_session_id": payload.generation_session_id,
+        }
+        if payload.execution_mode is not None:
+            kwargs["execution_mode"] = payload.execution_mode
         return pipeline.prepare_knowledge_base_document_generation(
             ctx,
             knowledge_base_name=kb,
-            template_version_id=payload.template_version_id,
-            document_schema_id=payload.document_schema_id,
-            document_schema_version=payload.document_schema_version,
-            generation_session_id=payload.generation_session_id,
+            **kwargs,
         )
     except PermissionError as exc:
         # 写操作权限失败应为 403，而非 400（区分"无权"与"请求非法"）。
@@ -548,6 +555,33 @@ def cancel_harness(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/document-generation/harness-runs/{run_id}/agent-decision")
+def agent_human_decision(
+    run_id: str,
+    kb: str,
+    payload: AgentHumanDecisionRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Approve/reject a pending low-confidence field proposal."""
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        return pipeline.resolve_knowledge_base_harness_human_decision(
+            ctx,
+            run_id,
+            pending_event_id=payload.pending_event_id,
+            proposal_hash=payload.proposal_hash,
+            decision=payload.decision,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/document-generation/artifacts/{artifact_id}/preview")

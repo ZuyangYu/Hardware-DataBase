@@ -22,6 +22,7 @@ from src.pipelines.document_rag.schemas import EvidenceEnvelope, IngestResult, R
 from src.projects.service import ProjectService
 from src.projects.retrieval import ProjectEvidenceRetrievalService, SourceUnavailableError
 from src.document_authoring.service import DocumentGenerationService
+from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
 from src.document_authoring.icd_scope_decision import (
     build_icd_scope_decision,
@@ -147,6 +148,16 @@ class AppPipeline:
             self.projects = ProjectService()
             self.project_retrieval = ProjectEvidenceRetrievalService(self.projects)
             self.document_generation = DocumentGenerationService(self.projects)
+            # Chat-created authoring work orders are durable jobs.  Keep one
+            # repository instance on the application pipeline so the HTTP
+            # tool adapter and the separated worker share the same database
+            # and idempotency boundary.
+            self.document_job_store = DocumentAuthoringJobStore()
+            # The chat runner is constructed before the document service, so
+            # bind the completed pipeline after initialization.  The runner
+            # still exposes the tools only when the explicit setting is on.
+            self.agent.document_authoring_pipeline = self
+            self.agent.document_job_store = self.document_job_store
             self.requirement_clarifier = RequirementClarifier()
             # Spreadsheet structured index (xlsx TableIndexStore). Shared with
             # the query agent; the KB authoring retriever also needs it so
@@ -246,6 +257,8 @@ class AppPipeline:
         query_mode: str = "deep",
         should_cancel: Callable[[], bool] | None = None,
         persist_thread: bool = False,
+        document_context: Any | None = None,
+        document_flow: bool | None = None,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -264,6 +277,8 @@ class AppPipeline:
                 query_mode=query_mode,
                 should_cancel=should_cancel,
                 persist_thread=persist_thread,
+                document_context=document_context,
+                document_flow=document_flow,
             )
         except QueryCancelled:
             return
@@ -791,9 +806,19 @@ class AppPipeline:
             correction=correction,
         )
 
-    def confirm_document_template(self, ctx: RequestContext, *, analysis_id: str, display_name: str):
+    def confirm_document_template(
+        self,
+        ctx: RequestContext,
+        *,
+        analysis_id: str,
+        display_name: str,
+        execution_mode: str | None = None,
+    ):
         return self.document_generation.confirm_template_analysis(
-            ctx, analysis_id=analysis_id, display_name=display_name,
+            ctx,
+            analysis_id=analysis_id,
+            display_name=display_name,
+            execution_mode=execution_mode,
         )
 
     def create_document_generation_session(
@@ -808,7 +833,11 @@ class AppPipeline:
         template = self.document_generation.store.get_template(template_version_id)
         if template is None:
             raise KeyError("template not found")
-        self.document_generation._require_template_kb_scope(ctx, template, "read")
+        if not ctx.has_kb_permission(knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+        self.document_generation._require_template_kb_scope(ctx, template, "write")
+        if template.knowledge_base_name != knowledge_base_name:
+            raise PermissionError("template does not belong to the selected knowledge base")
         analysis = self.document_generation.store.get_template_analysis(template_version_id)
         if analysis is None:
             raise KeyError("template analysis not found")
@@ -856,6 +885,10 @@ class AppPipeline:
         answer: str,
     ):
         session = self.get_document_generation_session(ctx, session_id)
+        if not ctx.has_kb_permission(session.knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+        if ctx.metadata.get("document_template_kb_name") != session.knowledge_base_name:
+            raise PermissionError("generation session belongs to another knowledge base")
         if session.status != "needs_clarification":
             raise ValueError("generation session is not accepting clarification answers")
         pending = next(
@@ -903,6 +936,10 @@ class AppPipeline:
 
     def confirm_document_generation_session(self, ctx: RequestContext, session_id: str):
         session = self.get_document_generation_session(ctx, session_id)
+        if not ctx.has_kb_permission(session.knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+        if ctx.metadata.get("document_template_kb_name") != session.knowledge_base_name:
+            raise PermissionError("generation session belongs to another knowledge base")
         analysis = self.document_generation.store.get_template_analysis(
             session.template_version_id,
         )
@@ -945,6 +982,12 @@ class AppPipeline:
         **kwargs,
     ):
         """Create a KB work order from the sources readable at creation time."""
+        # Creation freezes the readable source snapshot.  The mutating
+        # generation/approval operations below still require write access;
+        # keeping creation read-scoped preserves the legacy API contract and
+        # lets a read-only user prepare a reviewable work order without
+        # authorizing document mutation at this boundary.  Chat/API callers
+        # that create a job use their explicit write gate before reaching us.
         if not ctx.has_kb_permission(knowledge_base_name, "read"):
             raise PermissionError("knowledge base read permission is required")
         source_names = []
@@ -1152,6 +1195,8 @@ class AppPipeline:
         self,
         ctx: RequestContext,
         work_order_id: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
     ):
         """Run an existing KB work order after its frozen ICD scope is resolved."""
         order = self.document_generation.store.get_work_order(work_order_id)
@@ -1171,10 +1216,11 @@ class AppPipeline:
             source_set_snapshot_id=snapshot.source_set_snapshot_id,
             icd_scope_review=scope_review,
         )
+        run_kwargs: dict[str, Any] = {"retrieve": retrieve}
+        if should_cancel is not None:
+            run_kwargs["should_cancel"] = should_cancel
         return self.document_generation.run_internal_harness(
-            ctx,
-            work_order_id,
-            retrieve=retrieve,
+            ctx, work_order_id, **run_kwargs,
         )
 
     def submit_knowledge_base_document_generation(
@@ -1182,10 +1228,83 @@ class AppPipeline:
         ctx: RequestContext,
         work_order_id: str,
     ) -> str:
-        """Run an existing KB work order's harness on the background worker."""
+        """Queue an existing KB work order on the durable authoring worker.
+
+        The old in-process ``DocumentGenerationWorker`` remains a compatibility
+        path for small legacy callers that construct an ``AppPipeline`` without
+        the shared job store.  A production pipeline always has
+        ``document_job_store`` and therefore never serializes a request-bound
+        closure or authentication context into a background queue.
+        """
+        job_store = getattr(self, "document_job_store", None)
+        if callable(getattr(job_store, "create_job", None)):
+            order = self.document_generation.store.get_work_order(work_order_id)
+            if order is None:
+                raise KeyError("document work order was not found")
+            self.document_generation.require_work_order_capability(
+                ctx, order, "run_deterministic_work_order",
+            )
+            if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+                raise ValueError("work order is not a knowledge-base document generation")
+            if not ctx.has_kb_permission(order.knowledge_base_name, "write"):
+                raise PermissionError("knowledge base write permission is required")
+            job = job_store.create_job(
+                tenant_id=ctx.tenant_id or "default",
+                user_id=ctx.user_id,
+                session_id=ctx.session_id or f"document-generation:{work_order_id}",
+                client_request_id=f"work-order:{work_order_id}:generate",
+                operation="generate_work_order",
+                work_order_id=work_order_id,
+                payload={
+                    "work_order_id": work_order_id,
+                    "knowledge_base_name": order.knowledge_base_name,
+                },
+            )
+            return job.job_id
         return self.document_generation.worker.submit(
             work_order_id,
             lambda: self.continue_knowledge_base_document_generation(ctx, work_order_id),
+        )
+
+    def resume_knowledge_base_document_generation_run(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        harness_run_id: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ):
+        """Resume one already-selected HarnessRun without queueing it again.
+
+        This is the worker dispatch target for ``resume_work_order`` jobs.  It
+        deliberately rebuilds the retriever from the frozen snapshot at
+        execution time, so a browser/request process cannot smuggle a closure
+        or a mutable retrieval scope through the job payload.
+        """
+        order = self.document_generation.store.get_work_order(work_order_id)
+        if order is None:
+            raise KeyError("document work order was not found")
+        self.document_generation.require_work_order_capability(
+            ctx, order, "run_deterministic_work_order",
+        )
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("work order is not a knowledge-base document generation")
+        if not ctx.has_kb_permission(order.knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+        snapshot = self.document_generation.resolve_source_snapshot(order)
+        scope_review = self.document_generation.get_icd_scope_review(ctx, work_order_id)
+        retrieve = self._knowledge_base_retriever(
+            ctx,
+            order.knowledge_base_name,
+            list(snapshot.source_names),
+            source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            icd_scope_review=scope_review,
+        )
+        return self.document_generation.resume_internal_harness(
+            ctx,
+            harness_run_id,
+            retrieve=retrieve,
+            should_cancel=should_cancel,
         )
 
     def resume_knowledge_base_document_generation(
@@ -1209,6 +1328,17 @@ class AppPipeline:
         if not paused_runs:
             raise ValueError("work order has no paused Harness run")
         paused_run = paused_runs[-1]
+        job_store = getattr(self, "document_job_store", None)
+        if callable(getattr(job_store, "create_job", None)):
+            job = self._queue_document_authoring_resume(
+                ctx,
+                order,
+                paused_run.harness_run_id,
+                client_request_id=(
+                    f"work-order:{work_order_id}:resume:{paused_run.harness_run_id}"
+                ),
+            )
+            return job.job_id
         snapshot = self.document_generation.resolve_source_snapshot(order)
         scope_review = self.document_generation.get_icd_scope_review(ctx, work_order_id)
         retrieve = self._knowledge_base_retriever(
@@ -1225,6 +1355,36 @@ class AppPipeline:
                 paused_run.harness_run_id,
                 retrieve=retrieve,
             ),
+        )
+
+    def _queue_document_authoring_resume(
+        self,
+        ctx: RequestContext,
+        order,
+        harness_run_id: str,
+        *,
+        client_request_id: str,
+    ):
+        """Persist a restartable Harness resume request without request state."""
+        job_store = getattr(self, "document_job_store", None)
+        if not callable(getattr(job_store, "create_job", None)):
+            raise RuntimeError("durable document authoring job store is not configured")
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("document authoring resume requires a knowledge-base work order")
+        if not ctx.has_kb_permission(order.knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+        return job_store.create_job(
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+            session_id=ctx.session_id or f"document-generation:{order.work_order_id}",
+            client_request_id=str(client_request_id),
+            operation="resume_work_order",
+            work_order_id=order.work_order_id,
+            payload={
+                "work_order_id": order.work_order_id,
+                "knowledge_base_name": order.knowledge_base_name,
+                "harness_run_id": str(harness_run_id),
+            },
         )
 
     def delete_knowledge_base_document_work_order(
@@ -1711,6 +1871,65 @@ class AppPipeline:
     def cancel_harness_run(self, ctx: RequestContext, harness_run_id: str):
         return self.document_generation.cancel_harness_run(ctx, harness_run_id)
 
+    def resolve_knowledge_base_harness_human_decision(
+        self,
+        ctx: RequestContext,
+        harness_run_id: str,
+        *,
+        pending_event_id: str,
+        proposal_hash: str,
+        decision: str,
+    ):
+        """Apply an agent proposal decision and resume the same KB run."""
+        run = self.document_generation.store.get_harness_run(harness_run_id)
+        if run is None:
+            raise KeyError("harness run not found")
+        order = self.document_generation.store.get_work_order(run.work_order_id)
+        if order is None or order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("human agent decisions require a knowledge-base work order")
+        self.document_generation.require_work_order_capability(ctx, order, "run_deterministic_work_order")
+        job_store = getattr(self, "document_job_store", None)
+        if callable(getattr(job_store, "create_job", None)):
+            # The request process only consumes the atomic decision transition.
+            # Approval is resumed by the durable worker, which rebuilds the
+            # retriever and authorization context after a restart.
+            result = self.document_generation.resolve_agent_human_decision(
+                ctx,
+                harness_run_id,
+                pending_event_id=pending_event_id,
+                proposal_hash=proposal_hash,
+                decision=decision,
+                retrieve=None,
+            )
+            if result.get("decision") == "approve":
+                job = self._queue_document_authoring_resume(
+                    ctx,
+                    order,
+                    harness_run_id,
+                    client_request_id=f"human-decision:{result['decision_key']}",
+                )
+                result["job_id"] = job.job_id
+                result["job_status"] = job.status
+                result["next_actions"] = ["poll_status"]
+            return result
+        snapshot = self.document_generation.resolve_source_snapshot(order)
+        scope_review = self.document_generation.get_icd_scope_review(ctx, order.work_order_id)
+        retrieve = self._knowledge_base_retriever(
+            ctx,
+            order.knowledge_base_name,
+            list(snapshot.source_names),
+            source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            icd_scope_review=scope_review,
+        )
+        return self.document_generation.resolve_agent_human_decision(
+            ctx,
+            harness_run_id,
+            pending_event_id=pending_event_id,
+            proposal_hash=proposal_hash,
+            decision=decision,
+            retrieve=retrieve,
+        )
+
     def get_document_run_status(self, work_order_id: str, ctx: RequestContext | None = None):
         order = self.document_generation.store.get_work_order(work_order_id)
         if order is None:
@@ -1766,6 +1985,11 @@ class AppPipeline:
                 "checkpoint_id": latest_run.checkpoint_id,
                 "fencing_token": latest_run.fencing_token,
                 "error": latest_run.error,
+                "requested_executor": getattr(latest_run, "requested_executor", None),
+                "effective_executor": getattr(latest_run, "effective_executor", None),
+                "degraded_reasons": list(getattr(latest_run, "degraded_reasons", []) or []),
+                "agent_thread_id": getattr(latest_run, "agent_thread_id", None),
+                "pending_human_event": getattr(latest_run, "pending_human_event", None),
             }
         has_kb_permission = getattr(ctx, "has_kb_permission", None)
         can_write = bool(
@@ -1784,6 +2008,23 @@ class AppPipeline:
             "can_cancel": (active or paused) and can_write,
             "can_delete": terminal and can_write,
         })
+        job_store = getattr(self, "document_job_store", None)
+        get_job = getattr(job_store, "get_by_work_order", None)
+        if callable(get_job):
+            job = get_job(
+                order.work_order_id,
+                tenant_id=(ctx.tenant_id if ctx is not None else None),
+                user_id=(ctx.user_id if ctx is not None else None),
+            )
+            if job is not None:
+                status["job"] = {
+                    "job_id": job.job_id,
+                    "operation": job.operation,
+                    "status": job.status,
+                    "attempt": job.attempt,
+                    "last_error": job.last_error,
+                    "result": dict(job.result or {}),
+                }
         if order.validation_report_id:
             report = self.document_generation.store.get_validation_report(order.validation_report_id)
             if report is not None:

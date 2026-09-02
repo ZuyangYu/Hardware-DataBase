@@ -208,9 +208,12 @@ def _consistency_values_compatible(left: str, right: str) -> bool:
 
 def _expected_typed_kind(value_type: str) -> str | None:
     normalized = value_type.strip().casefold()
-    if normalized in {"text", "string", "scalar", "number", "integer", "float", "date"}:
+    if normalized in {
+        "text", "string", "scalar", "number", "integer", "float", "date",
+        "datetime", "boolean", "bool",
+    }:
         return "scalar"
-    if normalized in {"enum", "enumeration", "list", "set"}:
+    if normalized in {"enum", "enumeration", "list", "set", "array", "multi_enum"}:
         return "enumeration"
     return None
 

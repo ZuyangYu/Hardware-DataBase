@@ -338,6 +338,29 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(created.status_code, 201, created.text)
         self.assertEqual(created.json()["turn"]["query_mode"], "deep")
 
+    def test_turn_document_flow_true_requires_document_context(self):
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "新对话"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "问", "document_flow": True},
+            headers=self._auth(t),
+        )
+        self.assertEqual(created.status_code, 422, created.text)
+
+    def test_query_document_flow_true_requires_document_context(self):
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/query",
+            json={"kb_name": "shared", "query": "问", "document_flow": True},
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+
     def test_pending_turn_can_be_cancelled_without_starting(self):
         t = self._token("user1")
         session = self.client.post(

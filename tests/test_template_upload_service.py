@@ -117,7 +117,7 @@ class _TransportFailingSuggester:
 
 
 class _NonWritableTargetClient:
-    def chat(self, _messages, **_kwargs):
+    def invoke(self, _messages, **_kwargs):
         return json.dumps([{
             "semantic_unit_id": "protected",
             "label": "Protected",
@@ -128,7 +128,7 @@ class _NonWritableTargetClient:
 
 
 class _DuplicateTargetClient:
-    def chat(self, messages, **_kwargs):
+    def invoke(self, messages, **_kwargs):
         unit_id = json.loads(messages[1]["content"])["units"][0]["unit_id"]
         return json.dumps([
             {
@@ -685,10 +685,9 @@ def test_managed_llm_writer_rejects_model_supplied_validation_status():
     call_count = 0
 
     class _RecordingClient:
-        def chat(self, messages, **kwargs):
+        def invoke(self, messages, **kwargs):
             nonlocal call_count
             call_count += 1
-            assert kwargs["usage_stage"] == "document_authoring"
             return json.dumps({
                 "unit_id": "field:summary",
                 "run_id": "run-1",

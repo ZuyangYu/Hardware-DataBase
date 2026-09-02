@@ -15,9 +15,9 @@ delegated to ``deepagents.create_deep_agent``; this module only:
 - builds the retrieval summary + observability footer consumed by the API
   layer (query traces, log center, ``done`` payload).
 
-Model access goes through ``src.core.model_factory`` (LangChain
-``init_chat_model``): ``ollama:`` for local deployment, ``openai:`` with a
-custom base_url for any OpenAI-compatible cloud endpoint.
+Model access goes through ``src.core.model_factory`` and its allowlisted
+profiles: ``ollama:`` for local deployment, ``openai:`` with a custom
+base_url for any OpenAI-compatible cloud endpoint.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from langchain_core.messages import AIMessage
 from src.agents.schemas import Evidence
 from src.agents.tools.circuit_tools import make_circuit_search
 from src.agents.tools.document_rag_tool import make_document_search, make_document_search_batch
+from src.agents.tools.document_authoring_tools import make_document_authoring_tools
 from src.agents.tools.external_conversation_tools import make_conversation_search
 from src.agents.tools.memory_tools import make_memory_search
 from src.agents.tools.pipeline_catalog import make_catalog_tool
@@ -242,6 +243,66 @@ _FAST_WORKFLOW = """本次为快速模式，请尽量精简：
 _DEEP_WORKFLOW = """请充分检索后再回答：
 """
 
+# Deterministic chat-entry routing for the document-authoring flow (design §7).
+# The general Q&A agent otherwise picks tools freely; when a valid template
+# context is attached and the turn explicitly asks to produce a document, the
+# run must enter the document flow instead of leaving the choice to the model.
+_DOCUMENT_INTENT_CN_RE = re.compile("生成|创建|填写|填充|出具|制作|撰写|起草|工单")
+_DOCUMENT_INTENT_EN_RE = re.compile(
+    r"\b(?:generate|create|draft|produce|fill|write)\b[^.?!。？！]*"
+    r"\b(?:document|template|report|icd|sheet|form|work\s*order)\b|\bwork\s*order\b",
+    re.IGNORECASE,
+)
+
+_DOCUMENT_FLOW_PROMPT = """你是 Hardware DataBase 的文档生成流程助手。当前知识库为「{kb_name}」。
+用户已附加模板引用：analysis_id={analysis_id}，template_version_id={template_version_id}。
+
+本次对话只能使用文档工具驱动生成流程，禁止编造模板内容或生成结果：
+1. 先调用 get_document_template_analysis 读取模板的结构化分析结果，并用一两句话向用户复述识别出的字段/区域。
+2. 调用 start_document_generation_session 开始澄清会话；把返回的澄清问题逐条转述给用户，等待用户在后续消息中回答，不要替用户编造澄清答案。
+3. 用户回答后用 answer_clarification 逐题回填 question_id；全部回答完毕调用 confirm_generation_session。
+4. 确认成功后调用 create_document_work_order 创建异步工单（execution_mode 留空，默认 internal_harness）。
+5. 创建成功后明确告知工单已受理、work_order_id 和当前状态；说明生成是分钟级后台任务，可随时让你用 get_document_generation_status 查询进度。绝不声称生成已完成。
+
+约束：
+- 生成是分钟级后台任务，对话只负责发起与状态查询，不要等待或假装完成。
+- 如果用户只是在提问（例如询问模板结构）而不是要发起生成，基于 get_document_template_analysis 的结果直接回答，不要创建会话或工单。
+- 工具返回 status=rejected 时，把 error_code 与 message 如实告知用户并给出修正建议，同一操作不要重试超过 2 次。
+- 模板映射确认、ICD 范围确认和产物审批是人工门，必须由用户完成，你不能代替审批。
+"""
+
+
+def resolve_document_flow_route(
+    *,
+    document_context: Any | None,
+    query: str,
+    has_document_tools: bool,
+    explicit_flow: bool | None = None,
+) -> tuple[bool, str]:
+    """Decide deterministically whether this turn drives the document flow.
+
+    Returns ``(routed, routed_by)``.  An explicit ``explicit_flow`` value
+    (``True`` or ``False``) always wins over the intent-keyword regex and is
+    reported as ``routed_by="explicit"``; ``None`` keeps the legacy regex
+    fallback and is reported as ``routed_by="regex"``.
+    """
+
+    if explicit_flow is not None:
+        routed = (
+            has_document_tools
+            and document_context is not None
+            and not bool(getattr(document_context, "expired", False))
+        ) if explicit_flow else False
+        return routed, "explicit"
+    if not has_document_tools or document_context is None:
+        return False, "regex"
+    if bool(getattr(document_context, "expired", False)):
+        return False, "regex"
+    text = str(query or "")
+    return bool(
+        _DOCUMENT_INTENT_CN_RE.search(text) or _DOCUMENT_INTENT_EN_RE.search(text)
+    ), "regex"
+
 
 def _build_messages(query: str, history: list[tuple[str, str]]) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
@@ -398,6 +459,8 @@ class MultiSourceAgentRunner:
         circuit_service: CircuitIndexService | None = None,
         conversation_service=None,
         memory_service_factory: Callable[[], MemoryService] | None = None,
+        document_authoring_pipeline: Any | None = None,
+        document_job_store: Any | None = None,
     ):
         self.rag_backend = rag_backend
         self.document_store = document_store or PipelineDocumentStore()
@@ -409,6 +472,8 @@ class MultiSourceAgentRunner:
             conversation_service = ExternalConversationQueryEngine()
         self.conversation_service = conversation_service
         self.memory_service_factory = memory_service_factory or MemoryService
+        self.document_authoring_pipeline = document_authoring_pipeline
+        self.document_job_store = document_job_store
         self._model_lock = threading.Lock()
 
     def _get_model(self):
@@ -505,6 +570,8 @@ class MultiSourceAgentRunner:
         query_mode: str = "deep",
         should_cancel: Callable[[], bool] | None = None,
         persist_thread: bool = False,
+        document_context: Any | None = None,
+        document_flow: bool | None = None,
     ) -> Generator[str, None, None]:
         """Observability wrapper: one agent span + metrics per run."""
         started = time.monotonic()
@@ -529,6 +596,8 @@ class MultiSourceAgentRunner:
                     query_mode=query_mode,
                     should_cancel=should_cancel,
                     persist_thread=persist_thread,
+                    document_context=document_context,
+                    document_flow=document_flow,
                 )
             except QueryCancelled:
                 status = "cancelled"
@@ -579,6 +648,8 @@ class MultiSourceAgentRunner:
         query_mode: str = "deep",
         should_cancel: Callable[[], bool] | None = None,
         persist_thread: bool = False,
+        document_context: Any | None = None,
+        document_flow: bool | None = None,
     ) -> Generator[str, None, None]:
         """Run the deep agent and stream answer deltas live.
 
@@ -623,42 +694,119 @@ class MultiSourceAgentRunner:
         rt = ToolRuntime(
             kb_name=scope_kb,
             ctx=ctx,
+            document_context=document_context,
+            chat_session_id=str(thread_id or getattr(ctx, "session_id", "")),
             top_k=8 if query_mode == "deep" else 5,
             query_mode=query_mode,
             should_cancel=should_cancel,
             on_event=emit_event,
         )
 
-        tools = [] if is_general else [
-            make_catalog_tool(
+        document_tools: list[Any] = []
+        if (
+            getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False)
+            and document_context is not None
+            and self.document_authoring_pipeline is not None
+        ):
+            card_sink: Callable[[dict], None] | None = None
+            if event_callback is not None:
+                def card_sink(evt: dict) -> None:
+                    # Producer contract (DocumentAuthoringToolset._emit_card):
+                    # always {"type": "document_card", "card": {...}}; reshape
+                    # to the channel's {"type", "payload"} so emit persists the card.
+                    event_callback({"type": evt["type"], "payload": {"card": evt["card"]}})
+            document_tools = make_document_authoring_tools(
                 rt,
-                document_store=self.document_store,
-                spreadsheet_service=self.spreadsheet_service,
-                circuit_service=self.circuit_service,
-                rag_backend=self.rag_backend,
-            ),
-            make_document_search(rt, self.rag_backend, self.document_store),
-            make_document_search_batch(rt, self.rag_backend, self.document_store),
-            make_circuit_search(rt, self.circuit_service),
-            *make_spreadsheet_tools(rt, self.spreadsheet_service),
-            *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
-            make_conversation_search(rt, self.conversation_service),
-        ]
-        tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
-
-        base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
-        system_prompt = f"{kb_scope_line}\n\n{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}"
-        memory_context = self._prefetch_memory_context(
+                pipeline=self.document_authoring_pipeline,
+                job_store=self.document_job_store,
+                event_sink=card_sink,
+            )
+        document_flow_routed, routed_by = resolve_document_flow_route(
+            document_context=document_context,
             query=query,
-            kb_name=scope_kb,
-            ctx=ctx,
-            rt=rt,
+            has_document_tools=bool(document_tools),
+            explicit_flow=document_flow,
         )
-        if memory_context:
-            # The formatter owns the boundary markers and fixed warning.  It
-            # is appended after the fixed agent rules so memory text cannot
-            # replace the formal evidence hierarchy or tool policy.
-            system_prompt = f"{system_prompt}\n\n{memory_context}"
+
+        if document_flow_routed:
+            tools: list[Any] = list(document_tools)
+            system_prompt = _DOCUMENT_FLOW_PROMPT.format(
+                kb_name=scope_kb or kb_name,
+                analysis_id=document_context.analysis_id,
+                template_version_id=document_context.template_version_id,
+            )
+        else:
+            tools = []
+            if not is_general:
+                tools = [
+                    make_catalog_tool(
+                        rt,
+                        document_store=self.document_store,
+                        spreadsheet_service=self.spreadsheet_service,
+                        circuit_service=self.circuit_service,
+                        rag_backend=self.rag_backend,
+                    ),
+                    make_document_search(rt, self.rag_backend, self.document_store),
+                    make_document_search_batch(rt, self.rag_backend, self.document_store),
+                    make_circuit_search(rt, self.circuit_service),
+                    *make_spreadsheet_tools(rt, self.spreadsheet_service),
+                    *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
+                    make_conversation_search(rt, self.conversation_service),
+                ]
+            tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
+            base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
+            system_prompt = f"{kb_scope_line}\n\n{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}"
+            # Legacy behaviour (document_flow is None) keeps the document
+            # tools mounted on the general toolset.  An explicit false strips
+            # them so the agent cannot bypass the deterministic flow, and an
+            # explicit true that failed routing must not fall back to them.
+            if document_flow is None:
+                tools.extend(document_tools)
+            memory_context = self._prefetch_memory_context(
+                query=query,
+                kb_name=scope_kb,
+                ctx=ctx,
+                rt=rt,
+            )
+            if memory_context:
+                # The formatter owns the boundary markers and fixed warning.  It
+                # is appended after the fixed agent rules so memory text cannot
+                # replace the formal evidence hierarchy or tool policy.
+                system_prompt = f"{system_prompt}\n\n{memory_context}"
+
+        if document_flow_routed:
+            emit_event(
+                {
+                    "type": "stage",
+                    "payload": {
+                        "key": "document_flow_routed",
+                        "label": "文档生成流程",
+                        "status": "running",
+                        "routed_by": routed_by,
+                    },
+                }
+            )
+        elif document_flow is True:
+            # Explicit opt-in must not degrade silently: report why the
+            # document flow could not start before continuing on the general
+            # path.
+            if document_context is None:
+                unavailable_detail = "document_context is missing"
+            elif bool(getattr(document_context, "expired", False)):
+                unavailable_detail = "document_context has expired"
+            else:
+                unavailable_detail = "document authoring tools are unavailable"
+            emit_event(
+                {
+                    "type": "stage",
+                    "payload": {
+                        "key": "document_flow_unavailable",
+                        "label": "文档生成流程",
+                        "status": "error",
+                        "detail": unavailable_detail,
+                    },
+                }
+            )
 
         model = self._get_model()
         # 会话状态持久化：thread 模式挂 checkpointer，LangGraph 按
@@ -669,11 +817,13 @@ class MultiSourceAgentRunner:
             model=model, tools=tools, system_prompt=system_prompt, checkpointer=checkpointer
         )
         rounds = max(1, int(settings.AGENT_MAX_RETRIEVAL_ROUNDS))
-        config: dict[str, Any] = {
-            "recursion_limit": (
-                max(12, rounds * 12) if query_mode == "deep" else max(8, rounds * 6)
-            )
-        }
+        if document_flow_routed:
+            recursion_limit = max(24, rounds * 8)
+        elif query_mode == "deep":
+            recursion_limit = max(12, rounds * 12)
+        else:
+            recursion_limit = max(8, rounds * 6)
+        config: dict[str, Any] = {"recursion_limit": recursion_limit}
         if checkpointer is not None:
             config["configurable"] = {"thread_id": str(thread_id)}
             # checkpoint 已存在 → 只喂本轮新消息（历史由框架恢复）；

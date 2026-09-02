@@ -16,6 +16,7 @@ from src.core.app_pipeline import AppPipeline
 from src.pipelines.document_rag.schemas import EvidenceEnvelope
 from src.projects.retrieval import ProjectEvidenceRetrievalService
 from tests.test_document_authoring_p2a import _prepare_project
+from tests.document_gating_env import pin_deterministic_document_gating  # noqa: F401
 from tests.test_template_sanitizer import _active_parts, _docx_with_external_link_and_ole_object
 
 

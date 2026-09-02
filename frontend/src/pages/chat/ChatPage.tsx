@@ -4,17 +4,23 @@
  * 数据层在 useKbChat;渲染在各 chat/components 子组件。
  */
 import type { CSSProperties } from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import type { AuthSession } from '../../auth';
 import { api } from '@/api/client';
+import { analyzeTemplate } from '@/api/documentAuthoring';
 import type { KbView, MessageView } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
-import { CHAT_MAIN_CLASS } from './chatPageStyles';
-import { useKbChat } from './useKbChat';
+import { CHAT_MAIN_CLASS, chatBubbleClass, chatRowClass } from './chatPageStyles';
+import {
+  buildDocumentContext,
+  createClientRequestId,
+  useKbChat,
+} from './useKbChat';
+import DocumentStatusCard, { documentCardIdentity } from './components/DocumentStatusCard';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
@@ -27,11 +33,48 @@ type Props = {
   kbName?: string;
   availableKbs?: KbView[];
   onLogout: () => void;
+  /** Opt-out override for the Task 9 bridge; omitted means the env flag/default. */
+  documentAuthoringEnabled?: boolean;
 };
 
-export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogout }: Props) {
+const DOCUMENT_TEMPLATE_EXTENSIONS = ['.xlsx', '.xlsm', '.docx'];
+
+function documentUploadFingerprint(file: File): string {
+  return `${file.name}\u0000${file.size}\u0000${file.lastModified}`;
+}
+
+/**
+ * 对话侧文档工具桥默认开启;部署方将环境变量设为 falsy 字符串(如 "false")显式关闭。
+ */
+export function isDocumentAuthoringChatEnabled(value: unknown = undefined): boolean {
+  const configured = value ?? import.meta.env.VITE_AGENT_DOCUMENT_TOOLS_ENABLED
+    ?? import.meta.env.VITE_DOCUMENT_AUTHORING_CHAT_ENABLED;
+  const normalized = String(configured ?? '').trim().toLowerCase();
+  // 两个变量都未配置(或为空)时默认开启。
+  if (normalized === '') {
+    return true;
+  }
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+}
+
+export function resolveDocumentAuthoringEnabled(override?: boolean): boolean {
+  return override ?? isDocumentAuthoringChatEnabled();
+}
+
+export default function ChatPage({
+  auth,
+  kbName = '',
+  availableKbs = [],
+  onLogout,
+  documentAuthoringEnabled: documentAuthoringEnabledOverride,
+}: Props) {
   const navigate = useNavigate();
   const [mountedKbName, setMountedKbName] = useState(kbName);
+  const [documentContextLabel, setDocumentContextLabel] = useState<string | null>(null);
+  const [documentUploadPending, setDocumentUploadPending] = useState(false);
+  const [documentUploadProgress, setDocumentUploadProgress] = useState(0);
+  const documentUploadRequestRef = useRef<{ fingerprint: string; clientRequestId: string } | null>(null);
+  const documentAuthoringEnabled = resolveDocumentAuthoringEnabled(documentAuthoringEnabledOverride);
   const visibleKbs = useMemo(() => {
     const rows = availableKbs.filter((kb) => kb.permission);
     if (!mountedKbName || rows.some((kb) => kb.name === mountedKbName)) {
@@ -52,9 +95,11 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
 
   useEffect(() => {
     setMountedKbName(kbName);
+    setDocumentContextLabel(null);
+    documentUploadRequestRef.current = null;
   }, [kbName]);
 
-  const chat = useKbChat(mountedKbName);
+  const chat = useKbChat(mountedKbName, { documentContextEnabled: documentAuthoringEnabled });
   const {
     sessions,
     sessionsLoaded,
@@ -80,10 +125,80 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
     traceSteps,
     traceByMessageId,
     degradedNotes,
+    documentCards,
+    documentCardRefreshingId,
+    refreshDocumentCardStatus,
     send,
     abortStream,
     forbidden,
+    documentContext,
+    setDocumentContext,
+    documentFlowEnabled,
+    setDocumentFlowEnabled,
   } = chat;
+
+  // 标签跟随上下文生命周期:hook 侧清空模板上下文(新建/切换/删除会话)时同步清掉 chip 文案。
+  useEffect(() => {
+    if (documentContext == null) setDocumentContextLabel(null);
+  }, [documentContext]);
+
+  const canUploadDocumentTemplate = Boolean(
+    documentAuthoringEnabled
+      && mountedKbName
+      && ['write', 'admin'].includes(
+        availableKbs.find((kb) => kb.name === mountedKbName)?.permission ?? '',
+      ),
+  );
+
+  useEffect(() => {
+    if (!documentAuthoringEnabled) {
+      setDocumentContext(null);
+      setDocumentContextLabel(null);
+    }
+  }, [documentAuthoringEnabled, setDocumentContext]);
+
+  async function handleTemplateUpload(file: File) {
+    if (!canUploadDocumentTemplate || documentUploadPending) return;
+    const extension = `.${file.name.split('.').pop() || ''}`.toLowerCase();
+    if (!DOCUMENT_TEMPLATE_EXTENSIONS.includes(extension)) {
+      notify.error('模板仅支持 .xlsx、.xlsm 或 .docx 文件');
+      return;
+    }
+
+    const kbForUpload = mountedKbName;
+    const fingerprint = documentUploadFingerprint(file);
+    const previous = documentUploadRequestRef.current;
+    const clientRequestId = previous?.fingerprint === fingerprint
+      ? previous.clientRequestId
+      : createClientRequestId();
+    documentUploadRequestRef.current = { fingerprint, clientRequestId };
+
+    setDocumentUploadPending(true);
+    setDocumentUploadProgress(0);
+    try {
+      const analysis = await analyzeTemplate(kbForUpload, file, file.name, {
+        // Current analyze endpoint ignores this optional field; Task 8 can use it
+        // for idempotent upload handling without requiring a second client path.
+        clientRequestId,
+        onProgress: (percent) => setDocumentUploadProgress(percent),
+      });
+      const context = buildDocumentContext(analysis, kbForUpload, clientRequestId);
+      if (!context) throw new Error('分析响应缺少可用的模板引用');
+      setDocumentContext(context);
+      setDocumentContextLabel(file.name);
+      notify.success(`模板已上传并分析：${analysis.analysis_id}`);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '上传并分析模板失败');
+    } finally {
+      setDocumentUploadPending(false);
+      setDocumentUploadProgress(0);
+    }
+  }
+
+  function clearDocumentContext() {
+    setDocumentContext(null);
+    setDocumentContextLabel(null);
+  }
 
   // ---- 消息编辑 ----
   const [editTarget, setEditTarget] = useState<MessageView | null>(null);
@@ -164,8 +279,10 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
   // M17: 与 selectSession 同等门禁——回答生成中不允许切换知识库，
   // 避免旧会话在后端跑完后结果因会话比对被静默丢弃。
   function handleKbChange(nextKbName: string) {
-    if (streaming) return;
+    if (streaming || documentUploadPending) return;
     setMountedKbName(nextKbName);
+    clearDocumentContext();
+    documentUploadRequestRef.current = null;
     navigate(nextKbName ? `/chat?kb=${encodeURIComponent(nextKbName)}` : '/chat', { replace: true });
   }
 
@@ -216,6 +333,23 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           onCreateMemory={(messageId) => setUserMemoryTarget(messageId)}
           onEditMessage={openEditMessage}
         />
+        {documentCards.length > 0 && (
+          <div className="shrink-0 px-[24px] pb-[6px]">
+            <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[10px]">
+              {documentCards.map((card, index) => (
+                <div key={`${documentCardIdentity(card)}-${index}`} className={chatRowClass('assistant')}>
+                  <div className={chatBubbleClass('assistant')}>
+                    <DocumentStatusCard
+                      card={card}
+                      refreshing={Boolean(card.work_order_id) && documentCardRefreshingId === card.work_order_id}
+                      onRefreshStatus={(target) => void refreshDocumentCardStatus(target)}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         <Composer
           kbName={mountedKbName}
           availableKbs={visibleKbs}
@@ -225,6 +359,16 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           onKbChange={handleKbChange}
           onSend={() => void send()}
           onStop={abortStream}
+          documentAuthoringEnabled={documentAuthoringEnabled}
+          canUploadDocumentTemplate={canUploadDocumentTemplate}
+          documentContext={documentContext}
+          documentContextLabel={documentContextLabel ?? undefined}
+          documentFlowEnabled={documentFlowEnabled}
+          onToggleDocumentFlow={setDocumentFlowEnabled}
+          documentUploadPending={documentUploadPending}
+          documentUploadProgress={documentUploadProgress}
+          onUploadTemplate={handleTemplateUpload}
+          onClearDocumentContext={clearDocumentContext}
         />
       </main>
       <ChatSessionSidebar

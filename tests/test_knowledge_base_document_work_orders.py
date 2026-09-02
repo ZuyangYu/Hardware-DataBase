@@ -25,6 +25,7 @@ from src.document_authoring.harness.graph import _validated_evidence
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.writers.managed import DeterministicEvidenceWriter
 from src.pipelines.document_rag.schemas import EvidenceEnvelope, RequestContext
+from tests.document_gating_env import pin_deterministic_document_gating  # noqa: F401
 from tests.test_document_authoring_p2a import _xlsx_template
 
 

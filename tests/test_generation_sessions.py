@@ -9,6 +9,11 @@ from unittest.mock import Mock
 from src.core.app_pipeline import AppPipeline
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.generation_sessions import GenerationBrief, GenerationSession
+from src.document_authoring.harness.agent_contracts import (
+    BRIEF_TO_FIELD_MISSING_POLICY,
+    effective_missing_policy,
+    normalize_clarification_policy,
+)
 from src.document_authoring.models import (
     DocumentSchema,
     DocumentWorkOrder,
@@ -212,6 +217,7 @@ def test_legacy_work_order_fingerprint_ignores_absent_generation_brief():
         "unit_statuses", "evidence_matrix_id", "validation_report_id", "run_manifest_id",
             "error_code", "error_message", "retryable", "next_actions",
             "generation_session_id", "generation_brief", "restart_of_work_order_id",
+            "requested_executor", "input_fingerprint_version",
         }
     legacy_fingerprint = content_hash(order.model_dump(mode="json", exclude=legacy_excluded))
     payload = order.model_dump(mode="json")
@@ -336,3 +342,80 @@ def test_confirmed_session_binds_exactly_one_real_work_order(tmp_path):
     assert order.generation_brief["scope"]["revision"] == "当前发布版本"
     assert saved_session.work_order_id == order.work_order_id
     assert len(store.list_work_orders_for_knowledge_base("tenant-a", "hardware")) == 1
+
+
+# ── Phase 0 Task 0.1/0.2: clarification enum mapping + brief normalization ───
+
+
+@pytest.mark.parametrize("raw,canonical", [
+    ("标记未提供", "mark_tbd"),
+    ("保留空白", "keep_blank"),
+    ("停止并提示", "block_generation"),
+])
+def test_missing_data_policy_mapping_table(raw, canonical):
+    assert normalize_clarification_policy("missing_data_policy", raw) == canonical
+
+
+@pytest.mark.parametrize("raw,canonical", [
+    ("禁止推断", "forbid"),
+    ("允许但必须标注", "allow_labeled"),
+    ("允许有限推断", "allow_limited"),
+])
+def test_inference_policy_mapping_table(raw, canonical):
+    assert normalize_clarification_policy("inference_policy", raw) == canonical
+
+
+def test_canonical_values_pass_through_and_unknown_normalize_to_none():
+    assert normalize_clarification_policy("missing_data_policy", "mark_tbd") == "mark_tbd"
+    assert normalize_clarification_policy("missing_data_policy", "随便写") is None
+    assert normalize_clarification_policy("missing_data_policy", "") is None
+    assert normalize_clarification_policy("missing_data_policy", None) is None
+
+
+def test_legacy_brief_payload_with_chinese_policies_normalizes_on_read():
+    brief = GenerationBrief.model_validate({
+        "scope": {"revision": "当前发布版本"},
+        "missing_data_policy": "标记未提供",
+        "inference_policy": "禁止推断",
+    })
+    assert brief.missing_data_policy == "mark_tbd"
+    assert brief.inference_policy == "forbid"
+    assert brief.scope["revision"] == "当前发布版本"
+
+
+def test_legacy_brief_with_unmappable_policy_does_not_reach_writer():
+    brief = GenerationBrief.model_validate({"missing_data_policy": "听天由命"})
+    assert brief.missing_data_policy is None
+
+
+def test_apply_answer_records_raw_and_normalized_and_rejects_invalid():
+    clarifier = RequirementClarifier()
+    brief = GenerationBrief(scope={"revision": "当前发布版本"})
+    answered = clarifier.apply_answer(brief, question_id="missing_data_policy", answer="标记未提供")
+    assert answered.missing_data_policy == "mark_tbd"
+    assert [a.raw_answer for a in answered.clarification_answers] == ["标记未提供"]
+    assert [a.normalized_answer for a in answered.clarification_answers] == ["mark_tbd"]
+    re_answered = clarifier.apply_answer(answered, question_id="missing_data_policy", answer="保留空白")
+    assert re_answered.missing_data_policy == "keep_blank"
+    assert [a.normalized_answer for a in re_answered.clarification_answers] == ["keep_blank"]
+    with pytest.raises(ValueError):
+        clarifier.apply_answer(brief, question_id="missing_data_policy", answer="随缘")
+    with pytest.raises(ValueError):
+        clarifier.apply_answer(brief, question_id="inference_policy", answer="看情况")
+
+
+def test_brief_and_field_missing_policy_merge_takes_stricter():
+    assert BRIEF_TO_FIELD_MISSING_POLICY["mark_tbd"] == "mark_tbd"
+    assert effective_missing_policy("mark_tbd", "optional") == "mark_tbd"
+    assert effective_missing_policy("keep_blank", "block_section") == "block_section"
+    assert effective_missing_policy("block_generation", "mark_tbd") == "block_section"
+    assert effective_missing_policy(None, "optional") == "optional"
+    assert effective_missing_policy(None, None) is None
+
+
+def test_forbidden_inference_yields_empty_allowed_derivations():
+    from src.document_authoring.harness.agent_contracts import INFERENCE_TO_DERIVATION
+    assert "forbid" in INFERENCE_TO_DERIVATION
+    brief = GenerationBrief(inference_policy="forbid", allowed_derivations=[])
+    assert brief.inference_policy == "forbid"
+    assert brief.allowed_derivations == []

@@ -9,6 +9,8 @@ from typing import Any, Callable, Iterable
 
 from langmem import create_memory_store_manager
 
+from src.core.chat_model_runtime import ChatModelLike, instrument_chat_model
+from src.core.model_factory import create_chat_model, create_chat_model_for_settings
 from src.memory.catalog import MemoryCatalogRepository, memory_content_hash
 from src.memory.prompts import PROJECT_MEMORY_INSTRUCTIONS, USER_MEMORY_INSTRUCTIONS
 from src.memory.schemas import ProjectMemory, UserMemory
@@ -33,40 +35,19 @@ class MemoryExtractionOutput:
 
 
 def _memory_model(settings):
-    """Build the reflection model without changing the chat model cache."""
+    """Build the reflection model through the central profile factory."""
 
-    from langchain.chat_models import init_chat_model
+    import src.settings as application_settings
 
-    provider = str(getattr(settings, "MEMORY_MODEL_PROVIDER", "") or "").strip().lower()
-    configured_model = str(getattr(settings, "MEMORY_MODEL", "") or "").strip()
-    if not provider:
-        agent_provider = getattr(settings, "AGENT_LLM_PROVIDER", "ollama")
-        provider = str(getattr(agent_provider, "value", agent_provider)).lower()
-    if provider in {"openai", "custom"}:
-        model = configured_model or str(getattr(settings, "AGENT_CUSTOM_MODEL", "") or "")
-        if not model:
-            raise MemoryExtractionError("memory model is not configured")
-        return init_chat_model(
-            f"openai:{model}",
-            base_url=str(getattr(settings, "MEMORY_MODEL_BASE_URL", "") or getattr(settings, "AGENT_CUSTOM_BASE_URL", "") or "") or None,
-            api_key=str(getattr(settings, "MEMORY_MODEL_API_KEY", "") or getattr(settings, "AGENT_CUSTOM_API_KEY", "") or "") or None,
-            temperature=float(getattr(settings, "AGENT_TEMPERATURE", 0.2)),
-            max_tokens=int(getattr(settings, "AGENT_CUSTOM_MAX_TOKENS", 4096)),
-            max_retries=int(getattr(settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)),
-            timeout=int(getattr(settings, "MEMORY_REFLECTION_TIMEOUT_SECONDS", 120)),
-        )
-    if provider == "ollama":
-        model = configured_model or str(getattr(settings, "AGENT_OLLAMA_MODEL", "") or "")
-        if not model:
-            raise MemoryExtractionError("memory model is not configured")
-        return init_chat_model(
-            f"ollama:{model}",
-            base_url=str(getattr(settings, "MEMORY_MODEL_BASE_URL", "") or getattr(settings, "AGENT_OLLAMA_BASE_URL", "")),
-            temperature=float(getattr(settings, "AGENT_TEMPERATURE", 0.2)),
-            max_retries=int(getattr(settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)),
-            timeout=int(getattr(settings, "MEMORY_REFLECTION_TIMEOUT_SECONDS", 120)),
-        )
-    raise MemoryExtractionError(f"unsupported memory model provider: {provider}")
+    try:
+        if settings is application_settings:
+            return create_chat_model(profile="memory")
+        # Isolated workers/tests may provide a settings object. Keep that
+        # injection point inside the factory instead of rebuilding providers
+        # in the memory domain module.
+        return create_chat_model_for_settings(settings, profile="memory")
+    except Exception as exc:
+        raise MemoryExtractionError(str(exc)) from exc
 
 
 def _message_for_manager(message: dict[str, Any]) -> dict[str, str]:
@@ -89,6 +70,8 @@ class LangMemAdapter:
         *,
         settings=None,
         manager_factory: Callable[..., Any] | None = None,
+        model: ChatModelLike | None = None,
+        model_factory: Callable[[], ChatModelLike] | None = None,
     ):
         self.runtime = runtime
         self.catalog = catalog
@@ -98,12 +81,27 @@ class LangMemAdapter:
             settings = settings_module
         self.settings = settings
         self.manager_factory = manager_factory or create_memory_store_manager
+        self.model = model
+        self.model_factory = model_factory
+
+    def _get_model(self) -> ChatModelLike:
+        if self.model is None:
+            self.model = (
+                self.model_factory()
+                if self.model_factory is not None
+                else _memory_model(self.settings)
+            )
+        return self.model
 
     def _manager(self, scope: tuple[str, ...], *, user: bool) -> tuple[Any, CatalogAwareStore]:
         if scope[-1] != "candidate":
             raise MemoryExtractionError("LangMem manager may only use Candidate namespace")
         try:
-            model = _memory_model(self.settings)
+            model = instrument_chat_model(
+                self._get_model(),
+                operation="memory_reflection",
+                profile="memory",
+            )
         except Exception as exc:
             if isinstance(exc, MemoryExtractionError):
                 raise

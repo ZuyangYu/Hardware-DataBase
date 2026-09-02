@@ -9,11 +9,26 @@ from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from src.document_authoring.harness.agent_contracts import (
+    InferencePolicy,
+    MissingDataPolicy,
+    normalize_clarification_policy,
+)
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class ClarificationAnswer(BaseModel):
+    """Audit record for one clarification decision: raw text plus canonical policy."""
+
+    question_id: str
+    raw_answer: str
+    normalized_answer: str | None = None
+    answered_at: datetime = Field(default_factory=_utc_now)
 
 
 class GenerationBrief(BaseModel):
@@ -21,11 +36,38 @@ class GenerationBrief(BaseModel):
     scope: dict[str, Any] = Field(default_factory=dict)
     source_policy: dict[str, Any] = Field(default_factory=dict)
     output_policy: dict[str, Any] = Field(default_factory=dict)
-    missing_data_policy: str | None = None
-    inference_policy: str | None = None
+    missing_data_policy: MissingDataPolicy | None = None
+    inference_policy: InferencePolicy | None = None
+    clarification_answers: list[ClarificationAnswer] = Field(default_factory=list)
+    allowed_derivations: list[str] = Field(default_factory=list)
     confirmed: bool = False
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     updated_at: datetime = Field(default_factory=_utc_now)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_policies(cls, data: Any) -> Any:
+        """Normalize legacy Chinese clarification answers on read.
+
+        Old payloads stored the raw option text in the policy slots; unknown
+        values must never reach a Writer as policy, so they normalize to None
+        while remaining visible in clarification_answers when supplied.
+        """
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        for question_id in ("missing_data_policy", "inference_policy"):
+            if question_id in normalized:
+                canonical = normalize_clarification_policy(question_id, normalized[question_id])
+                normalized[question_id] = canonical
+        return normalized
+
+    @field_validator("allowed_derivations")
+    @classmethod
+    def _unique_derivations(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("allowed_derivations must be unique")
+        return value
 
 
 class ClarificationMessage(BaseModel):

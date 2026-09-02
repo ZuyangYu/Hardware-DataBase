@@ -21,6 +21,7 @@ from src.document_authoring.models import (
     TemplateSecurityReport,
     WorkbookFillPlan,
     WorkbookRegionSchema,
+    WorkbookTableSchema,
     content_hash,
 )
 from src.document_authoring.template_analysis import (
@@ -79,6 +80,7 @@ class XlsmRenderer:
         policy: RendererPolicy,
         *,
         security_approved: bool = False,
+        table_schemas: list[WorkbookTableSchema] | None = None,
     ) -> XlsmRenderResult:
         report = self.inspect(template_content)
         self._validate_active_content(report, policy, security_approved)
@@ -108,8 +110,82 @@ class XlsmRenderer:
                 raise ValueError(f"formula-like text is not allowed in generated content: {fill.region_id}")
             fills.append((region, value, fill.semantic_unit_id))
 
+        schemas = list(table_schemas or [])
+        if len({schema.table_region_id for schema in schemas}) != len(schemas):
+            raise ValueError("duplicate workbook table region ids are not allowed")
+        table_schema_by_id = {schema.table_region_id: schema for schema in schemas}
+        table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]]]] = []
+        seen_table_ids: set[str] = set()
+        table_locators: set[tuple[str, str]] = set()
+        table_values: list[str] = []
+        for table_fill in getattr(fill_plan, "table_fills", []) or []:
+            schema = table_schema_by_id.get(table_fill.table_region_id)
+            if schema is None:
+                raise ValueError(
+                    "table fill references an unregistered table region: "
+                    f"{table_fill.table_region_id}"
+                )
+            if table_fill.table_region_id in seen_table_ids:
+                raise ValueError(f"duplicate workbook table fill target: {table_fill.table_region_id}")
+            if table_fill.semantic_unit_id != schema.semantic_unit_id:
+                raise ValueError(
+                    f"table fill semantic unit does not match schema: {table_fill.table_region_id}"
+                )
+            if len(table_fill.rows) > schema.max_output_rows:
+                raise ValueError(
+                    f"table output exceeds max rows: {table_fill.table_region_id}"
+                )
+            column_ids = {column.column_id for column in schema.columns}
+            if len(column_ids) != len(schema.columns):
+                raise ValueError(f"duplicate workbook table columns: {schema.table_region_id}")
+            normalized_rows: list[dict[str, str]] = []
+            for row in table_fill.rows:
+                if not isinstance(row, dict):
+                    raise ValueError("workbook table rows must be objects")
+                unknown_columns = set(row) - column_ids
+                if unknown_columns:
+                    raise ValueError(
+                        f"table row contains unknown columns: {sorted(unknown_columns)}"
+                    )
+                normalized = {
+                    column.column_id: str(row.get(column.column_id, ""))
+                    for column in schema.columns
+                }
+                if policy.reject_formula_like_text and any(
+                    value.startswith(_FORMULA_PREFIXES) for value in normalized.values()
+                ):
+                    raise ValueError(
+                        "formula-like text is not allowed in generated table content: "
+                        f"{table_fill.table_region_id}"
+                    )
+                table_values.extend(normalized.values())
+                normalized_rows.append(normalized)
+            if schema.first_data_row < 1 or schema.last_template_row < schema.first_data_row:
+                raise ValueError(f"invalid workbook table row bounds: {schema.table_region_id}")
+            for column in schema.columns:
+                try:
+                    workbook_cell_coordinates(f"{column.column_letter}{schema.first_data_row}")
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid workbook table column locator: {column.column_letter}"
+                    ) from exc
+            for row_number in range(
+                schema.first_data_row,
+                max(schema.last_template_row, schema.first_data_row + len(normalized_rows) - 1) + 1,
+            ):
+                for column in schema.columns:
+                    locator = (schema.sheet_name, f"{column.column_letter}{row_number}".upper())
+                    if locator in seen_locators or locator in table_locators:
+                        raise ValueError(f"duplicate workbook fill target: {locator[0]}!{locator[1]}")
+                    table_locators.add(locator)
+            seen_table_ids.add(table_fill.table_region_id)
+            table_fills.append((schema, normalized_rows))
+
         long_value_counts: dict[str, int] = {}
         for _region, value, _semantic_unit_id in fills:
+            if len(value) >= 80:
+                long_value_counts[value] = long_value_counts.get(value, 0) + 1
+        for value in table_values:
             if len(value) >= 80:
                 long_value_counts[value] = long_value_counts.get(value, 0) + 1
         if any(count > 1 for count in long_value_counts.values()):
@@ -118,6 +194,9 @@ class XlsmRenderer:
         sheet_fills: dict[str, list[tuple[WorkbookRegionSchema, str]]] = {}
         for region, value, _semantic_unit_id in fills:
             sheet_fills.setdefault(region.sheet_name, []).append((region, value))
+        sheet_table_fills: dict[str, list[tuple[WorkbookTableSchema, list[dict[str, str]]]]] = {}
+        for schema, rows in table_fills:
+            sheet_table_fills.setdefault(schema.sheet_name, []).append((schema, rows))
 
         source = io.BytesIO(template_content)
         output = io.BytesIO()
@@ -130,7 +209,7 @@ class XlsmRenderer:
                 if "xl/sharedStrings.xml" in src.namelist()
                 else []
             )
-            required_sheets = set(sheet_fills)
+            required_sheets = set(sheet_fills) | set(sheet_table_fills)
             missing_sheets = required_sheets - set(worksheet_map)
             if missing_sheets:
                 raise ValueError(f"template sheets not found: {sorted(missing_sheets)}")
@@ -172,10 +251,53 @@ class XlsmRenderer:
                     "semantic_unit_id": semantic_unit_id,
                     "region_id": region.region_id,
                 })
+            for schema, rows in table_fills:
+                worksheet = src.read(worksheet_map[schema.sheet_name])
+                end_row = max(
+                    schema.last_template_row,
+                    schema.first_data_row + len(rows) - 1,
+                )
+                for row_number in range(schema.first_data_row, end_row + 1):
+                    row_values = rows[row_number - schema.first_data_row] if row_number - schema.first_data_row < len(rows) else {}
+                    for column in schema.columns:
+                        ref = f"{column.column_letter}{row_number}".upper()
+                        baseline_value = self._cell_value(worksheet, ref, shared_strings)
+                        baseline_hash = workbook_value_hash(baseline_value)
+                        expected_hash = schema.expected_value_hashes.get(ref)
+                        if expected_hash is not None and baseline_hash != expected_hash:
+                            raise PermissionError(f"workbook table cell baseline changed: {schema.sheet_name}!{ref}")
+                        if expected_hash is None and baseline_value is not None:
+                            raise PermissionError(
+                                f"workbook table cell has no frozen baseline for non-empty cell: "
+                                f"{schema.sheet_name}!{ref}"
+                            )
+                        if (
+                            baseline_value is not None
+                            and not schema.allow_example_region_replacement
+                        ):
+                            raise PermissionError(
+                                f"non-empty workbook table overwrite is not authorized: "
+                                f"{schema.sheet_name}!{ref}"
+                            )
+                        generated_value = str(row_values.get(column.column_id, ""))
+                        cell_changes.append({
+                            "sheet_name": schema.sheet_name,
+                            "cell": ref,
+                            "baseline_value_hash": baseline_hash,
+                            "generated_value_hash": workbook_value_hash(generated_value or None),
+                            "baseline_empty": baseline_value is None,
+                            "semantic_unit_id": schema.semantic_unit_id,
+                            "region_id": schema.table_region_id,
+                        })
             replacements: dict[str, bytes] = {}
             for sheet_name, fill_values in sheet_fills.items():
                 part = worksheet_map[sheet_name]
                 replacements[part] = self._patch_worksheet(src.read(part), fill_values)
+                changed_parts.add(part)
+            for sheet_name, table_fill_values in sheet_table_fills.items():
+                part = worksheet_map[sheet_name]
+                source_part = replacements.get(part, src.read(part))
+                replacements[part] = self._patch_tables(source_part, table_fill_values)
                 changed_parts.add(part)
             for info in src.infolist():
                 data = replacements.get(info.filename)
@@ -307,15 +429,106 @@ class XlsmRenderer:
                 row.append(cell)
             if region.preserve_formula or cell.find("x:f", NS) is not None:
                 raise ValueError(f"renderer will not replace a formula cell: {ref}")
-            for child in list(cell):
-                cell.remove(child)
-            cell.attrib["t"] = "inlineStr"
-            inline = ET.SubElement(cell, f"{{{MAIN_NS}}}is")
-            text = ET.SubElement(inline, f"{{{MAIN_NS}}}t")
-            if value[:1].isspace() or value[-1:].isspace():
-                text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            text.text = value
+            XlsmRenderer._set_inline_string(cell, value)
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @staticmethod
+    def _set_inline_string(cell: ET.Element, value: str) -> None:
+        """Replace a cell value while preserving its style and attributes."""
+        for child in list(cell):
+            cell.remove(child)
+        if not value:
+            cell.attrib.pop("t", None)
+            return
+        cell.attrib["t"] = "inlineStr"
+        inline = ET.SubElement(cell, f"{{{MAIN_NS}}}is")
+        text = ET.SubElement(inline, f"{{{MAIN_NS}}}t")
+        if value[:1].isspace() or value[-1:].isspace():
+            text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        text.text = value
+
+    @staticmethod
+    def _patch_tables(
+        source: bytes,
+        table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]]]],
+    ) -> bytes:
+        """Patch discovered table rows without changing other OOXML parts."""
+        root = ET.fromstring(source)
+        sheet_data = root.find("x:sheetData", NS)
+        if sheet_data is None:
+            sheet_data = ET.SubElement(root, f"{{{MAIN_NS}}}sheetData")
+        rows = {
+            int(row.attrib["r"]): row
+            for row in sheet_data.findall("x:row", NS)
+            if row.attrib.get("r", "").isdigit()
+        }
+        for schema, values in table_fills:
+            end_row = max(schema.last_template_row, schema.first_data_row + len(values) - 1)
+            style_row = rows.get(schema.style_source_row)
+            for row_number in range(schema.first_data_row, end_row + 1):
+                row = rows.get(row_number)
+                if row is None:
+                    row = XlsmRenderer._new_table_row(row_number, style_row, schema)
+                    inserted = False
+                    for index, candidate in enumerate(list(sheet_data)):
+                        candidate_row = candidate.attrib.get("r", "0")
+                        if candidate_row.isdigit() and int(candidate_row) > row_number:
+                            sheet_data.insert(index, row)
+                            inserted = True
+                            break
+                    if not inserted:
+                        sheet_data.append(row)
+                    rows[row_number] = row
+                row_values = values[row_number - schema.first_data_row] if row_number - schema.first_data_row < len(values) else {}
+                for column in schema.columns:
+                    ref = f"{column.column_letter}{row_number}".upper()
+                    cell = next(
+                        (candidate for candidate in row.findall("x:c", NS)
+                         if candidate.attrib.get("r", "").upper() == ref),
+                        None,
+                    )
+                    if cell is None:
+                        cell = ET.Element(f"{{{MAIN_NS}}}c", {"r": ref})
+                        row.append(cell)
+                    if cell.find("x:f", NS) is not None:
+                        raise ValueError(f"renderer will not replace a formula table cell: {ref}")
+                    XlsmRenderer._set_inline_string(
+                        cell,
+                        str(row_values.get(column.column_id, "")),
+                    )
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @staticmethod
+    def _new_table_row(
+        row_number: int,
+        style_row: ET.Element | None,
+        schema: WorkbookTableSchema,
+    ) -> ET.Element:
+        """Create an output row carrying only the registered column styles."""
+        if style_row is None:
+            row = ET.Element(f"{{{MAIN_NS}}}row", {"r": str(row_number)})
+            source_cells: dict[str, ET.Element] = {}
+        else:
+            attributes = {
+                key: value for key, value in style_row.attrib.items() if key != "r"
+            }
+            attributes["r"] = str(row_number)
+            row = ET.Element(style_row.tag, attributes)
+            source_cells = {
+                str(cell.attrib.get("r", "")).rstrip("0123456789").upper(): cell
+                for cell in style_row.findall("x:c", NS)
+            }
+        for column in schema.columns:
+            cell = source_cells.get(column.column_letter.upper())
+            if cell is None:
+                cell = ET.Element(f"{{{MAIN_NS}}}c")
+            else:
+                cell = copy.deepcopy(cell)
+                for child in list(cell):
+                    cell.remove(child)
+            cell.attrib["r"] = f"{column.column_letter}{row_number}".upper()
+            row.append(cell)
+        return row
 
     @staticmethod
     def _integrity_manifest(

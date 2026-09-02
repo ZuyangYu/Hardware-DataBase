@@ -80,6 +80,24 @@ AGENT_RATE_LIMIT_MAX_RETRIES = int(os.getenv("AGENT_RATE_LIMIT_MAX_RETRIES", "4"
 AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS = float(os.getenv("AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS", "1"))
 AGENT_RATE_LIMIT_MAX_DELAY_SECONDS = float(os.getenv("AGENT_RATE_LIMIT_MAX_DELAY_SECONDS", "16"))
 
+# Agentic document authoring is default-off until the integration/migration
+# gates are approved.  The execution flag is separate from the chat-tool flag
+# so enabling a document schema does not accidentally expose it through the
+# conversation agent.
+DOCUMENT_AUTHORING_AGENT_MODE_ENABLED = os.getenv(
+    "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+AGENT_DOCUMENT_TOOLS_ENABLED = os.getenv(
+    "AGENT_DOCUMENT_TOOLS_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND = os.getenv(
+    "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"
+).strip().lower()
+DOCUMENT_AUTHORING_CHECKPOINTER_PATH = _resolve_storage_path(
+    os.getenv("DOCUMENT_AUTHORING_CHECKPOINTER_PATH"),
+    "document_authoring_checkpoints.sqlite",
+)
+
 # External conversation (外部对话) domain switches.
 EXTERNAL_CONVERSATION_LLM_STRUCTURE = os.getenv("EXTERNAL_CONVERSATION_LLM_STRUCTURE", "true").lower() in {"1", "true", "yes", "on"}
 EXTERNAL_CONVERSATION_LLM_MAX_CHARS = int(os.getenv("EXTERNAL_CONVERSATION_LLM_MAX_CHARS", "12000"))
@@ -133,6 +151,11 @@ FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "5"))
 AGENT_MAX_RETRIEVAL_ROUNDS = int(os.getenv("AGENT_MAX_RETRIEVAL_ROUNDS", "3"))
 WORKER_POLL_INTERVAL_SECONDS = float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "0.5"))
 WORKER_PARSE_BATCH_SIZE = int(os.getenv("WORKER_PARSE_BATCH_SIZE", "1"))
+DOCUMENT_AUTHORING_JOB_LEASE_SECONDS = int(os.getenv("DOCUMENT_AUTHORING_JOB_LEASE_SECONDS", "300"))
+DOCUMENT_AUTHORING_JOB_BATCH_SIZE = int(os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_SIZE", "4"))
+DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS = float(
+    os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS", "10")
+)
 CHAT_TURN_HEARTBEAT_TTL_SECONDS = int(os.getenv("CHAT_TURN_HEARTBEAT_TTL_SECONDS", "90"))
 CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS", "10"))
 DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = os.getenv("DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES", "false").lower() == "true"
@@ -219,6 +242,12 @@ DEFAULT_VALUES = {
     "AGENT_RATE_LIMIT_MAX_RETRIES": "4",
     "AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS": "1",
     "AGENT_RATE_LIMIT_MAX_DELAY_SECONDS": "16",
+    "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED": "false",
+    "AGENT_DOCUMENT_TOOLS_ENABLED": "false",
+    "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND": "sqlite",
+    "DOCUMENT_AUTHORING_CHECKPOINTER_PATH": os.path.join(
+        STORAGE_DIR, "document_authoring_checkpoints.sqlite"
+    ),
     "MEMORY_ENABLED": "true",
     "MEMORY_STORE_BACKEND": "sqlite",
     "MEMORY_SQLITE_PATH": os.path.join(STORAGE_DIR, "memory.db"),
@@ -262,6 +291,9 @@ DEFAULT_VALUES = {
     "AGENT_MAX_RETRIEVAL_ROUNDS": "3",
     "WORKER_POLL_INTERVAL_SECONDS": "0.5",
     "WORKER_PARSE_BATCH_SIZE": "1",
+    "DOCUMENT_AUTHORING_JOB_LEASE_SECONDS": "300",
+    "DOCUMENT_AUTHORING_JOB_BATCH_SIZE": "4",
+    "DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS": "10",
     "CHAT_TURN_HEARTBEAT_TTL_SECONDS": "90",
     "CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS": "10",
     "OBS_ENABLED": "true",
@@ -308,8 +340,12 @@ def reload_settings():
     global AGENT_MODEL_MAX_INPUT_TOKENS
     global AGENT_RATE_LIMIT_MAX_RETRIES, AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS
     global AGENT_RATE_LIMIT_MAX_DELAY_SECONDS
+    global DOCUMENT_AUTHORING_AGENT_MODE_ENABLED, AGENT_DOCUMENT_TOOLS_ENABLED
+    global DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND, DOCUMENT_AUTHORING_CHECKPOINTER_PATH
     global FINAL_TOP_K, AGENT_MAX_RETRIEVAL_ROUNDS
     global WORKER_POLL_INTERVAL_SECONDS, WORKER_PARSE_BATCH_SIZE
+    global DOCUMENT_AUTHORING_JOB_LEASE_SECONDS, DOCUMENT_AUTHORING_JOB_BATCH_SIZE
+    global DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS
     global CHAT_TURN_HEARTBEAT_TTL_SECONDS, CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS
     global DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES, DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS, DOCUMENT_AUTO_PUBLISH_VERIFIED
     global OBS_ENABLED, OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT, OBS_ENVIRONMENT, OBS_SERVICE_VERSION
@@ -335,6 +371,10 @@ def reload_settings():
     global MEMORY_USER_MEMORY_REQUIRE_PER_EVENT_CONSENT, MEMORY_RETENTION_DAYS
 
     load_dotenv(dotenv_path=ENV_FILE_PATH, override=True, encoding=ENV_FILE_ENCODING)
+    # Invalidate cached chat models built from the previous env generation
+    # (lazy import avoids a settings -> model_factory import cycle).
+    from src.core.model_factory import notify_settings_reloaded
+    notify_settings_reloaded()
 
     RAGFLOW_BASE_URL = os.getenv("RAGFLOW_BASE_URL", "http://localhost:9380")
     RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
@@ -367,11 +407,29 @@ def reload_settings():
     AGENT_RATE_LIMIT_MAX_RETRIES = int(os.getenv("AGENT_RATE_LIMIT_MAX_RETRIES", "4"))
     AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS = float(os.getenv("AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS", "1"))
     AGENT_RATE_LIMIT_MAX_DELAY_SECONDS = float(os.getenv("AGENT_RATE_LIMIT_MAX_DELAY_SECONDS", "16"))
+    DOCUMENT_AUTHORING_AGENT_MODE_ENABLED = os.getenv(
+        "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    AGENT_DOCUMENT_TOOLS_ENABLED = os.getenv(
+        "AGENT_DOCUMENT_TOOLS_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND = os.getenv(
+        "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"
+    ).strip().lower()
+    DOCUMENT_AUTHORING_CHECKPOINTER_PATH = _resolve_storage_path(
+        os.getenv("DOCUMENT_AUTHORING_CHECKPOINTER_PATH"),
+        "document_authoring_checkpoints.sqlite",
+    )
 
     FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "5"))
     AGENT_MAX_RETRIEVAL_ROUNDS = int(os.getenv("AGENT_MAX_RETRIEVAL_ROUNDS", "3"))
     WORKER_POLL_INTERVAL_SECONDS = float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "0.5"))
     WORKER_PARSE_BATCH_SIZE = int(os.getenv("WORKER_PARSE_BATCH_SIZE", "1"))
+    DOCUMENT_AUTHORING_JOB_LEASE_SECONDS = int(os.getenv("DOCUMENT_AUTHORING_JOB_LEASE_SECONDS", "300"))
+    DOCUMENT_AUTHORING_JOB_BATCH_SIZE = int(os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_SIZE", "4"))
+    DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS = float(
+        os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS", "10")
+    )
     CHAT_TURN_HEARTBEAT_TTL_SECONDS = int(os.getenv("CHAT_TURN_HEARTBEAT_TTL_SECONDS", "90"))
     CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS", "10"))
     DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = os.getenv("DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES", "false").lower() == "true"
@@ -567,11 +625,14 @@ _INT_SETTING_KEYS = frozenset({
     "RAGFLOW_TIMEOUT_SECONDS",
     "AUTH_SESSION_TTL_HOURS",
     "AGENT_CUSTOM_MAX_TOKENS",
+    "AGENT_MODEL_MAX_INPUT_TOKENS",
     "AGENT_TIMEOUT_SECONDS",
     "AGENT_RATE_LIMIT_MAX_RETRIES",
     "FINAL_TOP_K",
     "AGENT_MAX_RETRIEVAL_ROUNDS",
     "WORKER_PARSE_BATCH_SIZE",
+    "DOCUMENT_AUTHORING_JOB_LEASE_SECONDS",
+    "DOCUMENT_AUTHORING_JOB_BATCH_SIZE",
     "CHAT_TURN_HEARTBEAT_TTL_SECONDS",
     "CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS",
     "MEMORY_SQLITE_BUSY_TIMEOUT_MS",
@@ -598,6 +659,7 @@ _FLOAT_SETTING_KEYS = frozenset({
     "AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS",
     "AGENT_RATE_LIMIT_MAX_DELAY_SECONDS",
     "WORKER_POLL_INTERVAL_SECONDS",
+    "DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS",
     "MEMORY_REFLECTION_MIN_INTERVAL_SECONDS",
 })
 
@@ -632,6 +694,13 @@ def validate_settings_values(settings_dict: dict) -> None:
                 raise ValueError(f"AGENT_LLM_PROVIDER 必须是以下之一: {valid}，当前值: {text!r}")
         elif key == "MEMORY_STORE_BACKEND" and text.strip().lower() not in {"sqlite", "postgres"}:
             raise ValueError(f"MEMORY_STORE_BACKEND 必须是 sqlite 或 postgres，当前值: {text!r}")
+        elif key == "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND" and text.strip().lower() not in {
+            "sqlite", "memory", "postgres"
+        }:
+            raise ValueError(
+                "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND 必须是 sqlite、memory 或 postgres，"
+                f"当前值: {text!r}"
+            )
         elif key in {"MEMORY_EMBEDDING_DIMS", "MEMORY_RETENTION_DAYS"} and text.strip():
             try:
                 int(text)

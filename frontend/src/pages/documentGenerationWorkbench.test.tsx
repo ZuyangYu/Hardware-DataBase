@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import { MemoryRouter } from 'react-router-dom';
 
 import {
   ClarificationPanel,
@@ -11,11 +12,13 @@ import DocumentGenerationPage, { CreateSection, StatusView } from './DocumentGen
 describe('document generation workbench', () => {
   it('uses the workbench shell on the document generation route', () => {
     const html = renderToStaticMarkup(
-      <DocumentGenerationPage
-        auth={{ token: 'token', user: { username: 'u', role: 'user', department_id: 1, department_name: '研发部' } }}
-        kbs={[{ name: 'hardware', kb_id: 1, department_id: 1, department_name: '研发部', permission: 'write', registered: true }]}
-        onLogout={() => undefined}
-      />,
+      <MemoryRouter initialEntries={['/document-generation']}>
+        <DocumentGenerationPage
+          auth={{ token: 'token', user: { username: 'u', role: 'user', department_id: 1, department_name: '研发部' } }}
+          kbs={[{ name: 'hardware', kb_id: 1, department_id: 1, department_name: '研发部', permission: 'write', registered: true }]}
+          onLogout={() => undefined}
+        />
+      </MemoryRouter>,
     );
 
     expect(html).toContain('文档生成工作台');

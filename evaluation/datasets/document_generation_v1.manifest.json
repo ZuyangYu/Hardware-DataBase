@@ -1,0 +1,51 @@
+{
+  "dataset_id": "document_generation_v1",
+  "dataset_sha256": "e6e614c97640c1ba298cf510770103eaab927b3ca3a9dc9dd13d6627c9063843",
+  "fixture_hashes": {
+    "conflict_review.xlsx": "895b22953711a5f5a9ca39327576ca38d2681d1194a6c953502d22affdd95c72",
+    "controller_review.docx": "0bdfa9e0a30c3e990e67b8421ba2e5bf463f356d149df90d3dc9fc3d60b61e49",
+    "interface_review.xlsx": "52f38d92946f4f047dcce88a1a3f48ad42ebfd88e2083cd82d7dfcce6d9c4949",
+    "power_table_review.xlsx": "94ccdaafa54c66517fe09b401d6f498134205d99577ebb1d29a8647916e7a3d1",
+    "rated_current_review.xlsx": "a50fe70b0276885bc0a41b1a1212724b7b586ba8e4a9e3f1a452245f076dddbf",
+    "safety_review.xlsx": "d619158cae3ddf7395548eb72ad026ef0aa00b86804546849c506be26fbe1f12",
+    "scope_violation_review.xlsx": "88595ed5123c33e3893c7490d76a294577ac44301b61b7578086e1b1af60694b",
+    "thermal_review.docx": "93999ab7e2bac945ab887a614cff5ecc5de5b9446ee5348d94d9768a7d085188"
+  },
+  "frozen_at": "2026-08-31",
+  "metric_denominators": {
+    "primary": "attempted_fields",
+    "report_by": [
+      "required",
+      "optional"
+    ],
+    "rules": {
+      "optional_missing": "counted_separately_not_failure",
+      "unknown_telemetry": "inconclusive_not_success_not_failure"
+    }
+  },
+  "notes": "fixture_hashes 由 evaluation/fixtures/document_generation/build_fixtures.py 生成并冻结；dataset_sha256 或 record_ids 变化必须升版本并重新冻结基线。",
+  "record_ids": [
+    "docgen-v1-rated-current",
+    "docgen-v1-insulation-class",
+    "docgen-v1-test-voltage-missing",
+    "docgen-v1-interface-modes",
+    "docgen-v1-baud-rate",
+    "docgen-v1-flow-control-blank",
+    "docgen-v1-voltage-range",
+    "docgen-v1-efficiency",
+    "docgen-v1-power-table",
+    "docgen-v1-safety-standard",
+    "docgen-v1-ip-rating",
+    "docgen-v1-creepage",
+    "docgen-v1-can-baud-conflict",
+    "docgen-v1-termination",
+    "docgen-v1-restricted-scope",
+    "docgen-v1-controller",
+    "docgen-v1-firmware-version",
+    "docgen-v1-release-date",
+    "docgen-v1-operating-temp",
+    "docgen-v1-thermal-resistance",
+    "docgen-v1-cooling-method"
+  ],
+  "schema_version": 1
+}

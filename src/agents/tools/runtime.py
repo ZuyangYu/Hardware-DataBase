@@ -94,6 +94,11 @@ class ToolDiagnostics:
 class ToolRuntime:
     kb_name: str
     ctx: RequestContext | None
+    # Server-normalized, owner-bound document context.  It is intentionally
+    # opaque to ordinary retrieval tools; only the explicitly gated document
+    # tool factory consumes it.
+    document_context: Any | None = None
+    chat_session_id: str = ""
     top_k: int = 6
     query_mode: str = "deep"
     should_cancel: Callable[[], bool] | None = None

@@ -1,0 +1,105 @@
+{
+  "fixtures": {
+    "conflict_review.xlsx": {
+      "expected_artifact_stage": "review_candidate",
+      "fields": [
+        "can_baud_rate",
+        "termination_resistor"
+      ],
+      "format": "xlsx",
+      "sha256": "895b22953711a5f5a9ca39327576ca38d2681d1194a6c953502d22affdd95c72",
+      "source_set_snapshot": "fixture-snapshot-v1",
+      "template_schema_id": "fixture-conflict-schema",
+      "template_schema_version": "1"
+    },
+    "controller_review.docx": {
+      "expected_artifact_stage": "review_candidate",
+      "fields": [
+        "controller_model",
+        "firmware_version",
+        "release_date"
+      ],
+      "format": "docx",
+      "sha256": "0bdfa9e0a30c3e990e67b8421ba2e5bf463f356d149df90d3dc9fc3d60b61e49",
+      "source_set_snapshot": "fixture-snapshot-v1",
+      "template_schema_id": "fixture-controller-schema",
+      "template_schema_version": "1"
+    },
+    "interface_review.xlsx": {
+      "expected_artifact_stage": "review_candidate",
+      "fields": [
+        "supported_modes",
+        "baud_rate",
+        "flow_control"
+      ],
+      "format": "xlsx",
+      "sha256": "52f38d92946f4f047dcce88a1a3f48ad42ebfd88e2083cd82d7dfcce6d9c4949",
+      "source_set_snapshot": "fixture-snapshot-v1",
+      "template_schema_id": "fixture-interface-schema",
+      "template_schema_version": "1"
+    },
+    "power_table_review.xlsx": {
+      "expected_artifact_stage": "review_candidate",
+      "fields": [
+        "voltage_range",
+        "efficiency_percent",
+        "power_table"
+      ],
+      "format": "xlsx",
+      "sha256": "94ccdaafa54c66517fe09b401d6f498134205d99577ebb1d29a8647916e7a3d1",
+      "source_set_snapshot": "fixture-snapshot-v1",
+      "template_schema_id": "fixture-power-table-schema",
+      "template_schema_version": "1"
+    },
+    "rated_current_review.xlsx": {
+      "expected_artifact_stage": "review_candidate",
+      "fields": [
+        "rated_current",
+        "insulation_class",
+        "test_voltage"
+      ],
+      "format": "xlsx",
+      "sha256": "a50fe70b0276885bc0a41b1a1212724b7b586ba8e4a9e3f1a452245f076dddbf",
+      "source_set_snapshot": "fixture-snapshot-v1",
+      "template_schema_id": "fixture-rated-current-schema",
+      "template_schema_version": "1"
+    },
+    "safety_review.xlsx": {
+      "expected_artifact_stage": "review_candidate",
+      "fields": [
+        "safety_standard",
+        "ip_rating",
+        "creepage_distance"
+      ],
+      "format": "xlsx",
+      "sha256": "d619158cae3ddf7395548eb72ad026ef0aa00b86804546849c506be26fbe1f12",
+      "source_set_snapshot": "fixture-snapshot-v1",
+      "template_schema_id": "fixture-safety-schema",
+      "template_schema_version": "1"
+    },
+    "scope_violation_review.xlsx": {
+      "expected_artifact_stage": "review_candidate",
+      "fields": [
+        "restricted_field"
+      ],
+      "format": "xlsx",
+      "sha256": "88595ed5123c33e3893c7490d76a294577ac44301b61b7578086e1b1af60694b",
+      "source_set_snapshot": "fixture-snapshot-v1",
+      "template_schema_id": "fixture-scope-schema",
+      "template_schema_version": "1"
+    },
+    "thermal_review.docx": {
+      "expected_artifact_stage": "review_candidate",
+      "fields": [
+        "operating_temp",
+        "thermal_resistance",
+        "cooling_method"
+      ],
+      "format": "docx",
+      "sha256": "93999ab7e2bac945ab887a614cff5ecc5de5b9446ee5348d94d9768a7d085188",
+      "source_set_snapshot": "fixture-snapshot-v1",
+      "template_schema_id": "fixture-thermal-schema",
+      "template_schema_version": "1"
+    }
+  }
+}

@@ -5,6 +5,7 @@ import {
   describeHarnessProgress,
   hasDocumentGenerationWritePermission,
   nextActionsForStatus,
+  resolveDeepLinkKb,
   resolveDocumentPhase,
 } from './documentGenerationModel';
 
@@ -50,5 +51,16 @@ describe('document generation status model', () => {
   it('formats completed parallel units for the technical progress panel', () => {
     expect(describeHarnessProgress({ completed_units: 7, total_units: 66 })).toBe('已完成单元：7 / 66');
     expect(describeHarnessProgress({ completed_units: 0, total_units: 0 })).toBeNull();
+  });
+
+  it('keeps a deep-link kb preselect only when it exists in the accessible list', () => {
+    const kbs = [{ name: '硬件知识库' }, { name: 'shared' }];
+    expect(resolveDeepLinkKb('硬件知识库', kbs)).toBe('硬件知识库');
+    expect(resolveDeepLinkKb('shared', kbs)).toBe('shared');
+    expect(resolveDeepLinkKb('nonexistent', kbs)).toBe('');
+    expect(resolveDeepLinkKb('', kbs)).toBe('');
+    expect(resolveDeepLinkKb('硬件知识库', [])).toBe('');
+    expect(resolveDeepLinkKb('硬件知识库', ['硬件知识库', 'other'])).toBe('硬件知识库');
+    expect(resolveDeepLinkKb('Shared', kbs)).toBe('');
   });
 });

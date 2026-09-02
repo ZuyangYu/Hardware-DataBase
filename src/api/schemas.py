@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from src.document_authoring.chat_context import DocumentContext, DocumentContextInput
+
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -173,6 +175,8 @@ class QueryRequest(BaseModel):
     # (and blocks DoS-shaped requests before the body is even read).
     history: list[tuple[str, str]] = Field(default_factory=list, max_length=100)
     thread_id: str = ""
+    document_context: DocumentContextInput | None = None
+    document_flow: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +195,7 @@ class SessionView(BaseModel):
     title: str
     created_at: str
     updated_at: str
+    document_context: DocumentContext | None = None
 
 
 class MemoryContextView(BaseModel):
@@ -217,6 +222,7 @@ class MessageView(BaseModel):
     edited_at: str | None = None
     redacted: bool = False
     memory_context: list[MemoryContextView] = Field(default_factory=list)
+    document_context: DocumentContext | None = None
 
 
 class AddMessageRequest(BaseModel):
@@ -248,6 +254,11 @@ class CreateTurnRequest(BaseModel):
     # Retained for wire compatibility; the route normalizes KB turns to deep
     # retrieval and general chat bypasses the knowledge-base agent entirely.
     query_mode: Literal["fast", "deep"] = "deep"
+    document_context: DocumentContextInput | None = None
+    # Explicit document-flow routing: True forces the document flow when the
+    # context is valid, False blocks it (and strips document tools from the
+    # general toolset); None keeps the legacy intent-keyword fallback.
+    document_flow: bool | None = None
 
 
 class TurnView(BaseModel):
@@ -269,6 +280,7 @@ class TurnView(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    document_context: DocumentContext | None = None
 
 
 class TurnStartResponse(BaseModel):
@@ -893,6 +905,7 @@ class TemplateMappingCorrectionRequest(BaseModel):
 
 class ConfirmTemplateRequest(BaseModel):
     display_name: str
+    execution_mode: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
 
 
 class CreateWorkOrderRequest(BaseModel):
@@ -900,6 +913,7 @@ class CreateWorkOrderRequest(BaseModel):
     document_schema_id: str
     document_schema_version: str
     generation_session_id: str | None = None
+    execution_mode: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
 
 
 class DeleteDocumentWorkOrderRequest(BaseModel):
@@ -929,3 +943,11 @@ class IcdResolutionRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     comment: str
+
+
+class AgentHumanDecisionRequest(BaseModel):
+    """One-time approve/reject decision for a pending agent proposal."""
+
+    pending_event_id: str = Field(min_length=1, max_length=200)
+    proposal_hash: str = Field(min_length=1, max_length=200)
+    decision: Literal["approve", "reject"]

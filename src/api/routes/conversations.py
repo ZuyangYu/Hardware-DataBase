@@ -33,6 +33,7 @@ def _session_view(s) -> SessionView:
         title=s.title,
         created_at=s.created_at,
         updated_at=s.updated_at,
+        document_context=getattr(s, "document_context", None),
     )
 
 
@@ -47,6 +48,7 @@ def _message_view(m) -> MessageView:
         edited_at=getattr(m, "edited_at", None),
         redacted=bool(getattr(m, "redacted", False)),
         memory_context=getattr(m, "memory_context", []),
+        document_context=getattr(m, "document_context", None),
     )
 
 

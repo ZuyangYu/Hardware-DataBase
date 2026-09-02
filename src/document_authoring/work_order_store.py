@@ -15,8 +15,10 @@ from typing import Any, TypeVar
 
 import src.settings
 from src.document_authoring.harness.policy import HarnessLeaseLost
+from src.document_authoring.harness.idempotency import execution_event_key
 from src.document_authoring.generation_sessions import GenerationSessionStore
 from src.document_authoring.models import (
+    AuthoringExecutionEvent,
     DeterministicRuleSpec,
     DocumentUnitDraft,
     DocumentArtifact,
@@ -33,6 +35,7 @@ from src.document_authoring.models import (
     LegacyTemplateClaim,
     NodeExecutionReceipt,
     AuthoringRunManifest,
+    EvidenceRegistryEntry,
     content_hash,
     RendererPolicy,
     TemplateSanitizationReport,
@@ -192,12 +195,32 @@ class DocumentAuthoringStore:
                     receipt_id TEXT PRIMARY KEY, harness_run_id TEXT NOT NULL,
                     node_name TEXT NOT NULL, unit_id TEXT NOT NULL,
                     input_fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+                    action_key TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL DEFAULT 1,
                     payload_json TEXT NOT NULL,
                     UNIQUE(harness_run_id, node_name, unit_id, input_fingerprint),
                     FOREIGN KEY(harness_run_id) REFERENCES harness_runs(harness_run_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_node_execution_receipts_run
                     ON node_execution_receipts(harness_run_id, status);
+                CREATE TABLE IF NOT EXISTS authoring_execution_events (
+                    event_id TEXT PRIMARY KEY, harness_run_id TEXT NOT NULL,
+                    work_order_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL, idempotency_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    UNIQUE(harness_run_id, idempotency_key),
+                    FOREIGN KEY(harness_run_id) REFERENCES harness_runs(harness_run_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_authoring_execution_events_scope
+                    ON authoring_execution_events(tenant_id, work_order_id, harness_run_id, sequence);
+                CREATE TABLE IF NOT EXISTS evidence_registry (
+                    evidence_id TEXT NOT NULL, harness_run_id TEXT NOT NULL,
+                    work_order_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                    source_set_snapshot_id TEXT NOT NULL, registered_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY(harness_run_id, evidence_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_evidence_registry_scope
+                    ON evidence_registry(tenant_id, harness_run_id, source_set_snapshot_id);
                 CREATE TABLE IF NOT EXISTS legacy_template_claims (
                     template_version_id TEXT NOT NULL, claim_id TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
@@ -251,6 +274,7 @@ class DocumentAuthoringStore:
             )
             self._migrate_docx_regions(conn)
             self._migrate_document_work_orders(conn)
+            self._migrate_node_execution_receipts(conn)
             conn.execute(
                 """INSERT OR IGNORE INTO template_analysis_revisions
                    (analysis_id, template_version_id, content_hash, payload_json)
@@ -325,6 +349,21 @@ class DocumentAuthoringStore:
             raise
         finally:
             conn.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _migrate_node_execution_receipts(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(node_execution_receipts)").fetchall()
+        }
+        if "action_key" not in columns:
+            conn.execute("ALTER TABLE node_execution_receipts ADD COLUMN action_key TEXT NOT NULL DEFAULT ''")
+        if "attempt" not in columns:
+            conn.execute("ALTER TABLE node_execution_receipts ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_node_execution_receipts_action_key
+               ON node_execution_receipts(harness_run_id, action_key)
+               WHERE action_key != ''"""
+        )
 
     @staticmethod
     def _put(conn, table: str, columns: dict[str, Any], payload: Any) -> None:
@@ -1275,6 +1314,139 @@ class DocumentAuthoringStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def resolve_harness_human_decision(
+        self,
+        run_id: str,
+        *,
+        pending_event_id: str,
+        proposal_hash: str,
+        decision: str,
+        decision_key: str,
+        actor_id: str,
+        tenant_id: str | None = None,
+    ) -> tuple[HarnessRun, AuthoringExecutionEvent]:
+        """Atomically consume one pending agent proposal decision.
+
+        The pending event is single-use.  Repeating the same decision key
+        returns the original event and current run (idempotent HTTP retry);
+        another decision, a different tenant, a mismatched proposal, or an
+        expired event is rejected without changing the run.
+        """
+        normalized_decision = str(decision or "").strip().casefold()
+        if normalized_decision not in {"approve", "reject"}:
+            raise ValueError("decision must be approve or reject")
+        event_key = execution_event_key(decision_key, "human_resumed")
+        now = datetime.now(timezone.utc)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM harness_runs WHERE harness_run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"harness run not found: {run_id}")
+                current = HarnessRun.model_validate(_payload(row))
+                existing_row = conn.execute(
+                    "SELECT payload_json FROM authoring_execution_events "
+                    "WHERE harness_run_id = ? AND idempotency_key = ?",
+                    (run_id, event_key),
+                ).fetchone()
+                if existing_row is not None:
+                    stored_event = AuthoringExecutionEvent.model_validate(_payload(existing_row))
+                    conn.execute("COMMIT")
+                    return current, stored_event
+                if tenant_id is not None and current.tenant_id != str(tenant_id):
+                    raise PermissionError("human decision tenant does not match the HarnessRun")
+                if current.status != "waiting_human":
+                    raise ValueError(f"harness run is not waiting for a human decision: {current.status}")
+                pending = current.pending_human_event
+                if not isinstance(pending, dict):
+                    raise ValueError("harness run has no pending human event")
+                if str(pending.get("event_id") or "") != str(pending_event_id):
+                    raise ValueError("pending human event does not match the HarnessRun")
+                if str(pending.get("proposal_hash") or "") != str(proposal_hash):
+                    raise ValueError("proposal hash does not match the pending human event")
+                expires_at = pending.get("expires_at")
+                if expires_at:
+                    try:
+                        expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                        if expires.tzinfo is None:
+                            expires = expires.replace(tzinfo=timezone.utc)
+                        if expires.astimezone(timezone.utc) <= now:
+                            raise ValueError("pending human event has expired")
+                    except ValueError as exc:
+                        if str(exc) == "pending human event has expired":
+                            raise
+                        raise ValueError("pending human event expiry is invalid") from exc
+
+                field_id = str(pending.get("field_id") or "").strip()
+                unit_statuses = dict(current.unit_statuses or {})
+                if field_id:
+                    unit_statuses[f"field:{field_id}"] = (
+                        "ready_to_render" if normalized_decision == "approve" else "requires_human"
+                    )
+                updated = current.model_copy(update={
+                    "status": "retrying" if normalized_decision == "approve" else "failed",
+                    "current_node": "agent_field_harness_resume" if normalized_decision == "approve" else "human_rejected",
+                    "pending_human_event": None,
+                    "unit_statuses": unit_statuses,
+                    "error": None if normalized_decision == "approve" else {
+                        "type": "HumanDecisionRejected",
+                        "message": "agent proposal was rejected by a human reviewer",
+                    },
+                    "last_error_code": None if normalized_decision == "approve" else "human_decision_rejected",
+                    "updated_at": now,
+                })
+                conn.execute(
+                    "UPDATE harness_runs SET status = ?, payload_json = ? WHERE harness_run_id = ?",
+                    (updated.status, _json(updated), run_id),
+                )
+                event = AuthoringExecutionEvent(
+                    event_id=f"authoring-event-{uuid.uuid4().hex}",
+                    event_type="human_resumed",
+                    tenant_id=current.tenant_id,
+                    work_order_id=current.work_order_id,
+                    harness_run_id=current.harness_run_id,
+                    idempotency_key=event_key,
+                    attempt=max(1, current.retry_count + 1),
+                    executor="agent_field_harness",
+                    node_name="agent_field_harness",
+                    field_id=field_id or None,
+                    unit_id=f"field:{field_id}" if field_id else None,
+                    status="resumed" if normalized_decision == "approve" else "rejected",
+                    error_code=None if normalized_decision == "approve" else "human_decision_rejected",
+                    sanitized_payload={
+                        "decision": normalized_decision,
+                        "pending_event_id": str(pending_event_id),
+                        "proposal_hash": str(proposal_hash),
+                        "actor_id": str(actor_id)[:200],
+                        "agent_thread_id": str(current.agent_thread_id or "")[:200],
+                    },
+                    occurred_at=now,
+                )
+                sequence = conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM authoring_execution_events "
+                    "WHERE harness_run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                event = event.model_copy(update={"sequence": int(sequence)})
+                self._put(conn, "authoring_execution_events", {
+                    "event_id": event.event_id,
+                    "harness_run_id": event.harness_run_id,
+                    "work_order_id": event.work_order_id,
+                    "tenant_id": event.tenant_id,
+                    "sequence": event.sequence,
+                    "idempotency_key": event.idempotency_key,
+                    "event_type": event.event_type,
+                    "occurred_at": event.occurred_at.isoformat(),
+                }, event)
+                conn.execute("COMMIT")
+                return updated, event
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def save_harness_checkpoint_owned(
         self,
         checkpoint: HarnessCheckpoint,
@@ -1333,6 +1505,129 @@ class DocumentAuthoringStore:
             )
         return checkpoint
 
+    def append_execution_event(self, event: AuthoringExecutionEvent) -> AuthoringExecutionEvent:
+        """Append one sanitized business fact with a run-scoped monotonic sequence.
+
+        The sequence is allocated inside the Store transaction (never wall-clock)
+        and a duplicate ``idempotency_key`` replays the stored event instead of
+        writing a second row.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM authoring_execution_events "
+                    "WHERE harness_run_id = ? AND idempotency_key = ?",
+                    (event.harness_run_id, event.idempotency_key),
+                ).fetchone()
+                if row is not None:
+                    stored = AuthoringExecutionEvent.model_validate(_payload(row))
+                    conn.execute("COMMIT")
+                    return stored
+                sequence = conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM authoring_execution_events "
+                    "WHERE harness_run_id = ?",
+                    (event.harness_run_id,),
+                ).fetchone()[0]
+                event = event.model_copy(update={"sequence": int(sequence)})
+                self._put(conn, "authoring_execution_events", {
+                    "event_id": event.event_id,
+                    "harness_run_id": event.harness_run_id,
+                    "work_order_id": event.work_order_id,
+                    "tenant_id": event.tenant_id,
+                    "sequence": event.sequence,
+                    "idempotency_key": event.idempotency_key,
+                    "event_type": event.event_type,
+                    "occurred_at": event.occurred_at.isoformat(),
+                }, event)
+                conn.execute("COMMIT")
+                return event
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def get_execution_event(self, harness_run_id: str, idempotency_key: str) -> AuthoringExecutionEvent | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM authoring_execution_events "
+                "WHERE harness_run_id = ? AND idempotency_key = ?",
+                (harness_run_id, idempotency_key),
+            ).fetchone()
+        return AuthoringExecutionEvent.model_validate(_payload(row)) if row else None
+
+    def list_execution_events(
+        self,
+        harness_run_id: str,
+        *,
+        tenant_id: str | None = None,
+        work_order_id: str | None = None,
+    ) -> list[AuthoringExecutionEvent]:
+        query = "SELECT payload_json FROM authoring_execution_events WHERE harness_run_id = ?"
+        params: list[Any] = [harness_run_id]
+        if tenant_id is not None:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if work_order_id is not None:
+            query += " AND work_order_id = ?"
+            params.append(work_order_id)
+        query += " ORDER BY sequence"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [AuthoringExecutionEvent.model_validate(_payload(row)) for row in rows]
+
+    def register_evidence(self, entry: EvidenceRegistryEntry) -> EvidenceRegistryEntry:
+        """Immutably register one evidence reference for a run.
+
+        Re-registering the identical (run, evidence_id, content_hash) triple is
+        idempotent; a different content hash for the same id is rejected because
+        registry records are immutable.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM evidence_registry "
+                    "WHERE harness_run_id = ? AND evidence_id = ?",
+                    (entry.harness_run_id, entry.evidence_id),
+                ).fetchone()
+                if row is not None:
+                    stored = EvidenceRegistryEntry.model_validate(_payload(row))
+                    if stored.content_hash != entry.content_hash:
+                        raise ValueError(
+                            f"evidence registry record is immutable: {entry.evidence_id}"
+                        )
+                    conn.execute("COMMIT")
+                    return stored
+                self._put(conn, "evidence_registry", {
+                    "evidence_id": entry.evidence_id,
+                    "harness_run_id": entry.harness_run_id,
+                    "work_order_id": entry.work_order_id,
+                    "tenant_id": entry.tenant_id,
+                    "source_set_snapshot_id": entry.source_set_snapshot_id,
+                    "registered_at": entry.registered_at.isoformat(),
+                }, entry)
+                conn.execute("COMMIT")
+                return entry
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def get_evidence_entry(self, harness_run_id: str, evidence_id: str) -> EvidenceRegistryEntry | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM evidence_registry WHERE harness_run_id = ? AND evidence_id = ?",
+                (harness_run_id, evidence_id),
+            ).fetchone()
+        return EvidenceRegistryEntry.model_validate(_payload(row)) if row else None
+
+    def list_evidence_entries(self, harness_run_id: str) -> list[EvidenceRegistryEntry]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM evidence_registry WHERE harness_run_id = ? ORDER BY registered_at",
+                (harness_run_id,),
+            ).fetchall()
+        return [EvidenceRegistryEntry.model_validate(_payload(row)) for row in rows]
+
     def begin_node_execution_owned(
         self,
         receipt: NodeExecutionReceipt,
@@ -1369,6 +1664,8 @@ class DocumentAuthoringStore:
                         "unit_id": receipt.unit_id,
                         "input_fingerprint": receipt.input_fingerprint,
                         "status": receipt.status,
+                        "action_key": receipt.action_key,
+                        "attempt": receipt.attempt,
                     }, receipt)
                 conn.execute("COMMIT")
                 return receipt

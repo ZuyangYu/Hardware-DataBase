@@ -9,34 +9,61 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.agents.claim_evidence import InformationRequirement
-from src.core.llm_client import LLMClient
+from src.core.chat_model_runtime import ChatModelLike, invoke_structured
+from src.core.model_factory import create_chat_model
 from src.document_authoring.writers.managed import _strip_code_fences
 
 
 logger = logging.getLogger(__name__)
 
 
+class QueryRewritePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rewrite: str = Field(min_length=1)
+
+
 class QueryRewriter:
-    """Rewrite a retrieval query using the shared LLM client."""
+    """Rewrite a retrieval query using the shared chat-model runtime."""
 
     provider_id = "query_rewriter"
 
-    def __init__(self, client: LLMClient | None = None):
-        self._client = client or LLMClient()
+    def __init__(
+        self,
+        model: ChatModelLike | None = None,
+        *,
+        model_factory: Callable[[], ChatModelLike] | None = None,
+    ):
+        self._model = model
+        self._model_factory = model_factory
+
+    def _get_model(self) -> ChatModelLike:
+        if self._model is None:
+            self._model = (
+                self._model_factory()
+                if self._model_factory is not None
+                else create_chat_model(profile="authoring_auxiliary")
+            )
+        return self._model
 
     def rewrite(self, requirement: InformationRequirement) -> str | None:
         prompt = _build_prompt(requirement)
         try:
-            response = self._client.chat(
+            result = invoke_structured(
+                self._get_model(),
+                QueryRewritePayload,
                 [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                usage_stage="query_rewrite",
-                timeout=20,
-                rate_limit_max_retries=0,
+                operation="query_rewrite",
+                profile="authoring_auxiliary",
+                text_fallback=lambda text: {"rewrite": _parse_rewrite(text) or ""},
             )
         except Exception as exc:
             logger.warning(
@@ -44,7 +71,7 @@ class QueryRewriter:
                 requirement.requirement_id, exc,
             )
             return None
-        return _parse_rewrite(response)
+        return result.value.rewrite.strip() or None
 
 
 _SYSTEM_PROMPT = """You rewrite a retrieval query to improve recall in a hardware knowledge base.

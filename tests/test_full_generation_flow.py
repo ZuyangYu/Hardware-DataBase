@@ -21,6 +21,11 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+# Env-isolation guard: pin document gating switches to safe defaults so local
+# .env overrides (e.g. DOCUMENT_AUTO_PUBLISH_VERIFIED=true) cannot flip the
+# governed review flow these tests assert.
+from tests.document_gating_env import pin_deterministic_document_gating  # noqa: F401
+
 from src.agents.claim_evidence import InformationRequirement, RetrievalOutcome
 from src.document_authoring.models import (
     DocumentFieldSchema,

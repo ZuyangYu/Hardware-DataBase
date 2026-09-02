@@ -74,6 +74,12 @@ class TemplateAnalysisSuggestion(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     value_shape: Literal["scalar", "repeating_table"] = "scalar"
     overwrite_basis: Literal["placeholder", "sample_value"] | None = None
+    value_type: str | None = None
+    required_capabilities: list[str] = Field(default_factory=list)
+    preferred_source_roles: list[str] = Field(default_factory=list)
+    missing_policy: str | None = None
+    allow_derivation: bool = False
+    description: str = ""
 
 
 class TemplateRiskMetrics(BaseModel):
@@ -164,3 +170,72 @@ class DocxRegionSchema(BaseModel):
         if self.role in protected_roles and self.write_policy != "never":
             raise ValueError("protected DOCX regions may not be writable")
         return self
+
+
+# ── Deterministic field-contract inference (Task 2) ──────────────────────────
+
+_NUMBER_WORDS = ("电压", "电流", "功率", "温度", "阻值", "频率", "距离", "效率", "容量", "电压", "电流")
+_DATE_WORDS = ("日期", "时间", "date", "发布")
+_VERSION_WORDS = ("版本", "固件", "version", "revision")
+_ENUM_WORDS = ("等级", "标准", "类型", "方式", "模式", "等级", "方法", "类别")
+_BOOLEAN_WORDS = ("是否", "有无", "启用", "屏蔽")
+_ENTITY_WORDS = ("型号", "器件", "芯片", "料号", "part", "model")
+
+UNIT_HEADER_WORDS = {
+    "number": _NUMBER_WORDS,
+    "date": _DATE_WORDS,
+    "version": _VERSION_WORDS,
+    "enum": _ENUM_WORDS,
+    "boolean": _BOOLEAN_WORDS,
+}
+
+
+def infer_field_contract(
+    suggestion: TemplateAnalysisSuggestion,
+    units: list[TemplateAnalysisUnit],
+) -> dict[str, Any]:
+    """Infer value_type/capabilities/missing_policy from deterministic signals.
+
+    Rules use only value_shape, the target unit's label/header words
+    (表头词表), unit role and the existing value_kind. LLM suggestions may
+    refine semantics but are never the only source (Task 2.2). Returns raw
+    contract fields; callers must normalize through contract_registry.
+    """
+    unit_by_id = {unit.unit_id: unit for unit in units}
+    target_units = [unit_by_id[u] for u in suggestion.target_unit_ids if u in unit_by_id]
+    header_text_parts: list[str] = [suggestion.label, *(term for term in suggestion.retrieval_terms)]
+    for unit in target_units:
+        header_text_parts.append(unit.label)
+        if unit.value_preview:
+            header_text_parts.append(unit.value_preview)
+        for neighbor in unit.neighborhood:
+            if neighbor.value_preview:
+                header_text_parts.append(neighbor.value_preview)
+    header_text = " ".join(part.casefold() for part in header_text_parts if part)
+
+    if suggestion.value_shape == "repeating_table":
+        value_type = "table"
+        capabilities = ["tabular_lookup", "document_claim_lookup"]
+    else:
+        value_type = "text"
+        capabilities = ["document_claim_lookup"]
+        for candidate, words in UNIT_HEADER_WORDS.items():
+            if any(word.casefold() in header_text for word in words):
+                value_type = candidate
+                break
+        if any(word.casefold() in header_text for word in _ENTITY_WORDS):
+            capabilities = ["entity_lookup", "document_claim_lookup"]
+
+    missing_policy = "mark_tbd"
+    description_parts = [suggestion.label]
+    for unit in target_units:
+        if unit.label and unit.label not in description_parts:
+            description_parts.append(unit.label)
+    return {
+        "value_type": value_type,
+        "required_capabilities": capabilities,
+        "preferred_source_roles": [],
+        "missing_policy": missing_policy,
+        "allow_derivation": False,
+        "description": " / ".join(description_parts),
+    }

@@ -7,7 +7,10 @@ from src.document_authoring.template_analysis import (
     TemplateAnalysisUnit,
     TemplateNeighbor,
 )
-from src.document_authoring.template_suggester import LLMTemplateSuggestionProvider
+from src.document_authoring.template_suggester import (
+    LLMTemplateSuggestionProvider,
+    TemplateSuggestionBatch,
+)
 
 
 class RecordingClient:
@@ -16,7 +19,7 @@ class RecordingClient:
         self.messages: list[dict[str, str]] = []
         self.usage_stage: str | None = None
 
-    def chat(self, messages: list[dict[str, str]], **kwargs: object) -> str:
+    def invoke(self, messages: list[dict[str, str]], **kwargs: object) -> str:
         self.messages = messages
         self.usage_stage = str(kwargs.get("usage_stage"))
         return self.response
@@ -26,9 +29,63 @@ class FailingClient:
     def __init__(self):
         self.calls = 0
 
-    def chat(self, messages: list[dict[str, str]], **kwargs: object) -> str:
+    def invoke(self, messages: list[dict[str, str]], **kwargs: object) -> str:
         self.calls += 1
         raise TimeoutError("template analysis timed out")
+
+
+class _SuggestionRunnable:
+    def __init__(self, response):
+        self.response = response
+
+    def invoke(self, messages, **kwargs):
+        return self.response
+
+
+class _StructuredSuggestionModel:
+    provider = "custom"
+    model_name = "suggestion-test"
+
+    def __init__(self, response):
+        self.response = response
+        self.schema = None
+
+    def with_structured_output(self, schema):
+        self.schema = schema
+        return _SuggestionRunnable(self.response)
+
+
+def test_llm_suggester_prefers_native_structured_output():
+    model = _StructuredSuggestionModel({
+        "suggestions": [{
+            "semantic_unit_id": "summary",
+            "label": "摘要",
+            "target_unit_ids": ["p-1"],
+            "retrieval_terms": ["summary"],
+            "confidence": 0.9,
+        }],
+    })
+
+    suggestions = LLMTemplateSuggestionProvider(model=model).suggest(_safe_docx_analysis())
+
+    assert model.schema is TemplateSuggestionBatch
+    assert [item.semantic_unit_id for item in suggestions] == ["summary"]
+
+
+def test_llm_suggester_uses_explicit_text_compatibility_model():
+    class _TextOnlyModel:
+        provider = "ollama"
+        model_name = "text-only"
+
+        def with_structured_output(self, schema):
+            raise NotImplementedError("structured output is not supported")
+
+        def invoke(self, messages, **kwargs):
+            return '[{"semantic_unit_id":"summary","label":"摘要","target_unit_ids":["p-1"],"retrieval_terms":["summary"],"confidence":0.9}]'
+
+    suggestions = LLMTemplateSuggestionProvider(model=_TextOnlyModel()).suggest(_safe_docx_analysis())
+
+    assert [item.semantic_unit_id for item in suggestions] == ["summary"]
 
 
 def _safe_docx_analysis() -> TemplateAnalysis:
@@ -55,7 +112,6 @@ def test_llm_suggester_only_sends_structural_inventory_and_parses_valid_json():
     assert "content_hash" in client.messages[1]["content"]
     assert "PK" not in client.messages[1]["content"]
     assert "template-safe" in client.messages[1]["content"]
-    assert client.usage_stage == "template_analysis"
     assert suggestions[0].semantic_unit_id == "summary"
 
 
@@ -195,7 +251,7 @@ def test_llm_suggester_chunks_large_template_and_merges():
             self.calls = 0
             self.payloads: list[dict] = []
 
-        def chat(self, messages, **kwargs):
+        def invoke(self, messages, **kwargs):
             self.calls += 1
             payload = json.loads(messages[1]["content"])
             self.payloads.append(payload)
@@ -242,7 +298,7 @@ def test_llm_suggester_survives_partial_chunk_failure():
         def __init__(self):
             self.calls = 0
 
-        def chat(self, messages, **kwargs):
+        def invoke(self, messages, **kwargs):
             self.calls += 1
             if self.calls == 2:
                 return "not json"  # 第二块整体失败

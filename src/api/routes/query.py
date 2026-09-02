@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -25,6 +25,7 @@ from src.core.conversation import (
     ChatTurn,
     ConversationService,
 )
+from src.document_authoring.chat_context import DocumentContext, build_document_context
 from src.observability import (
     current_trace_identity,
     extract_trace_context,
@@ -149,11 +150,20 @@ def _make_event_callback(emit_stage, emit):
             return
         if etype == "stage":
             payload = evt.get("payload") or {}
+            # Non-core payload keys (e.g. document_flow_routed's routed_by)
+            # are forwarded so durable/SSE consumers keep the full routing
+            # provenance instead of only key/label/status/detail.
+            extra = {
+                extra_key: extra_value
+                for extra_key, extra_value in payload.items()
+                if extra_key not in {"key", "label", "status", "detail"}
+            }
             emit_stage(
                 payload.get("key", ""),
                 payload.get("label", ""),
                 payload.get("status", "running"),
                 payload.get("detail", ""),
+                **extra,
             )
         else:
             emit(etype, evt.get("payload") or {})
@@ -161,11 +171,33 @@ def _make_event_callback(emit_stage, emit):
     return _on_event
 
 
+def _decode_document_flow(trace_context: dict[str, str] | None) -> bool | None:
+    """Decode the explicit document-flow flag persisted by ``create_turn``
+    (which writes ``trace_context["document_flow"]`` when the client sends an
+    explicit ``document_flow`` value).  Only the exact "true"/"false" markers
+    are meaningful; a missing, empty, or unknown value keeps the legacy
+    regex fallback (``None``) instead of being coerced to a decision.
+    """
+
+    raw = (trace_context or {}).get("document_flow")
+    if raw is None:
+        return None
+    return {"true": True, "false": False}.get(str(raw).strip().lower())
+
+
 def _conv_service() -> ConversationService:
     return ConversationService()
 
 
 def _turn_view(turn: ChatTurn) -> TurnView:
+    document_context = None
+    if turn.document_context:
+        try:
+            document_context = DocumentContext.model_validate(turn.document_context)
+        except Exception:
+            # A historical/malformed context is never allowed to become an
+            # active tool capability, but it remains hidden from the DTO.
+            document_context = None
     return TurnView(
         id=turn.id,
         session_id=turn.session_id,
@@ -185,10 +217,19 @@ def _turn_view(turn: ChatTurn) -> TurnView:
         created_at=turn.created_at,
         started_at=turn.started_at,
         finished_at=turn.finished_at,
+        document_context=document_context,
     )
 
 
 def _message_view(message: ChatMessage) -> MessageView:
+    document_context = None
+    if getattr(message, "document_context", None):
+        try:
+            document_context = DocumentContext.model_validate(message.document_context)
+        except Exception:
+            # Historical malformed context is never an active capability and
+            # must not turn a refresh into a 500 response.
+            document_context = None
     return MessageView(
         id=message.id,
         session_id=message.session_id,
@@ -197,6 +238,7 @@ def _message_view(message: ChatMessage) -> MessageView:
         footer=message.footer,
         created_at=message.created_at,
         memory_context=getattr(message, "memory_context", []),
+        document_context=document_context,
     )
 
 
@@ -230,6 +272,18 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     turn = conv.claim_turn(user.id, turn_id, worker_id)
     if turn is None:
         return
+    document_context = None
+    if turn.document_context:
+        try:
+            document_context = DocumentContext.model_validate(turn.document_context)
+            document_context.assert_scope(ctx=ctx, expected_kb=turn.kb_name, required_permission="read")
+        except PermissionError:
+            # The query itself remains durable, but an invalidated attachment
+            # must not be exposed to the agent as a capability.
+            document_context = None
+        except Exception:
+            document_context = None
+    document_flow = _decode_document_flow(turn.trace_context)
     turn_observation = observe.chain(
         "hdb.chat.turn",
         context=extract_trace_context(turn.trace_context),
@@ -317,13 +371,13 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         event = conv.append_turn_event(turn_id, event_type, payload)
         _publish_turn_event(turn_id, event.seq, event_type, payload)
 
-    def emit_stage(key: str, label: str, status: str = "running", detail: str = "") -> None:
+    def emit_stage(key: str, label: str, status: str = "running", detail: str = "", **extra: Any) -> None:
         now = time.monotonic()
         if status == "running":
             stage_started.setdefault(key, now)
         elif status in {"done", "error"} and key in stage_started:
             stage_durations_ms.setdefault(key, []).append(int((now - stage_started.pop(key)) * 1000))
-        emit("stage", {"key": key, "label": label, "status": status, "detail": detail})
+        emit("stage", {"key": key, "label": label, "status": status, "detail": detail, **extra})
 
     # Structural boundary: marks the start of a turn so surfaces can group the
     # whole user-message → answer span as one unit (OpenWorker's turn_start).
@@ -385,6 +439,8 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             turn.query_mode,
             cancelled,
             persist_thread=True,
+            document_context=document_context,
+            document_flow=document_flow,
         )
         try:
             for chunk in gen:
@@ -529,13 +585,40 @@ def create_turn(
     if session.kb_name != GENERAL_CHAT_KB_NAME and not ctx.has_kb_permission(session.kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
     query_mode = "fast" if session.kb_name == GENERAL_CHAT_KB_NAME else "deep"
+    if body.document_flow is True and body.document_context is None:
+        raise HTTPException(
+            status_code=422,
+            detail="document_flow=true requires document_context",
+        )
+    document_context = None
+    if body.document_context is not None:
+        if session.kb_name == GENERAL_CHAT_KB_NAME:
+            raise HTTPException(status_code=400, detail="document context requires a knowledge-base session")
+        try:
+            document_context = build_document_context(
+                body.document_context,
+                ctx=ctx,
+                expected_kb=session.kb_name,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    trace_context = inject_trace_context()
+    if body.document_flow is not None:
+        # The durable worker re-runs the turn outside this request, so the
+        # explicit routing decision must survive persistence.  The turn's
+        # trace_context dict is the only string-keyed per-turn carrier
+        # available without a schema migration.
+        trace_context["document_flow"] = "true" if body.document_flow else "false"
     turn = conv.create_turn(
         user.id,
         session_id,
         body.query,
         body.client_request_id,
         query_mode,
-        trace_context=inject_trace_context(),
+        trace_context=trace_context,
+        document_context=document_context,
     )
     messages = conv.list_messages(user.id, session_id)
     user_message = next((message for message in messages if message.id == turn.user_message_id), None)
@@ -727,10 +810,31 @@ async def query(
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ):
+    if body.document_flow is True and body.document_context is None:
+        raise HTTPException(
+            status_code=422,
+            detail="document_flow=true requires document_context",
+        )
+    if body.kb_name in ("", GENERAL_CHAT_KB_NAME):
+        if body.document_context is not None:
+            raise HTTPException(status_code=400, detail="document context requires a knowledge-base query")
     ctx = build_context_for_user(user, body.kb_name, auth=auth)
     reject_system_admin_kb_access(ctx)
     if body.kb_name not in ("", GENERAL_CHAT_KB_NAME) and not ctx.has_kb_permission(body.kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
+
+    document_context = None
+    if body.document_context is not None:
+        try:
+            document_context = build_document_context(
+                body.document_context,
+                ctx=ctx,
+                expected_kb=body.kb_name,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     pipeline = _resolve_pipeline(request)
     # Keep only the most recent 5 history turns -- Streamlit slices [-5:] and
@@ -798,6 +902,8 @@ async def query(
                 _forward_event,
                 "deep",
                 None,
+                document_context=document_context,
+                document_flow=body.document_flow,
             )
             for chunk in gen:
                 if cancel.is_set():
@@ -940,6 +1046,8 @@ def _query_generator(
     query_mode="deep",
     should_cancel=None,
     persist_thread=False,
+    document_context=None,
+    document_flow=None,
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -953,6 +1061,10 @@ def _query_generator(
             kwargs["should_cancel"] = should_cancel
         if persist_thread and "persist_thread" in params:
             kwargs["persist_thread"] = True
+        if "document_context" in params:
+            kwargs["document_context"] = document_context
+        if "document_flow" in params:
+            kwargs["document_flow"] = document_flow
         return pipeline.query(
             query,
             kb_name,
@@ -967,6 +1079,10 @@ def _query_generator(
         kwargs["should_cancel"] = should_cancel
     if persist_thread and "persist_thread" in params:
         kwargs["persist_thread"] = True
+    if "document_context" in params:
+        kwargs["document_context"] = document_context
+    if "document_flow" in params:
+        kwargs["document_flow"] = document_flow
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 

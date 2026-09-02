@@ -12,10 +12,25 @@ import hashlib
 import json
 import logging
 import re
+import time
 from typing import Any, Callable
 
-from src.core.llm_client import LLMClient
-from src.document_authoring.models import DocumentUnitDraft, DraftAssertion, TypedFieldValue
+from src.core.chat_model_runtime import (
+    ChatModelLike,
+    ModelInvocationError,
+    StructuredOutputCapabilityError,
+    StructuredOutputValidationError,
+    invoke_structured,
+    invoke_text,
+    model_name,
+    model_provider,
+)
+from src.document_authoring.models import (
+    DocumentUnitDraft,
+    DraftAssertion,
+    ManagedDraftPayload,
+    TypedFieldValue,
+)
 from src.document_authoring.pin_function_inference import (
     infer_pin_function_from_net,
     resolve_pin_function,
@@ -151,7 +166,7 @@ def _unique_values(values: list[str]) -> list[str]:
 
 
 class LLMManagedWriter:
-    """Constrained document draft provider backed by the shared chat client.
+    """Constrained document draft provider backed by a shared chat model.
 
     Robustness strategy:
 
@@ -171,113 +186,250 @@ class LLMManagedWriter:
     # Ceiling on how many times the LLM may be re-prompted with feedback.
     _MAX_LLM_ATTEMPTS = 2
 
-    def __init__(self, client: LLMClient | None = None):
-        # Constructing without a config deliberately reuses the same AGENT_*
-        # runtime configuration as intelligent chat.
-        self._client = client or LLMClient()
+    def __init__(
+        self,
+        model: ChatModelLike | None = None,
+        *,
+        observation_callback: Callable[[dict[str, Any]], None] | None = None,
+        model_factory: Callable[[], ChatModelLike] | None = None,
+    ):
+        """Create a managed writer.
+
+        A LangChain ``BaseChatModel`` is preferred. A factory is accepted for
+        lazy construction so importing the service never starts a provider
+        connection. Text JSON remains an explicit provider-compatibility path.
+        """
+        self._model = model
+        self._model_factory = model_factory
+        self._observation_callback = observation_callback
         self._validator = DocumentValidator()
 
     def generate(self, request: WriterRequest) -> DocumentUnitDraft:
         connector_draft = _connector_function_draft(request)
         if connector_draft is not None:
             logger.info("Using deterministic connector function resolver for unit %s", request.unit_id)
-            return connector_draft
+            return _with_writer_metadata(
+                connector_draft,
+                writer_mode="deterministic_connector",
+                observations=[],
+            )
+
+        draft, observations, capability_error = self._generate_structured(request)
+        if draft is not None:
+            return _with_writer_metadata(
+                draft, writer_mode="structured", observations=observations,
+            )
+        if capability_error is None:
+            return self._fallback_draft(
+                request,
+                observations,
+                fallback_reason="structured_output_validation_failed",
+                writer_mode="structured",
+            )
+        if capability_error is not None:
+            logger.info(
+                "Managed writer provider does not support structured output for %s; "
+                "using JSON compatibility path: %s",
+                request.unit_id, capability_error,
+            )
+            json_draft, json_observations, _ = self._generate_json(
+                request,
+                prior_observations=observations,
+                initial_error=f"structured output unsupported: {capability_error}",
+            )
+            if json_draft is not None:
+                return _with_writer_metadata(
+                    json_draft, writer_mode="json_fallback", observations=json_observations,
+                )
+            return self._fallback_draft(
+                request, json_observations,
+                fallback_reason="structured_output_unsupported_and_json_failed",
+                writer_mode="json_fallback",
+            )
+
+        draft, observations, _ = self._generate_json(
+            request, prior_observations=observations,
+        )
+        if draft is not None:
+            return _with_writer_metadata(
+                draft,
+                writer_mode="json_fallback",
+                observations=observations,
+            )
+        return self._fallback_draft(
+            request,
+            observations,
+            fallback_reason="json_compatibility_failed",
+            writer_mode="json_fallback",
+        )
+
+    def _get_model(self) -> Any | None:
+        if self._model is not None:
+            return self._model
+        if self._model_factory is not None:
+            self._model = self._model_factory()
+            return self._model
+        # The service's default production construction goes through the
+        # central factory.  Import lazily to keep this module usable by the
+        # deterministic/offline test path.
+        from src.core.model_factory import create_chat_model
+
+        self._model = create_chat_model()
+        return self._model
+
+    def _generate_structured(
+        self,
+        request: WriterRequest,
+    ) -> tuple[DocumentUnitDraft | None, list[dict[str, Any]], str | None]:
+        observations: list[dict[str, Any]] = []
         last_error: str | None = None
+        try:
+            model = self._get_model()
+        except Exception as exc:
+            observations.append(_runtime_observation(
+                attempt=1,
+                operation="structured",
+                started=time.monotonic(),
+                model=None,
+                error=exc,
+            ))
+            return None, observations, None
         for attempt in range(1, self._MAX_LLM_ATTEMPTS + 1):
             user_content = _build_user_prompt(request, last_error)
+            started = time.monotonic()
             try:
-                response = self._client.chat(
+                result = invoke_structured(
+                    model,
+                    ManagedDraftPayload,
                     [
                         {"role": "system", "content": _WRITER_SYSTEM_PROMPT},
                         {"role": "user", "content": user_content},
                     ],
-                    usage_stage="document_authoring",
-                    # A field writer is recoverable: after this bounded wait
-                    # the evidence-grounded deterministic writer can finish
-                    # the field instead of holding the whole Harness lease.
-                    timeout=60,
-                     # One template cell needs a concise, structured value;
-                    # retaining the global multi-thousand-token ceiling lets
-                    # a congested model hold an entire parallel worker open.
-                    max_tokens=512,
-                    # Under concurrent document generation, retrying a 429
-                    # inside one field can monopolize a worker for minutes.
-                    # A validated-evidence fallback is safer and faster.
-                     rate_limit_max_retries=0,
+                    operation="document_authoring",
+                    profile="default",
                 )
+                draft = self._draft_from_payload(result.value, request)
+                observations.append(_runtime_observation(
+                    attempt=attempt,
+                    operation="structured",
+                    started=started,
+                    model=model,
+                    result=result,
+                ))
+                return draft, observations, None
+            except StructuredOutputCapabilityError as exc:
+                observations.append(_runtime_observation(
+                    attempt=attempt,
+                    operation="structured",
+                    started=started,
+                    model=model,
+                    error=exc,
+                ))
+                return None, observations, str(exc)
+            except (ModelInvocationError, StructuredOutputValidationError, ValueError) as exc:
+                last_error = str(exc)
+                observations.append(_runtime_observation(
+                    attempt=attempt,
+                    operation="structured",
+                    started=started,
+                    model=model,
+                    error=exc,
+                ))
+                logger.warning(
+                    "LLMManagedWriter structured attempt %d/%d failed for unit %s: %s",
+                    attempt, self._MAX_LLM_ATTEMPTS, request.unit_id, last_error,
+                )
+        return None, observations, None
+
+    def _generate_json(
+        self,
+        request: WriterRequest,
+        *,
+        prior_observations: list[dict[str, Any]] | None = None,
+        initial_error: str | None = None,
+    ) -> tuple[DocumentUnitDraft | None, list[dict[str, Any]], str | None]:
+        observations = list(prior_observations or [])
+        last_error: str | None = initial_error
+        for attempt in range(1, self._MAX_LLM_ATTEMPTS + 1):
+            user_content = _build_user_prompt(request, last_error)
+            messages = [
+                {"role": "system", "content": _WRITER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ]
+            started = time.monotonic()
+            try:
+                model = self._get_model()
+                result = invoke_text(
+                    model,
+                    messages,
+                    operation="document_authoring",
+                    profile="default",
+                )
+                observations.append(_runtime_observation(
+                    attempt=attempt,
+                    operation="json_fallback",
+                    started=started,
+                    model=model,
+                    result=result,
+                ))
             except Exception as exc:
                 last_error = f"managed writer provider failed: {exc}"
+                observations.append(_runtime_observation(
+                    attempt=attempt,
+                    operation="json_fallback",
+                    started=started,
+                    model=self._model,
+                    error=exc,
+                ))
                 logger.warning(
-                    "LLMManagedWriter attempt %d/%d failed for unit %s: %s",
+                    "LLMManagedWriter JSON attempt %d/%d failed for unit %s: %s",
                     attempt, self._MAX_LLM_ATTEMPTS, request.unit_id, last_error,
                 )
                 continue
             try:
-                draft = self._parse_and_validate(response, request)
-                return draft
+                draft = self._parse_and_validate(result.text, request)
+                return draft, observations, None
             except ValueError as exc:
                 last_error = str(exc)
                 logger.warning(
-                    "LLMManagedWriter attempt %d/%d failed for unit %s: %s",
+                    "LLMManagedWriter JSON attempt %d/%d failed for unit %s: %s",
                     attempt, self._MAX_LLM_ATTEMPTS, request.unit_id, exc,
                 )
+        return None, observations, last_error
 
-        # Persistent LLM failure → fall back to the deterministic writer.
-        # This is safer than failing the whole generation run because the
-        # evidence has already been validated and the deterministic writer
-        # only copies that evidence verbatim.
-        logger.warning(
-            "LLMManagedWriter falling back to deterministic writer for unit %s: %s",
-            request.unit_id, last_error,
+    def _draft_from_payload(
+        self,
+        payload: ManagedDraftPayload,
+        request: WriterRequest,
+    ) -> DocumentUnitDraft:
+        """Attach coordinator-owned identity/lifecycle fields to a payload."""
+        draft = DocumentUnitDraft(
+            unit_id=request.unit_id,
+            run_id=request.run_id,
+            generated_by="managed_writer",
+            content=payload.content,
+            proposed_value=payload.proposed_value,
+            typed_value=payload.typed_value,
+            assertions=payload.assertions,
+            evidence_ids=payload.evidence_ids,
+            proposed_status="draft",
+            validation_status="pending",
+            validation_notes=[],
         )
-        return _deterministic_draft(request)
+        self._validate_draft(draft, request)
+        return draft
 
-
-    def _parse_and_validate(self, response: str, request: WriterRequest) -> DocumentUnitDraft:
-        cleaned = _strip_code_fences(response)
-        try:
-            payload = json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"managed writer returned malformed JSON: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("managed writer response must be a JSON object")
-        missing = _DRAFT_FIELDS - set(payload)
-        extra = set(payload) - _DRAFT_FIELDS
-        if missing or extra:
+    def _validate_draft(self, draft: DocumentUnitDraft, request: WriterRequest) -> None:
+        if not draft.content or not draft.assertions or draft.typed_value is None:
             raise ValueError(
-                f"managed writer returned unsupported draft fields "
-                f"(missing={sorted(missing)}, extra={sorted(extra)})"
-            )
-        try:
-            draft = DocumentUnitDraft.model_validate(payload)
-        except Exception as exc:
-            raise ValueError(f"managed writer returned malformed draft: {exc}") from exc
-        if draft.unit_id != request.unit_id or draft.run_id != request.run_id:
-            raise ValueError(
-                f"managed writer returned a draft for a different unit or run "
-                f"(got unit={draft.unit_id!r} run={draft.run_id!r}, "
-                f"expected unit={request.unit_id!r} run={request.run_id!r})"
-            )
-        if (
-            draft.generated_by != "managed_writer"
-            or not draft.content
-            or not draft.assertions
-            or draft.typed_value is None
-            or draft.validation_status != "pending"
-            or draft.validation_notes
-        ):
-            raise ValueError(
-                f"managed writer returned an unsupported draft "
-                f"(generated_by={draft.generated_by!r}, "
-                f"content={'set' if draft.content else 'empty'}, "
-                f"assertions={len(draft.assertions)}, "
-                f"validation_status={draft.validation_status!r}, "
-                f"validation_notes={draft.validation_notes})"
+                "managed writer returned an unsupported draft "
+                f"(content={'set' if draft.content else 'empty'}, "
+                f"assertions={len(draft.assertions)}, typed_value={'set' if draft.typed_value else 'empty'})"
             )
         evidence = {str(item.get("id") or ""): item for item in request.evidence}
         if not set(draft.evidence_ids) or not set(draft.evidence_ids) <= set(evidence):
             raise ValueError(
-                f"managed writer draft is not grounded in supplied evidence "
+                "managed writer draft is not grounded in supplied evidence "
                 f"(draft_evidence_ids={draft.evidence_ids}, "
                 f"available_evidence_ids={sorted(evidence)})"
             )
@@ -289,11 +441,113 @@ class LLMManagedWriter:
         )
         if validated.validation_status != "supported":
             raise ValueError(
-                f"managed writer returned an ungrounded draft "
+                "managed writer returned an ungrounded draft "
                 f"(validator_status={validated.validation_status!r}, "
                 f"notes={validated.validation_notes})"
             )
-        return draft
+
+    def _fallback_draft(
+        self,
+        request: WriterRequest,
+        observations: list[dict[str, Any]],
+        *,
+        fallback_reason: str,
+        writer_mode: str,
+    ) -> DocumentUnitDraft:
+        logger.warning(
+            "LLMManagedWriter falling back to deterministic writer for unit %s: %s",
+            request.unit_id,
+            fallback_reason,
+        )
+        return _with_writer_metadata(
+            _deterministic_draft(request),
+            writer_mode=writer_mode,
+            observations=observations,
+            writer_fallback=True,
+            fallback_reason=fallback_reason,
+        )
+
+    def _parse_and_validate(self, response: str, request: WriterRequest) -> DocumentUnitDraft:
+        cleaned = _strip_code_fences(response)
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"managed writer returned malformed JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("managed writer response must be a JSON object")
+        owned_fields = set(ManagedDraftPayload.model_fields)
+        compatibility_fields = _DRAFT_COORDINATOR_FIELDS
+        unknown = set(payload) - owned_fields - compatibility_fields
+        missing = {"content", "typed_value", "assertions", "evidence_ids"} - set(payload)
+        if unknown or missing:
+            raise ValueError(
+                f"managed writer returned unsupported draft fields "
+                f"(missing={sorted(missing)}, extra={sorted(unknown)})"
+            )
+        # Legacy JSON clients sent coordinator-owned fields.  They are parsed
+        # only on this explicitly named compatibility path, then overwritten
+        # by the request-owned identity/status below.
+        try:
+            managed_payload = ManagedDraftPayload.model_validate({
+                key: value for key, value in payload.items() if key in owned_fields
+            })
+        except Exception as exc:
+            raise ValueError(f"managed writer returned malformed JSON payload: {exc}") from exc
+        return self._draft_from_payload(managed_payload, request)
+
+
+_DRAFT_COORDINATOR_FIELDS = {
+    "unit_id", "run_id", "generated_by", "proposed_status",
+    "validation_status", "validation_notes",
+}
+
+
+def _runtime_observation(
+    *,
+    attempt: int,
+    operation: str,
+    started: float,
+    model: Any | None,
+    result: Any | None = None,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    usage = getattr(result, "usage", None)
+    usage_returned = bool(getattr(usage, "usage_returned", False))
+    prompt_tokens = getattr(usage, "input_tokens", None) if usage_returned else None
+    completion_tokens = getattr(usage, "output_tokens", None) if usage_returned else None
+    total_tokens = getattr(usage, "total_tokens", None) if usage_returned else None
+    return {
+        "call": attempt,
+        "operation": operation,
+        "duration_seconds": time.monotonic() - started,
+        "provider": model_provider(model),
+        "model": model_name(model),
+        "status": "error" if error is not None else "success",
+        "usage_returned": usage_returned,
+        "prompt_tokens": prompt_tokens if prompt_tokens is not None else "unknown",
+        "completion_tokens": completion_tokens if completion_tokens is not None else "unknown",
+        "total_tokens": total_tokens if total_tokens is not None else "unknown",
+        "error_type": type(error).__name__ if error is not None else None,
+    }
+
+
+def _with_writer_metadata(
+    draft: DocumentUnitDraft,
+    *,
+    writer_mode: str,
+    observations: list[dict[str, Any]],
+    writer_fallback: bool = False,
+    fallback_reason: str | None = None,
+) -> DocumentUnitDraft:
+    metadata = dict(draft.metadata or {})
+    metadata.update({
+        "writer_mode": writer_mode,
+        "writer_fallback": bool(writer_fallback),
+        "fallback_reason": fallback_reason,
+    })
+    if observations:
+        metadata["llm_observations"] = observations
+    return draft.model_copy(update={"metadata": metadata})
 
 
 _CONNECTOR_PIN_TERM_RE = re.compile(

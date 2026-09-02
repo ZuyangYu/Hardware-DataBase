@@ -1,10 +1,11 @@
 """LLM-as-judge evidence reranker for the authoring harness.
 
 Reorders already-validated evidence by relevance to a requirement before it
-reaches the writer, closing P6 (no rerank). Mirrors ``QueryRewriter``: it reuses
-the shared ``LLMClient``, is gated by ``HarnessPolicy.allowed_tools``
-(``rerank_evidence``) at injection time, and degrades to a verbatim pass-through
-on any LLM/parse failure so old policies or unavailable LLMs never regress.
+reaches the writer, closing P6 (no rerank). Mirrors ``QueryRewriter``: it uses
+the shared chat-model runtime, is gated by ``HarnessPolicy.allowed_tools``
+(``rerank_evidence``) at injection time, and degrades to a verbatim
+pass-through on any LLM/parse failure so old policies or unavailable LLMs never
+regress.
 """
 
 from __future__ import annotations
@@ -12,23 +13,48 @@ from __future__ import annotations
 import json
 import logging
 
+from collections.abc import Callable
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from src.agents.claim_evidence import InformationRequirement
-from src.core.llm_client import LLMClient
+from src.core.chat_model_runtime import ChatModelLike, invoke_structured
+from src.core.model_factory import create_chat_model
 from src.document_authoring.writers.managed import _strip_code_fences
 
 
 logger = logging.getLogger(__name__)
 
 
+class EvidenceRankingPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    indices: list[int] = Field(default_factory=list)
+
+
 class EvidenceReranker:
-    """Rerank validated evidence by requirement relevance using the LLM."""
+    """Rerank validated evidence by requirement relevance using a chat model."""
 
     provider_id = "evidence_reranker"
 
-    def __init__(self, client: LLMClient | None = None):
-        self._client = client or LLMClient()
+    def __init__(
+        self,
+        model: ChatModelLike | None = None,
+        *,
+        model_factory: Callable[[], ChatModelLike] | None = None,
+    ):
+        self._model = model
+        self._model_factory = model_factory
+
+    def _get_model(self) -> ChatModelLike:
+        if self._model is None:
+            self._model = (
+                self._model_factory()
+                if self._model_factory is not None
+                else create_chat_model(profile="authoring_auxiliary")
+            )
+        return self._model
 
     def rerank(
         self,
@@ -45,16 +71,18 @@ class EvidenceReranker:
         if len(evidence) <= 1:
             return list(evidence)
         try:
-            response = self._client.chat(
+            result = invoke_structured(
+                self._get_model(),
+                EvidenceRankingPayload,
                 [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": _build_prompt(requirement, evidence)},
                 ],
-                usage_stage="evidence_rerank",
-                timeout=20,
-                rate_limit_max_retries=0,
+                operation="evidence_rerank",
+                profile="authoring_auxiliary",
+                text_fallback=_parse_text_ranking,
             )
-            ordered = _apply_ranking(response, evidence)
+            ordered = _apply_ranking_indices(result.value.indices, evidence)
         except Exception as exc:
             logger.warning(
                 "EvidenceReranker failed for %s: %s",
@@ -107,6 +135,19 @@ def _apply_ranking(response: str, evidence: list[dict[str, Any]]) -> list[dict[s
     parsed = json.loads(cleaned)
     if not isinstance(parsed, list):
         raise ValueError("rerank response is not a list")
+    return _apply_ranking_indices(parsed, evidence)
+
+
+def _parse_text_ranking(response: str) -> dict[str, list[int]]:
+    cleaned = _strip_code_fences(str(response or "")).strip()
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, list):
+        raise ValueError("rerank response is not a list")
+    return {"indices": parsed}
+
+
+def _apply_ranking_indices(parsed: list[Any], evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply validated or compatibility indices while preserving all evidence."""
     ordered_idx: list[int] = []
     seen: set[int] = set()
     for item in parsed:

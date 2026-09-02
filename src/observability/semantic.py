@@ -34,6 +34,7 @@ METRIC_LABEL_KEYS = {
     "stage",
     "queue",
     "operation",
+    "tool",
     "metric",
     "provider",
     "streaming",

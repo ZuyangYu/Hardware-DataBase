@@ -25,6 +25,7 @@ from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
+from src.document_authoring.harness.idempotency import human_decision_key
 from src.document_authoring.icd_generation import render_icd_front_views
 from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.icd_validation import validate_icd_pin_set
@@ -41,6 +42,7 @@ from src.document_authoring.models import (
     LegacyTemplateClaim,
     DocumentSchema,
     DocumentWorkOrder,
+    compute_input_fingerprint_v2,
     RendererPolicy,
     TemplateSanitizationReport,
     TemplateUnitBinding,
@@ -80,7 +82,6 @@ from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.worker import DocumentGenerationWorker
 from src.document_authoring.writers.managed import DeterministicEvidenceWriter, LLMManagedWriter, ManagedWriter
-from src.core.llm_client import LLMClient
 from src.pipelines.document_rag.schemas import RequestContext
 from src.projects.service import ProjectService
 
@@ -173,7 +174,7 @@ class DocumentGenerationService:
         self.validator = DocumentValidator()
         self.worker = worker or DocumentGenerationWorker()
         self.harness_runtime = InternalDocumentHarnessRuntime(self.store, self.validator)
-        self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider(LLMClient())
+        self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider()
 
     @staticmethod
     def _require_template_kb_scope(
@@ -639,6 +640,7 @@ class DocumentGenerationService:
         *,
         analysis_id: str,
         display_name: str,
+        execution_mode: str | None = None,
     ) -> TemplateVersion:
         analysis = self.store.get_template_analysis_by_id(analysis_id)
         if analysis is None:
@@ -659,16 +661,22 @@ class DocumentGenerationService:
             raise ValueError("template content hash changed since analysis")
         analysis.validate_suggestions()
         regions, bindings = self._regions_and_bindings(template, analysis)
+        inferred_execution_mode = "internal_harness" if analysis.suggestions else "deterministic_only"
+        requested_execution_mode = execution_mode or inferred_execution_mode
+        if requested_execution_mode not in {
+            "deterministic_only", "internal_harness", "external_agent"
+        }:
+            raise ValueError("unsupported document execution mode")
         schema = DocumentSchema(
             document_schema_id=template.template_schema_id,
             version=template.template_schema_version,
             document_type=display_name.strip() or template.template_id,
             fields=[
-                self._field_for_suggestion(suggestion)
+                self._field_for_suggestion(suggestion, analysis.units)
                 for suggestion in analysis.suggestions
             ],
             status="approved",
-            execution_mode="internal_harness" if analysis.suggestions else "deterministic_only",
+            execution_mode=requested_execution_mode,
         )
         approved = template.model_copy(update={
             "status": "approved", "approved_by": ctx.user_id,
@@ -693,6 +701,9 @@ class DocumentGenerationService:
         idempotency_key: str | None = None,
         processing_artifact_ids: list[str] | None = None,
         harness_policy_id: str | None = None,
+        execution_mode: str | None = None,
+        generation_session_id: str | None = None,
+        generation_brief: dict[str, Any] | None = None,
     ) -> DocumentWorkOrder:
         tenant_id = ctx.tenant_id or "default"
         self.projects.access.require(ctx, project_id, "create_work_order")
@@ -705,6 +716,7 @@ class DocumentGenerationService:
             document_schema_id,
             document_schema_version,
             harness_policy_id,
+            execution_mode,
         )
         baseline = self.projects.store.get_baseline(baseline_id, tenant_id)
         if baseline is None:
@@ -723,6 +735,9 @@ class DocumentGenerationService:
             document_schema_version=document_schema_version,
             idempotency_key=idempotency_key,
             harness_policy_id=harness_policy_id,
+            execution_mode=execution_mode,
+            generation_session_id=generation_session_id,
+            generation_brief=generation_brief,
         )
 
     def create_knowledge_base_work_order(
@@ -735,9 +750,14 @@ class DocumentGenerationService:
         document_schema_id: str,
         document_schema_version: str,
         idempotency_key: str | None = None,
+        harness_policy_id: str | None = None,
+        execution_mode: str | None = None,
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
     ) -> DocumentWorkOrder:
+        # Work-order creation only snapshots sources the caller can read.
+        # Execution, approval, resume and artifact actions re-check write
+        # access at their own mutation boundaries.
         if not ctx.has_kb_permission(knowledge_base_name, "read"):
             raise PermissionError("knowledge base read permission is required")
         tenant_id = ctx.tenant_id or "default"
@@ -754,6 +774,8 @@ class DocumentGenerationService:
             template_version_id,
             document_schema_id,
             document_schema_version,
+            harness_policy_id,
+            execution_mode,
         )
         snapshot = self._create_knowledge_base_source_snapshot(
             ctx, knowledge_base_name, source_names
@@ -768,6 +790,8 @@ class DocumentGenerationService:
                 document_schema_id=document_schema_id,
                 document_schema_version=document_schema_version,
                 idempotency_key=idempotency_key,
+                harness_policy_id=harness_policy_id,
+                execution_mode=execution_mode,
                 generation_session_id=generation_session_id,
                 generation_brief=generation_brief,
             )
@@ -807,6 +831,8 @@ class DocumentGenerationService:
             generation_brief=original.generation_brief,
             restart_of_work_order_id=original.work_order_id,
             max_parallel_units=max_parallel_units,
+            execution_mode=original.execution_mode,
+            harness_policy_id=original.harness_policy_id,
         )
 
     def _find_knowledge_base_work_order_by_idempotency(
@@ -840,6 +866,7 @@ class DocumentGenerationService:
         knowledge_base_name: str | None = None,
         idempotency_key: str | None = None,
         harness_policy_id: str | None = None,
+        execution_mode: str | None = None,
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
          restart_of_work_order_id: str | None = None,
@@ -851,10 +878,15 @@ class DocumentGenerationService:
             raise ValueError(
                 "document generation requires approved template and document schema"
             )
-        if schema.execution_mode not in {"deterministic_only", "internal_harness"}:
-            raise ValueError("external-agent work orders are not enabled before P3")
+        if schema.execution_mode not in {
+            "deterministic_only", "internal_harness", "external_agent"
+        }:
+            raise ValueError("unsupported document execution mode")
+        if execution_mode is not None and execution_mode != schema.execution_mode:
+            raise ValueError("requested execution_mode does not match the approved schema")
+        requested_executor = execution_mode or schema.execution_mode
         harness_policy = None
-        if schema.execution_mode == "internal_harness":
+        if requested_executor in {"internal_harness", "external_agent"}:
             if harness_policy_id:
                 harness_policy = self.store.get_harness_policy(harness_policy_id)
             else:
@@ -862,7 +894,7 @@ class DocumentGenerationService:
                 harness_policy_id = harness_policy.harness_policy_id
             if harness_policy is None or harness_policy.status != "approved":
                 raise ValueError(
-                    "internal-harness work orders require an approved HarnessPolicy"
+                    "Harness-backed work orders require an approved HarnessPolicy"
                 )
         is_knowledge_base = scope_type == "knowledge_base"
         order = DocumentWorkOrder(
@@ -892,9 +924,10 @@ class DocumentGenerationService:
             retrieval_policy_version="1",
             renderer_policy_version=self._policy(template).version,
             target_format=template.format,
-            execution_mode=schema.execution_mode,
+            execution_mode=requested_executor,
             harness_policy_id=harness_policy_id,
             harness_policy_version=harness_policy.version if harness_policy else None,
+            requested_executor=requested_executor,
             unit_statuses={
                 **{item.field_id: "planned" for item in schema.fields},
                 **{item.review_item_id: "planned" for item in schema.review_items},
@@ -905,6 +938,12 @@ class DocumentGenerationService:
             generation_brief=dict(generation_brief or {}),
              restart_of_work_order_id=restart_of_work_order_id,
         )
+        # New work orders use the v2 preimage, which binds the immutable
+        # executor choice. Historical rows remain v1 and are migrated by 5b.
+        order = order.model_copy(update={
+            "input_fingerprint_version": 2,
+            "input_fingerprint": compute_input_fingerprint_v2(order),
+        })
         return self.store.create_work_order(order)
 
     def _validate_work_order_definition(
@@ -913,6 +952,7 @@ class DocumentGenerationService:
         document_schema_id: str,
         document_schema_version: str,
         harness_policy_id: str | None = None,
+        execution_mode: str | None = None,
     ) -> None:
         template = self._template(template_version_id)
         schema = self._schema(document_schema_id, document_schema_version)
@@ -920,13 +960,17 @@ class DocumentGenerationService:
             raise ValueError(
                 "document generation requires approved template and document schema"
             )
-        if schema.execution_mode not in {"deterministic_only", "internal_harness"}:
-            raise ValueError("external-agent work orders are not enabled before P3")
-        if schema.execution_mode == "internal_harness" and harness_policy_id:
+        if schema.execution_mode not in {
+            "deterministic_only", "internal_harness", "external_agent"
+        }:
+            raise ValueError("unsupported document execution mode")
+        if execution_mode is not None and execution_mode != schema.execution_mode:
+            raise ValueError("requested execution_mode does not match the approved schema")
+        if schema.execution_mode in {"internal_harness", "external_agent"} and harness_policy_id:
             policy = self.store.get_harness_policy(harness_policy_id)
             if policy is None or policy.status != "approved":
                 raise ValueError(
-                    "internal-harness work orders require an approved HarnessPolicy"
+                    "work orders using a Harness executor require an approved HarnessPolicy"
                 )
 
     def auto_generate_document(
@@ -1182,6 +1226,7 @@ class DocumentGenerationService:
         *,
         retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome],
         writer: ManagedWriter | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> DocumentArtifact:
         order = self._order(ctx, work_order_id, "run_deterministic_work_order")
         scope_review = self.store.get_icd_scope_review(work_order_id)
@@ -1191,8 +1236,8 @@ class DocumentGenerationService:
                 raise ValueError("ICD scope review source snapshot differs from the work order")
             if scope_review.pending_count:
                 raise ValueError("unresolved ICD scope exceptions block Harness execution")
-        if order.execution_mode != "internal_harness" or not order.harness_policy_id:
-            raise ValueError("work order is not configured for the internal Harness")
+        if order.execution_mode not in {"internal_harness", "external_agent"} or not order.harness_policy_id:
+            raise ValueError("work order is not configured for a Harness executor")
         if order.status not in {"planned", "retrieving", "blocked", "waiting_human_input"}:
             raise ValueError(f"work order cannot run from status {order.status}")
         policy = self.store.get_harness_policy(order.harness_policy_id, order.harness_policy_version)
@@ -1214,12 +1259,14 @@ class DocumentGenerationService:
                 work_order=order, run=run, manifest=manifest, policy=policy, schema=schema, snapshot=snapshot,
                 legacy_claims=self.store.list_legacy_template_claims(template.template_version_id),
                 writer=writer, retrieve=retrieve, rewriter=rewriter, reranker=reranker,
-                fit_checker=fit_checker,
+                fit_checker=fit_checker, should_cancel=should_cancel,
             )
         except Exception:
             current_run = self.store.get_harness_run(run.harness_run_id)
             if current_run is not None and current_run.status == "failed":
                 self._replace_order(order, status="blocked")
+            elif current_run is not None and current_run.status == "cancelled":
+                self._replace_order(order, status="cancelled")
             raise
         return self._finalize_internal_harness_safely(
             order,
@@ -1231,8 +1278,6 @@ class DocumentGenerationService:
     def pause_harness_run(self, ctx: RequestContext, harness_run_id: str):
         run = self._harness_run_for_context(ctx, harness_run_id)
         paused = self.store.request_harness_run_state(harness_run_id, "paused")
-        if paused.checkpoint_id:
-            self.store.finalize_harness_checkpoint(paused.checkpoint_id, "paused")
         order = self._order_raw(run.work_order_id)
         if order.status != "cancelled":
             self._replace_order(order, status="paused")
@@ -1241,8 +1286,6 @@ class DocumentGenerationService:
     def cancel_harness_run(self, ctx: RequestContext, harness_run_id: str):
         run = self._harness_run_for_context(ctx, harness_run_id)
         cancelled = self.store.request_harness_run_state(harness_run_id, "cancelled")
-        if cancelled.checkpoint_id:
-            self.store.finalize_harness_checkpoint(cancelled.checkpoint_id, "cancelled")
         order = self._order_raw(run.work_order_id)
         self._replace_order(order, status="cancelled")
         return cancelled
@@ -1268,11 +1311,12 @@ class DocumentGenerationService:
         *,
         retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome],
         writer: ManagedWriter | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> DocumentArtifact:
         run = self._harness_run_for_context(ctx, harness_run_id)
         order = self._order_raw(run.work_order_id)
-        if order.execution_mode != "internal_harness" or not order.harness_policy_id:
-            raise ValueError("work order is not configured for the internal Harness")
+        if order.execution_mode not in {"internal_harness", "external_agent"} or not order.harness_policy_id:
+            raise ValueError("work order is not configured for a Harness executor")
         snapshot = self.resolve_source_snapshot(order)
         scope_review = self.store.get_icd_scope_review(order.work_order_id)
         if scope_review is not None:
@@ -1307,12 +1351,14 @@ class DocumentGenerationService:
                 work_order=order, run=run, manifest=manifest, policy=policy, schema=schema, snapshot=snapshot,
                 legacy_claims=self.store.list_legacy_template_claims(template.template_version_id),
                 writer=writer, retrieve=retrieve, rewriter=rewriter, reranker=reranker,
-                fit_checker=fit_checker,
+                fit_checker=fit_checker, should_cancel=should_cancel,
             )
         except Exception:
             current_run = self.store.get_harness_run(run.harness_run_id)
             if current_run is not None and current_run.status == "failed":
                 self._replace_order(order, status="blocked")
+            elif current_run is not None and current_run.status == "cancelled":
+                self._replace_order(order, status="cancelled")
             raise
         return self._finalize_internal_harness_safely(
             order,
@@ -1320,6 +1366,68 @@ class DocumentGenerationService:
             run.harness_run_id,
             result,
         )
+
+    def resolve_agent_human_decision(
+        self,
+        ctx: RequestContext,
+        harness_run_id: str,
+        *,
+        pending_event_id: str,
+        proposal_hash: str,
+        decision: str,
+        retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome] | None = None,
+        writer: ManagedWriter | None = None,
+    ) -> dict[str, Any]:
+        """Consume a low-confidence proposal decision on the same HarnessRun.
+
+        The Store performs the tenant/hash/expiry/single-use check and fences
+        the state transition.  Approval may then resume the same logical run;
+        it never creates a second business run.  A missing retriever leaves an
+        approved run in ``retrying`` for an explicit worker retry rather than
+        pretending that approval completed generation.
+        """
+        run = self._harness_run_for_context(ctx, harness_run_id)
+        order = self._order_raw(run.work_order_id)
+        if order.scope_type == "knowledge_base":
+            if not order.knowledge_base_name or not ctx.has_kb_permission(order.knowledge_base_name, "write"):
+                raise PermissionError("knowledge base write permission is required for an agent decision")
+        try:
+            decision_key = human_decision_key(
+                harness_run_id=run.harness_run_id,
+                pending_event_id=str(pending_event_id),
+                proposal_hash=str(proposal_hash),
+                decision=decision,
+            )
+        except ValueError:
+            raise
+        updated, event = self.store.resolve_harness_human_decision(
+            run.harness_run_id,
+            pending_event_id=str(pending_event_id),
+            proposal_hash=str(proposal_hash),
+            decision=decision,
+            decision_key=decision_key,
+            actor_id=str(ctx.user_id),
+            tenant_id=ctx.tenant_id or "default",
+        )
+        result: dict[str, Any] = {
+            "decision": str(decision).strip().casefold(),
+            "decision_key": decision_key,
+            "event_id": event.event_id,
+            "harness_run": updated.model_dump(mode="json"),
+        }
+        if str(decision).strip().casefold() != "approve" or retrieve is None:
+            return result
+        artifact = self.resume_internal_harness(
+            ctx,
+            run.harness_run_id,
+            retrieve=retrieve,
+            writer=writer,
+        )
+        result["artifact"] = artifact.model_dump(mode="json") if hasattr(artifact, "model_dump") else artifact
+        latest = self.store.get_harness_run(run.harness_run_id)
+        if latest is not None:
+            result["harness_run"] = latest.model_dump(mode="json")
+        return result
 
     def _finalize_internal_harness_safely(
         self,
@@ -1376,6 +1484,7 @@ class DocumentGenerationService:
         harness_run_id: str,
         result,
     ) -> DocumentArtifact:
+        blocked_fields = self._block_generation_fields(order, result)
         bindings = self.store.list_unit_bindings(order.template_schema_id, order.template_schema_version)
         binding_by_unit = {binding.semantic_unit_id: binding for binding in bindings}
         fills = self._semantic_fills(template, result.drafts, result.unit_statuses, binding_by_unit)
@@ -1398,6 +1507,8 @@ class DocumentGenerationService:
         )
         self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
         report = self._append_icd_validation_issues(report, front_view_issues)
+        if blocked_fields:
+            report = self._append_block_generation_issues(report, blocked_fields)
         self.store.save_validation_report(report)
         artifact = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=order.tenant_id,
@@ -1411,6 +1522,21 @@ class DocumentGenerationService:
             result.unit_statuses,
             auto_publish_verified=src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED,
         )
+        if blocked_fields:
+            # Coordinator-level block_generation: unresolved required missing /
+            # conflicts under a confirmed block_generation brief never reach
+            # rendering or automatic publication. The review/status record and
+            # queries stay available while a human decides.
+            self._replace_order(
+                order, status="blocked", unit_statuses=result.unit_statuses,
+                evidence_matrix_id=f"matrix-{order.work_order_id}",
+                validation_report_id=report.validation_report_id,
+                error_code="block_generation_unresolved_missing",
+                error_message=f"confirmed brief blocks release for: {sorted(blocked_fields)}",
+                retryable=False,
+                next_actions=["provide_value", "view_error"],
+            )
+            return artifact
         if (
             _automatic_release_allowed(order, report, requires_review=requires_review)
         ):
@@ -1429,6 +1555,52 @@ class DocumentGenerationService:
             evidence_matrix_id=f"matrix-{order.work_order_id}", validation_report_id=report.validation_report_id,
         )
         return artifact
+
+    def _block_generation_fields(self, order: DocumentWorkOrder, result) -> list[str]:
+        """Fields whose confirmed brief forces block_generation on unresolved
+        required missing/conflicts. Data-complete runs are never blocked."""
+        from src.document_authoring.harness.agent_contracts import (
+            effective_missing_policy,
+            normalize_clarification_policy,
+        )
+
+        brief = dict(order.generation_brief or {})
+        if not brief.get("confirmed"):
+            return []
+        brief_missing = normalize_clarification_policy(
+            "missing_data_policy", brief.get("missing_data_policy")
+        )
+        if brief_missing != "block_generation":
+            return []
+        schema = self.store.get_document_schema(
+            order.document_schema_id, order.document_schema_version
+        )
+        if schema is None:
+            return []
+        missing_statuses = {"requires_human", "blocked", "conflicting", "retrieval_failed", "insufficient_evidence", "tbd"}
+        blocked: list[str] = []
+        for field in schema.fields:
+            unit_id = f"field:{field.field_id}"
+            status = result.unit_statuses.get(unit_id)
+            if (
+                field.required
+                and effective_missing_policy(brief_missing, field.missing_policy) == "block_section"
+                and status in missing_statuses
+            ):
+                blocked.append(field.field_id)
+        return blocked
+
+    def _append_block_generation_issues(self, report, blocked_fields: list[str]):
+        issues = list(getattr(report, "issues", []) or [])
+        for field_id in blocked_fields:
+            issues.append({
+                "code": "block_generation_unresolved_missing",
+                "field_id": field_id,
+                "message": "confirmed brief blocks release until this required field resolves",
+                "severity": "blocking",
+            })
+        return report.model_copy(update={"issues": issues, "status": "requires_human"}) \
+            if hasattr(report, "model_copy") else report
 
     def _auto_publish_verified_candidate(
         self,
@@ -1764,7 +1936,7 @@ class DocumentGenerationService:
     def _schema_harness_policy(self, schema: DocumentSchema, *, max_parallel_units: int = 3) -> HarnessPolicy:
         """Persist the bounded policy required by one approved semantic schema."""
         unit_count = (
-            sum(field.authoring_policy == "managed_writer" for field in schema.fields)
+            sum(field.authoring_policy in {"managed_writer", "external_agent_draft"} for field in schema.fields)
             + sum(item.evaluation_mode == "semantic_assisted" for item in schema.review_items)
         )
         attempts = _DEFAULT_RETRIEVAL_ATTEMPTS_PER_UNIT
@@ -1797,15 +1969,55 @@ class DocumentGenerationService:
             # each _step call keep the actual usage well below this ceiling.
             lease_seconds=max(300, unit_count * 120),
             writer_provider_id=LLMManagedWriter.provider_id,
+            agent_tools=(
+                [
+                    "read_field_brief", "retrieve_evidence", "propose_field_value", "mark_missing",
+                ]
+                if schema.execution_mode == "external_agent" else []
+            ),
         ))
 
     @staticmethod
-    def _field_for_suggestion(suggestion) -> Any:
+    def _field_for_suggestion(suggestion, units: list | None = None) -> Any:
+        from src.document_authoring.contract_registry import (
+            normalized_missing_policy,
+            normalized_source_roles,
+            normalized_value_type,
+            supported_capabilities,
+        )
         from src.document_authoring.models import DocumentFieldSchema
+        from src.document_authoring.template_analysis import infer_field_contract
 
+        inferred = infer_field_contract(suggestion, units or [])
+        llm_eligible = suggestion.confidence >= 0.7
+        value_type = normalized_value_type(
+            suggestion.value_type if llm_eligible else None
+        ) or normalized_value_type(inferred["value_type"]) or "text"
+        raw_capabilities = list(suggestion.required_capabilities or []) or list(inferred["required_capabilities"])
+        capabilities, unsupported = supported_capabilities(raw_capabilities)
+        if unsupported:
+            import logging
+            logging.getLogger(__name__).warning(
+                "suggestion %s carries unsupported capabilities %s; kept deterministic set",
+                suggestion.semantic_unit_id, unsupported,
+            )
+            capabilities, _ = supported_capabilities(list(inferred["required_capabilities"]))
+        missing_policy = normalized_missing_policy(
+            suggestion.missing_policy if llm_eligible else None
+        ) or normalized_missing_policy(inferred["missing_policy"]) or "mark_tbd"
+        description = suggestion.description or inferred["description"]
         return DocumentFieldSchema(
             field_id=suggestion.semantic_unit_id,
             label=suggestion.label,
+            description=description,
+            value_type=value_type,
+            required_capabilities=capabilities,
+            preferred_source_roles=normalized_source_roles(
+                suggestion.preferred_source_roles if llm_eligible else inferred["preferred_source_roles"]
+            ),
+            missing_policy=missing_policy,
+            allow_derivation=bool(suggestion.allow_derivation) if llm_eligible else inferred["allow_derivation"],
+            max_evidence_items=5,
             retrieval_policy_id=f"retrieval-{suggestion.semantic_unit_id}",
             verification_policy_id=f"verification-{suggestion.semantic_unit_id}",
             query_terms=list(suggestion.retrieval_terms),
@@ -1866,7 +2078,12 @@ class DocumentGenerationService:
         if policy.writer_provider_id == DeterministicEvidenceWriter.provider_id:
             return ManagedWriter(DeterministicEvidenceWriter())
         if policy.writer_provider_id == LLMManagedWriter.provider_id:
-            return ManagedWriter(LLMManagedWriter())
+            # Production managed writing is backed by the shared LangChain
+            # model factory. The normal service path probes native structured
+            # output first and keeps compatibility behavior inside the writer.
+            from src.core.model_factory import create_chat_model
+
+            return ManagedWriter(LLMManagedWriter(model=create_chat_model()))
         raise PermissionError("approved HarnessPolicy references an unsupported managed writer provider")
 
     @staticmethod

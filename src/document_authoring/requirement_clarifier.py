@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from src.document_authoring.generation_sessions import (
+    ClarificationAnswer,
     ClarificationMessage,
     GenerationBrief,
 )
+from src.document_authoring.harness.agent_contracts import normalize_clarification_policy
 
 
 class RequirementClarifier:
@@ -64,15 +66,32 @@ class RequirementClarifier:
             raise ValueError("clarification answer is required")
 
         updates: dict[str, Any]
+        previous_answers = [a for a in brief.clarification_answers if a.question_id != question_id]
         if question_id == "scope.revision":
             updates = {"scope": {**brief.scope, "revision": normalized}}
+            previous_answers.append(ClarificationAnswer(
+                question_id=question_id, raw_answer=normalized, normalized_answer=normalized,
+            ))
         elif question_id == "missing_data_policy":
-            updates = {"missing_data_policy": normalized}
+            canonical = normalize_clarification_policy(question_id, normalized)
+            if canonical is None:
+                raise ValueError(f"invalid missing_data_policy answer: {normalized}")
+            updates = {"missing_data_policy": canonical}
+            previous_answers.append(ClarificationAnswer(
+                question_id=question_id, raw_answer=normalized, normalized_answer=canonical,
+            ))
         elif question_id == "inference_policy":
-            updates = {"inference_policy": normalized}
+            canonical = normalize_clarification_policy(question_id, normalized)
+            if canonical is None:
+                raise ValueError(f"invalid inference_policy answer: {normalized}")
+            updates = {"inference_policy": canonical}
+            previous_answers.append(ClarificationAnswer(
+                question_id=question_id, raw_answer=normalized, normalized_answer=canonical,
+            ))
         else:
             raise ValueError("unknown clarification question")
 
+        updates["clarification_answers"] = previous_answers
         answered = sum([
             bool(brief.scope.get("revision")),
             bool(brief.missing_data_policy),

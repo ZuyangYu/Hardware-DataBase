@@ -46,6 +46,24 @@ export interface UploadAck {
   messages: string[];
 }
 
+/**
+ * Versioned reference passed from the chat shell to document-authoring tools.
+ *
+ * The field is intentionally optional at every API boundary below: older
+ * servers do not persist or return document context yet, while the enabled
+ * bridge can still send this stable object without changing the legacy chat
+ * payload when no template has been attached.
+ */
+export interface DocumentContext {
+  analysis_id: string;
+  template_version_id: string;
+  knowledge_base_name: string;
+  version: string | number;
+  expiry: string;
+  client_request_id: string;
+  generation_session_id?: string | null;
+}
+
 export interface AssetEvidenceView {
   id: number;
   file_id: string;
@@ -122,6 +140,8 @@ export interface SessionView {
   title: string;
   created_at: string;
   updated_at: string;
+  /** Optional until the conversation API exposes persisted document context. */
+  document_context?: DocumentContext | null;
 }
 
 export interface MemoryContextItem {
@@ -147,6 +167,8 @@ export interface MessageView {
   edited_at?: string | null;
   created_at: string;
   memory_context?: MemoryContextItem[];
+  /** Optional future projection; current servers omit this field. */
+  document_context?: DocumentContext | null;
 }
 
 export interface SessionMemorySummary {
@@ -173,6 +195,18 @@ export interface TurnView {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  /** Optional until Task 8 adds turn-context persistence to the API. */
+  document_context?: DocumentContext | null;
+}
+
+/** Request body accepted by the persistent turn endpoint. */
+export interface CreateTurnRequest {
+  query: string;
+  client_request_id?: string | null;
+  query_mode?: 'fast' | 'deep';
+  document_context?: DocumentContext | null;
+  /** Explicit document-flow override; sent only alongside document_context; absent keeps the server's regex fallback. */
+  document_flow?: boolean;
 }
 
 export interface TurnStartResponse {
@@ -847,6 +881,9 @@ export type DocumentAnalysis = {
   suggestions: DocumentSuggestion[];
   reason_codes?: string[];
   auto_activated?: boolean;
+  /** Optional server-provided context lifetime; older responses omit it. */
+  expiry?: string | null;
+  expires_at?: string | null;
 };
 
 export type TemplateReviewUnit = DocumentUnit & {

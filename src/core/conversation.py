@@ -6,6 +6,7 @@ import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import src.settings
 
@@ -24,6 +25,7 @@ class ChatSession:
     title: str
     created_at: str
     updated_at: str
+    document_context: dict | None = None
 
 
 @dataclass
@@ -37,6 +39,7 @@ class ChatMessage:
     edited_at: str | None = None
     redacted: bool = False
     memory_context: list[dict] = field(default_factory=list)
+    document_context: dict | None = None
 
 
 @dataclass
@@ -66,6 +69,7 @@ class ChatTurn:
     created_at: str
     started_at: str | None
     finished_at: str | None
+    document_context: dict | None = None
 
 
 @dataclass
@@ -101,6 +105,7 @@ class ConversationService:
                     department_id INTEGER,
                     kb_id INTEGER,
                     title TEXT NOT NULL,
+                    document_context_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -144,6 +149,7 @@ class ConversationService:
                     footer TEXT NOT NULL DEFAULT '',
                     metrics_json TEXT NOT NULL DEFAULT '{}',
                     trace_context_json TEXT NOT NULL DEFAULT '{}',
+                    document_context_json TEXT NOT NULL DEFAULT '{}',
                     error_message TEXT NOT NULL DEFAULT '',
                     worker_id TEXT NOT NULL DEFAULT '',
                     worker_heartbeat_at TEXT,
@@ -192,6 +198,7 @@ class ConversationService:
             """)
             self._ensure_column(conn, "chat_sessions", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "kb_id", "INTEGER")
+            self._ensure_column(conn, "chat_sessions", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
             self._ensure_column(conn, "chat_turns", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "kb_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "worker_id", "TEXT NOT NULL DEFAULT ''")
@@ -200,6 +207,7 @@ class ConversationService:
             self._ensure_column(conn, "chat_turns", "query_mode", "TEXT NOT NULL DEFAULT 'fast'")
             self._ensure_column(conn, "chat_turns", "metrics_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "chat_turns", "trace_context_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "chat_turns", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
             self._ensure_column(conn, "chat_messages", "edited_at", "TEXT")
             self._ensure_column(conn, "chat_messages", "redacted", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "chat_sessions", "auto_memory", "INTEGER NOT NULL DEFAULT 1")
@@ -345,7 +353,8 @@ class ConversationService:
             rows = conn.execute(
                 """
                 SELECT m.*, COALESCE(t.footer, '') AS footer,
-                       COALESCE(t.summary_json, '{}') AS turn_summary
+                       COALESCE(t.summary_json, '{}') AS turn_summary,
+                       COALESCE(t.document_context_json, '{}') AS turn_document_context
                 FROM chat_messages m
                 LEFT JOIN chat_turns t ON t.assistant_message_id = m.id
                 WHERE m.session_id = ?
@@ -640,6 +649,7 @@ class ConversationService:
         client_request_id: str | None = None,
         query_mode: str = "fast",
         trace_context: dict[str, str] | None = None,
+        document_context: dict | Any | None = None,
     ) -> ChatTurn:
         """Persist one user request and its assistant placeholder atomically.
 
@@ -651,6 +661,13 @@ class ConversationService:
             raise ValueError("query must not be empty")
         request_id = (client_request_id or "").strip()[:128] or None
         query_mode = query_mode if query_mode in {"fast", "deep"} else "fast"
+        if hasattr(document_context, "model_dump"):
+            document_context = document_context.model_dump(mode="json")
+        if document_context is not None and not isinstance(document_context, dict):
+            raise ValueError("document_context must be an object")
+        document_context_json = json.dumps(
+            document_context or {}, ensure_ascii=False, sort_keys=True, default=str,
+        )
         now = utc_now()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -680,8 +697,15 @@ class ConversationService:
                     (session_id, now),
                 )
                 conn.execute(
-                    "UPDATE chat_sessions SET updated_at = ?, title = CASE WHEN title = '新对话' THEN ? ELSE title END WHERE id = ?",
-                    (now, query.replace("\n", " ")[:32] or "新对话", session_id),
+                    """UPDATE chat_sessions
+                       SET updated_at = ?,
+                           title = CASE WHEN title = '新对话' THEN ? ELSE title END,
+                           document_context_json = CASE WHEN ? = '{}' THEN document_context_json ELSE ? END
+                       WHERE id = ?""",
+                    (
+                        now, query.replace("\n", " ")[:32] or "新对话",
+                        document_context_json, document_context_json, session_id,
+                    ),
                 )
                 turn_id = str(uuid.uuid4())
                 conn.execute(
@@ -689,7 +713,8 @@ class ConversationService:
                     INSERT INTO chat_turns (
                         id, session_id, user_message_id, assistant_message_id, kb_name, query, query_mode,
                         department_id, kb_id, status, client_request_id, trace_context_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                        , document_context_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -704,6 +729,7 @@ class ConversationService:
                         request_id,
                         json.dumps(trace_context or {}, ensure_ascii=False),
                         now,
+                        document_context_json,
                     ),
                 )
                 row = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
@@ -1147,6 +1173,11 @@ def utc_now() -> str:
 
 
 def row_to_session(row) -> ChatSession:
+    try:
+        raw_context = json.loads(row["document_context_json"] or "{}") if "document_context_json" in row.keys() else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_context = {}
+    context = raw_context if isinstance(raw_context, dict) and raw_context else None
     return ChatSession(
         id=int(row["id"]),
         user_id=int(row["user_id"]),
@@ -1156,6 +1187,7 @@ def row_to_session(row) -> ChatSession:
         title=row["title"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        document_context=context,
     )
 
 
@@ -1171,6 +1203,11 @@ def row_to_message(row) -> ChatMessage:
         candidate = summary.get("memory_context") if isinstance(summary, dict) else None
         if isinstance(candidate, list):
             memory_context = [item for item in candidate if isinstance(item, dict)]
+    try:
+        raw_context = json.loads(row["turn_document_context"] or "{}") if "turn_document_context" in row.keys() else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_context = {}
+    document_context = raw_context if isinstance(raw_context, dict) and raw_context else None
     legacy_suffix = f"\n\n---\n{footer}" if footer else ""
     if legacy_suffix and content.endswith(legacy_suffix):
         content = content[:-len(legacy_suffix)]
@@ -1184,6 +1221,7 @@ def row_to_message(row) -> ChatMessage:
         edited_at=row["edited_at"] if "edited_at" in row.keys() else None,
         redacted=bool(row["redacted"]) if "redacted" in row.keys() else False,
         memory_context=memory_context,
+        document_context=document_context,
     )
 
 
@@ -1202,6 +1240,14 @@ def row_to_turn(row) -> ChatTurn:
         trace_context = {}
     if not isinstance(trace_context, dict):
         trace_context = {}
+    try:
+        raw_document_context = (
+            json.loads(row["document_context_json"] or "{}")
+            if "document_context_json" in row.keys() else {}
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_document_context = {}
+    document_context = raw_document_context if isinstance(raw_document_context, dict) and raw_document_context else None
     return ChatTurn(
         id=row["id"],
         session_id=int(row["session_id"]),
@@ -1228,4 +1274,5 @@ def row_to_turn(row) -> ChatTurn:
         created_at=row["created_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+        document_context=document_context,
     )

@@ -91,6 +91,9 @@ class DocumentGenerationEvalRecord(BaseModel):
     allowed_sources: list[str] = Field(min_length=1)
     required: bool = True
     critical: bool = True
+    expected_value_type: str | None = None
+    expected_missing_policy: Literal["mark_tbd", "keep_blank", "block_section"] | None = None
+    evidence_rationale: str | None = None
 
     @field_validator("id", "template_fixture", "field_id", "expected_value")
     @classmethod
@@ -148,6 +151,13 @@ class DocumentGenerationSnapshot(BaseModel):
     source_scope_violation_count: int = Field(default=0, ge=0)
     unsupported_required_field_fill_count: int = Field(default=0, ge=0)
     auto_approved: bool = False
+    typed_value_ok: bool | None = None
+    writer_mode: str | None = None
+    writer_fallback: bool = False
+    requires_human: bool = False
+    llm_calls: int | None = None
+    duration_seconds: float | None = None
+    token_usage: dict[str, Any] = Field(default_factory=dict)
 
 
 class MetricResult(BaseModel):

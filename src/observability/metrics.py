@@ -235,3 +235,41 @@ def record_authoring_unit(*, operation: str, status: str, duration_s: float | No
     counter("hdb.authoring.unit.outcome", attributes={"operation": operation, "status": status}, description="Authoring unit outcomes")
     if duration_s is not None:
         histogram("hdb.authoring.unit.duration", duration_s, attributes={"operation": operation, "status": status})
+
+
+def record_authoring_agent(*, status: str, mode: str = "external_agent", duration_s: float | None = None) -> None:
+    """Record low-cardinality Agent executor metrics.
+
+    Run, field, evidence and proposal identifiers intentionally never become
+    metric labels; they belong on spans and the append-only execution events.
+    """
+
+    counter(
+        "hdb.authoring.agent.runs",
+        attributes={"status": status, "mode": mode},
+        description="Document authoring agent runs",
+    )
+    if duration_s is not None:
+        histogram(
+            "hdb.authoring.agent.duration",
+            duration_s,
+            attributes={"mode": mode},
+            description="Document authoring agent duration",
+        )
+
+
+def record_authoring_tool(*, tool: str, status: str, duration_s: float | None = None) -> None:
+    """Record one bounded agent-tool outcome using only tool/status labels."""
+
+    counter(
+        "hdb.authoring.agent.tool.calls",
+        attributes={"tool": tool, "status": status},
+        description="Document authoring agent tool calls",
+    )
+    if duration_s is not None:
+        histogram(
+            "hdb.authoring.agent.tool.duration",
+            duration_s,
+            attributes={"tool": tool},
+            description="Document authoring agent tool duration",
+        )

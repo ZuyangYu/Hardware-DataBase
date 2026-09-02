@@ -92,24 +92,15 @@ def test_llm_transport_or_empty_response_falls_back_to_evidence_copy():
 
     class EmptyResponseClient:
         calls = 0
-        timeouts = []
-        retry_limits = []
-        max_tokens = []
 
-        def chat(self, _messages, **kwargs):
+        def invoke(self, _messages, **kwargs):
             self.calls += 1
-            self.timeouts.append(kwargs.get("timeout"))
-            self.retry_limits.append(kwargs.get("rate_limit_max_retries"))
-            self.max_tokens.append(kwargs.get("max_tokens"))
             raise RuntimeError("Chat API returned an empty response")
 
     client = EmptyResponseClient()
     draft = LLMManagedWriter(client).generate(_request([_ev("e1", "额定电流为 10A")]))
 
     assert client.calls == 2
-    assert client.timeouts == [60, 60]
-    assert client.retry_limits == [0, 0]
-    assert client.max_tokens == [512, 512]
     assert draft.content == "额定电流为 10A"
     assert draft.validation_status == "pending"
 
@@ -143,7 +134,7 @@ def test_llm_writer_requires_and_returns_a_typed_value():
     from src.document_authoring.writers.managed import LLMManagedWriter
 
     class Client:
-        def chat(self, messages, **kwargs):
+        def invoke(self, messages, **kwargs):
             return json.dumps({
                 "unit_id": "field:f1",
                 "run_id": "run-1",
@@ -177,7 +168,7 @@ def test_llm_managed_writer_uses_connector_manual_for_function_fields_without_mo
     from src.document_authoring.writers.managed import LLMManagedWriter
 
     class Client:
-        def chat(self, *args, **kwargs):
+        def invoke(self, *args, **kwargs):
             raise RuntimeError("connector function should be deterministic")
 
     request = _request([{
@@ -202,7 +193,7 @@ def test_connector_function_writer_uses_net_rule_when_manual_has_no_pin_descript
     from src.document_authoring.writers.managed import LLMManagedWriter
 
     class Client:
-        def chat(self, *args, **kwargs):
+        def invoke(self, *args, **kwargs):
             raise RuntimeError("connector function should be deterministic")
 
     request = _request([_ev("circuit-x1903-1", "X1903-1 is connected to MIPI0_DATA0_P")]).model_copy(update={

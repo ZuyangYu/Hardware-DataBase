@@ -9,6 +9,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, isForbiddenError, sseGetStream } from '@/api/client';
 import type {
+  CreateTurnRequest,
+  DocumentContext,
   EvidenceItem,
   MemoryConsentListResponse,
   MemoryConsentView,
@@ -24,20 +26,70 @@ import type {
   TurnView,
 } from '@/api/types';
 import { notify } from '@/components/ui/app-toast';
+import { createClientRequestId } from '@/api/documentAuthoring';
+import { fetchDocumentWorkOrderStatus, mergeDocumentCards, parseCardArtifacts, parseDocumentCardEvent, type DocumentCardData } from './components/documentCardModel';
+
+// document context 纯函数与 client_request_id 生成已迁至 api/documentAuthoring;
+// 这里 re-export 保持既有 `from './useKbChat'` 导入(含测试)不破。
+// createClientRequestId 在本模块内部亦被使用(requestUuid),故经导入绑定再导出。
+export { createClientRequestId };
+export {
+  buildDocumentContext,
+  isDocumentContextExpired,
+  DOCUMENT_CONTEXT_TTL_MS,
+  DOCUMENT_CONTEXT_VERSION,
+} from '@/api/documentAuthoring';
 
 const GENERAL_CHAT_KB_NAME = '__general__';
 const QUERY_TRACE_HIDE_DELAY_MS = 5000;
 const STREAMING_RENDER_INTERVAL_MS = 64;
 
-/** crypto.randomUUID 仅在安全上下文(HTTPS/localhost)存在;HTTP+IP 访问时回退到手动拼 UUID。 */
 function requestUuid(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
+  return createClientRequestId();
+}
+
+/**
+ * Build the persistent-turn request without embedding document metadata in
+ * the user query. Keeping the property absent for null context preserves the
+ * legacy request body for servers that predate Task 8.
+ *
+ * `documentFlow` is only serialized when a context is attached: with context
+ * the explicit switch (true forces the document flow, false strips document
+ * tools) reaches the server; without context the field stays absent so the
+ * server keeps its regex fallback.
+ */
+export function buildTurnRequest(
+  query: string,
+  clientRequestId: string,
+  queryMode: 'fast' | 'deep',
+  documentContext?: DocumentContext | null,
+  documentFlow?: boolean,
+): CreateTurnRequest {
+  const request: CreateTurnRequest = {
+    query,
+    client_request_id: clientRequestId,
+    query_mode: queryMode,
+  };
+  if (documentContext) {
+    // A refreshed turn may contain the canonical server-owned context
+    // (tenant/owner/permission fields).  Never echo those fields back to the
+    // client-input schema; send only immutable references and the lease key.
+    request.document_context = {
+      analysis_id: documentContext.analysis_id,
+      template_version_id: documentContext.template_version_id,
+      knowledge_base_name: documentContext.knowledge_base_name,
+      version: documentContext.version,
+      expiry: documentContext.expiry,
+      client_request_id: documentContext.client_request_id,
+      ...(documentContext.generation_session_id
+        ? { generation_session_id: documentContext.generation_session_id }
+        : {}),
+    };
+    if (typeof documentFlow === 'boolean') {
+      request.document_flow = documentFlow;
+    }
   }
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
-  });
+  return request;
 }
 
 function normalizeTraceStatus(status: unknown): QueryTraceStatus {
@@ -143,8 +195,14 @@ function localAssistantMessage(sessionId: number, content: string): MessageView 
 
 export type UseKbChat = ReturnType<typeof useKbChat>;
 
-export function useKbChat(kbName: string) {
+export type UseKbChatOptions = {
+  /** Feature gate for the optional document_context wire field. */
+  documentContextEnabled?: boolean;
+};
+
+export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const scopeKbName = kbName || GENERAL_CHAT_KB_NAME;
+  const documentContextEnabled = options.documentContextEnabled ?? false;
   const [sessions, setSessions] = useState<SessionView[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
@@ -155,13 +213,28 @@ export function useKbChat(kbName: string) {
   const [streamingText, setStreamingText] = useState('');
   const [traceSteps, setTraceSteps] = useState<QueryTraceStep[]>([]);
   const [degradedNotes, setDegradedNotes] = useState<Array<{ stage: string; reason: string }>>([]);
+  const [documentCards, setDocumentCards] = useState<DocumentCardData[]>([]);
+  const [documentCardRefreshingId, setDocumentCardRefreshingId] = useState<string | null>(null);
   const [evidenceByMessageId, setEvidenceByMessageId] = useState<Record<number, EvidenceItem[]>>({});
   const [memorySummary, setMemorySummary] = useState<SessionMemorySummary | null>(null);
   const [sessionConsents, setSessionConsents] = useState<MemoryConsentView[] | null>(null);
   const [forbidden, setForbidden] = useState<string | null>(null);
+  const [documentContext, setDocumentContextState] = useState<DocumentContext | null>(null);
+  // 文档生成模式开关:默认开;仅当模板上下文已附加时才有意义。
+  // 每次新附加上下文时重置为默认开,避免上次关闭的选择影响新模板。
+  const [documentFlowEnabled, setDocumentFlowEnabledState] = useState(true);
+  const setDocumentContext = useCallback((context: DocumentContext | null) => {
+    setDocumentContextState(context);
+    if (context) setDocumentFlowEnabledState(true);
+  }, []);
+  const setDocumentFlowEnabled = useCallback((enabled: boolean) => {
+    setDocumentFlowEnabledState(enabled);
+  }, []);
   const abortRef = useRef<AbortController | null>(null);
   const currentTurnRef = useRef<string | null>(null);
   const sendingRef = useRef(false);
+  // 卡片刷新的在飞标记(ref 而非 state 闭包):两次快速点击只允许发起一次 REST 请求。
+  const documentCardRefreshInFlightRef = useRef(false);
   const activeSessionRef = useRef<number | null>(null);
   // opencode 风格轨迹:同一工具的多次调用各自占一行。
   // toolCallSeqRef 生成单调序号;toolActiveKeyRef 记录"工具名 -> 最近一次 running 的 step key",
@@ -234,12 +307,23 @@ export function useKbChat(kbName: string) {
     setActiveSessionId(null);
     setMessages([]);
     setEvidenceByMessageId({});
+    setDocumentContextState(null);
     api
       .get<SessionView[]>(`/api/v1/conversations?kb_name=${encodeURIComponent(scopeKbName)}`)
       .then((rows) => {
         if (cancelled) return;
         setSessions(rows);
-        setActiveSessionId((current) => (rows.some((session) => session.id === current) ? current : rows[0]?.id ?? null));
+        setActiveSessionId((current) => {
+          const next = rows.some((session) => session.id === current) ? current : rows[0]?.id ?? null;
+          const restoredContext = rows.find((session) => session.id === next)?.document_context;
+          if (restoredContext) {
+            // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
+            setDocumentContextState(restoredContext);
+            // 恢复的上下文同样遵循"新附加即默认开"的不变式,避免上个模板遗留的关闭选择泄漏。
+            setDocumentFlowEnabledState(true);
+          }
+          return next;
+        });
       })
       .catch((error) => {
         if (cancelled) return;
@@ -481,6 +565,12 @@ export function useKbChat(kbName: string) {
     scheduleTraceClear();
   }, [scheduleTraceClear]);
 
+  // 切换会话时清空上一会话的文档卡片,避免跨会话串显。
+  useEffect(() => {
+    setDocumentCards([]);
+    setDocumentCardRefreshingId(null);
+  }, [activeSessionId]);
+
   // 刷新或重新打开会话时，接回后端仍在执行的持久化 turn。
   useEffect(() => {
     if (activeSessionId == null || currentTurnRef.current || sendingRef.current) return undefined;
@@ -488,7 +578,16 @@ export function useKbChat(kbName: string) {
     let controller: AbortController | null = null;
     void api.get<TurnView[]>(`/api/v1/conversations/${activeSessionId}/turns`).then(async (turns) => {
       const turn = turns[0];
-      if (!turn || disposed) return;
+      if (disposed) return;
+      if (!turn) {
+        // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
+        // 空会话(无可恢复 turn)意味着没有服务端持久化事实,必须清掉残留上下文。
+        setDocumentContextState(null);
+        return;
+      }
+      // set-or-clear:目标会话最新 turn 有持久化上下文则恢复,没有则清空,避免跨会话残留。
+      setDocumentContextState(documentContextEnabled && turn.document_context ? turn.document_context : null);
+      if (turn.document_context) setDocumentFlowEnabledState(true);
       currentTurnRef.current = turn.id;
       controller = new AbortController();
       abortRef.current = controller;
@@ -518,6 +617,9 @@ export function useKbChat(kbName: string) {
           } else if (evt.event === 'degraded') {
             const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
             setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
+          } else if (evt.event === 'document_card') {
+            const card = parseDocumentCardEvent(evt.data);
+            if (card) setDocumentCards((prev) => mergeDocumentCards(prev, card));
           } else if (evt.event === 'done') {
             const payload = JSON.parse(evt.data) as QueryDonePayload;
             const answer = payload.answer ?? accumulated;
@@ -581,6 +683,9 @@ export function useKbChat(kbName: string) {
       setSessions((prev) => [session, ...prev]);
       setActiveSessionId(session.id);
       setMessages([]);
+      // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
+      setDocumentContextState(null);
+      setDocumentFlowEnabledState(true);
       return session;
     },
     [scopeKbName],
@@ -602,7 +707,11 @@ export function useKbChat(kbName: string) {
         await api.delete<OkResponse>(`/api/v1/conversations/${sessionId}`);
         setSessions((prev) => prev.filter((s) => s.id !== sessionId));
         setActiveSessionId((current) => (current === sessionId ? null : current));
-        if (activeSessionId === sessionId) setMessages([]);
+        if (activeSessionId === sessionId) {
+          setMessages([]);
+          // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
+          setDocumentContextState(null);
+        }
       } catch (error) {
         if (activeSessionId === sessionId) {
           setMessages((prev) => [
@@ -617,6 +726,9 @@ export function useKbChat(kbName: string) {
 
   const selectSession = useCallback((sessionId: number) => {
     if (streaming) return;
+    // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
+    // 同步清空避免残留 chip 闪烁;若目标会话最新 turn 带持久化上下文,由接回 effect 恢复。
+    setDocumentContextState(null);
     setActiveSessionId(sessionId);
   }, [streaming]);
 
@@ -637,6 +749,35 @@ export function useKbChat(kbName: string) {
     abortRef.current?.abort();
   }, []);
 
+  /** 卡片内"刷新状态"直调 REST 工单状态接口,不经过 agent/聊天发送链路。 */
+  const refreshDocumentCardStatus = useCallback(async (card: DocumentCardData) => {
+    const workOrderId = (card.work_order_id ?? '').trim();
+    if (!workOrderId || documentCardRefreshInFlightRef.current) return;
+    const sessionId = activeSessionRef.current;
+    documentCardRefreshInFlightRef.current = true;
+    setDocumentCardRefreshingId(workOrderId);
+    try {
+      const status = await fetchDocumentWorkOrderStatus(card.kb_name, workOrderId);
+      // 请求期间切走了会话:结果不再合并进当前消息流。
+      if (activeSessionRef.current !== sessionId) return;
+      setDocumentCards((prev) => mergeDocumentCards(prev, {
+        kind: 'work_order_status',
+        status: status.status || card.status,
+        next_actions: status.next_actions && status.next_actions.length > 0 ? status.next_actions : card.next_actions,
+        kb_name: card.kb_name,
+        work_order_id: workOrderId,
+        // 产物引用/格式一并合并:已完成的旧卡片刷新后也能拿到下载入口。
+        targetFormat: status.target_format || card.targetFormat,
+        artifacts: parseCardArtifacts(status.artifacts) ?? card.artifacts,
+      }));
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '刷新工单状态失败');
+    } finally {
+      documentCardRefreshInFlightRef.current = false;
+      setDocumentCardRefreshingId(null);
+    }
+  }, []);
+
   const send = useCallback(async () => {
     const query = input.trim();
     if (!query || streaming) return;
@@ -649,6 +790,8 @@ export function useKbChat(kbName: string) {
     toolActiveKeyRef.current.clear();
     setTraceSteps(createInitialTrace(scopeKbName === GENERAL_CHAT_KB_NAME));
     setDegradedNotes([]);
+    setDocumentCards([]);
+    setDocumentCardRefreshingId(null);
 
     let sessionId = activeSessionId;
     // 乐观更新:点发送立即上屏,不等建会话/建 turn 的两个往返(否则"思考中"
@@ -672,11 +815,20 @@ export function useKbChat(kbName: string) {
       }
 
       // 2. 后端原子写入 user/assistant 占位消息并创建幂等 turn。
-      const created = await api.post<TurnStartResponse>(`/api/v1/conversations/${sessionId}/turns`, {
-        query,
-        client_request_id: requestUuid(),
-        query_mode: scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
-      });
+      const created = await api.post<TurnStartResponse>(
+        `/api/v1/conversations/${sessionId}/turns`,
+        buildTurnRequest(
+          query,
+          requestUuid(),
+          scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
+          documentContextEnabled ? documentContext : null,
+          documentContextEnabled ? documentFlowEnabled : undefined,
+        ),
+      );
+      if (documentContextEnabled) {
+        const returnedContext = created.turn.document_context ?? created.user_message.document_context;
+        if (returnedContext) setDocumentContextState(returnedContext);
+      }
       setMessages((prev) => prev.map((m) => (m.id === optimisticId ? created.user_message : m)));
 
       // 3. 后端任务独立执行; SSE 只订阅持久化事件，刷新可从事件序号重放。
@@ -716,6 +868,13 @@ export function useKbChat(kbName: string) {
           try {
             const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
             setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
+          } catch {
+            // 忽略坏帧
+          }
+        } else if (evt.event === 'document_card') {
+          try {
+            const card = parseDocumentCardEvent(evt.data);
+            if (card) setDocumentCards((prev) => mergeDocumentCards(prev, card));
           } catch {
             // 忽略坏帧
           }
@@ -798,7 +957,7 @@ export function useKbChat(kbName: string) {
       setStreaming(false);
       resetStreamingText();
     }
-  }, [input, streaming, activeSessionId, createSession, scopeKbName, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary]);
+  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, documentFlowEnabled, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary]);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
@@ -827,6 +986,10 @@ export function useKbChat(kbName: string) {
     sessionConsents,
     refreshSessionConsents,
     revokeSessionConsent,
+    documentContext,
+    setDocumentContext,
+    documentFlowEnabled,
+    setDocumentFlowEnabled,
     // 输入
     input,
     setInput,
@@ -836,6 +999,9 @@ export function useKbChat(kbName: string) {
     traceSteps,
     traceByMessageId,
     degradedNotes,
+    documentCards,
+    documentCardRefreshingId,
+    refreshDocumentCardStatus,
     currentSessionRunning: streaming,
     send,
     abortStream,

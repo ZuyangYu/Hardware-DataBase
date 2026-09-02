@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.agents.claim_evidence import InformationRequirement
 from src.document_authoring.icd_scope_decision import IcdScopeDecision
@@ -297,6 +297,8 @@ class DocumentWorkOrder(BaseModel):
     generation_session_id: str | None = None
     generation_brief: dict[str, Any] = Field(default_factory=dict)
     restart_of_work_order_id: str | None = None
+    requested_executor: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
+    input_fingerprint_version: int = 1
     error_code: str | None = None
     error_message: str | None = None
     retryable: bool | None = None
@@ -326,14 +328,16 @@ class DocumentWorkOrder(BaseModel):
                 raise ValueError("knowledge-base work orders cannot name a project or baseline")
             if self.baseline_content_hash:
                 raise ValueError("knowledge-base work orders cannot bind a baseline content hash")
-        if self.execution_mode == "internal_harness" and (
+        if self.execution_mode in {"internal_harness", "external_agent"} and (
             not self.harness_policy_id or not self.harness_policy_version
         ):
-            raise ValueError("internal-harness work orders require a frozen HarnessPolicy version")
+            raise ValueError("Harness-backed work orders require a frozen HarnessPolicy version")
+        if self.requested_executor is not None and self.requested_executor != self.execution_mode:
+            raise ValueError("requested_executor conflicts with execution_mode")
         excluded = {
             "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
             "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
-            "error_message", "retryable", "next_actions",
+            "error_message", "retryable", "next_actions", "requested_executor", "input_fingerprint_version",
         }
         if self.scope_type == "project":
             # Preserve fingerprints from persisted project work orders created
@@ -348,11 +352,49 @@ class DocumentWorkOrder(BaseModel):
             # Preserve fingerprints for work orders stored before traceable
             # restart lineage was introduced.
             excluded.add("restart_of_work_order_id")
-        expected = content_hash(self.model_dump(mode="json", exclude=excluded))
+        if self.input_fingerprint_version >= 2:
+            if self.requested_executor is None:
+                raise ValueError("v2 input fingerprints require requested_executor")
+            # v2 deliberately binds the normalized requested executor.  The
+            # historical v1 preimage excluded this compatibility field.
+            excluded.discard("requested_executor")
+            expected = content_hash({
+                "input_fingerprint_version": 2,
+                "frozen_inputs": self.model_dump(mode="json", exclude=excluded),
+            })
+        else:
+            expected = content_hash(self.model_dump(mode="json", exclude=excluded))
         if self.input_fingerprint and self.input_fingerprint != expected:
             raise ValueError("work order input_fingerprint does not match frozen inputs")
         self.input_fingerprint = expected
         return self
+
+
+def compute_input_fingerprint_v2(order: DocumentWorkOrder) -> str:
+    """v2 work-order input fingerprint preimage.
+
+    v2 adds the immutable ``requested_executor`` (already normalized at work
+    order creation) on top of the v1 frozen-input preimage and a version tag.
+    Historical work orders keep their v1 fingerprint; the write-path switch to
+    v2 happens in Task 5c, not here.
+    """
+    if order.requested_executor is None:
+        raise ValueError("v2 input fingerprints require requested_executor")
+    excluded = {
+        "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
+        "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
+        "error_message", "retryable", "next_actions", "input_fingerprint_version",
+    }
+    if order.scope_type == "project":
+        excluded.update({"scope_type", "knowledge_base_name"})
+    if order.generation_session_id is None and not order.generation_brief:
+        excluded.update({"generation_session_id", "generation_brief"})
+    if order.restart_of_work_order_id is None:
+        excluded.add("restart_of_work_order_id")
+    return content_hash({
+        "input_fingerprint_version": 2,
+        "frozen_inputs": order.model_dump(mode="json", exclude=excluded),
+    })
 
 
 class IcdScopeResolution(BaseModel):
@@ -443,6 +485,18 @@ class HarnessPolicy(BaseModel):
     # Zero disables it even when the tool is allowlisted; the tool + budget
     # form a double switch, mirroring rewrite_query + max_query_rewrite_rounds.
     max_adaptive_recovery_rounds: int = 0
+    max_agent_tool_calls: int = 60
+    max_proposal_retries_per_field: int = 2
+    # Agent confidence is a policy input, never an instruction supplied by
+    # the model.  ``agent_confidence_threshold`` is accepted as a backwards-
+    # compatible spelling at the model boundary; the persisted canonical name
+    # is ``min_agent_confidence``.
+    min_agent_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    agent_tools: list[str] = Field(default_factory=list)
+    backend_profile: Literal["restricted"] = "restricted"
+    excluded_tools: list[str] = Field(default_factory=lambda: [
+        "filesystem", "shell", "command", "task", "general-purpose",
+    ])
     allowed_tools: list[str] = Field(default_factory=lambda: [
         "retrieve_evidence", "draft_ready_unit", "validate_unit_draft",
         "detect_template_contamination", "validate_cross_unit", "rewrite_query",
@@ -451,6 +505,17 @@ class HarnessPolicy(BaseModel):
     writer_provider_id: str = "managed"
     prompt_version: str = "1"
     status: Literal["draft", "approved", "obsolete"] = "draft"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_agent_confidence_aliases(cls, value):
+        if isinstance(value, dict) and "min_agent_confidence" not in value:
+            for alias in ("agent_confidence_threshold", "confidence_threshold"):
+                if alias in value:
+                    value = dict(value)
+                    value["min_agent_confidence"] = value[alias]
+                    break
+        return value
 
     @model_validator(mode="after")
     def validate_budget(self):
@@ -469,9 +534,23 @@ class HarnessPolicy(BaseModel):
             raise ValueError("max_parallel_units must be between 1 and 8")
         if self.max_adaptive_recovery_rounds < 0:
             raise ValueError("harness policy max_adaptive_recovery_rounds cannot be negative")
+        if min(self.max_agent_tool_calls, self.max_proposal_retries_per_field) < 1:
+            raise ValueError("harness policy agent budgets must be positive")
+        if len(self.agent_tools) != len(set(self.agent_tools)):
+            raise ValueError("harness policy agent_tools must be unique")
+        if len(self.excluded_tools) != len(set(self.excluded_tools)):
+            raise ValueError("harness policy excluded_tools must be unique")
+        forbidden = {"filesystem", "shell", "command", "task", "general-purpose"}
+        if forbidden.intersection(self.agent_tools):
+            raise ValueError("harness policy agent_tools contain excluded capabilities")
         if len(self.allowed_tools) != len(set(self.allowed_tools)):
             raise ValueError("harness policy tools must be unique")
         return self
+
+    @property
+    def agent_confidence_threshold(self) -> float:
+        """Compatibility accessor used by executor/agent integrations."""
+        return self.min_agent_confidence
 
 
 class AuthoringRunManifest(BaseModel):
@@ -501,6 +580,8 @@ class AuthoringRunManifest(BaseModel):
     max_parallel_units: int | None = None
     validator_version: str = "p2b-1"
     renderer_version: str = "p2a-1"
+    input_fingerprint_version: int = 1
+    requested_executor: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
     created_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
 
@@ -526,6 +607,32 @@ class HarnessRun(BaseModel):
     heartbeat_at: datetime | None = None
     last_error_code: str | None = None
     error: dict[str, Any] | None = None
+    tenant_id: str = "default"
+    knowledge_base_id: str | None = None
+    input_fingerprint: str = ""
+    input_fingerprint_version: int = 1
+    source_set_snapshot_id: str | None = None
+    unit_statuses: dict[str, str] = Field(default_factory=dict)
+    unit_attempts: dict[str, int] = Field(default_factory=dict)
+    dispatch_cursor: int = 0
+    evidence_matrix_hash: str | None = None
+    draft_ids: list[str] = Field(default_factory=list)
+    pending_human_event: dict[str, Any] | None = None
+    requested_executor: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
+    effective_executor: Literal["deterministic_rule", "authoring_graph", "agent_field_harness"] | None = None
+    degraded_reasons: list[str] = Field(default_factory=list)
+    agent_thread_id: str | None = None
+    graph_state_version: int = 1
+    migration_state: Literal["native", "converted", "legacy_terminal"] | None = None
+    last_agent_checkpoint_at: datetime | None = None
+    agent_token_usage: dict[str, Any] = Field(default_factory=lambda: {
+        "usage_returned": False,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "call_count": 0,
+    })
+    trace_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -561,6 +668,8 @@ class NodeExecutionReceipt(BaseModel):
     node_name: str
     unit_id: str
     input_fingerprint: str
+    action_key: str = ""
+    attempt: int = 1
     fencing_token: int
     status: Literal["started", "committed", "failed"] = "started"
     output_hash: str | None = None
@@ -592,6 +701,24 @@ class TypedFieldValue(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
 
 
+class ManagedDraftPayload(BaseModel):
+    """The only portion of a managed draft that a model may author.
+
+    Runtime identity and lifecycle fields deliberately do not belong to this
+    model.  The coordinator constructs those fields from the current request
+    after validating this payload, so a provider cannot move a draft to another
+    unit/run or mark it as already validated.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str | None = None
+    proposed_value: Any | None = None
+    typed_value: TypedFieldValue | None = None
+    assertions: list[DraftAssertion] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
 class DocumentUnitDraft(BaseModel):
     unit_id: str
     run_id: str
@@ -604,6 +731,10 @@ class DocumentUnitDraft(BaseModel):
     proposed_status: str | None = None
     validation_status: Literal["pending", "supported", "partial", "unsupported", "requires_human"] = "pending"
     validation_notes: list[str] = Field(default_factory=list)
+    # Operational/audit metadata is coordinator-owned and intentionally kept
+    # outside FillPlan eligibility checks.  It records writer mode, fallback
+    # reason and bounded token observations without changing validation state.
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvidenceMatrixRow(BaseModel):
@@ -639,6 +770,7 @@ class WorkbookFill(BaseModel):
 class WorkbookFillPlan(BaseModel):
     template_version_id: str
     fills: list[WorkbookFill] = Field(default_factory=list)
+    table_fills: list["WorkbookTableFill"] = Field(default_factory=list)
 
 
 class WorkbookTableColumnSchema(BaseModel):
@@ -671,6 +803,9 @@ class WorkbookTableFill(BaseModel):
     table_region_id: str
     semantic_unit_id: str
     rows: list[dict[str, str]] = Field(default_factory=list)
+
+
+WorkbookFillPlan.model_rebuild()
 
 
 class DocxFill(BaseModel):
@@ -775,3 +910,98 @@ class DocumentOutboxEvent(BaseModel):
     last_error: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     delivered_at: datetime | None = None
+
+
+EXECUTION_EVENT_TYPES = (
+    "run_started", "agent_started", "agent_succeeded", "agent_failed",
+    "tool_called", "tool_succeeded", "tool_rejected",
+    "llm_called", "llm_succeeded", "llm_failed",
+    "proposal_submitted", "proposal_accepted", "proposal_rejected",
+    "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
+    "human_waiting", "human_resumed", "run_finalized",
+)
+
+ExecutionEventType = Literal[
+    "run_started", "agent_started", "agent_succeeded", "agent_failed",
+    "tool_called", "tool_succeeded", "tool_rejected",
+    "llm_called", "llm_succeeded", "llm_failed",
+    "proposal_submitted", "proposal_accepted", "proposal_rejected",
+    "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
+    "human_waiting", "human_resumed", "run_finalized",
+]
+
+
+class AuthoringExecutionEvent(BaseModel):
+    """Append-only, sanitized business fact for the authoring execution.
+
+    Payloads carry IDs, issue codes, statuses, durations and token usage only.
+    Raw evidence, file contents, prompts, credentials and DB objects are
+    forbidden; the event log is the authoritative source for audits, evaluation
+    reconstruction and recovery -- OTel is cross-validation only.
+    """
+
+    event_id: str
+    event_type: ExecutionEventType
+    tenant_id: str = "default"
+    work_order_id: str
+    harness_run_id: str
+    idempotency_key: str
+    sequence: int = 0
+    attempt: int = 1
+    executor: Literal["deterministic_rule", "authoring_graph", "agent_field_harness"] | None = None
+    node_name: str | None = None
+    tool_name: str | None = None
+    field_id: str | None = None
+    unit_id: str | None = None
+    status: Literal["started", "succeeded", "failed", "rejected", "waiting", "resumed", "completed"] = "succeeded"
+    error_code: str | None = None
+    retryable: bool = False
+    trace_id: str | None = None
+    duration_seconds: float | None = None
+    sanitized_payload: dict[str, Any] = Field(default_factory=dict)
+    occurred_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_event(self):
+        if self.event_type not in EXECUTION_EVENT_TYPES:
+            raise ValueError(f"unknown authoring execution event type: {self.event_type}")
+        if not self.idempotency_key:
+            raise ValueError("authoring execution events require an idempotency_key")
+        forbidden = {"prompt", "content", "evidence_content", "credential", "password", "api_key"}
+        for key in self.sanitized_payload:
+            if str(key).casefold() in forbidden:
+                raise ValueError(f"sanitized payload must not contain key: {key}")
+        return self
+
+
+class EvidenceRegistryEntry(BaseModel):
+    """Run-scoped immutable registry record for evidence handed to agents.
+
+    Agents only ever see ``evidence_id``; raw evidence stays in the governed
+    evidence store and is re-read through the opaque handle server-side. The
+    registry binds every reference to tenant, run and frozen snapshot so
+    cross-tenant, cross-run or stale-snapshot proposals are rejected.
+    """
+
+    evidence_id: str
+    tenant_id: str = "default"
+    harness_run_id: str
+    work_order_id: str
+    knowledge_base_id: str | None = None
+    project_id: str | None = None
+    source_set_snapshot_id: str
+    snapshot_content_hash: str
+    content_hash: str
+    source_identity: str
+    redacted_summary: str = ""
+    reload_handle: str
+    registered_at: datetime = Field(default_factory=utc_now)
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_scope(self):
+        if not self.reload_handle or "/" in self.reload_handle or "\\" in self.reload_handle:
+            raise ValueError("reload_handle must be an opaque token without filesystem paths")
+        if bool(self.knowledge_base_id) == bool(self.project_id):
+            raise ValueError("evidence registry entries bind exactly one of KB or project scope")
+        return self

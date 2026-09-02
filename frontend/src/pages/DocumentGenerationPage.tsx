@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 
-import { api, apiDownload, uploadFiles } from '../api/client';
+import { api, apiDownload } from '../api/client';
+import { analyzeTemplate } from '../api/documentAuthoring';
 import type {
   CreateWorkOrderResult,
   DocumentAnalysis,
@@ -26,6 +28,7 @@ import {
 import {
   describeHarnessProgress,
   hasDocumentGenerationWritePermission,
+  resolveDeepLinkKb,
   resolveDocumentPhase,
   type DocumentGenerationPhase,
 } from './documentGenerationModel';
@@ -81,9 +84,53 @@ function KbSelect({ kbs, value, onChange }: { kbs: KbView[]; value: string; onCh
   );
 }
 
+/**
+ * 深链 kb 预选清理:仅当本地选中值仍等于深链预选(用户未改过)且 kbs 已
+ * 加载成功非空时,预选不可用才清空。提示由页面层统一发出,避免重复 toast。
+ */
+function useDropInvalidDeepLinkKb(
+  kb: string,
+  setKb: (v: string) => void,
+  initialKb: string,
+  kbs: KbView[],
+) {
+  useEffect(() => {
+    if (!kb || kb !== initialKb || kbs.length === 0) return;
+    if (resolveDeepLinkKb(kb, kbs)) return;
+    setKb('');
+  }, [kb, setKb, initialKb, kbs]);
+}
+
 export default function DocumentGenerationPage({ auth, kbs, onLogout }: Props) {
-  const [section, setSection] = useState<'templates' | 'create' | 'runs'>('templates');
+  const [searchParams, setSearchParams] = useSearchParams();
+  // 深链 /document-generation?kb=...&workOrder=... 仅在首次挂载消费一次,
+  // 随后清掉查询参数,避免刷新页面时重放预选。
+  const [deepLink] = useState(() => ({
+    kb: searchParams.get('kb') ?? '',
+    workOrder: searchParams.get('workOrder') ?? '',
+  }));
+  const [section, setSection] = useState<'templates' | 'create' | 'runs'>(() =>
+    deepLink.workOrder ? 'runs' : 'templates',
+  );
   const [runPhase, setRunPhase] = useState<DocumentGenerationPhase>('retrieving');
+  const hasDeepLink = Boolean(deepLink.kb || deepLink.workOrder);
+  useEffect(() => {
+    if (!hasDeepLink) return;
+    // 只清掉深链自己的 kb/workOrder 两个键,未来无关的查询参数保留不动。
+    const next = new URLSearchParams(searchParams);
+    next.delete('kb');
+    next.delete('workOrder');
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // 深链 kb 校验:kbs 加载成功且非空后校验一次,不可用则提示并忽略预选;
+  // kbs 为空(加载中或加载失败)时保留预选,避免误清。实际清空在各分区的
+  // useDropInvalidDeepLinkKb 中进行(那里持有 kb 状态),提示在这里只发一次。
+  useEffect(() => {
+    if (!deepLink.kb || kbs.length === 0) return;
+    if (resolveDeepLinkKb(deepLink.kb, kbs)) return;
+    notify.warning('深链指定的知识库不可用，已忽略预选');
+  }, [deepLink.kb, kbs]);
   const activePhase: DocumentGenerationPhase = section === 'templates'
     ? 'analyzing_template'
     : section === 'create'
@@ -128,37 +175,34 @@ export default function DocumentGenerationPage({ auth, kbs, onLogout }: Props) {
           </Card>
         )}
       >
-        {section === 'templates' && <TemplateSection kbs={kbs} />}
-        {section === 'create' && <CreateSection kbs={kbs} />}
-        {section === 'runs' && <RunsSection kbs={kbs} onPhaseChange={setRunPhase} />}
+        {section === 'templates' && <TemplateSection kbs={kbs} initialKb={deepLink.kb} />}
+        {section === 'create' && <CreateSection kbs={kbs} initialKb={deepLink.kb} />}
+        {section === 'runs' && (
+          <RunsSection kbs={kbs} onPhaseChange={setRunPhase} initialKb={deepLink.kb} initialWorkOrderId={deepLink.workOrder} />
+        )}
       </DocumentGenerationWorkbench>
     </div>
   );
 }
 
-function TemplateSection({ kbs }: { kbs: KbView[] }) {
+function TemplateSection({ kbs, initialKb = '' }: { kbs: KbView[]; initialKb?: string }) {
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState('');
   const [analysis, setAnalysis] = useState<DocumentAnalysis | null>(null);
-  const [kb, setKb] = useState('');
+  const [kb, setKb] = useState(initialKb);
   const [analyzing, setAnalyzing] = useState(false);
 
   // 只有一个可访问知识库时自动选中，避免漏选导致按钮一直 disabled、点击无反应。
   useEffect(() => {
     if (!kb && kbs.length === 1) setKb(kbs[0].name);
   }, [kb, kbs]);
+  useDropInvalidDeepLinkKb(kb, setKb, initialKb, kbs);
 
   async function analyze() {
     if (!file || analyzing) return;
-    const form = new FormData();
-    form.append('file', file);
-    form.append('template_name', name || file.name);
     setAnalyzing(true);
     try {
-      const a = await uploadFiles<DocumentAnalysis>(
-        `/api/v1/document-generation/templates/analyze?kb=${encodeURIComponent(kb)}`,
-        form,
-      );
+      const a = await analyzeTemplate(kb, file, name);
       setAnalysis(a);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '分析模板失败');
@@ -224,8 +268,8 @@ function TemplateSection({ kbs }: { kbs: KbView[] }) {
   );
 }
 
-export function CreateSection({ kbs }: { kbs: KbView[] }) {
-  const [kb, setKb] = useState('');
+export function CreateSection({ kbs, initialKb = '' }: { kbs: KbView[]; initialKb?: string }) {
+  const [kb, setKb] = useState(initialKb);
   const [options, setOptions] = useState<GenerationOptions | null>(null);
   const [templateId, setTemplateId] = useState('');
   const [schemaKey, setSchemaKey] = useState('');
@@ -237,6 +281,7 @@ export function CreateSection({ kbs }: { kbs: KbView[] }) {
   useEffect(() => {
     if (!kb && kbs.length === 1) setKb(kbs[0].name);
   }, [kb, kbs]);
+  useDropInvalidDeepLinkKb(kb, setKb, initialKb, kbs);
 
   useEffect(() => {
     if (!kb) return;
@@ -393,10 +438,20 @@ export function CreateSection({ kbs }: { kbs: KbView[] }) {
   );
 }
 
-function RunsSection({ kbs, onPhaseChange }: { kbs: KbView[]; onPhaseChange: (phase: DocumentGenerationPhase) => void }) {
-  const [kb, setKb] = useState('');
+function RunsSection({
+  kbs,
+  onPhaseChange,
+  initialKb = '',
+  initialWorkOrderId = '',
+}: {
+  kbs: KbView[];
+  onPhaseChange: (phase: DocumentGenerationPhase) => void;
+  initialKb?: string;
+  initialWorkOrderId?: string;
+}) {
+  const [kb, setKb] = useState(initialKb);
   const [orders, setOrders] = useState<WorkOrder[]>([]);
-  const [selected, setSelected] = useState('');
+  const [selected, setSelected] = useState(initialWorkOrderId);
   const [status, setStatus] = useState<WorkOrderStatus | null>(null);
   const [review, setReview] = useState<IcdScopeReview>({ exceptions: [], status: '' });
   const [actionBusy, setActionBusy] = useState(false);
@@ -405,6 +460,7 @@ function RunsSection({ kbs, onPhaseChange }: { kbs: KbView[]; onPhaseChange: (ph
   useEffect(() => {
     if (!kb && kbs.length === 1) setKb(kbs[0].name);
   }, [kb, kbs]);
+  useDropInvalidDeepLinkKb(kb, setKb, initialKb, kbs);
 
   const loadOrders = useCallback(() => {
     if (!kb) return;
@@ -490,6 +546,7 @@ function RunsSection({ kbs, onPhaseChange }: { kbs: KbView[]; onPhaseChange: (ph
             {kbs.length === 0 ? '当前账号无可访问的知识库，请联系管理员授权后再试。' : '请先选择知识库以加载工作单。'}
           </p>
         )}
+        {selected && <p className="text-sm text-muted-foreground">已从会话预选工作单 {selected}</p>}
         {orders.length > 0 && (
           <select className="w-full rounded-md border px-3 py-2" value={selected} onChange={(e) => setSelected(e.target.value)}>
             <option value="">选择工作单</option>

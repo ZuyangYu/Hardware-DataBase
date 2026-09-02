@@ -98,6 +98,15 @@ export function hasDocumentGenerationWritePermission(permission: string | null |
   return permission === 'write' || permission === 'admin';
 }
 
+/**
+ * 深链 kb 预选校验:仅当预选值出现在已加载的可访问知识库列表中时才保留
+ * (与 KbSelect 的选项 value 一致,按 kb.name 精确比较),否则返回空串。
+ */
+export function resolveDeepLinkKb(deepLinkKb: string, kbs: ReadonlyArray<{ name: string } | string>): string {
+  if (!deepLinkKb) return '';
+  return kbs.some((kb) => (typeof kb === 'string' ? kb : kb.name) === deepLinkKb) ? deepLinkKb : '';
+}
+
 export function describeHarnessProgress(run: HarnessRunView | undefined): string | null {
   const completed = Number(run?.completed_units ?? 0);
   const total = Number(run?.total_units ?? 0);

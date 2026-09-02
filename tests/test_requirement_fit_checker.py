@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
-
 from src.agents.claim_evidence import InformationRequirement
-from src.core.llm_client import LLMClient
 from src.document_authoring.models import DocumentUnitDraft
 from src.document_authoring.writers.requirement_fit_checker import RequirementFitChecker
 
@@ -21,17 +18,23 @@ def _draft(content: str = "额定电流为 10A") -> DocumentUnitDraft:
     )
 
 
-def _client(return_value: str = '{"fit": true, "reason": "ok"}', *, side_effect=None) -> Mock:
-    client = Mock(spec=LLMClient)
-    if side_effect is not None:
-        client.chat.side_effect = side_effect
-    else:
-        client.chat.return_value = return_value
-    return client
+class _TextModel:
+    def __init__(self, response: str | Exception = '{"fit": true, "reason": "ok"}'):
+        self.response = response
+        self.calls: list[tuple[object, dict]] = []
+
+    def with_structured_output(self, schema):
+        raise NotImplementedError("structured output is not supported")
+
+    def invoke(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
 
 
 def test_check_returns_fit_true_when_llm_says_fit():
-    checker = RequirementFitChecker(client=_client('{"fit": true, "reason": "covers spec"}'))
+    checker = RequirementFitChecker(model=_TextModel('{"fit": true, "reason": "covers spec"}'))
 
     verdict = checker.check(_draft(), _requirement())
 
@@ -40,7 +43,7 @@ def test_check_returns_fit_true_when_llm_says_fit():
 
 
 def test_check_returns_fit_false_when_llm_says_unfit():
-    checker = RequirementFitChecker(client=_client('{"fit": false, "reason": "missing spec value"}'))
+    checker = RequirementFitChecker(model=_TextModel('{"fit": false, "reason": "missing spec value"}'))
 
     verdict = checker.check(_draft(), _requirement())
 
@@ -49,7 +52,7 @@ def test_check_returns_fit_false_when_llm_says_unfit():
 
 
 def test_check_degrades_to_pass_on_llm_failure():
-    checker = RequirementFitChecker(client=_client(side_effect=RuntimeError("boom")))
+    checker = RequirementFitChecker(model=_TextModel(RuntimeError("boom")))
 
     verdict = checker.check(_draft(), _requirement())
 
@@ -59,16 +62,15 @@ def test_check_degrades_to_pass_on_llm_failure():
 
 def test_check_degrades_to_pass_on_parse_failure():
     for bad in ("not json", "42", '"a string"'):
-        checker = RequirementFitChecker(client=_client(bad))
+        checker = RequirementFitChecker(model=_TextModel(bad))
         verdict = checker.check(_draft(), _requirement())
         assert verdict["fit"] is True, f"failed for: {bad!r}"
         assert "unavailable" in verdict["reason"]
 
 
 def test_check_uses_requirement_fit_check_usage_stage():
-    client = _client('{"fit": true, "reason": "ok"}')
-    RequirementFitChecker(client=client).check(_draft(), _requirement())
+    model = _TextModel('{"fit": true, "reason": "ok"}')
+    RequirementFitChecker(model=model).check(_draft(), _requirement())
 
-    assert client.chat.call_args.kwargs.get("usage_stage") == "requirement_fit_check"
-    assert client.chat.call_args.kwargs.get("timeout") == 20
-    assert client.chat.call_args.kwargs.get("rate_limit_max_retries") == 0
+    assert len(model.calls) == 1
+    assert model.calls[0][1] == {}
