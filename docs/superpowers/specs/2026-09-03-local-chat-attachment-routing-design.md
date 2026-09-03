@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 状态：Proposed（已按代码核查意见修订，等待用户审阅）
-- 本次修订：补充混合检索、动态上下文注入和火山方舟 `Doubao-Seed-2.0-lite` 按需视觉分析通道。
+- 本次修订：补充混合检索、动态上下文注入、火山方舟 `Doubao-Seed-2.0-lite` 按需视觉分析通道，并对齐当前 `.env` 的火山连接配置。
 - 范围：将聊天中的“上传模板”升级为会话附件；会话附件中的 PDF/DOCX 在本地解析和检索；知识库文件继续使用现有 RAGFlow 链路；Excel/EDF 复用现有结构化解析与查询能力；Deep Agents 负责意图理解和工具编排。
 - 关联设计：[2026-09-02-agent-artifact-export-design.md](./2026-09-02-agent-artifact-export-design.md)、[2026-09-03-conversational-export-design.md](./2026-09-03-conversational-export-design.md)
 
@@ -219,6 +219,8 @@ AttachmentVisualAnalyzer
 ```
 
 本期推荐使用火山方舟的 `Doubao-Seed-2.0-lite` 作为视觉理解模型。它的逻辑名称与火山方舟实际 Endpoint ID 分离保存。方舟官方示例使用过形如 `doubao-seed-2-0-lite-260215` 的模型 ID，后续模型版本可能变化；生产配置必须使用控制台实际开通的 Endpoint ID，不把日期版本硬编码到业务代码。方舟 Responses API 支持通过函数调用接入外部工具，本方案只将它用于受限的视觉分析请求，不让模型获得本地文件系统权限。
+
+连接配置与当前 `.env` 保持一致：视觉网关的默认 Base URL 使用 `https://ark.cn-beijing.volces.com/api/plan/v3`，API Key 复用当前环境中已有的火山凭据来源，前提是该凭据已开通视觉 Endpoint 权限。实现时建议让 `CHAT_ATTACHMENT_VISUAL_BASE_URL` 回退到 `MEMORY_EMBEDDING_BASE_URL`，让 `CHAT_ATTACHMENT_VISUAL_API_KEY` 回退到 `MEMORY_EMBEDDING_API_KEY`，从而避免在 `.env` 中复制密钥；如果权限不同，才通过显式视觉配置覆盖，不能静默使用无权限凭据。`EVAL_EMBEDDING_*` 只用于评估，不作为线上附件视觉调用配置。视觉模型使用独立的 `CHAT_ATTACHMENT_VISUAL_MODEL`，不能误用 `MEMORY_EMBEDDING_MODEL`。
 
 虽然方舟也提供文档理解入口，第一版仍不把完整 PDF/DOCX 直接交给供应商处理，而是由本地服务完成解析和页面筛选后，再将必要的页面图像发送给视觉模型。这样可以保持附件权限、删除、引用和降级状态由本系统控制；供应商原生整文件输入只作为经过隐私审批的后续实验通道。
 
@@ -650,7 +652,7 @@ expires_at
 - 不提供任意 Shell、任意 Python 或任意本地路径工具；
 - 文件正文按不可信数据处理，不能覆盖系统提示或工具策略；
 - 火山方舟调用只在显式配置和本轮视觉路由触发时发生；默认不上传完整原始附件，只发送选定页面图像和最小必要文本；
-- `ARK_API_KEY` 只保存在服务端，前端不接触供应商密钥；记录供应商请求 ID、模型 ID 和用量，不记录完整图像或正文；
+- `CHAT_ATTACHMENT_VISUAL_API_KEY`（默认复用 `MEMORY_EMBEDDING_API_KEY`）只保存在服务端，前端不接触供应商密钥；记录供应商请求 ID、模型 ID 和用量，不记录完整图像或正文；
 - 使用火山方舟意味着选定页面内容离开本地网络边界，管理员必须在部署文档中明确数据驻留、供应商保留策略和合规要求；完全内网部署关闭 `CHAT_ATTACHMENT_VISUAL_ENABLED`，或改用已批准的本地视觉模型；
 - 日志记录文件 ID、哈希、状态和统计信息，不记录完整正文。
 
@@ -882,16 +884,16 @@ CHAT_ATTACHMENT_EMBEDDING_VERSION
 CHAT_ATTACHMENT_CONTEXT_MAX_TOKENS
 CHAT_ATTACHMENT_VISUAL_ENABLED
 CHAT_ATTACHMENT_VISUAL_PROVIDER=volcengine_ark
+CHAT_ATTACHMENT_VISUAL_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3
 CHAT_ATTACHMENT_VISUAL_MODEL
+CHAT_ATTACHMENT_VISUAL_API_KEY
 CHAT_ATTACHMENT_VISUAL_MAX_PAGES_PER_TURN
 CHAT_ATTACHMENT_VISUAL_MAX_IMAGE_BYTES
 CHAT_ATTACHMENT_VISUAL_TIMEOUT_SECONDS
 CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED
-ARK_BASE_URL
-ARK_API_KEY
 ```
 
-模型配置说明：`CHAT_ATTACHMENT_VISUAL_MODEL` 保存火山方舟实际 Endpoint ID；当前官方示例使用过 `doubao-seed-2-0-lite-260215`，也可能存在更新的日期版本，不能把示例 ID 当作永久别名。`ARK_API_KEY` 只由后端读取。推荐在隐私审批前将 `CHAT_ATTACHMENT_VISUAL_ENABLED=false`、`CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED=false`；审批通过并完成 Endpoint 配置后再开启。文件不进入 RAGFlow 不代表解析片段不会发送给远程 LLM；完全内网处理应使用本地视觉模型或脱敏策略。
+模型配置说明：`CHAT_ATTACHMENT_VISUAL_BASE_URL` 默认取当前 `.env` 中的 `MEMORY_EMBEDDING_BASE_URL`，其值为 `https://ark.cn-beijing.volces.com/api/plan/v3`；`CHAT_ATTACHMENT_VISUAL_API_KEY` 默认取 `MEMORY_EMBEDDING_API_KEY`，不在代码、文档、前端或日志中写入实际值。`CHAT_ATTACHMENT_VISUAL_MODEL` 保存火山方舟实际 Endpoint ID；当前官方示例使用过 `doubao-seed-2-0-lite-260215`，也可能存在更新的日期版本，不能把示例 ID 当作永久别名。推荐在隐私审批前将 `CHAT_ATTACHMENT_VISUAL_ENABLED=false`、`CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED=false`；审批通过并完成 Endpoint 配置后再开启。文件不进入 RAGFlow 不代表解析片段不会发送给远程 LLM；完全内网处理应使用本地视觉模型或脱敏策略。
 
 ## 18. 回滚策略
 
