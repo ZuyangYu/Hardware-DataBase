@@ -32,8 +32,13 @@ dependencies = [
     "openinference-semantic-conventions>=0.1.27,<1",
     "pandas>=2.3.3,<3",
     "pydantic>=2.11.10,<3",
+    # Result exports use the maintained OOXML/PDF renderers instead of
+    # assembling office packages by hand.
+    "python-docx>=1.1,<2",
     "python-dotenv>=1.2.1,<2",
     "python-multipart>=0.0.9,<1",
+    "python-pptx>=1.0,<2",
+    "reportlab>=4.2,<5",
     # spreadsheet_sql_query: LLM 生成 SQL 的只读校验(单条 SELECT/表白名单)
     "sqlglot>=27,<29",
     # kept: vendored SpyDrNet imports requests at module top level
@@ -45,6 +50,7 @@ dependencies = [
 hardware-database-eval = "src.evaluation.cli:main"
 hardware-database-server = "src.api.app:main"
 hardware-database-worker = "src.workers.main:main"
+hardware-database-export-worker = "src.result_exports.worker:main"
 hardware-database-memory-worker = "src.memory.worker:main"
 
 [build-system]

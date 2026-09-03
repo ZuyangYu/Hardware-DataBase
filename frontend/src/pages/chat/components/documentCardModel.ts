@@ -7,10 +7,15 @@
  * 刷新动作直调 REST 工单状态接口;产物下载 URL 由前端拼装(REST 直链)。
  */
 import { api, apiDownload } from '@/api/client';
-import type { WorkOrderStatus } from '@/api/types';
+import type { DocumentChatTaskView, WorkOrderStatus } from '@/api/types';
 import { describeWorkOrderStatus, type DocumentStatusTone } from '../../documentGenerationModel';
 
-export type DocumentCardArtifact = { artifact_id: string; stage: string };
+export type DocumentCardArtifact = {
+  artifact_id: string;
+  stage: string;
+  preview_url?: string;
+  download_url?: string;
+};
 
 export type DocumentCardData = {
   kind: string;
@@ -70,6 +75,12 @@ export function parseCardArtifacts(value: unknown): DocumentCardArtifact[] | und
     .map((entry) => ({
       artifact_id: entry.artifact_id as string,
       stage: typeof entry.stage === 'string' ? entry.stage : '',
+      ...(typeof entry.preview_url === 'string' && entry.preview_url.trim()
+        ? { preview_url: entry.preview_url }
+        : {}),
+      ...(typeof entry.download_url === 'string' && entry.download_url.trim()
+        ? { download_url: entry.download_url }
+        : {}),
     }));
   return parsed.length > 0 ? parsed : undefined;
 }
@@ -100,6 +111,23 @@ export function parseDocumentCardEvent(data: string): DocumentCardData | null {
   } catch {
     return null;
   }
+}
+
+/** Project a durable background task into the same card contract as SSE events. */
+export function documentCardFromChatTask(task: DocumentChatTaskView): DocumentCardData {
+  const status = task.status;
+  const card: DocumentCardData = {
+    kind: 'work_order_status',
+    status: String(status.phase || status.status || task.job_status || ''),
+    next_actions: Array.isArray(status.next_actions) ? status.next_actions : [],
+    kb_name: task.kb_name,
+    work_order_id: task.work_order_id,
+    generation_session_id: status.clarification_session_id ?? null,
+  };
+  if (status.target_format) card.targetFormat = status.target_format;
+  const artifacts = parseCardArtifacts(status.artifacts);
+  if (artifacts) card.artifacts = artifacts;
+  return card;
 }
 
 export function documentCardIdentity(card: DocumentCardData): string {
@@ -142,6 +170,15 @@ export function documentWorkOrderStatusPath(kbName: string, workOrderId: string)
   return `/api/v1/document-generation/work-orders/${encodeURIComponent(workOrderId)}/status?kb=${encodeURIComponent(kbName)}`;
 }
 
+export function documentChatTasksPath(sessionId?: number | null): string {
+  const suffix = sessionId == null ? '' : `?session_id=${encodeURIComponent(String(sessionId))}`;
+  return `/api/v1/document-generation/chat-tasks${suffix}`;
+}
+
+export async function fetchDocumentChatTasks(sessionId?: number | null): Promise<DocumentChatTaskView[]> {
+  return api.get<DocumentChatTaskView[]>(documentChatTasksPath(sessionId));
+}
+
 export async function fetchDocumentWorkOrderStatus(kbName: string, workOrderId: string): Promise<WorkOrderStatus> {
   return api.get<WorkOrderStatus>(documentWorkOrderStatusPath(kbName, workOrderId));
 }
@@ -151,7 +188,7 @@ export function documentArtifactDownloadPath(artifactId: string, kb: string): st
   return `/api/v1/document-generation/artifacts/${artifactId}/download?kb=${encodeURIComponent(kb)}`;
 }
 
-/** 下载端点不返回 Content-Disposition,文件名只能在前端拼。 */
+/** 客户端提供一个稳定回退文件名;服务端同时返回安全的 Content-Disposition。 */
 export function documentArtifactFileName(artifactId: string, targetFormat?: string): string {
   return `${artifactId}.${targetFormat || 'bin'}`;
 }
@@ -161,7 +198,7 @@ export async function downloadDocumentArtifact(
   artifact: DocumentCardArtifact,
 ): Promise<void> {
   await apiDownload.blob(
-    documentArtifactDownloadPath(artifact.artifact_id, card.kb_name),
+    artifact.download_url || documentArtifactDownloadPath(artifact.artifact_id, card.kb_name),
     documentArtifactFileName(artifact.artifact_id, card.targetFormat),
   );
 }

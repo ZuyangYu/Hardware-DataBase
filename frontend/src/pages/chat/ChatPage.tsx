@@ -8,9 +8,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import type { AuthSession } from '../../auth';
-import { api } from '@/api/client';
+import { api, downloadBlob } from '@/api/client';
 import { analyzeTemplate } from '@/api/documentAuthoring';
-import type { KbView, MessageView } from '@/api/types';
+import type { ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, MessageView } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -27,6 +27,12 @@ import MessageList from './components/MessageList';
 import Composer from './components/Composer';
 import EditMessageDialog from './EditMessageDialog';
 import { notify } from '@/components/ui/app-toast';
+import {
+  buildExportRequest,
+  exportFormatLabel,
+  isExportTerminal,
+  mergeExportJob,
+} from './exportResultModel';
 
 type Props = {
   auth: AuthSession;
@@ -73,6 +79,9 @@ export default function ChatPage({
   const [documentContextLabel, setDocumentContextLabel] = useState<string | null>(null);
   const [documentUploadPending, setDocumentUploadPending] = useState(false);
   const [documentUploadProgress, setDocumentUploadProgress] = useState(0);
+  const [exportJobsByMessageId, setExportJobsByMessageId] = useState<Record<number, ExportJobView[]>>({});
+  const [exportPreviewsByJobId, setExportPreviewsByJobId] = useState<Record<string, ExportArtifactView>>({});
+  const [exportFormats, setExportFormats] = useState<ExportFormat[] | undefined>(undefined);
   const documentUploadRequestRef = useRef<{ fingerprint: string; clientRequestId: string } | null>(null);
   const documentAuthoringEnabled = resolveDocumentAuthoringEnabled(documentAuthoringEnabledOverride);
   const visibleKbs = useMemo(() => {
@@ -98,6 +107,22 @@ export default function ChatPage({
     setDocumentContextLabel(null);
     documentUploadRequestRef.current = null;
   }, [kbName]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .get<ExportFormatsResponse>('/api/v1/exports/formats')
+      .then((formats) => {
+        if (!cancelled) setExportFormats(formats);
+      })
+      .catch(() => {
+        // Keep the legacy menu during a transient capability request failure;
+        // the API remains authoritative and rejects disabled formats.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const chat = useKbChat(mountedKbName, { documentContextEnabled: documentAuthoringEnabled });
   const {
@@ -141,6 +166,98 @@ export default function ChatPage({
   useEffect(() => {
     if (documentContext == null) setDocumentContextLabel(null);
   }, [documentContext]);
+
+  // 导出任务只保存 Artifact/任务引用，不把二进制塞进消息；刷新或切换会话后从服务端重新对账。
+  useEffect(() => {
+    if (activeSessionId == null) return undefined;
+    let cancelled = false;
+    void api
+      .get<ExportJobView[]>(`/api/v1/exports?session_id=${activeSessionId}`)
+      .then((jobs) => {
+        if (cancelled) return;
+        const byTurn = new Map(
+          messages
+            .filter((message) => message.role === 'assistant' && message.turn_id)
+            .map((message) => [message.turn_id as string, message.id]),
+        );
+        setExportJobsByMessageId((previous) => {
+          const next = { ...previous };
+          for (const job of jobs) {
+            const messageId = job.turn_id ? byTurn.get(job.turn_id) : undefined;
+            if (messageId == null) continue;
+            next[messageId] = mergeExportJob(next[messageId] ?? [], job);
+          }
+          return next;
+        });
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, messages]);
+
+  async function waitForExportJob(messageId: number, jobId: string) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, attempt < 4 ? 500 : 1000));
+      try {
+        const job = await api.get<ExportJobView>(`/api/v1/exports/${encodeURIComponent(jobId)}`);
+        setExportJobsByMessageId((previous) => ({
+          ...previous,
+          [messageId]: mergeExportJob(previous[messageId] ?? [], job),
+        }));
+        if (isExportTerminal(job.status)) return;
+      } catch {
+        // Worker/API 暂时不可用时继续轮询；任务本身仍由服务端持久化。
+      }
+    }
+  }
+
+  async function handleExportMessage(message: MessageView, format: ExportFormat) {
+    if (!message.turn_id) {
+      notify.error('该消息缺少可导出的持久化轮次，请刷新页面后重试');
+      return;
+    }
+    try {
+      const response = await api.post<ExportBatchResponse>(
+        '/api/v1/exports',
+        buildExportRequest(message.turn_id, format, `chat-export-${message.id}-${format}-${Date.now()}`),
+      );
+      const job = response.jobs[0];
+      if (!job) throw new Error('导出任务未创建');
+      setExportJobsByMessageId((previous) => ({
+        ...previous,
+        [message.id]: mergeExportJob(previous[message.id] ?? [], job),
+      }));
+      notify.success(`${exportFormatLabel(format)} 导出任务已提交`);
+      if (!isExportTerminal(job.status)) void waitForExportJob(message.id, job.export_job_id);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '提交导出任务失败');
+    }
+  }
+
+  async function handleDownloadExport(job: ExportJobView) {
+    if (!job.artifact) return;
+    try {
+      await downloadBlob(
+        job.artifact.download_url || `/api/v1/artifacts/${encodeURIComponent(job.artifact.artifact_id)}/download`,
+        job.artifact.filename,
+      );
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '下载导出文件失败');
+    }
+  }
+
+  async function handlePreviewExport(job: ExportJobView) {
+    if (!job.artifact) return;
+    try {
+      const preview = await api.get<ExportArtifactView>(
+        job.artifact.preview_url || `/api/v1/artifacts/${encodeURIComponent(job.artifact.artifact_id)}/preview`,
+      );
+      setExportPreviewsByJobId((previous) => ({ ...previous, [job.export_job_id]: preview }));
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '加载 Artifact 预览失败');
+    }
+  }
 
   const canUploadDocumentTemplate = Boolean(
     documentAuthoringEnabled
@@ -276,10 +393,8 @@ export default function ChatPage({
     }
   }
 
-  // M17: 与 selectSession 同等门禁——回答生成中不允许切换知识库，
-  // 避免旧会话在后端跑完后结果因会话比对被静默丢弃。
   function handleKbChange(nextKbName: string) {
-    if (streaming || documentUploadPending) return;
+    if (documentUploadPending) return;
     setMountedKbName(nextKbName);
     clearDocumentContext();
     documentUploadRequestRef.current = null;
@@ -304,6 +419,16 @@ export default function ChatPage({
 
   return (
     <div className="flex h-full min-h-0 bg-[#fcfcfc] text-[#18181a]" style={sidebarProviderStyle}>
+      <ChatSessionSidebar
+        kbName={mountedKbName}
+        sessions={sessions}
+        sessionsLoaded={sessionsLoaded}
+        activeSessionId={activeSessionId}
+        streaming={streaming}
+        onSelect={selectSession}
+        onNew={() => void newConversation()}
+        onDelete={(id) => void deleteSession(id)}
+      />
       <main className={cn(CHAT_MAIN_CLASS, 'flex-1')}>
         <ChatHeader
           title={activeSession?.title || '新对话'}
@@ -332,6 +457,12 @@ export default function ChatPage({
           degradedNotes={degradedNotes}
           onCreateMemory={(messageId) => setUserMemoryTarget(messageId)}
           onEditMessage={openEditMessage}
+          onExport={handleExportMessage}
+          onDownloadExport={(job) => void handleDownloadExport(job)}
+          onPreviewExport={(job) => void handlePreviewExport(job)}
+          exportJobsByMessageId={exportJobsByMessageId}
+          exportPreviewsByJobId={exportPreviewsByJobId}
+          exportFormats={exportFormats}
         />
         {documentCards.length > 0 && (
           <div className="shrink-0 px-[24px] pb-[6px]">
@@ -371,16 +502,6 @@ export default function ChatPage({
           onClearDocumentContext={clearDocumentContext}
         />
       </main>
-      <ChatSessionSidebar
-        kbName={mountedKbName}
-        sessions={sessions}
-        sessionsLoaded={sessionsLoaded}
-        activeSessionId={activeSessionId}
-        streaming={streaming}
-        onSelect={selectSession}
-        onNew={() => void newConversation()}
-        onDelete={(id) => void deleteSession(id)}
-      />
       <ConfirmDialog
         open={extractConfirmOpen}
         onOpenChange={(next) => {

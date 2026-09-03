@@ -1850,11 +1850,36 @@ class DocumentAuthoringStore:
             row = conn.execute("SELECT payload_json FROM document_artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
         return DocumentArtifact.model_validate(_payload(row)) if row else None
 
-    def read_artifact_content(self, artifact_id: str) -> bytes:
+    def _read_artifact_content(self, artifact_id: str, *, verify_integrity: bool) -> bytes:
         artifact = self.get_artifact(artifact_id)
         if artifact is None or not artifact.storage_ref:
             raise KeyError(f"artifact not found: {artifact_id}")
-        return Path(artifact.storage_ref).read_bytes()
+        path = Path(artifact.storage_ref).resolve()
+        root = Path(self.artifact_root).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise PermissionError("artifact storage reference is outside artifact storage") from exc
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise KeyError(f"artifact file is unavailable: {artifact_id}") from exc
+        if verify_integrity and hashlib.sha256(content).hexdigest() != artifact.content_hash:
+            raise ValueError("artifact integrity check failed")
+        return content
+
+    def read_artifact_content(self, artifact_id: str) -> bytes:
+        """Read a stored artifact and verify its persisted content hash."""
+        return self._read_artifact_content(artifact_id, verify_integrity=True)
+
+    def read_artifact_content_for_validation(self, artifact_id: str) -> bytes:
+        """Read bytes for the approval validator's own ordered checks.
+
+        Approval intentionally inspects active content before reporting a
+        content-hash mismatch.  External preview/download callers must use
+        ``read_artifact_content`` instead.
+        """
+        return self._read_artifact_content(artifact_id, verify_integrity=False)
 
     def list_artifacts(self, work_order_id: str) -> list[DocumentArtifact]:
         with closing(self._connect()) as conn:

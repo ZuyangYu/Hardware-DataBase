@@ -4,6 +4,7 @@ import {
   buildWorkbenchDeepLink,
   documentArtifactDownloadPath,
   documentArtifactFileName,
+  documentCardFromChatTask,
   documentCardIdentity,
   documentCardStatusLabel,
   documentCardStatusTone,
@@ -13,6 +14,7 @@ import {
   parseDocumentCardEvent,
   type DocumentCardData,
 } from './documentCardModel';
+import type { DocumentChatTaskView } from '@/api/types';
 
 function cardEvent(card: Record<string, unknown>): string {
   return JSON.stringify({ card });
@@ -230,6 +232,39 @@ describe('documentCardModel', () => {
     expect(documentArtifactFileName('a-1', 'xlsx')).toBe('a-1.xlsx');
     expect(documentArtifactFileName('a-1', '')).toBe('a-1.bin');
     expect(documentArtifactFileName('a-1', undefined)).toBe('a-1.bin');
+  });
+
+  it('projects a durable chat document task into a downloadable status card', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 17,
+      work_order_id: 'wo-chat-1',
+      kb_name: 'hardware',
+      job_status: 'succeeded',
+      created_at: '2026-09-02T12:00:00Z',
+      updated_at: '2026-09-02T12:05:00Z',
+      status: {
+        work_order_id: 'wo-chat-1',
+        status: 'complete',
+        phase: 'completed',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'hardware',
+        target_format: 'docx',
+        unit_statuses: {},
+        next_actions: ['view_result'],
+        artifacts: [{ artifact_id: 'artifact-chat-1', stage: 'approved_release' }],
+      },
+    };
+
+    expect(documentCardFromChatTask(task)).toEqual({
+      kind: 'work_order_status',
+      status: 'completed',
+      next_actions: ['view_result'],
+      kb_name: 'hardware',
+      work_order_id: 'wo-chat-1',
+      generation_session_id: null,
+      targetFormat: 'docx',
+      artifacts: [{ artifact_id: 'artifact-chat-1', stage: 'approved_release' }],
+    });
   });
 
   it('falls back to describeWorkOrderStatus for statuses outside the card map', () => {

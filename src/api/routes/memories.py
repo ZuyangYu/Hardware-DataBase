@@ -27,8 +27,8 @@ from src.api.schemas import (
     MemoryExtractionRequest,
     MemoryListResponse,
     MemoryListScope,
+    MemoryListStatus,
     MemoryOperationResponse,
-    MemoryStatus,
     MemoryView,
     RevokeMemoryConsentRequest,
     SupersedeMemoryRequest,
@@ -123,7 +123,7 @@ def _operation_response(value: Any) -> MemoryOperationResponse:
 @router.get("/memories", response_model=MemoryListResponse)
 def list_memories(
     scope: MemoryListScope = Query(default="all"),
-    status: MemoryStatus | None = Query(default=None),
+    status: MemoryListStatus | None = Query(default=None),
     kb_name: str | None = Query(default=None, min_length=1, max_length=200),
     query: str = Query(default="", max_length=2_000),
     limit: int = Query(default=50, ge=1, le=200),

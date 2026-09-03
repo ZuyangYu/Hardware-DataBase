@@ -6,11 +6,12 @@ not redefine business schemas here.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 from src.document_authoring.chat_context import DocumentContext, DocumentContextInput
+from src.result_exports.models import normalize_export_format
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +216,7 @@ class MemoryContextView(BaseModel):
 class MessageView(BaseModel):
     id: int
     session_id: int
+    turn_id: str | None = None
     role: str
     content: str
     footer: str = ""
@@ -289,12 +291,128 @@ class TurnStartResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Generic result exports
+# ---------------------------------------------------------------------------
+
+ExportFormat = Literal["md", "xlsx", "docx", "pdf", "pptx"]
+
+
+def _normalize_export_format_input(value: Any) -> str:
+    try:
+        return normalize_export_format(str(value))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+ExportRequestFormat = Annotated[ExportFormat, BeforeValidator(_normalize_export_format_input)]
+
+
+class ExportSourceRef(BaseModel):
+    kind: Literal["turn", "message", "snapshot"] = "turn"
+    id: str = Field(min_length=1, max_length=200)
+
+
+class CreateExportRequest(BaseModel):
+    source_ref: ExportSourceRef
+    formats: list[ExportRequestFormat] = Field(min_length=1, max_length=5)
+    content_shape: Literal["report", "data", "raw"] = "report"
+    title: str | None = Field(default=None, max_length=160)
+    client_request_id: str | None = Field(default=None, max_length=128)
+    include_citations: bool = True
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExportArtifactView(BaseModel):
+    artifact_id: str
+    export_job_id: str
+    session_id: int
+    format: ExportFormat
+    filename: str
+    mime_type: str
+    size: int
+    sha256: str
+    preview: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    expires_at: str | None = None
+    preview_url: str
+    download_url: str
+    tenant_id: str = "default"
+    department_id: str | None = None
+    knowledge_base_name: str = ""
+    snapshot_id: str = ""
+    turn_id: str | None = None
+    available: bool = True
+
+
+class LegacyArtifactView(BaseModel):
+    """Unified projection for a template-document artifact."""
+
+    artifact_id: str
+    artifact_kind: Literal["document_generation"] = "document_generation"
+    work_order_id: str
+    stage: str
+    format: str
+    filename: str
+    mime_type: str
+    size: int
+    sha256: str
+    preview: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    preview_url: str
+    download_url: str
+    tenant_id: str = "default"
+    department_id: str | None = None
+    knowledge_base_name: str = ""
+    available: bool = True
+
+
+class ExportJobView(BaseModel):
+    export_job_id: str
+    snapshot_id: str
+    session_id: int
+    turn_id: str | None = None
+    format: ExportFormat
+    content_shape: str
+    status: str
+    attempt: int
+    error_message: str = ""
+    artifact: ExportArtifactView | None = None
+    created_at: str
+    updated_at: str
+    completed_at: str | None = None
+    tenant_id: str = "default"
+    department_id: str | None = None
+    knowledge_base_name: str = ""
+
+
+class ExportBatchView(BaseModel):
+    snapshot_id: str
+    session_id: int
+    source_ref: ExportSourceRef
+    jobs: list[ExportJobView]
+
+
+# ---------------------------------------------------------------------------
 # Long-term memory governance
 # ---------------------------------------------------------------------------
 
 MemoryScope = Literal["project", "user"]
 MemoryListScope = Literal["all", "project", "user"]
 MemoryStatus = Literal[
+    "candidate",
+    "verification_pending",
+    "supersede_pending",
+    "needs_rebuild",
+    "verified",
+    "superseded",
+    "rejected",
+    "deleted",
+    "provenance_missing",
+]
+
+MemoryListStatus = Literal[
+    "all",
+    "active",
     "candidate",
     "verification_pending",
     "supersede_pending",

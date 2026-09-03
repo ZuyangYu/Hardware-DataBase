@@ -160,6 +160,7 @@ export interface MemoryContextItem {
 export interface MessageView {
   id: number;
   session_id: number;
+  turn_id?: string | null;
   role: 'user' | 'assistant' | 'system';
   content: string;
   footer?: string;
@@ -224,6 +225,8 @@ export type MemoryStatus =
   | 'rejected'
   | 'deleted'
   | 'provenance_missing';
+
+export type MemoryListStatus = MemoryStatus | 'active' | 'all';
 
 export interface MemorySourceView {
   source_id: string;
@@ -478,6 +481,58 @@ export interface QueryDonePayload {
   } | null;
   footer?: string;
   token_usage?: unknown;
+}
+
+export type ExportFormat = 'md' | 'xlsx' | 'docx' | 'pdf' | 'pptx';
+
+export interface ExportArtifactView {
+  artifact_id: string;
+  export_job_id: string;
+  session_id: number;
+  format: ExportFormat;
+  filename: string;
+  mime_type: string;
+  size: number;
+  sha256: string;
+  preview: Record<string, unknown>;
+  created_at: string;
+  expires_at?: string | null;
+  preview_url: string;
+  download_url: string;
+  tenant_id: string;
+  department_id?: string | null;
+  knowledge_base_name: string;
+  snapshot_id?: string;
+  turn_id?: string | null;
+  available?: boolean;
+}
+
+export interface ExportJobView {
+  export_job_id: string;
+  snapshot_id: string;
+  session_id: number;
+  turn_id?: string | null;
+  format: ExportFormat;
+  content_shape: 'report' | 'data' | 'raw' | string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'dead_letter' | string;
+  attempt: number;
+  error_message: string;
+  artifact: ExportArtifactView | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  tenant_id: string;
+  department_id?: string | null;
+  knowledge_base_name: string;
+}
+
+export type ExportFormatsResponse = ExportFormat[];
+
+export interface ExportBatchResponse {
+  snapshot_id: string;
+  session_id: number;
+  source_ref: { kind: 'turn' | 'message' | 'snapshot'; id: string };
+  jobs: ExportJobView[];
 }
 
 export type QueryTraceStatus = 'pending' | 'running' | 'done' | 'error';
@@ -1023,6 +1078,17 @@ export type WorkOrderStatus = {
   validation?: { status?: string; issues?: unknown[] };
   artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
   [k: string]: unknown;
+};
+
+/** Durable document-authoring task projected back into a chat session. */
+export type DocumentChatTaskView = {
+  session_id: number;
+  work_order_id: string;
+  kb_name: string;
+  job_status: string;
+  created_at: string;
+  updated_at: string;
+  status: WorkOrderStatus;
 };
 
 export type IcdScopeReview = {

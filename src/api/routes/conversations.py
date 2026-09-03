@@ -41,6 +41,7 @@ def _message_view(m) -> MessageView:
     return MessageView(
         id=m.id,
         session_id=m.session_id,
+        turn_id=getattr(m, "turn_id", None),
         role=m.role,
         content=m.content,
         footer=m.footer,

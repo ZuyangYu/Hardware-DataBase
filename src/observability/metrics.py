@@ -19,6 +19,10 @@ _MEMORY_INDEX_STATE: dict[str, dict[str, int | str]] = {}
 _MEMORY_PROJECTION_STATE: dict[str, float] = {"pending": 0.0, "lag_seconds": 0.0}
 _MEMORY_GAUGES: dict[str, Any] = {}
 
+_EXPORT_FORMATS = frozenset({"md", "xlsx", "docx", "pdf", "pptx"})
+_EXPORT_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled", "dead_letter"})
+_EXPORT_QUEUES = frozenset({"result-export", "result_exports", "export"})
+
 
 def _enabled() -> bool:
     try:
@@ -33,8 +37,9 @@ def metric_attributes(attributes: Mapping[str, Any] | None) -> dict[str, str]:
     """Drop high-cardinality labels before they can reach Prometheus."""
 
     result: dict[str, str] = {}
+    allowed_keys = METRIC_LABEL_KEYS | {"format"}
     for key, value in (attributes or {}).items():
-        if key not in METRIC_LABEL_KEYS or value is None:
+        if key not in allowed_keys or value is None:
             continue
         result[str(key)] = str(value)[:80]
     return result
@@ -273,3 +278,70 @@ def record_authoring_tool(*, tool: str, status: str, duration_s: float | None = 
             attributes={"tool": tool},
             description="Document authoring agent tool duration",
         )
+
+
+def _export_format(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _EXPORT_FORMATS else "other"
+
+
+def _export_status(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _EXPORT_STATUSES else "other"
+
+
+def record_export_job(
+    *,
+    format: str,
+    status: str,
+    duration_s: float,
+    queue_s: float | None = None,
+    job_id: str | None = None,
+) -> None:
+    """Record one export task without turning identifiers into metric labels."""
+    del job_id
+    attrs = {"format": _export_format(format), "status": _export_status(status)}
+    counter("hdb.export.jobs", attributes=attrs, description="Export jobs")
+    histogram("hdb.export.job.duration", duration_s, attributes=attrs, description="Export job duration")
+    if queue_s is not None:
+        histogram("hdb.export.queue.wait", queue_s, attributes={"format": attrs["format"]}, description="Export queue wait")
+
+
+def record_export_render(*, format: str, status: str, duration_s: float) -> None:
+    """Record renderer latency by bounded format and outcome."""
+    histogram(
+        "hdb.export.render.duration",
+        duration_s,
+        attributes={"format": _export_format(format), "status": _export_status(status)},
+        description="Export rendering duration",
+    )
+
+
+def record_export_bytes(*, format: str, byte_count: int) -> None:
+    """Record produced artifact size; IDs and filenames are intentionally excluded."""
+    histogram(
+        "hdb.export.artifact.bytes",
+        max(0, int(byte_count)),
+        attributes={"format": _export_format(format)},
+        unit="By",
+        description="Export artifact size",
+    )
+
+
+def record_export_download(*, format: str, status: str = "succeeded") -> None:
+    """Count artifact downloads by bounded format and outcome."""
+    counter(
+        "hdb.export.downloads",
+        attributes={"format": _export_format(format), "status": _export_status(status)},
+        description="Export artifact downloads",
+    )
+
+
+def set_export_queue_state(*, queue: str, depth: int, oldest_age_s: float) -> None:
+    """Publish export queue depth through the shared low-cardinality queue gauges."""
+    normalized = str(queue or "").strip().lower()
+    set_queue_state(
+        queue=normalized if normalized in _EXPORT_QUEUES else "other",
+        depth=depth,
+        oldest_age_s=oldest_age_s,
+    )

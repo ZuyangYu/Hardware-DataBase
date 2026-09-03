@@ -736,3 +736,43 @@ def test_internal_harness_rewrites_query_on_success_empty(tmp_path: Path, monkey
     # attempt 1 used no override; attempt 2 used the rewrite.
     assert overrides == [None, "rewrite-query"]
     rewriter.rewrite.assert_called_once()
+
+
+def test_legacy_artifact_read_rejects_tampered_content(tmp_path: Path):
+    store = DocumentAuthoringStore(
+        str(tmp_path / "authoring.db"),
+        str(tmp_path / "authoring-files"),
+    )
+    store.create_work_order(DocumentWorkOrder(
+        work_order_id="wo-integrity",
+        tenant_id="default",
+        project_id="project-integrity",
+        baseline_id="baseline-integrity",
+        baseline_content_hash="baseline-hash",
+        source_set_snapshot_id="snapshot-integrity",
+        template_version_id="template-integrity",
+        document_schema_id="schema-integrity",
+        document_schema_version="1",
+        template_schema_id="template-schema-integrity",
+        template_schema_version="1",
+        retrieval_policy_version="1",
+        renderer_policy_version="1",
+        target_format="xlsx",
+        execution_mode="deterministic_only",
+        created_by="alice",
+    ))
+    content = b"approved artifact"
+    artifact = DocumentArtifact(
+        artifact_id="artifact-integrity",
+        work_order_id="wo-integrity",
+        run_id="run-integrity",
+        stage="approved_release",
+        content_hash=hashlib.sha256(content).hexdigest(),
+        validation_report_id="report-integrity",
+        integrity_manifest_id="manifest-integrity",
+    )
+    saved = store.save_artifact(artifact, content, "bin")
+    Path(saved.storage_ref).write_bytes(b"tampered artifact")
+
+    with pytest.raises(ValueError, match="artifact integrity check failed"):
+        store.read_artifact_content(saved.artifact_id)

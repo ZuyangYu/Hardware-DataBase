@@ -68,6 +68,95 @@ def test_claim_heartbeat_and_lease_expired_takeover_are_atomic(tmp_path):
     assert adopted.lease_token == 2
 
 
+def test_resource_lock_serializes_same_knowledge_base_and_releases_after_completion(tmp_path):
+    store = _store(tmp_path)
+    first = _create(store, request_id="resource-lock-1", work_order_id="wo-1")
+    second = _create(
+        store,
+        request_id="resource-lock-2",
+        work_order_id="wo-2",
+        payload={"work_order_id": "wo-2", "knowledge_base_name": "hardware"},
+    )
+
+    claimed_first = store.claim(first.job_id, "worker-a", lease_seconds=30)
+    assert claimed_first is not None
+    assert store.claim(second.job_id, "worker-b", lease_seconds=30) is None
+
+    store.complete(first.job_id, "worker-a", claimed_first.lease_token, {"status": "completed"})
+
+    claimed_second = store.claim(second.job_id, "worker-b", lease_seconds=30)
+    assert claimed_second is not None
+    assert claimed_second.lease_owner == "worker-b"
+
+
+def test_resource_lock_has_fencing_and_rejects_stale_renewal(tmp_path):
+    store = _store(tmp_path)
+    first = store.acquire_resource_lock(
+        tenant_id="tenant-a",
+        resource_type="template",
+        resource_id="template-1",
+        owner_id="worker-a",
+        lease_seconds=30,
+    )
+    assert first is not None
+    assert first.fencing_token == 1
+    assert store.acquire_resource_lock(
+        tenant_id="tenant-a",
+        resource_type="template",
+        resource_id="template-1",
+        owner_id="worker-b",
+        lease_seconds=30,
+    ) is None
+
+    with pytest.raises(RuntimeError, match="resource lock lost"):
+        store.renew_resource_lock(
+            tenant_id="tenant-a",
+            resource_type="template",
+            resource_id="template-1",
+            owner_id="worker-b",
+            fencing_token=first.fencing_token,
+            lease_seconds=30,
+        )
+
+    released = store.release_resource_lock(
+        tenant_id="tenant-a",
+        resource_type="template",
+        resource_id="template-1",
+        owner_id="worker-a",
+        fencing_token=first.fencing_token,
+    )
+    assert released is True
+
+
+def test_expired_resource_lock_cannot_be_renewed(tmp_path):
+    store = _store(tmp_path)
+    lock = store.acquire_resource_lock(
+        tenant_id="tenant-a",
+        resource_type="project",
+        resource_id="project-1",
+        owner_id="worker-a",
+        lease_seconds=30,
+    )
+    assert lock is not None
+
+    expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE document_resource_locks SET lease_expires_at = ? WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?",
+            (expired, "tenant-a", "project", "project-1"),
+        )
+
+    with pytest.raises(RuntimeError, match="resource lock lost"):
+        store.renew_resource_lock(
+            tenant_id="tenant-a",
+            resource_type="project",
+            resource_id="project-1",
+            owner_id="worker-a",
+            fencing_token=lock.fencing_token,
+            lease_seconds=30,
+        )
+
+
 def test_retry_backoff_reaches_dead_letter_and_outbox_is_observable(tmp_path):
     store = _store(tmp_path)
     job = _create(store, request_id="request-retry", max_attempts=2)
@@ -128,6 +217,39 @@ def test_status_lookup_and_queue_metrics_are_scope_safe(tmp_path):
     depth, oldest_age = store.queue_state()
     assert depth == 1
     assert oldest_age >= 0
+
+
+def test_list_chat_session_jobs_is_scoped_to_owner_and_session(tmp_path):
+    store = _store(tmp_path)
+    owned = _create(store, request_id="request-owned")
+    other_session = store.create_job(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        session_id="chat-2",
+        client_request_id="request-other-session",
+        operation="generate_work_order",
+        work_order_id="wo-2",
+        payload={"work_order_id": "wo-2", "knowledge_base_name": "hardware"},
+    )
+    other_user = store.create_job(
+        tenant_id="tenant-a",
+        user_id="user-b",
+        session_id="chat-1",
+        client_request_id="request-other-user",
+        operation="generate_work_order",
+        work_order_id="wo-3",
+        payload={"work_order_id": "wo-3", "knowledge_base_name": "hardware"},
+    )
+
+    rows = store.list_chat_session_jobs(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        session_id="chat-1",
+    )
+
+    assert [row.job_id for row in rows] == [owned.job_id]
+    assert other_session.job_id not in {row.job_id for row in rows}
+    assert other_user.job_id not in {row.job_id for row in rows}
 
 
 def test_worker_dispatches_resume_job_after_restartable_claim(tmp_path, monkeypatch):

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { api } from '../api/client';
-import type { KbView, MemoryConsentListResponse, MemoryConsentView, MemoryListResponse, MemoryStatus, MemoryView, UserMemorySettingsView } from '../api/types';
+import type { KbView, MemoryConsentListResponse, MemoryConsentView, MemoryListResponse, MemoryListStatus, MemoryStatus, MemoryView, UserMemorySettingsView } from '../api/types';
 import type { AuthSession } from '../auth';
+import { visibleMemoryConsents } from './memoryViewModel';
 import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
 import { Button } from '@/components/ui/button';
@@ -16,10 +17,11 @@ type Props = {
   kbs: KbView[];
 };
 
-type ListStatus = MemoryStatus | 'all';
+type ListStatus = MemoryListStatus;
 
 const STATUS_LABEL: Record<ListStatus, string> = {
   all: '全部状态',
+  active: '当前有效',
   candidate: 'Candidate',
   verification_pending: '待审核',
   supersede_pending: '待替代',
@@ -46,7 +48,7 @@ function statusClass(status: MemoryStatus): string {
 
 export default function MemoryPage({ auth, onLogout, kbs }: Props) {
   const [scope, setScope] = useState<'user' | 'project'>('user');
-  const [status, setStatus] = useState<ListStatus>('all');
+  const [status, setStatus] = useState<ListStatus>('active');
   const [selectedKb, setSelectedKb] = useState(kbs[0]?.name ?? '');
   const [rows, setRows] = useState<MemoryView[]>([]);
   const [settings, setSettings] = useState<UserMemorySettingsView | null>(null);
@@ -54,6 +56,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
   const [detail, setDetail] = useState<MemoryView | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
+  const activeConsents = visibleMemoryConsents(consents);
 
   useEffect(() => {
     if (!selectedKb || !kbs.some((kb) => kb.name === selectedKb)) {
@@ -65,7 +68,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
     let cancelled = false;
     setLoaded(false);
     const params = new URLSearchParams({ scope });
-    if (status !== 'all') params.set('status', status);
+    params.set('status', status);
     if (scope === 'project' && selectedKb) params.set('kb_name', selectedKb);
     const listRequest = scope === 'project' && !selectedKb
       ? Promise.resolve<MemoryListResponse>({ items: [], next_cursor: null, total: 0 })
@@ -306,7 +309,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
         </div>
       )}
 
-      {scope === 'user' && consents.length > 0 && (
+      {scope === 'user' && activeConsents.length > 0 && (
         <section className="mt-[18px] rounded-[14px] border border-[#e3e7f1] bg-white px-[20px] py-[16px]">
           <div className="flex items-center justify-between gap-[12px]">
             <div>
@@ -315,7 +318,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
             </div>
           </div>
           <div className="mt-[10px] grid gap-[6px]">
-            {consents.map((consent) => (
+            {activeConsents.map((consent) => (
               <div key={consent.consent_event_id} className="flex flex-wrap items-center gap-[8px] rounded-[8px] bg-[#fafbfc] px-[10px] py-[8px] text-[11px] text-[#68728a]">
                 <span>会话 #{consent.session_id}</span>
                 <span>来源 {consent.source_count} 条</span>

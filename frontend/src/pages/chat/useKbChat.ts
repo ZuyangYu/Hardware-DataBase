@@ -27,7 +27,16 @@ import type {
 } from '@/api/types';
 import { notify } from '@/components/ui/app-toast';
 import { createClientRequestId } from '@/api/documentAuthoring';
-import { fetchDocumentWorkOrderStatus, mergeDocumentCards, parseCardArtifacts, parseDocumentCardEvent, type DocumentCardData } from './components/documentCardModel';
+import {
+  documentCardFromChatTask,
+  fetchDocumentChatTasks,
+  fetchDocumentWorkOrderStatus,
+  mergeDocumentCards,
+  parseCardArtifacts,
+  parseDocumentCardEvent,
+  type DocumentCardData,
+} from './components/documentCardModel';
+import { shouldCancelServerTurn, type ChatStreamDetachReason } from './chatTaskLifecycle';
 
 // document context 纯函数与 client_request_id 生成已迁至 api/documentAuthoring;
 // 这里 re-export 保持既有 `from './useKbChat'` 导入(含测试)不破。
@@ -43,6 +52,7 @@ export {
 const GENERAL_CHAT_KB_NAME = '__general__';
 const QUERY_TRACE_HIDE_DELAY_MS = 5000;
 const STREAMING_RENDER_INTERVAL_MS = 64;
+const DOCUMENT_TASK_POLL_INTERVAL_MS = 3000;
 
 function requestUuid(): string {
   return createClientRequestId();
@@ -198,6 +208,8 @@ export type UseKbChat = ReturnType<typeof useKbChat>;
 export type UseKbChatOptions = {
   /** Feature gate for the optional document_context wire field. */
   documentContextEnabled?: boolean;
+  /** Called only for a newly completed turn, never for recovered history. */
+  onTurnCompleted?: (message: MessageView, query: string) => void | Promise<void>;
 };
 
 export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
@@ -232,7 +244,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   }, []);
   const abortRef = useRef<AbortController | null>(null);
   const currentTurnRef = useRef<string | null>(null);
+  const streamTokenRef = useRef(0);
   const sendingRef = useRef(false);
+  const sendingGenerationRef = useRef<number | null>(null);
   // 卡片刷新的在飞标记(ref 而非 state 闭包):两次快速点击只允许发起一次 REST 请求。
   const documentCardRefreshInFlightRef = useRef(false);
   const activeSessionRef = useRef<number | null>(null);
@@ -241,6 +255,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   // 使 tool_result 能挂回正确的调用条目(流式恢复场景下退化为按工具名合并)。
   const toolCallSeqRef = useRef(0);
   const toolActiveKeyRef = useRef<Map<string, string>>(new Map());
+  const onTurnCompletedRef = useRef(options.onTurnCompleted);
+  onTurnCompletedRef.current = options.onTurnCompleted;
 
   const stepFromToolEvent = useCallback((etype: string, raw: string): QueryTraceStep | null => {
     const step = traceStepFromToolEvent(etype, raw);
@@ -298,6 +314,27 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     lastStreamingFlushAtRef.current = 0;
     setStreamingText('');
   }, []);
+
+  const detachClientStream = useCallback((reason: ChatStreamDetachReason) => {
+    const turnId = currentTurnRef.current;
+    if (turnId && shouldCancelServerTurn(reason)) {
+      // Only the explicit Stop action is allowed to mutate durable turn state.
+      void api.post(`/api/v1/turns/${turnId}/cancel`).catch(() => undefined);
+    }
+    streamTokenRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    currentTurnRef.current = null;
+    if (!shouldCancelServerTurn(reason)) {
+      // Let the newly selected session reconnect immediately.  The stale
+      // sender owns a separate generation and can no longer clear the new
+      // sender's state in its finally block.
+      sendingRef.current = false;
+      sendingGenerationRef.current = null;
+    }
+    setStreaming(false);
+    resetStreamingText();
+  }, [resetStreamingText]);
 
   // ---- 会话列表 ----
   useEffect(() => {
@@ -500,15 +537,26 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
 
   useEffect(() => {
     return () => {
-      const turnId = currentTurnRef.current;
-      if (turnId) {
-        void api.post(`/api/v1/turns/${turnId}/cancel`).catch(() => undefined);
-      }
       abortRef.current?.abort();
+      abortRef.current = null;
+      currentTurnRef.current = null;
+      streamTokenRef.current += 1;
       if (streamingFlushTimerRef.current) clearTimeout(streamingFlushTimerRef.current);
       if (traceClearTimerRef.current) clearTimeout(traceClearTimerRef.current);
     };
   }, []);
+
+  // A KB switch is navigation, not cancellation. Detach the old browser
+  // subscription so the next KB can accept a new request immediately.
+  useEffect(() => {
+    // A scope change invalidates even a request that is still creating its
+    // session/turn and therefore has not populated currentTurnRef yet.
+    if (currentTurnRef.current) {
+      detachClientStream('knowledge_base_switch');
+    } else {
+      streamTokenRef.current += 1;
+    }
+  }, [scopeKbName, detachClientStream]);
 
   const clearTraceTimer = useCallback(() => {
     if (traceClearTimerRef.current) {
@@ -571,14 +619,56 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     setDocumentCardRefreshingId(null);
   }, [activeSessionId]);
 
+  // Reconcile durable document jobs after navigation, refresh and reconnect.
+  // The worker owns execution; this polling only restores the user-visible
+  // card and stops once the work order reaches a stable terminal state.
+  useEffect(() => {
+    if (!documentContextEnabled || activeSessionId == null) return undefined;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleSync = () => {
+      if (!disposed) timer = setTimeout(() => void sync(), DOCUMENT_TASK_POLL_INTERVAL_MS);
+    };
+    const sync = async () => {
+      try {
+        const tasks = await fetchDocumentChatTasks(activeSessionId);
+        if (disposed || activeSessionRef.current !== activeSessionId) return;
+        setDocumentCards((prev) => tasks.reduce(
+          (cards, task) => mergeDocumentCards(cards, documentCardFromChatTask(task)),
+          prev,
+        ));
+        const stillRunning = tasks.some((task) => {
+          const phase = String(task.status.phase || task.status.status || task.job_status || '');
+          return !['completed', 'complete', 'succeeded', 'failed', 'blocked', 'cancelled', 'needs_review'].includes(phase);
+        });
+        if (stillRunning) scheduleSync();
+      } catch {
+        // A transient status read failure should not disrupt chat; retry while
+        // this session remains visible so a completed artifact still appears.
+        scheduleSync();
+      }
+    };
+    void sync();
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [activeSessionId, documentContextEnabled]);
+
   // 刷新或重新打开会话时，接回后端仍在执行的持久化 turn。
   useEffect(() => {
     if (activeSessionId == null || currentTurnRef.current || sendingRef.current) return undefined;
+    const generation = streamTokenRef.current;
     let disposed = false;
     let controller: AbortController | null = null;
+    const ownsStream = (turnId: string, sessionId: number) =>
+      !disposed &&
+      streamTokenRef.current === generation &&
+      currentTurnRef.current === turnId &&
+      activeSessionRef.current === sessionId;
     void api.get<TurnView[]>(`/api/v1/conversations/${activeSessionId}/turns`).then(async (turns) => {
       const turn = turns[0];
-      if (disposed) return;
+      if (disposed || streamTokenRef.current !== generation || activeSessionRef.current !== activeSessionId) return;
       if (!turn) {
         // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
         // 空会话(无可恢复 turn)意味着没有服务端持久化事实,必须清掉残留上下文。
@@ -600,9 +690,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       let accumulated = '';
       try {
         await api.post(`/api/v1/turns/${turn.id}/start`);
+        if (!ownsStream(turn.id, turn.session_id)) return;
         // Start from zero on a reload so the already-generated prefix is also restored.
         for await (const evt of sseGetStream(`/api/v1/turns/${turn.id}/events`, controller.signal)) {
-          if (disposed) break;
+          if (!ownsStream(turn.id, turn.session_id)) break;
           if (evt.event === 'delta') {
             const parsed = JSON.parse(evt.data) as { text?: string };
             accumulated += parsed.text ?? '';
@@ -621,29 +712,29 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
             const card = parseDocumentCardEvent(evt.data);
             if (card) setDocumentCards((prev) => mergeDocumentCards(prev, card));
           } else if (evt.event === 'done') {
+            if (!ownsStream(turn.id, turn.session_id)) break;
             const payload = JSON.parse(evt.data) as QueryDonePayload;
             const answer = payload.answer ?? accumulated;
-            if (activeSessionRef.current === turn.session_id) {
-              setMessages((prev) => [
-                ...prev.filter((message) => message.id !== turn.assistant_message_id),
-                {
-                  id: turn.assistant_message_id,
-                  session_id: turn.session_id,
-                  role: 'assistant',
-                  content: answer,
-                  footer: (payload.footer ?? '').trim(),
-                  memory_context: payload.summary?.memory_context ?? [],
-                  created_at: turn.created_at,
-                },
-              ]);
-              // 刷新恢复时同样回填证据面板,否则引用标号 [n] 没有来源可看
-              const recoveredEvidence = payload.summary?.evidence ?? [];
-              if (recoveredEvidence.length > 0 && turn.assistant_message_id != null) {
-                setEvidenceByMessageId((prev) => ({
-                  ...prev,
-                  [turn.assistant_message_id as number]: recoveredEvidence,
-                }));
-              }
+            setMessages((prev) => [
+              ...prev.filter((message) => message.id !== turn.assistant_message_id),
+              {
+                id: turn.assistant_message_id,
+                session_id: turn.session_id,
+                turn_id: turn.id,
+                role: 'assistant',
+                content: answer,
+                footer: (payload.footer ?? '').trim(),
+                memory_context: payload.summary?.memory_context ?? [],
+                created_at: turn.created_at,
+              },
+            ]);
+            // 刷新恢复时同样回填证据面板,否则引用标号 [n] 没有来源可看
+            const recoveredEvidence = payload.summary?.evidence ?? [];
+            if (recoveredEvidence.length > 0 && turn.assistant_message_id != null) {
+              setEvidenceByMessageId((prev) => ({
+                ...prev,
+                [turn.assistant_message_id as number]: recoveredEvidence,
+              }));
             }
             finishTrace('done', '已完成输出');
             void refreshMemorySummary();
@@ -651,16 +742,17 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
               setTraceByMessageId((prev) => ({ ...prev, [turn.assistant_message_id as number]: traceRef.current }));
             }
           } else if (evt.event === 'error') {
+            if (!ownsStream(turn.id, turn.session_id)) break;
             const parsed = JSON.parse(evt.data) as { message?: string };
             finishTrace('error', parsed.message || '查询失败');
           }
         }
       } catch (error) {
-        if (!disposed && !(error instanceof DOMException && error.name === 'AbortError')) {
+        if (ownsStream(turn.id, turn.session_id) && !(error instanceof DOMException && error.name === 'AbortError')) {
           finishTrace('error', error instanceof Error ? error.message : '恢复生成失败');
         }
       } finally {
-        if (!disposed) {
+        if (streamTokenRef.current === generation && currentTurnRef.current === turn.id) {
           currentTurnRef.current = null;
           abortRef.current = null;
           setStreaming(false);
@@ -672,15 +764,22 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       disposed = true;
       controller?.abort();
     };
-  }, [activeSessionId, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep, refreshMemorySummary]);
+  }, [activeSessionId, documentContextEnabled, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep, refreshMemorySummary]);
 
   const createSession = useCallback(
-    async (title: string): Promise<SessionView> => {
+    async (title: string, expectedStreamToken?: number): Promise<SessionView> => {
       const session = await api.post<SessionView>('/api/v1/conversations', {
         kb_name: scopeKbName,
         title: title || '新对话',
       });
+      // A navigation/KB switch may happen while the POST is in flight.  Keep
+      // the durable session, but do not let a stale request select it in the
+      // newly visible scope.
+      if (expectedStreamToken !== undefined && streamTokenRef.current !== expectedStreamToken) {
+        return session;
+      }
       setSessions((prev) => [session, ...prev]);
+      activeSessionRef.current = session.id;
       setActiveSessionId(session.id);
       setMessages([]);
       // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
@@ -692,13 +791,13 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   );
 
   const newConversation = useCallback(async () => {
-    if (streaming) return;
+    detachClientStream('route_navigation');
     try {
       await createSession('新对话');
     } catch (error) {
       setForbidden(error instanceof Error ? error.message : '创建会话失败');
     }
-  }, [createSession, streaming]);
+  }, [createSession, detachClientStream]);
 
   const deleteSession = useCallback(
     async (sessionId: number) => {
@@ -725,12 +824,12 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   );
 
   const selectSession = useCallback((sessionId: number) => {
-    if (streaming) return;
+    if (sessionId !== activeSessionRef.current) detachClientStream('route_navigation');
     // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
     // 同步清空避免残留 chip 闪烁;若目标会话最新 turn 带持久化上下文,由接回 effect 恢复。
     setDocumentContextState(null);
     setActiveSessionId(sessionId);
-  }, [streaming]);
+  }, [detachClientStream]);
 
   /** 用服务端返回的 MessageView 替换本地消息(编辑/脱敏回写)。 */
   const updateMessage = useCallback((updated: MessageView) => {
@@ -738,16 +837,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   }, []);
 
   const abortStream = useCallback(async () => {
-    const turnId = currentTurnRef.current;
-    if (turnId) {
-      try {
-        await api.post(`/api/v1/turns/${turnId}/cancel`);
-      } catch {
-        // SSE abort below still detaches this browser from the stream.
-      }
-    }
-    abortRef.current?.abort();
-  }, []);
+    detachClientStream('user_stop');
+  }, [detachClientStream]);
 
   /** 卡片内"刷新状态"直调 REST 工单状态接口,不经过 agent/聊天发送链路。 */
   const refreshDocumentCardStatus = useCallback(async (card: DocumentCardData) => {
@@ -781,7 +872,11 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const send = useCallback(async () => {
     const query = input.trim();
     if (!query || streaming) return;
+    const generation = streamTokenRef.current + 1;
+    streamTokenRef.current = generation;
+    sendingGenerationRef.current = generation;
     sendingRef.current = true;
+    const ownsGeneration = () => streamTokenRef.current === generation;
     setInput('');
     setStreaming(true);
     resetStreamingText();
@@ -810,9 +905,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     try {
       // 1. 确保会话存在(首次提问自动建会话,标题取问题前 20 字)
       if (sessionId == null) {
-        const session = await createSession(query.slice(0, 20));
+        const session = await createSession(query.slice(0, 20), generation);
         sessionId = session.id;
       }
+      if (!ownsGeneration()) return;
 
       // 2. 后端原子写入 user/assistant 占位消息并创建幂等 turn。
       const created = await api.post<TurnStartResponse>(
@@ -825,22 +921,30 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           documentContextEnabled ? documentFlowEnabled : undefined,
         ),
       );
-      if (documentContextEnabled) {
+      if (documentContextEnabled && ownsGeneration()) {
         const returnedContext = created.turn.document_context ?? created.user_message.document_context;
         if (returnedContext) setDocumentContextState(returnedContext);
       }
-      setMessages((prev) => prev.map((m) => (m.id === optimisticId ? created.user_message : m)));
+      if (ownsGeneration()) {
+        setMessages((prev) => prev.map((m) => (m.id === optimisticId ? created.user_message : m)));
+      }
 
       // 3. 后端任务独立执行; SSE 只订阅持久化事件，刷新可从事件序号重放。
       const controller = new AbortController();
-      abortRef.current = controller;
-      currentTurnRef.current = created.turn.id;
+      if (ownsGeneration()) {
+        abortRef.current = controller;
+        currentTurnRef.current = created.turn.id;
+      }
       await api.post(`/api/v1/turns/${created.turn.id}/start`);
+      if (!ownsGeneration()) return;
+      const ownsStream = () =>
+        ownsGeneration() && currentTurnRef.current === created.turn.id && activeSessionRef.current === sessionId;
       let finalPayload: QueryDonePayload | null = null;
       let errorMessage: string | null = null;
       let accumulated = '';
 
       for await (const evt of sseGetStream(`/api/v1/turns/${created.turn.id}/events`, controller.signal)) {
+        if (!ownsStream()) break;
         if (evt.event === 'delta') {
           try {
             const parsed = JSON.parse(evt.data) as { text?: string };
@@ -893,24 +997,32 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       }
 
       // 4. 收尾:done -> 落库 assistant 消息;error/中断 -> 提示
+      if (!ownsStream()) return;
       if (finalPayload) {
         const payload: QueryDonePayload = finalPayload;
         const answer = payload.answer ?? accumulated;
         const assistantMessage: MessageView = {
           id: created.turn.assistant_message_id,
           session_id: sessionId,
+          turn_id: created.turn.id,
           role: 'assistant',
           content: answer,
           footer: (payload.footer ?? '').trim(),
           memory_context: payload.summary?.memory_context ?? [],
           created_at: new Date().toISOString(),
         };
-        if (activeSessionRef.current === sessionId) {
-          setMessages((prev) => [...prev.filter((message) => message.id !== assistantMessage.id), assistantMessage]);
-        }
+        setMessages((prev) => [...prev.filter((message) => message.id !== assistantMessage.id), assistantMessage]);
         const evidence = payload.summary?.evidence ?? [];
         if (evidence.length > 0) {
           setEvidenceByMessageId((prev) => ({ ...prev, [assistantMessage.id]: evidence }));
+        }
+        const onTurnCompleted = onTurnCompletedRef.current;
+        if (onTurnCompleted) {
+          // The callback is intentionally detached from the SSE lifecycle:
+          // submitting an optional export must not delay or fail the chat turn.
+          void Promise.resolve()
+            .then(() => onTurnCompleted(assistantMessage, query))
+            .catch(() => undefined);
         }
         // 首轮对话后刷新会话列表(updated_at/标题排序变化)
         setSessions((prev) => {
@@ -923,39 +1035,44 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           return [updated, ...prev.filter((s) => s.id !== sessionId)];
         });
         void refreshMemorySummary();
-      } else if (errorMessage && activeSessionRef.current === sessionId) {
+      } else if (errorMessage) {
         setMessages((prev) => [...prev, localAssistantMessage(sessionId!, `⚠️ ${errorMessage}`)]);
       } else if (!finalPayload) {
         // 流在 done/error 之前中断(网络断开、服务重启):明确提示,不能静默吞掉
-        if (activeSessionRef.current === sessionId) {
-          setMessages((prev) => [
-            ...prev,
-            localAssistantMessage(sessionId!, '⚠️ 连接中断，回答可能未完成；刷新页面可尝试恢复。'),
-          ]);
-        }
+        setMessages((prev) => [
+          ...prev,
+          localAssistantMessage(sessionId!, '⚠️ 连接中断，回答可能未完成；刷新页面可尝试恢复。'),
+        ]);
         finishTrace('error', '连接中断');
       }
     } catch (error) {
       // 乐观消息还没被服务端记录对账过:撤回,避免发送失败后残留一条"幽灵消息"
-      setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        finishTrace('error', '已停止生成');
-      } else {
-        finishTrace('error', error instanceof Error ? error.message : '发送失败');
-        const failedSessionId = sessionId;
-        if (failedSessionId != null) {
-          setMessages((prev) => [
-            ...prev,
-            localAssistantMessage(failedSessionId, `⚠️ ${error instanceof Error ? error.message : '发送失败'}`),
-          ]);
+      if (ownsGeneration()) {
+        setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          finishTrace('error', '已停止生成');
+        } else {
+          finishTrace('error', error instanceof Error ? error.message : '发送失败');
+          const failedSessionId = sessionId;
+          if (failedSessionId != null) {
+            setMessages((prev) => [
+              ...prev,
+              localAssistantMessage(failedSessionId, `⚠️ ${error instanceof Error ? error.message : '发送失败'}`),
+            ]);
+          }
         }
       }
     } finally {
-      sendingRef.current = false;
-      abortRef.current = null;
-      currentTurnRef.current = null;
-      setStreaming(false);
-      resetStreamingText();
+      if (sendingGenerationRef.current === generation) {
+        sendingRef.current = false;
+        sendingGenerationRef.current = null;
+      }
+      if (ownsGeneration()) {
+        abortRef.current = null;
+        currentTurnRef.current = null;
+        setStreaming(false);
+        resetStreamingText();
+      }
     }
   }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, documentFlowEnabled, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary]);
 

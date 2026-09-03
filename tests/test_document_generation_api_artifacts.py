@@ -1,9 +1,11 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import src.settings
 import httpx
 
+from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.api.app import create_app
 from src.api.deps import get_auth_service, get_pipeline
 
@@ -102,10 +104,55 @@ class DocGenArtifactApiTests(unittest.TestCase):
 
     def test_download_artifact_returns_bytes(self):
         self.stub.download_document_artifact = lambda ctx, artifact_id: b"FILEBYTES"
+        self.stub.document_generation = SimpleNamespace(store=SimpleNamespace(
+            get_artifact=lambda artifact_id: SimpleNamespace(work_order_id="wo-docx"),
+            get_work_order=lambda work_order_id: SimpleNamespace(target_format="docx"),
+        ))
         t = self._token("user1")
         r = self.client.get("/api/v1/document-generation/artifacts/art-1/download?kb=shared", headers=self._auth(t))
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.content, b"FILEBYTES")
+        self.assertIn("attachment", r.headers.get("content-disposition", ""))
+        self.assertIn('document-art-1.docx', r.headers.get("content-disposition", ""))
+        self.assertIn(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            r.headers.get("content-type", ""),
+        )
+
+    def test_chat_tasks_project_current_status_and_artifacts(self):
+        store = DocumentAuthoringJobStore(self.db_path)
+        self.stub.document_job_store = store
+        store.create_job(
+            tenant_id="default",
+            user_id=self.user.username,
+            session_id="17",
+            client_request_id="chat-doc-1",
+            operation="generate_work_order",
+            work_order_id="wo-chat-1",
+            payload={"work_order_id": "wo-chat-1", "knowledge_base_name": "shared"},
+        )
+        self.stub.get_document_run_status = lambda work_order_id, ctx=None: {
+            "work_order_id": work_order_id,
+            "status": "complete",
+            "phase": "completed",
+            "scope_type": "knowledge_base",
+            "knowledge_base_name": "shared",
+            "target_format": "docx",
+            "next_actions": ["view_result"],
+            "unit_statuses": {},
+            "artifacts": [{"artifact_id": "artifact-chat-1", "stage": "approved_release"}],
+        }
+        token = self._token("user1")
+
+        response = self.client.get(
+            "/api/v1/document-generation/chat-tasks?session_id=17",
+            headers=self._auth(token),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[0]["session_id"], 17)
+        self.assertEqual(response.json()[0]["status"]["phase"], "completed")
+        self.assertEqual(response.json()[0]["status"]["artifacts"][0]["artifact_id"], "artifact-chat-1")
 
     def test_preview_returns_safe_sheets(self):
         self.stub.preview_document_artifact = lambda ctx, artifact_id: {

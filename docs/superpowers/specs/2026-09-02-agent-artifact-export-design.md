@@ -1,7 +1,7 @@
 # 通用 Agent Artifact 导出与后台任务设计
 
 - 日期：2026-09-02
-- 状态：待用户评审
+- 状态：Phase 1–3 核心能力及导出意图、类型保真、原子入队、开关和观测加固已实施；本轮已补齐资源锁、Artifact 历史/预览/完整性校验和旧文档产物通用访问适配。旧文档底层存储仍保持兼容，不做隐式物理迁移
 - 范围：知识库问答、结构化检索、普通对话和现有文档生成流程的统一结果导出
 
 ## 1. 背景与问题
@@ -41,7 +41,7 @@
 
 ### 4.3 格式与内容形态分离
 
-`xlsx`、`docx`、`pptx`、`pdf` 是文件格式；`narrative`、`table`、`report`、`slides`、`source_catalog` 是内容形态。用户要求 Excel 不代表回答一定能转换成高质量表格，Agent 必须明确选择或确认内容形态。
+`xlsx`、`docx`、`pptx`、`pdf` 是文件格式；当前实现将内容形态收敛为 `report`、`data`、`raw`。用户要求 Excel 不代表回答一定能转换成高质量表格，Agent 必须明确选择或确认内容形态。
 
 ### 4.4 模型只决定语义，后端决定文件
 
@@ -137,7 +137,7 @@ Agent 或前端提交统一的计划对象：
 {
   "formats": ["xlsx", "pdf"],
   "source_ref": {"type": "turn", "id": "turn-123"},
-  "content_shape": "table",
+  "content_shape": "data",
   "title": "接口查询结果",
   "language": "zh-CN",
   "include_citations": true,
@@ -149,7 +149,7 @@ Agent 或前端提交统一的计划对象：
 
 - 格式只允许 `md/markdown/xlsx/docx/pptx/pdf`，服务端统一别名；
 - 一次最多 5 种格式；
-- `source_ref` 只能引用当前用户可见的 turn 或 snapshot；
+- `source_ref` 只能引用当前用户可见的 turn、message 或 snapshot；
 - 不接受路径、脚本、模板 URL 或任意 MIME；
 - `options` 按格式分别校验，未知字段拒绝；
 - `idempotency_key` 由客户端提供或由 `turn_id + format + options_hash` 派生。
@@ -174,7 +174,7 @@ Agent 完成检索和回答后，服务端在同一事务中生成 ResultSnapsho
 
 ### 6.3 已完成回答上的导出
 
-前端导出菜单直接调用 `POST /exports`，引用已完成的 `turn_id` 或 `snapshot_id`，不再次调用 Agent。它与 Agent 声明路径使用相同的 ExportPlan、幂等键、任务状态和 Artifact 卡片。
+前端导出菜单直接调用 `POST /exports`，引用已完成的 `turn_id`、`message_id` 或 `snapshot_id`，不再次调用 Agent。它与 Agent 声明路径使用相同的 ExportPlan、幂等键、任务状态和 Artifact 卡片。
 
 ## 7. 数据流与状态
 
@@ -218,13 +218,16 @@ GET  /api/v1/exports?session_id=&status=
 GET  /api/v1/exports/{export_job_id}
 POST /api/v1/exports/{export_job_id}/retry
 POST /api/v1/exports/{export_job_id}/cancel
+GET  /api/v1/artifacts?session_id=&snapshot_id=&format=&limit=
 GET  /api/v1/artifacts/{artifact_id}/preview
 GET  /api/v1/artifacts/{artifact_id}/download
+GET  /api/v1/artifacts/document/{artifact_id}/preview
+GET  /api/v1/artifacts/document/{artifact_id}/download
 ```
 
 `POST /exports` 返回 `202 Accepted` 和任务状态；如果幂等键已经存在，返回现有任务而不是重复生成。列表接口必须按用户、租户、会话和知识库范围过滤。Artifact 下载在读取文件前再次检查当前权限；权限失效时返回 403/404，不泄露 Artifact 是否存在。
 
-现有 `/document-generation/artifacts/*` 接口保持兼容。模板文档产物可以在后续迁移到通用 Artifact 表，但迁移前不得改变旧客户端的字段和状态语义。
+通用 Artifact 历史接口保留过期产物的 hash、来源和状态元数据，但将二进制引用清空并标记 `available=false`，不可继续下载。现有 `/document-generation/artifacts/*` 接口保持兼容；`/artifacts/document/*` 是旧模板文档产物的统一访问适配器，会复用原权限、审核能力和存储校验，不改变旧客户端字段和状态语义。旧文档记录尚未物理迁移到 `result_artifacts`，需要单独发布窗口和迁移/回滚演练。
 
 ## 9. RendererRegistry
 
@@ -270,6 +273,8 @@ render(snapshot, plan) -> RenderedArtifact(bytes, filename, media_type, preview)
 - 同一资源写入：必须按 project/knowledge_base/template 维度加锁；
 - 只读知识库检索：允许并行，但仍受用户、模型和后端限流约束。
 
+文档生成 job store 已实现 SQLite `document_resource_locks`：租约、原子 claim、heartbeat 续租、fencing token 和完成/失败释放均在同一事务边界内；相同租户下同一资源串行，不同知识库可以并行。过期租约不能被旧 owner 续租，避免 worker 恢复后覆盖新 owner 的写入。
+
 当前已有的聊天持久化 worker 继续负责 ChatTurn。第一阶段只要求导出 worker 独立运行；真正增加 Agent worker 数量作为后续部署能力，不在导出功能中隐式改变现有模型并发配置。
 
 ## 12. 前端体验
@@ -277,7 +282,7 @@ render(snapshot, plan) -> RenderedArtifact(bytes, filename, media_type, preview)
 1. 完成的助手消息显示“导出”菜单：Markdown、Excel、Word、PPT、PDF。
 2. 用户在对话中明确要求格式时，回答下方自动出现 Artifact 卡片。
 3. 卡片展示排队中、生成中、已完成、失败、已取消和权限失效状态。
-4. 已完成产物展示“预览”和“下载”；下载沿用认证 blob 流程，不依赖未授权的裸 URL。
+4. 已完成产物展示“预览”和“下载”；下载沿用认证 blob 流程，不依赖未授权的裸 URL。Markdown 返回受限文本预览，XLSX/DOCX 从已鉴权文件解析受限结构，PDF/PPTX 至少提供安全下载和渲染器摘要。
 5. 应用 Shell 增加全局任务中心，跨聊天页、知识库页和设置页显示后台任务。
 6. 进入聊天页面时按 `session_id` 恢复该会话的 ExportJob 和 Artifact；SSE 只作为低延迟更新，API 列表是恢复来源。
 7. 导出失败只影响对应格式，并提供安全重试；重试复用快照，不重新执行检索。
@@ -355,23 +360,23 @@ render(snapshot, plan) -> RenderedArtifact(bytes, filename, media_type, preview)
 
 ### Phase 2：报告文件
 
-- DOCX、PDF Renderer；
-- 引用来源附录和预览；
-- 任务中心；
-- 重试、保留期和下载审计。
+- DOCX、PDF Renderer；✅
+- 引用来源附录和预览；✅
+- 任务中心；✅
+- 重试、保留期和下载审计。✅
 
 ### Phase 3：演示和高并发
 
-- PPTX Renderer、图表和主题；
-- 多导出 worker 和并发配额；
-- 资源锁、Artifact 历史版本和后续修订；
-- 与现有模板化文档产物逐步统一存储接口。
+- PPTX Renderer、图表和主题；✅
+- 多导出 worker 和并发配额；✅（数据库 lease + 全局 running quota）
+- 资源锁、Artifact 历史版本和后续修订；✅（资源锁、历史查询和过期元数据已实现；后续修订沿用不可变 snapshot）
+- 与现有模板化文档产物逐步统一存储接口；✅（已提供统一 preview/download 适配器；底层物理迁移保留为独立发布任务）
 
 ## 17. 兼容与迁移
 
 1. 不修改现有 ChatTurn 的完成、取消和 SSE 语义；只在完成阶段增加快照和导出事件。
 2. 不删除或重命名现有文档生成接口；新 Artifact API 作为通用入口。
-3. 现有文档工单的 `artifact_id` 可以通过适配器映射到通用 Artifact，但模板安全策略仍由原文档模块负责。
+3. 现有文档工单的 `artifact_id` 通过 `/api/v1/artifacts/document/{artifact_id}/preview|download` 适配到通用产物访问协议；模板安全策略、审核能力和原始字段仍由原文档模块负责，读取时额外校验存储路径和内容 hash。
 4. 所有新表采用启动时幂等 migration；旧数据库没有快照的历史回答不自动补生成快照，用户从旧消息点击导出时按权限创建新的快照。
 5. 新能力由 `RESULT_EXPORT_ENABLED` 和每格式开关控制，未安装对应渲染依赖时只隐藏该格式，不影响聊天和其他格式。
 

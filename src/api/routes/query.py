@@ -233,6 +233,7 @@ def _message_view(message: ChatMessage) -> MessageView:
     return MessageView(
         id=message.id,
         session_id=message.session_id,
+        turn_id=getattr(message, "turn_id", None),
         role=message.role,
         content=message.content,
         footer=message.footer,

@@ -104,7 +104,7 @@ export default function Composer({
             <Select
               value={kbName || '__none__'}
               onValueChange={(value) => onKbChange(value === '__none__' ? '' : value)}
-              disabled={streaming || disabled}
+              disabled={disabled}
             >
               <SelectTrigger
                 aria-label="挂载知识库"

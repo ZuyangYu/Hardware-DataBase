@@ -127,6 +127,13 @@ function renderComposer(overrides: Partial<ComposerProps> = {}) {
 }
 
 describe('Composer document generation toggle', () => {
+  it('keeps the knowledge-base selector usable while a turn is streaming', () => {
+    const markup = renderComposer({ streaming: true });
+
+    expect(markup).toMatch(/aria-label="挂载知识库"/);
+    expect(markup).not.toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="挂载知识库"/);
+  });
+
   it('hides the generation toggle when no document context is attached', () => {
     const markup = renderComposer({ onToggleDocumentFlow: () => undefined });
 

@@ -17,10 +17,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import src.settings
+from src.result_exports.models import ResourceLock
 
 
 JOB_OPERATIONS = frozenset({"generate_work_order", "resume_work_order"})
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled", "dead_letter"})
+RESOURCE_LOCK_TYPES = frozenset({"project", "knowledge_base", "template", "work_order"})
 
 
 def _now() -> datetime:
@@ -60,6 +62,7 @@ class DocumentAuthoringJob:
     lease_owner: str | None = None
     lease_token: int = 0
     lease_expires_at: str | None = None
+    resource_lock_token: int | None = None
     result: dict[str, Any] = field(default_factory=dict)
     last_error: str = ""
     created_at: str = field(default_factory=_iso)
@@ -107,6 +110,7 @@ class DocumentAuthoringJobStore:
                     lease_owner TEXT,
                     lease_token INTEGER NOT NULL DEFAULT 0,
                     lease_expires_at TEXT,
+                    resource_lock_token INTEGER,
                     payload_json TEXT NOT NULL DEFAULT '{}',
                     result_json TEXT NOT NULL DEFAULT '{}',
                     last_error TEXT NOT NULL DEFAULT '',
@@ -120,6 +124,8 @@ class DocumentAuthoringJobStore:
                     );
                 CREATE INDEX IF NOT EXISTS idx_document_authoring_jobs_queue
                     ON document_authoring_jobs(status, available_at, created_at);
+                CREATE INDEX IF NOT EXISTS idx_document_authoring_jobs_chat_session
+                    ON document_authoring_jobs(tenant_id, user_id, session_id, created_at);
                 CREATE TABLE IF NOT EXISTS document_authoring_job_outbox (
                     outbox_id TEXT PRIMARY KEY,
                     job_id TEXT NOT NULL UNIQUE,
@@ -133,8 +139,24 @@ class DocumentAuthoringJobStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_document_authoring_job_outbox_queue
                     ON document_authoring_job_outbox(status, available_at, created_at);
+                CREATE TABLE IF NOT EXISTS document_resource_locks (
+                    tenant_id TEXT NOT NULL,
+                    resource_type TEXT NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL DEFAULT 1,
+                    lease_expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(tenant_id, resource_type, resource_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_document_resource_locks_expiry
+                    ON document_resource_locks(lease_expires_at);
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(document_authoring_jobs)").fetchall()}
+            if "resource_lock_token" not in columns:
+                conn.execute("ALTER TABLE document_authoring_jobs ADD COLUMN resource_lock_token INTEGER")
 
     @staticmethod
     def _validate_operation(operation: str) -> str:
@@ -148,6 +170,248 @@ class DocumentAuthoringJobStore:
         if status not in JOB_STATUSES:
             raise ValueError("unsupported document authoring job status")
         return status
+
+    @staticmethod
+    def _validate_resource_scope(resource_type: str, resource_id: str) -> tuple[str, str]:
+        normalized_type = str(resource_type or "").strip().lower()
+        normalized_id = str(resource_id or "").strip()
+        if normalized_type not in RESOURCE_LOCK_TYPES:
+            raise ValueError("unsupported resource lock type")
+        if not normalized_id or len(normalized_id) > 300:
+            raise ValueError("resource lock id is required")
+        return normalized_type, normalized_id
+
+    @classmethod
+    def _resource_scope_from_payload(cls, payload: dict[str, Any], work_order_id: str | None) -> tuple[str, str] | None:
+        explicit = payload.get("resource_lock")
+        if explicit is not None:
+            if not isinstance(explicit, dict):
+                raise ValueError("resource_lock must be an object")
+            return cls._validate_resource_scope(explicit.get("type"), explicit.get("id"))
+        # Prefer the broadest mutable scope supplied by the caller.  A
+        # knowledge-base authoring job must not race a second work order that
+        # writes the same KB, while independent KBs remain parallelizable.
+        if payload.get("project_id") not in (None, ""):
+            return cls._validate_resource_scope("project", payload["project_id"])
+        if payload.get("knowledge_base_name") not in (None, ""):
+            return cls._validate_resource_scope("knowledge_base", payload["knowledge_base_name"])
+        if work_order_id not in (None, ""):
+            return cls._validate_resource_scope("work_order", work_order_id)
+        if payload.get("template_version_id") not in (None, ""):
+            return cls._validate_resource_scope("template", payload["template_version_id"])
+        return None
+
+    @staticmethod
+    def _job_lock_owner(job_id: str, attempt: int) -> str:
+        return f"document-job:{job_id}:{int(attempt)}"
+
+    @staticmethod
+    def _resource_lock_expired(value: str | None, now: datetime) -> bool:
+        if not value:
+            return False
+        try:
+            expiry = datetime.fromisoformat(str(value))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return expiry <= now
+        except (TypeError, ValueError, OverflowError):
+            # An unreadable lease is treated as active.  Taking a lock with an
+            # ambiguous expiry could let two writers operate concurrently.
+            return False
+
+    @classmethod
+    def _acquire_resource_lock_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        tenant_id: str,
+        resource_type: str,
+        resource_id: str,
+        owner_id: str,
+        lease_seconds: int,
+        now: datetime,
+    ) -> ResourceLock | None:
+        tenant = str(tenant_id or "").strip()
+        owner = str(owner_id or "").strip()
+        if not tenant or not owner:
+            raise ValueError("resource lock tenant and owner are required")
+        resource_type, resource_id = cls._validate_resource_scope(resource_type, resource_id)
+        expires = now + timedelta(seconds=max(5, int(lease_seconds)))
+        row = conn.execute(
+            """SELECT * FROM document_resource_locks
+               WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?""",
+            (tenant, resource_type, resource_id),
+        ).fetchone()
+        if row is None:
+            token = 1
+            conn.execute(
+                """INSERT INTO document_resource_locks(
+                       tenant_id, resource_type, resource_id, owner_id,
+                       fencing_token, lease_expires_at, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (tenant, resource_type, resource_id, owner, token, _iso(expires), _iso(now), _iso(now)),
+            )
+        else:
+            active = not cls._resource_lock_expired(row["lease_expires_at"], now)
+            if active and row["owner_id"] != owner:
+                return None
+            token = int(row["fencing_token"] or 0) + (0 if row["owner_id"] == owner and active else 1)
+            conn.execute(
+                """UPDATE document_resource_locks
+                   SET owner_id = ?, fencing_token = ?, lease_expires_at = ?, updated_at = ?
+                   WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?""",
+                (owner, token, _iso(expires), _iso(now), tenant, resource_type, resource_id),
+            )
+        return ResourceLock(
+            tenant_id=tenant,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            owner_id=owner,
+            fencing_token=token,
+            lease_expires_at=_iso(expires),
+        )
+
+    @classmethod
+    def _release_resource_lock_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        tenant_id: str,
+        resource_type: str,
+        resource_id: str,
+        owner_id: str,
+        fencing_token: int,
+    ) -> bool:
+        resource_type, resource_id = cls._validate_resource_scope(resource_type, resource_id)
+        cursor = conn.execute(
+            """DELETE FROM document_resource_locks
+               WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?
+                 AND owner_id = ? AND fencing_token = ?""",
+            (str(tenant_id), resource_type, resource_id, str(owner_id), int(fencing_token)),
+        )
+        return cursor.rowcount == 1
+
+    @classmethod
+    def _release_job_resource_lock_in_connection(
+        cls,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> bool:
+        scope = cls._resource_scope_from_payload(
+            _load(row["payload_json"], {}), row["work_order_id"]
+        )
+        if scope is None:
+            return False
+        resource_type, resource_id = scope
+        return cls._release_resource_lock_in_connection(
+            conn,
+            tenant_id=str(row["tenant_id"]),
+            resource_type=resource_type,
+            resource_id=resource_id,
+            owner_id=cls._job_lock_owner(row["job_id"], int(row["attempt"] or 0)),
+            fencing_token=(
+                int(row["resource_lock_token"])
+                if "resource_lock_token" in row.keys() and row["resource_lock_token"] is not None
+                else int(row["attempt"] or 0)
+            ),
+        )
+
+    def acquire_resource_lock(
+        self,
+        *,
+        tenant_id: str,
+        resource_type: str,
+        resource_id: str,
+        owner_id: str,
+        lease_seconds: int = 60,
+    ) -> ResourceLock | None:
+        now = _now()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                lock = self._acquire_resource_lock_in_connection(
+                    conn,
+                    tenant_id=tenant_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    owner_id=owner_id,
+                    lease_seconds=lease_seconds,
+                    now=now,
+                )
+                conn.execute("COMMIT")
+                return lock
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def renew_resource_lock(
+        self,
+        *,
+        tenant_id: str,
+        resource_type: str,
+        resource_id: str,
+        owner_id: str,
+        fencing_token: int,
+        lease_seconds: int = 60,
+    ) -> ResourceLock:
+        resource_type, resource_id = self._validate_resource_scope(resource_type, resource_id)
+        now = _now()
+        expires = now + timedelta(seconds=max(5, int(lease_seconds)))
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    """SELECT lease_expires_at FROM document_resource_locks
+                       WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?
+                         AND owner_id = ? AND fencing_token = ?""",
+                    (str(tenant_id), resource_type, resource_id, str(owner_id), int(fencing_token)),
+                ).fetchone()
+                if row is None or self._resource_lock_expired(row["lease_expires_at"], now):
+                    raise RuntimeError("resource lock lost")
+                cursor = conn.execute(
+                    """UPDATE document_resource_locks
+                       SET lease_expires_at = ?, updated_at = ?
+                       WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?
+                         AND owner_id = ? AND fencing_token = ?""",
+                    (_iso(expires), _iso(now), str(tenant_id), resource_type, resource_id,
+                     str(owner_id), int(fencing_token)),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("resource lock lost")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return ResourceLock(
+            tenant_id=str(tenant_id), resource_type=resource_type, resource_id=resource_id,
+            owner_id=str(owner_id), fencing_token=int(fencing_token), lease_expires_at=_iso(expires),
+        )
+
+    def release_resource_lock(
+        self,
+        *,
+        tenant_id: str,
+        resource_type: str,
+        resource_id: str,
+        owner_id: str,
+        fencing_token: int,
+    ) -> bool:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                released = self._release_resource_lock_in_connection(
+                    conn,
+                    tenant_id=tenant_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    owner_id=owner_id,
+                    fencing_token=fencing_token,
+                )
+                conn.execute("COMMIT")
+                return released
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def create_job(
         self,
@@ -175,6 +439,9 @@ class DocumentAuthoringJobStore:
         now = _now()
         available = (available_at or now).astimezone(timezone.utc)
         payload_value = dict(payload or {})
+        # Validate the optional explicit scope before writing an idempotent
+        # record.  Inferred scopes are checked again atomically at claim time.
+        self._resource_scope_from_payload(payload_value, work_order_id)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -270,6 +537,39 @@ class DocumentAuthoringJobStore:
             ).fetchone()
         return _row_to_job(row) if row else None
 
+    def list_chat_session_jobs(
+        self,
+        *,
+        user_id: str | int,
+        session_id: str | int | None = None,
+        tenant_id: str | None = None,
+        limit: int = 64,
+    ) -> list[DocumentAuthoringJob]:
+        """List document jobs owned by one chat user/session.
+
+        The chat UI uses this durable projection after a route change or a
+        browser restart.  Scope is applied in SQL before any work-order status
+        is projected, so a task from another user/session cannot become a
+        downloadable card by accident.
+        """
+        clauses = ["user_id = ?"]
+        params: list[Any] = [str(user_id)]
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(str(tenant_id))
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(str(session_id))
+        params.append(max(1, min(int(limit), 200)))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM document_authoring_jobs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at DESC, job_id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [_row_to_job(row) for row in rows]
+
     def queue_state(self) -> tuple[int, float]:
         """Return queued/lease-expired depth and oldest creation age."""
         with closing(self._connect()) as conn:
@@ -336,6 +636,8 @@ class DocumentAuthoringJobStore:
                     return None
                 next_attempt = int(row["attempt"] or 0) + 1
                 if next_attempt > int(row["max_attempts"] or 1):
+                    if row["status"] == "running":
+                        self._release_job_resource_lock_in_connection(conn, row)
                     conn.execute(
                         """UPDATE document_authoring_jobs
                            SET status = 'dead_letter', last_error = ?, updated_at = ?,
@@ -345,13 +647,49 @@ class DocumentAuthoringJobStore:
                     )
                     conn.execute("COMMIT")
                     return None
+                scope = self._resource_scope_from_payload(
+                    _load(row["payload_json"], {}), row["work_order_id"]
+                )
+                if scope is not None:
+                    if expired:
+                        # The job lease is the authoritative liveness signal.
+                        # Remove the previous attempt's lock before acquiring
+                        # the next fencing token; this also repairs legacy
+                        # rows whose lock lease was not heartbeated yet.
+                        self._release_resource_lock_in_connection(
+                            conn,
+                            tenant_id=str(row["tenant_id"]),
+                            resource_type=scope[0],
+                            resource_id=scope[1],
+                            owner_id=self._job_lock_owner(job_id, int(row["attempt"] or 0)),
+                            fencing_token=(
+                                int(row["resource_lock_token"])
+                                if "resource_lock_token" in row.keys() and row["resource_lock_token"] is not None
+                                else int(row["attempt"] or 0)
+                            ),
+                        )
+                    lock = self._acquire_resource_lock_in_connection(
+                        conn,
+                        tenant_id=str(row["tenant_id"]),
+                        resource_type=scope[0],
+                        resource_id=scope[1],
+                        owner_id=self._job_lock_owner(job_id, next_attempt),
+                        lease_seconds=lease_seconds,
+                        now=now,
+                    )
+                    if lock is None:
+                        conn.execute("COMMIT")
+                        return None
+                    resource_lock_token = lock.fencing_token
+                else:
+                    resource_lock_token = None
                 conn.execute(
                     """UPDATE document_authoring_jobs
                        SET status = 'running', attempt = ?, lease_owner = ?,
                            lease_token = lease_token + 1, lease_expires_at = ?,
-                           updated_at = ?, last_error = ''
+                           resource_lock_token = ?, updated_at = ?, last_error = ''
                        WHERE job_id = ?""",
-                    (next_attempt, worker_id, _iso(expires), _iso(now), job_id),
+                    (next_attempt, worker_id, _iso(expires), resource_lock_token, _iso(now), job_id),
                 )
                 claimed = conn.execute(
                     "SELECT * FROM document_authoring_jobs WHERE job_id = ?", (job_id,)
@@ -366,15 +704,45 @@ class DocumentAuthoringJobStore:
         now = _now()
         expires = now + timedelta(seconds=max(5, int(lease_seconds)))
         with closing(self._connect()) as conn:
-            cursor = conn.execute(
-                """UPDATE document_authoring_jobs
-                   SET lease_expires_at = ?, updated_at = ?
-                   WHERE job_id = ? AND status = 'running'
-                     AND lease_owner = ? AND lease_token = ?""",
-                (_iso(expires), _iso(now), job_id, worker_id, int(lease_token)),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("document authoring job lease lost")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM document_authoring_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                cursor = conn.execute(
+                    """UPDATE document_authoring_jobs
+                       SET lease_expires_at = ?, updated_at = ?
+                       WHERE job_id = ? AND status = 'running'
+                         AND lease_owner = ? AND lease_token = ?""",
+                    (_iso(expires), _iso(now), job_id, worker_id, int(lease_token)),
+                )
+                if cursor.rowcount != 1 or row is None:
+                    raise RuntimeError("document authoring job lease lost")
+                scope = self._resource_scope_from_payload(
+                    _load(row["payload_json"], {}), row["work_order_id"]
+                )
+                if scope is not None:
+                    lock_cursor = conn.execute(
+                        """UPDATE document_resource_locks
+                           SET lease_expires_at = ?, updated_at = ?
+                           WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?
+                             AND owner_id = ? AND fencing_token = ?""",
+                        (
+                            _iso(expires), _iso(now), str(row["tenant_id"]), scope[0], scope[1],
+                            self._job_lock_owner(job_id, int(row["attempt"] or 0)),
+                            (
+                                int(row["resource_lock_token"])
+                                if "resource_lock_token" in row.keys() and row["resource_lock_token"] is not None
+                                else int(row["attempt"] or 0)
+                            ),
+                        ),
+                    )
+                    if lock_cursor.rowcount != 1:
+                        raise RuntimeError("document resource lock lost")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         job = self.get(job_id)
         if job is None:  # pragma: no cover - guarded by the update
             raise KeyError(job_id)
@@ -385,16 +753,26 @@ class DocumentAuthoringJobStore:
     ) -> DocumentAuthoringJob:
         now = _now()
         with closing(self._connect()) as conn:
-            cursor = conn.execute(
-                """UPDATE document_authoring_jobs
-                   SET status = 'succeeded', result_json = ?, updated_at = ?, completed_at = ?,
-                       lease_owner = NULL, lease_expires_at = NULL
-                   WHERE job_id = ? AND status = 'running'
-                     AND lease_owner = ? AND lease_token = ?""",
-                (_json(result or {}), _iso(now), _iso(now), job_id, worker_id, int(lease_token)),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("document authoring job lease lost")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM document_authoring_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                cursor = conn.execute(
+                    """UPDATE document_authoring_jobs
+                       SET status = 'succeeded', result_json = ?, updated_at = ?, completed_at = ?,
+                           lease_owner = NULL, lease_expires_at = NULL
+                       WHERE job_id = ? AND status = 'running'
+                         AND lease_owner = ? AND lease_token = ?""",
+                    (_json(result or {}), _iso(now), _iso(now), job_id, worker_id, int(lease_token)),
+                )
+                if cursor.rowcount != 1 or row is None:
+                    raise RuntimeError("document authoring job lease lost")
+                self._release_job_resource_lock_in_connection(conn, row)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         job = self.get(job_id)
         if job is None:  # pragma: no cover
             raise KeyError(job_id)
@@ -426,19 +804,29 @@ class DocumentAuthoringJobStore:
             available = now
             completed = now
         with closing(self._connect()) as conn:
-            cursor = conn.execute(
-                """UPDATE document_authoring_jobs
-                   SET status = ?, available_at = ?, last_error = ?, updated_at = ?,
-                       completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
-                   WHERE job_id = ? AND status = 'running'
-                     AND lease_owner = ? AND lease_token = ?""",
-                (
-                    status, _iso(available), str(message or "")[:1000], _iso(now),
-                    _iso(completed) if completed else None, job_id, worker_id, int(lease_token),
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("document authoring job lease lost")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM document_authoring_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                cursor = conn.execute(
+                    """UPDATE document_authoring_jobs
+                       SET status = ?, available_at = ?, last_error = ?, updated_at = ?,
+                           completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
+                       WHERE job_id = ? AND status = 'running'
+                         AND lease_owner = ? AND lease_token = ?""",
+                    (
+                        status, _iso(available), str(message or "")[:1000], _iso(now),
+                        _iso(completed) if completed else None, job_id, worker_id, int(lease_token),
+                    ),
+                )
+                if cursor.rowcount != 1 or row is None:
+                    raise RuntimeError("document authoring job lease lost")
+                self._release_job_resource_lock_in_connection(conn, row)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         job = self.get(job_id)
         if job is None:  # pragma: no cover
             raise KeyError(job_id)
@@ -498,6 +886,11 @@ def _row_to_job(row: sqlite3.Row) -> DocumentAuthoringJob:
         lease_owner=row["lease_owner"],
         lease_token=int(row["lease_token"] or 0),
         lease_expires_at=row["lease_expires_at"],
+        resource_lock_token=(
+            int(row["resource_lock_token"])
+            if "resource_lock_token" in row.keys() and row["resource_lock_token"] is not None
+            else None
+        ),
         result=_load(row["result_json"], {}),
         last_error=str(row["last_error"] or ""),
         created_at=str(row["created_at"]),
@@ -506,4 +899,11 @@ def _row_to_job(row: sqlite3.Row) -> DocumentAuthoringJob:
     )
 
 
-__all__ = ["DocumentAuthoringJob", "DocumentAuthoringJobStore", "JOB_OPERATIONS", "JOB_STATUSES"]
+__all__ = [
+    "DocumentAuthoringJob",
+    "DocumentAuthoringJobStore",
+    "JOB_OPERATIONS",
+    "JOB_STATUSES",
+    "RESOURCE_LOCK_TYPES",
+    "ResourceLock",
+]

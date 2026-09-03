@@ -4,7 +4,7 @@
  */
 import { useEffect, useRef } from 'react';
 
-import type { EvidenceItem, MessageView, QueryTraceStep } from '@/api/types';
+import type { EvidenceItem, ExportArtifactView, ExportFormat, ExportJobView, MessageView, QueryTraceStep } from '@/api/types';
 import { Skeleton } from '@/components/ui/skeleton';
 import { CHAT_MESSAGES_CLASS, CHAT_MESSAGE_STACK_CLASS } from '../chatPageStyles';
 import MessageBubble from './MessageBubble';
@@ -26,6 +26,12 @@ type Props = {
   degradedNotes: Array<{ stage: string; reason: string }>;
   onCreateMemory?: (messageId: number) => void;
   onEditMessage?: (messageId: number) => void;
+  onExport?: (message: MessageView, format: ExportFormat) => void;
+  onDownloadExport?: (job: ExportJobView) => void;
+  onPreviewExport?: (job: ExportJobView) => void;
+  exportJobsByMessageId?: Record<number, ExportJobView[]>;
+  exportPreviewsByJobId?: Record<string, ExportArtifactView>;
+  exportFormats?: ExportFormat[];
 };
 
 export default function MessageList({
@@ -43,6 +49,12 @@ export default function MessageList({
   degradedNotes,
   onCreateMemory,
   onEditMessage,
+  onExport,
+  onDownloadExport,
+  onPreviewExport,
+  exportJobsByMessageId = {},
+  exportPreviewsByJobId = {},
+  exportFormats,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -86,6 +98,12 @@ export default function MessageList({
             evidence={msg.role === 'assistant' ? evidenceByMessageId[msg.id] : undefined}
             onCreateMemory={onCreateMemory}
             onEditMessage={onEditMessage}
+            onExport={onExport}
+            onDownload={onDownloadExport}
+            onPreview={onPreviewExport}
+            exportJobs={msg.role === 'assistant' ? (exportJobsByMessageId[msg.id] ?? []) : []}
+            exportPreviews={exportPreviewsByJobId}
+            exportFormats={exportFormats}
             showDiagnostics={showDiagnostics}
             traceSteps={msg.role === 'assistant' && showDiagnostics ? (traceByMessageId[msg.id] ?? []) : []}
           />

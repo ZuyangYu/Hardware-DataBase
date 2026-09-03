@@ -32,6 +32,7 @@ class ChatSession:
 class ChatMessage:
     id: int
     session_id: int
+    turn_id: str | None
     role: str
     content: str
     footer: str
@@ -70,6 +71,7 @@ class ChatTurn:
     started_at: str | None
     finished_at: str | None
     document_context: dict | None = None
+    export_plan: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -150,6 +152,7 @@ class ConversationService:
                     metrics_json TEXT NOT NULL DEFAULT '{}',
                     trace_context_json TEXT NOT NULL DEFAULT '{}',
                     document_context_json TEXT NOT NULL DEFAULT '{}',
+                    export_plan_json TEXT NOT NULL DEFAULT '{}',
                     error_message TEXT NOT NULL DEFAULT '',
                     worker_id TEXT NOT NULL DEFAULT '',
                     worker_heartbeat_at TEXT,
@@ -208,6 +211,7 @@ class ConversationService:
             self._ensure_column(conn, "chat_turns", "metrics_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "chat_turns", "trace_context_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "chat_turns", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
+            self._ensure_column(conn, "chat_turns", "export_plan_json", "TEXT NOT NULL DEFAULT '{}'" )
             self._ensure_column(conn, "chat_messages", "edited_at", "TEXT")
             self._ensure_column(conn, "chat_messages", "redacted", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "chat_sessions", "auto_memory", "INTEGER NOT NULL DEFAULT 1")
@@ -353,6 +357,7 @@ class ConversationService:
             rows = conn.execute(
                 """
                 SELECT m.*, COALESCE(t.footer, '') AS footer,
+                       t.id AS turn_id,
                        COALESCE(t.summary_json, '{}') AS turn_summary,
                        COALESCE(t.document_context_json, '{}') AS turn_document_context
                 FROM chat_messages m
@@ -668,6 +673,14 @@ class ConversationService:
         document_context_json = json.dumps(
             document_context or {}, ensure_ascii=False, sort_keys=True, default=str,
         )
+        from src.result_exports import infer_export_intent
+
+        export_plan = infer_export_intent(query)
+        export_plan_json = json.dumps(
+            export_plan.to_dict() if export_plan is not None else {},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         now = utc_now()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -713,8 +726,8 @@ class ConversationService:
                     INSERT INTO chat_turns (
                         id, session_id, user_message_id, assistant_message_id, kb_name, query, query_mode,
                         department_id, kb_id, status, client_request_id, trace_context_json, created_at
-                        , document_context_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                        , document_context_json, export_plan_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -730,6 +743,7 @@ class ConversationService:
                         json.dumps(trace_context or {}, ensure_ascii=False),
                         now,
                         document_context_json,
+                        export_plan_json,
                     ),
                 )
                 row = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
@@ -748,6 +762,18 @@ class ConversationService:
                 WHERE t.id = ? AND s.user_id = ?
                 """,
                 (turn_id, user_id),
+            ).fetchone()
+        return row_to_turn(row) if row else None
+
+    def get_turn_by_message(self, user_id: int, message_id: int) -> ChatTurn | None:
+        """Resolve a persisted user/assistant message to its owning turn."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT t.* FROM chat_turns t
+                   JOIN chat_sessions s ON s.id = t.session_id
+                   WHERE s.user_id = ? AND (t.user_message_id = ? OR t.assistant_message_id = ?)
+                   ORDER BY t.created_at DESC LIMIT 1""",
+                (user_id, message_id, message_id),
             ).fetchone()
         return row_to_turn(row) if row else None
 
@@ -951,6 +977,18 @@ class ConversationService:
         footer: str = "",
         metrics: dict | None = None,
     ) -> ChatTurn:
+        # Initialize the export schema before opening the completion
+        # transaction. The actual snapshot/jobs are inserted through the
+        # caller's connection below, so a completed answer and its requested
+        # exports commit or roll back together.
+        existing_turn = self.get_turn(user_id, turn_id)
+        if existing_turn is None:
+            raise KeyError("turn not found")
+        export_store = None
+        if existing_turn.export_plan:
+            from src.result_exports.store import ResultExportStore
+
+            export_store = ResultExportStore(self.db_path)
         now = utc_now()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -979,6 +1017,25 @@ class ConversationService:
                      json.dumps(metrics or {}, ensure_ascii=False, default=str), now, turn_id),
                 )
                 conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (now, row["session_id"]))
+                completed = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
+                completed_turn = row_to_turn(completed)
+                if export_store is not None and completed_turn.export_plan:
+                    from src.result_exports.content import envelope_from_turn
+
+                    export_store.enqueue_completed_turn_in_connection(
+                        conn,
+                        owner_user_id=user_id,
+                        tenant_id="default",
+                        department_id=completed_turn.department_id,
+                        knowledge_base_name=(
+                            "" if completed_turn.kb_name == GENERAL_CHAT_KB_NAME else completed_turn.kb_name
+                        ),
+                        session_id=completed_turn.session_id,
+                        turn_id=completed_turn.id,
+                        assistant_message_id=completed_turn.assistant_message_id,
+                        envelope=envelope_from_turn(completed_turn),
+                        export_plan=completed_turn.export_plan,
+                    )
                 # Project Reflection is deliberately outside the realtime
                 # query path, but its durable outbox entry is part of the
                 # same transaction as the completed turn.  Generic chats and
@@ -1013,7 +1070,6 @@ class ConversationService:
                         target_message_id=int(row["assistant_message_id"]),
                         available_at=available_at,
                     )
-                completed = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
                 conn.execute("COMMIT")
                 return row_to_turn(completed)
             except Exception:
@@ -1214,6 +1270,7 @@ def row_to_message(row) -> ChatMessage:
     return ChatMessage(
         id=int(row["id"]),
         session_id=int(row["session_id"]),
+        turn_id=(str(row["turn_id"]) if row["turn_id"] else None) if "turn_id" in row.keys() else None,
         role=row["role"],
         content=content,
         footer=footer,
@@ -1248,6 +1305,14 @@ def row_to_turn(row) -> ChatTurn:
     except (TypeError, ValueError, json.JSONDecodeError):
         raw_document_context = {}
     document_context = raw_document_context if isinstance(raw_document_context, dict) and raw_document_context else None
+    try:
+        raw_export_plan = (
+            json.loads(row["export_plan_json"] or "{}")
+            if "export_plan_json" in row.keys() else {}
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_export_plan = {}
+    export_plan = raw_export_plan if isinstance(raw_export_plan, dict) else {}
     return ChatTurn(
         id=row["id"],
         session_id=int(row["session_id"]),
@@ -1275,4 +1340,5 @@ def row_to_turn(row) -> ChatTurn:
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         document_context=document_context,
+        export_plan=export_plan,
     )

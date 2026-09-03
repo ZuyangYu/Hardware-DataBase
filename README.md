@@ -9,6 +9,7 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化�
 - **RAGFlow 后端固定化**：文档上传、解析任务、检索、删除和知识库治理都通过 RAGFlow 后端适配层完成。
 - **权限与治理**：支持部门、用户、知识库权限、审计日志、查询 trace 和文件处理状态。
 - **统一模型配置**：答案生成、工具决策和后台模型任务统一走 `src.core.model_factory` profile，并由 chat runtime 负责调用归一化与观测，支持 Ollama 或 OpenAI-compatible API。提示词 `SYSTEM_PROMPT` / `NO_CONTEXT_PROMPT` 可在系统配置中覆盖。
+- **结果 Artifact 导出**：已完成的对话/知识库检索结果先固化为不可变 ResultSnapshot，再由独立 export worker 生成 Markdown、Excel、Word、PDF 或 PowerPoint Artifact；聊天消息和全局任务中心提供带权限校验的后台任务状态、重试和下载入口。导出任务不依赖浏览器 SSE，切换会话、页面或刷新页面不会丢失。
 
 ## 界面示例
 
@@ -186,6 +187,14 @@ uv run hardware-database-memory-worker
        - 每步 tool_started / tool_result 事件驱动前端实时轨迹
   -> 统一模型封装 (src.core.model_factory)
 ```
+
+已完成助手消息的“导出结果”菜单支持 Markdown、Excel、Word、PDF、PowerPoint；同一回答可以分别提交多个格式，格式失败不会影响其他任务。用户在对话中明确说“导出/输出/生成为 Excel、PDF”等格式时，服务端会在 turn 完成事务内登记对应后台任务，浏览器只负责订阅和展示；普通提到某种文件格式的检索问题不会误触发。导出 API 为 `POST /api/v1/exports`，任务状态、预览和下载分别通过 `/api/v1/exports/{export_job_id}`、`/api/v1/artifacts/{artifact_id}/preview` 和 `/api/v1/artifacts/{artifact_id}/download` 获取。单机 API 默认拉起独立 export worker；多实例部署可设置 `HDB_API_SPAWN_EXPORT_WORKER=false`，单独运行：
+
+```bash
+uv run hardware-database-export-worker
+```
+
+Word/PDF 使用后端受控渲染器，PowerPoint 支持 light/dark/blue 主题和从真实数值表生成的柱状图；文件生成不执行用户脚本、不访问用户本地路径或外部网络。`RESULT_EXPORT_ENABLED` 和 `RESULT_EXPORT_{MD,XLSX,DOCX,PDF,PPTX}_ENABLED` 控制灰度发布，前端菜单从 `/api/v1/exports/formats` 获取可用格式，后端仍会强制校验。`RESULT_EXPORT_RETENTION_DAYS` 控制产物保留期，`RESULT_EXPORT_MAX_RUNNING_JOBS` 控制并发运行配额，过期文件由 export worker 清理二进制但保留 Artifact 历史元数据、任务历史和下载审计。Artifact 历史可通过 `GET /api/v1/artifacts` 查询；旧模板文档还可通过 `/api/v1/artifacts/document/{artifact_id}/preview|download` 使用统一访问协议，底层记录保持兼容。
 
 ## 常见问题
 

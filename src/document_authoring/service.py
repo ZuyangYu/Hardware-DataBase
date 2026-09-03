@@ -1815,7 +1815,12 @@ class DocumentGenerationService:
         snapshot = self.resolve_source_snapshot(order)
         if report is None or report.status == "failed":
             raise ValueError("candidate does not have a releasable validation result")
-        candidate_content = self.store.read_artifact_content(candidate.artifact_id)
+        read_for_validation = getattr(
+            self.store,
+            "read_artifact_content_for_validation",
+            self.store.read_artifact_content,
+        )
+        candidate_content = read_for_validation(candidate.artifact_id)
         self._assert_generated_artifact_clean(candidate_content, order.target_format)
         if hashlib.sha256(candidate_content).hexdigest() != candidate.content_hash:
             raise ValueError("candidate content hash changed since validation")

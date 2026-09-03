@@ -118,7 +118,9 @@ export async function downloadBlob(path: string, filename: string): Promise<void
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  // Let the browser start the navigation before releasing the object URL;
+  // immediate revocation intermittently produces a zero-byte download.
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 export const apiDownload = { blob: downloadBlob };

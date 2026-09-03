@@ -284,6 +284,63 @@ def test_stale_deletion_outbox_is_a_noop(memory_context, tmp_path, monkeypatch):
     service.close()
 
 
+def test_deleted_project_memory_is_hidden_by_default_and_tombstone_is_clean(memory_context, tmp_path):
+    ctx = memory_context
+    worker, runtime, _fake = run_project_worker(ctx, tmp_path)
+    service = MemoryService(db_path=ctx.db_path, auth=ctx.auth, store_runtime=runtime)
+    record = service.list_memories(actor=ctx.dept_admin, scope="project", kb_name="design")[0]
+
+    service.delete(
+        record["memory_id"],
+        actor=ctx.dept_admin,
+        expected_revision=record["revision"],
+        reason="用户删除项目记忆",
+        request_id="delete-project-memory",
+    )
+
+    assert service.list_memories(actor=ctx.dept_admin, scope="project", kb_name="design") == []
+
+    tombstones = service.list_memories(
+        actor=ctx.dept_admin,
+        scope="project",
+        kb_name="design",
+        status="deleted",
+    )
+    assert len(tombstones) == 1
+    assert tombstones[0]["status"] == "deleted"
+    assert tombstones[0]["content"] == {}
+    assert tombstones[0]["source_count"] == 0
+    assert tombstones[0]["projection_status"] == "retired"
+
+    with MemoryJobRepository(ctx.db_path)._connect() as conn:
+        source_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM memory_sources WHERE memory_id = ? AND source_valid = 1",
+            (record["memory_id"],),
+        ).fetchone()["count"]
+    assert source_count == 0
+
+    # Legacy project tombstones may still have a valid provenance edge.  They
+    # must not reappear as usable sources in the governance view.
+    with MemoryJobRepository(ctx.db_path)._connect() as conn:
+        conn.execute(
+            "UPDATE memory_sources SET source_valid = 1, invalidated_at = NULL WHERE memory_id = ?",
+            (record["memory_id"],),
+        )
+    legacy_tombstone = service.list_memories(
+        actor=ctx.dept_admin,
+        scope="project",
+        kb_name="design",
+        status="deleted",
+    )[0]
+    assert legacy_tombstone["source_count"] == 0
+    details = service.get_memory(record["memory_id"], actor=ctx.dept_admin, kb_name="design")
+    assert details["source_count"] == 0
+    assert details["sources"] and all(source["valid"] is False for source in details["sources"])
+
+    worker.close()
+    service.close()
+
+
 def test_user_consent_is_opt_in_and_reflect_job_reloads_only_manifest(memory_context):
     ctx = memory_context
     service = MemoryService(db_path=ctx.db_path, auth=ctx.auth)

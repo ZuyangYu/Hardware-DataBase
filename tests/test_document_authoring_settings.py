@@ -11,6 +11,10 @@ class DocumentAuthoringSettingsTests(unittest.TestCase):
         env = os.environ.copy()
         env.pop("DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", None)
         env.pop("AGENT_DOCUMENT_TOOLS_ENABLED", None)
+        # The assertion is about an unconfigured environment; do not let a
+        # developer's repository-level .env turn the subprocess into a
+        # configured deployment.
+        env["PYTHON_DOTENV_DISABLED"] = "1"
         result = subprocess.run(
             [
                 sys.executable,
@@ -31,6 +35,7 @@ class DocumentAuthoringSettingsTests(unittest.TestCase):
     def test_document_authoring_batch_time_budget_has_ten_second_default(self):
         env = os.environ.copy()
         env.pop("DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS", None)
+        env["PYTHON_DOTENV_DISABLED"] = "1"
         result = subprocess.run(
             [
                 sys.executable,

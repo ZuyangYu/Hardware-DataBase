@@ -70,6 +70,7 @@ const STATUS_ALIASES: Record<string, DocumentGenerationPhase> = {
   drafting: 'generating',
   waiting_human_input: 'needs_review',
   waiting_human_approval: 'needs_review',
+  complete: 'completed',
   approved: 'completed',
 };
 

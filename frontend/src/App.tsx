@@ -21,6 +21,7 @@ import {
   type AuthSession,
 } from './auth';
 import AppSidebar from './components/AppSidebar';
+import ExportTaskCenter from './components/ExportTaskCenter';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -286,6 +287,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
           </Routes>
         </div>
       </div>
+      <ExportTaskCenter />
     </SidebarProvider>
   );
 }

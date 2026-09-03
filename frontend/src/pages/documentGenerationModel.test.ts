@@ -19,6 +19,15 @@ describe('document generation status model', () => {
     expect(nextActionsForStatus('retrieving')).toContain('refresh');
   });
 
+  it('normalizes the legacy complete status to the downloadable completed state', () => {
+    expect(describeWorkOrderStatus('complete')).toEqual({
+      label: '文档已生成',
+      tone: 'success',
+      action: '预览或下载文档',
+    });
+    expect(nextActionsForStatus('complete')).toEqual(['view_result']);
+  });
+
   it('treats a completed harness with a renderer error as blocked', () => {
     expect(resolveDocumentPhase({
       work_order_id: 'wo-1',

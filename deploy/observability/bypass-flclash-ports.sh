@@ -34,16 +34,16 @@ fi
 # get sent back through the proxy.
 for ingress in eth0 FlClash; do
   while iptables -t mangle -C "${chain}" \
-    -i "${ingress}" -p tcp -m multiport --dports 3000,6006 \
+    -i "${ingress}" -p tcp -m multiport --dports 3000,6006,6080 \
     -m conntrack --ctstate NEW \
     -j CONNMARK --set-xmark "${mark}" 2>/dev/null; do
     iptables -t mangle -D "${chain}" \
-      -i "${ingress}" -p tcp -m multiport --dports 3000,6006 \
+      -i "${ingress}" -p tcp -m multiport --dports 3000,6006,6080 \
       -m conntrack --ctstate NEW \
       -j CONNMARK --set-xmark "${mark}"
   done
   iptables -t mangle -I "${chain}" 2 \
-    -i "${ingress}" -p tcp -m multiport --dports 3000,6006 \
+    -i "${ingress}" -p tcp -m multiport --dports 3000,6006,6080 \
     -m conntrack --ctstate NEW \
     -j CONNMARK --set-xmark "${mark}"
 done

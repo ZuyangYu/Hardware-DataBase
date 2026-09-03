@@ -515,7 +515,29 @@ class MemoryService:
             str(item.get("memory_id") or item.get("id") or ""),
         )
 
-    def _result(self, record: MemoryRecord, *, score: float | None = None) -> dict[str, Any]:
+    def _projection_status(self, record: MemoryRecord) -> str:
+        """Report the logical projection state without exposing Store details."""
+
+        if record.status in {"deleted", "rejected", "superseded", "provenance_missing"}:
+            return "retired"
+        projections = self.catalog.get_projections(
+            scope=record.scope,
+            user_id=record.user_id,
+            department_id=record.department_id,
+            kb_id=record.kb_id,
+            active_only=False,
+        )
+        if any(projection.memory_id == record.memory_id and projection.active and projection.retired_at is None for projection in projections):
+            return "active"
+        return "pending"
+
+    def _result(
+        self,
+        record: MemoryRecord,
+        *,
+        score: float | None = None,
+        projection_status: str | None = None,
+    ) -> dict[str, Any]:
         result = {
             "id": record.memory_id,
             "memory_id": record.memory_id,
@@ -534,8 +556,11 @@ class MemoryService:
             "created_at": record.created_at,
             "updated_at": record.updated_at,
             "replacement_id": record.replacement_id,
+            "projection_status": projection_status or "",
         }
-        valid_sources = self.catalog.get_sources(record.memory_id, valid_only=True)
+        # Deleted records are tombstones.  Treat legacy provenance edges as
+        # unusable too, so old rows cannot claim to still have live sources.
+        valid_sources = [] if record.status == "deleted" else self.catalog.get_sources(record.memory_id, valid_only=True)
         result["score"] = score
         result["source_count"] = len(valid_sources)
         result["has_provenance"] = bool(valid_sources)
@@ -674,21 +699,24 @@ class MemoryService:
         request_context=None,
         actor: AuthUser | int | str | None = None,
         scope: str = "all",
-        status: str | None = "all",
+        status: str | None = "active",
         kb_name: str | None = None,
         limit: int = 100,
         offset: int = 0,
         query: str = "",
         cursor: str | None = None,
     ) -> list[dict[str, Any]]:
-        status = status or "all"
+        status = status or "active"
         if scope not in {"all", "user", "project"}:
             raise ValueError("memory scope must be all, user, or project")
-        if status not in {"all", "candidate", "verified", "verification_pending", "rejected", "deleted", "superseded", "needs_rebuild", "supersede_pending", "provenance_missing"}:
+        if status not in {"all", "active", "candidate", "verified", "verification_pending", "rejected", "deleted", "superseded", "needs_rebuild", "supersede_pending", "provenance_missing"}:
             raise ValueError("unsupported memory status")
         from src.memory.catalog import MEMORY_STATUSES
 
-        statuses = {status} if status != "all" else set(MEMORY_STATUSES)
+        if status == "active":
+            statuses = set(ACTIVE_MEMORY_STATUSES)
+        else:
+            statuses = {status} if status != "all" else set(MEMORY_STATUSES)
         try:
             cursor_offset = max(0, int(cursor)) if cursor else 0
         except (TypeError, ValueError):
@@ -728,7 +756,7 @@ class MemoryService:
                     or str(query).lower() in json.dumps(record.content, ensure_ascii=False).lower()
                 )
             )
-        result = [self._result(record) for record in rows]
+        result = [self._result(record, projection_status=self._projection_status(record)) for record in rows]
         return result[cursor_offset: cursor_offset + requested_limit]
 
     def get_memory(
@@ -744,7 +772,7 @@ class MemoryService:
         if record is None:
             raise MemoryNotFound("memory not found")
         self._require_read(record, request_context=request_context, actor=actor, kb_name=kb_name)
-        result = self._result(record)
+        result = self._result(record, projection_status=self._projection_status(record))
         if include_audit:
             result["audit"] = {"events": self.catalog.audit_events(record.memory_id)}
             result["sources"] = [
@@ -755,20 +783,10 @@ class MemoryService:
                     "turn_id": row["turn_id"],
                     "message_id": row["message_id"],
                     "content_hash": row["source_hash"],
-                    "valid": bool(row["source_valid"]),
+                    "valid": bool(row["source_valid"]) and record.status != "deleted",
                 }
                 for row in self.catalog.get_sources(record.memory_id)
             ]
-            result["projection_status"] = "active" if any(
-                projection.memory_id == record.memory_id
-                for projection in self.catalog.get_projections(
-                    scope=record.scope,
-                    user_id=record.user_id,
-                    department_id=record.department_id,
-                    kb_id=record.kb_id,
-                    active_only=True,
-                )
-            ) else "pending_or_retired"
         return result
 
     # ------------------------------------------------------------------
@@ -1176,11 +1194,10 @@ class MemoryService:
                     "UPDATE memory_records SET status = ?, current_revision = ?, content_hash = ?, content_json = '{}', title = '已删除记忆', subject = NULL, memory_type = 'context', deleted_at = ?, updated_at = ? WHERE memory_id = ? AND current_revision = ?",
                     (next_status, revision, replacement_hash, utc_now(), utc_now(), memory_id, int(expected_revision)),
                 )
-                if row["scope"] == "user":
-                    conn.execute(
-                        "UPDATE memory_sources SET source_valid = 0, invalidated_at = COALESCE(invalidated_at, ?) WHERE memory_id = ?",
-                        (utc_now(), memory_id),
-                    )
+                conn.execute(
+                    "UPDATE memory_sources SET source_valid = 0, invalidated_at = COALESCE(invalidated_at, ?) WHERE memory_id = ?",
+                    (utc_now(), memory_id),
+                )
                 conn.execute("UPDATE memory_revisions SET before_content_json = NULL, after_content_json = NULL WHERE memory_id = ?", (memory_id,))
                 conn.execute("UPDATE memory_reflection_runs SET output_payload_json = NULL, encrypted_source_snapshot_ref = NULL WHERE job_id IN (SELECT job_id FROM memory_run_items WHERE memory_id = ?)", (memory_id,))
             else:
