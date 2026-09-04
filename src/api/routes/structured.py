@@ -11,7 +11,7 @@ from src.core.app_logs import AppLogService
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
 from src.ingestion.kb_paths import validate_kb_name
-from src.pipelines.document_rag.schemas import parse_status_label
+from src.pipelines.document_rag.schemas import parse_status_label, normalize_parse_status, TASK_STATUS_COMPLETED
 from src.test_data.query_engine import TestDataQueryEngine
 
 from src.api.context import build_context_for_user
@@ -96,7 +96,9 @@ def list_spreadsheets(
         "file_count": len(rows),
         "sheet_count": sum(int(row["sheet_count"]) for row in rows),
         "semantic_row_count": sum(int(row["semantic_row_count"]) for row in rows),
-        "pending_count": sum(1 for row in rows if row["status"] != "completed"),
+        "pending_count": sum(
+            1 for row in rows if normalize_parse_status(row["status"]) != TASK_STATUS_COMPLETED
+        ),
     }
     return SpreadsheetLedgerResponse(totals=totals, rows=rows)
 

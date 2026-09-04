@@ -187,7 +187,6 @@ def _write_run_state(
         dataset_path=dataset_path,
         snapshot_path="",
         mode=mode,
-        score_enabled=bool(metrics),
         status="completed",
         total_samples=total_samples,
         completed_samples=total_samples,

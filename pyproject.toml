@@ -77,7 +77,9 @@ dev = [
 ]
 eval = [
     "openai>=1.0,<3",
-    "ragas>=0.4,<0.5",
+    # Pin the collections API version used and tested by the adapter so
+    # metric prompts/semantics cannot drift across deployments.
+    "ragas==0.4.3",
 ]
 
 [tool.pytest.ini_options]

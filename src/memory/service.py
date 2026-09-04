@@ -1141,7 +1141,60 @@ class MemoryService:
         return self._retire_governed(memory_id, actor=actor, expected_revision=expected_revision, next_status="rejected", operation="reject", reason=reason, request_id=request_id, request_context=request_context, kb_name=kb_name)
 
     def delete(self, memory_id: str, *, actor, expected_revision: int, reason: str, request_id: str = "", request_context=None, kb_name: str | None = None) -> dict[str, Any]:
-        return self._retire_governed(memory_id, actor=actor, expected_revision=expected_revision, next_status="deleted", operation="delete", reason=reason, request_id=request_id, request_context=request_context, kb_name=kb_name, scrub=True)
+        result = self._retire_governed(
+            memory_id,
+            actor=actor,
+            expected_revision=expected_revision,
+            next_status="deleted",
+            operation="delete",
+            reason=reason,
+            request_id=request_id,
+            request_context=request_context,
+            kb_name=kb_name,
+            scrub=True,
+        )
+        # 用户主动删除 = 物理清除。墓碑（status=deleted 的空白行）只会在
+        # 列表里变成"空白记忆"，对用户没有意义。Store 的删除指令已由
+        # _retire_governed 写入 outbox（payload 自带 store_key，不依赖记录行），
+        # 所以这里可以安全移除控制面残留：sources/revisions/run_items/record。
+        # 审计事件保留（audit_events.memory_id 是无外键的字符串引用）。
+        try:
+            self._purge_deleted_record(memory_id)
+        except Exception as exc:
+            # 清除失败时退回墓碑（status=deleted），不下拉整个删除操作。
+            from src.core.logger import log
+
+            log(f"memory purge failed for {memory_id}: {exc}")
+        return result
+
+    def _purge_deleted_record(self, memory_id: str) -> None:
+        """Physically remove a tombstoned record and its control-plane rows."""
+
+        conn = self._begin_control_transaction()
+        try:
+            row = conn.execute("SELECT * FROM memory_records WHERE memory_id = ?", (memory_id,)).fetchone()
+            if row is None:
+                conn.commit()
+                return
+            if row["status"] != "deleted":
+                raise MemoryServiceError("purge is only allowed for deleted tombstones")
+            self.catalog.audit(
+                "deleted_purged",
+                memory_id=memory_id,
+                actor_id=None,
+                metadata={"scope": row["scope"], "title": row["title"]},
+                conn=conn,
+            )
+            conn.execute("DELETE FROM memory_run_items WHERE memory_id = ?", (memory_id,))
+            conn.execute("DELETE FROM memory_sources WHERE memory_id = ?", (memory_id,))
+            conn.execute("DELETE FROM memory_revisions WHERE memory_id = ?", (memory_id,))
+            conn.execute("DELETE FROM memory_records WHERE memory_id = ?", (memory_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _retire_governed(self, memory_id: str, *, actor, expected_revision: int, next_status: str, operation: str, reason: str, request_id: str, request_context, kb_name: str | None, scrub: bool = False) -> dict[str, Any]:
         record = self.catalog.get_record(memory_id)

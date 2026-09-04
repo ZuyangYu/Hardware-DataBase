@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import threading
@@ -10,6 +11,7 @@ from datetime import datetime, timezone
 import logging
 from pathlib import Path
 
+from .collection_qc import run_collection_qc
 from .dataset_loader import load_dataset
 from .history import cohort_fingerprint
 from .reporters import write_reports
@@ -35,7 +37,7 @@ _REPORT_ARTIFACT_NAMES = (
     "report.html",
     "report_complete.json",
 )
-_DELETABLE_RUN_STATUSES = frozenset({"failed", "cancelled", "completed"})
+_DELETABLE_RUN_STATUSES = frozenset({"failed", "cancelled", "completed", "collected"})
 _EXECUTION_DATASET_NAME = "execution_dataset.jsonl"
 
 
@@ -120,6 +122,16 @@ class RunStateStore:
             lambda state: self._mark_completed(state, report_path=report_path)
         )
 
+    def mark_collected(self, qc_verdict: str = "") -> EvaluationRunState:
+        """Transition a finished online collection to the QC gate state."""
+
+        return self.mutate(lambda state: self._mark_collected(state, qc_verdict))
+
+    def request_scoring(self) -> EvaluationRunState:
+        """Queue the scoring phase after a passing collection QC gate."""
+
+        return self.mutate(self._request_scoring)
+
     def complete_report_or_handle_control(
         self,
         *,
@@ -129,9 +141,7 @@ class RunStateStore:
         with self._lock:
             state = self.load()
             if state.status in {"queued", "running"}:
-                return self._write(
-                    self._mark_completed(state, report_path=report_path)
-                )
+                return self._write(self._mark_completed(state, report_path=report_path))
             if state.status == "pause_requested":
                 self.remove_report_artifacts()
                 return self._write(self._mark_paused(state))
@@ -159,9 +169,7 @@ class RunStateStore:
             updates["scoring_completed_items"] = completed_items
         if total_items is not None:
             updates["scoring_total_items"] = total_items
-        return self.mutate(
-            lambda state: self._with_update(state, **updates)
-        )
+        return self.mutate(lambda state: self._with_update(state, **updates))
 
     def publish_partial_report(
         self,
@@ -172,15 +180,20 @@ class RunStateStore:
         with self._lock:
             state = self.load()
             if state.status == "pause_requested":
-                return self._write(self._finish(state, "paused", report_path=report_path))
+                return self._write(
+                    self._finish(state, "paused", report_path=report_path)
+                )
             if state.status == "cancel_requested":
-                return self._write(self._finish(state, "cancelled", report_path=report_path))
+                return self._write(
+                    self._finish(state, "cancelled", report_path=report_path)
+                )
             return self._write(
                 self._finish(
                     state,
                     "failed",
                     report_path=report_path,
-                    error_message=error_message or "evaluation worker failed; see application logs",
+                    error_message=error_message
+                    or "evaluation worker failed; see application logs",
                 )
             )
 
@@ -246,6 +259,8 @@ class RunStateStore:
 
     @classmethod
     def _request_cancel(cls, state: EvaluationRunState) -> EvaluationRunState:
+        if state.status == "collected":
+            return cls._finish(state, "cancelled")
         if state.status in {"queued", "running", "pause_requested"}:
             return cls._with_update(state, status="cancel_requested")
         if state.status == "paused":
@@ -289,8 +304,39 @@ class RunStateStore:
         return cls._with_update(state, status="paused", stage="idle")
 
     @classmethod
+    def _mark_collected(
+        cls, state: EvaluationRunState, qc_verdict: str = ""
+    ) -> EvaluationRunState:
+        if state.status not in {"running", "pause_requested", "cancel_requested"}:
+            raise ValueError(f"cannot mark collected from {state.status!r}")
+        updates: dict[str, object] = {
+            "status": "collected",
+            "stage": "collected",
+            "current_sample_id": "",
+            "current_question": "",
+            "finished_at": _now(),
+        }
+        if qc_verdict:
+            evaluation_config = dict(state.evaluation_config or {})
+            evaluation_config["collection_qc_verdict"] = qc_verdict
+            updates["evaluation_config"] = evaluation_config
+        return cls._with_update(state, **updates)
+
+    @classmethod
+    def _request_scoring(cls, state: EvaluationRunState) -> EvaluationRunState:
+        if state.status != "collected":
+            raise ValueError(f"cannot start scoring from {state.status!r}")
+        return cls._with_update(
+            state,
+            status="queued",
+            stage="idle",
+            finished_at="",
+            error_message="",
+        )
+
+    @classmethod
     def _mark_cancelled(cls, state: EvaluationRunState) -> EvaluationRunState:
-        if state.status not in {"cancel_requested", "paused"}:
+        if state.status not in {"cancel_requested", "paused", "collected"}:
             raise ValueError(f"cannot mark cancelled from {state.status!r}")
         return cls._finish(state, "cancelled")
 
@@ -371,7 +417,6 @@ class EvaluationRunController:
         output_root: str | Path,
         samples: list[EvaluationSample],
         *,
-        score_enabled: bool,
         sample_ids: set[str] | list[str] | None = None,
         tags: set[str] | list[str] | None = None,
         kb_id: int | None = None,
@@ -402,13 +447,18 @@ class EvaluationRunController:
             "source_dataset_path": str(dataset_path),
             "dataset_sha256": source_digest,
             "execution_dataset_sha256": execution_digest,
-            "dataset_total_count": dataset_total_count if dataset_total_count is not None else len(samples),
+            "dataset_total_count": dataset_total_count
+            if dataset_total_count is not None
+            else len(samples),
             "dataset_sample_count": len(samples),
-            "matched_sample_count": matched_sample_count if matched_sample_count is not None else len(samples),
+            "matched_sample_count": matched_sample_count
+            if matched_sample_count is not None
+            else len(samples),
             "filtered_sample_count": filtered_sample_count,
             "normal_sample_count": len(samples) - denied_count,
             "expected_denied_sample_count": denied_count,
-            "cohort_fingerprint": cohort_fingerprint_value or cohort_fingerprint(sample.id for sample in samples),
+            "cohort_fingerprint": cohort_fingerprint_value
+            or cohort_fingerprint(sample.id for sample in samples),
             "snapshot_ownership_verified": snapshot_ownership_verified,
             "validation_warnings": list(validation_warnings or []),
             "evaluation_config": dict(evaluation_config or {}),
@@ -418,7 +468,6 @@ class EvaluationRunController:
             dataset_path=execution_path,
             snapshot_path=str(Path(output_root) / run_id / "snapshot.jsonl"),
             total_samples=len(samples),
-            score_enabled=score_enabled,
             sample_ids=sorted(sample_ids or []),
             tags=sorted(tags or []),
             metadata=metadata,
@@ -432,7 +481,6 @@ class EvaluationRunController:
         samples: list[EvaluationSample],
         snapshot_path: str | Path,
         *,
-        score_enabled: bool = True,
         sample_ids: set[str] | list[str] | None = None,
         tags: set[str] | list[str] | None = None,
         kb_id: int | None = None,
@@ -460,7 +508,6 @@ class EvaluationRunController:
             dataset_path=execution_path,
             snapshot_path=str(snapshot_path),
             mode="offline",
-            score_enabled=score_enabled,
             kb_id=kb_id,
             kb_name=kb_name,
             department_id=department_id,
@@ -468,13 +515,18 @@ class EvaluationRunController:
             source_dataset_path=str(dataset_path),
             dataset_sha256=source_digest,
             execution_dataset_sha256=execution_digest,
-            dataset_total_count=dataset_total_count if dataset_total_count is not None else len(samples),
+            dataset_total_count=dataset_total_count
+            if dataset_total_count is not None
+            else len(samples),
             dataset_sample_count=len(samples),
-            matched_sample_count=matched_sample_count if matched_sample_count is not None else len(samples),
+            matched_sample_count=matched_sample_count
+            if matched_sample_count is not None
+            else len(samples),
             filtered_sample_count=filtered_sample_count,
             normal_sample_count=len(samples) - denied_count,
             expected_denied_sample_count=denied_count,
-            cohort_fingerprint=cohort_fingerprint_value or cohort_fingerprint(sample.id for sample in samples),
+            cohort_fingerprint=cohort_fingerprint_value
+            or cohort_fingerprint(sample.id for sample in samples),
             snapshot_ownership_verified=snapshot_ownership_verified,
             validation_warnings=list(validation_warnings or []),
             evaluation_config=dict(evaluation_config or {}),
@@ -514,7 +566,8 @@ class EvaluationRunController:
             kb_name=state.kb_name,
             department_id=state.department_id,
             cohort_fingerprint=state.cohort_fingerprint,
-            ownership_verified=state.mode == "online" or state.snapshot_ownership_verified,
+            ownership_verified=state.mode == "online"
+            or state.snapshot_ownership_verified,
         )
         return store.mutate(
             lambda current: RunStateStore._with_update(
@@ -553,7 +606,9 @@ class EvaluationRunController:
                 current,
                 evaluation_config=evaluation_config,
                 llm_model=str(public.get("llm_model") or current.llm_model),
-                embedding_model=str(public.get("embedding_model") or current.embedding_model),
+                embedding_model=str(
+                    public.get("embedding_model") or current.embedding_model
+                ),
             )
         )
 
@@ -633,17 +688,12 @@ class EvaluationRunController:
             state = store.load()
             service = self.service_factory()
             state = self._record_service_metadata(store, service)
-            if state.score_enabled:
-                scoring_preflight = getattr(service, "preflight_scoring", None)
-                errors = scoring_preflight() if callable(scoring_preflight) else []
-                if errors:
-                    return store.mark_failed(
-                        f"evaluation scoring preflight failed: {'; '.join(errors)}"
-                    )
             if state.mode == "online":
                 errors = service.preflight_online(samples)
                 if errors:
-                    return store.mark_failed(f"evaluation preflight failed: {'; '.join(errors)}")
+                    return store.mark_failed(
+                        f"evaluation preflight failed: {'; '.join(errors)}"
+                    )
                 snapshots = service.collect(
                     samples,
                     state.snapshot_path,
@@ -666,12 +716,36 @@ class EvaluationRunController:
                 return store.load()
 
             state = store.load()
-            if not state.score_enabled:
-                return store.mark_completed()
+            # 采集/评分分离：在线 run 采集结束先做质检门禁，落盘
+            # collection_qc.json 并进入 collected 状态，等待用户确认后
+            # 通过 start_scoring() 显式进入评分（离线 run 不受影响）。
+            if state.mode == "online" and not (state.evaluation_config or {}).get(
+                "scoring_requested"
+            ):
+                qc = run_collection_qc(samples, snapshots)
+                qc_path = store.path.parent / "collection_qc.json"
+                qc_path.write_text(
+                    json.dumps(qc, ensure_ascii=False, indent=1) + "\n",
+                    encoding="utf-8",
+                )
+                return store.mark_collected(str(qc.get("verdict", "")))
+
+            # Scoring prerequisites are checked only when this execution is
+            # actually entering the scoring phase.  Online runs reach this
+            # point only after the explicit post-collection start_scoring()
+            # action; collection itself must not contact the judge LLM or
+            # embedding endpoint.
+            scoring_preflight = getattr(service, "preflight_scoring", None)
+            errors = scoring_preflight() if callable(scoring_preflight) else []
+            if errors:
+                return store.mark_failed(
+                    f"evaluation scoring preflight failed: {'; '.join(errors)}"
+                )
 
             store.mutate(
                 lambda current: RunStateStore._with_update(current, stage="scoring")
             )
+
             def checkpoint(summary, results, completed_groups, total_groups):
                 nonlocal latest_checkpoint
                 latest_checkpoint = (summary, results)
@@ -681,9 +755,17 @@ class EvaluationRunController:
                     self._decorate_summary(summary, store.load()),
                     results,
                 )
-                return store.load().status not in {"pause_requested", "cancel_requested"}
+                return store.load().status not in {
+                    "pause_requested",
+                    "cancel_requested",
+                }
+
+            last_item_report_at = 0.0
+            item_report_interval = 2.0
+            item_report_every = 5
 
             def item_checkpoint(summary, results, completed_items, total_items):
+                nonlocal last_item_report_at
                 nonlocal latest_checkpoint
                 latest_checkpoint = (summary, results)
                 state = store.load()
@@ -693,13 +775,24 @@ class EvaluationRunController:
                     completed_items=completed_items,
                     total_items=total_items,
                 )
-                write_reports(
-                    store.path.parent / ".checkpoint",
-                    self._decorate_summary(summary, store.load()),
-                    results,
+                now = time.monotonic()
+                should_write = (
+                    completed_items >= total_items
+                    or completed_items % item_report_every == 0
+                    or now - last_item_report_at >= item_report_interval
+                    or state.status in {"pause_requested", "cancel_requested"}
                 )
+                if should_write:
+                    write_reports(
+                        store.path.parent / ".checkpoint",
+                        self._decorate_summary(summary, store.load()),
+                        results,
+                    )
+                    last_item_report_at = now
 
-            scoring_service = service if state.mode == "online" else self.service_factory()
+            scoring_service = (
+                service if state.mode == "online" else self.service_factory()
+            )
             summary, results = scoring_service.score(
                 samples,
                 snapshots,
@@ -713,7 +806,9 @@ class EvaluationRunController:
             state = self._record_service_metadata(store, scoring_service)
             if state.status in {"pause_requested", "cancel_requested"}:
                 outcome_kind = (
-                    "partial_paused" if state.status == "pause_requested" else "partial_cancelled"
+                    "partial_paused"
+                    if state.status == "pause_requested"
+                    else "partial_cancelled"
                 )
                 paths = write_reports(
                     store.path.parent,
@@ -746,7 +841,9 @@ class EvaluationRunController:
             state = store.load()
             if state.status in {"pause_requested", "cancel_requested"}:
                 outcome_kind = (
-                    "partial_paused" if state.status == "pause_requested" else "partial_cancelled"
+                    "partial_paused"
+                    if state.status == "pause_requested"
+                    else "partial_cancelled"
                 )
                 paths = write_reports(
                     store.path.parent,
@@ -761,7 +858,9 @@ class EvaluationRunController:
                     },
                 )
                 return store.publish_partial_report(report_path=str(paths.report_html))
-            return store.complete_report_or_handle_control(report_path=str(paths.report_html))
+            return store.complete_report_or_handle_control(
+                report_path=str(paths.report_html)
+            )
         except Exception:
             logging.getLogger(__name__).exception("evaluation worker failed")
             if latest_checkpoint is not None:
@@ -779,9 +878,13 @@ class EvaluationRunController:
                             }
                         },
                     )
-                    return store.publish_partial_report(report_path=str(paths.report_html))
+                    return store.publish_partial_report(
+                        report_path=str(paths.report_html)
+                    )
                 except Exception:
-                    logging.getLogger(__name__).exception("failed to publish partial evaluation report")
+                    logging.getLogger(__name__).exception(
+                        "failed to publish partial evaluation report"
+                    )
             try:
                 store.remove_report_artifacts()
             except OSError:
@@ -846,6 +949,58 @@ class EvaluationRunController:
         store.mutate(queue)
         return self._refresh_progress(store)
 
+    def load_collection_qc(self, run_id: str) -> dict[str, object] | None:
+        """Return the persisted collection QC report, recomputing if absent."""
+
+        qc_path = self.state_root / run_id / "collection_qc.json"
+        if qc_path.is_file():
+            try:
+                return json.loads(qc_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+        state = self._store(run_id).load()
+        if state.mode != "online" or not Path(state.snapshot_path).is_file():
+            return None
+        samples = self._load_samples(state)
+        snapshots = SnapshotStore(state.snapshot_path).load_all()
+        qc = run_collection_qc(samples, snapshots)
+        try:
+            qc_path.write_text(
+                json.dumps(qc, ensure_ascii=False, indent=1) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return qc
+
+    def start_scoring(self, run_id: str, *, force: bool = False) -> EvaluationRunState:
+        """Enter the scoring phase from the collected QC-gate state."""
+
+        store = self._store(run_id)
+        state = store.load()
+        if state.status != "collected":
+            raise ValueError(
+                f"cannot start scoring from {state.status!r}; "
+                "scoring requires a run in the collected state"
+            )
+        qc = self.load_collection_qc(run_id) or {}
+        verdict = str(qc.get("verdict") or "fail")
+        if verdict == "fail" and not force:
+            issues = "; ".join(str(item) for item in (qc.get("issues") or []))
+            raise ValueError(f"collection QC failed: {issues or verdict}")
+        store.mutate(
+            lambda current: RunStateStore._with_update(
+                current,
+                evaluation_config={
+                    **(current.evaluation_config or {}),
+                    "scoring_requested": True,
+                },
+            )
+        )
+        store.request_scoring()
+        self.start(run_id)
+        return store.load()
+
     def load_for_display(self, run_id: str) -> EvaluationRunState:
         with self._threads_lock:
             thread = self._threads.get(run_id)
@@ -878,7 +1033,6 @@ class EvaluationRunController:
             dataset_path="",
             snapshot_path="",
             mode="offline",
-            score_enabled=False,
             status="completed",
             stage="reporting",
             total_samples=summary.sample_count,

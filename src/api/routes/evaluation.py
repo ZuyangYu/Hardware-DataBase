@@ -11,6 +11,7 @@ few pure helpers defined below (``list_evaluation_runs`` /
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from dataclasses import dataclass
 
@@ -317,7 +318,7 @@ def _prepare_evaluation(
             scan_sources=scan_sources,
         )
     )
-    if check_scoring and body.score_enabled:
+    if check_scoring:
         from src.evaluation.service import EvaluationService
 
         errors.extend(EvaluationService(pipeline_factory=lambda: pipeline).preflight_scoring())
@@ -575,6 +576,92 @@ def list_evaluation_knowledge_bases(
     ]
 
 
+# Resolve from the repository location rather than the process CWD.  The API
+# is sometimes started by an IDE or supervisor from a different directory.
+_DATASETS_DIR = _DATASET_ROOT
+_DATASET_SCAN_MAX_BYTES = 20 * 1024 * 1024
+
+
+@router.get("/evaluation/datasets")
+def list_evaluation_datasets(
+    _actor: AuthUser = Depends(require_system_admin),
+) -> list[dict[str, Any]]:
+    """Summarize built-in and previously uploaded datasets for the form.
+
+    Each ``*.jsonl`` under ``evaluation/datasets`` and the evaluation upload
+    area is scanned for sample count, knowledge-base bindings, tag vocabulary,
+    and denied/critical counts so the UI can offer a picker with meaningful
+    previews instead of a free-form path field.
+    """
+
+    items: list[dict[str, Any]] = []
+    upload_dir = _EVAL_ROOT / "uploads"
+    dataset_dirs = [_DATASETS_DIR, upload_dir]
+    # An uploaded file may intentionally reuse a built-in filename.  In that
+    # case prefer the uploaded copy (the upload directory is scanned last) so
+    # the picker does not show two indistinguishable entries.
+    paths_by_name: dict[str, Path] = {}
+    for directory in dataset_dirs:
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.jsonl"):
+            paths_by_name[path.name.casefold()] = path.resolve()
+    for path in sorted(paths_by_name.values(), key=lambda item: item.name.casefold()):
+        try:
+            if path.stat().st_size > _DATASET_SCAN_MAX_BYTES:
+                continue
+            kb_counts: dict[str, int] = {}
+            tags: set[str] = set()
+            total = denied = critical = malformed = 0
+            with path.open("r", encoding="utf-8-sig") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    total += 1
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        malformed += 1
+                        continue
+                    kb_name = str(record.get("kb_name") or "").strip()
+                    if kb_name:
+                        kb_counts[kb_name] = kb_counts.get(kb_name, 0) + 1
+                    if record.get("expected_access") == "denied":
+                        denied += 1
+                    if record.get("critical"):
+                        critical += 1
+                    record_tags = record.get("tags")
+                    if isinstance(record_tags, list):
+                        tags.update(str(tag) for tag in record_tags if str(tag).strip())
+            # Keep built-in paths portable (and compatible with the default
+            # value used by the frontend); uploaded paths are absolute because
+            # they live under the storage root returned by the upload API.
+            display_path = (
+                path.as_posix()
+                if _within(path, upload_dir)
+                else path.relative_to(_BASE_DIR).as_posix()
+            )
+            items.append(
+                {
+                    "name": path.name,
+                    "path": display_path,
+                    "sample_count": total,
+                    "malformed_lines": malformed,
+                    "kb_bindings": [
+                        {"kb_name": name, "count": count}
+                        for name, count in sorted(kb_counts.items(), key=lambda kv: -kv[1])
+                    ],
+                    "tags": sorted(tags),
+                    "expected_denied_count": denied,
+                    "critical_count": critical,
+                }
+            )
+        except OSError:
+            continue
+    return items
+
+
 def _run_list_item(path: Path) -> EvaluationRunListItemView:
     state: EvaluationRunState | None = None
     summary: EvaluationSummary | None = None
@@ -612,7 +699,6 @@ def _run_list_item(path: Path) -> EvaluationRunListItemView:
         dataset_path=getattr(source, "dataset_path", "") if state else "",
         source_dataset_path=getattr(source, "source_dataset_path", ""),
         mode=getattr(source, "mode", "") if state else "",
-        score_enabled=getattr(source, "score_enabled", True) if state else True,
         report_path=getattr(source, "report_path", "") if state else "",
         dataset_sample_count=getattr(source, "dataset_sample_count", 0),
         normal_sample_count=getattr(source, "normal_sample_count", 0),
@@ -654,7 +740,11 @@ def preflight_run(
         pipeline=pipeline,
         auth=auth,
         scan_sources=body.mode == "online",
-        check_scoring=True,
+        # This endpoint is the form's read-only dataset/scope preflight.
+        # RAGAS judge/embedding probes happen in the worker immediately
+        # before the scoring phase (after the explicit post-collection
+        # "开始评分" action for online runs).
+        check_scoring=False,
     )
     return _preflight_response(body, prepared)
 
@@ -667,9 +757,12 @@ def create_run(
     auth: AuthService = Depends(get_auth_service),
     pipeline: AppPipeline = Depends(get_pipeline),
 ) -> dict[str, Any]:
-    """Create an evaluation run. ``dataset_path`` is required; ``mode`` selects
-    online (default) vs offline (requires ``snapshot_path``). ``score_enabled``
-    toggles RAGAS scoring for online runs."""
+    """Create an evaluation run.
+
+    Online runs collect answers first and enter the post-collection QC gate;
+    scoring is explicitly started later.  Offline runs score an existing
+    snapshot after creation.
+    """
     output_root = _check_output_root(output_root)
     prepared = _prepare_evaluation(
         body,
@@ -715,7 +808,6 @@ def create_run(
                 output_root=output_root,
                 samples=selection.samples,
                 snapshot_path=snapshot_path,
-                score_enabled=body.score_enabled,
                 sample_ids=body.sample_ids,
                 tags=body.tags,
                 kb_id=binding.kb_id,
@@ -734,7 +826,6 @@ def create_run(
                 dataset_path=dataset_path,
                 output_root=output_root,
                 samples=selection.samples,
-                score_enabled=body.score_enabled,
                 sample_ids=body.sample_ids,
                 tags=body.tags,
                 kb_id=binding.kb_id,
@@ -843,6 +934,47 @@ def resume_run(
     return _state_dict(state)
 
 
+@router.get("/evaluation/runs/{run_id}/collection-qc")
+def get_collection_qc(
+    run_id: str,
+    output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
+    _actor: AuthUser = Depends(require_system_admin),
+) -> dict[str, Any]:
+    """Return the post-collection quality gate report (recomputing if absent)."""
+    output_root = _check_output_root(output_root)
+    _run_dir(output_root, run_id)
+    controller = _controller(output_root)
+    try:
+        qc = controller.load_collection_qc(run_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if qc is None:
+        raise HTTPException(status_code=404, detail="该运行没有可用的采集质检报告")
+    return qc
+
+
+@router.post("/evaluation/runs/{run_id}/score")
+def start_scoring(
+    run_id: str,
+    force: bool = Query(default=False),
+    output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
+    _actor: AuthUser = Depends(require_system_admin),
+) -> dict[str, Any]:
+    """Enter the scoring phase from a collected run after its QC gate.
+
+    Rejected while the collection QC reports a ``fail`` verdict unless
+    ``force`` is set explicitly.
+    """
+    output_root = _check_output_root(output_root)
+    _run_dir(output_root, run_id)
+    controller = _controller(output_root)
+    try:
+        state = controller.start_scoring(run_id, force=force)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _state_dict(state)
+
+
 @router.post("/evaluation/runs/{run_id}/cancel")
 def cancel_run(
     run_id: str,
@@ -939,6 +1071,11 @@ def get_run(
     else:
         result["sample_results"] = []
         result["sample_results_error"] = ""
+    if result.get("mode") == "online":
+        try:
+            result["collection_qc"] = _controller(output_root).load_collection_qc(run_id)
+        except Exception:
+            result["collection_qc"] = None
     return result
 
 

@@ -25,6 +25,14 @@ _MISSING_MARKERS = (
 _CONFLICT_MARKERS = ("冲突", "不一致", "差异", "分别", "一处", "另一处")
 _EVIDENCE_TYPE_ALIASES = {
     "document_text": "document",
+    # 表格管线的存储证据 kind → 数据集词汇 "spreadsheet"
+    "spreadsheet_table": "spreadsheet",
+    "spreadsheet_schema": "spreadsheet",
+    "spreadsheet_sql_result": "spreadsheet",
+    "table": "spreadsheet",
+    # 电路与目录证据的常见变体
+    "circuit": "circuit_design",
+    "catalog": "catalog",
 }
 
 
