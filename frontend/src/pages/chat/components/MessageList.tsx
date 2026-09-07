@@ -83,7 +83,11 @@ export default function MessageList({
           <MessageBubble
             key={msg.id}
             msg={msg}
-            evidence={msg.role === 'assistant' ? evidenceByMessageId[msg.id] : undefined}
+            evidence={
+              msg.role === 'assistant'
+                ? (evidenceByMessageId[msg.id] ?? msg.citations ?? [])
+                : undefined
+            }
             onCreateMemory={onCreateMemory}
             onEditMessage={onEditMessage}
             showDiagnostics={showDiagnostics}

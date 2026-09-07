@@ -78,6 +78,28 @@ def clear_finished_parse_tasks(
     return OkResponse(ok=True, message="finished tasks cleared")
 
 
+@router.post("/kbs/{kb_name}/parse-tasks/requeue-dead-letters", response_model=OkResponse)
+def requeue_dead_letter_parse_tasks(
+    kb_name: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Re-queue dead-lettered parse records so the worker can retry them.
+
+    Background parsing fails into ``dead_letter`` after exhausting its retry
+    budget; transient causes (remote backend hiccups, stale workers) leave
+    recoverable records stranded.  This resets them to ``queued``.
+    """
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "write"):
+        raise HTTPException(status_code=403, detail="write permission required")
+    names = pipeline.requeue_dead_letter_parse_tasks(kb_name, ctx=ctx)
+    message = f"requeued {len(names)} dead-letter task(s)" if names else "no dead-letter tasks"
+    return OkResponse(ok=True, message=message)
+
+
 @router.delete("/kbs/{kb_name}/parse-tasks/{task_id}", response_model=OkResponse)
 def delete_parse_task(
     kb_name: str,

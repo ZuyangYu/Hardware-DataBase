@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import threading
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -60,9 +62,44 @@ def _collection_worker_count(config: EvaluationConfig | None) -> int:
         return 4
 
 
+_DEGRADED_ANSWER_PREFIXES = ("系统错误", "模型服务调用过于频繁")
+
+
+def _is_degraded_snapshot(snapshot) -> bool:
+    """Detect fail-open snapshots that carry no usable answer content.
+
+    Legitimately empty retrievals (e.g. negative samples) still produce
+    success snapshots with a normal answer and access_check, so they are
+    never retried; only pipeline failure texts and failed snapshots are.
+    """
+
+    if snapshot is None:
+        return False
+    if snapshot.status != "success":
+        return True
+    answer = (snapshot.scored_response or snapshot.response or "").strip()
+    return answer.startswith(_DEGRADED_ANSWER_PREFIXES)
+
+
+def _collection_retry_budget() -> int:
+    try:
+        return max(0, int(os.getenv("EVAL_COLLECT_RETRIES", "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
 def new_run_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _collection_cache_key(sample: EvaluationSample) -> tuple[str, str, str, str]:
+    """Build a permission-aware key for exact duplicate collection inputs."""
+
+    context = json.dumps(
+        sample.request_context, sort_keys=True, ensure_ascii=False, default=str
+    )
+    return sample.question, sample.kb_name, sample.expected_access, context
 
 
 class EvaluationService:
@@ -95,8 +132,33 @@ class EvaluationService:
         completed_ids = store.completed_ids() if resume else set()
         completed_count = len(completed_ids)
         total = len(samples)
-        pending_samples = [sample for sample in samples if sample.id not in completed_ids]
+        pending_samples = [
+            sample for sample in samples if sample.id not in completed_ids
+        ]
         max_workers = _collection_worker_count(self.config)
+        # Keep this cache scoped to one collect invocation. Including the
+        # complete request context prevents reuse across users/departments.
+        collection_cache: dict[tuple[str, str, str, str], AnswerSnapshot] = {}
+        collection_cache_lock = threading.Lock()
+
+        def collect_or_reuse(sample: EvaluationSample) -> AnswerSnapshot:
+            key = _collection_cache_key(sample)
+            with collection_cache_lock:
+                cached = collection_cache.get(key)
+            if cached is not None and cached.status == "success":
+                return cached.model_copy(
+                    update={
+                        "sample_id": sample.id,
+                        "question": sample.question,
+                        "kb_name": sample.kb_name,
+                    }
+                )
+            snapshot = self._collect_sample(sample)
+            if snapshot.status == "success":
+                with collection_cache_lock:
+                    collection_cache.setdefault(key, snapshot)
+            return snapshot
+
         if max_workers > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 pending_iterator = iter(pending_samples)
@@ -114,7 +176,11 @@ class EvaluationService:
                         ):
                             submitting = False
                             break
-                        futures[submit_with_current_context(executor, self._collect_sample, sample)] = sample
+                        futures[
+                            submit_with_current_context(
+                                executor, collect_or_reuse, sample
+                            )
+                        ] = sample
                     if not futures:
                         continue
                     future = next(as_completed(futures))
@@ -128,9 +194,11 @@ class EvaluationService:
         for sample in samples:
             if sample.id in completed_ids:
                 continue
-            if before_sample is not None and not before_sample(sample, completed_count, total):
+            if before_sample is not None and not before_sample(
+                sample, completed_count, total
+            ):
                 break
-            snapshot = self._collect_sample(sample)
+            snapshot = collect_or_reuse(sample)
             store.append(snapshot)
             completed_count += 1
             if after_sample is not None:
@@ -147,6 +215,12 @@ class EvaluationService:
         ) as observation:
             try:
                 snapshot = self.answer_runner.collect(sample)
+                # 采集降级自愈：管线 fail-open 会把上游瞬时故障（限流/5xx/
+                # 递归超限）包成 status=success 的「系统错误」快照。这类快照
+                # 对评分毫无价值，原地重试一次；仍失败才落盘。
+                if _is_degraded_snapshot(snapshot) and _collection_retry_budget() > 0:
+                    observation.set("hdb.evaluation.sample.degraded_retry", True)
+                    snapshot = self.answer_runner.collect(sample)
                 status = snapshot.status
                 observation.set("hdb.evaluation.sample.status", status)
                 return snapshot
@@ -156,7 +230,9 @@ class EvaluationService:
             finally:
                 record_evaluation_sample(
                     status=status,
-                    duration_s=max(0.0, datetime.now(timezone.utc).timestamp() - started),
+                    duration_s=max(
+                        0.0, datetime.now(timezone.utc).timestamp() - started
+                    ),
                     mode="online",
                 )
 
@@ -171,7 +247,8 @@ class EvaluationService:
         # tests and alternative deployments they may not use the optional
         # native RAGAS packages at all.
         if adapter is not None and not (
-            isinstance(adapter, RagasAdapter) and getattr(adapter, "_backend", None) is None
+            isinstance(adapter, RagasAdapter)
+            and getattr(adapter, "_backend", None) is None
         ):
             return []
         config = adapter.config if isinstance(adapter, RagasAdapter) else self.config
@@ -186,20 +263,31 @@ class EvaluationService:
         thresholds: dict[str, float] | None = None,
         fail_on_threshold: bool = False,
         run_id: str | None = None,
-        progress_callback: Callable[[EvaluationSummary, list[SampleResult], int, int], bool] | None = None,
-        item_progress_callback: Callable[[EvaluationSummary, list[SampleResult], int, int], None]
+        progress_callback: Callable[
+            [EvaluationSummary, list[SampleResult], int, int], bool
+        ]
+        | None = None,
+        item_progress_callback: Callable[
+            [EvaluationSummary, list[SampleResult], int, int], None
+        ]
         | None = None,
         completed_groups: set[str] | None = None,
         seeded_metrics: dict[str, list[MetricResult]] | None = None,
     ) -> tuple[EvaluationSummary, list[SampleResult]]:
-        metric_names = DEFAULT_STANDARD_METRICS if metric_names is None else metric_names
+        metric_names = (
+            DEFAULT_STANDARD_METRICS if metric_names is None else metric_names
+        )
         resume_done_groups = completed_groups or set()
         seeded_metrics = seeded_metrics or {}
         scoring_skipped_reason = ""
         scoring_config_metadata: dict[str, str | int | float] = {}
         if self.config is not None:
             scoring_config_metadata = self.config.public_metadata()
-        if metric_names and samples and not any(snapshot.status == "success" for snapshot in snapshots):
+        if (
+            metric_names
+            and samples
+            and not any(snapshot.status == "success" for snapshot in snapshots)
+        ):
             metric_names = []
             scoring_skipped_reason = "no_successful_snapshots"
         snapshot_by_id = {snapshot.sample_id: snapshot for snapshot in snapshots}
@@ -226,16 +314,24 @@ class EvaluationService:
                 question=sample.question,
                 reference_answer=sample.reference_answer,
                 response=snapshot.response if snapshot is not None else "",
-                scored_response=(snapshot.scored_response or snapshot.response) if snapshot is not None else "",
-                retrieved_contexts=snapshot.retrieved_contexts if snapshot is not None else [],
+                scored_response=(snapshot.scored_response or snapshot.response)
+                if snapshot is not None
+                else "",
+                retrieved_contexts=snapshot.retrieved_contexts
+                if snapshot is not None
+                else [],
                 critical=sample.critical,
                 snapshot_status=status,
                 metrics=metrics,
                 access_check=snapshot.access_check if snapshot is not None else None,
             )
-            sample_results[sample.id].metadata["evaluation_cohort"] = sample_cohorts[sample.id]
+            sample_results[sample.id].metadata["evaluation_cohort"] = sample_cohorts[
+                sample.id
+            ]
             if snapshot is not None and snapshot.access_check is not None:
-                sample_results[sample.id].metadata["access_check"] = snapshot.access_check
+                sample_results[sample.id].metadata["access_check"] = (
+                    snapshot.access_check
+                )
             if snapshot is not None and snapshot.retrieval_summary:
                 sample_results[sample.id].metadata["retrieval_summary"] = (
                     snapshot.retrieval_summary
@@ -259,15 +355,21 @@ class EvaluationService:
             ]
             retrieval_ids = {sample.id for sample in retrieval_samples}
             retrieval_snapshots = [
-                snapshot for snapshot in snapshots if snapshot.sample_id in retrieval_ids
+                snapshot
+                for snapshot in snapshots
+                if snapshot.sample_id in retrieval_ids
             ]
             for sample in samples:
                 if sample.expected_access == "denied":
-                    reason = "sample validates access denial instead of normal retrieval"
+                    reason = (
+                        "sample validates access denial instead of normal retrieval"
+                    )
                 elif sample_cohorts[sample.id] != "non_retrieval":
                     continue
                 else:
-                    reason = "sample intentionally does not use knowledge-base retrieval"
+                    reason = (
+                        "sample intentionally does not use knowledge-base retrieval"
+                    )
                 for metric_name in metric_names:
                     if is_ragas_metric(metric_name):
                         sample_results[sample.id].metrics.append(
@@ -292,19 +394,26 @@ class EvaluationService:
                 total_groups = len(metric_names)
                 total_items = len(retrieval_samples) * len(metric_names)
                 if isinstance(adapter, RagasAdapter):
-                    scoring_snapshots, diagnostics = adapter.prepare_snapshots_for_scoring(
-                        retrieval_snapshots
+                    scoring_snapshots, diagnostics = (
+                        adapter.prepare_snapshots_for_scoring(
+                            retrieval_snapshots, full_contexts=True
+                        )
                     )
                     for sample_id, diagnostic in diagnostics.items():
                         if sample_id in sample_results:
-                            sample_results[sample_id].metadata["ragas_scoring"] = diagnostic
+                            sample_results[sample_id].metadata["ragas_scoring"] = (
+                                diagnostic
+                            )
                 else:
                     scoring_snapshots = retrieval_snapshots
+                pending_metric_names: list[str] = []
                 for metric_name in metric_names:
                     if metric_name in resume_done_groups:
                         completed_items += len(retrieval_samples)
                         completed_groups += 1
-                        ordered_results = [sample_results[sample.id] for sample in samples]
+                        ordered_results = [
+                            sample_results[sample.id] for sample in samples
+                        ]
                         summary = self._build_summary(
                             samples,
                             ordered_results,
@@ -321,77 +430,137 @@ class EvaluationService:
                             progress_callback(
                                 summary, ordered_results, completed_groups, total_groups
                             )
-                        continue
+                    else:
+                        pending_metric_names.append(metric_name)
+
+                def emit_item_progress() -> None:
+                    if item_progress_callback is None:
+                        return
+                    ordered = [sample_results[sample.id] for sample in samples]
+                    current_summary = self._build_summary(
+                        samples,
+                        ordered,
+                        thresholds=thresholds,
+                        fail_on_threshold=fail_on_threshold,
+                        run_id=run_id,
+                        completed_groups=completed_groups,
+                        total_groups=total_groups,
+                        completed_items=completed_items,
+                        total_items=total_items,
+                        outcome_kind="in_progress",
+                    )
+                    item_progress_callback(
+                        current_summary, ordered, completed_items, total_items
+                    )
+
+                if isinstance(adapter, RagasAdapter):
                     emitted_keys: set[tuple[str, str]] = set()
 
                     def on_metric_result(metric: MetricResult) -> None:
                         nonlocal completed_items
                         key = (metric.sample_id, metric.metric_name)
+                        if key in emitted_keys:
+                            return
                         emitted_keys.add(key)
                         target = sample_results[metric.sample_id]
-                        if not any(item.metric_name == metric.metric_name for item in target.metrics):
+                        if not any(
+                            item.metric_name == metric.metric_name
+                            for item in target.metrics
+                        ):
                             target.metrics.append(metric)
                         completed_items += 1
-                        if item_progress_callback is not None:
-                            ordered = [sample_results[sample.id] for sample in samples]
-                            current_summary = self._build_summary(
-                                samples,
-                                ordered,
-                                thresholds=thresholds,
-                                fail_on_threshold=fail_on_threshold,
-                                run_id=run_id,
-                                completed_groups=completed_groups,
-                                total_groups=total_groups,
-                                completed_items=completed_items,
-                                total_items=total_items,
-                                outcome_kind="in_progress",
-                            )
-                            item_progress_callback(
-                                current_summary,
-                                ordered,
-                                completed_items,
-                                total_items,
-                            )
+                        emit_item_progress()
 
-                    if isinstance(adapter, RagasAdapter):
+                    if pending_metric_names:
+                        metrics = adapter.score_batched(
+                            retrieval_samples,
+                            scoring_snapshots,
+                            pending_metric_names,
+                            snapshots_prepared=True,
+                            on_result=on_metric_result
+                            if item_progress_callback is not None
+                            else None,
+                        )
+                        for metric in metrics:
+                            key = (metric.sample_id, metric.metric_name)
+                            if key in emitted_keys:
+                                continue
+                            sample_results[metric.sample_id].metrics.append(metric)
+                            emitted_keys.add(key)
+                            completed_items += 1
+                            emit_item_progress()
+                        completed_groups += len(pending_metric_names)
+                else:
+                    for metric_name in pending_metric_names:
+                        emitted_keys: set[tuple[str, str]] = set()
+
+                        def on_metric_result(metric: MetricResult) -> None:
+                            nonlocal completed_items
+                            key = (metric.sample_id, metric.metric_name)
+                            emitted_keys.add(key)
+                            target = sample_results[metric.sample_id]
+                            if not any(
+                                item.metric_name == metric.metric_name
+                                for item in target.metrics
+                            ):
+                                target.metrics.append(metric)
+                            completed_items += 1
+                            emit_item_progress()
+
                         metrics = adapter.score(
                             retrieval_samples,
                             scoring_snapshots,
                             [metric_name],
-                            snapshots_prepared=True,
-                            on_result=on_metric_result if item_progress_callback is not None else None,
+                            **(
+                                {"on_result": on_metric_result}
+                                if item_progress_callback is not None
+                                else {}
+                            ),
                         )
-                    else:
-                        metrics = adapter.score(retrieval_samples, scoring_snapshots, [metric_name])
-                    for metric in metrics:
-                        if metric.metric_name == metric_name and (
-                            metric.sample_id,
-                            metric.metric_name,
-                        ) not in emitted_keys:
+                        for metric in metrics:
+                            if (
+                                metric.metric_name != metric_name
+                                or (
+                                    metric.sample_id,
+                                    metric.metric_name,
+                                )
+                                in emitted_keys
+                            ):
+                                continue
                             sample_results[metric.sample_id].metrics.append(metric)
                             emitted_keys.add((metric.sample_id, metric.metric_name))
                             completed_items += 1
-                            if item_progress_callback is not None:
-                                ordered = [sample_results[sample.id] for sample in samples]
-                                current_summary = self._build_summary(
-                                    samples,
-                                    ordered,
-                                    thresholds=thresholds,
-                                    fail_on_threshold=fail_on_threshold,
-                                    run_id=run_id,
-                                    completed_groups=completed_groups,
-                                    total_groups=total_groups,
-                                    completed_items=completed_items,
-                                    total_items=total_items,
-                                    outcome_kind="in_progress",
-                                )
-                                item_progress_callback(
-                                    current_summary,
-                                    ordered,
-                                    completed_items,
-                                    total_items,
-                                )
-                    completed_groups += 1
+                            emit_item_progress()
+                        completed_groups += 1
+
+                        ordered_results = [
+                            sample_results[sample.id] for sample in samples
+                        ]
+                        summary = self._build_summary(
+                            samples,
+                            ordered_results,
+                            thresholds=thresholds,
+                            fail_on_threshold=fail_on_threshold,
+                            run_id=run_id,
+                            completed_groups=completed_groups,
+                            total_groups=total_groups,
+                            completed_items=completed_items,
+                            total_items=total_items,
+                            outcome_kind="in_progress",
+                        )
+                        if progress_callback is not None and not progress_callback(
+                            summary, ordered_results, completed_groups, total_groups
+                        ):
+                            stopped = True
+                            break
+                        if stopped:
+                            break
+
+                if (
+                    not stopped
+                    and isinstance(adapter, RagasAdapter)
+                    and pending_metric_names
+                ):
                     ordered_results = [sample_results[sample.id] for sample in samples]
                     summary = self._build_summary(
                         samples,
@@ -409,9 +578,6 @@ class EvaluationService:
                         summary, ordered_results, completed_groups, total_groups
                     ):
                         stopped = True
-                        break
-                    if stopped:
-                        break
 
         ordered_results = [sample_results[sample.id] for sample in samples]
         summary = self._build_summary(
@@ -464,7 +630,9 @@ class EvaluationService:
             for metric in result.metrics
             if metric.status == "failed"
         )
-        successful = sum(result.snapshot_status == "success" for result in ordered_results)
+        successful = sum(
+            result.snapshot_status == "success" for result in ordered_results
+        )
         summary = EvaluationSummary(
             run_id=run_id or new_run_id(),
             sample_count=len(samples),
@@ -501,22 +669,30 @@ class EvaluationService:
         """
 
         def is_normal_retrieval(result: SampleResult) -> bool:
-            access_check = result.access_check or result.metadata.get("access_check") or {}
+            access_check = (
+                result.access_check or result.metadata.get("access_check") or {}
+            )
             if str(access_check.get("expected") or "").casefold() == "denied":
                 return False
-            return result.metadata.get("evaluation_cohort", "retrieval") != "non_retrieval"
+            return (
+                result.metadata.get("evaluation_cohort", "retrieval") != "non_retrieval"
+            )
 
-        normal_retrieval_results = [result for result in results if is_normal_retrieval(result)]
-        collection_failures = sum(result.snapshot_status == "failed" for result in results)
-        evidence_samples = sum(bool(result.retrieved_contexts) for result in normal_retrieval_results)
+        normal_retrieval_results = [
+            result for result in results if is_normal_retrieval(result)
+        ]
+        collection_failures = sum(
+            result.snapshot_status == "failed" for result in results
+        )
+        evidence_samples = sum(
+            bool(result.retrieved_contexts) for result in normal_retrieval_results
+        )
         no_evidence_samples = sum(
             result.snapshot_status == "success" and not result.retrieved_contexts
             for result in normal_retrieval_results
         )
         metric_failures = sum(
-            metric.status == "failed"
-            for result in results
-            for metric in result.metrics
+            metric.status == "failed" for result in results for metric in result.metrics
         )
         truncated_samples = sum(
             bool((result.metadata.get("ragas_scoring") or {}).get("contexts_truncated"))
@@ -545,12 +721,13 @@ class EvaluationService:
         all_zero_metrics = sorted(
             name
             for name, stats in metric_stats.items()
-            if stats["success"] > 0
-            and stats["zero_scores"] == stats["success"]
+            if stats["success"] > 0 and stats["zero_scores"] == stats["success"]
         )
         warnings: list[str] = []
         if collection_failures:
-            warnings.append(f"{collection_failures} 个样本采集失败，不能用整体分数代表完整数据集。")
+            warnings.append(
+                f"{collection_failures} 个样本采集失败，不能用整体分数代表完整数据集。"
+            )
         if no_evidence_samples:
             warnings.append(
                 f"{no_evidence_samples} 个成功样本没有检索证据；上下文相关指标不应按普通低分解读。"
@@ -564,7 +741,9 @@ class EvaluationService:
                 f"{truncated_samples} 个样本的评分上下文经过了数量或字符裁剪；请结合上下文选择诊断解读分数。"
             )
         if metric_failures:
-            warnings.append(f"有 {metric_failures} 条评分任务失败，失败项不应当当作 0 分。")
+            warnings.append(
+                f"有 {metric_failures} 条评分任务失败，失败项不应当当作 0 分。"
+            )
         if all_zero_metrics:
             warnings.append(
                 "以下指标的有效评分样本全部为 0："

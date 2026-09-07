@@ -61,7 +61,7 @@ class DatasetLoaderTests(unittest.TestCase):
                 request_context={"api_key": "secret"},
             )
 
-    def test_reference_contexts_are_required_only_when_context_recall_is_selected(self):
+    def test_context_recall_uses_reference_answer_without_reference_contexts(self):
         path = self._write([
             {
                 "id": "q1",
@@ -72,8 +72,8 @@ class DatasetLoaderTests(unittest.TestCase):
             }
         ])
 
-        with self.assertRaisesRegex(DatasetValidationError, "reference_contexts"):
-            load_dataset(path)
+        samples = load_dataset(path)
+        self.assertEqual(samples[0].reference_contexts, [])
 
     def test_document_generation_dataset_preserves_expected_value_and_allowed_sources(self):
         path = self._write([{

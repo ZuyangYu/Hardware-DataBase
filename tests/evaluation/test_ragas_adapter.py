@@ -288,14 +288,14 @@ class RagasAdapterTests(unittest.TestCase):
         self.assertEqual(embeddings.dimensions, 2048)
 
     @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
-    def test_native_backend_passes_limit_and_uses_single_relevancy_sample(self):
+    def test_native_backend_passes_limit_and_uses_ragas_default_relevancy_samples(self):
         backend = _NativeRagasBackend(_config(llm_max_tokens=2048))
         llm = backend._build_llm()
 
         metrics = backend._build_metrics(["answer_relevancy"])
 
         self.assertEqual(llm.model_args["max_tokens"], 2048)
-        self.assertEqual(metrics[0].strictness, 1)
+        self.assertEqual(metrics[0].strictness, 3)
 
     @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
     def test_native_backend_applies_runtime_limits_to_ragas(self):

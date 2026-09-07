@@ -1083,7 +1083,7 @@ dev = [
 ]
 eval = [
     { name = "openai", specifier = ">=1.0,<3" },
-    { name = "ragas", specifier = ">=0.4,<0.5" },
+    { name = "ragas", specifier = "==0.4.3" },
 ]
 
 [[package]]

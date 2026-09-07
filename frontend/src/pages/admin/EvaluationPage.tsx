@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, uploadFiles } from '../../api/client';
 import type {
   CreateEvaluationRunPayload,
   EvaluationCompareResponse,
+  EvaluationDatasetSummary,
   EvaluationDatasetUploadResponse,
+  CollectionQcReport,
   EvaluationKnowledgeBase,
   EvaluationPreflightResponse,
   EvaluationRunDetail,
@@ -40,14 +42,15 @@ type Props = {
   onLogout: () => void;
 };
 
-const DEFAULT_OUTPUT_ROOT = 'storage/evaluations';
 const DEFAULT_DATASET = 'evaluation/datasets/hardware_qa_v1.jsonl';
+const LAST_DATASET_KEY = 'hdb-eval-last-dataset';
 
 const STATUS_LABELS: Record<string, string> = {
   queued: '待开始',
   running: '运行中',
   pause_requested: '等待暂停',
   paused: '已暂停',
+  collected: '采集完成待评分',
   cancel_requested: '等待取消',
   cancelled: '已取消',
   completed: '已完成',
@@ -58,12 +61,13 @@ const STATUS_LABELS: Record<string, string> = {
 const STAGE_LABELS: Record<string, string> = {
   idle: '空闲',
   collecting: '采集回答',
+  collected: '采集质检完成',
   scoring: '评分',
   reporting: '生成报告',
 };
 
 const ACTIVE_STATUSES = new Set<EvaluationRunStatus>(['queued', 'running', 'pause_requested', 'cancel_requested']);
-const DELETABLE_STATUSES = new Set<EvaluationRunStatus>(['failed', 'cancelled', 'completed']);
+const DELETABLE_STATUSES = new Set<EvaluationRunStatus>(['failed', 'cancelled', 'completed', 'collected']);
 
 type LoadOptions = {
   silent?: boolean;
@@ -87,6 +91,9 @@ function progressPercent(run: EvaluationRunDetail | null): number {
 }
 
 function progressLabel(run: EvaluationRunDetail): string {
+  if (run.status === 'collected') {
+    return '采集完成，等待质检确认后评分';
+  }
   if (run.stage === 'scoring' && run.scoring_total_items > 0) {
     return `评分 ${run.scoring_completed_items}/${run.scoring_total_items}`;
   }
@@ -105,9 +112,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const [datasetPath, setDatasetPath] = useState(DEFAULT_DATASET);
   const [uploadingDataset, setUploadingDataset] = useState(false);
   const [mode, setMode] = useState<'online' | 'offline'>('online');
-  const [scoreEnabled, setScoreEnabled] = useState(true);
   const [sampleIds, setSampleIds] = useState('');
   const [tags, setTags] = useState('');
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
   const [snapshotPath, setSnapshotPath] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [knowledgeBases, setKnowledgeBases] = useState<EvaluationKnowledgeBase[]>([]);
@@ -115,10 +122,15 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const [selectedKbId, setSelectedKbId] = useState<number | null>(null);
   const [preflight, setPreflight] = useState<EvaluationPreflightResponse | null>(null);
   const [preflightLoading, setPreflightLoading] = useState(false);
+  const preflightRequestRef = useRef(0);
+  const [datasets, setDatasets] = useState<EvaluationDatasetSummary[]>([]);
+  const [datasetsLoaded, setDatasetsLoaded] = useState(false);
+  const [datasetSelect, setDatasetSelect] = useState<string>('');
 
   const [baselineRunId, setBaselineRunId] = useState('');
   const [compare, setCompare] = useState<EvaluationCompareResponse | null>(null);
   const [compareLoading, setCompareLoading] = useState(false);
+  const [scoringLoading, setScoringLoading] = useState(false);
 
   const selectedKnowledgeBase = knowledgeBases.find((item) => item.kb_id === selectedKbId) ?? null;
 
@@ -143,6 +155,61 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       cancelled = true;
     };
   }, []);
+
+  const loadDatasets = useCallback(() => {
+    let cancelled = false;
+    api
+      .get<EvaluationDatasetSummary[]>('/api/v1/evaluation/datasets')
+      .then((rows) => {
+        if (cancelled) return;
+        setDatasets(rows);
+        setDatasetsLoaded(true);
+        setDatasetSelect((current) => {
+          if (current && rows.some((row) => row.path === current)) {
+            setDatasetPath(current);
+            return current;
+          }
+          const last = window.localStorage.getItem(LAST_DATASET_KEY) ?? '';
+          const next = last && rows.some((row) => row.path === last)
+            ? last
+            : rows.some((row) => row.path === DEFAULT_DATASET)
+              ? DEFAULT_DATASET
+              : rows[0]?.path ?? '';
+          setDatasetPath(next);
+          return next;
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setDatasetsLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const selectedDataset = useMemo(
+    () => datasets.find((item) => item.path === datasetPath) ?? null,
+    [datasets, datasetPath],
+  );
+
+  function handleDatasetSelectChange(value: string) {
+    setDatasetSelect(value);
+    setDatasetPath(value);
+    window.localStorage.setItem(LAST_DATASET_KEY, value);
+    const summary = datasets.find((item) => item.path === value);
+    if (summary && summary.kb_bindings.length === 1) {
+      const bound = knowledgeBases.find((kb) => kb.kb_name === summary.kb_bindings[0].kb_name);
+      if (bound) setSelectedKbId(bound.kb_id);
+    }
+  }
+
+  function toggleTag(tag: string) {
+    const current = splitList(tags) ?? [];
+    const next = current.includes(tag)
+      ? current.filter((item) => item !== tag)
+      : [...current, tag];
+    setTags(next.join(','));
+  }
 
   const loadRuns = useCallback((options: LoadOptions = {}) => {
     const silent = options.silent ?? false;
@@ -202,9 +269,21 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   }, [selectedRunId]);
 
   useEffect(() => {
+    // Any configuration change invalidates the previous preflight result.
+    // The automatic preflight below will repopulate it after the debounce.
+    setPreflight(null);
+    preflightRequestRef.current += 1;
+  }, [datasetPath, selectedKbId, mode, sampleIds, tags, snapshotPath]);
+
+  useEffect(() => {
     const cancel = loadKnowledgeBases();
     return cancel;
   }, [loadKnowledgeBases]);
+
+  useEffect(() => {
+    const cancel = loadDatasets();
+    return cancel;
+  }, [loadDatasets]);
 
   useEffect(() => {
     const cancel = loadRuns();
@@ -233,8 +312,20 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   }, [selectedRunId]);
 
   useEffect(() => {
-    setPreflight(null);
-  }, [selectedKbId, datasetPath, mode, scoreEnabled, sampleIds, tags, snapshotPath]);
+    // 数据集/知识库/过滤条件变化后自动预检（防抖），替代手动清空旧预检结果。
+    if (!knowledgeBasesLoaded) return undefined;
+    if (selectedKbId == null || !datasetPath.trim()) return undefined;
+    if (mode === 'offline' && !snapshotPath.trim()) return undefined;
+    const timer = window.setTimeout(() => {
+      void runPreflight({ silent: true });
+    }, 600);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [datasetPath, selectedKbId, mode, sampleIds, tags, snapshotPath, knowledgeBasesLoaded]);
+
+  useEffect(() => {
+    if (sampleIds.trim() || tags.trim()) setAdvancedFiltersOpen(true);
+  }, [sampleIds, tags]);
 
   async function handleDatasetUpload(fileList: FileList | null) {
     const file = fileList?.[0];
@@ -252,6 +343,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         form,
       );
       setDatasetPath(result.dataset_path);
+      setDatasetSelect(result.dataset_path);
+      window.localStorage.setItem(LAST_DATASET_KEY, result.dataset_path);
+      loadDatasets();
       notify.success(`数据集已上传:${result.sample_count} 条样本`);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '上传数据集失败');
@@ -260,19 +354,21 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     }
   }
 
-  async function handlePreflight() {
+  async function runPreflight(options: { silent: boolean } = { silent: false }) {
+    const silent = options.silent;
     if (selectedKnowledgeBase == null) {
-      notify.error('请选择评估知识库');
+      if (!silent) notify.error('请选择评估知识库');
       return;
     }
     if (!datasetPath.trim()) {
-      notify.error('请输入数据集路径');
+      if (!silent) notify.error('请选择或输入数据集路径');
       return;
     }
     if (mode === 'offline' && !snapshotPath.trim()) {
-      notify.error('离线重评需要快照 JSONL 路径');
+      if (!silent) notify.error('离线重评需要快照 JSONL 路径');
       return;
     }
+    const requestId = ++preflightRequestRef.current;
     setPreflightLoading(true);
     try {
       const payload: CreateEvaluationRunPayload = {
@@ -280,7 +376,6 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         kb_id: selectedKnowledgeBase.kb_id,
         kb_name: selectedKnowledgeBase.kb_name,
         mode,
-        score_enabled: mode === 'online' ? scoreEnabled : true,
         sample_ids: splitList(sampleIds),
         tags: splitList(tags),
         snapshot_path: mode === 'offline' ? snapshotPath.trim() : null,
@@ -289,17 +384,25 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         '/api/v1/evaluation/preflight',
         payload,
       );
+      // Ignore late responses from an older configuration/request.
+      if (requestId !== preflightRequestRef.current) return;
       setPreflight(result);
-      if (result.can_create) {
-        notify.success(`预检通过：${result.dataset_sample_count} 条样本`);
-      } else {
-        notify.error(`预检未通过：${result.errors.join('；') || '请检查返回详情'}`);
+      if (!silent) {
+        if (result.can_create) {
+          notify.success(`预检通过：${result.dataset_sample_count} 条样本`);
+        } else {
+          notify.error(`预检未通过：${result.errors.join('；') || '请检查返回详情'}`);
+        }
       }
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '评估预检失败');
+      if (!silent) notify.error(error instanceof Error ? error.message : '评估预检失败');
     } finally {
-      setPreflightLoading(false);
+      if (requestId === preflightRequestRef.current) setPreflightLoading(false);
     }
+  }
+
+  function handlePreflight() {
+    void runPreflight({ silent: false });
   }
 
   async function handleCreateAndStart() {
@@ -326,7 +429,6 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         kb_id: selectedKnowledgeBase.kb_id,
         kb_name: selectedKnowledgeBase.kb_name,
         mode,
-        score_enabled: mode === 'online' ? scoreEnabled : true,
         sample_ids: splitList(sampleIds),
         tags: splitList(tags),
         snapshot_path: mode === 'offline' ? snapshotPath.trim() : null,
@@ -338,7 +440,12 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       await api.post<OkResponse>(
         `/api/v1/evaluation/runs/${encodeURIComponent(run.run_id)}/start`,
       );
-      notify.success('评估已创建并开始运行');
+      window.localStorage.setItem(LAST_DATASET_KEY, datasetPath.trim());
+      notify.success(
+        mode === 'online'
+          ? '采集已开始；完成后质检确认，再点击「开始评分」'
+          : '评估已创建并开始运行',
+      );
       setSelectedRunId(run.run_id);
       await Promise.all([loadRuns(), loadDetail(run.run_id)]);
     } catch (error) {
@@ -507,7 +614,24 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const canStart = selectedStatus === 'queued';
   const canPause = selectedStatus === 'queued' || selectedStatus === 'running';
   const canResume = selectedStatus === 'paused' || selectedStatus === 'cancelled';
-  const canCancel = selectedStatus != null && ['queued', 'running', 'pause_requested', 'paused'].includes(selectedStatus);
+  const canCancel = selectedStatus != null && ['queued', 'running', 'pause_requested', 'paused', 'collected'].includes(selectedStatus);
+  const canScore = selectedStatus === 'collected';
+
+  async function startScoring(force: boolean) {
+    if (!selectedRunId) return;
+    setScoringLoading(true);
+    try {
+      await api.post<EvaluationRunDetail>(
+        `/api/v1/evaluation/runs/${encodeURIComponent(selectedRunId)}/score${force ? '?force=true' : ''}`,
+      );
+      notify.success('评分已开始');
+      await Promise.all([loadRuns(), loadDetail(selectedRunId)]);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '开始评分失败');
+    } finally {
+      setScoringLoading(false);
+    }
+  }
 
   return (
     <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
@@ -562,8 +686,29 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
                   </Select>
                 )}
               </Field>
-              <Field label="数据集 JSONL">
-                <Input value={datasetPath} onChange={(e) => setDatasetPath(e.target.value)} className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
+              <Field label="评估数据集">
+                {!datasetsLoaded ? (
+                  <Skeleton className="h-[36px] rounded-[10px]" />
+                ) : !datasetSelect ? (
+                  <Select disabled>
+                    <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] text-[13px]">
+                      <SelectValue placeholder="暂无可用数据集，请上传" />
+                    </SelectTrigger>
+                  </Select>
+                ) : (
+                  <Select value={datasetSelect} onValueChange={handleDatasetSelectChange}>
+                    <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] text-[13px]">
+                      <SelectValue placeholder="选择数据集" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {datasets.map((item) => (
+                        <SelectItem key={item.path} value={item.path}>
+                          {item.name}（{item.sample_count} 条 · {item.kb_bindings.map((b) => b.kb_name).join('/') || '未绑定 KB'}）
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
               </Field>
               <Field label="上传数据集">
                 <input
@@ -585,36 +730,69 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
                   </SelectContent>
                 </Select>
               </Field>
-              {mode === 'offline' ? (
+              {mode === 'offline' && (
                 <Field label="快照 JSONL">
                   <Input value={snapshotPath} onChange={(e) => setSnapshotPath(e.target.value)} className="h-[36px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
                 </Field>
-              ) : (
-                <label className="flex items-center gap-[8px] text-[13px] text-[#464c5e]">
-                  <input
-                    type="checkbox"
-                    checked={scoreEnabled}
-                    onChange={(e) => setScoreEnabled(e.target.checked)}
-                    className="size-[14px] accent-[#18181a]"
-                  />
-                  启用 RAGAS 评分
-                </label>
               )}
         </div>
-        <div className="mt-[12px] grid grid-cols-2 gap-[12px] max-[720px]:grid-cols-1">
+        {selectedDataset && (
+          <p className="mt-[6px] text-[11px] text-[#858b9c]">
+            数据集绑定 {selectedDataset.kb_bindings.map((b) => `${b.kb_name}×${b.count}`).join('、') || '未绑定'} · 拒绝样本 {selectedDataset.expected_denied_count} · 关键 {selectedDataset.critical_count}
+            {selectedDataset.malformed_lines > 0 && ` · 异常行 ${selectedDataset.malformed_lines}`}
+          </p>
+        )}
+        <button
+          type="button"
+          aria-expanded={advancedFiltersOpen}
+          onClick={() => setAdvancedFiltersOpen((open) => !open)}
+          className="mt-[12px] inline-flex h-[30px] items-center gap-[6px] self-start rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
+        >
+          <AppIcon
+            name="arrow"
+            size={13}
+            className="shrink-0 transition-transform"
+            style={{ transform: `rotate(${advancedFiltersOpen ? -90 : 90}deg)` }}
+          />
+          高级筛选
+          {(sampleIds.trim() || tags.trim()) && (
+            <span className="text-[11px] text-[#858b9c]">已设置</span>
+          )}
+        </button>
+        {advancedFiltersOpen && (
+          <>
+            <div className="mt-[10px] grid grid-cols-2 gap-[12px] max-[720px]:grid-cols-1">
               <Field label="样本 ID">
-                <Textarea value={sampleIds} onChange={(e) => setSampleIds(e.target.value)} placeholder="可选,逗号或换行分隔" className="min-h-[68px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
+                <Textarea value={sampleIds} onChange={(e) => setSampleIds(e.target.value)} placeholder="可选，逗号或换行分隔" className="min-h-[68px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
               </Field>
               <Field label="标签">
-                <Textarea value={tags} onChange={(e) => setTags(e.target.value)} placeholder="可选,逗号或换行分隔" className="min-h-[68px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
+                <Textarea value={tags} onChange={(e) => setTags(e.target.value)} placeholder="可选，逗号或换行分隔" className="min-h-[68px] rounded-[10px] border-[#e3e7f1] text-[13px]" />
               </Field>
-        </div>
-        <div className="mt-[10px] flex flex-wrap items-center gap-x-[14px] gap-y-[4px] text-[11px] text-[#858b9c]">
-          <span>输出目录固定为 {DEFAULT_OUTPUT_ROOT}</span>
-          {selectedKnowledgeBase && (
-            <span>当前绑定：{selectedKnowledgeBase.kb_name} · {selectedKnowledgeBase.department_name || `部门 ${selectedKnowledgeBase.department_id ?? '-'}`}（ID {selectedKnowledgeBase.kb_id}）</span>
-          )}
-        </div>
+            </div>
+            {selectedDataset && selectedDataset.tags.length > 0 && (
+              <div className="mt-[6px] flex flex-wrap gap-[6px]">
+                {selectedDataset.tags.map((tag) => {
+                  const active = (splitList(tags) ?? []).includes(tag);
+                  return (
+                    <button
+                      key={tag}
+                      type="button"
+                      onClick={() => toggleTag(tag)}
+                      className={cn(
+                        'rounded-full px-[9px] py-[2px] text-[11px] transition-colors',
+                        active
+                          ? 'bg-[#18181a] text-white'
+                          : 'bg-[#f3f4f6] text-[#464c5e] hover:bg-[#e8eaf0]',
+                      )}
+                    >
+                      #{tag}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        )}
         {preflight && (
           <div className={cn(
             'mt-[12px] rounded-[10px] border px-[12px] py-[10px] text-[12px]',
@@ -719,10 +897,13 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           canPause={canPause}
           canResume={canResume}
           canCancel={canCancel}
+          canScore={canScore}
+          scoringLoading={scoringLoading}
           onStart={() => void controlRun('start')}
           onPause={() => void controlRun('pause')}
           onResume={() => void controlRun('resume')}
           onCancel={() => void controlRun('cancel')}
+          onScore={(force) => void startScoring(force)}
         />
       </section>
 
@@ -732,7 +913,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           if (!open) setDeleteTarget(null);
         }}
         title={<>删除评估运行「{deleteTarget?.run_id}」</>}
-        description="仅已完成、失败或已取消的运行可以删除。删除后该运行的状态、快照和评估报告将不可恢复；运行目录外的共享快照不会被删除。"
+        description="仅已完成、失败、已取消或采集完成的运行可以删除。删除后该运行的状态、快照和评估报告将不可恢复；运行目录外的共享快照不会被删除。"
         confirmText="删除"
         loading={deleting}
         destructive
@@ -759,7 +940,9 @@ function StatusPill({ status }: { status: string }) {
         ? 'bg-[#fce7e7] text-[#d20b0b]'
         : status === 'running'
           ? 'bg-[#eef1fb] text-[#4b63b7]'
-          : 'bg-[#f3f4f6] text-[#464c5e]';
+          : status === 'collected'
+            ? 'bg-[#e6f4f8] text-[#1b6d92]'
+            : 'bg-[#f3f4f6] text-[#464c5e]';
   return (
     <span className={cn('inline-flex rounded-full px-[8px] py-[2px] text-[11px]', tone)}>
       {STATUS_LABELS[status] ?? status}
@@ -775,10 +958,13 @@ function RunDetailPanel({
   canPause,
   canResume,
   canCancel,
+  canScore,
+  scoringLoading,
   onStart,
   onPause,
   onResume,
   onCancel,
+  onScore,
 }: {
   run: EvaluationRunDetail | null;
   loaded: boolean;
@@ -787,10 +973,13 @@ function RunDetailPanel({
   canPause: boolean;
   canResume: boolean;
   canCancel: boolean;
+  canScore: boolean;
+  scoringLoading: boolean;
   onStart: () => void;
   onPause: () => void;
   onResume: () => void;
   onCancel: () => void;
+  onScore: (force: boolean) => void;
 }) {
   if (!loaded) {
     return (
@@ -821,13 +1010,31 @@ function RunDetailPanel({
           </div>
           <p className="mt-[4px] text-[12px] text-[#858b9c]">
             {run.mode === 'online' ? '在线采集' : '离线重评'} · {STAGE_LABELS[run.stage] ?? run.stage}
-            {run.score_enabled ? ' · 启用评分' : ' · 仅采集'}
           </p>
         </div>
         <div className="flex flex-wrap gap-[8px]">
           <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')} onClick={onStart} disabled={!canStart}>
             开始
           </Button>
+          {canScore && (
+            <Button
+              className="h-[32px] rounded-[10px] bg-[#18181a] px-[12px] text-[12px] text-white hover:bg-[#333]"
+              onClick={() => onScore(false)}
+              disabled={scoringLoading || run.collection_qc?.verdict === 'fail'}
+            >
+              开始评分
+            </Button>
+          )}
+          {canScore && run.collection_qc?.verdict === 'fail' && (
+            <Button
+              variant="outline"
+              className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] border-[#f1d59a] text-[#8a5a00]')}
+              onClick={() => onScore(true)}
+              disabled={scoringLoading}
+            >
+              忽略质检并强制评分
+            </Button>
+          )}
           <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')} onClick={onPause} disabled={!canPause}>
             暂停
           </Button>
@@ -841,11 +1048,15 @@ function RunDetailPanel({
         </div>
       </div>
 
+      {run.status === 'collected' && run.mode === 'online' && (
+        <CollectionQcPanel qc={run.collection_qc ?? null} />
+      )}
+
       <div className="grid grid-cols-4 gap-[12px] max-[900px]:grid-cols-2">
         <StatCard label="样本总数" value={run.total_samples} />
         <StatCard label="采集完成" value={`${run.completed_samples}/${run.total_samples}`} />
-        <StatCard label="评分任务" value={!run.score_enabled ? '未启用' : run.scoring_total_items > 0 ? `${run.scoring_completed_items}/${run.scoring_total_items}` : '待开始'} />
-        <StatCard label="待评分" value={!run.score_enabled || run.scoring_total_items <= 0 ? '—' : Math.max(0, run.scoring_total_items - run.scoring_completed_items)} />
+        <StatCard label="评分任务" value={run.scoring_total_items > 0 ? `${run.scoring_completed_items}/${run.scoring_total_items}` : '待开始'} />
+        <StatCard label="待评分" value={run.scoring_total_items <= 0 ? '—' : Math.max(0, run.scoring_total_items - run.scoring_completed_items)} />
       </div>
 
       <div>
@@ -861,7 +1072,7 @@ function RunDetailPanel({
         )}
       </div>
 
-      {run.score_enabled && run.scoring_total_items > 0 && (
+      {run.scoring_total_items > 0 && (
         <div>
           <div className="mb-[6px] flex justify-between text-[11px] text-[#858b9c]">
             <span>评分项进度</span>
@@ -908,5 +1119,61 @@ function Meta({ label, value }: { label: string; value: string }) {
       <span className="text-[11px] text-[#858b9c]">{label}</span>
       <span className="break-words text-[12px] text-[#18181a]">{value}</span>
     </div>
+  );
+}
+
+const QC_VERDICT_LABELS: Record<CollectionQcReport['verdict'], string> = {
+  pass: '质检通过',
+  pass_with_warnings: '通过（有提醒）',
+  fail: '质检未通过',
+};
+
+function CollectionQcPanel({ qc }: { qc: CollectionQcReport | null }) {
+  if (!qc) {
+    return (
+      <div className="rounded-[10px] border border-[#edf0f4] px-[12px] py-[10px] text-[12px] text-[#858b9c]">
+        采集质检报告尚未生成；可刷新重试，评分前请先确认采集结果。
+      </div>
+    );
+  }
+  const verdictTone =
+    qc.verdict === 'pass'
+      ? 'bg-[#e6f6ec] text-[#138a55]'
+      : qc.verdict === 'pass_with_warnings'
+        ? 'bg-[#fff7e7] text-[#9a610d]'
+        : 'bg-[#fce7e7] text-[#d20b0b]';
+  return (
+    <section className="rounded-[10px] border border-[#edf0f4] p-[12px]">
+      <div className="flex flex-wrap items-center justify-between gap-[8px]">
+        <div className="flex items-center gap-[8px]">
+          <h4 className="text-[13px] font-semibold text-[#18181a]">采集质检</h4>
+          <span className={cn('rounded-full px-[8px] py-[2px] text-[11px]', verdictTone)}>
+            {QC_VERDICT_LABELS[qc.verdict]}
+          </span>
+        </div>
+        <span className="text-[11px] text-[#858b9c]">
+          样本 {qc.totals.snapshots}/{qc.totals.samples} · 失败 {qc.totals.failed} · 降级 {qc.totals.degraded} · 无证据 {qc.totals.zero_evidence} · 拒绝样本 {qc.totals.expected_denied}
+        </span>
+      </div>
+      {qc.issues.length > 0 && (
+        <div className="mt-[8px] rounded-[8px] bg-[#fff7f7] px-[10px] py-[8px]">
+          <p className="text-[12px] font-medium text-[#d20b0b]">必须处理的问题</p>
+          <ul className="mt-[3px] grid list-disc gap-[2px] pl-[18px] text-[12px] text-[#8a3030]">
+            {qc.issues.map((issue) => <li key={issue}>{issue}</li>)}
+          </ul>
+        </div>
+      )}
+      {qc.warnings.length > 0 && (
+        <div className="mt-[8px] rounded-[8px] bg-[#fffaf0] px-[10px] py-[8px]">
+          <p className="text-[12px] font-medium text-[#8a5a10]">提醒</p>
+          <ul className="mt-[3px] grid list-disc gap-[2px] pl-[18px] text-[12px] text-[#8a5a10]">
+            {qc.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+          </ul>
+        </div>
+      )}
+      {qc.issues.length === 0 && qc.warnings.length === 0 && (
+        <p className="mt-[8px] text-[12px] text-[#464c5e]">采集结果未发现异常，可以进入评分。</p>
+      )}
+    </section>
   );
 }

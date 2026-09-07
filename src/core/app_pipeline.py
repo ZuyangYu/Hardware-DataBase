@@ -609,6 +609,31 @@ class AppPipeline:
     def list_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
         return self.documents.list_parse_tasks(kb_name, ctx=ctx)
 
+    def requeue_dead_letter_parse_tasks(self, kb_name: str, ctx: RequestContext | None = None) -> list[str]:
+        try:
+            names = self.documents.requeue_dead_letter_parse_tasks(kb_name, ctx=ctx)
+            self._audit(
+                "requeue_dead_letter_parse_tasks",
+                ctx,
+                target_type="parse_task",
+                target_id=kb_name,
+                kb_name=kb_name,
+                success=True,
+                metadata={"requeued": names},
+            )
+            return names
+        except Exception as exc:
+            self._audit(
+                "requeue_dead_letter_parse_tasks",
+                ctx,
+                target_type="parse_task",
+                target_id=kb_name,
+                kb_name=kb_name,
+                success=False,
+                error_message=str(exc),
+            )
+            raise
+
     def pause_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
         return self.documents.pause_parse_task(task_id, ctx=ctx)
 

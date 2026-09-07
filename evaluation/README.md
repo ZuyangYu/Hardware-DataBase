@@ -7,7 +7,7 @@
 主要字段：
 
 - `reference_answer`：用于回答正确性评估。
-- `reference_contexts`：记录参考证据的来源说明，并用于判断上下文召回指标是否适用。当前 RAGAS `context_recall` 实际使用 `reference_answer` 与检索上下文评分，因此这里不能替代可核验的参考答案。
+- `reference_contexts`：可选的参考证据来源记录，便于人工审计；当前 RAGAS 0.4 `context_recall` 按官方 LLM 语义使用 `reference_answer` 与完整检索上下文评分，不要求该字段。
 - `required_evidence_types`：期望实际命中的证据类型。
 - `rubric.required_facts`：回答必须覆盖的器件、网络或结论。
 - `rubric.forbidden_claims`：回答不得编造或泄露的声明。
@@ -28,7 +28,7 @@ uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa
 系统管理员可在“RAGAS 评估”页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”都是协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效。“取消”不会删除已保存的 `snapshot.jsonl`；选择“继续”后，系统会使用原始数据集和筛选条件恢复运行，并跳过已成功的样本。
 系统管理员可以手动删除“已完成”“失败”或“已取消”的评估运行；删除会移除该运行目录下的输入副本、快照、状态和报告，且不可恢复。运行中、排队中、暂停中或请求态运行不能删除；运行目录外引用的离线快照和原始数据集不会被删除。
 
-在线运行可取消勾选“执行 RAGAS 评分”。此时系统只采集回答和检索证据，不需要安装 `eval` 依赖，也不需要配置裁判 LLM 或 Embedding。离线评分和勾选评分的在线运行仍需先执行 `uv sync --group eval`，并完成评估模型配置。
+在线运行先采集回答和检索证据，完成后进入采集质检状态；管理员确认后点击“开始评分”才执行 RAGAS。评分依赖、裁判 LLM 和 Embedding 的预检均延后到真正进入评分阶段。离线重评使用已有 `snapshot.jsonl`，创建并启动后直接进入评分，因此仍需先执行 `uv sync --group eval` 并完成评估模型配置。
 
 运行目录位于 `storage/evaluations/<run_id>/`，并始终包含 `run_state.json` 和规范化的 `execution_dataset.jsonl`。在线运行在至少持久化一条采集结果后，才会在该目录生成 `snapshot.jsonl`；离线运行则引用所提供的快照路径，该路径可能位于运行目录之外。新运行会写入 `snapshot.manifest.json`，记录知识库 ID、部门、样本集指纹和快照哈希，不包含密钥。仅在评分完整结束后，系统才会生成 `summary.json`、`results.jsonl`、`summary.csv` 和 `report.html`。这使暂停或取消的运行可以安全恢复，同时避免将不完整结果当作最终报告使用。
 
@@ -39,5 +39,13 @@ uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa
 评分结果解读：
 
 - `评分任务进度`表示评分工作项已完成/总工作项，不等于有效评分数；请同时查看 `确认评分失败`、各指标的适用样本数和 `metric_failures`。
-- `snapshot.jsonl` 中的 `retrieved_contexts` 是完整的原始检索结果；报告结果的 `metadata.ragas_scoring.scored_contexts` 是实际送入 RAGAS 的上下文窗口。两者数量不同表示发生了去重、相关性排序或预算裁剪，不应混为一谈。
+- `snapshot.jsonl` 中的 `retrieved_contexts` 是完整的原始检索结果；正式评分时 `metadata.ragas_scoring.scored_contexts` 与其一致，按原始顺序完整送入 RAGAS，不去重、不重排、不裁剪。
 - 在线采集并评分、离线重评都会在后端执行依赖和配置前置检查。离线重评不会重新检索；如果快照本身缺少证据，必须先补充/重新索引资料，再重新在线采集。
+
+性能与 RAGAS 调用方式：
+
+- 评分阶段按“适用指标集合”批量提交样本，一次批量 RAGAS 执行复用同一组 LLM、Embedding 和指标实例；当前使用 RAGAS 0.4 的 collections 指标异步 `ascore()` 接口，进度回调只负责落盘，不会把任务拆成逐样本的模型初始化。
+- 采集阶段按线程复用 `AppPipeline`；同一次采集中完全相同且权限上下文一致的问题会复用成功快照，不跨运行或跨权限范围缓存。
+- `EVAL_MAX_WORKERS` 同时作为 RAGAS `RunConfig.max_workers` 和在线采集并发上限。提高它前应确认裁判模型和 Embedding 服务的限流配置。
+- RAGAS 的 LLM 指标可能包含多次裁判请求；指标越多、上下文越长，耗时和费用越高。建议先用少量样本和 1～2 个指标做基准，再扩大评估范围。
+- 报告中的 `scored_contexts` 是实际送入 RAGAS 各上下文指标的完整原始上下文；`retrieved_contexts` 同时保留该内容用于审计。若上游模型因上下文限制失败，系统记录该指标失败，不改用缩小窗口生成可能失真的分数。

@@ -40,7 +40,9 @@ class GroupedAdapter:
 
 class IncrementalAdapter:
     def score(self, samples, snapshots, metric_names, *, on_result=None):
-        result = MetricResult(sample_id=samples[0].id, metric_name=metric_names[0], score=0.8)
+        result = MetricResult(
+            sample_id=samples[0].id, metric_name=metric_names[0], score=0.8
+        )
         if on_result is not None:
             on_result(result)
         return [result]
@@ -110,7 +112,9 @@ class EvaluationServiceTests(unittest.TestCase):
         service = EvaluationService(pipeline_factory=lambda: FakePipeline())
 
         def after_sample(snapshot, done, total):
-            persisted_ids = [item.sample_id for item in SnapshotStore(self.snapshot_path).load_all()]
+            persisted_ids = [
+                item.sample_id for item in SnapshotStore(self.snapshot_path).load_all()
+            ]
             self.assertIn(snapshot.sample_id, persisted_ids)
             progress.append((snapshot.sample_id, done, total))
 
@@ -217,7 +221,9 @@ class EvaluationServiceTests(unittest.TestCase):
 
         self.assertEqual(max_active, 2)
         self.assertEqual(set(persisted_ids), {item.id for item in samples})
-        self.assertEqual({item.sample_id for item in snapshots}, {item.id for item in samples})
+        self.assertEqual(
+            {item.sample_id for item in snapshots}, {item.id for item in samples}
+        )
 
     def test_score_keeps_successful_metrics_when_one_fails(self):
         service = EvaluationService(ragas_adapter=FakeAdapter())
@@ -246,15 +252,25 @@ class EvaluationServiceTests(unittest.TestCase):
             [_sample()],
             [_snapshot()],
             metric_names=["faithfulness", "answer_correctness"],
-            progress_callback=lambda current_summary, current_results, completed, total: (
+            progress_callback=lambda current_summary,
+            current_results,
+            completed,
+            total: (
                 progress.append(
-                    (completed, total, len(current_results[0].metrics), current_summary.metric_scores)
+                    (
+                        completed,
+                        total,
+                        len(current_results[0].metrics),
+                        current_summary.metric_scores,
+                    )
                 )
                 or True
             ),
         )
 
-        self.assertEqual(adapter.metric_batches, [("faithfulness",), ("answer_correctness",)])
+        self.assertEqual(
+            adapter.metric_batches, [("faithfulness",), ("answer_correctness",)]
+        )
         self.assertEqual([(item[0], item[1]) for item in progress], [(1, 2), (2, 2)])
         self.assertEqual(
             {metric.metric_name for metric in results[0].metrics},
@@ -277,8 +293,16 @@ class EvaluationServiceTests(unittest.TestCase):
             [_sample()],
             [_snapshot()],
             metric_names=["faithfulness"],
-            item_progress_callback=lambda current_summary, current_results, completed, total: progress.append(
-                (completed, total, len(current_results[0].metrics), current_summary.scoring_completed_items)
+            item_progress_callback=lambda current_summary,
+            current_results,
+            completed,
+            total: progress.append(
+                (
+                    completed,
+                    total,
+                    len(current_results[0].metrics),
+                    current_summary.scoring_completed_items,
+                )
             ),
         )
 
@@ -295,7 +319,8 @@ class EvaluationServiceTests(unittest.TestCase):
             [_sample()],
             [_snapshot()],
             metric_names=["faithfulness", "answer_correctness"],
-            progress_callback=lambda _summary, _results, completed, _total: completed < 1,
+            progress_callback=lambda _summary, _results, completed, _total: completed
+            < 1,
         )
 
         self.assertEqual(adapter.metric_batches, [("faithfulness",)])
@@ -339,7 +364,9 @@ class EvaluationServiceTests(unittest.TestCase):
 
         self.assertEqual(results[0].response, "正文。\n\n来源说明：证据 [1]。")
         self.assertEqual(results[0].scored_response, "正文。")
-        self.assertEqual(results[0].metadata["scored_response_filter"], {"filtered": True})
+        self.assertEqual(
+            results[0].metadata["scored_response_filter"], {"filtered": True}
+        )
 
     def test_score_marks_failed_snapshot_as_failed_sample(self):
         snapshot = _snapshot().model_copy(update={"status": "failed"})
@@ -363,9 +390,13 @@ class EvaluationServiceTests(unittest.TestCase):
         self.assertEqual(results[0].metrics, [])
         self.assertEqual(summary.metadata["scoring_skipped"], "no_successful_snapshots")
 
-    def test_non_retrieval_sample_skips_ragas_backend_and_marks_metrics_not_applicable(self):
+    def test_non_retrieval_sample_skips_ragas_backend_and_marks_metrics_not_applicable(
+        self,
+    ):
         backend = CapturingBackend()
-        service = EvaluationService(ragas_adapter=RagasAdapter(_config(), backend=backend))
+        service = EvaluationService(
+            ragas_adapter=RagasAdapter(_config(), backend=backend)
+        )
         sample = _sample().model_copy(update={"tags": ["direct", "small-talk"]})
 
         summary, results = service.score(
@@ -376,17 +407,29 @@ class EvaluationServiceTests(unittest.TestCase):
 
         self.assertEqual(backend.records, [])
         ragas_metrics = [
-            metric for metric in results[0].metrics if metric.metric_name.startswith("answer_")
+            metric
+            for metric in results[0].metrics
+            if metric.metric_name.startswith("answer_")
         ]
-        self.assertTrue(all(metric.status == "not_applicable" for metric in ragas_metrics))
+        self.assertTrue(
+            all(metric.status == "not_applicable" for metric in ragas_metrics)
+        )
         self.assertNotIn("answer_correctness", summary.metric_scores)
 
     def test_denied_access_sample_skips_ragas_backend_and_preserves_access_check(self):
         backend = CapturingBackend()
-        service = EvaluationService(ragas_adapter=RagasAdapter(_config(), backend=backend))
+        service = EvaluationService(
+            ragas_adapter=RagasAdapter(_config(), backend=backend)
+        )
         sample = _sample().model_copy(update={"expected_access": "denied"})
         snapshot = _snapshot().model_copy(
-            update={"access_check": {"expected": "denied", "observed": "denied", "reason": "permission"}}
+            update={
+                "access_check": {
+                    "expected": "denied",
+                    "observed": "denied",
+                    "reason": "permission",
+                }
+            }
         )
 
         summary, results = service.score(
@@ -435,12 +478,16 @@ class EvaluationServiceTests(unittest.TestCase):
 
     def test_score_preserves_original_contexts_and_records_scoring_budget(self):
         backend = CapturingBackend()
-        service = EvaluationService(ragas_adapter=RagasAdapter(_config(), backend=backend))
+        service = EvaluationService(
+            ragas_adapter=RagasAdapter(_config(), backend=backend)
+        )
         snapshot = _snapshot().model_copy(
             update={"retrieved_contexts": ["aaaa", "bbbb", "cccc"]}
         )
 
-        _, results = service.score([_sample()], [snapshot], metric_names=["faithfulness"])
+        _, results = service.score(
+            [_sample()], [snapshot], metric_names=["faithfulness"]
+        )
 
         self.assertEqual(results[0].retrieved_contexts, ["aaaa", "bbbb", "cccc"])
         self.assertEqual(
@@ -448,17 +495,19 @@ class EvaluationServiceTests(unittest.TestCase):
             {
                 "original_context_count": 3,
                 "original_context_characters": 12,
-                "scored_context_count": 2,
-                "scored_context_characters": 6,
-                "contexts_truncated": True,
-                "context_selection": "original_order",
+                "scored_context_count": 3,
+                "scored_context_characters": 12,
+                "contexts_truncated": False,
+                "context_selection": "raw_original_order",
                 "selected_evidence_ids": [],
                 "selected_claim_ids": [],
                 "excluded_evidence_ids": [],
-                "scored_contexts": ["aaaa", "bb"],
+                "scored_contexts": ["aaaa", "bbbb", "cccc"],
             },
         )
-        self.assertEqual(backend.records[0][0]["retrieved_contexts"], ["aaaa", "bb"])
+        self.assertEqual(
+            backend.records[0][0]["retrieved_contexts"], ["aaaa", "bbbb", "cccc"]
+        )
 
     def test_summary_exposes_scoring_caveats_and_public_config(self):
         snapshot = _snapshot().model_copy(
@@ -479,7 +528,9 @@ class EvaluationServiceTests(unittest.TestCase):
         self.assertEqual(diagnostics["retrieval_partial_failures"], 1)
         self.assertEqual(diagnostics["truncated_context_samples"], 0)
         self.assertEqual(diagnostics["status"], "technical_failure")
-        self.assertEqual(summary.metadata["scoring_config"]["max_contexts_per_sample"], 2)
+        self.assertEqual(
+            summary.metadata["scoring_config"]["max_contexts_per_sample"], 2
+        )
 
 
 if __name__ == "__main__":

@@ -226,12 +226,12 @@ uv run hardware-database-eval score --dataset evaluation/datasets/hardware_qa_v1
 
 裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。前端「RAGAS 评估」页面仅系统管理员可见。页面创建评估时会先选择已登记知识库并执行预检，服务端按稳定 `kb_id` 绑定知识库，部门管理员和普通用户仍没有 RAGAS 入口。
 
-管理员可在该页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”均为协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效；“取消”不会删除 `snapshot.jsonl`；“继续”会跳过其中已成功的样本。已完成、失败和已取消的历史运行可以删除，运行目录外的共享快照不受影响。历史对比默认严格校验知识库、样本集和模型配置，也可以明确选择带警告的“仅查看对比”。未勾选“执行 RAGAS 评分”时，系统只采集回答和检索证据，无需安装 `eval` 依赖或配置裁判 Embedding。
+管理员可在该页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”均为协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效；“取消”不会删除 `snapshot.jsonl`；“继续”会跳过其中已成功的样本。已完成、失败和已取消的历史运行可以删除，运行目录外的共享快照不受影响。历史对比默认严格校验知识库、样本集和模型配置，也可以明确选择带警告的“仅查看对比”。在线运行先采集回答和检索证据，进入采集质检状态后再由管理员点击“开始评分”；评分依赖和裁判模型预检只在真正进入评分阶段时执行。
 
 - 评估数据集格式与扩展方式：`evaluation/README.md`
 - 运行产物：`storage/evaluations/<run_id>/`
 - `snapshot.jsonl` 保存回答和检索上下文，可更换裁判模型重复评分。
-- `retrieved_contexts` 保存原始检索结果；`results.jsonl` 中 `metadata.ragas_scoring.scored_contexts` 保存实际送入 RAGAS 的上下文窗口。评分任务进度只表示工作项完成情况，不能替代有效评分数和评分失败数。
+- `retrieved_contexts` 保存原始检索结果；正式评分时 `results.jsonl` 中 `metadata.ragas_scoring.scored_contexts` 保存按原始顺序完整送入 RAGAS 的上下文。评分任务进度只表示工作项完成情况，不能替代有效评分数和评分失败数。
 - 每个运行目录都会保存 `run_state.json`。在线运行在至少持久化一条采集结果后，才会在该目录生成 `snapshot.jsonl`；离线运行则引用所提供的快照路径，该路径可能位于运行目录之外。只有完成评分的运行才会生成 `summary.json`、`results.jsonl`、`summary.csv` 和 `report.html`。
 - `summary.json` 是自动化消费的权威汇总，`summary.csv` 用于表格分析，`report.html` 用于人工查看。
 - 单题或单指标失败不会终止整批；`not_applicable` 不计入指标均值。

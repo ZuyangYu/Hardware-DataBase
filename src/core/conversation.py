@@ -37,6 +37,9 @@ class ChatMessage:
     edited_at: str | None = None
     redacted: bool = False
     memory_context: list[dict] = field(default_factory=list)
+    # 紧凑引用列表（来自 turn summary.evidence，内容截断），让"参考来源"
+    # 面板在刷新后仍可用，而不必重放 turn 事件。
+    citations: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1163,6 +1166,7 @@ def row_to_message(row) -> ChatMessage:
     content = row["content"]
     footer = row["footer"] if "footer" in row.keys() else ""
     memory_context: list[dict] = []
+    citations: list[dict] = []
     if "turn_summary" in row.keys():
         try:
             summary = json.loads(row["turn_summary"] or "{}")
@@ -1171,6 +1175,29 @@ def row_to_message(row) -> ChatMessage:
         candidate = summary.get("memory_context") if isinstance(summary, dict) else None
         if isinstance(candidate, list):
             memory_context = [item for item in candidate if isinstance(item, dict)]
+        evidence = summary.get("evidence") if isinstance(summary, dict) else None
+        if isinstance(evidence, list):
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                locator = item.get("locator")
+                citations.append(
+                    {
+                        "id": item.get("id"),
+                        "source_name": item.get("source_name"),
+                        "content_kind": item.get("content_kind"),
+                        "locator": locator if isinstance(locator, dict) else {},
+                        # 内容只保留预览长度，payload 保持轻量。
+                        "content": str(item.get("content") or "")[:240],
+                        "metadata": {
+                            "citation_number": (item.get("metadata") or {}).get(
+                                "citation_number"
+                            )
+                            if isinstance(item.get("metadata"), dict)
+                            else None,
+                        },
+                    }
+                )
     legacy_suffix = f"\n\n---\n{footer}" if footer else ""
     if legacy_suffix and content.endswith(legacy_suffix):
         content = content[:-len(legacy_suffix)]
@@ -1184,6 +1211,7 @@ def row_to_message(row) -> ChatMessage:
         edited_at=row["edited_at"] if "edited_at" in row.keys() else None,
         redacted=bool(row["redacted"]) if "redacted" in row.keys() else False,
         memory_context=memory_context,
+        citations=citations,
     )
 
 

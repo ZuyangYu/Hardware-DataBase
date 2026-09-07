@@ -908,6 +908,64 @@ class PipelineDocumentStore:
                 (record_id,),
             )
 
+    def requeue_dead_letter_records(
+        self,
+        kb_name: str | None = None,
+        department_id: str | int | None = None,
+        processor_kinds: Sequence[str] | None = None,
+    ) -> list[str]:
+        """Re-queue dead-lettered parse records so workers can retry them.
+
+        Background parsing fails into ``dead_letter`` after
+        ``WORKER_MAX_RETRIES`` attempts.  Transient causes (remote backend
+        hiccups, stale worker processes from an old code deployment) leave
+        recoverable records stranded; this resets them to ``queued`` with a
+        clean retry budget so the standing worker can pick them up again.
+        Returns the re-queued document names.
+        """
+
+        kinds = tuple(processor_kinds or (PROCESSOR_KIND_SPREADSHEET,))
+        if not kinds:
+            return []
+        placeholders = ", ".join("?" for _ in kinds)
+        conditions = [f"processor_kind IN ({placeholders})", "status = ?"]
+        params: list[Any] = [*kinds, TASK_STATUS_DEAD_LETTER]
+        if kb_name:
+            conditions.append("kb_name = ?")
+            params.append(kb_name)
+        if department_id not in (None, ""):
+            conditions.append("department_id = ?")
+            params.append(str(department_id))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT id, document_name FROM pipeline_documents WHERE {' AND '.join(conditions)}",
+                params,
+            ).fetchall()
+            if not rows:
+                return []
+            conn.execute(
+                f"""
+                UPDATE pipeline_documents
+                SET status = ?,
+                    upload_status = ?,
+                    retry_count = 0,
+                    worker_id = '',
+                    worker_started_at = '',
+                    worker_heartbeat_at = '',
+                    error_message = '',
+                    ragflow_error = '',
+                    parse_stage = '重新排队等待解析',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id IN ({", ".join("?" for _ in rows)})
+                """,
+                (
+                    TASK_STATUS_QUEUED,
+                    TASK_STATUS_QUEUED,
+                    *[int(row["id"]) for row in rows],
+                ),
+            )
+        return [str(row["document_name"]) for row in rows]
+
     def mark_document_failed_by_id(self, record_id: int, message: str):
         self.update_document_progress_by_id(
             record_id,

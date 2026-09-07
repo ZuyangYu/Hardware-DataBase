@@ -15,12 +15,13 @@ RunStatus = Literal[
     "running",
     "pause_requested",
     "paused",
+    "collected",
     "cancel_requested",
     "cancelled",
     "completed",
     "failed",
 ]
-RunStage = Literal["idle", "collecting", "scoring", "reporting"]
+RunStage = Literal["idle", "collecting", "collected", "scoring", "reporting"]
 
 
 class SampleRubric(BaseModel):
@@ -71,13 +72,6 @@ class EvaluationSample(BaseModel):
         if unsupported:
             raise ValueError(f"request_context contains unsupported fields: {', '.join(unsupported)}")
         return value
-
-    @model_validator(mode="after")
-    def validate_metric_inputs(self):
-        if "context_recall" in self.metrics and not self.reference_contexts:
-            raise ValueError("reference_contexts are required for context_recall")
-        return self
-
 
 class DocumentGenerationEvalRecord(BaseModel):
     """One expected field result for a controlled document template."""
@@ -231,7 +225,6 @@ class EvaluationRunState(BaseModel):
     dataset_path: str
     snapshot_path: str
     mode: Literal["online", "offline"]
-    score_enabled: bool
     kb_id: int | None = None
     kb_name: str = ""
     department_id: int | None = None
@@ -273,6 +266,15 @@ class EvaluationRunState(BaseModel):
     error_message: str = ""
     report_path: str = ""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_removed_score_enabled(cls, value: Any) -> Any:
+        """Read old run_state files without restoring the removed switch."""
+        if isinstance(value, dict) and "score_enabled" in value:
+            value = dict(value)
+            value.pop("score_enabled", None)
+        return value
+
     @classmethod
     def new_online(
         cls,
@@ -281,7 +283,6 @@ class EvaluationRunState(BaseModel):
         dataset_path: str,
         snapshot_path: str,
         total_samples: int,
-        score_enabled: bool,
         sample_ids: list[str] | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
@@ -291,7 +292,6 @@ class EvaluationRunState(BaseModel):
             dataset_path=dataset_path,
             snapshot_path=snapshot_path,
             mode="online",
-            score_enabled=score_enabled,
             total_samples=total_samples,
             sample_ids=sample_ids or [],
             tags=tags or [],

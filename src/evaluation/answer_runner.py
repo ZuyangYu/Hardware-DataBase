@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 import inspect
 import re
+import threading
 from time import perf_counter
 from typing import Any
 
@@ -90,7 +91,9 @@ def _sanitize(value: Any, depth: int = 0) -> Any:
         return "[truncated]"
     if isinstance(value, dict):
         return {
-            str(key): "[redacted]" if str(key).casefold() in _SENSITIVE_KEYS else _sanitize(item, depth + 1)
+            str(key): "[redacted]"
+            if str(key).casefold() in _SENSITIVE_KEYS
+            else _sanitize(item, depth + 1)
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -120,6 +123,19 @@ def _request_context(sample: EvaluationSample) -> RequestContext:
 class AnswerRunner:
     def __init__(self, pipeline_factory: Callable[[], Any]):
         self._pipeline_factory = pipeline_factory
+        # AppPipeline initialization opens the document/circuit indexes and
+        # creates the Agent runtime. Collection already uses a thread pool, so
+        # keep one pipeline per worker thread instead of rebuilding that stack
+        # for every sample. ContextVar-backed agent state keeps concurrent
+        # queries isolated while the thread-local prevents cross-thread reuse.
+        self._thread_local = threading.local()
+
+    def _pipeline_for_current_thread(self) -> Any:
+        pipeline = getattr(self._thread_local, "pipeline", None)
+        if pipeline is None:
+            pipeline = self._pipeline_factory()
+            self._thread_local.pipeline = pipeline
+        return pipeline
 
     def collect(self, sample: EvaluationSample) -> AnswerSnapshot:
         started_at = _utc_now()
@@ -128,7 +144,7 @@ class AnswerRunner:
         if sample.expected_access == "denied":
             return self._access_denied(sample, started_at, started, context)
         try:
-            pipeline = self._pipeline_factory()
+            pipeline = self._pipeline_for_current_thread()
         except Exception as exc:
             return self._failed(
                 sample,
@@ -166,7 +182,11 @@ class AnswerRunner:
             summary = pipeline.get_last_retrieval_summary() or {}
             safe_summary = _sanitize(summary)
             evidence = list(safe_summary.get("evidence") or [])
-            contexts = [str(item.get("content") or "") for item in evidence if item.get("content")]
+            contexts = [
+                str(item.get("content") or "")
+                for item in evidence
+                if item.get("content")
+            ]
             response = strip_narration_segments(
                 "".join(str(part) for part in parts), narrated
             )

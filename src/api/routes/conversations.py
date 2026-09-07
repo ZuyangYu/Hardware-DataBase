@@ -47,6 +47,7 @@ def _message_view(m) -> MessageView:
         edited_at=getattr(m, "edited_at", None),
         redacted=bool(getattr(m, "redacted", False)),
         memory_context=getattr(m, "memory_context", []),
+        citations=getattr(m, "citations", []) or [],
     )
 
 
