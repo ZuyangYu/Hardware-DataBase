@@ -20,15 +20,29 @@ from src.document_authoring.template_analysis import (
 )
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.work_order_store import DocumentAuthoringStore
+from src.document_authoring.evidence import (
+    AttachmentEvidenceProvider,
+    CompositeDocumentEvidenceProvider,
+    DocumentEvidenceProvider,
+    KnowledgeBaseEvidenceProvider,
+)
+from src.document_authoring.conversion import (
+    TemplateArtifactConversionService,
+    TemplateConversionError,
+    TemplateConversionResult,
+)
 
 __all__ = [
     "DeterministicRuleSpec",
     "DocumentArtifact",
     "DocumentUnitDraft",
     "DocumentAuthoringStore",
+    "DocumentEvidenceProvider",
     "DocumentGenerationService",
     "DocumentSchema",
     "DocumentWorkOrder",
+    "AttachmentEvidenceProvider",
+    "CompositeDocumentEvidenceProvider",
     "DocxRegionSchema",
     "HarnessPolicy",
     "ReviewItemSchema",
@@ -38,4 +52,8 @@ __all__ = [
     "TemplateAnalysisUnit",
     "TemplateVersion",
     "WorkbookRegionSchema",
+    "KnowledgeBaseEvidenceProvider",
+    "TemplateArtifactConversionService",
+    "TemplateConversionError",
+    "TemplateConversionResult",
 ]

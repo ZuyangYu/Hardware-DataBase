@@ -209,6 +209,38 @@ def test_cancel_is_idempotent_and_blocks_late_completion(tmp_path):
         store.complete(job.job_id, "worker-a", claimed.lease_token, {"status": "completed"})
 
 
+def test_cleanup_session_removes_jobs_outbox_and_resource_locks(tmp_path):
+    store = _store(tmp_path)
+    job = _create(store, request_id="request-cleanup")
+    claimed = store.claim(job.job_id, "worker-a", lease_seconds=30)
+    assert claimed is not None
+
+    work_order_ids = store.cleanup_session(session_id="chat-1")
+
+    assert work_order_ids == ["wo-1"]
+    assert store.get(job.job_id) is None
+    assert store.list_pending_outbox() == []
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM document_resource_locks").fetchone()[0] == 0
+    # The cleanup is safe to retry and does not touch another chat session.
+    assert store.cleanup_session(session_id="chat-1") == []
+
+
+def test_cancel_session_revokes_running_jobs_and_releases_locks(tmp_path):
+    store = _store(tmp_path)
+    job = _create(store, request_id="request-session-cancel")
+    claimed = store.claim(job.job_id, "worker-a", lease_seconds=30)
+    assert claimed is not None
+
+    work_order_ids = store.cancel_session(session_id="chat-1", reason="chat session deleted")
+
+    assert work_order_ids == ["wo-1"]
+    cancelled = store.get(job.job_id)
+    assert cancelled is not None and cancelled.status == "cancelled"
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM document_resource_locks").fetchone()[0] == 0
+
+
 def test_status_lookup_and_queue_metrics_are_scope_safe(tmp_path):
     store = _store(tmp_path)
     job = _create(store, request_id="request-status")
@@ -217,6 +249,37 @@ def test_status_lookup_and_queue_metrics_are_scope_safe(tmp_path):
     depth, oldest_age = store.queue_state()
     assert depth == 1
     assert oldest_age >= 0
+
+
+def test_conversion_job_is_durable_and_idempotent(tmp_path):
+    store = _store(tmp_path)
+    payload = {
+        "work_order_id": "wo-1",
+        "knowledge_base_name": "hardware",
+        "source_artifact_id": "artifact-native",
+        "target_format": "pdf",
+    }
+    first = store.create_job(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        session_id="chat-1",
+        client_request_id="artifact-conversion:artifact-native:pdf",
+        operation="convert_artifact",
+        work_order_id="wo-1",
+        payload=payload,
+    )
+    replay = store.create_job(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        session_id="chat-1",
+        client_request_id="artifact-conversion:artifact-native:pdf",
+        operation="convert_artifact",
+        work_order_id="wo-1",
+        payload=payload,
+    )
+    assert replay.job_id == first.job_id
+    claimed = store.claim(first.job_id, "worker-a", lease_seconds=30)
+    assert claimed is not None and claimed.operation == "convert_artifact"
 
 
 def test_list_chat_session_jobs_is_scoped_to_owner_and_session(tmp_path):

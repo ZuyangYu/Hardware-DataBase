@@ -112,7 +112,7 @@ class HardwareWorker:
             did_work = True
             started = time.monotonic()
             try:
-                if job.operation not in {"generate_work_order", "resume_work_order"}:
+                if job.operation not in {"generate_work_order", "resume_work_order", "convert_artifact"}:
                     # This should be unreachable because Store validates the
                     # operation, but keep the worker fail-closed if a future
                     # operation is added without a dispatch branch.
@@ -166,6 +166,31 @@ class HardwareWorker:
                     job.lease_token,
                     lease_seconds=max(15, int(getattr(src.settings, "DOCUMENT_AUTHORING_JOB_LEASE_SECONDS", 300))),
                 )
+                if job.operation == "convert_artifact":
+                    source_artifact_id = str(payload.get("source_artifact_id") or "").strip()
+                    target_format = str(payload.get("target_format") or "").strip().lower()
+                    if not source_artifact_id or not target_format:
+                        raise ValueError("document artifact conversion payload is incomplete")
+                    converted = self.pipeline.document_generation.convert_document_artifact(
+                        ctx,
+                        source_artifact_id,
+                        target_format=target_format,
+                    )
+                    self.document_jobs.complete(
+                        job.job_id,
+                        self.worker_id,
+                        job.lease_token,
+                        result={
+                            "work_order_id": work_order_id,
+                            "source_artifact_id": source_artifact_id,
+                            "artifact_id": converted.artifact_id,
+                            "output_format": converted.output_format,
+                            "stage": converted.stage,
+                            "status": "completed",
+                        },
+                    )
+                    record_worker(status="success", duration_s=time.monotonic() - started)
+                    continue
                 if job.operation == "generate_work_order":
                     result = self.pipeline.continue_knowledge_base_document_generation(
                         ctx, work_order_id, should_cancel=document_job_cancelled,
@@ -181,6 +206,19 @@ class HardwareWorker:
                         should_cancel=document_job_cancelled,
                     )
                 artifact_id = getattr(result, "artifact_id", None)
+                conversion_job_id = None
+                requested_output_format = str(payload.get("requested_output_format") or "native").strip().lower()
+                if artifact_id and requested_output_format not in {"", "native"}:
+                    artifact = self.pipeline.document_generation.store.get_artifact(str(artifact_id))
+                    native_format = str(getattr(artifact, "output_format", "") or "").strip().lower()
+                    if native_format and requested_output_format != native_format:
+                        conversion_job = self.pipeline.submit_document_artifact_conversion(
+                            ctx,
+                            str(artifact_id),
+                            target_format=requested_output_format,
+                            session_id=getattr(job, "session_id", None),
+                        )
+                        conversion_job_id = conversion_job.job_id
                 self.document_jobs.complete(
                     job.job_id,
                     self.worker_id,
@@ -189,6 +227,8 @@ class HardwareWorker:
                         "work_order_id": work_order_id,
                         "artifact_id": artifact_id,
                         "status": getattr(result, "stage", "completed"),
+                        "requested_output_format": requested_output_format,
+                        "conversion_job_id": conversion_job_id,
                     },
                 )
                 record_worker(status="success", duration_s=time.monotonic() - started)
@@ -219,6 +259,19 @@ class HardwareWorker:
     def run_once(self) -> bool:
         self._reload_runtime_settings_if_changed()
         did_work = False
+        # Chat attachment parse jobs (design §12.2): processed in the shared
+        # worker so a single deployment command covers the whole pipeline.
+        # Fail-soft: an attachment fault never blocks chat/document work.
+        if getattr(src.settings, "CHAT_ATTACHMENTS_ENABLED", False):
+            try:
+                from src.attachments.worker import AttachmentWorker
+
+                if not hasattr(self, "_attachment_worker"):
+                    self._attachment_worker = AttachmentWorker(worker_id=self.worker_id)
+                if self._attachment_worker.run_once():
+                    did_work = True
+            except Exception as exc:
+                error(f"Attachment worker failed: {exc}")
         if self._process_document_authoring_jobs(
             limit=max(1, int(getattr(src.settings, "DOCUMENT_AUTHORING_JOB_BATCH_SIZE", 4))),
             time_budget_seconds=max(

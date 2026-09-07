@@ -53,6 +53,30 @@ def test_server_export_intent_requires_explicit_output_language_and_normalizes_f
     assert infer_export_intent("不要导出成 Excel") is None
 
 
+def test_template_generation_does_not_create_a_chat_export_plan():
+    # The final artifact must be rendered from the approved template work
+    # order; a generic export here would only serialize the assistant answer.
+    assert infer_export_intent("参考模板，根据知识库生成新的 ICD 文档") is None
+    assert infer_export_intent("按照模板格式回填并导出 Excel") is None
+    assert infer_export_intent("将模板按照知识库内容回填并导出 Excel") is None
+
+
+def test_comparison_with_explicit_pdf_keeps_compare_route_and_requests_pdf_only():
+    query = "对比知识库和附件中的 HSI 文档差异，将结果整理成pdf供下载"
+
+    plan = infer_export_intent(query)
+
+    assert plan is not None
+    assert plan.formats == ("pdf",)
+
+
+def test_generic_report_export_does_not_infer_word_from_chinese_subject():
+    plan = infer_export_intent("请把检索结果整理成 PDF 文档")
+
+    assert plan is not None
+    assert plan.formats == ("pdf",)
+
+
 def test_envelope_citations_keep_stable_evidence_identity():
     turn = SimpleNamespace(
         query="查询器件",
@@ -137,6 +161,36 @@ def test_completed_turn_persists_export_plan_and_enqueues_jobs_without_browser_c
     assert completed.status == "completed"
     assert {job.format for job in jobs} == {"xlsx", "pdf"}
     assert all(job.snapshot_id for job in jobs)
+
+
+def test_completed_export_turn_persists_clean_answer_without_browser_html_fallback(tmp_path):
+    db_path = str(tmp_path / "auth.db")
+    _auth, _department, _admin, user = make_auth(db_path)
+    conversation = ConversationService(db_path)
+    session = conversation.create_session(user.id, "shared")
+    turn = conversation.create_turn(
+        user.id,
+        session.id,
+        "请将结果整理成 PDF",
+        client_request_id="clean-export-turn",
+    )
+
+    raw_answer = (
+        "## 结论\n\n已完成对比。\n\n"
+        "当前环境无法直接输出 PDF 文件，请将下方 HTML 复制到浏览器打印。\n\n"
+        "```html\n<!DOCTYPE html><html><body><h1>源码</h1></body></html>\n```"
+    )
+    completed = conversation.complete_turn(user.id, turn.id, raw_answer, {})
+
+    assert "当前环境无法直接输出 PDF" not in completed.answer
+    assert "<!DOCTYPE html>" not in completed.answer
+    assert "已提交 PDF 导出任务，生成完成后可在下方下载。" in completed.answer
+    snapshot = ResultExportStore(db_path, storage_dir=str(tmp_path / "exports")).get_snapshot(
+        user.id,
+        next(iter(ResultExportStore(db_path, storage_dir=str(tmp_path / "exports")).list_export_jobs(user.id))).snapshot_id,
+    )
+    assert snapshot is not None
+    assert "<!DOCTYPE html>" not in snapshot.envelope.answer
 
 
 def test_snapshot_has_version_and_content_hash_and_preserves_typed_table_values(tmp_path):

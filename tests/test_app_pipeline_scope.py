@@ -134,6 +134,22 @@ class AppPipelineScopeTests(unittest.TestCase):
         self.assertIsNone(pipeline.get_last_token_usage_summary())
         self.assertEqual(pipeline.agent.clear_calls, 1)
 
+    def test_query_can_propagate_agent_errors_for_durable_turns(self):
+        """Durable turn workers must see agent failures instead of an answer string."""
+        pipeline = self._pipeline()
+
+        class BrokenAgent:
+            def stream(self, **_kwargs):
+                raise RuntimeError("tool registration failed")
+
+            def clear_last_token_usage_summary(self):
+                return None
+
+        pipeline.agent = BrokenAgent()
+
+        with self.assertRaisesRegex(RuntimeError, "tool registration failed"):
+            list(pipeline.query("问", "kb", [], propagate_errors=True))
+
     def test_scan_kb_sources_exposes_application_layer_catalog_contract(self):
         class Store:
             def list_documents(self, kb_name, department_id=None):

@@ -15,7 +15,7 @@ import uuid
 import zipfile
 from copy import copy
 from datetime import datetime, timezone
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import requests
@@ -23,6 +23,10 @@ import requests
 import src.settings
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.artifact_preview import preview_artifact
+from src.document_authoring.conversion import (
+    TemplateArtifactConversionService,
+    TemplateConversionError,
+)
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
 from src.document_authoring.harness.idempotency import human_decision_key
@@ -49,6 +53,7 @@ from src.document_authoring.models import (
     TemplateVersion,
     DocxFill,
     DocxFillPlan,
+    ValidationReport,
     WorkbookFill,
     WorkbookFillPlan,
     WorkbookRegionSchema,
@@ -84,6 +89,7 @@ from src.document_authoring.worker import DocumentGenerationWorker
 from src.document_authoring.writers.managed import DeterministicEvidenceWriter, LLMManagedWriter, ManagedWriter
 from src.pipelines.document_rag.schemas import RequestContext
 from src.projects.service import ProjectService
+from src.attachments.models import SOURCE_SCOPES
 
 
 logger = logging.getLogger(__name__)
@@ -94,6 +100,58 @@ _MAX_AUTO_HARNESS_RETRIEVAL_ROUNDS = 1_000
 # that is 3002, so the ceiling must leave headroom for the rewrite step.
 _MAX_AUTO_HARNESS_STEPS = 3_600
 _DEFAULT_RETRIEVAL_ATTEMPTS_PER_UNIT = 2
+
+_ATTACHMENT_REF_SNAPSHOT_FIELDS = (
+    "attachment_id", "asset_id", "session_id", "filename", "media_type",
+    "extension", "size_bytes", "sha256", "usage_hint", "parse_status",
+    "degraded_reason",
+)
+
+
+def _ref_value(ref: Any, key: str, default: Any = None) -> Any:
+    if isinstance(ref, Mapping):
+        return ref.get(key, default)
+    return getattr(ref, key, default)
+
+
+def _freeze_attachment_ref_snapshot(refs: Sequence[Any] | None) -> list[dict[str, Any]]:
+    """Copy only server-issued attachment reference fields into a work order."""
+    snapshot: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in refs or ():
+        attachment_id = str(_ref_value(ref, "attachment_id", "") or "").strip()
+        asset_id = str(_ref_value(ref, "asset_id", "") or "").strip()
+        if not attachment_id or not asset_id:
+            raise ValueError("document attachment references require attachment_id and asset_id")
+        if attachment_id in seen:
+            continue
+        seen.add(attachment_id)
+        item: dict[str, Any] = {}
+        for field_name in _ATTACHMENT_REF_SNAPSHOT_FIELDS:
+            value = _ref_value(ref, field_name, "")
+            if field_name in {"session_id", "size_bytes"}:
+                try:
+                    value = int(value or 0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid document attachment reference {field_name}") from exc
+            elif value is None:
+                value = ""
+            item[field_name] = value
+        snapshot.append(item)
+    return snapshot
+
+
+def _resolve_document_source_scope(source_scope: Any, *, has_attachments: bool) -> str:
+    requested = str(source_scope or "knowledge_base_only").strip()
+    if requested not in SOURCE_SCOPES:
+        raise ValueError(f"unsupported document source scope: {requested}")
+    if requested == "auto":
+        return "attachment_and_knowledge_base" if has_attachments else "knowledge_base_only"
+    if requested == "attachment_only" and not has_attachments:
+        raise ValueError("attachment_only document generation requires attachment references")
+    if requested == "attachment_and_knowledge_base" and not has_attachments:
+        return "knowledge_base_only"
+    return requested
 
 
 def _requires_human_review(
@@ -175,6 +233,7 @@ class DocumentGenerationService:
         self.worker = worker or DocumentGenerationWorker()
         self.harness_runtime = InternalDocumentHarnessRuntime(self.store, self.validator)
         self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider()
+        self.converter = TemplateArtifactConversionService()
 
     @staticmethod
     def _require_template_kb_scope(
@@ -298,6 +357,10 @@ class DocumentGenerationService:
         content: bytes,
         template_name: str,
         progress_callback: TemplateProgressCallback | None = None,
+        origin_source_type: str | None = None,
+        origin_attachment_id: str | None = None,
+        origin_session_id: int | None = None,
+        origin_content_hash: str | None = None,
     ) -> TemplateAnalysis:
         """Persist an immutable draft then analyze its structure, never its bytes by LLM."""
         report_template_progress(progress_callback, TemplateProgress(stage="upload_started"))
@@ -339,6 +402,10 @@ class DocumentGenerationService:
             knowledge_base_name=ctx.metadata.get("document_template_kb_name"),
             resource_department_id=ctx.metadata.get("resource_department_id"),
             knowledge_base_id=ctx.metadata.get("kb_id"),
+            origin_source_type=origin_source_type,
+            origin_attachment_id=origin_attachment_id,
+            origin_session_id=origin_session_id,
+            origin_content_hash=origin_content_hash,
         )
         sanitization_report = TemplateSanitizationReport(
             template_version_id=template_version_id,
@@ -754,6 +821,8 @@ class DocumentGenerationService:
         execution_mode: str | None = None,
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
+        source_scope: str = "knowledge_base_only",
+        attachment_refs: Sequence[Any] | None = None,
     ) -> DocumentWorkOrder:
         # Work-order creation only snapshots sources the caller can read.
         # Execution, approval, resume and artifact actions re-check write
@@ -794,6 +863,8 @@ class DocumentGenerationService:
                 execution_mode=execution_mode,
                 generation_session_id=generation_session_id,
                 generation_brief=generation_brief,
+                source_scope=source_scope,
+                attachment_refs=attachment_refs,
             )
         except sqlite3.IntegrityError:
             if idempotency_key:
@@ -833,6 +904,9 @@ class DocumentGenerationService:
             max_parallel_units=max_parallel_units,
             execution_mode=original.execution_mode,
             harness_policy_id=original.harness_policy_id,
+            source_scope=original.source_scope_snapshot or "knowledge_base_only",
+            attachment_refs=original.attachment_refs_snapshot,
+            kb_scope_snapshot=original.kb_scope_snapshot,
         )
 
     def _find_knowledge_base_work_order_by_idempotency(
@@ -869,8 +943,11 @@ class DocumentGenerationService:
         execution_mode: str | None = None,
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
-         restart_of_work_order_id: str | None = None,
-         max_parallel_units: int = 3,
+        restart_of_work_order_id: str | None = None,
+        max_parallel_units: int = 3,
+        source_scope: str = "knowledge_base_only",
+        attachment_refs: Sequence[Any] | None = None,
+        kb_scope_snapshot: dict[str, Any] | None = None,
     ) -> DocumentWorkOrder:
         template = self._template(template_version_id)
         schema = self._schema(document_schema_id, document_schema_version)
@@ -897,6 +974,31 @@ class DocumentGenerationService:
                     "Harness-backed work orders require an approved HarnessPolicy"
                 )
         is_knowledge_base = scope_type == "knowledge_base"
+        frozen_attachment_refs = (
+            _freeze_attachment_ref_snapshot(attachment_refs)
+            if is_knowledge_base
+            else []
+        )
+        frozen_source_scope = (
+            _resolve_document_source_scope(
+                source_scope,
+                has_attachments=bool(frozen_attachment_refs),
+            )
+            if is_knowledge_base
+            else ""
+        )
+        frozen_kb_scope = (
+            dict(kb_scope_snapshot)
+            if kb_scope_snapshot
+            else {
+                "tenant_id": snapshot.tenant_id,
+                "knowledge_base_name": knowledge_base_name,
+                "resource_department_id": self._ctx_department_id(ctx),
+                "knowledge_base_id": self._ctx_kb_id(ctx),
+            }
+            if is_knowledge_base
+            else {}
+        )
         order = DocumentWorkOrder(
             work_order_id=(
                 f"wo-{uuid.uuid4().hex}"
@@ -916,6 +1018,9 @@ class DocumentGenerationService:
                 "" if is_knowledge_base else snapshot.baseline_content_hash
             ),
             source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            source_scope_snapshot=frozen_source_scope,
+            attachment_refs_snapshot=frozen_attachment_refs,
+            kb_scope_snapshot=frozen_kb_scope,
             template_version_id=template.template_version_id,
             document_schema_id=schema.document_schema_id,
             document_schema_version=schema.version,
@@ -1073,6 +1178,7 @@ class DocumentGenerationService:
         artifact = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=order.tenant_id,
             work_order_id=order.work_order_id, run_id=f"run-{uuid.uuid4().hex}",
+            output_format=template.format,
             stage="review_candidate", content_hash=hashlib.sha256(rendered_content).hexdigest(),
             validation_report_id=report.validation_report_id,
             integrity_manifest_id=integrity_manifest["manifest_hash"],
@@ -1513,6 +1619,7 @@ class DocumentGenerationService:
         artifact = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=order.tenant_id,
             work_order_id=order.work_order_id, run_id=harness_run_id,
+            output_format=template.format,
             stage="review_candidate", content_hash=hashlib.sha256(rendered_content).hexdigest(),
             validation_report_id=report.validation_report_id,
             integrity_manifest_id=integrity_manifest["manifest_hash"],
@@ -1630,6 +1737,7 @@ class DocumentGenerationService:
             tenant_id=candidate.tenant_id,
             work_order_id=candidate.work_order_id,
             run_id=candidate.run_id,
+            output_format=getattr(candidate, "output_format", None) or order.target_format,
             stage="approved_release",
             content_hash=candidate.content_hash,
             approval_subject_hash=subject_hash,
@@ -1646,7 +1754,7 @@ class DocumentGenerationService:
         released = self.store.save_artifact(
             released,
             candidate_content,
-            order.target_format,
+            getattr(candidate, "output_format", None) or order.target_format,
         )
         self._replace_order(
             order,
@@ -1821,7 +1929,7 @@ class DocumentGenerationService:
             self.store.read_artifact_content,
         )
         candidate_content = read_for_validation(candidate.artifact_id)
-        self._assert_generated_artifact_clean(candidate_content, order.target_format)
+        self._assert_artifact_content_clean(candidate_content, getattr(candidate, "output_format", None) or order.target_format)
         if hashlib.sha256(candidate_content).hexdigest() != candidate.content_hash:
             raise ValueError("candidate content hash changed since validation")
         subject_hash = _approval_subject_hash(candidate.content_hash, report.content_hash, snapshot.content_hash)
@@ -1836,12 +1944,17 @@ class DocumentGenerationService:
         released = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=candidate.tenant_id,
             work_order_id=candidate.work_order_id, run_id=candidate.run_id, stage="approved_release",
+            output_format=getattr(candidate, "output_format", None) or order.target_format,
             content_hash=candidate.content_hash, approval_subject_hash=subject_hash,
             parent_artifact_id=candidate.artifact_id, validation_report_id=candidate.validation_report_id,
             approval_event_ids=[event.event_id for event in approvals], integrity_manifest_id=candidate.integrity_manifest_id,
             released_at=datetime.now(timezone.utc),
         )
-        released = self.store.save_artifact(released, candidate_content, order.target_format)
+        released = self.store.save_artifact(
+            released,
+            candidate_content,
+            getattr(candidate, "output_format", None) or order.target_format,
+        )
         self._replace_order(order, status="complete")
         return released
 
@@ -1910,6 +2023,123 @@ class DocumentGenerationService:
         self.require_work_order_capability(ctx, order, capability)
         return self.store.read_artifact_content(artifact_id)
 
+    def convert_document_artifact(
+        self,
+        ctx: RequestContext,
+        artifact_id: str,
+        *,
+        target_format: str,
+    ) -> DocumentArtifact:
+        """Create a validated PDF/PPTX child artifact from a native result.
+
+        Conversion is a separate immutable operation.  The source artifact is
+        hash-checked before reading, the output receives its own validation
+        report and the parent/source hash is recorded in the idempotency key.
+        A candidate remains a candidate; an approved release can produce an
+        approved derived artifact without silently changing the work order.
+        """
+        source = self._artifact_for_context(ctx, artifact_id)
+        order = self._order(ctx, source.work_order_id, "run_deterministic_work_order")
+        if order.scope_type == "knowledge_base" and (
+            not order.knowledge_base_name
+            or not ctx.has_kb_permission(order.knowledge_base_name, "write")
+        ):
+            raise PermissionError("knowledge base write permission is required for artifact conversion")
+        normalized_target = str(target_format or "").strip().lower().lstrip(".")
+        if normalized_target not in self.converter.supported_targets:
+            raise ValueError("document artifact conversion supports only pdf or pptx")
+        source_format = str(getattr(source, "output_format", None) or order.target_format or "").strip().lower().lstrip(".")
+        if source_format == normalized_target:
+            raise ValueError("artifact is already in the requested output format")
+        get_validation_report = getattr(self.store, "get_validation_report", None)
+        source_report = (
+            get_validation_report(source.validation_report_id)
+            if callable(get_validation_report)
+            else None
+        )
+        if source_report is not None and source_report.status == "failed":
+            raise ValueError("source artifact validation failed; conversion is blocked")
+        source_content = self.store.read_artifact_content(source.artifact_id)
+        try:
+            converted = self.converter.convert(
+                source_content,
+                source_format=source_format,
+                target_format=normalized_target,
+            )
+        except TemplateConversionError:
+            raise
+        report = ValidationReport(
+            validation_report_id=f"validation-{uuid.uuid4().hex}",
+            work_order_id=order.work_order_id,
+            status="passed",
+            issues=[
+                {"code": "template_conversion_warning", "message": warning, "severity": "warning"}
+                for warning in converted.warnings
+            ],
+            evidence_matrix_hash=content_hash({
+                "source_artifact_id": source.artifact_id,
+                "source_content_hash": source.content_hash,
+                "target_format": normalized_target,
+            }),
+            renderer_manifest_hash=content_hash(converted.metadata),
+        )
+        self.store.save_validation_report(report)
+        subject_hash = None
+        if source.stage == "approved_release":
+            snapshot = self.resolve_source_snapshot(order)
+            subject_hash = _approval_subject_hash(
+                converted.metadata["content_hash"], report.content_hash, snapshot.content_hash,
+            )
+        child = DocumentArtifact(
+            artifact_id=f"artifact-{uuid.uuid4().hex}",
+            tenant_id=source.tenant_id,
+            work_order_id=source.work_order_id,
+            run_id=f"conversion-{uuid.uuid4().hex}",
+            output_format=normalized_target,
+            stage=source.stage,
+            validity_status="current",
+            policy_status="active",
+            access_status=source.access_status,
+            content_hash=converted.metadata["content_hash"],
+            approval_subject_hash=subject_hash,
+            parent_artifact_id=source.artifact_id,
+            validation_report_id=report.validation_report_id,
+            approval_event_ids=list(source.approval_event_ids) if source.stage == "approved_release" else [],
+            integrity_manifest_id=content_hash({
+                "source_artifact_id": source.artifact_id,
+                "source_content_hash": source.content_hash,
+                "conversion": converted.metadata,
+            }),
+            idempotency_fingerprint=content_hash({
+                "conversion": "template-artifact",
+                "source_artifact_id": source.artifact_id,
+                "source_content_hash": source.content_hash,
+                "target_format": normalized_target,
+                "converter_version": converted.metadata["converter_version"],
+            }),
+            status_reasons=[{
+                "code": "semantic_template_conversion",
+                "message": "模板成品已按段落/表格语义转换，并完成输出制品校验。",
+                "source_artifact_id": source.artifact_id,
+                "source_format": source_format,
+                "target_format": normalized_target,
+                "converter_version": converted.metadata["converter_version"],
+                "warnings": list(converted.warnings),
+            }],
+            released_at=datetime.now(timezone.utc) if source.stage == "approved_release" else None,
+        )
+        return self.store.save_artifact(child, converted.content, normalized_target)
+
+    def _assert_artifact_content_clean(self, content: bytes, artifact_format: str) -> None:
+        normalized = str(artifact_format or "").strip().lower().lstrip(".")
+        if normalized in {"pdf", "pptx"}:
+            if normalized == "pdf":
+                self.converter._validate_pdf(content)
+            else:
+                self.converter._validate_pptx(content)
+            return
+        self._assert_generated_artifact_clean(content, normalized)
+
     def preview_document_artifact(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
         """Return a bounded, read-only artifact preview after download-equivalent checks."""
         artifact = self._artifact_for_context(ctx, artifact_id)
@@ -1918,7 +2148,7 @@ class DocumentGenerationService:
         self.require_work_order_capability(ctx, order, capability)
         return preview_artifact(
             self.store.read_artifact_content(artifact_id),
-            order.target_format,
+            getattr(artifact, "output_format", None) or order.target_format,
         )
 
     # Internal helpers -----------------------------------------------------------------
@@ -2210,23 +2440,54 @@ class DocumentGenerationService:
         *,
         requirement_id: str = "knowledge-base-retrieval",
         source_set_snapshot_id: str = "",
+        attachment_ids: Sequence[str] = (),
     ) -> RetrievalOutcome:
-        """Bind backend evidence to one selected knowledge base and source set."""
+        """Bind KB and chat-attachment evidence to frozen source references."""
         frozen_source_names = list(dict.fromkeys(source_names))
+        frozen_attachment_ids = {
+            str(attachment_id).strip()
+            for attachment_id in attachment_ids
+            if str(attachment_id).strip()
+        }
         accepted = []
+        attachment_evidence_by_id: dict[str, list[str]] = {}
         for evidence in evidences:
+            metadata = dict(getattr(evidence, "metadata", {}) or {})
+            source_type = str(
+                metadata.get("source_type")
+                or getattr(evidence, "source_type", "")
+                or ""
+            ).strip()
+            if source_type == "chat_attachment":
+                attachment_id = str(metadata.get("attachment_id") or "").strip()
+                if not attachment_id or attachment_id not in frozen_attachment_ids:
+                    raise PermissionError(
+                        "retrieval evidence attachment is outside the frozen attachment set"
+                    )
+                bound_evidence = copy(evidence)
+                bound_evidence.metadata = {
+                    **metadata,
+                    "source_type": "chat_attachment",
+                    "attachment_id": attachment_id,
+                }
+                accepted.append(bound_evidence)
+                attachment_evidence_by_id.setdefault(attachment_id, []).append(
+                    str(getattr(evidence, "id", ""))
+                )
+                continue
             if evidence.source_name not in frozen_source_names:
                 raise PermissionError("retrieval evidence is outside the frozen source set")
             declared_kb_names = {
-                str(evidence.metadata.get(key) or "").strip()
+                str(metadata.get(key) or "").strip()
                 for key in ("knowledge_base_name", "kb_name")
             } - {""}
             if any(name != knowledge_base_name for name in declared_kb_names):
                 raise PermissionError("retrieval evidence knowledge base does not match selection")
             bound_evidence = copy(evidence)
             bound_evidence.metadata = {
-                **evidence.metadata,
+                **metadata,
                 "knowledge_base_name": knowledge_base_name,
+                "source_type": "knowledge_base",
             }
             accepted.append(bound_evidence)
         evidence_by_source = {
@@ -2252,6 +2513,13 @@ class DocumentGenerationService:
                     evidence_ids=evidence_by_source[source_name],
                 )
                 for source_name in frozen_source_names
+            ] + [
+                RetrievalSourceOutcome(
+                    source_version_id=f"attachment:{attachment_id}",
+                    status="success_with_hits" if evidence_ids else "success_empty",
+                    evidence_ids=evidence_ids,
+                )
+                for attachment_id, evidence_ids in attachment_evidence_by_id.items()
             ],
             query_fingerprint=hashlib.sha256(
                 (
@@ -2425,8 +2693,48 @@ class DocumentGenerationService:
                 raise PermissionError(
                     "knowledge base retrieval outcome used unexpected region policies"
                 )
+            source_scope = order.source_scope_snapshot or "knowledge_base_only"
+            if source_scope == "auto":
+                source_scope = (
+                    "attachment_and_knowledge_base"
+                    if order.attachment_refs_snapshot
+                    else "knowledge_base_only"
+                )
+            allowed_attachment_refs = {
+                str(ref.get("attachment_id") or "").strip(): ref
+                for ref in order.attachment_refs_snapshot
+                if str(ref.get("attachment_id") or "").strip()
+            }
             for evidence in outcome.evidences:
-                if evidence.metadata.get("knowledge_base_name") != order.knowledge_base_name:
+                metadata = dict(getattr(evidence, "metadata", {}) or {})
+                source_type = str(
+                    metadata.get("source_type")
+                    or getattr(evidence, "source_type", "")
+                    or ""
+                ).strip()
+                if source_type == "chat_attachment":
+                    if source_scope not in {"attachment_only", "attachment_and_knowledge_base"}:
+                        raise PermissionError(
+                            "retrieval outcome contains attachment evidence outside its source scope"
+                        )
+                    attachment_id = str(metadata.get("attachment_id") or "").strip()
+                    frozen_ref = allowed_attachment_refs.get(attachment_id)
+                    if frozen_ref is None:
+                        raise PermissionError(
+                            "retrieval evidence attachment is outside the work order snapshot"
+                        )
+                    asset_id = str(metadata.get("asset_id") or "").strip()
+                    frozen_asset_id = str(frozen_ref.get("asset_id") or "").strip()
+                    if asset_id and frozen_asset_id and asset_id != frozen_asset_id:
+                        raise PermissionError(
+                            "retrieval evidence attachment asset does not match the work order snapshot"
+                        )
+                    continue
+                if source_scope == "attachment_only":
+                    raise PermissionError(
+                        "retrieval outcome contains knowledge-base evidence outside its source scope"
+                    )
+                if metadata.get("knowledge_base_name") != order.knowledge_base_name:
                     raise PermissionError(
                         "retrieval evidence knowledge base does not match work order"
                     )

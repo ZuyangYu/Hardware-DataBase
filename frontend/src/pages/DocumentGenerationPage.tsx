@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
 import { api, apiDownload } from '../api/client';
-import { analyzeTemplate } from '../api/documentAuthoring';
+import { analyzeTemplate, requestDocumentArtifactConversion } from '../api/documentAuthoring';
 import type {
   CreateWorkOrderResult,
   DocumentAnalysis,
@@ -589,6 +589,7 @@ export function StatusView({
   const [previews, setPreviews] = useState<Record<string, unknown>>({});
   const [feedback, setFeedback] = useState<Record<string, string>>({});
   const [approve, setApprove] = useState<Record<string, string>>({});
+  const [conversionBusy, setConversionBusy] = useState<string | null>(null);
 
   async function loadPreview(artifact_id: string) {
     if (previews[artifact_id]) return;
@@ -620,6 +621,14 @@ export function StatusView({
       )
       .then(() => notify.success('已批准并发布。'))
       .catch((e) => notify.error(e instanceof Error ? e.message : '批准失败'));
+  }
+
+  function requestConversion(artifact_id: string, target_format: 'pdf' | 'pptx') {
+    setConversionBusy(`${artifact_id}:${target_format}`);
+    void requestDocumentArtifactConversion(kb, artifact_id, target_format)
+      .then(() => notify.success(`已提交 ${target_format.toUpperCase()} 转换，稍后刷新任务状态即可下载。`))
+      .catch((error) => notify.error(error instanceof Error ? error.message : '转换任务提交失败'))
+      .finally(() => setConversionBusy(null));
   }
 
   return (
@@ -654,8 +663,23 @@ export function StatusView({
               <Button size="sm" onClick={() => void loadPreview(a.artifact_id)}>预览</Button>
               <Button size="sm" onClick={() => void apiDownload.blob(
                 `/api/v1/document-generation/artifacts/${a.artifact_id}/download?kb=${encodeURIComponent(kb)}`,
-                `${a.artifact_id}.${status.target_format ?? 'bin'}`,
+                `${a.artifact_id}.${String(a.output_format ?? status.target_format ?? 'bin')}`,
               )}>下载</Button>
+              {!['pdf', 'pptx'].includes(String(a.output_format ?? '').toLowerCase()) && (
+                <>
+                  {(['pdf', 'pptx'] as const).map((target) => (
+                    <Button
+                      key={target}
+                      size="sm"
+                      variant="outline"
+                      disabled={conversionBusy !== null}
+                      onClick={() => requestConversion(a.artifact_id, target)}
+                    >
+                      {conversionBusy === `${a.artifact_id}:${target}` ? '提交中…' : `转 ${target.toUpperCase()}`}
+                    </Button>
+                  ))}
+                </>
+              )}
             </div>
             {preview && (
               <div className="space-y-1 rounded bg-muted p-2">

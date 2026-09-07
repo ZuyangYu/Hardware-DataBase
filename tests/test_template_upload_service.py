@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import zipfile
 from pathlib import Path
@@ -213,6 +214,29 @@ def test_confirmed_docx_analysis_creates_hash_bound_approved_template_and_schema
     assert authoring_service.store.get_template_analysis(template.template_version_id).content_hash == template.content_hash
     schema = authoring_service.store.get_document_schema(template.template_schema_id, "1")
     assert schema is not None and schema.status == "approved"
+
+
+def test_attachment_template_persists_origin_provenance(authoring_service, author_ctx):
+    content = _docx_with_text("Attachment template")
+    source_hash = hashlib.sha256(content).hexdigest()
+
+    analysis = authoring_service.analyze_uploaded_template(
+        author_ctx,
+        filename="attachment-template.docx",
+        content=content,
+        template_name="Attachment template",
+        origin_source_type="chat_attachment",
+        origin_attachment_id="att-source-1",
+        origin_session_id=42,
+        origin_content_hash=source_hash,
+    )
+
+    template = authoring_service.store.get_template(analysis.template_version_id)
+    assert template is not None
+    assert template.origin_source_type == "chat_attachment"
+    assert template.origin_attachment_id == "att-source-1"
+    assert template.origin_session_id == 42
+    assert template.origin_content_hash == source_hash
 
 
 def test_auto_activation_approves_template_with_valid_suggestions(authoring_service, author_ctx):

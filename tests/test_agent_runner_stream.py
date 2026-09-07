@@ -177,6 +177,113 @@ def test_general_chat_runs_through_agent_without_retrieval_tools(monkeypatch):
     assert "当前未挂载知识库" not in captured["system_prompt"]
 
 
+def test_export_request_mounts_server_owned_export_protocol(monkeypatch):
+    """Export requests must teach the model that the server owns file creation."""
+    from src.agents import runner as runner_mod
+
+    captured: dict = {}
+
+    def _fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+
+        class _Agent:
+            def stream(self, *args, **kwargs):
+                return iter(((AIMessage(content="已整理结果"), {"langgraph_node": "model"}),))
+
+        return _Agent()
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", _fake_create_deep_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    list(
+        runner.stream(
+            query="请将这次 HSI 对比结果整理成 PDF 供下载",
+            kb_name="ADAS",
+            history=[],
+            thread_id="export-prompt",
+        )
+    )
+
+    prompt = captured["system_prompt"]
+    assert "导出任务由服务器异步生成" in prompt
+    assert "不要生成 HTML" in prompt
+    assert "不得声称当前环境无法输出 PDF" in prompt
+
+
+def test_attachment_turn_prefetches_evidence_before_agent_answer(monkeypatch):
+    """An attached-file question must not depend on the model choosing the tool."""
+    from src.agents import runner as runner_mod
+    from src.agents.tools import attachment_tools as attachment_tools_mod
+    from src.attachments.models import AttachmentRef
+
+    captured: dict = {}
+    search_queries: list[str] = []
+
+    def attachment_list() -> str:
+        return "本轮可用附件：1. 600605919_EPS_HSI.docx — 解析状态: ready"
+
+    def attachment_search(query: str, top_k: int = 6) -> str:
+        search_queries.append(query)
+        return (
+            '<evidence id="1" source="600605919_EPS_HSI.docx">\n'
+            "EPS 系统状态定义如下：\n"
+            "</evidence>"
+        )
+
+    attachment_tools = [attachment_list, attachment_search]
+
+    def _build_attachment_tools(rt):
+        captured["runtime_attachment_user_id"] = rt.attachment_user_id
+        return attachment_tools
+
+    monkeypatch.setattr(attachment_tools_mod, "build_attachment_tools", _build_attachment_tools)
+
+    def _fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+
+        class _Agent:
+            def stream(self, *args, **kwargs):
+                return iter(((AIMessage(content="已读取附件"), {"langgraph_node": "model"}),))
+
+        return _Agent()
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", _fake_create_deep_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    ref = AttachmentRef(
+        attachment_id="att-1",
+        asset_id="asset-1",
+        session_id=1,
+        filename="600605919_EPS_HSI.docx",
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        extension=".docx",
+        size_bytes=1,
+        sha256="hash",
+    )
+    assert list(
+        runner.stream(
+            query="对比知识库中的HSI文档和附件中的HSI文档区别",
+            kb_name="ADAS",
+            history=[],
+            thread_id="1",
+            attachments=[ref],
+            source_scope="attachment_and_knowledge_base",
+            attachment_user_id=7,
+        )
+    ) == ["已读取附件"]
+
+    assert captured["runtime_attachment_user_id"] == 7
+    assert search_queries
+    assert any("600605919" in query and "EPS" in query for query in search_queries)
+    assert "600605919_EPS_HSI.docx" in captured["system_prompt"]
+    assert "EPS 系统状态定义如下" in captured["system_prompt"]
+    assert "不得声称附件未挂载" in captured["system_prompt"]
+
+
 def test_general_chat_hides_memory_trace_and_retrieval_footer(monkeypatch):
     from src.agents import runner as runner_mod
     from src.pipelines.document_rag.schemas import RequestContext

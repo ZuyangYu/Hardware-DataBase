@@ -358,6 +358,47 @@ def test_knowledge_base_work_order_requires_live_read_permission(
         document_schema_version=approved_schema.version,
     )
     assert order.scope_type == "knowledge_base"
+
+
+def test_knowledge_base_work_order_persists_document_source_scope_snapshots(
+    service, ctx, approved_template, approved_schema
+):
+    ref = SimpleNamespace(
+        attachment_id="att-1",
+        asset_id="asset-1",
+        session_id=42,
+        filename="board.edf",
+        media_type="application/x-edif",
+        extension=".edf",
+        size_bytes=100,
+        sha256="source-hash",
+        usage_hint="data",
+        parse_status="ready",
+        degraded_reason="",
+    )
+
+    order = service.create_knowledge_base_work_order(
+        ctx,
+        knowledge_base_name="hardware",
+        source_names=["spec.pdf"],
+        template_version_id=approved_template.template_version_id,
+        document_schema_id=approved_schema.document_schema_id,
+        document_schema_version=approved_schema.version,
+        source_scope="attachment_only",
+        attachment_refs=[ref],
+    )
+    restored = service.store.get_work_order(order.work_order_id)
+
+    assert restored is not None
+    assert restored.source_scope_snapshot == "attachment_only"
+    assert restored.attachment_refs_snapshot[0]["attachment_id"] == "att-1"
+    assert restored.attachment_refs_snapshot[0]["sha256"] == "source-hash"
+    assert restored.kb_scope_snapshot == {
+        "knowledge_base_id": None,
+        "knowledge_base_name": "hardware",
+        "resource_department_id": "hw",
+        "tenant_id": "tenant-a",
+    }
     ctx.kb_permissions.clear()
     with pytest.raises(PermissionError, match="knowledge base"):
         service.require_work_order_capability(

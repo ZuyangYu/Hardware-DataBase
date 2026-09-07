@@ -13,6 +13,7 @@ import { describeWorkOrderStatus, type DocumentStatusTone } from '../../document
 export type DocumentCardArtifact = {
   artifact_id: string;
   stage: string;
+  output_format?: string;
   preview_url?: string;
   download_url?: string;
 };
@@ -75,6 +76,9 @@ export function parseCardArtifacts(value: unknown): DocumentCardArtifact[] | und
     .map((entry) => ({
       artifact_id: entry.artifact_id as string,
       stage: typeof entry.stage === 'string' ? entry.stage : '',
+      ...(typeof entry.output_format === 'string' && entry.output_format.trim()
+        ? { output_format: entry.output_format }
+        : {}),
       ...(typeof entry.preview_url === 'string' && entry.preview_url.trim()
         ? { preview_url: entry.preview_url }
         : {}),
@@ -199,7 +203,7 @@ export async function downloadDocumentArtifact(
 ): Promise<void> {
   await apiDownload.blob(
     artifact.download_url || documentArtifactDownloadPath(artifact.artifact_id, card.kb_name),
-    documentArtifactFileName(artifact.artifact_id, card.targetFormat),
+    documentArtifactFileName(artifact.artifact_id, artifact.output_format || card.targetFormat),
   );
 }
 

@@ -22,6 +22,11 @@ from src.pipelines.document_rag.schemas import EvidenceEnvelope, IngestResult, R
 from src.projects.service import ProjectService
 from src.projects.retrieval import ProjectEvidenceRetrievalService, SourceUnavailableError
 from src.document_authoring.service import DocumentGenerationService
+from src.document_authoring.evidence import (
+    AttachmentEvidenceProvider,
+    CompositeDocumentEvidenceProvider,
+    KnowledgeBaseEvidenceProvider,
+)
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
 from src.document_authoring.icd_scope_decision import (
@@ -43,6 +48,11 @@ from src.document_authoring.retriever_registry import (
 )
 from src.services.document_manager import DocumentManager
 from src.services.kb_scope import kb_scope_from_context
+from src.attachments.models import (
+    resolve_source_scope,
+    scope_allows_kb,
+)
+from src.attachments.retrieval import AttachmentRetrievalService
 
 
 _ICD_PIN_TERMS = (
@@ -259,6 +269,10 @@ class AppPipeline:
         persist_thread: bool = False,
         document_context: Any | None = None,
         document_flow: bool | None = None,
+        attachments: list[Any] | None = None,
+        source_scope: str = "auto",
+        propagate_errors: bool = False,
+        attachment_user_id: int | None = None,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -279,6 +293,9 @@ class AppPipeline:
                 persist_thread=persist_thread,
                 document_context=document_context,
                 document_flow=document_flow,
+                attachments=attachments,
+                source_scope=source_scope,
+                attachment_user_id=attachment_user_id,
             )
         except QueryCancelled:
             return
@@ -286,6 +303,8 @@ class AppPipeline:
             error(f"查询出错: {exc}")
             traceback.print_exc()
             from src.core.error_friendly import friendly_error_message
+            if propagate_errors:
+                raise
             yield friendly_error_message(exc)
 
     def forget_agent_thread(self, thread_id: str) -> None:
@@ -764,9 +783,27 @@ class AppPipeline:
     def approve_template_schema(self, template_version_id: str, actor_id: str):
         return self.document_generation.approve_template(template_version_id, actor_id)
 
-    def analyze_document_template(self, ctx: RequestContext, *, filename: str, content: bytes, template_name: str):
+    def analyze_document_template(
+        self,
+        ctx: RequestContext,
+        *,
+        filename: str,
+        content: bytes,
+        template_name: str,
+        origin_source_type: str | None = None,
+        origin_attachment_id: str | None = None,
+        origin_session_id: int | None = None,
+        origin_content_hash: str | None = None,
+    ):
         return self.document_generation.analyze_uploaded_template(
-            ctx, filename=filename, content=content, template_name=template_name,
+            ctx,
+            filename=filename,
+            content=content,
+            template_name=template_name,
+            origin_source_type=origin_source_type,
+            origin_attachment_id=origin_attachment_id,
+            origin_session_id=origin_session_id,
+            origin_content_hash=origin_content_hash,
         )
 
     def analyze_and_activate_document_template(
@@ -829,6 +866,7 @@ class AppPipeline:
         template_version_id: str,
         purpose: str = "",
         output_policy: dict[str, Any] | None = None,
+        auto_confirm_recommended: bool = False,
     ):
         template = self.document_generation.store.get_template(template_version_id)
         if template is None:
@@ -843,7 +881,22 @@ class AppPipeline:
             raise KeyError("template analysis not found")
         policy = dict(output_policy or {})
         policy.setdefault("format", analysis.format)
-        brief = GenerationBrief(purpose=purpose.strip(), output_policy=policy)
+        # A one-shot chat request may explicitly authorize the safe template
+        # defaults (current published revision, mark missing data as TBD,
+        # forbid unsupported inference).  This is a policy decision, not an
+        # LLM guess, and remains opt-in for the original clarification API.
+        if auto_confirm_recommended:
+            brief = GenerationBrief(
+                purpose=purpose.strip(),
+                scope={"revision": "当前发布版本"},
+                output_policy=policy,
+                missing_data_policy="mark_tbd",
+                inference_policy="forbid",
+                confirmed=False,
+                confidence=1.0,
+            )
+        else:
+            brief = GenerationBrief(purpose=purpose.strip(), output_policy=policy)
         session = self.document_generation.store.generation_sessions.create_session(
             tenant_id=ctx.tenant_id or "default",
             user_id=ctx.user_id,
@@ -851,18 +904,31 @@ class AppPipeline:
             template_version_id=template_version_id,
             brief=brief,
         )
-        message = self.requirement_clarifier.next_message(
-            analysis.model_dump(mode="json"),
-            brief,
-        )
-        self.document_generation.store.generation_sessions.append_message(
-            session.session_id,
-            role=message.role,
-            content=message.content,
-            question_id=message.question_id,
-            options=message.options,
-            reason=message.reason,
-        )
+        sessions = self.document_generation.store.generation_sessions
+        if auto_confirm_recommended:
+            sessions.append_message(
+                session.session_id,
+                role="system",
+                content=(
+                    "已按模板推荐值确认：使用当前发布版本；缺失字段标记为未提供；"
+                    "禁止无证据推断。"
+                ),
+                reason="recommended_defaults_applied",
+            )
+            sessions.confirm(session.session_id)
+        else:
+            message = self.requirement_clarifier.next_message(
+                analysis.model_dump(mode="json"),
+                brief,
+            )
+            sessions.append_message(
+                session.session_id,
+                role=message.role,
+                content=message.content,
+                question_id=message.question_id,
+                options=message.options,
+                reason=message.reason,
+            )
         return self.get_document_generation_session(ctx, session.session_id)
 
     def get_document_generation_session(self, ctx: RequestContext, session_id: str):
@@ -990,17 +1056,25 @@ class AppPipeline:
         # that create a job use their explicit write gate before reaching us.
         if not ctx.has_kb_permission(knowledge_base_name, "read"):
             raise PermissionError("knowledge base read permission is required")
+        requested_scope = str(kwargs.get("source_scope") or "knowledge_base_only").strip()
+        has_attachment_refs = bool(kwargs.get("attachment_refs"))
+        effective_scope = resolve_source_scope(
+            requested_scope=requested_scope,
+            has_attachments=has_attachment_refs,
+            is_general_chat=False,
+        )
         source_names = []
-        for document in self.list_file_infos(knowledge_base_name, ctx):
-            name = (
-                document.get("name", "")
-                if isinstance(document, dict)
-                else getattr(document, "name", "")
-            )
-            normalized = str(name).strip()
-            if normalized and normalized not in source_names:
-                source_names.append(normalized)
-        if not source_names:
+        if effective_scope != "attachment_only":
+            for document in self.list_file_infos(knowledge_base_name, ctx):
+                name = (
+                    document.get("name", "")
+                    if isinstance(document, dict)
+                    else getattr(document, "name", "")
+                )
+                normalized = str(name).strip()
+                if normalized and normalized not in source_names:
+                    source_names.append(normalized)
+        if not source_names and effective_scope == "knowledge_base_only":
             raise ValueError(
                 "knowledge base has no readable source documents; "
                 "upload and parse a source before generating a document"
@@ -1078,12 +1152,43 @@ class AppPipeline:
         scope_review = None
         icd_schema = self._icd_connector_scope_schema(order)
         if icd_schema is not None:
-            supporting_evidences = self.backend.retrieve(
-                knowledge_base_name,
-                "ICD connector pin mapping",
+            scope_kwargs = self._document_retriever_scope_kwargs(order)
+            requested_scope = scope_kwargs.get("source_scope", "knowledge_base_only")
+            attachment_refs = list(scope_kwargs.get("attachment_refs", []) or [])
+            attachment_ids = [
+                str(
+                    ref.get("attachment_id", "")
+                    if isinstance(ref, dict)
+                    else getattr(ref, "attachment_id", "")
+                ).strip()
+                for ref in attachment_refs
+            ]
+            attachment_ids = list(dict.fromkeys(item for item in attachment_ids if item))
+            effective_scope = resolve_source_scope(
+                requested_scope=requested_scope,
+                has_attachments=bool(attachment_refs),
+                is_general_chat=False,
+            )
+            kb_provider = KnowledgeBaseEvidenceProvider(
+                self.backend,
                 top_k=src.settings.FINAL_TOP_K,
+                source_names=list(snapshot.source_names),
+            )
+            providers = [kb_provider]
+            if attachment_refs and effective_scope in {
+                "attachment_only", "attachment_and_knowledge_base",
+            }:
+                providers.append(AttachmentEvidenceProvider(
+                    retrieval=AttachmentRetrievalService(),
+                    refs_snapshot=attachment_refs,
+                    top_k=src.settings.FINAL_TOP_K,
+                ))
+            supporting_evidences = CompositeDocumentEvidenceProvider(providers).retrieve(
+                query="ICD connector pin mapping",
+                source_scope=effective_scope,
+                attachment_ids=attachment_ids,
+                kb_name=knowledge_base_name,
                 ctx=ctx,
-                filters={"source_names": list(snapshot.source_names)},
             )
             connector_refdes = (
                 list(dict.fromkeys(
@@ -1106,7 +1211,11 @@ class AppPipeline:
                         ctx,
                         refdes=connector_refdes,
                     )
-                    if getattr(self, "circuit_service", None) is not None
+                    if (
+                        getattr(self, "circuit_service", None) is not None
+                        and scope_allows_kb(effective_scope)
+                        and snapshot.source_names
+                    )
                     else []
                 )
                 decision = build_icd_scope_decision(
@@ -1179,6 +1288,7 @@ class AppPipeline:
         }
         if scope_review is not None:
             retriever_kwargs["icd_scope_review"] = scope_review
+        retriever_kwargs.update(self._document_retriever_scope_kwargs(order))
         retrieve = self._knowledge_base_retriever(
             ctx,
             knowledge_base_name,
@@ -1209,12 +1319,16 @@ class AppPipeline:
             raise ValueError("work order is not a knowledge-base document generation")
         snapshot = self.document_generation.resolve_source_snapshot(order)
         scope_review = self.document_generation.get_icd_scope_review(ctx, work_order_id)
+        retriever_kwargs = {
+            "source_set_snapshot_id": snapshot.source_set_snapshot_id,
+            "icd_scope_review": scope_review,
+        }
+        retriever_kwargs.update(self._document_retriever_scope_kwargs(order))
         retrieve = self._knowledge_base_retriever(
             ctx,
             order.knowledge_base_name,
             list(snapshot.source_names),
-            source_set_snapshot_id=snapshot.source_set_snapshot_id,
-            icd_scope_review=scope_review,
+            **retriever_kwargs,
         )
         run_kwargs: dict[str, Any] = {"retrieve": retrieve}
         if should_cancel is not None:
@@ -1266,6 +1380,57 @@ class AppPipeline:
             lambda: self.continue_knowledge_base_document_generation(ctx, work_order_id),
         )
 
+    def submit_document_artifact_conversion(
+        self,
+        ctx: RequestContext,
+        artifact_id: str,
+        *,
+        target_format: str,
+        session_id: str | int | None = None,
+        client_request_id: str | None = None,
+    ):
+        """Queue an immutable template-artifact conversion.
+
+        Only the artifact id and requested format are serialized.  The worker
+        re-reads the parent artifact and re-checks the work-order capability
+        before conversion, so a permission revocation or source replacement
+        cannot turn a stale browser request into a downloadable file.
+        """
+        job_store = getattr(self, "document_job_store", None)
+        if not callable(getattr(job_store, "create_job", None)):
+            raise RuntimeError("durable document authoring job store is not configured")
+        artifact = self.document_generation.store.get_artifact(str(artifact_id))
+        if artifact is None:
+            raise KeyError("artifact not found")
+        order = self.document_generation.store.get_work_order(artifact.work_order_id)
+        if order is None:
+            raise KeyError("work order not found")
+        self.document_generation.require_work_order_capability(
+            ctx, order, "run_deterministic_work_order",
+        )
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("artifact conversion requires a knowledge-base work order")
+        if not ctx.has_kb_permission(order.knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+        normalized_target = str(target_format or "").strip().lower().lstrip(".")
+        if normalized_target not in {"pdf", "pptx"}:
+            raise ValueError("document artifact conversion supports only pdf or pptx")
+        job = job_store.create_job(
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+            session_id=session_id or ctx.session_id or f"document-generation:{order.work_order_id}",
+            client_request_id=client_request_id or f"artifact-conversion:{artifact.artifact_id}:{normalized_target}",
+            operation="convert_artifact",
+            work_order_id=order.work_order_id,
+            payload={
+                "work_order_id": order.work_order_id,
+                "knowledge_base_name": order.knowledge_base_name,
+                "source_artifact_id": artifact.artifact_id,
+                "target_format": normalized_target,
+            },
+        )
+        return job
+
     def resume_knowledge_base_document_generation_run(
         self,
         ctx: RequestContext,
@@ -1293,12 +1458,16 @@ class AppPipeline:
             raise PermissionError("knowledge base write permission is required")
         snapshot = self.document_generation.resolve_source_snapshot(order)
         scope_review = self.document_generation.get_icd_scope_review(ctx, work_order_id)
+        retriever_kwargs = {
+            "source_set_snapshot_id": snapshot.source_set_snapshot_id,
+            "icd_scope_review": scope_review,
+        }
+        retriever_kwargs.update(self._document_retriever_scope_kwargs(order))
         retrieve = self._knowledge_base_retriever(
             ctx,
             order.knowledge_base_name,
             list(snapshot.source_names),
-            source_set_snapshot_id=snapshot.source_set_snapshot_id,
-            icd_scope_review=scope_review,
+            **retriever_kwargs,
         )
         return self.document_generation.resume_internal_harness(
             ctx,
@@ -1341,12 +1510,16 @@ class AppPipeline:
             return job.job_id
         snapshot = self.document_generation.resolve_source_snapshot(order)
         scope_review = self.document_generation.get_icd_scope_review(ctx, work_order_id)
+        retriever_kwargs = {
+            "source_set_snapshot_id": snapshot.source_set_snapshot_id,
+            "icd_scope_review": scope_review,
+        }
+        retriever_kwargs.update(self._document_retriever_scope_kwargs(order))
         retrieve = self._knowledge_base_retriever(
             ctx,
             order.knowledge_base_name,
             list(snapshot.source_names),
-            source_set_snapshot_id=snapshot.source_set_snapshot_id,
-            icd_scope_review=scope_review,
+            **retriever_kwargs,
         )
         return self.document_generation.worker.submit(
             work_order_id,
@@ -1424,10 +1597,46 @@ class AppPipeline:
         *,
         source_set_snapshot_id: str = "",
         icd_scope_review: Any | None = None,
+        source_scope: str = "knowledge_base_only",
+        attachment_refs: list[Any] | None = None,
+        attachment_retrieval: Any | None = None,
     ):
         if not ctx.has_kb_permission(kb_name, "read"):
             raise PermissionError("knowledge base read permission is required")
         frozen_source_names = list(dict.fromkeys(source_names))
+        frozen_attachment_refs = list(attachment_refs or [])
+        effective_source_scope = resolve_source_scope(
+            requested_scope=source_scope,
+            has_attachments=bool(frozen_attachment_refs),
+            is_general_chat=False,
+        )
+        attachment_ids = [
+            str(
+                ref.get("attachment_id", "")
+                if isinstance(ref, dict)
+                else getattr(ref, "attachment_id", "")
+            ).strip()
+            for ref in frozen_attachment_refs
+        ]
+        attachment_ids = list(dict.fromkeys(item for item in attachment_ids if item))
+        kb_provider = KnowledgeBaseEvidenceProvider(
+            self.backend,
+            top_k=src.settings.FINAL_TOP_K,
+            source_names=frozen_source_names,
+        )
+        attachment_provider = None
+        if frozen_attachment_refs and effective_source_scope in {
+            "attachment_only", "attachment_and_knowledge_base",
+        }:
+            attachment_provider = AttachmentEvidenceProvider(
+                retrieval=attachment_retrieval or AttachmentRetrievalService(),
+                refs_snapshot=frozen_attachment_refs,
+                top_k=src.settings.FINAL_TOP_K,
+            )
+        evidence_providers = [kb_provider]
+        if attachment_provider is not None:
+            evidence_providers.append(attachment_provider)
+        composite_provider = CompositeDocumentEvidenceProvider(evidence_providers)
         frozen_pin_evidence = self._frozen_icd_pin_evidence(
             kb_name,
             frozen_source_names,
@@ -1465,21 +1674,29 @@ class AppPipeline:
             # hard filter so a mis-routed query can reach frozen sources. The
             # frozen source_names scope stays, so the result never widens
             # beyond the frozen source set.
-            filters = {"source_names": frozen_source_names}
             if balanced_route:
-                filters["balanced_route"] = True
-            return list(
-                self.backend.retrieve(
-                    kb_name,
-                    query,
+                balanced_kb_provider = KnowledgeBaseEvidenceProvider(
+                    self.backend,
                     top_k=src.settings.FINAL_TOP_K,
-                    ctx=ctx,
-                    filters=filters,
+                    source_names=frozen_source_names,
+                    extra_filters={"balanced_route": True},
                 )
+                provider = CompositeDocumentEvidenceProvider(
+                    [balanced_kb_provider]
+                    + ([attachment_provider] if attachment_provider is not None else [])
+                )
+            else:
+                provider = composite_provider
+            return provider.retrieve(
+                query=query,
+                source_scope=effective_source_scope,
+                attachment_ids=attachment_ids,
+                kb_name=kb_name,
+                ctx=ctx,
             )
 
         specialized: dict[str, Callable[[str, Any], list]] = {}
-        if spreadsheet_tool is not None:
+        if spreadsheet_tool is not None and scope_allows_kb(effective_source_scope):
             def _tabular_retriever(query, requirement):
                 sp_evidences = spreadsheet_tool.run(
                     query,
@@ -1497,7 +1714,7 @@ class AppPipeline:
                     if evidence.source_name in frozen_source_names
                 ]
             specialized["tabular_lookup"] = _tabular_retriever
-        if circuit_tool is not None:
+        if circuit_tool is not None and scope_allows_kb(effective_source_scope):
             def _circuit_retriever(query, requirement):
                 circuit_evidences = circuit_tool.run(
                     query,
@@ -1517,7 +1734,7 @@ class AppPipeline:
                     if evidence.source_name in frozen_source_names
                 ]
             specialized["entity_lookup"] = _circuit_retriever
-        if circuit_tool is not None or frozen_pin_evidence:
+        if (circuit_tool is not None or frozen_pin_evidence) and scope_allows_kb(effective_source_scope):
             def _relationship_retriever(query, requirement):
                 circuit_evidences = (
                     _circuit_retriever(query, requirement)
@@ -1550,6 +1767,7 @@ class AppPipeline:
                 evidences,
                 requirement_id=requirement.requirement_id,
                 source_set_snapshot_id=source_set_snapshot_id,
+                attachment_ids=attachment_ids,
             )
 
         return retrieve
@@ -1676,6 +1894,23 @@ class AppPipeline:
                 },
             ))
         return frozen
+
+    @staticmethod
+    def _document_retriever_scope_kwargs(order: Any) -> dict[str, Any]:
+        """Return only persisted source-scope inputs for retriever rebuilds."""
+        kwargs: dict[str, Any] = {}
+        raw_scope = getattr(order, "source_scope_snapshot", "")
+        source_scope = raw_scope.strip() if isinstance(raw_scope, str) else ""
+        raw_refs = getattr(order, "attachment_refs_snapshot", None)
+        attachment_refs = list(raw_refs) if isinstance(raw_refs, (list, tuple)) else []
+        # Empty values identify pre-bridge work orders.  Omitting them keeps
+        # compatibility with injected/legacy order objects and lets the
+        # retriever use its knowledge-base-only default.
+        if source_scope:
+            kwargs["source_scope"] = source_scope
+        if attachment_refs:
+            kwargs["attachment_refs"] = attachment_refs
+        return kwargs
 
     def _project_retriever(self, ctx: RequestContext, project_id: str, snapshot_id: str):
         tenant_id = ctx.tenant_id or "default"
@@ -1914,12 +2149,16 @@ class AppPipeline:
             return result
         snapshot = self.document_generation.resolve_source_snapshot(order)
         scope_review = self.document_generation.get_icd_scope_review(ctx, order.work_order_id)
+        retriever_kwargs = {
+            "source_set_snapshot_id": snapshot.source_set_snapshot_id,
+            "icd_scope_review": scope_review,
+        }
+        retriever_kwargs.update(self._document_retriever_scope_kwargs(order))
         retrieve = self._knowledge_base_retriever(
             ctx,
             order.knowledge_base_name,
             list(snapshot.source_names),
-            source_set_snapshot_id=snapshot.source_set_snapshot_id,
-            icd_scope_review=scope_review,
+            **retriever_kwargs,
         )
         return self.document_generation.resolve_agent_human_decision(
             ctx,
@@ -2033,6 +2272,8 @@ class AppPipeline:
             {
                 "artifact_id": artifact.artifact_id,
                 "stage": artifact.stage,
+                "output_format": artifact.output_format or order.target_format,
+                "parent_artifact_id": artifact.parent_artifact_id,
                 "validation_report_id": artifact.validation_report_id,
                 "validity_status": artifact.validity_status,
                 "policy_status": artifact.policy_status,

@@ -15,7 +15,15 @@ class SpreadsheetIndexService:
     Spreadsheet data is a sibling processing product to RAG chunks. Keep its
     physical store scoped by department and KB so Excel evidence never lands in
     a shared table-index database.
+
+    ``storage_root`` injects an alternative physical root (used by the chat
+    attachment domain to keep session-scoped indexes out of the KB storage
+    tree, mirroring ``CircuitStore(root=...)``). It changes only WHERE index
+    files live — parser and query semantics stay shared.
     """
+
+    def __init__(self, storage_root: str | None = None):
+        self.storage_root = storage_root or src.settings.STORAGE_DIR
 
     def parse_and_index(
         self,
@@ -52,7 +60,7 @@ class SpreadsheetIndexService:
 
     def kb_index_path(self, department_id: str | int | None, kb_name: str, create: bool = True) -> str:
         return safe_child_path(
-            src.settings.STORAGE_DIR,
+            self.storage_root,
             "table_indexes",
             "departments",
             _safe_scope_part(department_id),

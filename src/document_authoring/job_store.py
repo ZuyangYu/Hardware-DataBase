@@ -20,7 +20,7 @@ import src.settings
 from src.result_exports.models import ResourceLock
 
 
-JOB_OPERATIONS = frozenset({"generate_work_order", "resume_work_order"})
+JOB_OPERATIONS = frozenset({"generate_work_order", "resume_work_order", "convert_artifact"})
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled", "dead_letter"})
 RESOURCE_LOCK_TYPES = frozenset({"project", "knowledge_base", "template", "work_order"})
 
@@ -845,6 +845,98 @@ class DocumentAuthoringJobStore:
                 (str(reason or "cancelled")[:1000], _iso(now), _iso(now), job_id),
             )
         return self.get(job_id)
+
+    def cancel_session(self, *, session_id: str | int, reason: str = "cancelled") -> list[str]:
+        """Revoke all queued/running jobs for one deleted chat session."""
+        session = str(session_id or "").strip()
+        if not session:
+            return []
+        now = _iso()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM document_authoring_jobs WHERE session_id = ?",
+                    (session,),
+                ).fetchall()
+                work_order_ids = sorted({
+                    str(row["work_order_id"]) for row in rows
+                    if row["work_order_id"] not in (None, "")
+                })
+                for row in rows:
+                    if row["status"] not in {"queued", "running"}:
+                        continue
+                    self._release_job_resource_lock_in_connection(conn, row)
+                    conn.execute(
+                        "DELETE FROM document_resource_locks WHERE owner_id LIKE ?",
+                        (f"document-job:{row['job_id']}:%",),
+                    )
+                    conn.execute(
+                        """UPDATE document_authoring_jobs
+                           SET status = 'cancelled', last_error = ?, updated_at = ?,
+                               completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
+                           WHERE job_id = ?""",
+                        (str(reason or "cancelled")[:1000], now, now, row["job_id"]),
+                    )
+                    conn.execute(
+                        """UPDATE document_authoring_job_outbox
+                           SET status = 'cancelled', last_error = ?, dispatched_at = ?
+                           WHERE job_id = ?""",
+                        (str(reason or "cancelled")[:1000], now, row["job_id"]),
+                    )
+                conn.execute("COMMIT")
+                return work_order_ids
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def cleanup_session(self, *, session_id: str | int) -> list[str]:
+        """Delete durable authoring jobs owned by a chat session.
+
+        A deleted chat session must not leave a queued or leased job able to
+        resume later.  Return the associated work-order ids so the authoring
+        store can reclaim the operational graph state and artifact files in
+        its own database.  The transaction is intentionally idempotent.
+        """
+        session = str(session_id or "").strip()
+        if not session:
+            return []
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    """SELECT * FROM document_authoring_jobs
+                       WHERE session_id = ?""",
+                    (session,),
+                ).fetchall()
+                work_order_ids = sorted({
+                    str(row["work_order_id"]) for row in rows
+                    if row["work_order_id"] not in (None, "")
+                })
+                for row in rows:
+                    self._release_job_resource_lock_in_connection(conn, row)
+                    # Repair legacy rows whose persisted fencing token no
+                    # longer matches the lock row before deleting the job.
+                    conn.execute(
+                        "DELETE FROM document_resource_locks WHERE owner_id LIKE ?",
+                        (f"document-job:{row['job_id']}:%",),
+                    )
+                if rows:
+                    conn.execute(
+                        "DELETE FROM document_authoring_job_outbox WHERE job_id IN ("
+                        + ",".join("?" for _ in rows)
+                        + ")",
+                        [row["job_id"] for row in rows],
+                    )
+                    conn.execute(
+                        "DELETE FROM document_authoring_jobs WHERE session_id = ?",
+                        (session,),
+                    )
+                conn.execute("COMMIT")
+                return work_order_ids
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def list_pending_outbox(self, limit: int = 32) -> list[dict[str, Any]]:
         with closing(self._connect()) as conn:

@@ -11,6 +11,7 @@ from contextlib import closing
 from typing import Any
 
 from src.agents.schemas import Evidence
+from src.agents.scopes import KnowledgeBaseSpreadsheetScopeResolver
 from src.core.query_tokens import tokenize_hardware_query
 from src.pipelines.document_rag.schemas import RequestContext
 from src.services.kb_scope import kb_scope_from_context
@@ -48,6 +49,31 @@ _DOMAIN_QUERY_TERMS = (
 _CJK_STOP_CHARS = frozenset("的是什么有哪些列出如何这该项目前中与和及到从为将或能否可以是否请问多少几片了用名")
 _CJK_NOISY_NGRAMS = frozenset({"电电", "围使", "存容", "源网", "络名"})
 _BOILERPLATE_MARKERS = ("填写说明", "template instructions", "封面", "cover", "模板变更历史")
+
+
+def _knowledge_base_scope(
+    service: SpreadsheetIndexService,
+    kb_name: str,
+    ctx: RequestContext | None,
+    action: str,
+):
+    """Resolve the KB namespace once before any spreadsheet query.
+
+    ``kb_scope_from_context`` retains the existing request-context/department
+    guard; the dedicated resolver then produces the typed scope consumed by
+    every spreadsheet entry point.  This keeps KB and attachment tools on the
+    same domain service while making it impossible for a caller to substitute
+    an unscoped database path.
+    """
+    context_scope = kb_scope_from_context(kb_name, ctx).require_department(action)
+    return KnowledgeBaseSpreadsheetScopeResolver(
+        lambda department_id, name: service.db_path(
+            department_id, name, create=False
+        )
+    ).resolve(
+        kb_name=context_scope.kb_name,
+        department_id=context_scope.department_id,
+    )
 
 
 def _tokens(query: str) -> list[str]:
@@ -140,8 +166,10 @@ def _like_clauses(columns: list[str], tokens: list[str]) -> tuple[str, list[str]
 
 
 def _semantic_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int) -> list[Evidence]:
-    scope = kb_scope_from_context(rt.kb_name, rt.ctx).require_department("search spreadsheet semantic rows in")
-    db_path = service.db_path(scope.department_id, scope.kb_name, create=False)
+    scope = _knowledge_base_scope(
+        service, rt.kb_name, rt.ctx, "search spreadsheet semantic rows in"
+    )
+    db_path = scope.db_path
     if not os.path.exists(db_path):
         return []
     tokens = _tokens(query)
@@ -198,8 +226,10 @@ def _semantic_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int)
 
 
 def _cell_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int) -> list[Evidence]:
-    scope = kb_scope_from_context(rt.kb_name, rt.ctx).require_department("search spreadsheet cells in")
-    db_path = service.db_path(scope.department_id, scope.kb_name, create=False)
+    scope = _knowledge_base_scope(
+        service, rt.kb_name, rt.ctx, "search spreadsheet cells in"
+    )
+    db_path = scope.db_path
     if not os.path.exists(db_path):
         return []
     tokens = _tokens(query)
@@ -367,8 +397,13 @@ class SpreadsheetSemanticTool:
         top_k: int = 5,
         filters: dict | None = None,
     ) -> list[Evidence]:
-        scope = kb_scope_from_context(kb_name, ctx).require_department("search spreadsheet semantic rows in")
-        db_path = self.spreadsheet_service.db_path(scope.department_id, scope.kb_name, create=False)
+        scope = _knowledge_base_scope(
+            self.spreadsheet_service,
+            kb_name,
+            ctx,
+            "search spreadsheet semantic rows in",
+        )
+        db_path = scope.db_path
         if not os.path.exists(db_path):
             return []
         record_id = int((filters or {}).get("record_id") or 0)
@@ -466,8 +501,13 @@ class SpreadsheetCellTool:
         top_k: int = 5,
         filters: dict | None = None,
     ) -> list[Evidence]:
-        scope = kb_scope_from_context(kb_name, ctx).require_department("search spreadsheet cells in")
-        db_path = self.spreadsheet_service.db_path(scope.department_id, scope.kb_name, create=False)
+        scope = _knowledge_base_scope(
+            self.spreadsheet_service,
+            kb_name,
+            ctx,
+            "search spreadsheet cells in",
+        )
+        db_path = scope.db_path
         if not os.path.exists(db_path):
             return []
         record_id = int((filters or {}).get("record_id") or 0)
@@ -548,7 +588,7 @@ def _load_sql_registry(db_path: str) -> list[dict]:
         try:
             rows = conn.execute(
                 """
-                SELECT r.table_name, r.sheet_name, r.column_count, r.row_count,
+                SELECT r.record_id, r.table_name, r.sheet_name, r.column_count, r.row_count,
                        r.schema_json, d.document_name
                 FROM sql_table_registry r
                 JOIN table_documents d ON d.record_id = r.record_id
@@ -565,6 +605,7 @@ def _load_sql_registry(db_path: str) -> list[dict]:
             schema = {}
         registry.append(
             {
+                "record_id": int(row["record_id"]),
                 "table_name": row["table_name"],
                 "sheet_name": row["sheet_name"],
                 "document_name": row["document_name"],
@@ -685,8 +726,13 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
         """列出可执行 SQL 的物化表 schema(表名/中文表头/类型/样本值), 写 SQL 前必查。"""
         from src.agents.tools.runtime import timed_tool_call
 
-        scope = kb_scope_from_context(rt.kb_name, rt.ctx).require_department("lookup spreadsheet sql schema in")
-        db_path = spreadsheet_service.db_path(scope.department_id, scope.kb_name, create=False)
+        scope = _knowledge_base_scope(
+            spreadsheet_service,
+            rt.kb_name,
+            rt.ctx,
+            "lookup spreadsheet sql schema in",
+        )
+        db_path = scope.db_path
 
         def _run() -> list[Evidence]:
             registry = _load_sql_registry(db_path)
@@ -737,8 +783,13 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
         """
         from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
-        scope = kb_scope_from_context(rt.kb_name, rt.ctx).require_department("query spreadsheet sql in")
-        db_path = spreadsheet_service.db_path(scope.department_id, scope.kb_name, create=False)
+        scope = _knowledge_base_scope(
+            spreadsheet_service,
+            rt.kb_name,
+            rt.ctx,
+            "query spreadsheet sql in",
+        )
+        db_path = scope.db_path
 
         def _run() -> list[Evidence]:
             registry = _load_sql_registry(db_path)
@@ -796,4 +847,3 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
         return format_tool_result(rt, adds_nothing, items)
 
     return spreadsheet_schema_lookup, spreadsheet_sql_query
-

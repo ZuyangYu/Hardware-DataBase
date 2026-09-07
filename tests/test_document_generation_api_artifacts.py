@@ -119,6 +119,22 @@ class DocGenArtifactApiTests(unittest.TestCase):
             r.headers.get("content-type", ""),
         )
 
+    def test_conversion_endpoint_queues_pdf_artifact_job(self):
+        self.stub.submit_document_artifact_conversion = lambda ctx, artifact_id, *, target_format: SimpleNamespace(
+            job_id="conversion-job-1",
+            operation="convert_artifact",
+            status="queued",
+        )
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/artifacts/artifact-native/convert?kb=shared",
+            headers=self._auth(t),
+            json={"target_format": "pdf"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["job_id"], "conversion-job-1")
+        self.assertEqual(r.json()["target_format"], "pdf")
+
     def test_chat_tasks_project_current_status_and_artifacts(self):
         store = DocumentAuthoringJobStore(self.db_path)
         self.stub.document_job_store = store

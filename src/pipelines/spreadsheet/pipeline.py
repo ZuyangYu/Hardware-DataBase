@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass, field
 
 from src.pipelines.spreadsheet.table_store import TableIndexStats, TableIndexStore
+from src.pipelines.spreadsheet.xlsx_parser import XlsxParseLimits
 from src.services.document_routing import TABLE_STATUS_ARCHIVED, TABLE_STATUS_INDEXED
 
 
@@ -16,6 +17,7 @@ class SpreadsheetIndexRequest:
     local_path: str
     content_hash: str
     kb_id: int = 0
+    parse_limits: XlsxParseLimits | None = None
 
 
 @dataclass
@@ -39,12 +41,12 @@ class SpreadsheetPipeline:
 
     def parse_and_index(self, request: SpreadsheetIndexRequest, progress_callback=None) -> SpreadsheetIndexResult:
         extension = os.path.splitext(request.document_name.lower())[1]
-        if extension != ".xlsx":
+        if extension not in {".xlsx", ".xlsm"}:
             return SpreadsheetIndexResult(
                 ok=False,
                 status=self.STATUS_UNSUPPORTED,
-                message=f"{request.document_name}: unsupported spreadsheet format; please upload .xlsx.",
-                warnings=["当前仅支持 .xlsx 结构化解析，请将 .xls 另存为 .xlsx 后重新上传。"],
+                message=f"{request.document_name}: unsupported spreadsheet format; please upload .xlsx or .xlsm.",
+                warnings=["当前仅支持 .xlsx/.xlsm 结构化解析，请将 .xls 另存为 .xlsx 后重新上传。"],
             )
 
         if progress_callback:
@@ -59,6 +61,7 @@ class SpreadsheetPipeline:
             file_path=request.file_path,
             local_path=request.local_path,
             content_hash=request.content_hash,
+            parse_limits=request.parse_limits,
             progress_callback=progress_callback,
         )
         warning_suffix = f" warnings={len(stats.warnings)}" if stats.warnings else ""

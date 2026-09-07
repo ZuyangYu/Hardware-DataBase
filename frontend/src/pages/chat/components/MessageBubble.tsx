@@ -448,6 +448,47 @@ function MessageBubble({
               ) : (
                 <div className={CHAT_PLAIN_ANSWER_CLASS}>{msg.content}</div>
               )}
+              {msg.attachments && msg.attachments.length > 0 && (
+                <div className="flex flex-wrap items-center justify-end gap-[6px]">
+                  {msg.attachments.map((attachment) => {
+                    const deleted = Boolean(attachment.deleted);
+                    const stateLabel =
+                      deleted
+                        ? '已删除'
+                        : attachment.parse_status === 'ready'
+                          ? '已就绪'
+                          : attachment.parse_status === 'degraded'
+                            ? '部分可读'
+                            : attachment.parse_status === 'failed'
+                              ? '解析失败'
+                              : '解析中…';
+                    return (
+                      <span
+                        key={attachment.attachment_id}
+                        title={`${attachment.filename} · ${stateLabel}`}
+                        className="inline-flex min-w-0 items-center gap-[6px] rounded-full border border-[#e3e7f1] bg-[#fafbfc] px-[9px] py-[2px] text-[11px] text-[#464c5e]"
+                      >
+                        <span className="min-w-0 max-w-[200px] truncate">
+                          {attachment.filename}
+                          {deleted ? '（已删除）' : ''}
+                        </span>
+                        <span
+                          className={cn(
+                            'shrink-0 text-[10px]',
+                            deleted || attachment.parse_status === 'failed'
+                              ? 'text-[#b45309]'
+                              : attachment.parse_status === 'ready'
+                                ? 'text-[#166534]'
+                                : 'text-[#858b9c]',
+                          )}
+                        >
+                          {stateLabel}
+                        </span>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
               {msg.role === 'user' && msg.id > 0 && !msg.redacted && (
                 <div className="flex items-center justify-end gap-[10px]">
                   {onEditMessage && (

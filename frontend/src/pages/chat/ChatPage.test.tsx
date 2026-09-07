@@ -3,8 +3,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 
 import type { AuthSession } from '../../auth';
-import type { DocumentContext, KbView } from '../../api/types';
-import ChatPage, { isDocumentAuthoringChatEnabled } from './ChatPage';
+import type { AttachmentView, DocumentContext, KbView } from '../../api/types';
+import ChatPage, {
+  isChatAttachmentsUiEnabled,
+  isDocumentAuthoringChatEnabled,
+  isTemplateGenerationChatIntent,
+  listTemplateCandidateAttachments,
+  pickAutoTemplateAttachment,
+  resolveTemplateAttachmentRoute,
+} from './ChatPage';
 import Composer from './components/Composer';
 
 const auth: AuthSession = {
@@ -72,6 +79,65 @@ describe('isDocumentAuthoringChatEnabled flag resolution (opt-out semantics)', (
     expect(isDocumentAuthoringChatEnabled(false)).toBe(false);
     vi.stubEnv('VITE_AGENT_DOCUMENT_TOOLS_ENABLED', 'false');
     expect(isDocumentAuthoringChatEnabled(true)).toBe(true);
+  });
+});
+
+describe('isChatAttachmentsUiEnabled flag resolution (opt-out semantics)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    delete (import.meta.env as Record<string, unknown>).VITE_CHAT_ATTACHMENTS_ENABLED;
+  });
+
+  it('defaults to enabled when the attachment env var is absent', () => {
+    expect(isChatAttachmentsUiEnabled()).toBe(true);
+  });
+
+  it('allows an explicit false value to disable the attachment UI', () => {
+    vi.stubEnv('VITE_CHAT_ATTACHMENTS_ENABLED', 'false');
+    expect(isChatAttachmentsUiEnabled()).toBe(false);
+  });
+});
+
+describe('natural-language template generation routing', () => {
+  const readyDocx: AttachmentView = {
+    attachment_id: 'att-docx',
+    asset_id: 'asset-docx',
+    filename: 'icd-template.docx',
+    media_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    extension: '.docx',
+    size_bytes: 10,
+    sha256: 'hash',
+    usage_hint: 'reference',
+    status: 'active',
+    parse_status: 'ready',
+    created_at: new Date().toISOString(),
+  };
+
+  it('recognizes template fill commands but not ordinary document questions', () => {
+    expect(isTemplateGenerationChatIntent('参考模板，根据知识库生成新的 ICD 文档')).toBe(true);
+    expect(isTemplateGenerationChatIntent('将模板按照知识库内容回填')).toBe(true);
+    expect(isTemplateGenerationChatIntent('参考模板，比较知识库和附件中的 HSI 文档差异')).toBe(false);
+    expect(isTemplateGenerationChatIntent('这个 PDF 里有哪些接口？')).toBe(false);
+  });
+
+  it('auto-selects one ready office attachment and stays fail-closed for ambiguity', () => {
+    expect(pickAutoTemplateAttachment('参考模板生成 ICD 文档', [readyDocx])).toEqual(readyDocx);
+    const candidates = listTemplateCandidateAttachments('参考模板生成 ICD 文档', [
+      readyDocx,
+      { ...readyDocx, attachment_id: 'att-other', filename: 'other.xlsx', extension: '.xlsx' },
+    ]);
+    expect(candidates).toHaveLength(2);
+    expect(pickAutoTemplateAttachment('参考模板生成 ICD 文档', candidates)).toBeNull();
+    expect(resolveTemplateAttachmentRoute('参考模板生成 ICD 文档', candidates)).toMatchObject({
+      requiresSelection: true,
+      requiresTemplate: false,
+      autoTemplate: null,
+    });
+    expect(resolveTemplateAttachmentRoute('参考模板生成 ICD 文档', candidates, true)).toMatchObject({
+      requiresSelection: false,
+      requiresTemplate: false,
+      autoTemplate: null,
+    });
   });
 });
 
@@ -164,5 +230,58 @@ describe('Composer document generation toggle', () => {
 
     expect(markup).toContain('文档生成模式');
     expect(markup).not.toMatch(/id="chat-document-flow-toggle"[^>]*checked/);
+  });
+});
+
+describe('Composer attachment status', () => {
+  it('shows the failure reason and retry affordance for a failed attachment', () => {
+    const failedAttachment: AttachmentView = {
+      attachment_id: 'att-failed',
+      asset_id: 'asset-failed',
+      filename: 'broken.pdf',
+      media_type: 'application/pdf',
+      extension: '.pdf',
+      size_bytes: 128,
+      sha256: 'hash',
+      usage_hint: 'reference',
+      status: 'active',
+      parse_status: 'failed',
+      error_code: 'parse_failed',
+      error_message: 'PDF 内容无法读取',
+      created_at: '2026-09-04T00:00:00Z',
+    };
+    const markup = renderComposer({
+      attachmentsEnabled: true,
+      draftAttachments: [failedAttachment],
+      onRetryAttachment: () => undefined,
+    });
+
+    expect(markup).toContain('PDF 内容无法读取');
+    expect(markup).toContain('重试解析');
+  });
+
+  it('offers template conversion only for an eligible ready attachment with write access', () => {
+    const attachment: AttachmentView = {
+      attachment_id: 'att-template',
+      asset_id: 'asset-template',
+      filename: 'review.xlsx',
+      media_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      extension: '.xlsx',
+      size_bytes: 128,
+      sha256: 'hash',
+      usage_hint: 'reference',
+      status: 'active',
+      parse_status: 'ready',
+      created_at: '2026-09-04T00:00:00Z',
+    };
+    const markup = renderComposer({
+      attachmentsEnabled: true,
+      documentAuthoringEnabled: true,
+      canUploadDocumentTemplate: true,
+      draftAttachments: [attachment],
+      onUseAsTemplate: () => undefined,
+    });
+
+    expect(markup).toContain('作为模板');
   });
 });

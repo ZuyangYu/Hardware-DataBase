@@ -98,7 +98,7 @@ export default function DocumentStatusCard({ card, refreshing = false, onRefresh
               onClick={() => void downloadDocumentArtifact(card, artifact)}
               className="rounded-[8px] border border-[#e3e7f1] bg-white px-[8px] py-[2px] text-[11px] font-medium text-[#0b6cf5] transition-colors hover:border-[#c9d2e4] hover:bg-[#f4f8ff]"
             >
-              下载 {artifact.stage}
+              下载 {artifact.output_format ? `${artifact.stage}（${artifact.output_format.toUpperCase()}）` : artifact.stage}
             </button>
           ))}
         </div>

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 import src.settings
@@ -16,8 +16,10 @@ from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import (
     AgentHumanDecisionRequest,
+    AnalyzeTemplateFromAttachmentRequest,
     AnswerGenerationSessionRequest,
     ConfirmTemplateRequest,
+    ConvertDocumentArtifactRequest,
     CreateGenerationSessionRequest,
     CreateWorkOrderRequest,
     DeleteDocumentWorkOrderRequest,
@@ -44,6 +46,8 @@ _DOCUMENT_DOWNLOAD_MEDIA_TYPES = {
     "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
     "markdown": "text/markdown; charset=utf-8",
     "md": "text/markdown; charset=utf-8",
+    "pdf": "application/pdf",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
 
@@ -85,7 +89,7 @@ def _analysis_view(analysis) -> TemplateAnalysisView:
             )
             for s in analysis.suggestions
         ],
-        reason_codes=list(decision.reason_codes) if decision is not None else [],
+        reason_codes=list(getattr(decision, "reason_codes", []) or []) if decision is not None else [],
     )
 
 
@@ -160,6 +164,92 @@ def analyze_template(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _analysis_view(analysis).model_copy(update={"auto_activated": auto_activated})
+
+
+@router.post(
+    "/document-generation/templates/analyze-from-attachment",
+    response_model=TemplateAnalysisView,
+)
+def analyze_template_from_attachment(
+    body: AnalyzeTemplateFromAttachmentRequest | None = Body(default=None),
+    kb: str | None = None,
+    session_id: int | None = None,
+    attachment_id: str | None = None,
+    template_name: str | None = None,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Create a template from a session attachment without a browser re-upload.
+
+    Permissions are intentionally stricter than plain attachments (design
+    §13.4): the target KB write permission is re-checked here, independent of
+    the session-scope ACL that allowed the upload. The legacy multipart
+    analyze endpoint keeps working unchanged.
+    """
+    if body is not None:
+        kb = body.kb
+        session_id = body.session_id
+        attachment_id = body.attachment_id
+        template_name = body.template_name
+    if not kb or session_id is None or not attachment_id or not template_name:
+        raise HTTPException(status_code=422, detail="kb, session_id, attachment_id and template_name are required")
+    if not src.settings.CHAT_ATTACHMENTS_ENABLED:
+        raise HTTPException(status_code=404, detail="chat attachments are not enabled")
+    _write_ctx(user, auth, kb)
+    from src.attachments.models import AttachmentError, AttachmentNotFound
+    from src.attachments.service import AttachmentService
+
+    service = AttachmentService()
+    try:
+        record, content = service.read_source_bytes(
+            attachment_id=attachment_id, session_id=session_id, user_id=user.id
+        )
+    except AttachmentNotFound as exc:
+        raise HTTPException(status_code=404, detail="attachment not found") from exc
+    except AttachmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    filename = record.filename
+    try:
+        analysis = pipeline.analyze_document_template(
+            _write_ctx(user, auth, kb),
+            filename=filename,
+            content=content,
+            template_name=template_name,
+            origin_source_type="chat_attachment",
+            origin_attachment_id=record.attachment_id,
+            origin_session_id=record.session_id,
+            origin_content_hash=record.sha256,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Attachment conversion must have exactly the same activation semantics as
+    # the regular template-upload endpoint.  Returning a draft context here
+    # makes the following chat generation request fail at schema validation;
+    # safe, auto-accepted mappings are therefore activated immediately while
+    # ambiguous mappings remain a human-review gate.
+    auto_activated = False
+    decision = getattr(analysis, "activation_decision", None)
+    if (
+        src.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES
+        and analysis.status == "ready_for_confirmation"
+        and decision is not None
+        and decision.status == "auto_accepted"
+    ):
+        try:
+            pipeline.confirm_document_template(
+                _write_ctx(user, auth, kb),
+                analysis_id=analysis.analysis_id,
+                display_name=template_name,
+            )
+            auto_activated = True
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _analysis_view(analysis).model_copy(update={"auto_activated": auto_activated})
 
 
@@ -437,6 +527,7 @@ def _safe_chat_task_status(status: dict) -> dict:
             {
                 "artifact_id": str(item.get("artifact_id")),
                 "stage": str(item.get("stage")),
+                "output_format": str(item.get("output_format") or ""),
                 # The generic Artifact namespace is a compatibility adapter
                 # over the legacy document store.  Keep the old fields above
                 # so existing clients remain unchanged.
@@ -473,6 +564,7 @@ def list_chat_document_tasks(
         session_id=session_id,
     )
     tasks: list[dict] = []
+    seen_work_orders: set[str] = set()
     for job in jobs:
         persisted_session_id = str(job.session_id or "").strip()
         if not persisted_session_id.isdecimal():
@@ -485,6 +577,12 @@ def list_chat_document_tasks(
         kb_name = str(job.payload.get("knowledge_base_name") or "").strip()
         if not work_order_id or not kb_name:
             continue
+        # Generation and its derived PDF/PPTX conversion share one work order.
+        # Jobs are returned newest-first, so expose one reconciled card instead
+        # of duplicating the same task in the chat stream.
+        if work_order_id in seen_work_orders:
+            continue
+        seen_work_orders.add(work_order_id)
         try:
             ctx = _ctx(user, auth, kb_name)
         except HTTPException as exc:
@@ -707,6 +805,38 @@ def artifact_preview(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/document-generation/artifacts/{artifact_id}/convert")
+def artifact_convert(
+    artifact_id: str,
+    kb: str,
+    payload: ConvertDocumentArtifactRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Queue PDF/PPTX conversion of an already generated template artifact."""
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        job = pipeline.submit_document_artifact_conversion(
+            ctx,
+            artifact_id,
+            target_format=payload.target_format,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "job_id": job.job_id,
+        "operation": job.operation,
+        "status": job.status,
+        "source_artifact_id": artifact_id,
+        "target_format": payload.target_format,
+    }
+
+
 @router.get("/document-generation/artifacts/{artifact_id}/download")
 def artifact_download(
     artifact_id: str,
@@ -731,7 +861,11 @@ def artifact_download(
         artifact = get_artifact(artifact_id)
         if artifact is not None and callable(get_work_order):
             order = get_work_order(getattr(artifact, "work_order_id", ""))
-            target_format = str(getattr(order, "target_format", "") or "bin").strip().lower()
+            target_format = str(
+                getattr(artifact, "output_format", None)
+                or getattr(order, "target_format", "")
+                or "bin"
+            ).strip().lower()
     target_format = re.sub(r"[^a-z0-9]+", "", target_format) or "bin"
     safe_artifact_id = re.sub(r"[^A-Za-z0-9._-]+", "-", artifact_id).strip(".-") or "artifact"
     filename = f"document-{safe_artifact_id}.{target_format}"

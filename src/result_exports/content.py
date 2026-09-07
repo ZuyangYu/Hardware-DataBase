@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from src.core.conversation import ChatTurn, GENERAL_CHAT_KB_NAME
+from src.result_exports.markdown import parse_markdown_blocks
 from src.result_exports.models import ResultEnvelope
 
 
@@ -134,6 +135,10 @@ def envelope_from_turn(turn: ChatTurn, *, title: str | None = None, include_cita
         footer=turn.footer,
         tables=_extract_tables(summary),
         citations=_extract_citations(summary) if include_citations else [],
+        # Persist the parsed answer structure in the immutable snapshot.  The
+        # renderers still derive blocks on demand for older snapshots created
+        # before this field was introduced.
+        blocks=parse_markdown_blocks(turn.answer),
         metadata={
             "knowledge_base": "" if turn.kb_name == GENERAL_CHAT_KB_NAME else turn.kb_name,
             "session_id": str(turn.session_id),

@@ -40,6 +40,8 @@ _LEGACY_MIME_TYPES = {
     "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
     "markdown": "text/markdown; charset=utf-8",
     "md": "text/markdown; charset=utf-8",
+    "pdf": "application/pdf",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
 
@@ -292,7 +294,11 @@ def _legacy_artifact_payload(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (KeyError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="artifact file is unavailable") from exc
-    target_format = str(getattr(order, "target_format", "bin") or "bin").strip().lower()
+    target_format = str(
+        getattr(artifact, "output_format", None)
+        or getattr(order, "target_format", "bin")
+        or "bin"
+    ).strip().lower()
     extension = "md" if target_format == "markdown" else target_format
     safe_extension = re.sub(r"[^a-z0-9]+", "", extension) or "bin"
     safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", artifact_id).strip(".-") or "artifact"

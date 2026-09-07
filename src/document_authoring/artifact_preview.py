@@ -47,6 +47,73 @@ def preview_artifact(
         except (BadZipFile, KeyError, ElementTree.ParseError, ValueError) as exc:
             result["warnings"].append(_warning(exc))
             return result
+    if normalized_format == "pdf":
+        result = {"format": normalized_format, "truncated": False, "warnings": [], "pages": []}
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(BytesIO(content), strict=False)
+            max_pages = min(20, max(1, int(max_sheets) * 5))
+            if len(reader.pages) > max_pages:
+                result["truncated"] = True
+            for page in reader.pages[:max_pages]:
+                result["pages"].append({"text": (page.extract_text() or "")[:8_000]})
+            result["page_count"] = len(reader.pages)
+            return result
+        except Exception as exc:
+            result["warnings"].append(_warning(exc))
+            return result
+    if normalized_format == "pptx":
+        result = {"format": normalized_format, "truncated": False, "warnings": [], "slides": []}
+        try:
+            from pptx import Presentation
+
+            presentation = Presentation(BytesIO(content))
+            max_slides = min(20, max(1, int(max_sheets) * 5))
+            if len(presentation.slides) > max_slides:
+                result["truncated"] = True
+            for slide in list(presentation.slides)[:max_slides]:
+                texts: list[str] = []
+                for shape in slide.shapes:
+                    if getattr(shape, "has_text_frame", False):
+                        texts.append(shape.text[:2_000])
+                result["slides"].append({"texts": texts})
+            result["slide_count"] = len(presentation.slides)
+            return result
+        except Exception as exc:
+            result["warnings"].append(_warning(exc))
+            return result
+    if normalized_format in {"markdown", "md"}:
+        text = content.decode("utf-8", errors="replace")
+        paragraphs: list[str] = []
+        tables: list[list[list[str]]] = []
+        lines = text.splitlines()
+        index = 0
+        while index < len(lines) and len(paragraphs) < max_paragraphs:
+            line = lines[index].strip()
+            if not line:
+                index += 1
+                continue
+            if line.startswith("|") and "|" in line[1:]:
+                rows: list[list[str]] = []
+                while index < len(lines) and lines[index].strip().startswith("|"):
+                    cells = [cell.strip() for cell in lines[index].strip().strip("|").split("|")]
+                    if cells and not all(set(cell) <= {"-", ":"} for cell in cells):
+                        rows.append(cells[:max_columns])
+                    index += 1
+                if rows:
+                    tables.append(rows[:max_rows])
+                continue
+            paragraphs.append(line[:8_000])
+            index += 1
+        result = {
+            "format": normalized_format,
+            "truncated": len(lines) > max_paragraphs,
+            "warnings": [],
+            "paragraphs": paragraphs,
+            "tables": tables,
+        }
+        return result
     return {
         "format": normalized_format or "unknown",
         "truncated": False,

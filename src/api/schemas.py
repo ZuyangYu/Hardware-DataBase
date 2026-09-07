@@ -213,6 +213,19 @@ class MemoryContextView(BaseModel):
     score: float | None = None
 
 
+class AttachmentSnapshotView(BaseModel):
+    """Frozen attachment view rendered with historical messages."""
+
+    attachment_id: str
+    filename: str
+    media_type: str = ""
+    usage_hint: str = "reference"
+    content_hash: str = ""
+    ordinal: int = 0
+    parse_status: str = "queued"
+    deleted: bool = False
+
+
 class MessageView(BaseModel):
     id: int
     session_id: int
@@ -225,6 +238,8 @@ class MessageView(BaseModel):
     redacted: bool = False
     memory_context: list[MemoryContextView] = Field(default_factory=list)
     document_context: DocumentContext | None = None
+    # Attachment snapshots of the owning turn (user messages only, optional).
+    attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
 
 
 class AddMessageRequest(BaseModel):
@@ -261,6 +276,17 @@ class CreateTurnRequest(BaseModel):
     # context is valid, False blocks it (and strips document tools from the
     # general toolset); None keeps the legacy intent-keyword fallback.
     document_flow: bool | None = None
+    # Chat attachments (design §5.1): session-scoped references; the server
+    # re-verifies ownership and parse state before persisting the turn.
+    attachment_ids: list[str] = Field(default_factory=list, max_length=20)
+    # "auto" expands deterministically server-side; explicit values may only
+    # narrow the resolved scope, never widen it.
+    source_scope: Literal[
+        "auto",
+        "attachment_only",
+        "knowledge_base_only",
+        "attachment_and_knowledge_base",
+    ] = "auto"
 
 
 class TurnView(BaseModel):
@@ -283,6 +309,8 @@ class TurnView(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     document_context: DocumentContext | None = None
+    source_scope: str = "auto"
+    attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
 
 
 class TurnStartResponse(BaseModel):
@@ -988,6 +1016,15 @@ class TemplateAnalysisView(BaseModel):
     auto_activated: bool = False
 
 
+class AnalyzeTemplateFromAttachmentRequest(BaseModel):
+    """JSON contract for converting an existing session attachment to a template."""
+
+    kb: str
+    session_id: int
+    attachment_id: str
+    template_name: str
+
+
 class TemplateReviewUnitView(TemplateUnitView):
     """Safe unit metadata used only by the human mapping-correction screen."""
 
@@ -1036,6 +1073,10 @@ class CreateWorkOrderRequest(BaseModel):
 
 class DeleteDocumentWorkOrderRequest(BaseModel):
     reason: str = ""
+
+
+class ConvertDocumentArtifactRequest(BaseModel):
+    target_format: Literal["pdf", "pptx"]
 
 
 class CreateGenerationSessionRequest(BaseModel):

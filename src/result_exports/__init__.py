@@ -13,7 +13,8 @@ from src.result_exports.models import (
     normalize_content_shape,
     normalize_export_format,
 )
-from src.result_exports.intent import ExportPlan, infer_export_intent
+from src.result_exports.intent import ExportPlan, infer_export_intent, is_template_generation_intent
+from src.result_exports.answer import normalize_export_answer, strip_export_fallback_markup
 
 __all__ = [
     "EXPORT_FORMATS",
@@ -26,6 +27,9 @@ __all__ = [
     "ResultSnapshot",
     "enabled_export_formats",
     "infer_export_intent",
+    "is_template_generation_intent",
+    "normalize_export_answer",
+    "strip_export_fallback_markup",
     "is_export_format_enabled",
     "normalize_content_shape",
     "normalize_export_format",

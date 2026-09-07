@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import Mock
 
@@ -13,9 +14,11 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from src.agents.runner import MultiSourceAgentRunner, resolve_document_flow_route
+from src.attachments.models import AttachmentRef
 from src.document_authoring.chat_context import build_document_context
 
 DOCUMENT_TOOL_NAMES = {
+    "generate_document_from_template",
     "get_document_template_analysis",
     "start_document_generation_session",
     "answer_clarification",
@@ -127,6 +130,16 @@ def test_question_intent_stays_with_general_agent(query):
     assert routed is False
 
 
+def test_comparison_intent_never_routes_to_document_flow_even_with_template_context():
+    routed, _ = resolve_document_flow_route(
+        document_context=_context(),
+        query="参考模板，比较知识库和附件中的 HSI 文档差异并整理成 PDF",
+        has_document_tools=True,
+    )
+
+    assert routed is False
+
+
 def test_route_requires_tools_fresh_context_and_query():
     routed, _ = resolve_document_flow_route(
         document_context=_context(), query="生成文档", has_document_tools=False
@@ -203,6 +216,64 @@ def test_routed_turn_assembles_document_only_agent(monkeypatch):
     assert len(routed_events) == 1
     # document_flow=None falls back to the intent-keyword regex here.
     assert routed_events[0]["payload"]["routed_by"] == "regex"
+    assert routed_events[0]["payload"]["intent"] == "template_generation"
+    assert routed_events[0]["payload"]["action"] == "generate"
+    assert routed_events[0]["payload"]["target"] == "template"
+    assert "template_targeted_command" in routed_events[0]["payload"]["reason_codes"]
+
+
+def test_direct_generation_intent_submits_artifact_without_calling_model(monkeypatch):
+    from src.agents import runner as runner_mod
+
+    class Pipeline:
+        def create_document_generation_session(self, *_args, **_kwargs):
+            return object()
+
+        def prepare_knowledge_base_document_generation(self, *_args, **_kwargs):
+            return {"stage": "ready", "work_order_id": "wo-direct"}
+
+    class DirectTool:
+        name = "generate_document_from_template"
+
+        def invoke(self, _args):
+            return json.dumps({
+                "status": "succeeded",
+                "message": "模板填充任务已提交，完成后可下载最终文档",
+                "work_order_id": "wo-direct",
+                "job_id": "job-direct",
+                "data": {"status": "queued", "stage": "ready", "target_format": "xlsx"},
+            }, ensure_ascii=False)
+
+    monkeypatch.setattr(runner_mod.settings, "AGENT_DOCUMENT_TOOLS_ENABLED", True)
+    monkeypatch.setattr(runner_mod, "make_document_authoring_tools", lambda *_args, **_kwargs: [DirectTool()])
+    monkeypatch.setattr(
+        runner_mod,
+        "create_chat_model",
+        lambda: pytest.fail("direct document generation must not call the model"),
+    )
+    runner = MultiSourceAgentRunner(
+        rag_backend=_FakeRAGBackend(),
+        circuit_service=None,
+        document_authoring_pipeline=Pipeline(),
+        document_job_store=Mock(),
+    )
+    events = []
+    answer = "".join(runner.stream(
+        query="参考模板，根据知识库生成新的 ICD 文档",
+        kb_name="kb_hw",
+        history=[],
+        thread_id="t1",
+        document_context=_context(),
+        event_callback=events.append,
+    ))
+
+    assert "真实的文档填充任务" in answer
+    assert "wo-direct" in answer
+    assert runner.get_last_retrieval_summary()["retriever_type"] == "document_authoring"
+    assert any(
+        event.get("payload", {}).get("key") == "document_generation_submission"
+        for event in events
+    )
 
 
 def test_non_routed_turn_keeps_general_toolset(monkeypatch):
@@ -350,6 +421,44 @@ def test_explicit_true_with_valid_context_routes_to_document_flow(monkeypatch):
         for event in events
         if event.get("payload", {}).get("key") == "document_flow_unavailable"
     ]
+
+
+def test_document_flow_mounts_structured_attachment_tools(monkeypatch):
+    captured = _install_fake_agent(monkeypatch)
+    monkeypatch.setattr("src.attachments.service.AttachmentService", lambda: Mock())
+    runner = MultiSourceAgentRunner(
+        rag_backend=_FakeRAGBackend(),
+        circuit_service=None,
+        document_authoring_pipeline=object(),
+        document_job_store=Mock(),
+    )
+    ref = AttachmentRef(
+        attachment_id="att-1",
+        asset_id="asset-1",
+        session_id=42,
+        filename="board.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        extension=".xlsx",
+        size_bytes=100,
+        sha256="hash",
+        parse_status="ready",
+    )
+
+    list(
+        runner.stream(
+            query="请根据模板生成报告",
+            kb_name="kb_hw",
+            history=[],
+            thread_id="42",
+            document_context=_context(),
+            document_flow=True,
+            attachments=[ref],
+            source_scope="attachment_only",
+        )
+    )
+
+    names = {_tool_name(tool) for tool in captured["tools"]}
+    assert {"attachment_table_query", "attachment_circuit_search"} <= names
 
 
 def test_explicit_true_without_document_tools_emits_unavailable_event(monkeypatch):

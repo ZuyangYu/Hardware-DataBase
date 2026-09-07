@@ -1,325 +1,369 @@
-# 本地会话附件与知识库 RAGFlow 双通道设计
+# Hardware-DataBase 会话附件、知识库与文档模板统一改造实施方案
 
 - 日期：2026-09-03
-- 状态：Proposed（已按代码核查意见修订，等待用户审阅）
-- 本次修订：补充混合检索、动态上下文注入、火山方舟 `Doubao-Seed-2.0-lite` 按需视觉分析通道，并对齐当前 `.env` 的火山连接配置。
-- 范围：将聊天中的“上传模板”升级为会话附件；会话附件中的 PDF/DOCX 在本地解析和检索；知识库文件继续使用现有 RAGFlow 链路；Excel/EDF 复用现有结构化解析与查询能力；Deep Agents 负责意图理解和工具编排。
-- 关联设计：[2026-09-02-agent-artifact-export-design.md](./2026-09-02-agent-artifact-export-design.md)、[2026-09-03-conversational-export-design.md](./2026-09-03-conversational-export-design.md)
+- 目标分支：`feature/fix-module-matching`
+- 状态：Final Recommended Implementation Plan
+- 适用仓库：`https://github.com/ZuyangYu/Hardware-DataBase.git`
+- 目标：指导代码修改、迁移、测试、灰度和验收，完成“知识库长期资产 + 会话临时附件 + 文档模板生成”统一协作能力。
 
-## 1. 决策摘要
+## 实施状态（截至 2026-09-04）
 
-本设计采用“共享领域能力、按来源分流”的方案：
+本方案已按分阶段策略在当前工作树完成核心闭环，现状如下：
 
-```text
-知识库文件
-  -> 现有 Ingestion
-  -> PipelineRegistry(source_type=knowledge_base)
-  -> RAGFlow / 现有结构化管线
+- 已落地并通过回归：会话附件生命周期、附件作用域工具、附件证据桥接、模板附件化、模板填充工单、通用 Markdown/Excel/Word/PDF/PowerPoint 导出及其权限/生命周期基础设施。
+- 本轮已完成统一的服务端 `IntentPlan`：比较请求优先于模板生成；显式格式请求才创建通用导出；“按推荐执行”仅在存在有效模板上下文时进入模板流程；路由事件会记录 intent/action/target/reason_codes。
+- 前端已对多个可用模板附件阻断自动猜选，要求用户明确点击“作为模板”；缺少合法模板时会在发送前提示上传或选择；服务端仍是最终权限和路由事实源。
+- 模板输出格式契约已加入：模板原生格式进入真实填充工单；请求 PDF/PPTX 时先生成原生模板成品，再由独立 `convert_artifact` worker 做语义排版、产物校验、哈希绑定、重试和候选/发布状态继承，不会把聊天 Markdown 冒充为模板成品。
+- OCR、视觉和 Dense/Hybrid Retrieval 已实现为独立可替换能力：均有硬资源上限、失败降级、证据元数据和低基数观测；默认仍按部署策略关闭，缺少 `tesseract`、远程凭据或 embedding 配置时不会影响本地附件检索。
+- 清理与观测已覆盖转换工单、转换子产物、会话删除和队列阶段；生成任务与转换任务按同一工单合并投影，避免前端重复卡片。
 
-会话附件
-  -> ChatAttachmentService
-  -> PipelineRegistry(source_type=chat_attachment)
-  -> 本地 PDF/DOCX 解析
-  -> 现有 Excel/EDF 解析与查询服务
+本轮验证包括服务端意图/文档/导出/转换回归、前端聊天与转换入口测试、静态检查；重启后再次检查 API readiness、前端入口和后台 worker。
 
-页面视觉分析（按需）
-  -> 本地页面渲染 / 图片提取
-  -> MultimodalModelGateway
-  -> 火山方舟 Doubao-Seed-2.0-lite
-```
+---
 
-两条链路共享 `Evidence`、内容定位、解析状态、观测和 Agent 工具协议，但不共享知识库权限、物理存储、生命周期或默认检索范围。
+## 1. 最终目标（Target State）
 
-本设计中的“本地附件处理”指原文件存储、格式解析、分块、索引和权限控制在本系统内完成。若启用火山方舟视觉分析，只有经过来源和页码筛选的页面图像及必要的上下文会发送到火山方舟；这不等同于完全内网推理，是否允许外发由部署配置和组织隐私策略决定。
+Hardware-DataBase 最终将同时支持两类一等数据源：
 
-明确不采用以下做法：
+1. **Knowledge Base Asset**
+   - 长期保存、可共享；
+   - 继续使用现有知识库权限体系；
+   - PDF/DOCX 等文档继续进入 RAGFlow；
+   - Excel/EDF 继续使用现有结构化解析、索引和查询能力。
 
-- 不把会话附件自动上传到 RAGFlow；
-- 不复制一套 Excel 或 EDF 解析器；
-- 不让模型直接访问本地文件路径；
-- 不让模型自由执行用户文件中的脚本；
-- 不把供应商原生文件输入能力作为系统的唯一实现；
-- 不让附件内容在未被用户选择时自动参与后续所有对话。
+2. **Chat Attachment**
+   - 当前用户、当前会话私有；
+   - 临时、可删除、可过期；
+   - 不自动进入 RAGFlow，不自动归档到知识库；
+   - PDF/DOCX/TXT/MD 本地解析和检索；
+   - Excel/EDF 复用现有领域 parser/service，只增加附件作用域；
+   - OCR、视觉理解、Dense Retrieval 作为后续可开关增强能力。
 
-## 2. 当前基线与问题
-
-当前聊天上传入口是文档模板专用能力：
-
-- `frontend/src/pages/chat/components/Composer.tsx` 只在文档创作构建开关（`VITE_AGENT_DOCUMENT_TOOLS_ENABLED` / `VITE_DOCUMENT_AUTHORING_CHAT_ENABLED`，默认开启）开启时显示上传入口，并接受 `.xlsx/.xlsm/.docx`；UI 内的“文档生成模式”开关不控制上传入口；
-- `frontend/src/pages/chat/ChatPage.tsx` 的 `handleTemplateUpload` 调用模板分析 API；
-- `/document-generation/templates/analyze` 要求知识库写权限，并把文件交给文档创作服务；
-- `CreateTurnRequest` 只有 `document_context`，没有通用附件引用；
-- `ToolRuntime` 只有知识库、文档模板和会话 ID 上下文，没有通用附件引用；
-- `document_search` 绑定 RAGFlow，表格和电路工具绑定当前知识库。
-
-现有领域能力已经存在：
-
-- `src/pipelines/spreadsheet/xlsx_parser.py`、`SpreadsheetIndexService` 和表格 SQL 工具负责 Excel 结构化处理；
-- `src/circuit/parsers`、`CircuitIndexService` 和 `CircuitQueryEngine` 负责 EDF/EDIF；
-- 知识库 PDF/DOCX 由 RAGFlow 管线处理；
-- `MultiSourceAgentRunner` 已通过 `deepagents.create_deep_agent` 动态调度工具，并且当前主动排除了通用文件系统和 Shell 工具。
-
-因此新增功能的核心不是再造一个“附件解析系统”，而是补充会话附件的存储、权限、解析作用域、局部检索工具和生命周期。
-
-## 3. 目标与非目标
-
-### 3.1 目标
-
-1. 将聊天入口从“上传模板”改为“添加附件”。
-2. 会话附件中的 PDF/DOCX 在应用本地完成安全检查、解析、分块和检索。
-3. 知识库中的 PDF/DOCX 继续进入现有 RAGFlow，现有知识库上传、权限和检索行为不变。
-4. Excel 和 EDF/EDIF 附件复用现有解析器、索引服务和查询引擎，只增加附件作用域。
-5. 用户可以要求只使用附件、只使用知识库，或联合使用两者。
-6. 用户上传附件后，下一条消息可以通过自然语言指定总结、抽取、比较、校验、计算或导出任务。
-7. Agent 返回的附件证据包含文件名和页码、段落、工作表、单元格、网络等定位信息。
-8. 解析任务和依赖附件的对话任务支持后台执行、页面切换和恢复。
-9. 删除会话时清理附件原件、解析索引、未完成任务和相关导出文件。
-10. 模板能力继续可用，但只作为附件的特殊角色，不影响普通附件解析。
-
-### 3.2 非目标
-
-1. 本期不替换 RAGFlow 的知识库文档解析和检索。
-2. 本期不把本地 PDF/DOCX 索引升级为新的通用本地向量平台；第一阶段使用章节/页分块和 SQLite FTS5，向量检索另行评估。
-3. 本期不提供在线 Word/PDF 编辑器。
-4. 本期不允许 Agent 自由运行 Shell、访问任意路径或执行附件中携带的宏/脚本。
-5. 本期不自动把附件归档到共享知识库；归档是单独的显式操作。
-6. 本期不保证扫描件、复杂 PDF 表格和复杂版式 100% 还原；解析能力必须通过状态和降级信息对用户可见。
-7. `Doubao-Seed-2.0-lite` 作为本期推荐的视觉理解适配器，不替代本地解析器、附件索引或知识库 RAGFlow；完全内网场景默认关闭远程视觉调用。
-
-## 4. 方案比较
-
-### 方案 A：所有附件复用 RAGFlow
-
-上传附件后创建临时 RAGFlow 文档或临时数据集。
-
-优点：实现较快，检索能力成熟。
-
-缺点：会话级删除和权限隔离复杂；临时数据集生命周期难治理；普通附件会污染 RAGFlow 资源；无法自然复用本地 Excel/EDF 结构化能力；敏感附件必须离开本地部署。
-
-结论：不采用。
-
-### 方案 B：本地附件服务 + 现有领域解析器复用
-
-PDF/DOCX 由本地解析器处理，Excel/EDF 复用现有管线，知识库仍由 RAGFlow 处理。Deep Agents 只通过来源受限的工具访问数据。
-
-优点：权限和生命周期清晰；不污染知识库；适合临时文件和内网部署；可复用当前结构化能力；供应商无关。
-
-缺点：需要维护本地 PDF/DOCX 解析器；扫描件 OCR 和复杂版式需要后续能力；会增加本地存储和索引任务。
-
-结论：推荐。
-
-### 方案 C：本地保存文件，直接交给模型供应商原生文件输入
-
-本地只保存附件，模型调用时将文件 ID 或原文件交给供应商处理。
-
-优点：应用侧解析代码少；小文件和视觉分析体验较好。
-
-缺点：依赖模型供应商能力；不能保证 Ollama 和 OpenAI-compatible provider 行为一致；权限、引用、数据留存和成本边界不易统一；不能替代 Excel/EDF 的确定性计算。
-
-结论：只作为图片、复杂页面或局部视觉分析的可选补充，不作为核心附件链路。
-
-## 5. 总体架构
+Deep Agent 不直接访问文件系统，也不把附件原路径暴露给模型，而是通过：
 
 ```text
-React Chat
-  |
-  | POST attachment / POST turn(attachment_ids)
-  v
-FastAPI
-  |
-  +-- ChatAttachmentService
-  |     +-- 安全检查
-  |     +-- 私有存储
-  |     +-- 解析任务
-  |     +-- 生命周期
-  |
-  +-- SourceRouter
-  |     +-- knowledge_base -> existing RAGFlow path
-  |     +-- chat_attachment -> local attachment path
-  |
-  v
-Attachment Processing Kernel
-  +-- local document parser: PDF/DOCX
-  +-- existing spreadsheet parser/index: XLSX/CSV extension path
-  +-- existing circuit parser/index: EDF/EDIF
-  +-- canonical manifest / parts / evidence
-  |
-  v
-Deep Agents
-  +-- attachment_list
-  +-- attachment_search
-  +-- attachment_read
-  +-- attachment_table_query -> existing spreadsheet service
-  +-- attachment_circuit_search -> existing circuit service
-  +-- document_search -> RAGFlow only
-  |
-  v
-ResultSnapshot / ResultEnvelope / ExportJob
-  +-- chat answer
-  +-- Markdown / XLSX / DOCX / PPTX / PDF Artifact
+SourceScope
++ ToolRuntime
++ ScopeResolver
++ Domain Tools
++ Evidence
 ```
 
-### 5.1 来源引用
+访问两类数据源。
 
-所有 Agent 工具使用明确的 `SourceRef`：
-
-```json
-{
-  "source_type": "chat_attachment",
-  "source_id": "att-01H...",
-  "session_id": 42,
-  "filename": "design-review.pdf"
-}
-```
-
-知识库引用则使用：
-
-```json
-{
-  "source_type": "knowledge_base",
-  "knowledge_base_name": "project-design",
-  "document_id": "ragflow-document-id"
-}
-```
-
-来源类型是权限和路由的硬边界。模型不能自行修改 `source_type`，后端根据用户、会话和已持久化的附件关系重新解析并校验。
-
-### 5.2 单一解析事实
-
-同一个文件在同一个作用域内只解析一次，使用以下键进行幂等控制：
+最终用户应能直接通过自然语言完成：
 
 ```text
-tenant_id + scope_type + scope_id + content_hash + parser_version
+“只分析这个附件”
+“只查知识库”
+“结合附件和知识库比较”
+“查这个 Excel 的参数”
+“检查这个 EDF 的网络连接”
+“分析 PDF 第 8 页的原理图”
+“把这个 DOCX 作为模板，根据附件和知识库生成设计说明书”
+“把分析结果导出为 Word / PDF / Excel / PPT”
 ```
 
-对会话附件，`scope_type` 固定为 `chat_session`，`scope_id` 即 `session_id`。幂等作用于解析产物（canonical parts、索引、manifest），不限制同一会话内上传多份相同内容的附件记录：后一份相同 `(session_id, sha256, parser_version)` 的附件直接复用已就绪的解析产物，不再重复入队解析任务。
+系统负责完成：来源选择、权限校验、工具编排、证据定位、后台任务、模板生成和结果交付。
 
-解析器输出统一的领域对象，索引只是它的投影：
+> 核心目标不是“给聊天增加文件上传按钮”，而是“给 Deep Agent 增加一个受权限控制、可追溯、可生命周期治理的会话级数据源”。
+
+---
+
+## 2. 当前代码基线与必须保持的不变量
+
+本方案以 `feature/fix-module-matching` 当前实现为基线。
+
+### 2.1 `PipelineRegistry` 不改为附件二维路由
+
+当前 `src/pipelines/registry.py` 的注册逻辑明确禁止两个 `PipelineSpec` 声明相同扩展名：
+
+```python
+overlap = spec.supported_extensions & existing.supported_extensions
+if overlap:
+    raise ValueError("Pipeline extension conflict ...")
+```
+
+因此当前不变量是：
 
 ```text
-CanonicalAsset
-  +-- manifest
-  +-- parts: text/table/image/circuit
-  +-- locators
-  +-- diagnostics
-  +-- parser_version
+extension -> one PipelineSpec
 ```
 
-允许知识库和附件各自有索引，但不能复制 Excel 或 EDF 的底层解析代码。跨作用域共享解析缓存时必须经过租户和权限边界，默认不做跨用户全局去重。
-
-### 5.3 多模态模型通道
-
-视觉模型通过后端 `MultimodalModelGateway` 接入，Agent 和解析器不直接依赖火山方舟 SDK：
+而不是：
 
 ```text
-AttachmentVisualAnalyzer
-  -> MultimodalModelGateway
-  -> provider=volcengine_ark
-  -> model=Doubao-Seed-2.0-lite
+(source_type, extension) -> PipelineSpec
 ```
 
-本期推荐使用火山方舟的 `Doubao-Seed-2.0-lite` 作为视觉理解模型。它的逻辑名称与火山方舟实际 Endpoint ID 分离保存。方舟官方示例使用过形如 `doubao-seed-2-0-lite-260215` 的模型 ID，后续模型版本可能变化；生产配置必须使用控制台实际开通的 Endpoint ID，不把日期版本硬编码到业务代码。方舟 Responses API 支持通过函数调用接入外部工具，本方案只将它用于受限的视觉分析请求，不让模型获得本地文件系统权限。
+**决策：保留现有 `PipelineRegistry` 作为知识库 ingestion router，不为附件改写其核心语义。**
 
-连接配置与当前 `.env` 保持一致：视觉网关的默认 Base URL 使用 `https://ark.cn-beijing.volces.com/api/plan/v3`，API Key 复用当前环境中已有的火山凭据来源，前提是该凭据已开通视觉 Endpoint 权限。实现时建议让 `CHAT_ATTACHMENT_VISUAL_BASE_URL` 回退到 `MEMORY_EMBEDDING_BASE_URL`，让 `CHAT_ATTACHMENT_VISUAL_API_KEY` 回退到 `MEMORY_EMBEDDING_API_KEY`，从而避免在 `.env` 中复制密钥；如果权限不同，才通过显式视觉配置覆盖，不能静默使用无权限凭据。`EVAL_EMBEDDING_*` 只用于评估，不作为线上附件视觉调用配置。视觉模型使用独立的 `CHAT_ATTACHMENT_VISUAL_MODEL`，不能误用 `MEMORY_EMBEDDING_MODEL`。
-
-虽然方舟也提供文档理解入口，第一版仍不把完整 PDF/DOCX 直接交给供应商处理，而是由本地服务完成解析和页面筛选后，再将必要的页面图像发送给视觉模型。这样可以保持附件权限、删除、引用和降级状态由本系统控制；供应商原生整文件输入只作为经过隐私审批的后续实验通道。
-
-默认职责边界：
-
-- 现有文本 Agent 模型继续负责意图理解、检索工具编排和结果组织，不因上传图片自动切换整个 Agent 模型；
-- `Doubao-Seed-2.0-lite` 只处理被选中的 PDF 页面图像、DOCX 提取图片或 OCR/文本辅助信息；
-- 本地 PDF/DOCX 解析和 FTS/向量索引仍是事实来源，视觉模型输出作为带页码的 `visual_evidence`，不能覆盖原始解析事实；
-- `Doubao-Seed-2.0-lite` 是视觉推理模型，不用它生成向量。未来需要图像/文本联合向量检索时，另行选择视觉 embedding 模型并记录其版本，不能复用视觉推理模型的输出作为 embedding；
-- 远程模型调用失败、超时或被策略禁止时，系统回退到文本/OCR 路径并将结果标记为 `degraded`，不能让整个附件查询无理由失败。
-
-接口约定：
+新增独立：
 
 ```text
-analyze_pages(
-  attachment_id,
-  page_refs,
-  user_question,
-  text_context,
-  max_pages,
-) -> VisualAnalysisResult
+AttachmentProcessorRouter
 ```
 
-网关负责请求格式转换、超时、重试、脱敏、模型 ID、供应商请求 ID 和用量记录；上层只接收结构化结论、页码/图像定位、置信信息和诊断信息。
+负责会话附件路由。
 
-视觉结果如需缓存，缓存键至少包含 `attachment_content_hash + render_version + page_refs + question_hash + provider + endpoint_id + prompt_version`，并遵守会话权限，不能因为文件内容相同就跨用户共享视觉结果。
+### 2.2 General Chat 当前绕过 KB Agent
 
-## 6. 数据模型与存储
+当前 `CreateTurnRequest` 已有：
 
-### 6.1 `chat_attachments`
+```text
+query
+client_request_id
+query_mode
+document_context
+document_flow
+```
 
-会话附件元数据放在当前会话数据库中，以便和会话权限、删除关系保持一致：
+但没有通用附件字段；代码注释还明确说明 general chat 绕过 knowledge-base agent。
+
+因此：
+
+```text
+General Chat + Attachment
+```
+
+必须新增明确的 Agent 路由，不能只在 KB Chat 中挂附件工具。
+
+### 2.3 当前 turn worker 只消费 `pending`
+
+当前 active 状态主要为：
+
+```text
+pending
+streaming
+cancelling
+```
+
+Worker 只取 `pending`；stale recovery 只处理 `streaming/cancelling`。
+
+因此如果新增：
+
+```text
+waiting_for_attachments
+```
+
+必须同时补齐状态机、取消、恢复、SSE、前端显示和附件就绪后的原子转移。
+
+### 2.4 Excel / Circuit 当前强制 Knowledge Base department scope
+
+现有 spreadsheet 和 circuit Agent tools 都依赖 KB/department 上下文。
+
+**决策：不复制 parser，不复制核心查询逻辑；抽象数据作用域解析。**
+
+### 2.5 CircuitStore 已支持自定义 root
+
+`CircuitStore(root=...)` 已经存在，并且 `design_dir()` 会执行 `validate_kb_name()` 和路径逃逸检查。
+
+因此附件 EDF 不应通过：
+
+```text
+kb_name="__chat_attachments__/42"
+```
+
+伪造路径；应使用独立 `CircuitStore(root=...)`。
+
+### 2.6 `parser_registry.py` 不是当前 live parser dispatcher
+
+当前代码已经注明 factories 不在 live path 使用，Agent 只消费 capability 描述。
+
+**决策：附件实现优先复用具体 parser/service，不强制经由 `src/ingestion/parser_registry.py`。**
+
+### 2.7 现有文档模板链路必须保留
+
+当前模板链路已经形成：
+
+```text
+Upload
+ -> sanitize_template
+ -> immutable TemplateVersion
+ -> TemplateAnalysis
+ -> review/activation
+ -> DocumentContext
+ -> Document Authoring Tools
+ -> renderer / worker
+```
+
+**Attachment 只是模板来源，不是 TemplateVersion 的替代品。**
+
+---
+
+## 3. 核心架构决策
+
+### 3.1 顶层架构
+
+```text
+                                  Deep Agents
+                                      |
+                         SourceScope / ToolRuntime
+                                      |
+               +----------------------+----------------------+
+               |                                             |
+        Knowledge Base Scope                           Attachment Scope
+               |                                             |
+      +--------+---------+                       +-----------+------------+
+      |        |         |                       |           |            |
+ RAGFlow   Spreadsheet  Circuit            Local Docs   Spreadsheet    Circuit
+ docs      Service      Service             Search        Adapter       Adapter
+                                                   |           |            |
+                                                   +----- shared domain ----+
+                                                           services
+                                      |
+                                  Evidence
+                                      |
+                         +------------+-------------+
+                         |                          |
+                   Chat Answer                Document / Export
+                                                   |
+                                    TemplateVersion / DocumentContext
+```
+
+### 3.2 三层职责必须分离
+
+不要把“来源路由、权限和 parser”混成一个 registry。
+
+```text
+AttachmentProcessorRouter
+    决定文件怎么解析
+
+ScopeResolver
+    决定本轮允许读什么
+
+Domain Service
+    真正执行文本、Excel、Circuit 查询
+
+Deep Agent Tool
+    只做薄适配和 Evidence 转换
+```
+
+### 3.3 不修改知识库默认行为
+
+知识库仍为：
+
+```text
+PDF/DOCX -> RAGFlow
+XLSX     -> SpreadsheetIndexService
+EDF/EDIF -> CircuitIndexService
+```
+
+现有 KB 上传 API 和 RAGFlow 数据集逻辑不因附件功能改变。
+
+---
+
+## 4. 数据模型最终设计
+
+为了真正实现“同一会话相同文件只解析一次”，必须把“用户上传记录”和“解析资产”分开。
+
+### 4.1 `chat_attachments`：用户可见附件记录
 
 ```text
 attachment_id TEXT PRIMARY KEY
 session_id INTEGER NOT NULL
 user_id INTEGER NOT NULL
 tenant_id TEXT NOT NULL DEFAULT 'default'
+asset_id TEXT NOT NULL
+client_request_id TEXT
 filename TEXT NOT NULL
 media_type TEXT NOT NULL
 extension TEXT NOT NULL
 size_bytes INTEGER NOT NULL
 sha256 TEXT NOT NULL
-role TEXT NOT NULL DEFAULT 'reference'
+usage_hint TEXT NOT NULL DEFAULT 'reference'
 status TEXT NOT NULL
-storage_key TEXT NOT NULL
-manifest_json TEXT NOT NULL DEFAULT '{}'
-parser_version TEXT NOT NULL DEFAULT ''
-error_code TEXT NOT NULL DEFAULT ''
-error_message TEXT NOT NULL DEFAULT ''
 created_at TEXT NOT NULL
 updated_at TEXT NOT NULL
 expires_at TEXT
 deleted_at TEXT
 ```
 
-`role` 取值：
+推荐：
 
 ```text
-reference  普通参考资料
-data       数据分析输入
-template   文档模板
+usage_hint = reference | data
+status = active | deleted | expired
 ```
 
-`tenant_id` 取自 `RequestContext.tenant_id`。当前 chat 域为单租户（`chat_sessions` 只有 `user_id`/`department_id`，conversation 域固定写 `default`），该列用于与 `result_exports`、`document_authoring` 等域的表结构对齐并预留多租户，参与唯一约束但不承担实际隔离；隔离主体是 `user_id + session_id`。
+不要把“正式模板状态”塞进 attachment `role=template`；模板是独立领域资产。
 
-### 6.2 `chat_attachment_parts`
+唯一约束：
 
-解析正文和定位信息放入独立的附件索引数据库，避免大量文本放大会话数据库：
+```text
+(session_id, client_request_id) WHERE client_request_id IS NOT NULL
+```
+
+### 4.2 `chat_attachment_assets`：物理文件与解析事实
+
+```text
+asset_id TEXT PRIMARY KEY
+session_id INTEGER NOT NULL
+user_id INTEGER NOT NULL
+tenant_id TEXT NOT NULL DEFAULT 'default'
+sha256 TEXT NOT NULL
+media_type TEXT NOT NULL
+extension TEXT NOT NULL
+size_bytes INTEGER NOT NULL
+storage_key TEXT NOT NULL
+parse_status TEXT NOT NULL
+parser_version TEXT NOT NULL DEFAULT ''
+manifest_json TEXT NOT NULL DEFAULT '{}'
+error_code TEXT NOT NULL DEFAULT ''
+error_message TEXT NOT NULL DEFAULT ''
+created_at TEXT NOT NULL
+updated_at TEXT NOT NULL
+```
+
+唯一约束：
+
+```text
+(tenant_id, user_id, session_id, sha256)
+```
+
+说明：
+
+- 同一会话重复上传相同内容可以产生多个 `chat_attachments`；
+- 多个附件记录指向同一个 `asset_id`；
+- 解析状态属于 asset，而不是附件展示记录；
+- parser 升级时对同一 asset 重新构建 parts，不需要重复保存原文件；
+- 默认禁止跨用户/跨会话全局 dedup。
+
+### 4.3 `chat_attachment_parts`
 
 ```text
 part_id TEXT PRIMARY KEY
-attachment_id TEXT NOT NULL
+asset_id TEXT NOT NULL
 ordinal INTEGER NOT NULL
 part_type TEXT NOT NULL
 text_content TEXT NOT NULL DEFAULT ''
 locator_json TEXT NOT NULL DEFAULT '{}'
 metadata_json TEXT NOT NULL DEFAULT '{}'
 content_hash TEXT NOT NULL
+parser_version TEXT NOT NULL
 ```
 
-`part_type` 初始支持 `text`、`table`、`image`，结构化附件可增加 `circuit`。
+`part_type`：
 
-附件索引数据库增加 FTS5 投影，用于 PDF/DOCX 的本地全文检索。FTS 结果必须回查 `chat_attachment_parts`，不能把 FTS 行直接作为最终证据。
+```text
+text
+table
+image
+circuit
+ocr_text
+visual_evidence
+```
 
-FTS5 是本项目首次引入，需要补充以下落地约定：
+### 4.4 `chat_attachment_jobs`
 
-- 目标运行环境的 SQLite 必须编译包含 FTS5 模块；服务启动时显式探测可用性，探测失败时附件检索功能降级关闭，不允许启动失败或生成虚假证据；
-- 附件索引库是独立于 `AUTH_DB_PATH` 的 SQLite 文件，连接与生命周期管理参考 `memory.db` 独立库先例；写路径收敛到解析 Worker 单写者，读路径使用 WAL；
-- `chat_attachment_parts.attachment_id` 跨库引用主库记录，不建外键，一致性由应用层和 §11.3 的删除顺序保证。
-
-### 6.3 `chat_attachment_jobs`
+解析任务应绑定 `asset_id`：
 
 ```text
 job_id TEXT PRIMARY KEY
 tenant_id TEXT NOT NULL
-user_id TEXT NOT NULL
+user_id INTEGER NOT NULL
 session_id INTEGER NOT NULL
-attachment_id TEXT NOT NULL
+asset_id TEXT NOT NULL
 job_type TEXT NOT NULL
 status TEXT NOT NULL
 attempt INTEGER NOT NULL DEFAULT 0
@@ -336,534 +380,1171 @@ updated_at TEXT NOT NULL
 completed_at TEXT
 ```
 
-任务使用现有 Worker 的 claim/lease/heartbeat 模式，页面断开不改变任务状态。字段和幂等索引对齐现有 `document_authoring_jobs`：建立 `(tenant_id, user_id, session_id, attachment_id, job_type)` 幂等唯一索引，配合上传幂等键避免同一附件重复入队。
+幂等键：
 
-### 6.4 `turn_attachments`
+```text
+(asset_id, job_type, parser_version)
+```
 
-不要只把附件 ID 放进不可查询的 JSON；使用关联表保存每个 turn 的附件快照：
+### 4.5 `turn_attachments`
+
+历史 turn 不能依赖附件仍然存在，因此保存快照：
 
 ```text
 turn_id TEXT NOT NULL
 attachment_id TEXT NOT NULL
-role_snapshot TEXT NOT NULL
 ordinal INTEGER NOT NULL
+filename_snapshot TEXT NOT NULL
+media_type_snapshot TEXT NOT NULL
+usage_hint_snapshot TEXT NOT NULL
+content_hash_snapshot TEXT NOT NULL
+parser_version_snapshot TEXT NOT NULL
 PRIMARY KEY(turn_id, attachment_id)
 ```
 
-`CreateTurnRequest` 增加 `attachment_ids`，后端在创建 turn 时校验附件属于当前用户和当前会话，并将关联关系一次性持久化。后续附件被删除或过期时，历史 turn 仍保留引用状态，但不能继续读取原文件。
-
-### 6.5 `chat_attachment_deletion_outbox`
-
-删除清理失败的可重试队列，模式对齐现有 `memory_deletion_outbox`：
+附件删除后历史消息仍可显示：
 
 ```text
-outbox_id TEXT PRIMARY KEY
-session_id INTEGER NOT NULL
-attachment_id TEXT NOT NULL DEFAULT ''
-payload_json TEXT NOT NULL DEFAULT '{}'
-reason TEXT NOT NULL DEFAULT ''
-attempt INTEGER NOT NULL DEFAULT 0
-next_retry_at TEXT
-created_at TEXT NOT NULL
-updated_at TEXT NOT NULL
+design-review.pdf（已删除）
 ```
 
-Agent checkpoint 删除（`forget_agent_thread` -> `checkpointer.delete_thread`）当前失败会被静默吞掉；本设计将 checkpoint、`result_exports` 和本地文件的清理失败统一写入该 outbox，由 Worker 重试，不阻塞会话删除响应。
+但不得继续读取原文件。
 
-## 7. 来源路由和解析器复用
+### 4.6 Cleanup Outbox
 
-现有路由入口是 `src/pipelines/registry.py` 的 `route_file(file_path, source_group=None)`（模块级封装同签名），`source_group` 决定文本类扩展走外部对话还是 RAGFlow；`src/ingestion/parser_registry.py` 是 `source_group -> ParserFactory` 注册表，没有独立路由函数。本设计将该路由扩展为“来源类型 + 扩展名”二维路由，最小改动是给 `route_file` 增加可选的 `source_type` 参数并保持默认行为不变：
+不建议再做一个字段过少的 `chat_attachment_deletion_outbox`。
+
+推荐新建通用：
+
+```text
+session_cleanup_outbox
+```
+
+字段至少包含：
+
+```text
+outbox_id
+session_id
+user_id
+tenant_id
+status                 # pending/running/retrying/completed/dead_letter
+targets_json           # attachments/exports/artifacts/checkpoints
+idempotency_key UNIQUE
+retry_count
+max_retries
+lease_owner
+lease_expires_at
+last_error
+next_retry_at
+created_at
+updated_at
+completed_at
+```
+
+所有 cleanup handler 必须幂等。
+
+---
+
+## 5. SourceScope 与权限模型
+
+### 5.1 API Scope
+
+新增：
 
 ```python
-route_file(file_path, source_group=None, source_type="knowledge_base")
-route_file(file_path, source_group=None, source_type="chat_attachment")
+SourceScope = Literal[
+    "auto",
+    "attachment_only",
+    "knowledge_base_only",
+    "attachment_and_knowledge_base",
+]
 ```
 
-### 7.1 知识库路径
+`CreateTurnRequest` 增加：
 
-`source_type=knowledge_base` 保持现有行为：
+```python
+attachment_ids: list[str] = []
+source_scope: SourceScope = "auto"
+```
+
+### 5.2 `auto` 的确定性解析
 
 ```text
-PDF/DOCX -> RAGFlow
-XLSX     -> existing spreadsheet index
-EDF/EDIF -> existing circuit index
+General Chat + no attachment
+    -> original general chat
+
+General Chat + attachment
+    -> attachment_only
+
+KB Chat + no attachment
+    -> knowledge_base_only
+
+KB Chat + attachment
+    -> attachment_and_knowledge_base
 ```
 
-现有 `/kbs/{kb_name}/files` API、`PipelineDocumentStore`、RAGFlow 数据集和知识库权限不做行为改变。
+用户明确指定“只看附件/只查知识库”时，`SourceScopePlanner` 可以进一步**收窄**作用域；任何模型规划都不能扩大后端已授权的 scope。
 
-### 7.2 会话附件路径
+### 5.3 权限硬边界
 
-`source_type=chat_attachment` 初始路由：
+附件工具每次调用都重新验证：
 
 ```text
-PDF/DOCX/TXT/MD -> local document parser + local FTS index
-XLSX            -> existing xlsx parser + attachment-scoped index
-EDF/EDIF        -> existing circuit parser + attachment-scoped design store
+user_id + session_id + attachment_id
 ```
 
-`.xls` 继续明确拒绝；`.xlsm` 默认只作为受控模板或只读附件处理，必须先进行宏/外链隔离，不能直接执行宏内容。
+知识库工具继续走现有 KB ACL。
 
-### 7.3 Excel 复用规则
+禁止：
 
-会话附件不新增 `attachment_xlsx_parser`。现有 `parse_xlsx` 产出的 workbook 模型作为唯一解析结果，再通过作用域适配写入附件索引。
+- 根据文件名猜 attachment；
+- 根据 hash 越权引用其他用户资产；
+- 让模型传任意本地路径；
+- 让 SQL 或 Circuit filter 绕过 attachment scope；
+- 让 Agent 修改 `source_type` 获取未挂载资源。
 
-现状澄清：`spreadsheet_row_search`、`spreadsheet_cell_lookup` 和只读 SQL 是闭包绑定 `SpreadsheetIndexService` 实例的 Agent 工具（`src/agents/tools/spreadsheet_tools.py`），不是 service 方法；现有实现通过 `kb_scope_from_context(...).require_department(...)` 强制 department 作用域。附件作用域没有 department 语义：附件版工具工厂在闭包中直接绑定本轮 `attachment_id` 集合，跳过 department 校验，改用 `user_id + session_id + attachment_id` 归属校验。只读 SQL 维持现有 sqlglot 校验、表白名单和 LIMIT 收敛，并在 SQL 执行前注入附件记录范围，禁止模型通过表名或 SQL 自行越权。
+---
 
-### 7.4 EDF/EDIF 复用规则
+## 6. 新增 AttachmentProcessorRouter
 
-会话附件不新增 EDF 解析器。现有 `EdfParser`、`CircuitIndexService` 和 `CircuitQueryEngine` 继续负责解析和查询；新增一个附件作用域的设计引用适配器：
+新增：
 
 ```text
-attachment_id -> design_id -> CircuitIndexService.query
+src/attachments/router.py
 ```
 
-查询证据增加 `attachment_id`、文件名、实例、网络或模块定位。知识库和附件使用不同的存储命名空间，避免同名 `design_id` 冲突：现有电路存储按 `kb_name` 目录划分（`STORAGE_DIR/circuits/{kb_name}/{design_id}/`），附件统一落入保留虚拟命名空间 `__chat_attachments__/{session_id}/`；现有电路工具强制 `department_id` 过滤，附件版工具跳过 department 元数据过滤，改按附件归属校验。`design_id` 继续沿用内容寻址生成规则。
+接口：
 
-### 7.5 模板规则
+```python
+class AttachmentProcessorRouter:
+    def resolve(self, extension: str) -> AttachmentProcessor:
+        ...
+```
 
-普通附件不会触发文档模板分析。用户明确说“把这个附件作为模板生成文档”后才执行：
+默认路由：
 
 ```text
-attachment.role=template
-  -> 现有模板清洗与安全检查
-  -> 现有 template analyzer
-  -> DocumentContext
-  -> 文档生成流程
+.pdf/.docx/.txt/.md -> LocalDocumentAttachmentProcessor
+.xlsx              -> SpreadsheetAttachmentProcessor
+.edf/.edif         -> CircuitAttachmentProcessor
+.xls               -> reject
+.xlsm              -> template conversion or explicitly read-only policy
 ```
 
-现有模板分析接口和 `DocumentContext` 保持兼容；模板附件的来源可以记录 `origin_attachment_id`，但模板版本仍由现有文档创作存储管理。
+**不要修改 `src/pipelines/registry.py` 为二维 source registry。**
 
-## 8. 本地 PDF/DOCX 处理
+---
 
-### 8.1 解析阶段
+## 7. 本地 PDF / DOCX 解析
 
-上传完成后先执行确定性处理：
+### 7.1 本地确定性处理流程
 
-1. 检查真实 MIME、扩展名和文件签名；
-2. 计算 SHA-256 并写入私有存储；
-3. 解析 PDF 页或 DOCX 文档结构；
-4. 生成带顺序和定位信息的 canonical parts，并记录 `page_count`、`has_embedded_image`、`renderable`、`text_density`、`ocr_status` 等视觉候选元数据；
-5. 写入 FTS5 索引，并按配置为后续 DenseRetriever 保留 embedding 任务入口；
-6. 生成 manifest 和可用性摘要；视觉页面只登记候选，不在上传解析阶段默认发送给远程模型；
-7. 更新 `ready`、`degraded` 或 `failed` 状态。
+```text
+Upload
+ -> MIME / extension / signature validation
+ -> stream to private storage
+ -> SHA-256
+ -> create/reuse AttachmentAsset
+ -> enqueue parse job
+ -> deterministic parser
+ -> canonical parts
+ -> lexical index
+ -> manifest
+ -> ready/degraded/failed
+```
 
-第一版 PDF 适配器使用可部署的本地文本解析库，按页生成内容；DOCX 复用项目已有 `python-docx`/OOXML 依赖（`python-docx>=1.1` 已在 pyproject.toml 中），提取标题、段落、表格和链接。PDF 扫描件和复杂版式在 OCR/渲染能力启用前标记为 `degraded`，不能假装已完整读取。
+### 7.2 PDF
 
-### 8.2 定位信息
+第一版：
 
-PDF：
+```text
+page -> text blocks -> parts
+```
+
+locator：
 
 ```json
 {"page": 8, "block": 3}
 ```
 
-DOCX：
-
-```json
-{"heading_path": ["3 电源设计", "3.2 额定电压"], "paragraph": 12}
-```
-
-DOCX 的自然页码依赖排版渲染，第一版不承诺固定页码；需要视觉还原时另行生成渲染页图。
-
-### 8.3 检索与上下文策略
-
-附件检索统一经过 `AttachmentRetrievalService`，Agent 不直接感知底层索引实现：
+如果页面文本密度过低：
 
 ```text
-ACL / source scope / attachment_ids 过滤
-  -> SparseRetriever（第一版 FTS5）
-  -> DenseRetriever（可选，本地 embedding + sqlite-vec 等）
-  -> RRF 融合
-  -> 可选 rerank
-  -> ContextPacker
-  -> Evidence / Citation
+parse_status = degraded
+ocr_candidate = true
 ```
 
-落地规则：
+不要伪装成完整解析成功。
 
-- 第一阶段实现 FTS5 和接口契约；混合检索作为可开关能力，不把 `sqlite-vec` 或某一个 embedding 模型写死为唯一实现；
-- 向量检索启用后，稀疏和稠密召回分别取候选集，再使用 RRF 融合，不直接比较不可校准的原始分数；
-- 索引记录 `embedding_model`、`embedding_version`、`embedding_dimension`、归一化方式和 `parser_version`，任一关键版本变化都能触发重建；
-- 文件较小且用户要求整体摘要、翻译或改写时，使用受模型上下文预算保护的全文读取；
-- 全文注入预算动态计算：模型上下文上限减去系统提示、历史消息、工具结果、预留输出和安全余量，不使用固定的 8K/16K 阈值；
-- 针对参数、器件、条款等定位问题，即使文件较小也优先通过检索获得可回溯 Evidence；
-- 普通问题由 `attachment_search` 统一完成关键词/语义召回和有限次补检索，读取必须携带 `attachment_id` 和当前会话权限；
-- 视觉问题只对命中的页面或用户明确指定的页面调用 `AttachmentVisualAnalyzer`；无文本扫描件可根据 OCR 状态和页图候选进行有限页面采样；
-- 工具结果包装为现有 `Evidence`；`Evidence` 没有顶层 `backend` 字段，`backend=local_attachment` 或 `backend=volcengine_ark` 写入 `Evidence.metadata`，并保留文件、页码、图像和模型信息；
-- 解析出的正文和视觉结果只作为数据，不作为系统指令或工具指令。
+### 7.3 DOCX
 
-## 9. Deep Agents 接入
+复用现有 `python-docx`/OOXML 依赖，提取：
 
-### 9.1 Runtime
+```text
+heading
+paragraph
+table
+link
+embedded image metadata
+```
 
-扩展现有 `ToolRuntime`：
+locator：
+
+```json
+{
+  "heading_path": ["3 电源设计", "3.2 额定电压"],
+  "paragraph": 12
+}
+```
+
+第一版不承诺 DOCX 固定自然页码；页码只在渲染后产生。
+
+---
+
+## 8. Hardware 专项本地检索
+
+### 8.1 第一阶段不是单纯“FTS5 默认 tokenizer”
+
+Hardware 文档中大量存在：
+
+```text
+STM32H743ZI
+TPS62130
+VDD_3V3
+ETH_TXP
++12V
+R1
+U2
+CAN_H
+```
+
+SQLite FTS5 默认 `unicode61` 对 CJK 连续文本、标点硬件标识、substring 搜索存在明显局限；单纯改为 trigram 又会对小于 3 个字符的 `R1/U2/EN/FB` 产生新问题。
+
+### 8.2 推荐组合策略
+
+```text
+AttachmentRetrievalService
+        |
+        +-- ExactIdentifierRetriever
+        |      raw / normalized / prefix
+        |
+        +-- SparseTextRetriever
+        |      unicode61 FTS5
+        |
+        +-- OptionalTrigramRetriever
+               CJK / substring >= 3 chars
+        |
+        +-- OptionalDenseRetriever
+               Phase 6
+        |
+        -> FusionRanker
+        -> ContextPacker
+        -> Evidence
+```
+
+### 8.3 Query Normalizer
+
+新增：
+
+```text
+AttachmentQueryNormalizer
+```
+
+负责：
+
+- FTS-safe quoting；
+- 原始 query 与 normalized query 分离；
+- 提取硬件 identifier；
+- 不直接把用户输入拼进 `MATCH`；
+- 特殊字符保持可查询。
+
+重点测试：
+
+```text
++12V
+-5V
+VDD_3V3
+A/B
+R1/R2
+STM32H7*
+USB_DP
+CAN_H/CAN_L
+连续中文
+```
+
+### 8.4 FTS5 不可用
+
+服务启动探测 FTS5。
+
+如果不可用：
+
+```text
+小附件 -> bounded lexical scan + degraded diagnostic
+大附件 -> attachment_search unavailable/degraded
+```
+
+不得导致整个服务启动失败，也不得生成虚假 Evidence。
+
+### 8.5 Context Budget
+
+`CHAT_ATTACHMENT_CONTEXT_MAX_TOKENS` 是 hard cap，不是固定注入长度。
+
+```text
+available =
+model_context_window
+- system_prompt
+- history
+- tool_results
+- reserved_output
+- safety_margin
+
+attachment_budget = min(
+    available * configured_ratio,
+    CHAT_ATTACHMENT_CONTEXT_MAX_TOKENS
+)
+```
+
+---
+
+## 9. Excel 作用域复用
+
+### 9.1 不创建新的 Excel parser
+
+继续复用现有：
+
+```text
+parse_xlsx
+SpreadsheetIndexService
+spreadsheet search
+read-only SQL
+```
+
+### 9.2 抽象 ScopeResolver
+
+新增建议：
+
+```text
+src/agents/scopes/base.py
+src/agents/scopes/knowledge_base.py
+src/agents/scopes/attachment.py
+```
+
+例如：
+
+```python
+@dataclass(frozen=True)
+class SpreadsheetScope:
+    source_type: str
+    db_path: str
+    allowed_record_ids: frozenset[str]
+    department_id: str | None = None
+    kb_name: str = ""
+    attachment_ids: tuple[str, ...] = ()
+```
+
+现有工具从：
+
+```python
+kb_scope_from_context(...).require_department(...)
+```
+
+逐步重构为：
+
+```python
+scope = spreadsheet_scope_resolver.resolve(rt)
+```
+
+SQL 安全能力必须继续共用：
+
+```text
+sqlglot validation
+read-only whitelist
+LIMIT
+allowed tables
+attachment record filtering
+```
+
+### 9.3 XLSX 安全限制必须在 parser 内部生效
+
+不仅限制 `MAX_ROWS`，还应在读取期间约束：
+
+```text
+max_rows
+max_cells
+max_sheets
+max_shared_strings
+max_uncompressed_bytes
+max_compression_ratio
+max_cell_text_length
+```
+
+解析后再检查已经太晚。
+
+---
+
+## 10. EDF / EDIF 作用域复用
+
+继续复用：
+
+```text
+EdfParser
+CircuitIndexService
+CircuitQueryEngine
+```
+
+附件侧新增：
+
+```text
+attachment_id -> asset_id -> design_id
+```
+
+Circuit storage：
+
+```text
+KB:
+STORAGE_DIR/circuits/<kb_name>/<design_id>
+
+Attachment:
+CHAT_ATTACHMENT_STORAGE_DIR/circuits/<session_id>/<safe_namespace>/<design_id>
+```
+
+实现方式使用：
+
+```python
+CircuitStore(root=attachment_circuit_root)
+```
+
+不要通过带 `/` 的虚拟 `kb_name` 注入目录层级。
+
+Circuit query 的授权从“强制 department”抽成：
+
+```text
+KnowledgeBaseCircuitScopeResolver
+AttachmentCircuitScopeResolver
+```
+
+query engine 核心保持一份。
+
+---
+
+## 11. Deep Agents 接入与 General Chat 修复
+
+### 11.1 扩展 ToolRuntime
+
+当前 ToolRuntime 已保存 KB、ctx、document context、session id、事件等请求级状态。
+
+增加：
 
 ```text
 attachment_refs
 source_scope
 attachment_service
+source_scope_resolver
 ```
 
-`ToolRuntime` 仍是每次 Agent 执行的请求级对象，用于保存附件范围、取消信号、工具诊断、证据和事件回调。附件服务不能从全局变量读取当前会话。
+推荐结构：
 
-### 9.2 工具集合
+```python
+@dataclass(frozen=True)
+class AttachmentRef:
+    attachment_id: str
+    asset_id: str
+    session_id: int
+    filename: str
+    media_type: str
+```
 
-新增薄适配器，不在 Agent 工具中重复底层解析：
+### 11.2 工具集合
+
+新增薄工具：
 
 ```text
 attachment_list
-  -> 返回当前 turn 可用的文件清单和 manifest
-
-attachment_search(query, attachment_ids?)
-  -> AttachmentRetrievalService（第一版 FTS5，后续可选混合检索）并返回 Evidence
-
-attachment_read(attachment_id, locator)
-  -> 读取页、章节、段落或表格
-
-attachment_visual_analyze(attachment_id, page_refs, question)
-  -> 按页权限和数量限制调用 MultimodalModelGateway
-
-attachment_table_query(operation, attachment_id, sheet?, filters?)
-  -> 调用现有 spreadsheet 只读工具链（闭包绑定 SpreadsheetIndexService，附件作用域）
-
-attachment_circuit_search(query, attachment_id)
-  -> 调用现有 CircuitIndexService/CircuitQueryEngine
+attachment_search
+attachment_read
+attachment_table_query
+attachment_circuit_search
+attachment_visual_analyze   # Phase 6
 ```
 
-现有 `document_search` 继续只访问 RAGFlow 知识库；如果用户未授权联合检索，不能把附件内容混入 `document_search`。
+### 11.3 取消 `is_general` 对所有数据工具的一刀切
 
-### 9.3 意图和来源范围
+当前 runner 对 general chat 不挂 KB toolset。
 
-Agent 的任务计划至少包含：
+改为按 scope 装配：
+
+```python
+tools = []
+
+if effective_scope.allows_kb:
+    tools += build_kb_tools(...)
+
+if effective_scope.allows_attachments:
+    tools += build_attachment_tools(...)
+
+if memory_allowed:
+    tools += [memory_tool]
+```
+
+这样得到：
+
+```text
+General + no attachment
+    -> 原 general chat
+
+General + attachment
+    -> Deep Agent + attachment tools
+
+KB + no attachment
+    -> 当前 KB Deep Agent
+
+KB + attachment
+    -> KB tools + attachment tools
+```
+
+### 11.4 Evidence 统一
+
+附件 Evidence 与 KB Evidence 使用同一个 `Evidence` 类型。
+
+建议 metadata：
 
 ```json
 {
-  "action": "answer | summarize | extract | compare | calculate | validate | export",
-  "source_scope": "attachment_only | knowledge_base_only | attachment_and_knowledge_base",
-  "attachment_ids": ["att-01H..."],
-  "operations": [],
-  "output": {
-    "mode": "chat | artifact",
-    "format": "markdown | xlsx | docx | pptx | pdf"
-  },
-  "clarification_needed": []
+  "source_type": "chat_attachment",
+  "attachment_id": "att-...",
+  "asset_id": "asset-...",
+  "filename": "design.pdf",
+  "backend": "local_attachment",
+  "locator": {"page": 8, "block": 3}
 }
 ```
 
-优先级：
+不要给 `Evidence` 新增一套附件专用平行模型。
 
-1. 系统安全和权限；
-2. 用户明确指定的文件和数据范围；
-3. 用户明确指定的操作和输出结构；
-4. 默认检索和默认输出规则。
+---
 
-用户说“只分析这个 PDF”时只挂载附件工具；用户说“结合附件和知识库”时同时挂载两类工具；只上传但没有在本轮选择的附件不能自动参与回答。
+## 12. Turn 等待附件状态机
 
-### 9.4 证据和导出
+### 12.1 新状态
 
-本地附件证据与 RAGFlow 证据进入同一个 `ToolRuntime.evidence` 和 `ResultEnvelope`。导出规划器只读取结构化结果、答案和证据，不直接读取原始文件路径。
+```text
+waiting_for_attachments
+```
 
-用户明确要求 PDF、Word、Excel 或 PPT 时，沿用现有对话式导出规则直接创建 Artifact 任务；用户没有要求文件时只返回聊天答案。附件分析和文件导出是两个阶段，不能因为文件已经上传就默认生成导出文件。
+推荐状态：
 
-视觉分析调用不改变来源范围：`attachment_only` 只能分析已授权附件页面，`attachment_and_knowledge_base` 仍需分别调用附件工具和知识库工具。视觉模型返回的内容必须附带 `attachment_id`、页码、供应商和模型版本，才能进入导出结果。
+```text
+waiting_for_attachments
+    -> pending
+    -> streaming
+    -> completed
 
-### 9.5 多模态工具调用约束
+waiting_for_attachments
+    -> failed
 
-`attachment_visual_analyze` 是后端受限工具，不允许模型传入任意 URL、文件路径或未挂载的附件。后端在调用前重新校验：
+waiting_for_attachments
+    -> cancelled
+```
 
-1. 页面属于当前会话且附件状态可读；
-2. 页码不超过单轮上限，图像大小经过压缩和格式校验；
-3. 用户问题和文本辅助上下文已与文件数据分隔；
-4. 当前部署允许向火山方舟发送数据；
-5. 超时、限流、供应商错误和视觉低置信结果均写入诊断，不伪造确定性证据。
+### 12.2 不让 Chat Worker 轮询附件
 
-## 10. API 与前端
+推荐由：
 
-### 10.1 附件 API
+```text
+Attachment Worker
+    -> asset ready/failed
+    -> AttachmentTurnCoordinator
+    -> atomically resolve waiting turn
+```
+
+Chat Worker 继续只消费 `pending`，降低对现有队列模型的影响。
+
+### 12.3 多附件规则
+
+turn 创建时冻结：
+
+```text
+required_attachment_ids
+```
+
+默认：
+
+```text
+所有显式选择附件都是 required
+```
+
+如果任一 required attachment `failed`：
+
+```text
+turn -> failed
+error_code = attachment_parse_failed
+```
+
+`degraded` 附件可以进入 pending，但必须把 degraded 原因带入 runtime/事件。
+
+### 12.4 必改位置
+
+至少同步修改：
+
+```text
+chat_turns status handling
+list_active_turns
+cancel turn
+SSE/status response
+frontend status rendering
+attachment ready coordinator
+session deletion
+recovery tests
+```
+
+---
+
+## 13. 文档模板与文档生成功能兼容方案
+
+### 13.1 核心原则
+
+```text
+Chat Attachment = 模板来源
+TemplateVersion = 正式、独立、不可变的模板资产
+```
+
+以下核心保持：
+
+```text
+sanitize_template
+TemplateAnalysis
+TemplateVersion
+Template activation/review
+DocumentContext
+DocumentAuthoringToolset
+renderer
+DocumentGenerationWorker
+```
+
+### 13.2 新模板入口
+
+当前前端“上传模板”最终要统一为“添加附件”，但必须分阶段迁移。
+
+最终交互：
+
+```text
+添加附件
+  -> template.docx
+  -> [作为文档模板]
+  -> 选择/确认目标 KB
+  -> KB write permission
+  -> analyze-as-template
+  -> TemplateVersion / Analysis
+  -> DocumentContext
+```
+
+### 13.3 新 API
+
+保留现有：
+
+```http
+POST /document-generation/templates/analyze
+```
+
+新增：
+
+```http
+POST /api/v1/document-generation/templates/analyze-from-attachment
+```
+
+请求：
+
+```json
+{
+  "attachment_id": "att-123",
+  "kb_name": "project-a",
+  "template_name": "硬件设计说明书"
+}
+```
+
+后端：
+
+```text
+attachment ACL
+ -> target KB write permission
+ -> read server-side attachment bytes
+ -> existing analyze_document_template(...)
+ -> existing sanitize/analyze/version flow
+```
+
+浏览器不重复上传文件。
+
+### 13.4 模板权限不能随附件放宽
+
+```text
+上传普通附件
+    -> session access
+
+转换为模板
+    -> target KB write/admin permission
+```
+
+不得因为“能上传附件”就获得创建 KB 模板的权限。
+
+### 13.5 Template provenance
+
+给 `TemplateVersion` 增加可选 provenance：
+
+```text
+origin_source_type = chat_attachment
+origin_attachment_id
+origin_session_id
+origin_content_hash
+```
+
+但正式 TemplateVersion 必须保存自己的 sanitized bytes。
+
+删除原 attachment 后，已经创建的 TemplateVersion 继续有效。
+
+### 13.6 DocumentContext 不合并进 AttachmentContext
+
+继续保持两个正交字段：
+
+```text
+attachment_ids
+    = 本轮数据来源
+
+document_context
+    = 本轮使用哪个正式模板
+```
+
+示例：
+
+```json
+{
+  "query": "根据附件和知识库生成设计说明书",
+  "attachment_ids": ["att-data-1", "att-data-2"],
+  "source_scope": "attachment_and_knowledge_base",
+  "document_context": {
+    "analysis_id": "...",
+    "template_version_id": "..."
+  },
+  "document_flow": true
+}
+```
+
+### 13.7 必须增加 Document Flow 的 Multi-source Evidence Bridge
+
+当前 `runner.py` 在 `document_flow_routed` 时将 tools 收敛为 `document_tools`。
+
+因此仅给普通 Agent 增加附件工具，不足以实现：
+
+```text
+模板 + 附件 + KB -> 文档生成
+```
+
+推荐方案不是让 renderer 直接读附件，而是在文档生成域增加：
+
+```text
+DocumentEvidenceProvider
+```
+
+接口：
+
+```python
+class DocumentEvidenceProvider(Protocol):
+    def retrieve(
+        self,
+        *,
+        query: str,
+        source_scope: SourceScope,
+        attachment_ids: list[str],
+        kb_name: str,
+        ctx: RequestContext,
+    ) -> list[Evidence]:
+        ...
+```
+
+默认组合：
+
+```text
+KnowledgeBaseEvidenceProvider
++ AttachmentEvidenceProvider
+-> CompositeDocumentEvidenceProvider
+```
+
+文档 harness / generation work order 保存：
+
+```text
+source_scope_snapshot
+attachment_refs_snapshot
+kb_scope_snapshot
+```
+
+这样 Document Flow 可以使用统一 Evidence，而不破坏 TemplateVersion/renderer 安全边界。
+
+---
+
+## 14. API 最终设计
+
+### 14.1 Attachment API
 
 ```http
 POST   /api/v1/conversations/{session_id}/attachments
 GET    /api/v1/conversations/{session_id}/attachments
-GET    /api/v1/attachments/{attachment_id}
+GET    /api/v1/conversations/{session_id}/attachments/{attachment_id}
 DELETE /api/v1/conversations/{session_id}/attachments/{attachment_id}
+POST   /api/v1/conversations/{session_id}/attachments/{attachment_id}/retry
 ```
 
-上传接口返回 `AttachmentView`：
+上传支持：
+
+```text
+client_request_id
+```
+
+返回：
 
 ```text
 attachment_id
+asset_id
 filename
 media_type
 size_bytes
-role
 status
+parse_status
 manifest
+error_code
 error_message
 created_at
 expires_at
 ```
 
-上传接口支持可选的 `client_request_id` 幂等：同一 `(session_id, client_request_id)` 重复上传返回同一 `attachment_id`。`sha256` 相同的重复文件允许存在多条附件记录，解析产物按 §5.2 幂等复用。
+### 14.2 Turn API
 
-### 10.2 Turn API
-
-`CreateTurnRequest` 增加：
+`CreateTurnRequest`：
 
 ```json
 {
-  "attachment_ids": ["att-01H..."],
-  "source_scope": "attachment_only"
+  "query": "...",
+  "attachment_ids": ["att-1", "att-2"],
+  "source_scope": "auto",
+  "document_context": null,
+  "document_flow": null
 }
 ```
 
-`TurnView`、`MessageView` 和会话附件查询返回本轮使用的附件摘要，避免前端只能依赖临时状态。
+`TurnView` / `MessageView` 返回附件快照摘要和等待状态。
 
-如果附件仍在解析，创建 turn 可以进入 `waiting_for_attachments`。这是 `chat_turns.status` 的新增枚举值，需同步 turn 状态机（`waiting_for_attachments -> pending -> ...`）、SSE 事件和 `TurnView`/`MessageView` 的状态透出，前端据此渲染等待提示。解析成功后由 Worker 自动转入 `pending`；如果附件解析失败，turn 进入可解释的失败或降级状态，不把原始文件路径暴露给前端。
+### 14.3 Template-from-Attachment API
 
-### 10.3 前端入口
-
-修改：
-
-- `Composer.tsx`：按钮和隐藏 input 改为“添加附件”；
-- `ChatPage.tsx`：从模板上传状态改为附件列表和附件状态；
-- `useKbChat.ts`：维护选中附件并发送 `attachment_ids`；
-- `frontend/src/api/types.ts`：增加附件和来源类型；
-- 新增附件 API 和附件卡片组件。
-
-普通聊天和知识库聊天都可以显示“添加附件”；文档生成权限只在用户选择“作为模板”时校验。附件卡片支持选择/取消选择、删除、重试解析和查看降级原因。
-
-## 11. 权限、生命周期与安全
-
-### 11.1 权限边界
-
-- 上传附件只要求当前用户能访问会话；不因普通附件要求知识库写权限；
-- 如果本轮同时查询知识库，仍按现有知识库读权限校验；
-- 所有附件工具按 `user_id + session_id + attachment_id` 二次校验；
-- 不能通过文件名、哈希、SQL 表名或路径推导其他附件；
-- 附件默认只在所属会话可用；需要共享必须创建明确的共享授权。
-
-### 11.2 文件安全
-
-- 流式写盘并限制单文件、单会话和租户总容量；
-- MIME、扩展名和文件签名同时校验；
-- 检查 ZIP 炸弹、递归压缩和异常解压比例；
-- DOCX/XLSX 的宏、外链和嵌入对象不执行；
-- 解析器在 Worker 中运行，并受超时、内存和页数限制；现有 `parse_xlsx` 一次性载入整个 workbook 模型，需增加行数上限（`CHAT_ATTACHMENT_MAX_ROWS`），超限时返回可解释错误而不是静默截断；
-- 不提供任意 Shell、任意 Python 或任意本地路径工具；
-- 文件正文按不可信数据处理，不能覆盖系统提示或工具策略；
-- 火山方舟调用只在显式配置和本轮视觉路由触发时发生；默认不上传完整原始附件，只发送选定页面图像和最小必要文本；
-- `CHAT_ATTACHMENT_VISUAL_API_KEY`（默认复用 `MEMORY_EMBEDDING_API_KEY`）只保存在服务端，前端不接触供应商密钥；记录供应商请求 ID、模型 ID 和用量，不记录完整图像或正文；
-- 使用火山方舟意味着选定页面内容离开本地网络边界，管理员必须在部署文档中明确数据驻留、供应商保留策略和合规要求；完全内网部署关闭 `CHAT_ATTACHMENT_VISUAL_ENABLED`，或改用已批准的本地视觉模型；
-- 日志记录文件 ID、哈希、状态和统计信息，不记录完整正文。
-
-### 11.3 删除与保留
-
-删除会话时：
-
-1. 标记附件和任务不可用；
-2. 停止或取消仍未开始的解析任务；
-3. 删除附件关联、parts、FTS 索引和本地原文件；
-4. 删除或标记由该会话产生的导出任务和 Artifact。现状 `delete_session` 不清理 `result_snapshots`/`result_export_jobs`/`result_artifacts` 及磁盘文件（conversational-export 设计的同项承诺也未实现），本设计阶段 1 提供统一的会话删除清理钩子补齐该项，conversational-export 复用同一钩子，不各自实现；
-5. 删除 Agent checkpoint 中的会话引用；
-6. 失败清理写入 §6.5 的 `chat_attachment_deletion_outbox`，由 Worker 重试，不阻塞会话删除响应。
-
-附件过期只影响附件内容访问；历史消息可以保留文件名、状态和“文件已过期”提示，不保留可下载的原文件引用。
-
-## 12. 错误与降级
-
-| 场景 | 状态/行为 |
-|---|---|
-| 文件类型不支持 | 上传拒绝，返回允许类型 |
-| 文件超过大小/页数限制 | 上传拒绝 |
-| PDF 无可提取文本 | `degraded`，提示需要 OCR 或图片分析 |
-| DOCX 结构异常 | `failed`，保留错误码和重试入口 |
-| FTS 无命中 | Agent 可以补检索；仍无证据则明确未找到 |
-| 附件权限失效 | 工具返回拒绝，不泄露文件存在性 |
-| 解析任务 Worker 崩溃 | lease 过期后重试 |
-| LLM 不可用 | 不影响原文件和解析状态；turn 按现有失败策略处理 |
-| 本地索引损坏 | 可根据原文件和 parser version 重建 |
-
-Agent 继续遵守当前 fail-open 规则：工具异常返回空结果并发出 `degraded` 事件；但上传安全校验失败、越权和文件损坏必须在 API 层明确拒绝。
-
-## 13. 兼容与迁移
-
-1. 保留 `/document-generation/templates/analyze` 及现有 `DocumentContext`，旧模板工作台不迁移。
-2. 保留 `/kbs/{kb_name}/files` 和知识库 RAGFlow 上传逻辑，不把历史 `pipeline_documents` 迁移为附件。
-3. 新增数据库表采用 additive migration，不删除现有列。
-4. `document_context` 和 `attachment_ids` 可以同时存在；模板流程优先使用服务端重授权后的 `DocumentContext`。
-5. 前端文案和组件从模板改名为附件，但模板功能仍可以通过附件角色触发。
-6. 增加 `CHAT_ATTACHMENTS_ENABLED` 开关，默认关闭新入口，完成单租户验证后再逐步开启。
-7. 用户显式选择“归档到知识库”时，重新调用现有 KB 上传/解析流程，生成新的知识库记录；不把会话附件记录直接伪装成知识库文件。
-
-## 14. 代码修改范围
-
-### 14.1 新增
-
-```text
-src/api/routes/attachments.py
-src/attachments/models.py
-src/attachments/store.py
-src/attachments/service.py
-src/attachments/jobs.py
-src/attachments/local_document_parser.py
-src/attachments/local_attachment_index.py
-src/agents/tools/attachment_tools.py
-frontend/src/api/attachments.ts
-frontend/src/pages/chat/components/AttachmentChip.tsx
-frontend/src/pages/chat/components/AttachmentList.tsx
-tests/test_chat_attachments.py
-tests/test_local_attachment_parser.py
-tests/test_attachment_agent_tools.py
+```http
+POST /api/v1/document-generation/templates/analyze-from-attachment
 ```
 
-实际实现应优先复用现有 `src/ingestion/parser_registry.py`、`src/pipelines/registry.py`、`src/pipelines/spreadsheet/` 和 `src/circuit/`，不创建平行的 Excel/EDF 解析目录。
+保留旧模板 API 直到新入口稳定，不做破坏性迁移。
 
-### 14.2 修改
+---
 
-```text
-src/api/schemas.py
-src/api/routes/query.py
-src/api/routes/conversations.py
-src/core/conversation.py
-src/agents/runner.py
-src/agents/tools/runtime.py
-src/workers/*
-src/settings.py
-frontend/src/api/types.ts
-frontend/src/pages/chat/components/Composer.tsx
-frontend/src/pages/chat/ChatPage.tsx
-frontend/src/pages/chat/useKbChat.ts
-docs/architecture_doc.md
-```
+## 15. 前端最终设计
 
-### 14.3 明确不修改行为
+### 15.1 Composer
+
+最终：
 
 ```text
-src/api/routes/upload.py       # 知识库上传入口
-src/pipelines/document_rag/    # 知识库 RAGFlow 路径
-src/pipelines/spreadsheet/     # 只扩展作用域适配
-src/circuit/                   # 只扩展附件引用适配
+“上传模板” -> “添加附件”
 ```
 
-## 15. 分阶段实施计划
-
-### 阶段 0：契约和开关
-
-- 定义 `SourceRef`、`AttachmentView`、附件状态和 `attachment_ids` API 字段；
-- 增加数据库迁移和 feature flag；
-- 不改变知识库上传和 RAGFlow 行为；
-- 添加跨作用域访问拒绝测试。
-
-### 阶段 1：附件基础设施
-
-- 上传、列表、删除和状态 API（含 `client_request_id` 幂等）；
-- 会话私有存储；
-- `chat_attachments`、`turn_attachments`、任务表和删除 outbox；
-- Worker claim/lease/重试；
-- 前端附件卡片；
-- 会话删除清理，含统一的 result_exports 清理钩子和 `chat_attachment_deletion_outbox` 消费。
-
-### 阶段 2：本地 PDF/DOCX
-
-- PDF 按页解析；
-- DOCX 按标题、段落和表格解析；
-- canonical parts 和 FTS5（含运行环境 FTS5 可用性探测，探测失败时检索降级关闭）；
-- 建立 `AttachmentRetrievalService`、`SparseRetriever`、`DenseRetriever`、`FusionRanker` 和 `ContextPacker` 接口；第一版启用 FTS5，全文注入使用动态上下文预算；
-- `attachment_search`、`attachment_read`；
-- 证据定位、降级状态和 Agent 事件。
-
-### 阶段 3：Deep Agents 和意图路由
-
-- `ToolRuntime` 注入附件作用域；
-- Agent 识别 attachment-only、KB-only 和联合查询；
-- 附件内容不作为系统指令；
-- 附件证据进入统一 ResultEnvelope；
-- 支持附件分析后的结构化导出（依赖对话式导出 Phase 1 的 Snapshot/ExportJob 通路；`ExportDocumentPlanner` 属对话式导出 Phase 2，未落地前本阶段不承诺结构化文档规划）。
-
-### 阶段 4：Excel/EDF 作用域复用
-
-- 将现有表格服务绑定到 `SourceRef`；
-- 将现有电路服务绑定到 `attachment_id -> design_id`；
-- 校验同一文件在 KB 和附件作用域的解析结果一致；
-- 禁止附件索引进入知识库检索。
-
-### 阶段 5：高级能力
-
-- OCR 和 PDF 页面渲染；
-- 图片/复杂图表分析：通过 `MultimodalModelGateway` 接入火山方舟 `Doubao-Seed-2.0-lite`，只发送筛选后的页面图像；
-- 本地向量检索的独立评估，评估通过后再开启 DenseRetriever 和 RRF；
-- 多附件比较；
-- 显式归档到知识库。
-
-## 16. 测试和验收
-
-### 16.1 API 和权限
-
-1. 普通用户可以上传当前会话附件，不需要 KB 写权限。
-2. 用户不能读取其他用户或其他会话的附件。
-3. `attachment_ids` 不属于当前会话时 turn 创建失败。
-4. 知识库 `document_search` 不会返回会话附件。
-5. 附件工具不会读取知识库中未授权的文件。
-6. 会话删除后，附件、解析结果和下载引用均不可访问，关联导出任务和 Artifact 一并清理。
-7. 同一 `client_request_id` 重复上传返回同一附件记录，不产生重复解析任务。
-
-### 16.2 解析和索引
-
-1. PDF 的页码和文本块顺序稳定。
-2. DOCX 的标题、段落、表格和链接可回溯。
-3. 无文本 PDF 正确进入 `degraded`，不生成虚假证据。
-4. 相同内容、相同作用域和相同 parser version 不重复解析。
-5. 解析失败后可以根据原文件重建索引。
-6. 运行环境缺少 FTS5 时，上传和解析仍可用，`attachment_search` 返回明确的降级说明。
-7. 小文件全文注入不会超过动态上下文预算，且仍保留 Evidence 定位。
-8. 启用 DenseRetriever 时，embedding 模型或 parser 版本变化会触发可观测的重建任务。
-
-### 16.3 复用和一致性
-
-1. 同一 Excel 在知识库和附件作用域的解析字段、行数、类型和值一致。
-2. 同一 EDF/EDIF 的器件、网络、模块和连接关系一致。
-3. 作用域变化只影响权限、存储和索引，不改变领域解析结果。
-4. 普通 `.docx` 不自动触发模板分析。
-5. 只有明确选择模板角色后才生成 `DocumentContext`。
-
-### 16.4 Agent 和后台
-
-1. “只分析附件”不调用 RAGFlow。
-2. “只查知识库”不读取附件。
-3. “结合附件和知识库”可以同时获得两类 Evidence，并保留 backend/source locator。
-4. 切换页面不会中断解析或 turn。
-5. Worker 崩溃后任务可由 lease 过期机制恢复。
-6. 用户要求 PDF/Word/Excel 等格式时，结果进入现有 Artifact/ExportJob，而不是导出原始对话 transcript。
-
-### 16.5 多模态和供应商边界
-
-1. 未启用视觉开关或完全内网配置时，不产生火山方舟请求。
-2. 视觉请求只包含当前会话已授权且被选中的页面，不包含原始本地路径。
-3. `Doubao-Seed-2.0-lite` 能够返回页面级视觉结论，并保留 `attachment_id`、页码、模型 ID 和供应商请求 ID。
-4. 火山方舟超时、限流或不可用时，系统返回文本/OCR 结果或可解释的 `degraded` 状态。
-5. 视觉结果不能绕过知识库和附件的来源权限，也不能注入系统提示或工具策略。
-
-## 17. 观测与配置
-
-新增指标：
+支持：
 
 ```text
-hdb.attachment.upload
-hdb.attachment.parse
-hdb.attachment.parse_duration
-hdb.attachment.parse_bytes
-hdb.attachment.search
-hdb.attachment.read
-hdb.attachment.visual
-hdb.attachment.visual_duration
-hdb.attachment.visual_failure
-hdb.attachment.degraded
-hdb.attachment.cleanup
+.pdf
+.docx
+.txt
+.md
+.xlsx
+.xlsm（受限）
+.edf
+.edif
 ```
 
-所有指标只记录 attachment ID 的哈希或不可逆短标识、类型、大小区间、状态和耗时，不记录正文。指标实现遵循现有约定：在 `src/observability/metrics.py` 集中封装 `hdb.attachment.*`，不在附件模块内直接调用 OTel。
+### 15.2 Attachment UI
 
-新增配置：
+新增：
+
+```text
+AttachmentChip.tsx
+AttachmentList.tsx
+```
+
+展示：
+
+```text
+filename
+parse status
+selected/unselected
+degraded reason
+retry
+delete
+作为模板（仅支持 xlsx/xlsm/docx 且有 KB write 权限）
+```
+
+### 15.3 模板迁移顺序
+
+在 `analyze-from-attachment` 和 DocumentContext bridge 未完成前：
+
+```text
+保留旧“上传模板”入口
+```
+
+完成并通过回归测试后，再在 feature flag 下切换为统一“添加附件”。
+
+不能先删除旧模板入口再补转换链路。
+
+### 15.4 Source Scope UI
+
+第一版可提供简单选择：
+
+```text
+自动
+仅附件
+仅知识库
+附件 + 知识库
+```
+
+自然语言范围识别作为 Agent planner 增强，但 UI/API 明确 scope 始终优先。
+
+---
+
+## 16. Phase 6：OCR / Visual / Hybrid Retrieval
+
+该阶段是增强能力，不阻塞附件核心链路；**本地没有 GPU 也可以完整实施。**
+
+### 16.1 OCR：本地 CPU
+
+流程：
+
+```text
+PDF text density too low
+ -> render selected page
+ -> LocalOcrEngine
+ -> OCR parts
+ -> Evidence
+```
+
+抽象：
+
+```python
+class OcrEngine(Protocol):
+    def recognize(self, image: bytes) -> OcrResult:
+        ...
+```
+
+可实现：
+
+```text
+LocalCpuOcrEngine
+RemoteOcrEngine
+DisabledOcrEngine
+```
+
+OCR 不要求 GPU；Worker 异步执行即可。
+
+### 16.2 Visual：默认远程按页调用
+
+新增：
+
+```text
+AttachmentVisualAnalyzer
+MultimodalModelGateway
+```
+
+默认职责：
+
+```text
+只处理被命中的页面/用户指定页面
+不默认上传完整 PDF
+不替代本地 parser
+不生成 embedding
+```
+
+推荐火山方舟在线推理：
+
+```text
+Base URL: https://ark.cn-beijing.volces.com/api/v3
+Responses: /api/v3/responses
+Model: 使用控制台当前实际可用 Model/Endpoint ID
+```
+
+配置不要 fallback 到 `MEMORY_EMBEDDING_API_KEY`。
+
+推荐：
+
+```text
+ARK_API_KEY / CredentialProvider
+    -> Memory embedding capability
+    -> Attachment visual capability
+```
+
+两者可以最终使用同一个 secret，但不要形成跨领域配置依赖。
+
+### 16.3 Visual 权限
+
+调用前重新验证：
+
+```text
+attachment ownership
+page bounds
+max pages
+image size
+remote inference policy
+```
+
+请求只包含：
+
+```text
+选中页图片
+最小必要 text context
+用户问题
+```
+
+### 16.4 Hybrid Retrieval
+
+Dense Retrieval 可选：
+
+```text
+Sparse + Dense -> RRF -> optional rerank
+```
+
+Embedding 可以：
+
+```text
+远程 API
+或
+本地 CPU 小模型
+```
+
+不要求本地 GPU。
+
+第一阶段不开 Dense 也完全可行。
+
+### 16.5 CPU-only 推荐部署
+
+```text
+8~16 CPU cores
+16~32 GB RAM
+SSD
+GPU: none
+```
+
+本地运行：
+
+```text
+FastAPI
+Deep Agents
+SQLite / FTS5
+PDF/DOCX parser
+CPU OCR
+Spreadsheet/Circuit services
+Attachment Worker
+```
+
+远程可选：
+
+```text
+Main LLM
+Embedding API
+Doubao visual API
+```
+
+只有未来要求“视觉模型也完全离线本地运行”时，才把 GPU 作为基础设施考虑。
+
+---
+
+## 17. 文件安全与资源限制
+
+上传：
+
+```text
+stream write
+MIME + extension + signature
+size limits
+session quota
+tenant quota
+SHA-256
+```
+
+OOXML / ZIP：
+
+```text
+zip bomb detection
+max uncompressed bytes
+compression ratio
+recursive archive policy
+embedded object policy
+external link policy
+macro never execute
+```
+
+Parser Worker：
+
+```text
+timeout
+memory budget
+page limit
+row/cell limit
+```
+
+LLM / Agent：
+
+```text
+附件正文 = untrusted data
+不可覆盖 system prompt
+不可生成本地路径能力
+不可执行附件脚本
+```
+
+日志：
+
+```text
+记录 IDs/hash/status/size bucket/latency
+不记录完整正文
+不记录页面图像
+不记录 API key
+```
+
+---
+
+## 18. 生命周期与删除
+
+### 18.1 单附件删除
+
+```text
+soft-delete attachment record
+ -> detach from future turns
+ -> if no attachment references asset:
+      schedule asset cleanup
+```
+
+历史 `turn_attachments` 快照继续存在。
+
+### 18.2 Session 删除
+
+`SessionCleanupCoordinator`：
+
+```text
+1. mark session resources unavailable
+2. cancel queued attachment jobs
+3. delete/reclaim attachment assets and parts
+4. delete FTS/vector/OCR/visual cache
+5. clean result exports/artifacts
+6. delete agent checkpoint
+7. cleanup failure -> session_cleanup_outbox
+```
+
+删除 API 不因下游磁盘清理失败而长期阻塞；清理动作由 outbox 重试。
+
+---
+
+## 19. 配置
+
+核心：
 
 ```text
 CHAT_ATTACHMENTS_ENABLED
@@ -873,54 +1554,695 @@ CHAT_ATTACHMENT_MAX_BYTES
 CHAT_ATTACHMENT_MAX_FILES_PER_SESSION
 CHAT_ATTACHMENT_MAX_PAGES
 CHAT_ATTACHMENT_MAX_ROWS
+CHAT_ATTACHMENT_MAX_CELLS
+CHAT_ATTACHMENT_MAX_UNCOMPRESSED_BYTES
 CHAT_ATTACHMENT_PARSE_TIMEOUT_SECONDS
 CHAT_ATTACHMENT_RETENTION_SECONDS
-CHAT_ATTACHMENT_OCR_ENABLED
-CHAT_ATTACHMENT_RETRIEVAL_MODE=fts5|hybrid
-CHAT_ATTACHMENT_DENSE_ENABLED
-CHAT_ATTACHMENT_EMBEDDING_PROVIDER=ollama
-CHAT_ATTACHMENT_EMBEDDING_MODEL
-CHAT_ATTACHMENT_EMBEDDING_VERSION
 CHAT_ATTACHMENT_CONTEXT_MAX_TOKENS
+CHAT_ATTACHMENT_CONTEXT_RATIO
+```
+
+检索：
+
+```text
+CHAT_ATTACHMENT_FTS_ENABLED
+CHAT_ATTACHMENT_TRIGRAM_ENABLED
+CHAT_ATTACHMENT_DENSE_ENABLED
+CHAT_ATTACHMENT_RETRIEVAL_MODE=lexical|hybrid
+CHAT_ATTACHMENT_EMBEDDING_PROVIDER
+CHAT_ATTACHMENT_EMBEDDING_MODEL
+```
+
+OCR：
+
+```text
+CHAT_ATTACHMENT_OCR_ENABLED
+CHAT_ATTACHMENT_OCR_PROVIDER=local_cpu|remote
+CHAT_ATTACHMENT_OCR_MAX_PAGES
+```
+
+Visual：
+
+```text
 CHAT_ATTACHMENT_VISUAL_ENABLED
+CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED
 CHAT_ATTACHMENT_VISUAL_PROVIDER=volcengine_ark
-CHAT_ATTACHMENT_VISUAL_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3
+CHAT_ATTACHMENT_VISUAL_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 CHAT_ATTACHMENT_VISUAL_MODEL
-CHAT_ATTACHMENT_VISUAL_API_KEY
 CHAT_ATTACHMENT_VISUAL_MAX_PAGES_PER_TURN
 CHAT_ATTACHMENT_VISUAL_MAX_IMAGE_BYTES
 CHAT_ATTACHMENT_VISUAL_TIMEOUT_SECONDS
-CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED
+ARK_API_KEY
 ```
 
-模型配置说明：`CHAT_ATTACHMENT_VISUAL_BASE_URL` 默认取当前 `.env` 中的 `MEMORY_EMBEDDING_BASE_URL`，其值为 `https://ark.cn-beijing.volces.com/api/plan/v3`；`CHAT_ATTACHMENT_VISUAL_API_KEY` 默认取 `MEMORY_EMBEDDING_API_KEY`，不在代码、文档、前端或日志中写入实际值。`CHAT_ATTACHMENT_VISUAL_MODEL` 保存火山方舟实际 Endpoint ID；当前官方示例使用过 `doubao-seed-2-0-lite-260215`，也可能存在更新的日期版本，不能把示例 ID 当作永久别名。推荐在隐私审批前将 `CHAT_ATTACHMENT_VISUAL_ENABLED=false`、`CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED=false`；审批通过并完成 Endpoint 配置后再开启。文件不进入 RAGFlow 不代表解析片段不会发送给远程 LLM；完全内网处理应使用本地视觉模型或脱敏策略。
+---
 
-## 18. 回滚策略
+## 20. Observability
 
-1. 关闭 `CHAT_ATTACHMENTS_ENABLED` 即隐藏新入口，已有知识库功能不受影响。
-2. 附件 Worker 停止后，未完成任务保持可恢复状态，不删除原文件。
-3. 本地附件 API 出现问题时，现有 KB API 和文档模板工作台继续运行。
-4. 数据库迁移只新增表和索引，不回写或删除历史会话数据。
-5. 若本地解析质量不满足要求，可以保留上传和下载，关闭 `attachment_search`，不影响 RAGFlow 知识库检索。
-6. 若火山方舟视觉通道不可用，关闭 `CHAT_ATTACHMENT_VISUAL_ENABLED` 或 `CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED`，回退到文本/OCR/`degraded`，不影响本地附件和知识库功能。
+集中到现有 observability 层，不在附件模块里散落直接 OTel 调用。
 
-## 19. 最终验收结论
-
-本设计完成后，系统应满足以下边界：
+建议：
 
 ```text
-KB 文档 = RAGFlow 的知识库资产
-会话附件 = 本地、私有、可过期的临时资产
-Excel/EDF = 复用现有领域解析器和查询引擎
-Deep Agents = 意图理解和工具编排层
-Doubao-Seed-2.0-lite = 按需页面视觉分析适配器，不是本地解析器或向量模型
-导出 = 结构化结果到 Artifact 的独立交付层
+hdb.attachment.upload
+hdb.attachment.asset_reuse
+hdb.attachment.parse
+hdb.attachment.parse_duration
+hdb.attachment.search
+hdb.attachment.read
+hdb.attachment.waiting_turn
+hdb.attachment.ocr
+hdb.attachment.visual
+hdb.attachment.visual_failure
+hdb.attachment.degraded
+hdb.attachment.cleanup
+hdb.attachment.cleanup_retry
 ```
 
-实现顺序应先完成附件契约、权限和生命周期，再接入本地 PDF/DOCX，最后扩展 Excel/EDF 的作用域适配。这样不会在当前知识库和导出功能尚未稳定时引入不可回滚的 RAGFlow 或解析行为变化。
+增加诊断字段：
 
-## 20. 供应商参考
+```text
+source_scope
+processor_kind
+parser_version
+retrieval_mode
+matched_backend
+```
 
-- [火山方舟 Doubao-Seed-2.0-lite 基础使用](https://www.volcengine.com/docs/82379/1795150)：模型调用、图片理解、视频理解和文档理解入口。
-- [火山方舟 Responses API 工具调用](https://www.volcengine.com/docs/82379/1958524?lang=zh)：函数调用和服务端工具编排方式。
-- [火山引擎模型产品页](https://www.volcengine.com/product/doubao/)：推理模型与独立 embedding 模型的能力边界。
+不得记录正文。
+
+---
+
+## 21. 代码修改范围
+
+### 21.1 新增后端
+
+```text
+src/attachments/__init__.py
+src/attachments/models.py
+src/attachments/store.py
+src/attachments/service.py
+src/attachments/router.py
+src/attachments/jobs.py
+src/attachments/worker.py
+src/attachments/coordinator.py
+src/attachments/local_document_parser.py
+src/attachments/index.py
+src/attachments/retrieval.py
+src/attachments/query_normalizer.py
+src/attachments/evidence.py
+src/attachments/template_bridge.py
+
+src/agents/scopes/base.py
+src/agents/scopes/knowledge_base.py
+src/agents/scopes/attachment.py
+src/agents/tools/attachment_tools.py
+
+src/document_authoring/evidence_provider.py
+src/core/session_cleanup.py
+```
+
+Phase 6：
+
+```text
+src/attachments/ocr.py
+src/attachments/visual.py
+src/core/multimodal_gateway.py
+src/core/embedding_gateway.py
+```
+
+### 21.2 修改后端
+
+```text
+src/api/schemas.py
+src/api/routes/query.py
+src/api/routes/conversations.py
+src/api/routes/document_generation.py
+src/core/conversation.py
+src/agents/runner.py
+src/agents/tools/runtime.py
+src/agents/tools/spreadsheet_tools.py
+src/agents/tools/circuit_tools.py
+src/document_authoring/models.py
+src/document_authoring/service.py
+src/document_authoring/work_order_store.py
+src/workers/*
+src/settings.py
+src/observability/metrics.py
+```
+
+### 21.3 保持行为不变
+
+```text
+src/pipelines/registry.py           # 不为附件重构二维 registry
+src/pipelines/document_rag/         # KB RAGFlow 行为不改
+src/api/routes/upload.py            # KB upload 行为不改
+src/pipelines/spreadsheet/           # parser 复用，只做 scope 接入
+src/circuit/                         # parser/query 核心复用，只做 scope/storage adapter
+```
+
+`src/ingestion/parser_registry.py` 不是附件实现的强制入口。
+
+### 21.4 前端新增
+
+```text
+frontend/src/api/attachments.ts
+frontend/src/pages/chat/components/AttachmentChip.tsx
+frontend/src/pages/chat/components/AttachmentList.tsx
+frontend/src/pages/chat/components/AttachmentSourceScope.tsx
+```
+
+### 21.5 前端修改
+
+```text
+frontend/src/api/types.ts
+frontend/src/pages/chat/components/Composer.tsx
+frontend/src/pages/chat/ChatPage.tsx
+frontend/src/pages/chat/useKbChat.ts
+```
+
+---
+
+## 22. 分阶段实施计划
+
+## Phase 0：契约、回归锁与 Migration
+
+目标：先固定不会反复变化的领域契约。
+
+实施：
+
+```text
+AttachmentRef
+AttachmentAsset
+SourceScope
+parse status
+turn_attachments snapshot
+DB migrations
+feature flags
+```
+
+同时补当前行为 regression tests：
+
+```text
+PipelineRegistry extension conflict
+General Chat current behavior
+KB document search current behavior
+Template upload/analyze/generate current behavior
+Spreadsheet/Circuit KB permission behavior
+```
+
+Definition of Done：
+
+- migration 可重复执行；
+- 新表未启用时不改变现有用户行为；
+- 旧测试全部通过。
+
+---
+
+## Phase 1：附件生命周期基础设施
+
+实施：
+
+```text
+AttachmentService
+AttachmentAsset storage
+upload/list/detail/delete/retry
+client_request_id idempotency
+asset reuse
+parse job queue
+AttachmentTurnCoordinator skeleton
+frontend attachment cards
+```
+
+此时可只支持上传和状态，不要求 Agent 能回答附件问题。
+
+**保留旧“上传模板”入口。**
+
+Definition of Done：
+
+- 不需 KB write 权限即可上传当前会话普通附件；
+- 无法读其他会话附件；
+- 相同文件在同 session 复用 asset；
+- 删除附件不会破坏历史 turn snapshot。
+
+---
+
+## Phase 2：本地 PDF / DOCX + Hardware Lexical Retrieval
+
+实施：
+
+```text
+PDF parser
+DOCX parser
+canonical parts
+FTS5 probe
+ExactIdentifierRetriever
+SparseTextRetriever
+optional trigram
+QueryNormalizer
+attachment_search
+attachment_read
+Evidence
+```
+
+专项测试：
+
+```text
+中文
+料号
+型号
+RefDes
+Net Name
++12V
+VDD_3V3
+STM32H743
+R1/U2/EN/FB
+```
+
+Definition of Done：
+
+- 能回答附件内容问题并返回定位；
+- 无文本 PDF 明确 degraded；
+- FTS5 缺失不导致服务崩溃。
+
+---
+
+## Phase 3：Deep Agents + General Chat + Turn Waiting
+
+实施：
+
+```text
+CreateTurnRequest.attachment_ids/source_scope
+ToolRuntime attachment scope
+attachment tools
+scope-based tool assembly
+General Chat + Attachment Deep Agent
+waiting_for_attachments
+AttachmentTurnCoordinator
+SSE / frontend status
+```
+
+Definition of Done：
+
+```text
+General + Attachment works
+KB only does not read attachments
+Attachment only does not call RAGFlow
+Combined can return both Evidence classes
+```
+
+---
+
+## Phase 4：Excel / EDF Attachment Scope
+
+实施：
+
+```text
+SpreadsheetScopeResolver
+CircuitScopeResolver
+attachment-scoped SpreadsheetIndexService storage
+attachment CircuitStore root
+SQL scope enforcement
+attachment_id -> design_id mapping
+```
+
+Definition of Done：
+
+- 同一 Excel 在 KB 和 Attachment 的领域解析结果一致；
+- 同一 EDF 的器件、网络、模块结果一致；
+- 差异只存在于 ACL/storage namespace；
+- KB SQL/Circuit 安全策略没有被附件路径绕开。
+
+---
+
+## Phase 5：模板附件化与 Document Flow Multi-source
+
+实施顺序：
+
+```text
+analyze-from-attachment API
+Template provenance
+Attachment card “作为模板”
+DocumentEvidenceProvider
+source_scope_snapshot in document generation
+attachment Evidence bridge
+regression tests
+```
+
+全部稳定后：
+
+```text
+Composer “上传模板” -> “添加附件”
+```
+
+旧模板 API 继续保留兼容。
+
+Definition of Done：
+
+```text
+Attachment DOCX/XLSX/XLSM -> TemplateVersion
+TemplateVersion 不依赖原 attachment 生命周期
+Template + KB -> generation works
+Template + Attachment -> generation works
+Template + Attachment + KB -> generation works
+```
+
+---
+
+## Phase 6：OCR / Visual / Hybrid Retrieval
+
+实施状态：已完成可插拔 CPU OCR、按页视觉分析和可选 Dense/RRF 混合检索；运行时仍由独立开关与凭据控制，高级能力不可用时统一返回 degraded 诊断。
+
+实施：
+
+### 6A CPU OCR
+
+```text
+PDF renderer
+LocalOcrEngine
+ocr_text parts
+```
+
+### 6B Dense/Hybrid
+
+```text
+EmbeddingGateway
+optional vector store
+DenseRetriever
+RRF
+retrieval evaluation
+```
+
+### 6C Visual
+
+```text
+AttachmentVisualAnalyzer
+MultimodalModelGateway
+selected-page remote visual inference
+visual Evidence
+```
+
+Definition of Done：
+
+- CPU-only 环境可以运行；
+- 远程视觉关闭时核心功能不受影响；
+- Vision failure 只产生 degraded，不破坏本地附件检索。
+
+---
+
+## Phase 7：清理、观测、灰度与发布
+
+实施状态：会话清理 outbox、附件/文档工单与产物回收、队列/阶段/附件观测已接入；灰度开关保留在部署配置层。
+
+实施：
+
+```text
+SessionCleanupCoordinator
+session_cleanup_outbox
+export/artifact/checkpoint cleanup
+metrics
+quota
+load tests
+retention cleanup
+feature flag rollout
+```
+
+发布顺序：
+
+```text
+internal dev
+-> single tenant pilot
+-> selected users
+-> default on
+```
+
+---
+
+## 23. 测试矩阵
+
+### 23.1 权限
+
+1. 普通附件不需要 KB write。
+2. 其他用户/会话 attachment id 返回权限拒绝且不泄露文件存在性。
+3. `attachment_only` 不调用 RAGFlow。
+4. `knowledge_base_only` 不读取 attachment。
+5. analyze-as-template 必须重新检查目标 KB write/admin。
+6. attachment SQL / Circuit query 无法越权其他 asset。
+
+### 23.2 数据模型与幂等
+
+1. 同一 `client_request_id` 返回同一 attachment。
+2. 同 session 同 hash 两个 attachment 共享一个 asset。
+3. 删除一个 attachment 不误删仍被引用 asset。
+4. parser version 更新可安全重建 parts。
+
+### 23.3 状态机
+
+1. parse 中创建 turn -> waiting。
+2. 所有 required ready -> pending。
+3. required failed -> failed。
+4. degraded -> pending + diagnostic。
+5. cancel waiting turn 生效。
+6. 页面刷新/切换不丢状态。
+
+### 23.4 本地文档
+
+1. PDF page locator 稳定。
+2. DOCX heading/paragraph/table locator 稳定。
+3. 扫描件不产生虚假文本证据。
+4. 小文件全文注入不突破动态 token budget。
+
+### 23.5 Hardware Retrieval
+
+专项：
+
+```text
+连续中文
+STM32H743ZI
+H743
+TPS62130
+VDD_3V3
++12V
+R1
+U2
+EN
+FB
+USB_DP
+CAN_H/CAN_L
+```
+
+同时验证 FTS 特殊字符不会产生查询语法错误。
+
+### 23.6 Excel / Circuit
+
+1. KB/Attachment parser 输出一致。
+2. SQL 仍只读。
+3. attachment scope 过滤不可被 SQL 绕过。
+4. Circuit store 不允许路径逃逸。
+5. attachment 和 KB 同名 design 不冲突。
+
+### 23.7 模板
+
+1. 原 `/document-generation/templates/analyze` 回归通过。
+2. attachment -> template 使用相同 sanitizer。
+3. 原 attachment 删除后 TemplateVersion 仍可生成文档。
+4. 无 KB write 权限不能把 attachment 转为模板。
+5. document_context 与 attachment_ids 可同时存在。
+6. Template + Attachment + KB 能生成带正确 Evidence 的文档。
+
+### 23.8 OCR / Visual
+
+1. 视觉开关关闭不产生远程请求。
+2. 只发送授权页面。
+3. 供应商超时 -> degraded。
+4. CPU-only 环境 OCR 可运行。
+5. Visual 结果保留 attachment/page/provider/model/request id。
+
+### 23.9 删除
+
+1. Session 删除后附件不可访问。
+2. parts/index/file 被清理。
+3. export/artifact/checkpoint 清理失败进入 outbox。
+4. outbox 重试幂等。
+
+---
+
+## 24. 验收标准（最终 Definition of Done）
+
+只有以下全部成立，才认为最终目标完成：
+
+### 用户体验
+
+- 普通聊天和 KB 聊天均可添加附件；
+- 用户可明确选择附件/KB/联合范围；
+- 能查看解析状态、失败原因、重试和删除；
+- 支持将合法 DOCX/XLSX/XLSM 附件显式转换为模板；
+- 用户可根据模板 + KB + Attachment 生成文档。
+
+### 架构
+
+- KB PDF/DOCX 继续 RAGFlow；
+- Chat PDF/DOCX 不自动进入 RAGFlow；
+- `PipelineRegistry` 的 KB 行为无回归；
+- Excel/EDF 只有一套领域 parser/query engine；
+- Agent 不拥有任意文件系统能力；
+- Attachment/KB 使用统一 Evidence。
+
+### 安全
+
+- session/user/KB ACL 全部后端强制；
+- 模板转换重新检查 KB write；
+- OOXML active content 不执行；
+- SQL 只读且 scope locked；
+- Remote Visual 明确受管理员配置控制。
+
+### 生命周期
+
+- 上传、解析、turn、删除、过期、cleanup 可恢复；
+- 历史 turn 保留附件快照；
+- session 删除可最终清除 attachment/export/checkpoint 资源。
+
+### 部署
+
+- 核心功能在无 GPU 环境可运行；
+- OCR 可 CPU 执行；
+- Dense 可关闭；
+- Visual 可关闭或远程按需；
+- 任一高级能力关闭不破坏核心附件链路。
+
+---
+
+## 25. P0 / P1 实施优先级
+
+### P0：进入代码前必须解决
+
+```text
+1. 独立 AttachmentProcessorRouter，不破坏 PipelineRegistry 不变量
+2. AttachmentRecord / AttachmentAsset 分层
+3. General Chat + Attachment Agent 路由
+4. waiting_for_attachments 完整状态机
+5. CircuitStore attachment root，不伪造 kb_name 路径
+6. Ark 在线推理 Base URL 使用 /api/v3
+7. 旧模板入口在新模板 bridge 完成前不得删除
+8. Document Flow 必须能获取 attachment Evidence
+```
+
+### P1：强烈推荐同时完成
+
+```text
+1. Spreadsheet/Circuit ScopeResolver
+2. SessionCleanupCoordinator + 完整 outbox 状态机
+3. Hardware-specific lexical + trigram/exact 组合策略
+4. Turn attachment snapshots + soft delete
+5. CredentialProvider 替代 Visual -> MEMORY_EMBEDDING_API_KEY fallback
+6. parser 内部 XLSX/ZIP 资源限制
+```
+
+---
+
+## 26. 回滚策略
+
+1. `CHAT_ATTACHMENTS_ENABLED=false`：隐藏新入口，原 KB 和模板能力继续工作。
+2. Attachment Worker 停止：原文件和任务保留，可恢复。
+3. Local search 故障：附件仍可上传/删除；KB RAGFlow 不受影响。
+4. Dense/Visual/OCR 分别有独立开关，可单独关闭。
+5. 新 template-from-attachment 故障：保留旧 `/document-generation/templates/analyze`。
+6. 数据库 migration 只 additive，不删除原 chat/KB/template 数据。
+7. 新 frontend 入口必须 feature flag 灰度，不做一次性替换。
+
+---
+
+## 27. 实施纪律
+
+开发过程中遵守以下约束：
+
+```text
+不要因为“代码复用”破坏来源权限边界。
+不要因为“统一路由”扩大现有 KB ingestion 回归面。
+不要因为“Agent 更聪明”把 ACL 决策交给模型。
+不要因为“附件已经存在”绕过模板 sanitizer。
+不要因为“Hybrid 更先进”阻塞第一版 lexical retrieval。
+不要因为“视觉效果好”默认把完整文件发送到远程模型。
+不要为了本功能引入本地 GPU 作为部署前提。
+```
+
+最终稳定抽象应是：
+
+```text
+Source
+Scope
+Asset
+Evidence
+Tool
+Lifecycle
+```
+
+底层未来可以替换：
+
+```text
+FTS5 -> Elasticsearch/OpenSearch
+Dense store -> sqlite-vec/Qdrant/pgvector
+Doubao -> approved local/cloud vision provider
+RAGFlow -> another KB retrieval backend
+```
+
+但这些替换不应改变上层 Agent、权限模型、文档模板链和用户交互契约。
+
+---
+
+## 28. 代码基线参考
+
+本方案主要基于以下 `feature/fix-module-matching` 文件核查：
+
+- `src/pipelines/registry.py`
+- `src/api/schemas.py`
+- `src/core/conversation.py`
+- `src/agents/runner.py`
+- `src/agents/tools/runtime.py`
+- `src/agents/tools/spreadsheet_tools.py`
+- `src/agents/tools/circuit_tools.py`
+- `src/circuit/store.py`
+- `src/ingestion/parser_registry.py`
+- `src/api/routes/document_generation.py`
+- `src/document_authoring/service.py`
+- `src/agents/tools/document_authoring_tools.py`
+- `frontend/src/pages/chat/components/Composer.tsx`
+- `frontend/src/pages/chat/ChatPage.tsx`
+
+外部技术参考：
+
+- SQLite FTS5：https://www.sqlite.org/fts5.html
+- 火山方舟 Doubao Seed 2.0：https://www.volcengine.com/docs/82379/1795150
+- 火山方舟 Responses API 工具调用：https://www.volcengine.com/docs/82379/1958524?lang=zh
+
+---
+
+## 29. 最终结论
+
+本方案完成后的系统边界应稳定为：
+
+```text
+Knowledge Base
+    = 长期共享知识资产
+    = RAGFlow + 现有结构化领域能力
+
+Chat Attachment
+    = 会话私有临时资产
+    = 本地解析 + 本地作用域 + 可选 OCR/Visual/Hybrid
+
+Document Template
+    = 独立、sanitize、版本化、可审计的正式模板资产
+    = Attachment 可以成为其来源，但不能替代 TemplateVersion
+
+Deep Agents
+    = 意图理解 + SourceScope 下的工具编排
+    = 不拥有任意本地文件系统能力
+
+Evidence
+    = KB / Attachment / Structured data 的统一事实接口
+
+Export / Document Generation
+    = 在 Evidence 基础上的独立结果交付层
+```
+
+建议严格按 Phase 0 -> Phase 7 推进，不提前引入 GPU、本地大视觉模型或重型向量基础设施。先完成来源、权限、生命周期、General Chat 路由和模板兼容，再逐步增加 OCR、Visual 和 Hybrid Retrieval。

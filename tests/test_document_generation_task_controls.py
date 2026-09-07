@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from src.document_authoring.models import DocumentArtifact, DocumentWorkOrder
+from src.document_authoring.models import DocumentArtifact, DocumentWorkOrder, HarnessCheckpoint, HarnessRun
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.harness import runtime as harness_runtime
 from src.document_authoring.harness.graph import HarnessExecutionResult
@@ -88,6 +88,73 @@ def test_terminal_delete_removes_owned_artifact_and_keeps_audit(tmp_path):
     assert not Path(artifact.storage_ref).exists()
     assert audit.work_order_id == order.work_order_id
     assert audit.actor_id == "writer"
+
+
+def test_session_cleanup_removes_authoring_artifacts_runs_checkpoints_and_sessions(tmp_path):
+    store = DocumentAuthoringStore(
+        db_path=str(tmp_path / "authoring.db"),
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    generation_session = store.generation_sessions.create_session(
+        tenant_id="tenant-a",
+        user_id="writer",
+        knowledge_base_name="hardware",
+        template_version_id="template-1",
+    )
+    order = _work_order("wo-session-cleanup", "retrieving").model_copy(
+        update={"generation_session_id": generation_session.session_id}
+    )
+    order = store.create_work_order(order)
+    content = b"generated workbook"
+    artifact = store.save_artifact(
+        DocumentArtifact(
+            artifact_id="artifact-session-cleanup",
+            tenant_id="tenant-a",
+            work_order_id=order.work_order_id,
+            run_id="run-session-cleanup",
+            stage="review_candidate",
+            content_hash=hashlib.sha256(content).hexdigest(),
+            validation_report_id="report-1",
+            integrity_manifest_id="manifest-1",
+        ),
+        content,
+        "xlsx",
+    )
+    run = store.create_harness_run(
+        HarnessRun(
+            harness_run_id="run-session-cleanup",
+            work_order_id=order.work_order_id,
+            run_manifest_id="manifest-1",
+            status="queued",
+            agent_thread_id="authoring-thread-session-cleanup",
+        )
+    )
+    claimed = store.claim_harness_run(run.harness_run_id, "authoring-worker", 30)
+    store.save_harness_checkpoint_owned(
+        HarnessCheckpoint(
+            checkpoint_id="checkpoint-session-cleanup",
+            harness_run_id=run.harness_run_id,
+            work_order_id=order.work_order_id,
+            input_fingerprint=order.input_fingerprint,
+            source_set_snapshot_id=order.source_set_snapshot_id,
+            fencing_token=claimed.fencing_token,
+        ),
+        "authoring-worker",
+        claimed.fencing_token,
+    )
+    artifact_path = Path(artifact.storage_ref)
+    assert artifact_path.exists()
+
+    store.cleanup_work_orders([order.work_order_id])
+
+    assert store.get_work_order(order.work_order_id) is None
+    assert store.get_artifact(artifact.artifact_id) is None
+    assert store.get_harness_run(run.harness_run_id) is None
+    assert store.get_harness_checkpoint("checkpoint-session-cleanup") is None
+    with pytest.raises(KeyError):
+        store.generation_sessions.get_session(generation_session.session_id)
+    assert not artifact_path.exists()
+    store.cleanup_work_orders([order.work_order_id])
 
 
 def test_running_work_order_cannot_be_deleted(tmp_path):

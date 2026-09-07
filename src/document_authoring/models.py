@@ -90,6 +90,13 @@ class TemplateVersion(BaseModel):
     approved_by: str | None = None
     approved_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
+    # Optional chat-attachment provenance (design §13.5). The sanitized
+    # bytes remain self-contained: deleting the origin attachment never
+    # invalidates the TemplateVersion.
+    origin_source_type: str | None = None
+    origin_attachment_id: str | None = None
+    origin_session_id: int | None = None
+    origin_content_hash: str | None = None
 
 
 class LegacyTemplateClaim(BaseModel):
@@ -277,6 +284,13 @@ class DocumentWorkOrder(BaseModel):
     baseline_id: str | None
     baseline_content_hash: str
     source_set_snapshot_id: str
+    # Document Flow source authorization is frozen alongside the source-set
+    # snapshot.  Empty defaults are intentional: payloads created before the
+    # attachment bridge was introduced must retain their historical
+    # fingerprints when they are rehydrated.
+    source_scope_snapshot: str = ""
+    attachment_refs_snapshot: list[dict[str, Any]] = Field(default_factory=list)
+    kb_scope_snapshot: dict[str, Any] = Field(default_factory=dict)
     template_version_id: str
     document_schema_id: str
     document_schema_version: str
@@ -316,6 +330,10 @@ class DocumentWorkOrder(BaseModel):
 
     @model_validator(mode="after")
     def calculate_input_fingerprint(self):
+        if self.source_scope_snapshot and self.source_scope_snapshot not in {
+            "auto", "attachment_only", "knowledge_base_only", "attachment_and_knowledge_base",
+        }:
+            raise ValueError("unsupported document source scope snapshot")
         if self.scope_type == "project":
             if not self.project_id or not self.baseline_id:
                 raise ValueError("project-scoped work orders require project_id and baseline_id")
@@ -352,6 +370,12 @@ class DocumentWorkOrder(BaseModel):
             # Preserve fingerprints for work orders stored before traceable
             # restart lineage was introduced.
             excluded.add("restart_of_work_order_id")
+        if not self.source_scope_snapshot:
+            excluded.add("source_scope_snapshot")
+        if not self.attachment_refs_snapshot:
+            excluded.add("attachment_refs_snapshot")
+        if not self.kb_scope_snapshot:
+            excluded.add("kb_scope_snapshot")
         if self.input_fingerprint_version >= 2:
             if self.requested_executor is None:
                 raise ValueError("v2 input fingerprints require requested_executor")
@@ -365,8 +389,29 @@ class DocumentWorkOrder(BaseModel):
         else:
             expected = content_hash(self.model_dump(mode="json", exclude=excluded))
         if self.input_fingerprint and self.input_fingerprint != expected:
-            raise ValueError("work order input_fingerprint does not match frozen inputs")
-        self.input_fingerprint = expected
+            # A short compatibility window is needed for callers that built
+            # a v1 preimage from a post-schema model dump before the new
+            # snapshot fields were added to the exclusion list.  Persisted
+            # rows from before the bridge omit these fields entirely; accepting
+            # this alternate preimage keeps those rows readable while new
+            # orders still use ``expected``.
+            compatibility_excluded = set(excluded)
+            compatibility_excluded.difference_update({
+                "source_scope_snapshot", "attachment_refs_snapshot", "kb_scope_snapshot",
+            })
+            if self.input_fingerprint_version >= 2:
+                compatibility_expected = content_hash({
+                    "input_fingerprint_version": 2,
+                    "frozen_inputs": self.model_dump(mode="json", exclude=compatibility_excluded),
+                })
+            else:
+                compatibility_expected = content_hash(
+                    self.model_dump(mode="json", exclude=compatibility_excluded)
+                )
+            if self.input_fingerprint != compatibility_expected:
+                raise ValueError("work order input_fingerprint does not match frozen inputs")
+        else:
+            self.input_fingerprint = expected
         return self
 
 
@@ -391,6 +436,12 @@ def compute_input_fingerprint_v2(order: DocumentWorkOrder) -> str:
         excluded.update({"generation_session_id", "generation_brief"})
     if order.restart_of_work_order_id is None:
         excluded.add("restart_of_work_order_id")
+    if not order.source_scope_snapshot:
+        excluded.add("source_scope_snapshot")
+    if not order.attachment_refs_snapshot:
+        excluded.add("attachment_refs_snapshot")
+    if not order.kb_scope_snapshot:
+        excluded.add("kb_scope_snapshot")
     return content_hash({
         "input_fingerprint_version": 2,
         "frozen_inputs": order.model_dump(mode="json", exclude=excluded),
@@ -842,6 +893,10 @@ class DocumentArtifact(BaseModel):
     tenant_id: str = "default"
     work_order_id: str
     run_id: str
+    # Native template output (xlsx/xlsm/docx/markdown) and explicit semantic
+    # conversion output (pdf/pptx).  ``None`` keeps old persisted artifacts
+    # readable; callers fall back to the work-order template format.
+    output_format: Literal["xlsm", "xlsx", "markdown", "docx", "pdf", "pptx"] | None = None
     stage: Literal["draft_preview", "review_candidate", "approved_release"]
     validity_status: Literal["current", "artifact_stale", "revalidation_required"] = "current"
     policy_status: Literal["active", "policy_obsolete"] = "active"

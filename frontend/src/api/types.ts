@@ -157,6 +157,17 @@ export interface MemoryContextItem {
   [key: string]: unknown;
 }
 
+export interface AttachmentSnapshot {
+  attachment_id: string;
+  filename: string;
+  media_type?: string;
+  usage_hint?: string;
+  content_hash?: string;
+  ordinal?: number;
+  parse_status?: string;
+  deleted?: boolean;
+}
+
 export interface MessageView {
   id: number;
   session_id: number;
@@ -170,6 +181,8 @@ export interface MessageView {
   memory_context?: MemoryContextItem[];
   /** Optional future projection; current servers omit this field. */
   document_context?: DocumentContext | null;
+  /** Frozen attachment snapshots of the owning turn (user messages). */
+  attachments?: AttachmentSnapshot[];
 }
 
 export interface SessionMemorySummary {
@@ -185,7 +198,7 @@ export interface TurnView {
   kb_name: string;
   query: string;
   query_mode: 'fast' | 'deep';
-  status: 'pending' | 'streaming' | 'cancelling' | 'completed' | 'cancelled' | 'failed';
+  status: 'pending' | 'streaming' | 'cancelling' | 'waiting_for_attachments' | 'completed' | 'cancelled' | 'failed';
   cancel_requested: boolean;
   last_event_seq: number;
   answer: string;
@@ -198,6 +211,28 @@ export interface TurnView {
   finished_at: string | null;
   /** Optional until Task 8 adds turn-context persistence to the API. */
   document_context?: DocumentContext | null;
+  source_scope?: string;
+  attachments?: AttachmentSnapshot[];
+}
+
+/** Chat attachment lifecycle DTO (aligned with src/api/routes/attachments.py). */
+export interface AttachmentView {
+  attachment_id: string;
+  asset_id: string;
+  filename: string;
+  media_type: string;
+  extension: string;
+  size_bytes: number;
+  sha256: string;
+  usage_hint: string;
+  status: 'active' | 'deleted' | 'expired';
+  parse_status: 'queued' | 'running' | 'ready' | 'degraded' | 'failed';
+  error_code?: string;
+  error_message?: string;
+  manifest?: Record<string, unknown>;
+  degraded_reasons?: string[];
+  created_at: string;
+  updated_at?: string;
 }
 
 /** Request body accepted by the persistent turn endpoint. */
@@ -208,6 +243,10 @@ export interface CreateTurnRequest {
   document_context?: DocumentContext | null;
   /** Explicit document-flow override; sent only alongside document_context; absent keeps the server's regex fallback. */
   document_flow?: boolean;
+  /** Session attachment references; server re-verifies ownership + parse state. */
+  attachment_ids?: string[];
+  /** Scope selector; "auto" expands deterministically server-side. */
+  source_scope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
 }
 
 export interface TurnStartResponse {

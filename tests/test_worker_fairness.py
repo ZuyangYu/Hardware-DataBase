@@ -128,3 +128,39 @@ def test_run_once_uses_shared_pipeline_for_general_chat_after_document_batch(mon
 
     assert worker.run_once() is True
     assert calls and calls[0]["pipeline"] is worker.pipeline
+
+
+def test_document_worker_dispatches_conversion_without_rerunning_generation(monkeypatch):
+    from src.workers import main as worker_module
+
+    store = _DocumentJobStore()
+    store.jobs = [SimpleNamespace(
+        job_id="conversion-1",
+        operation="convert_artifact",
+        user_id="user-1",
+        session_id="42",
+        work_order_id="wo-1",
+        lease_token=1,
+        payload={
+            "work_order_id": "wo-1",
+            "knowledge_base_name": "hardware",
+            "source_artifact_id": "artifact-native",
+            "target_format": "pdf",
+        },
+    )]
+    converted_calls = []
+
+    class _DocumentGeneration:
+        def convert_document_artifact(self, ctx, artifact_id, *, target_format):
+            converted_calls.append((ctx, artifact_id, target_format))
+            return SimpleNamespace(artifact_id="artifact-pdf", output_format="pdf", stage="review_candidate")
+
+    worker = _document_worker(store, SimpleNamespace(document_generation=_DocumentGeneration()))
+    monkeypatch.setattr(worker_module, "build_context_for_user", lambda *_args, **_kwargs: SimpleNamespace(metadata={}))
+    monkeypatch.setattr(worker_module, "record_worker", lambda **_kwargs: None)
+    monkeypatch.setattr(worker_module, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "set_queue_state", lambda *args, **kwargs: None)
+
+    assert worker._process_document_authoring_jobs(limit=1) is True
+    assert converted_calls and converted_calls[0][1:] == ("artifact-native", "pdf")
+    assert store.completed == ["conversion-1"]

@@ -2,7 +2,7 @@
  * 文档创作共享契约:Chat 聊天页与文档生成工作台共用的模板上传/分析请求,
  * 以及从 useKbChat 迁入的 document context 纯函数。
  */
-import { uploadFiles, uploadFilesWithProgress } from './client';
+import { api, uploadFiles, uploadFilesWithProgress } from './client';
 import type { DocumentAnalysis, DocumentContext } from './types';
 
 export const DOCUMENT_CONTEXT_VERSION = 1;
@@ -118,4 +118,55 @@ export async function analyzeTemplate(
     return uploadFilesWithProgress<DocumentAnalysis>(path, form, options.onProgress);
   }
   return uploadFiles<DocumentAnalysis>(path, form);
+}
+
+/**
+ * Build the server-side attachment bridge request. The attachment bytes stay
+ * in private storage; only the session-scoped reference crosses the wire.
+ */
+export function buildAttachmentTemplateAnalyzeRequest(
+  _kb?: string,
+  _sessionId?: number,
+  _attachmentId?: string,
+  _templateName?: string,
+): string {
+  return '/api/v1/document-generation/templates/analyze-from-attachment';
+}
+
+/** Convert an uploaded chat attachment into an independent TemplateVersion. */
+export function analyzeTemplateFromAttachment(
+  kb: string,
+  sessionId: number,
+  attachmentId: string,
+  templateName: string,
+): Promise<DocumentAnalysis> {
+  return api.post<DocumentAnalysis>(
+    buildAttachmentTemplateAnalyzeRequest(),
+    {
+      kb,
+      session_id: sessionId,
+      attachment_id: attachmentId,
+      template_name: templateName,
+    },
+  );
+}
+
+export type DocumentArtifactConversionJob = {
+  job_id: string;
+  operation: 'convert_artifact';
+  status: string;
+  source_artifact_id: string;
+  target_format: 'pdf' | 'pptx';
+};
+
+/** Queue semantic template-artifact conversion; the worker owns the bytes. */
+export function requestDocumentArtifactConversion(
+  kb: string,
+  artifactId: string,
+  targetFormat: 'pdf' | 'pptx',
+): Promise<DocumentArtifactConversionJob> {
+  return api.post<DocumentArtifactConversionJob>(
+    `/api/v1/document-generation/artifacts/${encodeURIComponent(artifactId)}/convert?kb=${encodeURIComponent(kb)}`,
+    { target_format: targetFormat },
+  );
 }

@@ -37,7 +37,14 @@ from src.observability.metrics import record_chat_turn
 
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
-from src.api.schemas import CreateTurnRequest, MessageView, QueryRequest, TurnStartResponse, TurnView
+from src.api.schemas import (
+    AttachmentSnapshotView,
+    CreateTurnRequest,
+    MessageView,
+    QueryRequest,
+    TurnStartResponse,
+    TurnView,
+)
 
 router = APIRouter(tags=["query"])
 _TURN_CANCEL_SIGNALS: dict[str, threading.Event] = {}
@@ -189,6 +196,30 @@ def _conv_service() -> ConversationService:
     return ConversationService()
 
 
+def _attachment_snapshot_view(snapshot: dict) -> AttachmentSnapshotView:
+
+    return AttachmentSnapshotView(
+        attachment_id=str(snapshot.get("attachment_id") or ""),
+        filename=str(snapshot.get("filename_snapshot") or ""),
+        media_type=str(snapshot.get("media_type_snapshot") or ""),
+        usage_hint=str(snapshot.get("usage_hint_snapshot") or "reference"),
+        content_hash=str(snapshot.get("content_hash_snapshot") or ""),
+        ordinal=int(snapshot.get("ordinal") or 0),
+        parse_status=str(snapshot.get("parse_status_snapshot") or "queued"),
+        deleted=bool(snapshot.get("deleted")),
+    )
+
+
+def _turn_attachments_for(turn: ChatTurn) -> list[AttachmentSnapshotView]:
+    if not getattr(turn, "required_attachment_ids", []):
+        return []
+    try:
+        snapshots = _conv_service().list_turn_attachments(turn.id)
+    except Exception:
+        return []
+    return [_attachment_snapshot_view(snapshot) for snapshot in snapshots]
+
+
 def _turn_view(turn: ChatTurn) -> TurnView:
     document_context = None
     if turn.document_context:
@@ -218,10 +249,16 @@ def _turn_view(turn: ChatTurn) -> TurnView:
         started_at=turn.started_at,
         finished_at=turn.finished_at,
         document_context=document_context,
+        source_scope=str(getattr(turn, "source_scope", "") or "auto"),
+        attachments=_turn_attachments_for(turn),
     )
 
 
-def _message_view(message: ChatMessage) -> MessageView:
+def _message_view(
+    message: ChatMessage,
+    *,
+    attachments: list[AttachmentSnapshotView] | None = None,
+) -> MessageView:
     document_context = None
     if getattr(message, "document_context", None):
         try:
@@ -240,6 +277,7 @@ def _message_view(message: ChatMessage) -> MessageView:
         created_at=message.created_at,
         memory_context=getattr(message, "memory_context", []),
         document_context=document_context,
+        attachments=attachments or [],
     )
 
 
@@ -285,6 +323,35 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         except Exception:
             document_context = None
     document_flow = _decode_document_flow(turn.trace_context)
+    # Attachment scope for this turn: refs are rebuilt server-side from the
+    # frozen turn_attachments snapshots so a stale client can never widen it.
+    attachment_refs: list = []
+    turn_attachments = conv.list_turn_attachments(turn_id)
+    if turn_attachments:
+        try:
+            from src.attachments.service import AttachmentService
+            from src.attachments.store import AttachmentStore
+
+            store = AttachmentStore()
+            service = AttachmentService(store=store)
+            for snapshot in turn_attachments:
+                record = store.get_attachment(
+                    attachment_id=snapshot["attachment_id"],
+                    session_id=int(turn.session_id),
+                    user_id=int(user.id),
+                    include_deleted=True,
+                )
+                if record is None or record.status != "active":
+                    continue
+                # Re-verify ownership: the snapshot belongs to this turn's
+                # session, so any mismatch fails closed.
+                if record.session_id != int(turn.session_id) or record.user_id != int(user.id):
+                    continue
+                refs = service.build_refs([record])
+                attachment_refs.extend(refs)
+        except Exception:
+            # Attachment plumbing must never take down a KB-only turn.
+            attachment_refs = []
     turn_observation = observe.chain(
         "hdb.chat.turn",
         context=extract_trace_context(turn.trace_context),
@@ -442,6 +509,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             persist_thread=True,
             document_context=document_context,
             document_flow=document_flow,
+            attachments=attachment_refs,
+            source_scope=str(getattr(turn, "source_scope", "") or "auto"),
+            propagate_errors=True,
+            attachment_user_id=int(user.id),
         )
         try:
             for chunk in gen:
@@ -481,6 +552,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "short_term_memory": short_term_memory,
         }
         completed = conv.complete_turn(user.id, turn_id, answer, summary, footer, metrics=metrics(summary=summary))
+        # ``complete_turn`` is the canonical normalization boundary for stale
+        # export fallbacks. Use its persisted answer in the final event so the
+        # browser does not replace the cleaned message with the raw model text.
+        answer = completed.answer
         turn_observation.set_output(answer, content_kind="llm")
         emit_stage("generate", "生成回答", "done", "最终回答已生成")
         emit(
@@ -511,8 +586,11 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             conv.fail_turn(user.id, turn_id, "已停止生成", cancelled=True)
             outcome_status = "cancelled"
         else:
-            conv.fail_turn(user.id, turn_id, str(exc))
-            emit("error", {"message": str(exc)})
+            from src.core.error_friendly import friendly_error_message
+
+            friendly_error = friendly_error_message(exc)
+            conv.fail_turn(user.id, turn_id, friendly_error)
+            emit("error", {"message": friendly_error})
             summary = {
                 **summary,
                 "short_term_memory": short_term_memory,
@@ -525,7 +603,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 summary=summary,
                 latency_ms=int((time.monotonic() - start) * 1000),
                 status="failed",
-                error_message=str(exc),
+                error_message=friendly_error,
                 turn_id=turn_id,
             )
         emit("turn_end", {"status": "failed"})
@@ -591,6 +669,48 @@ def create_turn(
             status_code=422,
             detail="document_flow=true requires document_context",
         )
+    # Chat attachments (design §5/§14.2): resolve the explicit source scope
+    # before touching attachment rows.  ``knowledge_base_only`` must not be
+    # widened merely because a stale client also sent attachment ids.
+    attachment_refs: list = []
+    requested_attachment_ids = [
+        str(item or "").strip() for item in (body.attachment_ids or []) if str(item or "").strip()
+    ]
+    has_attachments = bool(requested_attachment_ids)
+    from src.attachments.models import (
+        resolve_source_scope,
+        scope_allows_attachments,
+    )
+
+    is_general_chat = session.kb_name == GENERAL_CHAT_KB_NAME
+    try:
+        effective_scope = resolve_source_scope(
+            requested_scope=body.source_scope,
+            has_attachments=has_attachments,
+            is_general_chat=is_general_chat,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if has_attachments and scope_allows_attachments(effective_scope):
+        if not src.settings.CHAT_ATTACHMENTS_ENABLED:
+            raise HTTPException(status_code=404, detail="chat attachments are not enabled")
+        from src.attachments.service import AttachmentService
+
+        attachment_service = AttachmentService()
+        attachment_refs, blocked = attachment_service.resolve_refs_for_turn(
+            user_id=user.id,
+            session_id=session_id,
+            attachment_ids=requested_attachment_ids,
+        )
+        if blocked:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "one or more attachments are unavailable",
+                    "error_code": "attachment_unavailable",
+                    "attachment_ids": blocked[:10],
+                },
+            )
     document_context = None
     if body.document_context is not None:
         if session.kb_name == GENERAL_CHAT_KB_NAME:
@@ -620,12 +740,17 @@ def create_turn(
         query_mode,
         trace_context=trace_context,
         document_context=document_context,
+        attachment_ids=[ref.attachment_id for ref in attachment_refs],
+        source_scope=effective_scope,
     )
     messages = conv.list_messages(user.id, session_id)
     user_message = next((message for message in messages if message.id == turn.user_message_id), None)
     if user_message is None:
         raise HTTPException(status_code=500, detail="turn message was not persisted")
-    return TurnStartResponse(turn=_turn_view(turn), user_message=_message_view(user_message))
+    return TurnStartResponse(
+        turn=_turn_view(turn),
+        user_message=_message_view(user_message, attachments=_turn_attachments_for(turn)),
+    )
 
 
 @router.post("/turns/{turn_id}/start", response_model=TurnView, status_code=202)
@@ -1049,6 +1174,10 @@ def _query_generator(
     persist_thread=False,
     document_context=None,
     document_flow=None,
+    attachments=None,
+    source_scope="auto",
+    propagate_errors=False,
+    attachment_user_id=None,
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -1066,6 +1195,14 @@ def _query_generator(
             kwargs["document_context"] = document_context
         if "document_flow" in params:
             kwargs["document_flow"] = document_flow
+        if "attachments" in params:
+            kwargs["attachments"] = attachments
+        if "source_scope" in params:
+            kwargs["source_scope"] = source_scope
+        if "propagate_errors" in params:
+            kwargs["propagate_errors"] = propagate_errors
+        if "attachment_user_id" in params:
+            kwargs["attachment_user_id"] = attachment_user_id
         return pipeline.query(
             query,
             kb_name,
@@ -1084,6 +1221,14 @@ def _query_generator(
         kwargs["document_context"] = document_context
     if "document_flow" in params:
         kwargs["document_flow"] = document_flow
+    if "attachments" in params:
+        kwargs["attachments"] = attachments
+    if "source_scope" in params:
+        kwargs["source_scope"] = source_scope
+    if "propagate_errors" in params:
+        kwargs["propagate_errors"] = propagate_errors
+    if "attachment_user_id" in params:
+        kwargs["attachment_user_id"] = attachment_user_id
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 

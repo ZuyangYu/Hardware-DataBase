@@ -30,6 +30,12 @@ TOOL_LABELS = {
     "spreadsheet_schema_lookup": "表格SQL结构",
     "spreadsheet_sql_query": "表格SQL查询",
     "list_kb_sources": "读取知识库目录",
+    "attachment_list": "附件清单",
+    "attachment_search": "附件检索",
+    "attachment_read": "附件精读",
+    "attachment_table_query": "附件表格查询",
+    "attachment_circuit_search": "附件电路查询",
+    "attachment_visual_analyze": "附件视觉分析",
 }
 
 MAX_MEMORY_CONTEXT_CONTENT_CHARS = 2_000
@@ -103,6 +109,20 @@ class ToolRuntime:
     query_mode: str = "deep"
     should_cancel: Callable[[], bool] | None = None
     on_event: Callable[[dict], None] | None = None
+
+    # Server-resolved chat attachment scope (design §11.1).  The refs are
+    # frozen after ACL verification in the turn path; tools derive every
+    # allowed asset id from this list and can never widen it.
+    attachment_refs: list[Any] = field(default_factory=list)
+    source_scope: str = "auto"
+    # Numeric identities are copied from the authenticated request into the
+    # runtime so attachment tools can re-check ownership on every invocation.
+    # Missing identities intentionally fail closed in the tool layer.
+    attachment_user_id: int | None = None
+    attachment_session_id: int | None = None
+    attachment_service: Any | None = None
+    attachment_retrieval: Any | None = None
+    attachment_visual_analyzer: Any | None = None
 
     evidence: list[Evidence] = field(default_factory=list)
     evidence_index: dict[str, int] = field(default_factory=dict)

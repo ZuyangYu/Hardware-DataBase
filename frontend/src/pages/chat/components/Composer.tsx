@@ -5,7 +5,8 @@
  */
 import { useEffect, useRef, type FormEvent } from 'react';
 
-import type { DocumentContext } from '@/api/types';
+import type { AttachmentView, DocumentContext } from '@/api/types';
+import { CHAT_ATTACHMENT_ACCEPT } from '@/api/chatAttachments';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import type { KbView } from '@/api/types';
@@ -51,7 +52,22 @@ type Props = {
   documentUploadProgress?: number;
   onUploadTemplate?: (file: File) => void | Promise<void>;
   onClearDocumentContext?: () => void;
+  /** 会话附件(默认开):后端 CHAT_ATTACHMENTS_ENABLED 打开时由 ChatPage 传入。 */
+  attachmentsEnabled?: boolean;
+  draftAttachments?: AttachmentView[];
+  selectedAttachmentIds?: string[];
+  attachmentUploadPending?: boolean;
+  attachmentRetryingId?: string | null;
+  sourceScope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
+  onSourceScopeChange?: (scope: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base') => void;
+  onUploadAttachment?: (file: File) => void | Promise<void>;
+  onToggleAttachment?: (attachmentId: string) => void;
+  onRetryAttachment?: (attachmentId: string) => void | Promise<void>;
+  onUseAsTemplate?: (attachment: AttachmentView) => void | Promise<void>;
+  onRemoveAttachment?: (attachmentId: string) => void;
 };
+
+const TEMPLATE_ATTACHMENT_EXTENSIONS = new Set(['.docx', '.xlsx', '.xlsm']);
 
 function kbOptionLabel(kb: KbView): string {
   return kb.department_name ? `${kb.name} · ${kb.department_name}` : kb.name;
@@ -77,9 +93,25 @@ export default function Composer({
   documentUploadProgress = 0,
   onUploadTemplate,
   onClearDocumentContext,
+  // Attachment support is on by default; ChatPage passes the explicit
+  // environment-controlled value when an installation opts out.
+  attachmentsEnabled = true,
+  draftAttachments = [],
+  selectedAttachmentIds,
+  attachmentUploadPending = false,
+  attachmentRetryingId = null,
+  sourceScope = 'auto',
+  onSourceScopeChange,
+  onUploadAttachment,
+  onToggleAttachment,
+  onRetryAttachment,
+  onUseAsTemplate,
+  onRemoveAttachment,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const templateInputRef = useRef<HTMLInputElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const selectedIds = selectedAttachmentIds ?? draftAttachments.map((attachment) => attachment.attachment_id);
   const contextExpired = isDocumentContextExpired(documentContext);
   const showDocumentControls = documentAuthoringEnabled && documentContext;
 
@@ -174,6 +206,163 @@ export default function Composer({
                 {documentFlowEnabled ? '开' : '关'}
               </span>
             </label>
+          )}
+          {attachmentsEnabled && (
+            <div className="flex min-w-0 flex-col gap-[6px]">
+              {draftAttachments.length > 0 && (
+                <div className="flex min-w-0 flex-wrap items-center gap-[6px]">
+                  {draftAttachments.map((attachment) => {
+                    const selected = selectedIds.includes(attachment.attachment_id);
+                    const stateLabel =
+                      attachment.parse_status === 'ready'
+                        ? '已就绪'
+                        : attachment.parse_status === 'degraded'
+                          ? '部分可读'
+                          : attachment.parse_status === 'failed'
+                            ? '解析失败'
+                            : '解析中…';
+                    return (
+                      <span
+                        key={attachment.attachment_id}
+                        className="flex min-w-0 items-center gap-[8px] rounded-[10px] border border-[#e3e7f1] bg-[#fafbfc] px-[9px] py-[6px] text-[12px] text-[#464c5e]"
+                        aria-label={`附件 ${attachment.filename}`}
+                      >
+                        <AppIcon name="file" size={14} className="shrink-0 text-[#68728a]" />
+                        <span className="min-w-0 max-w-[220px] truncate" title={attachment.filename}>
+                          {attachment.filename}
+                        </span>
+                        {onToggleAttachment && (
+                          <button
+                            type="button"
+                            onClick={() => onToggleAttachment(attachment.attachment_id)}
+                            aria-pressed={selected}
+                            aria-label={`${selected ? '取消选择' : '选择'}附件 ${attachment.filename}`}
+                            className={cn(
+                              'shrink-0 rounded-[6px] border px-[5px] py-[1px] text-[10px] transition-colors',
+                              selected
+                                ? 'border-[#c8d8f5] bg-[#eef4ff] text-[#1d4ed8]'
+                                : 'border-[#e3e7f1] bg-white text-[#858b9c]',
+                            )}
+                          >
+                            {selected ? '已选' : '未选'}
+                          </button>
+                        )}
+                        <span
+                          className={cn(
+                            'shrink-0 text-[11px]',
+                            attachment.parse_status === 'failed'
+                              ? 'text-[#d20b0b]'
+                              : attachment.parse_status === 'ready'
+                                ? 'text-[#166534]'
+                                : 'text-[#858b9c]',
+                          )}
+                        >
+                          {stateLabel}
+                        </span>
+                        {attachment.parse_status === 'failed' && attachment.error_message && (
+                          <span
+                            className="min-w-0 max-w-[240px] truncate text-[11px] text-[#b42318]"
+                            title={attachment.error_message}
+                          >
+                            · {attachment.error_message}
+                          </span>
+                        )}
+                        {attachment.parse_status === 'failed' && onRetryAttachment && (
+                          <button
+                            type="button"
+                            onClick={() => void onRetryAttachment(attachment.attachment_id)}
+                            disabled={
+                              streaming ||
+                              disabled ||
+                              (attachmentRetryingId !== null && attachmentRetryingId !== attachment.attachment_id)
+                            }
+                            aria-label={`重试解析附件 ${attachment.filename}`}
+                            title="重试解析"
+                            className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            {attachmentRetryingId === attachment.attachment_id ? '重试中…' : '重试解析'}
+                          </button>
+                        )}
+                        {documentAuthoringEnabled &&
+                          canUploadDocumentTemplate &&
+                          onUseAsTemplate &&
+                          TEMPLATE_ATTACHMENT_EXTENSIONS.has(attachment.extension.toLowerCase()) &&
+                          (attachment.parse_status === 'ready' || attachment.parse_status === 'degraded') && (
+                            <button
+                              type="button"
+                              onClick={() => void onUseAsTemplate(attachment)}
+                              disabled={streaming || disabled || documentUploadPending}
+                              aria-label={`将附件 ${attachment.filename} 作为模板`}
+                              title="将附件转换为模板"
+                              className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
+                            >
+                              作为模板
+                            </button>
+                          )}
+                        {onRemoveAttachment && (
+                          <button
+                            type="button"
+                            onClick={() => onRemoveAttachment(attachment.attachment_id)}
+                            aria-label={`移除附件 ${attachment.filename}`}
+                            className="inline-grid size-[20px] shrink-0 place-items-center rounded-full border-0 bg-transparent p-0 text-[15px] leading-none text-[#a2a8b8] hover:text-[#18181a]"
+                          >
+                            ×
+                          </button>
+                        )}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="flex min-w-0 items-center gap-[8px]">
+                <input
+                  ref={attachmentInputRef}
+                  id="chat-attachment-upload"
+                  type="file"
+                  accept={CHAT_ATTACHMENT_ACCEPT}
+                  className="sr-only"
+                  disabled={streaming || disabled || attachmentUploadPending}
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    event.currentTarget.value = '';
+                    if (file && onUploadAttachment) void onUploadAttachment(file);
+                  }}
+                />
+                <label
+                  htmlFor="chat-attachment-upload"
+                  aria-disabled={streaming || disabled || attachmentUploadPending}
+                  title="添加会话附件"
+                  className={cn(
+                    'inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-[5px] rounded-[9px] border border-[#e3e7f1] bg-white px-[9px] text-[12px] text-[#68728a] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]',
+                    (streaming || disabled || attachmentUploadPending) &&
+                      'pointer-events-none cursor-not-allowed opacity-45',
+                  )}
+                >
+                  <AppIcon name="file" size={14} />
+                  {attachmentUploadPending ? '上传中…' : '添加附件'}
+                </label>
+                {selectedIds.length > 0 && onSourceScopeChange && (
+                  <label className="flex min-w-0 items-center gap-[6px] text-[11px] text-[#68728a]">
+                    检索范围
+                    <select
+                      value={sourceScope}
+                      onChange={(event) =>
+                        onSourceScopeChange(
+                          event.currentTarget.value as 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base',
+                        )
+                      }
+                      disabled={streaming || disabled}
+                      className="h-[26px] rounded-[8px] border border-[#e3e7f1] bg-white px-[6px] text-[11px] text-[#464c5e]"
+                    >
+                      <option value="auto">自动</option>
+                      <option value="attachment_only">仅附件</option>
+                      <option value="knowledge_base_only">仅知识库</option>
+                      <option value="attachment_and_knowledge_base">附件 + 知识库</option>
+                    </select>
+                  </label>
+                )}
+              </div>
+            </div>
           )}
           <textarea
             ref={textareaRef}

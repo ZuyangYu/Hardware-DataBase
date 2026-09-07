@@ -196,7 +196,16 @@ def record_agent(*, status: str, mode: str, duration_s: float, retrieval_rounds:
 
 
 def record_agent_stage(*, stage: str, duration_s: float, status: str = "success") -> None:
-    pass
+    normalized_stage = str(stage or "unknown").strip()[:80] or "unknown"
+    normalized_status = str(status or "success").strip()[:40] or "success"
+    attrs = {"stage": normalized_stage, "status": normalized_status}
+    counter("hdb.agent.stage.completed", attributes=attrs, description="Agent pipeline stages")
+    histogram(
+        "hdb.agent.stage.duration",
+        duration_s,
+        attributes={"stage": normalized_stage, "status": normalized_status},
+        description="Agent pipeline stage duration",
+    )
 
 
 def record_llm(*, provider: str, status: str, duration_s: float, streaming: bool, ttft_s: float | None = None) -> None:
@@ -213,6 +222,46 @@ def record_worker(*, status: str, duration_s: float | None = None) -> None:
         counter("hdb.worker.task.failed", description="Failed worker tasks")
     if duration_s is not None:
         histogram("hdb.worker.task.duration", duration_s, attributes={"status": status})
+
+
+_ATTACHMENT_EVENT_LABELS = frozenset(
+    {
+        "upload",
+        "asset_reuse",
+        "parse",
+        "search",
+        "read",
+        "waiting_turn",
+        "degraded",
+        "cleanup",
+        "cleanup_retry",
+        "visual",
+        "visual_failure",
+        "dense",
+        "ocr",
+    }
+)
+
+
+def record_attachment(
+    event: str,
+    *,
+    status: str = "ok",
+    duration_s: float | None = None,
+    scope: str = "",
+) -> None:
+    """Domain metrics for chat attachments (design §20).
+
+    Labels are low-cardinality (event/status/scope) — ids, filenames and
+    hashes never enter metric attributes.
+    """
+    event = event if event in _ATTACHMENT_EVENT_LABELS else "other"
+    attrs = {"event": event, "status": status}
+    if scope:
+        attrs["scope"] = scope
+    counter("hdb.attachment.events", attributes=attrs, description="Chat attachment events")
+    if duration_s is not None:
+        histogram("hdb.attachment.duration", duration_s, attributes={"event": event, "status": status})
 
 
 def record_evaluation(*, status: str, mode: str) -> None:

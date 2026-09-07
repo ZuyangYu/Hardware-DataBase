@@ -1817,6 +1817,7 @@ class DocumentAuthoringStore:
             "work_order_id": artifact.work_order_id,
             "run_id": artifact.run_id,
             "stage": artifact.stage,
+            "output_format": artifact.output_format,
             "content_hash": artifact.content_hash,
             "parent_artifact_id": artifact.parent_artifact_id,
             "validation_report_id": artifact.validation_report_id,
@@ -1830,7 +1831,10 @@ class DocumentAuthoringStore:
                 if existing is not None:
                     conn.execute("COMMIT")
                     return existing
-                target = self._storage_path("artifacts", artifact.work_order_id, f"{fingerprint}.{suffix}")
+                safe_suffix = str(suffix or artifact.output_format or "bin").strip().lower().lstrip(".")
+                if not safe_suffix or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in safe_suffix):
+                    raise ValueError("artifact suffix is invalid")
+                target = self._storage_path("artifacts", artifact.work_order_id, f"{fingerprint}.{safe_suffix}")
                 self._atomic_write(target, content)
                 artifact = artifact.model_copy(update={"storage_ref": target})
                 self._put(conn, "document_artifacts", {
@@ -1887,6 +1891,213 @@ class DocumentAuthoringStore:
                 "SELECT payload_json FROM document_artifacts WHERE work_order_id = ? ORDER BY rowid", (work_order_id,)
             ).fetchall()
         return [DocumentArtifact.model_validate(_payload(row)) for row in rows]
+
+    def cleanup_work_orders(self, work_order_ids: list[str] | tuple[str, ...]) -> None:
+        """Reclaim operational authoring state for deleted chat sessions.
+
+        Formal templates, schemas and source snapshots are shared assets and
+        are deliberately retained.  Work-order-owned runs, checkpoints,
+        drafts, evidence, outbox rows and generated artifact files are not.
+        The operation is safe to repeat after a partial cleanup.
+        """
+        ids = sorted({str(value or "").strip() for value in work_order_ids if str(value or "").strip()})
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        artifact_paths: list[str] = []
+        thread_ids: set[str] = set()
+        generation_session_ids: set[str] = set()
+        run_ids: set[str] = set()
+        now = datetime.now(timezone.utc)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                order_rows = conn.execute(
+                    "SELECT payload_json FROM document_work_orders WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                ).fetchall()
+                for row in order_rows:
+                    payload = _payload(row)
+                    generation_session_id = str(payload.get("generation_session_id") or "").strip()
+                    if generation_session_id:
+                        generation_session_ids.add(generation_session_id)
+
+                artifact_rows = conn.execute(
+                    """SELECT payload_json FROM document_artifacts
+                       WHERE work_order_id IN (""" + placeholders + ")",
+                    ids,
+                ).fetchall()
+                artifact_paths.extend(
+                    str(_payload(row).get("storage_ref") or "")
+                    for row in artifact_rows
+                    if str(_payload(row).get("storage_ref") or "")
+                )
+                run_rows = conn.execute(
+                    """SELECT harness_run_id, payload_json FROM harness_runs
+                       WHERE work_order_id IN (""" + placeholders + ")",
+                    ids,
+                ).fetchall()
+                for row in run_rows:
+                    run_id = str(row["harness_run_id"] or "").strip()
+                    if run_id:
+                        run_ids.add(run_id)
+                    payload = _payload(row)
+                    thread = str(payload.get("agent_thread_id") or "").strip()
+                    if thread:
+                        thread_ids.add(thread)
+                    for value in (payload.get("agent_thread_ids") or {}).values():
+                        value = str(value or "").strip()
+                        if value:
+                            thread_ids.add(value)
+                    # Revoke any in-flight graph lease before files/rows are
+                    # reclaimed.  Persist the payload change as well as the
+                    # indexed status column so readers stay consistent.
+                    payload.update({
+                        "status": "cancelled",
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                        "heartbeat_at": now.isoformat(),
+                        "fencing_token": int(payload.get("fencing_token") or 0) + 1,
+                        "updated_at": now.isoformat(),
+                    })
+                    conn.execute(
+                        "UPDATE harness_runs SET status = 'cancelled', payload_json = ? WHERE harness_run_id = ?",
+                        (_json(payload), run_id),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        self._delete_harness_threads(thread_ids)
+        root = Path(self.artifact_root).resolve()
+        for raw_path in artifact_paths:
+            path = Path(raw_path).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError as exc:
+                raise PermissionError("document artifact storage reference is outside artifact storage") from exc
+            path.unlink(missing_ok=True)
+
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if run_ids:
+                    run_placeholders = ",".join("?" for _ in run_ids)
+                    run_values = sorted(run_ids)
+                    conn.execute(
+                        "DELETE FROM node_execution_receipts WHERE harness_run_id IN ("
+                        + run_placeholders + ")",
+                        run_values,
+                    )
+                    conn.execute(
+                        "DELETE FROM authoring_execution_events WHERE harness_run_id IN ("
+                        + run_placeholders + ")",
+                        run_values,
+                    )
+                    conn.execute(
+                        "DELETE FROM evidence_registry WHERE harness_run_id IN ("
+                        + run_placeholders + ")",
+                        run_values,
+                    )
+                conn.execute(
+                    "DELETE FROM document_human_events WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM document_outbox_events WHERE aggregate_id IN ("
+                    + placeholders + ") OR json_extract(payload_json, '$.work_order_id') IN ("
+                    + placeholders + ")",
+                    [*ids, *ids],
+                )
+                conn.execute(
+                    "DELETE FROM document_artifacts WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM harness_checkpoints WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM document_unit_drafts WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM harness_runs WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM authoring_run_manifests WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM validation_reports WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM evidence_matrices WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM document_icd_scope_reviews WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM document_work_orders WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                if generation_session_ids:
+                    session_values = sorted(generation_session_ids)
+                    session_placeholders = ",".join("?" for _ in session_values)
+                    conn.execute(
+                        "DELETE FROM document_generation_messages WHERE session_id IN ("
+                        + session_placeholders + ")",
+                        session_values,
+                    )
+                    conn.execute(
+                        "DELETE FROM document_generation_sessions WHERE session_id IN ("
+                        + session_placeholders + ")",
+                        session_values,
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _delete_harness_threads(thread_ids: set[str]) -> None:
+        if not thread_ids:
+            return
+        from src.document_authoring.harness.checkpointer import build_checkpointer
+
+        backend = str(getattr(src.settings, "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"))
+        path = getattr(
+            src.settings,
+            "DOCUMENT_AUTHORING_CHECKPOINTER_PATH",
+            os.path.join(src.settings.STORAGE_DIR, "document_authoring_checkpoints.sqlite"),
+        )
+        checkpointer = build_checkpointer(
+            backend,
+            sqlite_path=path if backend.strip().casefold() == "sqlite" else None,
+        )
+        try:
+            for thread_id in sorted(thread_ids):
+                checkpointer.delete_thread(thread_id)
+        finally:
+            close = getattr(checkpointer, "close", None)
+            if callable(close):
+                close()
 
     def delete_terminal_work_order(
         self,

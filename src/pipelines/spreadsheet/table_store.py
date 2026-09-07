@@ -13,7 +13,12 @@ from src.pipelines.spreadsheet.sql_materializer import (
     ensure_registry_table,
     materialize_sheet,
 )
-from src.pipelines.spreadsheet.xlsx_parser import ParsedWorkbook, _row_col_from_ref, parse_xlsx
+from src.pipelines.spreadsheet.xlsx_parser import (
+    ParsedWorkbook,
+    XlsxParseLimits,
+    _row_col_from_ref,
+    parse_xlsx,
+)
 
 
 SPREADSHEET_KIND_UNIVERSAL = "universal_table_index"
@@ -195,11 +200,12 @@ class TableIndexStore:
         local_path: str,
         content_hash: str,
         kb_id: int | None = None,
+        parse_limits: XlsxParseLimits | None = None,
         progress_callback=None,
     ) -> TableIndexStats:
         if progress_callback:
             progress_callback(20, "读取 Excel 工作簿")
-        workbook = parse_xlsx(file_path)
+        workbook = parse_xlsx(file_path, limits=parse_limits)
         stats = _workbook_stats(workbook)
         if progress_callback:
             progress_callback(35, f"分析工作表结构（{len(workbook.sheets)} 个 sheet）")

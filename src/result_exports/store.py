@@ -1061,6 +1061,81 @@ class ResultExportStore:
                 pass
         return artifacts
 
+    def cleanup_session(self, *, session_id: str | int) -> None:
+        """Remove all export state owned by a deleted chat session.
+
+        Jobs are cancelled in a short transaction first so a worker that was
+        already rendering cannot publish a new artifact while the files are
+        being reclaimed.  Database rows are removed only after every known
+        artifact file is safely unlinked; a filesystem failure therefore
+        leaves the outbox entry retryable and the operation idempotent.
+        """
+        session = _as_id(session_id)
+        now = _iso()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """UPDATE result_export_jobs
+                       SET status = CASE WHEN status IN ('queued', 'running')
+                                         THEN 'cancelled' ELSE status END,
+                           lease_owner = NULL, lease_expires_at = NULL,
+                           completed_at = CASE WHEN status IN ('queued', 'running')
+                                               THEN ? ELSE completed_at END,
+                           updated_at = ?
+                       WHERE session_id = ?""",
+                    (now, now, session),
+                )
+                conn.execute(
+                    """UPDATE result_export_outbox
+                       SET status = CASE WHEN status IN ('pending', 'running')
+                                         THEN 'cancelled' ELSE status END,
+                           last_error = CASE WHEN status IN ('pending', 'running')
+                                             THEN 'session deleted' ELSE last_error END,
+                           dispatched_at = CASE WHEN status IN ('pending', 'running')
+                                                THEN ? ELSE dispatched_at END
+                       WHERE export_job_id IN (
+                           SELECT export_job_id FROM result_export_jobs WHERE session_id = ?
+                       )""",
+                    (now, session),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT storage_ref FROM result_artifacts
+                   WHERE session_id = ? AND storage_ref != ''""",
+                (session,),
+            ).fetchall()
+        for row in rows:
+            path = (self.storage_dir / str(row["storage_ref"])).resolve()
+            try:
+                path.relative_to(self.storage_dir)
+            except ValueError as exc:
+                raise PermissionError("export artifact storage reference is outside export storage") from exc
+            path.unlink(missing_ok=True)
+
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """DELETE FROM result_export_outbox
+                       WHERE export_job_id IN (
+                           SELECT export_job_id FROM result_export_jobs WHERE session_id = ?
+                       )""",
+                    (session,),
+                )
+                conn.execute("DELETE FROM result_artifacts WHERE session_id = ?", (session,))
+                conn.execute("DELETE FROM result_export_jobs WHERE session_id = ?", (session,))
+                conn.execute("DELETE FROM result_snapshots WHERE session_id = ?", (session,))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def get_snapshot_for_artifact(self, owner_user_id: str | int, artifact_id: str) -> ResultSnapshot | None:
         with closing(self._connect()) as conn:
             row = conn.execute(

@@ -1,17 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./client', () => ({
+  api: { post: vi.fn() },
   uploadFiles: vi.fn(),
   uploadFilesWithProgress: vi.fn(),
 }));
 
 import {
   analyzeTemplate,
+  analyzeTemplateFromAttachment,
   buildDocumentContext,
   buildTemplateAnalyzeRequest,
   isDocumentContextExpired,
+  requestDocumentArtifactConversion,
 } from './documentAuthoring';
-import { uploadFiles, uploadFilesWithProgress } from './client';
+import { api, uploadFiles, uploadFilesWithProgress } from './client';
 import type { DocumentAnalysis } from './types';
 
 const analysis: DocumentAnalysis = {
@@ -30,6 +33,7 @@ function templateFile(name = 'demo.xlsx'): File {
 beforeEach(() => {
   vi.mocked(uploadFiles).mockReset();
   vi.mocked(uploadFilesWithProgress).mockReset();
+  vi.mocked(api.post).mockReset();
 });
 
 describe('analyzeTemplate', () => {
@@ -108,6 +112,44 @@ describe('analyzeTemplate', () => {
     expect(path).toBe('/api/v1/document-generation/templates/analyze?kb=shared');
     expect(form.has('client_request_id')).toBe(false);
     expect(progress).toBe(onProgress);
+  });
+});
+
+describe('analyzeTemplateFromAttachment', () => {
+  it('posts the session-scoped attachment reference without re-uploading bytes', async () => {
+    vi.mocked(api.post).mockResolvedValue(analysis);
+
+    const result = await analyzeTemplateFromAttachment('shared', 42, 'att-1', '评审表');
+
+    expect(result).toBe(analysis);
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/document-generation/templates/analyze-from-attachment',
+      {
+        kb: 'shared',
+        session_id: 42,
+        attachment_id: 'att-1',
+        template_name: '评审表',
+      },
+    );
+  });
+});
+
+describe('requestDocumentArtifactConversion', () => {
+  it('queues a semantic PDF/PPTX conversion with encoded identifiers', async () => {
+    const job = {
+      job_id: 'job-1',
+      operation: 'convert_artifact' as const,
+      status: 'queued',
+      source_artifact_id: 'artifact-1',
+      target_format: 'pdf' as const,
+    };
+    vi.mocked(api.post).mockResolvedValue(job);
+
+    await expect(requestDocumentArtifactConversion('硬件 KB', 'artifact/a', 'pdf')).resolves.toBe(job);
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/document-generation/artifacts/artifact%2Fa/convert?kb=%E7%A1%AC%E4%BB%B6%20KB',
+      { target_format: 'pdf' },
+    );
   });
 });
 

@@ -1,4 +1,4 @@
-"""Contract tests for the six scoped document-authoring chat tools."""
+"""Contract tests for the scoped document-authoring chat tools."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.agents.tools.document_authoring_tools import DocumentAuthoringToolset
+from src.agents.tools.document_authoring_tools import GenerateDocumentArgs
 from src.document_authoring.chat_context import DocumentContextInput, build_document_context
 from src.document_authoring.generation_sessions import GenerationBrief, GenerationSession
 from src.document_authoring.job_store import DocumentAuthoringJobStore
@@ -107,6 +108,16 @@ class _Pipeline:
         self.analysis = _analysis()
         self.session = _session()
         self.order = _order()
+        self.document_generation = SimpleNamespace(
+            store=SimpleNamespace(
+                get_template=lambda _template_id: SimpleNamespace(
+                    template_schema_id="schema-a",
+                    template_schema_version="1",
+                    status="approved",
+                    format="xlsx",
+                ),
+            ),
+        )
 
     def get_document_template_analysis_for_review(self, _ctx, *, analysis_id):
         assert analysis_id == "analysis-a"
@@ -114,6 +125,10 @@ class _Pipeline:
 
     def create_document_generation_session(self, _ctx, **_kwargs):
         return self.session
+
+    def prepare_knowledge_base_document_generation(self, _ctx, **kwargs):
+        self.prepare_kwargs = kwargs
+        return {"stage": "ready", "work_order_id": self.order.work_order_id}
 
     def answer_document_generation_session(self, _ctx, session_id, **_kwargs):
         assert session_id == self.session.session_id
@@ -196,6 +211,7 @@ def test_all_six_tools_are_typed_scoped_and_outer_serialized(tmp_path):
 
     names = {tool.name for tool in toolset.as_tools()}
     assert names == {
+        "generate_document_from_template",
         "get_document_template_analysis",
         "start_document_generation_session",
         "answer_clarification",
@@ -392,6 +408,74 @@ def test_document_card_sink_failure_never_breaks_tool_result(tmp_path):
     )
     assert result.status == "succeeded"
     assert result.work_order_id == "work-order-a"
+
+
+def test_direct_generation_derives_schema_and_queues_template_artifact(tmp_path):
+    """A direct user request must create the real template work order.
+
+    The model should not have to guess the schema id/version emitted by
+    template activation.  The server owns that lookup and queues the durable
+    document-generation job, rather than exporting the chat answer.
+    """
+    sink = []
+    toolset = _toolset(tmp_path, event_sink=sink.append)
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板，根据知识库生成新的 ICD 文档",
+    )
+
+    assert result.status == "succeeded"
+    assert result.work_order_id == "work-order-a"
+    assert result.job_id
+    assert toolset.pipeline.prepare_kwargs["document_schema_id"] == "schema-a"
+    assert toolset.pipeline.prepare_kwargs["document_schema_version"] == "1"
+    assert toolset.pipeline.prepare_kwargs["generation_session_id"] == "generation-session-a"
+    assert sink[-1]["card"]["kind"] == "work_order_created"
+
+
+def test_template_generation_output_contract_accepts_native_format(tmp_path):
+    args = GenerateDocumentArgs(output_format="xlsx")
+    assert args.output_format == "xlsx"
+
+    result = _toolset(tmp_path).generate_document_from_template(
+        purpose="参考模板生成 ICD 文档",
+        output_format="xlsx",
+    )
+
+    assert result.status == "succeeded"
+    assert result.data["output_contract"]["requested_format"] == "xlsx"
+    assert result.data["output_contract"]["conversion_status"] == "not_required"
+
+
+def test_template_generation_output_contract_rejects_unavailable_conversion(tmp_path):
+    result = _toolset(tmp_path).generate_document_from_template(
+        purpose="参考模板生成 ICD 文档并导出 PDF",
+        output_format="pdf",
+    )
+
+    assert result.status == "rejected"
+    assert result.error_code == "template_output_conversion_not_enabled"
+    assert result.data["output_contract"] == {
+        "native_format": "xlsx",
+        "requested_format": "pdf",
+        "conversion_status": "not_enabled",
+    }
+
+
+def test_template_generation_output_contract_queues_supported_conversion(tmp_path):
+    toolset = _toolset(tmp_path)
+    toolset.pipeline.submit_document_artifact_conversion = lambda *_args, **_kwargs: None
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成 ICD 文档并导出 PDF",
+        output_format="pdf",
+    )
+
+    assert result.status == "succeeded"
+    assert result.data["output_contract"]["requested_format"] == "pdf"
+    assert result.data["output_contract"]["conversion_status"] == "pending_native_artifact"
+    job = toolset.job_store.get(result.job_id)
+    assert job is not None
+    assert job.payload["requested_output_format"] == "pdf"
 
 
 def test_client_context_cannot_cross_owner_or_knowledge_base(tmp_path):

@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, isForbiddenError, sseGetStream } from '@/api/client';
 import type {
+  AttachmentSnapshot,
   CreateTurnRequest,
   DocumentContext,
   EvidenceItem,
@@ -74,6 +75,7 @@ export function buildTurnRequest(
   queryMode: 'fast' | 'deep',
   documentContext?: DocumentContext | null,
   documentFlow?: boolean,
+  attachments?: { attachmentIds: string[]; sourceScope?: CreateTurnRequest['source_scope'] } | null,
 ): CreateTurnRequest {
   const request: CreateTurnRequest = {
     query,
@@ -97,6 +99,12 @@ export function buildTurnRequest(
     };
     if (typeof documentFlow === 'boolean') {
       request.document_flow = documentFlow;
+    }
+  }
+  if (attachments && attachments.attachmentIds.length > 0) {
+    request.attachment_ids = [...attachments.attachmentIds];
+    if (attachments.sourceScope && attachments.sourceScope !== 'auto') {
+      request.source_scope = attachments.sourceScope;
     }
   }
   return request;
@@ -869,7 +877,16 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     }
   }, []);
 
-  const send = useCallback(async () => {
+  const send = useCallback(async (
+    attachments?: {
+      attachmentIds: string[];
+      sourceScope?: CreateTurnRequest['source_scope'];
+      snapshots?: AttachmentSnapshot[];
+      /** A same-tick template conversion can provide the fresh context here. */
+      documentContextOverride?: DocumentContext | null;
+      documentFlowOverride?: boolean;
+    } | null,
+  ) => {
     const query = input.trim();
     if (!query || streaming) return;
     const generation = streamTokenRef.current + 1;
@@ -892,6 +909,18 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     // 乐观更新:点发送立即上屏,不等建会话/建 turn 的两个往返(否则"思考中"
     // 会先于自己的消息出现,体感像页面卡了一下)。turn 建好后用服务端记录对账替换。
     const optimisticId = -Date.now();
+    const optimisticAttachments = (attachments?.attachmentIds ?? []).map(
+      (attachmentId, ordinal) => {
+        const known = attachments?.snapshots?.find((item) => item.attachment_id === attachmentId);
+        return {
+          attachment_id: attachmentId,
+          filename: known?.filename ?? '附件',
+          media_type: known?.media_type,
+          ordinal,
+          parse_status: known?.parse_status ?? 'queued',
+        };
+      },
+    );
     setMessages((prev) => [
       ...prev,
       {
@@ -900,6 +929,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         role: 'user',
         content: query,
         created_at: new Date().toISOString(),
+        attachments: optimisticAttachments,
       },
     ]);
     try {
@@ -917,8 +947,17 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           query,
           requestUuid(),
           scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
-          documentContextEnabled ? documentContext : null,
-          documentContextEnabled ? documentFlowEnabled : undefined,
+          documentContextEnabled
+            ? (Object.prototype.hasOwnProperty.call(attachments ?? {}, 'documentContextOverride')
+              ? attachments?.documentContextOverride ?? null
+              : documentContext)
+            : null,
+          documentContextEnabled
+            ? (Object.prototype.hasOwnProperty.call(attachments ?? {}, 'documentFlowOverride')
+              ? attachments?.documentFlowOverride
+              : documentFlowEnabled)
+            : undefined,
+          attachments ?? null,
         ),
       );
       if (documentContextEnabled && ownsGeneration()) {

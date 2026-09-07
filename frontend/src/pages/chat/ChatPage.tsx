@@ -9,8 +9,14 @@ import { useNavigate } from 'react-router-dom';
 
 import type { AuthSession } from '../../auth';
 import { api, downloadBlob } from '@/api/client';
-import { analyzeTemplate } from '@/api/documentAuthoring';
-import type { ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, MessageView } from '@/api/types';
+import { analyzeTemplate, analyzeTemplateFromAttachment } from '@/api/documentAuthoring';
+import {
+  deleteAttachment,
+  listAttachments,
+  retryAttachment,
+  uploadAttachment,
+} from '@/api/chatAttachments';
+import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, MessageView } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -44,6 +50,87 @@ type Props = {
 };
 
 const DOCUMENT_TEMPLATE_EXTENSIONS = ['.xlsx', '.xlsm', '.docx'];
+const ATTACHMENT_STATUS_POLL_INTERVAL_MS = 2_000;
+const DOCUMENT_COMPARISON_PATTERN = /对比|比较|区别|差异|差别|异同|对照|compare|comparison|difference|diff/i;
+
+/**
+ * Detect the natural-language command that means "use the attached office
+ * file as a template and produce a filled document".  The backend remains
+ * authoritative; this client hint only removes the extra manual "作为模板"
+ * click when exactly one unambiguous office attachment is selected.
+ */
+export function isTemplateGenerationChatIntent(query: string): boolean {
+  const text = String(query || '').trim();
+  if (!text) return false;
+  // Comparison is a retrieval/reporting operation.  It must win over words
+  // such as “模板” and “生成” so the UI never converts a comparison into a
+  // template-fill request before the server sees the turn.
+  if (DOCUMENT_COMPARISON_PATTERN.test(text)) return false;
+  const action = '(?:参考|按照|按|基于|根据|填充|填写|回填|生成|创建|制作|撰写|起草|导出|输出|整理成|generate|create|fill|draft|produce|write|export|output)';
+  const target = '(?:模板|模版|文档|文件|报告|ICD|表格|表单|template|document|report|sheet|form)';
+  // Users naturally place the object first ("将模板…回填") or the
+  // action first ("参考模板生成文档").  Both forms represent the same
+  // server-side document-generation intent.
+  return new RegExp(`${action}[\\s\\S]{0,80}${target}|${target}[\\s\\S]{0,80}${action}`, 'i').test(text);
+}
+
+export function listTemplateCandidateAttachments(
+  query: string,
+  attachments: AttachmentView[],
+): AttachmentView[] {
+  if (!isTemplateGenerationChatIntent(query)) return [];
+  const seen = new Set<string>();
+  return attachments.filter((attachment) => {
+    const extension = String(attachment.extension || '').toLowerCase()
+      || `.${String(attachment.filename || '').split('.').pop() || ''}`.toLowerCase();
+    const id = String(attachment.attachment_id || '');
+    if (!DOCUMENT_TEMPLATE_EXTENSIONS.includes(extension)
+      || (attachment.parse_status !== 'ready' && attachment.parse_status !== 'degraded')
+      || (id && seen.has(id))) {
+      return false;
+    }
+    if (id) seen.add(id);
+    return true;
+  });
+}
+
+export type TemplateAttachmentRoute = {
+  intent: boolean;
+  candidates: AttachmentView[];
+  autoTemplate: AttachmentView | null;
+  requiresSelection: boolean;
+  requiresTemplate: boolean;
+};
+
+export function resolveTemplateAttachmentRoute(
+  query: string,
+  attachments: AttachmentView[],
+  hasDocumentContext = false,
+): TemplateAttachmentRoute {
+  const intent = isTemplateGenerationChatIntent(query);
+  // An already attached context is an explicit template choice.  Do not let
+  // additional Office evidence files make that choice ambiguous.
+  const candidates = intent && !hasDocumentContext
+    ? listTemplateCandidateAttachments(query, attachments)
+    : [];
+  return {
+    intent,
+    candidates,
+    autoTemplate: candidates.length === 1 ? candidates[0] : null,
+    requiresSelection: intent && !hasDocumentContext && candidates.length > 1,
+    requiresTemplate: intent && !hasDocumentContext && candidates.length === 0,
+  };
+}
+
+export function pickAutoTemplateAttachment(
+  query: string,
+  attachments: AttachmentView[],
+): AttachmentView | null {
+  const candidates = listTemplateCandidateAttachments(query, attachments);
+  // More than one possible template is ambiguous; preserve the explicit UI
+  // action so the user can choose the intended file.
+  return candidates.length === 1 ? candidates[0] : null;
+}
 
 function documentUploadFingerprint(file: File): string {
   return `${file.name}\u0000${file.size}\u0000${file.lastModified}`;
@@ -65,6 +152,17 @@ export function isDocumentAuthoringChatEnabled(value: unknown = undefined): bool
 
 export function resolveDocumentAuthoringEnabled(override?: boolean): boolean {
   return override ?? isDocumentAuthoringChatEnabled();
+}
+
+/**
+ * 会话附件入口默认开启；部署方可将 VITE_CHAT_ATTACHMENTS_ENABLED
+ * 设为 falsy 字符串显式关闭。
+ */
+export function isChatAttachmentsUiEnabled(value: unknown = undefined): boolean {
+  const configured = value ?? import.meta.env.VITE_CHAT_ATTACHMENTS_ENABLED;
+  const normalized = String(configured ?? '').trim().toLowerCase();
+  if (normalized === '') return true;
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
 }
 
 export default function ChatPage({
@@ -266,6 +364,7 @@ export default function ChatPage({
         availableKbs.find((kb) => kb.name === mountedKbName)?.permission ?? '',
       ),
   );
+  const chatAttachmentsEnabled = isChatAttachmentsUiEnabled();
 
   useEffect(() => {
     if (!documentAuthoringEnabled) {
@@ -312,9 +411,242 @@ export default function ChatPage({
     }
   }
 
+  async function handleUseAttachmentAsTemplate(attachment: AttachmentView) {
+    if (!canUploadDocumentTemplate || documentUploadPending || activeSessionId == null) return;
+    const extension = attachment.extension.toLowerCase();
+    if (!DOCUMENT_TEMPLATE_EXTENSIONS.includes(extension)) {
+      notify.error('仅支持将 .xlsx、.xlsm 或 .docx 附件转换为模板');
+      return;
+    }
+    if (attachment.parse_status !== 'ready' && attachment.parse_status !== 'degraded') {
+      notify.error('附件尚未完成解析，暂时不能转换为模板');
+      return;
+    }
+
+    setDocumentUploadPending(true);
+    try {
+      const analysis = await analyzeTemplateFromAttachment(
+        mountedKbName,
+        activeSessionId,
+        attachment.attachment_id,
+        attachment.filename,
+      );
+      const context = buildDocumentContext(analysis, mountedKbName, createClientRequestId());
+      if (!context) throw new Error('分析响应缺少可用的模板引用');
+      setDocumentContext(context);
+      setDocumentContextLabel(attachment.filename);
+      notify.success(`附件已转换为模板：${analysis.analysis_id}`);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '附件转换模板失败');
+    } finally {
+      setDocumentUploadPending(false);
+    }
+  }
+
   function clearDocumentContext() {
     setDocumentContext(null);
     setDocumentContextLabel(null);
+  }
+
+  // ---- 会话附件(design §15) ----
+  const [draftAttachments, setDraftAttachments] = useState<AttachmentView[]>([]);
+  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<string[]>([]);
+  const [attachmentUploadPending, setAttachmentUploadPending] = useState(false);
+  const [attachmentRetryingId, setAttachmentRetryingId] = useState<string | null>(null);
+  const [sourceScope, setSourceScope] = useState<
+    'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base'
+  >('auto');
+  const attachmentMutationVersionRef = useRef(0);
+
+  // 会话切换/新建后重新加载服务端附件;轮询让解析状态和失败原因最终
+  // 反映到当前会话,而不要求用户刷新页面。
+  useEffect(() => {
+    setDraftAttachments([]);
+    setSelectedAttachmentIds([]);
+    setAttachmentRetryingId(null);
+    setSourceScope('auto');
+    if (!chatAttachmentsEnabled || activeSessionId == null) return undefined;
+
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const sync = async () => {
+      const mutationVersion = attachmentMutationVersionRef.current;
+      try {
+        const attachments = await listAttachments(activeSessionId);
+        if (disposed || mutationVersion !== attachmentMutationVersionRef.current) return;
+        setDraftAttachments(attachments);
+        setSelectedAttachmentIds((previous) =>
+          previous.filter((id) => attachments.some((item) => item.attachment_id === id)),
+        );
+      } catch {
+        // The backend flag is independently configurable; a transient list
+        // failure must not interrupt normal chat input.
+      } finally {
+        if (!disposed) timer = setTimeout(() => void sync(), ATTACHMENT_STATUS_POLL_INTERVAL_MS);
+      }
+    };
+    void sync();
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [activeSessionId, chatAttachmentsEnabled]);
+
+  async function handleAttachmentUpload(file: File) {
+    if (attachmentUploadPending) return;
+    if (activeSessionId == null) {
+      notify.error('请先发送一条消息以创建会话，再添加附件');
+      return;
+    }
+    attachmentMutationVersionRef.current += 1;
+    setAttachmentUploadPending(true);
+    try {
+      const created = await uploadAttachment(activeSessionId, file, {
+        clientRequestId: createClientRequestId(),
+      });
+      setDraftAttachments((previous) =>
+        previous.some((item) => item.attachment_id === created.attachment_id)
+          ? previous
+          : [...previous, created],
+      );
+      setSelectedAttachmentIds((previous) =>
+        previous.includes(created.attachment_id) ? previous : [...previous, created.attachment_id],
+      );
+      notify.success(`附件已上传：${created.filename}`);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '上传附件失败');
+    } finally {
+      setAttachmentUploadPending(false);
+    }
+  }
+
+  async function handleRemoveAttachment(attachmentId: string) {
+    attachmentMutationVersionRef.current += 1;
+    setDraftAttachments((previous) =>
+      previous.filter((item) => item.attachment_id !== attachmentId),
+    );
+    setSelectedAttachmentIds((previous) => previous.filter((id) => id !== attachmentId));
+    if (activeSessionId == null) return;
+    try {
+      await deleteAttachment(activeSessionId, attachmentId);
+    } catch {
+      // 草稿已移除;服务端删除失败时不阻塞输入,真实状态以下次列表为准。
+    }
+  }
+
+  async function handleRetryAttachment(attachmentId: string) {
+    if (attachmentRetryingId !== null || activeSessionId == null) return;
+    attachmentMutationVersionRef.current += 1;
+    setAttachmentRetryingId(attachmentId);
+    try {
+      const updated = await retryAttachment(activeSessionId, attachmentId);
+      setDraftAttachments((previous) =>
+        previous.map((item) => (item.attachment_id === updated.attachment_id ? updated : item)),
+      );
+      notify.success(`已重新排队解析：${updated.filename}`);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '重试附件解析失败');
+    } finally {
+      setAttachmentRetryingId(null);
+    }
+  }
+
+  async function handleSendWithAttachments() {
+    const query = input.trim();
+    const selectedAttachments = draftAttachments.filter((item) =>
+      selectedAttachmentIds.includes(item.attachment_id),
+    );
+    const failed = selectedAttachments.find((item) => item.parse_status === 'failed');
+    if (failed) {
+      notify.error(`附件“${failed.filename}”解析失败，请先重试或移除`);
+      return;
+    }
+
+    // Natural-language template requests should create a template context
+    // before the turn is persisted.  The context override is passed to
+    // useKbChat.send in the same tick, avoiding a stale React state read.
+    // If a context already exists, it is the explicit template choice and
+    // unrelated Office attachments remain evidence.  Otherwise inspect all
+    // draft attachments: one eligible candidate can be auto-selected, while
+    // multiple candidates must be chosen with the explicit “作为模板” action.
+    const templateRoute = resolveTemplateAttachmentRoute(query, draftAttachments, documentContext != null);
+    if (templateRoute.requiresSelection) {
+      notify.error('检测到多个可用模板，请先点击目标附件“作为模板”后再发送');
+      return;
+    }
+    if (templateRoute.requiresTemplate) {
+      notify.error('请先上传或选择一个已解析的 DOCX、XLSX 或 XLSM 模板');
+      return;
+    }
+    const autoTemplate = templateRoute.autoTemplate;
+    if (autoTemplate && (!canUploadDocumentTemplate || activeSessionId == null)) {
+      notify.error(
+        !canUploadDocumentTemplate
+          ? '当前知识库没有模板写权限，无法发起文档生成'
+          : '请先建立会话后再发起模板生成',
+      );
+      return;
+    }
+    if (autoTemplate && canUploadDocumentTemplate && activeSessionId != null) {
+      setDocumentUploadPending(true);
+      try {
+        const analysis = await analyzeTemplateFromAttachment(
+          mountedKbName,
+          activeSessionId,
+          autoTemplate.attachment_id,
+          autoTemplate.filename,
+        );
+        const context = buildDocumentContext(analysis, mountedKbName, createClientRequestId());
+        if (!context) throw new Error('分析响应缺少可用的模板引用');
+        setDocumentContext(context);
+        setDocumentContextLabel(autoTemplate.filename);
+        if (analysis.auto_activated === false) {
+          notify.error('附件已识别为模板，但映射需要人工确认；请先在文档工作台完成确认');
+          return;
+        }
+        const sourceAttachments = selectedAttachments.filter(
+          (item) => item.attachment_id !== autoTemplate.attachment_id,
+        );
+        const sourceIds = sourceAttachments.map((item) => item.attachment_id);
+        const snapshots = sourceAttachments.map((item) => ({
+          attachment_id: item.attachment_id,
+          filename: item.filename,
+          media_type: item.media_type,
+          parse_status: item.parse_status,
+        }));
+        void send({
+          attachmentIds: sourceIds,
+          sourceScope: sourceIds.length > 0 ? sourceScope : 'auto',
+          snapshots,
+          documentContextOverride: context,
+          documentFlowOverride: true,
+        });
+        setSelectedAttachmentIds([]);
+        setSourceScope('auto');
+      } catch (error) {
+        notify.error(error instanceof Error ? error.message : '附件自动转换模板失败');
+      } finally {
+        setDocumentUploadPending(false);
+      }
+      return;
+    }
+
+    const ids = selectedAttachments.map((item) => item.attachment_id);
+    if (ids.length === 0) {
+      void send();
+      setSelectedAttachmentIds([]);
+      setSourceScope('auto');
+      return;
+    }
+    const snapshots = selectedAttachments.map((item) => ({
+      attachment_id: item.attachment_id,
+      filename: item.filename,
+      media_type: item.media_type,
+      parse_status: item.parse_status,
+    }));
+    void send({ attachmentIds: ids, sourceScope, snapshots });
+    setSelectedAttachmentIds([]);
+    setSourceScope('auto');
   }
 
   // ---- 消息编辑 ----
@@ -488,7 +820,7 @@ export default function ChatPage({
           setInput={setInput}
           streaming={streaming}
           onKbChange={handleKbChange}
-          onSend={() => void send()}
+          onSend={handleSendWithAttachments}
           onStop={abortStream}
           documentAuthoringEnabled={documentAuthoringEnabled}
           canUploadDocumentTemplate={canUploadDocumentTemplate}
@@ -500,6 +832,24 @@ export default function ChatPage({
           documentUploadProgress={documentUploadProgress}
           onUploadTemplate={handleTemplateUpload}
           onClearDocumentContext={clearDocumentContext}
+          attachmentsEnabled={chatAttachmentsEnabled}
+          draftAttachments={draftAttachments}
+          selectedAttachmentIds={selectedAttachmentIds}
+          attachmentUploadPending={attachmentUploadPending}
+          attachmentRetryingId={attachmentRetryingId}
+          sourceScope={sourceScope}
+          onSourceScopeChange={setSourceScope}
+          onUploadAttachment={handleAttachmentUpload}
+          onToggleAttachment={(attachmentId) =>
+            setSelectedAttachmentIds((previous) =>
+              previous.includes(attachmentId)
+                ? previous.filter((id) => id !== attachmentId)
+                : [...previous, attachmentId],
+            )
+          }
+          onRetryAttachment={handleRetryAttachment}
+          onUseAsTemplate={handleUseAttachmentAsTemplate}
+          onRemoveAttachment={handleRemoveAttachment}
         />
       </main>
       <ConfirmDialog

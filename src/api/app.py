@@ -18,6 +18,7 @@ from src.api.errors import install_error_handlers
 from src.api.deps import require_system_admin
 from src.api.routes import (
     assets,
+    attachments,
     auth,
     config,
     conversations,
@@ -222,6 +223,7 @@ def create_app() -> FastAPI:
     api_v1 = "/api/v1"
     app.include_router(auth.router, prefix=api_v1)
     app.include_router(assets.router, prefix=api_v1)
+    app.include_router(attachments.router, prefix=api_v1)
     app.include_router(conversations.router, prefix=api_v1)
     app.include_router(kbs.router, prefix=api_v1)
     app.include_router(files.router, prefix=api_v1)

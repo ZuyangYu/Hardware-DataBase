@@ -417,3 +417,38 @@ def test_expired_artifacts_are_removed_without_removing_export_history(tmp_path,
     assert store.get_artifact(7, artifact.artifact_id) is None
     retained_job = store.get_export_job(7, job.export_job_id)
     assert retained_job is not None and retained_job.status == "succeeded"
+
+
+def test_session_cleanup_removes_export_records_and_artifact_files(tmp_path):
+    store = ResultExportStore(str(tmp_path / "auth.db"), storage_dir=str(tmp_path / "exports"))
+    snapshot = store.create_snapshot(
+        owner_user_id=7,
+        tenant_id="default",
+        session_id=3,
+        turn_id="turn-cleanup",
+        envelope=_envelope(),
+    )
+    job = store.create_export_job(
+        owner_user_id=7,
+        tenant_id="default",
+        session_id=3,
+        snapshot_id=snapshot.snapshot_id,
+        format="md",
+        client_request_id="cleanup-export",
+    )
+    assert ResultExportWorker(store=store, worker_id="cleanup-worker").run_once() is True
+    completed = store.get_export_job(7, job.export_job_id)
+    assert completed is not None and completed.artifact_id
+    artifact = store.get_artifact(7, completed.artifact_id)
+    assert artifact is not None
+    artifact_path = store.storage_dir / artifact.storage_ref
+    assert artifact_path.exists()
+
+    store.cleanup_session(session_id=3)
+
+    assert not artifact_path.exists()
+    assert store.get_snapshot(7, snapshot.snapshot_id) is None
+    assert store.get_export_job(7, job.export_job_id) is None
+    assert store.get_artifact(7, artifact.artifact_id) is None
+    # Reconciliation retries are safe after the first pass.
+    store.cleanup_session(session_id=3)

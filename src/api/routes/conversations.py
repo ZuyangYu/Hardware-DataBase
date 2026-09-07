@@ -37,7 +37,29 @@ def _session_view(s) -> SessionView:
     )
 
 
+def _attachment_snapshot_view(snapshot: dict):
+    from src.api.schemas import AttachmentSnapshotView
+
+    return AttachmentSnapshotView(
+        attachment_id=str(snapshot.get("attachment_id") or ""),
+        filename=str(snapshot.get("filename_snapshot") or ""),
+        media_type=str(snapshot.get("media_type_snapshot") or ""),
+        usage_hint=str(snapshot.get("usage_hint_snapshot") or "reference"),
+        content_hash=str(snapshot.get("content_hash_snapshot") or ""),
+        ordinal=int(snapshot.get("ordinal") or 0),
+        parse_status=str(snapshot.get("parse_status_snapshot") or "queued"),
+        deleted=bool(snapshot.get("deleted", False)),
+    )
+
+
 def _message_view(m) -> MessageView:
+    attachments = []
+    if m.turn_id and m.role == "user":
+        try:
+            snapshots = _conv_service().list_turn_attachments(str(m.turn_id))
+            attachments = [_attachment_snapshot_view(snapshot) for snapshot in snapshots]
+        except Exception:
+            attachments = []
     return MessageView(
         id=m.id,
         session_id=m.session_id,
@@ -50,6 +72,7 @@ def _message_view(m) -> MessageView:
         redacted=bool(getattr(m, "redacted", False)),
         memory_context=getattr(m, "memory_context", []),
         document_context=getattr(m, "document_context", None),
+        attachments=attachments,
     )
 
 
