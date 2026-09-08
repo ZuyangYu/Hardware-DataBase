@@ -1,5 +1,6 @@
 # src/core/app_pipeline.py
 import os
+import hashlib
 import re
 import shutil
 import tempfile
@@ -41,6 +42,8 @@ from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.generation_sessions import GenerationBrief
 from src.document_authoring.models import content_hash
+from src.document_authoring.models import DocumentFieldSchema, DocumentSchema
+from src.document_authoring.planning.models import OutputSpec
 from src.document_authoring.planning.intake import OutputSpecIntakeService
 from src.document_authoring.requirement_clarifier import RequirementClarifier
 from src.document_authoring.requirement_resolver import RequirementResolver
@@ -1233,6 +1236,363 @@ class AppPipeline:
         if requested_kb is not None and session.knowledge_base_name != requested_kb:
             raise PermissionError("generation session belongs to another knowledge base")
         return session
+
+    @staticmethod
+    def _document_plan_view(
+        plan: Any,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+        session_status: str | None = None,
+        source_summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Project a plan to chat/workbench-safe metadata only."""
+
+        issues = list(getattr(plan, "issues", []) or [])
+        blocker_items: list[dict[str, Any]] = []
+        warning_items: list[str] = []
+        for issue in issues:
+            code = str(getattr(issue, "code", "plan_issue") or "plan_issue")
+            severity = str(getattr(issue, "severity", "warning") or "warning")
+            message = str(getattr(issue, "message", "") or "")
+            path = str(getattr(issue, "path", "") or "")
+            item = {"code": code, "severity": severity}
+            if path:
+                item["path"] = path
+            if message:
+                item["message"] = message
+            if bool(getattr(issue, "blocking", False)):
+                blocker_items.append(item)
+            else:
+                warning_items.append(message or code)
+        layout = getattr(plan, "layout_contract", None)
+        layout_summary = {
+            "mode": "provided_template" if getattr(layout, "kind", "") == "template" else "generated_structure",
+            "template_bound": bool(getattr(layout, "kind", "") == "template"),
+        }
+        render_spec = dict(getattr(plan, "render_spec", {}) or {})
+        deliverable_formats = [
+            str(value).strip()
+            for value in (render_spec.get("deliverables") or [])
+            if str(value).strip()
+        ]
+        if not deliverable_formats and render_spec.get("format"):
+            deliverable_formats = [str(render_spec["format"]).strip()]
+        deliverables = [
+            {"format": value, "role": "primary" if index == 0 else "derivative"}
+            for index, value in enumerate(deliverable_formats)
+        ]
+        summary = dict(getattr(plan, "output_spec_summary", {}) or {})
+        policies = {
+            "missing_data": summary.get("missing_data_policy"),
+            "inference": summary.get("inference_policy"),
+            "approval_policy_id": summary.get("approval_policy_id"),
+        }
+        status = str(session_status or getattr(plan, "status", "proposed") or "proposed")
+        executable = bool(getattr(plan, "is_executable", False))
+        return {
+            "session_id": session_id,
+            "task_id": task_id,
+            "document_plan_id": str(getattr(plan, "document_plan_id", "")),
+            "document_plan_version": int(getattr(plan, "version", 1) or 1),
+            "plan_hash": getattr(plan, "plan_hash", None),
+            "output_spec_id": getattr(plan, "output_spec_id", None),
+            "output_spec_version": getattr(plan, "output_spec_version", None),
+            "output_spec_hash": getattr(plan, "output_spec_hash", None),
+            "status": status,
+            "executable": executable,
+            "deliverables": deliverables,
+            "layout_summary": layout_summary,
+            "outline_count": len(summary.get("outline_unit_ids") or []),
+            "table_count": len(summary.get("table_unit_ids") or []),
+            "source_summary": dict(source_summary or {"snapshot_bound": True}),
+            "policies": policies,
+            "warnings": warning_items,
+            "blockers": blocker_items,
+            "next_actions": (
+                ["confirm_document_plan"]
+                if executable
+                else ["resolve_plan_blockers", "update_output_spec"]
+            ),
+        }
+
+    def _planning_source_snapshot(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Freeze currently readable source identities for a proposal."""
+
+        kb = str(knowledge_base_name or "").strip()
+        if not kb or not ctx.has_kb_permission(kb, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        source_names: list[str] = []
+        for document in self.list_file_infos(kb, ctx):
+            name = document.get("name", "") if isinstance(document, dict) else getattr(document, "name", "")
+            normalized = str(name or "").strip()
+            if normalized and normalized not in source_names:
+                source_names.append(normalized)
+        attachment_ids = [
+            str(item).strip()
+            for item in (ctx.metadata.get("document_authoring_attachment_ids", []) or [])
+            if str(item).strip()
+        ]
+        snapshot = self.document_generation._create_knowledge_base_source_snapshot(
+            ctx,
+            kb,
+            source_names,
+        )
+        source_hash = content_hash({
+            # KnowledgeBaseSourceSnapshot includes created_at and therefore
+            # its row hash is intentionally unique per freeze.  Proposal
+            # retries need a semantic scope hash independent of that nonce.
+            "knowledge_base_name": kb,
+            "source_names": sorted(set(source_names)),
+            "attachment_ids": sorted(set(attachment_ids)),
+        })
+        return snapshot, {
+            "knowledge_base_count": 1,
+            "attachment_count": len(set(attachment_ids)),
+            "source_count": len(source_names),
+            "snapshot_bound": True,
+            "snapshot_hash": source_hash,
+            "snapshot_content_hash": str(snapshot.content_hash),
+        }
+
+    @staticmethod
+    def _synthetic_document_schema(spec: OutputSpec) -> DocumentSchema:
+        """Give template-free Phase 1 proposals a schema for shadow compilation."""
+
+        return DocumentSchema(
+            document_schema_id=f"generated:{spec.output_spec_id}",
+            version=str(spec.version),
+            document_type=spec.document_type,
+            status="approved",
+            execution_mode="deterministic_only",
+            fields=[
+                DocumentFieldSchema(
+                    field_id=unit.unit_id,
+                    label=unit.title or unit.unit_id,
+                    required=unit.required,
+                    value_type="table" if unit.kind == "table" else "text",
+                    retrieval_policy_id="generic-retrieval",
+                    verification_policy_id="generic-verification",
+                )
+                for unit in spec.outline
+                if unit.kind in {"field", "paragraph", "section", "table", "list"}
+            ],
+        )
+
+    def create_document_plan_proposal(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+        *,
+        client_request_id: str | None = None,
+        expected_output_spec_version: int = 1,
+    ) -> dict[str, Any]:
+        """Compile and persist one hash-bound proposal for a v2 session."""
+
+        session = self.get_document_generation_session(ctx, session_id)
+        if session.contract_version != "output_spec_v1":
+            raise ValueError("plan proposals require output_spec_v1")
+        if session.status not in {"awaiting_plan", "awaiting_plan_confirmation"}:
+            raise ValueError("generation session is not awaiting a plan proposal")
+        current_version = int(session.output_spec_version or 0)
+        if current_version != int(expected_output_spec_version):
+            raise ValueError(
+                f"expected output spec version {expected_output_spec_version}, current version is {current_version}"
+            )
+        draft = session.output_spec_draft
+        if not isinstance(draft, dict):
+            raise ValueError("output spec draft is missing")
+        intake = getattr(self, "output_spec_intake", None) or OutputSpecIntakeService()
+        spec = intake.to_output_spec(draft).model_copy(update={"status": "proposed"})
+        snapshot, source_summary = self._planning_source_snapshot(
+            ctx,
+            knowledge_base_name=session.knowledge_base_name,
+        )
+        template = None
+        analysis = None
+        bindings: list[Any] = []
+        template_hash = ""
+        template_id = session.template_version_id
+        if not template_id and getattr(spec.layout_source, "mode", "") == "provided_template":
+            template_id = spec.layout_source.template_version_id
+        if template_id:
+            template = self.document_generation.store.get_template(template_id)
+            if template is None:
+                raise KeyError("template not found")
+            self.document_generation._require_template_kb_scope(ctx, template, "read")
+            schema = self.document_generation.store.get_document_schema(
+                template.template_schema_id,
+                template.template_schema_version,
+            )
+            if schema is None:
+                raise KeyError("document schema not found")
+            analysis = self.document_generation.store.get_template_analysis(template_id)
+            bindings = list(
+                self.document_generation.store.list_unit_bindings(
+                    template.template_schema_id,
+                    template.template_schema_version,
+                )
+            )
+            template_hash = str(template.content_hash or "")
+        else:
+            schema = self._synthetic_document_schema(spec)
+        plan = self.document_generation.planning.compile(
+            output_spec=spec,
+            document_schema=schema,
+            template_analysis=analysis,
+            bindings=bindings,
+            source_snapshot_id=str(snapshot.source_set_snapshot_id),
+            source_snapshot_hash=str(source_summary["snapshot_content_hash"]),
+        )
+        summary = dict(plan.output_spec_summary)
+        summary.update({
+            "template_content_hash": template_hash,
+            "source_scope_hash": source_summary["snapshot_hash"],
+        })
+        plan_payload = plan.model_dump(mode="json", exclude={"plan_hash"})
+        plan_payload["output_spec_summary"] = summary
+        plan = type(plan).model_validate(plan_payload)
+        planning = self.document_generation.planning
+        planning_store = planning.store
+        task_id = str(session.document_task_id or session.session_id)
+        latest = planning_store.get_latest_plan(
+            task_id,
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+        ) if planning_store is not None else None
+        state_matches = bool(
+            latest
+            and latest.status != "stale"
+            and latest.output_spec_hash == spec.content_hash
+            and str((latest.output_spec_summary or {}).get("source_scope_hash") or "") == source_summary["snapshot_hash"]
+            and str((latest.output_spec_summary or {}).get("template_content_hash") or "") == template_hash
+        )
+        if state_matches:
+            return self._document_plan_view(
+                latest,
+                session_id=session.session_id,
+                task_id=session.document_task_id,
+                session_status=session.status,
+                source_summary=source_summary,
+            )
+        if latest is not None and latest.status in {"proposed", "blocked"} and planning_store is not None:
+            reason = "source_changed"
+            if latest.output_spec_hash != spec.content_hash:
+                reason = "output_spec_changed"
+            elif str((latest.output_spec_summary or {}).get("template_content_hash") or "") != template_hash:
+                reason = "template_changed"
+            try:
+                planning_store.mark_plan_stale(
+                    latest.document_plan_id,
+                    latest.version,
+                    expected_plan_hash=latest.plan_hash,
+                    reason_code=reason,
+                    tenant_id=ctx.tenant_id or "default",
+                    user_id=ctx.user_id,
+                )
+            except ValueError:
+                pass
+            digest = hashlib.sha256(
+                f"{spec.content_hash}|{source_summary['snapshot_hash']}|{template_hash}".encode()
+            ).hexdigest()[:16]
+            plan_payload = plan.model_dump(mode="json", exclude={"plan_hash"})
+            plan_payload["document_plan_id"] = f"{plan.document_plan_id}:proposal-{digest}"
+            plan = type(plan).model_validate(plan_payload)
+        elif latest is not None and not state_matches:
+            digest = hashlib.sha256(
+                f"{spec.content_hash}|{source_summary['snapshot_hash']}|{template_hash}".encode()
+            ).hexdigest()[:16]
+            plan_payload = plan.model_dump(mode="json", exclude={"plan_hash"})
+            plan_payload["document_plan_id"] = f"{plan.document_plan_id}:proposal-{digest}"
+            plan = type(plan).model_validate(plan_payload)
+        if latest is not None and not state_matches:
+            try:
+                self.document_generation.store.generation_sessions.clear_plan(session.session_id)
+            except (KeyError, ValueError):
+                pass
+            if session.document_task_id:
+                try:
+                    self.document_generation.task_service.store.clear_plan(session.document_task_id)
+                except (KeyError, ValueError):
+                    pass
+        persisted = planning.persist_proposal(
+            output_spec=spec,
+            plan=plan,
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+            task_id=task_id,
+            idempotency_key=f"plan-proposal:{plan.document_plan_id}:v{plan.version}",
+        )
+        next_status = "awaiting_plan_confirmation" if persisted.is_executable else "awaiting_plan"
+        sessions = self.document_generation.store.generation_sessions
+        sessions.bind_plan(
+            session.session_id,
+            output_spec_id=spec.output_spec_id,
+            output_spec_version=spec.version,
+            document_plan_id=persisted.document_plan_id,
+            document_plan_version=persisted.version,
+            status=next_status,
+        )
+        if session.document_task_id:
+            try:
+                self.document_generation.task_service.store.bind_plan(
+                    session.document_task_id,
+                    output_spec_id=spec.output_spec_id,
+                    output_spec_version=spec.version,
+                    document_plan_id=persisted.document_plan_id,
+                    document_plan_version=persisted.version,
+                )
+                self.document_generation.task_service.store.update_status(
+                    session.document_task_id,
+                    next_status,
+                )
+            except (KeyError, ValueError):
+                pass
+        self._project_generation_session_event(
+            sessions.get_session(session.session_id),
+            "document_plan_proposed",
+            {
+                "document_plan_id": persisted.document_plan_id,
+                "document_plan_version": persisted.version,
+                "output_spec_version": spec.version,
+                "status": next_status,
+            },
+        )
+        return self._document_plan_view(
+            persisted,
+            session_id=session.session_id,
+            task_id=session.document_task_id,
+            session_status=next_status,
+            source_summary=source_summary,
+        )
+
+    def get_document_plan(
+        self,
+        ctx: RequestContext,
+        document_plan_id: str,
+        version: int,
+    ) -> dict[str, Any] | None:
+        planning_store = self.document_generation.planning.store
+        if planning_store is None:
+            return None
+        plan = planning_store.get_plan(
+            document_plan_id,
+            int(version),
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+        )
+        if plan is None:
+            return None
+        source_summary = {
+            "snapshot_bound": True,
+            "snapshot_hash": str((plan.output_spec_summary or {}).get("source_scope_hash") or plan.source_snapshot_hash),
+        }
+        return self._document_plan_view(plan, source_summary=source_summary)
 
     def answer_document_generation_session(
         self,

@@ -1116,6 +1116,37 @@ class AnswerGenerationSessionRequest(BaseModel):
     client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
+class CreatePlanProposalRequest(BaseModel):
+    """Hash-bound proposal request; all semantic values come from the session draft."""
+
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    expected_output_spec_version: int = Field(default=1, ge=1)
+
+
+class PlanProposalView(BaseModel):
+    """Safe projection of a plan; no source names, evidence or storage refs."""
+
+    session_id: str | None = None
+    task_id: str | None = None
+    document_plan_id: str
+    document_plan_version: int = Field(ge=1)
+    plan_hash: str | None = None
+    output_spec_id: str | None = None
+    output_spec_version: int | None = Field(default=None, ge=1)
+    output_spec_hash: str | None = None
+    status: str
+    executable: bool = False
+    deliverables: list[dict[str, Any]] = Field(default_factory=list)
+    layout_summary: dict[str, Any] = Field(default_factory=dict)
+    outline_count: int = Field(default=0, ge=0)
+    table_count: int = Field(default=0, ge=0)
+    source_summary: dict[str, int | str | bool] = Field(default_factory=dict)
+    policies: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    blockers: list[dict[str, Any] | str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+
+
 class IcdResolutionItem(BaseModel):
     exception_id: str
     action: Literal["include", "exclude"]

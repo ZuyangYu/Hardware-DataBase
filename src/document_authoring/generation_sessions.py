@@ -724,7 +724,27 @@ class GenerationSessionStore:
             "output_spec_id": self._optional(draft.get("output_spec_id")) or session.output_spec_id,
             "output_spec_version": draft_version,
             "output_spec_draft": dict(draft),
+            # A changed user decision invalidates any previously proposed
+            # plan.  The immutable plan row remains available for stale
+            # comparison, while the session can bind the next proposal.
+            "document_plan_id": None,
+            "document_plan_version": None,
             "status": status,
+            "updated_at": _utc_now(),
+        })
+        with closing(self._connect()) as conn:
+            self._update_session_row(conn, revised)
+        return revised
+
+    def clear_plan(self, session_id: str) -> GenerationSession:
+        """Drop only the session's current plan pointer before reproposal."""
+
+        session = self.get_session(session_id)
+        if session.document_plan_id is None and session.document_plan_version is None:
+            return session
+        revised = session.model_copy(update={
+            "document_plan_id": None,
+            "document_plan_version": None,
             "updated_at": _utc_now(),
         })
         with closing(self._connect()) as conn:

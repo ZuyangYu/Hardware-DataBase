@@ -21,6 +21,7 @@ from src.api.schemas import (
     ConfirmTemplateRequest,
     CompleteDocumentRevisionRequest,
     ConvertDocumentArtifactRequest,
+    CreatePlanProposalRequest,
     CreateDocumentRevisionRequest,
     CreateGenerationSessionRequest,
     CreateWorkOrderRequest,
@@ -28,6 +29,7 @@ from src.api.schemas import (
     DocumentReviewDecisionRequest,
     FeedbackRequest,
     IcdResolutionRequest,
+    PlanProposalView,
     TemplateAnalysisReviewView,
     TemplateAnalysisView,
     TemplateMappingCorrectionRequest,
@@ -432,6 +434,61 @@ def get_generation_session(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/document-generation/sessions/{session_id}/plan-proposals",
+    response_model=PlanProposalView,
+)
+def create_plan_proposal(
+    session_id: str,
+    kb: str,
+    payload: CreatePlanProposalRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Compile a frozen proposal without creating a WorkOrder or job."""
+
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        proposal = pipeline.create_document_plan_proposal(
+            ctx,
+            session_id,
+            client_request_id=payload.client_request_id,
+            expected_output_spec_version=payload.expected_output_spec_version,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return proposal
+
+
+@router.get(
+    "/document-generation/plans/{plan_id}/versions/{version}",
+    response_model=PlanProposalView,
+)
+def get_plan_proposal(
+    plan_id: str,
+    version: int,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        proposal = pipeline.get_document_plan(ctx, plan_id, version)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="document plan not found")
+    return proposal
 
 
 @router.post("/document-generation/sessions/{session_id}/messages")

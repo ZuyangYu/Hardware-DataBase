@@ -438,7 +438,7 @@ class DocumentPlanningStore:
                     """UPDATE document_plans
                        SET status = ?, stale_reason_code = ?, payload_json = ?
                        WHERE document_plan_id = ? AND version = ?
-                         AND status = 'proposed' AND plan_hash = ?""",
+                         AND status IN ('proposed', 'blocked') AND plan_hash = ?""",
                     (
                         stale_plan.status,
                         reason,

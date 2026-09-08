@@ -167,6 +167,61 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         self.assertIsNone(captured["template_version_id"])
         self.assertEqual(captured["output_spec"]["document_type"], "report")
 
+    def test_plan_proposal_endpoints_forward_hash_bound_request_and_safe_projection(self):
+        captured = {}
+        self.stub.create_document_plan_proposal = lambda ctx, session_id, **kwargs: (
+            captured.update({"session_id": session_id, **kwargs})
+            or {
+                "session_id": session_id,
+                "task_id": "task-1",
+                "document_plan_id": "plan-1",
+                "document_plan_version": 1,
+                "plan_hash": "sha256:plan",
+                "output_spec_id": "spec-1",
+                "output_spec_version": 1,
+                "output_spec_hash": "sha256:spec",
+                "status": "awaiting_plan_confirmation",
+                "executable": True,
+                "deliverables": [{"format": "xlsx", "role": "primary"}],
+                "layout_summary": {"mode": "provided_template"},
+                "outline_count": 2,
+                "table_count": 1,
+                "source_summary": {"knowledge_base_count": 1, "attachment_count": 0},
+                "policies": {"missing_data": "mark_tbd", "inference": "forbid"},
+                "warnings": [],
+                "blockers": [],
+                "next_actions": ["confirm_document_plan"],
+            }
+        )
+        self.stub.get_document_plan = lambda ctx, plan_id, version: {
+            "document_plan_id": plan_id,
+            "document_plan_version": version,
+            "status": "proposed",
+            "source_summary": {"knowledge_base_count": 1, "attachment_count": 0},
+            "warnings": [],
+            "blockers": [],
+            "next_actions": ["confirm_document_plan"],
+        }
+        headers = self._headers("admin1")
+        created = self.client.post(
+            "/api/v1/document-generation/sessions/session-1/plan-proposals?kb=shared",
+            headers=headers,
+            json={"client_request_id": "proposal-request-1", "expected_output_spec_version": 3},
+        )
+        fetched = self.client.get(
+            "/api/v1/document-generation/plans/plan-1/versions/1?kb=shared",
+            headers=headers,
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertEqual(captured, {
+            "session_id": "session-1",
+            "client_request_id": "proposal-request-1",
+            "expected_output_spec_version": 3,
+        })
+        self.assertNotIn("source_names", created.json())
+        self.assertNotIn("evidence", created.json())
+
     def test_work_order_creation_requires_write_permission(self):
         response = self.client.post(
             "/api/v1/document-generation/work-orders?kb=shared",

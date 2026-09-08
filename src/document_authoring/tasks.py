@@ -672,6 +672,51 @@ class DocumentTaskStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def clear_plan(self, task_id: str) -> DocumentTask:
+        """Clear the current plan pointer so a stale proposal can be replaced."""
+
+        normalized = str(task_id or "").strip()
+        if not normalized:
+            raise ValueError("task id is required")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM document_tasks WHERE task_id = ?", (normalized,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError("document task not found")
+                current = _row_to_task(row)
+                if current.document_plan_id is None and current.document_plan_version is None:
+                    conn.execute("COMMIT")
+                    return current
+                updated = current.model_copy(update={
+                    "document_plan_id": None,
+                    "document_plan_version": None,
+                    "updated_at": _now(),
+                })
+                conn.execute(
+                    """UPDATE document_tasks
+                       SET document_plan_id = NULL, document_plan_version = NULL,
+                           updated_at = ?, payload_json = ?
+                       WHERE task_id = ?""",
+                    (updated.updated_at.isoformat(), _json(updated), normalized),
+                )
+                conn.execute(
+                    """INSERT INTO document_task_events
+                       (event_id, task_id, event_type, idempotency_key, created_at, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        f"document-task-event-{uuid.uuid4().hex}", normalized,
+                        "plan_cleared", f"plan-clear:{uuid.uuid4().hex}", _iso(), _json({}),
+                    ),
+                )
+                conn.execute("COMMIT")
+                return updated
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def list_events(self, task_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         """Return the append-only task audit events in creation order."""
         normalized_task_id = str(task_id or "").strip()

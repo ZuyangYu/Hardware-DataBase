@@ -398,6 +398,58 @@ class DocumentPlanningService:
     def compile(self, **kwargs: Any) -> DocumentPlan:
         return self.adapter.compile(**kwargs)
 
+    def persist_proposal(
+        self,
+        *,
+        output_spec: OutputSpec,
+        plan: DocumentPlan,
+        tenant_id: str,
+        user_id: str,
+        task_id: str,
+        idempotency_key: str | None = None,
+    ) -> DocumentPlan:
+        """Persist one immutable, hash-bound proposal and its audit event.
+
+        Both rows are owner-scoped and idempotent.  A retry with the same
+        semantic versions returns the existing rows; a caller that attempts
+        to reuse an identity with different content is rejected by the store.
+        """
+
+        spec = output_spec if isinstance(output_spec, OutputSpec) else OutputSpec.model_validate(output_spec)
+        candidate = plan if isinstance(plan, DocumentPlan) else DocumentPlan.model_validate(plan)
+        if candidate.output_spec_id != spec.output_spec_id or candidate.output_spec_version != spec.version:
+            raise ValueError("document plan is not bound to the proposed OutputSpec")
+        if candidate.output_spec_hash != spec.content_hash:
+            raise ValueError("document plan OutputSpec hash does not match the proposed spec")
+        if self.store is None:
+            return candidate
+        persisted_spec = self.store.create_output_spec(
+            spec,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            task_id=task_id,
+        )
+        persisted_plan = self.store.create_plan(
+            candidate,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            task_id=task_id,
+        )
+        event_key = str(idempotency_key or f"plan-proposal:{candidate.document_plan_id}:v{candidate.version}").strip()
+        self.store.append_event(
+            task_id=task_id,
+            event_type="document_plan_proposed",
+            idempotency_key=event_key,
+            payload={
+                "document_plan_id": persisted_plan.document_plan_id,
+                "document_plan_version": persisted_plan.version,
+                "output_spec_id": persisted_spec.output_spec_id,
+                "output_spec_version": persisted_spec.version,
+                "plan_hash": persisted_plan.plan_hash,
+            },
+        )
+        return persisted_plan
+
     def propose_shadow(
         self,
         *,
