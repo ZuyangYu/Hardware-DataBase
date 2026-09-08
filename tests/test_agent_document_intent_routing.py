@@ -73,6 +73,18 @@ def _expired_context():
     )
 
 
+def _template_free_context():
+    return build_document_context(
+        {
+            "version": "v2",
+            "knowledge_base_name": "kb_hw",
+            "output_spec_id": "spec-1",
+            "output_spec_version": 1,
+        },
+        ctx=_FakeCtx(),
+    )
+
+
 def _install_fake_agent(monkeypatch):
     from src.agents import runner as runner_mod
 
@@ -146,6 +158,16 @@ def test_route_requires_tools_fresh_context_and_query():
         document_context=_context(), query="生成文档", has_document_tools=False
     )
     assert routed is False
+
+
+def test_template_free_authoring_routes_with_v2_context():
+    routed, by = resolve_document_flow_route(
+        document_context=_template_free_context(),
+        query="基于知识库创建 ICD 报告",
+        has_document_tools=True,
+    )
+    assert routed is True
+    assert by == "regex"
     routed, _ = resolve_document_flow_route(
         document_context=None, query="生成文档", has_document_tools=True
     )

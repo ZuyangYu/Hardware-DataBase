@@ -10,8 +10,17 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, Field, model_validator
 
-from src.document_authoring.chat_context import DocumentContext, DocumentContextInput
+from src.document_authoring.chat_context import (
+    DocumentAuthoringContext,
+    DocumentAuthoringContextInput,
+    DocumentContext,
+    DocumentContextInput,
+)
 from src.result_exports.models import normalize_export_format
+
+
+DocumentContextRequest = DocumentContextInput | DocumentAuthoringContextInput
+DocumentContextView = DocumentContext | DocumentAuthoringContext
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +185,7 @@ class QueryRequest(BaseModel):
     # (and blocks DoS-shaped requests before the body is even read).
     history: list[tuple[str, str]] = Field(default_factory=list, max_length=100)
     thread_id: str = ""
-    document_context: DocumentContextInput | None = None
+    document_context: DocumentContextRequest | None = None
     document_flow: bool | None = None
 
 
@@ -196,7 +205,7 @@ class SessionView(BaseModel):
     title: str
     created_at: str
     updated_at: str
-    document_context: DocumentContext | None = None
+    document_context: DocumentContextView | None = None
 
 
 class MemoryContextView(BaseModel):
@@ -237,7 +246,7 @@ class MessageView(BaseModel):
     edited_at: str | None = None
     redacted: bool = False
     memory_context: list[MemoryContextView] = Field(default_factory=list)
-    document_context: DocumentContext | None = None
+    document_context: DocumentContextView | None = None
     # Attachment snapshots of the owning turn (user messages only, optional).
     attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
 
@@ -271,7 +280,7 @@ class CreateTurnRequest(BaseModel):
     # Retained for wire compatibility; the route normalizes KB turns to deep
     # retrieval and general chat bypasses the knowledge-base agent entirely.
     query_mode: Literal["fast", "deep"] = "deep"
-    document_context: DocumentContextInput | None = None
+    document_context: DocumentContextRequest | None = None
     # Explicit document-flow routing: True forces the document flow when the
     # context is valid, False blocks it (and strips document tools from the
     # general toolset); None keeps the legacy intent-keyword fallback.
@@ -308,7 +317,7 @@ class TurnView(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
-    document_context: DocumentContext | None = None
+    document_context: DocumentContextView | None = None
     source_scope: str = "auto"
     attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
 

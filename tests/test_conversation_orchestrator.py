@@ -89,3 +89,40 @@ def test_plan_is_json_safe_and_preserves_source_scope():
     assert payload["route"] == "document_authoring"
     assert payload["source_scope"] == "attachment_and_knowledge_base"
     assert isinstance(payload["reason_codes"], list)
+
+
+def test_v2_context_can_route_template_free_authoring_with_authorized_source():
+    context = {
+        "version": "v2",
+        "knowledge_base_name": "kb_hw",
+        "owner_user_id": "user-1",
+        "tenant_id": "tenant-1",
+        "expired": False,
+        "output_spec_id": "spec-1",
+        "output_spec_version": 1,
+    }
+    plan = ConversationOrchestrator().plan(
+        query="基于知识库创建 ICD 报告",
+        document_context=context,
+        has_document_tools=True,
+        has_kb=True,
+    )
+
+    assert plan.route == "document_authoring"
+    assert plan.intent == "document_authoring"
+    assert plan.template_required is False
+    assert "document_authoring" in plan.allowed_tools
+
+
+def test_ambiguous_authoring_route_is_clarification_only():
+    plan = ConversationOrchestrator().plan(
+        query="整理成文档",
+        document_context=_document_context(),
+        has_document_tools=True,
+        has_kb=True,
+    )
+
+    assert plan.intent == "document_authoring"
+    assert plan.action == "clarify"
+    assert plan.reason_codes == ("ambiguous_document_request",)
+    assert plan.route == "document_authoring"

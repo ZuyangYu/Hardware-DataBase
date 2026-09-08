@@ -15,7 +15,7 @@ from typing import Any, Callable, Literal
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.document_authoring.chat_context import DocumentContext
+from src.document_authoring.chat_context import DocumentAuthoringContext, DocumentContext
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 
 
@@ -228,7 +228,7 @@ def _result_json(result: DocumentToolResult) -> str:
 class DocumentAuthoringToolset:
     pipeline: Any
     ctx: Any
-    context: DocumentContext
+    context: DocumentContext | DocumentAuthoringContext
     chat_session_id: str
     job_store: DocumentAuthoringJobStore
     event_sink: Callable[[dict], None] | None = None
@@ -241,13 +241,13 @@ class DocumentAuthoringToolset:
     def _authorize(self, permission: Literal["read", "write"]) -> None:
         self.context.assert_scope(
             ctx=self.ctx,
-            expected_kb=self.context.knowledge_base_name,
+            expected_kb=getattr(self.context, "knowledge_base_name", None),
             required_permission=permission,
         )
         # Every service call also receives the same server-derived KB scope.
         metadata = getattr(self.ctx, "metadata", None)
         if isinstance(metadata, dict):
-            metadata["document_template_kb_name"] = self.context.knowledge_base_name
+            metadata["document_template_kb_name"] = getattr(self.context, "knowledge_base_name", None) or ""
 
     def _mark_task_queued(self, task_id: str | None) -> None:
         document_generation = getattr(self.pipeline, "document_generation", None)
@@ -1216,7 +1216,7 @@ def make_document_authoring_tools(
     """Build document tools only for an already normalized server context."""
 
     context = rt.document_context
-    if not isinstance(context, DocumentContext):
+    if not isinstance(context, (DocumentContext, DocumentAuthoringContext)):
         return []
     return DocumentAuthoringToolset(
         pipeline=pipeline,

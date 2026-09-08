@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from src.core.intent import IntentPlan, classify_intent
 
 
@@ -62,3 +64,36 @@ def test_generic_table_export_is_not_template_generation_when_context_is_mounted
 
     assert plan.intent == "export"
     assert plan.requested_formats == ("xlsx",)
+
+
+@pytest.mark.parametrize(
+    "query,kwargs",
+    [
+        ("基于知识库创建 ICD 报告", {"has_kb": True}),
+        ("create a report from the attached files", {"has_attachments": True, "has_kb": False}),
+    ],
+)
+def test_generic_document_authoring_does_not_require_a_template(query, kwargs):
+    plan = classify_intent(query, **kwargs)
+
+    assert plan.intent == "document_authoring"
+    assert plan.action == "generate"
+    assert plan.template_required is False
+
+
+def test_current_result_pdf_is_conversational_export():
+    plan = classify_intent("请把当前结果另存为 PDF", has_kb=True)
+
+    assert plan.intent == "export"
+    assert plan.action == "export"
+    assert plan.export_requested is True
+    assert plan.requested_formats == ("pdf",)
+    assert "result_delivery_export" in plan.reason_codes
+
+
+def test_ambiguous_document_request_requires_clarification():
+    plan = classify_intent("整理成文档", has_kb=True)
+
+    assert plan.intent == "document_authoring"
+    assert plan.action == "clarify"
+    assert plan.reason_codes == ("ambiguous_document_request",)

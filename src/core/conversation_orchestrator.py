@@ -131,9 +131,12 @@ class ConversationOrchestrator:
         expired = bool(_value(document_context, "expired", False))
         context_valid = bool(document_context is not None and not expired)
         document_capable = bool(has_document_tools and context_valid)
+        template_context = bool(
+            context_valid and _value(document_context, "template_version_id", None)
+        )
         intent = classify_intent(
             query,
-            has_template_context=context_valid,
+            has_template_context=template_context,
             has_attachments=bool(has_attachments),
             has_kb=bool(has_kb),
         )
@@ -171,11 +174,12 @@ class ConversationOrchestrator:
             )
             routed_by = "explicit"
             reasons.append("explicit_document_flow_disabled")
-        elif document_capable and intent.intent == "template_generation":
+        elif document_capable and intent.intent in {"template_generation", "document_authoring"}:
             route = "document_authoring"
             document_flow = True
             routed_by = "deterministic"
-            reasons.append("backend_document_intent")
+            if intent.action != "clarify":
+                reasons.append("backend_document_intent")
         else:
             route, document_flow = self._non_document_route(
                 intent,

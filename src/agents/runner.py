@@ -59,6 +59,11 @@ from src.core.conversation import GENERAL_CHAT_KB_NAME
 from src.core.conversation_orchestrator import ConversationOrchestrator
 from src.core.intent import classify_intent
 from src.core.model_factory import create_chat_model
+from src.document_authoring.chat_context import (
+    DocumentAuthoringContext,
+    DocumentContext,
+    build_document_context,
+)
 from src import settings
 from src.observability import observe
 from src.observability.metrics import counter, record_agent, record_agent_stage
@@ -256,7 +261,10 @@ _DEEP_WORKFLOW = """请充分检索后再回答：
 """
 
 _DOCUMENT_FLOW_PROMPT = """你是 Hardware DataBase 的文档生成流程助手。当前知识库为「{kb_name}」。
-用户已附加模板引用：analysis_id={analysis_id}，template_version_id={template_version_id}。
+当前模板引用（可选）：analysis_id={analysis_id}，template_version_id={template_version_id}。
+
+如果模板引用显示“未挂载”，这是模板无关的文档规划对话：先通过文档澄清收集用途、
+文档类型、交付格式、结构和缺失数据策略；不要调用模板检查、模板填充或通用对话导出。
 
 本次对话只能使用文档工具驱动生成流程，禁止编造模板内容或生成结果。
 当用户表达“参考/按照模板生成、填充、回填、创建最终文档/ICD、导出最终文件”等意图时，必须优先调用
@@ -314,7 +322,14 @@ def resolve_document_flow_route(
     # Keep the public routed_by value for compatibility with existing traces,
     # while delegating the actual precedence/rules to the canonical planner.
     return (
-        classify_intent(query, has_template_context=True).intent == "template_generation"
+        classify_intent(
+            query,
+            has_template_context=bool(
+                getattr(document_context, "template_version_id", None)
+                and not bool(getattr(document_context, "expired", False))
+            ),
+        ).intent
+        in {"template_generation", "document_authoring"}
     ), "regex"
 
 
@@ -894,6 +909,43 @@ class MultiSourceAgentRunner:
             )
             kb_scope_line = f"{kb_scope_line}\n{attachment_scope_line}"
 
+        # Generic authoring does not need a pre-mounted template.  When the
+        # authenticated request has an authorized KB/attachment scope, build a
+        # server-owned v2 context before choosing the executor.  A malformed
+        # or unauthorised candidate is simply left absent; the orchestrator
+        # then fails closed instead of widening tools from a browser hint.
+        intent_candidate = classify_intent(
+            query,
+            has_template_context=bool(
+                document_context is not None
+                and getattr(document_context, "template_version_id", None)
+                and not bool(getattr(document_context, "expired", False))
+            ),
+            has_attachments=has_attachments,
+            has_kb=not is_general,
+        )
+        if (
+            document_context is None
+            and document_flow is not False
+            and (document_flow is True or intent_candidate.intent in {"template_generation", "document_authoring"})
+            and ctx is not None
+            and (not is_general or has_attachments)
+        ):
+            raw_context = {
+                "version": "v2",
+                "knowledge_base_name": None if is_general else scope_kb,
+                "attachment_ids": [str(getattr(ref, "attachment_id", "")) for ref in attachment_refs],
+                "source_scope": effective_scope,
+            }
+            try:
+                document_context = build_document_context(
+                    raw_context,
+                    ctx=ctx,
+                    expected_kb=None if is_general else scope_kb,
+                )
+            except (PermissionError, ValueError):
+                document_context = None
+
         def emit_event(evt: dict) -> None:
             # 通用对话可以在内部读取长期记忆，但这是上下文 plumbing，不应在
             # 用户可见的检索执行轨迹中显示。故只过滤展示事件，内部诊断仍保留。
@@ -933,6 +985,7 @@ class MultiSourceAgentRunner:
             query,
             has_template_context=bool(
                 document_context is not None
+                and getattr(document_context, "template_version_id", None)
                 and not bool(getattr(document_context, "expired", False))
             ),
             has_attachments=has_attachments,
@@ -940,10 +993,14 @@ class MultiSourceAgentRunner:
         )
 
         document_tools: list[Any] = []
-        if (
+        authoring_capable = bool(
             getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False)
             and document_context is not None
+            and not bool(getattr(document_context, "expired", False))
             and self.document_authoring_pipeline is not None
+        )
+        if (
+            authoring_capable
         ):
             card_sink: Callable[[dict], None] | None = None
             if event_callback is not None:
@@ -958,16 +1015,31 @@ class MultiSourceAgentRunner:
                 job_store=self.document_job_store,
                 event_sink=card_sink,
             )
+            # A template-free v2 context may enter the governed authoring
+            # conversation, but template inspection/fill/revision tools must
+            # not become available until the server has mounted both template
+            # references.  Status remains useful when a task id is present.
+            template_available = bool(
+                getattr(document_context, "template_version_id", None)
+                and getattr(document_context, "analysis_id", None)
+            )
+            if not template_available:
+                task_id = str(getattr(document_context, "task_id", "") or "").strip()
+                allowed_without_template = {"get_document_generation_status"} if task_id else set()
+                document_tools = [
+                    tool for tool in document_tools
+                    if str(getattr(tool, "name", "") or "") in allowed_without_template
+                ]
         document_flow_routed, routed_by = resolve_document_flow_route(
             document_context=document_context,
             query=query,
-            has_document_tools=bool(document_tools),
+            has_document_tools=authoring_capable,
             explicit_flow=document_flow,
         )
         conversation_plan = self.conversation_orchestrator.plan(
             query=query,
             document_context=document_context,
-            has_document_tools=bool(document_tools),
+            has_document_tools=authoring_capable,
             explicit_flow=document_flow,
             has_attachments=has_attachments,
             has_kb=not is_general,
@@ -1010,8 +1082,8 @@ class MultiSourceAgentRunner:
                 )
             system_prompt = _DOCUMENT_FLOW_PROMPT.format(
                 kb_name=scope_kb or kb_name,
-                analysis_id=document_context.analysis_id,
-                template_version_id=document_context.template_version_id,
+                analysis_id=getattr(document_context, "analysis_id", None) or "未挂载",
+                template_version_id=getattr(document_context, "template_version_id", None) or "未挂载",
             )
         else:
             tools = []

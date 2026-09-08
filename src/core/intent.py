@@ -20,9 +20,10 @@ IntentName = Literal[
     "attachment_qa",
     "compare",
     "template_generation",
+    "document_authoring",
     "export",
 ]
-IntentAction = Literal["answer", "compare", "generate", "export"]
+IntentAction = Literal["answer", "compare", "generate", "export", "clarify"]
 IntentTarget = Literal[
     "conversation",
     "knowledge_base",
@@ -44,7 +45,7 @@ _GENERATION_ACTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _EXPORT_ACTION_PATTERN = re.compile(
-    r"导出|输出|整理成|转换为|下载|保存为|"
+    r"导出|输出|整理成|转换为|下载|保存为|另存为|"
     r"export|output|download|convert|save\s+as",
     re.IGNORECASE,
 )
@@ -64,6 +65,16 @@ _RECOMMENDED_PATTERN = re.compile(
 )
 _EXPORT_NEGATION_PATTERN = re.compile(
     r"(?:不要|无需|不需要|别|禁止).{0,8}(?:导出|输出|生成|下载|保存|转换)",
+    re.IGNORECASE,
+)
+_CURRENT_RESULT_PATTERN = re.compile(
+    r"(?:当前|刚才|上述|本次|这个|this|current|previous|above)"
+    r".{0,24}(?:结果|回答|答案|result|answer|response)",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_DOCUMENT_PATTERN = re.compile(
+    r"(?:整理|汇总|组织|compile|整理一下).{0,12}(?:成|为|into|as)?\s*"
+    r"(?:文档|文件|document|file)\s*$",
     re.IGNORECASE,
 )
 
@@ -239,6 +250,22 @@ def classify_intent(
         and _EXPORT_ACTION_PATTERN.search(text)
         and not _EXPORT_NEGATION_PATTERN.search(text)
     )
+    # “整理成文档” leaves both the source material and output contract
+    # underspecified.  Keep it in the governed authoring route, but expose a
+    # clarification action so no worker/job can be started by keyword alone.
+    ambiguous_document = bool(
+        _AMBIGUOUS_DOCUMENT_PATTERN.search(text)
+        and not formats
+        and not _TEMPLATE_MARKER_PATTERN.search(text)
+    )
+    if ambiguous_document:
+        return IntentPlan(
+            intent="document_authoring",
+            action="clarify",
+            target=target,
+            confidence=0.78,
+            reason_codes=("ambiguous_document_request",),
+        )
     # A generic “输出 Excel 表格” is an export even when a template happens to
     # be mounted in the session.  Generation verbs, template markers and fill
     # verbs retain the document-flow meaning.
@@ -246,7 +273,6 @@ def classify_intent(
         recommended_followup
         or explicit_template_command
         or fill_command
-        or generation_command
         or (has_template_context and document_command and not explicit_export)
     )
     if template_command:
@@ -265,6 +291,17 @@ def classify_intent(
             reason_codes=reasons,
         )
 
+    if generation_command:
+        return IntentPlan(
+            intent="document_authoring",
+            action="generate",
+            target=target,
+            template_required=False,
+            requested_formats=formats,
+            confidence=0.94,
+            reason_codes=("document_authoring_command",),
+        )
+
     if explicit_export:
         return IntentPlan(
             intent="export",
@@ -273,7 +310,11 @@ def classify_intent(
             export_requested=True,
             requested_formats=formats,
             confidence=0.96,
-            reason_codes=("explicit_output_format",),
+            reason_codes=(
+                "result_delivery_export"
+                if _CURRENT_RESULT_PATTERN.search(text)
+                else "explicit_output_format",
+            ),
         )
 
     if has_attachments:

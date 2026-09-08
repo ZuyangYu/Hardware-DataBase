@@ -25,7 +25,12 @@ from src.core.conversation import (
     ChatTurn,
     ConversationService,
 )
-from src.document_authoring.chat_context import DocumentContext, build_document_context
+from src.document_authoring.chat_context import (
+    DocumentAuthoringContext,
+    DocumentAuthoringContextInput,
+    DocumentContext,
+    build_document_context,
+)
 from src.observability import (
     current_trace_identity,
     extract_trace_context,
@@ -45,6 +50,7 @@ from src.api.schemas import (
     TurnStartResponse,
     TurnView,
 )
+from src.core.intent import classify_intent
 
 router = APIRouter(tags=["query"])
 _TURN_CANCEL_SIGNALS: dict[str, threading.Event] = {}
@@ -61,6 +67,43 @@ _TURN_EVENT_QUEUES_LOCK = threading.Lock()
 _DELTA_FLUSH_CHARS = 240
 _DELTA_FLUSH_SECONDS = 0.12
 _SHORT_TERM_HISTORY_LIMIT = 5
+
+
+def _parse_document_context(value: Any) -> DocumentContext | DocumentAuthoringContext | None:
+    """Parse either the legacy v1 template context or the v2 authoring scope."""
+
+    if not value:
+        return None
+    if isinstance(value, (DocumentContext, DocumentAuthoringContext)):
+        return value
+    payload = value if isinstance(value, dict) else getattr(value, "model_dump", lambda **_: value)(mode="json")
+    if str(payload.get("version", "")).strip().lower() == "v2":
+        return DocumentAuthoringContext.model_validate(payload)
+    return DocumentContext.model_validate(payload)
+
+
+def _authoring_context_candidate(
+    *,
+    query: str,
+    document_flow: bool | None,
+    kb_name: str,
+    has_attachments: bool,
+) -> bool:
+    """Return whether the server should mount a v2 authoring context.
+
+    This is only a capability hint.  It never starts a job; the durable
+    planner/confirmation boundary remains responsible for execution.
+    """
+
+    if document_flow is False:
+        return False
+    plan = classify_intent(
+        query,
+        has_template_context=False,
+        has_attachments=has_attachments,
+        has_kb=bool(str(kb_name or "").strip()) and kb_name != GENERAL_CHAT_KB_NAME,
+    )
+    return plan.intent in {"template_generation", "document_authoring"}
 
 
 def _publish_turn_event(turn_id: str, seq: int | None, event_type: str, payload: dict) -> None:
@@ -224,7 +267,7 @@ def _turn_view(turn: ChatTurn) -> TurnView:
     document_context = None
     if turn.document_context:
         try:
-            document_context = DocumentContext.model_validate(turn.document_context)
+            document_context = _parse_document_context(turn.document_context)
         except Exception:
             # A historical/malformed context is never allowed to become an
             # active tool capability, but it remains hidden from the DTO.
@@ -262,7 +305,7 @@ def _message_view(
     document_context = None
     if getattr(message, "document_context", None):
         try:
-            document_context = DocumentContext.model_validate(message.document_context)
+            document_context = _parse_document_context(message.document_context)
         except Exception:
             # Historical malformed context is never an active capability and
             # must not turn a refresh into a 500 response.
@@ -335,7 +378,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     document_context = None
     if turn.document_context:
         try:
-            document_context = DocumentContext.model_validate(turn.document_context)
+            document_context = _parse_document_context(turn.document_context)
             document_context.assert_scope(ctx=ctx, expected_kb=turn.kb_name, required_permission="read")
         except PermissionError:
             # The query itself remains durable, but an invalidated attachment
@@ -685,11 +728,6 @@ def create_turn(
     if session.kb_name != GENERAL_CHAT_KB_NAME and not ctx.has_kb_permission(session.kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
     query_mode = "fast" if session.kb_name == GENERAL_CHAT_KB_NAME else "deep"
-    if body.document_flow is True and body.document_context is None:
-        raise HTTPException(
-            status_code=422,
-            detail="document_flow=true requires document_context",
-        )
     # Chat attachments (design §5/§14.2): resolve the explicit source scope
     # before touching attachment rows.  ``knowledge_base_only`` must not be
     # widened merely because a stale client also sent attachment ids.
@@ -712,6 +750,22 @@ def create_turn(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if (
+        body.document_flow is True
+        and (
+            not _authoring_context_candidate(
+                query=body.query,
+                document_flow=body.document_flow,
+                kb_name=session.kb_name,
+                has_attachments=has_attachments,
+            )
+            or (session.kb_name == GENERAL_CHAT_KB_NAME and not has_attachments)
+        )
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="document_flow=true requires an authorized knowledge-base, attachment, or task scope",
+        )
     if has_attachments and scope_allows_attachments(effective_scope):
         if not src.settings.CHAT_ATTACHMENTS_ENABLED:
             raise HTTPException(status_code=404, detail="chat attachments are not enabled")
@@ -733,14 +787,43 @@ def create_turn(
                 },
             )
     document_context = None
-    if body.document_context is not None:
+    raw_document_context: Any = body.document_context
+    if raw_document_context is None and _authoring_context_candidate(
+        query=body.query,
+        document_flow=body.document_flow,
+        kb_name=session.kb_name,
+        has_attachments=has_attachments,
+    ):
+        # A v2 context can be created from the already authorized session and
+        # frozen attachment references.  No browser-provided tenant/user
+        # fields participate in this construction.
+        raw_document_context = {
+            "version": "v2",
+            "knowledge_base_name": (
+                None if session.kb_name == GENERAL_CHAT_KB_NAME else session.kb_name
+            ),
+            "attachment_ids": requested_attachment_ids,
+            "source_scope": effective_scope,
+        }
+    if body.document_flow is True and raw_document_context is None:
+        raise HTTPException(
+            status_code=422,
+            detail="document_flow=true requires an authorized knowledge-base, attachment, or task scope",
+        )
+    if raw_document_context is not None:
         if session.kb_name == GENERAL_CHAT_KB_NAME:
-            raise HTTPException(status_code=400, detail="document context requires a knowledge-base session")
+            payload_version = str(
+                getattr(raw_document_context, "version", None)
+                or (raw_document_context.get("version") if isinstance(raw_document_context, dict) else "")
+                or ""
+            ).strip().lower()
+            if payload_version != "v2" or not has_attachments:
+                raise HTTPException(status_code=400, detail="document context requires an authorized source scope")
         try:
             document_context = build_document_context(
-                body.document_context,
+                raw_document_context,
                 ctx=ctx,
-                expected_kb=session.kb_name,
+                expected_kb=(None if session.kb_name == GENERAL_CHAT_KB_NAME else session.kb_name),
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -957,10 +1040,22 @@ async def query(
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ):
-    if body.document_flow is True and body.document_context is None:
+    if (
+        body.document_flow is True
+        and body.document_context is None
+        and (
+            not _authoring_context_candidate(
+                query=body.query,
+                document_flow=body.document_flow,
+                kb_name=body.kb_name,
+                has_attachments=False,
+            )
+            or body.kb_name in ("", GENERAL_CHAT_KB_NAME)
+        )
+    ):
         raise HTTPException(
             status_code=422,
-            detail="document_flow=true requires document_context",
+            detail="document_flow=true requires an authorized knowledge-base, attachment, or task scope",
         )
     if body.kb_name in ("", GENERAL_CHAT_KB_NAME):
         if body.document_context is not None:
@@ -971,12 +1066,38 @@ async def query(
         raise HTTPException(status_code=403, detail="read permission required")
 
     document_context = None
-    if body.document_context is not None:
+    raw_document_context: Any = body.document_context
+    if raw_document_context is None and _authoring_context_candidate(
+        query=body.query,
+        document_flow=body.document_flow,
+        kb_name=body.kb_name,
+        has_attachments=False,
+    ):
+        raw_document_context = {
+            "version": "v2",
+            "knowledge_base_name": (
+                None if body.kb_name in ("", GENERAL_CHAT_KB_NAME) else body.kb_name
+            ),
+            "source_scope": "knowledge_base_only",
+        }
+    if body.document_flow is True and raw_document_context is None:
+        raise HTTPException(
+            status_code=422,
+            detail="document_flow=true requires an authorized knowledge-base, attachment, or task scope",
+        )
+    if raw_document_context is not None:
+        payload_version = str(
+            getattr(raw_document_context, "version", None)
+            or (raw_document_context.get("version") if isinstance(raw_document_context, dict) else "")
+            or ""
+        ).strip().lower()
+        if body.kb_name in ("", GENERAL_CHAT_KB_NAME) and payload_version != "v2":
+            raise HTTPException(status_code=400, detail="document context requires an authorized source scope")
         try:
             document_context = build_document_context(
-                body.document_context,
+                raw_document_context,
                 ctx=ctx,
-                expected_kb=body.kb_name,
+                expected_kb=(None if body.kb_name in ("", GENERAL_CHAT_KB_NAME) else body.kb_name),
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
