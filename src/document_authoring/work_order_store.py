@@ -779,7 +779,18 @@ class DocumentAuthoringStore:
             row = conn.execute(sql, params).fetchone()
         return RendererPolicy.model_validate(_payload(row)) if row else None
 
-    def save_document_schema(self, schema: DocumentSchema) -> DocumentSchema:
+    def save_document_schema(
+        self,
+        schema: DocumentSchema,
+        *,
+        allow_plan_backed: bool = False,
+    ) -> DocumentSchema:
+        if getattr(src.settings, "DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED", False) and not allow_plan_backed:
+            from src.document_authoring.compatibility import CompatibilityClosureError
+
+            raise CompatibilityClosureError(
+                "direct document schema writes are closed; use an accepted document plan"
+            )
         with closing(self._connect()) as conn:
             self._put(conn, "document_schemas", {
                 "document_schema_id": schema.document_schema_id, "version": schema.version, "status": schema.status,
@@ -957,6 +968,42 @@ class DocumentAuthoringStore:
         return f"project:{work_order.project_id}"
 
     def create_work_order(self, work_order: DocumentWorkOrder) -> DocumentWorkOrder:
+        if getattr(src.settings, "DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED", False):
+            from src.document_authoring.compatibility import (
+                CompatibilityClosureError,
+                DocumentAuthoringCompatibilityService,
+            )
+
+            references = (
+                work_order.output_spec_id, work_order.output_spec_version,
+                work_order.output_spec_hash, work_order.document_plan_id,
+                work_order.document_plan_version, work_order.document_plan_hash,
+            )
+            if not all(value is not None and str(value).strip() for value in references):
+                raise CompatibilityClosureError(
+                    "direct WorkOrder writes are closed; accepted plan references are required"
+                )
+            planning_store = getattr(self, "planning", None)
+            output_spec = planning_store.get_output_spec(
+                work_order.output_spec_id,
+                int(work_order.output_spec_version),
+                tenant_id=work_order.tenant_id,
+                user_id=work_order.created_by,
+            ) if planning_store is not None else None
+            document_plan = planning_store.get_plan(
+                work_order.document_plan_id,
+                int(work_order.document_plan_version),
+                tenant_id=work_order.tenant_id,
+                user_id=work_order.created_by,
+            ) if planning_store is not None else None
+            if output_spec is None or document_plan is None:
+                raise CompatibilityClosureError(
+                    "WorkOrder plan references do not resolve to persisted rows"
+                )
+            DocumentAuthoringCompatibilityService(db_path=self.db_path).accepted_plan_references(
+                output_spec=output_spec,
+                document_plan=document_plan,
+            )
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:

@@ -83,7 +83,6 @@ from src.document_authoring.render_bindings import (
     RenderBindingResolver,
 )
 from src.document_authoring.document_model import DocumentModel
-from src.document_authoring.planning.artifact_review import ArtifactReviewReport, ArtifactReviewer
 from src.document_authoring.planning.document_review import (
     DocumentReleaseGate,
     DocumentReviewReport,
@@ -120,6 +119,10 @@ from src.document_authoring.template_suggester import (
 from src.document_authoring.tasks import DocumentTask, DocumentTaskService, DocumentTaskStore
 from src.document_authoring.reviews import DocumentReviewStore
 from src.document_authoring.revisions import ArtifactRevisionStore, DocumentRevisionService
+from src.document_authoring.compatibility import (
+    CompatibilityClosureError,
+    DocumentAuthoringCompatibilityService,
+)
 from src.document_authoring.planning.legacy import legacy_brief_to_output_spec
 from src.document_authoring.planning.service import DocumentPlanningService
 from src.document_authoring.validator import DocumentValidator
@@ -295,6 +298,11 @@ class DocumentGenerationService:
         # ICD/artifact review flows; it shares the authoring DB but has its
         # own command-idempotency namespace.
         self.review_store = DocumentReviewStore(self.store.db_path)
+        # Compatibility events share the authoring database so rollout
+        # counters and legacy classifications survive process restarts.
+        self.compatibility = DocumentAuthoringCompatibilityService(
+            db_path=self.store.db_path,
+        )
         self.revision_service = DocumentRevisionService(
             authoring_store=self.store,
             task_store=self.task_service.store,
@@ -662,14 +670,173 @@ class DocumentGenerationService:
     def register_renderer_policy(self, policy: RendererPolicy) -> RendererPolicy:
         return self.store.save_renderer_policy(policy)
 
-    def register_document_schema(self, schema: DocumentSchema) -> DocumentSchema:
-        return self.store.save_document_schema(schema)
+    def register_document_schema(
+        self,
+        schema: DocumentSchema,
+        *,
+        plan_backed: bool = False,
+        output_spec: Any | None = None,
+        document_plan: Any | None = None,
+        references: Mapping[str, Any] | None = None,
+    ) -> DocumentSchema:
+        """Persist a schema, subject to the Phase 5 direct-write closure."""
+        if plan_backed:
+            references_value = self.compatibility.accepted_plan_references(
+                output_spec=output_spec,
+                document_plan=document_plan,
+                references=references,
+            )
+            self.compatibility.record_plan_backed_execution(
+                operation="register_document_schema",
+                entity_type="document_schema",
+                entity_id=schema.document_schema_id,
+                plan_id=references_value.document_plan_id,
+                plan_version=references_value.document_plan_version,
+                plan_hash=references_value.document_plan_hash,
+            )
+            self.compatibility.record_new_write(
+                operation="register_document_schema",
+                entity_type="document_schema",
+                entity_id=schema.document_schema_id,
+                plan_id=references_value.document_plan_id,
+                plan_version=references_value.document_plan_version,
+                plan_hash=references_value.document_plan_hash,
+                route="plan_backed",
+            )
+        else:
+            if self.compatibility.closure_enabled:
+                raise CompatibilityClosureError(
+                    "direct document schema writes are closed; use an accepted document plan"
+                )
+            self.compatibility.record_legacy_write(
+                operation="register_document_schema",
+                entity_type="document_schema",
+                entity_id=schema.document_schema_id,
+            )
+        return self.store.save_document_schema(schema, allow_plan_backed=plan_backed)
 
     def register_deterministic_rule(self, spec: DeterministicRuleSpec) -> DeterministicRuleSpec:
         return self.store.save_rule_spec(spec)
 
     def register_harness_policy(self, policy: HarnessPolicy) -> HarnessPolicy:
         return self.store.save_harness_policy(policy)
+
+    def _record_compatibility_work_order_write(
+        self,
+        ctx: RequestContext,
+        *,
+        operation: str,
+        entity_id: str,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
+        output_spec: Any | None = None,
+        document_plan: Any | None = None,
+    ) -> None:
+        """Classify a new WorkOrder write and enforce Phase 5 closure."""
+        supplied = any(value is not None for value in (
+            output_spec_id, output_spec_version, output_spec_hash,
+            document_plan_id, document_plan_version, document_plan_hash,
+        )) or output_spec is not None or document_plan is not None
+        if supplied and (output_spec is None or document_plan is None):
+            planning_store = getattr(self.planning, "store", None)
+            if planning_store is None:
+                raise CompatibilityClosureError(
+                    "plan-backed WorkOrder writes require the planning store"
+                )
+            output_spec = planning_store.get_output_spec(
+                str(output_spec_id or ""), int(output_spec_version or 0),
+                tenant_id=ctx.tenant_id or "default", user_id=ctx.user_id,
+            )
+            document_plan = planning_store.get_plan(
+                str(document_plan_id or ""), int(document_plan_version or 0),
+                tenant_id=ctx.tenant_id or "default", user_id=ctx.user_id,
+            )
+            if output_spec is None or document_plan is None:
+                raise CompatibilityClosureError(
+                    "plan-backed WorkOrder references do not resolve to persisted rows"
+                )
+        refs = self.compatibility.validate_new_document_write(
+            operation=operation,
+            output_spec=output_spec,
+            document_plan=document_plan,
+        )
+        if refs is not None:
+            self.compatibility.record_plan_backed_execution(
+                operation=operation,
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="work_order",
+                entity_id=entity_id,
+                plan_id=refs.document_plan_id,
+                plan_version=refs.document_plan_version,
+                plan_hash=refs.document_plan_hash,
+            )
+            self.compatibility.record_new_write(
+                operation=operation,
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="work_order",
+                entity_id=entity_id,
+                plan_id=refs.document_plan_id,
+                plan_version=refs.document_plan_version,
+                plan_hash=refs.document_plan_hash,
+            )
+        else:
+            self.compatibility.record_legacy_direct_execution(
+                operation=operation,
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="work_order",
+                entity_id=entity_id,
+            )
+            self.compatibility.record_legacy_write(
+                operation=operation,
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="work_order",
+                entity_id=entity_id,
+            )
+
+    def _validate_compatibility_work_order_inputs(
+        self,
+        ctx: RequestContext,
+        *,
+        operation: str,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
+    ) -> None:
+        """Run the closure check before creating any source snapshot rows."""
+        supplied = any(value is not None for value in (
+            output_spec_id, output_spec_version, output_spec_hash,
+            document_plan_id, document_plan_version, document_plan_hash,
+        ))
+        if not supplied:
+            self.compatibility.validate_new_document_write(operation=operation)
+            return
+        planning_store = getattr(self.planning, "store", None)
+        if planning_store is None:
+            raise CompatibilityClosureError("plan-backed WorkOrder writes require the planning store")
+        output_spec = planning_store.get_output_spec(
+            str(output_spec_id or ""), int(output_spec_version or 0),
+            tenant_id=ctx.tenant_id or "default", user_id=ctx.user_id,
+        )
+        document_plan = planning_store.get_plan(
+            str(document_plan_id or ""), int(document_plan_version or 0),
+            tenant_id=ctx.tenant_id or "default", user_id=ctx.user_id,
+        )
+        if output_spec is None or document_plan is None:
+            raise CompatibilityClosureError(
+                "plan-backed WorkOrder references do not resolve to persisted rows"
+            )
+        self.compatibility.validate_new_document_write(
+            operation=operation,
+            output_spec=output_spec,
+            document_plan=document_plan,
+        )
 
     def register_template(
         self,
@@ -1192,6 +1359,16 @@ class DocumentGenerationService:
             existing = self.store.find_work_order_by_idempotency(tenant_id, project_id, idempotency_key)
             if existing is not None:
                 return existing
+        self._validate_compatibility_work_order_inputs(
+            ctx,
+            operation="create_work_order",
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
+        )
         self._validate_work_order_definition(
             template_version_id,
             document_schema_id,
@@ -1265,6 +1442,16 @@ class DocumentGenerationService:
             )
             if existing is not None:
                 return existing
+        self._validate_compatibility_work_order_inputs(
+            ctx,
+            operation="create_knowledge_base_work_order",
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
+        )
         self._validate_work_order_definition(
             template_version_id,
             document_schema_id,
@@ -1477,6 +1664,22 @@ class DocumentGenerationService:
         document_plan_version: int | None = None,
         document_plan_hash: str | None = None,
     ) -> DocumentWorkOrder:
+        prospective_work_order_id = (
+            snapshot.work_order_id
+            if scope_type != "knowledge_base"
+            else f"wo-{uuid.uuid4().hex}"
+        )
+        self._record_compatibility_work_order_write(
+            ctx,
+            operation="create_work_order",
+            entity_id=prospective_work_order_id,
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
+        )
         template = self._template(template_version_id)
         schema = self._schema(document_schema_id, document_schema_version)
         if template.status != "approved" or schema.status != "approved":
@@ -1548,7 +1751,7 @@ class DocumentGenerationService:
             raise RuntimeError("document task association is required but task writes are disabled")
         order = DocumentWorkOrder(
             work_order_id=(
-                f"wo-{uuid.uuid4().hex}"
+                prospective_work_order_id
                 if is_knowledge_base
                 else snapshot.work_order_id
             ),
@@ -1676,6 +1879,31 @@ class DocumentGenerationService:
         layout = getattr(plan, "layout_contract", None)
         if getattr(layout, "kind", None) != "structure":
             raise ValueError("template-free WorkOrder requires a structure layout contract")
+        prospective_work_order_id = f"wo-{uuid.uuid4().hex}"
+        refs = self.compatibility.validate_new_document_write(
+            operation="create_template_free_work_order",
+            output_spec=output_spec,
+            document_plan=plan,
+        )
+        if refs is not None:
+            self.compatibility.record_plan_backed_execution(
+                operation="create_template_free_work_order",
+                tenant_id=snapshot.tenant_id,
+                entity_type="work_order",
+                entity_id=prospective_work_order_id,
+                plan_id=refs.document_plan_id,
+                plan_version=refs.document_plan_version,
+                plan_hash=refs.document_plan_hash,
+            )
+            self.compatibility.record_new_write(
+                operation="create_template_free_work_order",
+                tenant_id=snapshot.tenant_id,
+                entity_type="work_order",
+                entity_id=prospective_work_order_id,
+                plan_id=refs.document_plan_id,
+                plan_version=refs.document_plan_version,
+                plan_hash=refs.document_plan_hash,
+            )
         render_spec = dict(getattr(plan, "render_spec", {}) or {})
         recipe_id = str(
             render_spec.get("recipe_id") or getattr(layout, "structure_profile_id", "")
@@ -1728,7 +1956,7 @@ class DocumentGenerationService:
             "knowledge_base_id": self._ctx_kb_id(ctx),
         }
         order = DocumentWorkOrder(
-            work_order_id=f"wo-{uuid.uuid4().hex}",
+            work_order_id=prospective_work_order_id,
             tenant_id=snapshot.tenant_id,
             scope_type="knowledge_base",
             knowledge_base_name=knowledge_base_name,

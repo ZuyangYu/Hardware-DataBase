@@ -70,6 +70,25 @@ from src.document_authoring.planning.document_review import (
     ReworkDecision,
 )
 from src.document_authoring.planning.artifact_review import ArtifactReviewReport, ArtifactReviewer
+from src.document_authoring.compatibility import (
+    AUTO_CONFIRMATION_ATTEMPT,
+    LEGACY_DIRECT_EXECUTION,
+    LEGACY_WRITE,
+    NEW_WRITE,
+    PLAN_BACKED_EXECUTION,
+    AcceptedPlanReferences,
+    CompatibilityAuditEvent,
+    CompatibilityClosureError,
+    CompatibilityCounters,
+    CompatibilityReadinessReport,
+    DocumentAuthoringCompatibilityService,
+    DocumentAuthoringCompatibilityStore,
+    LegacyBackfillMarker,
+    ReleaseObservation,
+    SqliteBackupReport,
+    create_sqlite_backup,
+    restore_sqlite_backup,
+)
 
 __all__ = [
     "DeterministicRuleSpec",
@@ -128,4 +147,21 @@ __all__ = [
     "DocumentReworkRouter",
     "ReleaseDecision",
     "ReworkDecision",
+    "AUTO_CONFIRMATION_ATTEMPT",
+    "LEGACY_DIRECT_EXECUTION",
+    "LEGACY_WRITE",
+    "NEW_WRITE",
+    "PLAN_BACKED_EXECUTION",
+    "AcceptedPlanReferences",
+    "CompatibilityAuditEvent",
+    "CompatibilityClosureError",
+    "CompatibilityCounters",
+    "CompatibilityReadinessReport",
+    "DocumentAuthoringCompatibilityService",
+    "DocumentAuthoringCompatibilityStore",
+    "LegacyBackfillMarker",
+    "ReleaseObservation",
+    "SqliteBackupReport",
+    "create_sqlite_backup",
+    "restore_sqlite_backup",
 ]

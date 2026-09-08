@@ -291,6 +291,26 @@ def record_authoring_unit(*, operation: str, status: str, duration_s: float | No
         histogram("hdb.authoring.unit.duration", duration_s, attributes={"operation": operation, "status": status})
 
 
+def record_document_compatibility(*, event_type: str, route: str) -> None:
+    """Count compatibility-boundary events with bounded labels only."""
+
+    known = {
+        "legacy_direct_execution", "plan_backed_execution",
+        "auto_confirmation_attempt", "new_write", "legacy_write",
+    }
+    kind = str(event_type or "other").strip().lower()
+    if kind not in known:
+        kind = "other"
+    normalized_route = str(route or "system").strip().lower()
+    if normalized_route not in {"legacy", "plan_backed", "conversation", "system"}:
+        normalized_route = "system"
+    counter(
+        "hdb.document.authoring.compatibility.events",
+        attributes={"kind": kind, "mode": normalized_route},
+        description="Document authoring compatibility boundary events",
+    )
+
+
 def record_authoring_agent(*, status: str, mode: str = "external_agent", duration_s: float | None = None) -> None:
     """Record low-cardinality Agent executor metrics.
 

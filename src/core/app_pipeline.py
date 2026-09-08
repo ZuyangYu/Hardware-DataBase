@@ -43,6 +43,7 @@ from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.generation_sessions import GenerationBrief
 from src.document_authoring.models import content_hash
 from src.document_authoring.models import DocumentFieldSchema, DocumentSchema
+from src.document_authoring.compatibility import CompatibilityClosureError
 from src.document_authoring.planning.models import OutputSpec
 from src.document_authoring.planning.intake import OutputSpecIntakeService
 from src.document_authoring.requirement_clarifier import RequirementClarifier
@@ -792,8 +793,8 @@ class AppPipeline:
     def register_renderer_policy(self, policy):
         return self.document_generation.register_renderer_policy(policy)
 
-    def register_document_schema(self, schema):
-        return self.document_generation.register_document_schema(schema)
+    def register_document_schema(self, schema, **kwargs):
+        return self.document_generation.register_document_schema(schema, **kwargs)
 
     def register_template(self, template, content: bytes, *, regions, bindings, legacy_claims=None):
         return self.document_generation.register_template(
@@ -985,6 +986,23 @@ class AppPipeline:
         contract_version: str = "legacy_brief_v1",
         output_spec: dict[str, Any] | None = None,
     ):
+        compatibility = getattr(self.document_generation, "compatibility", None)
+        if compatibility is not None and auto_confirm_recommended:
+            compatibility.record_auto_confirmation_attempt(
+                operation="create_generation_session",
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="generation_session",
+                entity_id="pending",
+                payload={"requested": True},
+            )
+            if compatibility.closure_enabled:
+                raise CompatibilityClosureError(
+                    "automatic document confirmation is closed; use explicit plan confirmation"
+                )
+        if compatibility is not None and contract_version == "legacy_brief_v1" and compatibility.closure_enabled:
+            raise CompatibilityClosureError(
+                "direct GenerationBrief sessions are closed; create an OutputSpec/DocumentPlan session"
+            )
         if contract_version == "output_spec_v1":
             return self._create_output_spec_generation_session(
                 ctx,

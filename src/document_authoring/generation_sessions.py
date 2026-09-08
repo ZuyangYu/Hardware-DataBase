@@ -22,6 +22,36 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _compatibility_service(db_path: str):
+    """Load the Phase 5 boundary lazily to keep legacy model imports light."""
+    from src.document_authoring.compatibility import DocumentAuthoringCompatibilityService
+
+    return DocumentAuthoringCompatibilityService(db_path=db_path)
+
+
+def _guard_legacy_generation_write(
+    db_path: str,
+    session: "GenerationSession | None",
+    *,
+    operation: str,
+) -> None:
+    if session is None or session.contract_version != "legacy_brief_v1":
+        return
+    compatibility = _compatibility_service(db_path)
+    if compatibility.closure_enabled:
+        from src.document_authoring.compatibility import CompatibilityClosureError
+
+        raise CompatibilityClosureError(
+            f"direct GenerationBrief {operation} is closed; use an accepted OutputSpec/DocumentPlan"
+        )
+    compatibility.record_legacy_write(
+        operation=operation,
+        tenant_id=session.tenant_id,
+        entity_type="generation_session",
+        entity_id=session.session_id,
+    )
+
+
 class ClarificationAnswer(BaseModel):
     """Audit record for one clarification decision: raw text plus canonical policy."""
 
@@ -237,6 +267,13 @@ class GenerationSessionStore:
         document_plan_id: str | None = None,
         document_plan_version: int | None = None,
     ) -> GenerationSession:
+        compatibility = _compatibility_service(self.db_path)
+        if contract_version == "legacy_brief_v1" and compatibility.closure_enabled:
+            from src.document_authoring.compatibility import CompatibilityClosureError
+
+            raise CompatibilityClosureError(
+                "direct GenerationBrief sessions are closed; use an OutputSpec/DocumentPlan session"
+            )
         now = _utc_now()
         initial_status = status or (
             "awaiting_plan" if contract_version == "output_spec_v1" else "needs_clarification"
@@ -281,6 +318,27 @@ class GenerationSessionStore:
                     session.created_at.isoformat(), session.updated_at.isoformat(),
                     self._json(session.model_dump(mode="json", exclude={"messages"})),
                 ),
+            )
+        if contract_version == "legacy_brief_v1":
+            compatibility.record_legacy_direct_execution(
+                operation="create_generation_session",
+                tenant_id=session.tenant_id,
+                entity_type="generation_session",
+                entity_id=session.session_id,
+            )
+            compatibility.record_legacy_write(
+                operation="create_generation_session",
+                tenant_id=session.tenant_id,
+                entity_type="generation_session",
+                entity_id=session.session_id,
+            )
+        else:
+            compatibility.record_new_write(
+                operation="create_output_spec_session",
+                tenant_id=session.tenant_id,
+                entity_type="generation_session",
+                entity_id=session.session_id,
+                route="conversation",
             )
         return session
 
@@ -327,6 +385,9 @@ class GenerationSessionStore:
         client_request_id: str | None = None,
     ) -> ClarificationMessage:
         session = self.get_session(session_id)
+        _guard_legacy_generation_write(
+            self.db_path, session, operation="append_generation_session_message",
+        )
         message = ClarificationMessage(
             role=role,
             content=content,
@@ -387,6 +448,10 @@ class GenerationSessionStore:
         request_id = self._optional(client_request_id)
         if not normalized_question or not normalized_answer:
             raise ValueError("clarification question and answer are required")
+        current_for_guard = self.get_session(session_id)
+        _guard_legacy_generation_write(
+            self.db_path, current_for_guard, operation="apply_clarification_answer",
+        )
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -614,6 +679,9 @@ class GenerationSessionStore:
 
     def update_brief(self, session_id: str, updates: dict[str, Any]) -> GenerationSession:
         session = self.get_session(session_id)
+        _guard_legacy_generation_write(
+            self.db_path, session, operation="update_generation_brief",
+        )
         brief_payload = session.brief.model_dump()
         brief_payload.update(updates)
         brief_payload["updated_at"] = _utc_now()
@@ -627,6 +695,9 @@ class GenerationSessionStore:
         session = self.get_session(session_id)
         if session.contract_version == "output_spec_v1":
             raise ValueError("output_spec_v1 sessions require an accepted document plan")
+        _guard_legacy_generation_write(
+            self.db_path, session, operation="confirm_generation_session",
+        )
         if session.status == "ready_to_generate" and session.brief.confirmed:
             return session
         now = _utc_now()

@@ -113,6 +113,35 @@ class DocumentAuthoringSettingsTests(unittest.TestCase):
                 settings.DOCUMENT_TASK_ASSOCIATION_REQUIRED,
             ) = previous
 
+    def test_compatibility_closure_defaults_off_and_reloads(self):
+        env = os.environ.copy()
+        env.pop("DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED", None)
+        env["PYTHON_DOTENV_DISABLED"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import src.settings as s; "
+                    "assert s.DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED is False; "
+                    "assert s.DEFAULT_VALUES[\"DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED\"] == \"false\""
+                ),
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+        previous = settings.DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED
+        try:
+            with patch.dict(os.environ, {"DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED": "true"}), patch("src.settings.load_dotenv"):
+                settings.reload_settings()
+            self.assertTrue(settings.DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED)
+        finally:
+            settings.DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED = previous
+
     def test_requirement_resolver_rollout_flag_defaults_off_and_reloads(self):
         env = os.environ.copy()
         env.pop("DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED", None)
