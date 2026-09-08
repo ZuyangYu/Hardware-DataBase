@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import re
 import sqlite3
 import uuid
 import zipfile
 from copy import copy
 from datetime import datetime, timezone
 from collections.abc import Callable, Mapping, Sequence
+from time import perf_counter
 from typing import Any
 
 import requests
@@ -88,6 +90,8 @@ from src.document_authoring.template_suggester import (
 from src.document_authoring.tasks import DocumentTask, DocumentTaskService, DocumentTaskStore
 from src.document_authoring.reviews import DocumentReviewStore
 from src.document_authoring.revisions import ArtifactRevisionStore, DocumentRevisionService
+from src.document_authoring.planning.legacy import legacy_brief_to_output_spec
+from src.document_authoring.planning.service import DocumentPlanningService
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.worker import DocumentGenerationWorker
@@ -95,6 +99,7 @@ from src.document_authoring.writers.managed import DeterministicEvidenceWriter, 
 from src.pipelines.document_rag.schemas import RequestContext
 from src.projects.service import ProjectService
 from src.attachments.models import SOURCE_SCOPES
+from src.observability.metrics import record_planning_shadow
 
 
 logger = logging.getLogger(__name__)
@@ -233,6 +238,9 @@ class DocumentGenerationService:
     ):
         self.projects = project_service or ProjectService()
         self.store = store or DocumentAuthoringStore()
+        self.planning = DocumentPlanningService(
+            store=getattr(self.store, "planning", None),
+        )
         self.workbook_renderer = renderer or XlsmRenderer()
         # Keep the existing public attribute for callers that supplied the
         # XLSX/XLSM renderer before DOCX support was introduced.
@@ -258,6 +266,167 @@ class DocumentGenerationService:
             revision_store=ArtifactRevisionStore(self.store.db_path),
             source_snapshot_resolver=self.resolve_source_snapshot,
         )
+
+    @staticmethod
+    def _shadow_issue_codes(plan: Any) -> list[str]:
+        """Return bounded issue codes suitable for an audit event/metric."""
+        safe_code = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,79}$")
+        codes: list[str] = []
+        for issue in getattr(plan, "issues", []) or []:
+            if not getattr(issue, "blocking", False):
+                continue
+            code = str(getattr(issue, "code", "other") or "other").strip().lower()
+            codes.append(code if safe_code.fullmatch(code) else "other")
+        return list(dict.fromkeys(codes))
+
+    def _run_shadow_planning(
+        self,
+        ctx: RequestContext,
+        order: DocumentWorkOrder,
+        *,
+        snapshot: Any | None = None,
+        schema: DocumentSchema | None = None,
+        template: TemplateVersion | None = None,
+        template_analysis: TemplateAnalysis | None = None,
+        bindings: Sequence[TemplateUnitBinding] | None = None,
+    ) -> Any | None:
+        """Compile and persist a non-executing plan for an existing WorkOrder.
+
+        This method is deliberately called after the legacy WorkOrder is
+        durable.  Every exception is converted into a sanitized planning event
+        and a metric; no execution state, queue entry or renderer input is
+        touched by the shadow path.
+        """
+        if not getattr(src.settings, "DOCUMENT_PLANNING_SHADOW_ENABLED", False):
+            return None
+        task_id = str(getattr(order, "task_id", "") or "").strip()
+        if not task_id:
+            # Legacy rows created while task writes were disabled have no safe
+            # owner for the planning tables, so leave them entirely unchanged.
+            return None
+        started = perf_counter()
+        planning = getattr(self, "planning", None)
+        if planning is None:
+            planning = DocumentPlanningService(
+                store=getattr(getattr(self, "store", None), "planning", None),
+            )
+        planning_store = getattr(planning, "store", None)
+        if planning_store is None:
+            return None
+        event_key = f"planning-shadow:{order.work_order_id}:v1"
+        try:
+            frozen_snapshot = snapshot or self.resolve_source_snapshot(order)
+            document_schema = schema or self._schema(
+                order.document_schema_id, order.document_schema_version,
+            )
+            document_template = template or self._template(order.template_version_id)
+            analysis = template_analysis
+            backing_store = getattr(self, "store", None)
+            if analysis is None and backing_store is not None:
+                analysis = backing_store.get_template_analysis(order.template_version_id)
+            if bindings is not None:
+                physical_bindings = list(bindings)
+            elif backing_store is not None:
+                physical_bindings = list(
+                    backing_store.list_unit_bindings(
+                        order.template_schema_id, order.template_schema_version,
+                    )
+                )
+            else:
+                physical_bindings = []
+            output_spec = legacy_brief_to_output_spec(
+                getattr(order, "generation_brief", {}) or {},
+                template_version_id=document_template.template_version_id,
+                template_schema_id=document_template.template_schema_id,
+                template_schema_version=document_template.template_schema_version,
+                document_type=document_schema.document_type,
+                target_format=order.target_format,
+                output_spec_id=f"shadow-output:{order.work_order_id}",
+                output_spec_version=1,
+                document_schema=document_schema,
+            )
+            plan = planning.propose_shadow(
+                tenant_id=str(getattr(order, "tenant_id", None) or "default"),
+                user_id=str(
+                    getattr(ctx, "user_id", None)
+                    or getattr(order, "created_by", None)
+                    or "system"
+                ),
+                task_id=task_id,
+                output_spec=output_spec,
+                document_schema=document_schema,
+                template_analysis=analysis,
+                bindings=physical_bindings,
+                source_snapshot_id=str(frozen_snapshot.source_set_snapshot_id),
+                source_snapshot_hash=str(frozen_snapshot.content_hash),
+            )
+            issue_codes = self._shadow_issue_codes(plan)
+            blocking_count = sum(
+                1 for issue in (getattr(plan, "issues", []) or [])
+                if getattr(issue, "blocking", False)
+            )
+            validity = "valid" if bool(getattr(plan, "is_executable", False)) else "invalid"
+            payload = {
+                "plan_status": str(getattr(plan, "status", "proposed")),
+                "validity": validity,
+                "blocking_issue_count": blocking_count,
+                "blocking_issue_codes": issue_codes,
+                "unit_count": len(getattr(plan, "semantic_units", []) or []),
+                "table_count": sum(
+                    1 for unit in (getattr(plan, "semantic_units", []) or [])
+                    if getattr(unit, "kind", None) == "table"
+                ),
+            }
+            planning_store.append_event(
+                task_id=task_id,
+                event_type="planning_shadow_succeeded",
+                idempotency_key=event_key,
+                payload=payload,
+            )
+            record_planning_shadow(
+                status="succeeded",
+                validity=validity,
+                blocking_issue_count=blocking_count,
+                blocking_issue_codes=issue_codes,
+                units=payload["unit_count"],
+                tables=payload["table_count"],
+                duration_s=perf_counter() - started,
+            )
+            return plan
+        except Exception:
+            # Deliberately omit exception text, source names, paths and
+            # evidence from both the event and telemetry.  The legacy caller
+            # receives its original result regardless of compiler failure.
+            try:
+                planning_store.append_event(
+                    task_id=task_id,
+                    event_type="planning_shadow_failed",
+                    idempotency_key=event_key,
+                    payload={
+                        "plan_status": "unavailable",
+                        "validity": "invalid",
+                        "blocking_issue_count": 1,
+                        "blocking_issue_codes": ["shadow_compiler_failed"],
+                        "unit_count": 0,
+                        "table_count": 0,
+                    },
+                )
+            except Exception:
+                pass
+            record_planning_shadow(
+                status="failed",
+                validity="invalid",
+                blocking_issue_count=1,
+                blocking_issue_codes=["shadow_compiler_failed"],
+                units=0,
+                tables=0,
+                duration_s=perf_counter() - started,
+            )
+            logger.warning(
+                "document planning shadow failed for work order %s",
+                str(getattr(order, "work_order_id", "")),
+            )
+            return None
 
     def ensure_document_task(
         self,
@@ -1230,6 +1399,16 @@ class DocumentGenerationService:
                 )
             else:
                 self.task_service.store.attach_work_order(task.task_id, persisted.work_order_id)
+        # Phase 0 planning is observational only.  It runs after both the
+        # WorkOrder and its task association are durable, and is fail-soft by
+        # construction so the legacy execution contract remains untouched.
+        self._run_shadow_planning(
+            ctx,
+            persisted,
+            snapshot=snapshot,
+            template=template,
+            schema=schema,
+        )
         return persisted
 
     def _validate_work_order_definition(

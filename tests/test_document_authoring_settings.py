@@ -144,6 +144,51 @@ class DocumentAuthoringSettingsTests(unittest.TestCase):
         finally:
             settings.DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED = previous
 
+    def test_document_planning_shadow_flags_default_off_and_reload(self):
+        env = os.environ.copy()
+        env.pop("DOCUMENT_PLANNING_SHADOW_ENABLED", None)
+        env.pop("DOCUMENT_PLANNING_V2_ENABLED", None)
+        env["PYTHON_DOTENV_DISABLED"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import src.settings as s; "
+                    "assert s.DOCUMENT_PLANNING_SHADOW_ENABLED is False; "
+                    "assert s.DOCUMENT_PLANNING_V2_ENABLED is False; "
+                    "assert s.DEFAULT_VALUES['DOCUMENT_PLANNING_SHADOW_ENABLED'] == 'false'; "
+                    "assert s.DEFAULT_VALUES['DOCUMENT_PLANNING_V2_ENABLED'] == 'false'"
+                ),
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+        previous = (
+            settings.DOCUMENT_PLANNING_SHADOW_ENABLED,
+            settings.DOCUMENT_PLANNING_V2_ENABLED,
+        )
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "DOCUMENT_PLANNING_SHADOW_ENABLED": "true",
+                    "DOCUMENT_PLANNING_V2_ENABLED": "true",
+                },
+            ), patch("src.settings.load_dotenv"):
+                settings.reload_settings()
+            self.assertTrue(settings.DOCUMENT_PLANNING_SHADOW_ENABLED)
+            self.assertTrue(settings.DOCUMENT_PLANNING_V2_ENABLED)
+        finally:
+            (
+                settings.DOCUMENT_PLANNING_SHADOW_ENABLED,
+                settings.DOCUMENT_PLANNING_V2_ENABLED,
+            ) = previous
+
 
 if __name__ == "__main__":
     unittest.main()

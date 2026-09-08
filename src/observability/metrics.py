@@ -329,6 +329,77 @@ def record_authoring_tool(*, tool: str, status: str, duration_s: float | None = 
         )
 
 
+_PLANNING_SHADOW_STATUSES = frozenset({"succeeded", "failed"})
+_PLANNING_SHADOW_VALIDITIES = frozenset({"valid", "invalid"})
+
+
+def record_planning_shadow(
+    *,
+    status: str,
+    validity: str,
+    blocking_issue_count: int = 0,
+    blocking_issue_codes: list[str] | tuple[str, ...] | None = None,
+    units: int = 0,
+    tables: int = 0,
+    duration_s: float | None = None,
+) -> None:
+    """Record shadow-planning quality without exposing document data.
+
+    Issue *codes* are deliberately represented as a bounded count rather than
+    metric labels: a schema or plugin must not be able to turn arbitrary
+    identifiers into a high-cardinality telemetry dimension.  The codes are
+    retained only in the sanitized planning event emitted by the coordinator.
+    """
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status not in _PLANNING_SHADOW_STATUSES:
+        normalized_status = "failed"
+    normalized_validity = str(validity or "").strip().lower()
+    if normalized_validity not in _PLANNING_SHADOW_VALIDITIES:
+        normalized_validity = "invalid"
+    attrs = {"status": normalized_status}
+    counter("hdb.document.planning.shadow.runs", attributes=attrs, description="Document planning shadow runs")
+    counter(
+        "hdb.document.planning.shadow.blocking_issues",
+        attributes=attrs,
+        value=max(0, int(blocking_issue_count)),
+        description="Blocking issues observed by document planning shadow mode",
+    )
+    counter(
+        "hdb.document.planning.shadow.issue_codes",
+        attributes=attrs,
+        value=len({str(code).strip() for code in (blocking_issue_codes or ()) if str(code).strip()}),
+        description="Distinct blocking issue codes observed by document planning shadow mode",
+    )
+    histogram(
+        "hdb.document.planning.shadow.validity",
+        1 if normalized_validity == "valid" else 0,
+        attributes=attrs,
+        unit="1",
+        description="Whether a document planning shadow plan is executable",
+    )
+    histogram(
+        "hdb.document.planning.shadow.units",
+        max(0, int(units)),
+        attributes=attrs,
+        unit="{units}",
+        description="Semantic units in document planning shadow plans",
+    )
+    histogram(
+        "hdb.document.planning.shadow.tables",
+        max(0, int(tables)),
+        attributes=attrs,
+        unit="{tables}",
+        description="Table units in document planning shadow plans",
+    )
+    if duration_s is not None:
+        histogram(
+            "hdb.document.planning.shadow.duration",
+            max(0.0, float(duration_s)),
+            attributes=attrs,
+            description="Document planning shadow compilation duration",
+        )
+
+
 def _export_format(value: str) -> str:
     normalized = str(value or "").strip().lower()
     return normalized if normalized in _EXPORT_FORMATS else "other"
