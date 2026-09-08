@@ -27,6 +27,7 @@ import {
   useKbChat,
 } from './useKbChat';
 import DocumentStatusCard, { documentCardIdentity } from './components/DocumentStatusCard';
+import { planConfirmationStaleKey } from './useKbChat';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
@@ -256,6 +257,9 @@ export default function ChatPage({
     documentCardAnsweringId,
     refreshDocumentCardStatus,
     answerDocumentCard,
+    documentCardConfirmingId,
+    documentCardStaleKeys,
+    confirmDocumentPlanCard,
     send,
     abortStream,
     forbidden,
@@ -806,8 +810,11 @@ export default function ChatPage({
                       card={card}
                       refreshing={documentCardRefreshingId === documentCardIdentity(card)}
                       answering={documentCardAnsweringId === documentCardIdentity(card)}
+                      confirming={documentCardConfirmingId === documentCardIdentity(card)}
+                      stale={documentCardStaleKeys.has(planConfirmationStaleKey(card))}
                       onRefreshStatus={(target) => void refreshDocumentCardStatus(target)}
                       onAnswerClarification={(target, answer) => void answerDocumentCard(target, answer)}
+                      onConfirmPlan={(target) => void confirmDocumentPlanCard(target)}
                     />
                   </div>
                 </div>

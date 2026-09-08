@@ -8,6 +8,8 @@ vi.mock('./client', () => ({
 
 import {
   analyzeTemplate,
+  confirmDocumentPlan,
+  createPlanProposal,
   analyzeTemplateFromAttachment,
   buildDocumentContext,
   buildClarificationAnswerRequest,
@@ -296,5 +298,67 @@ describe('document context helpers (migrated to api/documentAuthoring)', () => {
     );
     expect(isDocumentContextExpired({ ...context!, expiry: 'not-a-date' })).toBe(true);
     expect(isDocumentContextExpired(context, Date.parse('2026-08-31T00:29:59.000Z'))).toBe(false);
+  });
+});
+
+
+describe('plan proposal and confirmation contract', () => {
+  it('createPlanProposal posts a hash-free request and returns the safe proposal view', async () => {
+    const proposal = {
+      session_id: 'session-1',
+      task_id: 'task-1',
+      document_plan_id: 'plan-1',
+      document_plan_version: 1,
+      plan_hash: 'sha256:plan',
+      output_spec_id: 'spec-1',
+      output_spec_version: 3,
+      output_spec_hash: 'sha256:spec',
+      status: 'awaiting_plan_confirmation',
+      executable: true,
+      deliverables: [{ format: 'xlsx', role: 'primary' }],
+      layout_summary: { mode: 'provided_template' },
+      outline_count: 2,
+      table_count: 1,
+      source_summary: { knowledge_base_count: 1 },
+      policies: { missing_data: 'mark_tbd' },
+      warnings: [],
+      blockers: [],
+      next_actions: ['confirm_document_plan'],
+    };
+    vi.mocked(api.post).mockResolvedValue(proposal);
+
+    const result = await createPlanProposal('hardware', 'session-1', 3);
+
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/document-generation/sessions/session-1/plan-proposals?kb=hardware',
+      expect.objectContaining({ expected_output_spec_version: 3, client_request_id: expect.any(String) }),
+    );
+    expect(result.plan_hash).toBe('sha256:plan');
+    expect(result.executable).toBe(true);
+  });
+
+  it('confirmDocumentPlan posts the exact visible hashes and returns submission state', async () => {
+    vi.mocked(api.post).mockResolvedValue({
+      submission_id: 'sub-1',
+      status: 'pending',
+      work_order_id: null,
+      job_id: null,
+    });
+
+    const result = await confirmDocumentPlan('hardware', 'session-1', {
+      expected_output_spec_hash: 'sha256:spec',
+      expected_plan_hash: 'sha256:plan',
+      client_request_id: 'confirm-1',
+    });
+
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/document-generation/sessions/session-1/confirm-plan?kb=hardware',
+      {
+        expected_output_spec_hash: 'sha256:spec',
+        expected_plan_hash: 'sha256:plan',
+        client_request_id: 'confirm-1',
+      },
+    );
+    expect(result.status).toBe('pending');
   });
 });

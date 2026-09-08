@@ -12,7 +12,9 @@ import {
   documentCardIdentity,
   documentCardStatusLabel,
   documentCardStatusTone,
+  documentCardTitle,
   documentCardWorkbenchActions,
+  nextActionLabel,
   documentWorkOrderStatusPath,
   mergeDocumentCards,
   parseDocumentCardEvent,
@@ -566,5 +568,57 @@ describe('clarification answer interaction guards', () => {
     expect(clarificationAnswerValue('  docx  ', false)).toBe('docx');
     expect(clarificationAnswerValue('   ', false)).toBeNull();
     expect(clarificationAnswerValue('docx', true)).toBeNull();
+  });
+});
+
+
+describe('output_spec_confirmation card', () => {
+  const proposalEvent = JSON.stringify({
+    card: {
+      kind: 'output_spec_confirmation',
+      status: 'awaiting_plan_confirmation',
+      next_actions: ['confirm_document_plan'],
+      kb_name: 'hardware',
+      task_id: 'task-1',
+      generation_session_id: 'session-1',
+      proposal: {
+        document_plan_id: 'plan-1',
+        document_plan_version: 1,
+        plan_hash: 'sha256:plan',
+        output_spec_id: 'spec-1',
+        output_spec_version: 3,
+        output_spec_hash: 'sha256:spec',
+        status: 'awaiting_plan_confirmation',
+        executable: true,
+        deliverables: [{ format: 'xlsx', role: 'primary' }],
+        outline_count: 2,
+        table_count: 1,
+        warnings: ['来源中缺少 pin 定义'],
+        blockers: [],
+      },
+    },
+  });
+
+  it('parses the proposal summary and plan hashes', () => {
+    const card = parseDocumentCardEvent(proposalEvent);
+    expect(card?.kind).toBe('output_spec_confirmation');
+    expect(card?.proposal?.plan_hash).toBe('sha256:plan');
+    expect(card?.proposal?.output_spec_hash).toBe('sha256:spec');
+    expect(card?.proposal?.document_plan_id).toBe('plan-1');
+    expect(card?.proposal?.executable).toBe(true);
+    expect(card?.proposal?.blockers).toEqual([]);
+  });
+
+  it('rejects malformed proposal payloads', () => {
+    const card = parseDocumentCardEvent(JSON.stringify({
+      card: { kind: 'output_spec_confirmation', status: 'x', proposal: 'nope' },
+    }));
+    expect(card?.proposal).toBeUndefined();
+  });
+
+  it('labels the card 计划确认 and confirm action', () => {
+    expect(documentCardTitle('output_spec_confirmation')).toBe('计划确认');
+    expect(nextActionLabel('confirm_document_plan')).toBe('确认生成');
+    expect(nextActionLabel('propose_document_plan')).toBe('生成计划提案');
   });
 });

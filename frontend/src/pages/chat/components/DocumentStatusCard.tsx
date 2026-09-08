@@ -20,6 +20,7 @@ import {
   downloadDocumentArtifact,
   type DocumentCardData,
 } from './documentCardModel';
+import OutputSpecConfirmationCard from './OutputSpecConfirmationCard';
 
 // 兼容再导出:ChatPage 只用 identity 生成 React key,import 路径保持不变。
 export { documentCardIdentity } from './documentCardModel';
@@ -38,6 +39,9 @@ type Props = {
   onRefreshStatus?: (card: DocumentCardData) => void;
   onAnswerClarification?: (card: DocumentCardData, answer: string) => void;
   answering?: boolean;
+  confirming?: boolean;
+  stale?: boolean;
+  onConfirmPlan?: (card: DocumentCardData) => void;
 };
 
 export default function DocumentStatusCard({
@@ -46,6 +50,9 @@ export default function DocumentStatusCard({
   onRefreshStatus,
   onAnswerClarification,
   answering = false,
+  confirming = false,
+  stale = false,
+  onConfirmPlan,
 }: Props) {
   const [answer, setAnswer] = useState('');
   const answerInputId = useId();
@@ -53,6 +60,16 @@ export default function DocumentStatusCard({
   const canAnswer = canAnswerClarification(card, Boolean(onAnswerClarification));
   const tone = documentCardStatusTone(card.status);
   const workbenchActions = documentCardWorkbenchActions(card);
+  if (card.kind === 'output_spec_confirmation' && onConfirmPlan) {
+    return (
+      <OutputSpecConfirmationCard
+        card={card}
+        confirming={confirming}
+        stale={stale}
+        onConfirm={() => onConfirmPlan(card)}
+      />
+    );
+  }
   return (
     <div
       className="rounded-[10px] border border-[#e3e7f1] bg-[#fafbfc] px-[10px] py-[8px]"

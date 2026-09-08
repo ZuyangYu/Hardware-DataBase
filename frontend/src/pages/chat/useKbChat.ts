@@ -7,7 +7,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, isForbiddenError, sseGetStream } from '@/api/client';
+import { api, ApiError, isForbiddenError, sseGetStream } from '@/api/client';
 import type {
   AttachmentSnapshot,
   CreateTurnRequest,
@@ -29,6 +29,7 @@ import type {
 import { notify } from '@/components/ui/app-toast';
 import {
   answerGenerationSession,
+  confirmDocumentPlan,
   createClientRequestId,
   fetchGenerationSession,
 } from '@/api/documentAuthoring';
@@ -41,6 +42,7 @@ import {
   mergeDocumentCards,
   parseCardArtifacts,
   parseDocumentCardEvent,
+  planConfirmationInput,
   documentCardIdentity,
   type DocumentCardData,
 } from './components/documentCardModel';
@@ -71,6 +73,23 @@ function requestUuid(): string {
  * Keeping this reducer outside the hook makes replay and live-stream paths
  * use exactly the same identity and de-duplication rules.
  */
+/**
+ * Gate 1 确认提交守卫:仅 409(stale)触发提案刷新并要求重新确认;
+ * 其他错误一律按普通失败提示,绝不自动重试确认。
+ */
+export function isPlanConfirmationStale(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409;
+}
+
+/** stale 状态按会话身份记录;同一会话的提案刷新后自动清除。 */
+export function planConfirmationStaleKey(card: Pick<DocumentCardData, 'generation_session_id' | 'task_id' | 'work_order_id'>): string {
+  const sessionId = card.generation_session_id?.trim() ?? '';
+  if (sessionId) return sessionId;
+  const taskId = card.task_id?.trim() ?? '';
+  if (taskId) return taskId;
+  return card.work_order_id?.trim() ?? '';
+}
+
 export function mergeDocumentCardsFromSseEvent(
   prev: DocumentCardData[],
   eventType: string,
@@ -956,6 +975,68 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     }
   }, [documentCardAnsweringId]);
 
+  const [documentCardConfirmingId, setDocumentCardConfirmingId] = useState<string | null>(null);
+  const [documentCardStaleKeys, setDocumentCardStaleKeys] = useState<ReadonlySet<string>>(new Set());
+  const planConfirmInFlightRef = useRef(false);
+
+  const markPlanConfirmationStale = useCallback((card: DocumentCardData) => {
+    const key = planConfirmationStaleKey(card);
+    if (!key) return;
+    setDocumentCardStaleKeys((prev) => {
+      if (prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
+  }, []);
+
+  /**
+   * Gate 1 确认:提交用户看到过的精确哈希;409 时标记 stale 并刷新提案,
+   * 绝不自动重试确认(计划约定)。
+   */
+  const confirmDocumentPlanCard = useCallback(async (card: DocumentCardData) => {
+    if (planConfirmInFlightRef.current) return;
+    const sessionId = card.generation_session_id?.trim() ?? '';
+    if (!sessionId) return;
+    const request = planConfirmationInput(card, createClientRequestId());
+    if (!request) return;
+    const confirmKey = documentCardIdentity(card);
+    planConfirmInFlightRef.current = true;
+    setDocumentCardConfirmingId(confirmKey);
+    try {
+      const submission = await confirmDocumentPlan(card.kb_name, sessionId, request);
+      setDocumentCardStaleKeys((prev) => {
+        const key = planConfirmationStaleKey(card);
+        if (!key || !prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+      setDocumentCards((prev) => mergeDocumentCards(prev, {
+        ...card,
+        kind: 'output_spec_confirmation',
+        status: 'planned',
+        next_actions: ['await_generation', 'get_document_task_status'],
+        proposal: card.proposal
+          ? { ...card.proposal, status: 'accepted' }
+          : card.proposal,
+      }));
+      notify.success(submission.work_order_id
+        ? `确认成功，工单 ${submission.work_order_id} 已创建`
+        : '确认成功，后台正在创建生成工单');
+    } catch (error) {
+      if (isPlanConfirmationStale(error)) {
+        markPlanConfirmationStale(card);
+        notify.error('计划已过期或来源发生变化，请查看最新提案后重新确认');
+      } else {
+        notify.error(error instanceof Error ? error.message : '确认失败，请稍后重试');
+      }
+    } finally {
+      planConfirmInFlightRef.current = false;
+      setDocumentCardConfirmingId(null);
+    }
+  }, [markPlanConfirmationStale]);
+
   const send = useCallback(async (
     attachments?: {
       attachmentIds: string[];
@@ -1242,6 +1323,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     documentCardAnsweringId,
     refreshDocumentCardStatus,
     answerDocumentCard,
+    documentCardConfirmingId,
+    documentCardStaleKeys,
+    confirmDocumentPlanCard,
     currentSessionRunning: streaming,
     send,
     abortStream,

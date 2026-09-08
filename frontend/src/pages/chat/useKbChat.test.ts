@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
+import { ApiError } from '@/api/client';
 import {
+  isPlanConfirmationStale,
   mergeDocumentCardsFromSseEvent,
+  planConfirmationStaleKey,
 } from './useKbChat';
 
 describe('useKbChat document clarification SSE projection', () => {
@@ -76,5 +79,25 @@ describe('useKbChat document clarification SSE projection', () => {
     expect(mergeDocumentCardsFromSseEvent(existing, 'stage', '{}', 'hardware')).toBe(existing);
     expect(mergeDocumentCardsFromSseEvent(existing, 'document_clarification_question', '{}', 'hardware')).toBe(existing);
     expect(mergeDocumentCardsFromSseEvent(existing, 'document_clarification_ready', 'not-json', 'hardware')).toBe(existing);
+  });
+});
+
+
+describe('plan confirmation submission guard', () => {
+  it('marks only 409 responses as stale', () => {
+    expect(isPlanConfirmationStale(new ApiError(409, 'stale plan', 'Conflict'))).toBe(true);
+    expect(isPlanConfirmationStale(new ApiError(403, 'no access', 'Forbidden'))).toBe(false);
+    expect(isPlanConfirmationStale(new Error('network'))).toBe(false);
+  });
+
+  it('stale keys follow the owning session identity', () => {
+    const card = {
+      kind: 'output_spec_confirmation',
+      status: 'awaiting_plan_confirmation',
+      next_actions: [],
+      kb_name: 'hardware',
+      generation_session_id: 'session-1',
+    } as const;
+    expect(planConfirmationStaleKey(card)).toBe('session-1');
   });
 });

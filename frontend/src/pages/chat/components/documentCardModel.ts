@@ -18,6 +18,26 @@ export type DocumentCardArtifact = {
   download_url?: string;
 };
 
+/** Gate 1 提案摘要:只含 id/版本/哈希/计数与政策,不含来源名或证据正文。 */
+export type DocumentPlanProposalSummary = {
+  document_plan_id?: string;
+  document_plan_version?: number;
+  plan_hash?: string;
+  output_spec_id?: string;
+  output_spec_version?: number;
+  output_spec_hash?: string;
+  status?: string;
+  executable?: boolean;
+  deliverables?: Array<{ format: string; role: string; required?: boolean }>;
+  layout_summary?: Record<string, unknown>;
+  outline_count?: number;
+  table_count?: number;
+  source_summary?: Record<string, unknown>;
+  policies?: Record<string, unknown>;
+  warnings?: string[];
+  blockers?: Array<Record<string, unknown> | string>;
+};
+
 export type DocumentCardData = {
   kind: string;
   status: string;
@@ -32,6 +52,7 @@ export type DocumentCardData = {
   content?: string | null;
   targetFormat?: string;
   artifacts?: DocumentCardArtifact[];
+  proposal?: DocumentPlanProposalSummary;
 };
 
 export type DocumentClarificationEventType =
@@ -48,6 +69,8 @@ const CARD_TITLES: Record<string, string> = {
   work_order_created: '工单已创建',
   work_order_status: '工单状态',
   generation_session: '需求会话',
+  output_spec_confirmation: '计划确认',
+  requirement_clarification: '需求澄清',
 };
 
 const CARD_STATUS_LABELS: Record<string, string> = {
@@ -67,6 +90,10 @@ const NEXT_ACTION_LABELS: Record<string, string> = {
   answer_clarification: '回答澄清问题',
   start_document_generation_session: '开始需求澄清',
   create_document_work_order: '创建生成工单',
+  propose_document_plan: '生成计划提案',
+  confirm_document_plan: '确认生成',
+  await_generation: '等待后台生成',
+  get_document_task_status: '查询任务状态',
   resume_document_task: '继续执行任务',
   review_revision: '查看文档修订',
   open_document_workbench: '打开文档工作台',
@@ -101,6 +128,44 @@ export function parseCardArtifacts(value: unknown): DocumentCardArtifact[] | und
   return parsed.length > 0 ? parsed : undefined;
 }
 
+/** 解析 Gate 1 提案摘要;任何形状不符的字段整体丢弃(fail-closed)。 */
+export function parsePlanProposal(value: unknown): DocumentPlanProposalSummary | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const planHash = typeof record.plan_hash === 'string' ? record.plan_hash.trim() : '';
+  const specHash = typeof record.output_spec_hash === 'string' ? record.output_spec_hash.trim() : '';
+  if (!planHash && !specHash) return undefined;
+  const warnings = Array.isArray(record.warnings)
+    ? record.warnings.filter((item): item is string => typeof item === 'string' && item.trim() !== '').slice(0, 8)
+    : [];
+  // blockers 的存在性本身就是确认门:空数组也要保留。
+  const blockers = Array.isArray(record.blockers)
+    ? (record.blockers as unknown[]).slice(0, 8)
+    : undefined;
+  const deliverables = Array.isArray(record.deliverables)
+    ? (record.deliverables as unknown[]).slice(0, 16)
+    : [];
+  return {
+    ...(typeof record.document_plan_id === 'string' && record.document_plan_id.trim()
+      ? { document_plan_id: record.document_plan_id } : {}),
+    ...(typeof record.document_plan_version === 'number' ? { document_plan_version: record.document_plan_version } : {}),
+    ...(planHash ? { plan_hash: planHash } : {}),
+    ...(typeof record.output_spec_id === 'string' && record.output_spec_id.trim()
+      ? { output_spec_id: record.output_spec_id } : {}),
+    ...(typeof record.output_spec_version === 'number' ? { output_spec_version: record.output_spec_version } : {}),
+    ...(specHash ? { output_spec_hash: specHash } : {}),
+    ...(typeof record.status === 'string' ? { status: record.status } : {}),
+    ...(typeof record.executable === 'boolean' ? { executable: record.executable } : {}),
+    ...(deliverables.length ? { deliverables: deliverables as DocumentPlanProposalSummary['deliverables'] } : {}),
+    ...(record.layout_summary && typeof record.layout_summary === 'object' && !Array.isArray(record.layout_summary)
+      ? { layout_summary: record.layout_summary as Record<string, unknown> } : {}),
+    ...(typeof record.outline_count === 'number' ? { outline_count: record.outline_count } : {}),
+    ...(typeof record.table_count === 'number' ? { table_count: record.table_count } : {}),
+    ...(warnings.length ? { warnings } : {}),
+    ...(blockers !== undefined ? { blockers: blockers as DocumentPlanProposalSummary['blockers'] } : {}),
+  };
+}
+
 export function parseDocumentCardEvent(data: string): DocumentCardData | null {
   try {
     const parsed = JSON.parse(data) as { card?: Record<string, unknown> | null } | null;
@@ -128,6 +193,7 @@ export function parseDocumentCardEvent(data: string): DocumentCardData | null {
       ...(nonEmptyString(card.reason) ? { reason: nonEmptyString(card.reason) } : {}),
       ...(targetFormat ? { targetFormat } : {}),
       ...(artifacts ? { artifacts } : {}),
+      ...(kind === 'output_spec_confirmation' ? { proposal: parsePlanProposal(card.proposal) } : {}),
     };
   } catch {
     return null;
@@ -306,6 +372,30 @@ export function documentCardTitle(kind: string): string {
 
 export function documentCardStatusLabel(status: string): string {
   return CARD_STATUS_LABELS[status] ?? describeWorkOrderStatus(status).label;
+}
+
+/** 暴露给卡片操作区使用的 next_action 文案。 */
+export function nextActionLabel(action: string): string {
+  return NEXT_ACTION_LABELS[action] ?? '前往工作台处理';
+}
+
+/**
+ * Gate 1 确认输入:只允许提交用户看到过的 spec/plan 哈希。任一哈希缺失或
+ * request id 为空时返回 null(提交为 no-op),前端绝不自行推导哈希。
+ */
+export function planConfirmationInput(
+  card: DocumentCardData,
+  clientRequestId: string,
+): { expected_output_spec_hash: string; expected_plan_hash: string; client_request_id: string } | null {
+  const specHash = card.proposal?.output_spec_hash?.trim() ?? '';
+  const planHash = card.proposal?.plan_hash?.trim() ?? '';
+  const requestId = clientRequestId.trim();
+  if (!specHash || !planHash || !requestId) return null;
+  return {
+    expected_output_spec_hash: specHash,
+    expected_plan_hash: planHash,
+    client_request_id: requestId,
+  };
 }
 
 export function documentCardStatusTone(status: string): DocumentStatusTone {

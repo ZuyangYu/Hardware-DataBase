@@ -321,3 +321,89 @@ export async function resumeDocumentTask(
     {},
   );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1 v2: plan proposal and explicit hash-bound confirmation
+// ---------------------------------------------------------------------------
+
+export type PlanProposalView = {
+  session_id?: string | null;
+  task_id?: string | null;
+  document_plan_id: string;
+  document_plan_version: number;
+  plan_hash?: string | null;
+  output_spec_id?: string | null;
+  output_spec_version?: number | null;
+  output_spec_hash?: string | null;
+  status: string;
+  executable?: boolean;
+  deliverables?: Array<{ format: string; role: string; required?: boolean }>;
+  layout_summary?: Record<string, unknown>;
+  outline_count?: number;
+  table_count?: number;
+  source_summary?: Record<string, unknown>;
+  policies?: Record<string, unknown>;
+  warnings?: unknown[];
+  blockers?: unknown[];
+  next_actions?: string[];
+};
+
+export type PlanSubmissionView = {
+  submission_id: string;
+  status: string;
+  session_id?: string | null;
+  task_id?: string | null;
+  document_plan_id?: string | null;
+  document_plan_version?: number | null;
+  plan_hash?: string | null;
+  work_order_id?: string | null;
+  job_id?: string | null;
+  next_actions?: string[];
+};
+
+export function planProposalPath(knowledgeBaseName: string, sessionId: string): string {
+  return `/api/v1/document-generation/sessions/${encodeURIComponent(sessionId)}/plan-proposals?kb=${encodeURIComponent(knowledgeBaseName)}`;
+}
+
+export function confirmPlanPath(knowledgeBaseName: string, sessionId: string): string {
+  return `/api/v1/document-generation/sessions/${encodeURIComponent(sessionId)}/confirm-plan?kb=${encodeURIComponent(knowledgeBaseName)}`;
+}
+
+/**
+ * Compile/refresh the hash-bound plan proposal for a v2 session. The request
+ * carries no semantic values; the server owns template, sources and policies.
+ */
+export async function createPlanProposal(
+  knowledgeBaseName: string,
+  sessionId: string,
+  expectedOutputSpecVersion: number,
+  clientRequestId = createClientRequestId(),
+): Promise<PlanProposalView> {
+  return api.post<PlanProposalView>(planProposalPath(knowledgeBaseName, sessionId), {
+    client_request_id: clientRequestId,
+    expected_output_spec_version: expectedOutputSpecVersion,
+  });
+}
+
+export type ConfirmPlanInput = {
+  expected_output_spec_hash: string;
+  expected_plan_hash: string;
+  client_request_id: string;
+};
+
+/**
+ * Gate 1: submit the explicit user confirmation bound to the exact hashes the
+ * user saw. A 409 (stale) response must be surfaced to refresh the proposal;
+ * this function never retries automatically.
+ */
+export async function confirmDocumentPlan(
+  knowledgeBaseName: string,
+  sessionId: string,
+  input: ConfirmPlanInput,
+): Promise<PlanSubmissionView> {
+  return api.post<PlanSubmissionView>(confirmPlanPath(knowledgeBaseName, sessionId), {
+    expected_output_spec_hash: input.expected_output_spec_hash,
+    expected_plan_hash: input.expected_plan_hash,
+    client_request_id: input.client_request_id,
+  });
+}
