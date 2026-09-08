@@ -6,6 +6,7 @@ import {
   analyzeTemplate,
   buildClarificationAnswerRequest,
   fetchDocumentTaskProjection,
+  fetchGenerationSession,
   resumeDocumentTask,
   requestDocumentArtifactConversion,
 } from '../api/documentAuthoring';
@@ -41,6 +42,10 @@ import {
   resolveDocumentPhase,
   type DocumentGenerationPhase,
 } from './documentGenerationModel';
+import {
+  parseDocumentGenerationDeepLink,
+  resolveDocumentGenerationDeepLink,
+} from './documentGenerationDeepLink';
 import {
   confirmedBriefItems,
   latestClarificationQuestion,
@@ -113,23 +118,34 @@ function useDropInvalidDeepLinkKb(
 
 export default function DocumentGenerationPage({ auth, kbs, onLogout }: Props) {
   const [searchParams, setSearchParams] = useSearchParams();
-  // 深链 /document-generation?kb=...&workOrder=... 仅在首次挂载消费一次,
-  // 随后清掉查询参数,避免刷新页面时重放预选。
-  const [deepLink] = useState(() => ({
-    kb: searchParams.get('kb') ?? '',
-    workOrder: searchParams.get('workOrder') ?? '',
-  }));
-  const [section, setSection] = useState<'templates' | 'create' | 'runs'>(() =>
-    deepLink.workOrder ? 'runs' : 'templates',
-  );
+  // 深链 /document-generation?kb=...&workOrder|session|task=... 仅在首次挂载
+  // 消费一次,随后清掉查询参数,避免刷新页面时重放预选。
+  const [deepLink] = useState(() => {
+    const parsed = parseDocumentGenerationDeepLink(searchParams);
+    const resolved = resolveDocumentGenerationDeepLink(parsed);
+    return { ...parsed, resolved };
+  });
+  // session/task 深链打开需求/计划视图;workOrder 保留原有直连运行视图。
+  const [section, setSection] = useState<'templates' | 'create' | 'runs'>(() => {
+    if (deepLink.resolved.kind === 'workOrder') return 'runs';
+    if (deepLink.resolved.kind === 'session' || deepLink.resolved.kind === 'task') return 'create';
+    return 'templates';
+  });
   const [runPhase, setRunPhase] = useState<DocumentGenerationPhase>('retrieving');
-  const hasDeepLink = Boolean(deepLink.kb || deepLink.workOrder);
+  const hasDeepLink = Boolean(
+    deepLink.kb || deepLink.workOrder || deepLink.session || deepLink.task,
+  );
   useEffect(() => {
+    if (deepLink.resolved.kind === 'conflict') {
+      notify.error('深链同时携带 session 与 workOrder 且无法确定唯一任务，请修正链接后重试');
+    }
     if (!hasDeepLink) return;
-    // 只清掉深链自己的 kb/workOrder 两个键,未来无关的查询参数保留不动。
+    // 只清掉深链自己的查询键,未来无关的查询参数保留不动。
     const next = new URLSearchParams(searchParams);
     next.delete('kb');
     next.delete('workOrder');
+    next.delete('session');
+    next.delete('task');
     setSearchParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -186,9 +202,16 @@ export default function DocumentGenerationPage({ auth, kbs, onLogout }: Props) {
         )}
       >
         {section === 'templates' && <TemplateSection kbs={kbs} initialKb={deepLink.kb} />}
-        {section === 'create' && <CreateSection kbs={kbs} initialKb={deepLink.kb} />}
+        {section === 'create' && (
+          <CreateSection
+            kbs={kbs}
+            initialKb={deepLink.kb}
+            initialSessionId={deepLink.resolved.kind === 'session' ? deepLink.resolved.sessionId : ''}
+            initialTaskId={deepLink.resolved.kind === 'task' ? deepLink.resolved.taskId : ''}
+          />
+        )}
         {section === 'runs' && (
-          <RunsSection kbs={kbs} onPhaseChange={setRunPhase} initialKb={deepLink.kb} initialWorkOrderId={deepLink.workOrder} />
+          <RunsSection kbs={kbs} onPhaseChange={setRunPhase} initialKb={deepLink.kb} initialWorkOrderId={deepLink.resolved.kind === 'workOrder' ? deepLink.resolved.workOrderId : ''} />
         )}
       </DocumentGenerationWorkbench>
     </div>
@@ -278,7 +301,17 @@ function TemplateSection({ kbs, initialKb = '' }: { kbs: KbView[]; initialKb?: s
   );
 }
 
-export function CreateSection({ kbs, initialKb = '' }: { kbs: KbView[]; initialKb?: string }) {
+export function CreateSection({
+  kbs,
+  initialKb = '',
+  initialSessionId = '',
+  initialTaskId = '',
+}: {
+  kbs: KbView[];
+  initialKb?: string;
+  initialSessionId?: string;
+  initialTaskId?: string;
+}) {
   const [kb, setKb] = useState(initialKb);
   const [options, setOptions] = useState<GenerationOptions | null>(null);
   const [templateId, setTemplateId] = useState('');
@@ -286,6 +319,38 @@ export function CreateSection({ kbs, initialKb = '' }: { kbs: KbView[]; initialK
   const [creating, setCreating] = useState(false);
   const [session, setSession] = useState<GenerationSession | null>(null);
   const [reply, setReply] = useState('');
+  // 深链恢复:session/task 深链在挂载时拉取既有会话,刷新后回到同一任务。
+  const [deepLinkError, setDeepLinkError] = useState('');
+  useEffect(() => {
+    if (!initialSessionId && !initialTaskId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        if (initialSessionId) {
+          const restored = await fetchGenerationSession(initialKb, initialSessionId);
+          if (!cancelled) setSession(restored);
+          return;
+        }
+        const projection = await fetchDocumentTaskProjection(initialKb, initialTaskId);
+        if (cancelled) return;
+        const sessionId = (projection as { generation_session_id?: string | null }).generation_session_id
+          || (projection as { clarification_state?: { session_id?: string | null } }).clarification_state?.session_id
+          || '';
+        if (sessionId) {
+          const restored = await fetchGenerationSession(initialKb, sessionId);
+          if (!cancelled) setSession(restored);
+        } else if (!cancelled) {
+          setDeepLinkError('该任务尚未关联需求会话，请在任务与下载页查看执行状态');
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setDeepLinkError(error instanceof Error ? error.message : '深链恢复失败');
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSessionId, initialTaskId]);
 
   // 只有一个可访问知识库时自动选中，避免漏选导致按钮一直 disabled、点击无反应。
   useEffect(() => {
@@ -422,6 +487,12 @@ export function CreateSection({ kbs, initialKb = '' }: { kbs: KbView[]; initialK
           </select>
         </CardContent>
       </Card>
+
+      {deepLinkError && (
+        <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          {deepLinkError}
+        </div>
+      )}
 
       <ClarificationPanel
         messages={session
