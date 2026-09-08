@@ -29,6 +29,20 @@ from .models import (
     UnitTaskSpec,
     planning_content_hash,
 )
+from .registry import (
+    CapabilityRegistries,
+    DomainStrategy,
+    DomainStrategyDescriptor,
+    DomainStrategyRegistry,
+    LayoutAdapter,
+    LayoutAdapterDescriptor,
+    LayoutAdapterRegistry,
+    RendererCapability,
+    RendererCapabilityDescriptor,
+    RendererCapabilityRegistry,
+    build_builtin_registries,
+)
+from .sources import FrozenSourceRef, FrozenSourceScope, SourceType
 
 __all__ = [
     "ArtifactSpec",
@@ -53,4 +67,18 @@ __all__ = [
     "TemplateContract",
     "UnitTaskSpec",
     "planning_content_hash",
+    "CapabilityRegistries",
+    "DomainStrategy",
+    "DomainStrategyDescriptor",
+    "DomainStrategyRegistry",
+    "FrozenSourceRef",
+    "FrozenSourceScope",
+    "LayoutAdapter",
+    "LayoutAdapterDescriptor",
+    "LayoutAdapterRegistry",
+    "RendererCapability",
+    "RendererCapabilityDescriptor",
+    "RendererCapabilityRegistry",
+    "SourceType",
+    "build_builtin_registries",
 ]
