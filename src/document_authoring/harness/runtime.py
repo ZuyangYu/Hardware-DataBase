@@ -94,6 +94,13 @@ def _allowlisted(value: Any, configured: Any) -> bool:
     return bool(allowed) and ("*" in allowed or normalized in allowed)
 
 
+def _template_free_allowlisted(value: Any, configured: Any) -> bool:
+    """Use exact matches for the independent template-free canary scope."""
+    allowed = _allowlist_values(configured)
+    normalized = str(value or "").strip().casefold()
+    return bool(allowed) and normalized in allowed
+
+
 @dataclass
 class AuthoringRunContext:
     """Public capability boundary exposed to graph/executor nodes.
@@ -227,6 +234,35 @@ class InternalDocumentHarnessRuntime:
             raise PlanExecutionRouteError(
                 "accepted OutputSpec primary format does not match the Work Order"
             )
+        if getattr(plan.layout_contract, "kind", "") == "structure":
+            if not getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED", False):
+                raise PlanExecutionRouteError("template-free execution is disabled")
+            from src.document_authoring.planning.recipes import build_builtin_recipe_registry
+
+            layout = plan.layout_contract
+            recipe_id = str(
+                (plan.render_spec or {}).get("recipe_id")
+                or getattr(layout, "structure_profile_id", "")
+            ).strip()
+            recipe_version = str(
+                (plan.render_spec or {}).get("recipe_version")
+                or getattr(layout, "structure_profile_version", "")
+            ).strip()
+            recipe = build_builtin_recipe_registry().lookup(recipe_id, recipe_version)
+            if recipe is None or recipe.status != "available":
+                raise PlanExecutionRouteError("template-free recipe is unavailable")
+            if primary_format not in recipe.supported_formats:
+                raise PlanExecutionRouteError("template-free recipe does not support the primary format")
+            if not all(
+                _template_free_allowlisted(value, configured)
+                for value, configured in (
+                    (getattr(work_order, "tenant_id", None), getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_TENANTS", ())),
+                    (output_spec.document_type, getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_DOCUMENT_TYPES", ())),
+                    (primary_format, getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_FORMATS", ())),
+                    (f"{recipe_id}@{recipe_version}", getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_RECIPES", ())),
+                )
+            ):
+                raise PlanExecutionRouteError("template-free execution scope is not present in the configured allowlist")
         if not (
             _allowlisted(
                 getattr(work_order, "tenant_id", None),

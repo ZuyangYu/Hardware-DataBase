@@ -312,7 +312,7 @@ class DocumentWorkOrder(BaseModel):
     template_schema_version: str
     retrieval_policy_version: str
     renderer_policy_version: str
-    target_format: Literal["xlsm", "xlsx", "markdown", "docx"]
+    target_format: Literal["xlsm", "xlsx", "markdown", "docx", "pdf"]
     execution_mode: Literal["internal_harness", "deterministic_only", "external_agent"]
     harness_policy_id: str | None = None
     harness_policy_version: str | None = None

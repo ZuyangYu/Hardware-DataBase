@@ -623,6 +623,17 @@ class DocumentPlanningService:
         self.store = store
 
     def compile(self, **kwargs: Any) -> DocumentPlan:
+        output_spec = kwargs.get("output_spec")
+        layout_source = getattr(output_spec, "layout_source", None)
+        layout_mode = getattr(layout_source, "mode", None)
+        if layout_mode in {"system_recipe", "generated_structure"}:
+            # Template-free plans have a separate compiler and never receive
+            # template analysis/binding arguments from legacy callers.
+            return self.template_free_adapter.compile(
+                output_spec=output_spec,
+                source_snapshot_id=kwargs["source_snapshot_id"],
+                source_snapshot_hash=kwargs["source_snapshot_hash"],
+            )
         return self.adapter.compile(**kwargs)
 
     def compile_template_free(self, **kwargs: Any) -> DocumentPlan:

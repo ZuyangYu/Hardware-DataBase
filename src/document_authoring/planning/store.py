@@ -10,6 +10,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+import src.settings
 from src.document_authoring.harness.idempotency import canonical_json
 
 from .models import DocumentPlan, OutputSpec
@@ -606,7 +607,39 @@ class DocumentPlanningStore:
                 if not plan.is_executable:
                     raise ValueError("document plan is not executable")
                 if getattr(plan.layout_contract, "kind", "") != "template":
-                    raise ValueError("template-free document plans are not confirmable in Phase 1")
+                    if (
+                        getattr(plan.layout_contract, "kind", "") != "structure"
+                        or not getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED", False)
+                    ):
+                        raise ValueError(
+                            "template-free document plans are disabled or not confirmable"
+                        )
+                    from .recipes import build_builtin_recipe_registry
+
+                    layout_source = spec.layout_source
+                    if getattr(layout_source, "mode", "") not in {
+                        "system_recipe", "generated_structure",
+                    }:
+                        raise ValueError(
+                            "template-free plan layout does not match the OutputSpec"
+                        )
+                    recipe_id = str(
+                        (plan.render_spec or {}).get("recipe_id")
+                        or getattr(plan.layout_contract, "structure_profile_id", "")
+                    ).strip()
+                    recipe_version = str(
+                        (plan.render_spec or {}).get("recipe_version")
+                        or getattr(plan.layout_contract, "structure_profile_version", "")
+                    ).strip()
+                    recipe = build_builtin_recipe_registry().lookup(recipe_id, recipe_version)
+                    if recipe is None or recipe.status != "available":
+                        raise ValueError("template-free plan recipe is not registered")
+                    primary = next(
+                        item for item in spec.artifact.deliverables
+                        if item.role == "primary"
+                    )
+                    if primary.format not in recipe.supported_formats:
+                        raise ValueError("template-free plan recipe does not support its deliverable")
 
                 # Re-read the frozen source/template identities from this
                 # same DB while the write lock is held.  The worker performs a
@@ -625,28 +658,29 @@ class DocumentPlanningStore:
                     or snapshot_row["content_hash"] != plan.source_snapshot_hash
                 ):
                     raise ValueError("frozen source snapshot is missing or changed")
-                layout = plan.layout_contract
-                template_id = str(getattr(layout, "template_version_id", "") or "").strip()
-                template_schema_id = str(getattr(layout, "template_schema_id", "") or "").strip()
-                template_schema_version = str(getattr(layout, "template_schema_version", "") or "").strip()
-                template_row = connection.execute(
-                    """SELECT content_hash, payload_json
-                       FROM template_versions WHERE template_version_id = ?""",
-                    (template_id,),
-                ).fetchone()
-                if template_row is None:
-                    raise ValueError("frozen template is missing")
-                template_payload = json.loads(template_row["payload_json"])
-                if (
-                    template_payload.get("status") != "approved"
-                    or template_payload.get("content_hash") != template_row["content_hash"]
-                    or template_payload.get("template_schema_id") != template_schema_id
-                    or str(template_payload.get("template_schema_version") or "") != template_schema_version
-                ):
-                    raise ValueError("frozen template is not approved or schema-bound")
-                template_hash = str((plan.output_spec_summary or {}).get("template_content_hash") or "")
-                if not template_hash or template_hash != str(template_row["content_hash"]):
-                    raise ValueError("frozen template hash does not match the proposed plan")
+                if getattr(plan.layout_contract, "kind", "") == "template":
+                    layout = plan.layout_contract
+                    template_id = str(getattr(layout, "template_version_id", "") or "").strip()
+                    template_schema_id = str(getattr(layout, "template_schema_id", "") or "").strip()
+                    template_schema_version = str(getattr(layout, "template_schema_version", "") or "").strip()
+                    template_row = connection.execute(
+                        """SELECT content_hash, payload_json
+                           FROM template_versions WHERE template_version_id = ?""",
+                        (template_id,),
+                    ).fetchone()
+                    if template_row is None:
+                        raise ValueError("frozen template is missing")
+                    template_payload = json.loads(template_row["payload_json"])
+                    if (
+                        template_payload.get("status") != "approved"
+                        or template_payload.get("content_hash") != template_row["content_hash"]
+                        or template_payload.get("template_schema_id") != template_schema_id
+                        or str(template_payload.get("template_schema_version") or "") != template_schema_version
+                    ):
+                        raise ValueError("frozen template is not approved or schema-bound")
+                    template_hash = str((plan.output_spec_summary or {}).get("template_content_hash") or "")
+                    if not template_hash or template_hash != str(template_row["content_hash"]):
+                        raise ValueError("frozen template hash does not match the proposed plan")
 
                 accepted_at = datetime.now(timezone.utc)
                 accepted_spec = spec.model_copy(update={

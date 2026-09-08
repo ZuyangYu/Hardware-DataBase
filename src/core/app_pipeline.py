@@ -146,6 +146,23 @@ def _string_values(value: Any) -> list[str]:
     return []
 
 
+def _template_free_allowlisted(value: Any, configured: Any) -> bool:
+    """Require an exact, non-wildcard template-free canary allowlist match."""
+    if isinstance(configured, str):
+        values = configured.split(",")
+    elif isinstance(configured, (list, tuple, set, frozenset)):
+        values = configured
+    else:
+        values = ()
+    allowed = {
+        str(item).strip().casefold()
+        for item in values
+        if str(item).strip()
+    }
+    normalized = str(value or "").strip().casefold()
+    return bool(allowed) and normalized in allowed
+
+
 class AppPipeline:
     """Application orchestration for KB governance, document assets and Q&A."""
 
@@ -2120,8 +2137,60 @@ class AppPipeline:
             raise ValueError("accepted document plan is missing or changed")
         if plan.output_spec_hash != submission.output_spec_hash:
             raise ValueError("accepted OutputSpec does not match the submission")
-        if getattr(plan.layout_contract, "kind", "") != "template":
-            raise ValueError("template-free document plans are not dispatchable in Phase 1")
+        output_spec = store.get_output_spec(
+            submission.output_spec_id,
+            submission.output_spec_version,
+            tenant_id=submission.tenant_id,
+            user_id=submission.user_id,
+        )
+        if (
+            output_spec is None
+            or output_spec.status != "accepted"
+            or output_spec.content_hash != submission.output_spec_hash
+        ):
+            raise ValueError("accepted OutputSpec is missing or changed")
+
+        is_template_free = getattr(plan.layout_contract, "kind", "") == "structure"
+        if not is_template_free and getattr(plan.layout_contract, "kind", "") != "template":
+            raise ValueError("document plan has an unsupported layout contract")
+        recipe = None
+        recipe_key = ""
+        primary_format = ""
+        if is_template_free:
+            if not getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED", False):
+                raise ValueError("template-free execution is disabled")
+            from src.document_authoring.planning.recipes import build_builtin_recipe_registry
+
+            layout = plan.layout_contract
+            recipe_id = str(
+                (plan.render_spec or {}).get("recipe_id")
+                or getattr(layout, "structure_profile_id", "")
+            ).strip()
+            recipe_version = str(
+                (plan.render_spec or {}).get("recipe_version")
+                or getattr(layout, "structure_profile_version", "")
+            ).strip()
+            recipe_key = f"{recipe_id}@{recipe_version}"
+            recipe = build_builtin_recipe_registry().lookup(recipe_id, recipe_version)
+            primary_deliverables = [
+                item for item in output_spec.artifact.deliverables
+                if item.role == "primary"
+            ]
+            if recipe is None or recipe.status != "available" or len(primary_deliverables) != 1:
+                raise ValueError("template-free recipe or primary deliverable is unavailable")
+            primary_format = primary_deliverables[0].format
+            if primary_format not in recipe.supported_formats:
+                raise ValueError("template-free recipe does not support the primary deliverable")
+            if not all(
+                _template_free_allowlisted(value, configured)
+                for value, configured in (
+                    (submission.tenant_id, getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_TENANTS", ())),
+                    (output_spec.document_type, getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_DOCUMENT_TYPES", ())),
+                    (primary_format, getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_FORMATS", ())),
+                    (recipe_key, getattr(src.settings, "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_RECIPES", ())),
+                )
+            ):
+                raise ValueError("template-free execution scope is not present in the allowlist")
 
         knowledge_base_name = submission.knowledge_base_name
         if not ctx.has_kb_permission(knowledge_base_name, "read"):
@@ -2138,20 +2207,23 @@ class AppPipeline:
             raise ValueError("frozen source snapshot is missing or changed")
 
         layout = plan.layout_contract
-        template = self.document_generation.store.get_template(layout.template_version_id)
-        template_hash = str((plan.output_spec_summary or {}).get("template_content_hash") or "")
-        if (
-            template is None
-            or template.status != "approved"
-            or template.content_hash != template_hash
-        ):
-            raise ValueError("frozen template is missing or changed")
-        schema = self.document_generation.store.get_document_schema(
-            template.template_schema_id,
-            template.template_schema_version,
-        )
-        if schema is None or schema.status != "approved":
-            raise ValueError("frozen document schema is missing or not approved")
+        template = None
+        schema = None
+        if not is_template_free:
+            template = self.document_generation.store.get_template(layout.template_version_id)
+            template_hash = str((plan.output_spec_summary or {}).get("template_content_hash") or "")
+            if (
+                template is None
+                or template.status != "approved"
+                or template.content_hash != template_hash
+            ):
+                raise ValueError("frozen template is missing or changed")
+            schema = self.document_generation.store.get_document_schema(
+                template.template_schema_id,
+                template.template_schema_version,
+            )
+            if schema is None or schema.status != "approved":
+                raise ValueError("frozen document schema is missing or not approved")
 
         idempotency_key = (
             f"document-plan:{plan.document_plan_id}:{plan.version}:{plan.plan_hash}"
@@ -2163,24 +2235,36 @@ class AppPipeline:
             department_id=self.document_generation._ctx_department_id(ctx),
         )
         if order is None:
-            order = self.document_generation._create_frozen_work_order(
-                ctx,
-                scope_type="knowledge_base",
-                snapshot=snapshot,
-                knowledge_base_name=knowledge_base_name,
-                template_version_id=template.template_version_id,
-                document_schema_id=schema.document_schema_id,
-                document_schema_version=schema.version,
-                idempotency_key=idempotency_key,
-                generation_session_id=submission.session_id,
-                source_scope="knowledge_base_only",
-                output_spec_id=submission.output_spec_id,
-                output_spec_version=submission.output_spec_version,
-                output_spec_hash=submission.output_spec_hash,
-                document_plan_id=submission.document_plan_id,
-                document_plan_version=submission.document_plan_version,
-                document_plan_hash=submission.document_plan_hash,
-            )
+            if is_template_free:
+                order = self.document_generation._create_template_free_work_order(
+                    ctx,
+                    plan=plan,
+                    output_spec=output_spec,
+                    snapshot=snapshot,
+                    knowledge_base_name=knowledge_base_name,
+                    idempotency_key=idempotency_key,
+                    generation_session_id=submission.session_id,
+                    source_scope="knowledge_base_only",
+                )
+            else:
+                order = self.document_generation._create_frozen_work_order(
+                    ctx,
+                    scope_type="knowledge_base",
+                    snapshot=snapshot,
+                    knowledge_base_name=knowledge_base_name,
+                    template_version_id=template.template_version_id,
+                    document_schema_id=schema.document_schema_id,
+                    document_schema_version=schema.version,
+                    idempotency_key=idempotency_key,
+                    generation_session_id=submission.session_id,
+                    source_scope="knowledge_base_only",
+                    output_spec_id=submission.output_spec_id,
+                    output_spec_version=submission.output_spec_version,
+                    output_spec_hash=submission.output_spec_hash,
+                    document_plan_id=submission.document_plan_id,
+                    document_plan_version=submission.document_plan_version,
+                    document_plan_hash=submission.document_plan_hash,
+                )
             try:
                 self.document_generation.store.generation_sessions.bind_work_order(
                     submission.session_id,
@@ -2189,14 +2273,24 @@ class AppPipeline:
             except (KeyError, ValueError):
                 pass
 
-        stage = self._kb_document_generation_stages(
-            ctx,
-            order,
-            snapshot,
-            knowledge_base_name=knowledge_base_name,
-            document_schema_id=schema.document_schema_id,
-            document_schema_version=schema.version,
-        )
+        if is_template_free:
+            # Recipe plans have no uploaded template, ICD template profile or
+            # template-specific connector scope. Their accepted plan and
+            # server-owned recipe are the complete layout preflight.
+            stage = {
+                "stage": "ready",
+                "work_order_id": order.work_order_id,
+                "task_id": getattr(order, "task_id", None),
+            }
+        else:
+            stage = self._kb_document_generation_stages(
+                ctx,
+                order,
+                snapshot,
+                knowledge_base_name=knowledge_base_name,
+                document_schema_id=(schema.document_schema_id if schema is not None else order.document_schema_id),
+                document_schema_version=(schema.version if schema is not None else order.document_schema_version),
+            )
         if stage.get("stage") != "ready":
             result = {"status": "waiting_human", **stage}
             result.pop("job_id", None)

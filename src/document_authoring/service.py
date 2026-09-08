@@ -18,6 +18,7 @@ from copy import copy
 from datetime import datetime, timezone
 from collections.abc import Callable, Mapping, Sequence
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any
 
 import requests
@@ -68,6 +69,15 @@ from src.document_authoring.models import (
 from src.document_authoring.ooxml import validate_ooxml_package
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
+from src.document_authoring.renderers.structured import (
+    StructuredDocxRenderer,
+    StructuredPdfRenderer,
+    StructuredXlsxRenderer,
+)
+from src.document_authoring.planning.recipes import (
+    StructureBindingCompiler,
+    build_builtin_recipe_registry,
+)
 from src.document_authoring.render_bindings import (
     LegacyFillPlanAdapter,
     RenderBindingResolver,
@@ -1639,6 +1649,203 @@ class DocumentGenerationService:
         )
         return persisted
 
+    def _create_template_free_work_order(
+        self,
+        ctx: RequestContext,
+        *,
+        plan: Any,
+        output_spec: Any,
+        snapshot: KnowledgeBaseSourceSnapshot,
+        knowledge_base_name: str,
+        idempotency_key: str,
+        generation_session_id: str | None = None,
+        source_scope: str = "knowledge_base_only",
+    ) -> DocumentWorkOrder:
+        """Create a v3 WorkOrder for an accepted server-owned recipe plan.
+
+        Template-free execution still uses the existing WorkOrder, HarnessRun
+        and task stores.  The required template/schema columns carry
+        server-owned sentinel identities so legacy fingerprints and readers
+        remain compatible; no template bytes or caller-supplied package data
+        are introduced into this route.
+        """
+        from src.document_authoring.planning.recipes import build_builtin_recipe_registry
+
+        if getattr(plan, "status", None) != "accepted" or getattr(output_spec, "status", None) != "accepted":
+            raise ValueError("template-free WorkOrder requires accepted planning rows")
+        layout = getattr(plan, "layout_contract", None)
+        if getattr(layout, "kind", None) != "structure":
+            raise ValueError("template-free WorkOrder requires a structure layout contract")
+        render_spec = dict(getattr(plan, "render_spec", {}) or {})
+        recipe_id = str(
+            render_spec.get("recipe_id") or getattr(layout, "structure_profile_id", "")
+        ).strip()
+        recipe_version = str(
+            render_spec.get("recipe_version") or getattr(layout, "structure_profile_version", "")
+        ).strip()
+        recipe = build_builtin_recipe_registry().resolve(recipe_id, recipe_version)
+        primary_deliverables = [
+            item for item in output_spec.artifact.deliverables
+            if item.role == "primary"
+        ]
+        if len(primary_deliverables) != 1:
+            raise ValueError("template-free OutputSpec requires exactly one primary deliverable")
+        target_format = str(primary_deliverables[0].format).strip().casefold().lstrip(".")
+        if target_format not in recipe.supported_formats:
+            raise ValueError("template-free recipe does not support the primary deliverable")
+
+        template_version_id = f"system-recipe:{recipe_id}@{recipe_version}"
+        schema_id = f"system-recipe-schema:{recipe_id}@{recipe_version}"
+        base_schema = DocumentSchema(
+            document_schema_id=schema_id,
+            version=recipe_version,
+            document_type=output_spec.document_type,
+            status="approved",
+            execution_mode="internal_harness",
+        )
+        schema = self.harness_runtime._plan_execution_schema(plan, base_schema)
+        harness_policy = self._schema_harness_policy(schema)
+        task = self.ensure_document_task(
+            ctx,
+            template_version_id=template_version_id,
+            generation_session_id=generation_session_id,
+            project_id=None,
+            knowledge_base_name=knowledge_base_name,
+            idempotency_key=idempotency_key,
+        )
+        if task is None and getattr(src.settings, "DOCUMENT_TASK_ASSOCIATION_REQUIRED", False):
+            raise RuntimeError("document task association is required but task writes are disabled")
+
+        frozen_attachment_refs: list[dict[str, Any]] = []
+        frozen_source_scope = _resolve_document_source_scope(
+            source_scope,
+            has_attachments=False,
+        )
+        frozen_kb_scope = {
+            "tenant_id": snapshot.tenant_id,
+            "knowledge_base_name": knowledge_base_name,
+            "resource_department_id": self._ctx_department_id(ctx),
+            "knowledge_base_id": self._ctx_kb_id(ctx),
+        }
+        order = DocumentWorkOrder(
+            work_order_id=f"wo-{uuid.uuid4().hex}",
+            tenant_id=snapshot.tenant_id,
+            scope_type="knowledge_base",
+            knowledge_base_name=knowledge_base_name,
+            resource_department_id=self._ctx_department_id(ctx),
+            knowledge_base_id=self._ctx_kb_id(ctx),
+            project_id=None,
+            baseline_id=None,
+            baseline_content_hash="",
+            source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            source_scope_snapshot=frozen_source_scope,
+            attachment_refs_snapshot=frozen_attachment_refs,
+            kb_scope_snapshot=frozen_kb_scope,
+            template_version_id=template_version_id,
+            document_schema_id=schema.document_schema_id,
+            document_schema_version=schema.version,
+            template_schema_id=schema_id,
+            template_schema_version=recipe_version,
+            retrieval_policy_version="1",
+            renderer_policy_version=plan.renderer_capability_version,
+            target_format=target_format,
+            execution_mode="internal_harness",
+            harness_policy_id=harness_policy.harness_policy_id,
+            harness_policy_version=harness_policy.version,
+            requested_executor="internal_harness",
+            task_id=task.task_id if task is not None else None,
+            unit_statuses={
+                **{unit.unit_id: "planned" for unit in plan.semantic_units},
+            },
+            created_by=ctx.user_id,
+            idempotency_key=idempotency_key,
+            generation_session_id=generation_session_id,
+            output_spec_id=output_spec.output_spec_id,
+            output_spec_version=output_spec.version,
+            output_spec_hash=output_spec.content_hash,
+            document_plan_id=plan.document_plan_id,
+            document_plan_version=plan.version,
+            document_plan_hash=plan.plan_hash,
+        )
+        order = order.model_copy(update={
+            "input_fingerprint_version": 3,
+            "input_fingerprint": compute_input_fingerprint_v3(order.model_copy(update={
+                "input_fingerprint_version": 3,
+            })),
+        })
+        persisted = self.store.create_work_order(order)
+        if task is not None:
+            self.task_service.store.attach_work_order(task.task_id, persisted.work_order_id)
+        return persisted
+
+    def _template_free_execution_inputs(
+        self,
+        order: DocumentWorkOrder,
+    ) -> tuple[Any, DocumentSchema, Any, Any]:
+        """Reload the accepted recipe plan and build request-local run inputs."""
+        planning_store = getattr(self.planning, "store", None)
+        if planning_store is None:
+            raise ValueError("template-free execution requires a planning store")
+        plan = planning_store.get_plan(
+            str(order.document_plan_id or ""),
+            int(order.document_plan_version or 0),
+            tenant_id=order.tenant_id,
+            user_id=order.created_by,
+        )
+        output_spec = planning_store.get_output_spec(
+            str(order.output_spec_id or ""),
+            int(order.output_spec_version or 0),
+            tenant_id=order.tenant_id,
+            user_id=order.created_by,
+        )
+        if plan is None or plan.status != "accepted":
+            raise ValueError("accepted DocumentPlan is unavailable for template-free execution")
+        if output_spec is None or output_spec.status != "accepted":
+            raise ValueError("accepted OutputSpec is unavailable for template-free execution")
+        if (
+            plan.plan_hash != order.document_plan_hash
+            or plan.output_spec_id != order.output_spec_id
+            or plan.output_spec_version != order.output_spec_version
+            or plan.output_spec_hash != order.output_spec_hash
+            or output_spec.content_hash != order.output_spec_hash
+        ):
+            raise ValueError("template-free planning references do not match the WorkOrder")
+        layout = plan.layout_contract
+        if getattr(layout, "kind", None) != "structure":
+            raise ValueError("template-free execution requires a structure layout contract")
+        from src.document_authoring.planning.recipes import build_builtin_recipe_registry
+
+        render_spec = dict(plan.render_spec or {})
+        recipe_id = str(
+            render_spec.get("recipe_id") or getattr(layout, "structure_profile_id", "")
+        ).strip()
+        recipe_version = str(
+            render_spec.get("recipe_version") or getattr(layout, "structure_profile_version", "")
+        ).strip()
+        recipe = build_builtin_recipe_registry().resolve(recipe_id, recipe_version)
+        primary = [item for item in output_spec.artifact.deliverables if item.role == "primary"]
+        if len(primary) != 1 or str(primary[0].format).strip().casefold() != order.target_format:
+            raise ValueError("template-free primary deliverable does not match the WorkOrder")
+        base_schema = DocumentSchema(
+            document_schema_id=order.document_schema_id,
+            version=order.document_schema_version,
+            document_type=output_spec.document_type,
+            status="approved",
+            execution_mode="internal_harness",
+        )
+        schema = self.harness_runtime._plan_execution_schema(plan, base_schema)
+        template = SimpleNamespace(
+            template_version_id=order.template_version_id,
+            template_id=f"system-recipe:{recipe_id}",
+            format=order.target_format,
+            content_hash=recipe.recipe_hash or "",
+            template_schema_id=order.template_schema_id,
+            template_schema_version=order.template_schema_version,
+            renderer_policy_id=f"system-recipe-renderer:{recipe_id}@{recipe_version}",
+            status="approved",
+        )
+        return template, schema, plan, recipe
+
     def _validate_work_order_definition(
         self,
         template_version_id: str,
@@ -1944,9 +2151,12 @@ class DocumentGenerationService:
         rewriter = self._rewriter_for_policy(policy)
         reranker = self._reranker_for_policy(policy)
         fit_checker = self._fit_checker_for_policy(policy)
-        schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
-        template = self._template(order.template_version_id)
+        if str(order.template_version_id).startswith("system-recipe:"):
+            template, schema, _plan, _recipe = self._template_free_execution_inputs(order)
+        else:
+            schema = self._schema(order.document_schema_id, order.document_schema_version)
+            template = self._template(order.template_version_id)
         run, manifest = self.harness_runtime.create_run(order, policy, snapshot, template, schema)
         self._associate_task_run(order, run.harness_run_id)
         order = self._replace_order(order, status="retrieving", run_manifest_id=manifest.run_manifest_id)
@@ -2038,9 +2248,12 @@ class DocumentGenerationService:
         rewriter = self._rewriter_for_policy(policy)
         reranker = self._reranker_for_policy(policy)
         fit_checker = self._fit_checker_for_policy(policy)
-        schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
-        template = self._template(order.template_version_id)
+        if str(order.template_version_id).startswith("system-recipe:"):
+            template, schema, _plan, _recipe = self._template_free_execution_inputs(order)
+        else:
+            schema = self._schema(order.document_schema_id, order.document_schema_version)
+            template = self._template(order.template_version_id)
         self._associate_task_run(order, run.harness_run_id)
         order = self._replace_order(order, status="retrieving", run_manifest_id=manifest.run_manifest_id)
         try:
@@ -2317,19 +2530,27 @@ class DocumentGenerationService:
         ):
             raise ValueError("plan references do not match the frozen Work Order")
         layout = plan.layout_contract
-        if getattr(layout, "kind", None) != "template":
-            raise ValueError("plan-backed finalization requires a template layout contract")
-        if (
-            layout.template_version_id != template.template_version_id
-            or layout.template_schema_id != template.template_schema_id
-            or layout.template_schema_version != template.template_schema_version
-        ):
-            raise ValueError("plan layout contract does not match the frozen template")
-        declared_template_hash = str(
-            (plan.output_spec_summary or {}).get("template_content_hash") or ""
-        )
-        if declared_template_hash and declared_template_hash != template.content_hash:
-            raise ValueError("plan template content hash does not match the frozen template")
+        is_template_free = getattr(layout, "kind", None) == "structure"
+        if not is_template_free:
+            if getattr(layout, "kind", None) != "template":
+                raise ValueError("plan-backed finalization requires a supported layout contract")
+            if (
+                layout.template_version_id != template.template_version_id
+                or layout.template_schema_id != template.template_schema_id
+                or layout.template_schema_version != template.template_schema_version
+            ):
+                raise ValueError("plan layout contract does not match the frozen template")
+            declared_template_hash = str(
+                (plan.output_spec_summary or {}).get("template_content_hash") or ""
+            )
+            if declared_template_hash and declared_template_hash != template.content_hash:
+                raise ValueError("plan template content hash does not match the frozen template")
+        else:
+            # The synthetic template object is only the compatibility input
+            # required by HarnessRun/manifest schemas. Binding and rendering
+            # below use the accepted recipe, never template bytes or regions.
+            if not str(order.template_version_id).startswith("system-recipe:"):
+                raise ValueError("structure plan requires a server-owned recipe WorkOrder")
 
         evidence_entries = self.store.list_evidence_entries(harness_run_id)
         raw_evidence: dict[str, dict[str, Any]] = {}
@@ -2441,12 +2662,36 @@ class DocumentGenerationService:
             },
         )
 
-        fill_plan = self.build_plan_fill_plan(template, plan, document_model)
-        rendered_content, integrity_manifest = self._render_fill_plan(template, fill_plan)
-        render_result = {
-            "content": rendered_content,
-            "integrity_manifest": integrity_manifest,
-        }
+        if is_template_free:
+            recipe_id = str(
+                (plan.render_spec or {}).get("recipe_id")
+                or getattr(layout, "structure_profile_id", "")
+            ).strip()
+            recipe_version = str(
+                (plan.render_spec or {}).get("recipe_version")
+                or getattr(layout, "structure_profile_version", "")
+            ).strip()
+            recipe = build_builtin_recipe_registry().resolve(recipe_id, recipe_version)
+            binding = StructureBindingCompiler().compile(plan, document_model, recipe)
+            renderers = {
+                "docx": StructuredDocxRenderer(),
+                "pdf": StructuredPdfRenderer(),
+                "xlsx": StructuredXlsxRenderer(),
+            }
+            renderer = renderers.get(order.target_format)
+            if renderer is None:
+                raise ValueError(f"no template-free renderer is registered for {order.target_format}")
+            structured = renderer.render(document_model, recipe, binding)
+            rendered_content = structured.content
+            integrity_manifest = structured.integrity_manifest
+            render_result = structured
+        else:
+            fill_plan = self.build_plan_fill_plan(template, plan, document_model)
+            rendered_content, integrity_manifest = self._render_fill_plan(template, fill_plan)
+            render_result = {
+                "content": rendered_content,
+                "integrity_manifest": integrity_manifest,
+            }
         post_render = self.review_document_post_render(
             plan, document_model, render_result, rendered_content,
         )
@@ -2485,6 +2730,10 @@ class DocumentGenerationService:
             for report in (pre_render, post_render)
             for issue in report.issues
         ]
+        required_issues = self._required_content_issues(
+            order, result.unit_statuses, plan=plan,
+        )
+        review_issues.extend(required_issues)
         self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
         validation = self.validator.validate(
             work_order_id=order.work_order_id,
@@ -2511,14 +2760,15 @@ class DocumentGenerationService:
             tenant_id=order.tenant_id,
             work_order_id=order.work_order_id,
             run_id=harness_run_id,
-            output_format=template.format,
+            output_format=order.target_format if is_template_free else template.format,
             stage="review_candidate",
             content_hash=hashlib.sha256(rendered_content).hexdigest(),
             validation_report_id=validation.validation_report_id,
             integrity_manifest_id=integrity_manifest["manifest_hash"],
         )
         artifact = self._save_artifact_for_task(
-            order, artifact, rendered_content, template.format,
+            order, artifact, rendered_content,
+            order.target_format if is_template_free else template.format,
         )
         result.artifact = artifact
         self._bind_revision_child(order, artifact, report_status=validation.status)
@@ -2608,13 +2858,34 @@ class DocumentGenerationService:
         )
         return self.store.append_execution_event(event)
 
-    def _required_content_issues(self, order: DocumentWorkOrder, statuses: dict[str, str]) -> list[dict[str, Any]]:
+    def _required_content_issues(
+        self,
+        order: DocumentWorkOrder,
+        statuses: dict[str, str],
+        *,
+        plan: Any | None = None,
+    ) -> list[dict[str, Any]]:
         """A usable candidate is not a complete release when required content is absent.
 
         The brief's mark_tbd policy permits drafting, never silently relaxing
         the frozen schema's release requirements. Missing execution statuses
         are gaps too; otherwise a skipped field would evade the gate.
         """
+        if plan is not None and getattr(getattr(plan, "layout_contract", None), "kind", None) == "structure":
+            return [
+                {
+                    "code": "required_content_incomplete",
+                    "kind": "required_content_incomplete",
+                    "field_id": requirement.unit_id,
+                    "unit_id": f"field:{requirement.unit_id}",
+                    "coverage_status": statuses.get(f"field:{requirement.unit_id}", "unsearched"),
+                    "severity": "blocking",
+                    "message": f"必填内容尚未完成：{requirement.unit_id}",
+                }
+                for requirement in plan.coverage_contract.requirements
+                if requirement.required
+                and statuses.get(f"field:{requirement.unit_id}") != "ready_to_render"
+            ]
         schema = self.store.get_document_schema(order.document_schema_id, order.document_schema_version)
         if schema is None:
             return [{"code": "required_content_incomplete", "kind": "missing_schema", "severity": "blocking"}]
