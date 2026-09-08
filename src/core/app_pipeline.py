@@ -3490,6 +3490,73 @@ class AppPipeline:
         next_actions = list(status.get("next_actions") or [])
         if not next_actions:
             next_actions = self._document_task_next_actions(task, session_projection, order)
+        # Phase 1 v2 lifecycle projection: the internal pre-proposal state
+        # projects as a user-visible draft; confirmation and submission states
+        # surface their own actionable next steps.
+        projected_status = task.status
+        is_v2_task = bool(task.output_spec_id or task.document_plan_id) or (
+            (session_projection or {}).get("contract_version") == "output_spec_v1"
+        )
+        if is_v2_task and order is None:
+            session_status = (session_projection or {}).get("status")
+            if session_status == "awaiting_plan" or (
+                session_status is None and task.status == "needs_clarification"
+            ):
+                projected_status = "draft"
+                next_actions = ["answer_clarification", "propose_document_plan"]
+            elif task.status == "awaiting_plan_confirmation":
+                next_actions = ["propose_document_plan", "confirm_document_plan"]
+            elif task.status == "planned":
+                next_actions = ["await_generation", "get_document_task_status"]
+
+        planning_state = None
+        submission_state = None
+        spec_ref = (
+            str(task.output_spec_id or "").strip(),
+            int(task.output_spec_version or 0),
+        )
+        plan_ref = (
+            str(task.document_plan_id or "").strip(),
+            int(task.document_plan_version or 0),
+        )
+        if not spec_ref[0] or not plan_ref[0]:
+            # Proposal binding may live on the owning session while the task
+            # projection is refreshed; fall back to the session pointers.
+            sessions = getattr(
+                getattr(self.document_generation, "store", None),
+                "generation_sessions",
+                None,
+            )
+            session_id = str(getattr(task, "generation_session_id", "") or "").strip()
+            getter = getattr(sessions, "get_session", None)
+            if session_id and callable(getter):
+                try:
+                    bound = getter(
+                        session_id,
+                        tenant_id=str(getattr(ctx, "tenant_id", None) or "default"),
+                        user_id=str(getattr(ctx, "user_id", None) or ""),
+                    )
+                except (KeyError, PermissionError, ValueError):
+                    bound = None
+                if bound is not None:
+                    spec_ref = (
+                        spec_ref[0] or str(getattr(bound, "output_spec_id", "") or "").strip(),
+                        spec_ref[1] or int(getattr(bound, "output_spec_version", 0) or 0),
+                    )
+                    plan_ref = (
+                        plan_ref[0] or str(getattr(bound, "document_plan_id", "") or "").strip(),
+                        plan_ref[1] or int(getattr(bound, "document_plan_version", 0) or 0),
+                    )
+        if is_v2_task and spec_ref[0] and plan_ref[0]:
+            try:
+                planning_state, submission_state = self._document_planning_projection(
+                    ctx,
+                    task,
+                    spec_ref=spec_ref,
+                    plan_ref=plan_ref,
+                )
+            except Exception as exc:  # noqa: BLE001 - additive/fail-soft
+                warn(f"failed to project planning state for task {task.task_id}: {exc}")
         pending_review = status.get("pending_human_event")
         if pending_review is None:
             harness = status.get("harness_run") or {}
@@ -3527,7 +3594,7 @@ class AppPipeline:
         projection = {
             "task_id": task.task_id,
             "origin": task.origin,
-            "status": task.status,
+            "status": projected_status,
             "conversation_refs": {
                 key: value
                 for key, value in {
@@ -3561,10 +3628,69 @@ class AppPipeline:
             "revisions": revisions,
             "pending_review": pending_review,
             "next_actions": next_actions,
+            "planning_state": planning_state,
+            "submission": submission_state,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
         }
         return projection
+
+    def _document_planning_projection(
+        self,
+        ctx: RequestContext,
+        task: Any,
+        *,
+        spec_ref: tuple[str, int],
+        plan_ref: tuple[str, int],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Project safe planning identity for a v2 task (fail-soft caller)."""
+        planning = getattr(self.document_generation, "planning", None)
+        store = getattr(planning, "store", None)
+        if store is None:
+            return None, None
+        tenant_id = str(getattr(ctx, "tenant_id", None) or "default")
+        user_id = str(getattr(ctx, "user_id", None) or "")
+        spec = store.get_output_spec(
+            spec_ref[0],
+            spec_ref[1],
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        plan = store.get_plan(
+            plan_ref[0],
+            plan_ref[1],
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if spec is None or plan is None:
+            return None, None
+        planning_state = {
+            "output_spec_id": spec.output_spec_id,
+            "output_spec_version": spec.version,
+            "output_spec_hash": spec.content_hash,
+            "document_plan_id": plan.document_plan_id,
+            "document_plan_version": plan.version,
+            "plan_hash": plan.plan_hash,
+            "proposal_status": plan.status,
+        }
+        submission = store.submissions.get_by_plan(
+            plan.document_plan_id,
+            plan.version,
+            plan.plan_hash,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        submission_state = (
+            {
+                "submission_id": submission.submission_id,
+                "status": submission.status,
+                "work_order_id": submission.work_order_id,
+                "job_id": submission.job_id,
+            }
+            if submission is not None
+            else None
+        )
+        return planning_state, submission_state
 
     def list_document_reviews(
         self,
@@ -4020,6 +4146,7 @@ class AppPipeline:
         return {
             "session_id": session.session_id,
             "status": session.status,
+            "contract_version": getattr(session, "contract_version", "legacy_brief_v1"),
             "last_question_id": session.last_question_id,
             "clarification_revision": session.clarification_revision,
             "pending_question": (

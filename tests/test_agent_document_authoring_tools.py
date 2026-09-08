@@ -802,3 +802,21 @@ def test_v2_generate_document_from_template_still_uses_legacy_path_when_flag_off
     result = toolset.generate_document_from_template(purpose="参考模板生成 ICD 文档")
     assert result.status == "succeeded"
     assert result.work_order_id == "work-order-a"
+
+
+def test_v2_answer_clarification_emits_requirement_clarification_card(tmp_path, monkeypatch):
+    import src.settings
+
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLANNING_V2_ENABLED", True)
+    sink = []
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.event_sink = sink.append
+    toolset.pipeline.answer_document_generation_session = lambda _ctx, session_id, **_kw: toolset.pipeline.v2_session
+
+    result = toolset.answer_clarification(
+        "generation-session-a", "purpose", "评审报告", client_request_id="answer-1",
+    )
+
+    assert result.status == "succeeded"
+    kinds = [event["card"]["kind"] for event in sink]
+    assert "requirement_clarification" in kinds

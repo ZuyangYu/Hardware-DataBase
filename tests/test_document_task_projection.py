@@ -66,6 +66,7 @@ def test_document_task_projection_contains_clarification_and_conversation_refs(t
     assert projection["clarification_state"] == {
         "session_id": session.session_id,
         "status": "needs_clarification",
+        "contract_version": "legacy_brief_v1",
         "last_question_id": "scope.revision",
         "clarification_revision": 0,
         "pending_question": {
@@ -194,3 +195,127 @@ def test_document_task_projection_prioritizes_pending_revision_review(tmp_path):
 
     assert projection["pending_review"]["revision_id"] == "revision-1"
     assert projection["next_actions"] == ["review_revision", "open_document_workbench"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 Task 12: planning state projection and v2 lifecycle next actions
+# ---------------------------------------------------------------------------
+
+
+def _v2_pipeline(env):
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = SimpleNamespace(
+        task_service=SimpleNamespace(store=env.tasks),
+        store=SimpleNamespace(generation_sessions=env.sessions),
+        planning=SimpleNamespace(store=env.store.planning),
+    )
+    return pipeline
+
+
+def _projection_ctx():
+    from src.pipelines.document_rag.schemas import RequestContext
+
+    return RequestContext(
+        user_id="user-a",
+        tenant_id="tenant-a",
+        kb_permissions={"1:hardware": "read"},
+        metadata={"resource_department_id": 1},
+    )
+
+
+def test_projection_exposes_planning_state_and_submission_for_v2_task(tmp_path):
+    from tests.test_document_plan_confirmation import _confirm, _confirmable
+
+    env = _confirmable(tmp_path)
+    submission = _confirm(env)
+    pipeline = _v2_pipeline(env)
+
+    projection = pipeline.get_document_task_projection(
+        _projection_ctx(), env.task.task_id,
+    )
+
+    planning = projection["planning_state"]
+    assert planning["output_spec_id"] == "spec-confirm"
+    assert planning["output_spec_version"] == 1
+    assert planning["output_spec_hash"] == env.spec.content_hash
+    assert planning["document_plan_id"] == "plan:spec-confirm"
+    assert planning["plan_hash"] == env.plan.plan_hash
+    assert planning["proposal_status"] == "accepted"
+    assert "purpose" not in planning  # safe projection: identifiers/hashes only
+
+    assert projection["submission"] == {
+        "submission_id": submission.submission_id,
+        "status": "pending",
+        "work_order_id": None,
+        "job_id": None,
+    }
+    assert projection["status"] == "planned"
+    assert "get_document_task_status" in projection["next_actions"]
+
+
+def test_projection_projects_awaiting_plan_confirmation_next_actions(tmp_path):
+    from tests.test_document_plan_confirmation import _confirmable
+
+    env = _confirmable(tmp_path)
+    pipeline = _v2_pipeline(env)
+
+    projection = pipeline.get_document_task_projection(
+        _projection_ctx(), env.task.task_id,
+    )
+
+    assert projection["status"] == "awaiting_plan_confirmation"
+    assert projection["next_actions"] == [
+        "propose_document_plan", "confirm_document_plan",
+    ]
+    assert projection["planning_state"]["proposal_status"] == "proposed"
+    assert projection["submission"] is None
+
+
+def test_projection_maps_internal_awaiting_plan_to_draft(tmp_path):
+    import json
+    import sqlite3
+
+    from tests.test_document_plan_confirmation import _confirmable
+
+    env = _confirmable(tmp_path)
+    pipeline = _v2_pipeline(env)
+    session = env.sessions.get_session(env.task.generation_session_id)
+    raw = session.model_copy(update={
+        "document_plan_id": None,
+        "document_plan_version": None,
+        "status": "awaiting_plan",
+    })
+    task_row = env.tasks.get(env.task.task_id)
+    reset_task = task_row.model_copy(update={
+        "status": "needs_clarification",
+        "document_plan_id": None,
+        "document_plan_version": None,
+    })
+    with sqlite3.connect(env.db) as conn:
+        conn.execute(
+            "UPDATE document_generation_sessions SET status = 'awaiting_plan',"
+            " document_plan_id = NULL, document_plan_version = NULL,"
+            " payload_json = ? WHERE session_id = ?",
+            (
+                json.dumps(raw.model_dump(mode="json", exclude={"messages"})),
+                session.session_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE document_tasks SET status = 'needs_clarification',"
+            " document_plan_id = NULL, document_plan_version = NULL,"
+            " payload_json = ? WHERE task_id = ?",
+            (
+                json.dumps(reset_task.model_dump(mode="json")),
+                task_row.task_id,
+            ),
+        )
+
+    projection = pipeline.get_document_task_projection(
+        _projection_ctx(), env.task.task_id,
+    )
+
+    # The internal awaiting_plan state projects as a user-visible draft.
+    assert projection["status"] == "draft"
+    assert "propose_document_plan" in projection["next_actions"]
+    assert projection["planning_state"] is None

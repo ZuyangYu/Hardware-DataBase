@@ -1080,7 +1080,12 @@ class DocumentAuthoringToolset:
             task_id=getattr(session, "document_task_id", None),
             data=_safe_session(session), next_actions=_session_next_actions(session),
         )
-        self._emit_card("generation_session", result)
+        card_kind = (
+            "requirement_clarification"
+            if getattr(session, "contract_version", "legacy_brief_v1") == "output_spec_v1"
+            else "generation_session"
+        )
+        self._emit_card(card_kind, result)  # type: ignore[arg-type]
         return result
 
     def confirm_generation_session(self, session_id: str) -> DocumentToolResult:
