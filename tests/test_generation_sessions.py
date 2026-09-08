@@ -78,6 +78,65 @@ def test_generation_session_rejects_cross_user_access(tmp_path):
         )
 
 
+def test_output_spec_session_may_omit_template_and_round_trips_planning_refs(tmp_path):
+    store = GenerationSessionStore(str(tmp_path / "authoring.db"))
+    session = store.create_session(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        knowledge_base_name="hardware",
+        template_version_id=None,
+        contract_version="output_spec_v1",
+        status="awaiting_plan",
+        output_spec_id="spec-1",
+        output_spec_version=2,
+    )
+    assert session.template_version_id is None
+    assert session.contract_version == "output_spec_v1"
+    assert session.status == "awaiting_plan"
+    updated = store.bind_plan(
+        session.session_id,
+        output_spec_id="spec-1",
+        output_spec_version=2,
+        document_plan_id="plan-1",
+        document_plan_version=1,
+        status="awaiting_plan_confirmation",
+    )
+    loaded = store.get_session(session.session_id)
+    assert updated.document_plan_id == "plan-1"
+    assert loaded.document_plan_version == 1
+    assert loaded.status == "awaiting_plan_confirmation"
+
+
+def test_legacy_session_constructor_still_requires_template(tmp_path):
+    store = GenerationSessionStore(str(tmp_path / "authoring.db"))
+    with pytest.raises(ValueError, match="template"):
+        store.create_session(
+            tenant_id="tenant-a",
+            user_id="user-a",
+            knowledge_base_name="hardware",
+            template_version_id=None,
+        )
+
+
+def test_planning_pointer_conflict_is_rejected(tmp_path):
+    store = GenerationSessionStore(str(tmp_path / "authoring.db"))
+    session = store.create_session(
+        tenant_id="tenant-a", user_id="user-a", knowledge_base_name="hardware",
+        template_version_id=None, contract_version="output_spec_v1",
+    )
+    store.bind_plan(
+        session.session_id,
+        output_spec_id="spec-1", output_spec_version=1,
+        document_plan_id="plan-1", document_plan_version=1,
+    )
+    with pytest.raises(ValueError, match="already bound"):
+        store.bind_plan(
+            session.session_id,
+            output_spec_id="spec-2", output_spec_version=1,
+            document_plan_id="plan-2", document_plan_version=1,
+        )
+
+
 def test_document_authoring_store_exposes_generation_sessions(tmp_path):
     store = DocumentAuthoringStore(
         db_path=str(tmp_path / "authoring.db"),

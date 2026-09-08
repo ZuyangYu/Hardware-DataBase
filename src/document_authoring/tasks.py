@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 TASK_ORIGINS = frozenset({"chat", "workbench", "api", "legacy"})
 TASK_STATUSES = frozenset({
     "planned", "needs_clarification", "queued", "running", "waiting_human",
+    "awaiting_plan_confirmation", "awaiting_release",
     "completed", "failed", "cancelled", "legacy",
 })
 
@@ -61,12 +62,17 @@ class DocumentTask(BaseModel):
     knowledge_base_name: str | None = None
     template_version_id: str | None = None
     generation_session_id: str | None = None
+    output_spec_id: str | None = None
+    output_spec_version: int | None = Field(default=None, ge=1)
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
     work_order_id: str | None = None
     current_run_id: str | None = None
     current_artifact_id: str | None = None
     artifact_ids: list[str] = Field(default_factory=list)
     status: Literal[
         "planned", "needs_clarification", "queued", "running", "waiting_human",
+        "awaiting_plan_confirmation", "awaiting_release",
         "completed", "failed", "cancelled", "legacy",
     ] = "planned"
     idempotency_key: str | None = None
@@ -89,6 +95,11 @@ class DocumentTask(BaseModel):
             raise ValueError("only legacy document tasks may use legacy status")
         if self.idempotency_key is not None:
             self.idempotency_key = str(self.idempotency_key).strip()[:256] or None
+        for prefix in ("output_spec", "document_plan"):
+            identifier = getattr(self, f"{prefix}_id")
+            version = getattr(self, f"{prefix}_version")
+            if (identifier is None) != (version is None):
+                raise ValueError(f"{prefix} id and version must be provided together")
         self.artifact_ids = list(dict.fromkeys(
             str(item).strip() for item in self.artifact_ids if str(item).strip()
         ))
@@ -128,6 +139,10 @@ class DocumentTaskStore:
                     knowledge_base_name TEXT,
                     template_version_id TEXT,
                     generation_session_id TEXT,
+                    output_spec_id TEXT,
+                    output_spec_version INTEGER,
+                    document_plan_id TEXT,
+                    document_plan_version INTEGER,
                     work_order_id TEXT,
                     status TEXT NOT NULL,
                     idempotency_key TEXT,
@@ -159,6 +174,13 @@ class DocumentTaskStore:
                     ON document_task_events(task_id, created_at, event_id);
                 """
             )
+            for column, ddl in (
+                ("output_spec_id", "TEXT"),
+                ("output_spec_version", "INTEGER"),
+                ("document_plan_id", "TEXT"),
+                ("document_plan_version", "INTEGER"),
+            ):
+                self._ensure_column(conn, "document_tasks", column, ddl)
 
     @staticmethod
     def _normalize(value: Any) -> str | None:
@@ -179,6 +201,12 @@ class DocumentTaskStore:
             raise ValueError("unsupported document task status")
         return normalized
 
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
     def create_task(
         self,
         *,
@@ -193,6 +221,10 @@ class DocumentTaskStore:
         template_version_id: str | None = None,
         generation_session_id: str | None = None,
         status: str = "planned",
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
         idempotency_key: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> DocumentTask:
@@ -209,6 +241,10 @@ class DocumentTaskStore:
             knowledge_base_name=self._normalize(knowledge_base_name),
             template_version_id=self._normalize(template_version_id),
             generation_session_id=self._normalize(generation_session_id),
+            output_spec_id=self._normalize(output_spec_id),
+            output_spec_version=output_spec_version,
+            document_plan_id=self._normalize(document_plan_id),
+            document_plan_version=document_plan_version,
             status=status,  # type: ignore[arg-type]
             idempotency_key=self._normalize(idempotency_key),
             created_by=str(created_by or "").strip(),
@@ -232,15 +268,19 @@ class DocumentTaskStore:
                     """INSERT INTO document_tasks (
                            task_id, tenant_id, user_id, origin, conversation_id,
                            initiating_turn_id, project_id, knowledge_base_name,
-                           template_version_id, generation_session_id, work_order_id,
+                           template_version_id, generation_session_id,
+                           output_spec_id, output_spec_version, document_plan_id,
+                           document_plan_version, work_order_id,
                            status, idempotency_key, created_by, created_at, updated_at,
                            payload_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         task.task_id, task.tenant_id, task.user_id, task.origin,
                         task.conversation_id, task.initiating_turn_id, task.project_id,
                         task.knowledge_base_name, task.template_version_id,
-                        task.generation_session_id, task.work_order_id, task.status,
+                        task.generation_session_id, task.output_spec_id,
+                        task.output_spec_version, task.document_plan_id,
+                        task.document_plan_version, task.work_order_id, task.status,
                         task.idempotency_key, task.created_by, task.created_at.isoformat(),
                         task.updated_at.isoformat(), _json(task),
                     ),
@@ -557,6 +597,81 @@ class DocumentTaskStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def bind_plan(
+        self,
+        task_id: str,
+        *,
+        output_spec_id: str,
+        output_spec_version: int,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+    ) -> DocumentTask:
+        """Bind the current immutable planning pointers to a user task."""
+        spec_id = self._normalize(output_spec_id)
+        plan_id = self._normalize(document_plan_id)
+        if not spec_id or output_spec_version < 1:
+            raise ValueError("output spec id and positive version are required")
+        if (plan_id is None) != (document_plan_version is None):
+            raise ValueError("document plan id and version must be provided together")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM document_tasks WHERE task_id = ?", (str(task_id),)
+                ).fetchone()
+                if row is None:
+                    raise KeyError("document task not found")
+                task = _row_to_task(row)
+                existing = (
+                    task.output_spec_id, task.output_spec_version,
+                    task.document_plan_id, task.document_plan_version,
+                )
+                requested = (spec_id, output_spec_version, plan_id, document_plan_version)
+                if any(value is not None for value in existing):
+                    if existing != requested:
+                        raise ValueError("document task is already bound to another plan")
+                    conn.execute("COMMIT")
+                    return task
+                updated = task.model_copy(update={
+                    "output_spec_id": spec_id,
+                    "output_spec_version": output_spec_version,
+                    "document_plan_id": plan_id,
+                    "document_plan_version": document_plan_version,
+                    "updated_at": _now(),
+                })
+                conn.execute(
+                    """UPDATE document_tasks
+                       SET output_spec_id = ?, output_spec_version = ?,
+                           document_plan_id = ?, document_plan_version = ?,
+                           updated_at = ?, payload_json = ?
+                       WHERE task_id = ?""",
+                    (
+                        updated.output_spec_id, updated.output_spec_version,
+                        updated.document_plan_id, updated.document_plan_version,
+                        updated.updated_at.isoformat(), _json(updated), updated.task_id,
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO document_task_events
+                       (event_id, task_id, event_type, idempotency_key, created_at, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        f"document-task-event-{uuid.uuid4().hex}", updated.task_id,
+                        "plan_bound", f"plan:{spec_id}:{output_spec_version}", _iso(),
+                        _json({
+                            "output_spec_id": spec_id,
+                            "output_spec_version": output_spec_version,
+                            "document_plan_id": plan_id,
+                            "document_plan_version": document_plan_version,
+                        }),
+                    ),
+                )
+                conn.execute("COMMIT")
+                return updated
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def list_events(self, task_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         """Return the append-only task audit events in creation order."""
         normalized_task_id = str(task_id or "").strip()
@@ -622,6 +737,10 @@ class DocumentTaskService:
         generation_session_id: str | None = None,
         project_id: str | None = None,
         knowledge_base_name: str | None = None,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
         idempotency_key: str | None = None,
         status: str = "planned",
     ) -> DocumentTask:
@@ -674,6 +793,10 @@ class DocumentTaskService:
             knowledge_base_name=normalized_kb,
             template_version_id=normalized_template,
             generation_session_id=normalized_session,
+            output_spec_id=self._optional(output_spec_id),
+            output_spec_version=output_spec_version,
+            document_plan_id=self._optional(document_plan_id),
+            document_plan_version=document_plan_version,
             status=status,
             idempotency_key=normalized_key,
         )

@@ -1082,6 +1082,7 @@ class ConvertDocumentArtifactRequest(BaseModel):
 
 class CreateGenerationSessionRequest(BaseModel):
     template_version_id: str = Field(min_length=1)
+    contract_version: Literal["legacy_brief_v1", "output_spec_v1"] = "legacy_brief_v1"
     purpose: str = ""
     output_policy: dict[str, Any] = Field(default_factory=dict)
     # Optional until all existing callers select a schema before clarification.

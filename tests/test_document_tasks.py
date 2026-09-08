@@ -119,6 +119,31 @@ def test_status_changes_are_recorded_as_idempotent_task_events(tmp_path):
     assert events[1]["payload"] == {"from": "queued", "to": "running"}
 
 
+def test_task_supports_planning_confirmation_and_release_statuses(tmp_path):
+    store = _store(tmp_path)
+    task = _create(store)
+    assert store.update_status(task.task_id, "awaiting_plan_confirmation").status == "awaiting_plan_confirmation"
+    assert store.update_status(task.task_id, "awaiting_release").status == "awaiting_release"
+
+
+def test_task_planning_pointer_conflict_is_rejected(tmp_path):
+    store = _store(tmp_path)
+    task = _create(store)
+    bound = store.bind_plan(
+        task.task_id,
+        output_spec_id="spec-1", output_spec_version=1,
+        document_plan_id="plan-1", document_plan_version=1,
+    )
+    assert bound.output_spec_id == "spec-1"
+    assert bound.document_plan_id == "plan-1"
+    with pytest.raises(ValueError, match="already bound"):
+        store.bind_plan(
+            task.task_id,
+            output_spec_id="spec-2", output_spec_version=1,
+            document_plan_id="plan-2", document_plan_version=1,
+        )
+
+
 def test_non_chat_task_does_not_fabricate_a_turn(tmp_path):
     store = _store(tmp_path)
 

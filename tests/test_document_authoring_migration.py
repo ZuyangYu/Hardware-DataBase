@@ -11,6 +11,7 @@ import pytest
 
 from src.document_authoring.harness.idempotency import receipt_action_key
 from src.document_authoring.planning.store import DocumentPlanningStore
+from src.document_authoring.generation_sessions import GenerationSessionStore
 from src.document_authoring.migrations.runner import (
     MigrationError,
     reverse_migration_drill,
@@ -224,6 +225,60 @@ def test_pre_planning_database_gets_idempotent_planning_tables(tmp_path: Path):
         )
     }
     assert names == {"document_output_specs", "document_plans", "document_planning_events"}
+
+
+def test_old_generation_session_table_is_rebuilt_without_changing_payload(tmp_path: Path):
+    database = tmp_path / "sessions.db"
+    payload = _payload({
+        "session_id": "generation-session-legacy",
+        "tenant_id": "tenant-a",
+        "user_id": "user-a",
+        "knowledge_base_name": "hardware",
+        "template_version_id": "template-a",
+        "status": "needs_clarification",
+        "brief": {},
+        "conversation_id": None,
+        "initiating_turn_id": None,
+        "document_task_id": None,
+        "work_order_id": None,
+        "last_question_id": None,
+        "clarification_revision": 0,
+        "created_at": NOW,
+        "updated_at": NOW,
+    })
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """CREATE TABLE document_generation_sessions (
+            session_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL, knowledge_base_name TEXT NOT NULL,
+            template_version_id TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )"""
+    )
+    connection.execute(
+        "INSERT INTO document_generation_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("generation-session-legacy", "tenant-a", "user-a", "hardware", "template-a",
+         "needs_clarification", NOW, NOW, payload),
+    )
+    connection.commit()
+    connection.close()
+
+    first = GenerationSessionStore(str(database))
+    second = GenerationSessionStore(str(database))
+    loaded = first.get_session("generation-session-legacy")
+    assert loaded.template_version_id == "template-a"
+    assert loaded.contract_version == "legacy_brief_v1"
+    assert loaded.model_dump(mode="json")["session_id"] == "generation-session-legacy"
+    columns = {
+        row[1]: row[3]
+        for row in sqlite3.connect(database).execute(
+            "PRAGMA table_info(document_generation_sessions)"
+        ).fetchall()
+    }
+    assert columns["template_version_id"] == 0
+    assert "contract_version" in columns
+    assert second.get_session("generation-session-legacy").brief.purpose == ""
 
 
 def test_dry_run_is_read_only_and_verifies_backup(tmp_path: Path):
