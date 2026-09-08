@@ -20,6 +20,7 @@ from .models import (
     StructureContract,
 )
 from .registry import CapabilityRegistries, build_builtin_registries
+from .recipes import RecipeRegistry, StructureBindingCompiler, build_builtin_recipe_registry
 from .store import DocumentPlanningStore
 
 
@@ -391,6 +392,222 @@ class LegacyTemplatePlanningAdapter:
         return specs
 
 
+class TemplateFreePlanningAdapter:
+    """Compile an OutputSpec into a controlled recipe-backed structure plan.
+
+    This adapter never accepts template coordinates or model-generated package
+    instructions.  It only turns the user-owned outline/table contract into
+    semantic units and resolves exact server-owned recipe/capability versions.
+    """
+
+    def __init__(
+        self,
+        *,
+        registries: CapabilityRegistries | None = None,
+        recipe_registry: RecipeRegistry | None = None,
+        domain_strategy_id: str = "generic_report",
+        domain_strategy_version: str = "1",
+    ) -> None:
+        self.registries = registries or build_builtin_registries()
+        self.recipe_registry = recipe_registry or build_builtin_recipe_registry()
+        self.domain_strategy_id = domain_strategy_id
+        self.domain_strategy_version = domain_strategy_version
+
+    def compile(
+        self,
+        *,
+        output_spec: OutputSpec,
+        source_snapshot_id: str,
+        source_snapshot_hash: str,
+    ) -> DocumentPlan:
+        spec = output_spec if isinstance(output_spec, OutputSpec) else OutputSpec.model_validate(output_spec)
+        issues: list[PlanIssue] = []
+        primary = next(item for item in spec.artifact.deliverables if item.role == "primary")
+        layout_source = spec.layout_source
+        if layout_source.mode == "system_recipe":
+            recipe_id = layout_source.recipe_id
+            recipe_version = layout_source.recipe_version
+            adapter_id = "system_recipe"
+        elif layout_source.mode == "generated_structure":
+            recipe_id = layout_source.constraints_profile_id
+            recipe_version = layout_source.constraints_profile_version
+            adapter_id = "generated_structure"
+        else:
+            raise ValueError("template-free planning requires a template-free layout source")
+
+        recipe = self.recipe_registry.lookup(recipe_id, recipe_version)
+        if recipe is None:
+            issues.append(PlanIssue(
+                code="recipe_missing",
+                severity="error",
+                message=f"system recipe {recipe_id}@{recipe_version} is not registered",
+                path="layout_source",
+            ))
+        elif recipe.status != "available":
+            issues.append(PlanIssue(
+                code="recipe_unavailable",
+                severity="error",
+                message=f"system recipe {recipe_id}@{recipe_version} is unavailable",
+                path="layout_source",
+            ))
+        elif primary.format not in recipe.supported_formats:
+            issues.append(PlanIssue(
+                code="recipe_format_unsupported",
+                severity="error",
+                message=f"recipe {recipe_id}@{recipe_version} does not support {primary.format}",
+                path="artifact.deliverables",
+            ))
+
+        adapter_result = self.registries.layout_adapters.resolve(adapter_id, "1")
+        if isinstance(adapter_result, PlanIssue):
+            issues.append(adapter_result)
+        renderer_result = self.registries.renderers.resolve(primary.format, "1")
+        if isinstance(renderer_result, PlanIssue):
+            issues.append(renderer_result)
+        strategy_result = self.registries.domain_strategies.resolve(
+            self.domain_strategy_id, self.domain_strategy_version,
+        )
+        if isinstance(strategy_result, PlanIssue):
+            issues.append(strategy_result)
+
+        structure_components = list(recipe.component_ids) if recipe is not None else []
+        semantic_units: list[SemanticUnitPlan] = []
+        coverage_requirements: list[CoverageRequirement] = []
+        unit_tasks: list[UnitTaskSpec] = []
+        table_by_unit = {item.unit_id: item for item in spec.table_requirements}
+        required_capabilities = [
+            f"{adapter_id}@1",
+            f"{primary.format}@1",
+            f"{self.domain_strategy_id}@{self.domain_strategy_version}",
+        ]
+        resolved_capabilities = [
+            f"{adapter_id}@1",
+            f"{primary.format}@{renderer_result.version}" if not isinstance(renderer_result, PlanIssue) else "",
+            f"{self.domain_strategy_id}@{self.domain_strategy_version}" if not isinstance(strategy_result, PlanIssue) else "",
+        ]
+        for unit in spec.outline:
+            semantic_units.append(SemanticUnitPlan(
+                unit_id=unit.unit_id,
+                kind=unit.kind,
+                required=unit.required,
+                output_schema={"type": "table" if unit.kind == "table" else "text", "required": unit.required},
+            ))
+            table = table_by_unit.get(unit.unit_id)
+            if unit.kind == "table":
+                if table is None:
+                    issues.append(PlanIssue(
+                        code="table_requirement_missing",
+                        severity="error" if unit.required else "warning",
+                        message=f"table requirement is missing for unit {unit.unit_id}",
+                        path=f"outline.{unit.unit_id}",
+                    ))
+                    coverage_requirements.append(CoverageRequirement(
+                        requirement_id=unit.unit_id,
+                        unit_id=unit.unit_id,
+                        kind="table",
+                        required=unit.required,
+                        required_columns=["unresolved"],
+                    ))
+                else:
+                    coverage_requirements.append(CoverageRequirement(
+                        requirement_id=unit.unit_id,
+                        unit_id=unit.unit_id,
+                        kind="table",
+                        required=unit.required,
+                        row_keys=list(table.row_keys),
+                        required_columns=list(table.required_columns),
+                        row_identity_fields=list(table.row_identity_fields),
+                        row_key_schema=dict(table.row_key_schema),
+                        row_order=table.row_order,
+                        duplicate_policy=table.duplicate_policy,
+                    ))
+            else:
+                coverage_kind = "scalar" if unit.kind in {"field", "review_item"} else unit.kind
+                coverage_requirements.append(CoverageRequirement(
+                    requirement_id=unit.unit_id,
+                    unit_id=unit.unit_id,
+                    kind=coverage_kind,
+                    required=unit.required,
+                    min_evidence_items=1 if unit.required else 0,
+                ))
+            output_schema = {"type": "table" if unit.kind == "table" else "text"}
+            if table is not None:
+                output_schema.update({
+                    "row_keys": list(table.row_keys),
+                    "required_columns": list(table.required_columns),
+                    "row_order": table.row_order,
+                    "duplicate_policy": table.duplicate_policy,
+                })
+            unit_tasks.append(UnitTaskSpec(
+                task_id=f"unit-task:{unit.unit_id}",
+                unit_id=unit.unit_id,
+                plan_version=spec.version,
+                input_schema={"type": "frozen_source_scope"},
+                output_schema=output_schema,
+                row_scope=table.row_scope if table is not None else None,
+                allowed_sources=["frozen_source_scope"],
+                allowed_retrievers=["generic_report@1"],
+                max_attempts=3,
+                timeout_seconds=300,
+                action_key=f"document-plan:unit:{unit.unit_id}:v{spec.version}",
+            ))
+
+        output_summary = {
+            "purpose": spec.purpose,
+            "document_type": spec.document_type,
+            "target_identity": dict(spec.target_identity),
+            "layout_mode": layout_source.mode,
+            "recipe_id": recipe_id,
+            "recipe_version": recipe_version,
+            "primary_format": primary.format,
+            "outline_unit_ids": [unit.unit_id for unit in spec.outline],
+            "table_unit_ids": [item.unit_id for item in spec.table_requirements],
+            "missing_data_policy": spec.missing_data_policy,
+            "inference_policy": spec.inference_policy,
+            "approval_policy_id": spec.approval_policy_id,
+        }
+        return DocumentPlan(
+            document_plan_id=f"plan:{spec.output_spec_id}",
+            version=spec.version,
+            status="blocked" if any(issue.blocking for issue in issues) else "proposed",
+            output_spec_id=spec.output_spec_id,
+            output_spec_version=spec.version,
+            output_spec_hash=spec.content_hash,
+            output_spec_summary=output_summary,
+            source_snapshot_id=source_snapshot_id,
+            source_snapshot_hash=source_snapshot_hash,
+            domain_strategy_id=self.domain_strategy_id,
+            domain_strategy_version=self.domain_strategy_version,
+            layout_adapter_id=adapter_id,
+            layout_adapter_version="1",
+            renderer_capability_id=primary.format,
+            renderer_capability_version=(renderer_result.version if not isinstance(renderer_result, PlanIssue) else "1"),
+            layout_contract=StructureContract(
+                structure_profile_id=recipe_id,
+                structure_profile_version=recipe_version,
+                components=structure_components,
+            ),
+            semantic_units=semantic_units,
+            dependency_edges=[],
+            coverage_contract=CoverageContract(requirements=coverage_requirements),
+            unit_tasks=unit_tasks,
+            required_capabilities=list(dict.fromkeys(required_capabilities)),
+            resolved_capabilities=list(dict.fromkeys(value for value in resolved_capabilities if value)),
+            issues=issues,
+            retrieval_specs=[{"unit_id": unit.unit_id, "retrieval_policy_id": "generic_report"} for unit in spec.outline],
+            unit_review_policy={"policy_id": "unit-default@1"},
+            document_review_policy={"policy_id": "document-default@1"},
+            render_spec={
+                "format": primary.format,
+                "deliverables": [item.format for item in spec.artifact.deliverables],
+                "template_free": True,
+                "recipe_id": recipe_id,
+                "recipe_version": recipe_version,
+            },
+            approval_policy={"policy_id": spec.approval_policy_id},
+        )
+
+
 class DocumentPlanningService:
     """Thin coordinator around the pure compiler and optional persistence."""
 
@@ -398,13 +615,18 @@ class DocumentPlanningService:
         self,
         *,
         adapter: LegacyTemplatePlanningAdapter | None = None,
+        template_free_adapter: TemplateFreePlanningAdapter | None = None,
         store: DocumentPlanningStore | None = None,
     ):
         self.adapter = adapter or LegacyTemplatePlanningAdapter()
+        self.template_free_adapter = template_free_adapter or TemplateFreePlanningAdapter()
         self.store = store
 
     def compile(self, **kwargs: Any) -> DocumentPlan:
         return self.adapter.compile(**kwargs)
+
+    def compile_template_free(self, **kwargs: Any) -> DocumentPlan:
+        return self.template_free_adapter.compile(**kwargs)
 
     def persist_proposal(
         self,
@@ -484,4 +706,8 @@ class DocumentPlanningService:
         return plan
 
 
-__all__ = ["DocumentPlanningService", "LegacyTemplatePlanningAdapter"]
+__all__ = [
+    "DocumentPlanningService",
+    "LegacyTemplatePlanningAdapter",
+    "TemplateFreePlanningAdapter",
+]

@@ -156,6 +156,17 @@ def build_builtin_registries() -> CapabilityRegistries:
         version="1",
         supported_document_types=["generic", "icd", "fpt", "requirements"],
     ))
+    for strategy_id, document_types in (
+        ("generic_report", ["generic", "generic_report", "report"]),
+        ("icd", ["icd"]),
+        ("fpt", ["fpt"]),
+        ("requirements", ["requirements"]),
+    ):
+        domain_strategies.register(DomainStrategyDescriptor(
+            strategy_id=strategy_id,
+            version="1",
+            supported_document_types=document_types,
+        ))
 
     layout_adapters = LayoutAdapterRegistry()
     layout_adapters.register(LayoutAdapterDescriptor(
@@ -164,17 +175,19 @@ def build_builtin_registries() -> CapabilityRegistries:
         supported_formats=["xlsx", "xlsm", "docx", "markdown"],
         supported_modes=["provided_template"],
     ))
-    for adapter_id in ("system_recipe", "generated_structure"):
+    for adapter_id, formats in (
+        ("system_recipe", ["docx", "pdf", "xlsx"]),
+        ("generated_structure", ["docx", "pdf", "xlsx"]),
+    ):
         layout_adapters.register(LayoutAdapterDescriptor(
             adapter_id=adapter_id,
             version="1",
-            status="unavailable",
-            unavailable_reason="template-free execution is deferred to Phase 3",
+            supported_formats=formats,
             supported_modes=[adapter_id],
         ))
 
     renderers = RendererCapabilityRegistry()
-    for renderer_id in ("xlsx", "xlsm", "docx", "markdown"):
+    for renderer_id in ("xlsx", "xlsm", "docx", "pdf", "markdown"):
         renderers.register(RendererCapabilityDescriptor(
             renderer_id=renderer_id,
             version="1",

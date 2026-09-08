@@ -43,17 +43,16 @@ def test_disabled_or_missing_capability_returns_structured_issue_without_fallbac
     assert registry.resolve("future-domain", "1").code == "capability_missing"
 
 
-def test_builtin_registries_expose_current_renderers_and_explicit_template_free_gaps():
+def test_builtin_registries_expose_phase3_capabilities_without_version_fallback():
     registries = build_builtin_registries()
     assert registries.domain_strategies.lookup("legacy_document_schema", "1") is not None
     assert registries.layout_adapters.lookup("provided_template", "1") is not None
     assert registries.renderers.lookup("xlsx", "1") is not None
     assert registries.renderers.lookup("docx", "1") is not None
-
-    issue = registries.layout_adapters.resolve("generated_structure", "1")
-    assert isinstance(issue, PlanIssue)
-    assert issue.code == "capability_unavailable"
-    assert issue.blocking is True
+    assert registries.renderers.lookup("pdf", "1") is not None
+    assert registries.layout_adapters.resolve("generated_structure", "1").status == "available"
+    assert registries.layout_adapters.resolve("system_recipe", "1").status == "available"
+    assert registries.domain_strategies.lookup("generic_report", "1") is not None
 
 
 def test_descriptors_are_strict_and_do_not_accept_runtime_payloads():
@@ -71,4 +70,3 @@ def test_descriptors_are_strict_and_do_not_accept_runtime_payloads():
             formats=["xlsx"],
             path="/tmp/renderer",
         )
-

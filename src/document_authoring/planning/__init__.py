@@ -45,7 +45,17 @@ from .registry import (
 from .sources import FrozenSourceRef, FrozenSourceScope, SourceType
 from .diff import diff_document_plans
 from .legacy import legacy_brief_to_output_spec
-from .service import DocumentPlanningService, LegacyTemplatePlanningAdapter
+from .service import DocumentPlanningService, LegacyTemplatePlanningAdapter, TemplateFreePlanningAdapter
+from .recipes import (
+    RecipeComponent,
+    RecipeRegistry,
+    StructureBindingCompiler,
+    StructureBindingSet,
+    StructureConstraintsProfile,
+    StructureRenderBinding,
+    SystemRecipe,
+    build_builtin_recipe_registry,
+)
 from .intake import IntakeQuestion, OutputSpecIntakeService, OutputSpecVersionConflict
 from .coverage import CoverageEvaluator
 from .review_contracts import (
@@ -107,6 +117,15 @@ __all__ = [
     "diff_document_plans",
     "DocumentPlanningService",
     "LegacyTemplatePlanningAdapter",
+    "TemplateFreePlanningAdapter",
+    "RecipeComponent",
+    "RecipeRegistry",
+    "StructureBindingCompiler",
+    "StructureBindingSet",
+    "StructureConstraintsProfile",
+    "StructureRenderBinding",
+    "SystemRecipe",
+    "build_builtin_recipe_registry",
     "legacy_brief_to_output_spec",
     "IntakeQuestion",
     "OutputSpecIntakeService",
