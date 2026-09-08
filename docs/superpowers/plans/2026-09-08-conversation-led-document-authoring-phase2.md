@@ -702,7 +702,7 @@ production worker stop/restart and production UI/API exercise remain a
 release-operator prerequisite; this closeout does not enable the flag or any
 allowlist.
 
-- [ ] **Step 6: Commit closeout documentation and factual status**
+- [x] **Step 6: Commit closeout documentation and factual status**
 
 Stage only files actually changed. Update the design status and this plan with measured results only after the manual smoke and threshold approval complete.
 
