@@ -3,13 +3,16 @@
  *
  * 消费 document_card SSE 事件(线格式 {"type":"document_card","payload":{"card":{...}}}),
  * 只渲染后端约定的不可变引用与状态枚举:kind / status / next_actions / kb_name /
- * work_order_id / generation_session_id / target_format / artifacts(仅 artifact_id+stage)。
+ * task_id / work_order_id / generation_session_id / target_format / artifacts(仅 artifact_id+stage)。
  * 刷新状态按钮直调 REST 状态接口;人工门按钮一律深链到文档生成工作台;
  * 产物下载按钮走 REST 直链,URL 与文件名由 documentCardModel 前端拼装。
  */
 import { cn } from '@/lib/utils';
+import { useId, useState } from 'react';
 import type { DocumentStatusTone } from '../../documentGenerationModel';
 import {
+  canAnswerClarification,
+  clarificationAnswerValue,
   documentCardStatusTone,
   documentCardStatusLabel,
   documentCardTitle,
@@ -33,10 +36,21 @@ type Props = {
   card: DocumentCardData;
   refreshing?: boolean;
   onRefreshStatus?: (card: DocumentCardData) => void;
+  onAnswerClarification?: (card: DocumentCardData, answer: string) => void;
+  answering?: boolean;
 };
 
-export default function DocumentStatusCard({ card, refreshing = false, onRefreshStatus }: Props) {
+export default function DocumentStatusCard({
+  card,
+  refreshing = false,
+  onRefreshStatus,
+  onAnswerClarification,
+  answering = false,
+}: Props) {
+  const [answer, setAnswer] = useState('');
+  const answerInputId = useId();
   const workOrderId = card.work_order_id?.trim() ?? '';
+  const canAnswer = canAnswerClarification(card, Boolean(onAnswerClarification));
   const tone = documentCardStatusTone(card.status);
   const workbenchActions = documentCardWorkbenchActions(card);
   return (
@@ -62,17 +76,68 @@ export default function DocumentStatusCard({ card, refreshing = false, onRefresh
           工单 <span className="font-mono text-[#464c5e]">{workOrderId}</span>
         </div>
       )}
-      {((onRefreshStatus && workOrderId) || workbenchActions.length > 0) && (
+      {card.content && (
+        <div className="mt-[6px] rounded-md border border-[#e3e7f1] bg-white px-[8px] py-[6px] text-[12px] text-[#464c5e]">
+          <p>{card.content}</p>
+          {card.options && card.options.length > 0 && (
+            <div className="mt-[5px] flex flex-wrap gap-[4px]" aria-label="澄清候选项">
+              {card.options.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  disabled={!canAnswer || answering}
+                  onClick={() => setAnswer(option)}
+                  className="rounded-full bg-[#f1f5ff] px-[7px] py-[2px] text-[11px] text-[#315da8] disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+          )}
+          {canAnswer && (
+            <form
+              className="mt-[8px] flex flex-col gap-[5px]"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const value = clarificationAnswerValue(answer, answering);
+                if (value) onAnswerClarification?.(card, value);
+              }}
+            >
+              <label className="text-[11px] font-medium text-[#757f9c]" htmlFor={answerInputId}>
+                回答澄清问题
+              </label>
+              <textarea
+                id={answerInputId}
+                aria-label="回答澄清问题"
+                value={answer}
+                onChange={(event) => setAnswer(event.target.value)}
+                disabled={answering}
+                rows={2}
+                className="w-full resize-y rounded-md border border-[#e3e7f1] px-[7px] py-[5px] text-[12px] outline-none focus:border-[#0b6cf5]"
+                placeholder="输入回答，或先选择候选项"
+              />
+              <button
+                type="submit"
+                disabled={clarificationAnswerValue(answer, answering) === null}
+                className="self-end rounded-[8px] bg-[#0b6cf5] px-[10px] py-[3px] text-[12px] font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {answering ? '提交中…' : '提交回答'}
+              </button>
+            </form>
+          )}
+        </div>
+      )}
+      {((onRefreshStatus && (workOrderId || card.generation_session_id)) || workbenchActions.length > 0) && (
         <div className="mt-[6px] flex flex-wrap items-center gap-[8px]">
-          {onRefreshStatus && workOrderId && (
+          {onRefreshStatus && (workOrderId || card.generation_session_id) && (
             <button
               type="button"
-              aria-label={`刷新工单状态 ${workOrderId}`}
+              aria-label={workOrderId ? `刷新工单状态 ${workOrderId}` : '刷新澄清问题'}
               disabled={refreshing}
               onClick={() => onRefreshStatus(card)}
               className="rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] py-[3px] text-[12px] font-medium text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {refreshing ? '刷新中…' : '刷新状态'}
+              {refreshing ? '刷新中…' : workOrderId ? '刷新状态' : '刷新问题'}
             </button>
           )}
           {workbenchActions.map((action) => (

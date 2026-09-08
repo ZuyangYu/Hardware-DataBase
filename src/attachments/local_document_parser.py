@@ -62,6 +62,89 @@ def _rough_tokens(text: str) -> int:
     return int(len(text) / _CHARS_PER_TOKEN)
 
 
+def _json_text(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _split_oversized_docx_row(row: list[str], max_cell_text_length: int) -> list[list[str]]:
+    """Represent an oversized source row as ordered, bounded cell fragments.
+
+    A fragment keeps the original cell position and leaves the other cells
+    empty.  This keeps every payload a JSON array of rows while allowing the
+    caller to recover the exact source cell text by concatenating fragments.
+    """
+    fragments: list[list[str]] = []
+    width = len(row)
+    for cell_index, value in enumerate(row):
+        cursor = 0
+        if not value:
+            values = [""]
+        else:
+            values = []
+            while cursor < len(value):
+                remaining = min(max_cell_text_length, len(value) - cursor)
+                low, high = 1, remaining
+                best = 1
+                while low <= high:
+                    middle = (low + high) // 2
+                    candidate = [""] * width
+                    candidate[cell_index] = value[cursor : cursor + middle]
+                    if len(_json_text([candidate])) <= _MAX_PART_TEXT_CHARS:
+                        best = middle
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                values.append(value[cursor : cursor + best])
+                cursor += best
+        for fragment in values:
+            candidate = [""] * width
+            candidate[cell_index] = fragment
+            fragments.append(candidate)
+    return fragments
+
+
+def _docx_table_chunks(
+    rows: list[list[str]], max_cell_text_length: int
+) -> list[tuple[str, int, int]]:
+    """Serialize DOCX rows into valid, bounded JSON payloads.
+
+    The row bounds are source row indices (zero based), not chunk-local
+    positions.  Oversized rows are split into cell fragments before the
+    normal row packing loop, so no ``_part`` truncation can corrupt JSON.
+    """
+    chunks: list[tuple[str, int, int]] = []
+    current: list[list[str]] = []
+    current_indices: list[int] = []
+
+    def flush() -> None:
+        if not current:
+            return
+        chunks.append((_json_text(current), min(current_indices), max(current_indices)))
+        current.clear()
+        current_indices.clear()
+
+    for row_index, row in enumerate(rows):
+        if len(_json_text([row])) <= _MAX_PART_TEXT_CHARS and all(
+            len(cell) <= max_cell_text_length for cell in row
+        ):
+            row_fragments = [row]
+        else:
+            row_fragments = _split_oversized_docx_row(row, max_cell_text_length)
+        for row_fragment in row_fragments:
+            candidate = current + [row_fragment]
+            if current and len(_json_text(candidate)) > _MAX_PART_TEXT_CHARS:
+                flush()
+                candidate = [row_fragment]
+            # _split_oversized_docx_row guarantees this branch for ordinary
+            # strings; retain a defensive fallback for unusual JSON overhead.
+            if len(_json_text(candidate)) > _MAX_PART_TEXT_CHARS:
+                continue
+            current.append(row_fragment)
+            current_indices.append(row_index)
+    flush()
+    return chunks
+
+
 class LocalDocumentParser:
     """PDF / DOCX / TXT / MD parsing for the attachment domain."""
 
@@ -249,6 +332,11 @@ class LocalDocumentParser:
         degraded_reasons: list[str] = []
         heading_path: list[str] = []
         ordinal = 0
+        table_index = 0
+        table_part_count = 0
+        degraded_table_count = 0
+        rows_remaining = max(0, int(src.settings.CHAT_ATTACHMENT_MAX_ROWS))
+        cells_remaining = max(0, int(src.settings.CHAT_ATTACHMENT_MAX_CELLS))
 
         def _text_of_cell(cell) -> str:
             return "\n".join(
@@ -268,23 +356,95 @@ class LocalDocumentParser:
             if getattr(item, "text", None) is None and not hasattr(item, "rows"):
                 continue
             if hasattr(item, "rows"):  # Table
-                rows: list[list[str]] = []
-                for row in item.rows[:2000]:
-                    rows.append([_text_of_cell(cell)[:1000] for cell in row.cells[:64]])
-                if not rows:
-                    continue
-                table_text = json.dumps(rows, ensure_ascii=False)
-                parts.append(
-                    _part(
-                        asset.asset_id,
-                        ordinal,
-                        PART_TYPE_TABLE,
-                        table_text,
-                        locator={"heading_path": list(heading_path), "table": ordinal},
-                        metadata={"format": "docx", "rows": len(rows)},
-                    )
+                source_rows = item.rows
+                max_cell_text_length = max(
+                    1, int(src.settings.CHAT_ATTACHMENT_MAX_CELL_TEXT_LENGTH)
                 )
-                ordinal += 1
+                rows: list[list[str]] = []
+                table_degraded = False
+                allowed_rows = min(len(source_rows), rows_remaining)
+                if len(source_rows) > allowed_rows:
+                    degraded_reasons.append(
+                        f"DOCX table {table_index} exceeds row limit; "
+                        f"{len(source_rows) - allowed_rows} row(s) not indexed"
+                    )
+                    table_degraded = True
+                cells_seen = 0
+                fragmented_row_indices: set[int] = set()
+                for row_index, row in enumerate(source_rows[:allowed_rows]):
+                    remaining_cells = cells_remaining - cells_seen
+                    if remaining_cells <= 0:
+                        degraded_reasons.append(
+                            f"DOCX table {table_index} exceeds cell limit; "
+                            "remaining rows not indexed"
+                        )
+                        table_degraded = True
+                        break
+                    cells = row.cells
+                    if len(cells) > remaining_cells:
+                        degraded_reasons.append(
+                            f"DOCX table {table_index} exceeds cell limit; "
+                            f"{len(cells) - remaining_cells} cell(s) in row {row_index} not indexed"
+                        )
+                        table_degraded = True
+                    selected_cells = cells[:remaining_cells]
+                    rows.append([_text_of_cell(cell) for cell in selected_cells])
+                    cells_seen += len(selected_cells)
+                    if selected_cells and (
+                        len(_json_text([rows[-1]])) > _MAX_PART_TEXT_CHARS
+                        or any(
+                            len(value) > max_cell_text_length for value in rows[-1]
+                        )
+                    ):
+                        fragmented_row_indices.add(row_index)
+                rows_remaining -= len(rows)
+                cells_remaining -= cells_seen
+                if not rows:
+                    if table_degraded:
+                        degraded_table_count += 1
+                    table_index += 1
+                    continue
+                header_context = list(rows[0])
+                table_locator = ordinal
+                for table_text, row_start, row_end in _docx_table_chunks(
+                    rows, max_cell_text_length
+                ):
+                    payload_rows = json.loads(table_text)
+                    parts.append(
+                        _part(
+                            asset.asset_id,
+                            ordinal,
+                            PART_TYPE_TABLE,
+                            table_text,
+                            locator={
+                                "heading_path": list(heading_path),
+                                # Preserve the historical table locator (the
+                                # first emitted part's ordinal); table_index
+                                # is the stable source-table identity.
+                                "table": table_locator,
+                                "table_index": table_index,
+                                "row_start": row_start,
+                                "row_end": row_end,
+                            },
+                            metadata={
+                                "format": "docx",
+                                "rows": len(payload_rows),
+                                "table_rows": len(rows),
+                                "table_index": table_index,
+                                "table_id": f"table-{table_index}",
+                                "row_start": row_start,
+                                "row_end": row_end,
+                                "header_context": header_context,
+                                "row_fragment": row_start == row_end
+                                and row_start in fragmented_row_indices,
+                            },
+                        )
+                    )
+                    ordinal += 1
+                    table_part_count += 1
+                if table_degraded:
+                    degraded_table_count += 1
+                table_index += 1
                 continue
             text = (item.text or "").strip()
             if not text:
@@ -361,6 +521,9 @@ class LocalDocumentParser:
             "links": links[:100],
             "embedded_image_count": len(embedded_images),
             "embedded_images": embedded_images[:100],
+            "table_count": table_index,
+            "table_part_count": table_part_count,
+            "degraded_table_count": degraded_table_count,
         }
         status = PARSE_STATUS_DEGRADED if degraded_reasons else PARSE_STATUS_READY
         return ParseOutcome(

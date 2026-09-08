@@ -123,6 +123,26 @@ class DocumentValidator:
                 notes.append("scalar typed value requires one unique normalized value")
             if typed.kind == "enumeration" and not normalized_values:
                 notes.append("enumeration typed value requires at least one normalized value")
+            if typed.kind == "table":
+                if not typed.rows:
+                    notes.append("typed table requires at least one row")
+                seen_rows = set()
+                for index, row in enumerate(typed.rows):
+                    ids = set(row.evidence_ids)
+                    if not ids or not ids <= set(typed.evidence_ids) or not ids <= set(evidence_by_id):
+                        notes.append(f"table row {index} requires allowed row evidence")
+                        continue
+                    texts = [str(evidence_by_id[key].get("content") or "") for key in ids]
+                    if not row.cells or any(not value.strip() for value in row.cells.values()):
+                        notes.append(f"table row {index} contains empty cells")
+                    for column, value in row.cells.items():
+                        pattern = r"(?<![A-Za-z0-9_.])" + re.escape(value.strip()) + r"(?![A-Za-z0-9_.])"
+                        if value.strip() and not any(re.search(pattern, text, flags=re.IGNORECASE) for text in texts):
+                            notes.append(f"table row {index} column {column} is not supported by its row evidence")
+                    signature = tuple(sorted(row.cells.items()))
+                    if signature in seen_rows:
+                        notes.append(f"table row {index} duplicates an earlier record")
+                    seen_rows.add(signature)
             typed = typed.model_copy(update={"normalized_values": normalized_values})
 
         return base.model_copy(update={
@@ -208,6 +228,8 @@ def _consistency_values_compatible(left: str, right: str) -> bool:
 
 def _expected_typed_kind(value_type: str) -> str | None:
     normalized = value_type.strip().casefold()
+    if normalized in {"table", "repeating_table"}:
+        return "table"
     if normalized in {
         "text", "string", "scalar", "number", "integer", "float", "date",
         "datetime", "boolean", "bool",

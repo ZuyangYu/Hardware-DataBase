@@ -3,7 +3,14 @@
  * 以及从 useKbChat 迁入的 document context 纯函数。
  */
 import { api, uploadFiles, uploadFilesWithProgress } from './client';
-import type { DocumentAnalysis, DocumentContext } from './types';
+import type {
+  ArtifactRevision,
+  DocumentAnalysis,
+  DocumentContext,
+  DocumentReview,
+  DocumentTaskProjection,
+  GenerationSession,
+} from './types';
 
 export const DOCUMENT_CONTEXT_VERSION = 1;
 // Keep the client-side affordance aligned with the server-owned 30 minute
@@ -133,6 +140,52 @@ export function buildAttachmentTemplateAnalyzeRequest(
   return '/api/v1/document-generation/templates/analyze-from-attachment';
 }
 
+/** Build the idempotent clarification command shared by Workbench and Chat. */
+export function buildClarificationAnswerRequest(
+  sessionId: string | number,
+  knowledgeBaseName: string,
+  questionId: string,
+  answer: string,
+  clientRequestId = createClientRequestId(),
+): {
+  path: string;
+  body: {
+    question_id: string;
+    answer: string;
+    client_request_id: string;
+  };
+} {
+  return {
+    path: `/api/v1/document-generation/sessions/${encodeURIComponent(String(sessionId))}/messages?kb=${encodeURIComponent(knowledgeBaseName)}`,
+    body: {
+      question_id: questionId,
+      answer,
+      client_request_id: clientRequestId,
+    },
+  };
+}
+
+export function generationSessionPath(knowledgeBaseName: string, sessionId: string | number): string {
+  return `/api/v1/document-generation/sessions/${encodeURIComponent(String(sessionId))}?kb=${encodeURIComponent(knowledgeBaseName)}`;
+}
+
+export async function fetchGenerationSession(
+  knowledgeBaseName: string,
+  sessionId: string | number,
+): Promise<GenerationSession> {
+  return api.get<GenerationSession>(generationSessionPath(knowledgeBaseName, sessionId));
+}
+
+export async function answerGenerationSession(
+  knowledgeBaseName: string,
+  sessionId: string | number,
+  questionId: string,
+  answer: string,
+): Promise<GenerationSession> {
+  const request = buildClarificationAnswerRequest(sessionId, knowledgeBaseName, questionId, answer);
+  return api.post<GenerationSession>(request.path, request.body);
+}
+
 /** Convert an uploaded chat attachment into an independent TemplateVersion. */
 export function analyzeTemplateFromAttachment(
   kb: string,
@@ -168,5 +221,103 @@ export function requestDocumentArtifactConversion(
   return api.post<DocumentArtifactConversionJob>(
     `/api/v1/document-generation/artifacts/${encodeURIComponent(artifactId)}/convert?kb=${encodeURIComponent(kb)}`,
     { target_format: targetFormat },
+  );
+}
+
+export function documentTaskProjectionPath(knowledgeBaseName: string, taskId: string): string {
+  return `/api/v1/document-generation/tasks/${encodeURIComponent(taskId)}/projection?kb=${encodeURIComponent(knowledgeBaseName)}`;
+}
+
+export async function fetchDocumentTaskProjection(
+  knowledgeBaseName: string,
+  taskId: string,
+): Promise<DocumentTaskProjection> {
+  return api.get<DocumentTaskProjection>(documentTaskProjectionPath(knowledgeBaseName, taskId));
+}
+
+export function documentTaskReviewsPath(knowledgeBaseName: string, taskId: string): string {
+  return `/api/v1/document-generation/tasks/${encodeURIComponent(taskId)}/reviews?kb=${encodeURIComponent(knowledgeBaseName)}`;
+}
+
+export async function fetchDocumentTaskReviews(
+  knowledgeBaseName: string,
+  taskId: string,
+): Promise<DocumentReview[]> {
+  return api.get<DocumentReview[]>(documentTaskReviewsPath(knowledgeBaseName, taskId));
+}
+
+export function documentTaskRevisionsPath(knowledgeBaseName: string, taskId: string): string {
+  return `/api/v1/document-generation/tasks/${encodeURIComponent(taskId)}/revisions?kb=${encodeURIComponent(knowledgeBaseName)}`;
+}
+
+export async function fetchDocumentTaskRevisions(
+  knowledgeBaseName: string,
+  taskId: string,
+): Promise<ArtifactRevision[]> {
+  return api.get<ArtifactRevision[]>(documentTaskRevisionsPath(knowledgeBaseName, taskId));
+}
+
+export type CreateDocumentRevisionInput = {
+  parent_artifact_id: string;
+  request_type: ArtifactRevision['request_type'];
+  request: string;
+  changed_fields?: string[];
+  changed_sections?: string[];
+  client_request_id: string;
+  metadata?: Record<string, unknown>;
+};
+
+export async function createDocumentRevision(
+  knowledgeBaseName: string,
+  taskId: string,
+  body: CreateDocumentRevisionInput,
+): Promise<ArtifactRevision> {
+  return api.post<ArtifactRevision>(documentTaskRevisionsPath(knowledgeBaseName, taskId), body);
+}
+
+export type CompleteDocumentRevisionInput = {
+  child_artifact_id: string;
+  revalidation_status: 'passed' | 'failed' | 'requires_human';
+  revalidation_result?: Record<string, unknown>;
+};
+
+/** Commit a controlled worker's already-persisted revision child artifact. */
+export async function completeDocumentRevision(
+  knowledgeBaseName: string,
+  revisionId: string,
+  body: CompleteDocumentRevisionInput,
+): Promise<ArtifactRevision> {
+  return api.post<ArtifactRevision>(
+    `/api/v1/document-generation/revisions/${encodeURIComponent(revisionId)}/complete?kb=${encodeURIComponent(knowledgeBaseName)}`,
+    body,
+  );
+}
+
+export type DocumentReviewDecisionInput = {
+  subject_hash: string;
+  decision: unknown;
+  client_request_id: string;
+  status?: string;
+  decision_metadata?: Record<string, unknown>;
+};
+
+export async function submitDocumentReviewDecision(
+  knowledgeBaseName: string,
+  reviewId: string,
+  body: DocumentReviewDecisionInput,
+): Promise<DocumentReview> {
+  return api.post<DocumentReview>(
+    `/api/v1/document-generation/reviews/${encodeURIComponent(reviewId)}/decision?kb=${encodeURIComponent(knowledgeBaseName)}`,
+    body,
+  );
+}
+
+export async function resumeDocumentTask(
+  knowledgeBaseName: string,
+  taskId: string,
+): Promise<{ task_id: string; work_order_id?: string; run_id?: string; status: string }> {
+  return api.post(
+    `/api/v1/document-generation/tasks/${encodeURIComponent(taskId)}/resume?kb=${encodeURIComponent(knowledgeBaseName)}`,
+    {},
   );
 }

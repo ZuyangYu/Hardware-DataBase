@@ -1813,7 +1813,7 @@ class DocumentAuthoringStore:
         return ValidationReport.model_validate(_payload(row)) if row else None
 
     def save_artifact(self, artifact: DocumentArtifact, content: bytes, suffix: str) -> DocumentArtifact:
-        fingerprint = artifact.idempotency_fingerprint or content_hash({
+        fingerprint_payload = {
             "work_order_id": artifact.work_order_id,
             "run_id": artifact.run_id,
             "stage": artifact.stage,
@@ -1822,7 +1822,10 @@ class DocumentAuthoringStore:
             "parent_artifact_id": artifact.parent_artifact_id,
             "validation_report_id": artifact.validation_report_id,
             "approval_subject_hash": artifact.approval_subject_hash,
-        })
+        }
+        if artifact.revision_id:
+            fingerprint_payload["revision_id"] = artifact.revision_id
+        fingerprint = artifact.idempotency_fingerprint or content_hash(fingerprint_payload)
         artifact = artifact.model_copy(update={"idempotency_fingerprint": fingerprint})
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1853,6 +1856,60 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT payload_json FROM document_artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
         return DocumentArtifact.model_validate(_payload(row)) if row else None
+
+    def update_artifact(self, artifact_id: str, **updates: Any) -> DocumentArtifact:
+        """Update only governed lifecycle metadata on an immutable artifact.
+
+        Content, hashes and storage references are intentionally not writable
+        here.  Controlled revision completion may bind the already persisted
+        child to a revision through this metadata-only boundary; revision
+        planning still preserves the original bytes for audit.
+        """
+        allowed = {
+            "validity_status", "policy_status", "regeneration_status", "status_reasons", "revision_id",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"unsupported artifact metadata updates: {sorted(unknown)}")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM document_artifacts WHERE artifact_id = ?",
+                    (str(artifact_id or "").strip(),),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("artifact not found")
+                current = DocumentArtifact.model_validate(_payload(row))
+                revised = current.model_copy(update={**updates})
+                conn.execute(
+                    "UPDATE document_artifacts SET payload_json = ? WHERE artifact_id = ?",
+                    (_json(revised), revised.artifact_id),
+                )
+                event = DocumentOutboxEvent(
+                    event_id=f"outbox-{uuid.uuid4().hex}",
+                    event_key=f"artifact:{revised.artifact_id}:metadata:{content_hash(updates)}",
+                    aggregate_type="artifact",
+                    aggregate_id=revised.artifact_id,
+                    event_type="document_artifact.metadata_updated",
+                    payload={
+                        "artifact_id": revised.artifact_id,
+                        "work_order_id": revised.work_order_id,
+                        "validity_status": revised.validity_status,
+                        "regeneration_status": revised.regeneration_status,
+                    },
+                )
+                existing_event = conn.execute(
+                    "SELECT 1 FROM document_outbox_events WHERE event_key = ?",
+                    (event.event_key,),
+                ).fetchone()
+                if existing_event is None:
+                    self._put_outbox_event(conn, event)
+                conn.execute("COMMIT")
+                return revised
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def _read_artifact_content(self, artifact_id: str, *, verify_integrity: bool) -> bytes:
         artifact = self.get_artifact(artifact_id)

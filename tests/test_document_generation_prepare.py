@@ -6,6 +6,7 @@ from src.core.app_pipeline import AppPipeline
 
 class _Order:
     work_order_id = "wo-1"
+    task_id = "task-1"
     scope_type = "knowledge_base"
     knowledge_base_name = "shared"
 
@@ -18,6 +19,15 @@ class _Snapshot:
 class _ScopeReview:
     pending_count = 0
     exceptions = []
+
+
+class _Resolution:
+    def to_dict(self):
+        return {
+            "unresolved_requirements": [{"field": "pcb_revision"}],
+            "resolved_fields": {},
+            "coverage_by_field": {"pcb_revision": {"status": "missing"}},
+        }
 
 
 class _DocGen:
@@ -71,6 +81,7 @@ class PrepareTests(unittest.TestCase):
         )
         self.assertEqual(result["stage"], "ready")
         self.assertEqual(result["work_order_id"], "wo-1")
+        self.assertEqual(result["task_id"], "task-1")
 
     def test_prepare_icd_sample_blocks(self):
         p = self._pipeline(_icd_template_profile=lambda order: mock.Mock(kind="icd_sample", issues=[], connector_blocks=[]))
@@ -105,6 +116,24 @@ class PrepareTests(unittest.TestCase):
             idempotency_key="k",
         )
         self.assertEqual(seen["idempotency_key"], "k")
+
+    def test_prepare_can_attach_opt_in_requirement_resolution_snapshot(self):
+        resolver = mock.Mock()
+        resolver.resolve.return_value = _Resolution()
+        p = self._pipeline(requirement_resolver=resolver)
+        ctx = mock.Mock()
+        ctx.metadata = {"document_requirement_resolution_enabled": True}
+
+        result = p.prepare_knowledge_base_document_generation(
+            ctx,
+            knowledge_base_name="shared",
+            template_version_id="t1",
+            document_schema_id="s1",
+            document_schema_version="1",
+        )
+
+        self.assertEqual(result["requirement_resolution"]["unresolved_requirements"][0]["field"], "pcb_revision")
+        resolver.resolve.assert_called_once()
 
     def test_auto_generate_delegates_to_prepare_then_harness(self):
         dg = _DocGen()

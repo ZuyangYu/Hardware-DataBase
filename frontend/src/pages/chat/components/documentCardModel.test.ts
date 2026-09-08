@@ -2,9 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildWorkbenchDeepLink,
+  canAnswerClarification,
+  clarificationAnswerValue,
   documentArtifactDownloadPath,
   documentArtifactFileName,
   documentCardFromChatTask,
+  documentCardFromClarificationEvent,
+  documentCardFromGenerationSession,
   documentCardIdentity,
   documentCardStatusLabel,
   documentCardStatusTone,
@@ -14,7 +18,7 @@ import {
   parseDocumentCardEvent,
   type DocumentCardData,
 } from './documentCardModel';
-import type { DocumentChatTaskView } from '@/api/types';
+import type { DocumentChatTaskView, GenerationSession } from '@/api/types';
 
 function cardEvent(card: Record<string, unknown>): string {
   return JSON.stringify({ card });
@@ -25,6 +29,7 @@ const workOrderCard: DocumentCardData = {
   status: 'queued',
   next_actions: ['get_document_generation_status'],
   kb_name: 'hardware',
+  task_id: 'task-123',
   work_order_id: 'wo-123',
   generation_session_id: null,
 };
@@ -36,6 +41,7 @@ describe('documentCardModel', () => {
       status: 'queued',
       next_actions: ['get_document_generation_status'],
       kb_name: 'hardware',
+      task_id: 'task-123',
       work_order_id: 'wo-123',
     }))).toEqual(workOrderCard);
 
@@ -59,10 +65,107 @@ describe('documentCardModel', () => {
     });
   });
 
+  it('projects clarification question and ready events into one task card', () => {
+    const question = documentCardFromClarificationEvent(
+      'document_clarification_question',
+      {
+        generation_session_id: 'gs-clarify-1',
+        document_task_id: 'task-clarify-1',
+        question_id: 'scope',
+        options: ['全量', '增量', 7, null],
+        reason: 'scope_required',
+        content: '请选择生成范围',
+      },
+      'hardware',
+    );
+    expect(question).toEqual({
+      kind: 'generation_session',
+      status: 'needs_clarification',
+      next_actions: ['answer_clarification'],
+      kb_name: 'hardware',
+      task_id: 'task-clarify-1',
+      generation_session_id: 'gs-clarify-1',
+      question_id: 'scope',
+      options: ['全量', '增量'],
+      reason: 'scope_required',
+      content: '请选择生成范围',
+    });
+
+    const ready = documentCardFromClarificationEvent(
+      'document_clarification_ready',
+      {
+        generation_session_id: 'gs-clarify-1',
+        document_task_id: 'task-clarify-1',
+        reason: 'user_confirmed',
+      },
+      'hardware',
+    );
+    expect(ready).toMatchObject({
+      kind: 'generation_session',
+      status: 'ready_to_generate',
+      next_actions: ['create_document_work_order'],
+      task_id: 'task-clarify-1',
+      generation_session_id: 'gs-clarify-1',
+      question_id: null,
+      options: [],
+      reason: 'user_confirmed',
+      content: null,
+    });
+
+    const cards = mergeDocumentCards(mergeDocumentCards([], question!), ready!);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      status: 'ready_to_generate',
+      task_id: 'task-clarify-1',
+      question_id: null,
+      options: [],
+    });
+  });
+
+  it('accepts wrapped or raw clarification payloads and fails closed without identity', () => {
+    expect(documentCardFromClarificationEvent(
+      'document_clarification_question',
+      JSON.stringify({ payload: { generation_session_id: 'gs-2', question_id: 'q-2' } }),
+      'hardware',
+    )).toMatchObject({ generation_session_id: 'gs-2', question_id: 'q-2' });
+    expect(documentCardFromClarificationEvent(
+      'document_clarification_ready',
+      { reason: 'user_confirmed' },
+      'hardware',
+    )).toBeNull();
+    expect(documentCardFromClarificationEvent('unknown', {}, 'hardware')).toBeNull();
+    expect(documentCardFromClarificationEvent('document_clarification_question', 'not-json', 'hardware')).toBeNull();
+  });
+
+  it('matches a clarification task to an older session-only card', () => {
+    const oldCard: DocumentCardData = {
+      kind: 'generation_session',
+      status: 'needs_clarification',
+      next_actions: ['answer_clarification'],
+      kb_name: 'hardware',
+      generation_session_id: 'gs-3',
+    };
+    const nextCard = documentCardFromClarificationEvent(
+      'document_clarification_question',
+      {
+        generation_session_id: 'gs-3',
+        document_task_id: 'task-3',
+        question_id: 'q-3',
+        options: [],
+        reason: 'missing_field',
+        content: '请补充字段',
+      },
+      'hardware',
+    );
+    const cards = mergeDocumentCards([oldCard], nextCard!);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].task_id).toBe('task-3');
+  });
+
   it('mergeDocumentCards replaces in place per work order and appends new identities', () => {
     const updated = mergeDocumentCards(
       [workOrderCard],
-      { kind: 'work_order_status', status: 'retrieving', next_actions: [], kb_name: 'hardware', work_order_id: 'wo-123', generation_session_id: null },
+      { kind: 'work_order_status', status: 'retrieving', next_actions: [], kb_name: 'hardware', task_id: 'task-123', work_order_id: 'wo-123', generation_session_id: null },
     );
     expect(updated).toHaveLength(1);
     expect(updated[0].kind).toBe('work_order_status');
@@ -100,9 +203,27 @@ describe('documentCardModel', () => {
   });
 
   it('keys identity by work order first, then generation session', () => {
-    expect(documentCardIdentity({ ...workOrderCard, generation_session_id: 'gs-1' })).toBe('wo:wo-123');
-    expect(documentCardIdentity({ ...workOrderCard, work_order_id: null, generation_session_id: 'gs-1' })).toBe('gs:gs-1');
-    expect(documentCardIdentity({ ...workOrderCard, work_order_id: null, generation_session_id: null })).toBe('adhoc:work_order_created');
+    expect(documentCardIdentity({ ...workOrderCard, generation_session_id: 'gs-1' })).toBe('task:task-123');
+    expect(documentCardIdentity({ ...workOrderCard, task_id: null, generation_session_id: 'gs-1' })).toBe('wo:wo-123');
+    expect(documentCardIdentity({ ...workOrderCard, task_id: null, work_order_id: null, generation_session_id: 'gs-1' })).toBe('gs:gs-1');
+    expect(documentCardIdentity({ ...workOrderCard, task_id: null, work_order_id: null, generation_session_id: null })).toBe('adhoc:work_order_created');
+  });
+
+  it('keeps one card when a task receives a replacement work order', () => {
+    const first: DocumentCardData = {
+      ...workOrderCard,
+      work_order_id: 'wo-old',
+    };
+    const replaced = mergeDocumentCards([first], {
+      ...first,
+      kind: 'work_order_status',
+      work_order_id: 'wo-new',
+      status: 'running',
+    });
+
+    expect(replaced).toHaveLength(1);
+    expect(replaced[0].work_order_id).toBe('wo-new');
+    expect(documentCardIdentity(replaced[0])).toBe('task:task-123');
   });
 
   it('documentWorkOrderStatusPath targets the REST status endpoint, not the agent', () => {
@@ -222,6 +343,43 @@ describe('documentCardModel', () => {
     expect('targetFormat' in malformed!).toBe(false);
   });
 
+  it('parses clarification fields from document cards without exposing identifiers', () => {
+    const parsed = parseDocumentCardEvent(cardEvent({
+      kind: 'generation_session',
+      status: 'needs_clarification',
+      next_actions: ['answer_clarification'],
+      kb_name: 'hardware',
+      task_id: 'task-private',
+      generation_session_id: 'session-private',
+      question_id: 'scope',
+      content: '请选择生成范围',
+      options: ['当前版本', '全部版本'],
+    }));
+
+    expect(parsed).toMatchObject({
+      task_id: 'task-private',
+      question_id: 'scope',
+      content: '请选择生成范围',
+      options: ['当前版本', '全部版本'],
+    });
+  });
+
+  it('deep-links clarification cards with a session or task when no work order exists', () => {
+    expect(documentCardWorkbenchActions({
+      kind: 'generation_session',
+      status: 'needs_clarification',
+      next_actions: ['answer_clarification'],
+      kb_name: 'hardware',
+      generation_session_id: 'session/1',
+      question_id: 'scope',
+      work_order_id: null,
+    })).toEqual([{
+      action: 'answer_clarification',
+      label: '回答澄清问题',
+      href: '/document-generation?kb=hardware&session=session%2F1',
+    }]);
+  });
+
   it('builds artifact download path and file name client-side', () => {
     expect(documentArtifactDownloadPath('a-1', 'hardware')).toBe(
       '/api/v1/document-generation/artifacts/a-1/download?kb=hardware',
@@ -237,6 +395,7 @@ describe('documentCardModel', () => {
   it('projects a durable chat document task into a downloadable status card', () => {
     const task: DocumentChatTaskView = {
       session_id: 17,
+      task_id: 'task-chat-1',
       work_order_id: 'wo-chat-1',
       kb_name: 'hardware',
       job_status: 'succeeded',
@@ -260,6 +419,7 @@ describe('documentCardModel', () => {
       status: 'completed',
       next_actions: ['view_result'],
       kb_name: 'hardware',
+      task_id: 'task-chat-1',
       work_order_id: 'wo-chat-1',
       generation_session_id: null,
       targetFormat: 'docx',
@@ -274,5 +434,137 @@ describe('documentCardModel', () => {
     expect(documentCardStatusLabel('')).toBe('状态未知');
     expect(documentCardStatusTone('retrieving')).toBe('info');
     expect(documentCardStatusTone('mystery_status')).toBe('neutral');
+  });
+});
+
+describe('documentCardFromGenerationSession restores durable clarification state', () => {
+  const fallback: DocumentCardData = {
+    kind: 'work_order_status',
+    status: 'queued',
+    next_actions: ['get_document_generation_status'],
+    kb_name: 'hardware',
+    work_order_id: 'wo-stale',
+  };
+
+  function session(overrides: Partial<GenerationSession>): GenerationSession {
+    return {
+      session_id: 'gs-refresh-1',
+      knowledge_base_name: 'hardware',
+      status: 'needs_clarification',
+      brief: {
+        purpose: 'icd',
+        confirmed: false,
+        confidence: 0.9,
+        scope: {},
+        source_policy: {},
+        output_policy: {},
+        missing_data_policy: null,
+        inference_policy: null,
+      },
+      messages: [],
+      work_order_id: 'wo-refresh-1',
+      document_task_id: 'task-refresh-1',
+      last_question_id: null,
+      ...overrides,
+    };
+  }
+
+  it('restores the pending question, options and answer affordance after a page refresh', () => {
+    const restored = documentCardFromGenerationSession(session({
+      status: 'needs_clarification',
+      last_question_id: 'output_format',
+      messages: [
+        { message_id: 'm1', role: 'assistant', content: '请选择输出格式', question_id: 'output_format', options: ['docx', 'xlsx'], reason: 'format_required' },
+        { message_id: 'm2', role: 'user', content: 'docx', question_id: 'output_format', answer: 'docx' },
+      ],
+    }), fallback);
+
+    expect(restored).toMatchObject({
+      kind: 'work_order_status',
+      status: 'needs_clarification',
+      kb_name: 'hardware',
+      task_id: 'task-refresh-1',
+      work_order_id: 'wo-refresh-1',
+      generation_session_id: 'gs-refresh-1',
+      next_actions: ['answer_clarification'],
+      question_id: 'output_format',
+      options: ['docx', 'xlsx'],
+      reason: 'format_required',
+    });
+    expect(restored.content).toBe('请选择输出格式');
+  });
+
+  it('uses the latest unanswered assistant question over earlier answered ones', () => {
+    const restored = documentCardFromGenerationSession(session({
+      status: 'needs_clarification',
+      last_question_id: 'scope',
+      messages: [
+        { message_id: 'm1', role: 'assistant', content: '已回答的问题', question_id: 'format', options: ['docx'] },
+        { message_id: 'm2', role: 'user', content: 'docx', question_id: 'format', answer: 'docx' },
+        { message_id: 'm3', role: 'assistant', content: '请选择范围', question_id: 'scope', options: ['全部', '章节'], reason: 'scope_required' },
+      ],
+    }), fallback);
+
+    expect(restored.question_id).toBe('scope');
+    expect(restored.options).toEqual(['全部', '章节']);
+    expect(restored.content).toBe('请选择范围');
+  });
+
+  it('falls back to last_question_id when the message history has no question payload', () => {
+    const restored = documentCardFromGenerationSession(session({
+      status: 'needs_clarification',
+      last_question_id: 'pin_range',
+      messages: [],
+    }), fallback);
+
+    expect(restored.question_id).toBe('pin_range');
+    expect(restored.options).toEqual([]);
+    expect(restored.content).toBeNull();
+  });
+
+  it('clears the question state once the session leaves clarification', () => {
+    const restored = documentCardFromGenerationSession(session({
+      status: 'ready_to_generate',
+      last_question_id: 'output_format',
+      messages: [
+        { message_id: 'm1', role: 'assistant', content: '请选择输出格式', question_id: 'output_format', options: ['docx'] },
+      ],
+    }), fallback);
+
+    expect(restored.status).toBe('ready_to_generate');
+    expect(restored.question_id).toBeNull();
+    expect(restored.options).toEqual([]);
+    expect(restored.content).toBeNull();
+    expect(restored.next_actions).toEqual(fallback.next_actions);
+  });
+});
+
+describe('clarification answer interaction guards', () => {
+  const answerable: DocumentCardData = {
+    kind: 'generation_session',
+    status: 'needs_clarification',
+    next_actions: ['answer_clarification'],
+    kb_name: 'hardware',
+    task_id: 'task-clarify-2',
+    work_order_id: 'wo-clarify-2',
+    generation_session_id: 'gs-clarify-2',
+    question_id: 'scope',
+    options: ['全部'],
+    reason: 'scope_required',
+    content: '请选择范围',
+  };
+
+  it('allows answering only with question, session and callback present', () => {
+    expect(canAnswerClarification(answerable, true)).toBe(true);
+    expect(canAnswerClarification(answerable, false)).toBe(false);
+    expect(canAnswerClarification({ ...answerable, question_id: null }, true)).toBe(false);
+    expect(canAnswerClarification({ ...answerable, generation_session_id: null }, true)).toBe(false);
+    expect(canAnswerClarification({ ...answerable, status: 'running' }, true)).toBe(false);
+  });
+
+  it('normalizes answers and blocks submission while answering or blank', () => {
+    expect(clarificationAnswerValue('  docx  ', false)).toBe('docx');
+    expect(clarificationAnswerValue('   ', false)).toBeNull();
+    expect(clarificationAnswerValue('docx', true)).toBeNull();
   });
 });

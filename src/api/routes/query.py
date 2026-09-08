@@ -300,6 +300,26 @@ def _clear_turn_cancel_signal(turn_id: str) -> None:
         _TURN_CANCEL_SIGNALS.pop(turn_id, None)
 
 
+def _bind_document_task_trace(ctx: Any, turn: ChatTurn) -> None:
+    """Expose only the persisted Chat provenance to document authoring.
+
+    ``RequestContext.session_id`` is not sufficient provenance because
+    Workbench/API callers may use synthetic session values.  The durable turn
+    worker is the trusted boundary that knows both the numeric conversation id
+    and the real turn id.
+    """
+    metadata = getattr(ctx, "metadata", None)
+    if not isinstance(metadata, dict):
+        metadata = {}
+        setattr(ctx, "metadata", metadata)
+    metadata.update({
+        "document_task_origin": "chat",
+        "conversation_id": str(turn.session_id),
+        "initiating_turn_id": str(turn.id),
+        "document_task_idempotency_key": f"chat-turn:{turn.id}:document-generation",
+    })
+
+
 def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None) -> None:
     """Own a turn independently of any one SSE subscriber.
 
@@ -311,6 +331,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     turn = conv.claim_turn(user.id, turn_id, worker_id)
     if turn is None:
         return
+    _bind_document_task_trace(ctx, turn)
     document_context = None
     if turn.document_context:
         try:

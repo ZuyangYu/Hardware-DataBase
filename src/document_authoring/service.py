@@ -56,9 +56,11 @@ from src.document_authoring.models import (
     ValidationReport,
     WorkbookFill,
     WorkbookFillPlan,
+    WorkbookTableFill,
     WorkbookRegionSchema,
     content_hash,
 )
+from src.document_authoring.ooxml import validate_ooxml_package
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
 from src.document_authoring.template_activation import (
@@ -83,6 +85,9 @@ from src.document_authoring.template_suggester import (
     TemplateSuggestionProvider,
     TemplateSuggestionTechnicalFailure,
 )
+from src.document_authoring.tasks import DocumentTask, DocumentTaskService, DocumentTaskStore
+from src.document_authoring.reviews import DocumentReviewStore
+from src.document_authoring.revisions import ArtifactRevisionStore, DocumentRevisionService
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.worker import DocumentGenerationWorker
@@ -186,6 +191,11 @@ def _automatic_release_allowed(order: DocumentWorkOrder, report: Any, *, require
     """
     if not src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED or requires_review:
         return False
+    # A revision regeneration is a requested change to a released document;
+    # its candidate always passes the human release gate even when every
+    # machine check is green.
+    if getattr(order, "revision_id", None):
+        return False
     if getattr(report, "status", None) != "passed":
         return False
     if not order.generation_session_id:
@@ -234,6 +244,59 @@ class DocumentGenerationService:
         self.harness_runtime = InternalDocumentHarnessRuntime(self.store, self.validator)
         self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider()
         self.converter = TemplateArtifactConversionService()
+        # DocumentTask shares the authoring database but owns only the
+        # user-facing aggregate identity. WorkOrder, Job and Run retain their
+        # existing execution responsibilities.
+        self.task_service = DocumentTaskService(DocumentTaskStore(self.store.db_path))
+        # Generic review state is a task-bound adapter over the existing
+        # ICD/artifact review flows; it shares the authoring DB but has its
+        # own command-idempotency namespace.
+        self.review_store = DocumentReviewStore(self.store.db_path)
+        self.revision_service = DocumentRevisionService(
+            authoring_store=self.store,
+            task_store=self.task_service.store,
+            revision_store=ArtifactRevisionStore(self.store.db_path),
+            source_snapshot_resolver=self.resolve_source_snapshot,
+        )
+
+    def ensure_document_task(
+        self,
+        ctx: RequestContext,
+        *,
+        template_version_id: str | None = None,
+        generation_session_id: str | None = None,
+        project_id: str | None = None,
+        knowledge_base_name: str | None = None,
+        idempotency_key: str | None = None,
+        status: str = "planned",
+    ) -> DocumentTask | None:
+        """Create or reuse the user-level task for a generation request."""
+        if not getattr(src.settings, "DOCUMENT_TASK_WRITE_ENABLED", True):
+            return None
+        return self.task_service.ensure_task(
+            ctx,
+            template_version_id=template_version_id,
+            generation_session_id=generation_session_id,
+            project_id=project_id,
+            knowledge_base_name=knowledge_base_name,
+            idempotency_key=idempotency_key,
+            status=status,
+        )
+
+    def mark_document_task_queued(self, task_id: str | None) -> DocumentTask | None:
+        """Project successful queue submission to the user-level task."""
+        normalized = str(task_id or "").strip()
+        if not normalized or not getattr(src.settings, "DOCUMENT_TASK_WRITE_ENABLED", True):
+            return None
+        try:
+            return self.task_service.store.update_status(normalized, "queued")
+        except Exception:
+            logger.warning(
+                "failed to mark DocumentTask %s as queued",
+                normalized,
+                exc_info=True,
+            )
+            return None
 
     @staticmethod
     def _require_template_kb_scope(
@@ -318,6 +381,15 @@ class DocumentGenerationService:
         seen_regions = {region.region_id for region in regions}
         if len(seen_regions) != len(regions):
             raise ValueError("template region ids must be unique")
+        for binding in bindings:
+            if binding.table_schema is not None:
+                if template.format == "docx" or binding.semantic_unit_id != binding.table_schema.semantic_unit_id:
+                    raise ValueError("table binding does not match workbook semantic unit")
+                if binding.target_region_ids != [binding.table_schema.table_region_id]:
+                    raise ValueError("table binding must reference its exact table region")
+                if binding.table_schema.table_region_id in seen_regions:
+                    raise ValueError("duplicate table region id")
+                seen_regions.add(binding.table_schema.table_region_id)
         for binding in bindings:
             if binding.template_schema_id != template.template_schema_id or binding.template_schema_version != template.template_schema_version:
                 raise ValueError("template unit binding schema version mismatch")
@@ -901,6 +973,7 @@ class DocumentGenerationService:
             generation_session_id=original.generation_session_id,
             generation_brief=original.generation_brief,
             restart_of_work_order_id=original.work_order_id,
+            existing_task=self._bound_task(original),
             max_parallel_units=max_parallel_units,
             execution_mode=original.execution_mode,
             harness_policy_id=original.harness_policy_id,
@@ -908,6 +981,81 @@ class DocumentGenerationService:
             attachment_refs=original.attachment_refs_snapshot,
             kb_scope_snapshot=original.kb_scope_snapshot,
         )
+
+    def _bound_task(self, order: DocumentWorkOrder) -> DocumentTask | None:
+        task_id = str(getattr(order, "task_id", None) or "").strip()
+        if not task_id:
+            return None
+        task = self.task_service.store.get(task_id)
+        if task is None:
+            return None
+        if getattr(task, "work_order_id", None) not in {None, order.work_order_id}:
+            # The task has already advanced to a newer work order; do not fork
+            # the user-facing aggregate back to this lineage.
+            return None
+        return task
+
+    def restart_work_order_for_revision(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        revision_id: str,
+        max_parallel_units: int = 8,
+    ) -> DocumentWorkOrder:
+        """Freeze the controlled regeneration work order for an artifact revision.
+
+        Revisions never mutate the released parent.  This method is the
+        execution bridge requested by the optimization plan: the revision
+        record becomes a queued background generation that produces a fresh
+        candidate artifact, which is bound back to the revision on completion.
+        The work order is idempotent per revision, so client replays cannot
+        fork the lineage.
+        """
+        revision_service = getattr(self, "revision_service", None)
+        revision = revision_service.store.get(str(revision_id or "").strip()) if revision_service else None
+        if revision is None:
+            raise KeyError("artifact revision not found")
+        if revision.child_artifact_id:
+            raise ValueError("artifact revision already generated its child artifact")
+        original = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        if revision.work_order_id != original.work_order_id:
+            raise ValueError("artifact revision does not belong to this work order")
+        if original.scope_type != "knowledge_base" or not original.knowledge_base_name:
+            raise ValueError("revision regeneration currently supports knowledge-base work orders")
+        idempotency_key = f"revision:{revision.revision_id}"
+        existing = self._find_knowledge_base_work_order_by_idempotency(
+            original.tenant_id,
+            original.knowledge_base_name,
+            idempotency_key,
+            department_id=original.resource_department_id,
+        )
+        if existing is not None:
+            return existing
+        snapshot = self.resolve_source_snapshot(original)
+        order = self._create_frozen_work_order(
+            ctx,
+            scope_type="knowledge_base",
+            snapshot=snapshot,
+            knowledge_base_name=original.knowledge_base_name,
+            template_version_id=original.template_version_id,
+            document_schema_id=original.document_schema_id,
+            document_schema_version=original.document_schema_version,
+            idempotency_key=idempotency_key,
+            generation_session_id=original.generation_session_id,
+            generation_brief=original.generation_brief,
+            restart_of_work_order_id=original.work_order_id,
+            revision_id=revision.revision_id,
+            existing_task=self._bound_task(original),
+            max_parallel_units=max_parallel_units,
+            execution_mode=original.execution_mode,
+            harness_policy_id=original.harness_policy_id,
+            source_scope=original.source_scope_snapshot or "knowledge_base_only",
+            attachment_refs=original.attachment_refs_snapshot,
+            kb_scope_snapshot=original.kb_scope_snapshot,
+        )
+        revision_service.store.update_status(revision.revision_id, "generating")
+        return order
 
     def _find_knowledge_base_work_order_by_idempotency(
         self,
@@ -944,6 +1092,8 @@ class DocumentGenerationService:
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
         restart_of_work_order_id: str | None = None,
+        revision_id: str | None = None,
+        existing_task: DocumentTask | None = None,
         max_parallel_units: int = 3,
         source_scope: str = "knowledge_base_only",
         attachment_refs: Sequence[Any] | None = None,
@@ -999,6 +1149,25 @@ class DocumentGenerationService:
             if is_knowledge_base
             else {}
         )
+        if existing_task is not None:
+            # Restart/regeneration lineages must reuse the exact task bound to
+            # the parent work order; a fresh idempotency lookup could otherwise
+            # fork the user-facing aggregate.
+            task = existing_task
+        else:
+            task = self.ensure_document_task(
+                ctx,
+                template_version_id=template.template_version_id,
+                generation_session_id=generation_session_id,
+                project_id=None if is_knowledge_base else snapshot.project_id,
+                knowledge_base_name=knowledge_base_name if is_knowledge_base else None,
+                idempotency_key=(
+                    idempotency_key
+                    or (f"generation-session:{generation_session_id}" if generation_session_id else None)
+                ),
+            )
+        if task is None and getattr(src.settings, "DOCUMENT_TASK_ASSOCIATION_REQUIRED", False):
+            raise RuntimeError("document task association is required but task writes are disabled")
         order = DocumentWorkOrder(
             work_order_id=(
                 f"wo-{uuid.uuid4().hex}"
@@ -1033,6 +1202,8 @@ class DocumentGenerationService:
             harness_policy_id=harness_policy_id,
             harness_policy_version=harness_policy.version if harness_policy else None,
             requested_executor=requested_executor,
+            task_id=task.task_id if task is not None else None,
+            revision_id=revision_id,
             unit_statuses={
                 **{item.field_id: "planned" for item in schema.fields},
                 **{item.review_item_id: "planned" for item in schema.review_items},
@@ -1049,7 +1220,17 @@ class DocumentGenerationService:
             "input_fingerprint_version": 2,
             "input_fingerprint": compute_input_fingerprint_v2(order),
         })
-        return self.store.create_work_order(order)
+        persisted = self.store.create_work_order(order)
+        if task is not None:
+            if restart_of_work_order_id and task.work_order_id == restart_of_work_order_id:
+                self.task_service.store.advance_work_order(
+                    task.task_id,
+                    persisted.work_order_id,
+                    expected_work_order_id=restart_of_work_order_id,
+                )
+            else:
+                self.task_service.store.attach_work_order(task.task_id, persisted.work_order_id)
+        return persisted
 
     def _validate_work_order_definition(
         self,
@@ -1183,7 +1364,8 @@ class DocumentGenerationService:
             validation_report_id=report.validation_report_id,
             integrity_manifest_id=integrity_manifest["manifest_hash"],
         )
-        artifact = self.store.save_artifact(artifact, rendered_content, template.format)
+        artifact = self._save_artifact_for_task(order, artifact, rendered_content, template.format)
+        self._bind_revision_child(order, artifact, report_status=report.status)
         next_status = "waiting_human_approval" if report.status in {"passed", "requires_human"} else "blocked"
         self._replace_order(order, status=next_status, unit_statuses=statuses,
                             evidence_matrix_id=f"matrix-{order.work_order_id}", validation_report_id=report.validation_report_id)
@@ -1359,6 +1541,7 @@ class DocumentGenerationService:
         snapshot = self.resolve_source_snapshot(order)
         template = self._template(order.template_version_id)
         run, manifest = self.harness_runtime.create_run(order, policy, snapshot, template, schema)
+        self._associate_task_run(order, run.harness_run_id)
         order = self._replace_order(order, status="retrieving", run_manifest_id=manifest.run_manifest_id)
         try:
             result = self.harness_runtime.execute(
@@ -1451,6 +1634,7 @@ class DocumentGenerationService:
         schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
         template = self._template(order.template_version_id)
+        self._associate_task_run(order, run.harness_run_id)
         order = self._replace_order(order, status="retrieving", run_manifest_id=manifest.run_manifest_id)
         try:
             result = self.harness_runtime.execute(
@@ -1613,6 +1797,12 @@ class DocumentGenerationService:
         )
         self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
         report = self._append_icd_validation_issues(report, front_view_issues)
+        required_issues = self._required_content_issues(order, result.unit_statuses)
+        if required_issues:
+            report = report.model_copy(update={
+                "issues": [*report.issues, *required_issues],
+                "status": "requires_human" if report.status != "failed" else "failed",
+            })
         if blocked_fields:
             report = self._append_block_generation_issues(report, blocked_fields)
         self.store.save_validation_report(report)
@@ -1624,11 +1814,12 @@ class DocumentGenerationService:
             validation_report_id=report.validation_report_id,
             integrity_manifest_id=integrity_manifest["manifest_hash"],
         )
-        artifact = self.store.save_artifact(artifact, rendered_content, template.format)
+        artifact = self._save_artifact_for_task(order, artifact, rendered_content, template.format)
+        self._bind_revision_child(order, artifact, report_status=report.status)
         requires_review = _requires_human_review(
             result.unit_statuses,
             auto_publish_verified=src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED,
-        )
+        ) or bool(required_issues)
         if blocked_fields:
             # Coordinator-level block_generation: unresolved required missing /
             # conflicts under a confirmed block_generation brief never reach
@@ -1662,6 +1853,25 @@ class DocumentGenerationService:
             evidence_matrix_id=f"matrix-{order.work_order_id}", validation_report_id=report.validation_report_id,
         )
         return artifact
+
+    def _required_content_issues(self, order: DocumentWorkOrder, statuses: dict[str, str]) -> list[dict[str, Any]]:
+        """A usable candidate is not a complete release when required content is absent.
+
+        The brief's mark_tbd policy permits drafting, never silently relaxing
+        the frozen schema's release requirements. Missing execution statuses
+        are gaps too; otherwise a skipped field would evade the gate.
+        """
+        schema = self.store.get_document_schema(order.document_schema_id, order.document_schema_version)
+        if schema is None:
+            return [{"code": "required_content_incomplete", "kind": "missing_schema", "severity": "blocking"}]
+        return [
+            {"code": "required_content_incomplete", "kind": "required_content_incomplete",
+             "field_id": field.field_id, "unit_id": f"field:{field.field_id}",
+             "coverage_status": statuses.get(f"field:{field.field_id}", "unsearched"),
+             "severity": "blocking", "message": f"必填内容尚未完成：{field.label}"}
+            for field in schema.fields
+            if field.required and statuses.get(f"field:{field.field_id}") != "ready_to_render"
+        ]
 
     def _block_generation_fields(self, order: DocumentWorkOrder, result) -> list[str]:
         """Fields whose confirmed brief forces block_generation on unresolved
@@ -1751,7 +1961,8 @@ class DocumentGenerationService:
             }],
             released_at=datetime.now(timezone.utc),
         )
-        released = self.store.save_artifact(
+        released = self._save_artifact_for_task(
+            order,
             released,
             candidate_content,
             getattr(candidate, "output_format", None) or order.target_format,
@@ -1950,7 +2161,8 @@ class DocumentGenerationService:
             approval_event_ids=[event.event_id for event in approvals], integrity_manifest_id=candidate.integrity_manifest_id,
             released_at=datetime.now(timezone.utc),
         )
-        released = self.store.save_artifact(
+        released = self._save_artifact_for_task(
+            order,
             released,
             candidate_content,
             getattr(candidate, "output_format", None) or order.target_format,
@@ -2021,7 +2233,10 @@ class DocumentGenerationService:
         order = self._order_raw(artifact.work_order_id)
         capability = "download_approved_release" if artifact.stage == "approved_release" else "download_review_candidate"
         self.require_work_order_capability(ctx, order, capability)
-        return self.store.read_artifact_content(artifact_id)
+        content = self.store.read_artifact_content(artifact_id)
+        artifact_format = getattr(artifact, "output_format", None) or order.target_format
+        self._assert_artifact_content_clean(content, artifact_format)
+        return content
 
     def convert_document_artifact(
         self,
@@ -2128,10 +2343,16 @@ class DocumentGenerationService:
             }],
             released_at=datetime.now(timezone.utc) if source.stage == "approved_release" else None,
         )
-        return self.store.save_artifact(child, converted.content, normalized_target)
+        return self._save_artifact_for_task(order, child, converted.content, normalized_target)
 
     def _assert_artifact_content_clean(self, content: bytes, artifact_format: str) -> None:
         normalized = str(artifact_format or "").strip().lower().lstrip(".")
+        if normalized in {"md", "markdown"}:
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("generated Markdown artifact is not valid UTF-8") from exc
+            return
         if normalized in {"pdf", "pptx"}:
             if normalized == "pdf":
                 self.converter._validate_pdf(content)
@@ -2257,6 +2478,7 @@ class DocumentGenerationService:
             verification_policy_id=f"verification-{suggestion.semantic_unit_id}",
             query_terms=list(suggestion.retrieval_terms),
             authoring_policy="managed_writer",
+            table_columns=inferred.get("table_columns"),
         )
 
     @staticmethod
@@ -2266,6 +2488,20 @@ class DocumentGenerationService:
         bindings: list[TemplateUnitBinding] = []
         seen_targets: set[str] = set()
         for suggestion in analysis.suggestions:
+            if template.format != "docx" and suggestion.value_shape == "repeating_table":
+                from src.document_authoring.table_contracts import table_schema_from_targets
+                table = table_schema_from_targets(analysis, suggestion)
+                if seen_targets.intersection(suggestion.target_unit_ids):
+                    raise ValueError("suggested template targets may only be bound once")
+                seen_targets.update(suggestion.target_unit_ids)
+                bindings.append(TemplateUnitBinding(
+                    binding_id=f"binding-{table.table_region_id}",
+                    template_schema_id=template.template_schema_id,
+                    template_schema_version=template.template_schema_version,
+                    semantic_unit_type="field", semantic_unit_id=suggestion.semantic_unit_id,
+                    target_region_ids=[table.table_region_id], table_schema=table,
+                ))
+                continue
             if template.format != "docx":
                 if suggestion.value_shape != "scalar":
                     raise ValueError("workbook repeating tables require an explicit table schema")
@@ -2592,7 +2828,104 @@ class DocumentGenerationService:
             "updated_at": datetime.now(timezone.utc),
             "lock_version": order.lock_version + 1,
         })
-        return self.store.replace_work_order(revised)
+        persisted = self.store.replace_work_order(revised)
+        self._sync_task_status(persisted, persisted.status)
+        return persisted
+
+    def _associate_task_run(self, order: Any, run_id: str) -> None:
+        task_id = str(getattr(order, "task_id", None) or "").strip()
+        if task_id:
+            self.task_service.store.attach_run(task_id, run_id)
+
+    def _save_artifact_for_task(
+        self,
+        order: Any,
+        artifact: DocumentArtifact,
+        content: bytes,
+        suffix: str,
+    ) -> DocumentArtifact:
+        revision_id = str(getattr(order, "revision_id", None) or "").strip()
+        if revision_id and not str(getattr(artifact, "parent_artifact_id", None) or "").strip():
+            revision = self.revision_service.store.get(revision_id)
+            if revision is not None:
+                artifact = artifact.model_copy(update={
+                    "parent_artifact_id": revision.parent_artifact_id,
+                })
+        persisted = self.store.save_artifact(artifact, content, suffix)
+        task_id = str(getattr(order, "task_id", None) or "").strip()
+        if task_id:
+            if getattr(persisted, "run_id", None):
+                self.task_service.store.attach_run(task_id, persisted.run_id)
+            self.task_service.store.attach_artifact(task_id, persisted.artifact_id)
+        return persisted
+
+    def _bind_revision_child(self, order: Any, artifact: Any, *, report_status: str) -> None:
+        """Bind a finalized candidate as the child of the order's revision.
+
+        Worker-path completion: no user context exists here, so lineage is
+        re-verified inside ``bind_generated_child`` against stored facts.  A
+        failure must not lose the generated artifact, so binding errors are
+        logged and surfaced through the revision state instead.
+        """
+        if not str(getattr(order, "revision_id", None) or "").strip():
+            return
+        revalidation_status = {
+            "passed": "passed",
+            "requires_human": "requires_human",
+            "failed": "failed",
+        }.get(str(report_status or "").casefold())
+        if revalidation_status is None:
+            return
+        try:
+            self.revision_service.bind_generated_child(
+                order,
+                artifact,
+                revalidation_status=revalidation_status,
+                revalidation_result={
+                    "validation_report_id": str(getattr(artifact, "validation_report_id", "") or ""),
+                    "work_order_status_report": str(report_status),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "failed to bind revision child artifact %s for work order %s",
+                getattr(artifact, "artifact_id", "?"), getattr(order, "work_order_id", "?"),
+            )
+            raise
+
+    def _sync_task_status(self, order: Any, work_order_status: str) -> None:
+        task_id = str(getattr(order, "task_id", None) or "").strip()
+        if not task_id:
+            return
+        task_status = {
+            "planned": "planned",
+            "retrieving": "running",
+            "ready_to_draft": "running",
+            "drafting": "running",
+            "validating": "running",
+            "ready_to_render": "running",
+            "rendering": "running",
+            "waiting_human_input": "needs_clarification",
+            "waiting_human_approval": "waiting_human",
+            "paused": "waiting_human",
+            "complete": "completed",
+            "failed": "failed",
+            "blocked": "failed",
+            "cancelled": "cancelled",
+        }.get(str(work_order_status or "").strip(), "running")
+        try:
+            self.task_service.store.update_status(task_id, task_status)
+        except Exception:
+            # The task projection is additive during migration.  Do not turn
+            # a successfully persisted WorkOrder transition into a failed
+            # generation request if the projection store is temporarily
+            # unavailable; reconciliation can replay the status event.
+            logger.warning(
+                "failed to project WorkOrder %s status to DocumentTask %s",
+                getattr(order, "work_order_id", ""),
+                task_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _semantic_fills(
@@ -2602,6 +2935,7 @@ class DocumentGenerationService:
         bindings: dict[str, TemplateUnitBinding],
     ) -> WorkbookFillPlan | DocxFillPlan:
         fills: list[WorkbookFill] | list[DocxFill] = []
+        table_fills: list[WorkbookTableFill] = []
         for draft in drafts:
             if draft.validation_status != "supported" or statuses.get(draft.unit_id) != "ready_to_render":
                 continue
@@ -2611,6 +2945,20 @@ class DocumentGenerationService:
                 continue
             if draft.typed_value is None:
                 continue
+            if binding.table_schema is not None:
+                if draft.typed_value.kind != "table":
+                    raise ValueError("table binding requires a typed table draft")
+                columns = {col.column_id for col in binding.table_schema.columns}
+                if not draft.typed_value.rows or any(set(row.cells) != columns for row in draft.typed_value.rows):
+                    raise ValueError("table rows must match all mapped columns exactly")
+                table_fills.append(WorkbookTableFill(
+                    table_region_id=binding.table_schema.table_region_id,
+                    semantic_unit_id=semantic_unit_id,
+                    rows=[row.cells for row in draft.typed_value.rows],
+                ))
+                continue
+            if draft.typed_value.kind == "table":
+                raise ValueError("typed table requires a registered table binding")
             if template.format != "docx" and len(binding.target_region_ids) != 1:
                 raise ValueError("workbook scalar bindings require exactly one target")
             value = draft.typed_value.display_value
@@ -2619,7 +2967,10 @@ class DocumentGenerationService:
                     fills.append(DocxFill(region_id=region_id, value=str(value), semantic_unit_id=semantic_unit_id))
                 else:
                     fills.append(WorkbookFill(region_id=region_id, value=str(value), semantic_unit_id=semantic_unit_id))
-        return DocumentGenerationService._fill_plan(template, fills)
+        plan = DocumentGenerationService._fill_plan(template, fills)
+        if isinstance(plan, WorkbookFillPlan):
+            plan.table_fills = table_fills
+        return plan
 
     @staticmethod
     def _fill_plan(
@@ -2648,6 +2999,9 @@ class DocumentGenerationService:
                 fill_plan,
                 policy,
                 security_approved=True,
+                table_schemas=[binding.table_schema for binding in self.store.list_unit_bindings(
+                    template.template_schema_id, template.template_schema_version,
+                ) if binding.table_schema is not None],
             )
         elif template.format == "docx":
             if not isinstance(fill_plan, DocxFillPlan):
@@ -2669,6 +3023,9 @@ class DocumentGenerationService:
         return self.workbook_renderer.inspect(content, format)
 
     def _assert_generated_artifact_clean(self, content: bytes, format: str) -> None:
+        normalized = str(format or "").strip().lower().lstrip(".")
+        if normalized in {"xlsx", "xlsm", "docx"}:
+            validate_ooxml_package(content, normalized)
         if self._inspect(content, format).active_content_status != "clean":
             raise ValueError("generated artifact contains active content")
 

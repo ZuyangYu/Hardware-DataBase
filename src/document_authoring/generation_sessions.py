@@ -28,6 +28,9 @@ class ClarificationAnswer(BaseModel):
     question_id: str
     raw_answer: str
     normalized_answer: str | None = None
+    # A caller supplied request key makes answer retries safe across HTTP,
+    # tool and browser boundaries.  Historical answers have no key.
+    client_request_id: str | None = None
     answered_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -39,6 +42,10 @@ class GenerationBrief(BaseModel):
     missing_data_policy: MissingDataPolicy | None = None
     inference_policy: InferencePolicy | None = None
     clarification_answers: list[ClarificationAnswer] = Field(default_factory=list)
+    # Resolver output is a snapshot of what was unresolved when the brief was
+    # planned.  It is metadata for the clarifier/audit path, not writer input.
+    unresolved_requirements: list[dict[str, Any]] = Field(default_factory=list)
+    resolved_fields: dict[str, Any] = Field(default_factory=dict)
     allowed_derivations: list[str] = Field(default_factory=list)
     confirmed: bool = False
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -78,6 +85,7 @@ class ClarificationMessage(BaseModel):
     options: list[str] = Field(default_factory=list)
     answer: str | None = None
     reason: str | None = None
+    client_request_id: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
 
 
@@ -90,7 +98,15 @@ class GenerationSession(BaseModel):
     status: Literal["needs_clarification", "ready_to_generate", "generating", "completed", "cancelled"]
     brief: GenerationBrief = Field(default_factory=GenerationBrief)
     messages: list[ClarificationMessage] = Field(default_factory=list)
+    # These references make the clarification state part of the main
+    # conversation/task graph without moving the requirement brief into
+    # Conversation itself.
+    conversation_id: str | None = None
+    initiating_turn_id: str | None = None
+    document_task_id: str | None = None
     work_order_id: str | None = None
+    last_question_id: str | None = None
+    clarification_revision: int = Field(default=0, ge=0)
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)
 
@@ -136,6 +152,16 @@ class GenerationSessionStore:
                     ON document_generation_messages(session_id, created_at, message_id);
                 """
             )
+            # The message table predates answer idempotency.  Keep the
+            # payload as the source of truth while adding a queryable unique
+            # request key for safe retries on upgraded installations.
+            self._ensure_column(conn, "document_generation_messages", "client_request_id", "TEXT")
+            conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS
+                   idx_document_generation_messages_request
+                   ON document_generation_messages(session_id, client_request_id)
+                   WHERE client_request_id IS NOT NULL AND client_request_id != ''"""
+            )
 
     @staticmethod
     def _json(value: BaseModel | dict[str, Any]) -> str:
@@ -151,6 +177,9 @@ class GenerationSessionStore:
         knowledge_base_name: str,
         template_version_id: str,
         brief: GenerationBrief | None = None,
+        conversation_id: str | int | None = None,
+        initiating_turn_id: str | None = None,
+        document_task_id: str | None = None,
     ) -> GenerationSession:
         now = _utc_now()
         session = GenerationSession(
@@ -161,6 +190,9 @@ class GenerationSessionStore:
             template_version_id=template_version_id,
             status="needs_clarification",
             brief=brief or GenerationBrief(),
+            conversation_id=self._optional(conversation_id),
+            initiating_turn_id=self._optional(initiating_turn_id),
+            document_task_id=self._optional(document_task_id),
             created_at=now,
             updated_at=now,
         )
@@ -224,6 +256,7 @@ class GenerationSessionStore:
         options: list[str] | None = None,
         answer: str | None = None,
         reason: str | None = None,
+        client_request_id: str | None = None,
     ) -> ClarificationMessage:
         session = self.get_session(session_id)
         message = ClarificationMessage(
@@ -233,6 +266,7 @@ class GenerationSessionStore:
             options=options or [],
             answer=answer,
             reason=reason,
+            client_request_id=self._optional(client_request_id),
         )
         now = _utc_now()
         with closing(self._connect()) as conn:
@@ -240,16 +274,188 @@ class GenerationSessionStore:
             try:
                 conn.execute(
                     """INSERT INTO document_generation_messages
-                       (message_id, session_id, created_at, payload_json)
-                       VALUES (?, ?, ?, ?)""",
-                    (message.message_id, session_id, message.created_at.isoformat(), self._json(message)),
+                       (message_id, session_id, created_at, client_request_id, payload_json)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        message.message_id,
+                        session_id,
+                        message.created_at.isoformat(),
+                        message.client_request_id,
+                        self._json(message),
+                    ),
                 )
-                self._update_session_row(conn, session.model_copy(update={"updated_at": now}))
+                last_question_id = session.last_question_id
+                if role == "assistant":
+                    last_question_id = message.question_id
+                revised = session.model_copy(update={
+                    "updated_at": now,
+                    "last_question_id": last_question_id,
+                })
+                self._update_session_row(conn, revised)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
         return message
+
+    def apply_clarification_answer(
+        self,
+        session_id: str,
+        *,
+        question_id: str,
+        answer: str,
+        brief: GenerationBrief,
+        next_message: ClarificationMessage,
+        client_request_id: str | None = None,
+    ) -> tuple[GenerationSession, bool]:
+        """Atomically append an answer and its next prompt.
+
+        Returns ``(session, applied)``.  A repeated request key returns the
+        already committed session with ``applied=False``; a conflicting retry
+        is rejected instead of silently changing the brief.
+        """
+        normalized_question = str(question_id or "").strip()
+        normalized_answer = str(answer or "").strip()
+        request_id = self._optional(client_request_id)
+        if not normalized_question or not normalized_answer:
+            raise ValueError("clarification question and answer are required")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM document_generation_sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("generation session not found")
+                current = self._session_from_connection(conn, row)
+                if request_id:
+                    existing_row = conn.execute(
+                        """SELECT payload_json FROM document_generation_messages
+                           WHERE session_id = ? AND client_request_id = ?""",
+                        (session_id, request_id),
+                    ).fetchone()
+                    if existing_row is not None:
+                        existing = ClarificationMessage.model_validate(
+                            json.loads(existing_row["payload_json"])
+                        )
+                        if (
+                            existing.role != "user"
+                            or existing.question_id != normalized_question
+                            or (existing.answer or existing.content).strip() != normalized_answer
+                        ):
+                            raise ValueError(
+                                "clarification idempotency key conflicts with existing answer"
+                            )
+                        conn.execute("COMMIT")
+                        return current, False
+                if current.status != "needs_clarification":
+                    raise ValueError("generation session is not accepting clarification answers")
+                pending = next(
+                    (
+                        message for message in reversed(current.messages)
+                        if message.role == "assistant" and message.question_id
+                    ),
+                    None,
+                )
+                if pending is None or pending.question_id != normalized_question:
+                    raise ValueError("clarification answer does not match the current question")
+
+                user_message = ClarificationMessage(
+                    role="user",
+                    content=normalized_answer,
+                    question_id=normalized_question,
+                    answer=normalized_answer,
+                    client_request_id=request_id,
+                )
+                conn.execute(
+                    """INSERT INTO document_generation_messages
+                       (message_id, session_id, created_at, client_request_id, payload_json)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        user_message.message_id,
+                        session_id,
+                        user_message.created_at.isoformat(),
+                        request_id,
+                        self._json(user_message),
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO document_generation_messages
+                       (message_id, session_id, created_at, client_request_id, payload_json)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        next_message.message_id,
+                        session_id,
+                        next_message.created_at.isoformat(),
+                        None,
+                        self._json(next_message),
+                    ),
+                )
+                answers = list(brief.clarification_answers)
+                if request_id and answers:
+                    last = answers[-1]
+                    if last.question_id == normalized_question:
+                        answers[-1] = last.model_copy(update={"client_request_id": request_id})
+                        brief = brief.model_copy(update={"clarification_answers": answers})
+                revised = current.model_copy(update={
+                    "brief": brief,
+                    "last_question_id": next_message.question_id,
+                    "clarification_revision": current.clarification_revision + 1,
+                    "updated_at": _utc_now(),
+                })
+                self._update_session_row(conn, revised)
+                conn.execute("COMMIT")
+                return self._session_from_connection_by_id(session_id), True
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def bind_document_task(self, session_id: str, document_task_id: str) -> GenerationSession:
+        session = self.get_session(session_id)
+        task_id = self._optional(document_task_id)
+        if not task_id:
+            raise ValueError("document task id is required")
+        if session.document_task_id and session.document_task_id != task_id:
+            raise ValueError("generation session is already bound to another document task")
+        revised = session.model_copy(update={"document_task_id": task_id, "updated_at": _utc_now()})
+        with closing(self._connect()) as conn:
+            self._update_session_row(conn, revised)
+        return revised
+
+    @staticmethod
+    def _optional(value: Any) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
+
+    def _session_from_connection(self, conn: sqlite3.Connection, row: sqlite3.Row) -> GenerationSession:
+        payload = json.loads(row["payload_json"])
+        message_rows = conn.execute(
+            """SELECT payload_json FROM document_generation_messages
+               WHERE session_id = ? ORDER BY created_at, message_id""",
+            (row["session_id"],),
+        ).fetchall()
+        payload["messages"] = [
+            ClarificationMessage.model_validate(json.loads(item["payload_json"]))
+            for item in message_rows
+        ]
+        return GenerationSession.model_validate(payload)
+
+    def _session_from_connection_by_id(self, session_id: str) -> GenerationSession:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM document_generation_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("generation session not found")
+            return self._session_from_connection(conn, row)
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def update_brief(self, session_id: str, updates: dict[str, Any]) -> GenerationSession:
         session = self.get_session(session_id)

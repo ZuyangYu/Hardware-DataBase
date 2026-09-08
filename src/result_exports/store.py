@@ -16,6 +16,7 @@ from typing import Any
 import zipfile
 
 import src.settings
+from src.document_authoring.ooxml import validate_ooxml_package
 from src.result_exports.models import (
     EXPORT_JOB_STATUSES,
     Artifact,
@@ -108,6 +109,7 @@ def _validate_artifact_payload(format: str, content: bytes, mime_type: str) -> N
                 relationship_xml = archive.read(name).lower()
                 if b'targetmode="external"' in relationship_xml:
                     raise ValueError("external Office package links are not allowed")
+    validate_ooxml_package(content, format)
 
 
 class ResultExportStore:
@@ -1170,6 +1172,7 @@ class ResultExportStore:
             raise KeyError("artifact file is unavailable") from exc
         if len(content) != artifact.size or hashlib.sha256(content).hexdigest() != artifact.sha256:
             raise ValueError("artifact integrity check failed")
+        _validate_artifact_payload(artifact.format, content, artifact.mime_type)
         return content
 
     def _get_job_unscoped(self, job_id: str) -> ExportJob | None:

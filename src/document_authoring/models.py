@@ -147,6 +147,7 @@ class TemplateUnitBinding(BaseModel):
     semantic_unit_id: str
     target_region_ids: list[str]
     render_transform_id: str | None = None
+    table_schema: "WorkbookTableSchema | None" = None
 
 
 class DocumentFieldSchema(BaseModel):
@@ -166,6 +167,10 @@ class DocumentFieldSchema(BaseModel):
     allow_derivation: bool = False
     missing_policy: Literal["mark_tbd", "block_section", "optional"] = "mark_tbd"
     authoring_policy: Literal["deterministic", "managed_writer", "external_agent_draft", "human_only"] = "managed_writer"
+    # Column letter -> header label, discovered from inspected template
+    # headers.  Present only for table-shaped fields so writers receive the
+    # exact column contract without scalar flattening.
+    table_columns: dict[str, str] | None = None
 
 
 class ReviewItemSchema(BaseModel):
@@ -308,6 +313,15 @@ class DocumentWorkOrder(BaseModel):
         "validating", "waiting_human_approval", "ready_to_render", "rendering", "blocked",
         "paused", "complete", "failed", "cancelled",
     ] = "planned"
+    # User-level aggregate association.  This is deliberately not a frozen
+    # input: adding a task after a legacy WorkOrder was created must not alter
+    # its reproducibility fingerprint.
+    task_id: str | None = None
+    # Governed revision lineage.  Historical artifacts remain readable with
+    # ``None``; a revision regeneration binds its candidate artifact after the
+    # immutable bytes exist.  Like ``task_id`` this never enters the frozen
+    # input fingerprint.
+    revision_id: str | None = None
     generation_session_id: str | None = None
     generation_brief: dict[str, Any] = Field(default_factory=dict)
     restart_of_work_order_id: str | None = None
@@ -356,6 +370,10 @@ class DocumentWorkOrder(BaseModel):
             "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
             "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
             "error_message", "retryable", "next_actions", "requested_executor", "input_fingerprint_version",
+            # Execution metadata, never a frozen generation input.  Excluding it
+            # unconditionally keeps every persisted pre-revision fingerprint
+            # byte-identical under the new schema.
+            "revision_id",
         }
         if self.scope_type == "project":
             # Preserve fingerprints from persisted project work orders created
@@ -382,12 +400,22 @@ class DocumentWorkOrder(BaseModel):
             # v2 deliberately binds the normalized requested executor.  The
             # historical v1 preimage excluded this compatibility field.
             excluded.discard("requested_executor")
+            fingerprint_payload = self.model_dump(mode="json", exclude=excluded)
+            # Task identity is a user-facing association, not an execution
+            # input. Keep the key in the preimage as ``None`` so newly
+            # serialized models remain compatible with callers that calculated
+            # a legacy preimage from the post-schema model dump.
+            if "task_id" in fingerprint_payload:
+                fingerprint_payload["task_id"] = None
             expected = content_hash({
                 "input_fingerprint_version": 2,
-                "frozen_inputs": self.model_dump(mode="json", exclude=excluded),
+                "frozen_inputs": fingerprint_payload,
             })
         else:
-            expected = content_hash(self.model_dump(mode="json", exclude=excluded))
+            fingerprint_payload = self.model_dump(mode="json", exclude=excluded)
+            if "task_id" in fingerprint_payload:
+                fingerprint_payload["task_id"] = None
+            expected = content_hash(fingerprint_payload)
         if self.input_fingerprint and self.input_fingerprint != expected:
             # A short compatibility window is needed for callers that built
             # a v1 preimage from a post-schema model dump before the new
@@ -400,6 +428,12 @@ class DocumentWorkOrder(BaseModel):
                 "source_scope_snapshot", "attachment_refs_snapshot", "kb_scope_snapshot",
             })
             if self.input_fingerprint_version >= 2:
+                # The v2 preimage binds the requested executor; every v2
+                # compatibility variant must agree, otherwise persisted v2
+                # rows written before later optional fields existed would no
+                # longer validate (the base ``excluded`` set keeps the field
+                # excluded for the v1 branch only).
+                compatibility_excluded.discard("requested_executor")
                 compatibility_expected = content_hash({
                     "input_fingerprint_version": 2,
                     "frozen_inputs": self.model_dump(mode="json", exclude=compatibility_excluded),
@@ -409,7 +443,44 @@ class DocumentWorkOrder(BaseModel):
                     self.model_dump(mode="json", exclude=compatibility_excluded)
                 )
             if self.input_fingerprint != compatibility_expected:
-                raise ValueError("work order input_fingerprint does not match frozen inputs")
+                # Rows written before task association was introduced do not
+                # contain the optional key at all.  Accept that second legacy
+                # preimage, but never accept a changed association as a new
+                # frozen input.
+                legacy_compatibility_excluded = set(compatibility_excluded)
+                legacy_compatibility_excluded.add("task_id")
+                if self.input_fingerprint_version >= 2:
+                    legacy_compatibility_expected = content_hash({
+                        "input_fingerprint_version": 2,
+                        "frozen_inputs": self.model_dump(
+                            mode="json", exclude=legacy_compatibility_excluded,
+                        ),
+                    })
+                else:
+                    legacy_compatibility_expected = content_hash(
+                        self.model_dump(mode="json", exclude=legacy_compatibility_excluded)
+                    )
+                if self.input_fingerprint != legacy_compatibility_expected:
+                    # The two variants above re-include the empty snapshot
+                    # keys as nulls.  Rows whose stored preimage omitted
+                    # those keys entirely (frozen snapshots were conditional
+                    # from the start) validate against the strict branch
+                    # preimage minus the task key only.
+                    strict_legacy_excluded = set(excluded)
+                    strict_legacy_excluded.add("task_id")
+                    if self.input_fingerprint_version >= 2:
+                        strict_legacy_expected = content_hash({
+                            "input_fingerprint_version": 2,
+                            "frozen_inputs": self.model_dump(
+                                mode="json", exclude=strict_legacy_excluded,
+                            ),
+                        })
+                    else:
+                        strict_legacy_expected = content_hash(
+                            self.model_dump(mode="json", exclude=strict_legacy_excluded)
+                        )
+                    if self.input_fingerprint != strict_legacy_expected:
+                        raise ValueError("work order input_fingerprint does not match frozen inputs")
         else:
             self.input_fingerprint = expected
         return self
@@ -428,7 +499,7 @@ def compute_input_fingerprint_v2(order: DocumentWorkOrder) -> str:
     excluded = {
         "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
         "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
-        "error_message", "retryable", "next_actions", "input_fingerprint_version",
+        "error_message", "retryable", "next_actions", "input_fingerprint_version", "revision_id",
     }
     if order.scope_type == "project":
         excluded.update({"scope_type", "knowledge_base_name"})
@@ -442,9 +513,12 @@ def compute_input_fingerprint_v2(order: DocumentWorkOrder) -> str:
         excluded.add("attachment_refs_snapshot")
     if not order.kb_scope_snapshot:
         excluded.add("kb_scope_snapshot")
+    fingerprint_payload = order.model_dump(mode="json", exclude=excluded)
+    if "task_id" in fingerprint_payload:
+        fingerprint_payload["task_id"] = None
     return content_hash({
         "input_fingerprint_version": 2,
-        "frozen_inputs": order.model_dump(mode="json", exclude=excluded),
+        "frozen_inputs": fingerprint_payload,
     })
 
 
@@ -743,13 +817,21 @@ class DraftAssertion(BaseModel):
     ] = "document_statement"
 
 
+class TypedTableRow(BaseModel):
+    """One table record and the exact evidence supporting its cells."""
+
+    cells: dict[str, str]
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
 class TypedFieldValue(BaseModel):
     """A compact, evidence-backed value eligible for template filling."""
 
-    kind: Literal["scalar", "enumeration"]
+    kind: Literal["scalar", "enumeration", "table"]
     normalized_values: list[str] = Field(default_factory=list)
     display_value: str
     evidence_ids: list[str] = Field(default_factory=list)
+    rows: list[TypedTableRow] = Field(default_factory=list, max_length=10000)
 
 
 class ManagedDraftPayload(BaseModel):
@@ -857,6 +939,7 @@ class WorkbookTableFill(BaseModel):
 
 
 WorkbookFillPlan.model_rebuild()
+TemplateUnitBinding.model_rebuild()
 
 
 class DocxFill(BaseModel):
@@ -906,6 +989,10 @@ class DocumentArtifact(BaseModel):
     content_hash: str
     approval_subject_hash: str | None = None
     parent_artifact_id: str | None = None
+    # Optional governed revision lineage.  Historical artifacts remain
+    # readable with ``None``; a revision completion may bind an already saved
+    # child without changing its immutable bytes or hashes.
+    revision_id: str | None = None
     validation_report_id: str
     approval_event_ids: list[str] = Field(default_factory=list)
     integrity_manifest_id: str

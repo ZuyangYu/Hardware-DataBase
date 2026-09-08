@@ -29,6 +29,7 @@ class DocumentToolResult(BaseModel):
     analysis_id: str | None = None
     template_version_id: str | None = None
     generation_session_id: str | None = None
+    task_id: str | None = None
     work_order_id: str | None = None
     job_id: str | None = None
     run_id: str | None = None
@@ -52,6 +53,7 @@ class AnswerClarificationArgs(BaseModel):
     session_id: str = Field(min_length=1, max_length=200)
     question_id: str = Field(min_length=1, max_length=200)
     answer: str = Field(min_length=1, max_length=4000)
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ConfirmSessionArgs(BaseModel):
@@ -94,6 +96,18 @@ class GetStatusArgs(BaseModel):
     work_order_id: str = Field(min_length=1, max_length=200)
 
 
+class CreateDocumentRevisionArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(min_length=1, max_length=200)
+    parent_artifact_id: str = Field(min_length=1, max_length=200)
+    request_type: Literal["field_update", "section_update", "full_regeneration"]
+    request: str = Field(min_length=1, max_length=4000)
+    changed_fields: list[str] = Field(default_factory=list)
+    changed_sections: list[str] = Field(default_factory=list)
+    client_request_id: str = Field(min_length=1, max_length=128)
+
+
 def _safe_analysis(analysis: Any) -> dict[str, Any]:
     """Project analysis to metadata useful to a chat agent, not file paths."""
 
@@ -134,6 +148,11 @@ def _safe_session(session: Any) -> dict[str, Any]:
         "status": session.status,
         "template_version_id": session.template_version_id,
         "knowledge_base_name": session.knowledge_base_name,
+        "document_task_id": getattr(session, "document_task_id", None),
+        "conversation_id": getattr(session, "conversation_id", None),
+        "initiating_turn_id": getattr(session, "initiating_turn_id", None),
+        "last_question_id": getattr(session, "last_question_id", None),
+        "clarification_revision": getattr(session, "clarification_revision", 0),
         "work_order_id": session.work_order_id,
         "brief": session.brief.model_dump(mode="json"),
         "next_actions": _session_next_actions(session),
@@ -152,8 +171,35 @@ def _session_next_actions(session: Any) -> list[str]:
 
 def _safe_status(status: dict[str, Any]) -> dict[str, Any]:
     harness = status.get("harness_run") or {}
+    safe_artifacts = []
+    for artifact in (status.get("artifacts") or [])[:8]:
+        if not isinstance(artifact, dict):
+            continue
+        item = {
+            "artifact_id": str(artifact.get("artifact_id")),
+            "stage": str(artifact.get("stage")),
+        }
+        if str(artifact.get("output_format") or "").strip():
+            item["output_format"] = str(artifact.get("output_format"))
+        if str(artifact.get("revision_id") or "").strip():
+            item["revision_id"] = str(artifact.get("revision_id"))
+        safe_artifacts.append(item)
+    task = status.get("task") or {}
+    safe_revisions = []
+    for revision in (task.get("revisions") if isinstance(task, dict) else []) or []:
+        if not isinstance(revision, dict) or not str(revision.get("revision_id") or "").strip():
+            continue
+        safe_revisions.append({
+            "revision_id": str(revision["revision_id"]),
+            "parent_artifact_id": str(revision.get("parent_artifact_id") or ""),
+            "child_artifact_id": revision.get("child_artifact_id"),
+            "status": str(revision.get("status") or ""),
+            "revalidation_status": str(revision.get("revalidation_status") or "pending"),
+            "revalidation_scope": list(revision.get("revalidation_scope") or [])[:32],
+        })
     return {
         "work_order_id": status.get("work_order_id"),
+        "task_id": status.get("task_id"),
         "status": status.get("status"),
         "phase": status.get("phase"),
         "scope_type": status.get("scope_type"),
@@ -169,14 +215,8 @@ def _safe_status(status: dict[str, Any]) -> dict[str, Any]:
         "next_actions": list(status.get("next_actions") or []),
         "validation": status.get("validation"),
         # 只保留不可变引用(artifact_id/stage/output_format),其余字段(校验/策略状态)不下发到对话侧。
-        "artifacts": [
-            {
-                "artifact_id": str(a.get("artifact_id")),
-                "stage": str(a.get("stage")),
-                **({"output_format": str(a.get("output_format"))} if str(a.get("output_format") or "").strip() else {}),
-            }
-            for a in (status.get("artifacts") or [])[:8]
-        ],
+        "artifacts": safe_artifacts,
+        "revisions": safe_revisions,
     }
 
 
@@ -209,6 +249,12 @@ class DocumentAuthoringToolset:
         if isinstance(metadata, dict):
             metadata["document_template_kb_name"] = self.context.knowledge_base_name
 
+    def _mark_task_queued(self, task_id: str | None) -> None:
+        document_generation = getattr(self.pipeline, "document_generation", None)
+        mark_task_queued = getattr(document_generation, "mark_document_task_queued", None)
+        if callable(mark_task_queued):
+            mark_task_queued(task_id)
+
     def _rejected(self, operation: str, code: str, message: str, **ids: Any) -> DocumentToolResult:
         return DocumentToolResult(
             status="rejected", operation=operation, error_code=code, message=message, **ids,
@@ -237,6 +283,8 @@ class DocumentAuthoringToolset:
         }
         if result.work_order_id:
             card["work_order_id"] = result.work_order_id
+        if result.task_id:
+            card["task_id"] = result.task_id
         if result.generation_session_id:
             card["generation_session_id"] = result.generation_session_id
         if kind == "work_order_status":
@@ -703,6 +751,15 @@ class DocumentAuthoringToolset:
                 template_version_id=template_id,
                 generation_session_id=session.session_id,
             )
+        task_id = str(prepared.get("task_id") or "").strip() or None
+        if task_id is None:
+            authoring_store = getattr(
+                getattr(self.pipeline, "document_generation", None), "store", None,
+            )
+            get_work_order = getattr(authoring_store, "get_work_order", None)
+            if callable(get_work_order):
+                persisted_order = get_work_order(work_order_id)
+                task_id = str(getattr(persisted_order, "task_id", "") or "").strip() or None
         if stage != "ready":
             result = DocumentToolResult(
                 status="waiting_human",
@@ -710,6 +767,7 @@ class DocumentAuthoringToolset:
                 message="模板已完成安全预检，但生成前仍需要人工处理待办",
                 template_version_id=template_id,
                 generation_session_id=session.session_id,
+                task_id=task_id,
                 work_order_id=work_order_id,
                 data={
                     "status": self._preflight_status(stage),
@@ -729,6 +787,7 @@ class DocumentAuthoringToolset:
                 client_request_id=self._generation_client_request_id(session.session_id),
                 operation="generate_work_order",
                 work_order_id=work_order_id,
+                task_id=task_id,
                 payload={
                     "work_order_id": work_order_id,
                     "knowledge_base_name": self.context.knowledge_base_name,
@@ -758,12 +817,14 @@ class DocumentAuthoringToolset:
                 generation_session_id=session.session_id,
                 work_order_id=work_order_id,
             )
+        self._mark_task_queued(task_id)
         result = DocumentToolResult(
             status="succeeded",
             operation=operation,
             message="模板填充任务已提交，完成后可下载最终文档",
             template_version_id=template_id,
             generation_session_id=session.session_id,
+            task_id=task_id,
             work_order_id=work_order_id,
             job_id=job.job_id,
             data={
@@ -833,19 +894,30 @@ class DocumentAuthoringToolset:
         result = DocumentToolResult(
             status="succeeded", operation=operation, message="generation session started",
             template_version_id=template_id, generation_session_id=session.session_id,
+            task_id=getattr(session, "document_task_id", None),
             data=_safe_session(session), next_actions=_session_next_actions(session),
         )
         self._emit_card("generation_session", result)
         return result
 
-    def answer_clarification(self, session_id: str, question_id: str, answer: str) -> DocumentToolResult:
+    def answer_clarification(
+        self,
+        session_id: str,
+        question_id: str,
+        answer: str,
+        client_request_id: str | None = None,
+    ) -> DocumentToolResult:
         operation = "answer_clarification"
         self._authorize("write")
         if self.context.generation_session_id and session_id != self.context.generation_session_id:
             return self._rejected(operation, "document_context_session_mismatch", "session reference does not match the attached context", generation_session_id=session_id)
         try:
             session = self.pipeline.answer_document_generation_session(
-                self.ctx, session_id, question_id=question_id, answer=answer,
+                self.ctx,
+                session_id,
+                question_id=question_id,
+                answer=answer,
+                client_request_id=client_request_id,
             )
         except PermissionError:
             raise
@@ -856,6 +928,7 @@ class DocumentAuthoringToolset:
         result = DocumentToolResult(
             status="succeeded", operation=operation, message="clarification recorded",
             template_version_id=session.template_version_id, generation_session_id=session.session_id,
+            task_id=getattr(session, "document_task_id", None),
             data=_safe_session(session), next_actions=_session_next_actions(session),
         )
         self._emit_card("generation_session", result)
@@ -877,6 +950,7 @@ class DocumentAuthoringToolset:
         result = DocumentToolResult(
             status="succeeded", operation=operation, message="generation session confirmed",
             template_version_id=session.template_version_id, generation_session_id=session.session_id,
+            task_id=getattr(session, "document_task_id", None),
             data=_safe_session(session), next_actions=["create_document_work_order"],
         )
         self._emit_card("generation_session", result)
@@ -952,6 +1026,7 @@ class DocumentAuthoringToolset:
                 client_request_id=self.context.client_request_id,
                 operation="generate_work_order",
                 work_order_id=order.work_order_id,
+                task_id=getattr(order, "task_id", None),
                 payload={
                     "work_order_id": order.work_order_id,
                     "knowledge_base_name": self.context.knowledge_base_name,
@@ -965,9 +1040,11 @@ class DocumentAuthoringToolset:
             return self._rejected(operation, "work_order_rejected", "document work order could not be created", template_version_id=template_id)
         except Exception:
             return self._unavailable(operation, "document work order is temporarily unavailable", template_version_id=template_id)
+        self._mark_task_queued(getattr(order, "task_id", None))
         result = DocumentToolResult(
             status="succeeded", operation=operation, message="document work order queued",
             template_version_id=template_id, generation_session_id=session_id,
+            task_id=getattr(order, "task_id", None),
             work_order_id=order.work_order_id, job_id=job.job_id,
             data={"status": job.status, "execution_mode": order.execution_mode},
             next_actions=["get_document_generation_status"],
@@ -1002,8 +1079,106 @@ class DocumentAuthoringToolset:
         harness = status.get("harness_run") or {}
         result = DocumentToolResult(
             status="succeeded", operation=operation, message="document generation status loaded",
-            work_order_id=work_order_id, run_id=harness.get("run_id"), data=result,
+            task_id=status.get("task_id"), work_order_id=work_order_id,
+            run_id=harness.get("run_id"), data=result,
             next_actions=list(result.get("next_actions") or []),
+        )
+        self._emit_card("work_order_status", result)
+        return result
+
+    def create_document_revision(
+        self,
+        task_id: str,
+        parent_artifact_id: str,
+        request_type: Literal["field_update", "section_update", "full_regeneration"],
+        request: str,
+        changed_fields: list[str] | None = None,
+        changed_sections: list[str] | None = None,
+        client_request_id: str = "",
+    ) -> DocumentToolResult:
+        """Record a task-bound revision request without fabricating bytes."""
+
+        operation = "create_document_revision"
+        self._authorize("write")
+        normalized_task = str(task_id or "").strip()
+        normalized_parent = str(parent_artifact_id or "").strip()
+        if not normalized_task or not normalized_parent:
+            return self._rejected(
+                operation,
+                "revision_identity_missing",
+                "task_id and parent_artifact_id are required",
+            )
+        try:
+            revision = self.pipeline.create_document_revision(
+                self.ctx,
+                normalized_task,
+                parent_artifact_id=normalized_parent,
+                request_type=request_type,
+                request=str(request or "").strip(),
+                changed_fields=list(changed_fields or []),
+                changed_sections=list(changed_sections or []),
+                client_request_id=str(client_request_id or "").strip(),
+            )
+        except PermissionError:
+            raise
+        except (ValueError, KeyError):
+            return self._rejected(
+                operation,
+                "revision_rejected",
+                "document revision request was rejected",
+                task_id=normalized_task,
+            )
+        except Exception:
+            return self._unavailable(
+                operation,
+                "document revision service is temporarily unavailable",
+                task_id=normalized_task,
+            )
+        payload = (
+            revision.model_dump(mode="json")
+            if isinstance(revision, BaseModel)
+            else dict(revision or {})
+        )
+        returned_task = str(payload.get("task_id") or "").strip()
+        if returned_task and returned_task != normalized_task:
+            return self._rejected(
+                operation,
+                "revision_task_mismatch",
+                "revision does not belong to the requested task",
+                task_id=normalized_task,
+            )
+        revision_id = str(payload.get("revision_id") or "").strip()
+        if not revision_id:
+            return self._unavailable(
+                operation,
+                "revision service did not return a revision identity",
+                task_id=normalized_task,
+            )
+        regeneration = payload.get("regeneration") or {}
+        regeneration_order = str(regeneration.get("work_order_id") or "").strip()
+        result = DocumentToolResult(
+            status="succeeded" if regeneration_order else "waiting_human",
+            operation=operation,
+            message=(
+                "文档修订已受理：已创建新的受控生成工单并在后台执行，完成后需人工审核"
+                if regeneration_order
+                else "文档修订请求已记录；待受控执行器生成候选 Artifact 后再重新验证"
+            ),
+            task_id=normalized_task,
+            work_order_id=(
+                regeneration_order
+                or str(payload.get("work_order_id") or "").strip()
+            ) or None,
+            data={"revision": payload, **payload},
+            next_actions=(
+                [
+                    "get_document_generation_status",
+                    "review_revision",
+                    "open_document_workbench",
+                ]
+                if regeneration_order
+                else ["review_revision", "open_document_workbench"]
+            ),
         )
         self._emit_card("work_order_status", result)
         return result
@@ -1026,6 +1201,7 @@ class DocumentAuthoringToolset:
             wrap("answer_clarification", "回答当前文档生成会话的澄清问题。", AnswerClarificationArgs, self.answer_clarification),
             wrap("confirm_generation_session", "确认已完成澄清的文档生成会话。", ConfirmSessionArgs, self.confirm_generation_session),
             wrap("create_document_work_order", "创建异步文档生成工单。", CreateWorkOrderArgs, self.create_document_work_order),
+            wrap("create_document_revision", "记录对现有文档 Artifact 的受控修订请求；不要声称修订文件已经生成。", CreateDocumentRevisionArgs, self.create_document_revision),
             wrap("get_document_generation_status", "读取文档生成工单状态。", GetStatusArgs, self.get_document_generation_status),
         ]
 

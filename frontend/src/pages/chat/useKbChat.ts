@@ -27,14 +27,21 @@ import type {
   TurnView,
 } from '@/api/types';
 import { notify } from '@/components/ui/app-toast';
-import { createClientRequestId } from '@/api/documentAuthoring';
+import {
+  answerGenerationSession,
+  createClientRequestId,
+  fetchGenerationSession,
+} from '@/api/documentAuthoring';
 import {
   documentCardFromChatTask,
+  documentCardFromClarificationEvent,
+  documentCardFromGenerationSession,
   fetchDocumentChatTasks,
   fetchDocumentWorkOrderStatus,
   mergeDocumentCards,
   parseCardArtifacts,
   parseDocumentCardEvent,
+  documentCardIdentity,
   type DocumentCardData,
 } from './components/documentCardModel';
 import { shouldCancelServerTurn, type ChatStreamDetachReason } from './chatTaskLifecycle';
@@ -57,6 +64,23 @@ const DOCUMENT_TASK_POLL_INTERVAL_MS = 3000;
 
 function requestUuid(): string {
   return createClientRequestId();
+}
+
+/**
+ * Apply the document-related SSE events to the single Chat task-card list.
+ * Keeping this reducer outside the hook makes replay and live-stream paths
+ * use exactly the same identity and de-duplication rules.
+ */
+export function mergeDocumentCardsFromSseEvent(
+  prev: DocumentCardData[],
+  eventType: string,
+  data: string,
+  kbName: string,
+): DocumentCardData[] {
+  const card = eventType === 'document_card'
+    ? parseDocumentCardEvent(data)
+    : documentCardFromClarificationEvent(eventType, data, kbName);
+  return card ? mergeDocumentCards(prev, card) : prev;
 }
 
 /**
@@ -235,6 +259,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const [degradedNotes, setDegradedNotes] = useState<Array<{ stage: string; reason: string }>>([]);
   const [documentCards, setDocumentCards] = useState<DocumentCardData[]>([]);
   const [documentCardRefreshingId, setDocumentCardRefreshingId] = useState<string | null>(null);
+  const [documentCardAnsweringId, setDocumentCardAnsweringId] = useState<string | null>(null);
   const [evidenceByMessageId, setEvidenceByMessageId] = useState<Record<number, EvidenceItem[]>>({});
   const [memorySummary, setMemorySummary] = useState<SessionMemorySummary | null>(null);
   const [sessionConsents, setSessionConsents] = useState<MemoryConsentView[] | null>(null);
@@ -625,6 +650,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   useEffect(() => {
     setDocumentCards([]);
     setDocumentCardRefreshingId(null);
+    setDocumentCardAnsweringId(null);
   }, [activeSessionId]);
 
   // Reconcile durable document jobs after navigation, refresh and reconnect.
@@ -641,8 +667,25 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       try {
         const tasks = await fetchDocumentChatTasks(activeSessionId);
         if (disposed || activeSessionRef.current !== activeSessionId) return;
-        setDocumentCards((prev) => tasks.reduce(
-          (cards, task) => mergeDocumentCards(cards, documentCardFromChatTask(task)),
+        const restoredCards = await Promise.all(tasks.map(async (task) => {
+          const card = documentCardFromChatTask(task);
+          const sessionId = card.generation_session_id?.trim() ?? '';
+          const phase = String(task.status.phase || task.status.status || task.job_status || '');
+          if (sessionId && phase === 'needs_clarification') {
+            try {
+              return documentCardFromGenerationSession(
+                await fetchGenerationSession(task.kb_name, sessionId),
+                card,
+              );
+            } catch {
+              // The task projection remains useful if the session is temporarily unavailable.
+            }
+          }
+          return card;
+        }));
+        if (disposed || activeSessionRef.current !== activeSessionId) return;
+        setDocumentCards((prev) => restoredCards.reduce(
+          (cards, card) => mergeDocumentCards(cards, card),
           prev,
         ));
         const stillRunning = tasks.some((task) => {
@@ -716,9 +759,12 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           } else if (evt.event === 'degraded') {
             const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
             setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
-          } else if (evt.event === 'document_card') {
-            const card = parseDocumentCardEvent(evt.data);
-            if (card) setDocumentCards((prev) => mergeDocumentCards(prev, card));
+          } else if (
+            evt.event === 'document_card'
+            || evt.event === 'document_clarification_question'
+            || evt.event === 'document_clarification_ready'
+          ) {
+            setDocumentCards((prev) => mergeDocumentCardsFromSseEvent(prev, evt.event, evt.data, scopeKbName));
           } else if (evt.event === 'done') {
             if (!ownsStream(turn.id, turn.session_id)) break;
             const payload = JSON.parse(evt.data) as QueryDonePayload;
@@ -772,7 +818,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       disposed = true;
       controller?.abort();
     };
-  }, [activeSessionId, documentContextEnabled, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep, refreshMemorySummary]);
+  }, [activeSessionId, documentContextEnabled, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep, refreshMemorySummary, scopeKbName]);
 
   const createSession = useCallback(
     async (title: string, expectedStreamToken?: number): Promise<SessionView> => {
@@ -851,31 +897,64 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   /** 卡片内"刷新状态"直调 REST 工单状态接口,不经过 agent/聊天发送链路。 */
   const refreshDocumentCardStatus = useCallback(async (card: DocumentCardData) => {
     const workOrderId = (card.work_order_id ?? '').trim();
-    if (!workOrderId || documentCardRefreshInFlightRef.current) return;
-    const sessionId = activeSessionRef.current;
+    const sessionId = (card.generation_session_id ?? '').trim();
+    if ((!workOrderId && !sessionId) || documentCardRefreshInFlightRef.current) return;
+    const activeChatSessionId = activeSessionRef.current;
     documentCardRefreshInFlightRef.current = true;
-    setDocumentCardRefreshingId(workOrderId);
+    const refreshKey = documentCardIdentity(card);
+    setDocumentCardRefreshingId(refreshKey);
     try {
-      const status = await fetchDocumentWorkOrderStatus(card.kb_name, workOrderId);
+      const status = workOrderId ? await fetchDocumentWorkOrderStatus(card.kb_name, workOrderId) : null;
       // 请求期间切走了会话:结果不再合并进当前消息流。
-      if (activeSessionRef.current !== sessionId) return;
-      setDocumentCards((prev) => mergeDocumentCards(prev, {
+      if (activeSessionRef.current !== activeChatSessionId) return;
+      let refreshed: DocumentCardData = status ? {
         kind: 'work_order_status',
         status: status.status || card.status,
         next_actions: status.next_actions && status.next_actions.length > 0 ? status.next_actions : card.next_actions,
         kb_name: card.kb_name,
+        task_id: status.task_id || card.task_id,
         work_order_id: workOrderId,
+        generation_session_id: status.clarification_session_id || card.generation_session_id,
         // 产物引用/格式一并合并:已完成的旧卡片刷新后也能拿到下载入口。
         targetFormat: status.target_format || card.targetFormat,
         artifacts: parseCardArtifacts(status.artifacts) ?? card.artifacts,
-      }));
+      } : card;
+      const clarificationSessionId = refreshed.generation_session_id?.trim() ?? '';
+      if (clarificationSessionId && refreshed.status === 'needs_clarification') {
+        refreshed = documentCardFromGenerationSession(
+          await fetchGenerationSession(refreshed.kb_name, clarificationSessionId),
+          refreshed,
+        );
+      }
+      setDocumentCards((prev) => mergeDocumentCards(prev, refreshed));
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '刷新工单状态失败');
+      notify.error(error instanceof Error ? error.message : workOrderId ? '刷新工单状态失败，请稍后重试' : '刷新澄清问题失败，请稍后重试');
     } finally {
       documentCardRefreshInFlightRef.current = false;
       setDocumentCardRefreshingId(null);
     }
   }, []);
+
+  const answerDocumentCard = useCallback(async (card: DocumentCardData, answer: string) => {
+    const sessionId = card.generation_session_id?.trim() ?? '';
+    const questionId = card.question_id?.trim() ?? '';
+    if (!sessionId || !questionId || !answer.trim() || documentCardAnsweringId) return;
+    const activeSessionIdAtStart = activeSessionRef.current;
+    const answerKey = documentCardIdentity(card);
+    setDocumentCardAnsweringId(answerKey);
+    try {
+      const updated = await answerGenerationSession(card.kb_name, sessionId, questionId, answer.trim());
+      if (activeSessionRef.current !== activeSessionIdAtStart) return;
+      setDocumentCards((prev) => mergeDocumentCards(
+        prev,
+        documentCardFromGenerationSession(updated, card),
+      ));
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '回答未提交，请检查后重试');
+    } finally {
+      setDocumentCardAnsweringId(null);
+    }
+  }, [documentCardAnsweringId]);
 
   const send = useCallback(async (
     attachments?: {
@@ -1014,10 +1093,13 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           } catch {
             // 忽略坏帧
           }
-        } else if (evt.event === 'document_card') {
+        } else if (
+          evt.event === 'document_card'
+          || evt.event === 'document_clarification_question'
+          || evt.event === 'document_clarification_ready'
+        ) {
           try {
-            const card = parseDocumentCardEvent(evt.data);
-            if (card) setDocumentCards((prev) => mergeDocumentCards(prev, card));
+            setDocumentCards((prev) => mergeDocumentCardsFromSseEvent(prev, evt.event, evt.data, scopeKbName));
           } catch {
             // 忽略坏帧
           }
@@ -1157,7 +1239,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     degradedNotes,
     documentCards,
     documentCardRefreshingId,
+    documentCardAnsweringId,
     refreshDocumentCardStatus,
+    answerDocumentCard,
     currentSessionRunning: streaming,
     send,
     abortStream,

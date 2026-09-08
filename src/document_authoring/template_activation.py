@@ -75,7 +75,15 @@ def decide_template_activation(
         if suggestion.value_shape == "scalar" and len(suggestion.target_unit_ids) != 1:
             reject("scalar_target_fanout")
         if suggestion.value_shape == "repeating_table":
-            reject("repeating_table_requires_schema")
+            # A repeating table is only activatable when its targets already
+            # form a complete, protected-cell-free rectangle under inspected
+            # headers. The contract builder is the deterministic authority;
+            # malformed mappings stay hard failures.
+            try:
+                from src.document_authoring.table_contracts import table_schema_from_targets
+                table_schema_from_targets(analysis, suggestion)
+            except (ValueError, KeyError):
+                reject("repeating_table_requires_schema")
         if suggestion.confidence < effective.min_mapping_confidence:
             reject("low_mapping_confidence")
         for unit_id in suggestion.target_unit_ids:

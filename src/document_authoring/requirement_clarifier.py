@@ -45,6 +45,31 @@ class RequirementClarifier:
                 reason="推断策略决定 Writer 可以生成的内容边界。",
             )
 
+        for requirement in brief.unresolved_requirements:
+            if hasattr(requirement, "to_dict"):
+                requirement = requirement.to_dict()
+            if not isinstance(requirement, dict):
+                continue
+            field_id = str(
+                requirement.get("field")
+                or requirement.get("field_id")
+                or ""
+            ).strip()
+            if not field_id or not requirement.get("requires_clarification", True):
+                continue
+            if field_id in brief.resolved_fields:
+                continue
+            raw_candidates = requirement.get("candidate_values") or requirement.get("options") or []
+            options = [str(value) for value in raw_candidates if str(value).strip()]
+            label = str(requirement.get("field_label") or requirement.get("label") or field_id)
+            return ClarificationMessage(
+                role="assistant",
+                question_id=f"field:{field_id}",
+                content=f"请确认字段“{label}”应使用哪个值？",
+                options=options,
+                reason=str(requirement.get("reason") or "字段需求尚未明确。"),
+            )
+
         template_format = str(
             brief.output_policy.get("format") or template_analysis.get("format") or "文档",
         )
@@ -87,6 +112,26 @@ class RequirementClarifier:
             updates = {"inference_policy": canonical}
             previous_answers.append(ClarificationAnswer(
                 question_id=question_id, raw_answer=normalized, normalized_answer=canonical,
+            ))
+        elif question_id.startswith("field:"):
+            field_id = question_id.removeprefix("field:").strip()
+            known_fields = {
+                str(item.get("field") or item.get("field_id") or "").strip()
+                for item in brief.unresolved_requirements
+                if isinstance(item, dict)
+            }
+            if not field_id or field_id not in known_fields:
+                raise ValueError("unknown clarification field")
+            updates = {
+                "resolved_fields": {
+                    **brief.resolved_fields,
+                    field_id: normalized,
+                },
+            }
+            previous_answers.append(ClarificationAnswer(
+                question_id=question_id,
+                raw_answer=normalized,
+                normalized_answer=normalized,
             ))
         else:
             raise ValueError("unknown clarification question")

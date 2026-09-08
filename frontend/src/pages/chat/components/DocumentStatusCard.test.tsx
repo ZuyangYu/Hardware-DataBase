@@ -86,6 +86,58 @@ describe('DocumentStatusCard', () => {
     expect(sessionCard).not.toContain('document-generation?');
   });
 
+  it('renders the durable clarification question and options in the task card', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'generation_session',
+          status: 'needs_clarification',
+          next_actions: ['answer_clarification'],
+          kb_name: 'hardware',
+          task_id: 'task-clarify-1',
+          generation_session_id: 'session-clarify-1',
+          question_id: 'scope',
+          content: '请选择生成范围',
+          options: ['当前发布版本', '最新上传版本'],
+        }}
+      />,
+    );
+
+    expect(markup).toContain('请选择生成范围');
+    expect(markup).toContain('当前发布版本');
+    expect(markup).toContain('最新上传版本');
+  });
+
+  it('renders an answer form and option buttons without showing internal identifiers', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'generation_session',
+          status: 'needs_clarification',
+          next_actions: ['answer_clarification'],
+          kb_name: 'hardware',
+          task_id: 'task-private',
+          generation_session_id: 'session-private',
+          question_id: 'scope',
+          content: '请选择生成范围',
+          options: ['当前发布版本', '最新上传版本'],
+        }}
+        onAnswerClarification={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('回答澄清问题');
+    expect(markup).toContain('textarea');
+    expect(markup).toContain('当前发布版本');
+    expect(markup).toContain('最新上传版本');
+    expect(markup).toContain('提交回答');
+    // Identifiers are used only in the actionable deep-link URL, never as
+    // visible card copy.
+    expect(markup).not.toContain('>task-private<');
+    expect(markup).not.toContain('>session-private<');
+    expect(markup).not.toContain('scope');
+  });
+
   it('renders one download button per artifact, none without artifacts or work order', () => {
     const withArtifacts = parseDocumentCardEvent(cardEvent({
       kind: 'work_order_status',

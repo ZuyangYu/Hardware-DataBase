@@ -96,6 +96,8 @@ export function listTemplateCandidateAttachments(
 
 export type TemplateAttachmentRoute = {
   intent: boolean;
+  /** The server owns executor selection; this is only a client-side hint. */
+  authority: 'backend';
   candidates: AttachmentView[];
   autoTemplate: AttachmentView | null;
   requiresSelection: boolean;
@@ -115,6 +117,7 @@ export function resolveTemplateAttachmentRoute(
     : [];
   return {
     intent,
+    authority: 'backend',
     candidates,
     autoTemplate: candidates.length === 1 ? candidates[0] : null,
     requiresSelection: intent && !hasDocumentContext && candidates.length > 1,
@@ -250,7 +253,9 @@ export default function ChatPage({
     degradedNotes,
     documentCards,
     documentCardRefreshingId,
+    documentCardAnsweringId,
     refreshDocumentCardStatus,
+    answerDocumentCard,
     send,
     abortStream,
     forbidden,
@@ -570,14 +575,9 @@ export default function ChatPage({
     // draft attachments: one eligible candidate can be auto-selected, while
     // multiple candidates must be chosen with the explicit “作为模板” action.
     const templateRoute = resolveTemplateAttachmentRoute(query, draftAttachments, documentContext != null);
-    if (templateRoute.requiresSelection) {
-      notify.error('检测到多个可用模板，请先点击目标附件“作为模板”后再发送');
-      return;
-    }
-    if (templateRoute.requiresTemplate) {
-      notify.error('请先上传或选择一个已解析的 DOCX、XLSX 或 XLSM 模板');
-      return;
-    }
+    // These checks remain UI hints for affordances and copy.  They must not
+    // block the turn: the backend ConversationPlan is authoritative and can
+    // route an ambiguous request to clarification, retrieval, or chat.
     const autoTemplate = templateRoute.autoTemplate;
     if (autoTemplate && (!canUploadDocumentTemplate || activeSessionId == null)) {
       notify.error(
@@ -804,8 +804,10 @@ export default function ChatPage({
                   <div className={chatBubbleClass('assistant')}>
                     <DocumentStatusCard
                       card={card}
-                      refreshing={Boolean(card.work_order_id) && documentCardRefreshingId === card.work_order_id}
+                      refreshing={documentCardRefreshingId === documentCardIdentity(card)}
+                      answering={documentCardAnsweringId === documentCardIdentity(card)}
                       onRefreshStatus={(target) => void refreshDocumentCardStatus(target)}
+                      onAnswerClarification={(target, answer) => void answerDocumentCard(target, answer)}
                     />
                   </div>
                 </div>

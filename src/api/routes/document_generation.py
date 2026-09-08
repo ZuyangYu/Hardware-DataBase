@@ -19,10 +19,13 @@ from src.api.schemas import (
     AnalyzeTemplateFromAttachmentRequest,
     AnswerGenerationSessionRequest,
     ConfirmTemplateRequest,
+    CompleteDocumentRevisionRequest,
     ConvertDocumentArtifactRequest,
+    CreateDocumentRevisionRequest,
     CreateGenerationSessionRequest,
     CreateWorkOrderRequest,
     DeleteDocumentWorkOrderRequest,
+    DocumentReviewDecisionRequest,
     FeedbackRequest,
     IcdResolutionRequest,
     TemplateAnalysisReviewView,
@@ -66,6 +69,10 @@ def _write_ctx(user: AuthUser, auth: AuthService, kb: str):
     ctx = _ctx(user, auth, kb)
     if not ctx.has_kb_permission(kb, "write"):
         raise HTTPException(status_code=403, detail="write permission required")
+    # This API is the controlled Workbench/management entry point.  Keep the
+    # origin explicit so DocumentTask does not infer a Chat turn from a
+    # synthetic RequestContext session id.
+    ctx.metadata["document_task_origin"] = "workbench"
     return ctx
 
 
@@ -397,6 +404,8 @@ def create_generation_session(
             template_version_id=payload.template_version_id,
             purpose=payload.purpose,
             output_policy=payload.output_policy,
+            document_schema_id=payload.document_schema_id,
+            document_schema_version=payload.document_schema_version,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -439,6 +448,7 @@ def answer_generation_session(
             session_id,
             question_id=payload.question_id,
             answer=payload.answer,
+            client_request_id=payload.client_request_id,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -483,6 +493,8 @@ def create_work_order(
             "document_schema_version": payload.document_schema_version,
             "generation_session_id": payload.generation_session_id,
         }
+        if payload.client_request_id is not None:
+            kwargs["idempotency_key"] = payload.client_request_id
         if payload.execution_mode is not None:
             kwargs["execution_mode"] = payload.execution_mode
         return pipeline.prepare_knowledge_base_document_generation(
@@ -509,9 +521,229 @@ def list_work_orders(
     return [order.model_dump() if hasattr(order, "model_dump") else dict(vars(order)) for order in orders]
 
 
+@router.get("/document-generation/tasks/{task_id}/projection")
+def document_task_projection(
+    task_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Read the task aggregate shared by Chat and the Workbench."""
+    ctx = _ctx(user, auth, kb)
+    try:
+        projection = pipeline.get_document_task_projection(ctx, task_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if projection is None:
+        raise HTTPException(status_code=404, detail="document task not found")
+    return projection
+
+
+@router.get("/document-generation/tasks")
+def list_document_task_projections(
+    kb: str,
+    conversation_id: str | None = None,
+    session_id: int | None = None,
+    limit: int = 100,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """List the same task projections used to restore a Chat task card."""
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.list_document_task_projections(
+            ctx,
+            knowledge_base_name=kb,
+            conversation_id=(conversation_id if conversation_id is not None else session_id),
+            limit=max(1, min(limit, 200)),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.get("/document-generation/tasks/{task_id}/reviews")
+def list_document_task_reviews(
+    task_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.list_document_reviews(ctx, task_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/document-generation/reviews/{review_id}")
+def get_document_review(
+    review_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        review = pipeline.get_document_review(ctx, review_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if review is None:
+        raise HTTPException(status_code=404, detail="document review not found")
+    return review
+
+
+@router.post("/document-generation/reviews/{review_id}/decision")
+def submit_document_review_decision(
+    review_id: str,
+    kb: str,
+    payload: DocumentReviewDecisionRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        return pipeline.submit_document_review_decision(
+            ctx,
+            review_id,
+            subject_hash=payload.subject_hash,
+            decision=payload.decision,
+            client_request_id=payload.client_request_id,
+            status=payload.status,
+            decision_metadata=payload.decision_metadata,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/document-generation/tasks/{task_id}/revisions")
+def list_document_task_revisions(
+    task_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.list_document_revisions(ctx, task_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/document-generation/revisions/{revision_id}")
+def get_document_revision(
+    revision_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        revision = pipeline.get_document_revision(ctx, revision_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if revision is None:
+        raise HTTPException(status_code=404, detail="artifact revision not found")
+    return revision
+
+
+@router.post("/document-generation/tasks/{task_id}/revisions")
+def create_document_revision(
+    task_id: str,
+    kb: str,
+    payload: CreateDocumentRevisionRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        return pipeline.create_document_revision(
+            ctx,
+            task_id,
+            parent_artifact_id=payload.parent_artifact_id,
+            request_type=payload.request_type,
+            request=payload.request,
+            changed_fields=payload.changed_fields,
+            changed_sections=payload.changed_sections,
+            client_request_id=payload.client_request_id,
+            metadata=payload.metadata,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/document-generation/revisions/{revision_id}/complete")
+def complete_document_revision(
+    revision_id: str,
+    kb: str,
+    payload: CompleteDocumentRevisionRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Commit a controlled worker's child artifact and revalidation result."""
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        return pipeline.complete_document_revision(
+            ctx,
+            revision_id,
+            child_artifact_id=payload.child_artifact_id,
+            revalidation_status=payload.revalidation_status,
+            revalidation_result=payload.revalidation_result,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/document-generation/tasks/{task_id}/resume")
+def resume_document_task(
+    task_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Resume a document generation task through its task identity."""
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        return pipeline.resume_document_task(ctx, task_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 def _safe_chat_task_status(status: dict) -> dict:
     """Project only status/card fields needed by the chat task center."""
     return {
+        "task_id": status.get("task_id"),
         "work_order_id": status.get("work_order_id"),
         "status": status.get("status"),
         "phase": status.get("phase"),
@@ -540,6 +772,28 @@ def _safe_chat_task_status(status: dict) -> dict:
     }
 
 
+def _safe_chat_task_projection(projection: dict) -> dict:
+    """Adapt the aggregate projection to the legacy chat-task envelope."""
+    work_order = projection.get("work_order") or {}
+    run = projection.get("run") or {}
+    return _safe_chat_task_status({
+        "task_id": projection.get("task_id"),
+        "work_order_id": projection.get("work_order_id"),
+        "status": projection.get("status"),
+        "phase": work_order.get("phase") or projection.get("status"),
+        "scope_type": "knowledge_base" if projection.get("knowledge_base_name") else "project",
+        "knowledge_base_name": projection.get("knowledge_base_name"),
+        "target_format": work_order.get("target_format"),
+        "next_actions": projection.get("next_actions") or [],
+        "error_code": projection.get("error_code"),
+        "error_message": projection.get("error_message"),
+        "retryable": projection.get("retryable"),
+        "artifacts": projection.get("artifacts") or [],
+        "harness_run": run,
+        "clarification_session_id": projection.get("generation_session_id"),
+    })
+
+
 @router.get("/document-generation/chat-tasks")
 def list_chat_document_tasks(
     session_id: int | None = None,
@@ -553,6 +807,57 @@ def list_chat_document_tasks(
     sessions.  Every work order is re-authorized with its persisted KB before
     its status or artifact IDs are returned.
     """
+    task_store = getattr(
+        getattr(getattr(pipeline, "document_generation", None), "task_service", None),
+        "store",
+        None,
+    )
+    tasks: list[dict] = []
+    seen_task_ids: set[str] = set()
+    seen_work_orders: set[str] = set()
+    if (
+        src.settings.DOCUMENT_TASK_READ_ENABLED
+        and callable(getattr(task_store, "list_for_owner", None))
+        and callable(getattr(pipeline, "get_document_task_projection", None))
+    ):
+        for task in task_store.list_for_owner(
+            tenant_id="default",
+            user_id=user.username,
+            limit=200,
+        ):
+            if getattr(task, "origin", None) != "chat":
+                continue
+            persisted_conversation_id = str(getattr(task, "conversation_id", None) or "").strip()
+            if not persisted_conversation_id.isdecimal():
+                continue
+            if session_id is not None and int(persisted_conversation_id) != session_id:
+                continue
+            task_id = str(getattr(task, "task_id", None) or "").strip()
+            kb_name = str(getattr(task, "knowledge_base_name", None) or "").strip()
+            if not task_id or not kb_name:
+                continue
+            try:
+                ctx = _ctx(user, auth, kb_name)
+                projection = pipeline.get_document_task_projection(ctx, task_id)
+            except (HTTPException, PermissionError, KeyError, ValueError):
+                continue
+            if not isinstance(projection, dict):
+                continue
+            work_order_id = str(projection.get("work_order_id") or "").strip()
+            seen_task_ids.add(task_id)
+            if work_order_id:
+                seen_work_orders.add(work_order_id)
+            tasks.append({
+                "session_id": int(persisted_conversation_id),
+                "task_id": task_id,
+                "work_order_id": work_order_id,
+                "kb_name": kb_name,
+                "job_status": str(projection.get("status") or ""),
+                "created_at": getattr(task, "created_at", None),
+                "updated_at": getattr(task, "updated_at", None),
+                "status": _safe_chat_task_projection(projection),
+            })
+
     job_store = getattr(pipeline, "document_job_store", None)
     if not callable(getattr(job_store, "list_chat_session_jobs", None)):
         job_store = DocumentAuthoringJobStore()
@@ -563,8 +868,6 @@ def list_chat_document_tasks(
         user_id=user.username,
         session_id=session_id,
     )
-    tasks: list[dict] = []
-    seen_work_orders: set[str] = set()
     for job in jobs:
         persisted_session_id = str(job.session_id or "").strip()
         if not persisted_session_id.isdecimal():
@@ -580,7 +883,7 @@ def list_chat_document_tasks(
         # Generation and its derived PDF/PPTX conversion share one work order.
         # Jobs are returned newest-first, so expose one reconciled card instead
         # of duplicating the same task in the chat stream.
-        if work_order_id in seen_work_orders:
+        if work_order_id in seen_work_orders or str(job.task_id or "").strip() in seen_task_ids:
             continue
         seen_work_orders.add(work_order_id)
         try:
@@ -600,8 +903,14 @@ def list_chat_document_tasks(
             continue
         if not isinstance(status, dict):
             continue
+        task_id = (
+            job.task_id or status.get("task_id")
+            if src.settings.DOCUMENT_TASK_READ_ENABLED
+            else None
+        )
         tasks.append({
             "session_id": int(persisted_session_id),
+            "task_id": task_id,
             "work_order_id": work_order_id,
             "kb_name": kb_name,
             "job_status": job.status,

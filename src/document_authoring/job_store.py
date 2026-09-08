@@ -55,6 +55,7 @@ class DocumentAuthoringJob:
     operation: str
     payload: dict[str, Any] = field(default_factory=dict)
     work_order_id: str | None = None
+    task_id: str | None = None
     status: str = "queued"
     attempt: int = 0
     max_attempts: int = 3
@@ -103,6 +104,7 @@ class DocumentAuthoringJobStore:
                     client_request_id TEXT NOT NULL,
                     operation TEXT NOT NULL,
                     work_order_id TEXT,
+                    task_id TEXT,
                     status TEXT NOT NULL,
                     attempt INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL DEFAULT 3,
@@ -157,6 +159,12 @@ class DocumentAuthoringJobStore:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(document_authoring_jobs)").fetchall()}
             if "resource_lock_token" not in columns:
                 conn.execute("ALTER TABLE document_authoring_jobs ADD COLUMN resource_lock_token INTEGER")
+            if "task_id" not in columns:
+                conn.execute("ALTER TABLE document_authoring_jobs ADD COLUMN task_id TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_document_authoring_jobs_task "
+                "ON document_authoring_jobs(tenant_id, task_id, created_at)"
+            )
 
     @staticmethod
     def _validate_operation(operation: str) -> str:
@@ -423,6 +431,7 @@ class DocumentAuthoringJobStore:
         operation: str,
         payload: dict[str, Any] | None = None,
         work_order_id: str | None = None,
+        task_id: str | None = None,
         max_attempts: int = 3,
         available_at: datetime | None = None,
     ) -> DocumentAuthoringJob:
@@ -453,20 +462,40 @@ class DocumentAuthoringJobStore:
                 ).fetchone()
                 if existing is not None:
                     current = _row_to_job(existing)
-                    if current.payload != payload_value or current.work_order_id != work_order_id:
+                    requested_task_id = str(task_id).strip() if task_id else None
+                    if (
+                        current.payload != payload_value
+                        or current.work_order_id != work_order_id
+                        or (
+                            current.task_id is not None
+                            and requested_task_id is not None
+                            and current.task_id != requested_task_id
+                        )
+                    ):
                         raise ValueError("document authoring job idempotency key conflicts with existing payload")
+                    if current.task_id is None and requested_task_id is not None:
+                        conn.execute(
+                            "UPDATE document_authoring_jobs SET task_id = ?, updated_at = ? WHERE job_id = ?",
+                            (requested_task_id, _iso(now), current.job_id),
+                        )
+                        existing = conn.execute(
+                            "SELECT * FROM document_authoring_jobs WHERE job_id = ?",
+                            (current.job_id,),
+                        ).fetchone()
+                        current = _row_to_job(existing)
                     conn.execute("COMMIT")
                     return current
                 job_id = f"document-job-{uuid.uuid4().hex}"
                 conn.execute(
                     """INSERT INTO document_authoring_jobs (
                            job_id, tenant_id, user_id, session_id, client_request_id,
-                           operation, work_order_id, status, attempt, max_attempts,
+                           operation, work_order_id, task_id, status, attempt, max_attempts,
                            available_at, payload_json, created_at, updated_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)""",
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)""",
                     (
                         job_id, tenant_id, user_id, session_id, client_request_id,
-                        operation, work_order_id, max_attempts, _iso(available),
+                        operation, work_order_id, str(task_id).strip() if task_id else None,
+                        max_attempts, _iso(available),
                         _json(payload_value), _iso(now), _iso(now),
                     ),
                 )
@@ -971,6 +1000,7 @@ def _row_to_job(row: sqlite3.Row) -> DocumentAuthoringJob:
         operation=str(row["operation"]),
         payload=_load(row["payload_json"], {}),
         work_order_id=row["work_order_id"],
+        task_id=(str(row["task_id"]).strip() if "task_id" in row.keys() and row["task_id"] else None),
         status=str(row["status"]),
         attempt=int(row["attempt"] or 0),
         max_attempts=int(row["max_attempts"] or 1),

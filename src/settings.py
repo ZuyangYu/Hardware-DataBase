@@ -111,6 +111,19 @@ DOCUMENT_AUTHORING_CHECKPOINTER_PATH = _resolve_storage_path(
     os.getenv("DOCUMENT_AUTHORING_CHECKPOINTER_PATH"),
     "document_authoring_checkpoints.sqlite",
 )
+# DocumentTask is introduced additively.  These gates allow task writes,
+# projections and the eventual association requirement to be enabled in
+# separate rollout steps and rolled back without deleting durable authoring
+# data.
+DOCUMENT_TASK_WRITE_ENABLED = _env_bool("DOCUMENT_TASK_WRITE_ENABLED", True)
+DOCUMENT_TASK_READ_ENABLED = _env_bool("DOCUMENT_TASK_READ_ENABLED", True)
+DOCUMENT_TASK_ASSOCIATION_REQUIRED = _env_bool("DOCUMENT_TASK_ASSOCIATION_REQUIRED", False)
+# Requirement resolution is additive and opt-in while existing schemas migrate
+# to field-level evidence contracts.  The per-request metadata flag may still
+# enable it for controlled pilots without changing deployment-wide behavior.
+DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED = _env_bool(
+    "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED", False
+)
 
 # External conversation (外部对话) domain switches.
 EXTERNAL_CONVERSATION_LLM_STRUCTURE = os.getenv("EXTERNAL_CONVERSATION_LLM_STRUCTURE", "true").lower() in {"1", "true", "yes", "on"}
@@ -333,6 +346,10 @@ DEFAULT_VALUES = {
     "DOCUMENT_AUTHORING_CHECKPOINTER_PATH": os.path.join(
         STORAGE_DIR, "document_authoring_checkpoints.sqlite"
     ),
+    "DOCUMENT_TASK_WRITE_ENABLED": "true",
+    "DOCUMENT_TASK_READ_ENABLED": "true",
+    "DOCUMENT_TASK_ASSOCIATION_REQUIRED": "false",
+    "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED": "false",
     "MEMORY_ENABLED": "true",
     "MEMORY_STORE_BACKEND": "sqlite",
     "MEMORY_SQLITE_PATH": os.path.join(STORAGE_DIR, "memory.db"),
@@ -475,6 +492,8 @@ def reload_settings():
     global AGENT_RATE_LIMIT_MAX_DELAY_SECONDS
     global DOCUMENT_AUTHORING_AGENT_MODE_ENABLED, AGENT_DOCUMENT_TOOLS_ENABLED
     global DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND, DOCUMENT_AUTHORING_CHECKPOINTER_PATH
+    global DOCUMENT_TASK_WRITE_ENABLED, DOCUMENT_TASK_READ_ENABLED, DOCUMENT_TASK_ASSOCIATION_REQUIRED
+    global DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED
     global FINAL_TOP_K, AGENT_MAX_RETRIEVAL_ROUNDS
     global WORKER_POLL_INTERVAL_SECONDS, WORKER_PARSE_BATCH_SIZE
     global DOCUMENT_AUTHORING_JOB_LEASE_SECONDS, DOCUMENT_AUTHORING_JOB_BATCH_SIZE
@@ -574,6 +593,12 @@ def reload_settings():
     DOCUMENT_AUTHORING_CHECKPOINTER_PATH = _resolve_storage_path(
         os.getenv("DOCUMENT_AUTHORING_CHECKPOINTER_PATH"),
         "document_authoring_checkpoints.sqlite",
+    )
+    DOCUMENT_TASK_WRITE_ENABLED = _env_bool("DOCUMENT_TASK_WRITE_ENABLED", True)
+    DOCUMENT_TASK_READ_ENABLED = _env_bool("DOCUMENT_TASK_READ_ENABLED", True)
+    DOCUMENT_TASK_ASSOCIATION_REQUIRED = _env_bool("DOCUMENT_TASK_ASSOCIATION_REQUIRED", False)
+    DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED = _env_bool(
+        "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED", False
     )
 
     FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "5"))

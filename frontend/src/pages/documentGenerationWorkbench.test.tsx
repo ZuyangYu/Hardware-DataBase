@@ -75,6 +75,62 @@ describe('document generation workbench', () => {
     expect(html).not.toContain('状态：retrieving');
   });
 
+  it('renders the per-field coverage panel from the status coverage block', () => {
+    const html = renderToStaticMarkup(
+      <RunStatusPanel
+        status={{
+          work_order_id: 'wo-1',
+          status: 'validating',
+          scope_type: 'knowledge_base',
+          unit_statuses: { 'field:rated_current': 'ready_to_render', 'field:pin_map': 'conflicting' },
+          artifacts: [],
+          coverage: {
+            fields: [
+              {
+                kind: 'field', field_id: 'rated_current', unit_id: 'field:rated_current',
+                label: '额定电流', required: true, status: 'ready_to_render',
+                coverage_status: 'supported', display_value: '10 A', evidence_count: 2,
+              },
+              {
+                kind: 'field', field_id: 'pin_map', unit_id: 'field:pin_map',
+                label: '管脚定义', required: false, status: 'conflicting', evidence_count: 0,
+              },
+            ],
+            summary: { covered: 1, missing: 0, conflicting: 1, failed: 0, pending: 0 },
+            total: 2,
+          },
+        }}
+      />,
+    );
+
+    expect(html).toContain('内容覆盖');
+    expect(html).toContain('共 2 项');
+    expect(html).toContain('已完成 1');
+    expect(html).toContain('冲突 1');
+    expect(html).toContain('额定电流');
+    expect(html).toContain('必填');
+    expect(html).toContain('10 A');
+    expect(html).toContain('证据 2 条');
+    expect(html).toContain('管脚定义');
+    expect(html).toContain('冲突');
+  });
+
+  it('hides the coverage panel when the status carries none', () => {
+    const html = renderToStaticMarkup(
+      <RunStatusPanel
+        status={{
+          work_order_id: 'wo-1',
+          status: 'retrieving',
+          scope_type: 'knowledge_base',
+          unit_statuses: {},
+          artifacts: [],
+        }}
+      />,
+    );
+
+    expect(html).not.toContain('内容覆盖');
+  });
+
   it('renders lifecycle controls permitted by a paused work order', () => {
     const html = renderToStaticMarkup(
       <RunStatusPanel

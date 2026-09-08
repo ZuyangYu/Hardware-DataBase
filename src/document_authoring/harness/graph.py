@@ -1636,6 +1636,7 @@ def build_writer_request(
     confirmed = bool(brief.get("confirmed"))
     missing_or_conflicts: list[dict[str, Any]] = []
     allowed_derivations: list[dict[str, Any]] = []
+    field = _field_for_unit(unit_id, schema)
     if confirmed:
         brief_missing = normalize_clarification_policy(
             "missing_data_policy", brief.get("missing_data_policy")
@@ -1669,6 +1670,7 @@ def build_writer_request(
         unit_label=_unit_label(unit_id, schema),
         unit_description=_unit_description(unit_id, schema),
         field_value_type=_unit_value_type(unit_id, schema),
+        table_columns=dict(field.table_columns) if field is not None and getattr(field, "table_columns", None) else None,
         retrieval_query_terms=list(requirement.retrieval_query_terms),
         evidence=evidence,
         allowed_derivations=allowed_derivations,

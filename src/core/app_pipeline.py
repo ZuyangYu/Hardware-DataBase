@@ -14,7 +14,7 @@ from src.agents.tools.circuit_tools import CircuitQueryTool
 from src.agents.tools.spreadsheet_tools import SpreadsheetSemanticTool
 from src.core.auth import AuthService
 from src.core.cancellation import QueryCancelled
-from src.core.conversation import GENERAL_CHAT_KB_NAME
+from src.core.conversation import ConversationService, GENERAL_CHAT_KB_NAME
 from src.core.logger import error, log, warn
 from src.ingestion.kb_paths import InvalidKnowledgeBaseName, validate_kb_name
 from src.pipelines.document_rag.factory import create_rag_backend
@@ -39,7 +39,10 @@ from src.document_authoring.icd_generation import connector_refdes_from_front_vi
 from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.generation_sessions import GenerationBrief
+from src.document_authoring.models import content_hash
 from src.document_authoring.requirement_clarifier import RequirementClarifier
+from src.document_authoring.requirement_resolver import RequirementResolver
+from src.document_authoring.reviews import resolve_review_decision_status
 from src.document_authoring.retriever_registry import (
     CrossUnitEvidenceCache,
     RetrieverRegistry,
@@ -169,6 +172,7 @@ class AppPipeline:
             self.agent.document_authoring_pipeline = self
             self.agent.document_job_store = self.document_job_store
             self.requirement_clarifier = RequirementClarifier()
+            self.requirement_resolver = RequirementResolver()
             # Spreadsheet structured index (xlsx TableIndexStore). Shared with
             # the query agent; the KB authoring retriever also needs it so
             # frozen .xlsx sources can produce tabular evidence.
@@ -826,6 +830,92 @@ class AppPipeline:
     def get_document_template_sanitization_summary(self, ctx: RequestContext, template_version_id: str):
         return self.document_generation.get_template_sanitization_summary(ctx, template_version_id)
 
+    def resolve_document_requirements(
+        self,
+        ctx: RequestContext,
+        *,
+        document_schema_id: str | None = None,
+        document_schema_version: str | None = None,
+        document_schema: Any | None = None,
+        field_contracts: Any | None = None,
+        evidence: Any | None = None,
+        project_context: Any | None = None,
+        available_sources: Any | None = None,
+        generation_policy: Any | None = None,
+    ):
+        """Resolve field requirements before a writer is allowed to act."""
+        schema = document_schema
+        if schema is None and document_schema_id:
+            getter = getattr(self.document_generation.store, "get_document_schema", None)
+            if not callable(getter):
+                raise KeyError("document schema store is unavailable")
+            schema = getter(
+                document_schema_id,
+                document_schema_version or "1",
+            )
+        if schema is None and field_contracts is None:
+            raise KeyError("document schema is required")
+        resolver = getattr(self, "requirement_resolver", None) or RequirementResolver()
+        metadata = getattr(ctx, "metadata", {})
+        return resolver.resolve(
+            document_schema=schema,
+            field_contracts=field_contracts,
+            evidence=evidence if evidence is not None else metadata.get("document_evidence"),
+            project_context=(
+                project_context
+                if project_context is not None
+                else metadata.get("document_project_context")
+            ),
+            available_sources=(
+                available_sources
+                if available_sources is not None
+                else metadata.get("document_available_sources")
+            ),
+            generation_policy=(
+                generation_policy
+                if generation_policy is not None
+                else metadata.get("document_generation_policy")
+            ),
+        )
+
+    @staticmethod
+    def _document_requirement_resolution_enabled(ctx: RequestContext) -> bool:
+        metadata = getattr(ctx, "metadata", {})
+        if isinstance(metadata, dict) and "document_requirement_resolution_enabled" in metadata:
+            return bool(metadata["document_requirement_resolution_enabled"])
+        return bool(getattr(src.settings, "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED", False))
+
+    def _document_requirement_resolution_snapshot(
+        self,
+        ctx: RequestContext,
+        *,
+        document_schema_id: str,
+        document_schema_version: str,
+    ) -> dict[str, Any] | None:
+        """Resolve requirements only for an explicitly enabled rollout.
+
+        The snapshot is attached to the preflight/session projection.  It is
+        never treated as writer authority; the generation worker still uses
+        the frozen schema, evidence and policy captured by the WorkOrder.
+        """
+        if not self._document_requirement_resolution_enabled(ctx):
+            return None
+        result = self.resolve_document_requirements(
+            ctx,
+            document_schema_id=document_schema_id,
+            document_schema_version=document_schema_version,
+        )
+        return result.to_dict()
+
+    @staticmethod
+    def _attach_requirement_resolution(
+        payload: dict[str, Any],
+        resolution: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if resolution is not None:
+            payload["requirement_resolution"] = resolution
+        return payload
+
     def get_document_template_analysis_for_review(
         self,
         ctx: RequestContext,
@@ -866,6 +956,8 @@ class AppPipeline:
         template_version_id: str,
         purpose: str = "",
         output_policy: dict[str, Any] | None = None,
+        document_schema_id: str | None = None,
+        document_schema_version: str | None = None,
         auto_confirm_recommended: bool = False,
     ):
         template = self.document_generation.store.get_template(template_version_id)
@@ -897,14 +989,46 @@ class AppPipeline:
             )
         else:
             brief = GenerationBrief(purpose=purpose.strip(), output_policy=policy)
+        if document_schema_id:
+            resolver_snapshot = self._document_requirement_resolution_snapshot(
+                ctx,
+                document_schema_id=document_schema_id,
+                document_schema_version=document_schema_version or "1",
+            )
+            if resolver_snapshot is not None:
+                brief = brief.model_copy(update={
+                    "unresolved_requirements": resolver_snapshot["unresolved_requirements"],
+                    "resolved_fields": resolver_snapshot["resolved_fields"],
+                })
         session = self.document_generation.store.generation_sessions.create_session(
             tenant_id=ctx.tenant_id or "default",
             user_id=ctx.user_id,
             knowledge_base_name=knowledge_base_name,
             template_version_id=template_version_id,
             brief=brief,
+            conversation_id=ctx.metadata.get("conversation_id"),
+            initiating_turn_id=ctx.metadata.get("initiating_turn_id"),
         )
         sessions = self.document_generation.store.generation_sessions
+        task = self.document_generation.ensure_document_task(
+            ctx,
+            template_version_id=template_version_id,
+            generation_session_id=session.session_id,
+            knowledge_base_name=knowledge_base_name,
+            idempotency_key=(
+                ctx.metadata.get("document_task_idempotency_key")
+                or f"generation-session:{session.session_id}"
+            ),
+            status="needs_clarification",
+        )
+        if task is not None:
+            session = sessions.bind_document_task(session.session_id, task.task_id)
+            try:
+                self.document_generation.task_service.store.update_status(
+                    task.task_id, "needs_clarification"
+                )
+            except Exception:
+                warn(f"failed to project clarification status for task {task.task_id}")
         if auto_confirm_recommended:
             sessions.append_message(
                 session.session_id,
@@ -916,6 +1040,13 @@ class AppPipeline:
                 reason="recommended_defaults_applied",
             )
             sessions.confirm(session.session_id)
+            if task is not None:
+                try:
+                    self.document_generation.task_service.store.update_status(
+                        task.task_id, "planned"
+                    )
+                except Exception:
+                    warn(f"failed to project confirmed task {task.task_id}")
         else:
             message = self.requirement_clarifier.next_message(
                 analysis.model_dump(mode="json"),
@@ -929,7 +1060,33 @@ class AppPipeline:
                 options=message.options,
                 reason=message.reason,
             )
-        return self.get_document_generation_session(ctx, session.session_id)
+        session = self.get_document_generation_session(ctx, session.session_id)
+        if auto_confirm_recommended:
+            self._project_generation_session_event(
+                session,
+                "document_clarification_ready",
+                {"reason": "recommended_defaults_applied"},
+            )
+        else:
+            pending = next(
+                (
+                    item for item in reversed(session.messages)
+                    if item.role == "assistant" and item.question_id
+                ),
+                None,
+            )
+            if pending is not None:
+                self._project_generation_session_event(
+                    session,
+                    "document_clarification_question",
+                    {
+                        "question_id": pending.question_id,
+                        "options": list(pending.options),
+                        "reason": pending.reason,
+                        "content": pending.content,
+                    },
+                )
+        return session
 
     def get_document_generation_session(self, ctx: RequestContext, session_id: str):
         session = self.document_generation.store.generation_sessions.get_session(
@@ -949,38 +1106,18 @@ class AppPipeline:
         *,
         question_id: str,
         answer: str,
+        client_request_id: str | None = None,
     ):
         session = self.get_document_generation_session(ctx, session_id)
         if not ctx.has_kb_permission(session.knowledge_base_name, "write"):
             raise PermissionError("knowledge base write permission is required")
         if ctx.metadata.get("document_template_kb_name") != session.knowledge_base_name:
             raise PermissionError("generation session belongs to another knowledge base")
-        if session.status != "needs_clarification":
-            raise ValueError("generation session is not accepting clarification answers")
-        pending = next(
-            (
-                message
-                for message in reversed(session.messages)
-                if message.role == "assistant" and message.question_id
-            ),
-            None,
-        )
-        if pending is None or pending.question_id != question_id:
-            raise ValueError("clarification answer does not match the current question")
         brief = self.requirement_clarifier.apply_answer(
             session.brief,
             question_id=question_id,
             answer=answer,
         )
-        sessions = self.document_generation.store.generation_sessions
-        sessions.append_message(
-            session_id,
-            role="user",
-            content=answer.strip(),
-            question_id=question_id,
-            answer=answer.strip(),
-        )
-        sessions.update_brief(session_id, brief.model_dump())
         analysis = self.document_generation.store.get_template_analysis(
             session.template_version_id,
         )
@@ -990,14 +1127,48 @@ class AppPipeline:
             analysis.model_dump(mode="json"),
             brief,
         )
-        sessions.append_message(
+        sessions = self.document_generation.store.generation_sessions
+        revised, applied = sessions.apply_clarification_answer(
             session_id,
-            role=message.role,
-            content=message.content,
-            question_id=message.question_id,
-            options=message.options,
-            reason=message.reason,
+            question_id=question_id,
+            answer=answer,
+            brief=brief,
+            next_message=message,
+            client_request_id=client_request_id,
         )
+        if applied:
+            task_id = revised.document_task_id
+            if task_id:
+                try:
+                    self.document_generation.task_service.store.update_status(
+                        task_id, "needs_clarification"
+                    )
+                except Exception:
+                    warn(f"failed to project clarification answer for task {task_id}")
+            self._project_generation_session_event(
+                revised,
+                "document_clarification_answer",
+                {
+                    "question_id": question_id,
+                    "answer": answer.strip(),
+                    "client_request_id": client_request_id,
+                },
+            )
+            event_type = (
+                "document_clarification_ready"
+                if message.reason == "ready_to_generate"
+                else "document_clarification_question"
+            )
+            self._project_generation_session_event(
+                revised,
+                event_type,
+                {
+                    "question_id": message.question_id,
+                    "options": list(message.options),
+                    "reason": message.reason,
+                    "content": message.content,
+                },
+            )
         return self.get_document_generation_session(ctx, session_id)
 
     def confirm_document_generation_session(self, ctx: RequestContext, session_id: str):
@@ -1017,7 +1188,61 @@ class AppPipeline:
         )
         if ready.reason != "ready_to_generate":
             raise ValueError("generation brief still has unanswered questions")
-        return self.document_generation.store.generation_sessions.confirm(session_id)
+        confirmed = self.document_generation.store.generation_sessions.confirm(session_id)
+        if confirmed.document_task_id:
+            try:
+                self.document_generation.task_service.store.update_status(
+                    confirmed.document_task_id, "planned"
+                )
+            except Exception:
+                warn(f"failed to project confirmed task {confirmed.document_task_id}")
+        self._project_generation_session_event(
+            confirmed,
+            "document_clarification_ready",
+            {"reason": "user_confirmed"},
+        )
+        return confirmed
+
+    @staticmethod
+    def _project_generation_session_event(
+        session: Any,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Project safe clarification metadata into the owning Chat turn.
+
+        GenerationSession remains the requirement-state source of truth.  The
+        Conversation event is a durable, replayable view for Chat/Workbench
+        timelines and intentionally carries identifiers and question metadata
+        only, never source evidence or rendered document content.
+        """
+        turn_id = str(getattr(session, "initiating_turn_id", None) or "").strip()
+        conversation_id = str(getattr(session, "conversation_id", None) or "").strip()
+        if not turn_id or not conversation_id:
+            return
+        try:
+            conversation = ConversationService()
+            turn = conversation.get_turn_unscoped(turn_id)
+            if turn is None or str(turn.session_id) != conversation_id:
+                return
+            projected = {
+                "generation_session_id": session.session_id,
+                "document_task_id": session.document_task_id,
+                "conversation_id": conversation_id,
+                "initiating_turn_id": turn_id,
+                "clarification_revision": session.clarification_revision,
+                **{
+                    key: value
+                    for key, value in payload.items()
+                    if value is not None
+                },
+            }
+            conversation.append_turn_event(turn_id, event_type, projected)
+        except Exception as exc:
+            # Projection is additive during migration.  The authoring state
+            # was already committed and remains authoritative if the chat DB
+            # is temporarily unavailable.
+            warn(f"failed to project generation session event {event_type}: {exc}")
 
     def create_document_work_order(self, ctx: RequestContext, **kwargs):
         return self.document_generation.create_document_work_order(ctx, **kwargs)
@@ -1138,17 +1363,26 @@ class AppPipeline:
                 order.work_order_id,
             )
         snapshot = self.document_generation.resolve_source_snapshot(order)
+        requirement_resolution = self._document_requirement_resolution_snapshot(
+            ctx,
+            document_schema_id=document_schema_id,
+            document_schema_version=document_schema_version,
+        )
         profile = self._icd_template_profile(order)
         if profile is not None and profile.kind == "icd_sample":
-            return {
-                "stage": "template_contract_review_required",
-                "work_order_id": order.work_order_id,
-                "issues": [{
-                    "code": "icd_formal_template_required",
-                    "severity": "blocking",
-                    "message": "ICD 示例模板缺少正式连接器定义；请上传含连接器编号、板端型号和管脚定义表的正式 ICD 模板。",
-                }, *profile.issues],
-            }
+            return self._attach_requirement_resolution(
+                {
+                    "stage": "template_contract_review_required",
+                    "work_order_id": order.work_order_id,
+                    "task_id": getattr(order, "task_id", None),
+                    "issues": [{
+                        "code": "icd_formal_template_required",
+                        "severity": "blocking",
+                        "message": "ICD 示例模板缺少正式连接器定义；请上传含连接器编号、板端型号和管脚定义表的正式 ICD 模板。",
+                    }, *profile.issues],
+                },
+                requirement_resolution,
+            )
         scope_review = None
         icd_schema = self._icd_connector_scope_schema(order)
         if icd_schema is not None:
@@ -1231,17 +1465,28 @@ class AppPipeline:
                 decision,
             )
             if scope_review.pending_count:
-                return {
-                    "stage": "scope_review_required",
-                    "work_order_id": order.work_order_id,
-                    "exceptions": [
-                        exception.model_dump()
-                        if hasattr(exception, "model_dump")
-                        else dict(vars(exception))
-                        for exception in scope_review.exceptions
-                    ],
-                }
-        return {"stage": "ready", "work_order_id": order.work_order_id}
+                return self._attach_requirement_resolution(
+                    {
+                        "stage": "scope_review_required",
+                        "work_order_id": order.work_order_id,
+                        "task_id": getattr(order, "task_id", None),
+                        "exceptions": [
+                            exception.model_dump()
+                            if hasattr(exception, "model_dump")
+                            else dict(vars(exception))
+                            for exception in scope_review.exceptions
+                        ],
+                    },
+                    requirement_resolution,
+                )
+        return self._attach_requirement_resolution(
+            {
+                "stage": "ready",
+                "work_order_id": order.work_order_id,
+                "task_id": getattr(order, "task_id", None),
+            },
+            requirement_resolution,
+        )
 
     def _generation_session_work_order_inputs(
         self,
@@ -1369,11 +1614,15 @@ class AppPipeline:
                 client_request_id=f"work-order:{work_order_id}:generate",
                 operation="generate_work_order",
                 work_order_id=work_order_id,
+                task_id=getattr(order, "task_id", None),
                 payload={
                     "work_order_id": work_order_id,
                     "knowledge_base_name": order.knowledge_base_name,
                 },
             )
+            mark_task_queued = getattr(self.document_generation, "mark_document_task_queued", None)
+            if callable(mark_task_queued):
+                mark_task_queued(getattr(order, "task_id", None))
             return job.job_id
         return self.document_generation.worker.submit(
             work_order_id,
@@ -1422,6 +1671,7 @@ class AppPipeline:
             client_request_id=client_request_id or f"artifact-conversion:{artifact.artifact_id}:{normalized_target}",
             operation="convert_artifact",
             work_order_id=order.work_order_id,
+            task_id=getattr(order, "task_id", None),
             payload={
                 "work_order_id": order.work_order_id,
                 "knowledge_base_name": order.knowledge_base_name,
@@ -1546,19 +1796,24 @@ class AppPipeline:
             raise ValueError("document authoring resume requires a knowledge-base work order")
         if not ctx.has_kb_permission(order.knowledge_base_name, "write"):
             raise PermissionError("knowledge base write permission is required")
-        return job_store.create_job(
+        job = job_store.create_job(
             tenant_id=ctx.tenant_id or "default",
             user_id=ctx.user_id,
             session_id=ctx.session_id or f"document-generation:{order.work_order_id}",
             client_request_id=str(client_request_id),
             operation="resume_work_order",
             work_order_id=order.work_order_id,
+            task_id=getattr(order, "task_id", None),
             payload={
                 "work_order_id": order.work_order_id,
                 "knowledge_base_name": order.knowledge_base_name,
                 "harness_run_id": str(harness_run_id),
             },
         )
+        mark_task_queued = getattr(self.document_generation, "mark_document_task_queued", None)
+        if callable(mark_task_queued):
+            mark_task_queued(getattr(order, "task_id", None))
+        return job
 
     def delete_knowledge_base_document_work_order(
         self,
@@ -2169,6 +2424,99 @@ class AppPipeline:
             retrieve=retrieve,
         )
 
+    @staticmethod
+    def _coverage_bucket(status: str) -> str:
+        """Map one execution unit status to the coverage panel bucket.
+
+        The panel speaks the user's language (已完成/缺证据/冲突), so the
+        bucket mapping is the single place where internal unit-status strings
+        become user-facing aggregates.
+        """
+        return {
+            "ready_to_render": "covered",
+            "passed": "covered",
+            "tbd": "missing",
+            "insufficient_evidence": "missing",
+            "conflicting": "conflicting",
+            "retrieval_failed": "failed",
+            "failed": "failed",
+            "blocked": "failed",
+        }.get(str(status or "").strip(), "pending")
+
+    def _document_coverage_block(self, order) -> dict[str, Any]:
+        """Per-field coverage projection for the workbench coverage panel.
+
+        Combines three stored facts -- frozen schema labels, execution unit
+        statuses and the persisted evidence matrix. Every source degrades
+        independently so a partial read never hides the panel; the execution
+        statuses alone are always sufficient to render it.
+        """
+        store = self.document_generation.store
+        schema = None
+        try:
+            schema = store.get_document_schema(order.document_schema_id, order.document_schema_version)
+        except Exception:
+            schema = None
+        matrix_rows: list[Any] = []
+        try:
+            matrix_rows = store.get_evidence_matrix(order.work_order_id) or []
+        except Exception:
+            matrix_rows = []
+        row_by_unit: dict[str, dict[str, Any]] = {}
+        for row in matrix_rows:
+            if not isinstance(row, dict):
+                continue
+            for key in ("field_id", "review_item_id", "semantic_unit_id"):
+                unit_id = str(row.get(key) or "").strip()
+                if unit_id:
+                    row_by_unit.setdefault(unit_id, row)
+                    break
+        unit_statuses = dict(getattr(order, "unit_statuses", {}) or {})
+
+        entries: list[dict[str, Any]] = []
+        summary = {"covered": 0, "missing": 0, "conflicting": 0, "failed": 0, "pending": 0}
+
+        def _entry(kind: str, unit_id: str, label: str, required: bool) -> dict[str, Any]:
+            unit_key = f"{kind}:{unit_id}"
+            status_value = (
+                unit_statuses.get(unit_key)
+                or unit_statuses.get(unit_id)
+                or "planned"
+            )
+            row = row_by_unit.get(unit_id) or {}
+            evidence_ids = row.get("evidence_ids") or []
+            display_value = row.get("display_value")
+            return {
+                "kind": kind,
+                "field_id": unit_id,
+                "unit_id": unit_key,
+                "label": label or unit_id,
+                "required": required,
+                "status": status_value,
+                "coverage_status": str(row.get("coverage_status") or "") or None,
+                "display_value": str(display_value) if display_value not in (None, "") else None,
+                "evidence_count": len(evidence_ids) if isinstance(evidence_ids, list) else 0,
+            }
+
+        schema_unit_ids: set[str] = set()
+        if schema is not None:
+            for field in schema.fields:
+                schema_unit_ids.add(field.field_id)
+                entries.append(_entry("field", field.field_id, field.label, bool(field.required)))
+            for item in schema.review_items:
+                schema_unit_ids.add(item.review_item_id)
+                entries.append(_entry("review", item.review_item_id, item.label, False))
+        for key, _status_value in unit_statuses.items():
+            kind = "review" if key.startswith("review:") else "field"
+            unit_id = key.removeprefix("field:").removeprefix("review:")
+            if unit_id in schema_unit_ids:
+                continue
+            schema_unit_ids.add(unit_id)
+            entries.append(_entry(kind, unit_id, unit_id, False))
+        for entry in entries:
+            summary[self._coverage_bucket(entry["status"])] += 1
+        return {"fields": entries, "summary": summary, "total": len(entries)}
+
     def get_document_run_status(self, work_order_id: str, ctx: RequestContext | None = None):
         order = self.document_generation.store.get_work_order(work_order_id)
         if order is None:
@@ -2183,8 +2531,24 @@ class AppPipeline:
                 order,
                 "view_project",
             )
+        task_projection = None
+        task_service = getattr(self.document_generation, "task_service", None)
+        if getattr(src.settings, "DOCUMENT_TASK_READ_ENABLED", True):
+            if getattr(order, "task_id", None) and getattr(task_service, "store", None) is not None:
+                try:
+                    task_projection = task_service.store.get(order.task_id)
+                except Exception:
+                    # Task projection is an additive read model; a transient
+                    # read failure must not hide the already-authorized WorkOrder.
+                    task_projection = None
+            elif callable(getattr(task_service, "legacy_view_for_work_order", None)):
+                task_projection = task_service.legacy_view_for_work_order(order)
         status = {
             "work_order_id": order.work_order_id,
+            "task_id": (
+                getattr(order, "task_id", None)
+                or getattr(task_projection, "task_id", None)
+            ) if getattr(src.settings, "DOCUMENT_TASK_READ_ENABLED", True) else None,
             "status": order.status,
             "phase": {
                 "waiting_human_input": "needs_review",
@@ -2198,6 +2562,7 @@ class AppPipeline:
             "project_id": order.project_id,
             "target_format": order.target_format,
             "unit_statuses": dict(order.unit_statuses),
+            "coverage": self._document_coverage_block(order),
             "validation_report_id": order.validation_report_id,
             "clarification_session_id": getattr(order, "generation_session_id", None),
             "generation_brief": dict(getattr(order, "generation_brief", {}) or {}),
@@ -2206,6 +2571,8 @@ class AppPipeline:
             "retryable": getattr(order, "retryable", None),
             "next_actions": list(getattr(order, "next_actions", []) or []),
         }
+        if task_projection is not None:
+            status["task"] = task_projection.model_dump(mode="json")
         if order.run_manifest_id:
             status["run_manifest_id"] = order.run_manifest_id
         harness_runs = self.document_generation.store.list_harness_runs(order.work_order_id)
@@ -2256,7 +2623,7 @@ class AppPipeline:
                 user_id=(ctx.user_id if ctx is not None else None),
             )
             if job is not None:
-                status["job"] = {
+                job_status = {
                     "job_id": job.job_id,
                     "operation": job.operation,
                     "status": job.status,
@@ -2264,6 +2631,9 @@ class AppPipeline:
                     "last_error": job.last_error,
                     "result": dict(job.result or {}),
                 }
+                if getattr(src.settings, "DOCUMENT_TASK_READ_ENABLED", True):
+                    job_status["task_id"] = getattr(job, "task_id", None)
+                status["job"] = job_status
         if order.validation_report_id:
             report = self.document_generation.store.get_validation_report(order.validation_report_id)
             if report is not None:
@@ -2281,6 +2651,652 @@ class AppPipeline:
             for artifact in self.document_generation.store.list_artifacts(order.work_order_id)
         ]
         return status
+
+    def get_document_task_projection(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the user-facing aggregate projection for one DocumentTask.
+
+        DocumentTask owns cross-entry-point identity; WorkOrder/Run/Artifact
+        remain the execution stores.  This method composes their read models
+        only after rechecking tenant, user and knowledge-base scope.
+        """
+        if not getattr(src.settings, "DOCUMENT_TASK_READ_ENABLED", True):
+            return None
+        task_service = getattr(self.document_generation, "task_service", None)
+        task_store = getattr(task_service, "store", None)
+        if task_store is None:
+            return None
+        task = task_store.get(str(task_id))
+        if task is None:
+            return None
+        tenant_id = str(getattr(ctx, "tenant_id", None) or "default")
+        user_id = str(getattr(ctx, "user_id", None) or "")
+        if task.tenant_id != tenant_id or task.user_id != user_id:
+            raise PermissionError("document task is outside the current owner scope")
+        kb_name = str(task.knowledge_base_name or "").strip()
+        requested_kb = str(getattr(ctx, "metadata", {}).get("document_template_kb_name") or "").strip()
+        if requested_kb and kb_name and requested_kb != kb_name:
+            raise PermissionError("document task belongs to another knowledge base")
+        if kb_name and not ctx.has_kb_permission(kb_name, "read"):
+            raise PermissionError("knowledge base read permission is required")
+
+        session_projection = self._document_clarification_projection(ctx, task)
+        order = None
+        status: dict[str, Any] = {}
+        if task.work_order_id:
+            order = self.document_generation.store.get_work_order(task.work_order_id)
+            if order is not None:
+                if getattr(order, "task_id", None) not in {None, task.task_id}:
+                    raise ValueError("document task/work-order association mismatch")
+                status_reader = getattr(self, "get_document_run_status", None)
+                if callable(status_reader):
+                    status = status_reader(order.work_order_id, ctx) or {}
+
+        artifacts: list[dict[str, Any]] = []
+        if order is not None:
+            list_artifacts = getattr(self.document_generation.store, "list_artifacts", None)
+            if callable(list_artifacts):
+                for artifact in list_artifacts(order.work_order_id) or []:
+                    artifacts.append(self._safe_document_task_artifact(artifact, order))
+
+        reviews = self._document_reviews_for_task(ctx, task, order)
+        revisions: list[dict[str, Any]] = []
+        revision_service = getattr(self.document_generation, "revision_service", None)
+        if revision_service is not None:
+            try:
+                revisions = [
+                    item.model_dump(mode="json")
+                    for item in revision_service.list_revisions(ctx, task.task_id)
+                ]
+            except (PermissionError, KeyError, ValueError):
+                revisions = []
+
+        next_actions = list(status.get("next_actions") or [])
+        if not next_actions:
+            next_actions = self._document_task_next_actions(task, session_projection, order)
+        pending_review = status.get("pending_human_event")
+        if pending_review is None:
+            harness = status.get("harness_run") or {}
+            pending_review = harness.get("pending_human_event")
+        if pending_review is None:
+            pending_review = next(
+                (
+                    {
+                        "review_id": review.get("review_id"),
+                        "review_kind": review.get("review_kind"),
+                        "status": review.get("status"),
+                    }
+                    for review in reviews
+                    if review.get("status") in {"pending", "changes_requested"}
+                ),
+                None,
+            )
+        if pending_review is None:
+            pending_review = next(
+                (
+                    {
+                        "revision_id": revision.get("revision_id"),
+                        "status": revision.get("status"),
+                        "impact_scope": revision.get("impact_scope"),
+                    }
+                    for revision in revisions
+                    if revision.get("status") in {"planned", "waiting_human", "revalidated", "revalidation_required"}
+                ),
+                None,
+            )
+        if pending_review and pending_review.get("revision_id"):
+            next_actions = ["review_revision", "open_document_workbench"]
+        elif pending_review and pending_review.get("review_kind") not in {None, "icd_scope"}:
+            next_actions = ["review_document", "open_document_workbench"]
+        projection = {
+            "task_id": task.task_id,
+            "origin": task.origin,
+            "status": task.status,
+            "conversation_refs": {
+                key: value
+                for key, value in {
+                    "conversation_id": task.conversation_id,
+                    "initiating_turn_id": task.initiating_turn_id,
+                }.items()
+                if value is not None
+            },
+            "generation_session_id": task.generation_session_id,
+            "work_order_id": task.work_order_id,
+            "current_run_id": task.current_run_id,
+            "current_artifact_id": task.current_artifact_id,
+            "artifact_ids": list(task.artifact_ids),
+            "knowledge_base_name": task.knowledge_base_name,
+            "template_version_id": task.template_version_id,
+            "project_id": task.project_id,
+            "clarification_state": session_projection,
+            "work_order": (
+                {
+                    "work_order_id": order.work_order_id,
+                    "status": status.get("status", getattr(order, "status", None)),
+                    "phase": status.get("phase"),
+                    "target_format": getattr(order, "target_format", None),
+                }
+                if order is not None
+                else None
+            ),
+            "run": status.get("harness_run"),
+            "artifacts": artifacts,
+            "reviews": reviews,
+            "revisions": revisions,
+            "pending_review": pending_review,
+            "next_actions": next_actions,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+        }
+        return projection
+
+    def list_document_reviews(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+    ) -> list[dict[str, Any]]:
+        task = self._document_task_for_context(ctx, task_id)
+        order = None
+        if task.work_order_id:
+            order = self.document_generation.store.get_work_order(task.work_order_id)
+            if order is not None and getattr(order, "task_id", None) not in {None, task.task_id}:
+                raise ValueError("document task/work-order association mismatch")
+        return self._document_reviews_for_task(ctx, task, order)
+
+    def get_document_review(
+        self,
+        ctx: RequestContext,
+        review_id: str,
+    ) -> dict[str, Any] | None:
+        review_store = getattr(self.document_generation, "review_store", None)
+        if review_store is None:
+            return None
+        review = review_store.get(review_id)
+        if review is None:
+            return None
+        self._document_task_for_context(ctx, review.task_id)
+        return review.model_dump(mode="json")
+
+    def submit_document_review_decision(
+        self,
+        ctx: RequestContext,
+        review_id: str,
+        *,
+        subject_hash: str,
+        decision: Any,
+        client_request_id: str,
+        status: str | None = None,
+        decision_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        review_store = getattr(self.document_generation, "review_store", None)
+        if review_store is None:
+            raise KeyError("document review not found")
+        review = review_store.get(review_id)
+        if review is None:
+            raise KeyError("document review not found")
+        self._document_task_for_context(ctx, review.task_id, required_permission="write")
+        if review.review_kind == "icd_scope":
+            raise ValueError("ICD scope reviews must use the dedicated scope resolution endpoint")
+        requested_status = resolve_review_decision_status(decision, status)
+        is_artifact_approval = (
+            str(review.review_kind).startswith("artifact_approval:")
+            and bool(review.artifact_id)
+        )
+        if is_artifact_approval and requested_status == "approved":
+            if review.subject_hash != str(subject_hash or "").strip():
+                raise ValueError("review subject hash does not match current subject")
+            # Release is a side effect outside the review database transaction.
+            # Preflight it while the review is still pending so a stale or
+            # otherwise unreleasable candidate cannot become permanently
+            # recorded as approved without a corresponding release Artifact.
+            if review.decision is None and review.decided_at is None:
+                self._release_approved_document_review(ctx, review)
+        decided = review_store.submit_decision(
+            review_id,
+            subject_hash=subject_hash,
+            decision=decision,
+            client_request_id=client_request_id,
+            status=status,
+            decision_metadata=decision_metadata,
+        )
+        # Review state is authoritative for the review itself; the task
+        # projection is advanced only for an approval and only from the
+        # human-waiting state.  This makes retries harmless and prevents a
+        # late review response from regressing a task that already finished.
+        if decided.status == "approved":
+            if is_artifact_approval:
+                self._release_approved_document_review(ctx, review)
+                revision_service = getattr(self.document_generation, "revision_service", None)
+                if revision_service is not None:
+                    try:
+                        revision_service.mark_released(ctx, review.artifact_id)
+                    except Exception:
+                        # Release is already guarded and durable.  A revision
+                        # status projection can be reconciled from the child
+                        # release on the next task read.
+                        warn(f"failed to close artifact revision for {review.artifact_id}")
+                task = self._document_task_for_context(ctx, review.task_id)
+                task_service = getattr(
+                    getattr(self.document_generation, "task_service", None),
+                    "store",
+                    None,
+                )
+                if task.status != "completed" and task_service is not None:
+                    try:
+                        task_service.update_status(task.task_id, "completed")
+                    except Exception:
+                        warn(f"failed to project released artifact for task {task.task_id}")
+                return decided.model_dump(mode="json")
+            task_service = getattr(
+                getattr(self.document_generation, "task_service", None),
+                "store",
+                None,
+            )
+            task = self._document_task_for_context(ctx, review.task_id)
+            if task.status == "waiting_human" and task_service is not None:
+                try:
+                    task_service.update_status(task.task_id, "planned")
+                except Exception:
+                    warn(f"failed to project approved review for task {task.task_id}")
+        return decided.model_dump(mode="json")
+
+    def _release_approved_document_review(self, ctx: RequestContext, review: Any) -> Any:
+        """Apply an approved generic artifact review to the guarded release path."""
+        artifact_id = str(getattr(review, "artifact_id", None) or "").strip()
+        if not artifact_id:
+            raise ValueError("artifact review is missing its artifact identity")
+        list_artifacts = getattr(self.document_generation.store, "list_artifacts", None)
+        if callable(list_artifacts):
+            for artifact in list_artifacts(getattr(review, "work_order_id", None)) or []:
+                if (
+                    getattr(artifact, "stage", None) == "approved_release"
+                    and getattr(artifact, "parent_artifact_id", None) == artifact_id
+                ):
+                    return artifact
+        approve = getattr(self.document_generation, "approve_document_artifact", None)
+        if not callable(approve):
+            raise ValueError("artifact approval service is unavailable")
+        decision = getattr(review, "decision", None)
+        comment = ""
+        if isinstance(decision, dict):
+            comment = str(decision.get("comment") or "").strip()
+        return approve(ctx, artifact_id, comment=comment)
+
+    def list_document_revisions(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+    ) -> list[dict[str, Any]]:
+        revision_service = getattr(self.document_generation, "revision_service", None)
+        if revision_service is None:
+            raise KeyError("document revision service is unavailable")
+        return [
+            item.model_dump(mode="json")
+            for item in revision_service.list_revisions(ctx, task_id)
+        ]
+
+    def get_document_revision(
+        self,
+        ctx: RequestContext,
+        revision_id: str,
+    ) -> dict[str, Any] | None:
+        revision_service = getattr(self.document_generation, "revision_service", None)
+        if revision_service is None:
+            return None
+        revision = revision_service.get_revision(ctx, revision_id)
+        return revision.model_dump(mode="json") if revision is not None else None
+
+    def create_document_revision(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Record a governed revision and queue its regeneration work order.
+
+        Revision requests are execution orders, not sticky notes: after the
+        revision snapshot is frozen, a revision-idempotent WorkOrder restarts
+        generation from the parent's frozen inputs on the durable worker.  The
+        returned ``regeneration`` block lets callers show progress without
+        polling the revision record.
+        """
+        revision_service = getattr(self.document_generation, "revision_service", None)
+        if revision_service is None:
+            raise KeyError("document revision service is unavailable")
+        revision = revision_service.create_revision(ctx, task_id=task_id, **kwargs)
+        payload = revision.model_dump(mode="json")
+        if not revision.child_artifact_id:
+            order = self.document_generation.restart_work_order_for_revision(
+                ctx, revision.work_order_id, revision_id=revision.revision_id,
+            )
+            run_id = self.submit_knowledge_base_document_generation(ctx, order.work_order_id)
+            payload["regeneration"] = {
+                "work_order_id": order.work_order_id,
+                "run_id": run_id,
+                "status": "queued",
+            }
+        return payload
+
+    def complete_document_revision(
+        self,
+        ctx: RequestContext,
+        revision_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        revision_service = getattr(self.document_generation, "revision_service", None)
+        if revision_service is None:
+            raise KeyError("document revision service is unavailable")
+        revision = revision_service.complete_revision(ctx, revision_id, **kwargs)
+        return revision.model_dump(mode="json")
+
+    def resume_document_task(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+    ) -> dict[str, Any]:
+        """Resume a task through its durable identity.
+
+        The endpoint is deliberately task-bound: callers cannot resume an
+        arbitrary WorkOrder copied from a stale browser URL.  A pending review
+        must be decided first; once the task is ready, the existing WorkOrder
+        queue/resume paths retain their own idempotency and frozen-input
+        checks.
+        """
+        task = self._document_task_for_context(ctx, task_id)
+        work_order_id = str(getattr(task, "work_order_id", None) or "").strip()
+        if not work_order_id:
+            raise ValueError("document task has no work order to resume")
+        order = self.document_generation.store.get_work_order(work_order_id)
+        if order is None:
+            raise KeyError("document task work order not found")
+        if getattr(order, "task_id", None) not in {None, task.task_id}:
+            raise ValueError("document task/work-order association mismatch")
+        self.document_generation.require_work_order_capability(
+            ctx, order, "run_deterministic_work_order",
+        )
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("task resume currently supports knowledge-base document work orders")
+        if not ctx.has_kb_permission(order.knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+
+        reviews = self._document_reviews_for_task(ctx, task, order)
+        if any(review.get("status") in {"pending", "changes_requested"} for review in reviews):
+            raise ValueError("document task has pending human review")
+
+        if order.status == "paused":
+            run_id = self.resume_knowledge_base_document_generation(ctx, work_order_id)
+        elif order.status in {"planned", "waiting_human_input"}:
+            run_id = self.submit_knowledge_base_document_generation(ctx, work_order_id)
+        else:
+            raise ValueError(f"document task cannot resume from work order status {order.status}")
+        return {
+            "task_id": task.task_id,
+            "work_order_id": work_order_id,
+            "run_id": run_id,
+            "status": "queued",
+        }
+
+    def _document_task_for_context(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+        *,
+        required_permission: str = "read",
+    ) -> Any:
+        task_store = getattr(getattr(self.document_generation, "task_service", None), "store", None)
+        task = task_store.get(str(task_id)) if task_store is not None else None
+        if task is None:
+            raise KeyError("document task not found")
+        tenant_id = str(getattr(ctx, "tenant_id", None) or "default")
+        user_id = str(getattr(ctx, "user_id", None) or "")
+        if task.tenant_id != tenant_id or task.user_id != user_id:
+            raise PermissionError("document task is outside the current owner scope")
+        kb_name = str(task.knowledge_base_name or "").strip()
+        requested_kb = str(getattr(ctx, "metadata", {}).get("document_template_kb_name") or "").strip()
+        if requested_kb and kb_name and requested_kb != kb_name:
+            raise PermissionError("document task belongs to another knowledge base")
+        if kb_name and not ctx.has_kb_permission(kb_name, required_permission):
+            raise PermissionError(f"knowledge base {required_permission} permission is required")
+        return task
+
+    def _document_reviews_for_task(
+        self,
+        ctx: RequestContext,
+        task: Any,
+        order: Any | None,
+    ) -> list[dict[str, Any]]:
+        review_store = getattr(self.document_generation, "review_store", None)
+        if review_store is None:
+            return []
+        if order is not None:
+            self._materialize_document_reviews(task, order, review_store)
+        return [review.model_dump(mode="json") for review in review_store.list_for_task(task.task_id)]
+
+    def _materialize_document_reviews(self, task: Any, order: Any, review_store: Any) -> None:
+        """Adapt legacy ICD/artifact gates into the generic review namespace."""
+        schema_hash = content_hash({
+            "template_version_id": getattr(order, "template_version_id", None),
+            "document_schema_id": getattr(order, "document_schema_id", None),
+            "document_schema_version": getattr(order, "document_schema_version", None),
+        })
+        source_hash = ""
+        resolve_snapshot = getattr(self.document_generation, "resolve_source_snapshot", None)
+        if callable(resolve_snapshot):
+            try:
+                snapshot = resolve_snapshot(order)
+            except (KeyError, PermissionError, ValueError):
+                # Do not create a review bound to a snapshot identifier (or a
+                # synthetic fallback) when the immutable source cannot be
+                # resolved.  A review without the exact content hash would be
+                # unsafe to approve; the next projection can retry once the
+                # source store is available.
+                return
+            if snapshot is not None:
+                source_hash = str(getattr(snapshot, "content_hash", "") or "").strip()
+            if not source_hash:
+                return
+        else:
+            source_hash = str(getattr(order, "baseline_content_hash", "") or "").strip()
+        if not source_hash:
+            return
+        existing_kinds = {
+            str(item.review_kind)
+            for item in review_store.list_for_task(task.task_id)
+        }
+        get_icd = getattr(self.document_generation.store, "get_icd_scope_review", None)
+        icd_review = get_icd(order.work_order_id) if callable(get_icd) else None
+        if icd_review is not None and "icd_scope" not in existing_kinds:
+            subject_hash = str(getattr(icd_review, "decision_content_hash", "") or "").strip()
+            if not subject_hash:
+                subject_hash = content_hash(getattr(icd_review, "decision", {}))
+            exceptions = list(getattr(icd_review, "exceptions", []) or [])
+            review_store.create(
+                task_id=task.task_id,
+                work_order_id=order.work_order_id,
+                review_kind="icd_scope",
+                status="approved" if getattr(icd_review, "status", "pending") == "frozen" else "pending",
+                subject_hash=subject_hash,
+                source_snapshot_hash=str(getattr(icd_review, "source_snapshot_hash", "") or source_hash),
+                schema_hash=schema_hash,
+                metadata={
+                    "exception_ids": [str(getattr(item, "exception_id", "")) for item in exceptions],
+                    "pending_count": int(getattr(icd_review, "pending_count", 0) or 0),
+                },
+                client_request_id=f"legacy-adapter:icd-scope:{order.work_order_id}:{subject_hash}",
+            )
+
+        list_artifacts = getattr(self.document_generation.store, "list_artifacts", None)
+        artifacts = list_artifacts(order.work_order_id) if callable(list_artifacts) else []
+        for artifact in artifacts or []:
+            if getattr(artifact, "stage", None) != "review_candidate":
+                continue
+            if any(
+                getattr(released, "stage", None) == "approved_release"
+                and getattr(released, "parent_artifact_id", None) == getattr(artifact, "artifact_id", None)
+                for released in artifacts or []
+            ):
+                # The legacy artifact approval endpoint may have released the
+                # candidate before the generic review adapter was projected.
+                # Do not resurrect a stale pending review for an immutable
+                # artifact that already has a release child.
+                continue
+            kind = f"artifact_approval:{artifact.artifact_id}"
+            if kind in existing_kinds:
+                continue
+            artifact_content_hash = str(getattr(artifact, "content_hash", None) or "").strip()
+            stored_subject_hash = str(getattr(artifact, "approval_subject_hash", None) or "").strip()
+            report_hash = ""
+            get_report = getattr(self.document_generation.store, "get_validation_report", None)
+            if callable(get_report):
+                report = get_report(getattr(artifact, "validation_report_id", None))
+                report_hash = str(getattr(report, "content_hash", None) or "").strip()
+            if artifact_content_hash and report_hash:
+                subject_hash = content_hash({
+                    "artifact_content_hash": artifact_content_hash,
+                    "validation_report_hash": report_hash,
+                    "source_set_snapshot_hash": source_hash,
+                })
+                if stored_subject_hash and stored_subject_hash != subject_hash:
+                    continue
+            else:
+                subject_hash = stored_subject_hash or artifact_content_hash
+            if not subject_hash:
+                continue
+            review_store.create(
+                task_id=task.task_id,
+                work_order_id=order.work_order_id,
+                artifact_id=artifact.artifact_id,
+                review_kind=kind,
+                status="pending",
+                subject_hash=subject_hash,
+                source_snapshot_hash=source_hash,
+                schema_hash=schema_hash,
+                metadata={"stage": str(getattr(artifact, "stage", ""))},
+                client_request_id=f"legacy-adapter:artifact:{artifact.artifact_id}:{subject_hash}",
+            )
+
+    def list_document_task_projections(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str | None = None,
+        conversation_id: str | int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List task projections using the same authorization as single reads."""
+        task_service = getattr(self.document_generation, "task_service", None)
+        task_store = getattr(task_service, "store", None)
+        if task_store is None or not getattr(src.settings, "DOCUMENT_TASK_READ_ENABLED", True):
+            return []
+        requested_kb = str(knowledge_base_name or "").strip() or None
+        if requested_kb and not ctx.has_kb_permission(requested_kb, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        requested_conversation = str(conversation_id or "").strip() or None
+        projections: list[dict[str, Any]] = []
+        for task in task_store.list_for_owner(
+            tenant_id=str(getattr(ctx, "tenant_id", None) or "default"),
+            user_id=str(getattr(ctx, "user_id", None) or ""),
+            limit=limit,
+        ):
+            if requested_kb and task.knowledge_base_name != requested_kb:
+                continue
+            if requested_conversation and task.conversation_id != requested_conversation:
+                continue
+            try:
+                projection = self.get_document_task_projection(ctx, task.task_id)
+            except PermissionError:
+                continue
+            if projection is not None:
+                projections.append(projection)
+        return projections
+
+    def _document_clarification_projection(
+        self,
+        ctx: RequestContext,
+        task: Any,
+    ) -> dict[str, Any] | None:
+        session_id = str(getattr(task, "generation_session_id", None) or "").strip()
+        if not session_id:
+            return None
+        sessions = getattr(getattr(self.document_generation, "store", None), "generation_sessions", None)
+        if sessions is None:
+            return None
+        try:
+            session = sessions.get_session(
+                session_id,
+                tenant_id=str(getattr(ctx, "tenant_id", None) or "default"),
+                user_id=str(getattr(ctx, "user_id", None) or ""),
+            )
+        except (KeyError, PermissionError, ValueError):
+            # The task projection is additive and must remain readable when a
+            # legacy/partially migrated task points at a removed or unavailable
+            # GenerationSession.  WorkOrder/Artifact state is still useful.
+            return None
+        if session is None:
+            return None
+        pending = next(
+            (
+                item for item in reversed(session.messages)
+                if item.role == "assistant" and item.question_id
+            ),
+            None,
+        )
+        return {
+            "session_id": session.session_id,
+            "status": session.status,
+            "last_question_id": session.last_question_id,
+            "clarification_revision": session.clarification_revision,
+            "pending_question": (
+                {
+                    "question_id": pending.question_id,
+                    "content": pending.content,
+                    "options": list(pending.options),
+                    "reason": pending.reason,
+                }
+                if pending is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _safe_document_task_artifact(artifact: Any, order: Any) -> dict[str, Any]:
+        projection = {
+            "artifact_id": str(getattr(artifact, "artifact_id", "") or ""),
+            "run_id": str(getattr(artifact, "run_id", "") or ""),
+            "stage": str(getattr(artifact, "stage", "") or ""),
+            "output_format": getattr(artifact, "output_format", None) or getattr(order, "target_format", None),
+            "parent_artifact_id": getattr(artifact, "parent_artifact_id", None),
+            "validity_status": getattr(artifact, "validity_status", None),
+            "policy_status": getattr(artifact, "policy_status", None),
+            "validation_report_id": getattr(artifact, "validation_report_id", None),
+        }
+        revision_id = getattr(artifact, "revision_id", None)
+        if revision_id:
+            projection["revision_id"] = revision_id
+        return projection
+
+    @staticmethod
+    def _document_task_next_actions(
+        task: Any,
+        clarification: dict[str, Any] | None,
+        order: Any,
+    ) -> list[str]:
+        if clarification and clarification.get("status") == "needs_clarification":
+            return ["answer_clarification"]
+        if order is None and task.status == "planned":
+            return ["create_document_work_order"]
+        if order is not None and task.status == "planned":
+            return ["resume_document_task"]
+        if task.status in {"queued", "running"}:
+            return ["poll_status"]
+        if task.status == "waiting_human":
+            return ["review_document"]
+        if task.status == "completed":
+            return ["view_result"]
+        return []
 
     def submit_document_human_event(self, ctx: RequestContext, **kwargs):
         return self.document_generation.submit_document_human_event(ctx, **kwargs)

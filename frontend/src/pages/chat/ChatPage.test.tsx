@@ -132,12 +132,27 @@ describe('natural-language template generation routing', () => {
       requiresSelection: true,
       requiresTemplate: false,
       autoTemplate: null,
+      authority: 'backend',
     });
     expect(resolveTemplateAttachmentRoute('参考模板生成 ICD 文档', candidates, true)).toMatchObject({
       requiresSelection: false,
       requiresTemplate: false,
       autoTemplate: null,
+      authority: 'backend',
     });
+  });
+
+  it('keeps ambiguous and missing-template results as backend hints instead of blockers', () => {
+    const ambiguous = resolveTemplateAttachmentRoute('参考模板生成 ICD 文档', [
+      readyDocx,
+      { ...readyDocx, attachment_id: 'att-other', filename: 'other.xlsx', extension: '.xlsx' },
+    ]);
+    const missing = resolveTemplateAttachmentRoute('参考模板生成 ICD 文档', []);
+
+    expect(ambiguous.authority).toBe('backend');
+    expect(ambiguous.requiresSelection).toBe(true);
+    expect(missing.authority).toBe('backend');
+    expect(missing.requiresTemplate).toBe(true);
   });
 });
 

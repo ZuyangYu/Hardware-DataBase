@@ -1,4 +1,4 @@
-import type { HarnessRunView, WorkOrderStatus } from '../api/types';
+import type { DocumentCoverage, DocumentCoverageField, HarnessRunView, WorkOrderStatus } from '../api/types';
 
 export type DocumentGenerationPhase =
   | 'draft'
@@ -119,4 +119,85 @@ export function resolveDocumentPhase(status: WorkOrderStatus): DocumentGeneratio
   if (status.harness_run?.current_node === 'complete' && status.harness_run.error) return 'blocked';
   const raw = String(status.phase ?? status.status ?? 'draft');
   return STATUS_ALIASES[raw] ?? (raw in WORK_ORDER_STATUS_LABELS ? raw as DocumentGenerationPhase : 'draft');
+}
+
+/** 覆盖面板：执行单元状态 -> 用户可读文案。 */
+export const DOCUMENT_UNIT_STATUS_LABELS: Record<string, string> = {
+  planned: '待处理',
+  ready_to_render: '已完成',
+  passed: '通过',
+  failed: '未通过',
+  tbd: '未提供',
+  insufficient_evidence: '缺证据',
+  conflicting: '冲突',
+  retrieval_failed: '检索失败',
+  blocked: '阻断',
+  requires_human: '需人工确认',
+};
+
+export function describeDocumentUnitStatus(status: string): string {
+  return DOCUMENT_UNIT_STATUS_LABELS[status] ?? (status || '状态未知');
+}
+
+export function documentUnitStatusTone(status: string): DocumentStatusTone {
+  const bucket = (
+    status === 'ready_to_render' || status === 'passed'
+      ? 'success'
+      : status === 'tbd' || status === 'insufficient_evidence'
+        ? 'warning'
+        : status === 'conflicting' || status === 'retrieval_failed' || status === 'failed' || status === 'blocked'
+          ? 'danger'
+          : 'neutral'
+  );
+  return bucket as DocumentStatusTone;
+}
+
+export type DocumentCoverageBucket = {
+  key: 'covered' | 'missing' | 'conflicting' | 'failed' | 'pending';
+  label: string;
+  tone: DocumentStatusTone;
+  count: number;
+};
+
+/** 覆盖汇总徽章：只展示非零桶，全零/无数据返回空数组。 */
+export function documentCoverageBuckets(coverage: DocumentCoverage | undefined): DocumentCoverageBucket[] {
+  if (!coverage || coverage.total < 1) return [];
+  const summary = coverage.summary;
+  return ([
+    { key: 'covered', label: '已完成', tone: 'success' as const },
+    { key: 'missing', label: '缺证据', tone: 'warning' as const },
+    { key: 'conflicting', label: '冲突', tone: 'danger' as const },
+    { key: 'failed', label: '失败', tone: 'danger' as const },
+    { key: 'pending', label: '待处理', tone: 'neutral' as const },
+  ] as const)
+    .map((bucket) => ({ ...bucket, count: summary?.[bucket.key] ?? 0 }))
+    .filter((bucket) => bucket.count > 0);
+}
+
+/** 供面板渲染的覆盖条目：必填标记融入 label 之外单独返回。 */
+export function documentCoverageRows(coverage: DocumentCoverage | undefined): DocumentCoverageField[] {
+  return coverage?.fields ?? [];
+}
+
+/** 修订差异报告摘要行；无报告/读取失败时返回可读文案。 */
+export function describeRevisionDiffSummary(
+  result: Record<string, unknown> | null | undefined,
+): string | null {
+  const report = result?.diff_report as
+    | {
+        summary?: { changed?: number; added?: number; removed?: number; unchanged?: number };
+        error?: string;
+        truncated?: boolean;
+      }
+    | undefined;
+  if (!report) return null;
+  if (report.error) return `差异报告不可用：${report.error}`;
+  const summary = report.summary ?? {};
+  const parts = [
+    `变更 ${summary.changed ?? 0}`,
+    `新增 ${summary.added ?? 0}`,
+    `删除 ${summary.removed ?? 0}`,
+    `保持不变 ${summary.unchanged ?? 0}`,
+  ];
+  return `差异报告：${parts.join('；')}${report.truncated ? '（明细已截断，详情见产物）' : ''}`;
 }

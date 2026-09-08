@@ -8,6 +8,10 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   DOCUMENT_PHASES,
   describeWorkOrderStatus,
+  describeDocumentUnitStatus,
+  documentCoverageBuckets,
+  documentCoverageRows,
+  documentUnitStatusTone,
   nextActionsForStatus,
   resolveDocumentPhase,
   type DocumentGenerationPhase,
@@ -237,6 +241,36 @@ export function RunStatusPanel({
         </div>
       )}
       {status.current_unit && <p className="text-sm">当前字段：{status.current_unit}</p>}
+      {status.coverage && status.coverage.total > 0 && (
+        <div className="rounded-lg border border-current/20 bg-white/55 p-3 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="font-medium">内容覆盖</p>
+            <span className="text-xs opacity-70">共 {status.coverage.total} 项</span>
+            {documentCoverageBuckets(status.coverage).map((bucket) => (
+              <span
+                key={bucket.key}
+                className={`rounded-full border px-2 py-[1px] text-xs ${TONE_CLASSES[bucket.tone]}`}
+                aria-label={`覆盖汇总 ${bucket.label} ${bucket.count} 项`}
+              >
+                {bucket.label} {bucket.count}
+              </span>
+            ))}
+          </div>
+          <ul className="mt-2 max-h-64 space-y-1 overflow-auto text-xs" aria-label="逐项内容覆盖">
+            {documentCoverageRows(status.coverage).map((row) => (
+              <li key={row.unit_id} className="flex flex-wrap items-center gap-2">
+                <span className="font-medium">{row.label}</span>
+                {row.required && <span className="rounded bg-red-100 px-1 text-[10px] text-red-700">必填</span>}
+                <span className={`rounded-full border px-2 py-[1px] ${TONE_CLASSES[documentUnitStatusTone(row.status)]}`}>
+                  {describeDocumentUnitStatus(row.status)}
+                </span>
+                {row.display_value && <span className="min-w-0 truncate opacity-80">{row.display_value}</span>}
+                {row.evidence_count > 0 && <span className="opacity-60">证据 {row.evidence_count} 条</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {error && (
         <div className="rounded-lg border border-current/20 bg-white/55 p-3 text-sm">
           <p className="font-medium">{status.error_code ? `错误：${status.error_code}` : '任务未能继续'}</p>

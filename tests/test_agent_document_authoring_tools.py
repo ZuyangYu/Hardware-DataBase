@@ -100,6 +100,7 @@ def _order() -> DocumentWorkOrder:
         harness_policy_id="policy-a",
         harness_policy_version="1",
         created_by="user-a",
+        task_id="document-task-a",
     )
 
 
@@ -128,10 +129,15 @@ class _Pipeline:
 
     def prepare_knowledge_base_document_generation(self, _ctx, **kwargs):
         self.prepare_kwargs = kwargs
-        return {"stage": "ready", "work_order_id": self.order.work_order_id}
+        return {
+            "stage": "ready",
+            "work_order_id": self.order.work_order_id,
+            "task_id": self.order.task_id,
+        }
 
     def answer_document_generation_session(self, _ctx, session_id, **_kwargs):
         assert session_id == self.session.session_id
+        self.answer_kwargs = _kwargs
         return self.session
 
     def confirm_document_generation_session(self, _ctx, session_id):
@@ -142,6 +148,20 @@ class _Pipeline:
         assert session_id == self.session.session_id
         return self.session
 
+    def create_document_revision(self, _ctx, task_id, **kwargs):
+        return {
+            "revision_id": "revision-a",
+            "task_id": task_id,
+            "parent_artifact_id": kwargs["parent_artifact_id"],
+            "status": "generating",
+            "work_order_id": "work-order-a",
+            "regeneration": {
+                "work_order_id": "work-order-b",
+                "run_id": "run-revision-a",
+                "status": "queued",
+            },
+        }
+
     def create_knowledge_base_document_work_order(self, _ctx, **_kwargs):
         return self.order
 
@@ -149,6 +169,7 @@ class _Pipeline:
         assert work_order_id == self.order.work_order_id
         return {
             "work_order_id": work_order_id,
+            "task_id": self.order.task_id,
             "status": "queued",
             "phase": "retrieving",
             "scope_type": "knowledge_base",
@@ -193,8 +214,9 @@ def test_all_six_tools_are_typed_scoped_and_outer_serialized(tmp_path):
     session_result = toolset.start_document_generation_session(purpose="review")
     assert session_result.generation_session_id == "generation-session-a"
     assert toolset.answer_clarification(
-        "generation-session-a", "purpose", "review"
+        "generation-session-a", "purpose", "review", client_request_id="clarification-request-1"
     ).status == "succeeded"
+    assert toolset.pipeline.answer_kwargs["client_request_id"] == "clarification-request-1"
     assert toolset.confirm_generation_session("generation-session-a").status == "succeeded"
 
     queued = toolset.create_document_work_order(
@@ -217,6 +239,7 @@ def test_all_six_tools_are_typed_scoped_and_outer_serialized(tmp_path):
         "answer_clarification",
         "confirm_generation_session",
         "create_document_work_order",
+        "create_document_revision",
         "get_document_generation_status",
     }
     outer = next(
@@ -226,6 +249,27 @@ def test_all_six_tools_are_typed_scoped_and_outer_serialized(tmp_path):
     encoded = outer.invoke({"analysis_id": "analysis-a"})
     assert isinstance(encoded, str)
     assert json.loads(encoded)["status"] == "succeeded"
+
+
+def test_chat_can_create_a_governed_task_bound_revision(tmp_path):
+    toolset = _toolset(tmp_path)
+
+    result = toolset.create_document_revision(
+        task_id="document-task-a",
+        parent_artifact_id="artifact-a",
+        request_type="section_update",
+        request="更新评审结论",
+        changed_sections=["conclusion"],
+        client_request_id="revision-request-a",
+    )
+
+    assert result.status == "succeeded"
+    assert result.task_id == "document-task-a"
+    assert result.work_order_id == "work-order-b"
+    assert result.data["revision_id"] == "revision-a"
+    assert result.data["regeneration"]["work_order_id"] == "work-order-b"
+    assert "get_document_generation_status" in result.next_actions
+    assert "后台" in result.message
 
 
 def test_read_only_or_expired_context_cannot_mutate_but_can_read(tmp_path):
@@ -259,9 +303,10 @@ def test_document_card_emitted_on_create_work_order_and_not_on_rejection(tmp_pat
     assert sink[0]["card"]["work_order_id"] == "work-order-a"
     assert sink[0]["card"]["status"] == "queued"
     assert sink[0]["card"]["kb_name"] == "hardware"
+    assert sink[0]["card"]["task_id"] == "document-task-a"
     assert "get_document_generation_status" in sink[0]["card"]["next_actions"]
     assert set(sink[0]["card"]) <= {
-        "kind", "work_order_id", "generation_session_id", "status", "next_actions", "kb_name",
+        "kind", "task_id", "work_order_id", "generation_session_id", "status", "next_actions", "kb_name",
         "target_format", "artifacts",
     }
 
@@ -273,6 +318,22 @@ def test_document_card_emitted_on_create_work_order_and_not_on_rejection(tmp_pat
     )
     assert rejected.status == "rejected"
     assert len(sink) == 1
+
+
+def test_create_work_order_job_keeps_the_document_task_association(tmp_path):
+    toolset = _toolset(tmp_path)
+
+    result = toolset.create_document_work_order(
+        document_schema_id="schema-a",
+        document_schema_version="1",
+        generation_session_id="generation-session-a",
+    )
+
+    assert result.status == "succeeded"
+    assert result.task_id == "document-task-a"
+    job = toolset.job_store.get(result.job_id)
+    assert job is not None
+    assert job.task_id == "document-task-a"
 
 
 def test_document_card_emitted_on_status_tool(tmp_path):
@@ -288,9 +349,10 @@ def test_document_card_emitted_on_status_tool(tmp_path):
     assert card["work_order_id"] == "work-order-a"
     assert card["status"] == "queued"
     assert card["kb_name"] == "hardware"
+    assert card["task_id"] == "document-task-a"
     assert card["next_actions"] == ["poll_status"]
     assert set(card) <= {
-        "kind", "work_order_id", "generation_session_id", "status", "next_actions", "kb_name",
+        "kind", "task_id", "work_order_id", "generation_session_id", "status", "next_actions", "kb_name",
         "target_format", "artifacts",
     }
 
@@ -300,6 +362,7 @@ def test_status_card_carries_sanitized_artifacts_and_target_format(tmp_path):
     toolset = _toolset(tmp_path, event_sink=sink.append)
     toolset.pipeline.get_document_run_status = lambda work_order_id, _ctx: {
         "work_order_id": work_order_id,
+        "task_id": "document-task-a",
         "status": "complete",
         "phase": "completed",
         "scope_type": "knowledge_base",
@@ -323,6 +386,7 @@ def test_status_card_carries_sanitized_artifacts_and_target_format(tmp_path):
     result = toolset.get_document_generation_status("work-order-a")
 
     assert result.status == "succeeded"
+    assert result.task_id == "document-task-a"
     assert result.data["target_format"] == "xlsx"
     assert result.data["artifacts"] == [
         {"artifact_id": f"artifact-{index}", "stage": f"stage-{index}"} for index in range(8)
@@ -334,7 +398,7 @@ def test_status_card_carries_sanitized_artifacts_and_target_format(tmp_path):
         {"artifact_id": f"artifact-{index}", "stage": f"stage-{index}"} for index in range(8)
     ]
     assert set(card) <= {
-        "kind", "work_order_id", "generation_session_id", "status", "next_actions", "kb_name",
+        "kind", "task_id", "work_order_id", "generation_session_id", "status", "next_actions", "kb_name",
         "target_format", "artifacts",
     }
 
@@ -426,6 +490,7 @@ def test_direct_generation_derives_schema_and_queues_template_artifact(tmp_path)
 
     assert result.status == "succeeded"
     assert result.work_order_id == "work-order-a"
+    assert result.task_id == "document-task-a"
     assert result.job_id
     assert toolset.pipeline.prepare_kwargs["document_schema_id"] == "schema-a"
     assert toolset.pipeline.prepare_kwargs["document_schema_version"] == "1"

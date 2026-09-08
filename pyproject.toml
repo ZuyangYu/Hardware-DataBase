@@ -96,3 +96,7 @@ norecursedirs = ["build", "src/circuit/vendor/spydrnet"]
 [tool.ruff]
 # vendored SpyDrNet (含 sch_parse / spydrnet_extension 等 upstream 风格代码) 不属于本应用源码,不纳入 lint。
 extend-exclude = ["src/circuit/vendor", ".claude"]
+
+[tool.ruff.lint.per-file-ignores]
+# 基准脚本必须先设置环境变量/sys.path 再 import src.*, E402 是有意为之。
+"benchmarks/spreadsheet/*" = ["E402"]

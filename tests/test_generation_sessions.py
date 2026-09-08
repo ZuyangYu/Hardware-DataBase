@@ -218,6 +218,9 @@ def test_legacy_work_order_fingerprint_ignores_absent_generation_brief():
             "error_code", "error_message", "retryable", "next_actions",
             "generation_session_id", "generation_brief", "restart_of_work_order_id",
             "requested_executor", "input_fingerprint_version",
+            # revision_id is execution metadata excluded unconditionally, so a
+            # legacy preimage never contained the key at all.
+            "revision_id",
         }
     legacy_fingerprint = content_hash(order.model_dump(mode="json", exclude=legacy_excluded))
     payload = order.model_dump(mode="json")
@@ -226,6 +229,57 @@ def test_legacy_work_order_fingerprint_ignores_absent_generation_brief():
     loaded = DocumentWorkOrder.model_validate(payload)
 
     assert loaded.input_fingerprint == legacy_fingerprint
+
+
+def test_v2_work_order_without_task_key_and_with_attachments_still_validates():
+    """Real persisted v2 rows: no task_id/revision_id keys, non-empty
+    attachment snapshot, preimage binding requested_executor."""
+    order = DocumentWorkOrder(
+        work_order_id="wo-legacy-v2",
+        tenant_id="tenant-a",
+        scope_type="knowledge_base",
+        knowledge_base_name="hardware",
+        project_id=None,
+        baseline_id=None,
+        baseline_content_hash="",
+        source_set_snapshot_id="snapshot-1",
+        source_scope_snapshot="knowledge_base_only",
+        attachment_refs_snapshot=[{"attachment_id": "att-1", "file_name": "hsi.docx"}],
+        kb_scope_snapshot={"tenant_id": "tenant-a", "knowledge_base_name": "hardware"},
+        template_version_id="template-1",
+        document_schema_id="schema-1",
+        document_schema_version="1",
+        template_schema_id="template-schema-1",
+        template_schema_version="1",
+        retrieval_policy_version="1",
+        renderer_policy_version="1",
+        target_format="xlsx",
+        execution_mode="internal_harness",
+        requested_executor="internal_harness",
+        harness_policy_id="policy-1",
+        harness_policy_version="1",
+        created_by="user-a",
+        input_fingerprint_version=2,
+    )
+    # The stored preimage: v2 semantics (executor bound), with the task and
+    # revision keys entirely absent because those rows predate both fields.
+    stored_excluded = {
+        "input_fingerprint", "created_at", "updated_at", "lock_version", "status",
+        "unit_statuses", "evidence_matrix_id", "validation_report_id", "run_manifest_id",
+        "error_code", "error_message", "retryable", "next_actions",
+        "generation_session_id", "generation_brief", "restart_of_work_order_id",
+        "input_fingerprint_version", "task_id", "revision_id",
+    }
+    stored_fingerprint = content_hash({
+        "input_fingerprint_version": 2,
+        "frozen_inputs": order.model_dump(mode="json", exclude=stored_excluded),
+    })
+
+    loaded = DocumentWorkOrder.model_validate(
+        {**order.model_dump(mode="json"), "input_fingerprint": stored_fingerprint},
+    )
+
+    assert loaded.input_fingerprint == stored_fingerprint
 
 
 def test_confirmed_session_binds_exactly_one_real_work_order(tmp_path):

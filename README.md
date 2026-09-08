@@ -210,6 +210,9 @@ A: 当前检索后端为 RAGFlow，请按顺序排查：1) RAGFlow 服务是否�
 **Q: Agent 响应很慢或超时？**
 A: 可适当调大 `AGENT_TIMEOUT_SECONDS`；`AGENT_MAX_RETRIEVAL_ROUNDS` 现在直接决定 agent 循环的 `recursion_limit` 预算——调大检索会更充分但更慢，调小则更快但可能检索不足；确认 LLM 模型（Ollama 或 custom API）的响应速度。
 
+**Q: RAGFlow 日志出现 SiliconFlow `connect timeout=30`？**
+A: 这是 RAGFlow 容器内部到 SiliconFlow 的请求超时，不是本项目的 `RAGFLOW_TIMEOUT_SECONDS`。部署配置在 RAGFlow compose 目录的 `.env` 中设置 `SILICONFLOW_EMBEDDING_TIMEOUT_SECONDS=100`；`deploy/ragflow/embedding_model.py` 通过只读挂载覆盖 RAGFlow v0.26.4 的硬编码值。修改后需重建 `ragflow-cpu` 容器。
+
 **Q: 首次启动后无法使用问答？**
 A: 请先以系统管理员进入「系统配置」检查并补全 RAGFlow 与 Agent 模型配置，保存后生效。
 

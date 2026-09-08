@@ -21,6 +21,7 @@ from xml.sax.saxutils import escape
 from src.result_exports.answer import is_full_html_document, strip_export_fallback_markup
 from src.result_exports.markdown import parse_markdown_blocks
 from src.result_exports.models import RenderedResult, ResultEnvelope, normalize_content_shape, normalize_export_format
+from src.document_authoring.ooxml import sanitize_xml10_text, validate_ooxml_package
 
 
 MARKDOWN_MIME = "text/markdown; charset=utf-8"
@@ -275,7 +276,7 @@ def _column_name(index: int) -> str:
 
 
 def _safe_sheet_name(value: str, used: set[str]) -> str:
-    base = re.sub(r"[\\/*?:\[\]]", "-", value or "结果").strip() or "结果"
+    base = re.sub(r"[\\/*?:\[\]]", "-", sanitize_xml10_text(value or "结果")).strip() or "结果"
     base = base[:31]
     name = base
     suffix = 1
@@ -310,7 +311,7 @@ def _cell_xml(reference: str, value: Any) -> str:
         return f'<c r="{reference}"><v>{number}</v></c>'
     if isinstance(value, (date, datetime)):
         return f'<c r="{reference}" s="1"><v>{format(_excel_date_serial(value), ".15g")}</v></c>'
-    text = escape(_text(value))
+    text = escape(sanitize_xml10_text(_text(value)))
     preserve = ' xml:space="preserve"' if text[:1].isspace() or text[-1:].isspace() else ""
     return f'<c r="{reference}" t="inlineStr"><is><t{preserve}>{text}</t></is></c>'
 
@@ -1403,4 +1404,6 @@ def render_result(
         rendered = _render_pptx(envelope, shape, options)
     else:
         raise ValueError(f"unsupported export format: {format}")
+    if normalized in {"xlsx", "docx", "pptx"}:
+        validate_ooxml_package(rendered.content, normalized)
     return replace(rendered, preview={**rendered.preview, "content_shape": shape})

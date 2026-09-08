@@ -1068,6 +1068,7 @@ class CreateWorkOrderRequest(BaseModel):
     document_schema_id: str
     document_schema_version: str
     generation_session_id: str | None = None
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
     execution_mode: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
 
 
@@ -1083,11 +1084,17 @@ class CreateGenerationSessionRequest(BaseModel):
     template_version_id: str = Field(min_length=1)
     purpose: str = ""
     output_policy: dict[str, Any] = Field(default_factory=dict)
+    # Optional until all existing callers select a schema before clarification.
+    # When supplied, the resolver can attach field-level requirements to the
+    # GenerationSession without changing the legacy fixed-question flow.
+    document_schema_id: str | None = Field(default=None, min_length=1)
+    document_schema_version: str | None = Field(default=None, min_length=1)
 
 
 class AnswerGenerationSessionRequest(BaseModel):
     question_id: str = Field(min_length=1)
     answer: str = Field(min_length=1)
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class IcdResolutionItem(BaseModel):
@@ -1102,6 +1109,32 @@ class IcdResolutionRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     comment: str
+
+
+class DocumentReviewDecisionRequest(BaseModel):
+    subject_hash: str = Field(min_length=1, max_length=256)
+    decision: Any
+    client_request_id: str = Field(min_length=1, max_length=128)
+    status: str | None = Field(default=None, min_length=1, max_length=64)
+    decision_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateDocumentRevisionRequest(BaseModel):
+    parent_artifact_id: str = Field(min_length=1, max_length=200)
+    request_type: Literal["field_update", "section_update", "full_regeneration"]
+    request: str = Field(min_length=1, max_length=4000)
+    changed_fields: list[str] = Field(default_factory=list)
+    changed_sections: list[str] = Field(default_factory=list)
+    client_request_id: str = Field(min_length=1, max_length=128)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CompleteDocumentRevisionRequest(BaseModel):
+    """Worker completion contract for a generated revision child artifact."""
+
+    child_artifact_id: str = Field(min_length=1, max_length=200)
+    revalidation_status: Literal["passed", "failed", "requires_human"]
+    revalidation_result: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentHumanDecisionRequest(BaseModel):

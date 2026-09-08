@@ -24,6 +24,7 @@ DOCUMENT_TOOL_NAMES = {
     "answer_clarification",
     "confirm_generation_session",
     "create_document_work_order",
+    "create_document_revision",
     "get_document_generation_status",
 }
 
@@ -220,6 +221,39 @@ def test_routed_turn_assembles_document_only_agent(monkeypatch):
     assert routed_events[0]["payload"]["action"] == "generate"
     assert routed_events[0]["payload"]["target"] == "template"
     assert "template_targeted_command" in routed_events[0]["payload"]["reason_codes"]
+
+
+def test_routed_turn_persists_backend_conversation_plan(monkeypatch):
+    _install_fake_agent(monkeypatch)
+    runner = MultiSourceAgentRunner(
+        rag_backend=_FakeRAGBackend(),
+        circuit_service=None,
+        document_authoring_pipeline=object(),
+        document_job_store=Mock(),
+    )
+    events = []
+    list(
+        runner.stream(
+            query="请根据模板生成 ICD 文档",
+            kb_name="kb_hw",
+            history=[],
+            thread_id="t-plan",
+            document_context=_context(),
+            event_callback=events.append,
+        )
+    )
+
+    routed = [
+        event["payload"]
+        for event in events
+        if event.get("type") == "stage"
+        and event.get("payload", {}).get("key") == "document_flow_routed"
+    ]
+    assert len(routed) == 1
+    assert routed[0]["route_authority"] == "backend"
+    assert routed[0]["conversation_plan"]["route"] == "document_authoring"
+    assert routed[0]["conversation_plan"]["schema_version"] == "v1"
+    assert runner.get_last_retrieval_summary()["conversation_plan"]["route"] == "document_authoring"
 
 
 def test_direct_generation_intent_submits_artifact_without_calling_model(monkeypatch):

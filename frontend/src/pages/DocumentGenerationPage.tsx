@@ -2,10 +2,18 @@ import { useCallback, useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
 import { api, apiDownload } from '../api/client';
-import { analyzeTemplate, requestDocumentArtifactConversion } from '../api/documentAuthoring';
+import {
+  analyzeTemplate,
+  buildClarificationAnswerRequest,
+  fetchDocumentTaskProjection,
+  resumeDocumentTask,
+  requestDocumentArtifactConversion,
+} from '../api/documentAuthoring';
 import type {
+  ArtifactRevision,
   CreateWorkOrderResult,
   DocumentAnalysis,
+  DocumentTaskProjection,
   GenerationSession,
   GenerationOptions,
   IcdScopeReview,
@@ -27,6 +35,7 @@ import {
 } from './documentGenerationWorkbench';
 import {
   describeHarnessProgress,
+  describeRevisionDiffSummary,
   hasDocumentGenerationWritePermission,
   resolveDeepLinkKb,
   resolveDocumentPhase,
@@ -38,6 +47,7 @@ import {
   pendingBriefItems,
   sessionMessagesForWorkbench,
 } from './documentGenerationSession';
+import { DocumentReviewPanel } from './documentGenerationReview';
 
 type Props = { auth: AuthSession; kbs: KbView[]; onLogout: () => void };
 
@@ -312,7 +322,12 @@ export function CreateSection({ kbs, initialKb = '' }: { kbs: KbView[]; initialK
     try {
       const created = await api.post<GenerationSession>(
         `/api/v1/document-generation/sessions?kb=${encodeURIComponent(kb)}`,
-        { template_version_id: templateId, purpose: reply.trim() },
+        {
+          template_version_id: templateId,
+          purpose: reply.trim(),
+          document_schema_id: schemaKey.split('@')[0],
+          document_schema_version: schemaKey.split('@')[1] || '1',
+        },
       );
       setSession(created);
       setReply('');
@@ -330,9 +345,15 @@ export function CreateSection({ kbs, initialKb = '' }: { kbs: KbView[]; initialK
     if (!question?.question_id || !answer) return;
     setCreating(true);
     try {
+      const request = buildClarificationAnswerRequest(
+        session.session_id,
+        kb,
+        question.question_id,
+        answer,
+      );
       const updated = await api.post<GenerationSession>(
-        `/api/v1/document-generation/sessions/${session.session_id}/messages?kb=${encodeURIComponent(kb)}`,
-        { question_id: question.question_id, answer },
+        request.path,
+        request.body,
       );
       setSession(updated);
       setReply('');
@@ -529,6 +550,21 @@ function RunsSection({
     }
   }
 
+  const resumeTask = useCallback(async () => {
+    if (!status?.task_id || actionBusy) return;
+    setActionBusy(true);
+    try {
+      await resumeDocumentTask(kb, status.task_id);
+      await loadOrders();
+      await loadStatus();
+      notify.success('已通过任务身份继续生成。');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '继续任务失败');
+    } finally {
+      setActionBusy(false);
+    }
+  }, [actionBusy, kb, loadOrders, loadStatus, status?.task_id]);
+
   useEffect(() => {
     if (!selected) return;
     api.get<IcdScopeReview>(`/api/v1/document-generation/work-orders/${selected}/icd-scope-review?kb=${encodeURIComponent(kb)}`)
@@ -559,6 +595,7 @@ function RunsSection({
           actionBusy={actionBusy}
           onPause={() => void runLifecycleAction('pause')}
           onResume={() => void runLifecycleAction('resume')}
+          onTaskResume={() => void resumeTask()}
           onCancel={() => void runLifecycleAction('cancel')}
           onDelete={() => void runLifecycleAction('delete')}
         />}
@@ -575,6 +612,7 @@ export function StatusView({
   actionBusy = false,
   onPause,
   onResume,
+  onTaskResume,
   onCancel,
   onDelete,
 }: {
@@ -583,6 +621,7 @@ export function StatusView({
   actionBusy?: boolean;
   onPause?: () => void;
   onResume?: () => void;
+  onTaskResume?: () => void;
   onCancel?: () => void;
   onDelete?: () => void;
 }) {
@@ -590,6 +629,33 @@ export function StatusView({
   const [feedback, setFeedback] = useState<Record<string, string>>({});
   const [approve, setApprove] = useState<Record<string, string>>({});
   const [conversionBusy, setConversionBusy] = useState<string | null>(null);
+  const [taskProjection, setTaskProjection] = useState<DocumentTaskProjection | null>(null);
+
+  const loadTaskProjection = useCallback(async () => {
+    const taskId = status.task_id?.trim() ?? '';
+    if (!taskId || !kb) {
+      setTaskProjection(null);
+      return;
+    }
+    try {
+      const projection = await fetchDocumentTaskProjection(kb, taskId);
+      setTaskProjection(projection);
+    } catch {
+      // The task projection is additive; the legacy WorkOrder status remains
+      // usable when an upgraded API is temporarily unavailable.
+      setTaskProjection(null);
+    }
+  }, [kb, status.task_id]);
+
+  useEffect(() => {
+    void loadTaskProjection();
+  }, [loadTaskProjection]);
+
+  const hasTaskResumeAction = Boolean(
+    onTaskResume
+    && status.task_id
+    && (taskProjection?.next_actions.includes('resume_document_task') || status.status === 'planned'),
+  );
 
   async function loadPreview(artifact_id: string) {
     if (previews[artifact_id]) return;
@@ -641,6 +707,25 @@ export function StatusView({
         onCancel={onCancel}
         onDelete={onDelete}
       />
+      {hasTaskResumeAction && (
+        <div className="rounded-lg border border-blue-200 bg-blue-50/50 p-3">
+          <p className="font-medium">任务已准备好继续执行</p>
+          <p className="mt-1 text-xs text-muted-foreground">通过持久化 DocumentTask 恢复，不依赖页面中的工单参数。</p>
+          <Button className="mt-2" size="sm" onClick={onTaskResume} disabled={actionBusy}>
+            {actionBusy ? '提交中…' : '继续生成'}
+          </Button>
+        </div>
+      )}
+      {taskProjection && (
+        <DocumentRevisionStatusPanel revisions={taskProjection.revisions ?? []} />
+      )}
+      {taskProjection && (
+        <DocumentReviewPanel
+          knowledgeBaseName={kb}
+          reviews={taskProjection.reviews ?? []}
+          onChanged={() => void loadTaskProjection()}
+        />
+      )}
       {status.harness_run && (
         <details className="rounded-lg border bg-muted/20 p-3">
           <summary className="font-medium">运行技术详情</summary>
@@ -706,6 +791,47 @@ export function StatusView({
                 />
                 <Button size="sm" onClick={() => submitApprove(a.artifact_id)}>批准并发布</Button>
               </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DocumentRevisionDiffSummary({ result }: { result: Record<string, unknown> | null | undefined }) {
+  const summary = describeRevisionDiffSummary(result);
+  if (!summary) return null;
+  return <p className="text-xs text-muted-foreground">{summary}</p>;
+}
+
+function DocumentRevisionStatusPanel({ revisions }: { revisions: ArtifactRevision[] }) {
+  if (revisions.length === 0) return null;
+  return (
+    <div className="space-y-2 rounded-lg border border-blue-200 bg-blue-50/40 p-3 text-sm">
+      <p className="font-semibold">文档修订</p>
+      {revisions.map((revision) => {
+        const revalidation = revision.revalidation_status ?? 'pending';
+        const statusText = revision.status === 'revalidated'
+          ? '已重新验证，等待审核'
+          : revision.status === 'completed'
+            ? '已审核并发布'
+          : revision.status === 'failed'
+            ? '重新验证失败'
+            : revision.status === 'waiting_human'
+              ? '等待人工处理'
+              : '等待受控执行器处理';
+        return (
+          <div key={revision.revision_id} className="space-y-1 rounded-md border bg-background p-2">
+            <p className="font-medium">{revision.request_type} · {revision.revision_id}</p>
+            <p className="text-xs text-muted-foreground">
+              父 Artifact：{revision.parent_artifact_id}
+              {revision.child_artifact_id ? ` → 子 Artifact：${revision.child_artifact_id}` : ''}
+            </p>
+            <p className="text-xs text-muted-foreground">状态：{statusText}；重新验证：{revalidation}</p>
+            <DocumentRevisionDiffSummary result={revision.revalidation_result} />
+            {revision.status === 'planned' && (
+              <p className="text-xs text-muted-foreground">原 Artifact 保留不变；候选文件生成后才会进入重新验证和审核。</p>
             )}
           </div>
         );

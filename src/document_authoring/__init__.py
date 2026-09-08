@@ -31,6 +31,19 @@ from src.document_authoring.conversion import (
     TemplateConversionError,
     TemplateConversionResult,
 )
+from src.document_authoring.tasks import DocumentTask, DocumentTaskService, DocumentTaskStore
+from src.document_authoring.reviews import DocumentReview, DocumentReviewStore
+from src.document_authoring.revisions import (
+    ArtifactRevision,
+    ArtifactRevisionStore,
+    DocumentRevisionService,
+)
+from src.document_authoring.requirement_resolver import (
+    EvidenceCoverage,
+    RequirementResolutionResult,
+    RequirementResolver,
+    UnresolvedRequirement,
+)
 
 __all__ = [
     "DeterministicRuleSpec",
@@ -56,4 +69,16 @@ __all__ = [
     "TemplateArtifactConversionService",
     "TemplateConversionError",
     "TemplateConversionResult",
+    "DocumentTask",
+    "DocumentTaskService",
+    "DocumentTaskStore",
+    "DocumentReview",
+    "DocumentReviewStore",
+    "ArtifactRevision",
+    "ArtifactRevisionStore",
+    "DocumentRevisionService",
+    "EvidenceCoverage",
+    "RequirementResolutionResult",
+    "RequirementResolver",
+    "UnresolvedRequirement",
 ]

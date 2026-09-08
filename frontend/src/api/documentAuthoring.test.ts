@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./client', () => ({
-  api: { post: vi.fn() },
+  api: { get: vi.fn(), post: vi.fn() },
   uploadFiles: vi.fn(),
   uploadFilesWithProgress: vi.fn(),
 }));
@@ -10,9 +10,16 @@ import {
   analyzeTemplate,
   analyzeTemplateFromAttachment,
   buildDocumentContext,
+  buildClarificationAnswerRequest,
   buildTemplateAnalyzeRequest,
+  completeDocumentRevision,
+  createDocumentRevision,
+  fetchGenerationSession,
+  fetchDocumentTaskProjection,
   isDocumentContextExpired,
   requestDocumentArtifactConversion,
+  resumeDocumentTask,
+  submitDocumentReviewDecision,
 } from './documentAuthoring';
 import { api, uploadFiles, uploadFilesWithProgress } from './client';
 import type { DocumentAnalysis } from './types';
@@ -33,6 +40,7 @@ function templateFile(name = 'demo.xlsx'): File {
 beforeEach(() => {
   vi.mocked(uploadFiles).mockReset();
   vi.mocked(uploadFilesWithProgress).mockReset();
+  vi.mocked(api.get).mockReset();
   vi.mocked(api.post).mockReset();
 });
 
@@ -149,6 +157,114 @@ describe('requestDocumentArtifactConversion', () => {
     expect(api.post).toHaveBeenCalledWith(
       '/api/v1/document-generation/artifacts/artifact%2Fa/convert?kb=%E7%A1%AC%E4%BB%B6%20KB',
       { target_format: 'pdf' },
+    );
+  });
+});
+
+describe('buildClarificationAnswerRequest', () => {
+  it('builds an idempotent session answer request with encoded identifiers', () => {
+    expect(buildClarificationAnswerRequest(
+      'session/1',
+      'kb 空格',
+      'missing_data_policy',
+      '标记未提供',
+      'answer-key-1',
+    )).toEqual({
+      path: '/api/v1/document-generation/sessions/session%2F1/messages?kb=kb%20%E7%A9%BA%E6%A0%BC',
+      body: {
+        question_id: 'missing_data_policy',
+        answer: '标记未提供',
+        client_request_id: 'answer-key-1',
+      },
+    });
+  });
+
+  it('fetches a generation session for restored clarification cards', async () => {
+    const session = { session_id: 'session-1' };
+    vi.mocked(api.get).mockResolvedValue(session);
+
+    await expect(fetchGenerationSession('硬件 KB', 'session/1')).resolves.toBe(session);
+    expect(api.get).toHaveBeenCalledWith(
+      '/api/v1/document-generation/sessions/session%2F1?kb=%E7%A1%AC%E4%BB%B6%20KB',
+    );
+  });
+});
+
+describe('DocumentTask projection and revision requests', () => {
+  it('fetches the task aggregate through the shared projection endpoint', async () => {
+    const projection = { task_id: 'task-1' };
+    vi.mocked(api.get).mockResolvedValue(projection);
+
+    await expect(fetchDocumentTaskProjection('硬件 KB', 'task/a')).resolves.toBe(projection);
+    expect(api.get).toHaveBeenCalledWith(
+      '/api/v1/document-generation/tasks/task%2Fa/projection?kb=%E7%A1%AC%E4%BB%B6%20KB',
+    );
+  });
+
+  it('creates a task-bound revision with its caller idempotency key', async () => {
+    const revision = { revision_id: 'revision-1' };
+    vi.mocked(api.post).mockResolvedValue(revision);
+    const body = {
+      parent_artifact_id: 'artifact-1',
+      request_type: 'section_update' as const,
+      request: '更新评审结论',
+      client_request_id: 'revision-key-1',
+    };
+
+    await expect(createDocumentRevision('硬件 KB', 'task/a', body)).resolves.toBe(revision);
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/document-generation/tasks/task%2Fa/revisions?kb=%E7%A1%AC%E4%BB%B6%20KB',
+      body,
+    );
+  });
+
+  it('commits a worker-produced revision child with revalidation metadata', async () => {
+    const revision = { revision_id: 'revision-1', status: 'revalidated' };
+    vi.mocked(api.post).mockResolvedValue(revision);
+    const body = {
+      child_artifact_id: 'artifact-child',
+      revalidation_status: 'passed' as const,
+      revalidation_result: { report_id: 'report-child' },
+    };
+
+    await expect(completeDocumentRevision('硬件 KB', 'revision/a', body)).resolves.toBe(revision);
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/document-generation/revisions/revision%2Fa/complete?kb=%E7%A1%AC%E4%BB%B6%20KB',
+      body,
+    );
+  });
+
+  it('submits a hash-bound review decision and can resume by task identity', async () => {
+    const decision = { review_id: 'review-1', status: 'approved' };
+    vi.mocked(api.post).mockResolvedValueOnce(decision).mockResolvedValueOnce({
+      task_id: 'task-1',
+      status: 'queued',
+    });
+
+    await expect(submitDocumentReviewDecision('硬件 KB', 'review/a', {
+      subject_hash: 'subject-hash',
+      decision: { outcome: 'approved' },
+      status: 'approved',
+      client_request_id: 'decision-key-1',
+    })).resolves.toBe(decision);
+    await expect(resumeDocumentTask('硬件 KB', 'task/a')).resolves.toEqual({
+      task_id: 'task-1',
+      status: 'queued',
+    });
+    expect(api.post).toHaveBeenNthCalledWith(
+      1,
+      '/api/v1/document-generation/reviews/review%2Fa/decision?kb=%E7%A1%AC%E4%BB%B6%20KB',
+      {
+        subject_hash: 'subject-hash',
+        decision: { outcome: 'approved' },
+        status: 'approved',
+        client_request_id: 'decision-key-1',
+      },
+    );
+    expect(api.post).toHaveBeenNthCalledWith(
+      2,
+      '/api/v1/document-generation/tasks/task%2Fa/resume?kb=%E7%A1%AC%E4%BB%B6%20KB',
+      {},
     );
   });
 });

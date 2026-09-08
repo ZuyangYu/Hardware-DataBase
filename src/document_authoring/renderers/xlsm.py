@@ -11,11 +11,13 @@ import copy
 import hashlib
 import io
 import posixpath
+import re
 import zipfile
 from dataclasses import dataclass
 from typing import Any
 from xml.etree import ElementTree as ET
 
+from src.document_authoring.ooxml import sanitize_xml10_text, validate_ooxml_package
 from src.document_authoring.models import (
     RendererPolicy,
     TemplateSecurityReport,
@@ -309,6 +311,13 @@ class XlsmRenderer:
                 dst.writestr(cloned, data)
 
         rendered = output.getvalue()
+        # ElementTree preserves Python control characters unless they are
+        # removed before serialization.  Validate every XML part before the
+        # result is handed to the service/store boundary.
+        # Some legacy templates omit the package content-types part.  The
+        # renderer can still verify every present XML member; the persisted
+        # artifact/store boundary applies the complete-package requirement.
+        validate_ooxml_package(rendered, "xlsx", require_content_types=False)
         after = self.inspect(rendered)
         if after.active_content_status != "clean":
             raise ValueError("generated artifact contains active content")
@@ -400,6 +409,7 @@ class XlsmRenderer:
 
     @staticmethod
     def _patch_worksheet(source: bytes, fills: list[tuple[WorkbookRegionSchema, str]]) -> bytes:
+        XlsmRenderer._register_source_namespaces(source)
         root = ET.fromstring(source)
         sheet_data = root.find("x:sheetData", NS)
         if sheet_data is None:
@@ -430,11 +440,13 @@ class XlsmRenderer:
             if region.preserve_formula or cell.find("x:f", NS) is not None:
                 raise ValueError(f"renderer will not replace a formula cell: {ref}")
             XlsmRenderer._set_inline_string(cell, value)
-        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        serialized = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return XlsmRenderer._repair_markup_compatibility_prefixes(serialized)
 
     @staticmethod
     def _set_inline_string(cell: ET.Element, value: str) -> None:
         """Replace a cell value while preserving its style and attributes."""
+        value = sanitize_xml10_text(value)
         for child in list(cell):
             cell.remove(child)
         if not value:
@@ -453,6 +465,7 @@ class XlsmRenderer:
         table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]]]],
     ) -> bytes:
         """Patch discovered table rows without changing other OOXML parts."""
+        XlsmRenderer._register_source_namespaces(source)
         root = ET.fromstring(source)
         sheet_data = root.find("x:sheetData", NS)
         if sheet_data is None:
@@ -496,7 +509,61 @@ class XlsmRenderer:
                         cell,
                         str(row_values.get(column.column_id, "")),
                     )
-        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        serialized = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return XlsmRenderer._repair_markup_compatibility_prefixes(serialized)
+
+    @staticmethod
+    def _register_source_namespaces(source: bytes) -> None:
+        """Keep source prefixes used by markup-compatibility attributes.
+
+        ``mc:Ignorable`` stores prefixes as text rather than QName-valued XML
+        attributes.  ElementTree otherwise renames unknown prefixes to
+        ``nsN`` while leaving that text unchanged, yielding a package that is
+        XML-well-formed but rejected by Excel.  Registering the source
+        namespace declarations before serialization preserves those prefixes.
+        """
+        for _event, (prefix, uri) in ET.iterparse(io.BytesIO(source), events=("start-ns",)):
+            ET.register_namespace(prefix or "", uri)
+
+    @staticmethod
+    def _repair_markup_compatibility_prefixes(serialized: bytes) -> bytes:
+        """Drop stale ``mc:Ignorable`` tokens after ElementTree serialization.
+
+        ElementTree omits namespace declarations that are no longer used by
+        an element/attribute and may rename the remaining ones.  The value of
+        ``mc:Ignorable`` is a whitespace-separated list of prefix *strings*,
+        so it is not rewritten automatically.  Keep only prefixes declared in
+        the serialized root, preventing Excel from treating the worksheet as a
+        malformed package.
+        """
+        declared_prefixes = {
+            prefix or ""
+            for _event, (prefix, _uri) in ET.iterparse(
+                io.BytesIO(serialized), events=("start-ns",)
+            )
+        }
+        pattern = re.compile(
+            rb"(?P<attribute>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?Ignorable)"
+            rb"(?P<equals>\s*=\s*)(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+            re.DOTALL,
+        )
+
+        def replace(match: re.Match[bytes]) -> bytes:
+            value = match.group("value").decode("utf-8")
+            retained = " ".join(
+                token for token in value.split() if token in declared_prefixes
+            )
+            if not retained:
+                return b""
+            return (
+                match.group("attribute")
+                + match.group("equals")
+                + match.group("quote")
+                + retained.encode("utf-8")
+                + match.group("quote")
+            )
+
+        return pattern.sub(replace, serialized)
 
     @staticmethod
     def _new_table_row(

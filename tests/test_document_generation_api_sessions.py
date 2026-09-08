@@ -90,12 +90,21 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         created = self.client.post(
             "/api/v1/document-generation/sessions?kb=shared",
             headers=headers,
-            json={"template_version_id": "tv1", "purpose": "生成评审表"},
+            json={
+                "template_version_id": "tv1",
+                "purpose": "生成评审表",
+                "document_schema_id": "schema-1",
+                "document_schema_version": "2",
+            },
         )
         answered = self.client.post(
             "/api/v1/document-generation/sessions/generation-session-1/messages?kb=shared",
             headers=headers,
-            json={"question_id": "scope.revision", "answer": "当前发布版本"},
+            json={
+                "question_id": "scope.revision",
+                "answer": "当前发布版本",
+                "client_request_id": "clarification-request-1",
+            },
         )
         confirmed = self.client.post(
             "/api/v1/document-generation/sessions/generation-session-1/confirm?kb=shared",
@@ -108,6 +117,12 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         self.assertEqual(confirmed.json()["status"], "ready_to_generate")
         self.assertEqual([call[0] for call in calls], ["create", "answer", "confirm"])
+        self.assertEqual(calls[0][1]["document_schema_id"], "schema-1")
+        self.assertEqual(calls[0][1]["document_schema_version"], "2")
+        self.assertEqual(
+            calls[1][1][1]["client_request_id"],
+            "clarification-request-1",
+        )
 
     def test_session_creation_requires_write_permission(self):
         headers = self._headers()
@@ -131,6 +146,173 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403, response.text)
+
+    def test_task_projection_endpoints_use_task_identity(self):
+        self.stub.get_document_task_projection = lambda ctx, task_id: {
+            "task_id": task_id,
+            "status": "needs_clarification",
+            "conversation_refs": {"conversation_id": "17"},
+            "next_actions": ["answer_clarification"],
+        }
+        self.stub.list_document_task_projections = lambda ctx, **kwargs: [{
+            "task_id": "task-a",
+            "knowledge_base_name": kwargs.get("knowledge_base_name"),
+            "conversation_id": kwargs.get("conversation_id"),
+        }]
+        headers = self._headers("admin1")
+
+        single = self.client.get(
+            "/api/v1/document-generation/tasks/task-a/projection?kb=shared",
+            headers=headers,
+        )
+        listed = self.client.get(
+            "/api/v1/document-generation/tasks?kb=shared&conversation_id=17",
+            headers=headers,
+        )
+
+        self.assertEqual(single.status_code, 200, single.text)
+        self.assertEqual(single.json()["task_id"], "task-a")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()[0], {
+            "task_id": "task-a",
+            "knowledge_base_name": "shared",
+            "conversation_id": "17",
+        })
+
+    def test_task_review_endpoints_are_task_bound_and_idempotent(self):
+        self.stub.list_document_reviews = lambda ctx, task_id: [{
+            "review_id": "review-a",
+            "task_id": task_id,
+            "status": "pending",
+        }]
+        self.stub.get_document_review = lambda ctx, review_id: {
+            "review_id": review_id,
+            "task_id": "task-a",
+            "status": "pending",
+        }
+        self.stub.submit_document_review_decision = lambda ctx, review_id, **kwargs: {
+            "review_id": review_id,
+            "task_id": "task-a",
+            "status": kwargs["status"],
+            "decision": kwargs["decision"],
+        }
+        headers = self._headers("admin1")
+
+        listed = self.client.get(
+            "/api/v1/document-generation/tasks/task-a/reviews?kb=shared",
+            headers=headers,
+        )
+        detail = self.client.get(
+            "/api/v1/document-generation/reviews/review-a?kb=shared",
+            headers=headers,
+        )
+        decided = self.client.post(
+            "/api/v1/document-generation/reviews/review-a/decision?kb=shared",
+            headers=headers,
+            json={
+                "subject_hash": "subject-a",
+                "decision": {"outcome": "approved"},
+                "status": "approved",
+                "client_request_id": "decision-a",
+            },
+        )
+
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()[0]["task_id"], "task-a")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["review_id"], "review-a")
+        self.assertEqual(decided.status_code, 200, decided.text)
+        self.assertEqual(decided.json()["status"], "approved")
+
+    def test_task_revision_endpoints_preserve_parent_and_snapshot_contract(self):
+        self.stub.list_document_revisions = lambda ctx, task_id: [{
+            "revision_id": "revision-a",
+            "task_id": task_id,
+            "parent_artifact_id": "artifact-a",
+            "status": "planned",
+        }]
+        self.stub.get_document_revision = lambda ctx, revision_id: {
+            "revision_id": revision_id,
+            "task_id": "task-a",
+            "parent_artifact_id": "artifact-a",
+            "input_snapshot_hash": "snapshot-a",
+        }
+        self.stub.create_document_revision = lambda ctx, task_id, **kwargs: {
+            "revision_id": "revision-a",
+            "task_id": task_id,
+            "parent_artifact_id": kwargs["parent_artifact_id"],
+            "status": "planned",
+        }
+        headers = self._headers("admin1")
+
+        listed = self.client.get(
+            "/api/v1/document-generation/tasks/task-a/revisions?kb=shared",
+            headers=headers,
+        )
+        detail = self.client.get(
+            "/api/v1/document-generation/revisions/revision-a?kb=shared",
+            headers=headers,
+        )
+        created = self.client.post(
+            "/api/v1/document-generation/tasks/task-a/revisions?kb=shared",
+            headers=headers,
+            json={
+                "parent_artifact_id": "artifact-a",
+                "request_type": "field_update",
+                "request": "更新版本字段",
+                "changed_fields": ["pcb_revision"],
+                "client_request_id": "revision-request-1",
+            },
+        )
+
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["input_snapshot_hash"], "snapshot-a")
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["parent_artifact_id"], "artifact-a")
+
+    def test_revision_completion_binds_child_and_revalidation_result(self):
+        self.stub.complete_document_revision = lambda ctx, revision_id, **kwargs: {
+            "revision_id": revision_id,
+            "child_artifact_id": kwargs["child_artifact_id"],
+            "revalidation_status": kwargs["revalidation_status"],
+            "revalidation_result": kwargs["revalidation_result"],
+            "status": "revalidated",
+        }
+        response = self.client.post(
+            "/api/v1/document-generation/revisions/revision-a/complete?kb=shared",
+            headers=self._headers("admin1"),
+            json={
+                "child_artifact_id": "artifact-child",
+                "revalidation_status": "passed",
+                "revalidation_result": {"report_id": "report-child"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {
+            "revision_id": "revision-a",
+            "child_artifact_id": "artifact-child",
+            "revalidation_status": "passed",
+            "revalidation_result": {"report_id": "report-child"},
+            "status": "revalidated",
+        })
+
+    def test_task_resume_endpoint_uses_task_identity(self):
+        headers = self._headers("admin1")
+        response = self.client.post(
+            "/api/v1/document-generation/tasks/task-a/resume?kb=shared",
+            headers=headers,
+            json={},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {
+            "task_id": "task-a",
+            "work_order_id": "wo-1",
+            "run_id": "bg-task-resume",
+            "status": "queued",
+        })
 
     def test_generation_start_requires_write_permission(self):
         response = self.client.post(

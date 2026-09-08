@@ -1041,6 +1041,8 @@ export type GenerationBriefView = {
   inference_policy: string | null;
   confirmed: boolean;
   confidence: number;
+  unresolved_requirements?: Array<Record<string, unknown>>;
+  resolved_fields?: Record<string, unknown>;
   updated_at?: string;
 };
 
@@ -1052,15 +1054,22 @@ export type ClarificationMessage = {
   options?: string[];
   answer?: string | null;
   reason?: string | null;
+  client_request_id?: string | null;
   created_at?: string;
 };
 
 export type GenerationSession = {
   session_id: string;
+  knowledge_base_name?: string;
   status: 'needs_clarification' | 'ready_to_generate' | 'generating' | 'completed' | 'cancelled';
   brief: GenerationBriefView;
   messages: ClarificationMessage[];
   work_order_id?: string | null;
+  conversation_id?: string | null;
+  initiating_turn_id?: string | null;
+  document_task_id?: string | null;
+  last_question_id?: string | null;
+  clarification_revision?: number;
 };
 
 export type WorkOrderStage =
@@ -1070,6 +1079,7 @@ export type WorkOrderStage =
 
 export type CreateWorkOrderResult = {
   work_order_id: string;
+  task_id?: string | null;
   stage: WorkOrderStage;
   exceptions?: unknown[];
   issues?: unknown[];
@@ -1077,6 +1087,7 @@ export type CreateWorkOrderResult = {
 
 export type WorkOrder = {
   work_order_id: string;
+  task_id?: string | null;
   status: string;
   scope_type: string;
   target_format?: string;
@@ -1092,8 +1103,35 @@ export type HarnessRunView = {
   error?: string;
 } & Record<string, unknown>;
 
+/** One schema unit projected for the workbench coverage panel. */
+export type DocumentCoverageField = {
+  kind: 'field' | 'review';
+  field_id: string;
+  unit_id: string;
+  label: string;
+  required: boolean;
+  status: string;
+  coverage_status?: string | null;
+  display_value?: string | null;
+  evidence_count: number;
+};
+
+/** Per-field coverage projection served with the work-order status. */
+export type DocumentCoverage = {
+  fields: DocumentCoverageField[];
+  summary: {
+    covered: number;
+    missing: number;
+    conflicting: number;
+    failed: number;
+    pending: number;
+  };
+  total: number;
+};
+
 export type WorkOrderStatus = {
   work_order_id: string;
+  task_id?: string | null;
   status: string;
   phase?: string;
   display_label?: string;
@@ -1113,6 +1151,7 @@ export type WorkOrderStatus = {
   knowledge_base_name?: string;
   target_format?: string;
   unit_statuses: Record<string, string>;
+  coverage?: DocumentCoverage;
   harness_run?: HarnessRunView;
   validation?: { status?: string; issues?: unknown[] };
   artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
@@ -1122,12 +1161,73 @@ export type WorkOrderStatus = {
 /** Durable document-authoring task projected back into a chat session. */
 export type DocumentChatTaskView = {
   session_id: number;
-  work_order_id: string;
+  task_id?: string | null;
+  work_order_id?: string | null;
   kb_name: string;
   job_status: string;
   created_at: string;
   updated_at: string;
   status: WorkOrderStatus;
+};
+
+export type DocumentReview = {
+  review_id: string;
+  task_id: string;
+  work_order_id?: string | null;
+  artifact_id?: string | null;
+  review_kind: string;
+  status: string;
+  subject_hash: string;
+  source_snapshot_hash: string;
+  schema_hash: string;
+  decision?: unknown;
+  decision_client_request_id?: string | null;
+  client_request_id?: string | null;
+  [k: string]: unknown;
+};
+
+export type ArtifactRevision = {
+  revision_id: string;
+  task_id: string;
+  work_order_id?: string | null;
+  parent_artifact_id: string;
+  child_artifact_id?: string | null;
+  status: string;
+  request_type: 'field_update' | 'section_update' | 'full_regeneration';
+  input_snapshot_hash: string;
+  source_snapshot_hash: string;
+  schema_hash: string;
+  impact_scope: Record<string, unknown>;
+  revalidation_scope: string[];
+  revalidation_status?: 'pending' | 'passed' | 'failed' | 'requires_human' | string;
+  revalidation_result?: Record<string, unknown>;
+  invalidated_approval_event_ids: string[];
+  client_request_id?: string | null;
+  [k: string]: unknown;
+};
+
+export type DocumentTaskProjection = {
+  task_id: string;
+  origin: string;
+  status: string;
+  conversation_refs: Record<string, string>;
+  generation_session_id?: string | null;
+  work_order_id?: string | null;
+  current_run_id?: string | null;
+  current_artifact_id?: string | null;
+  artifact_ids: string[];
+  knowledge_base_name?: string | null;
+  template_version_id?: string | null;
+  clarification_state?: Record<string, unknown> | null;
+  work_order?: Record<string, unknown> | null;
+  run?: Record<string, unknown> | null;
+  artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
+  reviews: DocumentReview[];
+  revisions: ArtifactRevision[];
+  pending_review?: Record<string, unknown> | null;
+  next_actions: string[];
+  created_at: string;
+  updated_at: string;
 };
 
 export type IcdScopeReview = {

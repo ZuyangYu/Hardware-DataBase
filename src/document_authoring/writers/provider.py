@@ -20,6 +20,7 @@ class WriterRequest(BaseModel):
     unit_label: str
     unit_description: str = ""
     field_value_type: str = "text"
+    table_columns: dict[str, str] | None = None
     retrieval_query_terms: list[str] = Field(default_factory=list)
     style: dict[str, Any] = Field(default_factory=dict)
     evidence: list[dict[str, Any]] = Field(default_factory=list)

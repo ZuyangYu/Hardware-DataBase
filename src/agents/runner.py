@@ -56,6 +56,7 @@ from src.agents.tools.spreadsheet_tools import make_spreadsheet_sql_tools, make_
 from src.circuit.index_service import CircuitIndexService
 from src.core.cancellation import QueryCancelled
 from src.core.conversation import GENERAL_CHAT_KB_NAME
+from src.core.conversation_orchestrator import ConversationOrchestrator
 from src.core.intent import classify_intent
 from src.core.model_factory import create_chat_model
 from src import settings
@@ -268,6 +269,11 @@ generate_document_from_template。该工具由服务器自动读取模板绑定�
 3. 用户回答后用 answer_clarification 逐题回填 question_id；全部回答完毕调用 confirm_generation_session。
 4. 确认成功后调用 create_document_work_order 创建异步工单。schema id/version 必须使用工具从已批准模板派生的值，不得猜测。
 5. 创建成功后明确告知工单已受理、work_order_id 和当前状态；说明生成是分钟级后台任务，可随时让你用 get_document_generation_status 查询进度。绝不声称生成已完成。
+
+如果用户要求修改已经生成的文档，先使用 get_document_generation_status 获取对应任务和 Artifact，
+再调用 create_document_revision 记录 task_id、parent_artifact_id、修改类型和具体范围。修订请求只会进入
+受控执行流程；在工具/状态返回 child_artifact_id 和 revalidation_status 之前，绝不声称文件已经修改、
+验证或发布，也不能覆盖原 Artifact。
 
 约束：
 - 生成是分钟级后台任务，对话只负责发起与状态查询，不要等待或假装完成。
@@ -525,6 +531,7 @@ class MultiSourceAgentRunner:
         self.memory_service_factory = memory_service_factory or MemoryService
         self.document_authoring_pipeline = document_authoring_pipeline
         self.document_job_store = document_job_store
+        self.conversation_orchestrator = ConversationOrchestrator()
         self._model_lock = threading.Lock()
 
     @staticmethod
@@ -957,6 +964,24 @@ class MultiSourceAgentRunner:
             has_document_tools=bool(document_tools),
             explicit_flow=document_flow,
         )
+        conversation_plan = self.conversation_orchestrator.plan(
+            query=query,
+            document_context=document_context,
+            has_document_tools=bool(document_tools),
+            explicit_flow=document_flow,
+            has_attachments=has_attachments,
+            has_kb=not is_general,
+            source_scope=effective_scope,
+        )
+        # The legacy helper retains its historical ``routed_by`` values for
+        # trace consumers, while the plan below is the authoritative route.
+        # Keep the boolean in lockstep with the versioned contract so no
+        # frontend hint can select a different executor.
+        document_flow_routed = conversation_plan.document_flow
+        if conversation_plan.routed_by == "deterministic" and document_flow_routed:
+            routed_by = "regex"  # wire-compatibility for pre-ConversationPlan traces
+        elif conversation_plan.routed_by == "fallback":
+            routed_by = "explicit"
 
         if document_flow_routed:
             tools: list[Any] = list(document_tools)
@@ -1067,6 +1092,8 @@ class MultiSourceAgentRunner:
                         "action": intent_plan.action,
                         "target": intent_plan.target,
                         "reason_codes": list(intent_plan.reason_codes),
+                        "route_authority": conversation_plan.authority,
+                        "conversation_plan": conversation_plan.to_dict(),
                     },
                 }
             )
@@ -1200,6 +1227,7 @@ class MultiSourceAgentRunner:
                     "citation_coverage": 0.0,
                 },
                 "intent_plan": intent_plan.to_dict(),
+                "conversation_plan": conversation_plan.to_dict(),
             }
             emit_event(
                 {
@@ -1321,6 +1349,7 @@ class MultiSourceAgentRunner:
         }
         record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
         record.retrieval_summary["intent_plan"] = intent_plan.to_dict()
+        record.retrieval_summary["conversation_plan"] = conversation_plan.to_dict()
         record.footer = "" if is_general else self._format_footer(rt, verification, timeline)
 
         if not answer_text:

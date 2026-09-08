@@ -190,6 +190,58 @@ UNIT_HEADER_WORDS = {
 }
 
 
+def _table_column_contract(
+    suggestion: TemplateAnalysisSuggestion,
+    unit_by_id: dict[str, TemplateAnalysisUnit],
+) -> dict[str, str]:
+    """Derive column letter -> header label from inspected header units.
+
+    Uses only template inspection facts: the first data row is the smallest
+    target row, and each column's header is the cell one row above it whose
+    role was inspected as ``table_header``.
+    """
+    coords: dict[str, tuple[int, int]] = {}
+    sheet_names: set[str | None] = set()
+    for unit_id in suggestion.target_unit_ids:
+        unit = unit_by_id.get(unit_id)
+        if unit is None:
+            continue
+        reference = str(unit.locator.get("cell", ""))
+        try:
+            column, row = workbook_cell_coordinates(reference)
+        except ValueError:
+            return {}
+        sheet_names.add(unit.locator.get("sheet_name"))
+        coords[reference] = (column, row)
+    if not coords or len(sheet_names) != 1:
+        return {}
+    sheet_name = next(iter(sheet_names))
+    rows = sorted({row for _, row in coords.values()})
+    header_row = rows[0] - 1
+    if header_row < 1:
+        return {}
+    by_position: dict[tuple, TemplateAnalysisUnit] = {}
+    for unit in unit_by_id.values():
+        reference = str(unit.locator.get("cell", ""))
+        try:
+            column, row = workbook_cell_coordinates(reference)
+        except ValueError:
+            continue
+        by_position[(unit.locator.get("sheet_name"), column, row)] = unit
+    columns: dict[str, str] = {}
+    for reference, (column, row) in coords.items():
+        if row != rows[0]:
+            continue
+        letter = reference.rstrip("0123456789")
+        header = by_position.get((sheet_name, column, header_row))
+        if header is None or header.structural_role_hint != "table_header":
+            continue
+        label = (header.value_preview or "").strip()
+        if label:
+            columns[letter] = label
+    return columns
+
+
 def infer_field_contract(
     suggestion: TemplateAnalysisSuggestion,
     units: list[TemplateAnalysisUnit],
@@ -238,4 +290,8 @@ def infer_field_contract(
         "missing_policy": missing_policy,
         "allow_derivation": False,
         "description": " / ".join(description_parts),
+        "table_columns": (
+            _table_column_contract(suggestion, unit_by_id)
+            if suggestion.value_shape == "repeating_table" else None
+        ),
     }

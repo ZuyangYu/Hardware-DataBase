@@ -125,7 +125,7 @@ def test_system_prompt_uses_fixed_boundaries_and_canonical_values_only():
 # ── coordinator-level block_generation gate ──────────────────────────────────
 
 
-def _block_pipeline(tmp_path, monkeypatch, *, block_brief: bool):
+def _block_pipeline(tmp_path, monkeypatch, *, block_brief: bool, has_data: bool | None = None, required: bool = True):
     from tests.test_document_authoring_p2a import _prepare_project
     from src.document_authoring.service import DocumentGenerationService
     from src.document_authoring.work_order_store import DocumentAuthoringStore
@@ -151,6 +151,7 @@ def _block_pipeline(tmp_path, monkeypatch, *, block_brief: bool):
         "fields": [DocumentFieldSchema.model_validate({
             "field_id": "rated_current", "label": "额定电流",
             "retrieval_policy_id": "r-1", "verification_policy_id": "v-1",
+            "required": required,
         })],
     }))
     template = service.register_template(
@@ -186,11 +187,11 @@ def _block_pipeline(tmp_path, monkeypatch, *, block_brief: bool):
     )
 
     def retrieve(requirement, attempt, query_override=None):
-        has_data = not block_brief
+        data_available = (not block_brief) if has_data is None else has_data
         evidences = [EvidenceEnvelope(
             id="ev-1", content="额定电流为10 A。", project_id=project.project_id,
             source_version_id="version-a", processing_artifact_id="processing-a",
-        )] if has_data else []
+        )] if data_available else []
         return RetrievalOutcome(
             requirement_id=requirement.requirement_id,
             status="success_with_hits" if has_data else "success_empty",
@@ -257,3 +258,22 @@ def test_block_generation_does_not_block_data_complete_runs(tmp_path, monkeypatc
     report = store.get_validation_report(artifact.validation_report_id)
     codes = {issue.get("code") for issue in report.issues}
     assert "block_generation_unresolved_missing" not in codes
+
+
+def test_recommended_defaults_never_publish_missing_required_field(tmp_path, monkeypatch):
+    service, store, order, artifact = _block_pipeline(
+        tmp_path, monkeypatch, block_brief=False, has_data=False,
+    )
+    assert artifact.stage == "review_candidate"
+    report = store.get_validation_report(artifact.validation_report_id)
+    assert report.status == "requires_human"
+    assert any(issue.get("code") == "required_content_incomplete" for issue in report.issues)
+    assert "approved_release" not in {a.stage for a in store.list_artifacts(order.work_order_id)}
+
+
+def test_optional_missing_field_can_remain_a_documented_gap(tmp_path, monkeypatch):
+    service, store, order, artifact = _block_pipeline(
+        tmp_path, monkeypatch, block_brief=False, has_data=False, required=False,
+    )
+    assert artifact.stage == "approved_release"
+    assert store.get_work_order(order.work_order_id).unit_statuses["field:rated_current"] == "tbd"

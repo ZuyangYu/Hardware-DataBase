@@ -554,7 +554,7 @@ def _split_multi_target(
     """
     split: list[TemplateAnalysisSuggestion] = []
     for suggestion in suggestions:
-        if len(suggestion.target_unit_ids) <= 1:
+        if suggestion.value_shape == "repeating_table" or len(suggestion.target_unit_ids) <= 1:
             split.append(suggestion)
             continue
         for unit_id in suggestion.target_unit_ids:
