@@ -45,6 +45,7 @@ from src.document_authoring.models import (
     ValidationReport,
     WorkbookRegionSchema,
 )
+from src.document_authoring.planning.store import DocumentPlanningStore
 from src.document_authoring.template_analysis import DocxRegionSchema, TemplateAnalysis
 
 
@@ -68,6 +69,7 @@ class DocumentAuthoringStore:
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         os.makedirs(self.artifact_root, exist_ok=True)
         self._init_db()
+        self.planning = DocumentPlanningStore(self.db_path)
         self.generation_sessions = GenerationSessionStore(self.db_path)
 
     def _connect(self):

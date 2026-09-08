@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from src.document_authoring.harness.idempotency import receipt_action_key
+from src.document_authoring.planning.store import DocumentPlanningStore
 from src.document_authoring.migrations.runner import (
     MigrationError,
     reverse_migration_drill,
@@ -205,6 +206,24 @@ def _read(database: Path, query: str, params: tuple = ()):
     row = connection.execute(query, params).fetchall()
     connection.close()
     return row
+
+
+def test_pre_planning_database_gets_idempotent_planning_tables(tmp_path: Path):
+    database = _make_database(tmp_path)
+    first = DocumentPlanningStore(str(database))
+    second = DocumentPlanningStore(str(database))
+
+    assert first.db_path == second.db_path == str(database)
+    names = {
+        row[0]
+        for row in _read(
+            database,
+            """SELECT name FROM sqlite_master
+               WHERE type = 'table' AND name IN (?, ?, ?)""",
+            ("document_output_specs", "document_plans", "document_planning_events"),
+        )
+    }
+    assert names == {"document_output_specs", "document_plans", "document_planning_events"}
 
 
 def test_dry_run_is_read_only_and_verifies_backup(tmp_path: Path):
