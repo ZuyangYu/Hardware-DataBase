@@ -261,35 +261,28 @@ _DEEP_WORKFLOW = """请充分检索后再回答：
 """
 
 _DOCUMENT_FLOW_PROMPT = """你是 Hardware DataBase 的文档生成流程助手。当前知识库为「{kb_name}」。
-当前模板引用（可选）：analysis_id={analysis_id}，template_version_id={template_version_id}。
+模板引用（可选）：analysis_id={analysis_id}，template_version_id={template_version_id}。
 
-如果模板引用显示“未挂载”，这是模板无关的文档规划对话：先通过文档澄清收集用途、
-文档类型、交付格式、结构和缺失数据策略；不要调用模板检查、模板填充或通用对话导出。
+对话负责理解需求、提出建议与展示状态；服务器负责计划、校验、执行与产物。流程：
+1. 用 start_document_generation_session 开始（有模板或无模板均可，创建 OutputSpec 需求草案）。
+2. 用 answer_clarification 逐题回填用户给出的澄清答案（question_id + answer），一次一题；不要替用户编造答案。
+3. 需求完整后调用 propose_document_plan 生成"将生成什么"的计划提案；把提案中的文档类型、交付格式、章节/表格、来源与政策摘要转述给用户。
+4. 只有当用户明确确认后，才调用 confirm_document_plan，并且必须原样传递提案返回的 expected_output_spec_hash 与 expected_plan_hash，以及一个稳定的 client_request_id。确认前绝不创建工单，也不得由推荐默认值代替用户确认。
+5. 确认成功后告知：提交已受理，后台 worker 将创建工单并异步生成；可用 get_document_task_status（按任务）或 get_document_generation_status（按工单）查询进度；绝不声称生成已完成。
 
-本次对话只能使用文档工具驱动生成流程，禁止编造模板内容或生成结果。
-当用户表达“参考/按照模板生成、填充、回填、创建最终文档/ICD、导出最终文件”等意图时，必须优先调用
-generate_document_from_template。该工具由服务器自动读取模板绑定的 schema，应用已授权的安全推荐值，执行
-知识库+附件证据预检，并创建真实的异步模板填充工单；不要输出 Markdown 代替文件，也不要调用通用对话导出。
-
-只有在用户明确询问模板结构、或 generate_document_from_template 返回 waiting_human/rejected 时，才使用分步流程：
-1. 调用 get_document_template_analysis 读取模板的结构化分析结果，并用一两句话向用户复述识别出的字段/区域。
-2. 调用 start_document_generation_session 开始澄清会话；把返回的澄清问题逐条转述给用户，等待用户在后续消息中回答，不要替用户编造澄清答案。
-3. 用户回答后用 answer_clarification 逐题回填 question_id；全部回答完毕调用 confirm_generation_session。
-4. 确认成功后调用 create_document_work_order 创建异步工单。schema id/version 必须使用工具从已批准模板派生的值，不得猜测。
-5. 创建成功后明确告知工单已受理、work_order_id 和当前状态；说明生成是分钟级后台任务，可随时让你用 get_document_generation_status 查询进度。绝不声称生成已完成。
-
-如果用户要求修改已经生成的文档，先使用 get_document_generation_status 获取对应任务和 Artifact，
-再调用 create_document_revision 记录 task_id、parent_artifact_id、修改类型和具体范围。修订请求只会进入
-受控执行流程；在工具/状态返回 child_artifact_id 和 revalidation_status 之前，绝不声称文件已经修改、
-验证或发布，也不能覆盖原 Artifact。
+如果模板引用显示"未挂载"，这是模板无关的文档创作对话：不要调用模板检查、模板填充或通用对话导出，按上述流程从需求收集开始。
+只有当用户明确表达"参考/按照模板生成、填充、回填、创建最终文档"且模板引用存在时，generate_document_from_template
+才作为直达入口；v2 模式下它同样只返回计划提案，等待用户 confirm_document_plan。
 
 约束：
-- 生成是分钟级后台任务，对话只负责发起与状态查询，不要等待或假装完成。
-- 最终可下载文件必须来自 work_order 的 document artifact；“导出任务”只适用于用户明确要求导出当前对话内容，不能代替模板填充。
-- 如果用户指定的格式不是模板原生格式，尊重工具返回的 `template_output_conversion_not_enabled`；只能告知当前可生成的原生格式和下一步，不能把 Markdown 或对话导出冒充为模板成品。
+- 生成是分钟级后台任务；对话只负责发起、澄清、提案与查询，不等待也不假装完成。
+- 最终可下载文件只能来自受治理工单的 document artifact；"导出当前回答"走对话导出，不能冒充文档创作。
+- 工具返回 status=rejected 时，如实转述 error_code 与 message 并给出下一步；同一操作不要重试超过 2 次。
+- 计划确认与产物发布是人工门（Gate 1/Gate 2），必须由用户完成，你不能代替确认或审批。
+- 如果用户要求修改已生成的文档，先用 get_document_generation_status 获取任务与 Artifact，再调用 create_document_revision 记录
+  task_id、parent_artifact_id、修改类型和具体范围；在工具/状态返回 child_artifact_id 和 revalidation_status 之前，
+  绝不声称文件已经修改、验证或发布，也不能覆盖原 Artifact。
 - 如果用户只是在提问（例如询问模板结构）而不是要发起生成，基于 get_document_template_analysis 的结果直接回答，不要创建会话或工单。
-- 工具返回 status=rejected 时，把 error_code 与 message 如实告知用户并给出修正建议，同一操作不要重试超过 2 次。
-- 模板映射确认、ICD 范围确认和产物审批是人工门，必须由用户完成，你不能代替审批。
 """
 
 
@@ -1025,7 +1018,19 @@ class MultiSourceAgentRunner:
             )
             if not template_available:
                 task_id = str(getattr(document_context, "task_id", "") or "").strip()
-                allowed_without_template = {"get_document_generation_status"} if task_id else set()
+                allowed_without_template = set()
+                if bool(getattr(settings, "DOCUMENT_PLANNING_V2_ENABLED", False)):
+                    # A template-free v2 context enters the governed authoring
+                    # conversation: intake, proposal and confirmation tools;
+                    # template inspection/fill stay unavailable by design.
+                    allowed_without_template.update({
+                        "start_document_generation_session",
+                        "answer_clarification",
+                        "propose_document_plan",
+                        "confirm_document_plan",
+                    })
+                if task_id:
+                    allowed_without_template.update({"get_document_generation_status"})
                 document_tools = [
                     tool for tool in document_tools
                     if str(getattr(tool, "name", "") or "") in allowed_without_template

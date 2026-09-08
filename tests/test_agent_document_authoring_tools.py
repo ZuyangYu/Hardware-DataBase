@@ -567,3 +567,238 @@ def test_client_context_cannot_cross_owner_or_knowledge_base(tmp_path):
             ),
             expected_kb="hardware",
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 Task 11: v2 plan-proposal/confirmation tool surface
+# ---------------------------------------------------------------------------
+
+
+def _v2_session(*, status: str = "awaiting_plan") -> GenerationSession:
+    return GenerationSession(
+        session_id="generation-session-a",
+        tenant_id="tenant-a",
+        user_id="user-a",
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        contract_version="output_spec_v1",
+        status=status,
+        output_spec_id="output-spec-a",
+        output_spec_version=3,
+        output_spec_draft={"output_spec_id": "output-spec-a", "version": 3},
+    )
+
+
+def _v2_pipeline() -> _Pipeline:
+    pipeline = _Pipeline()
+    pipeline.v2_session = _v2_session()
+    pipeline.create_kwargs = {}
+    pipeline.proposal = {
+        "session_id": "generation-session-a",
+        "task_id": "document-task-a",
+        "document_plan_id": "plan-a",
+        "document_plan_version": 1,
+        "plan_hash": "sha256:plan",
+        "output_spec_id": "output-spec-a",
+        "output_spec_version": 3,
+        "output_spec_hash": "sha256:spec",
+        "status": "awaiting_plan_confirmation",
+        "executable": True,
+        "deliverables": [{"format": "xlsx", "role": "primary"}],
+        "layout_summary": {"mode": "provided_template"},
+        "outline_count": 2,
+        "table_count": 1,
+        "source_summary": {"knowledge_base_count": 1},
+        "policies": {"missing_data": "mark_tbd"},
+        "warnings": [],
+        "blockers": [],
+        "next_actions": ["confirm_document_plan"],
+    }
+    pipeline.submission = {
+        "submission_id": "submission-a",
+        "status": "pending",
+        "session_id": "generation-session-a",
+        "task_id": "document-task-a",
+        "document_plan_id": "plan-a",
+        "document_plan_version": 1,
+        "plan_hash": "sha256:plan",
+        "work_order_id": None,
+        "job_id": None,
+        "next_actions": ["await_generation"],
+    }
+
+    def _create_v2_session(_ctx, **kwargs):
+        pipeline.create_kwargs = kwargs
+        return pipeline.v2_session
+
+    def _propose(_ctx, session_id, **kwargs):
+        pipeline.propose_kwargs = {"session_id": session_id, **kwargs}
+        return dict(pipeline.proposal, session_id=session_id)
+
+    def _confirm(_ctx, session_id, **kwargs):
+        pipeline.confirm_kwargs = {"session_id": session_id, **kwargs}
+        return dict(pipeline.submission, session_id=session_id)
+
+    def _answer(_ctx, session_id, **kwargs):
+        pipeline.answer_v2_kwargs = {"session_id": session_id, **kwargs}
+        return pipeline.v2_session
+
+    def _task_projection(_ctx, task_id):
+        pipeline.task_projection_id = task_id
+        return {
+            "task_id": task_id,
+            "status": "awaiting_plan_confirmation",
+            "knowledge_base_name": "hardware",
+            "planning_state": {
+                "document_plan_id": "plan-a",
+                "plan_hash": "sha256:plan",
+                "output_spec_hash": "sha256:spec",
+            },
+            "next_actions": ["confirm_document_plan"],
+        }
+
+    pipeline.create_document_generation_session = _create_v2_session
+    pipeline.create_document_plan_proposal = _propose
+    pipeline.confirm_document_plan = _confirm
+    pipeline.answer_document_generation_session = _answer
+    pipeline.get_document_task_projection = _task_projection
+
+    def _get_v2_session(_ctx, session_id):
+        assert session_id == pipeline.v2_session.session_id
+        return pipeline.v2_session
+
+    pipeline.get_document_generation_session = _get_v2_session
+    return pipeline
+
+
+def _v2_toolset(tmp_path, monkeypatch, *, template=True, permission="write"):
+    import src.settings
+
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLANNING_V2_ENABLED", True)
+    ctx = _request_context(permission=permission)
+    if template:
+        context = build_document_context(
+            DocumentContextInput(
+                analysis_id="analysis-a",
+                template_version_id="template-a",
+                knowledge_base_name="hardware",
+                client_request_id="client-a",
+            ),
+            ctx=ctx,
+            expected_kb="hardware",
+        )
+    else:
+        from src.document_authoring.chat_context import DocumentAuthoringContextInput
+
+        context = build_document_context(
+            DocumentAuthoringContextInput(
+                knowledge_base_name="hardware",
+                client_request_id="client-a",
+            ),
+            ctx=ctx,
+            expected_kb="hardware",
+        )
+    return DocumentAuthoringToolset(
+        pipeline=_v2_pipeline(),
+        ctx=ctx,
+        context=context,
+        chat_session_id="chat-a",
+        job_store=DocumentAuthoringJobStore(str(tmp_path / "jobs.db")),
+    )
+
+
+def test_v2_tool_surface_swaps_work_order_for_plan_confirmation(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+
+    names = {tool.name for tool in toolset.as_tools()}
+    assert "create_document_work_order" not in names
+    assert "generate_document_from_template" in names
+    assert {"propose_document_plan", "confirm_document_plan", "get_document_task_status"} <= names
+
+
+def test_v2_direct_template_request_returns_proposal_not_work_order(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成 ICD 文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "waiting_human"
+    assert "confirm_document_plan" in result.next_actions
+    assert result.data["proposal"]["plan_hash"] == "sha256:plan"
+    assert result.data["proposal"]["output_spec_hash"] == "sha256:spec"
+    # No Work Order preflight and no job may be created before confirmation.
+    assert not hasattr(toolset.pipeline, "prepare_kwargs")
+    assert toolset.job_store.list_pending(limit=10) == []
+    # Recommendations may be applied, but never a silent confirmation.
+    assert toolset.pipeline.create_kwargs.get("contract_version") == "output_spec_v1"
+    assert "auto_confirm_recommended" not in toolset.pipeline.create_kwargs
+
+
+def test_v2_propose_document_plan_tool_forwards_session_and_request_id(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+
+    result = toolset.propose_document_plan("generation-session-a")
+
+    assert result.status == "succeeded"
+    assert toolset.pipeline.propose_kwargs["session_id"] == "generation-session-a"
+    assert toolset.pipeline.propose_kwargs["expected_output_spec_version"] == 3
+    assert toolset.pipeline.propose_kwargs["client_request_id"]
+    assert result.data["plan_hash"] == "sha256:plan"
+
+
+def test_v2_confirm_document_plan_requires_explicit_hashes(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+
+    missing = toolset.confirm_document_plan(
+        "generation-session-a",
+        expected_output_spec_hash="",
+        expected_plan_hash="sha256:plan",
+        client_request_id="confirm-1",
+    )
+    assert missing.status == "rejected"
+    assert not hasattr(toolset.pipeline, "confirm_kwargs")
+
+    confirmed = toolset.confirm_document_plan(
+        "generation-session-a",
+        expected_output_spec_hash="sha256:spec",
+        expected_plan_hash="sha256:plan",
+        client_request_id="confirm-1",
+    )
+    assert confirmed.status == "succeeded"
+    assert toolset.pipeline.confirm_kwargs["expected_output_spec_hash"] == "sha256:spec"
+    assert toolset.pipeline.confirm_kwargs["expected_plan_hash"] == "sha256:plan"
+    assert toolset.pipeline.confirm_kwargs["client_request_id"] == "confirm-1"
+    assert confirmed.data["status"] == "pending"
+    assert confirmed.work_order_id is None and confirmed.job_id is None
+
+
+def test_v2_get_document_task_status_reads_aggregate_by_task_id(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+
+    result = toolset.get_document_task_status("document-task-a")
+
+    assert result.status == "succeeded"
+    assert toolset.pipeline.task_projection_id == "document-task-a"
+    assert result.data["planning_state"]["plan_hash"] == "sha256:plan"
+    assert result.data["next_actions"] == ["confirm_document_plan"]
+
+
+def test_v2_start_session_without_template_creates_intake_session(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch, template=False)
+
+    result = toolset.start_document_generation_session(purpose="生成评审报告")
+
+    assert result.status == "succeeded"
+    assert toolset.pipeline.create_kwargs["template_version_id"] is None
+    assert toolset.pipeline.create_kwargs["contract_version"] == "output_spec_v1"
+    assert result.data["status"] == "awaiting_plan"
+
+
+def test_v2_generate_document_from_template_still_uses_legacy_path_when_flag_off(tmp_path):
+    toolset = _toolset(tmp_path)
+
+    result = toolset.generate_document_from_template(purpose="参考模板生成 ICD 文档")
+    assert result.status == "succeeded"
+    assert result.work_order_id == "work-order-a"

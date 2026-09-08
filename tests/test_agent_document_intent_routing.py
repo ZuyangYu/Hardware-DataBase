@@ -630,3 +630,87 @@ def test_decode_document_flow_round_trip():
     assert _decode_document_flow({"document_flow": "yes"}) is None
     assert _decode_document_flow({"document_flow": ""}) is None
     assert _decode_document_flow(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 Task 11: v2 tool mounting and generic document-flow prompt
+# ---------------------------------------------------------------------------
+
+_V2_INTAKE_TOOL_NAMES = {
+    "start_document_generation_session",
+    "answer_clarification",
+    "propose_document_plan",
+    "confirm_document_plan",
+}
+
+
+def _stream_once(monkeypatch, *, query, context, v2=True):
+    import src.settings
+
+    from src.agents import runner as runner_mod
+
+    captured = _install_fake_agent(monkeypatch)
+    if v2:
+        monkeypatch.setattr(runner_mod.settings, "DOCUMENT_PLANNING_V2_ENABLED", True)
+    else:
+        monkeypatch.setattr(runner_mod.settings, "DOCUMENT_PLANNING_V2_ENABLED", False)
+    runner = MultiSourceAgentRunner(
+        rag_backend=_FakeRAGBackend(),
+        circuit_service=None,
+        document_authoring_pipeline=object(),
+        document_job_store=Mock(),
+    )
+    deltas = list(
+        runner.stream(
+            query=query,
+            kb_name="kb_hw",
+            history=[],
+            thread_id="t1",
+            document_context=context,
+        )
+    )
+    assert deltas
+    return captured
+
+
+def test_template_free_v2_context_mounts_intake_tools(monkeypatch):
+    captured = _stream_once(
+        monkeypatch,
+        query="基于知识库生成一份评审报告",
+        context=_template_free_context(),
+    )
+
+    names = {_tool_name(tool) for tool in captured["tools"]}
+    assert _V2_INTAKE_TOOL_NAMES <= names
+    assert "create_document_work_order" not in names
+    assert "generate_document_from_template" not in names
+    assert "get_document_template_analysis" not in names
+    prompt = str(captured["system_prompt"])
+    assert "confirm_document_plan" in prompt
+    assert "propose_document_plan" in prompt
+
+
+def test_v2_flag_excludes_work_order_tool_for_template_contexts(monkeypatch):
+    captured = _stream_once(
+        monkeypatch,
+        query="请根据模板生成 ICD 文档",
+        context=_context(),
+    )
+
+    names = {_tool_name(tool) for tool in captured["tools"]}
+    assert "create_document_work_order" not in names
+    assert _V2_INTAKE_TOOL_NAMES <= names
+
+
+def test_v2_flag_off_keeps_legacy_tool_surface(monkeypatch):
+    captured = _stream_once(
+        monkeypatch,
+        query="请根据模板生成 ICD 文档",
+        context=_context(),
+        v2=False,
+    )
+
+    names = {_tool_name(tool) for tool in captured["tools"]}
+    assert "create_document_work_order" in names
+    assert "propose_document_plan" not in names
+    assert "confirm_document_plan" not in names

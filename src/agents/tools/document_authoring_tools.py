@@ -12,11 +12,16 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
+import src.settings
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.document_authoring.chat_context import DocumentAuthoringContext, DocumentContext
 from src.document_authoring.job_store import DocumentAuthoringJobStore
+
+
+def _v2_enabled() -> bool:
+    return bool(getattr(src.settings, "DOCUMENT_PLANNING_V2_ENABLED", False))
 
 
 class DocumentToolResult(BaseModel):
@@ -96,6 +101,24 @@ class GetStatusArgs(BaseModel):
     work_order_id: str = Field(min_length=1, max_length=200)
 
 
+class ProposePlanArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_id: str = Field(min_length=1, max_length=200)
+
+
+class ConfirmPlanArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_id: str = Field(min_length=1, max_length=200)
+    expected_output_spec_hash: str = Field(min_length=1, max_length=256)
+    expected_plan_hash: str = Field(min_length=1, max_length=256)
+    client_request_id: str = Field(min_length=1, max_length=128)
+
+
+class TaskStatusArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    task_id: str = Field(min_length=1, max_length=200)
+
+
 class CreateDocumentRevisionArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -160,11 +183,25 @@ def _safe_session(session: Any) -> dict[str, Any]:
 
 
 def _session_next_actions(session: Any) -> list[str]:
-    if session.status == "needs_clarification":
+    status = getattr(session, "status", "")
+    if getattr(session, "contract_version", "legacy_brief_v1") == "output_spec_v1":
+        if status == "awaiting_plan":
+            # The internal pre-proposal state projects as a draft action;
+            # there is no user-visible awaiting_plan status.  A premature
+            # proposal is rejected with an actionable error by the pipeline.
+            return ["answer_clarification", "propose_document_plan"]
+        if status == "awaiting_plan_confirmation":
+            return ["propose_document_plan", "confirm_document_plan"]
+        if status == "planned":
+            return ["await_generation", "get_document_task_status"]
+        if status == "blocked":
+            return ["answer_clarification"]
+        return []
+    if status == "needs_clarification":
         return ["answer_clarification"]
-    if session.status == "ready_to_generate":
+    if status == "ready_to_generate":
         return ["create_document_work_order"]
-    if session.status == "generating":
+    if status == "generating":
         return ["get_document_generation_status"]
     return []
 
@@ -268,7 +305,10 @@ class DocumentAuthoringToolset:
 
     def _emit_card(
         self,
-        kind: Literal["generation_session", "work_order_created", "work_order_status"],
+        kind: Literal[
+            "generation_session", "work_order_created", "work_order_status",
+            "output_spec_confirmation",
+        ],
         result: DocumentToolResult,
     ) -> None:
         if self.event_sink is None or result.status not in {"succeeded", "waiting_human"}:
@@ -552,6 +592,89 @@ class DocumentAuthoringToolset:
             )
         return session, None
 
+    def _v2_confirmation_for_direct_request(
+        self,
+        *,
+        template_id: str | None,
+        purpose: str,
+        use_recommended_defaults: bool,
+    ) -> tuple[DocumentToolResult | None, DocumentToolResult | None]:
+        """v2 direct path: prepare recommendations + proposal, never execute.
+
+        Returns ``(result, error)``.  The result is always ``waiting_human``
+        with ``confirm_document_plan`` as the next action; a Work Order or
+        generation job can only appear after the explicit hash-bound
+        confirmation, which this tool must never perform.
+        """
+        operation = "generate_document_from_template"
+        try:
+            session = self.pipeline.create_document_generation_session(
+                self.ctx,
+                knowledge_base_name=self.context.knowledge_base_name,
+                template_version_id=template_id,
+                purpose=str(purpose or "").strip(),
+                contract_version="output_spec_v1",
+            )
+        except PermissionError:
+            raise
+        except (ValueError, KeyError):
+            return None, self._rejected(
+                operation,
+                "generation_session_not_ready",
+                "generation session could not be created",
+                template_version_id=template_id,
+            )
+        if use_recommended_defaults:
+            try:
+                session = self.pipeline.answer_document_generation_session(
+                    self.ctx,
+                    session.session_id,
+                    question_id="recommendations",
+                    answer="采用推荐方案",
+                    client_request_id=self._generation_client_request_id(session.session_id),
+                )
+            except (PermissionError, ValueError, KeyError):
+                # Recommendation acceptance is advisory; a rejection must not
+                # block the proposal from being compiled.
+                pass
+        try:
+            proposal = self.pipeline.create_document_plan_proposal(
+                self.ctx,
+                session.session_id,
+                client_request_id=self._generation_client_request_id(session.session_id),
+                expected_output_spec_version=int(
+                    getattr(session, "output_spec_version", 0) or 0
+                ),
+            )
+        except PermissionError:
+            raise
+        except (ValueError, KeyError):
+            return None, self._rejected(
+                operation,
+                "plan_proposal_rejected",
+                "document plan proposal could not be compiled; answer the pending clarification first",
+                generation_session_id=session.session_id,
+                next_actions=["answer_clarification", "propose_document_plan"],
+            )
+        result = DocumentToolResult(
+            status="waiting_human",
+            operation=operation,
+            message=(
+                "已生成文档计划提案；请确认将要生成的内容后再执行生成。"
+                "确认前不会创建工单或后台任务。"
+            ),
+            template_version_id=template_id,
+            generation_session_id=session.session_id,
+            task_id=getattr(session, "document_task_id", None),
+            data={
+                "status": "awaiting_plan_confirmation",
+                "proposal": proposal,
+            },
+            next_actions=["confirm_document_plan"],
+        )
+        self._emit_card("output_spec_confirmation", result)
+        return result, None
+
     def generate_document_from_template(
         self,
         purpose: str = "",
@@ -588,6 +711,20 @@ class DocumentAuthoringToolset:
         )
         if schema_error is not None:
             return schema_error
+
+        if _v2_enabled():
+            # Gate 1: a direct template request prepares recommendations and a
+            # hash-bound proposal, but the explicit confirmation is the only
+            # path into the Work Order/job pipeline.
+            v2_template_id = template_id or None
+            result, error = self._v2_confirmation_for_direct_request(
+                template_id=v2_template_id,
+                purpose=purpose,
+                use_recommended_defaults=use_recommended_defaults,
+            )
+            if error is not None:
+                return error
+            return result
 
         try:
             analysis = self.pipeline.get_document_template_analysis_for_review(
@@ -877,23 +1014,35 @@ class DocumentAuthoringToolset:
     ) -> DocumentToolResult:
         operation = "start_document_generation_session"
         self._authorize("write")
-        template_id = str(template_version_id or self.context.template_version_id).strip()
-        if template_id != self.context.template_version_id:
+        raw_template = template_version_id or self.context.template_version_id
+        template_id = str(raw_template).strip() if raw_template is not None else ""
+        if template_id and template_id != self.context.template_version_id:
             return self._rejected(operation, "document_context_template_mismatch", "template reference does not match the attached context", template_version_id=template_id)
         try:
-            session = self.pipeline.create_document_generation_session(
-                self.ctx,
-                knowledge_base_name=self.context.knowledge_base_name,
-                template_version_id=template_id,
-                purpose=str(purpose or "").strip(),
-            )
+            if _v2_enabled():
+                # A v2 intake session may be template-free; the layout source
+                # binding stays server-owned in the OutputSpec draft.
+                session = self.pipeline.create_document_generation_session(
+                    self.ctx,
+                    knowledge_base_name=self.context.knowledge_base_name,
+                    template_version_id=template_id or None,
+                    purpose=str(purpose or "").strip(),
+                    contract_version="output_spec_v1",
+                )
+            else:
+                session = self.pipeline.create_document_generation_session(
+                    self.ctx,
+                    knowledge_base_name=self.context.knowledge_base_name,
+                    template_version_id=template_id,
+                    purpose=str(purpose or "").strip(),
+                )
         except PermissionError:
             raise
         except (ValueError, KeyError):
             return self._rejected(operation, "generation_session_not_ready", "generation session could not be created", template_version_id=template_id)
         result = DocumentToolResult(
             status="succeeded", operation=operation, message="generation session started",
-            template_version_id=template_id, generation_session_id=session.session_id,
+            template_version_id=template_id or None, generation_session_id=session.session_id,
             task_id=getattr(session, "document_task_id", None),
             data=_safe_session(session), next_actions=_session_next_actions(session),
         )
@@ -1086,6 +1235,141 @@ class DocumentAuthoringToolset:
         self._emit_card("work_order_status", result)
         return result
 
+    def propose_document_plan(self, session_id: str) -> DocumentToolResult:
+        """Compile and return the safe, hash-bound plan proposal (v2)."""
+        operation = "propose_document_plan"
+        self._authorize("write")
+        if self.context.generation_session_id and session_id != self.context.generation_session_id:
+            return self._rejected(operation, "document_context_session_mismatch", "session reference does not match the attached context", generation_session_id=session_id)
+        expected_version = 0
+        try:
+            session = self.pipeline.get_document_generation_session(self.ctx, session_id)
+            expected_version = int(getattr(session, "output_spec_version", 0) or 0)
+        except PermissionError:
+            raise
+        except (KeyError, ValueError):
+            return self._rejected(operation, "generation_session_not_found", "generation session was not found", generation_session_id=session_id)
+        try:
+            proposal = self.pipeline.create_document_plan_proposal(
+                self.ctx,
+                session_id,
+                client_request_id=self._generation_client_request_id(session_id),
+                expected_output_spec_version=expected_version,
+            )
+        except PermissionError:
+            raise
+        except KeyError:
+            return self._rejected(operation, "generation_session_not_found", "generation session was not found", generation_session_id=session_id)
+        except ValueError as exc:
+            return self._rejected(
+                operation,
+                "plan_proposal_rejected",
+                str(exc) or "document plan proposal was rejected",
+                generation_session_id=session_id,
+                next_actions=["answer_clarification"],
+            )
+        executable = bool(proposal.get("executable")) if isinstance(proposal, dict) else False
+        safe_proposal = dict(proposal) if isinstance(proposal, dict) else {}
+        result = DocumentToolResult(
+            status="succeeded",
+            operation=operation,
+            message="document plan proposal compiled",
+            generation_session_id=session_id,
+            task_id=safe_proposal.get("task_id"),
+            data={
+                **safe_proposal,
+                "executable": executable,
+            },
+            next_actions=(
+                ["confirm_document_plan"] if executable else ["answer_clarification"]
+            ),
+        )
+        self._emit_card("output_spec_confirmation", result)
+        return result
+
+    def confirm_document_plan(
+        self,
+        session_id: str,
+        expected_output_spec_hash: str,
+        expected_plan_hash: str,
+        client_request_id: str,
+    ) -> DocumentToolResult:
+        """Explicit Gate 1 confirmation bound to the visible plan/spec hashes."""
+        operation = "confirm_document_plan"
+        self._authorize("write")
+        if self.context.generation_session_id and session_id != self.context.generation_session_id:
+            return self._rejected(operation, "document_context_session_mismatch", "session reference does not match the attached context", generation_session_id=session_id)
+        spec_hash = str(expected_output_spec_hash or "").strip()
+        plan_hash = str(expected_plan_hash or "").strip()
+        request_key = str(client_request_id or "").strip()
+        if not spec_hash or not plan_hash or not request_key:
+            return self._rejected(
+                operation,
+                "confirmation_hashes_missing",
+                "confirming a plan requires the exact output spec hash, plan hash and a client request id",
+                generation_session_id=session_id,
+                next_actions=["propose_document_plan", "confirm_document_plan"],
+            )
+        try:
+            submission = self.pipeline.confirm_document_plan(
+                self.ctx,
+                session_id,
+                expected_output_spec_hash=spec_hash,
+                expected_plan_hash=plan_hash,
+                client_request_id=request_key,
+            )
+        except PermissionError:
+            raise
+        except KeyError:
+            return self._rejected(operation, "generation_session_not_found", "generation session was not found", generation_session_id=session_id)
+        except ValueError as exc:
+            return self._rejected(
+                operation,
+                "plan_confirmation_rejected",
+                str(exc) or "document plan confirmation was rejected",
+                generation_session_id=session_id,
+                next_actions=["propose_document_plan"],
+            )
+        result = DocumentToolResult(
+            status="succeeded",
+            operation=operation,
+            message="document plan confirmed; the submission worker will materialize the work order",
+            generation_session_id=session_id,
+            task_id=(submission.get("task_id") if isinstance(submission, dict) else None),
+            work_order_id=(submission.get("work_order_id") if isinstance(submission, dict) else None),
+            job_id=(submission.get("job_id") if isinstance(submission, dict) else None),
+            data={
+                "submission": submission,
+                "status": submission.get("status") if isinstance(submission, dict) else None,
+            },
+            next_actions=["await_generation", "get_document_task_status"],
+        )
+        self._emit_card("output_spec_confirmation", result)
+        return result
+
+    def get_document_task_status(self, task_id: str) -> DocumentToolResult:
+        """Read the task aggregate by task id (planning + execution states)."""
+        operation = "get_document_task_status"
+        self._authorize("read")
+        try:
+            projection = self.pipeline.get_document_task_projection(self.ctx, str(task_id).strip())
+        except PermissionError:
+            raise
+        except KeyError:
+            return self._rejected(operation, "task_not_found", "document task was not found", task_id=task_id)
+        except ValueError:
+            return self._rejected(operation, "task_association_mismatch", "document task is bound to another execution lineage", task_id=task_id)
+        if projection is None:
+            return self._rejected(operation, "task_not_found", "document task was not found", task_id=task_id)
+        return DocumentToolResult(
+            status="succeeded",
+            operation=operation,
+            message="document task status loaded",
+            task_id=str(task_id).strip(),
+            data=projection,
+            next_actions=list(projection.get("next_actions") or []),
+        )
+
     def create_document_revision(
         self,
         task_id: str,
@@ -1194,7 +1478,7 @@ class DocumentAuthoringToolset:
                 call, name=name, description=description, args_schema=args_schema,
             )
 
-        return [
+        tools = [
             wrap("generate_document_from_template", "按当前已批准模板和知识库证据创建最终文档填充任务；不要改用对话导出。", GenerateDocumentArgs, self.generate_document_from_template),
             wrap("get_document_template_analysis", "读取当前模板的结构化分析结果。", GetAnalysisArgs, self.get_document_template_analysis),
             wrap("start_document_generation_session", "开始当前模板的文档生成澄清会话。", StartSessionArgs, self.start_document_generation_session),
@@ -1204,6 +1488,16 @@ class DocumentAuthoringToolset:
             wrap("create_document_revision", "记录对现有文档 Artifact 的受控修订请求；不要声称修订文件已经生成。", CreateDocumentRevisionArgs, self.create_document_revision),
             wrap("get_document_generation_status", "读取文档生成工单状态。", GetStatusArgs, self.get_document_generation_status),
         ]
+        if _v2_enabled():
+            # The low-level Work Order transition is owned by the submission
+            # worker in v2; the model only proposes and confirms plans.
+            tools = [tool for tool in tools if tool.name != "create_document_work_order"]
+            tools.extend([
+                wrap("propose_document_plan", "为已完成需求澄清的文档会话编译并返回计划提案（不创建工单）。", ProposePlanArgs, self.propose_document_plan),
+                wrap("confirm_document_plan", "以当前可见的 spec/plan 哈希显式确认文档计划；确认后由后台 worker 创建工单。", ConfirmPlanArgs, self.confirm_document_plan),
+                wrap("get_document_task_status", "按任务 ID 读取文档任务聚合状态。", TaskStatusArgs, self.get_document_task_status),
+            ])
+        return tools
 
 
 def make_document_authoring_tools(
