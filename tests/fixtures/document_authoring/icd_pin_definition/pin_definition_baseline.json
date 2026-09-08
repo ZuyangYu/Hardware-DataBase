@@ -1,0 +1,108 @@
+{
+  "fixture_id": "icd-pin-definition-baseline-v1",
+  "metric_version": "icd-pin-definition-v1",
+  "provenance": {
+    "kind": "synthetic-reviewed",
+    "source": "Phase 2 Task 7 offline parity fixture; no external workbook bytes",
+    "reviewed_on": "2026-09-08"
+  },
+  "required_columns": [
+    "connector",
+    "pin_number",
+    "pin_definition"
+  ],
+  "human": {
+    "file_name": "pin_definition_human_baseline.xlsx",
+    "rows": [
+      ["Connector", "Pin Number", "Pin Definition", "Function", "Notice"],
+      ["J1", "1", "CAN_H", "CAN high", ""],
+      ["J1", "2", "CAN_L", "CAN low", "twisted pair"],
+      ["J2", "1", "GND", "Ground", "shield reference"]
+    ],
+    "evidence_by_key": {
+      "j1:1": {
+        "connector": ["human:j1:1:connector"],
+        "pin_number": ["human:j1:1:pin_number"],
+        "pin_definition": ["human:j1:1:pin_definition"]
+      },
+      "j1:2": {
+        "connector": ["human:j1:2:connector"],
+        "pin_number": ["human:j1:2:pin_number"],
+        "pin_definition": ["human:j1:2:pin_definition"]
+      },
+      "j2:1": {
+        "connector": ["human:j2:1:connector"],
+        "pin_number": ["human:j2:1:pin_number"],
+        "pin_definition": ["human:j2:1:pin_definition"]
+      }
+    }
+  },
+  "xlsx": {
+    "file_name": "pin_definition_generated.xlsx",
+    "rows": [
+      ["Connector", "Pin Number", "Pin Definition", "Function", "Notice"],
+      ["J1", "1", "CAN_H", "CAN high", ""],
+      ["J1", "2", "CAN_L", "CAN low", "twisted pair"],
+      ["J2", "1", "GND", "Ground", "shield reference"]
+    ],
+    "evidence_by_key": {
+      "j1:1": {
+        "connector": ["generated:j1:1:connector"],
+        "pin_number": ["generated:j1:1:pin_number"],
+        "pin_definition": ["generated:j1:1:pin_definition"]
+      },
+      "j1:2": {
+        "connector": ["generated:j1:2:connector"],
+        "pin_number": ["generated:j1:2:pin_number"],
+        "pin_definition": ["generated:j1:2:pin_definition"]
+      },
+      "j2:1": {
+        "connector": ["generated:j2:1:connector"],
+        "pin_number": ["generated:j2:1:pin_number"],
+        "pin_definition": ["generated:j2:1:pin_definition"]
+      }
+    }
+  },
+  "xlsm": {
+    "file_name": "pin_definition_generated.xlsm",
+    "rows": [
+      ["Connector", "Pin Number", "Pin Definition", "Function", "Notice"],
+      ["J1", "1", "CAN_H", "CAN high", ""],
+      ["J1", "2", "CAN_L", "CAN low", "twisted pair"],
+      ["J2", "1", "GND", "Ground", "shield reference"]
+    ],
+    "evidence_by_key": {
+      "j1:1": {
+        "connector": ["generated:j1:1:connector"],
+        "pin_number": ["generated:j1:1:pin_number"],
+        "pin_definition": ["generated:j1:1:pin_definition"]
+      },
+      "j1:2": {
+        "connector": ["generated:j1:2:connector"],
+        "pin_number": ["generated:j1:2:pin_number"],
+        "pin_definition": ["generated:j1:2:pin_definition"]
+      },
+      "j2:1": {
+        "connector": ["generated:j2:1:connector"],
+        "pin_number": ["generated:j2:1:pin_number"],
+        "pin_definition": ["generated:j2:1:pin_definition"]
+      }
+    }
+  },
+  "packages": {
+    "xlsx": {
+      "format": "xlsx",
+      "has_vba_project": false,
+      "protected": true,
+      "merged_range_count": 1,
+      "external_link_count": 0
+    },
+    "xlsm": {
+      "format": "xlsm",
+      "has_vba_project": true,
+      "protected": true,
+      "merged_range_count": 1,
+      "external_link_count": 0
+    }
+  }
+}
