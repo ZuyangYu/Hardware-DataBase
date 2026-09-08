@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 
 from src.document_authoring.chat_context import DocumentContext, DocumentContextInput
 from src.result_exports.models import normalize_export_format
@@ -1081,15 +1081,24 @@ class ConvertDocumentArtifactRequest(BaseModel):
 
 
 class CreateGenerationSessionRequest(BaseModel):
-    template_version_id: str = Field(min_length=1)
+    template_version_id: str | None = Field(default=None, min_length=1)
     contract_version: Literal["legacy_brief_v1", "output_spec_v1"] = "legacy_brief_v1"
     purpose: str = ""
     output_policy: dict[str, Any] = Field(default_factory=dict)
+    output_spec: dict[str, Any] | None = None
     # Optional until all existing callers select a schema before clarification.
     # When supplied, the resolver can attach field-level requirements to the
     # GenerationSession without changing the legacy fixed-question flow.
     document_schema_id: str | None = Field(default=None, min_length=1)
     document_schema_version: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_contract_input(self):
+        if self.contract_version == "legacy_brief_v1" and not self.template_version_id:
+            raise ValueError("legacy generation sessions require template_version_id")
+        if self.output_spec is not None and not isinstance(self.output_spec, dict):
+            raise ValueError("output_spec must be an object")
+        return self
 
 
 class AnswerGenerationSessionRequest(BaseModel):

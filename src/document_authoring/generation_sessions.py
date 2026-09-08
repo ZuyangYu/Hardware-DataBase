@@ -111,6 +111,7 @@ class GenerationSession(BaseModel):
     work_order_id: str | None = None
     output_spec_id: str | None = None
     output_spec_version: int | None = Field(default=None, ge=1)
+    output_spec_draft: dict[str, Any] | None = None
     document_plan_id: str | None = None
     document_plan_version: int | None = Field(default=None, ge=1)
     last_question_id: str | None = None
@@ -131,6 +132,8 @@ class GenerationSession(BaseModel):
             version = getattr(self, f"{prefix}_version")
             if (identifier is None) != (version is None):
                 raise ValueError(f"{prefix} id and version must be provided together")
+        if self.output_spec_draft is not None and self.output_spec_id is None:
+            raise ValueError("output spec draft requires an output spec reference")
         return self
 
 
@@ -160,6 +163,7 @@ class GenerationSessionStore:
                     contract_version TEXT NOT NULL DEFAULT 'legacy_brief_v1',
                     output_spec_id TEXT,
                     output_spec_version INTEGER,
+                    output_spec_draft_json TEXT,
                     document_plan_id TEXT,
                     document_plan_version INTEGER,
                     status TEXT NOT NULL,
@@ -189,6 +193,7 @@ class GenerationSessionStore:
                 ("contract_version", "TEXT NOT NULL DEFAULT 'legacy_brief_v1'"),
                 ("output_spec_id", "TEXT"),
                 ("output_spec_version", "INTEGER"),
+                ("output_spec_draft_json", "TEXT"),
                 ("document_plan_id", "TEXT"),
                 ("document_plan_version", "INTEGER"),
             ):
@@ -228,6 +233,7 @@ class GenerationSessionStore:
         ] | None = None,
         output_spec_id: str | None = None,
         output_spec_version: int | None = None,
+        output_spec_draft: dict[str, Any] | None = None,
         document_plan_id: str | None = None,
         document_plan_version: int | None = None,
     ) -> GenerationSession:
@@ -249,6 +255,7 @@ class GenerationSessionStore:
             document_task_id=self._optional(document_task_id),
             output_spec_id=self._optional(output_spec_id),
             output_spec_version=output_spec_version,
+            output_spec_draft=output_spec_draft,
             document_plan_id=self._optional(document_plan_id),
             document_plan_version=document_plan_version,
             created_at=now,
@@ -259,14 +266,17 @@ class GenerationSessionStore:
                     """INSERT INTO document_generation_sessions (
                        session_id, tenant_id, user_id, knowledge_base_name,
                        template_version_id, contract_version, output_spec_id,
-                       output_spec_version, document_plan_id, document_plan_version,
+                       output_spec_version, output_spec_draft_json,
+                       document_plan_id, document_plan_version,
                        status, created_at, updated_at, payload_json
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session.session_id, session.tenant_id, session.user_id,
                     session.knowledge_base_name, session.template_version_id,
                     session.contract_version, session.output_spec_id,
-                    session.output_spec_version, session.document_plan_id,
+                    session.output_spec_version,
+                    self._json(session.output_spec_draft) if session.output_spec_draft is not None else None,
+                    session.document_plan_id,
                     session.document_plan_version, session.status,
                     session.created_at.isoformat(), session.updated_at.isoformat(),
                     self._json(session.model_dump(mode="json", exclude={"messages"})),
@@ -690,17 +700,50 @@ class GenerationSessionStore:
             self._update_session_row(conn, revised)
         return revised
 
+    def update_output_spec_draft(
+        self,
+        session_id: str,
+        draft: dict[str, Any],
+        *,
+        expected_version: int,
+        status: str = "awaiting_plan",
+    ) -> GenerationSession:
+        """Persist the next draft revision only when its expected version matches."""
+        session = self.get_session(session_id)
+        if session.contract_version != "output_spec_v1":
+            raise ValueError("output spec drafts require output_spec_v1")
+        current_version = int(session.output_spec_version or 0)
+        if current_version != int(expected_version):
+            raise ValueError(
+                f"expected output spec version {expected_version}, current version is {current_version}"
+            )
+        draft_version = int(draft.get("version") or 0)
+        if draft_version <= current_version:
+            raise ValueError("output spec draft version must advance")
+        revised = session.model_copy(update={
+            "output_spec_id": self._optional(draft.get("output_spec_id")) or session.output_spec_id,
+            "output_spec_version": draft_version,
+            "output_spec_draft": dict(draft),
+            "status": status,
+            "updated_at": _utc_now(),
+        })
+        with closing(self._connect()) as conn:
+            self._update_session_row(conn, revised)
+        return revised
+
     def _update_session_row(self, conn: sqlite3.Connection, session: GenerationSession) -> None:
         cursor = conn.execute(
             """UPDATE document_generation_sessions
                SET template_version_id = ?, contract_version = ?,
                    output_spec_id = ?, output_spec_version = ?,
+                   output_spec_draft_json = ?,
                    document_plan_id = ?, document_plan_version = ?,
                    status = ?, updated_at = ?, payload_json = ?
                WHERE session_id = ?""",
             (
                 session.template_version_id, session.contract_version,
                 session.output_spec_id, session.output_spec_version,
+                self._json(session.output_spec_draft) if session.output_spec_draft is not None else None,
                 session.document_plan_id, session.document_plan_version,
                 session.status,
                 session.updated_at.isoformat(),

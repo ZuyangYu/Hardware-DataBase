@@ -134,6 +134,39 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403, response.text)
 
+    def test_v2_session_request_allows_template_free_output_spec_input(self):
+        captured = {}
+        self.stub.create_document_generation_session = lambda ctx, **kwargs: (
+            captured.update(kwargs)
+            or {
+                "session_id": "generation-session-v2",
+                "contract_version": "output_spec_v1",
+                "template_version_id": None,
+                "status": "awaiting_plan",
+                "messages": [],
+            }
+        )
+        response = self.client.post(
+            "/api/v1/document-generation/sessions?kb=shared",
+            headers=self._headers("admin1"),
+            json={
+                "contract_version": "output_spec_v1",
+                "purpose": "生成通用报告",
+                "output_spec": {
+                    "document_type": "report",
+                    "layout_source": {
+                        "mode": "generated_structure",
+                        "constraints_profile_id": "generic-report",
+                        "constraints_profile_version": "1",
+                    },
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(captured["contract_version"], "output_spec_v1")
+        self.assertIsNone(captured["template_version_id"])
+        self.assertEqual(captured["output_spec"]["document_type"], "report")
+
     def test_work_order_creation_requires_write_permission(self):
         response = self.client.post(
             "/api/v1/document-generation/work-orders?kb=shared",

@@ -402,8 +402,10 @@ def create_generation_session(
             ctx,
             knowledge_base_name=kb,
             template_version_id=payload.template_version_id,
+            contract_version=payload.contract_version,
             purpose=payload.purpose,
             output_policy=payload.output_policy,
+            output_spec=payload.output_spec,
             document_schema_id=payload.document_schema_id,
             document_schema_version=payload.document_schema_version,
         )

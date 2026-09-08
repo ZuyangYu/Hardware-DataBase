@@ -46,6 +46,7 @@ from .sources import FrozenSourceRef, FrozenSourceScope, SourceType
 from .diff import diff_document_plans
 from .legacy import legacy_brief_to_output_spec
 from .service import DocumentPlanningService, LegacyTemplatePlanningAdapter
+from .intake import IntakeQuestion, OutputSpecIntakeService, OutputSpecVersionConflict
 
 __all__ = [
     "ArtifactSpec",
@@ -88,4 +89,7 @@ __all__ = [
     "DocumentPlanningService",
     "LegacyTemplatePlanningAdapter",
     "legacy_brief_to_output_spec",
+    "IntakeQuestion",
+    "OutputSpecIntakeService",
+    "OutputSpecVersionConflict",
 ]

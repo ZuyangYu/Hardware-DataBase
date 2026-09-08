@@ -4,6 +4,7 @@ import re
 import shutil
 import tempfile
 import traceback
+import uuid
 from typing import Any, Callable, Generator, List, Tuple
 
 import src.settings
@@ -40,6 +41,7 @@ from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.template_progress import TemplateProgressCallback
 from src.document_authoring.generation_sessions import GenerationBrief
 from src.document_authoring.models import content_hash
+from src.document_authoring.planning.intake import OutputSpecIntakeService
 from src.document_authoring.requirement_clarifier import RequirementClarifier
 from src.document_authoring.requirement_resolver import RequirementResolver
 from src.document_authoring.reviews import resolve_review_decision_status
@@ -173,6 +175,7 @@ class AppPipeline:
             self.agent.document_job_store = self.document_job_store
             self.requirement_clarifier = RequirementClarifier()
             self.requirement_resolver = RequirementResolver()
+            self.output_spec_intake = OutputSpecIntakeService()
             # Spreadsheet structured index (xlsx TableIndexStore). Shared with
             # the query agent; the KB authoring retriever also needs it so
             # frozen .xlsx sources can produce tabular evidence.
@@ -959,7 +962,23 @@ class AppPipeline:
         document_schema_id: str | None = None,
         document_schema_version: str | None = None,
         auto_confirm_recommended: bool = False,
+        contract_version: str = "legacy_brief_v1",
+        output_spec: dict[str, Any] | None = None,
     ):
+        if contract_version == "output_spec_v1":
+            return self._create_output_spec_generation_session(
+                ctx,
+                knowledge_base_name=knowledge_base_name,
+                template_version_id=template_version_id,
+                purpose=purpose,
+                output_policy=output_policy,
+                document_schema_id=document_schema_id,
+                document_schema_version=document_schema_version,
+                output_spec=output_spec,
+                auto_confirm_recommended=auto_confirm_recommended,
+            )
+        if contract_version != "legacy_brief_v1":
+            raise ValueError("unsupported generation session contract version")
         template = self.document_generation.store.get_template(template_version_id)
         if template is None:
             raise KeyError("template not found")
@@ -1088,6 +1107,122 @@ class AppPipeline:
                 )
         return session
 
+    def _create_output_spec_generation_session(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+        template_version_id: str | None,
+        purpose: str = "",
+        output_policy: dict[str, Any] | None = None,
+        document_schema_id: str | None = None,
+        document_schema_version: str | None = None,
+        output_spec: dict[str, Any] | None = None,
+        auto_confirm_recommended: bool = False,
+    ):
+        """Create a v2 OutputSpec draft without entering legacy execution."""
+        if auto_confirm_recommended:
+            raise ValueError("auto_confirm_recommended is not available for output_spec_v1")
+        if not ctx.has_kb_permission(knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+        template = None
+        if template_version_id:
+            template = self.document_generation.store.get_template(template_version_id)
+            if template is None:
+                raise KeyError("template not found")
+            self.document_generation._require_template_kb_scope(ctx, template, "write")
+            if template.knowledge_base_name != knowledge_base_name:
+                raise PermissionError("template does not belong to the selected knowledge base")
+
+        raw = dict(output_spec or {})
+        schema = None
+        if document_schema_id:
+            schema = self.document_generation.store.get_document_schema(
+                document_schema_id, document_schema_version or "1",
+            )
+            if schema is None:
+                raise KeyError("document schema not found")
+        intake = getattr(self, "output_spec_intake", None) or OutputSpecIntakeService()
+        allowed = {
+            "purpose", "audience", "document_type", "deliverables", "artifact", "outline",
+            "layout_source", "table_requirements", "source_scope", "target_identity", "language", "style",
+            "missing_data_policy", "inference_policy", "approval_policy_id",
+            "accepted_recommendations",
+        }
+        draft_kwargs = {key: raw[key] for key in allowed if key in raw}
+        draft_kwargs.setdefault("purpose", purpose.strip() or raw.get("purpose"))
+        if schema is not None:
+            draft_kwargs.setdefault("document_type", schema.document_type)
+        if template is not None:
+            draft_kwargs["layout_source"] = {
+                "mode": "provided_template",
+                "template_version_id": template.template_version_id,
+                "template_schema_id": template.template_schema_id,
+                "template_schema_version": template.template_schema_version,
+            }
+            draft_kwargs.setdefault("document_type", schema.document_type if schema else template.template_id)
+        elif "layout_source" in raw:
+            draft_kwargs["layout_source"] = raw["layout_source"]
+        # Template references are server-owned.  A client cannot smuggle a
+        # provided-template layout into a template-free session.
+        layout = draft_kwargs.get("layout_source")
+        if isinstance(layout, dict) and layout.get("mode") == "provided_template" and template is None:
+            raise ValueError("provided-template layout requires template_version_id")
+        draft = intake.start_draft(
+            output_spec_id=f"output-spec-{uuid.uuid4().hex}",
+            template_version_id=template.template_version_id if template else None,
+            template_schema_id=template.template_schema_id if template else None,
+            template_schema_version=template.template_schema_version if template else None,
+            **draft_kwargs,
+        )
+        sessions = self.document_generation.store.generation_sessions
+        session = sessions.create_session(
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+            knowledge_base_name=knowledge_base_name,
+            template_version_id=template.template_version_id if template else None,
+            contract_version="output_spec_v1",
+            status="awaiting_plan",
+            output_spec_id=draft["output_spec_id"],
+            output_spec_version=draft["version"],
+            output_spec_draft=draft,
+            conversation_id=ctx.metadata.get("conversation_id"),
+            initiating_turn_id=ctx.metadata.get("initiating_turn_id"),
+        )
+        task = self.document_generation.ensure_document_task(
+            ctx,
+            template_version_id=template.template_version_id if template else None,
+            generation_session_id=session.session_id,
+            knowledge_base_name=knowledge_base_name,
+            idempotency_key=(
+                ctx.metadata.get("document_task_idempotency_key")
+                or f"generation-session:{session.session_id}"
+            ),
+            status="needs_clarification",
+        )
+        if task is not None:
+            session = sessions.bind_document_task(session.session_id, task.task_id)
+        question = intake.next_question(draft)
+        if question is None:
+            sessions.append_message(
+                session.session_id,
+                role="assistant",
+                content="需求已经明确，可以生成文档计划提案。",
+                reason="awaiting_plan",
+            )
+            if task is not None:
+                self.document_generation.task_service.store.update_status(task.task_id, "planned")
+        else:
+            sessions.append_message(
+                session.session_id,
+                role="assistant",
+                content=question.prompt,
+                question_id=question.question_id,
+                options=question.options,
+                reason=question.reason,
+            )
+        return self.get_document_generation_session(ctx, session.session_id)
+
     def get_document_generation_session(self, ctx: RequestContext, session_id: str):
         session = self.document_generation.store.generation_sessions.get_session(
             session_id,
@@ -1113,6 +1248,14 @@ class AppPipeline:
             raise PermissionError("knowledge base write permission is required")
         if ctx.metadata.get("document_template_kb_name") != session.knowledge_base_name:
             raise PermissionError("generation session belongs to another knowledge base")
+        if session.contract_version == "output_spec_v1":
+            return self._answer_output_spec_generation_session(
+                ctx,
+                session,
+                question_id=question_id,
+                answer=answer,
+                client_request_id=client_request_id,
+            )
         brief = self.requirement_clarifier.apply_answer(
             session.brief,
             question_id=question_id,
@@ -1170,6 +1313,82 @@ class AppPipeline:
                 },
             )
         return self.get_document_generation_session(ctx, session_id)
+
+    def _answer_output_spec_generation_session(
+        self,
+        ctx: RequestContext,
+        session: Any,
+        *,
+        question_id: str,
+        answer: str,
+        client_request_id: str | None = None,
+    ):
+        intake = getattr(self, "output_spec_intake", None) or OutputSpecIntakeService()
+        draft = session.output_spec_draft
+        if not isinstance(draft, dict):
+            raise ValueError("output spec draft is missing")
+        expected_version = int(session.output_spec_version or draft.get("version") or 0)
+        if answer.strip().casefold() in {"采用推荐方案", "use recommended", "accept recommendations"}:
+            revised_draft = intake.accept_recommendation(
+                draft,
+                recommendation_id=OutputSpecIntakeService._RECOMMENDATION_ID,
+                expected_version=expected_version,
+            )
+        else:
+            revised_draft = intake.merge_answer(
+                draft,
+                expected_version=expected_version,
+                question_id=question_id,
+                answer=answer,
+            )
+        sessions = self.document_generation.store.generation_sessions
+        revised = sessions.update_output_spec_draft(
+            session.session_id,
+            revised_draft,
+            expected_version=expected_version,
+            status="awaiting_plan",
+        )
+        try:
+            sessions.append_message(
+                session.session_id,
+                role="user",
+                content=answer.strip(),
+                question_id=question_id,
+                answer=answer.strip(),
+                client_request_id=client_request_id,
+            )
+        except Exception:
+            # The draft CAS has already made the answer durable.  A duplicate
+            # browser request must not turn a successful draft update into a
+            # failed authoring session.
+            pass
+        question = intake.next_question(revised_draft)
+        if question is None:
+            sessions.append_message(
+                session.session_id,
+                role="assistant",
+                content="需求已经明确，可以生成文档计划提案。",
+                reason="awaiting_plan",
+            )
+            task_status = "planned"
+        else:
+            sessions.append_message(
+                session.session_id,
+                role="assistant",
+                content=question.prompt,
+                question_id=question.question_id,
+                options=question.options,
+                reason=question.reason,
+            )
+            task_status = "needs_clarification"
+        if revised.document_task_id:
+            try:
+                self.document_generation.task_service.store.update_status(
+                    revised.document_task_id, task_status,
+                )
+            except Exception:
+                warn("failed to project output spec clarification status")
+        return self.get_document_generation_session(ctx, session.session_id)
 
     def confirm_document_generation_session(self, ctx: RequestContext, session_id: str):
         session = self.get_document_generation_session(ctx, session_id)
