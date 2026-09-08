@@ -146,8 +146,20 @@ class ArtifactRevision(BaseModel):
     changed_sections: list[str] = Field(default_factory=list)
     input_snapshot_hash: str
     source_snapshot_hash: str
-    template_version_id: str
-    schema_hash: str
+    template_version_id: str = ""
+    schema_hash: str = ""
+    parent_plan_id: str | None = None
+    parent_plan_version: int | None = None
+    parent_plan_hash: str | None = None
+    child_plan_id: str | None = None
+    child_plan_version: int | None = None
+    child_plan_hash: str | None = None
+    plan_diff_hash: str | None = None
+    strategy_hash: str | None = None
+    policy_hash: str | None = None
+    affected_unit_ids: list[str] = Field(default_factory=list)
+    reused_unit_ids: list[str] = Field(default_factory=list)
+    execution_scope_hash: str | None = None
     impact_scope: dict[str, Any] = Field(default_factory=dict)
     revalidation_scope: list[str] = Field(default_factory=list)
     revalidation_status: str = "pending"
@@ -163,7 +175,7 @@ class ArtifactRevision(BaseModel):
         for field_name in (
             "revision_id", "task_id", "work_order_id", "parent_artifact_id",
             "request_type", "request", "input_snapshot_hash", "source_snapshot_hash",
-            "template_version_id", "schema_hash", "status", "revalidation_status",
+            "status", "revalidation_status",
         ):
             value = str(getattr(self, field_name) or "").strip()
             if not value:
@@ -173,8 +185,22 @@ class ArtifactRevision(BaseModel):
             raise ValueError("unsupported revision revalidation status")
         self.changed_fields = _normalize_list(self.changed_fields)
         self.changed_sections = _normalize_list(self.changed_sections)
+        self.affected_unit_ids = _normalize_list(self.affected_unit_ids)
+        self.reused_unit_ids = _normalize_list(self.reused_unit_ids)
         self.revalidation_scope = _normalize_list(self.revalidation_scope)
         self.invalidated_approval_event_ids = _normalize_list(self.invalidated_approval_event_ids)
+        plan_fields = (
+            "parent_plan_id", "parent_plan_version", "parent_plan_hash",
+        )
+        if any(getattr(self, field_name) is not None for field_name in plan_fields) and not all(
+            getattr(self, field_name) not in (None, "") for field_name in plan_fields
+        ):
+            raise ValueError("revision parent plan binding must include id, version and hash")
+        child_fields = ("child_plan_id", "child_plan_version", "child_plan_hash")
+        if any(getattr(self, field_name) is not None for field_name in child_fields) and not all(
+            getattr(self, field_name) not in (None, "") for field_name in child_fields
+        ):
+            raise ValueError("revision child plan binding must include id, version and hash")
         if self.client_request_id is not None:
             self.client_request_id = str(self.client_request_id).strip() or None
         return self
@@ -242,7 +268,10 @@ class ArtifactRevisionStore:
                 "task_id", "work_order_id", "parent_artifact_id", "request_type", "request",
                 "changed_fields", "changed_sections", "input_snapshot_hash", "source_snapshot_hash",
                 "template_version_id", "schema_hash", "impact_scope", "revalidation_scope",
-                "metadata", "client_request_id",
+                "metadata", "client_request_id", "parent_plan_id", "parent_plan_version",
+                "parent_plan_hash", "child_plan_id", "child_plan_version", "child_plan_hash",
+                "plan_diff_hash", "strategy_hash", "policy_hash", "affected_unit_ids",
+                "reused_unit_ids", "execution_scope_hash",
             )
         }
 
@@ -453,6 +482,11 @@ class DocumentRevisionService:
         changed_sections: Any = None,
         client_request_id: str,
         metadata: Mapping[str, Any] | None = None,
+        parent_plan: Any | None = None,
+        child_plan: Any | None = None,
+        plan_diff: Any | None = None,
+        strategy_hash: str | None = None,
+        policy_hash: str | None = None,
     ) -> ArtifactRevision:
         task = self._task_for_context(ctx, task_id, required_permission="write")
         parent_id = str(parent_artifact_id or "").strip()
@@ -519,6 +553,65 @@ class DocumentRevisionService:
             "source_snapshot_hash": source_snapshot_hash,
             "schema_hash": schema_hash,
         })
+        parent_plan_id = parent_plan_version = parent_plan_hash = None
+        child_plan_id = child_plan_version = child_plan_hash = None
+        plan_diff_hash = None
+        affected_unit_ids: list[str] = []
+        reused_unit_ids: list[str] = []
+        execution_scope_hash = None
+        frozen_strategy_hash = str(strategy_hash or "").strip() or None
+        frozen_policy_hash = str(policy_hash or "").strip() or None
+        if parent_plan is not None or child_plan is not None or plan_diff is not None:
+            from src.document_authoring.planning.diff import compile_affected_subgraph, diff_document_plans
+            from src.document_authoring.planning.models import DocumentPlan, PlanDiff
+
+            if parent_plan is None or child_plan is None:
+                raise ValueError("plan-bound revisions require both parent_plan and child_plan")
+            frozen_parent_plan = (
+                parent_plan if isinstance(parent_plan, DocumentPlan)
+                else DocumentPlan.model_validate(parent_plan)
+            )
+            frozen_child_plan = (
+                child_plan if isinstance(child_plan, DocumentPlan)
+                else DocumentPlan.model_validate(child_plan)
+            )
+            frozen_diff = (
+                plan_diff if isinstance(plan_diff, PlanDiff)
+                else PlanDiff.model_validate(plan_diff)
+                if plan_diff is not None
+                else diff_document_plans(frozen_parent_plan, frozen_child_plan)
+            )
+            if (
+                frozen_diff.parent_plan_id != frozen_parent_plan.document_plan_id
+                or frozen_diff.parent_plan_version != frozen_parent_plan.version
+                or frozen_diff.child_plan_id != frozen_child_plan.document_plan_id
+                or frozen_diff.child_plan_version != frozen_child_plan.version
+            ):
+                raise ValueError("plan diff is not bound to the supplied parent and child plans")
+            if frozen_parent_plan.source_snapshot_hash != frozen_child_plan.source_snapshot_hash:
+                raise ValueError("plan-bound revision cannot mix source snapshots")
+            if source_snapshot_hash != frozen_parent_plan.source_snapshot_hash:
+                raise ValueError("revision source snapshot does not match the parent plan")
+            scope = compile_affected_subgraph(frozen_parent_plan, frozen_child_plan, frozen_diff)
+            parent_plan_id = frozen_parent_plan.document_plan_id
+            parent_plan_version = frozen_parent_plan.version
+            parent_plan_hash = frozen_parent_plan.plan_hash
+            child_plan_id = frozen_child_plan.document_plan_id
+            child_plan_version = frozen_child_plan.version
+            child_plan_hash = frozen_child_plan.plan_hash
+            plan_diff_hash = frozen_diff.diff_hash
+            affected_unit_ids = list(scope.affected_unit_ids)
+            reused_unit_ids = list(scope.reused_unit_ids)
+            execution_scope_hash = scope.scope_hash
+            frozen_strategy_hash = frozen_strategy_hash or content_hash({
+                "strategy_id": frozen_child_plan.domain_strategy_id,
+                "strategy_version": frozen_child_plan.domain_strategy_version,
+            })
+            frozen_policy_hash = frozen_policy_hash or content_hash({
+                "unit_review_policy": frozen_child_plan.unit_review_policy,
+                "document_review_policy": frozen_child_plan.document_review_policy,
+                "approval_policy": frozen_child_plan.approval_policy,
+            })
         impact_kind = (
             "full"
             if request_kind == "full_regeneration" or not fields and not sections
@@ -534,7 +627,14 @@ class DocumentRevisionService:
             "sections": sections,
             "requires_full_revalidation": impact_kind == "full",
         }
-        revalidation_scope = ["artifact", "approval", *fields, *sections]
+        if parent_plan_id is not None:
+            revalidation_scope = [
+                "artifact", "approval", "document_review", "render", *fields, *sections,
+                *affected_unit_ids,
+            ]
+        else:
+            # Preserve the historical revision projection for legacy rows.
+            revalidation_scope = ["artifact", "approval", *fields, *sections]
         revision = self.store.create(
             task_id=task.task_id,
             work_order_id=work_order_id,
@@ -548,6 +648,18 @@ class DocumentRevisionService:
             source_snapshot_hash=source_snapshot_hash,
             template_version_id=str(getattr(order, "template_version_id", "") or ""),
             schema_hash=schema_hash,
+            parent_plan_id=parent_plan_id,
+            parent_plan_version=parent_plan_version,
+            parent_plan_hash=parent_plan_hash,
+            child_plan_id=child_plan_id,
+            child_plan_version=child_plan_version,
+            child_plan_hash=child_plan_hash,
+            plan_diff_hash=plan_diff_hash,
+            strategy_hash=frozen_strategy_hash,
+            policy_hash=frozen_policy_hash,
+            affected_unit_ids=affected_unit_ids,
+            reused_unit_ids=reused_unit_ids,
+            execution_scope_hash=execution_scope_hash,
             impact_scope=impact_scope,
             revalidation_scope=revalidation_scope,
             invalidated_approval_event_ids=list(getattr(parent, "approval_event_ids", []) or []),

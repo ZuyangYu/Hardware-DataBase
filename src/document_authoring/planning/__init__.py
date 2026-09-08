@@ -7,6 +7,7 @@ needed before a proposal can be confirmed.
 
 from .models import (
     ArtifactSpec,
+    AffectedSubgraph,
     CoverageContract,
     CoverageRequirement,
     DependencyEdge,
@@ -43,7 +44,7 @@ from .registry import (
     build_builtin_registries,
 )
 from .sources import FrozenSourceRef, FrozenSourceScope, SourceType
-from .diff import diff_document_plans
+from .diff import compile_affected_subgraph, diff_document_plans
 from .legacy import legacy_brief_to_output_spec
 from .service import DocumentPlanningService, LegacyTemplatePlanningAdapter, TemplateFreePlanningAdapter
 from .recipes import (
@@ -79,9 +80,31 @@ from .document_review import (
     ReleaseDecision,
     ReworkDecision,
 )
+from .strategies import (
+    DocumentDomainStrategy,
+    DomainRequirements,
+    FptStrategy,
+    GenericReportStrategy,
+    IcdStrategy,
+    RequirementsStrategy,
+    build_builtin_domain_strategies,
+)
+from .release import (
+    ApprovalPolicy,
+    ApprovalPolicyRegistry,
+    ArtifactLineage,
+    GateFact,
+    PolicyReleaseDecision,
+    ReleasePolicyService,
+    ReleaseSignature,
+    TenantReleasePolicy,
+    build_builtin_approval_policy_registry,
+    reconstruct_artifact_lineage,
+)
 
 __all__ = [
     "ArtifactSpec",
+    "AffectedSubgraph",
     "CoverageContract",
     "CoverageRequirement",
     "DependencyEdge",
@@ -118,6 +141,7 @@ __all__ = [
     "SourceType",
     "build_builtin_registries",
     "diff_document_plans",
+    "compile_affected_subgraph",
     "DocumentPlanningService",
     "LegacyTemplatePlanningAdapter",
     "TemplateFreePlanningAdapter",
@@ -152,4 +176,21 @@ __all__ = [
     "DocumentReworkRouter",
     "ReleaseDecision",
     "ReworkDecision",
+    "DocumentDomainStrategy",
+    "DomainRequirements",
+    "FptStrategy",
+    "GenericReportStrategy",
+    "IcdStrategy",
+    "RequirementsStrategy",
+    "build_builtin_domain_strategies",
+    "ApprovalPolicy",
+    "ApprovalPolicyRegistry",
+    "ArtifactLineage",
+    "GateFact",
+    "PolicyReleaseDecision",
+    "ReleasePolicyService",
+    "ReleaseSignature",
+    "TenantReleasePolicy",
+    "build_builtin_approval_policy_registry",
+    "reconstruct_artifact_lineage",
 ]

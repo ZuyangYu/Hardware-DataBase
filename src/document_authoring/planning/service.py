@@ -22,7 +22,6 @@ from .models import (
 from .registry import CapabilityRegistries, build_builtin_registries
 from .recipes import (
     RecipeRegistry,
-    StructureBindingCompiler,
     StructureProfileRegistry,
     build_builtin_recipe_registry,
     build_builtin_structure_profile_registry,
@@ -551,6 +550,33 @@ class TemplateFreePlanningAdapter:
         )
         if isinstance(strategy_result, PlanIssue):
             issues.append(strategy_result)
+        else:
+            if spec.document_type not in strategy_result.supported_document_types:
+                issues.append(PlanIssue(
+                    code="strategy_document_type_unsupported",
+                    severity="error",
+                    message=(
+                        f"domain strategy {self.domain_strategy_id}@{self.domain_strategy_version} "
+                        f"does not support {spec.document_type}"
+                    ),
+                    path="document_type",
+                ))
+            implementation = self.registries.domain_strategies.implementation(
+                self.domain_strategy_id, self.domain_strategy_version,
+            )
+            if implementation is None:
+                issues.append(PlanIssue(
+                    code="strategy_implementation_missing",
+                    severity="error",
+                    message=(
+                        f"domain strategy {self.domain_strategy_id}@{self.domain_strategy_version} "
+                        "has no registered implementation"
+                    ),
+                    path="domain_strategy",
+                ))
+            else:
+                domain_requirements = implementation.identify_requirements(spec, None)
+                issues.extend(domain_requirements.issues)
 
         structure_components = list(recipe.component_ids) if recipe is not None else []
         semantic_units: list[SemanticUnitPlan] = []

@@ -574,6 +574,13 @@ class PlanDiff(PlanningModel):
     changed_layout: list[NonEmptyId] = Field(default_factory=list, max_length=1_000)
     changed_source_versions: list[NonEmptyId] = Field(default_factory=list, max_length=1_000)
     changed_policy_versions: list[NonEmptyId] = Field(default_factory=list, max_length=1_000)
+    directly_affected_unit_ids: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    affected_unit_ids: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    affected_task_ids: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    dependency_closure: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    reused_unit_ids: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    scope_reason_codes: list[NonEmptyId] = Field(default_factory=list, max_length=64)
+    diff_hash: str | None = None
 
     @model_validator(mode="after")
     def normalize_diff(self) -> "PlanDiff":
@@ -586,7 +593,44 @@ class PlanDiff(PlanningModel):
             "changed_layout",
             "changed_source_versions",
             "changed_policy_versions",
+            "directly_affected_unit_ids",
+            "affected_unit_ids",
+            "affected_task_ids",
+            "dependency_closure",
+            "reused_unit_ids",
+            "scope_reason_codes",
         ):
             values = _unique_strings(getattr(self, field_name), label=field_name)
             setattr(self, field_name, sorted(values))
+        expected_hash = planning_content_hash(self, exclude={"diff_hash"})
+        if self.diff_hash is not None and self.diff_hash != expected_hash:
+            raise ValueError("diff_hash does not match the canonical PlanDiff content")
+        object.__setattr__(self, "diff_hash", expected_hash)
+        return self
+
+
+class AffectedSubgraph(PlanningModel):
+    """The bounded, deterministic execution scope for a plan revision."""
+
+    child_plan_id: NonEmptyId
+    child_plan_version: int = Field(ge=1)
+    directly_affected_unit_ids: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    affected_unit_ids: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    affected_task_ids: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    reused_unit_ids: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    dependency_closure: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
+    reason_codes: list[NonEmptyId] = Field(default_factory=list, max_length=64)
+    scope_hash: str | None = None
+
+    @model_validator(mode="after")
+    def normalize_scope(self) -> "AffectedSubgraph":
+        for field_name in (
+            "directly_affected_unit_ids", "affected_unit_ids", "affected_task_ids",
+            "reused_unit_ids", "dependency_closure", "reason_codes",
+        ):
+            setattr(self, field_name, sorted(_unique_strings(getattr(self, field_name), label=field_name)))
+        expected = planning_content_hash(self, exclude={"scope_hash"})
+        if self.scope_hash is not None and self.scope_hash != expected:
+            raise ValueError("scope_hash does not match the canonical affected subgraph")
+        object.__setattr__(self, "scope_hash", expected)
         return self

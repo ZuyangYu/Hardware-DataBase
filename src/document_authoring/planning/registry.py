@@ -150,6 +150,11 @@ def build_builtin_registries() -> CapabilityRegistries:
     choosing a different layout or renderer.
     """
 
+    # Implementations are attached only to the process-local registry.  The
+    # descriptor and exact version are what gets frozen into a DocumentPlan.
+    from .strategies import build_builtin_domain_strategies
+
+    implementations = build_builtin_domain_strategies()
     domain_strategies = DomainStrategyRegistry()
     domain_strategies.register(DomainStrategyDescriptor(
         strategy_id="legacy_document_schema",
@@ -166,7 +171,7 @@ def build_builtin_registries() -> CapabilityRegistries:
             strategy_id=strategy_id,
             version="1",
             supported_document_types=document_types,
-        ))
+        ), implementation=implementations[strategy_id])
 
     layout_adapters = LayoutAdapterRegistry()
     layout_adapters.register(LayoutAdapterDescriptor(
