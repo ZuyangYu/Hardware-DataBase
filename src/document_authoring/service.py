@@ -48,7 +48,7 @@ from src.document_authoring.models import (
     LegacyTemplateClaim,
     DocumentSchema,
     DocumentWorkOrder,
-    compute_input_fingerprint_v2,
+    compute_input_fingerprint_v3,
     RendererPolicy,
     TemplateSanitizationReport,
     TemplateUnitBinding,
@@ -1012,6 +1012,12 @@ class DocumentGenerationService:
         execution_mode: str | None = None,
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
     ) -> DocumentWorkOrder:
         tenant_id = ctx.tenant_id or "default"
         self.projects.access.require(ctx, project_id, "create_work_order")
@@ -1267,6 +1273,12 @@ class DocumentGenerationService:
         source_scope: str = "knowledge_base_only",
         attachment_refs: Sequence[Any] | None = None,
         kb_scope_snapshot: dict[str, Any] | None = None,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
     ) -> DocumentWorkOrder:
         template = self._template(template_version_id)
         schema = self._schema(document_schema_id, document_schema_version)
@@ -1381,14 +1393,43 @@ class DocumentGenerationService:
             idempotency_key=idempotency_key,
             generation_session_id=generation_session_id,
             generation_brief=dict(generation_brief or {}),
-             restart_of_work_order_id=restart_of_work_order_id,
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
+            restart_of_work_order_id=restart_of_work_order_id,
         )
-        # New work orders use the v2 preimage, which binds the immutable
-        # executor choice. Historical rows remain v1 and are migrated by 5b.
-        order = order.model_copy(update={
-            "input_fingerprint_version": 2,
-            "input_fingerprint": compute_input_fingerprint_v2(order),
-        })
+        # New plan-backed work orders use the v3 preimage, which binds the
+        # accepted OutputSpec/DocumentPlan references.  Legacy callers retain
+        # the v2 preimage and historical v1 rows remain untouched.
+        if any(
+            value is not None
+            for value in (
+                output_spec_id, output_spec_version, output_spec_hash,
+                document_plan_id, document_plan_version, document_plan_hash,
+            )
+        ):
+            if not all(
+                value is not None
+                for value in (
+                    output_spec_id, output_spec_version, output_spec_hash,
+                    document_plan_id, document_plan_version, document_plan_hash,
+                )
+            ):
+                raise ValueError("plan-backed work orders require complete planning references")
+            order = order.model_copy(update={"input_fingerprint_version": 3})
+            order = order.model_copy(update={
+                "input_fingerprint": compute_input_fingerprint_v3(order),
+            })
+        else:
+            from src.document_authoring.models import compute_input_fingerprint_v2
+
+            order = order.model_copy(update={"input_fingerprint_version": 2})
+            order = order.model_copy(update={
+                "input_fingerprint": compute_input_fingerprint_v2(order),
+            })
         persisted = self.store.create_work_order(order)
         if task is not None:
             if restart_of_work_order_id and task.work_order_id == restart_of_work_order_id:

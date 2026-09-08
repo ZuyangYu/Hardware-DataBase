@@ -280,6 +280,10 @@ def test_legacy_work_order_fingerprint_ignores_absent_generation_brief():
             # revision_id is execution metadata excluded unconditionally, so a
             # legacy preimage never contained the key at all.
             "revision_id",
+            # Planning refs only exist in v3+ preimages; legacy rows never
+            # carried these keys.
+            "output_spec_id", "output_spec_version", "output_spec_hash",
+            "document_plan_id", "document_plan_version", "document_plan_hash",
         }
     legacy_fingerprint = content_hash(order.model_dump(mode="json", exclude=legacy_excluded))
     payload = order.model_dump(mode="json")
@@ -328,6 +332,10 @@ def test_v2_work_order_without_task_key_and_with_attachments_still_validates():
         "error_code", "error_message", "retryable", "next_actions",
         "generation_session_id", "generation_brief", "restart_of_work_order_id",
         "input_fingerprint_version", "task_id", "revision_id",
+        # Planning refs only exist in v3+ preimages; v2 rows never carried
+        # these keys.
+        "output_spec_id", "output_spec_version", "output_spec_hash",
+        "document_plan_id", "document_plan_version", "document_plan_hash",
     }
     stored_fingerprint = content_hash({
         "input_fingerprint_version": 2,

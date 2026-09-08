@@ -1942,6 +1942,32 @@ class AppPipeline:
                 order.work_order_id,
             )
         snapshot = self.document_generation.resolve_source_snapshot(order)
+        return self._kb_document_generation_stages(
+            ctx,
+            order,
+            snapshot,
+            knowledge_base_name=knowledge_base_name,
+            document_schema_id=document_schema_id,
+            document_schema_version=document_schema_version,
+        )
+
+    def _kb_document_generation_stages(
+        self,
+        ctx: RequestContext,
+        order,
+        snapshot,
+        *,
+        knowledge_base_name: str,
+        document_schema_id: str,
+        document_schema_version: str,
+    ):
+        """Run the shared fast preflight for a frozen KB document Work Order.
+
+        Mirrors the synchronous pre-harness half of ``auto_generate_...``:
+        check the ICD template profile and build the ICD connector-scope
+        decision.  Used by both the legacy prepare path and the plan-submission
+        dispatcher so a confirmed plan cannot skip a human gate.
+        """
         requirement_resolution = self._document_requirement_resolution_snapshot(
             ctx,
             document_schema_id=document_schema_id,
@@ -2066,6 +2092,174 @@ class AppPipeline:
             },
             requirement_resolution,
         )
+
+    def dispatch_confirmed_document_plan(
+        self,
+        ctx: RequestContext,
+        submission,
+    ) -> dict[str, Any]:
+        """Materialize one confirmed plan into its template-backed Work Order.
+
+        Only immutable identifiers/hashes arrive in ``submission``.  The
+        accepted plan, frozen snapshot and approved template are re-read from
+        this database and re-authorized here; the Work Order carries the v3
+        fingerprint binding the planning references.  A preflight human gate
+        parks the submission instead of creating a generation job.
+        """
+        planning = getattr(self.document_generation, "planning", None)
+        store = getattr(planning, "store", None)
+        if store is None:
+            raise RuntimeError("document planning store is not configured")
+        plan = store.get_plan(
+            submission.document_plan_id,
+            submission.document_plan_version,
+            tenant_id=submission.tenant_id,
+            user_id=submission.user_id,
+        )
+        if plan is None or plan.status != "accepted" or plan.plan_hash != submission.document_plan_hash:
+            raise ValueError("accepted document plan is missing or changed")
+        if plan.output_spec_hash != submission.output_spec_hash:
+            raise ValueError("accepted OutputSpec does not match the submission")
+        if getattr(plan.layout_contract, "kind", "") != "template":
+            raise ValueError("template-free document plans are not dispatchable in Phase 1")
+
+        knowledge_base_name = submission.knowledge_base_name
+        if not ctx.has_kb_permission(knowledge_base_name, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        snapshot = self.document_generation.store.get_knowledge_base_source_snapshot(
+            submission.source_snapshot_id,
+        )
+        if (
+            snapshot is None
+            or snapshot.tenant_id != submission.tenant_id
+            or snapshot.knowledge_base_name != knowledge_base_name
+            or snapshot.content_hash != submission.source_snapshot_hash
+        ):
+            raise ValueError("frozen source snapshot is missing or changed")
+
+        layout = plan.layout_contract
+        template = self.document_generation.store.get_template(layout.template_version_id)
+        template_hash = str((plan.output_spec_summary or {}).get("template_content_hash") or "")
+        if (
+            template is None
+            or template.status != "approved"
+            or template.content_hash != template_hash
+        ):
+            raise ValueError("frozen template is missing or changed")
+        schema = self.document_generation.store.get_document_schema(
+            template.template_schema_id,
+            template.template_schema_version,
+        )
+        if schema is None or schema.status != "approved":
+            raise ValueError("frozen document schema is missing or not approved")
+
+        idempotency_key = (
+            f"document-plan:{plan.document_plan_id}:{plan.version}:{plan.plan_hash}"
+        )
+        order = self.document_generation._find_knowledge_base_work_order_by_idempotency(
+            submission.tenant_id,
+            knowledge_base_name,
+            idempotency_key,
+            department_id=self.document_generation._ctx_department_id(ctx),
+        )
+        if order is None:
+            order = self.document_generation._create_frozen_work_order(
+                ctx,
+                scope_type="knowledge_base",
+                snapshot=snapshot,
+                knowledge_base_name=knowledge_base_name,
+                template_version_id=template.template_version_id,
+                document_schema_id=schema.document_schema_id,
+                document_schema_version=schema.version,
+                idempotency_key=idempotency_key,
+                generation_session_id=submission.session_id,
+                source_scope="knowledge_base_only",
+                output_spec_id=submission.output_spec_id,
+                output_spec_version=submission.output_spec_version,
+                output_spec_hash=submission.output_spec_hash,
+                document_plan_id=submission.document_plan_id,
+                document_plan_version=submission.document_plan_version,
+                document_plan_hash=submission.document_plan_hash,
+            )
+            try:
+                self.document_generation.store.generation_sessions.bind_work_order(
+                    submission.session_id,
+                    order.work_order_id,
+                )
+            except (KeyError, ValueError):
+                pass
+
+        stage = self._kb_document_generation_stages(
+            ctx,
+            order,
+            snapshot,
+            knowledge_base_name=knowledge_base_name,
+            document_schema_id=schema.document_schema_id,
+            document_schema_version=schema.version,
+        )
+        if stage.get("stage") != "ready":
+            result = {"status": "waiting_human", **stage}
+            result.pop("job_id", None)
+            return result
+        job_id = self.submit_knowledge_base_document_generation(
+            ctx, order.work_order_id,
+        )
+        return {
+            "status": "dispatched",
+            "stage": "ready",
+            "work_order_id": order.work_order_id,
+            "job_id": job_id,
+        }
+
+    def confirm_document_plan(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+        *,
+        expected_output_spec_hash: str,
+        expected_plan_hash: str,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        """Gate 1: accept the proposed plan and enqueue its durable submission.
+
+        The whole acceptance transition commits inside
+        ``document_authoring.db``; the Work Order/job are materialized later
+        by the outbox worker in the separate auth/job database.
+        """
+        session = self.get_document_generation_session(ctx, session_id)
+        if session.contract_version != "output_spec_v1":
+            raise ValueError("plan confirmation requires output_spec_v1")
+        planning_store = self.document_generation.planning.store
+        submission = planning_store.confirm_submission(
+            session_id=session.session_id,
+            tenant_id=ctx.tenant_id or "default",
+            user_id=ctx.user_id,
+            expected_output_spec_hash=expected_output_spec_hash,
+            expected_plan_hash=expected_plan_hash,
+            client_request_id=client_request_id,
+        )
+        return self._document_plan_submission_view(submission)
+
+    def _document_plan_submission_view(self, submission) -> dict[str, Any]:
+        next_actions = ["await_generation"]
+        if submission.status in {"pending", "retrying", "running"}:
+            next_actions = ["await_generation"]
+        elif submission.status == "waiting_human":
+            next_actions = ["open_document_workbench"]
+        elif submission.status in {"failed", "dead_letter"}:
+            next_actions = ["review_failure"]
+        return {
+            "submission_id": submission.submission_id,
+            "status": submission.status,
+            "session_id": submission.session_id,
+            "task_id": submission.task_id,
+            "document_plan_id": submission.document_plan_id,
+            "document_plan_version": submission.document_plan_version,
+            "plan_hash": submission.document_plan_hash,
+            "work_order_id": submission.work_order_id,
+            "job_id": submission.job_id,
+            "next_actions": next_actions,
+        }
 
     def _generation_session_work_order_inputs(
         self,

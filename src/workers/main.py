@@ -253,6 +253,89 @@ class HardwareWorker:
                 heartbeat(self.worker_id)
         return did_work
 
+    def _plan_submission_store(self):
+        planning = getattr(getattr(self.pipeline, "document_generation", None), "planning", None)
+        return getattr(planning, "store", None) and planning.store.submissions
+
+    def _process_document_plan_submissions(self, limit: int = 2) -> bool:
+        """Drain confirmed plan submissions before normal document jobs.
+
+        Each submission is claimed under a lease, re-authorized from the live
+        auth database, and materialized into exactly one template-backed
+        Work Order/job by the pipeline dispatcher.  Deterministic failures
+        (permission/hash errors) fail non-retryably; provider failures retry
+        with backoff until ``max_attempts``.
+        """
+        submissions = self._plan_submission_store()
+        if submissions is None:
+            return False
+        pending = submissions.list_pending(limit=limit)
+        did_work = False
+        for candidate in pending:
+            claimed = submissions.claim(
+                candidate.submission_id,
+                self.worker_id,
+                lease_seconds=max(15, int(getattr(src.settings, "DOCUMENT_AUTHORING_JOB_LEASE_SECONDS", 300))),
+            )
+            if claimed is None:
+                continue
+            did_work = True
+            try:
+                user = self.auth.get_user_by_username(claimed.user_id)
+                if user is None:
+                    try:
+                        user = self.auth.get_user_by_id(int(claimed.user_id))
+                    except (TypeError, ValueError):
+                        user = None
+                if user is None or not user.is_active:
+                    submissions.fail(
+                        claimed.submission_id, self.worker_id, claimed.lease_token,
+                        "plan submission owner is unavailable", retryable=False,
+                    )
+                    continue
+                ctx = build_context_for_user(
+                    user, claimed.knowledge_base_name, auth=self.auth,
+                )
+                submissions.heartbeat(
+                    claimed.submission_id,
+                    self.worker_id,
+                    claimed.lease_token,
+                    lease_seconds=max(15, int(getattr(src.settings, "DOCUMENT_AUTHORING_JOB_LEASE_SECONDS", 300))),
+                )
+                result = self.pipeline.dispatch_confirmed_document_plan(ctx, claimed)
+                status = str(result.get("status") or "")
+                if status == "dispatched":
+                    submissions.mark_dispatched(
+                        claimed.submission_id, self.worker_id, claimed.lease_token,
+                        work_order_id=str(result["work_order_id"]),
+                        job_id=str(result["job_id"]),
+                    )
+                elif status == "waiting_human":
+                    submissions.mark_waiting_human(
+                        claimed.submission_id, self.worker_id, claimed.lease_token,
+                        work_order_id=str(result["work_order_id"]),
+                    )
+                else:
+                    submissions.fail(
+                        claimed.submission_id, self.worker_id, claimed.lease_token,
+                        f"unexpected dispatch status: {status or 'missing'}",
+                        retryable=True,
+                    )
+            except Exception as exc:
+                retryable = not isinstance(exc, (PermissionError, KeyError, ValueError))
+                try:
+                    submissions.fail(
+                        claimed.submission_id,
+                        self.worker_id,
+                        claimed.lease_token,
+                        str(exc)[:1000] or type(exc).__name__,
+                        retryable=retryable,
+                    )
+                except Exception as fail_exc:
+                    error(f"Plan submission failure state update failed for {claimed.submission_id}: {fail_exc}")
+                error(f"Plan submission dispatch failed for {claimed.submission_id}: {exc}")
+        return did_work
+
     def stop(self, *_args) -> None:
         self.running = False
 
@@ -272,6 +355,10 @@ class HardwareWorker:
                     did_work = True
             except Exception as exc:
                 error(f"Attachment worker failed: {exc}")
+        if self._process_document_plan_submissions(
+            limit=max(1, int(getattr(src.settings, "DOCUMENT_PLAN_SUBMISSION_BATCH_SIZE", 2))),
+        ):
+            did_work = True
         if self._process_document_authoring_jobs(
             limit=max(1, int(getattr(src.settings, "DOCUMENT_AUTHORING_JOB_BATCH_SIZE", 4))),
             time_budget_seconds=max(

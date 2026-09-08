@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 import src.settings
 import httpx
@@ -221,6 +222,76 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         })
         self.assertNotIn("source_names", created.json())
         self.assertNotIn("evidence", created.json())
+
+    def test_confirm_plan_endpoint_forwards_hashes_and_reports_submission(self):
+        captured = {}
+        self.stub.confirm_document_plan = lambda ctx, session_id, **kwargs: (
+            captured.update({"session_id": session_id, **kwargs})
+            or {
+                "submission_id": "document-plan-submission-1",
+                "status": "pending",
+                "session_id": session_id,
+                "task_id": "task-1",
+                "document_plan_id": "plan-1",
+                "document_plan_version": 1,
+                "plan_hash": "sha256:plan",
+                "work_order_id": None,
+                "job_id": None,
+                "next_actions": ["await_generation"],
+            }
+        )
+        headers = self._headers("admin1")
+        response = self.client.post(
+            "/api/v1/document-generation/sessions/session-1/confirm-plan?kb=shared",
+            headers=headers,
+            json={
+                "expected_output_spec_hash": "sha256:spec",
+                "expected_plan_hash": "sha256:plan",
+                "client_request_id": "confirm-request-1",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(captured, {
+            "session_id": "session-1",
+            "expected_output_spec_hash": "sha256:spec",
+            "expected_plan_hash": "sha256:plan",
+            "client_request_id": "confirm-request-1",
+        })
+        body = response.json()
+        self.assertEqual(body["submission_id"], "document-plan-submission-1")
+        self.assertEqual(body["status"], "pending")
+        # No job can exist yet: the outbox worker owns that transition.
+        self.assertIsNone(body.get("work_order_id"))
+        self.assertIsNone(body.get("job_id"))
+
+    def test_confirm_plan_maps_errors_to_http_statuses(self):
+        headers = self._headers("admin1")
+        payload = {
+            "expected_output_spec_hash": "sha256:spec",
+            "expected_plan_hash": "sha256:plan",
+            "client_request_id": "confirm-request-1",
+        }
+
+        self.stub.confirm_document_plan = Mock(side_effect=ValueError("stale plan"))
+        stale = self.client.post(
+            "/api/v1/document-generation/sessions/session-1/confirm-plan?kb=shared",
+            headers=headers, json=payload,
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+
+        self.stub.confirm_document_plan = Mock(side_effect=PermissionError("no access"))
+        forbidden = self.client.post(
+            "/api/v1/document-generation/sessions/session-1/confirm-plan?kb=shared",
+            headers=headers, json=payload,
+        )
+        self.assertEqual(forbidden.status_code, 403, forbidden.text)
+
+        self.stub.confirm_document_plan = Mock(side_effect=KeyError("generation session not found"))
+        missing = self.client.post(
+            "/api/v1/document-generation/sessions/session-1/confirm-plan?kb=shared",
+            headers=headers, json=payload,
+        )
+        self.assertEqual(missing.status_code, 404, missing.text)
 
     def test_work_order_creation_requires_write_permission(self):
         response = self.client.post(

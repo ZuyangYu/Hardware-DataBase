@@ -1147,6 +1147,33 @@ class PlanProposalView(BaseModel):
     next_actions: list[str] = Field(default_factory=list)
 
 
+class ConfirmPlanRequest(BaseModel):
+    """Hash-bound Gate 1 confirmation; every semantic value is server-owned."""
+
+    expected_output_spec_hash: str = Field(min_length=1, max_length=256)
+    expected_plan_hash: str = Field(min_length=1, max_length=256)
+    client_request_id: str = Field(min_length=1, max_length=128)
+
+
+class PlanSubmissionView(BaseModel):
+    """Safe projection of a plan-submission outbox row.
+
+    The confirmation HTTP response must not claim a job exists before the
+    outbox worker creates one, so Work Order/job refs stay optional.
+    """
+
+    submission_id: str
+    status: str
+    session_id: str | None = None
+    task_id: str | None = None
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
+    plan_hash: str | None = None
+    work_order_id: str | None = None
+    job_id: str | None = None
+    next_actions: list[str] = Field(default_factory=list)
+
+
 class IcdResolutionItem(BaseModel):
     exception_id: str
     action: Literal["include", "exclude"]

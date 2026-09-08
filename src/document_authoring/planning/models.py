@@ -20,6 +20,7 @@ from src.document_authoring.harness.idempotency import canonical_json
 _HASH_EXCLUDED_FIELDS = frozenset({
     "accepted_at",
     "confirmed_at",
+    "confirmed_by",
     "created_at",
     "plan_hash",
     "stale_at",

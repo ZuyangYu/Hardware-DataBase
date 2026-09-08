@@ -324,6 +324,15 @@ class DocumentWorkOrder(BaseModel):
     revision_id: str | None = None
     generation_session_id: str | None = None
     generation_brief: dict[str, Any] = Field(default_factory=dict)
+    # Phase 1 plan-backed work orders retain the accepted immutable planning
+    # references.  They are optional so historical v1/v2 payloads remain
+    # byte-compatible and are never retroactively assigned fictional plans.
+    output_spec_id: str | None = None
+    output_spec_version: int | None = Field(default=None, ge=1)
+    output_spec_hash: str | None = None
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
+    document_plan_hash: str | None = None
     restart_of_work_order_id: str | None = None
     requested_executor: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
     input_fingerprint_version: int = 1
@@ -374,6 +383,10 @@ class DocumentWorkOrder(BaseModel):
             # unconditionally keeps every persisted pre-revision fingerprint
             # byte-identical under the new schema.
             "revision_id",
+            # These fields are included only in the explicit v3 preimage.
+            # Leaving them excluded for v1/v2 preserves historical hashes.
+            "output_spec_id", "output_spec_version", "output_spec_hash",
+            "document_plan_id", "document_plan_version", "document_plan_hash",
         }
         if self.scope_type == "project":
             # Preserve fingerprints from persisted project work orders created
@@ -394,7 +407,29 @@ class DocumentWorkOrder(BaseModel):
             excluded.add("attachment_refs_snapshot")
         if not self.kb_scope_snapshot:
             excluded.add("kb_scope_snapshot")
-        if self.input_fingerprint_version >= 2:
+        if self.input_fingerprint_version >= 3:
+            if self.requested_executor is None:
+                raise ValueError("v3 input fingerprints require requested_executor")
+            if (
+                not self.output_spec_id or self.output_spec_version is None or not self.output_spec_hash
+                or not self.document_plan_id or self.document_plan_version is None
+                or not self.document_plan_hash
+            ):
+                raise ValueError("v3 input fingerprints require accepted OutputSpec and DocumentPlan references")
+            excluded.discard("requested_executor")
+            for field_name in (
+                "output_spec_id", "output_spec_version", "output_spec_hash",
+                "document_plan_id", "document_plan_version", "document_plan_hash",
+            ):
+                excluded.discard(field_name)
+            fingerprint_payload = self.model_dump(mode="json", exclude=excluded)
+            if "task_id" in fingerprint_payload:
+                fingerprint_payload["task_id"] = None
+            expected = content_hash({
+                "input_fingerprint_version": 3,
+                "frozen_inputs": fingerprint_payload,
+            })
+        elif self.input_fingerprint_version >= 2:
             if self.requested_executor is None:
                 raise ValueError("v2 input fingerprints require requested_executor")
             # v2 deliberately binds the normalized requested executor.  The
@@ -417,6 +452,11 @@ class DocumentWorkOrder(BaseModel):
                 fingerprint_payload["task_id"] = None
             expected = content_hash(fingerprint_payload)
         if self.input_fingerprint and self.input_fingerprint != expected:
+            if self.input_fingerprint_version >= 3:
+                # There is no safe legacy variant for a v3 plan-backed order;
+                # accepting one would allow the planning references to drift
+                # from the frozen WorkOrder preimage.
+                raise ValueError("work order input_fingerprint does not match frozen inputs")
             # A short compatibility window is needed for callers that built
             # a v1 preimage from a post-schema model dump before the new
             # snapshot fields were added to the exclusion list.  Persisted
@@ -500,6 +540,8 @@ def compute_input_fingerprint_v2(order: DocumentWorkOrder) -> str:
         "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
         "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
         "error_message", "retryable", "next_actions", "input_fingerprint_version", "revision_id",
+        "output_spec_id", "output_spec_version", "output_spec_hash",
+        "document_plan_id", "document_plan_version", "document_plan_hash",
     }
     if order.scope_type == "project":
         excluded.update({"scope_type", "knowledge_base_name"})
@@ -518,6 +560,42 @@ def compute_input_fingerprint_v2(order: DocumentWorkOrder) -> str:
         fingerprint_payload["task_id"] = None
     return content_hash({
         "input_fingerprint_version": 2,
+        "frozen_inputs": fingerprint_payload,
+    })
+
+
+def compute_input_fingerprint_v3(order: DocumentWorkOrder) -> str:
+    """v3 preimage for WorkOrders created from an accepted document plan."""
+    if order.requested_executor is None:
+        raise ValueError("v3 input fingerprints require requested_executor")
+    if (
+        not order.output_spec_id or order.output_spec_version is None or not order.output_spec_hash
+        or not order.document_plan_id or order.document_plan_version is None
+        or not order.document_plan_hash
+    ):
+        raise ValueError("v3 input fingerprints require accepted planning references")
+    excluded = {
+        "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
+        "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
+        "error_message", "retryable", "next_actions", "input_fingerprint_version", "revision_id",
+    }
+    if order.scope_type == "project":
+        excluded.update({"scope_type", "knowledge_base_name"})
+    if order.generation_session_id is None and not order.generation_brief:
+        excluded.update({"generation_session_id", "generation_brief"})
+    if order.restart_of_work_order_id is None:
+        excluded.add("restart_of_work_order_id")
+    if not order.source_scope_snapshot:
+        excluded.add("source_scope_snapshot")
+    if not order.attachment_refs_snapshot:
+        excluded.add("attachment_refs_snapshot")
+    if not order.kb_scope_snapshot:
+        excluded.add("kb_scope_snapshot")
+    fingerprint_payload = order.model_dump(mode="json", exclude=excluded)
+    if "task_id" in fingerprint_payload:
+        fingerprint_payload["task_id"] = None
+    return content_hash({
+        "input_fingerprint_version": 3,
         "frozen_inputs": fingerprint_payload,
     })
 

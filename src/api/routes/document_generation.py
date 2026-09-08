@@ -18,6 +18,7 @@ from src.api.schemas import (
     AgentHumanDecisionRequest,
     AnalyzeTemplateFromAttachmentRequest,
     AnswerGenerationSessionRequest,
+    ConfirmPlanRequest,
     ConfirmTemplateRequest,
     CompleteDocumentRevisionRequest,
     ConvertDocumentArtifactRequest,
@@ -30,6 +31,7 @@ from src.api.schemas import (
     FeedbackRequest,
     IcdResolutionRequest,
     PlanProposalView,
+    PlanSubmissionView,
     TemplateAnalysisReviewView,
     TemplateAnalysisView,
     TemplateMappingCorrectionRequest,
@@ -489,6 +491,38 @@ def get_plan_proposal(
     if proposal is None:
         raise HTTPException(status_code=404, detail="document plan not found")
     return proposal
+
+
+@router.post(
+    "/document-generation/sessions/{session_id}/confirm-plan",
+    response_model=PlanSubmissionView,
+)
+def confirm_document_plan(
+    session_id: str,
+    kb: str,
+    payload: ConfirmPlanRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Gate 1 confirmation: hash-bound, explicit, idempotent per client request."""
+
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        submission = pipeline.confirm_document_plan(
+            ctx,
+            session_id,
+            expected_output_spec_hash=payload.expected_output_spec_hash,
+            expected_plan_hash=payload.expected_plan_hash,
+            client_request_id=payload.client_request_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return submission
 
 
 @router.post("/document-generation/sessions/{session_id}/messages")

@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from src.document_authoring.harness.idempotency import canonical_json
 
 from .models import DocumentPlan, OutputSpec
+from .submissions import DocumentPlanSubmission, DocumentPlanSubmissionStore
 
 
 _FORBIDDEN_EVENT_KEYS = frozenset({
@@ -73,6 +74,10 @@ class DocumentPlanningStore:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._init_db()
+        # Keep the outbox repository on the same SQLite file.  The planning
+        # store passes its open connection during confirmation so accepted
+        # spec/plan/session/task rows and the outbox insert commit together.
+        self.submissions = DocumentPlanSubmissionStore(db_path)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
@@ -130,6 +135,45 @@ class DocumentPlanningStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_document_planning_events_task
                     ON document_planning_events(task_id, created_at, event_id);
+                CREATE TABLE IF NOT EXISTS document_plan_submissions (
+                    submission_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    knowledge_base_name TEXT NOT NULL,
+                    output_spec_id TEXT NOT NULL,
+                    output_spec_version INTEGER NOT NULL,
+                    output_spec_hash TEXT NOT NULL,
+                    document_plan_id TEXT NOT NULL,
+                    document_plan_version INTEGER NOT NULL,
+                    document_plan_hash TEXT NOT NULL,
+                    source_snapshot_id TEXT NOT NULL,
+                    source_snapshot_hash TEXT NOT NULL,
+                    client_request_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    available_at TEXT NOT NULL,
+                    lease_owner TEXT,
+                    lease_token INTEGER NOT NULL DEFAULT 0,
+                    lease_expires_at TEXT,
+                    work_order_id TEXT,
+                    job_id TEXT,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_document_plan_submissions_plan
+                    ON document_plan_submissions(
+                        tenant_id, user_id, document_plan_id,
+                        document_plan_version, document_plan_hash
+                    );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_document_plan_submissions_request
+                    ON document_plan_submissions(tenant_id, user_id, session_id, client_request_id);
+                CREATE INDEX IF NOT EXISTS idx_document_plan_submissions_queue
+                    ON document_plan_submissions(status, available_at, created_at);
                 """
             )
             self._ensure_column(connection, "document_plans", "stale_reason_code", "TEXT")
@@ -452,6 +496,326 @@ class DocumentPlanningStore:
                     raise ValueError("document plan became stale or changed concurrently")
                 connection.execute("COMMIT")
                 return stale_plan
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+    def confirm_submission(
+        self,
+        *,
+        session_id: str,
+        tenant_id: str,
+        user_id: str,
+        expected_output_spec_hash: str,
+        expected_plan_hash: str,
+        client_request_id: str,
+        source_snapshot_id: str | None = None,
+    ) -> DocumentPlanSubmission:
+        """Accept one executable plan and enqueue its worker submission atomically.
+
+        The session, task, planning rows and outbox all live in this database.
+        This method deliberately performs the complete state transition on a
+        single ``BEGIN IMMEDIATE`` connection; the separate auth/job database
+        is touched only by the later worker.
+        """
+        tenant, user = self._require_owner(tenant_id, user_id)
+        session_key = str(session_id or "").strip()
+        expected_spec = str(expected_output_spec_hash or "").strip()
+        expected_plan = str(expected_plan_hash or "").strip()
+        request_key = str(client_request_id or "").strip()[:128]
+        if not session_key or not expected_spec or not expected_plan or not request_key:
+            raise ValueError(
+                "session, expected hashes and client_request_id are required"
+            )
+
+        # Imports are local to avoid making the planning models depend on the
+        # session/task projection modules at import time.
+        from src.document_authoring.generation_sessions import GenerationSession
+        from src.document_authoring.tasks import DocumentTask
+
+        from .submissions import _row_to_submission  # type: ignore[attr-defined]
+
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                session_row = connection.execute(
+                    """SELECT * FROM document_generation_sessions
+                       WHERE session_id = ? AND tenant_id = ? AND user_id = ?""",
+                    (session_key, tenant, user),
+                ).fetchone()
+                if session_row is None:
+                    raise KeyError("generation session not found")
+                session_payload = json.loads(session_row["payload_json"])
+                session = GenerationSession.model_validate(session_payload)
+                if session.contract_version != "output_spec_v1":
+                    raise ValueError("plan confirmation requires output_spec_v1")
+                if session.status not in {"awaiting_plan_confirmation", "planned"}:
+                    raise ValueError("generation session is not awaiting plan confirmation")
+
+                plan_id = str(session.document_plan_id or "").strip()
+                plan_version = int(session.document_plan_version or 0)
+                spec_id = str(session.output_spec_id or "").strip()
+                spec_version = int(session.output_spec_version or 0)
+                if not plan_id or plan_version < 1 or not spec_id or spec_version < 1:
+                    raise ValueError("generation session is not bound to a complete document plan")
+
+                plan_row = connection.execute(
+                    """SELECT * FROM document_plans
+                       WHERE document_plan_id = ? AND version = ?
+                         AND tenant_id = ? AND user_id = ?""",
+                    (plan_id, plan_version, tenant, user),
+                ).fetchone()
+                spec_row = connection.execute(
+                    """SELECT * FROM document_output_specs
+                       WHERE output_spec_id = ? AND version = ?
+                         AND tenant_id = ? AND user_id = ?""",
+                    (spec_id, spec_version, tenant, user),
+                ).fetchone()
+                if plan_row is None or spec_row is None:
+                    raise KeyError("document plan or output spec not found")
+                plan = self._validate_plan_row(plan_row)
+                spec = self._validate_spec_row(spec_row)
+                if plan.output_spec_id != spec.output_spec_id or plan.output_spec_version != spec.version:
+                    raise ValueError("document plan is not bound to the session OutputSpec")
+                if plan.output_spec_hash != spec.content_hash:
+                    raise ValueError("document plan OutputSpec hash does not match persisted spec")
+                if spec.content_hash != expected_spec:
+                    raise ValueError("expected output spec hash does not match current spec")
+                if plan.plan_hash != expected_plan:
+                    raise ValueError("expected plan hash does not match current plan")
+                if source_snapshot_id is not None and str(source_snapshot_id).strip() != plan.source_snapshot_id:
+                    raise ValueError("source snapshot does not match current plan")
+                if plan.status == "accepted" or spec.status == "accepted":
+                    existing = connection.execute(
+                        """SELECT * FROM document_plan_submissions
+                           WHERE tenant_id = ? AND user_id = ?
+                             AND document_plan_id = ? AND document_plan_version = ?
+                             AND document_plan_hash = ?""",
+                        (tenant, user, plan.document_plan_id, plan.version, plan.plan_hash),
+                    ).fetchone()
+                    if existing is None:
+                        raise ValueError("accepted plan has no durable submission")
+                    if existing["client_request_id"] != request_key:
+                        # A second request key is an idempotent replay of the
+                        # already accepted plan.  Return the original row.
+                        pass
+                    connection.execute("COMMIT")
+                    return _row_to_submission(existing)
+                if plan.status not in {"proposed"} or spec.status not in {"proposed"}:
+                    raise ValueError("document plan or OutputSpec is not confirmable")
+                if not plan.is_executable:
+                    raise ValueError("document plan is not executable")
+                if getattr(plan.layout_contract, "kind", "") != "template":
+                    raise ValueError("template-free document plans are not confirmable in Phase 1")
+
+                # Re-read the frozen source/template identities from this
+                # same DB while the write lock is held.  The worker performs a
+                # second live permission check; this protects the acceptance
+                # transaction from stale/deleted immutable inputs.
+                snapshot_row = connection.execute(
+                    """SELECT tenant_id, knowledge_base_name, content_hash
+                       FROM knowledge_base_source_snapshots
+                       WHERE source_set_snapshot_id = ?""",
+                    (plan.source_snapshot_id,),
+                ).fetchone()
+                if (
+                    snapshot_row is None
+                    or snapshot_row["tenant_id"] != tenant
+                    or snapshot_row["knowledge_base_name"] != session.knowledge_base_name
+                    or snapshot_row["content_hash"] != plan.source_snapshot_hash
+                ):
+                    raise ValueError("frozen source snapshot is missing or changed")
+                layout = plan.layout_contract
+                template_id = str(getattr(layout, "template_version_id", "") or "").strip()
+                template_schema_id = str(getattr(layout, "template_schema_id", "") or "").strip()
+                template_schema_version = str(getattr(layout, "template_schema_version", "") or "").strip()
+                template_row = connection.execute(
+                    """SELECT content_hash, payload_json
+                       FROM template_versions WHERE template_version_id = ?""",
+                    (template_id,),
+                ).fetchone()
+                if template_row is None:
+                    raise ValueError("frozen template is missing")
+                template_payload = json.loads(template_row["payload_json"])
+                if (
+                    template_payload.get("status") != "approved"
+                    or template_payload.get("content_hash") != template_row["content_hash"]
+                    or template_payload.get("template_schema_id") != template_schema_id
+                    or str(template_payload.get("template_schema_version") or "") != template_schema_version
+                ):
+                    raise ValueError("frozen template is not approved or schema-bound")
+                template_hash = str((plan.output_spec_summary or {}).get("template_content_hash") or "")
+                if not template_hash or template_hash != str(template_row["content_hash"]):
+                    raise ValueError("frozen template hash does not match the proposed plan")
+
+                accepted_at = datetime.now(timezone.utc)
+                accepted_spec = spec.model_copy(update={
+                    "status": "accepted",
+                    "confirmed_by": user,
+                    "confirmed_at": accepted_at,
+                })
+                accepted_plan = plan.model_copy(update={"status": "accepted"})
+                updated_spec = connection.execute(
+                    """UPDATE document_output_specs
+                       SET status = ?, payload_json = ?
+                       WHERE output_spec_id = ? AND version = ?
+                         AND tenant_id = ? AND user_id = ? AND status = 'proposed'
+                         AND content_hash = ?""",
+                    (
+                        accepted_spec.status,
+                        _safe_json(accepted_spec.model_dump(mode="json")),
+                        spec.output_spec_id, spec.version, tenant, user,
+                        expected_spec,
+                    ),
+                ).rowcount
+                if updated_spec != 1:
+                    raise ValueError("OutputSpec changed while confirming")
+                updated_plan = connection.execute(
+                    """UPDATE document_plans
+                       SET status = ?, payload_json = ?
+                       WHERE document_plan_id = ? AND version = ?
+                         AND tenant_id = ? AND user_id = ? AND status = 'proposed'
+                         AND plan_hash = ?""",
+                    (
+                        accepted_plan.status,
+                        _safe_json(accepted_plan.model_dump(mode="json")),
+                        plan.document_plan_id, plan.version, tenant, user,
+                        expected_plan,
+                    ),
+                ).rowcount
+                if updated_plan != 1:
+                    raise ValueError("DocumentPlan changed while confirming")
+
+                # Update the v2 session projection in the same transaction.
+                session_updated = session.model_copy(update={
+                    "status": "planned",
+                    "output_spec_id": spec.output_spec_id,
+                    "output_spec_version": spec.version,
+                    "document_plan_id": plan.document_plan_id,
+                    "document_plan_version": plan.version,
+                    "updated_at": accepted_at,
+                })
+                session_cursor = connection.execute(
+                    """UPDATE document_generation_sessions
+                       SET output_spec_id = ?, output_spec_version = ?,
+                           document_plan_id = ?, document_plan_version = ?,
+                           status = ?, updated_at = ?, payload_json = ?
+                       WHERE session_id = ? AND tenant_id = ? AND user_id = ?""",
+                    (
+                        session_updated.output_spec_id, session_updated.output_spec_version,
+                        session_updated.document_plan_id, session_updated.document_plan_version,
+                        session_updated.status, session_updated.updated_at.isoformat(),
+                        json.dumps(session_updated.model_dump(mode="json", exclude={"messages"}), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        session_key, tenant, user,
+                    ),
+                ).rowcount
+                if session_cursor != 1:
+                    raise ValueError("generation session changed while confirming")
+
+                task_id = str(session.document_task_id or session_key).strip()
+                task_row = connection.execute(
+                    "SELECT * FROM document_tasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if task_row is not None:
+                    task_payload = json.loads(task_row["payload_json"])
+                    task = DocumentTask.model_validate(task_payload)
+                    if task.tenant_id != tenant or task.user_id != user:
+                        raise PermissionError("document task belongs to another owner")
+                    if task.generation_session_id not in {None, session_key}:
+                        raise ValueError("document task is bound to another generation session")
+                    if task.output_spec_id not in {None, spec.output_spec_id} or task.document_plan_id not in {None, plan.document_plan_id}:
+                        raise ValueError("document task is already bound to another plan")
+                    updated_task = task.model_copy(update={
+                        "output_spec_id": spec.output_spec_id,
+                        "output_spec_version": spec.version,
+                        "document_plan_id": plan.document_plan_id,
+                        "document_plan_version": plan.version,
+                        "status": "planned",
+                        "updated_at": accepted_at,
+                    })
+                    connection.execute(
+                        """UPDATE document_tasks
+                           SET output_spec_id = ?, output_spec_version = ?,
+                               document_plan_id = ?, document_plan_version = ?,
+                               status = ?, updated_at = ?, payload_json = ?
+                           WHERE task_id = ?""",
+                        (
+                            updated_task.output_spec_id, updated_task.output_spec_version,
+                            updated_task.document_plan_id, updated_task.document_plan_version,
+                            updated_task.status, updated_task.updated_at.isoformat(),
+                            json.dumps(updated_task.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                            task_id,
+                        ),
+                    )
+                    task_event_key = f"plan-confirmed:{plan.document_plan_id}:{plan.version}:{plan.plan_hash}"
+                    connection.execute(
+                        """INSERT OR IGNORE INTO document_task_events
+                           (event_id, task_id, event_type, idempotency_key, created_at, payload_json)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            f"document-task-event-{uuid.uuid4().hex}", task_id,
+                            "plan_confirmed", task_event_key, accepted_at.isoformat(),
+                            _safe_json({
+                                "document_plan_id": plan.document_plan_id,
+                                "document_plan_version": plan.version,
+                                "plan_hash": plan.plan_hash,
+                                "output_spec_id": spec.output_spec_id,
+                                "output_spec_version": spec.version,
+                                "output_spec_hash": spec.content_hash,
+                            }),
+                        ),
+                    )
+
+                planning_task_id = task_id
+                event_key = f"plan-confirmation:{plan.document_plan_id}:{plan.version}:{plan.plan_hash}"
+                event_payload = {
+                    "session_id": session_key,
+                    "task_id": task_id,
+                    "document_plan_id": plan.document_plan_id,
+                    "document_plan_version": plan.version,
+                    "plan_hash": plan.plan_hash,
+                    "output_spec_id": spec.output_spec_id,
+                    "output_spec_version": spec.version,
+                    "output_spec_hash": spec.content_hash,
+                    "source_snapshot_id": plan.source_snapshot_id,
+                    "source_snapshot_hash": plan.source_snapshot_hash,
+                    "actor_id": user,
+                }
+                _event_payload_is_safe(event_payload)
+                connection.execute(
+                    """INSERT OR IGNORE INTO document_planning_events
+                       (event_id, task_id, event_type, idempotency_key, created_at, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        f"planning-event-{uuid.uuid4().hex}", planning_task_id,
+                        "document_plan_confirmed", event_key, accepted_at.isoformat(),
+                        _safe_json(event_payload),
+                    ),
+                )
+
+                submission = DocumentPlanSubmission(
+                    submission_id=f"document-plan-submission-{uuid.uuid4().hex}",
+                    tenant_id=tenant,
+                    user_id=user,
+                    task_id=task_id,
+                    session_id=session_key,
+                    knowledge_base_name=session.knowledge_base_name,
+                    output_spec_id=spec.output_spec_id,
+                    output_spec_version=spec.version,
+                    output_spec_hash=spec.content_hash,
+                    document_plan_id=plan.document_plan_id,
+                    document_plan_version=plan.version,
+                    document_plan_hash=plan.plan_hash,
+                    source_snapshot_id=plan.source_snapshot_id,
+                    source_snapshot_hash=plan.source_snapshot_hash,
+                    client_request_id=request_key,
+                    created_at=accepted_at.isoformat(),
+                    updated_at=accepted_at.isoformat(),
+                )
+                persisted = self.submissions.insert_or_get(submission, connection=connection)
+                connection.execute("COMMIT")
+                return persisted
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
