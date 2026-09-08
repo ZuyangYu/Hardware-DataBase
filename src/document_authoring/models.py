@@ -1238,7 +1238,8 @@ EXECUTION_EVENT_TYPES = (
     "llm_called", "llm_succeeded", "llm_failed",
     "proposal_submitted", "proposal_accepted", "proposal_rejected",
     "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
-    "human_waiting", "human_resumed", "run_finalized",
+    "human_waiting", "human_resumed", "coverage_evaluated", "unit_reviewed",
+    "unit_rework_requested", "run_finalized",
 )
 
 ExecutionEventType = Literal[
@@ -1247,7 +1248,8 @@ ExecutionEventType = Literal[
     "llm_called", "llm_succeeded", "llm_failed",
     "proposal_submitted", "proposal_accepted", "proposal_rejected",
     "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
-    "human_waiting", "human_resumed", "run_finalized",
+    "human_waiting", "human_resumed", "coverage_evaluated", "unit_reviewed",
+    "unit_rework_requested", "run_finalized",
 ]
 
 

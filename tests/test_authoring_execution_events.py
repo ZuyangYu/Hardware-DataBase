@@ -66,6 +66,29 @@ def test_event_model_rejects_unknown_types_and_unsanitized_payloads():
         })
 
 
+def test_review_fact_events_are_append_only_and_idempotent(tmp_path):
+    store = _store(tmp_path)
+    _seed_work_order_and_run(store)
+    event = _event(
+        event_type="unit_reviewed",
+        idempotency_key="review-fact-1",
+        node_name="unit_review",
+        unit_id="field:voltage",
+        sanitized_payload={
+            "review_status": "rework",
+            "issue_codes": ["unknown_evidence"],
+            "report_hash": "sha256:report",
+        },
+    )
+
+    stored = store.append_execution_event(event)
+    replay = store.append_execution_event(event.model_copy(update={"event_id": "different"}))
+
+    assert stored.event_type == "unit_reviewed"
+    assert replay.event_id == stored.event_id
+    assert len(store.list_execution_events("run-1")) == 1
+
+
 def test_append_assigns_monotonic_sequence_inside_store_transaction(tmp_path):
     store = _store(tmp_path)
     _seed_work_order_and_run(store)

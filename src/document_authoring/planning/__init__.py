@@ -47,6 +47,16 @@ from .diff import diff_document_plans
 from .legacy import legacy_brief_to_output_spec
 from .service import DocumentPlanningService, LegacyTemplatePlanningAdapter
 from .intake import IntakeQuestion, OutputSpecIntakeService, OutputSpecVersionConflict
+from .coverage import CoverageEvaluator
+from .review_contracts import (
+    CoverageReport,
+    CoverageRequirementResult,
+    RequirementCoverageResult,
+    ReviewIssue,
+    UnitReviewResult,
+    safe_review_projection,
+)
+from .unit_review import UnitReviewer
 
 __all__ = [
     "ArtifactSpec",
@@ -92,4 +102,12 @@ __all__ = [
     "IntakeQuestion",
     "OutputSpecIntakeService",
     "OutputSpecVersionConflict",
+    "CoverageEvaluator",
+    "CoverageReport",
+    "CoverageRequirementResult",
+    "RequirementCoverageResult",
+    "ReviewIssue",
+    "UnitReviewer",
+    "UnitReviewResult",
+    "safe_review_projection",
 ]
