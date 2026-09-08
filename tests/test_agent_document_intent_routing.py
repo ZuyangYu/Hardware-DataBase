@@ -645,7 +645,6 @@ _V2_INTAKE_TOOL_NAMES = {
 
 
 def _stream_once(monkeypatch, *, query, context, v2=True):
-    import src.settings
 
     from src.agents import runner as runner_mod
 

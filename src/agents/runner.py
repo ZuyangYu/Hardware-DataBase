@@ -60,8 +60,6 @@ from src.core.conversation_orchestrator import ConversationOrchestrator
 from src.core.intent import classify_intent
 from src.core.model_factory import create_chat_model
 from src.document_authoring.chat_context import (
-    DocumentAuthoringContext,
-    DocumentContext,
     build_document_context,
 )
 from src import settings
