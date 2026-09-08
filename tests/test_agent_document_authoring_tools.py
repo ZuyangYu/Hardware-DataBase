@@ -820,3 +820,20 @@ def test_v2_answer_clarification_emits_requirement_clarification_card(tmp_path, 
     assert result.status == "succeeded"
     kinds = [event["card"]["kind"] for event in sink]
     assert "requirement_clarification" in kinds
+
+
+def test_v2_proposal_card_carries_safe_plan_summary(tmp_path, monkeypatch):
+    sink = []
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.event_sink = sink.append
+
+    toolset.propose_document_plan("generation-session-a")
+
+    card = sink[-1]["card"]
+    assert card["kind"] == "output_spec_confirmation"
+    proposal = card["proposal"]
+    assert proposal["plan_hash"] == "sha256:plan"
+    assert proposal["output_spec_hash"] == "sha256:spec"
+    assert proposal["document_plan_id"] == "plan-a"
+    assert "source_names" not in json.dumps(card)
+    assert "evidence" not in json.dumps(card)

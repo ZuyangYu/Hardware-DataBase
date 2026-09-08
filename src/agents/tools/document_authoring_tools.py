@@ -333,6 +333,18 @@ class DocumentAuthoringToolset:
                 card["target_format"] = result.data.get("target_format")
             if result.data.get("artifacts"):
                 card["artifacts"] = result.data.get("artifacts")
+        if kind == "output_spec_confirmation":
+            # Gate 1 card: only the safe plan-proposal projection crosses the
+            # wire (ids/versions/hashes/counts/policies), never sources.
+            nested = result.data.get("proposal")
+            proposal = nested if isinstance(nested, dict) else (
+                result.data if result.data.get("plan_hash") else None
+            )
+            if isinstance(proposal, dict):
+                card["proposal"] = proposal
+            submission = result.data.get("submission")
+            if isinstance(submission, dict):
+                card["submission"] = submission
         try:
             self.event_sink({"type": "document_card", "card": card})
         except Exception:
