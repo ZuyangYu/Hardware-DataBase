@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
+from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
@@ -26,6 +28,7 @@ from src.document_authoring.renderers.structured import (
     StructuredPdfRenderer,
     StructuredXlsxRenderer,
 )
+import src.document_authoring.renderers.structured as structured_renderers
 
 
 def _model(plan_hash: str = "sha256:plan-recipe-test") -> DocumentModel:
@@ -190,3 +193,33 @@ def test_structured_table_recipe_emits_parseable_xlsx_and_rejects_formula_text()
     model.blocks[2].rows[0].cells["value"] = "=HYPERLINK(\"https://evil.invalid\",\"x\")"
     with pytest.raises(ValueError, match="formula-like"):
         StructuredXlsxRenderer().render(model, recipe, binding)
+
+
+def test_initial_recipe_artifacts_have_parser_and_visual_baseline_evidence():
+    validator = getattr(structured_renderers, "validate_structured_artifact", None)
+    baseline = getattr(structured_renderers, "visual_baseline_fingerprint", None)
+    assert callable(validator), "structured artifact parser is not implemented"
+    assert callable(baseline), "visual baseline fingerprint is not implemented"
+
+    registry = build_builtin_recipe_registry()
+    cases = [
+        ("docx", "generic-report", StructuredDocxRenderer(), _model(_plan().plan_hash), _plan()),
+        ("pdf", "generic-report", StructuredPdfRenderer(), _model(_plan(fmt="pdf").plan_hash), _plan(fmt="pdf")),
+        ("xlsx", "structured-table", StructuredXlsxRenderer(), _model(_plan(fmt="xlsx", recipe_id="structured-table").plan_hash), _plan(fmt="xlsx", recipe_id="structured-table")),
+    ]
+    fixture_path = Path(__file__).parent / "fixtures" / "document_authoring" / "structure_visual_baselines.json"
+    baselines = json.loads(fixture_path.read_text(encoding="utf-8"))
+    for fmt, recipe_id, renderer, model, plan in cases:
+        binding = StructureBindingCompiler(registry).compile(plan, model)
+        rendered = renderer.render(model, registry.resolve(recipe_id, "1"), binding)
+        parsed = validator(rendered.content, fmt)
+        assert parsed.status == "passed", parsed.errors
+        assert parsed.format == fmt
+        expected = baselines[f"{recipe_id}@1"][fmt]
+        assert rendered.integrity_manifest["artifact_hash"] == expected["artifact_hash"]
+        assert baseline(rendered.content, fmt) == expected["visual_baseline_hash"]
+        assert parsed.block_count == expected["block_count"]
+        if "table_count" in expected:
+            assert parsed.table_count == expected["table_count"]
+        if "page_count" in expected:
+            assert parsed.page_count == expected["page_count"]

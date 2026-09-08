@@ -19,6 +19,7 @@ from .models import DocumentPlan, NonEmptyId, PlanningModel, StructureContract, 
 
 
 BlockKind = Literal["section", "paragraph", "list", "table", "cross_reference"]
+GateStatus = Literal["pending", "passed", "failed"]
 
 
 class StructureConstraintsProfile(PlanningModel):
@@ -40,6 +41,96 @@ class StructureConstraintsProfile(PlanningModel):
         self.allowed_component_ids = _unique(self.allowed_component_ids, "allowed_component_ids")
         self.supported_formats = _unique(self.supported_formats, "supported_formats")
         return self
+
+
+class StructureProfile(StructureConstraintsProfile):
+    """Server-owned generated-structure profile and release evidence.
+
+    A profile is more than a bag of limits: it is the exact-version contract
+    that says which document types, semantic block kinds and ordering rules a
+    generated outline may use.  The four readiness statuses are evidence from
+    the schema, coverage, parser and visual-baseline test suites.  They are
+    deliberately data, rather than an implicit property of a recipe, so a
+    profile can be disabled without changing its recipe bytes or version.
+    """
+
+    recipe_id: NonEmptyId
+    recipe_version: NonEmptyId
+    supported_document_types: list[NonEmptyId] = Field(min_length=1, max_length=64)
+    allowed_block_kinds: list[BlockKind] = Field(min_length=1, max_length=16)
+    allowed_ordering: list[BlockKind] = Field(default_factory=list, max_length=16)
+    schema_gate_status: GateStatus = "pending"
+    coverage_gate_status: GateStatus = "pending"
+    parser_gate_status: GateStatus = "pending"
+    visual_baseline_gate_status: GateStatus = "pending"
+    visual_baseline_refs: dict[NonEmptyId, NonEmptyId] = Field(default_factory=dict, max_length=16)
+    status: Literal["available", "unavailable", "disabled"] = "available"
+    unavailable_reason: str | None = Field(default=None, max_length=1_000)
+    profile_hash: str | None = None
+
+    @model_validator(mode="after")
+    def validate_profile(self) -> "StructureProfile":
+        self.supported_document_types = _unique(
+            self.supported_document_types, "supported_document_types",
+        )
+        self.allowed_block_kinds = _unique(self.allowed_block_kinds, "allowed_block_kinds")
+        self.allowed_ordering = _unique(self.allowed_ordering, "allowed_ordering")
+        if set(self.allowed_ordering) - set(self.allowed_block_kinds):
+            raise ValueError("allowed_ordering contains a block kind outside allowed_block_kinds")
+        if self.status != "available" and not self.unavailable_reason:
+            raise ValueError("unavailable structure profiles require unavailable_reason")
+        expected = planning_content_hash(self, exclude={"profile_hash"})
+        if self.profile_hash is not None and self.profile_hash != expected:
+            raise ValueError("profile_hash does not match profile contents")
+        object.__setattr__(self, "profile_hash", expected)
+        return self
+
+    @property
+    def readiness_statuses(self) -> dict[str, str]:
+        return {
+            "schema": self.schema_gate_status,
+            "coverage": self.coverage_gate_status,
+            "parser": self.parser_gate_status,
+            "visual_baseline": self.visual_baseline_gate_status,
+        }
+
+    @property
+    def gates_passed(self) -> bool:
+        return all(status == "passed" for status in self.readiness_statuses.values())
+
+    @property
+    def ready_for_generated_structure(self) -> bool:
+        return self.status == "available" and self.gates_passed
+
+
+class StructureProfileRegistry:
+    """Exact-version registry for generated-structure profiles."""
+
+    def __init__(self) -> None:
+        self._profiles: dict[tuple[str, str], StructureProfile] = {}
+
+    def register(self, profile: StructureProfile) -> StructureProfile:
+        key = (profile.profile_id, profile.version)
+        if key in self._profiles:
+            raise ValueError(
+                f"duplicate structure profile registration: {profile.profile_id}@{profile.version}"
+            )
+        self._profiles[key] = profile
+        return profile
+
+    def lookup(self, profile_id: str, version: str) -> StructureProfile | None:
+        return self._profiles.get((str(profile_id).strip(), str(version).strip()))
+
+    get = lookup
+
+    def resolve(self, profile_id: str, version: str) -> StructureProfile:
+        profile = self.lookup(profile_id, version)
+        if profile is None:
+            raise ValueError(f"structure profile {profile_id}@{version} is not registered")
+        return profile
+
+    def list(self) -> list[StructureProfile]:
+        return [self._profiles[key] for key in sorted(self._profiles)]
 
 
 class RecipeComponent(PlanningModel):
@@ -179,8 +270,14 @@ class StructureBindingCompiler:
 
     _SAFE_HINT_KEYS = frozenset({"level", "emphasis", "orientation", "keep_with_next"})
 
-    def __init__(self, registry: RecipeRegistry | None = None) -> None:
+    def __init__(
+        self,
+        registry: RecipeRegistry | None = None,
+        *,
+        profile_registry: StructureProfileRegistry | None = None,
+    ) -> None:
         self.registry = registry or build_builtin_recipe_registry()
+        self.profile_registry = profile_registry or build_builtin_structure_profile_registry()
 
     def compile(
         self,
@@ -231,13 +328,36 @@ class StructureBindingCompiler:
         bindings: list[StructureRenderBinding] = []
         total_text = 0
         component_counts: dict[str, int] = {}
-        if len(model.blocks) > selected_profile(selected).max_components:
+        profile = selected_profile(selected, self.profile_registry)
+        if candidate_plan.layout_adapter_id == "generated_structure" and not profile.ready_for_generated_structure:
+            raise ValueError("structure profile readiness gates are incomplete")
+        document_type = str(candidate_plan.output_spec_summary.get("document_type", "")).strip()
+        if document_type and document_type not in profile.supported_document_types:
+            raise ValueError("structure profile does not support document type")
+        if self.format_kind_is_not_supported(profile, output_format):
+            raise ValueError("structure profile does not support output format")
+        if len(model.blocks) > profile.max_components:
             raise ValueError("structure exceeds the recipe component limit")
+        previous_rank = -1
         for ordinal, block in enumerate(model.blocks):
             hints = getattr(block, "layout_hints", {}) or {}
             unsafe = set(hints) - self._SAFE_HINT_KEYS
             if unsafe:
                 raise ValueError(f"layout hint is not allowlisted: {sorted(unsafe)}")
+            level = hints.get("level", 1)
+            try:
+                level_value = int(level)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("layout hint level is invalid") from exc
+            if level_value < 1 or level_value > profile.max_nesting_depth:
+                raise ValueError("structure nesting depth exceeds the profile limit")
+            if block.kind not in profile.allowed_block_kinds:
+                raise ValueError(f"structure profile does not allow block kind: {block.kind}")
+            if profile.allowed_ordering:
+                rank = profile.allowed_ordering.index(block.kind)
+                if rank < previous_rank:
+                    raise ValueError("structure block ordering is outside the profile")
+                previous_rank = rank
             unit_id = str(block.unit_id).strip()
             plan_unit = plan_units.get(unit_id)
             if plan_unit is None:
@@ -252,7 +372,6 @@ class StructureBindingCompiler:
                 raise ValueError(f"component instance limit exceeded: {component.component_id}")
             text_size, table_rows, table_columns = _block_size(block)
             total_text += text_size
-            profile = selected_profile(selected)
             if total_text > profile.max_text_chars:
                 raise ValueError("structure exceeds the recipe text limit")
             if table_rows > profile.max_table_rows:
@@ -269,7 +388,6 @@ class StructureBindingCompiler:
 
         if not bindings:
             raise ValueError("template-free structure requires at least one renderable block")
-        profile = selected_profile(selected)
         return StructureBindingSet(
             plan_id=candidate_plan.document_plan_id,
             plan_version=candidate_plan.version,
@@ -283,8 +401,15 @@ class StructureBindingCompiler:
             bindings=bindings,
         )
 
+    @staticmethod
+    def format_kind_is_not_supported(profile: StructureProfile, output_format: str) -> bool:
+        return output_format not in profile.supported_formats
 
-def selected_profile(recipe: SystemRecipe) -> StructureConstraintsProfile:
+
+def selected_profile(
+    recipe: SystemRecipe,
+    profile_registry: StructureProfileRegistry | None = None,
+) -> StructureConstraintsProfile:
     """Return the built-in profile represented by a recipe.
 
     Profiles are embedded in the immutable recipe for now.  Keeping this
@@ -292,6 +417,12 @@ def selected_profile(recipe: SystemRecipe) -> StructureConstraintsProfile:
     registry without changing renderers.
     """
 
+    registry = profile_registry or build_builtin_structure_profile_registry()
+    registered = registry.lookup(recipe.constraints_profile_id, recipe.constraints_profile_version)
+    if registered is not None:
+        if registered.recipe_id != recipe.recipe_id or registered.recipe_version != recipe.version:
+            raise ValueError("structure profile is not bound to the selected system recipe")
+        return registered
     limits = {
         "generic-report": dict(max_components=256, max_text_chars=200_000, max_table_rows=10_000, max_table_columns=32),
         "structured-table": dict(max_components=128, max_text_chars=100_000, max_table_rows=10_000, max_table_columns=100),
@@ -303,6 +434,58 @@ def selected_profile(recipe: SystemRecipe) -> StructureConstraintsProfile:
         supported_formats=recipe.supported_formats,
         **limits,
     )
+
+
+def build_builtin_structure_profile_registry() -> StructureProfileRegistry:
+    """Return the reviewed profiles whose four offline gates have passed."""
+
+    registry = StructureProfileRegistry()
+    registry.register(StructureProfile(
+        profile_id="generic-report",
+        version="1",
+        recipe_id="generic-report",
+        recipe_version="1",
+        supported_document_types=["generic", "generic_report", "report"],
+        allowed_component_ids=[
+            "report.section", "report.paragraph", "report.list",
+            "report.table", "report.cross_reference",
+        ],
+        supported_formats=["docx", "pdf"],
+        allowed_block_kinds=["section", "paragraph", "list", "table", "cross_reference"],
+        allowed_ordering=["section", "paragraph", "list", "table", "cross_reference"],
+        max_components=256,
+        max_text_chars=200_000,
+        max_table_rows=10_000,
+        max_table_columns=32,
+        max_nesting_depth=8,
+        schema_gate_status="passed",
+        coverage_gate_status="passed",
+        parser_gate_status="passed",
+        visual_baseline_gate_status="passed",
+        visual_baseline_refs={"docx": "baseline:generic-report:docx@1", "pdf": "baseline:generic-report:pdf@1"},
+    ))
+    registry.register(StructureProfile(
+        profile_id="structured-table",
+        version="1",
+        recipe_id="structured-table",
+        recipe_version="1",
+        supported_document_types=["structured_table", "generic", "icd"],
+        allowed_component_ids=["table.title", "table.paragraph", "table.list", "table.data"],
+        supported_formats=["xlsx"],
+        allowed_block_kinds=["section", "paragraph", "list", "table"],
+        allowed_ordering=["section", "paragraph", "list", "table"],
+        max_components=128,
+        max_text_chars=100_000,
+        max_table_rows=10_000,
+        max_table_columns=100,
+        max_nesting_depth=4,
+        schema_gate_status="passed",
+        coverage_gate_status="passed",
+        parser_gate_status="passed",
+        visual_baseline_gate_status="passed",
+        visual_baseline_refs={"xlsx": "baseline:structured-table:xlsx@1"},
+    ))
+    return registry
 
 
 def build_builtin_recipe_registry() -> RecipeRegistry:
@@ -370,10 +553,13 @@ def _block_size(block: Any) -> tuple[int, int, int]:
 __all__ = [
     "RecipeComponent",
     "RecipeRegistry",
+    "StructureProfile",
+    "StructureProfileRegistry",
     "StructureBindingCompiler",
     "StructureBindingSet",
     "StructureConstraintsProfile",
     "StructureRenderBinding",
     "SystemRecipe",
     "build_builtin_recipe_registry",
+    "build_builtin_structure_profile_registry",
 ]

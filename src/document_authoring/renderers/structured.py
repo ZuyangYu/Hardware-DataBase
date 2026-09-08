@@ -15,8 +15,9 @@ import math
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from xml.sax.saxutils import escape
+from xml.etree import ElementTree
 
 from src.document_authoring.document_model import (
     DocumentModel,
@@ -50,6 +51,139 @@ class StructuredRenderResult:
     extension: str
     preview: dict[str, Any]
     integrity_manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class StructuredArtifactValidation:
+    """Parser evidence recorded for a fresh-package artifact."""
+
+    format: str
+    status: Literal["passed", "failed"]
+    block_count: int = 0
+    table_count: int = 0
+    page_count: int = 0
+    errors: tuple[str, ...] = ()
+    parser_version: str = "1"
+
+
+def validate_structured_artifact(content: bytes, output_format: str) -> StructuredArtifactValidation:
+    """Parse a generated artifact and reject active/external content.
+
+    This is intentionally an independent post-render check.  It proves that
+    the bytes produced by each opened recipe remain parseable and inert; it
+    does not turn parser output into planner instructions.
+    """
+
+    normalized = str(output_format or "").strip().lower().lstrip(".")
+    try:
+        if not isinstance(content, (bytes, bytearray)) or not content:
+            raise ValueError("artifact content is empty")
+        if normalized == "docx":
+            block_count, table_count = _parse_docx_artifact(bytes(content))
+            return StructuredArtifactValidation(
+                format=normalized, status="passed", block_count=block_count,
+                table_count=table_count,
+            )
+        if normalized == "pdf":
+            page_count, block_count = _parse_pdf_artifact(bytes(content))
+            return StructuredArtifactValidation(
+                format=normalized, status="passed", page_count=page_count,
+                block_count=block_count,
+            )
+        if normalized == "xlsx":
+            block_count, table_count = _parse_xlsx_artifact(bytes(content))
+            return StructuredArtifactValidation(
+                format=normalized, status="passed", block_count=block_count,
+                table_count=table_count,
+            )
+        raise ValueError(f"unsupported structured artifact format: {normalized or 'unknown'}")
+    except Exception as exc:
+        return StructuredArtifactValidation(
+            format=normalized,
+            status="failed",
+            errors=(str(exc) or exc.__class__.__name__,),
+        )
+
+
+def visual_baseline_fingerprint(content: bytes, output_format: str) -> str:
+    """Return the stable artifact fingerprint used by visual-baseline tests.
+
+    The repository's offline baseline is a strict rendered-package hash.  A
+    production visual comparator may add pixel metrics later, but the gate is
+    kept separate from planning and never allows a model to choose layout.
+    """
+
+    report = validate_structured_artifact(content, output_format)
+    if report.status != "passed":
+        raise ValueError("cannot fingerprint an invalid structured artifact")
+    normalized = str(output_format or "").strip().lower().lstrip(".")
+    return f"sha256:{hashlib.sha256(normalized.encode() + b":" + bytes(content)).hexdigest()}"
+
+
+def _parse_docx_artifact(content: bytes) -> tuple[int, int]:
+    validate_ooxml_package(content, "docx")
+    with zipfile.ZipFile(io.BytesIO(content), "r") as package:
+        names = package.namelist()
+        _reject_active_package_parts(names)
+        if any(_has_external_relationships(package.read(name)) for name in names if name.endswith(".rels")):
+            raise ValueError("DOCX contains external relationships")
+    from docx import Document
+
+    document = Document(io.BytesIO(content))
+    block_count = len(document.paragraphs) + len(document.tables)
+    if block_count == 0:
+        raise ValueError("DOCX contains no parseable blocks")
+    return block_count, len(document.tables)
+
+
+def _parse_pdf_artifact(content: bytes) -> tuple[int, int]:
+    if not content.startswith(b"%PDF") or not content.rstrip().endswith(b"%%EOF"):
+        raise ValueError("PDF is not a complete package")
+    dangerous_markers = (b"/JavaScript", b"/JS", b"/OpenAction", b"/AA", b"/Launch", b"/EmbeddedFiles")
+    if any(marker in content for marker in dangerous_markers):
+        raise ValueError("PDF contains active content")
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(content), strict=False)
+    if not reader.pages:
+        raise ValueError("PDF contains no pages")
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    block_count = sum(1 for line in text.splitlines() if line.strip())
+    return len(reader.pages), max(1, block_count)
+
+
+def _parse_xlsx_artifact(content: bytes) -> tuple[int, int]:
+    validate_ooxml_package(content, "xlsx")
+    with zipfile.ZipFile(io.BytesIO(content), "r") as package:
+        names = package.namelist()
+        _reject_active_package_parts(names)
+        if any("external" in name.lower() for name in names):
+            raise ValueError("XLSX contains external content")
+        if any(_has_external_relationships(package.read(name)) for name in names if name.endswith(".rels")):
+            raise ValueError("XLSX contains external relationships")
+        worksheet_names = sorted(
+            name for name in names
+            if name.startswith("xl/worksheets/") and name.endswith(".xml")
+        )
+        if not worksheet_names:
+            raise ValueError("XLSX contains no worksheets")
+        nonempty_cells = 0
+        for name in worksheet_names:
+            root = ElementTree.fromstring(package.read(name))
+            for cell in root.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"):
+                if list(cell):
+                    nonempty_cells += 1
+        return max(1, nonempty_cells), len(worksheet_names)
+
+
+def _reject_active_package_parts(names: list[str]) -> None:
+    active_markers = ("vba", "embeddings", "activex", "customui", "external", "macros")
+    if any(any(marker in name.lower() for marker in active_markers) for name in names):
+        raise ValueError("structured artifact contains active or external package parts")
+
+
+def _has_external_relationships(content: bytes) -> bool:
+    return b"TargetMode=\"External\"" in content or b"TargetMode='External'" in content
 
 
 class _StructuredRenderer:
@@ -558,8 +692,11 @@ def _xlsx_package(sheets: list[tuple[str, list[list[str]]]]) -> bytes:
 
 
 __all__ = [
+    "StructuredArtifactValidation",
     "StructuredDocxRenderer",
     "StructuredPdfRenderer",
     "StructuredRenderResult",
     "StructuredXlsxRenderer",
+    "validate_structured_artifact",
+    "visual_baseline_fingerprint",
 ]

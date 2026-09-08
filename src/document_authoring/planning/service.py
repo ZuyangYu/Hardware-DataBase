@@ -20,7 +20,13 @@ from .models import (
     StructureContract,
 )
 from .registry import CapabilityRegistries, build_builtin_registries
-from .recipes import RecipeRegistry, StructureBindingCompiler, build_builtin_recipe_registry
+from .recipes import (
+    RecipeRegistry,
+    StructureBindingCompiler,
+    StructureProfileRegistry,
+    build_builtin_recipe_registry,
+    build_builtin_structure_profile_registry,
+)
 from .store import DocumentPlanningStore
 
 
@@ -405,13 +411,48 @@ class TemplateFreePlanningAdapter:
         *,
         registries: CapabilityRegistries | None = None,
         recipe_registry: RecipeRegistry | None = None,
+        profile_registry: StructureProfileRegistry | None = None,
         domain_strategy_id: str = "generic_report",
         domain_strategy_version: str = "1",
     ) -> None:
         self.registries = registries or build_builtin_registries()
         self.recipe_registry = recipe_registry or build_builtin_recipe_registry()
+        self.profile_registry = profile_registry or build_builtin_structure_profile_registry()
         self.domain_strategy_id = domain_strategy_id
         self.domain_strategy_version = domain_strategy_version
+
+    @staticmethod
+    def _append_structure_profile_issues(
+        profile: Any,
+        *,
+        document_type: str,
+        output_format: str,
+        issues: list[PlanIssue],
+    ) -> None:
+        if document_type not in profile.supported_document_types:
+            issues.append(PlanIssue(
+                code="structure_profile_document_type_unsupported",
+                severity="error",
+                message=f"structure profile {profile.profile_id}@{profile.version} does not support {document_type}",
+                path="document_type",
+            ))
+        if output_format not in profile.supported_formats:
+            issues.append(PlanIssue(
+                code="structure_profile_format_unsupported",
+                severity="error",
+                message=f"structure profile {profile.profile_id}@{profile.version} does not support {output_format}",
+                path="artifact.deliverables",
+            ))
+        if not profile.ready_for_generated_structure:
+            failed = ", ".join(
+                name for name, status in profile.readiness_statuses.items() if status != "passed"
+            ) or ("status=" + str(profile.status))
+            issues.append(PlanIssue(
+                code="structure_profile_gates_incomplete",
+                severity="error",
+                message=f"structure profile {profile.profile_id}@{profile.version} is not ready: {failed}",
+                path="layout_source",
+            ))
 
     def compile(
         self,
@@ -429,8 +470,27 @@ class TemplateFreePlanningAdapter:
             recipe_version = layout_source.recipe_version
             adapter_id = "system_recipe"
         elif layout_source.mode == "generated_structure":
-            recipe_id = layout_source.constraints_profile_id
-            recipe_version = layout_source.constraints_profile_version
+            profile_id = layout_source.constraints_profile_id
+            profile_version = layout_source.constraints_profile_version
+            profile = self.profile_registry.lookup(profile_id, profile_version)
+            if profile is None:
+                issues.append(PlanIssue(
+                    code="structure_profile_missing",
+                    severity="error",
+                    message=f"structure profile {profile_id}@{profile_version} is not registered",
+                    path="layout_source",
+                ))
+                recipe_id = profile_id
+                recipe_version = profile_version
+            else:
+                recipe_id = profile.recipe_id
+                recipe_version = profile.recipe_version
+                self._append_structure_profile_issues(
+                    profile,
+                    document_type=spec.document_type,
+                    output_format=primary.format,
+                    issues=issues,
+                )
             adapter_id = "generated_structure"
         else:
             raise ValueError("template-free planning requires a template-free layout source")
@@ -457,6 +517,28 @@ class TemplateFreePlanningAdapter:
                 message=f"recipe {recipe_id}@{recipe_version} does not support {primary.format}",
                 path="artifact.deliverables",
             ))
+
+        if layout_source.mode == "system_recipe":
+            profile = self.profile_registry.lookup(
+                recipe.constraints_profile_id, recipe.constraints_profile_version,
+            ) if recipe is not None else None
+            if profile is None:
+                issues.append(PlanIssue(
+                    code="structure_profile_missing",
+                    severity="error",
+                    message=(
+                        f"structure profile {getattr(recipe, 'constraints_profile_id', recipe_id)}@"
+                        f"{getattr(recipe, 'constraints_profile_version', recipe_version)} is not registered"
+                    ),
+                    path="layout_source",
+                ))
+            elif spec.document_type not in profile.supported_document_types or primary.format not in profile.supported_formats:
+                self._append_structure_profile_issues(
+                    profile,
+                    document_type=spec.document_type,
+                    output_format=primary.format,
+                    issues=issues,
+                )
 
         adapter_result = self.registries.layout_adapters.resolve(adapter_id, "1")
         if isinstance(adapter_result, PlanIssue):

@@ -52,9 +52,12 @@ from .recipes import (
     StructureBindingCompiler,
     StructureBindingSet,
     StructureConstraintsProfile,
+    StructureProfile,
+    StructureProfileRegistry,
     StructureRenderBinding,
     SystemRecipe,
     build_builtin_recipe_registry,
+    build_builtin_structure_profile_registry,
 )
 from .intake import IntakeQuestion, OutputSpecIntakeService, OutputSpecVersionConflict
 from .coverage import CoverageEvaluator
@@ -123,9 +126,12 @@ __all__ = [
     "StructureBindingCompiler",
     "StructureBindingSet",
     "StructureConstraintsProfile",
+    "StructureProfile",
+    "StructureProfileRegistry",
     "StructureRenderBinding",
     "SystemRecipe",
     "build_builtin_recipe_registry",
+    "build_builtin_structure_profile_registry",
     "legacy_brief_to_output_spec",
     "IntakeQuestion",
     "OutputSpecIntakeService",

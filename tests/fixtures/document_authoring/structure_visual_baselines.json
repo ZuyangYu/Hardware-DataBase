@@ -1,0 +1,24 @@
+{
+  "generic-report@1": {
+    "docx": {
+      "artifact_hash": "c7b205aac23cc7a1035f7cd5b6b5c6c072f1630f4d008b7a2b9aab6775c9f3a4",
+      "visual_baseline_hash": "sha256:1dba5628a9742ae5252e4e34c6e07195ba18cd33db5e0374b8fb9a886c7253b3",
+      "block_count": 4,
+      "table_count": 1
+    },
+    "pdf": {
+      "artifact_hash": "2034ed2514a4c0ab3d8f09b39ffc0f75c1ec76bbc486f8fcf6e9ab3628f42252",
+      "visual_baseline_hash": "sha256:904ddaea24cba1986455d710a5711cd3ea0115db9e7913791b3c0e8befe54ca6",
+      "block_count": 13,
+      "page_count": 1
+    }
+  },
+  "structured-table@1": {
+    "xlsx": {
+      "artifact_hash": "14f4a3de06e5602524f5772cf35199dac3886bd832e2f718049fb5e0c6c760a2",
+      "visual_baseline_hash": "sha256:168781e8b2aca2db4c6d8c5bda430503d71650fcbee7780d467250452d3a5c28",
+      "block_count": 9,
+      "table_count": 1
+    }
+  }
+}
