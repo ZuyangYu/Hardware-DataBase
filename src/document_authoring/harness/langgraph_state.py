@@ -69,8 +69,16 @@ class DocumentAuthoringState(TypedDict, total=False):
     run_manifest_id: str
     source_set_snapshot_id: str
     input_fingerprint: str
+    document_plan_id: str | None
+    document_plan_version: int | None
+    document_plan_hash: str | None
+    task_graph_id: str | None
+    task_graph_version: int | None
+    task_graph_hash: str | None
+    execution_route: str
     unit_ids: list[str]
     unit_statuses: Annotated[dict[str, str], _merge_dict]
+    node_statuses: Annotated[dict[str, str], _merge_dict]
     unit_attempts: Annotated[dict[str, int], _merge_dict]
     dispatch_cursor: Annotated[int, _max_int]
     in_flight_unit_ids: Annotated[list[str], _append_unique]
@@ -106,6 +114,13 @@ def initial_authoring_state(
     unit_statuses: dict[str, str] | None = None,
     unit_attempts: dict[str, int] | None = None,
     dispatch_cursor: int = 0,
+    document_plan_id: str | None = None,
+    document_plan_version: int | None = None,
+    document_plan_hash: str | None = None,
+    task_graph_id: str | None = None,
+    task_graph_version: int | None = None,
+    task_graph_hash: str | None = None,
+    execution_route: str = "legacy_schema",
 ) -> DocumentAuthoringState:
     """Create a fully-versioned, JSON-safe initial state."""
     return {
@@ -116,8 +131,16 @@ def initial_authoring_state(
         "run_manifest_id": run_manifest_id,
         "source_set_snapshot_id": source_set_snapshot_id,
         "input_fingerprint": input_fingerprint,
+        "document_plan_id": document_plan_id,
+        "document_plan_version": document_plan_version,
+        "document_plan_hash": document_plan_hash,
+        "task_graph_id": task_graph_id,
+        "task_graph_version": task_graph_version,
+        "task_graph_hash": task_graph_hash,
+        "execution_route": execution_route,
         "unit_ids": list(unit_ids),
         "unit_statuses": dict(unit_statuses or {unit_id: "planned" for unit_id in unit_ids}),
+        "node_statuses": {},
         "unit_attempts": dict(unit_attempts or {unit_id: 1 for unit_id in unit_ids}),
         "dispatch_cursor": int(dispatch_cursor),
         "in_flight_unit_ids": [],

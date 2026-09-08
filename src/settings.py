@@ -129,6 +129,10 @@ DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED = _env_bool(
 # rolled back without changing legacy WorkOrder behavior.
 DOCUMENT_PLANNING_SHADOW_ENABLED = _env_bool("DOCUMENT_PLANNING_SHADOW_ENABLED", False)
 DOCUMENT_PLANNING_V2_ENABLED = _env_bool("DOCUMENT_PLANNING_V2_ENABLED", False)
+# Phase 2 plan-backed execution is independently gated from proposal/confirm
+# behavior.  Keep it disabled until graph, review and parity gates are signed
+# off for an allowlisted tenant/document type.
+DOCUMENT_PLAN_DAG_EXECUTION_ENABLED = _env_bool("DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", False)
 
 # External conversation (外部对话) domain switches.
 EXTERNAL_CONVERSATION_LLM_STRUCTURE = os.getenv("EXTERNAL_CONVERSATION_LLM_STRUCTURE", "true").lower() in {"1", "true", "yes", "on"}

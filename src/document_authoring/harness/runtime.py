@@ -11,7 +11,13 @@ from hashlib import sha256
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
-from src.document_authoring.harness.graph import AuthoringGraph, HarnessExecutionResult, RetrievalProvider
+from src.document_authoring.harness.graph import (
+    AuthoringGraph,
+    HarnessExecutionResult,
+    RetrievalProvider,
+    PlanExecutionRouteError,
+    select_execution_route,
+)
 from src.document_authoring.harness.agent_loop import (
     AgentFieldHarness,
     HarnessExecutionContext,
@@ -35,8 +41,12 @@ from src.document_authoring.models import (
     content_hash,
 )
 from src.document_authoring.harness.idempotency import execution_event_key, receipt_action_key
+from src.document_authoring.harness.plan_graph import PlanDAGExecutor
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
+from src.document_authoring.planning.models import DocumentPlan
+from src.document_authoring.planning.task_graph import CompiledTaskGraph, TaskGraphCompiler
+from src.document_authoring.planning.task_graph_store import TaskGraphStore
 from src.document_authoring.writers.managed import ManagedWriter
 from src.projects.models import SourceSetSnapshot
 from src.observability import observe
@@ -101,6 +111,56 @@ class InternalDocumentHarnessRuntime:
         self.validator = validator or DocumentValidator()
         self.checkpointer = checkpointer
         self.checkpointer_factory = checkpointer_factory
+        self.task_graphs = TaskGraphStore(store.db_path)
+
+    def _bind_plan_graph(
+        self,
+        work_order: DocumentWorkOrder,
+        *,
+        document_plan: DocumentPlan | None = None,
+        compiled_graph: CompiledTaskGraph | None = None,
+    ) -> tuple[str, DocumentPlan | None, CompiledTaskGraph | None]:
+        route = select_execution_route(
+            work_order,
+            enabled=bool(getattr(src.settings, "DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", False)),
+        )
+        if route != "plan_dag":
+            return route, None, None
+
+        plan_id = str(getattr(work_order, "document_plan_id", "") or "")
+        plan_version = getattr(work_order, "document_plan_version", None)
+        plan_hash = str(getattr(work_order, "document_plan_hash", "") or "")
+        plan = document_plan
+        if plan is None:
+            planning_store = getattr(self.store, "planning", None)
+            if planning_store is not None:
+                plan = planning_store.get_plan(
+                    plan_id,
+                    int(plan_version),
+                    tenant_id=getattr(work_order, "tenant_id", None),
+                    user_id=getattr(work_order, "created_by", None),
+                )
+        if plan is None:
+            raise PlanExecutionRouteError("accepted DocumentPlan is unavailable for plan execution")
+        if (
+            plan.document_plan_id != plan_id
+            or plan.version != int(plan_version)
+            or plan.plan_hash != plan_hash
+            or plan.status != "accepted"
+        ):
+            raise PlanExecutionRouteError("accepted DocumentPlan identity or status does not match Work Order")
+
+        graph = compiled_graph or TaskGraphCompiler().compile(plan)
+        expected_graph_id = f"document-plan:{plan.document_plan_id}:v{plan.version}"
+        if graph.graph_id != expected_graph_id or graph.plan_hash != plan.plan_hash:
+            raise PlanExecutionRouteError("compiled task graph is not bound to the accepted DocumentPlan")
+        persisted = self.task_graphs.put(
+            graph,
+            tenant_id=getattr(work_order, "tenant_id", "default"),
+            user_id=getattr(work_order, "created_by", "system"),
+            task_id=getattr(work_order, "task_id", None),
+        )
+        return route, plan, persisted
 
     def create_run(
         self,
@@ -109,8 +169,25 @@ class InternalDocumentHarnessRuntime:
         snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
         template: TemplateVersion,
         schema: DocumentSchema,
+        *,
+        document_plan: DocumentPlan | None = None,
+        compiled_graph: CompiledTaskGraph | None = None,
     ) -> tuple[HarnessRun, AuthoringRunManifest]:
-        manifest = self.build_manifest(work_order, policy, snapshot, template, schema)
+        route, plan, graph = self._bind_plan_graph(
+            work_order,
+            document_plan=document_plan,
+            compiled_graph=compiled_graph,
+        )
+        manifest = self.build_manifest(
+            work_order,
+            policy,
+            snapshot,
+            template,
+            schema,
+            document_plan=plan,
+            compiled_graph=graph,
+            execution_route=route,
+        )
         run = HarnessRun(
             harness_run_id=f"harness-{uuid.uuid4().hex}", work_order_id=work_order.work_order_id,
             run_manifest_id=manifest.run_manifest_id, status="queued", max_retries=policy.max_retries,
@@ -119,13 +196,20 @@ class InternalDocumentHarnessRuntime:
             input_fingerprint=work_order.input_fingerprint,
             input_fingerprint_version=getattr(work_order, "input_fingerprint_version", 1),
             source_set_snapshot_id=work_order.source_set_snapshot_id,
-            total_units=len(schema.fields) + len(schema.review_items),
+            total_units=len(plan.unit_tasks) if plan is not None else len(schema.fields) + len(schema.review_items),
             unit_statuses=dict(getattr(work_order, "unit_statuses", {}) or {}),
             requested_executor=(
                 getattr(work_order, "requested_executor", None)
                 or getattr(work_order, "execution_mode", None)
             ),
             migration_state="native",
+            task_graph_id=graph.graph_id if graph is not None else None,
+            task_graph_version=graph.version if graph is not None else None,
+            task_graph_hash=graph.graph_hash if graph is not None else None,
+            document_plan_id=plan.document_plan_id if plan is not None else None,
+            document_plan_version=plan.version if plan is not None else None,
+            document_plan_hash=plan.plan_hash if plan is not None else None,
+            execution_route=route,
         )
         self.store.save_run_manifest(manifest)
         self.store.create_harness_run(run)
@@ -138,6 +222,10 @@ class InternalDocumentHarnessRuntime:
         snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
         template: TemplateVersion,
         schema: DocumentSchema,
+        *,
+        document_plan: DocumentPlan | None = None,
+        compiled_graph: CompiledTaskGraph | None = None,
+        execution_route: str = "legacy_schema",
     ) -> AuthoringRunManifest:
         source_names = (
             list(snapshot.source_names)
@@ -172,6 +260,13 @@ class InternalDocumentHarnessRuntime:
             max_retrieval_rounds=policy.max_retrieval_rounds,
             max_retrieval_attempts_per_unit=policy.max_retrieval_attempts_per_unit,
             max_parallel_units=policy.max_parallel_units,
+            task_graph_id=compiled_graph.graph_id if compiled_graph is not None else None,
+            task_graph_version=compiled_graph.version if compiled_graph is not None else None,
+            task_graph_hash=compiled_graph.graph_hash if compiled_graph is not None else None,
+            document_plan_id=document_plan.document_plan_id if document_plan is not None else None,
+            document_plan_version=document_plan.version if document_plan is not None else None,
+            document_plan_hash=document_plan.plan_hash if document_plan is not None else None,
+            execution_route=execution_route if execution_route in {"legacy_schema", "plan_dag"} else "legacy_schema",
         )
 
     def execute(

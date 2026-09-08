@@ -68,6 +68,32 @@ ProgressCallback = Callable[[DocumentAuthoringState], None]
 DraftProvider = Callable[[WriterRequest], DocumentUnitDraft]
 
 
+class PlanExecutionRouteError(ValueError):
+    """Raised when a Work Order has an unsafe partial plan binding."""
+
+
+def select_execution_route(work_order: Any, *, enabled: bool) -> str:
+    """Select the immutable execution family for a Work Order.
+
+    Legacy rows have no plan reference and remain on the schema graph.  A
+    plan-backed row must carry the complete plan identity before the feature
+    flag can select the new route; a partial identity is never treated as a
+    legacy row by accident.
+    """
+    fields = (
+        "document_plan_id",
+        "document_plan_version",
+        "document_plan_hash",
+    )
+    values = [getattr(work_order, field, None) for field in fields]
+    present = [value not in (None, "") for value in values]
+    if not any(present):
+        return "legacy_schema"
+    if not all(present):
+        raise PlanExecutionRouteError("plan binding is incomplete")
+    return "plan_dag" if enabled else "legacy_schema"
+
+
 @dataclass
 class HarnessExecutionResult:
     requirements: dict[str, InformationRequirement] = field(default_factory=dict)

@@ -785,6 +785,13 @@ class AuthoringRunManifest(BaseModel):
     renderer_version: str = "p2a-1"
     input_fingerprint_version: int = 1
     requested_executor: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
+    task_graph_id: str | None = None
+    task_graph_version: int | None = Field(default=None, ge=1)
+    task_graph_hash: str | None = None
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
+    document_plan_hash: str | None = None
+    execution_route: Literal["legacy_schema", "plan_dag"] = "legacy_schema"
     created_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
 
@@ -827,6 +834,13 @@ class HarnessRun(BaseModel):
     agent_thread_id: str | None = None
     graph_state_version: int = 1
     migration_state: Literal["native", "converted", "legacy_terminal"] | None = None
+    task_graph_id: str | None = None
+    task_graph_version: int | None = Field(default=None, ge=1)
+    task_graph_hash: str | None = None
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
+    document_plan_hash: str | None = None
+    execution_route: Literal["legacy_schema", "plan_dag"] = "legacy_schema"
     last_agent_checkpoint_at: datetime | None = None
     agent_token_usage: dict[str, Any] = Field(default_factory=lambda: {
         "usage_returned": False,
