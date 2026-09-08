@@ -126,6 +126,18 @@ def _task_list(task: Mapping[str, Any], key: str) -> list[str]:
 def _coverage_result(value: Any, unit_id: str) -> CoverageRequirementResult | dict[str, Any] | None:
     if isinstance(value, CoverageRequirementResult):
         return value if value.unit_id == unit_id or value.requirement_id == unit_id else None
+    # ``CoverageEvaluator`` returns a typed CoverageReport in the service
+    # path.  Keep accepting the historical mapping projection, but do not
+    # silently treat the model object as an empty context (which would mark a
+    # missing required row as a passing unit).
+    requirement_results = getattr(value, "requirement_results", None)
+    if requirement_results is not None:
+        values = requirement_results.values() if isinstance(requirement_results, Mapping) else requirement_results
+        for result in values:
+            candidate = _coverage_result(result, unit_id)
+            if candidate is not None:
+                return candidate
+        return None
     if isinstance(value, Mapping):
         if "requirement_results" in value:
             results = value.get("requirement_results") or {}
@@ -196,4 +208,3 @@ def _evidence_map(value: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
             continue
         result[evidence_id] = dict(item) if isinstance(item, Mapping) else {"id": evidence_id}
     return result
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from threading import Barrier
 
 import pytest
 
@@ -26,8 +27,9 @@ from src.document_authoring.models import (
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.planning.models import DocumentPlan
 from src.document_authoring.planning.task_graph import TaskGraphCompiler
+from src.pipelines.document_rag.schemas import EvidenceEnvelope
 
-from tests.test_document_planning_contracts import _plan_payload
+from tests.test_document_planning_contracts import _output_payload, _plan_payload
 
 
 def _plan(**overrides) -> DocumentPlan:
@@ -157,6 +159,22 @@ def test_plan_executor_waits_for_dependencies_and_barriers() -> None:
     assert result.completed_nodes == graph.topological_order
 
 
+def test_plan_executor_fans_out_independent_units_with_bounded_workers() -> None:
+    graph = TaskGraphCompiler().compile(_plan())
+    started = Barrier(2)
+    calls: list[str] = []
+
+    def execute_unit(node, attempt):
+        started.wait(timeout=1)
+        calls.append(node.node_id)
+        return {"node_id": node.node_id, "attempt": attempt}
+
+    result = PlanDAGExecutor(max_workers=2).run(graph, execute_unit=execute_unit)
+
+    assert set(calls) == {"unit:task-cover", "unit:task-pins"}
+    assert result.completed_nodes == graph.topological_order
+
+
 def test_plan_executor_reuses_committed_receipts_and_recovers_after_failure() -> None:
     graph = TaskGraphCompiler().compile(_plan_with_dependency())
     calls: list[tuple[str, int]] = []
@@ -175,7 +193,10 @@ def test_plan_executor_reuses_committed_receipts_and_recovers_after_failure() ->
     recovered = PlanDAGExecutor().run(
         graph,
         execute_unit=execute_unit,
-        committed_receipts={"unit:task-cover": "cover-receipt"},
+        committed_receipts={
+            "preflight": "preflight-receipt",
+            "unit:task-cover": "cover-receipt",
+        },
     )
 
     assert ("unit:task-cover", 1) not in calls[1:]
@@ -183,10 +204,194 @@ def test_plan_executor_reuses_committed_receipts_and_recovers_after_failure() ->
     assert recovered.statuses["release"] == "committed"
 
 
+def test_plan_executor_dispatches_structural_nodes_through_an_optional_callback() -> None:
+    graph = TaskGraphCompiler().compile(_plan_with_dependency())
+    structural_calls: list[tuple[str, int]] = []
+
+    def execute_unit(node, attempt):
+        return {"node_id": node.node_id, "attempt": attempt}
+
+    def execute_node(node, attempt, _state):
+        structural_calls.append((node.node_id, attempt))
+        return {"node_id": node.node_id, "kind": node.kind}
+
+    result = PlanDAGExecutor().run(
+        graph,
+        execute_unit=execute_unit,
+        execute_node=execute_node,
+    )
+
+    assert structural_calls == [
+        (node.node_id, 1)
+        for node in graph.nodes
+        if node.kind != "unit"
+    ]
+    assert result.outputs["aggregate"]["kind"] == "aggregate"
+    assert result.outputs["release"]["kind"] == "release"
+
+
+def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
+    tmp_path, monkeypatch
+) -> None:
+    import src.document_authoring.harness.runtime as runtime_module
+    import src.settings
+
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS", {"tenant-a"}, raising=False)
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES", {"icd"}, raising=False)
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS", {"xlsx"}, raising=False)
+    snapshot = KnowledgeBaseSourceSnapshot(
+        source_set_snapshot_id="source-plan-runtime",
+        tenant_id="tenant-a",
+        knowledge_base_name="ADAS",
+        source_names=["design.pdf"],
+        created_by="user-a",
+    )
+    plan_payload = _plan(status="accepted").model_dump(mode="json")
+    plan_payload.update({
+        "source_snapshot_id": snapshot.source_set_snapshot_id,
+        "source_snapshot_hash": snapshot.content_hash,
+    })
+    plan_payload.pop("plan_hash", None)
+    plan = DocumentPlan.model_validate(plan_payload)
+    order = DocumentWorkOrder(
+        work_order_id="wo-plan-runtime",
+        tenant_id="tenant-a",
+        scope_type="knowledge_base",
+        knowledge_base_name="ADAS",
+        project_id=None,
+        baseline_id=None,
+        baseline_content_hash="",
+        source_set_snapshot_id=snapshot.source_set_snapshot_id,
+        template_version_id="template-001",
+        document_schema_id="schema-001",
+        document_schema_version="1",
+        template_schema_id="schema-001",
+        template_schema_version="1",
+        retrieval_policy_version="1",
+        renderer_policy_version="1",
+        target_format="xlsx",
+        execution_mode="internal_harness",
+        harness_policy_id="policy-1",
+        harness_policy_version="1",
+        requested_executor="internal_harness",
+        input_fingerprint_version=3,
+        output_spec_id=plan.output_spec_id,
+        output_spec_version=plan.output_spec_version,
+        output_spec_hash=plan.output_spec_hash,
+        document_plan_id=plan.document_plan_id,
+        document_plan_version=plan.version,
+        document_plan_hash=plan.plan_hash,
+        created_by="user-a",
+    )
+    policy = HarnessPolicy(
+        harness_policy_id="policy-1", version="1", status="approved",
+        writer_provider_id="deterministic_evidence_writer",
+        max_parallel_units=1,
+        max_retrieval_rounds=8,
+    )
+    template = TemplateVersion(
+        template_version_id="template-001", template_id="template-001",
+        format="xlsx", content_hash="template-hash", template_schema_id="schema-001",
+        template_schema_version="1", renderer_policy_id="renderer-1",
+    )
+    schema = DocumentSchema(
+        document_schema_id="schema-001", version="1", document_type="icd",
+        status="approved", execution_mode="internal_harness",
+    )
+    store = DocumentAuthoringStore(
+        str(tmp_path / "authoring.db"), artifact_root=str(tmp_path / "artifacts")
+    )
+    store.create_work_order(order)
+    store.planning.create_output_spec(
+        # The runtime only needs the accepted plan row; this spec is included
+        # so the test exercises the same durable planning store boundary.
+        __import__("src.document_authoring.planning.models", fromlist=["OutputSpec"]).OutputSpec.model_validate(
+            _output_payload_for_runtime(plan)
+        ),
+        tenant_id="tenant-a", user_id="user-a",
+    )
+    store.planning.create_plan(plan, tenant_id="tenant-a", user_id="user-a")
+    runtime = runtime_module.InternalDocumentHarnessRuntime(store=store)
+    run, manifest = runtime.create_run(
+        order, policy, snapshot, template, schema, document_plan=plan,
+    )
+
+    monkeypatch.setattr(
+        runtime_module,
+        "AuthoringGraph",
+        lambda *args, **kwargs: pytest.fail("plan route constructed the legacy graph"),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "InternalGraphExecutor",
+        lambda *args, **kwargs: pytest.fail("plan route constructed the legacy executor"),
+    )
+
+    def retrieve(requirement, attempt, query_override=None):
+        del attempt, query_override
+        is_table = requirement.semantic_unit_id == "field:pins"
+        metadata = {
+            "knowledge_base_name": "ADAS",
+            "table_row": {
+                "row_key": "J1:1",
+                "cells": {"connector": "J1", "pin": "1", "signal": "CANH"},
+            },
+        } if is_table else {"knowledge_base_name": "ADAS"}
+        content = (
+            "connector=J1 pin=1 signal=CANH"
+            if is_table else "Cover title: ADAS ICD"
+        )
+        return __import__("src.agents.claim_evidence", fromlist=["RetrievalOutcome"]).RetrievalOutcome(
+            requirement_id=requirement.requirement_id,
+            status="success_with_hits",
+            evidences=[EvidenceEnvelope(
+                id=f"ev-{requirement.semantic_unit_id}", content=content,
+                source_name="design.pdf", metadata=metadata,
+            )],
+            query_fingerprint="query",
+            applied_source_set_snapshot_id=snapshot.source_set_snapshot_id,
+        )
+
+    result = runtime.execute(
+        work_order=order, run=run, manifest=manifest, policy=policy, schema=schema,
+        snapshot=snapshot, legacy_claims=[],
+        writer=__import__("src.document_authoring.writers.managed", fromlist=["ManagedWriter", "DeterministicEvidenceWriter"]).ManagedWriter(
+            __import__("src.document_authoring.writers.managed", fromlist=["DeterministicEvidenceWriter"]).DeterministicEvidenceWriter()
+        ),
+        retrieve=retrieve,
+    )
+
+    assert len(result.drafts) == 2
+    assert {draft.unit_id for draft in result.drafts} == {"field:cover", "field:pins"}
+    persisted_run = store.get_harness_run(run.harness_run_id)
+    assert persisted_run is not None
+    assert persisted_run.execution_route == "plan_dag"
+    assert persisted_run.current_node == "complete"
+
+
+def _output_payload_for_runtime(plan: DocumentPlan) -> dict:
+    """Build the durable OutputSpec row needed by the runtime-only test."""
+    payload = _output_payload()
+    payload["output_spec_id"] = plan.output_spec_id
+    payload["version"] = plan.output_spec_version
+    payload["status"] = "accepted"
+    payload["layout_source"] = {
+        "mode": "provided_template",
+        "template_version_id": "template-001",
+        "template_schema_id": "schema-001",
+        "template_schema_version": "1",
+    }
+    return payload
+
+
 def test_runtime_create_run_binds_compiled_graph_when_flag_is_enabled(tmp_path, monkeypatch) -> None:
     import src.settings
 
     monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS", {"tenant-a"}, raising=False)
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES", {"icd"}, raising=False)
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS", {"xlsx"}, raising=False)
     plan = _plan(status="accepted")
     order = DocumentWorkOrder(
         work_order_id="wo-plan",
@@ -240,6 +445,12 @@ def test_runtime_create_run_binds_compiled_graph_when_flag_is_enabled(tmp_path, 
         str(tmp_path / "authoring.db"), artifact_root=str(tmp_path / "artifacts")
     )
     authoring_store.create_work_order(order)
+    authoring_store.planning.create_output_spec(
+        __import__("src.document_authoring.planning.models", fromlist=["OutputSpec"]).OutputSpec.model_validate(
+            _output_payload_for_runtime(plan)
+        ),
+        tenant_id="tenant-a", user_id="user-a",
+    )
     runtime = InternalDocumentHarnessRuntime(
         # The runtime should initialize the graph store against the same DB.
         store=authoring_store,

@@ -189,6 +189,62 @@ class DocumentAuthoringSettingsTests(unittest.TestCase):
                 settings.DOCUMENT_PLANNING_V2_ENABLED,
             ) = previous
 
+    def test_document_plan_dag_flag_defaults_off_and_reloads(self):
+        env = os.environ.copy()
+        env.pop("DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", None)
+        env.pop("DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS", None)
+        env.pop("DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES", None)
+        env.pop("DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS", None)
+        env["PYTHON_DOTENV_DISABLED"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import src.settings as s; "
+                    "assert s.DOCUMENT_PLAN_DAG_EXECUTION_ENABLED is False; "
+                    "assert s.DEFAULT_VALUES['DOCUMENT_PLAN_DAG_EXECUTION_ENABLED'] == 'false'; "
+                    "assert not s.DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS; "
+                    "assert not s.DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES; "
+                    "assert not s.DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS"
+                ),
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+        previous = (
+            settings.DOCUMENT_PLAN_DAG_EXECUTION_ENABLED,
+            settings.DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS,
+            settings.DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES,
+            settings.DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS,
+        )
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "DOCUMENT_PLAN_DAG_EXECUTION_ENABLED": "true",
+                    "DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS": "tenant-a",
+                    "DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES": "icd",
+                    "DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS": "xlsx,xlsm",
+                },
+            ), patch("src.settings.load_dotenv"):
+                settings.reload_settings()
+            self.assertTrue(settings.DOCUMENT_PLAN_DAG_EXECUTION_ENABLED)
+            self.assertEqual(settings.DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS, {"tenant-a"})
+            self.assertEqual(settings.DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES, {"icd"})
+            self.assertEqual(settings.DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS, {"xlsx", "xlsm"})
+        finally:
+            (
+                settings.DOCUMENT_PLAN_DAG_EXECUTION_ENABLED,
+                settings.DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS,
+                settings.DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES,
+                settings.DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS,
+            ) = previous
+
 
 if __name__ == "__main__":
     unittest.main()

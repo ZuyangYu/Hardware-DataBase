@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from src.document_authoring.models import DocumentUnitDraft, DraftAssertion, TypedFieldValue
 from src.document_authoring.planning.models import CoverageRequirement, UnitTaskSpec
+from src.document_authoring.planning.review_contracts import CoverageReport, CoverageRequirementResult
 from src.document_authoring.planning.unit_review import UnitReviewer, safe_review_projection
 
 
@@ -91,3 +92,21 @@ def test_policy_issue_cannot_be_auto_approved():
 
     assert result.status == "blocked"
     assert any(issue.code == "policy_immutable" for issue in result.issues)
+
+
+def test_unit_reviewer_consumes_a_typed_coverage_report_object():
+    coverage = CoverageReport(
+        plan_id="plan-1",
+        plan_version=1,
+        plan_hash="sha256:plan",
+        requirement_results={"voltage": CoverageRequirementResult(
+            requirement_id="voltage", unit_id="voltage", kind="scalar",
+            status="missing", missing_count=1,
+            issues=[{"code": "missing_evidence", "unit_id": "voltage"}],
+        )},
+    )
+
+    result = UnitReviewer().review(_task(), _draft(), coverage, EVIDENCE)
+
+    assert result.status == "rework"
+    assert any(issue.code == "missing_evidence" for issue in result.issues)

@@ -14,6 +14,15 @@ def _env_bool(name: str, default: bool) -> bool:
     """Parse a boolean environment setting using the application's flag syntax."""
     return os.getenv(name, str(default).lower()).strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_csv(name: str) -> frozenset[str]:
+    """Parse a comma-separated rollout allowlist into normalized values."""
+    return frozenset(
+        item.strip().casefold()
+        for item in os.getenv(name, "").split(",")
+        if item.strip()
+    )
+
 # Serialises .env read-modify-write cycles (save_settings_to_env). Sync API
 # routes run in Starlette's threadpool, so two concurrent PUT /config requests
 # would otherwise interleave read/modify/write and lose updates. RLock because
@@ -133,6 +142,9 @@ DOCUMENT_PLANNING_V2_ENABLED = _env_bool("DOCUMENT_PLANNING_V2_ENABLED", False)
 # behavior.  Keep it disabled until graph, review and parity gates are signed
 # off for an allowlisted tenant/document type.
 DOCUMENT_PLAN_DAG_EXECUTION_ENABLED = _env_bool("DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", False)
+DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS")
+DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES")
+DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS")
 
 # External conversation (外部对话) domain switches.
 EXTERNAL_CONVERSATION_LLM_STRUCTURE = os.getenv("EXTERNAL_CONVERSATION_LLM_STRUCTURE", "true").lower() in {"1", "true", "yes", "on"}
@@ -361,6 +373,10 @@ DEFAULT_VALUES = {
     "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED": "false",
     "DOCUMENT_PLANNING_SHADOW_ENABLED": "false",
     "DOCUMENT_PLANNING_V2_ENABLED": "false",
+    "DOCUMENT_PLAN_DAG_EXECUTION_ENABLED": "false",
+    "DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS": "",
+    "DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES": "",
+    "DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS": "",
     "MEMORY_ENABLED": "true",
     "MEMORY_STORE_BACKEND": "sqlite",
     "MEMORY_SQLITE_PATH": os.path.join(STORAGE_DIR, "memory.db"),
@@ -506,6 +522,9 @@ def reload_settings():
     global DOCUMENT_TASK_WRITE_ENABLED, DOCUMENT_TASK_READ_ENABLED, DOCUMENT_TASK_ASSOCIATION_REQUIRED
     global DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED
     global DOCUMENT_PLANNING_SHADOW_ENABLED, DOCUMENT_PLANNING_V2_ENABLED
+    global DOCUMENT_PLAN_DAG_EXECUTION_ENABLED
+    global DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS, DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES
+    global DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS
     global FINAL_TOP_K, AGENT_MAX_RETRIEVAL_ROUNDS
     global WORKER_POLL_INTERVAL_SECONDS, WORKER_PARSE_BATCH_SIZE
     global DOCUMENT_AUTHORING_JOB_LEASE_SECONDS, DOCUMENT_AUTHORING_JOB_BATCH_SIZE
@@ -614,6 +633,10 @@ def reload_settings():
     )
     DOCUMENT_PLANNING_SHADOW_ENABLED = _env_bool("DOCUMENT_PLANNING_SHADOW_ENABLED", False)
     DOCUMENT_PLANNING_V2_ENABLED = _env_bool("DOCUMENT_PLANNING_V2_ENABLED", False)
+    DOCUMENT_PLAN_DAG_EXECUTION_ENABLED = _env_bool("DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", False)
+    DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS")
+    DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES")
+    DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS")
 
     FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "5"))
     AGENT_MAX_RETRIEVAL_ROUNDS = int(os.getenv("AGENT_MAX_RETRIEVAL_ROUNDS", "3"))

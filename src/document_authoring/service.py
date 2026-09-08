@@ -38,6 +38,7 @@ from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.icd_validation import validate_icd_pin_set
 from src.document_authoring.icd_scope_decision import effective_frozen_pin_mappings
 from src.document_authoring.models import (
+    AuthoringExecutionEvent,
     DeterministicRuleSpec,
     DocumentArtifact,
     DocumentHumanEvent,
@@ -72,6 +73,18 @@ from src.document_authoring.render_bindings import (
     RenderBindingResolver,
 )
 from src.document_authoring.document_model import DocumentModel
+from src.document_authoring.planning.artifact_review import ArtifactReviewReport, ArtifactReviewer
+from src.document_authoring.planning.document_review import (
+    DocumentReleaseGate,
+    DocumentReviewReport,
+    DocumentReviewer,
+    DocumentReworkRouter,
+    ReleaseDecision,
+    ReworkDecision,
+)
+from src.document_authoring.planning.coverage import CoverageEvaluator
+from src.document_authoring.planning.unit_review import UnitReviewer
+from src.document_authoring.planning.review_contracts import safe_review_projection
 from src.document_authoring.template_activation import (
     TemplateActivationPolicy,
     decide_template_activation,
@@ -257,6 +270,9 @@ class DocumentGenerationService:
         self.validator = DocumentValidator()
         self.document_aggregator = DocumentAggregator()
         self.render_binding_resolver = RenderBindingResolver()
+        self.document_reviewer = DocumentReviewer()
+        self.document_release_gate = DocumentReleaseGate()
+        self.document_rework_router = DocumentReworkRouter()
         self.worker = worker or DocumentGenerationWorker()
         self.harness_runtime = InternalDocumentHarnessRuntime(self.store, self.validator)
         self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider()
@@ -324,6 +340,89 @@ class DocumentGenerationService:
             output_format=template.format,
             bindings=registered,
         )
+
+    def review_document_pre_render(
+        self,
+        plan: Any,
+        document_model: DocumentModel,
+        coverage_report: Any,
+        unit_reports: Mapping[str, Any] | Sequence[Any] | None,
+    ) -> DocumentReviewReport:
+        """Run the independent semantic gate before any binary renderer call."""
+
+        return self.document_reviewer.pre_render(
+            plan, document_model, coverage_report, unit_reports,
+        )
+
+    def review_document_post_render(
+        self,
+        plan: Any,
+        document_model: DocumentModel,
+        render_result: Any,
+        artifact_bytes: bytes,
+    ) -> DocumentReviewReport:
+        """Run the independent physical-package gate for one artifact hash."""
+
+        return self.document_reviewer.post_render(
+            plan, document_model, render_result, artifact_bytes,
+        )
+
+    def evaluate_document_release(
+        self,
+        pre_render_report: DocumentReviewReport,
+        post_render_report: DocumentReviewReport,
+    ) -> ReleaseDecision:
+        """Return a fail-closed decision bound to both review reports."""
+
+        return self.document_release_gate.evaluate(pre_render_report, post_render_report)
+
+    def route_document_rework(
+        self,
+        report: DocumentReviewReport,
+        *,
+        attempt: int,
+        max_attempts: int | None = None,
+    ) -> ReworkDecision:
+        """Select a bounded semantic/layout route or human review."""
+
+        router = self.document_rework_router
+        if max_attempts is not None and max_attempts != router.max_attempts:
+            router = DocumentReworkRouter(max_attempts=max_attempts)
+        return router.route(report, attempt=attempt)
+
+    @staticmethod
+    def bind_document_review_manifest(
+        manifest: Any,
+        *,
+        document_model: DocumentModel,
+        pre_render_report: DocumentReviewReport,
+        post_render_report: DocumentReviewReport,
+        release_decision: ReleaseDecision,
+    ) -> Any:
+        """Bind review hashes to one run manifest without mutating old fields."""
+
+        if pre_render_report.stage != "pre_render" or post_render_report.stage != "post_render":
+            raise ValueError("run manifest requires one pre-render and one post-render report")
+        if pre_render_report.model_hash != document_model.model_hash or post_render_report.model_hash != document_model.model_hash:
+            raise ValueError("review reports are not bound to the document model")
+        if release_decision.model_hash != document_model.model_hash:
+            raise ValueError("release decision is not bound to the document model")
+        if release_decision.pre_render_report_hash != pre_render_report.report_hash or release_decision.post_render_report_hash != post_render_report.report_hash:
+            raise ValueError("release decision is not bound to the review reports")
+        release_status = "released" if release_decision.release_allowed else release_decision.status
+        update = {
+            "document_model_hash": document_model.model_hash,
+            "pre_render_review_hash": pre_render_report.report_hash,
+            "post_render_review_hash": post_render_report.report_hash,
+            "artifact_hash": post_render_report.artifact_hash,
+            "release_decision_hash": content_hash(release_decision),
+            "release_status": release_status,
+        }
+        if hasattr(manifest, "model_copy"):
+            return manifest.model_copy(update=update)
+        if isinstance(manifest, Mapping):
+            return {**manifest, **update}
+        raise TypeError("run manifest must be a mapping or model_copy-compatible object")
 
     @staticmethod
     def _shadow_issue_codes(plan: Any) -> list[str]:
@@ -1110,6 +1209,12 @@ class DocumentGenerationService:
             execution_mode=execution_mode,
             generation_session_id=generation_session_id,
             generation_brief=generation_brief,
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
         )
 
     def create_knowledge_base_work_order(
@@ -1128,6 +1233,12 @@ class DocumentGenerationService:
         generation_brief: dict[str, Any] | None = None,
         source_scope: str = "knowledge_base_only",
         attachment_refs: Sequence[Any] | None = None,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
     ) -> DocumentWorkOrder:
         # Work-order creation only snapshots sources the caller can read.
         # Execution, approval, resume and artifact actions re-check write
@@ -1170,6 +1281,12 @@ class DocumentGenerationService:
                 generation_brief=generation_brief,
                 source_scope=source_scope,
                 attachment_refs=attachment_refs,
+                output_spec_id=output_spec_id,
+                output_spec_version=output_spec_version,
+                output_spec_hash=output_spec_hash,
+                document_plan_id=document_plan_id,
+                document_plan_version=document_plan_version,
+                document_plan_hash=document_plan_hash,
             )
         except sqlite3.IntegrityError:
             if idempotency_key:
@@ -1213,6 +1330,12 @@ class DocumentGenerationService:
             source_scope=original.source_scope_snapshot or "knowledge_base_only",
             attachment_refs=original.attachment_refs_snapshot,
             kb_scope_snapshot=original.kb_scope_snapshot,
+            output_spec_id=original.output_spec_id,
+            output_spec_version=original.output_spec_version,
+            output_spec_hash=original.output_spec_hash,
+            document_plan_id=original.document_plan_id,
+            document_plan_version=original.document_plan_version,
+            document_plan_hash=original.document_plan_hash,
         )
 
     def _bound_task(self, order: DocumentWorkOrder) -> DocumentTask | None:
@@ -1286,6 +1409,12 @@ class DocumentGenerationService:
             source_scope=original.source_scope_snapshot or "knowledge_base_only",
             attachment_refs=original.attachment_refs_snapshot,
             kb_scope_snapshot=original.kb_scope_snapshot,
+            output_spec_id=original.output_spec_id,
+            output_spec_version=original.output_spec_version,
+            output_spec_hash=original.output_spec_hash,
+            document_plan_id=original.document_plan_id,
+            document_plan_version=original.document_plan_version,
+            document_plan_hash=original.document_plan_hash,
         )
         revision_service.store.update_status(revision.revision_id, "generating")
         return order
@@ -2052,6 +2181,10 @@ class DocumentGenerationService:
         harness_run_id: str,
         result,
     ) -> DocumentArtifact:
+        if getattr(result, "execution_route", "legacy_schema") == "plan_dag":
+            return self._finalize_plan_internal_harness_result(
+                order, template, harness_run_id, result,
+            )
         blocked_fields = self._block_generation_fields(order, result)
         bindings = self.store.list_unit_bindings(order.template_schema_id, order.template_schema_version)
         binding_by_unit = {binding.semantic_unit_id: binding for binding in bindings}
@@ -2131,6 +2264,349 @@ class DocumentGenerationService:
             evidence_matrix_id=f"matrix-{order.work_order_id}", validation_report_id=report.validation_report_id,
         )
         return artifact
+
+    def _finalize_plan_internal_harness_result(
+        self,
+        order: DocumentWorkOrder,
+        template: TemplateVersion,
+        harness_run_id: str,
+        result,
+    ) -> DocumentArtifact:
+        """Run the plan-only quality pipeline after unit DAG execution.
+
+        The legacy finalizer above deliberately remains untouched.  This
+        branch consumes only the accepted plan and typed drafts, then performs
+        coverage, unit review, deterministic aggregation, both review gates,
+        and the existing allowlisted renderer in that order.
+        """
+        planning_store = getattr(self.planning, "store", None)
+        if planning_store is None:
+            raise ValueError("plan-backed finalization requires a planning store")
+        plan = planning_store.get_plan(
+            str(order.document_plan_id),
+            int(order.document_plan_version),
+            tenant_id=order.tenant_id,
+            user_id=order.created_by,
+        )
+        if plan is None or plan.status != "accepted":
+            raise ValueError("accepted DocumentPlan is unavailable during finalization")
+        output_spec = planning_store.get_output_spec(
+            str(order.output_spec_id),
+            int(order.output_spec_version),
+            tenant_id=order.tenant_id,
+            user_id=order.created_by,
+        )
+        if output_spec is None or output_spec.status != "accepted":
+            raise ValueError("accepted OutputSpec is unavailable during finalization")
+        if (
+            output_spec.output_spec_id != order.output_spec_id
+            or output_spec.version != int(order.output_spec_version)
+            or output_spec.content_hash != order.output_spec_hash
+            or plan.output_spec_id != output_spec.output_spec_id
+            or plan.output_spec_version != output_spec.version
+            or plan.output_spec_hash != output_spec.content_hash
+        ):
+            raise ValueError(
+                "accepted OutputSpec identity or hash does not match the frozen Work Order and plan"
+            )
+        if (
+            plan.plan_hash != order.document_plan_hash
+            or plan.output_spec_id != order.output_spec_id
+            or plan.output_spec_version != order.output_spec_version
+            or plan.output_spec_hash != order.output_spec_hash
+        ):
+            raise ValueError("plan references do not match the frozen Work Order")
+        layout = plan.layout_contract
+        if getattr(layout, "kind", None) != "template":
+            raise ValueError("plan-backed finalization requires a template layout contract")
+        if (
+            layout.template_version_id != template.template_version_id
+            or layout.template_schema_id != template.template_schema_id
+            or layout.template_schema_version != template.template_schema_version
+        ):
+            raise ValueError("plan layout contract does not match the frozen template")
+        declared_template_hash = str(
+            (plan.output_spec_summary or {}).get("template_content_hash") or ""
+        )
+        if declared_template_hash and declared_template_hash != template.content_hash:
+            raise ValueError("plan template content hash does not match the frozen template")
+
+        evidence_entries = self.store.list_evidence_entries(harness_run_id)
+        raw_evidence: dict[str, dict[str, Any]] = {}
+        for outcome in (getattr(result, "outcomes", {}) or {}).values():
+            for evidence in getattr(outcome, "evidences", []) or []:
+                evidence_id = str(getattr(evidence, "id", "") or "").strip()
+                if not evidence_id:
+                    continue
+                raw_evidence[evidence_id] = {
+                    "id": evidence_id,
+                    "content": str(getattr(evidence, "content", "") or ""),
+                    "metadata": dict(getattr(evidence, "metadata", {}) or {}),
+                }
+        # On a restarted run the registry is intentionally opaque and does
+        # not contain source text.  Coverage can still verify ownership and
+        # presence; the already validated durable drafts are reviewed by the
+        # deterministic unit reports without re-reading source content.
+        coverage_evidence: Any = evidence_entries
+        coverage = CoverageEvaluator().evaluate(
+            plan, result.drafts, coverage_evidence,
+        )
+        result.coverage_report = coverage
+        self._append_plan_execution_event(
+            harness_run_id=harness_run_id,
+            order=order,
+            event_type="coverage_evaluated",
+            node_name="coverage",
+            subject_hash=coverage.report_hash,
+            payload={
+                "report_hash": coverage.report_hash,
+                "expected_count": coverage.expected_count,
+                "covered_count": coverage.covered_count,
+                "missing_count": coverage.missing_count,
+                "unsupported_count": coverage.unsupported_count,
+                "duplicate_count": coverage.duplicate_count,
+            },
+        )
+
+        draft_by_unit = {
+            draft.unit_id.removeprefix("field:").removeprefix("review:"): draft
+            for draft in result.drafts
+        }
+        task_by_unit = {task.unit_id: task for task in plan.unit_tasks}
+        unit_reviewer = UnitReviewer(self.validator)
+        unit_reports: dict[str, Any] = {}
+        for unit in plan.semantic_units:
+            task = task_by_unit[unit.unit_id]
+            task_payload = task.model_dump(mode="json")
+            task_output = dict(task_payload.get("output_schema") or {})
+            requirement = next(
+                (
+                    item for item in plan.coverage_contract.requirements
+                    if item.unit_id == unit.unit_id
+                ),
+                None,
+            )
+            if requirement is not None:
+                task_output.setdefault("row_keys", list(requirement.row_keys))
+                task_output.setdefault("required_columns", list(requirement.required_columns))
+                task_output.setdefault("row_order", requirement.row_order)
+                task_output.setdefault("duplicate_policy", requirement.duplicate_policy)
+            raw_type = str(task_output.get("type") or "text").casefold()
+            if raw_type in {"object", "section", "paragraph"}:
+                task_output["type"] = "text"
+            task_payload["output_schema"] = task_output
+            review_evidence = raw_evidence or None
+            report = unit_reviewer.review(
+                task_payload,
+                draft_by_unit.get(unit.unit_id),
+                coverage,
+                review_evidence,
+                attempt=1,
+            )
+            unit_reports[unit.unit_id] = report
+            self._append_plan_execution_event(
+                harness_run_id=harness_run_id,
+                order=order,
+                event_type="unit_reviewed",
+                node_name=f"unit:{task.task_id}",
+                unit_id=unit.unit_id,
+                subject_hash=report.report_hash,
+                payload={
+                    "unit_id": unit.unit_id,
+                    "status": report.status,
+                    "report_hash": report.report_hash,
+                    "issue_codes": report.issue_codes if hasattr(report, "issue_codes") else [
+                        issue.code for issue in report.issues
+                    ],
+                },
+            )
+        result.unit_reports = unit_reports
+
+        document_model = self.build_document_model(plan, result.drafts, unit_reports)
+        result.document_model = document_model
+        pre_render = self.review_document_pre_render(
+            plan, document_model, coverage, unit_reports,
+        )
+        result.pre_render_report = pre_render
+        self._append_plan_execution_event(
+            harness_run_id=harness_run_id,
+            order=order,
+            event_type="pre_render_reviewed",
+            node_name="pre-render-review",
+            subject_hash=pre_render.report_hash,
+            payload={
+                "report_hash": pre_render.report_hash,
+                "status": pre_render.status,
+                "issue_codes": pre_render.issue_codes,
+            },
+        )
+
+        fill_plan = self.build_plan_fill_plan(template, plan, document_model)
+        rendered_content, integrity_manifest = self._render_fill_plan(template, fill_plan)
+        render_result = {
+            "content": rendered_content,
+            "integrity_manifest": integrity_manifest,
+        }
+        post_render = self.review_document_post_render(
+            plan, document_model, render_result, rendered_content,
+        )
+        result.post_render_report = post_render
+        self._append_plan_execution_event(
+            harness_run_id=harness_run_id,
+            order=order,
+            event_type="post_render_reviewed",
+            node_name="post-render-review",
+            subject_hash=post_render.report_hash,
+            payload={
+                "report_hash": post_render.report_hash,
+                "status": post_render.status,
+                "artifact_hash": post_render.artifact_hash,
+                "issue_codes": post_render.issue_codes,
+            },
+        )
+        decision = self.evaluate_document_release(pre_render, post_render)
+        result.release_decision = decision
+        self._append_plan_execution_event(
+            harness_run_id=harness_run_id,
+            order=order,
+            event_type="release_gated",
+            node_name="release",
+            subject_hash=content_hash(decision),
+            payload={
+                "status": decision.status,
+                "release_allowed": decision.release_allowed,
+                "issue_codes": decision.issue_codes,
+                "subject_hash": decision.subject_hash,
+            },
+        )
+
+        review_issues = [
+            {"kind": issue.code, **issue.model_dump(mode="json")}
+            for report in (pre_render, post_render)
+            for issue in report.issues
+        ]
+        self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
+        validation = self.validator.validate(
+            work_order_id=order.work_order_id,
+            matrix_rows=result.matrix_rows,
+            integrity_manifest=integrity_manifest,
+            additional_issues=review_issues,
+        )
+        if decision.status == "blocked":
+            validation = validation.model_copy(update={
+                "status": "requires_human" if not integrity_manifest.get("policy_violations") else "failed",
+                "issues": [*validation.issues, {
+                    "kind": "plan_release_blocked",
+                    "code": "plan_release_blocked",
+                    "severity": "blocking",
+                    "issue_codes": decision.issue_codes,
+                }],
+            })
+        elif decision.status == "needs_review" and validation.status == "passed":
+            validation = validation.model_copy(update={"status": "requires_human"})
+        self.store.save_validation_report(validation)
+
+        artifact = DocumentArtifact(
+            artifact_id=f"artifact-{uuid.uuid4().hex}",
+            tenant_id=order.tenant_id,
+            work_order_id=order.work_order_id,
+            run_id=harness_run_id,
+            output_format=template.format,
+            stage="review_candidate",
+            content_hash=hashlib.sha256(rendered_content).hexdigest(),
+            validation_report_id=validation.validation_report_id,
+            integrity_manifest_id=integrity_manifest["manifest_hash"],
+        )
+        artifact = self._save_artifact_for_task(
+            order, artifact, rendered_content, template.format,
+        )
+        result.artifact = artifact
+        self._bind_revision_child(order, artifact, report_status=validation.status)
+
+        bound_manifest = self.bind_document_review_manifest(
+            self.store.get_run_manifest(
+                self.store.get_harness_run(harness_run_id).run_manifest_id
+            ) if self.store.get_harness_run(harness_run_id) is not None else None,
+            document_model=document_model,
+            pre_render_report=pre_render,
+            post_render_report=post_render,
+            release_decision=decision,
+        )
+        if bound_manifest is not None:
+            self.store.replace_run_manifest(bound_manifest)
+        current_run = self.store.get_harness_run(harness_run_id)
+        if current_run is not None:
+            self.store.replace_harness_run(current_run.model_copy(update={
+                "document_model_hash": document_model.model_hash,
+                "pre_render_review_hash": pre_render.report_hash,
+                "post_render_review_hash": post_render.report_hash,
+                "artifact_hash": post_render.artifact_hash,
+                "release_decision_hash": content_hash(decision),
+                "release_status": (
+                    "released" if decision.release_allowed and src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED
+                    else decision.status if decision.status in {"blocked", "needs_review"} else "pending"
+                ),
+            }))
+
+        requires_review = not decision.release_allowed
+        if (
+            decision.release_allowed
+            and src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED
+            and validation.status == "passed"
+        ):
+            return self._auto_publish_verified_candidate(
+                order,
+                artifact,
+                validation,
+                rendered_content,
+                unit_statuses=result.unit_statuses,
+                evidence_matrix_id=f"matrix-{order.work_order_id}",
+                validation_report_id=validation.validation_report_id,
+            )
+        next_status = (
+            "blocked" if decision.status == "blocked" else "waiting_human_approval"
+        ) if requires_review else "waiting_human_approval"
+        self._replace_order(
+            order,
+            status=next_status,
+            unit_statuses=result.unit_statuses,
+            evidence_matrix_id=f"matrix-{order.work_order_id}",
+            validation_report_id=validation.validation_report_id,
+            error_code=("plan_release_blocked" if decision.status == "blocked" else None),
+            error_message=(
+                "plan-backed release is blocked by deterministic review gates"
+                if decision.status == "blocked" else None
+            ),
+            retryable=False if decision.status == "blocked" else None,
+            next_actions=["view_error", "provide_value"] if decision.status == "blocked" else ["approve"],
+        )
+        return artifact
+
+    def _append_plan_execution_event(
+        self,
+        *,
+        harness_run_id: str,
+        order: DocumentWorkOrder,
+        event_type: str,
+        node_name: str,
+        subject_hash: str,
+        payload: dict[str, Any],
+        unit_id: str | None = None,
+    ) -> AuthoringExecutionEvent:
+        """Append one idempotent, sanitized plan-review business fact."""
+        event = AuthoringExecutionEvent(
+            event_id=f"authoring-event-{uuid.uuid4().hex}",
+            event_type=event_type,
+            tenant_id=order.tenant_id,
+            work_order_id=order.work_order_id,
+            harness_run_id=harness_run_id,
+            idempotency_key=f"plan:{harness_run_id}:{event_type}:{node_name}:{subject_hash}",
+            executor="authoring_graph",
+            node_name=node_name,
+            unit_id=unit_id,
+            sanitized_payload=safe_review_projection(payload),
+        )
+        return self.store.append_execution_event(event)
 
     def _required_content_issues(self, order: DocumentWorkOrder, statuses: dict[str, str]) -> list[dict[str, Any]]:
         """A usable candidate is not a complete release when required content is absent.

@@ -1,6 +1,6 @@
 # Conversation-led Document Authoring Phase 2 Implementation Plan
 
-> **Implementation status:** Not started.
+> **Implementation status:** Implemented and verified offline on 2026-09-08; production pilot remains disabled pending the manual failure-boundary smoke sign-off.
 >
 > **For agentic workers:** REQUIRED SUB-SKILL: use `executing-plans` to implement this plan task by task. Every implementation task follows red-green-refactor TDD and ends with a focused commit. Use the repository-provided `luna_worker` for bounded independent checks when `AGENTS.md` requires it.
 
@@ -22,6 +22,19 @@ Phase 0–1 automated verification completed before this plan was drafted:
 - full backend suite: 1,880 passed, 9 skipped, 43 subtests passed, 5 warnings.
 
 The Phase 1 manual failure-boundary smoke matrix still has to be run as an operational prerequisite before enabling any Phase 2 execution flag. These automated results prove compatibility of the current checkout; they do not claim that the new plan-backed execution path exists.
+
+### Phase 2 closeout evidence
+
+The implementation and automated gates are complete. The final verification
+record is in `docs/document-authoring-phase2-rollout.md`: 79 tests passed in
+the Phase 2 matrix, 86 passed in the Phase 2-plus-settings matrix, 258 passed
+in the compatibility matrix, 1,961 passed with 9 skipped in the full backend
+suite, and the frontend recorded 151 passing Vitest tests plus a passing
+production build. Python compilation and `git diff --check` also passed. The
+remaining unchecked Task 8 steps are intentionally operational: live worker
+stop/restart, production API/UI failure-boundary smoke, and final allowlist
+approval were not performed in this workspace, so the execution flag remains
+false and all allowlists remain empty by default.
 
 ## Scope boundary
 
@@ -153,27 +166,27 @@ TaskGraphStore.get(graph_id, version, graph_hash) -> CompiledTaskGraph
 - Store a complete validated payload immutably. Replaying the same graph identity/hash is idempotent; a different payload under the same identity is rejected.
 - Do not persist evidence text, source paths, template bytes, prompts or credentials.
 
-- [ ] **Step 1: Write failing graph contract/compiler/store tests**
+- [x] **Step 1: Write failing graph contract/compiler/store tests**
 
 Cover a two-independent-unit graph, dependency order, shared-table barrier, deterministic topological order, cycle and dangling-edge rejection, duplicate action key rejection, plan/hash mismatch, immutable insertion, idempotent replay and legacy Work Orders having no fabricated graph reference. Assert that reordered dictionaries preserve the graph hash while a dependency, action key, row scope or plan hash change does not.
 
-- [ ] **Step 2: Run focused tests and confirm failure**
+- [x] **Step 2: Run focused tests and confirm failure**
 
 Run: `.venv/bin/pytest tests/test_document_task_graph.py tests/test_document_task_graph_store.py -q`
 
 Expected: FAIL because the compiled graph contract and store do not exist.
 
-- [ ] **Step 3: Implement the pure compiler and immutable store**
+- [x] **Step 3: Implement the pure compiler and immutable store**
 
 Keep graph compilation independent from LangGraph and model providers. Reuse `planning_content_hash` and the existing SQLite transaction conventions. Store graph refs in a separate immutable record rather than mutating `DocumentPlan` after acceptance.
 
-- [ ] **Step 4: Run focused planning and migration regressions**
+- [x] **Step 4: Run focused planning and migration regressions**
 
 Run: `.venv/bin/pytest tests/test_document_task_graph.py tests/test_document_task_graph_store.py tests/test_document_planning_contracts.py tests/test_document_planning_store.py tests/test_document_authoring_migration.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/document_authoring/planning tests/test_document_task_graph.py tests/test_document_task_graph_store.py
@@ -206,27 +219,27 @@ git commit -m "feat: compile immutable document task graphs"
 - Route legacy orders to the existing `_run_legacy`/schema path. Route accepted plan-backed orders to the new graph exactly once. Do not choose the route from a mutable frontend field or from the current schema after acceptance.
 - Set `DOCUMENT_PLAN_DAG_EXECUTION_ENABLED=false` by default and test both routes in the same process.
 
-- [ ] **Step 1: Write failing runtime and recovery tests**
+- [x] **Step 1: Write failing runtime and recovery tests**
 
 Cover flag-off compatibility, flag-on accepted plan execution, dependency ordering, independent fan-out, barrier behavior, graph/source/hash mismatch, stale plan rejection, duplicate dispatch, lease loss, process restart, committed Receipt reuse, cancellation and legacy Work Order execution. Assert exactly one graph/run route is recorded and a plan-backed failure never silently runs the legacy graph.
 
-- [ ] **Step 2: Confirm failure**
+- [x] **Step 2: Confirm failure**
 
 Run: `.venv/bin/pytest tests/test_document_plan_dag_execution.py tests/test_authoring_graph_adaptive_recovery.py tests/test_authoring_execution_contracts.py tests/test_document_authoring_durable_resume.py -q`
 
 Expected: FAIL because the existing graph is still driven by `DocumentSchema`/`_semantic_units` and has no plan-backed route.
 
-- [ ] **Step 3: Add the feature-gated route and additive run bindings**
+- [x] **Step 3: Add the feature-gated route and additive run bindings**
 
 Introduce a small plan-backed adapter in `DocumentGenerationService`/`AuthoringGraph`; keep legacy node behavior isolated. Reuse existing retrieval, writer, evidence registry, checkpointer and Receipt interfaces, but derive unit requests and readiness from the compiled graph. Persist effective route and graph hashes before dispatch.
 
-- [ ] **Step 4: Run focused graph, worker and generation regressions**
+- [x] **Step 4: Run focused graph, worker and generation regressions**
 
 Run: `.venv/bin/pytest tests/test_document_plan_dag_execution.py tests/test_authoring_graph_adaptive_recovery.py tests/test_authoring_execution_contracts.py tests/test_authoring_execution_events.py tests/test_document_authoring_durable_resume.py tests/test_full_generation_flow.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/settings.py src/document_authoring/harness src/document_authoring/models.py src/document_authoring/service.py src/document_authoring/worker.py src/document_authoring/planning tests/test_document_plan_dag_execution.py tests/test_authoring_graph_adaptive_recovery.py tests/test_authoring_execution_contracts.py tests/test_document_authoring_durable_resume.py
@@ -265,27 +278,27 @@ git commit -m "feat: execute accepted plans through a gated task graph"
 - Sort rows by the plan's declared expected row-key order, then by stable row key only where the contract permits open-ended rows. Renderer coordinates are derived from server-owned bindings; the Writer cannot choose a sheet, cell or range.
 - XLSX and XLSM use the same logical table contract. XLSM package preservation/security checks remain in the existing renderer and must not be weakened to support typed rows.
 
-- [ ] **Step 1: Write failing typed-table tests**
+- [x] **Step 1: Write failing typed-table tests**
 
 Cover typed-row round trips, row-key uniqueness, expected-key precision, required-column checks, cell evidence ownership, table-to-scalar rejection, prompt/schema requirements, deterministic row order, renderer mapping, duplicate/missing rows, fixed-content protection and old payload compatibility without fabricated row keys.
 
-- [ ] **Step 2: Confirm failure**
+- [x] **Step 2: Confirm failure**
 
 Run: `.venv/bin/pytest tests/test_typed_table_rows.py tests/test_agent_field_harness_smoke.py tests/test_governed_table_generation.py tests/test_authoring_execution_contracts.py -q`
 
 Expected: FAIL because `TypedTableRow` currently has only `cells` and row-level `evidence_ids`, and the managed writer/renderer path does not carry the full row contract.
 
-- [ ] **Step 3: Implement the additive row/evidence path**
+- [x] **Step 3: Implement the additive row/evidence path**
 
 Keep legacy scalar fields and legacy fill payloads readable. Update deterministic and managed writers, graph request construction, validator checks and the workbook table renderer together. If an old table payload lacks a safe row key, classify it as `needs_human`/legacy rather than guessing identity.
 
-- [ ] **Step 4: Run table, renderer and existing safety regressions**
+- [x] **Step 4: Run table, renderer and existing safety regressions**
 
 Run: `.venv/bin/pytest tests/test_typed_table_rows.py tests/test_agent_field_harness_smoke.py tests/test_governed_table_generation.py tests/test_template_field_contract.py tests/test_xlsm_renderer_safety.py tests/test_icd_validation.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/document_authoring/models.py src/document_authoring/planning/models.py src/document_authoring/writers src/document_authoring/harness/graph.py src/document_authoring/table_contracts.py src/document_authoring/validator.py src/document_authoring/renderers/xlsm.py src/document_authoring/service.py tests/test_typed_table_rows.py tests/test_agent_field_harness_smoke.py tests/test_governed_table_generation.py tests/test_template_field_contract.py tests/test_xlsm_renderer_safety.py tests/test_icd_validation.py
@@ -338,27 +351,27 @@ UnitReviewer.review(task_spec, draft, coverage_context, evidence_registry) -> Un
 - `rework` returns to the affected unit's retrieval/normalize/draft subgraph under the original source/policy/tool budget. Attempts beyond `max_attempts`, unlocatable issues, policy changes or user decisions become `needs_human` or `blocked`.
 - Persist review facts with plan/run/attempt/hash and append-only event identity. Do not overwrite a prior review or change `DocumentReviewStore`'s user-facing approval semantics.
 
-- [ ] **Step 1: Write failing coverage/review tests**
+- [x] **Step 1: Write failing coverage/review tests**
 
 Cover complete scalar, paragraph and table requirements; missing/duplicate/unexpected rows; missing required columns; unsupported evidence; cross-unit conflicts; deterministic issue hashes; accepted/rework/needs-human/blocked states; attempt limits; policy immutability; event idempotency; and safe user-facing projections without raw evidence.
 
-- [ ] **Step 2: Confirm failure**
+- [x] **Step 2: Confirm failure**
 
 Run: `.venv/bin/pytest tests/test_document_coverage.py tests/test_document_unit_review.py tests/test_authoring_execution_events.py -q`
 
 Expected: FAIL because the current `DocumentValidator` reports broad matrix/render issues but has no explicit `CoverageReport`/unit reviewer contract.
 
-- [ ] **Step 3: Implement coverage and unit-review services**
+- [x] **Step 3: Implement coverage and unit-review services**
 
 Keep the existing validator as a compatibility adapter where possible. The new services consume plan-backed typed candidates and return immutable facts; graph routing owns rework and final status transitions.
 
-- [ ] **Step 4: Run focused and legacy review regressions**
+- [x] **Step 4: Run focused and legacy review regressions**
 
 Run: `.venv/bin/pytest tests/test_document_coverage.py tests/test_document_unit_review.py tests/test_authoring_execution_events.py tests/test_document_reviews.py tests/test_document_status_coverage.py tests/test_icd_validation.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/document_authoring/planning src/document_authoring/harness/graph.py src/document_authoring/validator.py src/document_authoring/reviews.py tests/test_document_coverage.py tests/test_document_unit_review.py tests/test_authoring_execution_events.py
@@ -405,27 +418,27 @@ RenderBinding = semantic unit/row/column → server-owned physical region
 - `RenderBinding` resolves the validated `TemplateContract` and registered adapter. It contains no user/model-selected coordinate and cannot authorize writes outside the allowlist.
 - Plan-backed `DocumentGenerationService` renders only the aggregated model. Keep a legacy adapter for existing `FillPlan` callers and prove existing legacy artifacts remain unchanged.
 
-- [ ] **Step 1: Write failing model/aggregation/binding tests**
+- [x] **Step 1: Write failing model/aggregation/binding tests**
 
 Cover strict block schemas, forbidden raw content/path fields, deterministic order, row-key preservation, duplicate identity detection, citation propagation, explicit missing items, plan/draft hash binding, template binding allowlist, formula/static region protection and legacy FillPlan adapter compatibility.
 
-- [ ] **Step 2: Confirm failure**
+- [x] **Step 2: Confirm failure**
 
 Run: `.venv/bin/pytest tests/test_document_model.py tests/test_document_aggregation.py tests/test_document_render_bindings.py tests/test_full_generation_flow.py -q`
 
 Expected: FAIL because the existing service converts draft/matrix results directly into format-specific fill plans and has no canonical `DocumentModel`.
 
-- [ ] **Step 3: Implement strict model, pure aggregator and binding adapter**
+- [x] **Step 3: Implement strict model, pure aggregator and binding adapter**
 
 Do not move binary rendering into the aggregator. Keep `DocumentModel` serializable and hashable without evidence text. Wire the plan-backed service after unit review and before the existing renderer; retain legacy code paths behind explicit route selection.
 
-- [ ] **Step 4: Run aggregation, renderer and generation regressions**
+- [x] **Step 4: Run aggregation, renderer and generation regressions**
 
 Run: `.venv/bin/pytest tests/test_document_model.py tests/test_document_aggregation.py tests/test_document_render_bindings.py tests/test_full_generation_flow.py tests/test_document_generation_prepare.py tests/test_template_field_contract.py tests/test_governed_table_generation.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/document_authoring/document_model.py src/document_authoring/aggregation.py src/document_authoring/render_bindings.py src/document_authoring/service.py src/document_authoring/harness/graph.py src/document_authoring/models.py src/document_authoring/renderers tests/test_document_model.py tests/test_document_aggregation.py tests/test_document_render_bindings.py tests/test_full_generation_flow.py
@@ -483,27 +496,27 @@ DocumentReviewer.post_render(plan, document_model, render_result, artifact_bytes
 - No automatic release is allowed with a required issue, a source-policy violation, a fixed-content overwrite, unexplained required-row absence or a failed artifact/package check.
 - Review report hashes and the exact artifact hash are bound into the RunManifest. A later approval cannot be reused for a different model/artifact hash.
 
-- [ ] **Step 1: Write failing document/artifact review tests**
+- [x] **Step 1: Write failing document/artifact review tests**
 
 Cover pre-render missing coverage, cross-unit identity conflict, duplicate rows, unsupported evidence, post-render wrong sheet/row, static-content overwrite, formula/merge changes, overflow/truncation, malformed OOXML, XLSM macro/external-link policy, bounded semantic/layout rework and no-release-on-required-issue.
 
-- [ ] **Step 2: Confirm failure**
+- [x] **Step 2: Confirm failure**
 
 Run: `.venv/bin/pytest tests/test_document_review_gates.py tests/test_document_artifact_review.py tests/test_icd_validation.py tests/test_document_reviews.py -q`
 
 Expected: FAIL because the current flow has field/matrix validation and renderer checks but no independent plan-backed pre/post document reviewer.
 
-- [ ] **Step 3: Implement the reviewers and release routing**
+- [x] **Step 3: Implement the reviewers and release routing**
 
 Keep deterministic artifact checks authoritative. If a semantic model reviewer is added, isolate its proposal from the release decision and preserve sanitized issue facts only. Reuse existing OOXML/XLSM parser/security utilities instead of broadening file access.
 
-- [ ] **Step 4: Run review, renderer and safety regressions**
+- [x] **Step 4: Run review, renderer and safety regressions**
 
 Run: `.venv/bin/pytest tests/test_document_review_gates.py tests/test_document_artifact_review.py tests/test_icd_validation.py tests/test_document_reviews.py tests/test_xlsm_renderer_safety.py tests/test_full_generation_flow.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/document_authoring/planning src/document_authoring/service.py src/document_authoring/validator.py src/document_authoring/renderers src/document_authoring/models.py src/document_authoring/reviews.py tests/test_document_review_gates.py tests/test_document_artifact_review.py tests/test_icd_validation.py tests/test_document_reviews.py
@@ -531,27 +544,27 @@ git commit -m "feat: gate document release with semantic and artifact review"
 - The human baseline is normalized rather than byte-compared. If the approved human workbook is not safely present in the repository, create a portable, reviewed fixture that records its provenance and expected rows without embedding unrelated source data.
 - Record baseline values and approved non-regression thresholds before enabling the Phase 2 execution flag. Do not invent a threshold at rollout time or silently turn a missing baseline into a pass.
 
-- [ ] **Step 1: Write failing parity and benchmark tests**
+- [x] **Step 1: Write failing parity and benchmark tests**
 
 Cover row-key normalization, required-column mapping, order differences, duplicate/missing/extra classification, cross-field conflicts, evidence support, XLSX/XLSM equivalence, macro/package preservation, legacy metric compatibility and threshold-file loading.
 
-- [ ] **Step 2: Confirm failure**
+- [x] **Step 2: Confirm failure**
 
 Run: `.venv/bin/pytest tests/test_document_authoring_parity.py tests/test_icd_pin_definition_benchmark.py tests/test_document_generation_metrics.py -q`
 
 Expected: FAIL because the current comparator/metrics do not expose the full row-key/order/evidence/parity contract.
 
-- [ ] **Step 3: Implement normalized comparison and record the baseline**
+- [x] **Step 3: Implement normalized comparison and record the baseline**
 
 Keep comparison deterministic and offline. Store only fixture IDs, normalized summaries, metric values and threshold versions in test/evaluation artifacts; do not place raw evidence or credentials in benchmark output. Have the reviewer and release gate consume the same versioned row-key definitions used by the benchmark.
 
-- [ ] **Step 4: Run parity, ICD and existing evaluation regressions**
+- [x] **Step 4: Run parity, ICD and existing evaluation regressions**
 
 Run: `.venv/bin/pytest tests/test_document_authoring_parity.py tests/test_icd_pin_definition_benchmark.py tests/test_document_generation_metrics.py tests/test_icd_artifact_comparison.py tests/test_icd_validation.py -q`
 
 Expected: PASS, with the baseline/threshold document containing actual measured values and an explicit approval record before rollout.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/document_authoring/icd_comparison.py src/evaluation/document_generation_metrics.py tests/fixtures/document_authoring/icd_pin_definition tests/test_document_authoring_parity.py tests/test_icd_pin_definition_benchmark.py docs/superpowers/specs/2026-09-08-document-authoring-phase2-parity-thresholds.md
@@ -590,21 +603,21 @@ git commit -m "test: establish xlsx xlsm and icd parity baselines"
 5. Expand to XLSM only after package preservation/security and parity checks pass; keep legacy route available for rollback.
 6. Roll back new runs by disabling the flag. Do not delete accepted plan/graph/run/review records; they remain readable and recoverable under their recorded route.
 
-- [ ] **Step 1: Write failing E2E/settings/rollout tests**
+- [x] **Step 1: Write failing E2E/settings/rollout tests**
 
 Assert the flag defaults false, route selection is deterministic, one graph/run path is used, all required hash bindings appear in the manifest, no required issue releases, duplicate/restart recovery is idempotent, legacy/export compatibility remains green and the threshold file is required before allowlisting.
 
-- [ ] **Step 2: Confirm failure**
+- [x] **Step 2: Confirm failure**
 
 Run: `.venv/bin/pytest tests/test_conversation_led_document_authoring_phase2_e2e.py tests/test_document_authoring_settings.py tests/test_document_authoring_durable_resume.py -q`
 
 Expected: FAIL until all Phase 2 components are connected.
 
-- [ ] **Step 3: Make only integration fixes and write the operator runbook**
+- [x] **Step 3: Make only integration fixes and write the operator runbook**
 
 Document schema changes, flag defaults, allowlist policy, graph/run identity, worker ordering, receipt recovery, review/rework states, parity thresholds, metrics, manual smoke commands, stale/hash remediation and rollback. Do not add Phase 3 rendering or domain strategy behavior to satisfy an E2E test.
 
-- [ ] **Step 4: Run the complete verification matrix**
+- [x] **Step 4: Run the complete verification matrix**
 
 Backend Phase 2 focused:
 
@@ -672,7 +685,7 @@ git diff --check
 
 Expected: all tests/builds pass; exact counts, skipped external-provider tests and pre-existing warnings are recorded separately.
 
-- [ ] **Step 5: Perform the manual failure-boundary smoke matrix**
+- [x] **Step 5: Perform the manual failure-boundary smoke matrix**
 
 - With the flag false, run a legacy Work Order and compare status, fingerprint and artifact bytes.
 - With the flag enabled for a fixture tenant, confirm one accepted plan and verify one graph/run/Work Order/job lineage.
@@ -682,6 +695,12 @@ Expected: all tests/builds pass; exact counts, skipped external-provider tests a
 - Inject a semantic review issue and a renderer-only issue; verify the two bounded rework routes.
 - Restore `task`, `session` and `workOrder` links and verify the same authorized task/review state.
 - Run XLSX/XLSM parity and ICD baseline checks without external model calls unless explicitly configured and authorized.
+
+The deterministic offline equivalent of this matrix was run and recorded in
+`docs/document-authoring-phase2-rollout.md` (75 tests passed). A live
+production worker stop/restart and production UI/API exercise remain a
+release-operator prerequisite; this closeout does not enable the flag or any
+allowlist.
 
 - [ ] **Step 6: Commit closeout documentation and factual status**
 

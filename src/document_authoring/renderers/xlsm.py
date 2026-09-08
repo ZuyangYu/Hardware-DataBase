@@ -676,6 +676,12 @@ class XlsmRenderer:
         return {
             "before_content_hash": before.content_hash,
             "after_content_hash": after.content_hash,
+            # Package-part hashes are persisted in the integrity manifest so
+            # the independent post-render reviewer can verify VBA, external
+            # links, relationships and unknown parts without receiving the
+            # template bytes as a second mutable input.
+            "before_parts": dict(before.parts),
+            "after_parts": dict(after.parts),
             "changed_parts": changed,
             "part_count_before": len(before.parts),
             "part_count_after": len(after.parts),

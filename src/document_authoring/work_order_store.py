@@ -1742,6 +1742,35 @@ class DocumentAuthoringStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def list_node_execution_receipts(
+        self,
+        harness_run_id: str,
+        *,
+        node_name: str | None = None,
+        status: str | None = "committed",
+    ) -> list[NodeExecutionReceipt]:
+        """Return durable node receipts in deterministic creation order.
+
+        The plan-backed coordinator uses this read-only projection to rebuild
+        its in-memory result after a worker restart.  Legacy callers do not
+        need to know about the new ``plan_node`` namespace.
+        """
+        query = (
+            "SELECT payload_json FROM node_execution_receipts "
+            "WHERE harness_run_id = ?"
+        )
+        params: list[Any] = [harness_run_id]
+        if node_name is not None:
+            query += " AND node_name = ?"
+            params.append(node_name)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY rowid, receipt_id"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [NodeExecutionReceipt.model_validate(_payload(row)) for row in rows]
+
     @staticmethod
     def _require_active_lease(
         run: HarnessRun,

@@ -57,6 +57,15 @@ from .review_contracts import (
     safe_review_projection,
 )
 from .unit_review import UnitReviewer
+from .artifact_review import ArtifactReviewReport, ArtifactReviewer
+from .document_review import (
+    DocumentReleaseGate,
+    DocumentReviewReport,
+    DocumentReviewer,
+    DocumentReworkRouter,
+    ReleaseDecision,
+    ReworkDecision,
+)
 
 __all__ = [
     "ArtifactSpec",
@@ -110,4 +119,12 @@ __all__ = [
     "UnitReviewer",
     "UnitReviewResult",
     "safe_review_projection",
+    "ArtifactReviewReport",
+    "ArtifactReviewer",
+    "DocumentReleaseGate",
+    "DocumentReviewReport",
+    "DocumentReviewer",
+    "DocumentReworkRouter",
+    "ReleaseDecision",
+    "ReworkDecision",
 ]

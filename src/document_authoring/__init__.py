@@ -61,6 +61,15 @@ from src.document_authoring.render_bindings import (
     RenderBindingSet,
     legacy_fill_plan_from_model,
 )
+from src.document_authoring.planning.document_review import (
+    DocumentReleaseGate,
+    DocumentReviewReport,
+    DocumentReviewer,
+    DocumentReworkRouter,
+    ReleaseDecision,
+    ReworkDecision,
+)
+from src.document_authoring.planning.artifact_review import ArtifactReviewReport, ArtifactReviewer
 
 __all__ = [
     "DeterministicRuleSpec",
@@ -111,4 +120,12 @@ __all__ = [
     "RenderBindingResolver",
     "RenderBindingSet",
     "legacy_fill_plan_from_model",
+    "ArtifactReviewReport",
+    "ArtifactReviewer",
+    "DocumentReleaseGate",
+    "DocumentReviewReport",
+    "DocumentReviewer",
+    "DocumentReworkRouter",
+    "ReleaseDecision",
+    "ReworkDecision",
 ]

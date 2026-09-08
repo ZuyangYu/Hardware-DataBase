@@ -801,6 +801,14 @@ class AuthoringRunManifest(BaseModel):
     document_plan_version: int | None = Field(default=None, ge=1)
     document_plan_hash: str | None = None
     execution_route: Literal["legacy_schema", "plan_dag"] = "legacy_schema"
+    # Phase 2 review lineage.  These are optional so legacy manifests remain
+    # readable; plan-backed runs populate every value before release routing.
+    document_model_hash: str | None = None
+    pre_render_review_hash: str | None = None
+    post_render_review_hash: str | None = None
+    artifact_hash: str | None = None
+    release_decision_hash: str | None = None
+    release_status: Literal["pending", "blocked", "needs_review", "released"] = "pending"
     created_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
 
@@ -850,6 +858,12 @@ class HarnessRun(BaseModel):
     document_plan_version: int | None = Field(default=None, ge=1)
     document_plan_hash: str | None = None
     execution_route: Literal["legacy_schema", "plan_dag"] = "legacy_schema"
+    document_model_hash: str | None = None
+    pre_render_review_hash: str | None = None
+    post_render_review_hash: str | None = None
+    artifact_hash: str | None = None
+    release_decision_hash: str | None = None
+    release_status: Literal["pending", "blocked", "needs_review", "released"] = "pending"
     last_agent_checkpoint_at: datetime | None = None
     agent_token_usage: dict[str, Any] = Field(default_factory=lambda: {
         "usage_returned": False,
@@ -1239,7 +1253,8 @@ EXECUTION_EVENT_TYPES = (
     "proposal_submitted", "proposal_accepted", "proposal_rejected",
     "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
     "human_waiting", "human_resumed", "coverage_evaluated", "unit_reviewed",
-    "unit_rework_requested", "run_finalized",
+    "unit_rework_requested", "pre_render_reviewed", "post_render_reviewed",
+    "release_gated", "run_finalized",
 )
 
 ExecutionEventType = Literal[
@@ -1249,7 +1264,8 @@ ExecutionEventType = Literal[
     "proposal_submitted", "proposal_accepted", "proposal_rejected",
     "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
     "human_waiting", "human_resumed", "coverage_evaluated", "unit_reviewed",
-    "unit_rework_requested", "run_finalized",
+    "unit_rework_requested", "pre_render_reviewed", "post_render_reviewed",
+    "release_gated", "run_finalized",
 ]
 
 

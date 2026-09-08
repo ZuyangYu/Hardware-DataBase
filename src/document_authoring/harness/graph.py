@@ -106,6 +106,21 @@ class HarnessExecutionResult:
     step_count: int = 0
     retrieval_round_count: int = 0
     agent_token_usage: dict[str, Any] = field(default_factory=dict)
+    # Plan-backed executions keep their immutable route identity beside the
+    # legacy result fields.  These defaults are deliberately additive so old
+    # schema-driven callers deserialize and compare exactly as before.
+    execution_route: str = "legacy_schema"
+    document_plan_id: str | None = None
+    task_graph_id: str | None = None
+    plan_node_outputs: dict[str, Any] = field(default_factory=dict)
+    finalization_result: Any | None = None
+    coverage_report: Any | None = None
+    unit_reports: dict[str, Any] = field(default_factory=dict)
+    document_model: Any | None = None
+    pre_render_report: Any | None = None
+    post_render_report: Any | None = None
+    release_decision: Any | None = None
+    artifact: Any | None = None
 
 
 def _json_safe_graph_value(value: Any) -> Any:
