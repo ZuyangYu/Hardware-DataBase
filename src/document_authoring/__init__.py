@@ -44,6 +44,23 @@ from src.document_authoring.requirement_resolver import (
     RequirementResolver,
     UnresolvedRequirement,
 )
+from src.document_authoring.document_model import (
+    Citation,
+    CrossReferenceBlock,
+    DocumentModel,
+    ListBlock,
+    MissingItem,
+    ParagraphBlock,
+    SectionBlock,
+    TypedTableBlock,
+)
+from src.document_authoring.render_bindings import (
+    LegacyFillPlanAdapter,
+    RenderBinding,
+    RenderBindingResolver,
+    RenderBindingSet,
+    legacy_fill_plan_from_model,
+)
 
 __all__ = [
     "DeterministicRuleSpec",
@@ -81,4 +98,17 @@ __all__ = [
     "RequirementResolutionResult",
     "RequirementResolver",
     "UnresolvedRequirement",
+    "Citation",
+    "CrossReferenceBlock",
+    "DocumentModel",
+    "ListBlock",
+    "MissingItem",
+    "ParagraphBlock",
+    "SectionBlock",
+    "TypedTableBlock",
+    "LegacyFillPlanAdapter",
+    "RenderBinding",
+    "RenderBindingResolver",
+    "RenderBindingSet",
+    "legacy_fill_plan_from_model",
 ]

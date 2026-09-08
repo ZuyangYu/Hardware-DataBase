@@ -32,6 +32,7 @@ from src.document_authoring.conversion import (
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
 from src.document_authoring.harness.idempotency import human_decision_key
+from src.document_authoring.aggregation import DocumentAggregator
 from src.document_authoring.icd_generation import render_icd_front_views
 from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.icd_validation import validate_icd_pin_set
@@ -66,6 +67,11 @@ from src.document_authoring.models import (
 from src.document_authoring.ooxml import validate_ooxml_package
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
+from src.document_authoring.render_bindings import (
+    LegacyFillPlanAdapter,
+    RenderBindingResolver,
+)
+from src.document_authoring.document_model import DocumentModel
 from src.document_authoring.template_activation import (
     TemplateActivationPolicy,
     decide_template_activation,
@@ -249,6 +255,8 @@ class DocumentGenerationService:
         self.docx_renderer = docx_renderer or DocxRenderer()
         self.rules = DeterministicRuleExecutor()
         self.validator = DocumentValidator()
+        self.document_aggregator = DocumentAggregator()
+        self.render_binding_resolver = RenderBindingResolver()
         self.worker = worker or DocumentGenerationWorker()
         self.harness_runtime = InternalDocumentHarnessRuntime(self.store, self.validator)
         self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider()
@@ -266,6 +274,55 @@ class DocumentGenerationService:
             task_store=self.task_service.store,
             revision_store=ArtifactRevisionStore(self.store.db_path),
             source_snapshot_resolver=self.resolve_source_snapshot,
+        )
+
+    def build_document_model(
+        self,
+        plan: Any,
+        accepted_drafts: Mapping[str, DocumentUnitDraft] | Sequence[DocumentUnitDraft],
+        reviews: Mapping[str, Any] | None = None,
+    ) -> DocumentModel:
+        """Aggregate accepted plan outputs before any format-specific render."""
+
+        return self.document_aggregator.aggregate(plan, accepted_drafts, reviews)
+
+    def build_plan_fill_plan(
+        self,
+        template: TemplateVersion,
+        plan: Any,
+        document_model: DocumentModel,
+        *,
+        bindings: Sequence[TemplateUnitBinding] | Mapping[str, TemplateUnitBinding] | None = None,
+    ):
+        """Resolve server-owned bindings and adapt a model for the legacy renderer."""
+
+        registered = list(bindings) if bindings is not None else list(
+            self.store.list_unit_bindings(
+                template.template_schema_id, template.template_schema_version,
+            )
+        )
+        contract = getattr(plan, "layout_contract", None)
+        if contract is None and isinstance(plan, Mapping):
+            contract = plan.get("layout_contract")
+        if contract is None:
+            raise ValueError("plan-backed document model requires a template layout contract")
+        regions: Sequence[Any] = []
+        if template.format == "docx":
+            regions = list(self.store.list_docx_regions(
+                template.template_schema_id, template.template_schema_version,
+            ))
+        else:
+            regions = list(self.store.list_workbook_regions(
+                template.template_schema_id, template.template_schema_version,
+            ))
+        self.render_binding_resolver.resolve(
+            contract, document_model, registered, regions=regions,
+        )
+        return LegacyFillPlanAdapter.to_fill_plan(
+            document_model,
+            template_version_id=template.template_version_id,
+            output_format=template.format,
+            bindings=registered,
         )
 
     @staticmethod
