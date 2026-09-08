@@ -171,6 +171,15 @@ class DocumentFieldSchema(BaseModel):
     # headers.  Present only for table-shaped fields so writers receive the
     # exact column contract without scalar flattening.
     table_columns: dict[str, str] | None = None
+    # Table identity/order is server-owned metadata.  Empty defaults preserve
+    # schemas written before typed table rows existed; such legacy rows are
+    # readable but are never assigned a guessed identity at render time.
+    table_row_scope: str | None = None
+    table_row_identity_fields: list[str] = Field(default_factory=list)
+    table_row_key_schema: dict[str, Any] = Field(default_factory=dict)
+    table_row_keys: list[str] = Field(default_factory=list)
+    table_row_order: Literal["declared", "stable_key", "input"] = "declared"
+    table_duplicate_policy: Literal["reject", "allow"] = "reject"
 
 
 class ReviewItemSchema(BaseModel):
@@ -912,8 +921,14 @@ class DraftAssertion(BaseModel):
 class TypedTableRow(BaseModel):
     """One table record and the exact evidence supporting its cells."""
 
+    # ``row_key`` intentionally defaults to empty for old serialized drafts.
+    # A plan-backed/table-contract validation pass requires a non-empty key;
+    # the compatibility default makes old payloads readable without inventing
+    # identity from display text.
+    row_key: str = ""
     cells: dict[str, str]
     evidence_ids: list[str] = Field(default_factory=list)
+    cell_evidence_ids: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class TypedFieldValue(BaseModel):
@@ -1020,6 +1035,75 @@ class WorkbookTableSchema(BaseModel):
     columns: list[WorkbookTableColumnSchema] = Field(default_factory=list)
     expected_value_hashes: dict[str, str] = Field(default_factory=dict)
     allow_example_region_replacement: bool = True
+    # Optional semantic row contract.  Empty values are the legacy table
+    # shape; they remain readable but cannot satisfy a closed row-key scope.
+    expected_row_keys: list[str] = Field(default_factory=list)
+    required_columns: list[str] = Field(default_factory=list)
+    row_order: Literal["declared", "stable_key", "input"] = "input"
+    duplicate_policy: Literal["reject", "allow"] = "reject"
+
+    @model_validator(mode="after")
+    def validate_table_row_contract(self) -> "WorkbookTableSchema":
+        self.expected_row_keys = _unique_nonempty_strings(
+            self.expected_row_keys, label="expected_row_keys",
+        )
+        self.required_columns = _unique_nonempty_strings(
+            self.required_columns, label="required_columns",
+        )
+        column_ids = {column.column_id for column in self.columns}
+        if len(column_ids) != len(self.columns):
+            raise ValueError("workbook table columns must be unique")
+        unknown_required = set(self.required_columns) - column_ids
+        if unknown_required:
+            raise ValueError(
+                "workbook table required columns are not mapped: "
+                f"{sorted(unknown_required)}"
+            )
+        return self
+
+    @property
+    def row_keys(self) -> list[str]:
+        """Compatibility spelling for the declared expected row-key order."""
+
+        return list(self.expected_row_keys)
+
+
+def _unique_nonempty_strings(values: list[str], *, label: str) -> list[str]:
+    normalized = [str(value).strip() for value in values]
+    if any(not value for value in normalized):
+        raise ValueError(f"{label} entries must be non-empty")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{label} entries must be unique")
+    return normalized
+
+
+class WorkbookTableRowFill(BaseModel):
+    """Typed semantic table row passed to the workbook renderer.
+
+    ``WorkbookTableFill`` still accepts the historical ``dict[column, value]``
+    representation.  New plan-backed writes use this model so row identity
+    and per-cell evidence survive the render-binding boundary.
+    """
+
+    row_key: str = ""
+    cells: dict[str, str] = Field(default_factory=dict)
+    evidence_ids: list[str] = Field(default_factory=list)
+    cell_evidence_ids: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_row(self) -> "WorkbookTableRowFill":
+        self.row_key = self.row_key.strip()
+        self.evidence_ids = _unique_nonempty_strings(self.evidence_ids, label="evidence_ids")
+        normalized: dict[str, list[str]] = {}
+        for column, evidence_ids in self.cell_evidence_ids.items():
+            column_id = str(column).strip()
+            if not column_id:
+                raise ValueError("cell evidence column ids must be non-empty")
+            normalized[column_id] = _unique_nonempty_strings(
+                evidence_ids, label=f"cell_evidence_ids[{column_id}]",
+            )
+        self.cell_evidence_ids = normalized
+        return self
 
 
 class WorkbookTableFill(BaseModel):
@@ -1027,7 +1111,9 @@ class WorkbookTableFill(BaseModel):
 
     table_region_id: str
     semantic_unit_id: str
-    rows: list[dict[str, str]] = Field(default_factory=list)
+    # The union is deliberately additive: old serialized plans contain plain
+    # column/value dictionaries, while new plans carry typed row metadata.
+    rows: list[WorkbookTableRowFill | dict[str, str]] = Field(default_factory=list)
 
 
 WorkbookFillPlan.model_rebuild()

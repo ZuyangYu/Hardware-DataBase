@@ -23,6 +23,7 @@ from src.document_authoring.models import (
     TemplateSecurityReport,
     WorkbookFillPlan,
     WorkbookRegionSchema,
+    WorkbookTableRowFill,
     WorkbookTableSchema,
     content_hash,
 )
@@ -116,7 +117,7 @@ class XlsmRenderer:
         if len({schema.table_region_id for schema in schemas}) != len(schemas):
             raise ValueError("duplicate workbook table region ids are not allowed")
         table_schema_by_id = {schema.table_region_id: schema for schema in schemas}
-        table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]]]] = []
+        table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]], list[str]]] = []
         seen_table_ids: set[str] = set()
         table_locators: set[tuple[str, str]] = set()
         table_values: list[str] = []
@@ -141,16 +142,32 @@ class XlsmRenderer:
             if len(column_ids) != len(schema.columns):
                 raise ValueError(f"duplicate workbook table columns: {schema.table_region_id}")
             normalized_rows: list[dict[str, str]] = []
+            row_keys: list[str] = []
+            typed_row_count = 0
+            legacy_row_count = 0
             for row in table_fill.rows:
-                if not isinstance(row, dict):
+                if isinstance(row, WorkbookTableRowFill):
+                    typed_row_count += 1
+                    row_key = row.row_key.strip()
+                    values = dict(row.cells)
+                elif isinstance(row, dict):
+                    legacy_row_count += 1
+                    row_key = ""
+                    values = row
+                else:
                     raise ValueError("workbook table rows must be objects")
-                unknown_columns = set(row) - column_ids
+                unknown_columns = set(values) - column_ids
                 if unknown_columns:
                     raise ValueError(
                         f"table row contains unknown columns: {sorted(unknown_columns)}"
                     )
+                missing_columns = set(schema.required_columns) - set(values)
+                if missing_columns:
+                    raise ValueError(
+                        f"table row is missing required columns: {sorted(missing_columns)}"
+                    )
                 normalized = {
-                    column.column_id: str(row.get(column.column_id, ""))
+                    column.column_id: str(values.get(column.column_id, ""))
                     for column in schema.columns
                 }
                 if policy.reject_formula_like_text and any(
@@ -162,6 +179,35 @@ class XlsmRenderer:
                     )
                 table_values.extend(normalized.values())
                 normalized_rows.append(normalized)
+                row_keys.append(row_key)
+            if typed_row_count and legacy_row_count:
+                raise ValueError("workbook table rows may not mix typed and legacy row payloads")
+            if schema.expected_row_keys:
+                if any(not row_key for row_key in row_keys):
+                    raise ValueError(
+                        f"table rows require non-empty row keys: {schema.table_region_id}"
+                    )
+                expected = list(schema.expected_row_keys)
+                if set(row_keys) != set(expected):
+                    missing = [key for key in expected if key not in set(row_keys)]
+                    unexpected = [key for key in row_keys if key not in set(expected)]
+                    raise ValueError(
+                        f"table row keys do not match expected scope: "
+                        f"missing={missing}, unexpected={unexpected}"
+                    )
+                if schema.duplicate_policy == "reject" and len(row_keys) != len(set(row_keys)):
+                    raise ValueError("duplicate workbook table row keys are not allowed")
+                if schema.row_order == "declared" and row_keys != expected:
+                    raise ValueError("workbook table rows are not in declared row-key order")
+            elif schema.row_order == "stable_key":
+                if any(not row_key for row_key in row_keys):
+                    raise ValueError("stable workbook table ordering requires row keys")
+                if schema.duplicate_policy == "reject" and len(row_keys) != len(set(row_keys)):
+                    raise ValueError("duplicate workbook table row keys are not allowed")
+                if row_keys != sorted(row_keys):
+                    raise ValueError("workbook table rows are not in stable row-key order")
+            elif schema.duplicate_policy == "reject" and any(row_keys) and len(row_keys) != len(set(row_keys)):
+                raise ValueError("duplicate workbook table row keys are not allowed")
             if schema.first_data_row < 1 or schema.last_template_row < schema.first_data_row:
                 raise ValueError(f"invalid workbook table row bounds: {schema.table_region_id}")
             for column in schema.columns:
@@ -181,7 +227,7 @@ class XlsmRenderer:
                         raise ValueError(f"duplicate workbook fill target: {locator[0]}!{locator[1]}")
                     table_locators.add(locator)
             seen_table_ids.add(table_fill.table_region_id)
-            table_fills.append((schema, normalized_rows))
+            table_fills.append((schema, normalized_rows, row_keys))
 
         long_value_counts: dict[str, int] = {}
         for _region, value, _semantic_unit_id in fills:
@@ -196,9 +242,9 @@ class XlsmRenderer:
         sheet_fills: dict[str, list[tuple[WorkbookRegionSchema, str]]] = {}
         for region, value, _semantic_unit_id in fills:
             sheet_fills.setdefault(region.sheet_name, []).append((region, value))
-        sheet_table_fills: dict[str, list[tuple[WorkbookTableSchema, list[dict[str, str]]]]] = {}
-        for schema, rows in table_fills:
-            sheet_table_fills.setdefault(schema.sheet_name, []).append((schema, rows))
+        sheet_table_fills: dict[str, list[tuple[WorkbookTableSchema, list[dict[str, str]], list[str]]]] = {}
+        for schema, rows, row_keys in table_fills:
+            sheet_table_fills.setdefault(schema.sheet_name, []).append((schema, rows, row_keys))
 
         source = io.BytesIO(template_content)
         output = io.BytesIO()
@@ -253,7 +299,7 @@ class XlsmRenderer:
                     "semantic_unit_id": semantic_unit_id,
                     "region_id": region.region_id,
                 })
-            for schema, rows in table_fills:
+            for schema, rows, row_keys in table_fills:
                 worksheet = src.read(worksheet_map[schema.sheet_name])
                 end_row = max(
                     schema.last_template_row,
@@ -290,6 +336,8 @@ class XlsmRenderer:
                             "baseline_empty": baseline_value is None,
                             "semantic_unit_id": schema.semantic_unit_id,
                             "region_id": schema.table_region_id,
+                            "row_key": row_keys[row_number - schema.first_data_row]
+                            if row_number - schema.first_data_row < len(row_keys) else "",
                         })
             replacements: dict[str, bytes] = {}
             for sheet_name, fill_values in sheet_fills.items():
@@ -462,7 +510,7 @@ class XlsmRenderer:
     @staticmethod
     def _patch_tables(
         source: bytes,
-        table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]]]],
+        table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]], list[str]]],
     ) -> bytes:
         """Patch discovered table rows without changing other OOXML parts."""
         XlsmRenderer._register_source_namespaces(source)
@@ -475,7 +523,7 @@ class XlsmRenderer:
             for row in sheet_data.findall("x:row", NS)
             if row.attrib.get("r", "").isdigit()
         }
-        for schema, values in table_fills:
+        for schema, values, _row_keys in table_fills:
             end_row = max(schema.last_template_row, schema.first_data_row + len(values) - 1)
             style_row = rows.get(schema.style_source_row)
             for row_number in range(schema.first_data_row, end_row + 1):

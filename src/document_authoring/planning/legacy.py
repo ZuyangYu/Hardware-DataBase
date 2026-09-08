@@ -86,6 +86,13 @@ def legacy_brief_to_output_spec(
             row_scope=str(scope.get("row_scope") or "unresolved"),
             required_columns=columns,
             row_keys=_string_list(requested_rows),
+            row_identity_fields=_string_list(scope.get("row_identity_fields")),
+            row_key_schema=(
+                dict(scope.get("row_key_schema"))
+                if isinstance(scope.get("row_key_schema"), Mapping) else {}
+            ),
+            row_order=str(scope.get("row_order") or "declared"),
+            duplicate_policy=str(scope.get("duplicate_policy") or "reject"),
         ))
     source_policy = normalized_brief.source_policy if isinstance(normalized_brief.source_policy, Mapping) else {}
     source_scope = SourceScopeSpec(

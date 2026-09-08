@@ -182,12 +182,50 @@ class TableRequirement(PlanningModel):
         default_factory=list,
         max_length=100_000,
     )
+    # The planning boundary owns row identity and ordering.  These fields are
+    # additive so legacy briefs with only ``row_scope``/columns remain
+    # readable; a closed row scope is enforced later by the typed validator.
+    row_identity_fields: list[NonEmptyId] = Field(default_factory=list, max_length=32)
+    row_key_schema: dict[str, Any] = Field(default_factory=dict)
+    row_order: Literal["declared", "stable_key", "input"] = "declared"
+    duplicate_policy: Literal["reject", "allow"] = "reject"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_contract_names(cls, value):
+        if not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+        # A few callers describe the same immutable contract using the more
+        # verbose names.  Normalize them before ``extra=forbid`` validation so
+        # persisted plan payloads have one canonical representation.
+        aliases = {
+            "expected_row_keys": "row_keys",
+            "ordering": "row_order",
+            "row_identity": "row_identity_fields",
+            "row_key_derivation": "row_key_schema",
+        }
+        for alias, canonical in aliases.items():
+            if alias in data and canonical not in data:
+                data[canonical] = data[alias]
+            data.pop(alias, None)
+        return data
 
     @model_validator(mode="after")
     def validate_table_contract(self) -> "TableRequirement":
         self.required_columns = _unique_strings(self.required_columns, label="required_columns")
         self.row_keys = _unique_strings(self.row_keys, label="row_keys")
+        self.row_identity_fields = _unique_strings(
+            self.row_identity_fields, label="row_identity_fields",
+        )
+        _reject_forbidden_mappings(self.row_key_schema, path="row_key_schema")
         return self
+
+    @property
+    def expected_row_keys(self) -> list[str]:
+        """Compatibility spelling used by runtime table contracts."""
+
+        return list(self.row_keys)
 
 
 class SourceScopeSpec(PlanningModel):
@@ -313,16 +351,28 @@ class CoverageRequirement(PlanningModel):
     required: bool = True
     row_keys: list[NonEmptyId] = Field(default_factory=list, max_length=100_000)
     required_columns: list[NonEmptyId] = Field(default_factory=list, max_length=128)
+    row_identity_fields: list[NonEmptyId] = Field(default_factory=list, max_length=32)
+    row_key_schema: dict[str, Any] = Field(default_factory=dict)
+    row_order: Literal["declared", "stable_key", "input"] = "declared"
+    duplicate_policy: Literal["reject", "allow"] = "reject"
     min_evidence_items: int = Field(default=0, ge=0, le=100)
 
     @model_validator(mode="after")
     def validate_coverage_shape(self) -> "CoverageRequirement":
         self.row_keys = _unique_strings(self.row_keys, label="row_keys")
         self.required_columns = _unique_strings(self.required_columns, label="required_columns")
+        self.row_identity_fields = _unique_strings(
+            self.row_identity_fields, label="row_identity_fields",
+        )
+        _reject_forbidden_mappings(self.row_key_schema, path="row_key_schema")
         if self.kind == "table" and self.required and not self.required_columns:
             raise ValueError("required table coverage needs required_columns")
-        if self.kind != "table" and (self.row_keys or self.required_columns):
-            raise ValueError("row_keys and required_columns are only valid for table coverage")
+        if self.kind != "table" and (
+            self.row_keys or self.required_columns or self.row_identity_fields or self.row_key_schema
+        ):
+            raise ValueError(
+                "table row contract fields are only valid for table coverage"
+            )
         return self
 
 

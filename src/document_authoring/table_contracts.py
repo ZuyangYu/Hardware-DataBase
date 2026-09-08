@@ -43,5 +43,6 @@ def table_schema_from_targets(analysis, suggestion):
         header_row=rows[0] - 1, first_data_row=rows[0], last_template_row=rows[-1],
         style_source_row=rows[0], max_output_rows=len(rows), columns=table_columns,
         expected_value_hashes={unit.locator["cell"]: unit.value_hash or workbook_value_hash(unit.value_preview) for unit in targets},
+        required_columns=[column.column_id for column in table_columns],
         allow_example_region_replacement=True,
     )

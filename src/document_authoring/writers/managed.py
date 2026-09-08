@@ -30,6 +30,7 @@ from src.document_authoring.models import (
     DraftAssertion,
     ManagedDraftPayload,
     TypedFieldValue,
+    TypedTableRow,
 )
 from src.document_authoring.pin_function_inference import (
     infer_pin_function_from_net,
@@ -116,6 +117,8 @@ def _extract_typed_value(
 ) -> TypedFieldValue | None:
     """Extract only explicit assignments; arbitrary evidence prose is not a value."""
     value_kind = request.field_value_type.strip().casefold()
+    if value_kind in {"table", "repeating_table"} or request.table_mode == "typed_rows":
+        return _extract_typed_table(request)
     if value_kind in {"text", "string", "scalar", "number", "integer", "float", "date"}:
         kind = "scalar"
     elif value_kind in {"enum", "enumeration", "list", "set"}:
@@ -151,6 +154,93 @@ def _extract_typed_value(
         normalized_values=normalized_values,
         display_value=display_value,
         evidence_ids=evidence_ids,
+    )
+
+
+def _extract_typed_table(request: WriterRequest) -> TypedFieldValue | None:
+    """Copy only server-shaped row metadata into a typed table value.
+
+    The deterministic writer deliberately does not derive identity from a
+    display sentence.  Retrieval adapters may expose a bounded ``row_key``
+    and ``cells`` mapping in evidence metadata; absent that structure the
+    table remains unfilled and the normal validator reports a missing typed
+    table rather than guessing.
+    """
+
+    candidates: list[TypedTableRow] = []
+    for evidence in request.evidence:
+        evidence_id = str(evidence.get("id") or "").strip()
+        metadata = evidence.get("metadata") or {}
+        row_values: list[dict[str, Any]] = []
+        if isinstance(metadata, dict):
+            table_rows = metadata.get("table_rows")
+            if isinstance(table_rows, list):
+                row_values.extend(item for item in table_rows if isinstance(item, dict))
+            elif isinstance(metadata.get("table_row"), dict):
+                row_values.append(metadata["table_row"])
+            elif metadata.get("row_key") is not None and isinstance(metadata.get("cells"), dict):
+                row_values.append(metadata)
+        if evidence.get("row_key") is not None and isinstance(evidence.get("cells"), dict):
+            row_values.append(evidence)
+        for value in row_values:
+            row_key = str(value.get("row_key") or "").strip()
+            cells = value.get("cells")
+            if not row_key or not isinstance(cells, dict) or not evidence_id:
+                # Empty identity is not safe to render.  It is left out so a
+                # later validation result can classify the incomplete table.
+                continue
+            normalized_cells = {
+                str(column): str(cell_value).strip()
+                for column, cell_value in cells.items()
+            }
+            cell_ids = value.get("cell_evidence_ids")
+            if not isinstance(cell_ids, dict):
+                cell_ids = {
+                    column: [evidence_id]
+                    for column in normalized_cells
+                }
+            else:
+                cell_ids = {
+                    str(column): [str(item) for item in ids]
+                    if isinstance(ids, (list, tuple, set)) else [str(ids)]
+                    for column, ids in cell_ids.items()
+                }
+            candidates.append(TypedTableRow(
+                row_key=row_key,
+                cells=normalized_cells,
+                evidence_ids=[evidence_id],
+                cell_evidence_ids=cell_ids,
+            ))
+    if not candidates:
+        return None
+
+    by_key: dict[str, TypedTableRow] = {}
+    for row in candidates:
+        if row.row_key in by_key:
+            # Keep the first occurrence deterministic; the validator will
+            # still reject duplicate identity when the contract requires it.
+            continue
+        by_key[row.row_key] = row
+    if request.expected_row_keys:
+        ordered = [by_key[key] for key in request.expected_row_keys if key in by_key]
+        ordered.extend(
+            row for key, row in by_key.items() if key not in set(request.expected_row_keys)
+        )
+    elif request.row_order == "stable_key":
+        ordered = [by_key[key] for key in sorted(by_key)]
+    else:
+        ordered = list(by_key.values())
+    evidence_ids = _unique_values([
+        evidence_id
+        for row in ordered
+        for evidence_id in row.evidence_ids
+    ])
+    return TypedFieldValue(
+        kind="table",
+        normalized_values=[row.row_key for row in ordered],
+        display_value=f"{len(ordered)} rows",
+        evidence_ids=evidence_ids,
+        rows=ordered,
     )
 
 
@@ -438,6 +528,10 @@ class LLMManagedWriter:
             validated,
             evidence,
             expected_value_type=request.field_value_type,
+            expected_row_keys=request.expected_row_keys,
+            required_columns=request.expected_columns,
+            row_order=request.row_order,
+            duplicate_policy=request.duplicate_policy,
         )
         if validated.validation_status != "supported":
             raise ValueError(
@@ -666,6 +760,12 @@ Rules:
 - `typed_value.evidence_ids` must exist in the request evidence and directly
   support its normalized values. Do not create `typed_value` from an entire
   evidence paragraph or from low-confidence/reused evidence.
+- When `table_mode` is `typed_rows`, `typed_value.kind` MUST be `table` and
+  every row MUST contain a non-empty server-owned `row_key`, a `cells` object
+  using only the expected columns, and `cell_evidence_ids` for its cell
+  evidence. Return typed rows, never a scalar, comma-separated list, or
+  display string in place of a table. Do not derive a row key from display
+  text and do not choose workbook sheets, cells, or ranges.
 - Each `assertions[].text` must reuse concrete wording from the cited
   evidence (a subphrase or key noun/number from the evidence content).
 - Do NOT invent facts, tools, locations, sources, or file content.
@@ -685,6 +785,14 @@ def _build_user_prompt(request: WriterRequest, last_error: str | None) -> str:
         "Example structure (copy the shape, fill with real content):",
         example,
     ]
+    if request.table_mode == "typed_rows":
+        parts[4:4] = [
+            "TABLE OUTPUT REQUIREMENT: return typed rows with row_key, cells, "
+            "and cell_evidence_ids; never as a scalar or prose list.",
+            "Every row key must come from the server-owned row contract. "
+            "The writer must not choose workbook coordinates.",
+            "",
+        ]
     if last_error:
         parts.extend([
             "",
@@ -706,6 +814,43 @@ def _example_from_request(request: WriterRequest) -> str:
         if content:
             # Take a short snippet the LLM can lexically anchor on
             ev_snippet = content[:80]
+    if request.table_mode == "typed_rows":
+        row_key = request.expected_row_keys[0] if request.expected_row_keys else "<server-row-key>"
+        columns = request.expected_columns or list(request.table_columns or {})
+        row_cells = {column: f"<{column}-value>" for column in columns}
+        row_evidence = [ev_id] if ev_id else []
+        return json.dumps({
+            "unit_id": request.unit_id,
+            "run_id": request.run_id,
+            "generated_by": "managed_writer",
+            "content": ev_snippet,
+            "proposed_value": ev_snippet,
+            "typed_value": {
+                "kind": "table",
+                "normalized_values": [row_key],
+                "display_value": "1 row",
+                "evidence_ids": row_evidence,
+                "rows": [{
+                    "row_key": row_key,
+                    "cells": row_cells,
+                    "evidence_ids": row_evidence,
+                    "cell_evidence_ids": {
+                        column: row_evidence for column in columns
+                    },
+                }],
+            },
+            "assertions": [{
+                "assertion_id": f"assertion-{request.unit_id}-1",
+                "text": ev_snippet,
+                "claim_id": f"claim-{request.unit_id}",
+                "evidence_ids": row_evidence,
+                "value": row_key,
+                "consistency_key": request.unit_id,
+                "assertion_kind": "document_statement",
+            }],
+            "evidence_ids": row_evidence,
+        }, ensure_ascii=False, indent=2)
+
     example = {
         "unit_id": request.unit_id,
         "run_id": request.run_id,

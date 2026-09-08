@@ -1648,6 +1648,7 @@ def build_writer_request(
     requirement: InformationRequirement,
     evidence: list[dict[str, Any]],
     prompt_version: str,
+    table_requirement: Any | None = None,
 ) -> WriterRequest:
     """Assemble the WriterRequest, translating the confirmed brief into
     canonical writer constraints. Work orders without a brief keep the legacy
@@ -1663,6 +1664,67 @@ def build_writer_request(
     missing_or_conflicts: list[dict[str, Any]] = []
     allowed_derivations: list[dict[str, Any]] = []
     field = _field_for_unit(unit_id, schema)
+    table_columns = (
+        dict(field.table_columns)
+        if field is not None and getattr(field, "table_columns", None)
+        else None
+    )
+    is_table = _unit_value_type(unit_id, schema).strip().casefold() in {"table", "repeating_table"}
+    expected_row_keys: list[str] = []
+    expected_columns: list[str] = []
+    row_key_schema: dict[str, Any] = {}
+    row_order = "input"
+    duplicate_policy = "reject"
+    if is_table:
+        if table_requirement is not None:
+            expected_row_keys = list(
+                getattr(table_requirement, "row_keys", None)
+                if not isinstance(table_requirement, dict)
+                else table_requirement.get("row_keys", [])
+                or []
+            )
+            required_columns = list(
+                getattr(table_requirement, "required_columns", None)
+                if not isinstance(table_requirement, dict)
+                else table_requirement.get("required_columns", [])
+                or []
+            )
+            row_key_schema = dict(
+                getattr(table_requirement, "row_key_schema", None)
+                if not isinstance(table_requirement, dict)
+                else table_requirement.get("row_key_schema", {})
+                or {}
+            )
+            row_order = str(
+                getattr(table_requirement, "row_order", None)
+                if not isinstance(table_requirement, dict)
+                else table_requirement.get("row_order", "input")
+                or "input"
+            )
+            duplicate_policy = str(
+                getattr(table_requirement, "duplicate_policy", None)
+                if not isinstance(table_requirement, dict)
+                else table_requirement.get("duplicate_policy", "reject")
+                or "reject"
+            )
+            column_ids = set(table_columns or {})
+            labels_to_ids = {
+                label.strip(): column_id
+                for column_id, label in (table_columns or {}).items()
+            }
+            expected_columns = [
+                column if column in column_ids else labels_to_ids.get(str(column).strip(), str(column).strip())
+                for column in required_columns
+                if str(column).strip()
+            ]
+        else:
+            expected_row_keys = list(getattr(field, "table_row_keys", []) or []) if field is not None else []
+            expected_columns = list(table_columns or {})
+            row_key_schema = dict(getattr(field, "table_row_key_schema", {}) or {}) if field is not None else {}
+            row_order = str(getattr(field, "table_row_order", "input") or "input") if field is not None else "input"
+            duplicate_policy = str(getattr(field, "table_duplicate_policy", "reject") or "reject") if field is not None else "reject"
+        if not expected_columns:
+            expected_columns = list(table_columns or {})
     if confirmed:
         brief_missing = normalize_clarification_policy(
             "missing_data_policy", brief.get("missing_data_policy")
@@ -1696,7 +1758,14 @@ def build_writer_request(
         unit_label=_unit_label(unit_id, schema),
         unit_description=_unit_description(unit_id, schema),
         field_value_type=_unit_value_type(unit_id, schema),
-        table_columns=dict(field.table_columns) if field is not None and getattr(field, "table_columns", None) else None,
+        table_columns=table_columns,
+        table_mode="typed_rows" if is_table else "scalar",
+        expected_row_keys=expected_row_keys,
+        expected_columns=expected_columns,
+        row_key_schema=row_key_schema,
+        row_order=row_order,
+        duplicate_policy=duplicate_policy,
+        table_output_requirement="typed_rows" if is_table else "scalar",
         retrieval_query_terms=list(requirement.retrieval_query_terms),
         evidence=evidence,
         allowed_derivations=allowed_derivations,

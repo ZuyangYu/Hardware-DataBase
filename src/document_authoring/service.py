@@ -59,6 +59,7 @@ from src.document_authoring.models import (
     WorkbookFill,
     WorkbookFillPlan,
     WorkbookTableFill,
+    WorkbookTableRowFill,
     WorkbookRegionSchema,
     content_hash,
 )
@@ -3171,10 +3172,43 @@ class DocumentGenerationService:
                 columns = {col.column_id for col in binding.table_schema.columns}
                 if not draft.typed_value.rows or any(set(row.cells) != columns for row in draft.typed_value.rows):
                     raise ValueError("table rows must match all mapped columns exactly")
+                rows = list(draft.typed_value.rows)
+                expected_row_keys = list(binding.table_schema.expected_row_keys)
+                row_keys = [row.row_key.strip() for row in rows]
+                if expected_row_keys:
+                    if any(not row_key for row_key in row_keys):
+                        raise ValueError("table rows require server-owned row keys")
+                    if set(row_keys) != set(expected_row_keys):
+                        missing = [key for key in expected_row_keys if key not in set(row_keys)]
+                        unexpected = [key for key in row_keys if key not in set(expected_row_keys)]
+                        raise ValueError(
+                            "table row keys do not match expected scope: "
+                            f"missing={missing}, unexpected={unexpected}"
+                        )
+                    if len(row_keys) != len(set(row_keys)) and binding.table_schema.duplicate_policy == "reject":
+                        raise ValueError("duplicate table row keys are not allowed")
+                    order = {key: index for index, key in enumerate(expected_row_keys)}
+                    rows.sort(key=lambda row: order[row.row_key])
+                elif binding.table_schema.row_order == "stable_key":
+                    if any(not row_key for row_key in row_keys):
+                        raise ValueError("stable table row ordering requires row keys")
+                    rows.sort(key=lambda row: row.row_key)
+                    if len(row_keys) != len(set(row_keys)) and binding.table_schema.duplicate_policy == "reject":
+                        raise ValueError("duplicate table row keys are not allowed")
+                elif len(row_keys) != len(set(row_keys)) and any(row_keys) and binding.table_schema.duplicate_policy == "reject":
+                    raise ValueError("duplicate table row keys are not allowed")
                 table_fills.append(WorkbookTableFill(
                     table_region_id=binding.table_schema.table_region_id,
                     semantic_unit_id=semantic_unit_id,
-                    rows=[row.cells for row in draft.typed_value.rows],
+                    rows=[WorkbookTableRowFill(
+                        row_key=row.row_key,
+                        cells=dict(row.cells),
+                        evidence_ids=list(row.evidence_ids),
+                        cell_evidence_ids={
+                            column: list(evidence_ids)
+                            for column, evidence_ids in row.cell_evidence_ids.items()
+                        },
+                    ) for row in rows],
                 ))
                 continue
             if draft.typed_value.kind == "table":

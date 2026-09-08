@@ -92,6 +92,10 @@ class LegacyTemplatePlanningAdapter:
                 else:
                     required_coverage = field.required
                 row_keys = table_requirement.row_keys if table_requirement else []
+                row_identity_fields = table_requirement.row_identity_fields if table_requirement else []
+                row_key_schema = table_requirement.row_key_schema if table_requirement else {}
+                row_order = table_requirement.row_order if table_requirement else "declared"
+                duplicate_policy = table_requirement.duplicate_policy if table_requirement else "reject"
                 if field.required and not row_keys:
                     issues.append(PlanIssue(
                         code="row_scope_unresolved",
@@ -106,6 +110,10 @@ class LegacyTemplatePlanningAdapter:
                     required=required_coverage,
                     row_keys=row_keys,
                     required_columns=columns,
+                    row_identity_fields=row_identity_fields,
+                    row_key_schema=row_key_schema,
+                    row_order=row_order,
+                    duplicate_policy=duplicate_policy,
                 ))
             else:
                 coverage_requirements.append(CoverageRequirement(
