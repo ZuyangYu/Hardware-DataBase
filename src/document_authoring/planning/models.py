@@ -276,12 +276,14 @@ class TemplateContract(PlanningModel):
     template_schema_id: NonEmptyId
     template_schema_version: NonEmptyId
     bindings: dict[NonEmptyId, list[NonEmptyId]] = Field(default_factory=dict, max_length=10_000)
+    table_schemas: dict[NonEmptyId, dict[str, Any]] = Field(default_factory=dict, max_length=10_000)
 
     @model_validator(mode="after")
     def validate_bindings(self) -> "TemplateContract":
         for unit_id, regions in self.bindings.items():
             self.bindings[unit_id] = _unique_strings(regions, label=f"bindings[{unit_id}]")
         _reject_forbidden_mappings(self.bindings, path="bindings")
+        _reject_forbidden_mappings(self.table_schemas, path="table_schemas")
         return self
 
 
@@ -405,6 +407,7 @@ class DocumentPlan(PlanningModel):
     output_spec_id: NonEmptyId
     output_spec_version: int = Field(ge=1)
     output_spec_hash: NonEmptyId
+    output_spec_summary: dict[str, Any] = Field(default_factory=dict, max_length=256)
     source_snapshot_id: NonEmptyId
     source_snapshot_hash: NonEmptyId
     domain_strategy_id: NonEmptyId
@@ -480,6 +483,7 @@ class DocumentPlan(PlanningModel):
         self.required_capabilities = _unique_strings(self.required_capabilities, label="required_capabilities")
         self.resolved_capabilities = _unique_strings(self.resolved_capabilities, label="resolved_capabilities")
         for field_name in (
+            "output_spec_summary",
             "retrieval_specs",
             "unit_review_policy",
             "document_review_policy",

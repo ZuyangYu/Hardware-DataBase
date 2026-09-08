@@ -43,6 +43,9 @@ from .registry import (
     build_builtin_registries,
 )
 from .sources import FrozenSourceRef, FrozenSourceScope, SourceType
+from .diff import diff_document_plans
+from .legacy import legacy_brief_to_output_spec
+from .service import DocumentPlanningService, LegacyTemplatePlanningAdapter
 
 __all__ = [
     "ArtifactSpec",
@@ -81,4 +84,8 @@ __all__ = [
     "RendererCapabilityRegistry",
     "SourceType",
     "build_builtin_registries",
+    "diff_document_plans",
+    "DocumentPlanningService",
+    "LegacyTemplatePlanningAdapter",
+    "legacy_brief_to_output_spec",
 ]
