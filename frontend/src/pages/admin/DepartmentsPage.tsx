@@ -95,6 +95,7 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
         title: '操作',
         width: 120,
         align: 'right',
+        className: 'whitespace-nowrap',
         render: (d) => {
           const protectedDept = PROTECTED_DEPARTMENT_NAMES.has(d.name);
           return (
@@ -102,7 +103,7 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
               type="button"
               disabled={protectedDept}
               onClick={() => setDeleteTarget(d)}
-              className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7] disabled:cursor-not-allowed disabled:text-[#b3b8c4] disabled:hover:border-[#e3e7f1] disabled:hover:bg-white"
+              className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7] disabled:cursor-not-allowed disabled:text-[#b3b8c4] disabled:hover:border-[#e3e7f1] disabled:hover:bg-white"
               title={protectedDept ? '系统部门不可删除' : '删除部门'}
             >
               <AppIcon name="trash" size={13} />

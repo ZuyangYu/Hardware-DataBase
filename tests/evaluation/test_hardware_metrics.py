@@ -36,45 +36,40 @@ def _by_name(results, name):
 
 
 class HardwareMetricTests(unittest.TestCase):
-    def test_completeness_lists_missing_facts(self):
-        sample = _sample(required_facts=["U1700", "LP87702-Q1", "VCC1V1"])
+    def test_returns_only_lexical_metrics(self):
+        sample = _sample(
+            required_facts=["U1700", "LP87702-Q1", "VCC1V1"],
+            must_disclose_missing=True,
+            must_disclose_conflicts=True,
+            forbidden_claims=["TC377"],
+        )
 
-        metric = _by_name(score_hardware_rules(sample, _snapshot("U1700 是 LP87702-Q1")), "completeness")
+        names = [metric.metric_name for metric in score_hardware_rules(sample, _snapshot("answer"))]
 
-        self.assertAlmostEqual(metric.score, 2 / 3)
-        self.assertEqual(metric.details["missing_facts"], ["VCC1V1"])
+        self.assertEqual(names, ["forbidden_claims", "evidence_consistency"])
 
-    def test_completeness_normalizes_case_and_unicode_width(self):
-        sample = _sample(required_facts=["VCC1V1", "LP87702-Q1"])
+    def test_forbidden_claims_metric_flags_exact_wrong_tokens(self):
+        sample = _sample(forbidden_claims=["TC377"])
 
-        metric = _by_name(score_hardware_rules(sample, _snapshot("vcc1v1，ＬＰ８７７０２－Ｑ１")), "completeness")
+        clean = _by_name(score_hardware_rules(sample, _snapshot("U900 是 TC367")), "forbidden_claims")
+        hit = _by_name(score_hardware_rules(sample, _snapshot("U900 是 TC377")), "forbidden_claims")
 
-        self.assertEqual(metric.score, 1.0)
+        self.assertEqual(clean.score, 1.0)
+        self.assertEqual(hit.score, 0.0)
+        self.assertEqual(hit.details["forbidden_hits"], ["TC377"])
 
-    def test_missing_information_honesty_rejects_forbidden_claim(self):
-        sample = _sample(must_disclose_missing=True, forbidden_claims=["12.5元"])
+    def test_forbidden_claims_not_applicable_without_claims(self):
+        metric = _by_name(score_hardware_rules(_sample(), _snapshot("answer")), "forbidden_claims")
+        self.assertEqual(metric.status, "not_applicable")
+
+    def test_forbidden_claim_matching_normalizes_case_and_width(self):
+        sample = _sample(forbidden_claims=["TC377"])
 
         metric = _by_name(
-            score_hardware_rules(sample, _snapshot("未找到 BOM，但单价为 12.5元")),
-            "missing_information_honesty",
+            score_hardware_rules(sample, _snapshot("主控是 ｔｃ３７７ 系列")), "forbidden_claims"
         )
 
         self.assertEqual(metric.score, 0.0)
-        self.assertEqual(metric.details["forbidden_hits"], ["12.5元"])
-
-    def test_missing_information_honesty_accepts_explicit_gap(self):
-        sample = _sample(must_disclose_missing=True)
-
-        metric = _by_name(
-            score_hardware_rules(sample, _snapshot("当前知识库未找到替代料和价格证据。")),
-            "missing_information_honesty",
-        )
-
-        self.assertEqual(metric.score, 1.0)
-
-    def test_conflict_disclosure_is_not_applicable_without_requirement(self):
-        metric = _by_name(score_hardware_rules(_sample(), _snapshot("answer")), "conflict_disclosure")
-        self.assertEqual(metric.status, "not_applicable")
 
     def test_evidence_consistency_reports_missing_evidence_types(self):
         sample = EvaluationSample(

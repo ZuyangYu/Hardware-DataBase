@@ -88,7 +88,11 @@ class AnswerRunnerTests(unittest.TestCase):
 
         self.assertEqual(snapshot.status, "success")
         self.assertEqual(snapshot.response, "第一段第二段")
-        self.assertEqual(snapshot.retrieved_contexts, ["电路上下文", "文档上下文"])
+        # retrieved_contexts 不再落盘；裁判上下文从 evidence 现场派生
+        self.assertEqual(snapshot.retrieved_contexts, [])
+        self.assertEqual(
+            snapshot.contexts_for_scoring(), ["电路上下文", "文档上下文"]
+        )
         self.assertEqual(len(snapshot.evidence), 2)
 
     def test_collect_records_structured_access_check_for_normalized_denial(self):
@@ -208,7 +212,8 @@ class AnswerRunnerTests(unittest.TestCase):
         self.assertIn("api_key=[redacted]", snapshot.error_message)
         self.assertNotIn("secret-value", snapshot.error_message)
         self.assertEqual(snapshot.evidence, [{"content": "partial evidence"}])
-        self.assertEqual(snapshot.retrieved_contexts, ["partial evidence"])
+        self.assertEqual(snapshot.retrieved_contexts, [])
+        self.assertEqual(snapshot.contexts_for_scoring(), ["partial evidence"])
         self.assertEqual(snapshot.retrieval_summary["tool_diagnostics"][0]["error"], "timeout")
         self.assertEqual(snapshot.response, "")
 

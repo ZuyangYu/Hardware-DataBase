@@ -920,13 +920,20 @@ def pause_run(
 def resume_run(
     run_id: str,
     output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
+    mode: str = Query(default="continue"),
     _actor: AuthUser = Depends(require_system_admin),
 ) -> dict[str, Any]:
+    """继续已暂停的运行。
+
+    mode=continue:断点续跑,从 .checkpoint 播种已完成的评分格子(仅 paused);
+    mode=restart:忽略 checkpoint,评分从零重来( paused/cancelled 均可)。
+    """
+
     output_root = _check_output_root(output_root)
     _run_dir(output_root, run_id)
     controller = _controller(output_root)
     try:
-        state = controller.resume(run_id)
+        state = controller.resume(run_id, mode=mode)
         # Mirrors the UI: resume re-starts the worker thread.
         controller.start(run_id)
     except Exception as exc:

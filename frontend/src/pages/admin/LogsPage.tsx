@@ -261,7 +261,7 @@ function AuditPanel() {
 function AuditDetailDialog({ event, onClose }: { event: AuditEventView | null; onClose: () => void }) {
   return (
     <Dialog open={event !== null} onOpenChange={(o: boolean) => { if (!o) onClose(); }}>
-      <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[calc(100%-32px)] max-w-[840px] flex-col overflow-hidden rounded-[16px] p-0">
+      <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[min(1040px,calc(100vw-32px))] max-w-none flex-col overflow-hidden rounded-[16px] p-0 sm:max-w-none">
         <DialogHeader className="shrink-0 px-[24px] pt-[20px]">
           <DialogTitle className="text-[16px] font-semibold text-[#18181a]">审计事件详情</DialogTitle>
         </DialogHeader>
@@ -277,7 +277,7 @@ function AuditDetailDialog({ event, onClose }: { event: AuditEventView | null; o
               {event.error_message && <Field label="错误" value={event.error_message} />}
               <div className="grid min-w-0 gap-[4px]">
                 <span className="text-[11px] text-[#858b9c]">元数据</span>
-                <pre className="max-h-[380px] max-w-full overflow-auto whitespace-pre rounded-[8px] bg-[#f6f6f6] p-[10px] text-[11px] leading-[18px] text-[#464c5e]">
+                <pre className="max-h-[380px] max-w-full overflow-auto rounded-[8px] bg-[#f6f6f6] p-[10px] text-[11px] leading-[18px] text-[#464c5e] [overflow-wrap:anywhere] whitespace-pre-wrap">
                   {formatJsonText(event.metadata_json)}
                 </pre>
               </div>
@@ -486,7 +486,7 @@ function QueryDetailDialog({
 }) {
   return (
     <Dialog open={trace !== null} onOpenChange={(o: boolean) => { if (!o) onClose(); }}>
-      <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[calc(100%-32px)] max-w-[720px] flex-col overflow-hidden rounded-[16px] p-0">
+      <DialogContent className="flex max-h-[calc(100dvh-32px)] w-[min(960px,calc(100vw-32px))] max-w-none flex-col overflow-hidden rounded-[16px] p-0 sm:max-w-none">
         <DialogHeader className="shrink-0 px-[24px] pt-[20px]">
           <DialogTitle className="text-[16px] font-semibold text-[#18181a]">查询详情</DialogTitle>
         </DialogHeader>

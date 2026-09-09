@@ -38,6 +38,40 @@ class GroupedAdapter:
         ]
 
 
+class RecordingRagasAdapter(RagasAdapter):
+    def __init__(self):
+        super().__init__(_config())
+        self.batches = []
+
+    def score_batched(
+        self,
+        samples,
+        snapshots,
+        metric_names,
+        *,
+        snapshots_prepared=False,
+        on_result=None,
+        skip_cells=None,
+    ):
+        self.batches.append(
+            {
+                "samples": [sample.id for sample in samples],
+                "metrics": tuple(metric_names),
+                "skip": sorted(skip_cells or set()),
+            }
+        )
+        skipped = skip_cells or set()
+        results = []
+        for sample in samples:
+            for metric_name in metric_names:
+                if (sample.id, metric_name) in skipped:
+                    continue
+                results.append(
+                    MetricResult(sample_id=sample.id, metric_name=metric_name, score=0.9)
+                )
+        return results
+
+
 class IncrementalAdapter:
     def score(self, samples, snapshots, metric_names, *, on_result=None):
         result = MetricResult(
@@ -236,7 +270,13 @@ class EvaluationServiceTests(unittest.TestCase):
 
         self.assertEqual(summary.metric_scores["faithfulness"], 0.9)
         self.assertEqual(summary.metric_failures["answer_correctness"], 1)
-        self.assertIn("completeness", summary.metric_scores)
+        rule_names = {
+            metric.metric_name
+            for metric in results[0].metrics
+            if metric.metric_name in {"forbidden_claims", "evidence_consistency"}
+        }
+        self.assertEqual(rule_names, {"forbidden_claims", "evidence_consistency"})
+        self.assertNotIn("completeness", summary.metric_scores)
         self.assertEqual(results[0].sample_id, "q1")
         self.assertEqual(results[0].question, "Q")
         self.assertEqual(results[0].reference_answer, "A")
@@ -275,10 +315,8 @@ class EvaluationServiceTests(unittest.TestCase):
         self.assertEqual(
             {metric.metric_name for metric in results[0].metrics},
             {
-                "completeness",
+                "forbidden_claims",
                 "evidence_consistency",
-                "missing_information_honesty",
-                "conflict_disclosure",
                 "faithfulness",
                 "answer_correctness",
             },
@@ -306,7 +344,7 @@ class EvaluationServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(progress, [(1, 1, 5, 1)])
+        self.assertEqual(progress, [(1, 1, 3, 1)])
         self.assertEqual(summary.scoring_completed_items, 1)
         self.assertEqual(summary.scoring_total_items, 1)
         self.assertEqual(results[0].metrics[-1].metric_name, "faithfulness")
@@ -327,10 +365,8 @@ class EvaluationServiceTests(unittest.TestCase):
         self.assertEqual(
             [metric.metric_name for metric in results[0].metrics],
             [
-                "completeness",
+                "forbidden_claims",
                 "evidence_consistency",
-                "missing_information_honesty",
-                "conflict_disclosure",
                 "faithfulness",
             ],
         )
@@ -575,3 +611,50 @@ if __name__ == "__main__":
 
         comp = [m for m in results[0].metrics if m.metric_name == "completeness"]
         self.assertEqual(len(comp), 1)
+
+    def test_score_resume_seeds_partial_cells_and_skips_them(self):
+        adapter = RecordingRagasAdapter()
+        service = EvaluationService(ragas_adapter=adapter)
+        samples = [_sample("q1"), _sample("q2")]
+        snapshots = [
+            AnswerSnapshot(
+                sample_id="q1",
+                question="Q",
+                kb_name="ADAS",
+                response="U1700",
+                retrieved_contexts=["context"],
+            ),
+            AnswerSnapshot(
+                sample_id="q2",
+                question="Q",
+                kb_name="ADAS",
+                response="U1700",
+                retrieved_contexts=["context"],
+            ),
+        ]
+        seeded = [
+            MetricResult(sample_id="q1", metric_name="faithfulness", score=0.7),
+            MetricResult(sample_id="q1", metric_name="answer_relevancy", score=0.6),
+        ]
+
+        summary, results = service.score(
+            samples,
+            snapshots,
+            metric_names=["faithfulness", "answer_relevancy", "context_recall"],
+            seeded_metrics={"q1": seeded},
+        )
+
+        self.assertEqual(len(adapter.batches), 1)
+        self.assertEqual(
+            adapter.batches[0]["skip"],
+            [("q1", "answer_relevancy"), ("q1", "faithfulness")],
+        )
+        self.assertEqual(summary.scoring_completed_items, 6)
+        faith1 = next(
+            m for m in results[0].metrics if m.metric_name == "faithfulness"
+        )
+        self.assertEqual(faith1.score, 0.7)
+        faith2 = next(
+            m for m in results[1].metrics if m.metric_name == "faithfulness"
+        )
+        self.assertEqual(faith2.score, 0.9)

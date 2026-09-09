@@ -125,6 +125,22 @@ class AnswerSnapshot(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     access_check: dict[str, str] | None = None
 
+    def contexts_for_scoring(self) -> list[str]:
+        """裁判输入用的上下文列表。
+
+        retrieved_contexts 是 evidence.content 的纯派生数据，新快照不再
+        落盘副本；为空时从 evidence 现场提取。旧快照（字段非空）直接
+        沿用，保证历史数据兼容。
+        """
+
+        if self.retrieved_contexts:
+            return self.retrieved_contexts
+        return [
+            str(item.get("content") or "")
+            for item in self.evidence
+            if item.get("content")
+        ]
+
 
 class DocumentGenerationSnapshot(BaseModel):
     """Observed output needed to score a document-generation eval record."""

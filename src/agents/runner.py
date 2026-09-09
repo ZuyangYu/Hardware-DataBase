@@ -625,6 +625,8 @@ class MultiSourceAgentRunner:
             ctx=ctx,
             top_k=8 if query_mode == "deep" else 5,
             query_mode=query_mode,
+            question=query,
+            evidence_budget=int(getattr(settings, "AGENT_EVIDENCE_BUDGET", 30) or 30),
             should_cancel=should_cancel,
             on_event=emit_event,
         )
@@ -751,6 +753,7 @@ class MultiSourceAgentRunner:
             )
 
         record.token_usage_summary = usage
+        rt.finalize_evidence()
         answer_text = _current_run().answer
         claim_coverage = _build_claim_coverage(answer_text, rt.evidence)
         cited_ids = {c["evidence_ids"][0] for c in claim_coverage if c.get("evidence_ids")}

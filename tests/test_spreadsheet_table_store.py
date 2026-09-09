@@ -3,9 +3,16 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from src.pipelines.spreadsheet.table_store import TableIndexStore, _infer_headers, _sheet_semantic_rows
+from src.pipelines.spreadsheet.table_store import (
+    TableIndexStore,
+    _infer_headers,
+    _sheet_semantic_rows,
+    is_boilerplate_sheet,
+)
 from src.pipelines.spreadsheet.pipeline import SpreadsheetPipeline
+from src.pipelines.spreadsheet.xlsx_parser import ParsedSheet, ParsedWorkbook
 
 
 class SpreadsheetTableStoreTests(unittest.TestCase):
@@ -152,7 +159,90 @@ class _FakeSheet:
         self.name = name
         self.rows = rows
         self.row_indices = list(range(1, len(rows) + 1))
+        self.cells: list = []
         self.merged_ranges: list[str] = []
+
+
+class BoilerplateSheetTests(unittest.TestCase):
+    def test_name_patterns_and_content_signature_detect_boilerplate(self):
+        self.assertTrue(is_boilerplate_sheet("模板使用说明Template instructions", []))
+        self.assertTrue(is_boilerplate_sheet("模板变更历史Template change histor", []))
+        self.assertTrue(
+            is_boilerplate_sheet(
+                "数据表",
+                [
+                    ["序号", "变更单号", "变更原因"],
+                    ["1", "XXX-01", "首次发布"],
+                    ["2", "XXX-02", "ASPICE4.0要求"],
+                ],
+            )
+        )
+        self.assertFalse(
+            is_boilerplate_sheet(
+                "电源需求",
+                [
+                    ["需求编号", "需求描述", "试验要求"],
+                    ["HW-REQ-6", "支持极性自适应", "反接1分钟无损坏"],
+                ],
+            )
+        )
+
+    def test_index_xlsx_skips_boilerplate_sheets_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "table_indexes.db")
+            store = TableIndexStore(db_path=db_path)
+            workbook = ParsedWorkbook(
+                file_name="demo.xlsx",
+                sheets=[
+                    _FakeSheet(
+                        "模板变更历史Template change histor",
+                        [["序号", "变更单号", "变更原因"], ["1", "XXX", "首次发布"]],
+                    ),
+                    _FakeSheet(
+                        "电源需求",
+                        [["需求编号", "需求描述"], ["HW-REQ-6", "支持极性自适应"]],
+                    ),
+                ],
+            )
+            with patch(
+                "src.pipelines.spreadsheet.table_store.parse_xlsx", return_value=workbook
+            ):
+                stats = store.index_xlsx(
+                    record_id=11,
+                    kb_name="kb_hw",
+                    department_id="dept_hw",
+                    document_name="demo.xlsx",
+                    source_group="design",
+                    file_path="demo.xlsx",
+                    local_path="design/demo.xlsx",
+                    content_hash="hash-11",
+                )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                sheet_names = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT sheet_name FROM table_sheets WHERE record_id = 11"
+                    ).fetchall()
+                }
+                row_texts = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT row_text FROM table_rows WHERE record_id = 11"
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+
+            self.assertEqual(sheet_names, {"电源需求"})
+            self.assertTrue(
+                any("支持极性自适应" in text for text in row_texts)
+            )
+            self.assertFalse(any("变更单号" in text for text in row_texts))
+            self.assertTrue(
+                any("已跳过样板工作表" in warning for warning in stats.warnings)
+            )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from src.core.llm_headers import opencode_extra_headers
 from .access import build_evaluation_context
 from .config import EvaluationConfig
 from .schemas import EvaluationSample
@@ -137,6 +138,7 @@ def _ping_endpoints(config: EvaluationConfig) -> list[str]:
     headers_llm = {}
     if config.llm_api_key:
         headers_llm["Authorization"] = f"Bearer {config.llm_api_key}"
+    headers_llm.update(opencode_extra_headers(config.llm_base_url))
     try:
         response = httpx.post(
             config.llm_base_url.rstrip("/") + "/chat/completions",
@@ -159,6 +161,7 @@ def _ping_endpoints(config: EvaluationConfig) -> list[str]:
     headers_emb = {}
     if config.embedding_api_key:
         headers_emb["Authorization"] = f"Bearer {config.embedding_api_key}"
+    headers_emb.update(opencode_extra_headers(config.embedding_base_url))
     try:
         response = httpx.post(
             config.embedding_base_url.rstrip("/") + "/embeddings",

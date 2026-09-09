@@ -16,6 +16,8 @@ from functools import lru_cache
 import src.settings as settings
 from langchain.chat_models import init_chat_model
 
+from src.core.llm_headers import opencode_extra_headers
+
 
 @lru_cache(maxsize=4)
 def create_chat_model(
@@ -55,6 +57,7 @@ def create_chat_model(
         max_tokens=int(settings.AGENT_CUSTOM_MAX_TOKENS),
         max_retries=max_retries,
         timeout=timeout,
+        default_headers=opencode_extra_headers(settings.AGENT_CUSTOM_BASE_URL) or None,
     )
     _apply_model_profile(model)
     return model

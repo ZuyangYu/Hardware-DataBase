@@ -80,6 +80,36 @@ def tool_label(tool_name: str) -> str:
     return TOOL_LABELS.get(tool_name, tool_name)
 
 
+_LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+_NON_LATIN_RE = re.compile(r"[A-Za-z0-9_\s]+")
+
+
+def _evidence_tokens(text: str) -> set[str]:
+    """词法标记:拉丁词根 + CJK 二元组,用于问题-证据相关性估算。"""
+
+    tokens: set[str] = set()
+    for match in _LATIN_TOKEN_RE.findall(text or ""):
+        tokens.add(match.casefold())
+    cleaned = _NON_LATIN_RE.sub("", text or "")
+    for index in range(len(cleaned) - 1):
+        tokens.add(cleaned[index : index + 2])
+    return tokens
+
+
+def _evidence_relevance(question_tokens: set[str], item: Evidence) -> float:
+    if not question_tokens:
+        return 0.0
+    content_tokens = _evidence_tokens(
+        f"{item.source_name or ''} \n{item.content or ''}"
+    )
+    if not content_tokens:
+        return 0.0
+    return (
+        sum(1 for token in question_tokens if token in content_tokens)
+        / len(question_tokens)
+    )
+
+
 @dataclass
 class ToolDiagnostics:
     tool_name: str
@@ -96,6 +126,8 @@ class ToolRuntime:
     ctx: RequestContext | None
     top_k: int = 6
     query_mode: str = "deep"
+    question: str = ""
+    evidence_budget: int = 30
     should_cancel: Callable[[], bool] | None = None
     on_event: Callable[[dict], None] | None = None
 
@@ -140,19 +172,63 @@ class ToolRuntime:
                 for item in self.queries
             )
 
-    def add_evidence(self, items: list[Evidence]) -> list[int]:
-        """Register evidence rows and return their 1-based citation numbers."""
-        numbers: list[int] = []
+    def add_evidence(self, items: list[Evidence]) -> list[int | None]:
+        """Register evidence rows and return their 1-based citation numbers.
+
+        ``None`` marks items rejected by the evidence budget: they were never
+        registered, so callers must not render or cite them. 超出预算时按
+        与问题的词法相关性准入;已编号的证据永不淘汰,保证历史消息里
+        的 [n] 引用不悬空。
+        """
+        numbers: list[int | None] = []
         with self._lock:
-            for item in items:
-                key = item.id or f"{item.source_name}:{len(self.evidence)}"
-                if key in self.evidence_index:
-                    numbers.append(self.evidence_index[key])
+            fresh: list[int] = []
+            for position, item in enumerate(items):
+                if item.id and item.id in self.evidence_index:
+                    numbers.append(self.evidence_index[item.id])
                     continue
+                fresh.append(position)
+                numbers.append(None)
+            room = (
+                max(0, self.evidence_budget - len(self.evidence))
+                if self.evidence_budget > 0
+                else len(fresh)
+            )
+            if len(fresh) > room:
+                question_tokens = _evidence_tokens(self.question)
+                # 检索器相似度优先(RAGFlow score 为真实语义分), 词法分仅作次键;
+                # 纯词法排序会错杀"问题文本中不出现的要素"(如"谁编制"问题里的人名)。
+                fresh.sort(
+                    key=lambda position: (
+                        items[position].score or 0.0,
+                        _evidence_relevance(question_tokens, items[position]),
+                    ),
+                    reverse=True,
+                )
+                kept = set(fresh[:room])
+            else:
+                kept = set(fresh)
+            for position in fresh:
+                if position not in kept:
+                    continue
+                item = items[position]
+                key = item.id or f"{item.source_name}:{len(self.evidence)}"
                 self.evidence.append(item)
                 self.evidence_index[key] = len(self.evidence)
-                numbers.append(len(self.evidence))
+                numbers[position] = len(self.evidence)
         return numbers
+
+    def finalize_evidence(self) -> None:
+        """按问题相关性重排证据堆;citation_number 在 metadata 里,编号不变。"""
+
+        with self._lock:
+            if len(self.evidence) < 2:
+                return
+            question_tokens = _evidence_tokens(self.question)
+            self.evidence.sort(
+                key=lambda item: _evidence_relevance(question_tokens, item),
+                reverse=True,
+            )
 
     def add_memory_context(self, items: list[dict[str, Any]]) -> None:
         """Keep unique long-term memory rows for the final UI summary."""
@@ -243,31 +319,34 @@ def timed_tool_call(
         return [], False
     latency_ms = int((time.monotonic() - started) * 1000)
     rt.log_query(tool_name, query)
+    numbers = rt.add_evidence(items)
+    admitted_items: list[Evidence] = []
+    for item, number in zip(items, numbers):
+        if number is None:
+            continue
+        item.metadata = {**item.metadata, "citation_number": number}
+        admitted_items.append(item)
     rt.record_diagnostic(
         ToolDiagnostics(
             tool_name=tool_name,
-            hit_count=len(items),
+            hit_count=len(admitted_items),
             latency_ms=latency_ms,
             filters=dict(filters or {}),
         )
     )
-    numbers = rt.add_evidence(items)
     rt.emit(
         "tool_result",
         {
             "tool_name": tool_name,
-            "hit_count": len(items),
+            "hit_count": len(admitted_items),
             "status": "done",
             "latency_ms": latency_ms,
         },
     )
-    # Citation numbers follow registration order so the LLM can cite [n].
-    for item, number in zip(items, numbers):
-        item.metadata = {**item.metadata, "citation_number": number}
-    adds_nothing = bool(items) and all(
-        item.id and item.id in pre_registered for item in items
+    adds_nothing = bool(admitted_items) and all(
+        item.id and item.id in pre_registered for item in admitted_items
     )
-    return items, was_repeat and adds_nothing
+    return admitted_items, was_repeat and adds_nothing
 
 
 _LEADING_CITATION_RE = re.compile(r"(?m)^(\[\d+\])")

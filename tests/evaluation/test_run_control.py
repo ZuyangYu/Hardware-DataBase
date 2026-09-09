@@ -17,6 +17,7 @@ from src.evaluation.schemas import (
     EvaluationRunState,
     EvaluationSample,
     EvaluationSummary,
+    MetricResult,
     SampleResult,
 )
 from src.evaluation.snapshot_store import SnapshotStore
@@ -272,6 +273,8 @@ class FakeEvaluationService:
         run_id,
         progress_callback=None,
         item_progress_callback=None,
+        should_stop=None,
+        seeded_metrics=None,
     ):
         self.score_calls += 1
         snapshot_ids = {snapshot.sample_id for snapshot in snapshots}
@@ -371,6 +374,146 @@ class EvaluationRunControllerTests(unittest.TestCase):
 
         self.assertEqual(final.status, "completed")
         self.assertTrue((self.root / state.run_id / "summary.json").is_file())
+
+    def test_resume_modes_validate_state_and_record_intent(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples
+        )
+        final = self.controller.execute(state.run_id)
+        self.assertEqual(final.status, "collected")
+        run_dir = self.root / state.run_id
+        checkpoint = run_dir / ".checkpoint"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "results.jsonl").write_text("stale\n", encoding="utf-8")
+        store = self.controller._store(state.run_id)
+        store.mutate(
+            lambda current: RunStateStore._with_update(
+                current, status="paused", stage="scoring"
+            )
+        )
+
+        resumed = self.controller.resume(state.run_id, mode="continue")
+        self.assertEqual(resumed.status, "queued")
+        self.assertEqual(resumed.evaluation_config.get("scoring_resume"), "continue")
+        self.assertTrue((checkpoint / "results.jsonl").is_file())
+
+        store.mutate(
+            lambda current: RunStateStore._with_update(current, status="paused")
+        )
+        restarted = self.controller.resume(state.run_id, mode="restart")
+        self.assertEqual(restarted.status, "queued")
+        self.assertEqual(restarted.evaluation_config.get("scoring_resume"), "restart")
+        self.assertFalse(checkpoint.exists())
+
+    def test_resume_continue_from_cancelled_is_rejected(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples
+        )
+        self.controller.execute(state.run_id)
+        store = self.controller._store(state.run_id)
+        store.mutate(
+            lambda current: RunStateStore._with_update(current, status="cancelled")
+        )
+
+        with self.assertRaises(ValueError):
+            self.controller.resume(state.run_id, mode="continue")
+        state_after = self.controller.resume(state.run_id, mode="restart")
+        self.assertEqual(state_after.status, "queued")
+
+    def test_repeated_cancel_and_pause_requests_are_idempotent(self):
+        state = self.controller.create_online_run(
+            self.dataset, self.root, self.samples
+        )
+        self.controller.execute(state.run_id)
+        store = self.controller._store(state.run_id)
+        store.mutate(
+            lambda current: RunStateStore._with_update(current, status="running")
+        )
+
+        first = store.request_cancel()
+        self.assertEqual(first.status, "cancel_requested")
+        second = store.request_cancel()
+        self.assertEqual(second.status, "cancel_requested")
+
+        store.mutate(
+            lambda current: RunStateStore._with_update(current, status="running")
+        )
+        store.request_pause()
+        again = store.request_pause()
+        self.assertEqual(again.status, "pause_requested")
+
+    def test_load_checkpoint_metrics_normalizes_legacy_metric_names(self):
+        run_dir = self.root / "alias-run"
+        checkpoint = run_dir / ".checkpoint"
+        checkpoint.mkdir(parents=True)
+        legacy = SampleResult(
+            sample_id="q1",
+            question="Q",
+            reference_answer="A",
+            response="R",
+            metrics=[
+                MetricResult(
+                    sample_id="q1",
+                    metric_name="context_precision_with_reference",
+                    score=0.8,
+                    status="success",
+                ),
+                MetricResult(
+                    sample_id="q1",
+                    metric_name="context_precision_with_reference",
+                    score=0.9,
+                    status="success",
+                ),
+            ],
+        )
+        (checkpoint / "results.jsonl").write_text(
+            legacy.model_dump_json() + "\n", encoding="utf-8"
+        )
+
+        seeded = EvaluationRunController._load_checkpoint_metrics(run_dir)
+
+        cells = seeded["q1"]
+        self.assertEqual([m.metric_name for m in cells], ["context_precision"])
+        self.assertEqual(cells[0].score, 0.9)
+
+    def test_load_checkpoint_metrics_keeps_only_successful_cells(self):
+        run_dir = self.root / "checkpoint-run"
+        checkpoint = run_dir / ".checkpoint"
+        checkpoint.mkdir(parents=True)
+        success = SampleResult(
+            sample_id="q1",
+            question="Q",
+            reference_answer="A",
+            response="R",
+            metrics=[
+                MetricResult(
+                    sample_id="q1",
+                    metric_name="faithfulness",
+                    score=0.7,
+                    status="success",
+                ),
+                MetricResult(
+                    sample_id="q1",
+                    metric_name="context_recall",
+                    status="failed",
+                    reason="judge failed",
+                ),
+            ],
+        )
+        (checkpoint / "results.jsonl").write_text(
+            success.model_dump_json() + "\n", encoding="utf-8"
+        )
+
+        seeded = EvaluationRunController._load_checkpoint_metrics(run_dir)
+
+        self.assertIsNotNone(seeded)
+        self.assertEqual(
+            [(m.metric_name, m.score) for m in seeded["q1"]],
+            [("faithfulness", 0.7)],
+        )
+        self.assertIsNone(
+            EvaluationRunController._load_checkpoint_metrics(self.root / "missing")
+        )
 
     def test_create_run_freezes_normalized_input_and_records_binding_metadata(self):
         state = self.controller.create_online_run(
@@ -580,7 +723,8 @@ class EvaluationRunControllerTests(unittest.TestCase):
             (self.root / state.run_id / "summary.json").read_text(encoding="utf-8")
         )
         self.assertEqual(partial.metadata["run_outcome"]["kind"], "partial_cancelled")
-        resumed_state = self.controller.resume(state.run_id)
+        # 取消后的运行按新语义只能整轮重评（mode=restart），不再断点续跑
+        resumed_state = self.controller.resume(state.run_id, mode="restart")
         self.assertEqual(
             self.controller.execute(resumed_state.run_id).status, "completed"
         )
