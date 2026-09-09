@@ -698,6 +698,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
         title: '操作',
         width: 90,
         align: 'right',
+        className: 'whitespace-nowrap',
         render: (file) => (
             <button
               type="button"
@@ -705,7 +706,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
                 event.stopPropagation();
                 setDeleteTarget(file);
               }}
-              className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7]"
+              className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7]"
             >
               删除
             </button>
@@ -923,7 +924,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="flex max-h-[calc(100dvh-64px)] w-[calc(100%-32px)] max-w-[760px] flex-col overflow-hidden rounded-[16px] p-0">
+        <DialogContent className="flex max-h-[calc(100dvh-64px)] w-[min(760px,calc(100vw-32px))] max-w-none flex-col overflow-hidden rounded-[16px] p-0 sm:max-w-none">
           <DialogHeader className="px-[24px] pt-[20px]">
             <DialogTitle className="truncate text-[16px] font-semibold text-[#18181a]">
               解析分块{parseResult ? ` · ${parseResult.file_name}(${parseResult.chunk_count} 块)` : ''}
@@ -1362,11 +1363,12 @@ export function ChatsPanel({
       key: 'actions',
       title: '',
       width: 70,
+      className: 'whitespace-nowrap',
       render: (row) =>
         canWrite ? (
           <button
             type="button"
-            className="text-[12px] text-[#c0392b] hover:underline"
+            className="whitespace-nowrap text-[12px] text-[#c0392b] hover:underline"
             onClick={(event) => {
               event.stopPropagation();
               onDelete(row);

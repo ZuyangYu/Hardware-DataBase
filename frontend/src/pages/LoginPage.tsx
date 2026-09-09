@@ -93,6 +93,7 @@ function DataFlowBackdrop() {
             x2={edge.to.x}
             y2={edge.to.y}
             pathLength={1}
+            vectorEffect="non-scaling-stroke"
             style={{ animationDelay: `${edge.delay}s` }}
           />
         ))}
@@ -158,22 +159,22 @@ export default function LoginPage({ onLogin }: { onLogin: (session: AuthSession)
     {
       icon: 'database',
       title: '硬件数据管理',
-      text: '统一管理知识库、文件和结构化资产，围绕设备台账与部门归属展开。',
+      text: '统一管理知识库、文件与结构化资产，设备台账按部门归档，条理清晰可查。',
     },
     {
       icon: 'grid',
       title: '结构化解析',
-      text: '支持文档、表格、电路和原理图等结构化召回，不把问答放在主位。',
+      text: '文档、表格、电路网表与原理图自动解析入库，检索与问答有据可依。',
     },
     {
       icon: 'lock',
       title: '权限治理',
-      text: '按部门挂载、授权、重挂，治理角色与内容访问边界分离。',
+      text: '知识库按部门隔离，授权与重挂分级管理，谁能看、谁能管一目了然。',
     },
     {
       icon: 'history',
       title: '审计追踪',
-      text: '保留操作日志、查询日志和评估记录，方便回溯与排查。',
+      text: '操作与查询全程留痕，评估报告完整留存，问题随时可回溯排查。',
     },
   ] as const;
 
@@ -185,12 +186,12 @@ export default function LoginPage({ onLogin }: { onLogin: (session: AuthSession)
         left={<div className="pt-[3px]"><BrandLogo markSize={28} /></div>}
         right={null}
       />
-      <main className="relative z-[1] flex flex-1 flex-col items-center px-[32px]">
-        <div className={`flex w-full max-w-[1120px] flex-col items-center ${showForm ? 'pt-[56px]' : 'pt-[88px]'}`}>
+      <main className="relative z-[1] flex flex-1 flex-col items-center justify-center px-[32px] py-[32px]">
+        <div className={`flex w-full max-w-[1200px] flex-col items-center ${showForm ? 'pt-[24px]' : 'pt-[40px]'}`}>
           <span className="rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] px-[20px] py-[6px] text-[14px] text-[#464c5e]">
             硬件数据平台
           </span>
-          <h1 className="mt-[6px] text-center text-[48px] font-semibold leading-[64px] tracking-[1px] text-[#18181a] max-[560px]:text-[34px] max-[560px]:leading-[48px]">
+          <h1 className="mt-[14px] text-center text-[48px] font-semibold leading-[64px] tracking-[1px] text-[#18181a] max-[560px]:text-[34px] max-[560px]:leading-[48px]">
             Hardware DataBase
             <br />
             硬件数据平台
@@ -261,14 +262,14 @@ export default function LoginPage({ onLogin }: { onLogin: (session: AuthSession)
           )}
         </div>
 
-        <section className="mt-[72px] w-full max-w-[1200px] pb-[56px] max-[720px]:mt-[56px]">
+        <section className={`w-full max-w-[1200px] pb-[56px] ${showForm ? 'mt-[48px]' : 'mt-[72px]'} max-[720px]:mt-[56px]`}>
           <div className="grid gap-[16px] md:grid-cols-2 xl:grid-cols-4">
             {featureCards.map((card) => (
               <article
                 key={card.title}
                 className="group flex min-h-[190px] flex-col items-center justify-center rounded-[20px] border border-[#e6e9f1] bg-white/90 p-[24px] shadow-[0_12px_32px_rgba(17,17,17,0.07)] backdrop-blur-[8px] transition-transform duration-200 hover:-translate-y-[3px]"
               >
-                <div className="flex w-full max-w-[230px] flex-col items-center">
+                <div className="flex w-full max-w-[260px] flex-col items-center">
                   <div className="mb-[14px] flex size-[42px] items-center justify-center rounded-[14px] bg-[#f6f6f6] text-[#18181a]">
                     <AppIcon name={card.icon as Parameters<typeof AppIcon>[0]['name']} size={20} />
                   </div>

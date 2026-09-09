@@ -11,6 +11,7 @@ from typing import Any, Callable, Generator
 import requests
 
 import src.settings as settings
+from src.core.llm_headers import opencode_extra_headers
 from src.observability import observe
 from src.observability.metrics import record_llm
 
@@ -538,6 +539,7 @@ class LLMClient:
         headers = {"Content-Type": "application/json"}
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
+        headers.update(opencode_extra_headers(config.base_url))
         payload = {
             "messages": messages,
             "temperature": kwargs.get("temperature", config.temperature),
@@ -576,6 +578,7 @@ class LLMClient:
         headers = {"Content-Type": "application/json"}
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
+        headers.update(opencode_extra_headers(config.base_url))
         payload = {
             "messages": messages,
             "temperature": kwargs.get("temperature", config.temperature),
@@ -647,6 +650,7 @@ class LLMClient:
         headers = {"Content-Type": "application/json"}
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
+        headers.update(opencode_extra_headers(config.base_url))
         base_payload = {
             "messages": messages,
             "temperature": kwargs.get("temperature", config.temperature),
@@ -775,6 +779,7 @@ class LLMClient:
         headers = {"Content-Type": "application/json"}
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
+        headers.update(opencode_extra_headers(config.base_url))
         base_payload = {
             "messages": messages,
             "temperature": kwargs.get("temperature", config.temperature),

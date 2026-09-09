@@ -288,6 +288,7 @@ export default function KbPermissionsPage({ auth, onLogout }: Props) {
         title: '操作',
         width: 110,
         align: 'right',
+        className: 'whitespace-nowrap',
         render: (p) =>
           // sysadmin 不能撤销(铁律:不碰 KB 内容权限操作);dept_admin 可撤销
           sysAdmin ? (
@@ -296,7 +297,7 @@ export default function KbPermissionsPage({ auth, onLogout }: Props) {
             <button
               type="button"
               onClick={() => setRevokeTarget(p)}
-              className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7]"
+              className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#d20b0b] transition-colors hover:border-[#f3b0b0] hover:bg-[#fce7e7]"
             >
               撤销
             </button>

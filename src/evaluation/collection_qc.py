@@ -54,7 +54,7 @@ def run_collection_qc(
                 flags.append("degraded_answer")
                 degraded += 1
                 issues.append(f"{sample.id}: 降级答案（{answer[:24]}…），无评分价值")
-            evidence_count = len(snap.retrieved_contexts or [])
+            evidence_count = len(snap.contexts_for_scoring())
             if sample.expected_access == "denied":
                 denied_total += 1
             elif evidence_count == 0:

@@ -134,13 +134,13 @@ export default function AssetsPage({ auth, onLogout, kbs }: Props) {
       },
       { key: 'confidence', title: '置信度', width: 90, align: 'right', render: (candidate) => <span>{Math.round(candidate.confidence * 100)}%</span> },
       {
-        key: 'actions', title: '确认', width: 146, align: 'right', render: (candidate) => (
+        key: 'actions', title: '确认', width: 146, align: 'right', className: 'whitespace-nowrap', render: (candidate) => (
           <div className="flex justify-end gap-[6px]">
             <button
               type="button"
               disabled={!canWrite}
               onClick={(event) => { event.stopPropagation(); openConfirm(candidate); }}
-              className="inline-flex h-[28px] items-center rounded-[8px] bg-[#18181a] px-[10px] text-[12px] text-white disabled:cursor-not-allowed disabled:opacity-40"
+              className="inline-flex h-[28px] items-center whitespace-nowrap rounded-[8px] bg-[#18181a] px-[10px] text-[12px] text-white disabled:cursor-not-allowed disabled:opacity-40"
             >
               确认
             </button>
@@ -148,7 +148,7 @@ export default function AssetsPage({ auth, onLogout, kbs }: Props) {
               type="button"
               disabled={!canWrite}
               onClick={(event) => { event.stopPropagation(); void rejectCandidate(candidate); }}
-              className="inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#757f9c] disabled:cursor-not-allowed disabled:opacity-40"
+              className="inline-flex h-[28px] items-center whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#757f9c] disabled:cursor-not-allowed disabled:opacity-40"
             >
               忽略
             </button>
@@ -186,7 +186,7 @@ export default function AssetsPage({ auth, onLogout, kbs }: Props) {
         ),
       },
       {
-        key: 'action', title: '操作', width: 110, align: 'right', render: (source) => (
+        key: 'action', title: '操作', width: 120, align: 'right', className: 'whitespace-nowrap', render: (source) => (
           <button
             type="button"
             disabled={source.asset_eligible && (!canWrite || source.file_status !== 'completed' || generating)}
@@ -195,7 +195,7 @@ export default function AssetsPage({ auth, onLogout, kbs }: Props) {
               if (source.asset_eligible) void generateCandidate(source.file_id);
               else navigate(`/kbs/${encodeURIComponent(kbName)}/files`);
             }}
-            className="inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] disabled:cursor-not-allowed disabled:opacity-40"
+            className="inline-flex h-[28px] items-center whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] disabled:cursor-not-allowed disabled:opacity-40"
           >
             {source.asset_eligible
               ? (source.link_status === 'pending_review' ? '重新提取' : source.link_status === 'linked' ? '再次提取' : '生成候选')
@@ -348,7 +348,7 @@ export default function AssetsPage({ auth, onLogout, kbs }: Props) {
       )}
 
       <Dialog open={Boolean(candidateToConfirm)} onOpenChange={(open) => { if (!open && !saving) { setCandidateToConfirm(null); setCandidateForm(null); } }}>
-        <DialogContent className="max-w-[560px] gap-[16px] rounded-[10px] p-[24px]">
+        <DialogContent className="w-[min(560px,calc(100vw-32px))] max-w-none gap-[16px] rounded-[10px] p-[24px] sm:max-w-none">
           <DialogHeader><DialogTitle>确认资产候选</DialogTitle></DialogHeader>
           {candidateToConfirm && candidateForm && (
             <div className="grid gap-[14px]">
@@ -371,7 +371,7 @@ export default function AssetsPage({ auth, onLogout, kbs }: Props) {
       </Dialog>
 
       <Dialog open={Boolean(assetDetail)} onOpenChange={(open) => { if (!open) setAssetDetail(null); }}>
-        <DialogContent className="max-w-[640px] gap-[16px] rounded-[10px] p-[24px]">
+        <DialogContent className="w-[min(640px,calc(100vw-32px))] max-w-none gap-[16px] rounded-[10px] p-[24px] sm:max-w-none">
           <DialogHeader><DialogTitle>{assetDetail?.name ?? '资产详情'}</DialogTitle></DialogHeader>
           {assetDetail && (
             <div className="grid gap-[16px]">
@@ -379,7 +379,7 @@ export default function AssetsPage({ auth, onLogout, kbs }: Props) {
                 <Detail label="类型" value={ASSET_TYPE_LABEL[assetDetail.asset_type]} /><Detail label="型号" value={assetDetail.model || '-'} />
                 <Detail label="厂商" value={assetDetail.manufacturer || '-'} /><Detail label="版本" value={assetDetail.version || '-'} />
               </div>
-              <div className="border-t border-[#edf0f5] pt-[12px]"><h3 className="text-[13px] font-medium text-[#18181a]">来源证据</h3><div className="mt-[8px] grid gap-[8px]">{assetDetail.evidence.map((evidence) => <div key={evidence.id} className="border-l-2 border-[#d8e2d8] bg-[#f7faf7] px-[12px] py-[9px]"><p className="text-[12px] font-medium text-[#526052]">{evidence.file_name}{evidence.locator ? ` · ${evidence.locator}` : ''}</p>{evidence.excerpt && <p className="mt-[4px] whitespace-pre-wrap text-[12px] leading-[1.6] text-[#757f9c]">{evidence.excerpt}</p>}</div>)}</div></div>
+              <div className="border-t border-[#edf0f5] pt-[12px]"><h3 className="text-[13px] font-medium text-[#18181a]">来源证据</h3><div className="mt-[8px] grid gap-[8px]">{assetDetail.evidence.map((evidence) => <div key={evidence.id} className="min-w-0 border-l-2 border-[#d8e2d8] bg-[#f7faf7] px-[12px] py-[9px]"><p className="break-words text-[12px] font-medium text-[#526052]">{evidence.file_name}{evidence.locator ? ` · ${evidence.locator}` : ''}</p>{evidence.excerpt && <p className="mt-[4px] whitespace-pre-wrap break-words text-[12px] leading-[1.6] text-[#757f9c]">{evidence.excerpt}</p>}</div>)}</div></div>
             </div>
           )}
         </DialogContent>
@@ -393,7 +393,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function Detail({ label, value }: { label: string; value: string }) {
-  return <div><p className="text-[11px] text-[#858b9c]">{label}</p><p className="mt-[2px] text-[#464c5e]">{value}</p></div>;
+  return <div className="min-w-0"><p className="text-[11px] text-[#858b9c]">{label}</p><p className="mt-[2px] break-words text-[#464c5e]">{value}</p></div>;
 }
 
 function LoadingRows() {

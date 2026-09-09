@@ -12,6 +12,7 @@ from typing import Any, Callable, Protocol
 
 from .config import EvaluationConfig
 from .schemas import AnswerSnapshot, EvaluationSample, MetricResult
+from src.core.llm_headers import opencode_extra_headers
 from src.observability import observe
 
 
@@ -99,7 +100,10 @@ def strip_markup(text: str) -> str:
 
 class RagasBackend(Protocol):
     def score(
-        self, records: list[dict[str, Any]], metric_names: list[str]
+        self,
+        records: list[dict[str, Any]],
+        metric_names: list[str],
+        on_row: Callable[[int, dict[str, Any]], None] | None = ...,
     ) -> list[dict[str, Any]]: ...
 
 
@@ -169,10 +173,24 @@ def _is_retryable_evaluator_error(exc: Exception) -> bool:
     )
 
 
+class _ScoringCancelled(Exception):
+    """内部信号：评分被用户取消，停止发出新的裁判调用。"""
+
+
 class RagasAdapter:
     def __init__(self, config: EvaluationConfig, backend: RagasBackend | None = None):
         self.config = config
         self._backend = backend
+        self._stop_check: Callable[[], bool] | None = None
+
+    def set_stop_check(self, stop_check: Callable[[], bool] | None) -> None:
+        """注册取消探测函数；评分循环在每个裁判调用发出前轮询它。"""
+
+        self._stop_check = stop_check
+
+    def _raise_if_stopped(self) -> None:
+        if self._stop_check is not None and self._stop_check():
+            raise _ScoringCancelled()
 
     def score(
         self,
@@ -234,6 +252,7 @@ class RagasAdapter:
         backend = self._backend
         if grouped and backend is None:
             backend = _NativeRagasBackend(self.config)
+            backend.set_stop_check(self._stop_check)
 
         # A native RAGAS batch does not yield rows until every input finishes.
         # For a live progress view, evaluate one sample at a time so callers
@@ -262,6 +281,7 @@ class RagasAdapter:
 
         for applicable, pairs in grouped.items():
             for metric_name in applicable:
+                self._raise_if_stopped()
                 records = [
                     self._record(sample, snapshot, metric_name)
                     for sample, snapshot in pairs
@@ -434,6 +454,7 @@ class RagasAdapter:
         *,
         snapshots_prepared: bool = False,
         on_result: Callable[[MetricResult], None] | None = None,
+        skip_cells: set[tuple[str, str]] | None = None,
     ) -> list[MetricResult]:
         """Score a dataset in as few native RAGAS calls as possible.
 
@@ -442,7 +463,9 @@ class RagasAdapter:
         live UI, however, must not turn one dataset into one ``evaluate`` call
         per sample. This path sends every applicable metric and all samples in
         a group to the backend together; retries are restricted to failed
-        cells only.
+        cells only. Cells listed in ``skip_cells`` as ``(sample_id,
+        metric_name)`` are assumed already scored (resumed runs) and are not
+        sent to the judge, nor re-emitted.
         """
 
         unknown = sorted(set(metric_names) - STANDARD_METRICS)
@@ -451,6 +474,7 @@ class RagasAdapter:
         if not snapshots_prepared:
             snapshots, _ = self.prepare_snapshots_for_scoring(snapshots)
         snapshot_by_id = {snapshot.sample_id: snapshot for snapshot in snapshots}
+        skipped = skip_cells or set()
         results: list[MetricResult] = []
 
         def emit(result: MetricResult) -> None:
@@ -465,6 +489,8 @@ class RagasAdapter:
             snapshot = snapshot_by_id.get(sample.id)
             if snapshot is None or snapshot.status != "success":
                 for metric_name in metric_names:
+                    if (sample.id, metric_name) in skipped:
+                        continue
                     emit(
                         MetricResult(
                             sample_id=sample.id,
@@ -477,10 +503,11 @@ class RagasAdapter:
             applicable = tuple(
                 metric_name
                 for metric_name in metric_names
-                if _metric_is_applicable(metric_name, sample, snapshot)
+                if (sample.id, metric_name) not in skipped
+                and _metric_is_applicable(metric_name, sample, snapshot)
             )
             for metric_name in metric_names:
-                if metric_name not in applicable:
+                if metric_name not in applicable and (sample.id, metric_name) not in skipped:
                     emit(
                         MetricResult(
                             sample_id=sample.id,
@@ -495,6 +522,7 @@ class RagasAdapter:
         backend = self._backend
         if grouped and backend is None:
             backend = _NativeRagasBackend(self.config)
+            backend.set_stop_check(self._stop_check)
 
         execution_groups: dict[
             tuple[str, tuple[str, ...]], list[tuple[EvaluationSample, AnswerSnapshot]]
@@ -512,6 +540,7 @@ class RagasAdapter:
                 execution_groups[("curated", curated_metrics)].extend(pairs)
 
         for (context_mode, applicable), pairs in execution_groups.items():
+            self._raise_if_stopped()
             metric_list = list(applicable)
             if context_mode == "raw":
                 raw_pairs: list[tuple[EvaluationSample, AnswerSnapshot]] = []
@@ -545,12 +574,48 @@ class RagasAdapter:
                     record_to_unique[key] = unique_index
                     unique_records.append(record)
                 unique_indices.append(unique_index)
+
+            streamed: set[tuple[str, str]] = set()
+            positions_by_unique: dict[int, list[int]] = {}
+            for position, unique_index in enumerate(unique_indices):
+                positions_by_unique.setdefault(unique_index, []).append(position)
+
+            backend_on_row: Callable[[int, dict[str, Any]], None] | None = None
+            if on_result is not None and isinstance(backend, _NativeRagasBackend):
+
+                def backend_on_row(unique_index: int, cells: dict[str, Any]) -> None:
+                    # 只流式转发干净分数；异常/NaN 单元仍走下方重试与
+                    # 正式 emit 路径，避免把失败值先写进服务层。
+                    for metric_name, value in cells.items():
+                        if isinstance(value, float) and not math.isnan(value):
+                            for position in positions_by_unique.get(unique_index, []):
+                                sample, _ = pairs[position]
+                                key = (sample.id, metric_name)
+                                if key in streamed:
+                                    continue
+                                streamed.add(key)
+                                emit(
+                                    MetricResult(
+                                        sample_id=sample.id,
+                                        metric_name=metric_name,
+                                        score=value,
+                                        status="success",
+                                    )
+                                )
+
             try:
-                unique_rows = backend.score(unique_records, metric_list)  # type: ignore[union-attr]
+                if isinstance(backend, _NativeRagasBackend):
+                    unique_rows = backend.score(
+                        unique_records, metric_list, on_row=backend_on_row
+                    )
+                else:
+                    unique_rows = backend.score(unique_records, metric_list)  # type: ignore[union-attr]
                 scored_rows = [
                     unique_rows[index] if index < len(unique_rows) else {}
                     for index in unique_indices
                 ]
+            except _ScoringCancelled:
+                raise
             except Exception as exc:
                 scored_rows = [
                     {metric_name: exc for metric_name in metric_list} for _ in records
@@ -567,6 +632,14 @@ class RagasAdapter:
                     value = row.get(metric_name)
                     attempts = 1
                     retry_diagnostic: dict[str, int | str] | None = None
+                    if (
+                        (sample.id, metric_name) in streamed
+                        and isinstance(value, float)
+                        and not math.isnan(value)
+                        and not isinstance(value, Exception)
+                    ):
+                        # 流式阶段已转发的干净分数，避免重复 emit
+                        continue
                     if (
                         isinstance(value, Exception)
                         and metric_name in CONTEXT_METRICS
@@ -724,7 +797,7 @@ class RagasAdapter:
         prepared: list[AnswerSnapshot] = []
         diagnostics: dict[str, dict[str, Any]] = {}
         for snapshot in snapshots:
-            raw_contexts = list(snapshot.retrieved_contexts)
+            raw_contexts = list(snapshot.contexts_for_scoring())
             if full_contexts:
                 bounded_contexts = raw_contexts
                 diagnostic = {
@@ -1139,6 +1212,16 @@ class _NativeRagasBackend:
         self._embeddings = None
         self._modern_embeddings = None
         self._modern_metrics_cache: dict[tuple[str, ...], list[Any]] = {}
+        self._stop_check: Callable[[], bool] | None = None
+
+    def set_stop_check(self, stop_check: Callable[[], bool] | None) -> None:
+        """注册取消探测函数；评分循环在每个裁判调用发出前轮询它。"""
+
+        self._stop_check = stop_check
+
+    def _raise_if_stopped(self) -> None:
+        if self._stop_check is not None and self._stop_check():
+            raise _ScoringCancelled()
 
     def _build_llm(
         self,
@@ -1160,6 +1243,7 @@ class _NativeRagasBackend:
             api_key=use_key or "not-required",
             base_url=use_base,
             timeout=self.config.timeout_seconds,
+            default_headers=opencode_extra_headers(use_base) or None,
         )
         llm = llm_factory(
             use_model,
@@ -1206,6 +1290,7 @@ class _NativeRagasBackend:
             api_key=config.embedding_api_key or "not-required",
             base_url=config.embedding_base_url,
             timeout=config.timeout_seconds,
+            default_headers=opencode_extra_headers(config.embedding_base_url) or None,
         )
 
         class ConfiguredEmbeddings(ModernOpenAIEmbeddings):
@@ -1306,37 +1391,61 @@ class _NativeRagasBackend:
         records: list[dict[str, Any]],
         metric_names: list[str],
         llm: Any,
+        *,
+        on_row: Callable[[int, dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         metrics = self._build_modern_metrics(metric_names, llm)
         semaphore = asyncio.Semaphore(max(1, self.config.max_workers))
 
-        async def score_one(record: dict[str, Any], metric: Any) -> Any:
-            metric_name = str(getattr(metric, "name", ""))
+        def fields_for(metric_name: str) -> set[str]:
             if metric_name == "answer_correctness":
-                fields = {"user_input", "response", "reference"}
-            elif metric_name == "answer_relevancy":
-                fields = {"user_input", "response"}
-            elif metric_name == "faithfulness":
-                fields = {"user_input", "response", "retrieved_contexts"}
-            elif metric_name == "context_precision_with_reference":
-                fields = {"user_input", "reference", "retrieved_contexts"}
-            else:
-                fields = {"user_input", "reference", "retrieved_contexts"}
-            kwargs = {key: record[key] for key in fields if key in record}
-            async with semaphore:
-                result = await metric.ascore(**kwargs)
-            return getattr(result, "value", result)
+                return {"user_input", "response", "reference"}
+            if metric_name == "answer_relevancy":
+                return {"user_input", "response"}
+            if metric_name == "faithfulness":
+                return {"user_input", "response", "retrieved_contexts"}
+            if metric_name == "context_precision_with_reference":
+                return {"user_input", "reference", "retrieved_contexts"}
+            return {"user_input", "reference", "retrieved_contexts"}
 
-        jobs = [score_one(record, metric) for record in records for metric in metrics]
-        values = await asyncio.gather(*jobs, return_exceptions=True)
-        rows: list[dict[str, Any]] = []
-        offset = 0
-        for _record in records:
-            row: dict[str, Any] = {}
-            for metric_name in metric_names:
-                row[metric_name] = values[offset]
-                offset += 1
-            rows.append(row)
+        async def run_job(record_index: int, metric_name: str, metric: Any, record: dict[str, Any]):
+            # 每个裁判调用发出前轮询取消标志：取消后未发出的调用即刻跳过，
+            # 已在途的请求由 wait_for 强制超时（代理环境下 socket 级读超时
+            # 可能永不触发，必须用协程级超时兜底）。
+            self._raise_if_stopped()
+            kwargs = {key: record[key] for key in fields_for(metric_name) if key in record}
+            async with semaphore:
+                try:
+                    result = await asyncio.wait_for(
+                        metric.ascore(**kwargs),
+                        timeout=max(self.config.timeout_seconds, 1) * 2,
+                    )
+                except asyncio.TimeoutError as exc:
+                    return record_index, metric_name, exc
+                except Exception as exc:
+                    return record_index, metric_name, exc
+            return record_index, metric_name, getattr(result, "value", result)
+
+        jobs = [
+            asyncio.ensure_future(run_job(record_index, metric_name, metric, record))
+            for record_index, record in enumerate(records)
+            for metric_name, metric in zip(metric_names, metrics)
+        ]
+        rows: list[dict[str, Any]] = [
+            {metric_name: None for metric_name in metric_names} for _ in records
+        ]
+        # 逐条产出：每完成一个 (样本, 指标) 就落一格并通知，不再等整批。
+        for future in asyncio.as_completed(jobs):
+            try:
+                record_index, metric_name, value = await future
+            except _ScoringCancelled:
+                continue
+            rows[record_index][metric_name] = value
+            if on_row is not None:
+                try:
+                    on_row(record_index, {metric_name: value})
+                except Exception:
+                    pass
         return rows
 
     @staticmethod
@@ -1365,7 +1474,10 @@ class _NativeRagasBackend:
         return result[0]
 
     def score(
-        self, records: list[dict[str, Any]], metric_names: list[str]
+        self,
+        records: list[dict[str, Any]],
+        metric_names: list[str],
+        on_row: Callable[[int, dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         try:
             from ragas.metrics.collections import AnswerCorrectness  # noqa: F401
@@ -1375,7 +1487,9 @@ class _NativeRagasBackend:
             ) from exc
 
         llm = self._build_llm()
-        rows = self._run_async(self._score_modern_async(records, metric_names, llm))
+        rows = self._run_async(
+            self._score_modern_async(records, metric_names, llm, on_row=on_row)
+        )
         primary_embeddings = (
             self._build_embeddings() if self.config.fallback_ready else None
         )

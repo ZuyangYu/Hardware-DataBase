@@ -12,17 +12,6 @@ from .schemas import (
 )
 
 
-_MISSING_MARKERS = (
-    "未找到",
-    "没有找到",
-    "缺少",
-    "缺失",
-    "无证据",
-    "无法确认",
-    "暂无",
-    "不能确定",
-)
-_CONFLICT_MARKERS = ("冲突", "不一致", "差异", "分别", "一处", "另一处")
 _EVIDENCE_TYPE_ALIASES = {
     "document_text": "document",
     # 表格管线的存储证据 kind → 数据集词汇 "spreadsheet"
@@ -63,16 +52,28 @@ def _result(sample: EvaluationSample, name: str, score: float | None, **kwargs) 
 
 
 def score_hardware_rules(sample: EvaluationSample, snapshot: AnswerSnapshot) -> list[MetricResult]:
+    """确定性词法层评估。
+
+    始终执行：forbidden_claims（禁词命中=确定性错误）、evidence_consistency（工具路由审计）。
+    这两项是天然词法的检查，子串匹配在此是恰当的，且可复现、可进 CI 门禁。
+
+    语义性质的评估（事实覆盖度、诚实度、冲突披露）不由规则承担——
+    子串/标记词实现对自然语言答案存在系统性误杀，统一交给 RAGAS 裁判层
+    （answer_correctness / faithfulness）按参考答案语义判卷。
+    """
     answer = snapshot.response or ""
-    required = sample.rubric.required_facts
-    missing_facts = [fact for fact in required if not _contains(answer, fact)]
-    completeness_score = (len(required) - len(missing_facts)) / len(required) if required else None
-    completeness = _result(
-        sample,
-        "completeness",
-        completeness_score,
-        details={"required_facts": required, "missing_facts": missing_facts},
-    )
+
+    # 禁词命中：出现即确定性错误（如把 U900 判成 TC377）
+    forbidden_hits = [claim for claim in sample.rubric.forbidden_claims if _contains(answer, claim)]
+    if sample.rubric.forbidden_claims:
+        forbidden = _result(
+            sample,
+            "forbidden_claims",
+            0.0 if forbidden_hits else 1.0,
+            details={"forbidden_hits": forbidden_hits},
+        )
+    else:
+        forbidden = _result(sample, "forbidden_claims", None, details={"forbidden_hits": []})
 
     actual_types = {
         _canonical_evidence_type(
@@ -99,36 +100,7 @@ def score_hardware_rules(sample: EvaluationSample, snapshot: AnswerSnapshot) -> 
         },
     )
 
-    forbidden_hits = [claim for claim in sample.rubric.forbidden_claims if _contains(answer, claim)]
-    if sample.rubric.must_disclose_missing:
-        disclosed = any(marker in answer for marker in _MISSING_MARKERS)
-        honesty_score = 1.0 if disclosed and not forbidden_hits else 0.0
-        honesty = _result(
-            sample,
-            "missing_information_honesty",
-            honesty_score,
-            details={"disclosed_missing": disclosed, "forbidden_hits": forbidden_hits},
-        )
-    else:
-        honesty = _result(
-            sample,
-            "missing_information_honesty",
-            None,
-            details={"forbidden_hits": forbidden_hits},
-        )
-
-    if sample.rubric.must_disclose_conflicts:
-        disclosed = any(marker in answer for marker in _CONFLICT_MARKERS)
-        conflict = _result(
-            sample,
-            "conflict_disclosure",
-            1.0 if disclosed else 0.0,
-            details={"disclosed_conflict": disclosed},
-        )
-    else:
-        conflict = _result(sample, "conflict_disclosure", None)
-
-    return [completeness, evidence_consistency, honesty, conflict]
+    return [forbidden, evidence_consistency]
 
 
 def score_document_generation(

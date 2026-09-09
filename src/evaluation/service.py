@@ -25,7 +25,7 @@ from .dataset_loader import load_dataset, validate_dataset
 from .gates import DEFAULT_THRESHOLDS, evaluate_gate
 from .hardware_metrics import score_hardware_rules
 from .preflight import EvaluationPreflight
-from .ragas_adapter import RagasAdapter
+from .ragas_adapter import RagasAdapter, _ScoringCancelled
 from .schemas import (
     AnswerSnapshot,
     EvaluationSample,
@@ -273,12 +273,22 @@ class EvaluationService:
         | None = None,
         completed_groups: set[str] | None = None,
         seeded_metrics: dict[str, list[MetricResult]] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> tuple[EvaluationSummary, list[SampleResult]]:
         metric_names = (
             DEFAULT_STANDARD_METRICS if metric_names is None else metric_names
         )
         resume_done_groups = completed_groups or set()
         seeded_metrics = seeded_metrics or {}
+        seeded_cells: dict[str, set[str]] = {}
+        for sample_id, items in seeded_metrics.items():
+            for item in items:
+                if (
+                    item.status == "success"
+                    and item.score is not None
+                    and is_ragas_metric(item.metric_name)
+                ):
+                    seeded_cells.setdefault(item.metric_name, set()).add(sample_id)
         scoring_skipped_reason = ""
         scoring_config_metadata: dict[str, str | int | float] = {}
         if self.config is not None:
@@ -317,7 +327,7 @@ class EvaluationService:
                 scored_response=(snapshot.scored_response or snapshot.response)
                 if snapshot is not None
                 else "",
-                retrieved_contexts=snapshot.retrieved_contexts
+                retrieved_contexts=snapshot.contexts_for_scoring()
                 if snapshot is not None
                 else [],
                 critical=sample.critical,
@@ -407,8 +417,13 @@ class EvaluationService:
                 else:
                     scoring_snapshots = retrieval_snapshots
                 pending_metric_names: list[str] = []
+                ragas_skip_cells: set[tuple[str, str]] = set()
                 for metric_name in metric_names:
-                    if metric_name in resume_done_groups:
+                    covered = seeded_cells.get(metric_name, set()) & retrieval_ids
+                    group_done = metric_name in resume_done_groups or (
+                        bool(retrieval_samples) and covered >= retrieval_ids
+                    )
+                    if group_done:
                         completed_items += len(retrieval_samples)
                         completed_groups += 1
                         ordered_results = [
@@ -432,6 +447,11 @@ class EvaluationService:
                             )
                     else:
                         pending_metric_names.append(metric_name)
+                        if covered:
+                            completed_items += len(covered)
+                            ragas_skip_cells.update(
+                                (sample_id, metric_name) for sample_id in covered
+                            )
 
                 def emit_item_progress() -> None:
                     if item_progress_callback is None:
@@ -472,15 +492,43 @@ class EvaluationService:
                         emit_item_progress()
 
                     if pending_metric_names:
-                        metrics = adapter.score_batched(
-                            retrieval_samples,
-                            scoring_snapshots,
-                            pending_metric_names,
-                            snapshots_prepared=True,
-                            on_result=on_metric_result
-                            if item_progress_callback is not None
-                            else None,
-                        )
+                        if (
+                            should_stop is not None
+                            and isinstance(adapter, RagasAdapter)
+                        ):
+                            adapter.set_stop_check(should_stop)
+                        try:
+                            metrics = adapter.score_batched(
+                                retrieval_samples,
+                                scoring_snapshots,
+                                pending_metric_names,
+                                snapshots_prepared=True,
+                                on_result=on_metric_result
+                                if item_progress_callback is not None
+                                else None,
+                                skip_cells=ragas_skip_cells or None,
+                            )
+                        except _ScoringCancelled:
+                            # 用户取消：未完成的 (样本, 指标) 标记为
+                            # not_applicable，保留已完成的部分结果。
+                            metrics = []
+                            emitted = {
+                                (item.sample_id, item.metric_name)
+                                for result in sample_results.values()
+                                for item in result.metrics
+                            }
+                            for sample in retrieval_samples:
+                                for metric_name in pending_metric_names:
+                                    if (sample.id, metric_name) in emitted:
+                                        continue
+                                    sample_results[sample.id].metrics.append(
+                                        MetricResult(
+                                            sample_id=sample.id,
+                                            metric_name=metric_name,
+                                            status="not_applicable",
+                                            reason="scoring cancelled",
+                                        )
+                                    )
                         for metric in metrics:
                             key = (metric.sample_id, metric.metric_name)
                             if key in emitted_keys:

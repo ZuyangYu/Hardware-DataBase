@@ -5,15 +5,13 @@ from src.evaluation.schemas import EvaluationSummary, SampleResult
 
 
 _METRIC_DISPLAY_LABELS = {
-    "completeness": "完整性",
+    "forbidden_claims": "禁词检查",
     "evidence_consistency": "证据一致性",
     "answer_correctness": "答案正确性",
     "faithfulness": "忠实性",
     "answer_relevancy": "答案相关性",
     "context_precision": "上下文精确率",
     "context_recall": "上下文召回率",
-    "missing_information_honesty": "缺失信息诚实性",
-    "conflict_disclosure": "冲突披露",
 }
 
 _METRIC_CHART_ORDER = tuple(_METRIC_DISPLAY_LABELS)

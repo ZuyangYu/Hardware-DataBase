@@ -42,6 +42,13 @@ RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
 # deployment; exact refdes/net queries always stay available.
 CIRCUIT_SEMANTIC_QUERY_ENABLED = os.getenv("CIRCUIT_SEMANTIC_QUERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
+# 表格管线:模板使用说明/模板变更历史等样板 sheet 不进行行索引,
+# 避免其作为证据污染检索堆(源文件仍保留,可随时关闭开关回溯)。
+SPREADSHEET_SKIP_BOILERPLATE_SHEETS = os.getenv("SPREADSHEET_SKIP_BOILERPLATE_SHEETS", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+# Agent 单题证据堆上限:超出后按问题词法相关性准入新证据(已入堆不淘汰)。
+AGENT_EVIDENCE_BUDGET = int(os.getenv("AGENT_EVIDENCE_BUDGET", "30") or 30)
+
 AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
 # LangGraph checkpointer：agent 会话状态（thread 级完整消息历史）的持久化库。
 AGENT_CHECKPOINT_DB_PATH = os.getenv(
@@ -171,7 +178,10 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "2. 回答前自查：证据是否已覆盖问题的全部要点？若仍有缺口，先继续检索补证，不要凭当前片段草率收敛。\n"
     "3. 如果【参考资料】内容不足或无关，请明确说明知识库中未找到相关信息，不要编造。\n"
     "4. 多次检索时不要用完全相同的查询原样重复调用；重复前先确认已有证据是否覆盖问题，需要新信息时换关键词或换检索工具。\n"
-    "5. 回答必须使用中文。"
+    "5. 回答必须使用中文。\n"
+    "6. 引用必须实质支撑：引用的证据片段必须实际包含所陈述的具体要素（人名、日期、数值、阈值、引脚等）；"
+    "仅主题相关但不含该要素的片段不得作为具体结论的依据，此时应如实说明证据不足。"
+    "表格行、总结性结论同样需要有证据支撑，不得无引用断言。"
 ))
 
 NO_CONTEXT_PROMPT = os.getenv(

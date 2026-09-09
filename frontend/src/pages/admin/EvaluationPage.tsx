@@ -81,23 +81,15 @@ function splitList(value: string): string[] | null {
   return items.length > 0 ? items : null;
 }
 
-function progressPercent(run: EvaluationRunDetail | null): number {
-  if (!run) return 0;
-  if (run.stage === 'scoring' && run.scoring_total_items > 0) {
-    return Math.max(0, Math.min(100, Math.round((run.scoring_completed_items / run.scoring_total_items) * 100)));
-  }
-  if (run.total_samples <= 0) return 0;
-  return Math.max(0, Math.min(100, Math.round((run.completed_samples / run.total_samples) * 100)));
+function fileNameOnly(path: string): string {
+  const normalized = (path || '').replace(/\\/g, '/');
+  const base = normalized.split('/').filter(Boolean).pop();
+  return base || path || '-';
 }
 
-function progressLabel(run: EvaluationRunDetail): string {
-  if (run.status === 'collected') {
-    return '采集完成，等待质检确认后评分';
-  }
-  if (run.stage === 'scoring' && run.scoring_total_items > 0) {
-    return `评分 ${run.scoring_completed_items}/${run.scoring_total_items}`;
-  }
-  return run.current_sample_id || '当前无运行样本';
+function datasetFileLabel(path: string, sampleCount?: number): string {
+  const name = fileNameOnly(path);
+  return sampleCount ? `${name}（${sampleCount} 条样本）` : name;
 }
 
 export default function EvaluationPage({ auth, onLogout }: Props) {
@@ -455,11 +447,15 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     }
   }
 
-  async function controlRun(action: 'start' | 'pause' | 'resume' | 'cancel') {
+  async function controlRun(
+    action: 'start' | 'pause' | 'resume' | 'cancel',
+    resumeMode?: 'continue' | 'restart',
+  ) {
     if (!selectedRunId) return;
     try {
+      const suffix = action === 'resume' && resumeMode ? `?mode=${resumeMode}` : '';
       await api.post<OkResponse | EvaluationRunDetail>(
-        `/api/v1/evaluation/runs/${encodeURIComponent(selectedRunId)}/${action}`,
+        `/api/v1/evaluation/runs/${encodeURIComponent(selectedRunId)}/${action}${suffix}`,
       );
       notify.success(
         action === 'start'
@@ -467,7 +463,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           : action === 'pause'
             ? '已请求暂停'
             : action === 'resume'
-              ? '评估已继续'
+              ? resumeMode === 'restart'
+                ? '评分将重新开始'
+                : '评估已从断点继续'
               : '已请求取消',
       );
       await Promise.all([loadRuns(), loadDetail(selectedRunId)]);
@@ -572,8 +570,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       {
         key: 'actions',
         title: '操作',
-        width: 160,
+        width: 180,
         align: 'right',
+        className: 'whitespace-nowrap',
         render: (run) => (
           <div className="flex justify-end gap-[6px]">
             <button
@@ -584,7 +583,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
                 setCompare(null);
                 loadDetail(run.run_id);
               }}
-              className="inline-flex h-[28px] items-center rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
+              className="inline-flex h-[28px] items-center whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
             >
               查看
             </button>
@@ -595,7 +594,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
                   event.stopPropagation();
                   setDeleteTarget(run);
                 }}
-                className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#f3b0b0] bg-white px-[10px] text-[12px] text-[#d20b0b] transition-colors hover:bg-[#fce7e7]"
+                className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] border border-[#f3b0b0] bg-white px-[10px] text-[12px] text-[#d20b0b] transition-colors hover:bg-[#fce7e7]"
                 title="删除已完成、失败或已取消的运行"
               >
                 <AppIcon name="trash" size={13} />
@@ -613,9 +612,10 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   const selectedStatus = detail?.status;
   const canStart = selectedStatus === 'queued';
   const canPause = selectedStatus === 'queued' || selectedStatus === 'running';
-  const canResume = selectedStatus === 'paused' || selectedStatus === 'cancelled';
+  const canResume = selectedStatus === 'paused';
+  const canRestartScoring = selectedStatus === 'paused' || selectedStatus === 'cancelled';
   const canCancel = selectedStatus != null && ['queued', 'running', 'pause_requested', 'paused', 'collected'].includes(selectedStatus);
-  const canScore = selectedStatus === 'collected';
+  const canScore = selectedStatus === 'collected' || (selectedStatus === 'failed' && !!detail && detail.completed_samples === detail.total_samples && detail.successful_samples > 0);
 
   async function startScoring(force: boolean) {
     if (!selectedRunId) return;
@@ -896,12 +896,14 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           canStart={canStart}
           canPause={canPause}
           canResume={canResume}
+          canRestartScoring={canRestartScoring}
           canCancel={canCancel}
           canScore={canScore}
           scoringLoading={scoringLoading}
           onStart={() => void controlRun('start')}
           onPause={() => void controlRun('pause')}
-          onResume={() => void controlRun('resume')}
+          onResume={() => void controlRun('resume', 'continue')}
+          onRestartScoring={() => void controlRun('resume', 'restart')}
           onCancel={() => void controlRun('cancel')}
           onScore={(force) => void startScoring(force)}
         />
@@ -957,12 +959,14 @@ function RunDetailPanel({
   canStart,
   canPause,
   canResume,
+  canRestartScoring,
   canCancel,
   canScore,
   scoringLoading,
   onStart,
   onPause,
   onResume,
+  onRestartScoring,
   onCancel,
   onScore,
 }: {
@@ -972,12 +976,14 @@ function RunDetailPanel({
   canStart: boolean;
   canPause: boolean;
   canResume: boolean;
+  canRestartScoring: boolean;
   canCancel: boolean;
   canScore: boolean;
   scoringLoading: boolean;
   onStart: () => void;
   onPause: () => void;
   onResume: () => void;
+  onRestartScoring: () => void;
   onCancel: () => void;
   onScore: (force: boolean) => void;
 }) {
@@ -996,7 +1002,6 @@ function RunDetailPanel({
     );
   }
 
-  const percent = progressPercent(run);
   const scoringPercent = run.scoring_total_items > 0
     ? Math.max(0, Math.min(100, Math.round((run.scoring_completed_items / run.scoring_total_items) * 100)))
     : 0;
@@ -1038,9 +1043,26 @@ function RunDetailPanel({
           <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')} onClick={onPause} disabled={!canPause}>
             暂停
           </Button>
-          <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')} onClick={onResume} disabled={!canResume}>
+          <Button
+            variant="outline"
+            className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')}
+            onClick={onResume}
+            disabled={!canResume}
+            title="从断点继续：跳过已完成的评分格子"
+          >
             继续
           </Button>
+          {canRestartScoring && (
+            <Button
+              variant="outline"
+              className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')}
+              onClick={onRestartScoring}
+              disabled={scoringLoading}
+              title="评分从零重新开始，不沿用已完成的分数"
+            >
+              重新开始评分
+            </Button>
+          )}
           <Button variant="outline" className="h-[32px] gap-[4px] rounded-[10px] border-[#f3b0b0] bg-white px-[12px] text-[12px] text-[#d20b0b] hover:bg-[#fce7e7]" onClick={onCancel} disabled={!canCancel}>
             <AppIcon name="stop" size={13} />
             取消
@@ -1059,23 +1081,10 @@ function RunDetailPanel({
         <StatCard label="待评分" value={run.scoring_total_items <= 0 ? '—' : Math.max(0, run.scoring_total_items - run.scoring_completed_items)} />
       </div>
 
-      <div>
-        <div className="mb-[6px] flex justify-between text-[11px] text-[#858b9c]">
-          <span>{progressLabel(run)}</span>
-          <span>{percent}%</span>
-        </div>
-        <div className="h-[8px] overflow-hidden rounded-full bg-[#f2f3f7]">
-          <div className="h-full rounded-full bg-[#18181a] transition-[width]" style={{ width: `${percent}%` }} />
-        </div>
-        {run.current_question && (
-          <p className="mt-[8px] line-clamp-2 text-[12px] leading-[18px] text-[#464c5e]">{run.current_question}</p>
-        )}
-      </div>
-
       {run.scoring_total_items > 0 && (
         <div>
           <div className="mb-[6px] flex justify-between text-[11px] text-[#858b9c]">
-            <span>评分项进度</span>
+            <span>评分进度</span>
             <span>{run.scoring_completed_items} / {run.scoring_total_items} · {scoringPercent}%</span>
           </div>
           <div className="h-[8px] overflow-hidden rounded-full bg-[#f2f3f7]">
@@ -1083,18 +1092,21 @@ function RunDetailPanel({
           </div>
         </div>
       )}
+      {run.current_question && (
+        <p className="line-clamp-2 text-[12px] leading-[18px] text-[#464c5e]">{run.current_question}</p>
+      )}
 
       <div className="grid grid-cols-2 gap-[10px] text-[12px] max-[900px]:grid-cols-1">
         <Meta label="知识库" value={run.kb_name ? `${run.kb_name}（ID ${run.kb_id ?? '-'} · 部门 ${run.department_id ?? '-'}）` : '旧版任务，未记录知识库'} />
         <Meta label="样本范围" value={`${run.dataset_sample_count || run.total_samples} 条 · 正常 ${run.normal_sample_count || Math.max(0, run.total_samples - run.expected_denied_sample_count)} · 拒绝 ${run.expected_denied_sample_count}`} />
-        <Meta label="数据集" value={run.dataset_path} />
-        {run.source_dataset_path && <Meta label="原始数据集" value={run.source_dataset_path} />}
+        <Meta label="数据集" value={run.dataset_path ? datasetFileLabel(run.dataset_path, run.dataset_sample_count || run.total_samples) : '-'} />
+        {run.source_dataset_path && <Meta label="原始数据集" value={datasetFileLabel(run.source_dataset_path)} />}
         {run.created_by && <Meta label="创建人" value={run.created_by} />}
-        <Meta label="快照" value={run.snapshot_path || '-'} />
+        <Meta label="采集快照" value={`${run.dataset_sample_count || run.completed_samples} 条回答已存档`} />
         <Meta label="开始时间" value={run.started_at ? formatDateTime(run.started_at) : '-'} />
         <Meta label="更新时间" value={run.updated_at ? formatDateTime(run.updated_at) : '-'} />
         {run.error_message && <Meta label="错误" value={run.error_message} />}
-        {run.report_path && <Meta label="报告" value={run.report_path} />}
+        {run.report_path && <Meta label="报告" value={fileNameOnly(run.report_path)} />}
       </div>
 
       {run.summary && (

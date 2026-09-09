@@ -311,6 +311,133 @@ class RagasAdapterTests(unittest.TestCase):
         self.assertEqual(run_config.max_retries, 4)
         self.assertEqual(metric.max_retries, 4)
 
+    @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
+    def test_score_modern_rows_use_canonical_metric_names(self):
+        class FakeMetric:
+            name = "context_precision_with_reference"
+
+            async def ascore(self, **kwargs):
+                class _Value:
+                    value = 0.5
+
+                return _Value()
+
+        backend = _NativeRagasBackend(_config())
+        fake = FakeMetric()
+        record = {
+            "sample_id": "q1",
+            "user_input": "问题",
+            "response": "回答",
+            "reference": "参考",
+            "retrieved_contexts": ["证据"],
+        }
+
+        with patch.object(backend, "_build_modern_metrics", return_value=[fake]), patch.object(
+            backend, "_build_llm", return_value=object()
+        ):
+            rows = backend._run_async(
+                backend._score_modern_async([record], ["context_precision"], object())
+            )
+
+        self.assertIn("context_precision", rows[0])
+        self.assertEqual(rows[0]["context_precision"], 0.5)
+        self.assertNotIn("context_precision_with_reference", rows[0])
+
+    @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
+    def test_native_backend_stop_check_defaults_to_noop(self):
+        backend = _NativeRagasBackend(_config())
+
+        backend._raise_if_stopped()
+
+    @unittest.skipUnless(_has_native_ragas_deps(), "requires ragas/openai/langchain_openai")
+    def test_native_backend_stop_check_raises_when_triggered(self):
+        from src.evaluation.ragas_adapter import _ScoringCancelled
+
+        backend = _NativeRagasBackend(_config())
+        backend.set_stop_check(lambda: True)
+
+        with self.assertRaises(_ScoringCancelled):
+            backend._raise_if_stopped()
+
+    def test_score_forwards_stop_check_to_native_backend(self):
+        created = []
+        recorded = []
+
+        class SpyBackend:
+            def __init__(self, config):
+                created.append(self)
+
+            def set_stop_check(self, stop_check):
+                recorded.append(stop_check)
+
+            def score(self, records, metric_names, on_row=None):
+                return [{metric_names[0]: 0.5} for _ in records]
+
+        adapter = RagasAdapter(_config())
+        stop_check = lambda: False  # noqa: E731
+        adapter.set_stop_check(stop_check)
+        with patch("src.evaluation.ragas_adapter._NativeRagasBackend", SpyBackend):
+            results = adapter.score(
+                [EvaluationSample(id="q1", question="问题", reference_answer="参考答案", kb_name="ADAS")],
+                [
+                    AnswerSnapshot(
+                        sample_id="q1",
+                        question="问题",
+                        kb_name="ADAS",
+                        response="A",
+                        retrieved_contexts=["c"],
+                    )
+                ],
+                ["faithfulness"],
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(recorded, [stop_check])
+
+    def test_score_batched_skips_seeded_cells(self):
+        class RecordingBackend:
+            def __init__(self):
+                self.calls = []
+
+            def score(self, records, metric_names):
+                self.calls.append((tuple(metric_names), [r["sample_id"] for r in records]))
+                return [{name: 0.5 for name in metric_names} for _ in records]
+
+        backend = RecordingBackend()
+        adapter = RagasAdapter(_config(), backend=backend)
+        samples = [
+            EvaluationSample(id="q1", question="问题", reference_answer="参考答案", kb_name="ADAS"),
+            EvaluationSample(id="q2", question="问题", reference_answer="参考答案", kb_name="ADAS"),
+        ]
+        snapshots = [
+            AnswerSnapshot(sample_id="q1", question="问题", kb_name="ADAS", response="A", retrieved_contexts=["c"]),
+            AnswerSnapshot(sample_id="q2", question="问题", kb_name="ADAS", response="A", retrieved_contexts=["c"]),
+        ]
+
+        results = adapter.score_batched(
+            samples,
+            snapshots,
+            ["faithfulness", "context_recall"],
+            snapshots_prepared=True,
+            skip_cells={("q1", "faithfulness")},
+        )
+
+        names = {(r.sample_id, r.metric_name) for r in results}
+        self.assertEqual(
+            names,
+            {
+                ("q1", "context_recall"),
+                ("q2", "context_recall"),
+                ("q2", "faithfulness"),
+            },
+        )
+        metrics_by_call = [call[0] for call in backend.calls]
+        self.assertIn(("context_recall",), metrics_by_call)
+        self.assertIn(("faithfulness",), metrics_by_call)
+        faith_call = next(c for c in backend.calls if c[0] == ("faithfulness",))
+        self.assertEqual(faith_call[1], ["q2"])
+
     def test_prepares_bounded_scoring_snapshots_without_mutating_evidence(self):
         snapshot = AnswerSnapshot(
             sample_id="q1",

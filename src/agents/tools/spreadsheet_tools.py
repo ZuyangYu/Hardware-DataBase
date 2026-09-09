@@ -709,19 +709,39 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
                 scored = registry
             scored.sort(key=lambda entry: -sum(1 for token in tokens if token in searchable(entry)))
             selected = scored[: max(1, min(int(top_k), 20))]
-            return [
-                Evidence(
-                    id=f"xlsx-schema:{entry['table_name']}",
-                    content=_format_schema_entry(entry),
-                    source_name=entry["document_name"],
-                    content_kind="spreadsheet_schema",
-                    processor_kind="spreadsheet_table",
-                    score=1.0,
-                    locator={"table_name": entry["table_name"], "sheet_name": entry["sheet_name"]},
-                    metadata={"tool": "spreadsheet_schema_lookup", "query": query},
+            # 打包成 ≤1100 字符的分块: 单条证据渲染上限 1200 字符,
+            # 超限会让排在后面的表对 agent 不可见, SQL 规划会漏表。
+            chunks: list[list[str]] = [[]]
+            size = 0
+            for index, entry in enumerate(selected, start=1):
+                block = f"【{index}】{_format_schema_entry(entry)}"
+                if size + len(block) > 1100 and chunks[-1]:
+                    chunks.append([])
+                    size = 0
+                chunks[-1].append(block)
+                size += len(block) + 2
+            source_names = ", ".join(
+                dict.fromkeys(entry["document_name"] for entry in selected)
+            )
+            evidences: list[Evidence] = []
+            for chunk_index, blocks in enumerate(chunks, start=1):
+                header = (
+                    f"可执行 SQL 的物化表(第 {chunk_index}/{len(chunks)} 部分, "
+                    f"文档: {source_names}):"
                 )
-                for entry in selected
-            ]
+                evidences.append(
+                    Evidence(
+                        id=f"xlsx-schema:summary:{chunk_index}",
+                        content=f"{header}\n\n" + "\n\n".join(blocks),
+                        source_name=source_names,
+                        content_kind="spreadsheet_schema",
+                        processor_kind="spreadsheet_table",
+                        score=1.0,
+                        locator={"part": f"{chunk_index}/{len(chunks)}"},
+                        metadata={"tool": "spreadsheet_schema_lookup", "query": query},
+                    )
+                )
+            return evidences
 
         items, adds_nothing = timed_tool_call(rt, "spreadsheet_schema_lookup", query, None, _run)
         if not items:

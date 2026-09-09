@@ -182,11 +182,12 @@ class AnswerRunner:
             summary = pipeline.get_last_retrieval_summary() or {}
             safe_summary = _sanitize(summary)
             evidence = list(safe_summary.get("evidence") or [])
-            contexts = [
-                str(item.get("content") or "")
-                for item in evidence
-                if item.get("content")
-            ]
+            # 落盘瘦身：retrieval_summary.evidence 与快照顶层 evidence 是
+            # 同一批数据，删掉摘要里的副本（诊断键保留）。
+            safe_summary.pop("evidence", None)
+            # retrieved_contexts 不再落盘：它是 evidence.content 的纯派生
+            # 数据（双份存储曾让快照体积翻倍），评分时由
+            # AnswerSnapshot.contexts_for_scoring() 现场提取。
             response = strip_narration_segments(
                 "".join(str(part) for part in parts), narrated
             )
@@ -199,7 +200,6 @@ class AnswerRunner:
                     str(safe_summary.get("error_stage") or "answer_collection"),
                     RuntimeError(error_message) if error_message else None,
                     evidence=evidence,
-                    retrieved_contexts=contexts,
                     retrieval_summary=safe_summary,
                     context=context,
                 )
@@ -212,7 +212,6 @@ class AnswerRunner:
                     context=context,
                     retrieval_summary=safe_summary,
                     evidence=evidence,
-                    retrieved_contexts=contexts,
                 )
             scored_response, filter_diagnostic = extract_scored_response(response)
             access_check = assess_access(
@@ -228,7 +227,6 @@ class AnswerRunner:
                 kb_name=sample.kb_name,
                 response=response,
                 scored_response=scored_response,
-                retrieved_contexts=contexts,
                 evidence=evidence,
                 retrieval_summary=safe_summary,
                 started_at=started_at,
