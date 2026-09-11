@@ -284,7 +284,7 @@ def test_stale_deletion_outbox_is_a_noop(memory_context, tmp_path, monkeypatch):
     service.close()
 
 
-def test_deleted_project_memory_is_hidden_by_default_and_tombstone_is_clean(memory_context, tmp_path):
+def test_deleted_project_memory_is_hidden_by_default_and_record_is_purged(memory_context, tmp_path):
     ctx = memory_context
     worker, runtime, _fake = run_project_worker(ctx, tmp_path)
     service = MemoryService(db_path=ctx.db_path, auth=ctx.auth, store_runtime=runtime)
@@ -300,27 +300,54 @@ def test_deleted_project_memory_is_hidden_by_default_and_tombstone_is_clean(memo
 
     assert service.list_memories(actor=ctx.dept_admin, scope="project", kb_name="design") == []
 
+    # 用户主动删除是物理清除：不留空白墓碑，控制面残留一并移除，
+    # 删除指令已写入 Store outbox 并保留审计事件。
     tombstones = service.list_memories(
         actor=ctx.dept_admin,
         scope="project",
         kb_name="design",
         status="deleted",
     )
-    assert len(tombstones) == 1
-    assert tombstones[0]["status"] == "deleted"
-    assert tombstones[0]["content"] == {}
-    assert tombstones[0]["source_count"] == 0
-    assert tombstones[0]["projection_status"] == "retired"
+    assert tombstones == []
 
     with MemoryJobRepository(ctx.db_path)._connect() as conn:
         source_count = conn.execute(
             "SELECT COUNT(*) AS count FROM memory_sources WHERE memory_id = ? AND source_valid = 1",
             (record["memory_id"],),
         ).fetchone()["count"]
+        record_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM memory_records WHERE memory_id = ?",
+            (record["memory_id"],),
+        ).fetchone()["count"]
     assert source_count == 0
+    assert record_count == 0
 
-    # Legacy project tombstones may still have a valid provenance edge.  They
-    # must not reappear as usable sources in the governance view.
+    worker.close()
+    service.close()
+
+
+def test_legacy_deleted_project_tombstone_hides_reauthored_sources(memory_context, tmp_path):
+    """历史删除墓碑即使 provenance 边重新有效，也不得回到治理视图。"""
+
+    ctx = memory_context
+    worker, runtime, _fake = run_project_worker(ctx, tmp_path)
+    service = MemoryService(db_path=ctx.db_path, auth=ctx.auth, store_runtime=runtime)
+    record = service.list_memories(actor=ctx.dept_admin, scope="project", kb_name="design")[0]
+
+    # 公共 delete 现已物理清除；这里用内部退休路径构造历史墓碑数据。
+    service._retire_governed(
+        record["memory_id"],
+        actor=ctx.dept_admin,
+        expected_revision=record["revision"],
+        next_status="deleted",
+        operation="delete",
+        reason="历史版本删除",
+        request_id="legacy-delete",
+        request_context=None,
+        kb_name="design",
+        scrub=True,
+    )
+
     with MemoryJobRepository(ctx.db_path)._connect() as conn:
         conn.execute(
             "UPDATE memory_sources SET source_valid = 1, invalidated_at = NULL WHERE memory_id = ?",
