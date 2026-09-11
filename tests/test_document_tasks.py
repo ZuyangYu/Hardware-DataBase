@@ -119,6 +119,217 @@ def test_status_changes_are_recorded_as_idempotent_task_events(tmp_path):
     assert events[1]["payload"] == {"from": "queued", "to": "running"}
 
 
+def test_chat_task_creation_atomically_advances_the_conversation_current_task(tmp_path):
+    """Catches regressions where refresh chooses an older task by timestamp."""
+    store = _store(tmp_path)
+    first = _create(store)
+    second = _create(
+        store,
+        initiating_turn_id="turn-2",
+        idempotency_key="turn-2:document-generation",
+    )
+
+    current = store.get_current_chat_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+        knowledge_base_name="hardware",
+    )
+
+    assert current is not None
+    assert current.task_id == second.task_id
+    state = store.get_conversation_document_state(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+    )
+    assert state == {
+        "current_task_id": second.task_id,
+        "revision": 2,
+    }
+
+    # Replaying the first request is idempotent and must not reactivate it.
+    assert _create(store).task_id == first.task_id
+    assert store.get_current_chat_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+    ).task_id == second.task_id
+
+
+def test_chat_task_stream_events_are_ordered_and_scoped_to_the_owner(tmp_path):
+    """Catches missing/out-of-order event cursors and cross-owner leakage."""
+    store = _store(tmp_path)
+    task = _create(store)
+    store.update_status(task.task_id, "queued")
+    store.update_status(task.task_id, "running")
+
+    events = store.list_conversation_stream_events(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+        after_seq=0,
+    )
+
+    assert [event["event_type"] for event in events] == [
+        "task_activated",
+        "status_changed",
+        "status_changed",
+    ]
+    assert [event["seq"] for event in events] == sorted(event["seq"] for event in events)
+    assert events[-1]["payload"] == {"from": "queued", "to": "running"}
+    assert store.list_conversation_stream_events(
+        tenant_id="tenant-a",
+        user_id="other-user",
+        conversation_id="conversation-1",
+        after_seq=0,
+    ) == []
+
+
+def test_projection_snapshots_are_deduplicated_and_keep_measurable_progress(tmp_path):
+    store = _store(tmp_path)
+    task = _create(store)
+    first_projection = {
+        "task_id": task.task_id,
+        "status": "running",
+        "progress": {"completed_units": 2, "total_units": 10},
+    }
+
+    first = store.append_projection_snapshot(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+        task_id=task.task_id,
+        projection=first_projection,
+    )
+    duplicate = store.append_projection_snapshot(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+        task_id=task.task_id,
+        projection=dict(first_projection),
+    )
+    second = store.append_projection_snapshot(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+        task_id=task.task_id,
+        projection={
+            **first_projection,
+            "progress": {"completed_units": 3, "total_units": 10},
+        },
+    )
+
+    assert first is not None
+    assert duplicate is None
+    assert second is not None
+    assert second["seq"] > first["seq"]
+    events = store.list_conversation_stream_events(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+        after_seq=first["seq"],
+    )
+    assert events[-1]["event_type"] == "projection"
+    assert events[-1]["payload"]["projection"]["progress"] == {
+        "completed_units": 3,
+        "total_units": 10,
+    }
+
+
+def test_chat_task_association_changes_are_visible_to_the_stream(tmp_path):
+    store = _store(tmp_path)
+    task = _create(store)
+    store.bind_plan(
+        task.task_id,
+        output_spec_id="spec-1",
+        output_spec_version=1,
+        document_plan_id="plan-1",
+        document_plan_version=1,
+    )
+    store.attach_work_order(task.task_id, "wo-1")
+    store.attach_run(task.task_id, "run-1")
+    store.attach_artifact(task.task_id, "artifact-1")
+    store.clear_plan(task.task_id)
+
+    event_types = [
+        event["event_type"]
+        for event in store.list_conversation_stream_events(
+            tenant_id="tenant-a",
+            user_id="user-a",
+            conversation_id="conversation-1",
+        )
+    ]
+
+    assert event_types == [
+        "task_activated",
+        "plan_bound",
+        "work_order_bound",
+        "run_bound",
+        "artifact_bound",
+        "plan_cleared",
+    ]
+
+
+def test_current_chat_task_backfills_legacy_conversations_without_a_pointer(tmp_path):
+    """Catches legacy sessions staying empty after the current-task migration."""
+    store = _store(tmp_path)
+    first = _create(store)
+    second = _create(
+        store,
+        initiating_turn_id="turn-2",
+        idempotency_key="turn-2:document-generation",
+    )
+    with store._connect() as conn:  # migration fixture: simulate a pre-pointer database
+        conn.execute("DELETE FROM conversation_document_states")
+
+    current = store.get_current_chat_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+        knowledge_base_name="hardware",
+    )
+
+    assert current is not None
+    assert current.task_id == second.task_id
+    assert current.task_id != first.task_id
+    assert store.get_conversation_document_state(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+    ) == {"current_task_id": second.task_id, "revision": 1}
+
+
+def test_kb_filter_never_reactivates_an_older_task_over_the_current_pointer(tmp_path):
+    store = _store(tmp_path)
+    older = _create(store)
+    current = store.create_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        origin="chat",
+        created_by="user-a",
+        conversation_id="conversation-1",
+        initiating_turn_id="turn-other-kb",
+        knowledge_base_name="other-kb",
+        status="queued",
+        idempotency_key="turn-other-kb:document-generation",
+    )
+
+    assert store.get_current_chat_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+        knowledge_base_name="hardware",
+    ) is None
+    state = store.get_conversation_document_state(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        conversation_id="conversation-1",
+    )
+    assert state == {"current_task_id": current.task_id, "revision": 2}
+    assert state["current_task_id"] != older.task_id
+
+
 def test_task_supports_planning_confirmation_and_release_statuses(tmp_path):
     store = _store(tmp_path)
     task = _create(store)

@@ -372,6 +372,86 @@ class GenerationSessionStore:
         payload["messages"] = messages
         return GenerationSession.model_validate(payload)
 
+    def find_recent_active_output_spec_session(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        knowledge_base_name: str,
+        conversation_id: str | int | None,
+        template_version_id: str | None = None,
+    ) -> GenerationSession | None:
+        """Latest live intake session bound to the same chat conversation.
+
+        Chat-led intake owns exactly one session per conversation.  A tool
+        call that lost its session pointer must resume this one instead of
+        forking a fresh draft that discards recorded clarification answers.
+        """
+
+        conversation = self._optional(conversation_id)
+        if not conversation:
+            return None
+        template = self._optional(template_version_id)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT * FROM document_generation_sessions
+                   WHERE tenant_id = ? AND user_id = ? AND knowledge_base_name = ?
+                     AND contract_version = 'output_spec_v1'
+                     AND status IN ('needs_clarification', 'awaiting_plan', 'awaiting_plan_confirmation')
+                   ORDER BY created_at DESC LIMIT 50""",
+                (tenant_id, user_id, knowledge_base_name),
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                if str(payload.get("conversation_id") or "") != conversation:
+                    continue
+                if template and str(payload.get("template_version_id") or "") != template:
+                    continue
+                session = self._session_from_connection(conn, row)
+                if str(session.status or "") in {
+                    "needs_clarification", "awaiting_plan", "awaiting_plan_confirmation",
+                }:
+                    return session
+        return None
+
+    def find_latest_output_spec_session(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        knowledge_base_name: str,
+        conversation_id: str | int | None,
+        template_version_id: str | None = None,
+    ) -> GenerationSession | None:
+        """Latest output-spec session in the conversation, any status.
+
+        Later turns must inherit the server-owned scope (notably a
+        knowledge-base discovery ``target_identity``) even after the plan was
+        confirmed: re-asking for the hardware/connector identity would fork
+        the conversation and contradict the earlier delegation.
+        """
+
+        conversation = self._optional(conversation_id)
+        if not conversation:
+            return None
+        template = self._optional(template_version_id)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT * FROM document_generation_sessions
+                   WHERE tenant_id = ? AND user_id = ? AND knowledge_base_name = ?
+                     AND contract_version = 'output_spec_v1'
+                   ORDER BY created_at DESC LIMIT 50""",
+                (tenant_id, user_id, knowledge_base_name),
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                if str(payload.get("conversation_id") or "") != conversation:
+                    continue
+                if template and str(payload.get("template_version_id") or "") != template:
+                    continue
+                return self._session_from_connection(conn, row)
+        return None
+
     def append_message(
         self,
         session_id: str,
@@ -687,6 +767,32 @@ class GenerationSessionStore:
         brief_payload["updated_at"] = _utc_now()
         brief = GenerationBrief.model_validate(brief_payload)
         revised = session.model_copy(update={"brief": brief, "updated_at": _utc_now()})
+        with closing(self._connect()) as conn:
+            self._update_session_row(conn, revised)
+        return revised
+
+    def set_status(self, session_id: str, status: str) -> GenerationSession:
+        """Persist a lifecycle status transition without changing the draft.
+
+        Worker-side quality gates use this to hand a blocked task back to the
+        conversation when a required field has no reliable evidence.  The
+        transition is deliberately small and validated against the same
+        session enum as ``bind_plan``/``update_output_spec_draft``.
+        """
+        normalized = str(status or "").strip()
+        allowed = {
+            "needs_clarification", "ready_to_generate", "generating", "completed", "cancelled",
+            "awaiting_plan", "awaiting_plan_confirmation", "planned", "blocked",
+        }
+        if normalized not in allowed:
+            raise ValueError("unsupported generation session status")
+        session = self.get_session(session_id)
+        if session.status == normalized:
+            return session
+        revised = session.model_copy(update={
+            "status": normalized,
+            "updated_at": _utc_now(),
+        })
         with closing(self._connect()) as conn:
             self._update_session_row(conn, revised)
         return revised

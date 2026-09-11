@@ -628,6 +628,21 @@ class IcdScopeResolution(BaseModel):
         return self
 
 
+def icd_scope_decision_hash(decision: "IcdScopeDecision") -> str:
+    """Hash the frozen scope identity, ignoring advisory presentation fields.
+
+    ``suggested_refdes`` is operator guidance derived from the frozen EDF, not
+    part of the decision identity; excluding it keeps previously persisted
+    reviews verifiable after the field was introduced.
+    """
+
+    payload = decision.model_dump(mode="json")
+    for exception in payload.get("exceptions") or []:
+        if isinstance(exception, dict):
+            exception.pop("suggested_refdes", None)
+    return content_hash(payload)
+
+
 class IcdScopeReview(BaseModel):
     """Hash-bound, one-batch review of an ICD scope decision."""
 
@@ -655,7 +670,7 @@ class IcdScopeReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_frozen_scope(self):
-        expected_hash = content_hash(self.decision)
+        expected_hash = icd_scope_decision_hash(self.decision)
         if self.decision_content_hash and self.decision_content_hash != expected_hash:
             raise ValueError("ICD scope decision hash does not match contents")
         self.decision_content_hash = expected_hash

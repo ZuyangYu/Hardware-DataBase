@@ -65,6 +65,10 @@ export const WORK_ORDER_STATUS_LABELS: Record<DocumentGenerationPhase, DocumentS
 };
 
 const STATUS_ALIASES: Record<string, DocumentGenerationPhase> = {
+  needs_input: 'needs_clarification',
+  awaiting_confirmation: 'ready_to_generate',
+  queued: 'generating',
+  running: 'generating',
   planned: 'draft',
   ready_to_draft: 'generating',
   drafting: 'generating',

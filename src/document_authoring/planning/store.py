@@ -800,6 +800,34 @@ class DocumentPlanningStore:
                             }),
                         ),
                     )
+                    stream_table = connection.execute(
+                        """SELECT 1 FROM sqlite_master
+                            WHERE type = 'table' AND name = 'document_task_stream_events'"""
+                    ).fetchone()
+                    if (
+                        stream_table is not None
+                        and task.origin == "chat"
+                        and task.conversation_id
+                    ):
+                        connection.execute(
+                            """INSERT INTO document_task_stream_events (
+                                   tenant_id, user_id, conversation_id, task_id,
+                                   event_type, created_at, payload_json
+                               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                task.tenant_id,
+                                task.user_id,
+                                task.conversation_id,
+                                task_id,
+                                "plan_confirmed",
+                                accepted_at.isoformat(),
+                                _safe_json({
+                                    "status": "planned",
+                                    "document_plan_id": plan.document_plan_id,
+                                    "document_plan_version": plan.version,
+                                }),
+                            ),
+                        )
 
                 planning_task_id = task_id
                 event_key = f"plan-confirmation:{plan.document_plan_id}:{plan.version}:{plan.plan_hash}"

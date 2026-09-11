@@ -493,6 +493,17 @@ def test_canonical_values_pass_through_and_unknown_normalize_to_none():
     assert normalize_clarification_policy("missing_data_policy", None) is None
 
 
+@pytest.mark.parametrize("raw,canonical", [
+    ("A", "mark_tbd"),
+    ("选A", "mark_tbd"),
+    ("明确标注待补充并保留占位", "mark_tbd"),
+    ("B. 允许但必须标注", "allow_labeled"),
+])
+def test_policy_option_aliases_are_normalized_for_legacy_and_v2_callers(raw, canonical):
+    question_id = "inference_policy" if canonical == "allow_labeled" else "missing_data_policy"
+    assert normalize_clarification_policy(question_id, raw) == canonical
+
+
 def test_legacy_brief_payload_with_chinese_policies_normalizes_on_read():
     brief = GenerationBrief.model_validate({
         "scope": {"revision": "当前发布版本"},

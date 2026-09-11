@@ -387,12 +387,14 @@ def _is_fillable_table_header(value_preview: str | None) -> bool:
 
 
 def _workbook_has_active_content(names: set[str], package: zipfile.ZipFile) -> bool:
+    # External workbook links are treated as stale reference metadata. They
+    # must never become evidence, but they do not make every visible worksheet
+    # non-writable. Macro, ActiveX and embedded-object payloads remain a hard
+    # safety boundary.
     sensitive_markers = ("/embeddings/", "/activex/", "/ctrlprops/", "/vba")
     if any(marker in name.lower() for name in names for marker in sensitive_markers):
         return True
-    if any(name.startswith("xl/externalLinks/") for name in names):
-        return True
-    return any(_has_external_relationship(package.read(name)) for name in names if name.endswith(".rels"))
+    return False
 
 
 def _workbook_blocked_reason(

@@ -271,6 +271,38 @@ def test_formal_icd_retrieves_only_profile_connector_refdes():
     )
 
 
+def test_confirmed_target_connector_replaces_example_template_connector_scope():
+    pipeline, ctx, service, snapshot = _pipeline()
+    order = service.create_knowledge_base_work_order.return_value
+    order.generation_brief = {
+        "target_identity": {
+            "hardware": "EQ6 ADAS 控制器",
+            "connector_refdes": "X1900",
+        }
+    }
+    service.store.read_template_content.return_value = _formal_icd_template_bytes("X302")
+    pipeline.circuit_service.list_pin_mapping_evidence.return_value = [
+        _pin_mapping_evidence_for("X1900", "1", "CAN_H")
+    ]
+    service.prepare_icd_scope_review.return_value = SimpleNamespace(
+        pending_count=1,
+        exceptions=[SimpleNamespace(user_instruction="Confirm X1900 exposure")],
+    )
+
+    result = pipeline.auto_generate_knowledge_base_document(
+        ctx,
+        knowledge_base_name="hardware",
+        template_version_id="template-a",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "scope_review_required"
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
+        "hardware", list(snapshot.source_names), ctx, refdes=["X1900"],
+    )
+
+
 def test_formal_icd_scope_ignores_front_view_only_connector_refdes():
     pipeline, ctx, service, snapshot = _pipeline()
     service.store.read_template_content.return_value = _formal_icd_template_bytes(
@@ -443,8 +475,13 @@ def test_icd_connector_with_no_edf_mapping_returns_controlled_blocker():
     assert result["stage"] == "scope_review_required"
     assert [issue["kind"] for issue in result["exceptions"]] == ["connector_mapping_missing"]
     assert result["exceptions"][0]["refdes"] == "J7"
-    pipeline.circuit_service.list_pin_mapping_evidence.assert_called_once_with(
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_any_call(
         "hardware", list(snapshot.source_names), ctx, refdes=["J7"],
+    )
+    # The blocker also discovers the frozen EDF's actual connectors so the
+    # user can confirm an evidence-led replacement.
+    pipeline.circuit_service.list_pin_mapping_evidence.assert_any_call(
+        "hardware", list(snapshot.source_names), ctx,
     )
     service.run_internal_harness.assert_not_called()
 
@@ -584,3 +621,177 @@ def test_frozen_icd_pin_evidence_preserves_each_mapping_edf_source():
         (evidence.source_name, evidence.metadata["pin_mappings"][0]["source_name"])
         for evidence in outcome.evidences
     } == {("left.edf", "left.edf"), ("right.edf", "right.edf")}
+
+
+def test_edf_connector_discovery_keeps_only_template_prefix_connectors():
+    pipeline, ctx, _service, snapshot = _pipeline()
+    pipeline.circuit_service.list_pin_mapping_evidence.return_value = [
+        _pin_mapping_evidence_for("X1900", "1", "CAN_H"),
+        _pin_mapping_evidence_for("X1902", "1", "CAN_H"),
+        _pin_mapping_evidence_for("C1101", "1", "GND"),
+        _pin_mapping_evidence_for("U400-3", "1", "GND"),
+    ]
+
+    refdes = pipeline._edf_connector_refdes(
+        "hardware", snapshot, ctx, refdes_hint=["X302"],
+    )
+
+    assert refdes == ["X1900", "X1902"]
+
+
+def test_scope_auto_replace_predicates():
+    assert AppPipeline._template_example_replacement_authorized(SimpleNamespace(
+        generation_brief={"additional_requirements": [
+            {"field": "confirmed_template_mapping_hash", "value": "hash-1"},
+        ]},
+    ))
+    assert not AppPipeline._template_example_replacement_authorized(SimpleNamespace(
+        generation_brief={"additional_requirements": [
+            {"field": "confirmed_preview_hash", "value": "hash-1"},
+        ]},
+    ))
+    assert AppPipeline._pending_scope_allows_edf_replacement(SimpleNamespace(
+        resolutions=[],
+        exceptions=[SimpleNamespace(exception_id="e1", kind="connector_mapping_missing")],
+    ))
+    assert not AppPipeline._pending_scope_allows_edf_replacement(SimpleNamespace(
+        resolutions=[],
+        exceptions=[SimpleNamespace(exception_id="e2", kind="conflicting_pin_definition")],
+    ))
+    assert not AppPipeline._pending_scope_allows_edf_replacement(SimpleNamespace(
+        resolutions=[SimpleNamespace(exception_id="e1")],
+        exceptions=[SimpleNamespace(exception_id="e1", kind="connector_mapping_missing")],
+    ))
+
+
+def _auto_replace_fixture(monkeypatch, *, authorized: bool):
+    pipeline, ctx, service, snapshot = _pipeline()
+    snapshot.content_hash = "snapshot-hash"
+    icd_schema = _relationship_schema(query_terms=["connector J7 pinout"])
+    brief = (
+        {"additional_requirements": [
+            {"field": "confirmed_template_mapping_hash", "value": "hash-1"},
+        ]}
+        if authorized else {}
+    )
+    order = SimpleNamespace(
+        work_order_id="work-auto",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+        template_version_id="template-a",
+        generation_brief=brief,
+    )
+    monkeypatch.setattr(pipeline, "_icd_template_profile", lambda _order: None)
+    monkeypatch.setattr(pipeline, "_icd_connector_scope_schema", lambda _order: icd_schema)
+    monkeypatch.setattr(pipeline, "_document_requirement_resolution_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_icd_front_view_connector_refdes", lambda _order: [])
+    monkeypatch.setattr(pipeline, "_document_retriever_scope_kwargs", lambda _order: {})
+
+    def fake_pin_evidence(_kb, _sources, _ctx, *, refdes=None, **_kwargs):
+        if refdes is None:
+            return [_pin_mapping_evidence_for("J8", "1", "CAN_H")]
+        if list(refdes) == ["J8"]:
+            return [_pin_mapping_evidence_for("J8", "1", "CAN_H")]
+        return []
+
+    pipeline.circuit_service.list_pin_mapping_evidence = Mock(side_effect=fake_pin_evidence)
+    service.prepare_icd_scope_review.side_effect = lambda _ctx, _wo, decision: IcdScopeReview(
+        work_order_id="work-auto", decision=decision,
+        source_snapshot_hash="snapshot-hash", status="pending",
+    )
+    service.store.get_icd_scope_review.return_value = None
+    service.store.save_icd_scope_review.side_effect = lambda review: review
+    service.store.replace_pending_icd_scope_review.side_effect = lambda review: review
+    return pipeline, ctx, service, snapshot, order
+
+
+def test_template_example_scope_is_auto_replaced_from_edf_when_authorized(monkeypatch):
+    pipeline, ctx, service, snapshot, order = _auto_replace_fixture(
+        monkeypatch, authorized=True,
+    )
+
+    result = pipeline._kb_document_generation_stages(
+        ctx, order, snapshot,
+        knowledge_base_name="hardware",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "ready", result
+    service.store.save_icd_scope_review.assert_called_once()
+    frozen = service.store.save_icd_scope_review.call_args.args[0]
+    assert frozen.status == "frozen"
+    assert frozen.pending_count == 0
+    assert [mapping["refdes"] for mapping in frozen.decision.frozen_pin_mappings] == ["J8"]
+
+
+def test_template_example_scope_without_authorization_stays_pending(monkeypatch):
+    pipeline, ctx, service, snapshot, order = _auto_replace_fixture(
+        monkeypatch, authorized=False,
+    )
+
+    result = pipeline._kb_document_generation_stages(
+        ctx, order, snapshot,
+        knowledge_base_name="hardware",
+        document_schema_id="schema-a",
+        document_schema_version="1",
+    )
+
+    assert result["stage"] == "scope_review_required"
+    assert [issue["kind"] for issue in result["exceptions"]] == ["connector_mapping_missing"]
+    service.store.replace_pending_icd_scope_review.assert_not_called()
+
+
+def test_kb_retriever_second_pass_attaches_pin_function_candidates():
+    from src.agents.claim_evidence import InformationRequirement
+    from src.agents.schemas import Evidence
+    from src.document_authoring.icd_scope_decision import build_icd_scope_decision
+
+    pipeline, ctx, service, _snapshot = _pipeline()
+    pipeline.circuit_service = None
+    decision = build_icd_scope_decision(
+        [_pin_mapping_evidence_for("X1900", "1", "CAN0H")], [],
+    )
+    review = IcdScopeReview(
+        work_order_id="work-1",
+        decision=decision,
+        source_snapshot_hash="snapshot-1",
+    )
+    function_chunk = Evidence(
+        id="hsi-x1900-table",
+        content=(
+            "<table><caption>X1900 connector pinout</caption>"
+            "<tr><td>Pin</td><td>Function</td></tr>"
+            "<tr><td>1</td><td>车身CAN0高</td></tr></table>"
+        ),
+        source_name="board.edf",
+        content_kind="document",
+        processor_kind="document",
+    )
+
+    def fake_retrieve(_kb, query, **_kwargs):
+        if "X1900 管脚" in query:
+            return [function_chunk]
+        return []
+
+    pipeline.backend.retrieve.side_effect = fake_retrieve
+    retrieve = pipeline._knowledge_base_retriever(
+        ctx, "hardware", ["board.edf"], icd_scope_review=review,
+    )
+    requirement = InformationRequirement(
+        requirement_id="req-1",
+        semantic_unit_id="field:table:Sheet1:15",
+        claim_type="attribute",
+        subject="管脚表",
+        retrieval_query_terms=["管脚号 Pin Number", "功能描述 Function"],
+        required_capabilities=["relationship_lookup"],
+    )
+
+    outcome = retrieve(requirement, 1)
+
+    merged = [
+        evidence for evidence in outcome.evidences
+        if getattr(evidence, "id", "") == "hsi-x1900-table"
+    ]
+    assert merged, [getattr(evidence, "id", "") for evidence in outcome.evidences]
+    assert merged[0].metadata.get("pin_function_hits") == {"X1900-1": "车身CAN0高"}

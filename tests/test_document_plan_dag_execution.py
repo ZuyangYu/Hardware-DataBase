@@ -15,6 +15,7 @@ from src.document_authoring.harness.plan_graph import (
     PlanDAGExecutor,
 )
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
+from src.document_authoring.harness.runtime import _plan_field_execution_key
 from src.document_authoring.models import (
     AuthoringRunManifest,
     DocumentSchema,
@@ -141,6 +142,11 @@ def test_execution_route_rejects_partial_plan_binding_instead_of_falling_back() 
         )
 
 
+def test_plan_execution_key_never_double_prefixes_template_semantic_ids() -> None:
+    assert _plan_field_execution_key("cover") == "field:cover"
+    assert _plan_field_execution_key("field:sheet:Sheet1!C16") == "field:sheet:Sheet1!C16"
+
+
 def test_plan_executor_waits_for_dependencies_and_barriers() -> None:
     graph = TaskGraphCompiler().compile(_plan_with_dependency())
     calls: list[str] = []
@@ -230,8 +236,9 @@ def test_plan_executor_dispatches_structural_nodes_through_an_optional_callback(
     assert result.outputs["release"]["kind"] == "release"
 
 
+@pytest.mark.parametrize("prefixed_plan_units", [False, True])
 def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, prefixed_plan_units
 ) -> None:
     import src.document_authoring.harness.runtime as runtime_module
     import src.settings
@@ -248,6 +255,20 @@ def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
         created_by="user-a",
     )
     plan_payload = _plan(status="accepted").model_dump(mode="json")
+    if prefixed_plan_units:
+        def prefixed(value: str) -> str:
+            return value if value.startswith("field:") else f"field:{value}"
+
+        for unit in plan_payload["semantic_units"]:
+            unit["unit_id"] = prefixed(unit["unit_id"])
+        for requirement in plan_payload["coverage_contract"]["requirements"]:
+            requirement["unit_id"] = prefixed(requirement["unit_id"])
+        for task in plan_payload["unit_tasks"]:
+            task["unit_id"] = prefixed(task["unit_id"])
+        plan_payload["layout_contract"]["bindings"] = {
+            prefixed(key): value
+            for key, value in plan_payload["layout_contract"]["bindings"].items()
+        }
     plan_payload.update({
         "source_snapshot_id": snapshot.source_set_snapshot_id,
         "source_snapshot_hash": snapshot.content_hash,
@@ -368,6 +389,10 @@ def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
     assert persisted_run is not None
     assert persisted_run.execution_route == "plan_dag"
     assert persisted_run.current_node == "complete"
+    assert persisted_run.completed_units == 2
+    assert persisted_run.total_units == 2
+    assert set(persisted_run.unit_statuses) >= {"field:cover", "field:pins"}
+    assert set(persisted_run.draft_ids) >= {"field:cover", "field:pins"}
 
 
 def _output_payload_for_runtime(plan: DocumentPlan) -> dict:

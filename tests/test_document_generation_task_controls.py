@@ -7,7 +7,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from src.document_authoring.models import DocumentArtifact, DocumentWorkOrder, HarnessCheckpoint, HarnessRun
+from src.document_authoring.models import (
+    AuthoringExecutionEvent,
+    DocumentArtifact,
+    DocumentWorkOrder,
+    HarnessCheckpoint,
+    HarnessRun,
+)
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.harness import runtime as harness_runtime
 from src.document_authoring.harness.graph import HarnessExecutionResult
@@ -223,3 +229,35 @@ def test_harness_progress_mirrors_checkpoint_into_run(monkeypatch):
         and update.get("total_units") == 0
         for update in progress_updates
     )
+
+
+def test_terminal_delete_removes_execution_events_without_fk_failure(tmp_path):
+    store = DocumentAuthoringStore(
+        db_path=str(tmp_path / "authoring.db"),
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    order = store.create_work_order(_work_order("wo-with-events", "blocked"))
+    run = store.create_harness_run(HarnessRun(
+        harness_run_id="run-events",
+        work_order_id=order.work_order_id,
+        run_manifest_id="manifest-events",
+        status="failed",
+    ))
+    store.append_execution_event(AuthoringExecutionEvent(
+        event_id="event-1",
+        event_type="coverage_evaluated",
+        tenant_id="tenant-a",
+        work_order_id=order.work_order_id,
+        harness_run_id=run.harness_run_id,
+        idempotency_key="event-key-1",
+    ))
+
+    audit = store.delete_terminal_work_order(
+        order.work_order_id,
+        actor_id="writer",
+        reason="清除未完成工单",
+    )
+
+    assert store.get_work_order(order.work_order_id) is None
+    assert store.get_harness_run(run.harness_run_id) is None
+    assert audit.work_order_id == order.work_order_id

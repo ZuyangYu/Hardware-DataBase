@@ -3,7 +3,7 @@
  * 删掉重命名按钮/员工 handoff;保留会话标题 + KB 名 + 记忆提炼信息 + 退出。
  * 另含本会话授权台账入口(查看/撤销个人记忆授权)与长期记忆页链接。
  */
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
 import UserMenu from '@/components/UserMenu';
@@ -44,6 +44,8 @@ type Props = {
   sessionConsents?: MemoryConsentView[] | null;
   /** 撤销一条授权;返回是否成功。 */
   onRevokeConsent?: (consentEventId: string, reason: string) => Promise<boolean>;
+  /** 页面级附加操作(如嵌入的导出任务中心),渲染在用户菜单之前。 */
+  actions?: ReactNode;
 };
 
 function MemoryToggle({
@@ -91,6 +93,7 @@ export default function ChatHeader({
   onToggleAutoExtract,
   sessionConsents = null,
   onRevokeConsent,
+  actions = null,
 }: Props) {
   const [toggling, setToggling] = useState(false);
   const [consentsOpen, setConsentsOpen] = useState(false);
@@ -132,6 +135,7 @@ export default function ChatHeader({
         <span className={CHAT_HEADER_TITLE_META_CLASS}>{kbName}</span>
       </div>
       <div className="flex items-center gap-[8px]">
+        {actions}
         {memorySummary && (
           <label
             className="flex cursor-pointer items-center gap-[6px] rounded-[8px] px-[8px] py-[4px] text-[11px] transition-colors hover:bg-[#f6f7fa]"

@@ -36,6 +36,17 @@ def decide_template_activation(
 ) -> TemplateActivationDecision:
     """Classify a model proposal without granting the model policy authority."""
     effective = policy or TemplateActivationPolicy()
+    if (
+        analysis.format != "docx"
+        and analysis.suggestions
+        and not analysis.human_confirmed_target_unit_ids
+    ):
+        from src.document_authoring.table_contracts import repair_repeating_table_targets
+
+        analysis.suggestions = [
+            repair_repeating_table_targets(analysis, suggestion)
+            for suggestion in analysis.suggestions
+        ]
     unit_by_id = {unit.unit_id: unit for unit in analysis.units}
     target_ids = [
         unit_id
@@ -60,6 +71,7 @@ def decide_template_activation(
         ),
     )
     reasons: list[str] = []
+    validated_table_target_ids: set[str] = set()
 
     def reject(reason: str) -> None:
         if reason not in reasons:
@@ -82,6 +94,7 @@ def decide_template_activation(
             try:
                 from src.document_authoring.table_contracts import table_schema_from_targets
                 table_schema_from_targets(analysis, suggestion)
+                validated_table_target_ids.update(suggestion.target_unit_ids)
             except (ValueError, KeyError):
                 reject("repeating_table_requires_schema")
         if suggestion.confidence < effective.min_mapping_confidence:
@@ -98,6 +111,12 @@ def decide_template_activation(
                 reject("mapping_conflict")
                 continue
             if analysis.format == "docx":
+                continue
+            if suggestion.value_shape == "repeating_table" and unit_id in validated_table_target_ids:
+                # The table contract has already checked the complete body
+                # rectangle, inspected headers, writability, and any explicit
+                # sample-value overwrite approval. Layout blanks inside that
+                # rectangle are legitimate table cells, not scalar targets.
                 continue
             if unit.value_kind == "formula":
                 reject("formula_target")
@@ -129,6 +148,7 @@ def decide_template_activation(
         risky_targets = [
             unit
             for unit in target_units
+            if unit.unit_id not in validated_table_target_ids
             if not (
                 unit.structural_role_hint == "placeholder"
                 or (

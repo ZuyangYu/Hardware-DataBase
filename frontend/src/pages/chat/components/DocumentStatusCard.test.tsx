@@ -86,7 +86,102 @@ describe('DocumentStatusCard', () => {
     expect(sessionCard).not.toContain('document-generation?');
   });
 
-  it('renders the durable clarification question and options in the task card', () => {
+  it('renders a blocking ICD scope gate with the operator instruction', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'work_order_status',
+          status: 'needs_review',
+          next_actions: ['submit_icd_scope_resolution', 'open_document_workbench'],
+          kb_name: 'ADAS',
+          work_order_id: 'wo-89b3',
+          generation_session_id: null,
+          gateReview: {
+            reviewKind: 'icd_scope',
+            status: 'pending',
+            scopePendingCount: 1,
+            scopeBlocking: true,
+            scopeExceptions: [{
+              kind: 'connector_mapping_missing',
+              refdes: 'X302',
+              user_instruction: '已确定接插件 X302，但当前冻结来源中未找到其 EDF 管脚映射。',
+              suggested_refdes: ['X1900', 'X1902'],
+            }],
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain('ICD 范围异常待办');
+    expect(markup).toContain('X302');
+    expect(markup).toContain('EDF');
+    expect(markup).toContain('X1900');
+    expect(markup).toContain('请直接回复“确认”');
+    expect(markup).toContain('按 EDF 实际位号生成');
+    expect(markup).not.toContain('候选文档已生成');
+  });
+
+  it('offers a chat resolution hint for non-blocking scope exceptions', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'work_order_status',
+          status: 'needs_review',
+          next_actions: ['submit_icd_scope_resolution', 'open_document_workbench'],
+          kb_name: 'ADAS',
+          work_order_id: 'wo-99',
+          generation_session_id: null,
+          gateReview: {
+            reviewKind: 'icd_scope',
+            status: 'pending',
+            scopePendingCount: 1,
+            scopeBlocking: false,
+            scopeExceptions: [{
+              kind: 'connector_scope_ambiguous',
+              refdes: 'X301',
+              user_instruction: '请确认使用 X301 还是 X302。',
+            }],
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain('ICD 范围异常待办');
+    expect(markup).toContain('X301');
+    expect(markup).toContain('包含');
+    expect(markup).toContain('排除');
+    expect(markup).toContain('实际情况');
+    expect(markup).toContain('待处理：X301');
+  });
+
+  it('renders a generic review gate without ICD include/exclude copy', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'work_order_status',
+          status: 'needs_review',
+          next_actions: ['review_document', 'open_document_workbench'],
+          kb_name: 'ADAS',
+          work_order_id: 'wo-77',
+          generation_session_id: null,
+          gateReview: {
+            reviewKind: 'artifact_approval:artifact-a',
+            status: 'pending',
+            scopePendingCount: 0,
+            scopeBlocking: false,
+            scopeExceptions: [],
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain('待处理人工审核');
+    expect(markup).toContain('工作台');
+    expect(markup).not.toContain('包含');
+    expect(markup).not.toContain('排除');
+  });
+
+  it('keeps durable clarification content in the conversation, not the status card', () => {
     const markup = renderToStaticMarkup(
       <DocumentStatusCard
         card={{
@@ -103,12 +198,12 @@ describe('DocumentStatusCard', () => {
       />,
     );
 
-    expect(markup).toContain('请选择生成范围');
-    expect(markup).toContain('当前发布版本');
-    expect(markup).toContain('最新上传版本');
+    expect(markup).not.toContain('请选择生成范围');
+    expect(markup).not.toContain('当前发布版本');
+    expect(markup).not.toContain('最新上传版本');
   });
 
-  it('renders an answer form and option buttons without showing internal identifiers', () => {
+  it('keeps clarification interaction in the main conversation composer', () => {
     const markup = renderToStaticMarkup(
       <DocumentStatusCard
         card={{
@@ -122,17 +217,17 @@ describe('DocumentStatusCard', () => {
           content: '请选择生成范围',
           options: ['当前发布版本', '最新上传版本'],
         }}
-        onAnswerClarification={() => undefined}
       />,
     );
 
-    expect(markup).toContain('回答澄清问题');
-    expect(markup).toContain('textarea');
-    expect(markup).toContain('当前发布版本');
-    expect(markup).toContain('最新上传版本');
-    expect(markup).toContain('提交回答');
-    // Identifiers are used only in the actionable deep-link URL, never as
-    // visible card copy.
+    expect(markup).not.toContain('请在下方对话输入框回复');
+    expect(markup).not.toContain('当前发布版本');
+    expect(markup).not.toContain('最新上传版本');
+    expect(markup).not.toContain('textarea');
+    expect(markup).not.toContain('提交回答');
+    expect(markup).not.toContain('aria-label="澄清候选项"');
+    expect(markup).not.toContain('href="/document-generation?kb=hardware&amp;session=session-private"');
+    // Internal identifiers are never rendered as visible card copy.
     expect(markup).not.toContain('>task-private<');
     expect(markup).not.toContain('>session-private<');
     expect(markup).not.toContain('scope');
@@ -179,6 +274,79 @@ describe('DocumentStatusCard', () => {
       />,
     );
     expect(noWorkOrder).not.toContain('下载');
+  });
+
+  it('renders live unit progress and the terminal execution error inline', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'work_order_status',
+          status: 'failed',
+          next_actions: [],
+          kb_name: 'hardware',
+          work_order_id: 'wo-failed',
+          errorCode: 'document_job_failed',
+          errorMessage: '执行范围不在白名单中',
+          retryable: false,
+          progress: {
+            currentNode: 'fill_fields',
+            completedUnits: 7,
+            totalUnits: 21,
+            percent: 33,
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain('已失败');
+    expect(markup).toContain('字段生成进度 7 / 21');
+    expect(markup).toContain('33%');
+    expect(markup).toContain('执行范围不在白名单中');
+    expect(markup).toContain('role="progressbar"');
+  });
+
+  it('explains blocked generation in the conversation and marks review candidates', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'work_order_status',
+          status: 'blocked',
+          next_actions: ['view_error', 'provide_value'],
+          kb_name: 'ADAS',
+          work_order_id: 'wo-blocked',
+          errorMessage: '21 个字段尚未完成，无法发布',
+          artifacts: [{ artifact_id: 'candidate-1', stage: 'review_candidate' }],
+        }}
+      />,
+    );
+
+    expect(markup).toContain('生成被阻止');
+    expect(markup).toContain('请在下方对话中补充或确认缺失信息');
+    expect(markup).toContain('候选文档（待审核）');
+    expect(markup).not.toContain('0 / 210%');
+  });
+
+  it('does not call a blocked terminal node completed', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'work_order_status',
+          status: 'blocked',
+          next_actions: ['view_error'],
+          kb_name: 'ADAS',
+          work_order_id: 'wo-blocked-terminal',
+          progress: {
+            currentNode: 'complete',
+            completedUnits: 0,
+            totalUnits: 21,
+            percent: 0,
+          },
+        }}
+      />,
+    );
+
+    expect(markup).toContain('执行进度 0 / 21');
+    expect(markup).not.toContain('生成完成 0 / 21');
   });
 
   it('workbench preselects kb and work order from query params', () => {

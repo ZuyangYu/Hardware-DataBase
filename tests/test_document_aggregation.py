@@ -96,3 +96,25 @@ def test_aggregator_keeps_distinct_rows_with_same_display_values_and_marks_missi
     )
     assert any(item.row_key == "J1:1" for item in missing.missing_items)
     assert any(item.row_key == "J1:2" for item in missing.missing_items)
+
+
+def test_aggregator_preserves_prefixed_plan_unit_identity_for_template_binding():
+    unit_id = "field:sheet:Sheet1!C16"
+    plan = SimpleNamespace(
+        document_plan_id="plan-prefixed", version=1, plan_hash="sha256:plan",
+        semantic_units=[SimpleNamespace(unit_id=unit_id, kind="field", required=True)],
+        coverage_contract=CoverageContract(requirements=[
+            CoverageRequirement(
+                requirement_id=unit_id, unit_id=unit_id, kind="paragraph",
+            ),
+        ]),
+    )
+
+    model = DocumentAggregator().aggregate(
+        plan,
+        {unit_id: _draft(unit_id, text="Controller power supply", evidence_id="e1")},
+    )
+
+    assert [block.unit_id for block in model.blocks] == [unit_id]
+    assert model.blocks[0].content == "Controller power supply"
+    assert not model.missing_items

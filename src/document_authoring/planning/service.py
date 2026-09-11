@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 from src.document_authoring.contract_registry import CAPABILITIES
@@ -67,14 +68,36 @@ class LegacyTemplatePlanningAdapter:
         unit_tasks: list[UnitTaskSpec] = []
         required_capabilities: list[str] = []
         resolved_capabilities: list[str] = []
+        target_terms = self._target_identity_terms(spec.target_identity)
 
         for field in schema.fields:
             kind = "table" if field.value_type == "table" else "field"
+            # Keep the semantic contract alongside the physical binding.  The
+            # plan is immutable and may be executed without reloading the
+            # original DocumentSchema, so a unit containing only ``type``
+            # silently degenerates into a cell-address query (for example
+            # ``Sheet1!C16``).  These bounded strings are metadata, not source
+            # content, and are consumed by the existing retrieval/writer
+            # boundary at execution time.
+            field_output_schema = {
+                "type": field.value_type,
+                "required": field.required,
+                "label": field.label,
+                "description": field.description,
+                "query_terms": self._unique([*field.query_terms, *target_terms]),
+                "subject_aliases": list(field.subject_aliases),
+                "required_capabilities": list(field.required_capabilities),
+                "preferred_source_roles": list(field.preferred_source_roles),
+                "missing_policy": field.missing_policy,
+                "row_scope": field.table_row_scope,
+            }
+            if field.table_columns:
+                field_output_schema["columns"] = list(field.table_columns.values())
             semantic_units.append(SemanticUnitPlan(
                 unit_id=field.field_id,
                 kind=kind,
                 required=field.required,
-                output_schema={"type": field.value_type, "required": field.required},
+                output_schema=field_output_schema,
                 source_capabilities=[f"{capability}@1" for capability in field.required_capabilities],
                 reviewer_policy_id=field.verification_policy_id,
             ))
@@ -83,7 +106,13 @@ class LegacyTemplatePlanningAdapter:
                     (item for item in spec.table_requirements if item.unit_id == field.field_id),
                     None,
                 )
-                columns = list((field.table_columns or {}).values())
+                # Coverage contracts use stable physical column IDs.  Header
+                # labels are presentation metadata and may legitimately
+                # repeat (for example several ERP columns in an ICD sheet).
+                # Using labels here made otherwise valid templates fail the
+                # uniqueness invariant before rendering; the execution schema
+                # still carries the label mapping in ``field_output_schema``.
+                columns = list((field.table_columns or {}).keys())
                 if table_requirement is not None:
                     columns = table_requirement.required_columns
                 if not columns:
@@ -97,12 +126,35 @@ class LegacyTemplatePlanningAdapter:
                     required_coverage = False
                 else:
                     required_coverage = field.required
-                row_keys = table_requirement.row_keys if table_requirement else []
-                row_identity_fields = table_requirement.row_identity_fields if table_requirement else []
-                row_key_schema = table_requirement.row_key_schema if table_requirement else {}
-                row_order = table_requirement.row_order if table_requirement else "declared"
-                duplicate_policy = table_requirement.duplicate_policy if table_requirement else "reject"
-                if field.required and not row_keys:
+                row_keys = table_requirement.row_keys if table_requirement else list(field.table_row_keys or [])
+                row_identity_fields = (
+                    table_requirement.row_identity_fields if table_requirement
+                    else list(field.table_row_identity_fields or [])
+                )
+                row_key_schema = (
+                    table_requirement.row_key_schema if table_requirement
+                    else dict(field.table_row_key_schema or {})
+                )
+                row_order = (
+                    table_requirement.row_order if table_requirement
+                    else (field.table_row_order or "declared")
+                )
+                duplicate_policy = (
+                    table_requirement.duplicate_policy if table_requirement
+                    else (field.table_duplicate_policy or "reject")
+                )
+                row_scope = (
+                    table_requirement.row_scope
+                    if table_requirement is not None
+                    else field.table_row_scope
+                )
+                # An explicit TableRequirement promises a closed row scope;
+                # without row keys it is unresolved.  A schema-inferred
+                # template table may use its server-owned dynamic scope and
+                # discover row identities from evidence at execution time.
+                if field.required and not row_keys and (
+                    table_requirement is not None or not row_scope
+                ):
                     issues.append(PlanIssue(
                         code="row_scope_unresolved",
                         severity="error",
@@ -139,7 +191,7 @@ class LegacyTemplatePlanningAdapter:
             unit_tasks.append(self._unit_task(
                 unit_id=field.field_id,
                 plan_version=spec.version,
-                output_schema={"type": field.value_type},
+                output_schema=field_output_schema,
                 source_capabilities=field.required_capabilities,
                 retrieval_policy_id=field.retrieval_policy_id,
             ))
@@ -213,10 +265,31 @@ class LegacyTemplatePlanningAdapter:
                     path=f"semantic_units.{unit.unit_id}",
                 ))
 
+        # An ICD pin sheet must be represented as a table contract.  A schema
+        # made only of physical cell coordinates cannot provide row identity or
+        # field meaning; allowing it through causes the writer to fan out the
+        # same retrieved paragraph into every cell.
+        if (
+            spec.document_type.casefold() == "icd"
+            and semantic_units
+            and not any(unit.kind == "table" for unit in semantic_units)
+            and all(re.search(r"(?:^|!)?[A-Z]{1,3}[1-9][0-9]+$", unit.unit_id) for unit in semantic_units)
+        ):
+            issues.append(PlanIssue(
+                code="icd_semantic_table_required",
+                severity="error",
+                message="ICD pin content must be bound as a semantic table with connector and pin row identity.",
+                path="semantic_units",
+            ))
+
         output_summary = {
             "purpose": spec.purpose,
             "document_type": spec.document_type,
             "target_identity": dict(spec.target_identity),
+            "additional_requirements": [
+                item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+                for item in spec.additional_requirements
+            ],
             "layout_mode": spec.layout_source.mode,
             "primary_format": primary.format,
             "outline_unit_ids": [unit.unit_id for unit in spec.outline],
@@ -386,6 +459,26 @@ class LegacyTemplatePlanningAdapter:
     @staticmethod
     def _unique(values: list[str]) -> list[str]:
         return list(dict.fromkeys(str(value) for value in values if str(value).strip()))
+
+    @classmethod
+    def _target_identity_terms(cls, value: Any) -> list[str]:
+        """Flatten only bounded scalar identity values into retrieval hints."""
+        terms: list[str] = []
+
+        def visit(item: Any) -> None:
+            if isinstance(item, dict):
+                for child in item.values():
+                    visit(child)
+            elif isinstance(item, (list, tuple, set)):
+                for child in item:
+                    visit(child)
+            elif isinstance(item, (str, int, float)):
+                text = str(item).strip()
+                if text and len(text) <= 160:
+                    terms.append(text)
+
+        visit(value)
+        return cls._unique(terms)
 
     @staticmethod
     def _retrieval_specs(schema: DocumentSchema) -> list[dict[str, str]]:
@@ -664,6 +757,10 @@ class TemplateFreePlanningAdapter:
             "purpose": spec.purpose,
             "document_type": spec.document_type,
             "target_identity": dict(spec.target_identity),
+            "additional_requirements": [
+                item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+                for item in spec.additional_requirements
+            ],
             "layout_mode": layout_source.mode,
             "recipe_id": recipe_id,
             "recipe_version": recipe_version,

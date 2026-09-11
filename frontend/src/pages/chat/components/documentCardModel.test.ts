@@ -7,6 +7,7 @@ import {
   documentArtifactDownloadPath,
   documentArtifactFileName,
   documentCardFromChatTask,
+  documentCardFromWorkOrderStatus,
   documentCardFromClarificationEvent,
   documentCardFromGenerationSession,
   documentCardIdentity,
@@ -14,10 +15,13 @@ import {
   documentCardStatusTone,
   documentCardTitle,
   documentCardWorkbenchActions,
+  documentCurrentChatTaskPath,
+  documentChatTaskEventsPath,
   nextActionLabel,
   documentWorkOrderStatusPath,
   mergeDocumentCards,
   parseDocumentCardEvent,
+  parseDocumentTaskStreamEvent,
   type DocumentCardData,
 } from './documentCardModel';
 import type { DocumentChatTaskView, GenerationSession } from '@/api/types';
@@ -37,6 +41,34 @@ const workOrderCard: DocumentCardData = {
 };
 
 describe('documentCardModel', () => {
+  it('builds the durable current-task snapshot path for one conversation', () => {
+    expect(documentCurrentChatTaskPath(85)).toBe(
+      '/api/v1/document-generation/chat-tasks/current?session_id=85',
+    );
+  });
+
+  it('builds and parses the replayable current-task event stream', () => {
+    expect(documentChatTaskEventsPath(85)).toBe(
+      '/api/v1/document-generation/chat-tasks/events?session_id=85',
+    );
+    const task = {
+      session_id: 85,
+      task_id: 'task-current',
+      work_order_id: null,
+      kb_name: 'ADAS',
+      job_status: 'running',
+      created_at: '',
+      updated_at: '',
+      status: { status: 'running', phase: 'running', artifacts: [] },
+    };
+    expect(parseDocumentTaskStreamEvent(JSON.stringify({
+      event_type: 'projection',
+      current: task,
+    }))).toEqual(task);
+    expect(parseDocumentTaskStreamEvent('{bad json')).toBeNull();
+    expect(parseDocumentTaskStreamEvent(JSON.stringify({ current: { task_id: 'task' } }))).toBeNull();
+  });
+
   it('parses document_card event payloads defensively', () => {
     expect(parseDocumentCardEvent(cardEvent({
       kind: 'work_order_created',
@@ -59,7 +91,7 @@ describe('documentCardModel', () => {
     }));
     expect(parsed).toEqual({
       kind: 'work_order_status',
-      status: '',
+      status: 'draft',
       next_actions: ['get_document_generation_status'],
       kb_name: 'kb',
       work_order_id: null,
@@ -429,6 +461,421 @@ describe('documentCardModel', () => {
     });
   });
 
+  it('titles a session-only task as a requirement clarification, not a work order', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 97,
+      task_id: 'task-clarify-1',
+      work_order_id: null,
+      kb_name: 'ADAS',
+      job_status: 'needs_clarification',
+      created_at: '2026-09-10T11:21:34Z',
+      updated_at: '2026-09-10T11:21:34Z',
+      status: {
+        work_order_id: null,
+        status: 'needs_clarification',
+        phase: 'needs_clarification',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'ADAS',
+        unit_statuses: {},
+        next_actions: ['answer_clarification'],
+        clarification_session_id: 'generation-session-clarify',
+        clarification_state: {
+          session_id: 'generation-session-clarify',
+          status: 'needs_clarification',
+          pending_question: {
+            question_id: 'recommendations',
+            content: '是否采用推荐的生成与审核策略？',
+            options: ['采用推荐方案', '逐项设置'],
+            reason: '可一次确认安全默认值。',
+          },
+        },
+        artifacts: [],
+      },
+    };
+
+    const card = documentCardFromChatTask(task);
+    expect(card.kind).toBe('requirement_clarification');
+    expect(card.status).toBe('needs_clarification');
+    expect(card.question_id).toBe('recommendations');
+    expect(documentCardTitle(card.kind)).toBe('需求澄清');
+  });
+
+  it('titles a session without a work order as a requirement session', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 98,
+      task_id: 'task-session-1',
+      work_order_id: null,
+      kb_name: 'ADAS',
+      job_status: 'pending',
+      created_at: '2026-09-10T11:22:00Z',
+      updated_at: '2026-09-10T11:22:00Z',
+      status: {
+        work_order_id: null,
+        status: 'draft',
+        phase: 'draft',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'ADAS',
+        unit_statuses: {},
+        next_actions: ['answer_clarification', 'propose_document_plan'],
+        artifacts: [],
+      },
+    };
+
+    const card = documentCardFromChatTask(task);
+    expect(card.kind).toBe('generation_session');
+    expect(documentCardTitle(card.kind)).toBe('需求会话');
+  });
+
+  it('maps a pending ICD scope review into an actionable gate', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 99,
+      task_id: 'task-scope',
+      work_order_id: 'wo-89b3',
+      kb_name: 'ADAS',
+      job_status: 'needs_review',
+      created_at: '2026-09-10T16:12:57Z',
+      updated_at: '2026-09-10T16:12:58Z',
+      status: {
+        work_order_id: 'wo-89b3',
+        status: 'needs_review',
+        phase: 'needs_review',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'ADAS',
+        unit_statuses: {},
+        next_actions: ['submit_icd_scope_resolution', 'open_document_workbench'],
+        artifacts: [],
+        pending_review: {
+          review_id: 'review-scope',
+          review_kind: 'icd_scope',
+          status: 'pending',
+          scope_review: {
+            status: 'pending',
+            pending_count: 1,
+            blocking: true,
+            exceptions: [{
+              kind: 'connector_mapping_missing',
+              refdes: 'X302',
+              recommended_action: 'check_edf_mapping',
+              user_instruction: '已确定接插件 X302，但当前冻结来源中未找到其 EDF 管脚映射。',
+              suggested_refdes: ['X1900', 'X1902'],
+            }],
+          },
+        },
+      },
+    };
+
+    const card = documentCardFromChatTask(task);
+
+    expect(card.status).toBe('needs_review');
+    expect(card.gateReview).toMatchObject({
+      reviewKind: 'icd_scope',
+      status: 'pending',
+      scopePendingCount: 1,
+      scopeBlocking: true,
+      scopeExceptions: [expect.objectContaining({
+        refdes: 'X302',
+        suggested_refdes: ['X1900', 'X1902'],
+      })],
+    });
+  });
+
+  it('clears the gate on refresh when the work order no longer reports it', () => {
+    const fallback: DocumentCardData = {
+      kind: 'work_order_status',
+      status: 'needs_review',
+      next_actions: ['submit_icd_scope_resolution', 'open_document_workbench'],
+      kb_name: 'ADAS',
+      work_order_id: 'wo-89b3',
+      generation_session_id: null,
+      gateReview: {
+        reviewKind: 'icd_scope',
+        status: 'pending',
+        scopePendingCount: 1,
+        scopeBlocking: false,
+        scopeExceptions: [{ kind: 'connector_scope_ambiguous', refdes: 'X301' }],
+      },
+    };
+
+    const refreshed = documentCardFromWorkOrderStatus({
+      work_order_id: 'wo-89b3',
+      status: 'running',
+      scope_type: 'knowledge_base',
+      knowledge_base_name: 'ADAS',
+      unit_statuses: {},
+      artifacts: [],
+    }, fallback);
+
+    expect(refreshed.gateReview).toBeUndefined();
+  });
+
+  it('keeps the gate on refresh when the work order still reports it', () => {
+    const fallback: DocumentCardData = {
+      kind: 'work_order_status',
+      status: 'needs_review',
+      next_actions: ['submit_icd_scope_resolution', 'open_document_workbench'],
+      kb_name: 'ADAS',
+      work_order_id: 'wo-89b3',
+      generation_session_id: null,
+    };
+
+    const refreshed = documentCardFromWorkOrderStatus({
+      work_order_id: 'wo-89b3',
+      status: 'needs_review',
+      scope_type: 'knowledge_base',
+      knowledge_base_name: 'ADAS',
+      unit_statuses: {},
+      artifacts: [],
+      pending_review: {
+        review_kind: 'icd_scope',
+        status: 'pending',
+        scope_review: {
+          status: 'pending',
+          pending_count: 1,
+          blocking: true,
+          exceptions: [{ kind: 'connector_mapping_missing', refdes: 'X302' }],
+        },
+      },
+    }, fallback);
+
+    expect(refreshed.gateReview?.scopeBlocking).toBe(true);
+    expect(refreshed.gateReview?.scopeExceptions[0]?.refdes).toBe('X302');
+  });
+
+  it('does not invent a gate review when the task has no pending review', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 98,
+      task_id: 'task-session-1',
+      work_order_id: null,
+      kb_name: 'ADAS',
+      job_status: 'pending',
+      created_at: '2026-09-10T11:22:00Z',
+      updated_at: '2026-09-10T11:22:00Z',
+      status: {
+        work_order_id: null,
+        status: 'draft',
+        phase: 'draft',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'ADAS',
+        unit_statuses: {},
+        next_actions: ['answer_clarification'],
+        artifacts: [],
+        pending_review: null,
+      },
+    };
+
+    expect(documentCardFromChatTask(task).gateReview).toBeUndefined();
+  });
+
+  it('restores a hash-bound confirmation card after refresh', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 85,
+      task_id: 'task-confirm-refresh',
+      work_order_id: null,
+      kb_name: 'ADAS',
+      job_status: 'awaiting_plan_confirmation',
+      created_at: '2026-09-09T09:38:16Z',
+      updated_at: '2026-09-09T09:38:16Z',
+      status: {
+        work_order_id: null,
+        status: 'awaiting_plan_confirmation',
+        phase: 'awaiting_confirmation',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'ADAS',
+        unit_statuses: {},
+        next_actions: ['confirm_document_plan'],
+        clarification_session_id: 'generation-session-confirm',
+        planning_state: {
+          output_spec_id: 'spec-1',
+          output_spec_version: 2,
+          output_spec_hash: 'sha256:spec',
+          document_plan_id: 'plan-1',
+          document_plan_version: 2,
+          plan_hash: 'sha256:plan',
+          proposal_status: 'proposed',
+        },
+        artifacts: [],
+      },
+    };
+
+    expect(documentCardFromChatTask(task)).toMatchObject({
+      kind: 'output_spec_confirmation',
+      status: 'awaiting_confirmation',
+      task_id: 'task-confirm-refresh',
+      generation_session_id: 'generation-session-confirm',
+      proposal: {
+        output_spec_hash: 'sha256:spec',
+        plan_hash: 'sha256:plan',
+        status: 'proposed',
+        executable: true,
+      },
+    });
+  });
+
+  it('projects authoritative execution failure and real unit progress', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 17,
+      task_id: 'task-failed',
+      work_order_id: 'wo-failed',
+      kb_name: 'hardware',
+      job_status: 'failed',
+      created_at: '2026-09-09T09:00:00Z',
+      updated_at: '2026-09-09T09:06:22Z',
+      status: {
+        work_order_id: 'wo-failed',
+        status: 'failed',
+        phase: 'failed',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'hardware',
+        target_format: 'xlsx',
+        unit_statuses: {},
+        next_actions: [],
+        error_code: 'document_job_failed',
+        error_message: 'plan execution scope is not present in the configured allowlist',
+        retryable: false,
+        harness_run: {
+          status: 'running',
+          current_node: 'fill_fields',
+          completed_units: 7,
+          total_units: 21,
+        },
+        artifacts: [],
+      },
+    };
+
+    expect(documentCardFromChatTask(task)).toMatchObject({
+      status: 'failed',
+      errorCode: 'document_job_failed',
+      errorMessage: 'plan execution scope is not present in the configured allowlist',
+      retryable: false,
+      progress: {
+        currentNode: 'fill_fields',
+        completedUnits: 7,
+        totalUnits: 21,
+        percent: 33,
+      },
+    });
+  });
+
+  it('normalizes a blocked release even when the execution node says complete', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 17,
+      task_id: 'task-blocked',
+      work_order_id: 'wo-blocked',
+      kb_name: 'ADAS',
+      job_status: 'pending',
+      created_at: '',
+      updated_at: '',
+      status: {
+        work_order_id: 'wo-blocked',
+        status: 'pending',
+        phase: 'pending',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'ADAS',
+        unit_statuses: {},
+        next_actions: ['view_error', 'provide_value'],
+        error_code: 'plan_release_blocked',
+        error_message: '21 个字段尚未完成，无法发布',
+        harness_run: {
+          status: 'completed',
+          current_node: 'complete',
+          completed_units: 0,
+          total_units: 21,
+        },
+        artifacts: [{ artifact_id: 'candidate-1', stage: 'review_candidate' }],
+      },
+    };
+
+    expect(documentCardFromChatTask(task)).toMatchObject({
+      status: 'blocked',
+      errorCode: 'plan_release_blocked',
+      progress: { completedUnits: 0, totalUnits: 21, percent: 0 },
+      artifacts: [{ artifact_id: 'candidate-1', stage: 'review_candidate' }],
+    });
+  });
+
+  it('keeps blocked/error/progress semantics when a work-order refresh replaces the card', () => {
+    const refreshed = documentCardFromWorkOrderStatus({
+      work_order_id: 'wo-blocked',
+      task_id: 'task-blocked',
+      status: 'pending',
+      phase: 'pending',
+      scope_type: 'knowledge_base',
+      knowledge_base_name: 'ADAS',
+      unit_statuses: {},
+      next_actions: ['view_error', 'provide_value'],
+      error_code: 'plan_release_blocked',
+      error_message: '发布被阻止',
+      harness_run: { current_node: 'complete', completed_units: 0, total_units: 21 },
+      artifacts: [{ artifact_id: 'candidate-1', stage: 'review_candidate' }],
+    }, {
+      kind: 'work_order_status', status: 'running', next_actions: [], kb_name: 'ADAS',
+      work_order_id: 'wo-blocked', generation_session_id: null,
+    });
+    expect(refreshed.status).toBe('blocked');
+    expect(refreshed.errorMessage).toBe('发布被阻止');
+    expect(refreshed.progress?.percent).toBe(0);
+    expect(refreshed.artifacts?.[0].stage).toBe('review_candidate');
+  });
+
+  it('restores a pending question when a refreshed v2 session is awaiting a plan', () => {
+    const task: DocumentChatTaskView = {
+      session_id: 76,
+      task_id: 'task-clarify-refresh',
+      work_order_id: null,
+      kb_name: 'hardware',
+      job_status: 'needs_clarification',
+      created_at: '2026-09-09T02:16:38Z',
+      updated_at: '2026-09-09T02:16:51Z',
+      status: {
+        work_order_id: null,
+        status: 'draft',
+        phase: 'draft',
+        clarification_session_id: 'generation-session-clarify-refresh',
+        scope_type: 'knowledge_base',
+        knowledge_base_name: 'hardware',
+        unit_statuses: {},
+        next_actions: ['answer_clarification', 'propose_document_plan'],
+        artifacts: [],
+      },
+    };
+    const fallback = documentCardFromChatTask(task);
+    expect(fallback.generation_session_id).toBe('generation-session-clarify-refresh');
+    const restored = documentCardFromGenerationSession({
+      session_id: 'generation-session-clarify-refresh',
+      knowledge_base_name: 'hardware',
+      status: 'awaiting_plan' as unknown as GenerationSession['status'],
+      brief: {
+        purpose: '参考模板生成 ICD',
+        confirmed: false,
+        confidence: 0.9,
+        scope: {},
+        source_policy: {},
+        output_policy: {},
+        missing_data_policy: null,
+        inference_policy: null,
+      },
+      messages: [{
+        message_id: 'question-outline',
+        role: 'assistant',
+        content: '需要包含哪些章节或字段？可直接输入名称列表。',
+        question_id: 'outline',
+        options: [],
+        reason: '章节范围决定计划中的语义单元。',
+      }],
+      document_task_id: 'task-clarify-refresh',
+      last_question_id: 'outline',
+    }, fallback);
+
+    expect(restored).toMatchObject({
+      status: 'needs_clarification',
+      generation_session_id: 'generation-session-clarify-refresh',
+      question_id: 'outline',
+      content: '需要包含哪些章节或字段？可直接输入名称列表。',
+      next_actions: ['answer_clarification'],
+    });
+    expect(canAnswerClarification(restored, true)).toBe(true);
+  });
+
   it('falls back to describeWorkOrderStatus for statuses outside the card map', () => {
     expect(documentCardStatusLabel('queued')).toBe('排队中');
     expect(documentCardStatusLabel('retrieving')).toBe('正在检索资料');
@@ -471,7 +918,7 @@ describe('documentCardFromGenerationSession restores durable clarification state
     };
   }
 
-  it('restores the pending question, options and answer affordance after a page refresh', () => {
+  it('does not restore an answered question as the pending composer payload after a page refresh', () => {
     const restored = documentCardFromGenerationSession(session({
       status: 'needs_clarification',
       last_question_id: 'output_format',
@@ -488,12 +935,29 @@ describe('documentCardFromGenerationSession restores durable clarification state
       task_id: 'task-refresh-1',
       work_order_id: 'wo-refresh-1',
       generation_session_id: 'gs-refresh-1',
-      next_actions: ['answer_clarification'],
-      question_id: 'output_format',
-      options: ['docx', 'xlsx'],
-      reason: 'format_required',
+      next_actions: fallback.next_actions,
+      question_id: null,
+      options: [],
+      reason: null,
     });
-    expect(restored.content).toBe('请选择输出格式');
+    // An answered question must not be resurrected as stale composer content.
+    expect(restored.content).toBeNull();
+  });
+
+  it('does not resurrect an answered assistant question when clarification payload is missing', () => {
+    const restored = documentCardFromGenerationSession(session({
+      status: 'needs_clarification',
+      last_question_id: 'format',
+      messages: [
+        { message_id: 'm1', role: 'assistant', content: '请选择输出格式', question_id: 'format', options: ['docx'] },
+        { message_id: 'm2', role: 'user', content: 'docx', question_id: 'format', answer: 'docx' },
+      ],
+    }), fallback);
+
+    expect(restored.status).toBe('needs_clarification');
+    expect(restored.question_id).toBeNull();
+    expect(restored.content).toBeNull();
+    expect(restored.options).toEqual([]);
   });
 
   it('uses the latest unanswered assistant question over earlier answered ones', () => {
@@ -512,14 +976,15 @@ describe('documentCardFromGenerationSession restores durable clarification state
     expect(restored.content).toBe('请选择范围');
   });
 
-  it('falls back to last_question_id when the message history has no question payload', () => {
+  it('does not expose an answer action when the message history has no question payload', () => {
     const restored = documentCardFromGenerationSession(session({
       status: 'needs_clarification',
       last_question_id: 'pin_range',
       messages: [],
     }), fallback);
 
-    expect(restored.question_id).toBe('pin_range');
+    expect(restored.question_id).toBeNull();
+    expect(restored.next_actions).toEqual(fallback.next_actions);
     expect(restored.options).toEqual([]);
     expect(restored.content).toBeNull();
   });

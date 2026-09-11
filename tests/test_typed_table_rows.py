@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from src.document_authoring.harness.graph import build_writer_request
 from src.document_authoring.models import (
     DocumentFieldSchema,
     DocumentSchema,
     DocumentUnitDraft,
-    HarnessRun,
     RendererPolicy,
     TemplateUnitBinding,
+    TypedFieldValue,
     TypedTableRow,
     WorkbookFillPlan,
     WorkbookTableColumnSchema,
@@ -363,3 +362,161 @@ def test_renderer_rejects_typed_table_rows_without_server_owned_keys():
             RendererPolicy(renderer_policy_id="smoke-renderer"),
             table_schemas=[schema], security_approved=True,
         )
+
+
+def test_renderer_row_bound_expands_for_validated_dynamic_table_fills():
+    """Frozen dynamic tables may exceed the activation-time template bound."""
+    schema = _table_schema().model_copy(update={"max_output_rows": 2})
+    fill = WorkbookTableFill(
+        table_region_id="interfaces-table", semantic_unit_id="interfaces",
+        rows=[
+            WorkbookTableRowFill(row_key=f"J1:{index}", cells={"signal": "CAN", "pin": f"P13.{index}"})
+            for index in range(1, 4)
+        ],
+    )
+    plan = WorkbookFillPlan(
+        template_version_id="template-a", fills=[], table_fills=[fill],
+    )
+
+    schemas = DocumentGenerationService._table_schemas_for_fill_plan([schema], plan)
+
+    assert schemas[0].max_output_rows == 3
+    assert schemas[0].table_region_id == "interfaces-table"
+
+
+def test_pin_functions_from_drafts_reads_function_column(monkeypatch):
+    from types import SimpleNamespace
+
+    service = object.__new__(DocumentGenerationService)
+    schema = DocumentSchema(
+        document_schema_id="ds", version="1", document_type="icd",
+        fields=[DocumentFieldSchema(
+            field_id="table:Sheet1:15", label="管脚表", value_type="table",
+            retrieval_policy_id="r", verification_policy_id="v",
+            table_columns={
+                "A": "管脚号 Pin Number",
+                "B": "管脚定义 Pin Definition",
+                "C": "功能描述 Function",
+            },
+        )],
+    )
+    monkeypatch.setattr(service, "_schema", lambda *_args, **_kwargs: schema)
+
+    def _draft(unit_id: str, rows: list[TypedTableRow]) -> DocumentUnitDraft:
+        return DocumentUnitDraft(
+            unit_id=unit_id, run_id="run-1", generated_by="managed_writer",
+            content="table", evidence_ids=["e1"],
+            typed_value=TypedFieldValue(
+                kind="table", normalized_values=[row.row_key for row in rows],
+                display_value=f"{len(rows)} rows", evidence_ids=["e1"], rows=rows,
+            ),
+            validation_status="supported",
+        )
+
+    order = SimpleNamespace(document_schema_id="ds", document_schema_version="1")
+    drafts = [
+        _draft("field:table:Sheet1:15", [
+            TypedTableRow(row_key="X1900-1", cells={
+                "A": "X1900-1", "B": "I_S_WKUP", "C": "唤醒控制输入",
+            }, evidence_ids=["e1"]),
+            TypedTableRow(row_key="X1900-2", cells={
+                "A": "X1900-2", "B": "CAN0H", "C": "TBD（知识库未提供可靠功能描述）",
+            }, evidence_ids=["e1"]),
+        ]),
+    ]
+
+    functions = service._pin_functions_from_drafts(order, drafts)
+
+    assert functions == {"X1900-1": "唤醒控制输入"}
+
+
+def test_field_evidence_selection_keeps_pin_function_evidence_under_cap():
+    from src.document_authoring.harness.graph import _select_field_evidence
+
+    items = [
+        {
+            "id": f"generic-{index}",
+            "content": f"generic chunk {index} " + "x" * 100,
+            "score": 0.9,
+            "metadata": {},
+        }
+        for index in range(6)
+    ]
+    items.append({
+        "id": "frozen",
+        "content": "Frozen ICD pin mappings: X1900-1 -> I_S_WKUP",
+        "score": 1.0,
+        "metadata": {
+            "frozen_icd_scope": True,
+            "pin_mappings": [{"refdes": "X1900", "pin_name": "1", "net_name": "I_S_WKUP"}],
+        },
+    })
+    items.append({
+        "id": "pin-function:hits",
+        "content": "X1900-1 KL15唤醒 | STB,STG,OPL | X1900-1 | ADAS处于休眠状态",
+        "score": 1.0,
+        "metadata": {"pin_function_hits": {"X1900-1": "KL15唤醒"}},
+    })
+
+    selected, discarded = _select_field_evidence(
+        items,
+        max_items=5,
+        preserve_rerank_order=False,
+        retrieval_query_terms=["管脚号 Pin Number", "功能描述 Function"],
+    )
+
+    selected_ids = {item["id"] for item in selected}
+    assert {"frozen", "pin-function:hits"} <= selected_ids
+    assert len(selected) == 5
+    assert "pin-function:hits" not in discarded
+
+
+def test_plan_execution_schema_preserves_template_table_labels():
+    from types import SimpleNamespace
+
+    from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
+    from src.document_authoring.planning.models import (
+        CoverageContract,
+        CoverageRequirement,
+    )
+
+    original = DocumentSchema(
+        document_schema_id="ds", version="1", document_type="icd", status="approved",
+        fields=[DocumentFieldSchema(
+            field_id="table:Sheet1:15", label="管脚表", value_type="table",
+            retrieval_policy_id="r", verification_policy_id="v",
+            table_columns={
+                "A": "管脚号 Pin Number",
+                "B": "管脚定义 Pin Definition",
+                "C": "功能描述 Function",
+            },
+        )],
+    )
+    plan = SimpleNamespace(
+        document_plan_id="plan-1",
+        semantic_units=[SimpleNamespace(
+            unit_id="table:Sheet1:15",
+            required=True,
+            output_schema={
+                "type": "table",
+                "label": "管脚表",
+                "columns": ["A", "B", "C"],
+            },
+            source_capabilities=[],
+        )],
+        coverage_contract=CoverageContract(requirements=[CoverageRequirement(
+            requirement_id="table:Sheet1:15",
+            unit_id="table:Sheet1:15",
+            kind="table",
+            required_columns=["A", "B", "C"],
+        )]),
+    )
+
+    adapted = InternalDocumentHarnessRuntime._plan_execution_schema(plan, original)
+    field = adapted.fields[0]
+
+    assert field.table_columns == {
+        "A": "管脚号 Pin Number",
+        "B": "管脚定义 Pin Definition",
+        "C": "功能描述 Function",
+    }

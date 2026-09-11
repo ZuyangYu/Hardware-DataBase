@@ -18,6 +18,7 @@ from src.document_authoring.template_analysis import (
     TemplateAnalysisUnit,
 )
 from src.document_authoring.template_progress import TemplateProgressCallback
+from src.document_authoring.table_contracts import repair_repeating_table_targets
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ _SUGGESTION_OPTIONAL_CONTRACT_FIELDS = (
 # 远小于 max_tokens，单块失败只丢该块而非整份分析。
 _SUGGESTION_CHUNK_SIZE = 50
 _FUNCTION_HEADER_RE = re.compile(
-    r"(?:\bfunction\b|\bdescription\b|功能描述|功能说明|功能)",
+    r"(?:^|[/\s])(?:function|description)(?:$|[/\s])|功能描述|功能说明",
     re.IGNORECASE,
 )
 _SYSTEM_PROMPT = """You analyze a safe template structural inventory and decide how each proposed semantic unit will be generated.
@@ -188,6 +189,10 @@ class LLMTemplateSuggestionProvider:
                 parsed = [
                     _to_analysis_suggestion(item)
                     for item in response.value.suggestions
+                ]
+                parsed = [
+                    repair_repeating_table_targets(analysis, suggestion)
+                    for suggestion in parsed
                 ]
                 for suggestion in parsed:
                     valid_targets: list[str] = []
@@ -352,6 +357,74 @@ def _deterministic_function_table_suggestions(
         if sheet_name and column is not None:
             function_headers[(sheet_name, column)] = header.value_preview
     suggestions: list[TemplateAnalysisSuggestion] = []
+    # A fully populated example table is still a valid template region when
+    # its header row describes the values to be replaced. Require a rectangular
+    # run with at least three populated cells per row so ordinary label/value
+    # examples are not promoted accidentally.
+    from collections import defaultdict
+    from src.document_authoring.template_analysis import workbook_cell_coordinates
+    headers_by_row: dict[tuple[str, int], list[tuple[TemplateAnalysisUnit, int]]] = defaultdict(list)
+    for candidate in analysis.units:
+        if candidate.structural_role_hint != "table_header" or not candidate.value_preview:
+            continue
+        try:
+            column, row = workbook_cell_coordinates(str(candidate.locator.get("cell", "")))
+        except ValueError:
+            continue
+        headers_by_row[(str(candidate.locator.get("sheet_name") or ""), row)].append((candidate, column))
+    for (sheet_name, header_row), header_run in headers_by_row.items():
+        header_run.sort(key=lambda value: value[1])
+        header_columns = [column for _unit_id, column in header_run]
+        if len(header_columns) < 3 or not any(
+            _FUNCTION_HEADER_RE.search(classified_id.value_preview or "")
+            for classified_id, _column in header_run
+        ):
+            continue
+        by_row_cells: dict[int, list[tuple[TemplateAnalysisUnit, int]]] = {}
+        for candidate in analysis.units:
+            if str(candidate.locator.get("sheet_name") or "") != sheet_name:
+                continue
+            try:
+                candidate_column, candidate_row = workbook_cell_coordinates(str(candidate.locator.get("cell", "")))
+            except ValueError:
+                continue
+            if candidate_row > header_row and candidate_column in header_columns:
+                by_row_cells.setdefault(candidate_row, []).append((candidate, candidate_column))
+        body_rows = [
+            row for row, row_cells in sorted(by_row_cells.items())
+            if len(row_cells) == len(header_columns)
+            and sum(bool(item.value_preview) for item, _column in row_cells) >= 3
+        ]
+        if not body_rows:
+            continue
+        # Keep only the contiguous body prefix below the header.
+        contiguous_rows: list[int] = []
+        for row in body_rows:
+            if contiguous_rows and row != contiguous_rows[-1] + 1:
+                break
+            contiguous_rows.append(row)
+        if not contiguous_rows:
+            continue
+        target_ids = [
+            item.unit_id
+            for row in contiguous_rows
+            for item, _column in sorted(by_row_cells[row], key=lambda value: value[1])
+            if item.writable and item.value_kind != "formula"
+        ]
+        if len(target_ids) != len(contiguous_rows) * len(header_columns):
+            continue
+        labels = [item.value_preview for item, _column in header_run if item.value_preview]
+        suggestions.append(TemplateAnalysisSuggestion(
+            semantic_unit_id=f"table:{sheet_name}:{header_row}",
+            label=" / ".join(labels),
+            target_unit_ids=target_ids,
+            retrieval_terms=labels[:8],
+            confidence=0.94,
+            value_shape="repeating_table",
+            overwrite_basis="sample_value",
+            description="Template data table inferred from a descriptive header row",
+        ))
+        return suggestions
     for unit in analysis.units:
         if (
             not unit.writable
@@ -360,12 +433,19 @@ def _deterministic_function_table_suggestions(
             or not unit.candidate_for_auto_fill
         ):
             continue
-        neighborhood_values = [
+        same_row_values = [
+            neighbor.value_preview
+            for neighbor in unit.neighborhood
+            if neighbor.value_preview and neighbor.relative_row == 0
+        ]
+        headers = [
             neighbor.value_preview
             for neighbor in unit.neighborhood
             if neighbor.value_preview
+            and neighbor.relative_column == 0
+            and neighbor.relative_row < 0
+            and _FUNCTION_HEADER_RE.search(neighbor.value_preview)
         ]
-        headers = [value for value in neighborhood_values if _FUNCTION_HEADER_RE.search(value)]
         sheet_name = str(unit.locator.get("sheet_name") or "")
         column = _cell_column_index(str(unit.locator.get("cell") or ""))
         if not headers and sheet_name and column is not None:
@@ -375,11 +455,11 @@ def _deterministic_function_table_suggestions(
         if not headers:
             continue
         terms: list[str] = []
-        for value in [*headers, *neighborhood_values]:
+        for value in [*headers, *same_row_values]:
             if value and value not in terms:
                 terms.append(value)
         suggestions.append(TemplateAnalysisSuggestion(
-            semantic_unit_id=f"field:{unit.unit_id}",
+            semantic_unit_id=unit.unit_id,
             label=unit.label,
             target_unit_ids=[unit.unit_id],
             retrieval_terms=terms[:8],

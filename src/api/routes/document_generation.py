@@ -6,10 +6,13 @@ Endpoints are thin: they build a RequestContext and delegate to AppPipeline.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+from typing import Any
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response, StreamingResponse
 
 import src.settings
 from src.api.context import build_context_for_user
@@ -833,6 +836,78 @@ def resume_document_task(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+_HARNESS_RUN_VIEW_KEYS = (
+    "run_id",
+    "status",
+    "current_node",
+    "completed_units",
+    "total_units",
+    "step_count",
+    "error",
+)
+
+
+def _safe_harness_run(value: Any) -> dict | None:
+    """Whitelist harness progress fields; never expose pending decision payloads.
+
+    ``pending_human_event`` carries proposal hashes and evidence identifiers
+    that must stay inside the governed authoring APIs.
+    """
+    if not isinstance(value, dict):
+        return None
+    safe = {
+        key: value.get(key)
+        for key in _HARNESS_RUN_VIEW_KEYS
+        if value.get(key) is not None
+    }
+    return safe or None
+
+
+def _safe_pending_review(value: Any) -> dict | None:
+    """Project a human gate without hashes or source evidence.
+
+    The chat task center must be able to explain *why* a task is waiting
+    (for example a missing ICD connector mapping) and which identifiers the
+    operator instruction refers to; it must never leak review hashes or
+    evidence content.
+    """
+    if not isinstance(value, dict):
+        return None
+    reviewed: dict[str, Any] = {}
+    for key in ("review_id", "review_kind", "status", "artifact_id", "revision_id"):
+        text = str(value.get(key) or "").strip()
+        if text:
+            reviewed[key] = text
+    scope = value.get("scope_review")
+    if isinstance(scope, dict):
+        exceptions: list[dict[str, Any]] = []
+        for item in list(scope.get("exceptions") or [])[:20]:
+            if not isinstance(item, dict):
+                continue
+            exception = {
+                key: item.get(key)
+                for key in ("kind", "refdes", "pin_name", "recommended_action", "user_instruction")
+                if item.get(key) not in (None, "")
+            }
+            suggested = item.get("suggested_refdes")
+            if isinstance(suggested, list):
+                safe_suggested = [
+                    str(value).strip()
+                    for value in suggested[:20]
+                    if str(value).strip()
+                ]
+                if safe_suggested:
+                    exception["suggested_refdes"] = safe_suggested
+            exceptions.append(exception)
+        reviewed["scope_review"] = {
+            "status": scope.get("status"),
+            "pending_count": int(scope.get("pending_count") or 0),
+            "blocking": bool(scope.get("blocking")),
+            "exceptions": exceptions,
+        }
+    return reviewed or None
+
+
 def _safe_chat_task_status(status: dict) -> dict:
     """Project only status/card fields needed by the chat task center."""
     return {
@@ -840,6 +915,7 @@ def _safe_chat_task_status(status: dict) -> dict:
         "work_order_id": status.get("work_order_id"),
         "status": status.get("status"),
         "phase": status.get("phase"),
+        "clarification_session_id": status.get("clarification_session_id"),
         "scope_type": status.get("scope_type"),
         "knowledge_base_name": status.get("knowledge_base_name"),
         "target_format": status.get("target_format"),
@@ -848,6 +924,29 @@ def _safe_chat_task_status(status: dict) -> dict:
         "error_code": status.get("error_code"),
         "error_message": status.get("error_message"),
         "retryable": status.get("retryable"),
+        "harness_run": _safe_harness_run(status.get("harness_run")),
+        "pending_review": _safe_pending_review(status.get("pending_review")),
+        "planning_state": (
+            dict(status.get("planning_state"))
+            if isinstance(status.get("planning_state"), dict)
+            else None
+        ),
+        "clarification_state": (
+            dict(status.get("clarification_state"))
+            if isinstance(status.get("clarification_state"), dict)
+            else None
+        ),
+        "coverage": (
+            dict(status.get("coverage"))
+            if isinstance(status.get("coverage"), dict)
+            else None
+        ),
+        "validation": status.get("validation"),
+        "submission": (
+            dict(status.get("submission"))
+            if isinstance(status.get("submission"), dict)
+            else None
+        ),
         "artifacts": [
             {
                 "artifact_id": str(item.get("artifact_id")),
@@ -869,11 +968,15 @@ def _safe_chat_task_projection(projection: dict) -> dict:
     """Adapt the aggregate projection to the legacy chat-task envelope."""
     work_order = projection.get("work_order") or {}
     run = projection.get("run") or {}
+    projected_status = projection.get("status")
+    phase = projection.get("lifecycle_phase") or work_order.get("phase") or projected_status
+    if projected_status in {"failed", "blocked", "cancelled", "completed", "complete", "needs_review"}:
+        phase = projected_status
     return _safe_chat_task_status({
         "task_id": projection.get("task_id"),
         "work_order_id": projection.get("work_order_id"),
         "status": projection.get("status"),
-        "phase": work_order.get("phase") or projection.get("status"),
+        "phase": phase,
         "scope_type": "knowledge_base" if projection.get("knowledge_base_name") else "project",
         "knowledge_base_name": projection.get("knowledge_base_name"),
         "target_format": work_order.get("target_format"),
@@ -881,10 +984,198 @@ def _safe_chat_task_projection(projection: dict) -> dict:
         "error_code": projection.get("error_code"),
         "error_message": projection.get("error_message"),
         "retryable": projection.get("retryable"),
+        "harness_run": run or None,
+        "clarification_state": projection.get("clarification_state"),
+        "pending_review": projection.get("pending_review"),
+        "coverage": projection.get("coverage"),
+        "validation": projection.get("validation"),
+        "planning_state": projection.get("planning_state"),
+        "submission": projection.get("submission"),
         "artifacts": projection.get("artifacts") or [],
-        "harness_run": run,
         "clarification_session_id": projection.get("generation_session_id"),
     })
+
+
+def _document_task_sse(event: str, data: dict, event_id: int | None = None) -> str:
+    payload = json.dumps(data, ensure_ascii=False, default=str)
+    prefix = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{prefix}event: {event}\ndata: {payload}\n\n"
+
+
+def _chat_task_view(task, projection: dict) -> dict:
+    conversation_id = str(getattr(task, "conversation_id", None) or "").strip()
+    work_order_id = str(projection.get("work_order_id") or "").strip()
+    return {
+        "session_id": int(conversation_id),
+        "task_id": str(getattr(task, "task_id", None) or "").strip(),
+        "work_order_id": work_order_id,
+        "kb_name": str(getattr(task, "knowledge_base_name", None) or "").strip(),
+        "job_status": str(projection.get("status") or ""),
+        "created_at": getattr(task, "created_at", None),
+        "updated_at": getattr(task, "updated_at", None),
+        "conversation_revision": projection.get("conversation_revision"),
+        "status": _safe_chat_task_projection(projection),
+    }
+
+
+def _add_conversation_revision(task_store, user_id: str, session_id: int, projection: dict) -> None:
+    getter = getattr(task_store, "get_conversation_document_state", None)
+    if not callable(getter):
+        return
+    state = getter(
+        tenant_id="default",
+        user_id=user_id,
+        conversation_id=str(session_id),
+    )
+    if isinstance(state, dict) and state.get("revision") is not None:
+        projection["conversation_revision"] = int(state["revision"])
+
+
+@router.get("/document-generation/chat-tasks/current")
+def current_chat_document_task(
+    session_id: int,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Return the one durable current document task for a chat session."""
+    if session_id <= 0:
+        raise HTTPException(status_code=422, detail="session_id must be positive")
+    task_store = getattr(
+        getattr(getattr(pipeline, "document_generation", None), "task_service", None),
+        "store",
+        None,
+    )
+    getter = getattr(task_store, "get_current_chat_task", None)
+    if not src.settings.DOCUMENT_TASK_READ_ENABLED or not callable(getter):
+        return None
+    task = getter(
+        tenant_id="default",
+        user_id=user.username,
+        conversation_id=str(session_id),
+        knowledge_base_name=None,
+    )
+    if task is None:
+        return None
+    task_id = str(getattr(task, "task_id", None) or "").strip()
+    kb_name = str(getattr(task, "knowledge_base_name", None) or "").strip()
+    if not task_id or not kb_name:
+        return None
+    try:
+        ctx = _ctx(user, auth, kb_name)
+        projection = pipeline.get_document_task_projection(ctx, task_id)
+    except (HTTPException, PermissionError, KeyError, ValueError):
+        # Do not disclose a pointer when its persisted scope is no longer
+        # readable by the caller.
+        return None
+    if not isinstance(projection, dict):
+        return None
+    _add_conversation_revision(task_store, user.username, session_id, projection)
+    return _chat_task_view(task, projection)
+
+
+@router.get("/document-generation/chat-tasks/events")
+async def stream_chat_document_tasks(
+    session_id: int,
+    request: Request,
+    after: int = 0,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Stream replayable full projections for the current conversation task."""
+    if session_id <= 0:
+        raise HTTPException(status_code=422, detail="session_id must be positive")
+    task_store = getattr(
+        getattr(getattr(pipeline, "document_generation", None), "task_service", None),
+        "store",
+        None,
+    )
+    if not (
+        src.settings.DOCUMENT_TASK_READ_ENABLED
+        and getattr(src.settings, "DOCUMENT_TASK_STREAM_ENABLED", True)
+        and callable(getattr(task_store, "get_current_chat_task", None))
+        and callable(getattr(task_store, "list_conversation_stream_events", None))
+        and callable(getattr(task_store, "append_projection_snapshot", None))
+    ):
+        raise HTTPException(status_code=404, detail="document task streaming is unavailable")
+    try:
+        last_seq = max(after, int(request.headers.get("Last-Event-ID") or 0))
+    except ValueError:
+        last_seq = max(0, after)
+
+    async def event_stream():
+        nonlocal last_seq
+        while True:
+            if await request.is_disconnected():
+                break
+            current_view = None
+            current_task = task_store.get_current_chat_task(
+                tenant_id="default",
+                user_id=user.username,
+                conversation_id=str(session_id),
+                knowledge_base_name=None,
+            )
+            if current_task is not None:
+                task_id = str(getattr(current_task, "task_id", None) or "").strip()
+                kb_name = str(
+                    getattr(current_task, "knowledge_base_name", None) or ""
+                ).strip()
+                if task_id and kb_name:
+                    try:
+                        ctx = _ctx(user, auth, kb_name)
+                        projection = pipeline.get_document_task_projection(ctx, task_id)
+                    except (HTTPException, PermissionError, KeyError, ValueError):
+                        projection = None
+                    if isinstance(projection, dict):
+                        _add_conversation_revision(
+                            task_store,
+                            user.username,
+                            session_id,
+                            projection,
+                        )
+                        current_view = _chat_task_view(current_task, projection)
+                        try:
+                            task_store.append_projection_snapshot(
+                                tenant_id="default",
+                                user_id=user.username,
+                                conversation_id=str(session_id),
+                                task_id=task_id,
+                                projection=current_view,
+                            )
+                        except ValueError:
+                            # The current pointer changed between reads; the
+                            # next loop will publish the replacement task.
+                            current_view = None
+
+            events = task_store.list_conversation_stream_events(
+                tenant_id="default",
+                user_id=user.username,
+                conversation_id=str(session_id),
+                after_seq=last_seq,
+                limit=200,
+            )
+            if events:
+                for item in events:
+                    last_seq = int(item["seq"])
+                    yield _document_task_sse(
+                        "document_task",
+                        {
+                            "event_type": item["event_type"],
+                            "task_id": item["task_id"],
+                            "current": current_view,
+                        },
+                        event_id=last_seq,
+                    )
+                continue
+            yield ": keepalive\n\n"
+            await asyncio.sleep(0.4)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/document-generation/chat-tasks")

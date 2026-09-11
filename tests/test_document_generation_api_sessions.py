@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import src.settings
@@ -10,6 +12,7 @@ import httpx
 
 from src.api.app import create_app
 from src.api.deps import get_auth_service, get_pipeline
+from src.api.routes.document_generation import _document_task_sse, _safe_chat_task_projection
 from tests._api_stub import Server, StubPipeline, make_auth
 
 
@@ -337,6 +340,220 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
             "knowledge_base_name": "shared",
             "conversation_id": "17",
         })
+
+    def test_chat_task_projection_preserves_clarification_session_id(self):
+        projected = _safe_chat_task_projection({
+            "task_id": "task-clarify",
+            "status": "draft",
+            "generation_session_id": "generation-session-clarify",
+            "next_actions": ["answer_clarification"],
+            "knowledge_base_name": "shared",
+        })
+
+        self.assertEqual(
+            projected["clarification_session_id"],
+            "generation-session-clarify",
+        )
+
+    def test_chat_task_projection_preserves_plan_confirmation_identity(self):
+        projected = _safe_chat_task_projection({
+            "task_id": "task-confirm",
+            "status": "awaiting_plan_confirmation",
+            "generation_session_id": "generation-session-confirm",
+            "knowledge_base_name": "shared",
+            "next_actions": ["confirm_document_plan"],
+            "planning_state": {
+                "output_spec_id": "spec-1",
+                "output_spec_version": 2,
+                "output_spec_hash": "sha256:spec",
+                "document_plan_id": "plan-1",
+                "document_plan_version": 2,
+                "plan_hash": "sha256:plan",
+                "proposal_status": "proposed",
+            },
+        })
+
+        self.assertEqual(projected["planning_state"]["output_spec_hash"], "sha256:spec")
+        self.assertEqual(projected["planning_state"]["plan_hash"], "sha256:plan")
+
+    def test_current_chat_task_endpoint_returns_only_the_durable_pointer_target(self):
+        current = SimpleNamespace(
+            task_id="task-current",
+            conversation_id="17",
+            knowledge_base_name="shared",
+            created_at="2026-09-09T10:00:00Z",
+            updated_at="2026-09-09T10:01:00Z",
+        )
+
+        class TaskStore:
+            def get_current_chat_task(self, **kwargs):
+                self.kwargs = kwargs
+                return current
+
+            def get_conversation_document_state(self, **_kwargs):
+                return {"current_task_id": "task-current", "revision": 7}
+
+        task_store = TaskStore()
+        self.stub.document_generation = SimpleNamespace(
+            task_service=SimpleNamespace(store=task_store),
+        )
+        self.stub.get_document_task_projection = lambda ctx, task_id: {
+            "task_id": task_id,
+            "status": "queued",
+            "knowledge_base_name": "shared",
+            "next_actions": ["get_document_task_status"],
+        }
+
+        response = self.client.get(
+            "/api/v1/document-generation/chat-tasks/current?session_id=17",
+            headers=self._headers("admin1"),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["task_id"], "task-current")
+        self.assertEqual(response.json()["status"]["status"], "queued")
+        self.assertEqual(response.json()["conversation_revision"], 7)
+        self.assertEqual(task_store.kwargs, {
+            "tenant_id": "default",
+            "user_id": "admin1",
+            "conversation_id": "17",
+            "knowledge_base_name": None,
+        })
+
+    def test_current_chat_task_endpoint_returns_null_without_a_current_task(self):
+        task_store = SimpleNamespace(get_current_chat_task=lambda **_kwargs: None)
+        self.stub.document_generation = SimpleNamespace(
+            task_service=SimpleNamespace(store=task_store),
+        )
+
+        response = self.client.get(
+            "/api/v1/document-generation/chat-tasks/current?session_id=17",
+            headers=self._headers("admin1"),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(response.json())
+
+    def test_document_task_sse_frames_are_replayable_json_events(self):
+        frame = _document_task_sse(
+            "document_task",
+            {"current": {"task_id": "task-1", "status": {"status": "running"}}},
+            event_id=41,
+        )
+
+        self.assertTrue(frame.startswith("id: 41\nevent: document_task\n"))
+        self.assertIn('"task_id": "task-1"', frame)
+        self.assertTrue(frame.endswith("\n\n"))
+
+    def test_chat_task_projection_preserves_failure_and_harness_progress(self):
+        projected = _safe_chat_task_projection({
+            "task_id": "task-running",
+            "status": "failed",
+            "generation_session_id": "generation-session-running",
+            "knowledge_base_name": "shared",
+            "error_code": "document_job_failed",
+            "error_message": "execution failed",
+            "retryable": False,
+            "run": {
+                "status": "running",
+                "current_node": "fill_fields",
+                "completed_units": 7,
+                "total_units": 21,
+            },
+        })
+
+        self.assertEqual(projected["status"], "failed")
+        self.assertEqual(projected["error_code"], "document_job_failed")
+        self.assertEqual(projected["error_message"], "execution failed")
+        self.assertFalse(projected["retryable"])
+        self.assertEqual(projected["harness_run"]["completed_units"], 7)
+        self.assertEqual(projected["harness_run"]["total_units"], 21)
+
+    def test_chat_task_projection_prioritizes_pending_review_phase_over_blocked_work_order(self):
+        projected = _safe_chat_task_projection({
+            "task_id": "task-review",
+            "status": "needs_review",
+            "knowledge_base_name": "shared",
+            "work_order": {"phase": "blocked", "target_format": "xlsx"},
+            "next_actions": ["review_document", "open_document_workbench"],
+        })
+
+        self.assertEqual(projected["status"], "needs_review")
+        self.assertEqual(projected["phase"], "needs_review")
+
+    def test_chat_task_projection_exposes_pending_scope_review_details(self):
+        projected = _safe_chat_task_projection({
+            "task_id": "task-scope",
+            "status": "needs_review",
+            "knowledge_base_name": "shared",
+            "next_actions": ["submit_icd_scope_resolution", "open_document_workbench"],
+            "pending_review": {
+                "review_id": "review-scope",
+                "review_kind": "icd_scope",
+                "status": "pending",
+                "scope_review": {
+                    "status": "pending",
+                    "pending_count": 1,
+                    "blocking": True,
+                    "exceptions": [{
+                        "kind": "connector_mapping_missing",
+                        "refdes": "X302",
+                        "pin_name": None,
+                        "recommended_action": "check_edf_mapping",
+                        "user_instruction": "已确定接插件 X302，但当前冻结来源中未找到其 EDF 管脚映射。",
+                        "suggested_refdes": ["X1900", "X1902"],
+                    }],
+                },
+            },
+        })
+
+        pending = projected["pending_review"]
+        self.assertEqual(pending["review_kind"], "icd_scope")
+        self.assertEqual(pending["status"], "pending")
+        scope = pending["scope_review"]
+        self.assertTrue(scope["blocking"])
+        self.assertEqual(scope["exceptions"][0]["refdes"], "X302")
+        self.assertEqual(scope["exceptions"][0]["suggested_refdes"], ["X1900", "X1902"])
+        self.assertIn("EDF", scope["exceptions"][0]["user_instruction"])
+
+    def test_chat_task_projection_strips_sensitive_harness_pending_event(self):
+        projected = _safe_chat_task_projection({
+            "task_id": "task-scope",
+            "status": "needs_review",
+            "knowledge_base_name": "shared",
+            "run": {
+                "run_id": "run-1",
+                "status": "waiting_human",
+                "current_node": "await_human",
+                "completed_units": 1,
+                "total_units": 3,
+                "step_count": 5,
+                "pending_human_event": {
+                    "pending_event_id": "event-1",
+                    "proposal_hash": "sha256:secret",
+                    "evidence_ids": ["evidence-secret"],
+                },
+            },
+        })
+
+        self.assertEqual(projected["harness_run"]["current_node"], "await_human")
+        self.assertEqual(projected["harness_run"]["completed_units"], 1)
+        self.assertNotIn("pending_human_event", projected["harness_run"])
+        serialized = json.dumps(projected)
+        self.assertNotIn("proposal_hash", serialized)
+        self.assertNotIn("evidence-secret", serialized)
+
+    def test_chat_task_projection_uses_the_canonical_lifecycle_phase(self):
+        projected = _safe_chat_task_projection({
+            "task_id": "task-confirm",
+            "status": "awaiting_plan_confirmation",
+            "lifecycle_phase": "awaiting_confirmation",
+            "knowledge_base_name": "shared",
+            "next_actions": ["confirm_document_plan"],
+        })
+
+        self.assertEqual(projected["status"], "awaiting_plan_confirmation")
+        self.assertEqual(projected["phase"], "awaiting_confirmation")
 
     def test_task_review_endpoints_are_task_bound_and_idempotent(self):
         self.stub.list_document_reviews = lambda ctx, task_id: [{

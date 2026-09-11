@@ -249,6 +249,15 @@ class SourceScopeSpec(PlanningModel):
         return self
 
 
+class AdditionalRequirement(PlanningModel):
+    """A user constraint that is explicit but outside the core option enums."""
+
+    field: NonEmptyId
+    value: BoundedText | None = None
+    meaning: BoundedText = ""
+    raw_text: BoundedText | None = None
+
+
 class OutputSpec(PlanningModel):
     output_spec_id: NonEmptyId
     version: int = Field(ge=1)
@@ -265,6 +274,7 @@ class OutputSpec(PlanningModel):
     outline: list[OutlineUnitSpec] = Field(min_length=1, max_length=10_000)
     table_requirements: list[TableRequirement] = Field(default_factory=list, max_length=10_000)
     source_scope: SourceScopeSpec = Field(default_factory=SourceScopeSpec)
+    additional_requirements: list[AdditionalRequirement] = Field(default_factory=list, max_length=256)
     language: Annotated[str, Field(min_length=2, max_length=32)] = "en-US"
     style: dict[str, BoundedText] = Field(default_factory=dict, max_length=64)
     missing_data_policy: Literal["mark_tbd", "keep_blank", "block_generation"] = "mark_tbd"

@@ -184,6 +184,56 @@ def test_shadow_compiler_is_deterministic_and_keeps_physical_bindings_without_co
     assert first.coverage_contract.requirements[1].required_columns == ["connector", "pin", "signal"]
 
 
+def test_shadow_compiler_carries_semantic_field_contract_into_plan_units():
+    """Plan execution must retain field meaning, not only template coordinates."""
+    adapter = LegacyTemplatePlanningAdapter(registries=build_builtin_registries())
+    schema = _schema()
+    schema.fields[0].description = "the product/controller identity"
+    schema.fields[0].query_terms = ["ADAS controller", "product"]
+    plan = adapter.compile(
+        output_spec=_output_spec(),
+        document_schema=schema,
+        template_analysis=_analysis(),
+        bindings=_bindings(),
+        source_snapshot_id="snapshot-1",
+        source_snapshot_hash="snapshot-hash",
+    )
+
+    product = next(unit for unit in plan.semantic_units if unit.unit_id == "product")
+    assert product.output_schema["label"] == "Product"
+    assert product.output_schema["description"] == "the product/controller identity"
+    assert product.output_schema["query_terms"][:2] == ["ADAS controller", "product"]
+    assert "ADAS" in product.output_schema["query_terms"]
+    pins = next(unit for unit in plan.semantic_units if unit.unit_id == "pins")
+    assert pins.output_schema["label"] == "Pin Definition"
+    assert pins.output_schema["columns"] == ["connector", "pin", "signal"]
+
+
+def test_shadow_compiler_adds_target_identity_to_each_retrieval_contract():
+    original = _output_spec()
+    payload = original.model_dump(mode="json", exclude={"content_hash"})
+    payload["target_identity"] = {
+        "name": "EQ6 ADAS controller",
+        "connector": "X1900",
+    }
+    spec = OutputSpec.model_validate(payload)
+
+    plan = LegacyTemplatePlanningAdapter(
+        registries=build_builtin_registries()
+    ).compile(
+        output_spec=spec,
+        document_schema=_schema(),
+        template_analysis=_analysis(),
+        bindings=_bindings(),
+        source_snapshot_id="snapshot-1",
+        source_snapshot_hash="snapshot-hash",
+    )
+
+    for unit in plan.semantic_units:
+        assert "EQ6 ADAS controller" in unit.output_schema["query_terms"]
+        assert "X1900" in unit.output_schema["query_terms"]
+
+
 def test_shadow_compiler_reports_missing_table_rows_and_bindings_without_inventing_keys():
     adapter = LegacyTemplatePlanningAdapter(registries=build_builtin_registries())
     output = _output_spec()
@@ -208,6 +258,59 @@ def test_shadow_compiler_reports_missing_table_rows_and_bindings_without_inventi
     assert "binding_missing" in codes
     assert not any(requirement.row_keys for requirement in plan.coverage_contract.requirements if requirement.kind == "table")
     assert plan.is_executable is False
+
+
+def test_icd_coordinate_only_schema_is_blocked_before_generation():
+    schema = DocumentSchema(
+        document_schema_id="schema-bad-icd",
+        version="1",
+        document_type="icd",
+        status="approved",
+        fields=[
+            DocumentFieldSchema(
+                field_id="sheet:Example!C16",
+                label="sheet:Example!C16",
+                required=True,
+                retrieval_policy_id="retrieval-cell",
+                verification_policy_id="verify-cell",
+            ),
+            DocumentFieldSchema(
+                field_id="sheet:Example!C17",
+                label="sheet:Example!C17",
+                required=True,
+                retrieval_policy_id="retrieval-cell",
+                verification_policy_id="verify-cell",
+            ),
+        ],
+    )
+    spec = _output_spec()
+    spec = OutputSpec.model_validate({
+        **spec.model_dump(mode="json", exclude={"content_hash", "outline"}),
+        "document_type": "icd",
+        "table_requirements": [],
+        "outline": [
+            {"unit_id": "sheet:Example!C16", "kind": "field", "required": True},
+            {"unit_id": "sheet:Example!C17", "kind": "field", "required": True},
+        ],
+    })
+    plan = LegacyTemplatePlanningAdapter(registries=build_builtin_registries()).compile(
+        output_spec=spec,
+        document_schema=schema,
+        bindings=[
+            TemplateUnitBinding(
+                binding_id="b16", template_schema_id=schema.document_schema_id,
+                template_schema_version=schema.version, semantic_unit_type="field",
+                semantic_unit_id="sheet:Example!C16", target_region_ids=["r16"],
+            ),
+            TemplateUnitBinding(
+                binding_id="b17", template_schema_id=schema.document_schema_id,
+                template_schema_version=schema.version, semantic_unit_type="field",
+                semantic_unit_id="sheet:Example!C17", target_region_ids=["r17"],
+            ),
+        ],
+    )
+    assert plan.is_executable is False
+    assert any(issue.code == "icd_semantic_table_required" for issue in plan.issues)
 
 
 def test_service_wraps_pure_compiler_without_calling_external_dependencies():

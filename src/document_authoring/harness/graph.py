@@ -121,6 +121,11 @@ class HarnessExecutionResult:
     post_render_report: Any | None = None
     release_decision: Any | None = None
     artifact: Any | None = None
+    # Durable plan-DAG progress is kept on the result as well as HarnessRun so
+    # finalization can publish authoritative counts after the route returns.
+    completed_units: int = 0
+    total_units: int = 0
+    draft_ids: list[str] = field(default_factory=list)
 
 
 def _json_safe_graph_value(value: Any) -> Any:
@@ -1302,10 +1307,9 @@ def _use_deterministic_evidence_writer(
 
 def _max_evidence_items(unit_id: str, schema: DocumentSchema) -> int:
     if unit_id.startswith("field:"):
-        field_id = unit_id.removeprefix("field:")
-        for field in schema.fields:
-            if field.field_id == field_id:
-                return field.max_evidence_items
+        field = _schema_field_for_execution_unit(unit_id, schema)
+        if field is not None:
+            return field.max_evidence_items
     return 5
 
 
@@ -1336,13 +1340,29 @@ def _select_field_evidence(
     discarded: list[str] = []
     seen_content: set[str] = set()
     specific_terms = _field_specific_query_terms(retrieval_query_terms or [])
+    # A template-derived query often contains row samples (pin numbers,
+    # ``NC`` markers, etc.) that are useful for retrieval but are not present
+    # verbatim in the authoritative prose chunk.  Strictly dropping every
+    # long chunk in that situation turns a successful RAG recall into an empty
+    # field.  Only enable the long-chunk guard when at least one candidate
+    # actually proves a field-specific lexical match; otherwise let the
+    # bounded reranker/writer inspect the returned candidates.
+    has_anchored_candidate = bool(
+        specific_terms
+        and any(
+            _has_query_anchor(str(item.get("content") or ""), specific_terms)
+            for item in ranked
+        )
+    )
     for item in ranked:
         content = str(item.get("content") or "").strip()
         evidence_id = str(item.get("id") or "")
         if (
             len(content) >= 80
             and specific_terms
+            and has_anchored_candidate
             and not _has_query_anchor(content, specific_terms)
+            and not (item.get("metadata") or {}).get("pin_function_hits")
         ):
             if evidence_id:
                 discarded.append(evidence_id)
@@ -1354,8 +1374,21 @@ def _select_field_evidence(
             continue
         seen_content.add(content_hash)
         unique.append(item)
-    selected = unique[:max_items]
-    discarded.extend(str(item.get("id") or "") for item in unique[max_items:] if item.get("id"))
+    # Frozen ICD pin facts and second-stage pin-function evidence are
+    # contract-critical for the connector table unit: keep them ahead of the
+    # generic top-N cap so the table can never lose its identity or function
+    # evidence to unrelated chunks.
+    priority_items = [
+        item for item in unique
+        if (item.get("metadata") or {}).get("frozen_icd_scope")
+        or (item.get("metadata") or {}).get("pin_function_hits")
+    ]
+    priority_ids = {id(item) for item in priority_items}
+    ordered = priority_items + [
+        item for item in unique if id(item) not in priority_ids
+    ]
+    selected = ordered[:max_items]
+    discarded.extend(str(item.get("id") or "") for item in ordered[max_items:] if item.get("id"))
     return selected, discarded
 
 
@@ -1363,6 +1396,20 @@ _GENERIC_RETRIEVAL_TERMS = {
     "data", "detail", "information", "net", "pin", "power", "signal",
     "text", "value", "ground", "连接", "信号", "信息", "数据", "引脚",
     "电源", "网络", "内容", "字段", "详情",
+}
+# A persisted template label such as ``Sheet1!C16`` is not a useful
+# retrieval anchor.  Keep short refdes/part identifiers (``U2``, ``R10``)
+# because those are often the strongest hardware anchors; only treat a
+# coordinate without a sheet prefix as such when its row has two or more
+# digits.
+_TEMPLATE_COORDINATE_RE = re.compile(
+    r"^(?:[a-z0-9_ .-]+!)?[A-Z]{1,3}(?:1[0-9]|[2-9][0-9]|[1-9][0-9]{2,})$",
+    re.IGNORECASE,
+)
+_GENERIC_TEMPLATE_LABELS = {
+    "功能描述 function", "功能说明 function", "功能 function",
+    "管脚号 pin number", "管脚定义 pin definition", "备注 notice",
+    "总成erp", "填写说明", "说明", "notice", "function", "description",
 }
 
 
@@ -1373,7 +1420,13 @@ def _field_specific_query_terms(query_terms: list[str]) -> list[str]:
     for term in query_terms:
         normalized = str(term or "").strip()
         folded = normalized.casefold()
-        if not normalized or folded in _GENERIC_RETRIEVAL_TERMS or folded in seen:
+        if (
+            not normalized
+            or folded in _GENERIC_RETRIEVAL_TERMS
+            or folded in _GENERIC_TEMPLATE_LABELS
+            or _TEMPLATE_COORDINATE_RE.fullmatch(normalized)
+            or folded in seen
+        ):
             continue
         # Single ASCII letters and digits are too broad to establish that a
         # long result belongs to this field.  Identifiers (for example
@@ -1623,31 +1676,35 @@ def _missing_status(unit_id: str, schema: DocumentSchema, outcome: RetrievalOutc
     if outcome.status in {"retrieval_failed", "source_unavailable", "access_denied", "partial_failure"}:
         return "retrieval_failed"
     if unit_id.startswith("field:"):
-        field_id = unit_id.removeprefix("field:")
-        field = next(item for item in schema.fields if item.field_id == field_id)
+        field = _schema_field_for_execution_unit(unit_id, schema)
+        if field is None:
+            return "insufficient_evidence"
         return "blocked" if field.missing_policy == "block_section" else "tbd"
     return "insufficient_evidence"
 
 
 def _unit_label(unit_id: str, schema: DocumentSchema) -> str:
     if unit_id.startswith("field:"):
-        return next(item.label for item in schema.fields if item.field_id == unit_id.removeprefix("field:"))
+        field = _schema_field_for_execution_unit(unit_id, schema)
+        if field is None:
+            raise StopIteration(f"schema field is unavailable for execution unit {unit_id}")
+        return field.label
     return next(item.label for item in schema.review_items if item.review_item_id == unit_id.removeprefix("review:"))
 
 
 def _unit_description(unit_id: str, schema: DocumentSchema) -> str:
     if unit_id.startswith("field:"):
-        return next(item.description for item in schema.fields if item.field_id == unit_id.removeprefix("field:"))
+        field = _schema_field_for_execution_unit(unit_id, schema)
+        return field.description if field is not None else ""
     return ""
 
 
 def _unit_value_type(unit_id: str, schema: DocumentSchema) -> str:
     if unit_id.startswith("field:"):
-        return next(
-            item.value_type
-            for item in schema.fields
-            if item.field_id == unit_id.removeprefix("field:")
-        )
+        field = _schema_field_for_execution_unit(unit_id, schema)
+        if field is None:
+            raise StopIteration(f"schema field is unavailable for execution unit {unit_id}")
+        return field.value_type
     return "text"
 
 
@@ -1791,8 +1848,19 @@ def build_writer_request(
 
 def _field_for_unit(unit_id: str, schema):
     if unit_id.startswith("field:"):
-        field_id = unit_id.removeprefix("field:")
-        return next((item for item in schema.fields if item.field_id == field_id), None)
+        return _schema_field_for_execution_unit(unit_id, schema)
+    return None
+
+
+def _schema_field_for_execution_unit(unit_id: str, schema: DocumentSchema):
+    """Resolve both ordinary and legacy-prefixed semantic field identities."""
+    candidates = [unit_id]
+    if unit_id.startswith("field:"):
+        candidates.append(unit_id.removeprefix("field:"))
+    for candidate in candidates:
+        field = next((item for item in schema.fields if item.field_id == candidate), None)
+        if field is not None:
+            return field
     return None
 
 

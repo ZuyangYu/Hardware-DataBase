@@ -212,7 +212,7 @@ def _extract_typed_table(request: WriterRequest) -> TypedFieldValue | None:
                 cell_evidence_ids=cell_ids,
             ))
     if not candidates:
-        return None
+        return _frozen_pin_table_value(request)
 
     by_key: dict[str, TypedTableRow] = {}
     for row in candidates:
@@ -242,6 +242,200 @@ def _extract_typed_table(request: WriterRequest) -> TypedFieldValue | None:
         evidence_ids=evidence_ids,
         rows=ordered,
     )
+
+
+_MISSING_MARKER = "TBD"
+
+
+def _frozen_pin_mappings(
+    request: WriterRequest,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``(evidence_id, refdes, pin_name, net_name)`` frozen facts."""
+
+    result: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for evidence in request.evidence:
+        evidence_id = str(evidence.get("id") or "").strip()
+        metadata = evidence.get("metadata") or {}
+        if not evidence_id or not isinstance(metadata, dict):
+            continue
+        raw_mappings = metadata.get("pin_mappings")
+        if not isinstance(raw_mappings, list):
+            continue
+        for raw in raw_mappings:
+            if not isinstance(raw, dict):
+                continue
+            refdes = str(raw.get("refdes") or "").strip()
+            pin_name = str(
+                raw.get("pin_name") or raw.get("raw_pin_name") or ""
+            ).strip()
+            if not (refdes and pin_name):
+                continue
+            key = (refdes.casefold(), pin_name.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            net_name = str(raw.get("net_name") or "").strip() or "NC"
+            result.append((evidence_id, refdes, pin_name, net_name))
+    return result
+
+
+def _column_semantics(columns: dict[str, str]) -> dict[str, str]:
+    """Classify template column labels into pin-table cell semantics."""
+
+    semantics: dict[str, str] = {}
+    for column_id, label in columns.items():
+        normalized = str(label or "").casefold().replace("\n", " ")
+        compact = re.sub(r"\s+", "", normalized)
+        if any(
+            token in compact
+            for token in ("管脚号", "引脚号", "pin number", "pin no", "pinnumber", "pinno")
+        ):
+            semantics[column_id] = "pin"
+        elif any(
+            token in compact
+            for token in ("管脚定义", "引脚定义", "pin definition", "signal definition", "定义")
+        ):
+            semantics[column_id] = "definition"
+        elif any(token in compact for token in ("功能描述", "功能", "function")):
+            semantics[column_id] = "function"
+        elif any(token in compact for token in ("备注", "notice", "说明")):
+            semantics[column_id] = "notice"
+        else:
+            semantics[column_id] = "tbd"
+    return semantics
+
+
+def _token_in_text(value: str, text: str) -> bool:
+    token = value.strip()
+    if not token or not text:
+        return False
+    pattern = (
+        r"(?<![A-Za-z0-9_.])"
+        + re.escape(token)
+        + r"(?![A-Za-z0-9_.])"
+    )
+    return bool(re.search(pattern, text, flags=re.IGNORECASE))
+
+
+def _frozen_pin_table_value(request: WriterRequest) -> TypedFieldValue | None:
+    """Assemble a typed pin table directly from frozen pin-mapping metadata.
+
+    The frozen circuit scope is the authoritative source for connector pin
+    identity and net definition.  Cells that cannot be anchored in the frozen
+    evidence (for example ERP numbers or a function description absent from
+    the knowledge base) carry the governed ``TBD`` marker instead of a model
+    invention, so a 100+ row table never depends on one oversized LLM reply.
+    """
+
+    if request.table_mode != "typed_rows":
+        return None
+    columns = dict(request.table_columns or {})
+    if not columns and request.expected_columns:
+        columns = {column: column for column in request.expected_columns}
+    if not columns:
+        return None
+    mappings = _frozen_pin_mappings(request)
+    if not mappings:
+        return None
+    semantics = _column_semantics(columns)
+    evidence_text = {
+        str(evidence.get("id") or ""): str(evidence.get("content") or "")
+        for evidence in request.evidence
+    }
+    function_hits: dict[str, tuple[str, str]] = {}
+    for evidence in request.evidence:
+        evidence_id = str(evidence.get("id") or "").strip()
+        metadata = evidence.get("metadata") or {}
+        hits = metadata.get("pin_function_hits") if isinstance(metadata, dict) else None
+        if not evidence_id or not isinstance(hits, dict):
+            continue
+        for row_key, text in hits.items():
+            key = str(row_key or "").strip()
+            value = str(text or "").strip()
+            if key and value and key not in function_hits:
+                function_hits[key] = (value, evidence_id)
+    rows: list[TypedTableRow] = []
+    for evidence_id, refdes, pin_name, net_name in mappings:
+        text = evidence_text.get(evidence_id, "")
+        row_key = f"{refdes}-{pin_name}"
+        row_evidence = [evidence_id]
+        cells: dict[str, str] = {}
+        cell_evidence: dict[str, list[str]] = {}
+        for column_id, kind in semantics.items():
+            support_id = evidence_id
+            if kind == "pin":
+                candidate = f"{refdes}-{pin_name}"
+            elif kind == "function" and row_key in function_hits:
+                candidate, support_id = function_hits[row_key]
+            elif kind == "definition":
+                candidate = net_name
+            elif kind == "function":
+                resolution = resolve_pin_function(
+                    refdes=refdes, pin_name=pin_name, net_name=net_name,
+                )
+                candidate = str(getattr(resolution, "function", "") or "").strip()
+            else:
+                candidate = ""
+            anchor_text = evidence_text.get(support_id, "") or text
+            cells[column_id] = (
+                candidate
+                if candidate and _token_in_text(candidate, anchor_text)
+                else _MISSING_MARKER
+            )
+            if support_id not in row_evidence:
+                row_evidence.append(support_id)
+            cell_evidence[column_id] = [support_id]
+        rows.append(TypedTableRow(
+            row_key=row_key,
+            cells=cells,
+            evidence_ids=row_evidence,
+            cell_evidence_ids=cell_evidence,
+        ))
+    if not rows:
+        return None
+    return TypedFieldValue(
+        kind="table",
+        normalized_values=[row.row_key for row in rows],
+        display_value=f"{len(rows)} rows",
+        evidence_ids=_unique_values([
+            evidence_id
+            for row in rows
+            for evidence_id in row.evidence_ids
+        ]),
+        rows=rows,
+    )
+
+
+def _frozen_pin_table_draft(request: WriterRequest) -> DocumentUnitDraft | None:
+    """Return a validated deterministic table draft, or ``None`` to fall back."""
+
+    if request.table_mode != "typed_rows" or not _frozen_pin_mappings(request):
+        return None
+    try:
+        draft = _deterministic_draft(request)
+    except ValueError:
+        return None
+    evidence = {str(item.get("id") or ""): item for item in request.evidence}
+    validator = DocumentValidator()
+    validated = validator.validate_unit_draft(draft, evidence)
+    validated = validator.validate_typed_field_draft(
+        validated,
+        evidence,
+        expected_value_type=request.field_value_type,
+        expected_row_keys=request.expected_row_keys,
+        required_columns=request.expected_columns,
+        row_order=request.row_order,
+        duplicate_policy=request.duplicate_policy,
+    )
+    if validated.validation_status != "supported":
+        logger.info(
+            "Deterministic frozen pin table failed validation for unit %s: %s",
+            request.unit_id,
+            validated.validation_notes,
+        )
+        return None
+    return draft
 
 
 def _unique_values(values: list[str]) -> list[str]:
@@ -303,6 +497,16 @@ class LLMManagedWriter:
                 writer_mode="deterministic_connector",
                 observations=[],
             )
+
+        if request.table_mode == "typed_rows":
+            table_draft = _frozen_pin_table_draft(request)
+            if table_draft is not None:
+                logger.info("Using deterministic frozen pin table for unit %s", request.unit_id)
+                return _with_writer_metadata(
+                    table_draft,
+                    writer_mode="deterministic_pin_table",
+                    observations=[],
+                )
 
         draft, observations, capability_error = self._generate_structured(request)
         if draft is not None:
@@ -651,8 +855,19 @@ _CONNECTOR_PIN_TERM_RE = re.compile(
 
 
 def _connector_function_draft(request: WriterRequest) -> DocumentUnitDraft | None:
-    """Build a grounded function draft without asking the LLM to cross-wire rows."""
+    """Build a grounded function draft without asking the LLM to cross-wire rows.
 
+    This resolver answers a single-pin function question.  A typed table unit
+    must never take this shortcut: it would replace the whole table contract
+    with one scalar row and fail the deterministic release gate.
+    """
+
+    if (
+        request.table_mode == "typed_rows"
+        or str(request.field_value_type).strip().casefold()
+        in {"table", "repeating_table"}
+    ):
+        return None
     field_text = f"{request.unit_label} {request.unit_description}".casefold()
     if not any(term in field_text for term in ("功能描述", "功能说明", "function", "pin function")):
         return None
@@ -724,16 +939,17 @@ _WRITER_SYSTEM_PROMPT = """You are the Managed Writer for a governed document au
 
 Return ONE JSON object, and ONLY that object — no prose, no code fences.
 
-Top-level keys (exactly these eleven, no others):
-  unit_id             string   — copy verbatim from the request
-  run_id              string   — copy verbatim from the request
-  generated_by        string   — must be exactly "managed_writer"
+Top-level keys (exactly these five, no others):
   content             string   — the drafted body text, non-empty
   proposed_value      string   — usually the same as `content`
   typed_value         object   — required for automatic filling, with:
-      kind               string — "scalar" or "enumeration", matching field_value_type
+      kind               string — "scalar", "enumeration" or "table", matching field_value_type
       normalized_values  array of strings — one value for scalar; deduplicated values for enumeration
       display_value      string — the exact value to fill, never a whole evidence chunk
+      rows               array    — required when kind is "table"; each row has:
+          row_key            string — the server-owned row identity from expected_row_keys
+          cells              object — one string per expected column
+          cell_evidence_ids  object — evidence ids per column, from the request evidence
       evidence_ids       array of strings — ids that directly support the typed value
   assertions          array    — non-empty; each item is an object with:
       assertion_id       string   — a stable id you generate (e.g. "assertion-<unit_id>-1")
@@ -746,12 +962,10 @@ Top-level keys (exactly these eleven, no others):
                                     "derived_observation", "inference",
                                     "missing_information", "conflict"; default "document_statement"
   evidence_ids        array of strings — MUST be a subset of the request evidence ids
-  proposed_status     string   — use "draft"
-  validation_status   string   — MUST be exactly "pending"
-  validation_notes    array    — MUST be an empty list []
 
 Rules:
-- Copy `unit_id` and `run_id` verbatim from the request; do NOT invent them.
+- The coordinator owns unit_id, run_id, generated_by and the lifecycle status;
+  do NOT include those keys.
 - Treat `retrieval_query_terms` as the field's focus. Prefer the smallest
   evidence-grounded value that answers those terms; do not copy a whole table,
   page dump, or unrelated long evidence chunk into a cell.

@@ -107,6 +107,7 @@ function AdminRoute({
 }
 
 function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) {
+  const location = useLocation();
   const [kbs, setKbs] = useState<KbView[]>([]);
   const [kbsLoaded, setKbsLoaded] = useState(false);
   const sysAdmin = isSystemAdmin(auth.user);
@@ -287,7 +288,10 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
           </Routes>
         </div>
       </div>
-      <ExportTaskCenter />
+      {/* 聊天页在页头内嵌导出任务中心,避免悬浮入口遮挡右侧会话侧栏 */}
+      {!((location.pathname === '/chat' || /^\/kbs\/[^/]+\/chat(?:\/.*)?$/.test(location.pathname))) && (
+        <ExportTaskCenter />
+      )}
     </SidebarProvider>
   );
 }

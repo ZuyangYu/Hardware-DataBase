@@ -9,9 +9,11 @@ frozen template changed.  The rollout flags must default to false.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 
-import src.settings
 from src.core.app_pipeline import AppPipeline
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.models import DocumentSchema
@@ -20,9 +22,7 @@ from src.pipelines.document_rag.schemas import RequestContext
 from src.workers.main import HardwareWorker
 from tests.test_document_plan_confirmation import (
     KB,
-    SESSION_ID,
     TENANT,
-    TEMPLATE_HASH,
     USER,
     _confirm,
     _confirmable,
@@ -38,8 +38,18 @@ def _ctx(*, permission: str = "write") -> RequestContext:
     )
 
 
-def _real_stack(tmp_path: Path):
-    env = _confirmable(tmp_path)
+def _real_stack(tmp_path: Path, *, chat_lineage: bool = False):
+    env = _confirmable(
+        tmp_path,
+        **(
+            {
+                "conversation_id": "conversation-17",
+                "initiating_turn_id": "turn-17",
+            }
+            if chat_lineage
+            else {}
+        ),
+    )
     service = DocumentGenerationService(store=env.store)
     service.register_document_schema(
         DocumentSchema(
@@ -67,8 +77,26 @@ def _real_stack(tmp_path: Path):
 
 
 def test_rollout_flags_default_false():
-    assert getattr(src.settings, "DOCUMENT_PLANNING_SHADOW_ENABLED") is False
-    assert getattr(src.settings, "DOCUMENT_PLANNING_V2_ENABLED") is False
+    env = os.environ.copy()
+    env.pop("DOCUMENT_PLANNING_SHADOW_ENABLED", None)
+    env.pop("DOCUMENT_PLANNING_V2_ENABLED", None)
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import src.settings as s; "
+                "assert s.DOCUMENT_PLANNING_SHADOW_ENABLED is False; "
+                "assert s.DOCUMENT_PLANNING_V2_ENABLED is False"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_e2e_confirm_dispatch_restart_stays_exactly_one(tmp_path):
@@ -80,7 +108,6 @@ def test_e2e_confirm_dispatch_restart_stays_exactly_one(tmp_path):
     # returns an active user and the module-level context builder yields the
     # authorized scope (permission revocation is covered separately below).
     import src.workers.main as worker_module
-    from src.pipelines.document_rag.schemas import RequestContext as _Ctx
 
     original_builder = worker_module.build_context_for_user
     worker_module.build_context_for_user = lambda user, kb_name, auth=None: _ctx()
@@ -120,6 +147,93 @@ def test_e2e_confirm_dispatch_restart_stays_exactly_one(tmp_path):
     worker_two._submission_store = env.planning.submissions
     assert worker_two._process_document_plan_submissions(limit=2) is False
     assert len(service.store.list_work_orders_for_knowledge_base(TENANT, KB)) == 1
+
+
+def test_confirmed_output_spec_is_frozen_into_the_materialized_work_order(tmp_path):
+    """A worker must not discard the scope and policies confirmed in Chat."""
+    env = _confirmable(
+        tmp_path,
+        spec_overrides={
+            "document_type": "icd",
+            "target_identity": {"value": "整个原理图中的模块"},
+            "missing_data_policy": "mark_tbd",
+            "inference_policy": "forbid",
+        },
+    )
+    service = DocumentGenerationService(store=env.store)
+    service.register_document_schema(
+        DocumentSchema(
+            document_schema_id="ts-1",
+            version="1",
+            document_type="icd",
+            status="approved",
+            execution_mode="deterministic_only",
+        )
+    )
+    job_store = DocumentAuthoringJobStore(str(tmp_path / "auth.db"))
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = service
+    pipeline.document_job_store = job_store
+    pipeline.backend = object()
+    pipeline.spreadsheet_service = None
+    pipeline._icd_template_profile = lambda order: None
+    pipeline._icd_connector_scope_schema = lambda order: None
+    pipeline._icd_front_view_connector_refdes = lambda order: []
+    pipeline._document_requirement_resolution_snapshot = lambda *_args, **_kwargs: {
+        "unresolved_requirements": [],
+        "resolved_fields": {},
+    }
+
+    submission = _confirm(env)
+    result = pipeline.dispatch_confirmed_document_plan(_ctx(), submission)
+
+    order = service.store.get_work_order(result["work_order_id"])
+    assert order.generation_brief == {
+        "confirmed": True,
+        "purpose": "生成接口文档",
+        "document_type": "icd",
+        "target_identity": {"value": "整个原理图中的模块"},
+        "missing_data_policy": "mark_tbd",
+        "inference_policy": "forbid",
+        "approval_policy_id": "default-document-v1",
+        "language": "zh-CN",
+        "additional_requirements": [],
+    }
+
+
+def test_e2e_chat_lineage_survives_worker_context_rebuild(tmp_path, monkeypatch):
+    """A worker rebuild must preserve chat task identity before dispatch."""
+    env, _service, job_store, pipeline = _real_stack(tmp_path, chat_lineage=True)
+    submission = _confirm(env)
+
+    import src.workers.main as worker_module
+
+    # This is the ordinary worker context: it re-authorizes the live KB
+    # permission but intentionally has no request-local chat metadata.
+    monkeypatch.setattr(
+        worker_module,
+        "build_context_for_user",
+        lambda user, kb_name, auth=None: _ctx(),
+    )
+    worker = object.__new__(HardwareWorker)
+    worker.worker_id = "worker-chat-lineage"
+    worker.auth = _FakeAuth()
+    worker.pipeline = pipeline
+    worker.document_jobs = job_store
+    worker.runtime = None
+    worker._env_mtime_ns = -1
+    worker._submission_store = env.planning.submissions
+
+    assert worker._process_document_plan_submissions(limit=2) is True
+
+    dispatched = env.planning.submissions.get(submission.submission_id)
+    assert dispatched.status == "dispatched"
+    assert dispatched.work_order_id and dispatched.job_id
+    task = env.tasks.get(env.task.task_id)
+    assert task is not None
+    assert task.origin == "chat"
+    assert task.conversation_id == "conversation-17"
+    assert task.initiating_turn_id == "turn-17"
 
 
 def test_e2e_template_change_rejects_confirmation(tmp_path):

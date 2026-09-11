@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.core.app_pipeline import AppPipeline
+from src.core.app_pipeline import AppPipeline, _completed_document_coverage_is_valid
 from src.document_authoring.models import (
     DocumentFieldSchema,
     DocumentSchema,
@@ -109,6 +109,38 @@ def test_coverage_block_survives_missing_schema_and_matrix_and_extras():
     assert extra["evidence_count"] == 0
 
 
+def test_coverage_block_does_not_duplicate_schema_ids_that_already_include_kind_prefix():
+    schema = DocumentSchema.model_validate({
+        "document_schema_id": "ds-prefixed", "version": "1", "document_type": "ICD",
+        "status": "approved", "execution_mode": "internal_harness",
+        "fields": [DocumentFieldSchema.model_validate({
+            "field_id": "field:sheet:Sheet1!C16", "label": "Sheet1!C16",
+            "retrieval_policy_id": "r-1", "verification_policy_id": "v-1",
+            "required": True,
+        })],
+        "review_items": [],
+    })
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = SimpleNamespace(store=SimpleNamespace(
+        get_document_schema=lambda _schema_id, _version: schema,
+        get_evidence_matrix=lambda _work_order_id: [{
+            "field_id": "field:sheet:Sheet1!C16",
+            "coverage_status": "supported", "display_value": "Power supply",
+            "evidence_ids": ["e1"],
+        }],
+    ))
+
+    coverage = pipeline._document_coverage_block(SimpleNamespace(
+        work_order_id="wo-prefixed", document_schema_id="ds-prefixed",
+        document_schema_version="1",
+        unit_statuses={"field:sheet:Sheet1!C16": "ready_to_render"},
+    ))
+
+    assert coverage["total"] == 1
+    assert coverage["summary"]["covered"] == 1
+    assert coverage["fields"][0]["display_value"] == "Power supply"
+
+
 def test_coverage_buckets_cover_every_known_status():
     cases = {
         "ready_to_render": "covered", "passed": "covered",
@@ -119,3 +151,12 @@ def test_coverage_buckets_cover_every_known_status():
     }
     for status, bucket in cases.items():
         assert AppPipeline._coverage_bucket(status) == bucket, status
+
+
+def test_completed_projection_requires_every_required_unit_to_be_covered():
+    assert _completed_document_coverage_is_valid({
+        "fields": [{"required": True, "status": "ready_to_render"}],
+    })
+    assert not _completed_document_coverage_is_valid({
+        "fields": [{"required": True, "status": "planned"}],
+    })

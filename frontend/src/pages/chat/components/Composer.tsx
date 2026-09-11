@@ -40,6 +40,7 @@ type Props = {
   onKbChange?: (kbName: string) => void;
   onSend: () => void;
   onStop: () => void;
+  quickReplies?: string[];
   /** The bridge is opt-in; false keeps the legacy composer unchanged. */
   documentAuthoringEnabled?: boolean;
   canUploadDocumentTemplate?: boolean;
@@ -49,8 +50,6 @@ type Props = {
   documentFlowEnabled?: boolean;
   onToggleDocumentFlow?: (enabled: boolean) => void;
   documentUploadPending?: boolean;
-  documentUploadProgress?: number;
-  onUploadTemplate?: (file: File) => void | Promise<void>;
   onClearDocumentContext?: () => void;
   /** 会话附件(默认开):后端 CHAT_ATTACHMENTS_ENABLED 打开时由 ChatPage 传入。 */
   attachmentsEnabled?: boolean;
@@ -83,6 +82,7 @@ export default function Composer({
   onKbChange = () => undefined,
   onSend,
   onStop,
+  quickReplies = [],
   documentAuthoringEnabled = false,
   canUploadDocumentTemplate = false,
   documentContext = null,
@@ -90,8 +90,6 @@ export default function Composer({
   documentFlowEnabled = true,
   onToggleDocumentFlow,
   documentUploadPending = false,
-  documentUploadProgress = 0,
-  onUploadTemplate,
   onClearDocumentContext,
   // Attachment support is on by default; ChatPage passes the explicit
   // environment-controlled value when an installation opts out.
@@ -109,10 +107,20 @@ export default function Composer({
   onRemoveAttachment,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const templateInputRef = useRef<HTMLInputElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const selectedIds = selectedAttachmentIds ?? draftAttachments.map((attachment) => attachment.attachment_id);
   const contextExpired = isDocumentContextExpired(documentContext);
+  const contextReference = documentContext
+    ? documentContextLabel
+      || documentContext.template_version_id
+      || documentContext.generation_session_id
+      || (documentContext.version === 'v2' && documentContext.task_id
+        ? documentContext.task_id
+        : undefined)
+      || (documentContext.version === 'v2' && documentContext.attachment_ids?.length
+        ? '会话附件'
+        : '文档会话')
+    : '';
   const showDocumentControls = documentAuthoringEnabled && documentContext;
 
   // 自适应高度
@@ -164,8 +172,8 @@ export default function Composer({
               aria-label="当前文档模板引用"
             >
               <AppIcon name="file" size={16} className="shrink-0 text-[#68728a]" />
-              <span className="min-w-0 flex-1 truncate" title={documentContextLabel || documentContext.template_version_id}>
-                模板引用：{documentContextLabel || documentContext.template_version_id}
+              <span className="min-w-0 flex-1 truncate" title={contextReference}>
+                {documentContext.template_version_id ? '模板引用' : '文档范围'}：{contextReference}
               </span>
               <span className={cn('shrink-0 text-[11px]', contextExpired ? 'text-[#b45309]' : 'text-[#858b9c')}>
                 {contextExpired ? '已过期，仅可读取历史状态' : '已附加'}
@@ -341,6 +349,11 @@ export default function Composer({
                   <AppIcon name="file" size={14} />
                   {attachmentUploadPending ? '上传中…' : '添加附件'}
                 </label>
+                {documentUploadPending && (
+                  <span className="shrink-0 text-[11px] text-[#68728a]" role="status" aria-live="polite">
+                    模板分析中…
+                  </span>
+                )}
                 {selectedIds.length > 0 && onSourceScopeChange && (
                   <label className="flex min-w-0 items-center gap-[6px] text-[11px] text-[#68728a]">
                     检索范围
@@ -364,6 +377,24 @@ export default function Composer({
               </div>
             </div>
           )}
+          {quickReplies.length > 0 && !streaming && (
+            <div className="flex flex-wrap gap-[6px]" aria-label="文档快捷回复">
+              {quickReplies.slice(0, 6).map((reply) => (
+                <button
+                  key={reply}
+                  type="button"
+                  onClick={() => {
+                    setInput(reply);
+                    textareaRef.current?.focus();
+                  }}
+                  disabled={disabled}
+                  className="rounded-full border border-[#c8d8f5] bg-[#f4f7ff] px-[9px] py-[3px] text-[11px] text-[#315da8] hover:bg-[#eaf1ff] disabled:opacity-45"
+                >
+                  {reply}
+                </button>
+              ))}
+            </div>
+          )}
           <textarea
             ref={textareaRef}
             value={input}
@@ -380,47 +411,7 @@ export default function Composer({
             }}
           />
           <div className={CHAT_COMPOSER_TOOLBAR_CLASS}>
-            {documentAuthoringEnabled ? (
-              <div className="flex min-w-0 items-center gap-[8px]">
-                <input
-                  ref={templateInputRef}
-                  id="chat-document-template-upload"
-                  type="file"
-                  accept=".xlsx,.xlsm,.docx"
-                  className="sr-only"
-                  disabled={streaming || disabled || documentUploadPending || !canUploadDocumentTemplate}
-                  onChange={(event) => {
-                    const file = event.currentTarget.files?.[0];
-                    event.currentTarget.value = '';
-                    if (file && onUploadTemplate) void onUploadTemplate(file);
-                  }}
-                />
-                <label
-                  htmlFor="chat-document-template-upload"
-                  aria-disabled={streaming || disabled || documentUploadPending || !canUploadDocumentTemplate}
-                  title={canUploadDocumentTemplate ? '上传并分析文档模板' : '需要该知识库的写权限才能上传模板'}
-                  className={cn(
-                    'inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-[5px] rounded-[9px] border border-[#e3e7f1] bg-white px-[9px] text-[12px] text-[#68728a] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]',
-                    (streaming || disabled || documentUploadPending || !canUploadDocumentTemplate) &&
-                      'pointer-events-none cursor-not-allowed opacity-45',
-                  )}
-                >
-                  <AppIcon name="file" size={14} />
-                  上传模板
-                </label>
-                {documentUploadPending && (
-                  <span className="shrink-0 text-[11px] text-[#68728a]" role="status" aria-live="polite">
-                    分析中 {Math.max(0, Math.min(100, documentUploadProgress))}%
-                  </span>
-                )}
-                {!canUploadDocumentTemplate && !documentUploadPending && (
-                  <span className="hidden text-[11px] text-[#b45309] md:inline">需 KB 写权限</span>
-                )}
-                <span className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</span>
-              </div>
-            ) : (
-              <span className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</span>
-            )}
+            <span className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</span>
             {streaming ? (
               <button
                 type="button"

@@ -203,6 +203,11 @@ class DocumentValidator:
                     if not row.cells or any(not str(value).strip() for value in row.cells.values()):
                         notes.append(f"table row {index} contains empty cells")
                     for column, value in row.cells.items():
+                        if _is_explicit_missing(value):
+                            # The confirmed missing-data policy is expressed as
+                            # an explicit marker.  It asserts no fabricated
+                            # fact, so it needs no lexical evidence anchor.
+                            continue
                         support_ids = cell_evidence.get(column, ids)
                         if not support_ids:
                             notes.append(
@@ -299,6 +304,21 @@ class DocumentValidator:
                 continue
             conflicts.append({"kind": "cross_unit_conflict", "consistency_key": key, "values": by_value})
         return conflicts
+
+
+_EXPLICIT_MISSING_RE = re.compile(r"TBD(?:\s*[（(][^）)]*[）)])?", re.IGNORECASE)
+
+
+def _is_explicit_missing(value: Any) -> bool:
+    """Return whether a cell value is the governed mark_tbd marker.
+
+    Only the canonical ``TBD`` marker (optionally followed by a
+    parenthesized reason) is accepted.  Arbitrary prose never becomes a
+    missing value, so this cannot smuggle unanchored content past the gate.
+    """
+
+    text = str(value or "").strip()
+    return bool(text) and bool(_EXPLICIT_MISSING_RE.fullmatch(text))
 
 
 def _has_lexical_anchor(assertion_text: str, evidence_text: str) -> bool:

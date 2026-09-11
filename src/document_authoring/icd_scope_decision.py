@@ -15,6 +15,14 @@ _PIN_REFERENCE = re.compile(
     r"(?<![A-Za-z0-9_])([A-Za-z]{1,12}\d+[A-Za-z0-9_.-]*)\s*-\s*([A-Za-z0-9_.]+)(?![A-Za-z0-9_])"
 )
 
+# Exception kinds that cannot be resolved by include/exclude: the frozen
+# source must first provide the connector scope/EDF mapping.  Keep this the
+# single server-side definition for both the resolution gate and read models.
+ICD_BLOCKING_SCOPE_EXCEPTION_KINDS = frozenset({
+    "connector_scope_unknown",
+    "connector_mapping_missing",
+})
+
 
 class IcdScopeItem(BaseModel):
     """A pin mapping safe to include without a user decision."""
@@ -37,6 +45,7 @@ class IcdScopeException(BaseModel):
     source_names: list[str] = Field(default_factory=list)
     recommended_action: str
     user_instruction: str
+    suggested_refdes: list[str] = Field(default_factory=list)
 
 
 class IcdScopeDecision(BaseModel):
@@ -59,17 +68,25 @@ def build_icd_scope_decision(
     supporting_evidences: Iterable[Any],
     *,
     connector_refdes: Iterable[str] | None = None,
+    available_refdes: Iterable[str] | None = None,
 ) -> IcdScopeDecision:
     """Freeze declared EDF pins and auto-adopt only directly supported mappings.
 
     When a connector range has already been determined, absent EDF pin mappings
-    are a governed stop rather than an empty, silently frozen ICD scope.
+    are a governed stop rather than an empty, silently frozen ICD scope.  The
+    frozen EDF's actual connector identities are reported on the exception so
+    the user can confirm replacing a template-example refdes with real data.
     """
 
     mappings = _pin_mappings(circuit_evidences)
     requested_connectors = _unique(
         str(refdes).strip().upper()
         for refdes in connector_refdes or []
+        if str(refdes).strip()
+    )
+    available_connectors = _unique(
+        str(refdes).strip().upper()
+        for refdes in available_refdes or []
         if str(refdes).strip()
     )
     if requested_connectors:
@@ -120,6 +137,14 @@ def build_icd_scope_decision(
     for refdes in requested_connectors:
         if refdes.casefold() in mapped_connectors:
             continue
+        user_instruction = f"已确定接插件 {refdes}，但当前冻结来源中未找到其 EDF 管脚映射。"
+        if available_connectors:
+            user_instruction += (
+                "冻结 EDF 中的实际位号为 " + "、".join(available_connectors) + "。"
+                "如需按实际 EDF 位号替换模板示例位号，请在对话中回复“确认”或“按 EDF 实际位号生成”"
+                "（直接要求继续/填充生成也可以）。"
+            )
+        user_instruction += "请检查已上传 EDF 是否包含该位号并重新解析后再生成。"
         exceptions.append(IcdScopeException(
             exception_id=_stable_scope_id("exception", {
                 "kind": "connector_mapping_missing",
@@ -128,10 +153,8 @@ def build_icd_scope_decision(
             kind="connector_mapping_missing",
             refdes=refdes,
             recommended_action="check_edf_mapping",
-            user_instruction=(
-                f"已确定接插件 {refdes}，但当前冻结来源中未找到其 EDF 管脚映射。"
-                "请检查已上传 EDF 是否包含该位号并重新解析后再生成。"
-            ),
+            user_instruction=user_instruction,
+            suggested_refdes=list(available_connectors),
         ))
 
     decision_payload = {

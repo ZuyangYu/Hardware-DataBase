@@ -73,6 +73,29 @@ def test_template_free_planner_compiles_an_executable_system_recipe_plan():
     assert not plan.has_blocking_issues
 
 
+def test_planner_summary_keeps_explicit_additional_requirements():
+    spec = _spec().model_copy(update={
+        "additional_requirements": [{
+            "field": "generation_basis",
+            "value": "actual_function",
+            "meaning": "use_actual_function",
+        }],
+    })
+    plan = TemplateFreePlanningAdapter(
+        recipe_registry=build_builtin_recipe_registry(),
+    ).compile(
+        output_spec=spec,
+        source_snapshot_id="snapshot:phase3-extra",
+        source_snapshot_hash="sha256:snapshot-phase3-extra",
+    )
+
+    assert plan.output_spec_summary["additional_requirements"] == [{
+        "field": "generation_basis",
+        "value": "actual_function",
+        "meaning": "use_actual_function",
+    }]
+
+
 def test_template_free_planner_supports_generated_structure_only_for_known_profile():
     spec = _spec(mode="generated_structure", fmt="pdf")
     plan = TemplateFreePlanningAdapter(

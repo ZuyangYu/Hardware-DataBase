@@ -31,7 +31,7 @@ describe('ChatSessionSidebar background turns', () => {
     expect(markup).toContain('正在生成的会话');
   });
 
-  it('anchors the history rail on the left and keeps its resize handle on the right', () => {
+  it('anchors the history rail on the right and keeps its resize handle on the left', () => {
     const markup = renderToStaticMarkup(
       <ChatSessionSidebar
         kbName="hardware"
@@ -45,10 +45,10 @@ describe('ChatSessionSidebar background turns', () => {
       />,
     );
 
-    expect(markup).toContain('border-r');
-    expect(markup).not.toContain('border-l');
-    expect(markup).toContain('right-0');
-    expect(markup).not.toContain('absolute left-0');
+    expect(markup).toContain('border-l');
+    expect(markup).not.toContain('border-r');
+    expect(markup).toContain('left-0');
+    expect(markup).not.toContain('absolute right-0');
     expect(markup).toContain('title="新建会话"');
   });
 });

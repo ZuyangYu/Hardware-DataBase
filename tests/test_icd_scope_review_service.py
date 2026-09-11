@@ -10,6 +10,7 @@ from src.document_authoring.icd_scope_decision import (
     build_icd_scope_decision,
 )
 from src.document_authoring.models import (
+    content_hash,
     DocumentArtifact,
     DocumentWorkOrder,
     HarnessPolicy,
@@ -413,3 +414,59 @@ def test_feedback_cannot_change_frozen_scope_review(scope_review_service):
         service.submit_document_feedback(
             denied_ctx, artifact.artifact_id, comment="change PGND"
         )
+
+
+def test_pending_scope_review_can_be_replaced_but_a_frozen_one_cannot(scope_review_service):
+    service, ctx, order = scope_review_service
+    store = service.store
+    first = service.prepare_icd_scope_review(
+        ctx, order.work_order_id, decision_with_one_exception()
+    )
+    assert first.status == "pending"
+
+    replacement = IcdScopeReview(
+        work_order_id=order.work_order_id,
+        decision=IcdScopeDecision(
+            frozen_pin_mappings=[
+                {"refdes": "X1900", "pin_name": "1", "net_name": "CAN_H"},
+            ],
+        ),
+        source_snapshot_hash=first.source_snapshot_hash,
+        status="frozen",
+        resolution_comment="按 EDF 实际位号生成",
+    )
+    replaced = store.replace_pending_icd_scope_review(replacement)
+    assert replaced.status == "frozen"
+    persisted = store.get_icd_scope_review(order.work_order_id)
+    assert persisted.decision.frozen_pin_mappings[0]["refdes"] == "X1900"
+
+    with pytest.raises(ValueError, match="frozen"):
+        store.replace_pending_icd_scope_review(replacement)
+
+
+def test_scope_review_hash_ignores_advisory_suggested_refdes():
+    """Persisted reviews stay verifiable after suggested_refdes was added."""
+    decision = IcdScopeDecision(
+        frozen_pin_mappings=[],
+        exceptions=[IcdScopeException(
+            exception_id="exception-missing",
+            kind="connector_mapping_missing",
+            refdes="X302",
+            recommended_action="check_edf_mapping",
+            user_instruction="模板示例位号",
+            suggested_refdes=["X1900", "X1902"],
+        )],
+    )
+    legacy_payload = decision.model_dump(mode="json")
+    for exception in legacy_payload["exceptions"]:
+        exception.pop("suggested_refdes", None)
+    legacy_hash = content_hash(legacy_payload)
+
+    review = IcdScopeReview(
+        work_order_id="work-legacy",
+        decision=decision,
+        decision_content_hash=legacy_hash,
+        source_snapshot_hash="snapshot-legacy",
+    )
+
+    assert review.decision_content_hash == legacy_hash

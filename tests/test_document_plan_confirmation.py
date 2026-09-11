@@ -107,14 +107,23 @@ def _plan_payload(spec: OutputSpec, snapshot) -> dict:
     }
 
 
-def _confirmable(tmp_path, *, plan_overrides: dict | None = None):
+def _confirmable(
+    tmp_path,
+    *,
+    plan_overrides: dict | None = None,
+    spec_overrides: dict | None = None,
+    conversation_id: str | None = None,
+    initiating_turn_id: str | None = None,
+):
     """Create a fully proposed, template-backed, confirmable state."""
+    if (conversation_id is None) != (initiating_turn_id is None):
+        raise ValueError("conversation_id and initiating_turn_id must be provided together")
     db = str(tmp_path / "authoring.db")
     store = DocumentAuthoringStore(db, str(tmp_path / "files"))
     template = _save_template(store)
     snapshot = _save_snapshot(store)
 
-    spec = OutputSpec.model_validate({
+    spec_payload = {
         "output_spec_id": "spec-confirm",
         "version": 1,
         "status": "proposed",
@@ -132,7 +141,10 @@ def _confirmable(tmp_path, *, plan_overrides: dict | None = None):
         "outline": [{"unit_id": "summary", "kind": "section", "required": True}],
         "language": "zh-CN",
         "approval_policy_id": "default-document-v1",
-    })
+    }
+    if spec_overrides:
+        spec_payload.update(spec_overrides)
+    spec = OutputSpec.model_validate(spec_payload)
     plan_data = _plan_payload(spec, snapshot)
     if callable(plan_overrides):
         plan_overrides(plan_data, snapshot)
@@ -148,8 +160,10 @@ def _confirmable(tmp_path, *, plan_overrides: dict | None = None):
     task = tasks.create_task(
         tenant_id=TENANT,
         user_id=USER,
-        origin="api",
+        origin="chat" if conversation_id is not None else "api",
         created_by=USER,
+        conversation_id=conversation_id,
+        initiating_turn_id=initiating_turn_id,
         knowledge_base_name=KB,
         template_version_id="tv-1",
         generation_session_id=SESSION_ID,
@@ -167,6 +181,8 @@ def _confirmable(tmp_path, *, plan_overrides: dict | None = None):
         contract_version="output_spec_v1",
         status="awaiting_plan_confirmation",
         document_task_id=task.task_id,
+        conversation_id=conversation_id,
+        initiating_turn_id=initiating_turn_id,
         output_spec_id=spec.output_spec_id,
         output_spec_version=spec.version,
         document_plan_id=plan.document_plan_id,
@@ -253,6 +269,24 @@ def test_confirmation_accepts_and_enqueues_exactly_one_submission(tmp_path):
         assert len(events) == 1
     # No auth.db job exists yet: the submission is pending worker dispatch.
     assert submission.job_id is None
+
+
+def test_chat_confirmation_immediately_streams_the_planned_state(tmp_path):
+    env = _confirmable(
+        tmp_path,
+        conversation_id="85",
+        initiating_turn_id="turn-confirm",
+    )
+
+    _confirm(env)
+
+    events = env.tasks.list_conversation_stream_events(
+        tenant_id=TENANT,
+        user_id=USER,
+        conversation_id="85",
+    )
+    assert events[-1]["event_type"] == "plan_confirmed"
+    assert events[-1]["payload"]["status"] == "planned"
 
 
 def test_confirmation_replays_are_idempotent(tmp_path):

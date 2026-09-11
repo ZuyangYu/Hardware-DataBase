@@ -257,6 +257,40 @@ class HardwareWorker:
         planning = getattr(getattr(self.pipeline, "document_generation", None), "planning", None)
         return getattr(planning, "store", None) and planning.store.submissions
 
+    def _restore_document_task_lineage(self, ctx, submission):
+        """Restore durable Chat lineage before materializing a plan submission.
+
+        Plan submissions intentionally carry identifiers only.  The worker
+        must rebuild the request context from live authorization and recover
+        the Chat association from the owner-scoped GenerationSession; using a
+        synthetic worker context would otherwise make the existing Chat task
+        look like an API task during idempotency checks.
+        """
+        generation_store = getattr(
+            getattr(getattr(self.pipeline, "document_generation", None), "store", None),
+            "generation_sessions",
+            None,
+        )
+        if generation_store is None:
+            return ctx
+        session = generation_store.get_session(
+            submission.session_id,
+            tenant_id=submission.tenant_id,
+            user_id=submission.user_id,
+        )
+        conversation_id = str(getattr(session, "conversation_id", None) or "").strip()
+        initiating_turn_id = str(getattr(session, "initiating_turn_id", None) or "").strip()
+        if not conversation_id and not initiating_turn_id:
+            return ctx
+        if not conversation_id or not initiating_turn_id:
+            raise ValueError("document generation session has incomplete conversation lineage")
+        ctx.metadata.update({
+            "document_task_origin": "chat",
+            "conversation_id": conversation_id,
+            "initiating_turn_id": initiating_turn_id,
+        })
+        return ctx
+
     def _process_document_plan_submissions(self, limit: int = 2) -> bool:
         """Drain confirmed plan submissions before normal document jobs.
 
@@ -296,6 +330,7 @@ class HardwareWorker:
                 ctx = build_context_for_user(
                     user, claimed.knowledge_base_name, auth=self.auth,
                 )
+                ctx = self._restore_document_task_lineage(ctx, claimed)
                 submissions.heartbeat(
                     claimed.submission_id,
                     self.worker_id,

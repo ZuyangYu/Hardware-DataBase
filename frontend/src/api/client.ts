@@ -15,7 +15,18 @@ export class ApiError extends Error {
   body: string;
 
   constructor(status: number, body: string, statusText: string) {
-    super(parseErrorMessage(body) || statusText || `HTTP ${status}`);
+    const parsedMessage = parseErrorMessage(body);
+    // Vite's dev proxy returns an empty 500 response when the API target is
+    // down.  Surface the actionable cause instead of exposing its generic
+    // "Internal Server Error" text to users (the default API port is 8001).
+    const proxyUnavailable =
+      status === 500 && !body.trim() && statusText.toLowerCase() === 'internal server error';
+    super(
+      parsedMessage ||
+        (proxyUnavailable
+          ? '无法连接后端服务，请确认 API 已在 8001 端口运行'
+          : statusText || `HTTP ${status}`),
+    );
     this.name = 'ApiError';
     this.status = status;
     this.body = body;

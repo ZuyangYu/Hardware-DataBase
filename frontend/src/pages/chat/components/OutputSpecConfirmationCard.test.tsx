@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import OutputSpecConfirmationCard from './OutputSpecConfirmationCard';
 import {
@@ -41,21 +41,20 @@ const proposalCard = cardEvent({
 describe('OutputSpecConfirmationCard', () => {
   it('renders the what-will-be-generated summary without leaking hashes', () => {
     const markup = renderToStaticMarkup(
-      <OutputSpecConfirmationCard card={proposalCard} confirming={false} onConfirm={() => undefined} />,
+      <OutputSpecConfirmationCard card={proposalCard} />,
     );
     expect(markup).toContain('计划确认');
     expect(markup).toContain('xlsx');
     expect(markup).toContain('章节 2');
     expect(markup).toContain('表格 1');
     expect(markup).toContain('来源中缺少部分管脚定义');
-    expect(markup).toContain('确认生成');
-    expect(markup).toContain('修改需求');
-    expect(markup).toContain('采用推荐方案');
+    expect(markup).toContain('请在下方对话输入“确认生成”');
+    expect(markup).not.toContain('<button');
     expect(markup).not.toContain('sha256:plan');
     expect(markup).not.toContain('sha256:spec');
   });
 
-  it('disables confirmation while blockers exist or a request is in flight', () => {
+  it('shows blockers without exposing an out-of-conversation confirmation action', () => {
     const blocked = cardEvent({
       kind: 'output_spec_confirmation',
       status: 'awaiting_plan_confirmation',
@@ -64,24 +63,17 @@ describe('OutputSpecConfirmationCard', () => {
       proposal: { plan_hash: 'h', output_spec_hash: 's', blockers: ['模板不可用'] },
     });
     const blockedMarkup = renderToStaticMarkup(
-      <OutputSpecConfirmationCard card={blocked} confirming={false} onConfirm={() => undefined} />,
+      <OutputSpecConfirmationCard card={blocked} />,
     );
-    expect(blockedMarkup).toContain('disabled');
     expect(blockedMarkup).toContain('模板不可用');
-
-    const inFlight = renderToStaticMarkup(
-      <OutputSpecConfirmationCard card={proposalCard} confirming onConfirm={() => undefined} />,
-    );
-    expect(inFlight).toContain('disabled');
+    expect(blockedMarkup).not.toContain('<button');
   });
 
   it('shows the stale reconfirmation hint instead of auto-retrying', () => {
     const markup = renderToStaticMarkup(
       <OutputSpecConfirmationCard
         card={proposalCard}
-        confirming={false}
         stale
-        onConfirm={() => undefined}
       />,
     );
     expect(markup).toContain('计划已更新');

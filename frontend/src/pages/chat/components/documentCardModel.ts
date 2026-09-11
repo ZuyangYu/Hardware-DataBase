@@ -38,6 +38,23 @@ export type DocumentPlanProposalSummary = {
   blockers?: Array<Record<string, unknown> | string>;
 };
 
+export type DocumentCardGateException = {
+  kind?: string;
+  refdes?: string;
+  pin_name?: string;
+  recommended_action?: string;
+  user_instruction?: string;
+  suggested_refdes?: string[];
+};
+
+export type DocumentCardGateReview = {
+  reviewKind: string;
+  status?: string;
+  scopePendingCount: number;
+  scopeBlocking: boolean;
+  scopeExceptions: DocumentCardGateException[];
+};
+
 export type DocumentCardData = {
   kind: string;
   status: string;
@@ -53,7 +70,68 @@ export type DocumentCardData = {
   targetFormat?: string;
   artifacts?: DocumentCardArtifact[];
   proposal?: DocumentPlanProposalSummary;
+  gateReview?: DocumentCardGateReview;
+  errorCode?: string;
+  errorMessage?: string;
+  retryable?: boolean;
+  progress?: {
+    currentNode?: string;
+    completedUnits: number;
+    totalUnits: number;
+    percent: number;
+  };
 };
+
+/**
+ * Normalize the mixed WorkOrder/DocumentTask status payload into one status
+ * for the chat card.  The execution phase is not authoritative when a
+ * release gate has failed (for example `phase=pending` with
+ * `status=blocked`/`plan_release_blocked`).  Resolve terminal/error states
+ * first so the user never sees contradictory "pending" and "complete"
+ * labels for the same run.
+ */
+export function normalizeDocumentCardStatus(value: {
+  status?: unknown;
+  phase?: unknown;
+  release_status?: unknown;
+  error_code?: unknown;
+  error_message?: unknown;
+  harness_run?: { current_node?: unknown; error?: unknown } | null;
+}): string {
+  const rawStatus = normalizeStatusString(value.status);
+  const rawPhase = normalizeStatusString(value.phase);
+  const releaseStatus = normalizeStatusString(value.release_status);
+  const errorCode = normalizeStatusString(value.error_code);
+  const hasError = Boolean(errorCode || normalizeStatusString(value.error_message) || normalizeStatusString(value.harness_run?.error));
+  const currentNode = normalizeStatusString(value.harness_run?.current_node);
+
+  if (rawStatus === 'blocked' || rawPhase === 'blocked' || releaseStatus === 'blocked') return 'blocked';
+  // A renderer/release error reported at the terminal node is a blocked
+  // candidate, not a successfully completed document.
+  if (hasError && (
+    currentNode === 'complete'
+    || errorCode === 'plan_release_blocked'
+    || errorCode === 'release_blocked'
+    || errorCode === 'renderer_safety_violation'
+  )) return 'blocked';
+  if (rawStatus === 'failed' || rawPhase === 'failed') return 'failed';
+  if (hasError) return 'failed';
+
+  const candidate = rawStatus || rawPhase;
+  if (!candidate) return 'draft';
+  // `pending` is the queue state in the durable task store.  The chat card
+  // uses the user-facing queued label instead of exposing an implementation
+  // detail that is easy to confuse with a release review pending state.
+  if (candidate === 'pending') return 'queued';
+  if (candidate === 'awaiting_plan_confirmation') return 'awaiting_confirmation';
+  if (candidate === 'complete' || candidate === 'succeeded') return 'completed';
+  if (candidate === 'waiting_human_input' || candidate === 'waiting_human_approval') return 'needs_review';
+  return candidate;
+}
+
+function normalizeStatusString(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
 
 export type DocumentClarificationEventType =
   | 'document_clarification_question'
@@ -74,15 +152,39 @@ const CARD_TITLES: Record<string, string> = {
 };
 
 const CARD_STATUS_LABELS: Record<string, string> = {
+  needs_input: '等待补充信息',
+  needs_clarification: '等待对话澄清',
+  awaiting_confirmation: '等待确认',
   queued: '排队中',
+  retrieving: '正在检索资料',
   running: '进行中',
+  generating: '正在生成内容',
+  validating: '正在校验内容',
+  rendering: '正在写入模板',
+  needs_review: '候选稿待审核',
+  blocked: '生成被阻止',
+  cancelled: '已取消',
+  completed: '已完成',
   succeeded: '已成功',
+  failed: '已失败',
 };
 
 const CARD_STATUS_TONES: Record<string, DocumentStatusTone> = {
+  needs_input: 'warning',
+  needs_clarification: 'warning',
+  awaiting_confirmation: 'warning',
   queued: 'info',
+  retrieving: 'info',
   running: 'info',
+  generating: 'info',
+  validating: 'info',
+  rendering: 'info',
+  needs_review: 'warning',
+  blocked: 'danger',
+  cancelled: 'neutral',
+  completed: 'success',
   succeeded: 'success',
+  failed: 'danger',
 };
 
 const NEXT_ACTION_LABELS: Record<string, string> = {
@@ -126,6 +228,33 @@ export function parseCardArtifacts(value: unknown): DocumentCardArtifact[] | und
         : {}),
     }));
   return parsed.length > 0 ? parsed : undefined;
+}
+
+/** Parse and bound live Harness unit progress for a status card. */
+export function parseCardProgress(value: unknown): DocumentCardData['progress'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const completed = Number(record.completedUnits ?? record.completed_units);
+  const total = Number(record.totalUnits ?? record.total_units);
+  if (!Number.isFinite(completed) || !Number.isFinite(total) || total < 1) return undefined;
+  const boundedCompleted = Math.max(0, Math.min(total, Math.round(completed)));
+  const percent = Math.round((boundedCompleted / total) * 100);
+  const currentNode = typeof record.currentNode === 'string'
+    ? record.currentNode.trim()
+    : typeof record.current_node === 'string'
+      ? record.current_node.trim()
+      : '';
+  return {
+    ...(currentNode ? { currentNode } : {}),
+    completedUnits: boundedCompleted,
+    totalUnits: Math.round(total),
+    percent,
+  };
+}
+
+function progressFromHarness(run: unknown): DocumentCardData['progress'] | undefined {
+  if (!run || typeof run !== 'object' || Array.isArray(run)) return undefined;
+  return parseCardProgress(run);
 }
 
 /** 解析 Gate 1 提案摘要;任何形状不符的字段整体丢弃(fail-closed)。 */
@@ -175,9 +304,23 @@ export function parseDocumentCardEvent(data: string): DocumentCardData | null {
     if (!kind) return null;
     const targetFormat = typeof card.target_format === 'string' ? card.target_format : undefined;
     const artifacts = parseCardArtifacts(card.artifacts);
+    const errorCode = nonEmptyString(card.error_code);
+    const errorMessage = nonEmptyString(card.error_message);
+    const harnessRun = card.harness_run && typeof card.harness_run === 'object' && !Array.isArray(card.harness_run)
+      ? card.harness_run as { current_node?: unknown; error?: unknown }
+      : null;
+    const progress = parseCardProgress(card.progress) ?? progressFromHarness(harnessRun);
+    const status = normalizeDocumentCardStatus({
+      status: card.status,
+      phase: card.phase,
+      release_status: card.release_status,
+      error_code: errorCode,
+      error_message: errorMessage,
+      harness_run: harnessRun,
+    });
     return {
       kind,
-      status: typeof card.status === 'string' ? card.status : '',
+      status,
       next_actions: Array.isArray(card.next_actions)
         ? card.next_actions.filter((action): action is string => typeof action === 'string')
         : [],
@@ -193,6 +336,9 @@ export function parseDocumentCardEvent(data: string): DocumentCardData | null {
       ...(nonEmptyString(card.reason) ? { reason: nonEmptyString(card.reason) } : {}),
       ...(targetFormat ? { targetFormat } : {}),
       ...(artifacts ? { artifacts } : {}),
+      ...(errorCode ? { errorCode } : {}),
+      ...(errorMessage ? { errorMessage } : {}),
+      ...(progress ? { progress } : {}),
       ...(kind === 'output_spec_confirmation' ? { proposal: parsePlanProposal(card.proposal) } : {}),
     };
   } catch {
@@ -272,21 +418,187 @@ export function documentCardFromClarificationEvent(
 }
 
 /** Project a durable background task into the same card contract as SSE events. */
+/** Normalize the safe human-gate projection into renderable card data. */
+export function parseGateReview(value: unknown): DocumentCardGateReview | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const pending = value as Record<string, unknown>;
+  const reviewKind = nonEmptyString(pending.review_kind);
+  const scope = pending.scope_review && typeof pending.scope_review === 'object'
+    && !Array.isArray(pending.scope_review)
+    ? pending.scope_review as Record<string, unknown>
+    : null;
+  const exceptions = Array.isArray(scope?.exceptions)
+    ? (scope.exceptions as unknown[])
+      .filter((item): item is Record<string, unknown> => (
+        Boolean(item) && typeof item === 'object' && !Array.isArray(item)
+      ))
+      .slice(0, 20)
+      .map((item) => ({
+        ...(typeof item.kind === 'string' && item.kind.trim() ? { kind: item.kind } : {}),
+        ...(typeof item.refdes === 'string' && item.refdes.trim() ? { refdes: item.refdes } : {}),
+        ...(typeof item.pin_name === 'string' && item.pin_name.trim() ? { pin_name: item.pin_name } : {}),
+        ...(typeof item.recommended_action === 'string' && item.recommended_action.trim()
+          ? { recommended_action: item.recommended_action }
+          : {}),
+        ...(typeof item.user_instruction === 'string' && item.user_instruction.trim()
+          ? { user_instruction: item.user_instruction }
+          : {}),
+        ...(Array.isArray(item.suggested_refdes)
+          ? {
+            suggested_refdes: (item.suggested_refdes as unknown[])
+              .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+              .slice(0, 20),
+          }
+          : {}),
+      }))
+    : [];
+  if (!reviewKind && exceptions.length === 0) return undefined;
+  return {
+    reviewKind: reviewKind || 'review',
+    ...(typeof pending.status === 'string' && pending.status.trim() ? { status: pending.status } : {}),
+    scopePendingCount: typeof scope?.pending_count === 'number' ? scope.pending_count : 0,
+    scopeBlocking: scope?.blocking === true,
+    scopeExceptions: exceptions,
+  };
+}
+
 export function documentCardFromChatTask(task: DocumentChatTaskView): DocumentCardData {
   const status = task.status;
+  const rawPhase = String(status.phase || status.status || task.job_status || '');
+  const phase = normalizeDocumentCardStatus({
+    status: status.status,
+    phase: status.phase,
+    release_status: status.release_status,
+    error_code: status.error_code,
+    error_message: status.error_message,
+    harness_run: status.harness_run,
+  });
+  const planningState = status.planning_state && typeof status.planning_state === 'object'
+    && !Array.isArray(status.planning_state)
+    ? status.planning_state as Record<string, unknown>
+    : null;
+  const restoredProposal = (
+    rawPhase === 'awaiting_confirmation' || rawPhase === 'awaiting_plan_confirmation'
+  ) && planningState
+    ? parsePlanProposal({
+      ...planningState,
+      status: planningState.proposal_status,
+      executable: true,
+      blockers: [],
+    })
+    : undefined;
+  const clarificationState = status.clarification_state;
+  let clarificationQuestion: Record<string, unknown> | null = null;
+  if (clarificationState && typeof clarificationState === 'object' && !Array.isArray(clarificationState)) {
+    const pending = (clarificationState as Record<string, unknown>).pending_question;
+    if (pending && typeof pending === 'object' && !Array.isArray(pending)) {
+      const question = pending as Record<string, unknown>;
+      if (nonEmptyString(question.question_id) && nonEmptyString(question.content)) {
+        clarificationQuestion = question;
+      }
+    }
+  }
+  // The card title must match the durable object it describes: a pending
+  // intake question is a requirement clarification, and a session without a
+  // work order is not a work order status.
+  const cardKind = restoredProposal
+    ? 'output_spec_confirmation'
+    : clarificationQuestion
+      ? 'requirement_clarification'
+      : task.work_order_id
+        ? 'work_order_status'
+        : 'generation_session';
   const card: DocumentCardData = {
-    kind: 'work_order_status',
-    status: String(status.phase || status.status || task.job_status || ''),
+    kind: cardKind,
+    status: phase,
     next_actions: Array.isArray(status.next_actions) ? status.next_actions : [],
     kb_name: task.kb_name,
     ...(task.task_id ? { task_id: task.task_id } : {}),
     work_order_id: task.work_order_id,
     generation_session_id: status.clarification_session_id ?? null,
   };
+  if (restoredProposal) card.proposal = restoredProposal;
   if (status.target_format) card.targetFormat = status.target_format;
   const artifacts = parseCardArtifacts(status.artifacts);
   if (artifacts) card.artifacts = artifacts;
+  if (typeof status.error_code === 'string' && status.error_code.trim()) {
+    card.errorCode = status.error_code;
+  }
+  if (typeof status.error_message === 'string' && status.error_message.trim()) {
+    card.errorMessage = status.error_message;
+  }
+  if (typeof status.retryable === 'boolean') card.retryable = status.retryable;
+  const gateReview = parseGateReview(status.pending_review);
+  if (gateReview) card.gateReview = gateReview;
+  const progress = parseCardProgress(status.progress) ?? progressFromHarness(status.harness_run);
+  if (progress) card.progress = progress;
+  if (clarificationQuestion) {
+    card.status = 'needs_clarification';
+    card.question_id = nonEmptyString(clarificationQuestion.question_id);
+    card.content = nonEmptyString(clarificationQuestion.content);
+    card.options = parseStringOptions(clarificationQuestion.options);
+    card.reason = nonEmptyString(clarificationQuestion.reason);
+    card.next_actions = ['answer_clarification'];
+  }
   return card;
+}
+
+/** Apply the same authoritative status normalization to a manual REST refresh. */
+export function documentCardFromWorkOrderStatus(
+  status: WorkOrderStatus,
+  fallback: DocumentCardData,
+): DocumentCardData {
+  const next: DocumentCardData = {
+    ...fallback,
+    status: normalizeDocumentCardStatus({
+      status: status.status,
+      phase: status.phase,
+      release_status: status.release_status,
+      error_code: status.error_code,
+      error_message: status.error_message,
+      harness_run: status.harness_run,
+    }),
+    task_id: status.task_id || fallback.task_id,
+    work_order_id: status.work_order_id || fallback.work_order_id,
+    generation_session_id: status.clarification_session_id || fallback.generation_session_id,
+    next_actions: status.next_actions && status.next_actions.length > 0
+      ? status.next_actions
+      : fallback.next_actions,
+  };
+  if (status.target_format) next.targetFormat = status.target_format;
+  const artifacts = parseCardArtifacts(status.artifacts);
+  if (artifacts) next.artifacts = artifacts;
+  if (typeof status.error_code === 'string' && status.error_code.trim()) next.errorCode = status.error_code;
+  if (typeof status.error_message === 'string' && status.error_message.trim()) next.errorMessage = status.error_message;
+  if (typeof status.retryable === 'boolean') next.retryable = status.retryable;
+  const gateReview = parseGateReview(status.pending_review);
+  if (gateReview) {
+    next.gateReview = gateReview;
+  } else {
+    // The authoritative status no longer reports a pending gate: clear the
+    // stale block instead of keeping it until the next stream event.
+    delete next.gateReview;
+  }
+  const progress = parseCardProgress(status.progress) ?? progressFromHarness(status.harness_run);
+  if (progress) next.progress = progress;
+  const clarificationState = status.clarification_state;
+  if (clarificationState && typeof clarificationState === 'object' && !Array.isArray(clarificationState)) {
+    const pending = (clarificationState as Record<string, unknown>).pending_question;
+    if (pending && typeof pending === 'object' && !Array.isArray(pending)) {
+      const question = pending as Record<string, unknown>;
+      const questionId = nonEmptyString(question.question_id);
+      const content = nonEmptyString(question.content);
+      if (questionId && content) {
+        next.status = 'needs_clarification';
+        next.question_id = questionId;
+        next.content = content;
+        next.options = parseStringOptions(question.options);
+        next.reason = nonEmptyString(question.reason);
+        next.next_actions = ['answer_clarification'];
+      }
+    }
+  }
+  return next;
 }
 
 /** Fill a restored task card with the durable pending question, when present. */
@@ -294,23 +606,54 @@ export function documentCardFromGenerationSession(
   session: GenerationSession,
   fallback: DocumentCardData,
 ): DocumentCardData {
-  const question = [...session.messages].reverse().find((message) => (
-    message.role === 'assistant' && Boolean(message.question_id) && Boolean(message.content)
-  ));
+  const answeredQuestionIds = new Set<string>();
+  let pendingQuestion: GenerationSession['messages'][number] | undefined;
+  for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+    const message = session.messages[index];
+    const questionId = message.question_id?.trim() ?? '';
+    if (message.role === 'user') {
+      if (questionId && Boolean(message.answer?.trim() || message.content?.trim())) {
+        answeredQuestionIds.add(questionId);
+      }
+      continue;
+    }
+    if (
+      message.role === 'assistant'
+      && questionId
+      && Boolean(message.content?.trim())
+      && !answeredQuestionIds.has(questionId)
+    ) {
+      pendingQuestion = message;
+      break;
+    }
+  }
+  const hasPendingClarification = Boolean(pendingQuestion)
+    && (session.status === 'needs_clarification' || session.status === 'awaiting_plan');
+  // Never resurrect the latest assistant question solely because the session
+  // is in a clarification phase.  A durable session can contain several
+  // answered questions; only the reverse-scanned unanswered payload is safe
+  // to expose in the composer.  A last_question_id without its unanswered
+  // payload is not sufficient to create an answer action.
+  const question = pendingQuestion;
+  const displayStatus = hasPendingClarification
+    ? 'needs_clarification'
+    : session.status === 'awaiting_plan'
+      ? 'draft'
+      : session.status;
   return {
     ...fallback,
-    status: session.status,
+    status: displayStatus,
     kb_name: session.knowledge_base_name || fallback.kb_name,
     task_id: session.document_task_id ?? fallback.task_id,
     work_order_id: session.work_order_id ?? fallback.work_order_id,
     generation_session_id: session.session_id,
-    next_actions: session.status === 'needs_clarification'
+    next_actions: hasPendingClarification
       ? ['answer_clarification']
       : fallback.next_actions,
-    question_id: session.status === 'needs_clarification' ? (question?.question_id ?? session.last_question_id ?? null) : null,
-    content: session.status === 'needs_clarification' ? (question?.content ?? null) : null,
-    options: session.status === 'needs_clarification' ? (question?.options ?? []) : [],
-    reason: session.status === 'needs_clarification' ? (question?.reason ?? null) : null,
+    question_id: hasPendingClarification ? (question?.question_id ?? null) : null,
+    content: hasPendingClarification ? (question?.content ?? null) : null,
+    options: hasPendingClarification ? (question?.options ?? []) : [],
+    reason: hasPendingClarification ? (question?.reason ?? null) : null,
   };
 }
 
@@ -421,6 +764,40 @@ export function documentWorkOrderStatusPath(kbName: string, workOrderId: string)
 export function documentChatTasksPath(sessionId?: number | null): string {
   const suffix = sessionId == null ? '' : `?session_id=${encodeURIComponent(String(sessionId))}`;
   return `/api/v1/document-generation/chat-tasks${suffix}`;
+}
+
+export function documentCurrentChatTaskPath(sessionId: number): string {
+  return `/api/v1/document-generation/chat-tasks/current?session_id=${encodeURIComponent(String(sessionId))}`;
+}
+
+export function documentChatTaskEventsPath(sessionId: number): string {
+  return `/api/v1/document-generation/chat-tasks/events?session_id=${encodeURIComponent(String(sessionId))}`;
+}
+
+export function parseDocumentTaskStreamEvent(data: string): DocumentChatTaskView | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data) as unknown;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const current = (parsed as Record<string, unknown>).current;
+  if (!current || typeof current !== 'object' || Array.isArray(current)) return null;
+  const task = current as Record<string, unknown>;
+  if (
+    typeof task.session_id !== 'number'
+    || !nonEmptyString(task.task_id)
+    || !nonEmptyString(task.kb_name)
+    || !task.status
+    || typeof task.status !== 'object'
+    || Array.isArray(task.status)
+  ) return null;
+  return current as DocumentChatTaskView;
+}
+
+export async function fetchDocumentCurrentChatTask(sessionId: number): Promise<DocumentChatTaskView | null> {
+  return api.get<DocumentChatTaskView | null>(documentCurrentChatTaskPath(sessionId));
 }
 
 export async function fetchDocumentChatTasks(sessionId?: number | null): Promise<DocumentChatTaskView[]> {

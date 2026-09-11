@@ -7,15 +7,29 @@ APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_ROOT"
 
 API_HOST="${HDB_API_HOST:-127.0.0.1}"
-API_PORT="${HDB_API_PORT:-8003}"
-FRONT_PORT="${HDB_FRONT_PORT:-5175}"
+API_PORT="${HDB_API_PORT:-8001}"
+FRONT_PORT="${HDB_FRONT_PORT:-5176}"
 LOG_DIR="${HDB_LOG_DIR:-$APP_ROOT/storage/logs}"
 PID_DIR="${HDB_PID_DIR:-$APP_ROOT/storage/run}"
 API_PID_FILE="$PID_DIR/api.pid"
 FRONT_PID_FILE="$PID_DIR/frontend.pid"
+WORKER_PID_FILE="$PID_DIR/worker.pid"
+MEMORY_WORKER_PID_FILE="$PID_DIR/memory-worker.pid"
+EXPORT_WORKER_PID_FILE="$PID_DIR/export-worker.pid"
+
+# 后台 worker 命令名:聊天/文档轮次在 worker 进程内执行(agent 工具、
+# 计划提交、记忆提炼),重复启动会留下携带旧代码的僵尸实例,因此
+# start/stop 前先清理未纳管的本项目 worker。
+WORKER_PATTERNS=(
+  "hardware-database-worker"
+  "hardware-database-memory-worker"
+  "src.workers.main"
+  "src.result_exports.worker"
+)
 
 api_ok()   { curl -sf -m 2 "http://${API_HOST}:${API_PORT}/health" >/dev/null 2>&1; }
 front_ok() { curl -sf -m 2 -o /dev/null "http://127.0.0.1:${FRONT_PORT}/"; }
+pid_alive() { kill -0 "$1" 2>/dev/null; }
 
 pid_matches_root() {
   local pid="$1" expected_root="$2" cwd
@@ -54,6 +68,71 @@ stop_process() {
   rm -f "$pid_file"
 }
 
+# ---- worker 生命周期(纳管 + 清理未纳管旧实例) ----
+
+worker_pid_files() {
+  printf '%s\n' "$WORKER_PID_FILE" "$MEMORY_WORKER_PID_FILE" "$EXPORT_WORKER_PID_FILE"
+}
+
+is_managed_worker_pid() {
+  local pid="$1" pid_file candidate
+  for pid_file in $(worker_pid_files); do
+    if [ "$pid" = "$(sed -n '1p' "$pid_file" 2>/dev/null || true)" ]; then return 0; fi
+  done
+  return 1
+}
+
+cleanup_stale_workers() {
+  local pattern pid killed=0
+  for pattern in "${WORKER_PATTERNS[@]}"; do
+    while read -r pid; do
+      [ -n "$pid" ] || continue
+      is_managed_worker_pid "$pid" && continue
+      # 仅清理 cwd 属于本副本的进程,绝不误伤其它 checkout 的同名 worker。
+      pid_matches_root "$pid" "$APP_ROOT" || continue
+      if kill "$pid" 2>/dev/null; then
+        echo "[cleanup] 停掉未纳管的旧 worker 进程 $pid (${pattern})"
+        killed=$((killed + 1))
+      fi
+    done < <(pgrep -f "$pattern" 2>/dev/null || true)
+  done
+  if [ "$killed" -gt 0 ]; then sleep 1; fi
+  return 0
+}
+
+start_worker_processes() {
+  # 幂等:重复 start 先停掉已纳管实例,避免越积越多的 worker 抢同一队列。
+  stop_worker_processes
+  echo "[worker] 启动中..."
+  start_process worker "$APP_ROOT" "$WORKER_PID_FILE" \
+    uv run hardware-database-worker
+  start_process memory-worker "$APP_ROOT" "$MEMORY_WORKER_PID_FILE" \
+    uv run hardware-database-memory-worker
+  start_process export-worker "$APP_ROOT" "$EXPORT_WORKER_PID_FILE" \
+    uv run python -m src.result_exports.worker
+  sleep 1
+  local pid_file name
+  for name in worker memory-worker export-worker; do
+    case "$name" in
+      worker) pid_file="$WORKER_PID_FILE" ;;
+      memory-worker) pid_file="$MEMORY_WORKER_PID_FILE" ;;
+      export-worker) pid_file="$EXPORT_WORKER_PID_FILE" ;;
+    esac
+    pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && pid_alive "$pid"; then
+      echo "[${name}] 已启动 (pid ${pid})"
+    else
+      echo "[${name}] 未能启动,查看 $LOG_DIR/${name}.log"
+    fi
+  done
+}
+
+stop_worker_processes() {
+  stop_process worker "$APP_ROOT" "$WORKER_PID_FILE"
+  stop_process memory-worker "$APP_ROOT" "$MEMORY_WORKER_PID_FILE"
+  stop_process export-worker "$APP_ROOT" "$EXPORT_WORKER_PID_FILE"
+}
+
 wait_for() {
   local check_fn="$1" attempts="$2" i
   for i in $(seq 1 "$attempts"); do
@@ -65,6 +144,8 @@ wait_for() {
 
 do_start() {
   mkdir -p "$LOG_DIR" "$PID_DIR"
+  # 先清理历史残留的未纳管 worker,避免旧代码实例继续消费队列。
+  cleanup_stale_workers
   if api_ok; then
     echo "[api]    已在运行 (:$API_PORT)"
   else
@@ -93,12 +174,16 @@ do_start() {
       return 1
     fi
   fi
+  start_worker_processes
   do_status
 }
 
 do_stop() {
   stop_process frontend "$APP_ROOT/frontend" "$FRONT_PID_FILE"
   stop_process api "$APP_ROOT" "$API_PID_FILE"
+  stop_worker_processes
+  # 兜底清理未纳管的本项目 worker 实例。
+  cleanup_stale_workers
   for _ in $(seq 1 5); do
     if ! api_ok && ! front_ok; then break; fi
     sleep 1
@@ -121,6 +206,20 @@ do_status() {
     echo "❌ [front]  未启动      -> bash scripts/hdb.sh start"
     rc=1
   fi
+  local pid_file name pid
+  for name in worker memory-worker export-worker; do
+    case "$name" in
+      worker) pid_file="$WORKER_PID_FILE" ;;
+      memory-worker) pid_file="$MEMORY_WORKER_PID_FILE" ;;
+      export-worker) pid_file="$EXPORT_WORKER_PID_FILE" ;;
+    esac
+    pid="$(managed_pid "$pid_file" "$APP_ROOT" 2>/dev/null || true)"
+    if [ -n "$pid" ] && pid_alive "$pid"; then
+      echo "✅ [${name}]  pid ${pid}"
+    else
+      echo "⚠️  [${name}]  未纳管/未启动 -> bash scripts/hdb.sh start"
+    fi
+  done
   [ "$rc" = 0 ] && echo "—— 全部就绪（API 子进程按本副本配置管理）——" || echo "—— 有缺失,执行: bash scripts/hdb.sh start ——"
   return "$rc"
 }

@@ -11,6 +11,7 @@ import { api, ApiError, isForbiddenError, sseGetStream } from '@/api/client';
 import type {
   AttachmentSnapshot,
   CreateTurnRequest,
+  DocumentChatTaskView,
   DocumentContext,
   EvidenceItem,
   MemoryConsentListResponse,
@@ -35,13 +36,15 @@ import {
 } from '@/api/documentAuthoring';
 import {
   documentCardFromChatTask,
+  documentCardFromWorkOrderStatus,
   documentCardFromClarificationEvent,
   documentCardFromGenerationSession,
-  fetchDocumentChatTasks,
+  documentChatTaskEventsPath,
+  fetchDocumentCurrentChatTask,
   fetchDocumentWorkOrderStatus,
   mergeDocumentCards,
-  parseCardArtifacts,
   parseDocumentCardEvent,
+  parseDocumentTaskStreamEvent,
   planConfirmationInput,
   documentCardIdentity,
   type DocumentCardData,
@@ -63,6 +66,38 @@ const GENERAL_CHAT_KB_NAME = '__general__';
 const QUERY_TRACE_HIDE_DELAY_MS = 5000;
 const STREAMING_RENDER_INTERVAL_MS = 64;
 const DOCUMENT_TASK_POLL_INTERVAL_MS = 3000;
+const DOCUMENT_TASK_FALLBACK_POLL_INTERVAL_MS = 10000;
+
+const DOCUMENT_TASK_TERMINAL_PHASES = new Set([
+  'completed', 'complete', 'succeeded', 'failed', 'blocked', 'cancelled', 'needs_review',
+]);
+
+/** Keep polling through the confirmation-to-task creation gap. */
+export function documentTaskPollDelay(
+  tasks: DocumentChatTaskView[],
+  hasDocumentActivity = false,
+): number | null {
+  if (tasks.length === 0) {
+    return hasDocumentActivity ? DOCUMENT_TASK_POLL_INTERVAL_MS : null;
+  }
+  const hasActiveTask = tasks.some((task) => {
+    const phase = String(task.status.phase || task.status.status || task.job_status || '');
+    return !DOCUMENT_TASK_TERMINAL_PHASES.has(phase);
+  });
+  return hasActiveTask ? DOCUMENT_TASK_POLL_INTERVAL_MS : null;
+}
+
+/** The compact status tray follows only the newest task in this conversation. */
+export function latestDocumentChatTasks(tasks: DocumentChatTaskView[]): DocumentChatTaskView[] {
+  if (tasks.length <= 1) return tasks;
+  const timestamp = (task: DocumentChatTaskView) => {
+    const value = Date.parse(task.updated_at || task.created_at || '');
+    return Number.isFinite(value) ? value : 0;
+  };
+  return [tasks.reduce((latest, task) => (
+    timestamp(task) > timestamp(latest) ? task : latest
+  ))];
+}
 
 function requestUuid(): string {
   return createClientRequestId();
@@ -129,17 +164,39 @@ export function buildTurnRequest(
     // A refreshed turn may contain the canonical server-owned context
     // (tenant/owner/permission fields).  Never echo those fields back to the
     // client-input schema; send only immutable references and the lease key.
-    request.document_context = {
-      analysis_id: documentContext.analysis_id,
-      template_version_id: documentContext.template_version_id,
-      knowledge_base_name: documentContext.knowledge_base_name,
-      version: documentContext.version,
-      expiry: documentContext.expiry,
-      client_request_id: documentContext.client_request_id,
-      ...(documentContext.generation_session_id
-        ? { generation_session_id: documentContext.generation_session_id }
-        : {}),
-    };
+    if (documentContext.version === 'v2') {
+      request.document_context = {
+        version: 'v2',
+        knowledge_base_name: documentContext.knowledge_base_name ?? null,
+        attachment_ids: [...(documentContext.attachment_ids ?? [])],
+        source_scope: documentContext.source_scope ?? 'auto',
+        ...(documentContext.task_id ? { task_id: documentContext.task_id } : {}),
+        ...(documentContext.generation_session_id
+          ? { generation_session_id: documentContext.generation_session_id }
+          : {}),
+        ...(documentContext.output_spec_id
+          ? { output_spec_id: documentContext.output_spec_id } : {}),
+        ...(documentContext.output_spec_version != null
+          ? { output_spec_version: documentContext.output_spec_version } : {}),
+        ...(documentContext.template_version_id
+          ? { template_version_id: documentContext.template_version_id } : {}),
+        ...(documentContext.analysis_id ? { analysis_id: documentContext.analysis_id } : {}),
+        expiry: documentContext.expiry,
+        client_request_id: documentContext.client_request_id,
+      };
+    } else {
+      request.document_context = {
+        analysis_id: documentContext.analysis_id,
+        template_version_id: documentContext.template_version_id,
+        knowledge_base_name: documentContext.knowledge_base_name,
+        version: documentContext.version,
+        expiry: documentContext.expiry,
+        client_request_id: documentContext.client_request_id,
+        ...(documentContext.generation_session_id
+          ? { generation_session_id: documentContext.generation_session_id }
+          : {}),
+      };
+    }
     if (typeof documentFlow === 'boolean') {
       request.document_flow = documentFlow;
     }
@@ -672,55 +729,71 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     setDocumentCardAnsweringId(null);
   }, [activeSessionId]);
 
-  // Reconcile durable document jobs after navigation, refresh and reconnect.
-  // The worker owns execution; this polling only restores the user-visible
-  // card and stops once the work order reaches a stable terminal state.
+  // Reconcile the one durable current task after navigation/refresh, then
+  // follow its replayable conversation event stream. REST polling is only a
+  // degraded fallback after the stream exhausts its reconnect budget.
   useEffect(() => {
     if (!documentContextEnabled || activeSessionId == null) return undefined;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    const scheduleSync = () => {
-      if (!disposed) timer = setTimeout(() => void sync(), DOCUMENT_TASK_POLL_INTERVAL_MS);
-    };
-    const sync = async () => {
-      try {
-        const tasks = await fetchDocumentChatTasks(activeSessionId);
-        if (disposed || activeSessionRef.current !== activeSessionId) return;
-        const restoredCards = await Promise.all(tasks.map(async (task) => {
-          const card = documentCardFromChatTask(task);
-          const sessionId = card.generation_session_id?.trim() ?? '';
-          const phase = String(task.status.phase || task.status.status || task.job_status || '');
-          if (sessionId && phase === 'needs_clarification') {
-            try {
-              return documentCardFromGenerationSession(
-                await fetchGenerationSession(task.kb_name, sessionId),
-                card,
-              );
-            } catch {
-              // The task projection remains useful if the session is temporarily unavailable.
-            }
-          }
-          return card;
-        }));
-        if (disposed || activeSessionRef.current !== activeSessionId) return;
-        setDocumentCards((prev) => restoredCards.reduce(
-          (cards, card) => mergeDocumentCards(cards, card),
-          prev,
-        ));
-        const stillRunning = tasks.some((task) => {
-          const phase = String(task.status.phase || task.status.status || task.job_status || '');
-          return !['completed', 'complete', 'succeeded', 'failed', 'blocked', 'cancelled', 'needs_review'].includes(phase);
-        });
-        if (stillRunning) scheduleSync();
-      } catch {
-        // A transient status read failure should not disrupt chat; retry while
-        // this session remains visible so a completed artifact still appears.
-        scheduleSync();
+    const controller = new AbortController();
+
+    const restoreTask = async (task: DocumentChatTaskView | null) => {
+      if (!task || disposed || activeSessionRef.current !== activeSessionId) return;
+      let card = documentCardFromChatTask(task);
+      const generationSessionId = card.generation_session_id?.trim() ?? '';
+      const phase = String(task.status.phase || task.status.status || task.job_status || '');
+      if (
+        generationSessionId
+        && ['needs_input', 'needs_clarification', 'draft', 'awaiting_plan'].includes(phase)
+      ) {
+        try {
+          card = documentCardFromGenerationSession(
+            await fetchGenerationSession(task.kb_name, generationSessionId),
+            card,
+          );
+        } catch {
+          // The aggregate projection remains useful while session detail is unavailable.
+        }
+      }
+      if (!disposed && activeSessionRef.current === activeSessionId) {
+        setDocumentCards([card]);
       }
     };
-    void sync();
+
+    const fallbackSync = async () => {
+      try {
+        const currentTask = await fetchDocumentCurrentChatTask(activeSessionId);
+        await restoreTask(currentTask);
+      } catch {
+        // Keep the conversation usable while the status surface is degraded.
+      } finally {
+        if (!disposed) {
+          timer = setTimeout(
+            () => void fallbackSync(),
+            DOCUMENT_TASK_FALLBACK_POLL_INTERVAL_MS,
+          );
+        }
+      }
+    };
+
+    void (async () => {
+      try {
+        await restoreTask(await fetchDocumentCurrentChatTask(activeSessionId));
+        for await (const event of sseGetStream(
+          documentChatTaskEventsPath(activeSessionId),
+          controller.signal,
+        )) {
+          if (event.event !== 'document_task') continue;
+          await restoreTask(parseDocumentTaskStreamEvent(event.data));
+        }
+      } catch {
+        if (!disposed && !controller.signal.aborted) void fallbackSync();
+      }
+    })();
     return () => {
       disposed = true;
+      controller.abort();
       if (timer) clearTimeout(timer);
     };
   }, [activeSessionId, documentContextEnabled]);
@@ -926,18 +999,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       const status = workOrderId ? await fetchDocumentWorkOrderStatus(card.kb_name, workOrderId) : null;
       // 请求期间切走了会话:结果不再合并进当前消息流。
       if (activeSessionRef.current !== activeChatSessionId) return;
-      let refreshed: DocumentCardData = status ? {
-        kind: 'work_order_status',
-        status: status.status || card.status,
-        next_actions: status.next_actions && status.next_actions.length > 0 ? status.next_actions : card.next_actions,
-        kb_name: card.kb_name,
-        task_id: status.task_id || card.task_id,
-        work_order_id: workOrderId,
-        generation_session_id: status.clarification_session_id || card.generation_session_id,
-        // 产物引用/格式一并合并:已完成的旧卡片刷新后也能拿到下载入口。
-        targetFormat: status.target_format || card.targetFormat,
-        artifacts: parseCardArtifacts(status.artifacts) ?? card.artifacts,
-      } : card;
+      let refreshed: DocumentCardData = status
+        ? documentCardFromWorkOrderStatus(status, card)
+        : card;
       const clarificationSessionId = refreshed.generation_session_id?.trim() ?? '';
       if (clarificationSessionId && refreshed.status === 'needs_clarification') {
         refreshed = documentCardFromGenerationSession(

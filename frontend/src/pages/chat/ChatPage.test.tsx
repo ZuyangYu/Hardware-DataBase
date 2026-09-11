@@ -154,6 +154,17 @@ describe('natural-language template generation routing', () => {
     expect(missing.authority).toBe('backend');
     expect(missing.requiresTemplate).toBe(true);
   });
+
+  it('fails closed while an intended template attachment is still parsing', () => {
+    const pending = resolveTemplateAttachmentRoute('参考模板生成 ICD 文档', [{
+      ...readyDocx,
+      parse_status: 'queued',
+    }]);
+
+    expect(pending.waitingForTemplate).toBe(true);
+    expect(pending.pendingCandidates).toHaveLength(1);
+    expect(pending.autoTemplate).toBeNull();
+  });
 });
 
 describe('ChatPage document authoring bridge', () => {
@@ -166,19 +177,21 @@ describe('ChatPage document authoring bridge', () => {
     expect(markup).not.toContain('chat-document-template-upload');
   });
 
-  it('exposes the template upload entry only after explicit opt-in', () => {
+  it('uses the unified attachment entry instead of a dedicated template upload', () => {
     const markup = renderChat(true);
 
-    expect(markup).toContain('上传模板');
-    expect(markup).toContain('chat-document-template-upload');
-    expect(markup).toContain('.xlsx,.xlsm,.docx');
+    expect(markup).toContain('添加附件');
+    expect(markup).toContain('chat-attachment-upload');
+    expect(markup).not.toContain('上传模板');
+    expect(markup).not.toContain('chat-document-template-upload');
   });
 
-  it('keeps upload disabled for a read-only knowledge base', () => {
+  it('does not reintroduce a dedicated template upload for a read-only knowledge base', () => {
     const markup = renderChat(true, [{ ...writableKb, permission: 'read' }]);
 
-    expect(markup).toContain('需 KB 写权限');
-    expect(markup).toMatch(/id="chat-document-template-upload"[^>]*disabled/);
+    expect(markup).toContain('添加附件');
+    expect(markup).not.toContain('上传模板');
+    expect(markup).not.toContain('chat-document-template-upload');
   });
 });
 
@@ -208,6 +221,14 @@ function renderComposer(overrides: Partial<ComposerProps> = {}) {
 }
 
 describe('Composer document generation toggle', () => {
+  it('renders document quick replies beside the main conversation input', () => {
+    const markup = renderComposer({ quickReplies: ['确认生成', '修改计划'] });
+
+    expect(markup).toContain('aria-label="文档快捷回复"');
+    expect(markup).toContain('确认生成');
+    expect(markup).toContain('修改计划');
+  });
+
   it('keeps the knowledge-base selector usable while a turn is streaming', () => {
     const markup = renderComposer({ streaming: true });
 
@@ -218,7 +239,8 @@ describe('Composer document generation toggle', () => {
   it('hides the generation toggle when no document context is attached', () => {
     const markup = renderComposer({ onToggleDocumentFlow: () => undefined });
 
-    expect(markup).toContain('上传模板');
+    expect(markup).toContain('添加附件');
+    expect(markup).not.toContain('上传模板');
     expect(markup).not.toContain('文档生成模式');
     expect(markup).not.toContain('chat-document-flow-toggle');
   });

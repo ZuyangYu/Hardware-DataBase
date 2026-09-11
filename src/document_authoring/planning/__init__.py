@@ -6,6 +6,7 @@ needed before a proposal can be confirmed.
 """
 
 from .models import (
+    AdditionalRequirement,
     ArtifactSpec,
     AffectedSubgraph,
     CoverageContract,
@@ -103,6 +104,7 @@ from .release import (
 )
 
 __all__ = [
+    "AdditionalRequirement",
     "ArtifactSpec",
     "AffectedSubgraph",
     "CoverageContract",

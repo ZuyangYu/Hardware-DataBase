@@ -27,7 +27,6 @@ from src.core.conversation import (
 )
 from src.document_authoring.chat_context import (
     DocumentAuthoringContext,
-    DocumentAuthoringContextInput,
     DocumentContext,
     build_document_context,
 )
@@ -752,6 +751,7 @@ def create_turn(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if (
         body.document_flow is True
+        and body.document_context is None
         and (
             not _authoring_context_candidate(
                 query=body.query,

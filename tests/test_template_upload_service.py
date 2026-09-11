@@ -19,7 +19,10 @@ from src.document_authoring.models import (
 )
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
-from src.document_authoring.service import DocumentGenerationService
+from src.document_authoring.service import (
+    DocumentGenerationService,
+    _canonical_template_document_type,
+)
 from src.document_authoring.template_sanitizer import sanitize_template
 from src.document_authoring.template_analysis import TemplateAnalysisSuggestion, TemplateAnalysisUnit
 from src.document_authoring.template_progress import TemplateProgress
@@ -64,6 +67,11 @@ def _docx_with_text(text: str) -> bytes:
         for name, value in parts.items():
             package.writestr(name, value)
     return output.getvalue()
+
+
+def test_template_filename_is_canonicalized_to_document_family():
+    assert _canonical_template_document_type("icd_example.xlsx", "icd_example.xlsx") == "icd"
+    assert _canonical_template_document_type("Review", "review.docx") == "Review"
 
 
 class _SuggestedSemanticUnit:

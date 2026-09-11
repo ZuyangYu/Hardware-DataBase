@@ -17,11 +17,50 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.document_authoring.chat_context import DocumentAuthoringContext, DocumentContext
+from src.document_authoring.icd_scope_decision import ICD_BLOCKING_SCOPE_EXCEPTION_KINDS
 from src.document_authoring.job_store import DocumentAuthoringJobStore
+from src.document_authoring.planning.intake import OutputSpecIntakeService
 
 
 def _v2_enabled() -> bool:
     return bool(getattr(src.settings, "DOCUMENT_PLANNING_V2_ENABLED", False))
+
+
+def _plan_confirmation_reasons(proposal: Any, session: Any) -> list[str]:
+    """Return deterministic reasons that require a visible Gate 1 confirmation."""
+    if not isinstance(proposal, dict):
+        return ["proposal_unavailable"]
+    reasons: list[str] = []
+    if not bool(proposal.get("executable")):
+        reasons.append("proposal_not_executable")
+    if proposal.get("blockers"):
+        reasons.append("proposal_has_blockers")
+    if proposal.get("warnings"):
+        reasons.append("proposal_has_warnings")
+    deliverables = proposal.get("deliverables")
+    if not isinstance(deliverables, list) or sum(
+        1
+        for item in deliverables
+        if isinstance(item, dict) and item.get("role") == "primary"
+    ) != 1:
+        reasons.append("primary_deliverable_ambiguous")
+    draft = getattr(session, "output_spec_draft", None)
+    draft = draft if isinstance(draft, dict) else {}
+    if str(draft.get("inference_policy") or "").strip() != "forbid":
+        reasons.append("inference_requires_confirmation")
+    source_summary = proposal.get("source_summary")
+    source_summary = source_summary if isinstance(source_summary, dict) else {}
+    source_count = sum(
+        int(source_summary.get(key) or 0)
+        for key in ("knowledge_base_count", "attachment_count", "project_count")
+    )
+    if source_count < 1:
+        reasons.append("source_scope_unfixed")
+    layout = proposal.get("layout_summary")
+    layout = layout if isinstance(layout, dict) else {}
+    if str(layout.get("mode") or "") not in {"provided_template", "generated_structure"}:
+        reasons.append("layout_change_requires_confirmation")
+    return list(dict.fromkeys(reasons))
 
 
 class DocumentToolResult(BaseModel):
@@ -119,6 +158,21 @@ class TaskStatusArgs(BaseModel):
     task_id: str = Field(min_length=1, max_length=200)
 
 
+class ResolveIcdScopeArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["include", "exclude", "use_edf_connectors"] = Field(
+        description=(
+            "包含/排除待处理的 ICD 范围异常项；use_edf_connectors 表示用户确认"
+            "用冻结 EDF 的实际位号替换模板示例位号并继续生成。"
+        ),
+    )
+    comment: str = Field(min_length=1, max_length=2000)
+    exception_ids: list[str] = Field(default_factory=list, max_length=50)
+    refdes: list[str] = Field(default_factory=list, max_length=50)
+    work_order_id: str | None = Field(default=None, max_length=200)
+
+
 class CreateDocumentRevisionArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -165,8 +219,41 @@ def _safe_analysis(analysis: Any) -> dict[str, Any]:
     }
 
 
+def _pending_question_view(session: Any) -> dict[str, Any] | None:
+    """Project the next unanswered intake question with its canonical options.
+
+    The model must relay the server-published options verbatim; without this
+    projection it invents its own option labels that the intake then rejects.
+    """
+
+    if str(getattr(session, "contract_version", "") or "") != "output_spec_v1":
+        return None
+    answered: set[str] = set()
+    for message in reversed(getattr(session, "messages", None) or []):
+        question_id = str(getattr(message, "question_id", "") or "").strip()
+        if getattr(message, "role", "") == "user":
+            if question_id and (
+                str(getattr(message, "answer", "") or "").strip()
+                or str(getattr(message, "content", "") or "").strip()
+            ):
+                answered.add(question_id)
+            continue
+        if (
+            question_id
+            and str(getattr(message, "content", "") or "").strip()
+            and question_id not in answered
+        ):
+            return {
+                "question_id": question_id,
+                "content": str(message.content),
+                "options": [str(item) for item in (getattr(message, "options", None) or [])],
+                "reason": str(getattr(message, "reason", "") or ""),
+            }
+    return None
+
+
 def _safe_session(session: Any) -> dict[str, Any]:
-    return {
+    result = {
         "session_id": session.session_id,
         "status": session.status,
         "template_version_id": session.template_version_id,
@@ -180,6 +267,15 @@ def _safe_session(session: Any) -> dict[str, Any]:
         "brief": session.brief.model_dump(mode="json"),
         "next_actions": _session_next_actions(session),
     }
+    if getattr(session, "contract_version", "legacy_brief_v1") == "output_spec_v1":
+        result.update({
+            "contract_version": "output_spec_v1",
+            "output_spec_id": getattr(session, "output_spec_id", None),
+            "output_spec_version": getattr(session, "output_spec_version", None),
+            "output_spec_draft": getattr(session, "output_spec_draft", None),
+            "pending_question": _pending_question_view(session),
+        })
+    return result
 
 
 def _session_next_actions(session: Any) -> list[str]:
@@ -275,6 +371,35 @@ class DocumentAuthoringToolset:
     attachment_refs: list[Any] = field(default_factory=list)
     source_scope: str = "knowledge_base_only"
 
+    def _uses_v2_planning(self) -> bool:
+        """Enable the v2 tool surface only when the pipeline can execute it.
+
+        The feature flag is process-wide, while tests, rolling upgrades and
+        injected compatibility pipelines may briefly expose only the legacy
+        methods.  Advertising plan tools in that state is misleading and a
+        direct request would otherwise fail with an unhandled
+        ``AttributeError``.  The production AppPipeline implements all three
+        methods; older pipelines safely retain their legacy tool surface until
+        they are upgraded.
+        """
+        if not _v2_enabled():
+            return False
+        # The router may construct a tool surface before a concrete document
+        # service is installed (for example during a lazy startup or a
+        # route-only compatibility probe).  Keep the advertised v2 names in
+        # that case; an actual invocation will still fail closed at the
+        # service boundary.  A pipeline that *does* expose the legacy service
+        # but lacks v2 methods is different: it is an older executable and
+        # must retain the legacy tool set.
+        if not hasattr(self.pipeline, "document_generation"):
+            return True
+        required = (
+            "create_document_plan_proposal",
+            "confirm_document_plan",
+            "get_document_task_projection",
+        )
+        return all(callable(getattr(self.pipeline, name, None)) for name in required)
+
     def _authorize(self, permission: Literal["read", "write"]) -> None:
         self.context.assert_scope(
             ctx=self.ctx,
@@ -327,6 +452,9 @@ class DocumentAuthoringToolset:
             card["task_id"] = result.task_id
         if result.generation_session_id:
             card["generation_session_id"] = result.generation_session_id
+        # Clarification questions never cross the card channel: the popup is
+        # progress-only and the conversation is the single input surface, so
+        # the same question is never rendered twice.
         if kind == "work_order_status":
             # 产物只带不可变引用(artifact_id/stage)与格式枚举;URL 由前端拼装。
             if result.data.get("target_format"):
@@ -405,16 +533,27 @@ class DocumentAuthoringToolset:
                 ),
             )
         if str(getattr(template, "status", "")) != "approved":
+            template_status = str(getattr(template, "status", "") or "unknown")
             return (
                 template,
                 None,
                 None,
-                self._rejected(
-                    "generate_document_from_template",
-                    "template_not_approved",
-                    "template must be approved before generation; review or confirm the template mapping first",
+                DocumentToolResult(
+                    status="rejected",
+                    operation="generate_document_from_template",
+                    error_code="template_not_approved",
+                    message=(
+                        "模板映射尚未完成人工确认，当前不能生成文档；"
+                        "请先查看模板分析并由有权限的人员确认映射。"
+                    ),
                     template_version_id=template_id,
-                    next_actions=["review_template_mapping", "confirm_document_template"],
+                    next_actions=["get_document_template_analysis"],
+                    data={
+                        "mapping_status": template_status,
+                        "mapping_explanation": (
+                            "模板的字段映射仍处于待确认状态，生成工具不会自动批准或修改映射。"
+                        ),
+                    },
                 ),
             )
         bound_id = str(getattr(template, "template_schema_id", "") or "").strip()
@@ -507,6 +646,33 @@ class DocumentAuthoringToolset:
         if normalized_session:
             return f"document-generation:{normalized_session}"[:128]
         return str(self.context.client_request_id).strip()[:128]
+
+    @staticmethod
+    def _pending_output_spec_question(session: Any) -> dict[str, Any] | None:
+        """Return the next intake question when a v2 draft is incomplete."""
+
+        # ``needs_clarification`` is persisted state, and may represent a
+        # server-published question (for example content_confirmation) that
+        # is not derivable from the current draft.  Prefer that question while
+        # retaining _pending_question_view's answer-aware ordering so an
+        # already answered question is never revived.
+        if str(getattr(session, "status", "") or "") == "needs_clarification":
+            persisted = _pending_question_view(session)
+            if persisted is not None:
+                return persisted
+
+        draft = getattr(session, "output_spec_draft", None)
+        if not isinstance(draft, dict):
+            return None
+        question = OutputSpecIntakeService().next_question(draft)
+        if question is None:
+            return None
+        return {
+            "question_id": question.question_id,
+            "content": question.prompt,
+            "options": list(question.options),
+            "reason": question.reason,
+        }
 
     def _generation_session_for_direct_request(
         self,
@@ -604,12 +770,124 @@ class DocumentAuthoringToolset:
             )
         return session, None
 
+    def _reusable_v2_session(
+        self,
+        *,
+        generation_session_id: str | None,
+        template_id: str | None,
+    ) -> Any | None:
+        """Return the attached live intake session, or ``None`` to create one.
+
+        The conversation owns one OutputSpec intake session per document
+        request.  Recreating a session per tool call would fork the state and
+        silently discard already-recorded clarification answers.
+        """
+
+        session = None
+        session_id = str(
+            generation_session_id or self.context.generation_session_id or ""
+        ).strip()
+        if session_id:
+            try:
+                session = self.pipeline.get_document_generation_session(self.ctx, session_id)
+            except (PermissionError, KeyError, ValueError):
+                # A stale or foreign pointer must not abort the turn; a fresh
+                # server-owned session fails closed on its own scope checks.
+                session = None
+        if session is None:
+            # No usable pointer: resume the conversation's own intake session
+            # so recorded answers are never discarded by a fork.
+            finder = getattr(self.pipeline, "find_reusable_document_generation_session", None)
+            if callable(finder):
+                session = finder(
+                    self.ctx,
+                    knowledge_base_name=self.context.knowledge_base_name,
+                    template_version_id=template_id,
+                )
+        if session is None:
+            return None
+        if str(getattr(session, "contract_version", "") or "") != "output_spec_v1":
+            return None
+        if template_id and str(getattr(session, "template_version_id", "") or "") != template_id:
+            return None
+        if str(getattr(session, "status", "") or "") not in {
+            "needs_clarification", "awaiting_plan", "awaiting_plan_confirmation", "blocked",
+        }:
+            return None
+        return session
+
+    def _resolve_attached_clarification_session(self, session_id: str | None) -> Any | None:
+        """Resolve the live intake session even when the call lost its pointer.
+
+        The session reference is server-owned: a model may still pass a stale
+        or fabricated id after a browser refresh.  Prefer the requested id,
+        then the attached context pointer, then the conversation's own active
+        OutputSpec session, so a lost pointer resumes the recorded answers
+        instead of forking a fresh draft.
+        """
+
+        candidates = (
+            str(session_id or "").strip(),
+            str(self.context.generation_session_id or "").strip(),
+        )
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                return self.pipeline.get_document_generation_session(self.ctx, candidate)
+            except (PermissionError, KeyError, ValueError):
+                continue
+        finder = getattr(self.pipeline, "find_reusable_document_generation_session", None)
+        if callable(finder):
+            return finder(
+                self.ctx,
+                knowledge_base_name=self.context.knowledge_base_name,
+                template_version_id=None,
+            )
+        return None
+
+    @staticmethod
+    def _has_recommended_policies(draft: Any) -> bool:
+        if not isinstance(draft, dict):
+            return False
+        return bool(
+            str(draft.get("missing_data_policy") or "").strip()
+            and str(draft.get("inference_policy") or "").strip()
+            and str(draft.get("approval_policy_id") or "").strip()
+        )
+
+    def _apply_v2_recommended_defaults(
+        self,
+        session: Any,
+        *,
+        use_recommended_defaults: bool,
+    ) -> Any:
+        """Accept the safe recommendation bundle at most once per session."""
+
+        if not use_recommended_defaults or self._has_recommended_policies(
+            getattr(session, "output_spec_draft", None)
+        ):
+            return session
+        try:
+            return self.pipeline.answer_document_generation_session(
+                self.ctx,
+                session.session_id,
+                question_id="recommendations",
+                answer="采用推荐方案",
+                client_request_id=self._generation_client_request_id(session.session_id),
+            )
+        except (PermissionError, ValueError, KeyError):
+            # Recommendation acceptance is advisory; a rejection must not
+            # block the proposal from being compiled.
+            return session
+
     def _v2_confirmation_for_direct_request(
         self,
         *,
         template_id: str | None,
         purpose: str,
         use_recommended_defaults: bool,
+        generation_session_id: str | None = None,
     ) -> tuple[DocumentToolResult | None, DocumentToolResult | None]:
         """v2 direct path: prepare recommendations + proposal, never execute.
 
@@ -619,36 +897,79 @@ class DocumentAuthoringToolset:
         confirmation, which this tool must never perform.
         """
         operation = "generate_document_from_template"
-        try:
-            session = self.pipeline.create_document_generation_session(
-                self.ctx,
-                knowledge_base_name=self.context.knowledge_base_name,
-                template_version_id=template_id,
-                purpose=str(purpose or "").strip(),
-                contract_version="output_spec_v1",
-            )
-        except PermissionError:
-            raise
-        except (ValueError, KeyError):
-            return None, self._rejected(
-                operation,
-                "generation_session_not_ready",
-                "generation session could not be created",
-                template_version_id=template_id,
-            )
-        if use_recommended_defaults:
+        session = self._reusable_v2_session(
+            generation_session_id=generation_session_id,
+            template_id=template_id,
+        )
+        if session is None:
             try:
-                session = self.pipeline.answer_document_generation_session(
+                session = self.pipeline.create_document_generation_session(
                     self.ctx,
-                    session.session_id,
-                    question_id="recommendations",
-                    answer="采用推荐方案",
-                    client_request_id=self._generation_client_request_id(session.session_id),
+                    knowledge_base_name=self.context.knowledge_base_name,
+                    template_version_id=template_id,
+                    purpose=str(purpose or "").strip(),
+                    contract_version="output_spec_v1",
                 )
-            except (PermissionError, ValueError, KeyError):
-                # Recommendation acceptance is advisory; a rejection must not
-                # block the proposal from being compiled.
-                pass
+            except PermissionError:
+                raise
+            except (ValueError, KeyError):
+                return None, self._rejected(
+                    operation,
+                    "generation_session_not_ready",
+                    "generation session could not be created",
+                    template_version_id=template_id,
+                )
+        if str(getattr(session, "status", "") or "") != "blocked":
+            session = self._apply_v2_recommended_defaults(
+                session,
+                use_recommended_defaults=use_recommended_defaults,
+            )
+        # The advisory answer above may have advanced the draft version; the
+        # proposal must bind the version that is current right now.
+        try:
+            session = self.pipeline.get_document_generation_session(
+                self.ctx, session.session_id,
+            )
+        except (PermissionError, KeyError, ValueError):
+            pass
+        if str(getattr(session, "status", "") or "") == "blocked":
+            explanation = "文档生成会话已被阻止，当前无法继续。"
+            reason = "document_generation_blocked"
+            for message in reversed(getattr(session, "messages", None) or []):
+                if getattr(message, "role", "") != "assistant":
+                    continue
+                content = str(getattr(message, "content", "") or "").strip()
+                if content:
+                    explanation = content
+                candidate_reason = str(getattr(message, "reason", "") or "").strip()
+                if candidate_reason:
+                    reason = candidate_reason
+                break
+            return DocumentToolResult(
+                status="waiting_human",
+                operation=operation,
+                error_code=reason,
+                message=explanation,
+                template_version_id=template_id,
+                generation_session_id=session.session_id,
+                task_id=getattr(session, "document_task_id", None),
+                data={"status": "blocked", "reason": reason},
+                next_actions=[],
+            ), None
+        pending_question = self._pending_output_spec_question(session)
+        if pending_question is not None:
+            result = DocumentToolResult(
+                status="waiting_human",
+                operation=operation,
+                message=pending_question["content"],
+                template_version_id=template_id,
+                generation_session_id=session.session_id,
+                task_id=getattr(session, "document_task_id", None),
+                data={"status": "needs_clarification", **pending_question},
+                next_actions=["answer_clarification"],
+            )
+            self._emit_card("generation_session", result)
+            return result, None
         try:
             proposal = self.pipeline.create_document_plan_proposal(
                 self.ctx,
@@ -660,14 +981,63 @@ class DocumentAuthoringToolset:
             )
         except PermissionError:
             raise
-        except (ValueError, KeyError):
+        except (ValueError, KeyError) as exc:
+            reason = (
+                str(exc).strip().strip("'").strip()
+                or "document plan proposal could not be compiled"
+            )
+            retry = self._pending_output_spec_question(session)
             return None, self._rejected(
                 operation,
                 "plan_proposal_rejected",
-                "document plan proposal could not be compiled; answer the pending clarification first",
+                reason,
                 generation_session_id=session.session_id,
-                next_actions=["answer_clarification", "propose_document_plan"],
+                next_actions=["answer_clarification"] if retry else ["propose_document_plan"],
             )
+        confirmation_reasons = _plan_confirmation_reasons(proposal, session)
+        if (
+            bool(getattr(src.settings, "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED", False))
+            and not confirmation_reasons
+        ):
+            try:
+                submission = self.pipeline.confirm_document_plan(
+                    self.ctx,
+                    session.session_id,
+                    expected_output_spec_hash=str(proposal.get("output_spec_hash") or ""),
+                    expected_plan_hash=str(proposal.get("plan_hash") or ""),
+                    client_request_id=(
+                        f"risk-auto:{session.session_id}:{proposal.get('plan_hash') or ''}"
+                    )[:128],
+                )
+            except (PermissionError, KeyError, ValueError):
+                confirmation_reasons = ["automatic_confirmation_failed"]
+            else:
+                result = DocumentToolResult(
+                    status="succeeded",
+                    operation=operation,
+                    message="低风险文档计划已自动确认，后台正在创建生成工单。",
+                    template_version_id=template_id,
+                    generation_session_id=session.session_id,
+                    task_id=getattr(session, "document_task_id", None),
+                    work_order_id=(
+                        submission.get("work_order_id")
+                        if isinstance(submission, dict) else None
+                    ),
+                    job_id=(submission.get("job_id") if isinstance(submission, dict) else None),
+                    data={
+                        "status": (
+                            submission.get("status")
+                            if isinstance(submission, dict) else "pending"
+                        ),
+                        "submission": submission,
+                        "confirmation_required": False,
+                        "confirmation_reasons": [],
+                    },
+                    next_actions=["await_generation"],
+                )
+                self._emit_card("work_order_status", result)
+                return result, None
+
         result = DocumentToolResult(
             status="waiting_human",
             operation=operation,
@@ -681,6 +1051,8 @@ class DocumentAuthoringToolset:
             data={
                 "status": "awaiting_plan_confirmation",
                 "proposal": proposal,
+                "confirmation_required": True,
+                "confirmation_reasons": confirmation_reasons,
             },
             next_actions=["confirm_document_plan"],
         )
@@ -716,15 +1088,29 @@ class DocumentAuthoringToolset:
                 "template reference does not match the attached context",
                 template_version_id=template_id,
             )
-        template, schema_id, schema_version, schema_error = self._resolve_template_schema(
-            template_id,
-            document_schema_id=document_schema_id,
-            document_schema_version=document_schema_version,
-        )
-        if schema_error is not None:
-            return schema_error
-
-        if _v2_enabled():
+        if self._uses_v2_planning():
+            # Planning/intake may begin from a draft template.  Only require
+            # that the server can resolve the template; approval and schema
+            # binding remain prerequisites for the later artifact path.
+            template = self._template_record(template_id)
+            if template is None:
+                return self._rejected(
+                    operation,
+                    "template_not_found",
+                    "template version was not found",
+                    template_version_id=template_id,
+                )
+            bound_id = str(getattr(template, "template_schema_id", "") or "").strip()
+            bound_version = str(getattr(template, "template_schema_version", "") or "").strip()
+            if (document_schema_id and document_schema_id != bound_id) or (
+                document_schema_version and document_schema_version != bound_version
+            ):
+                return self._rejected(
+                    operation,
+                    "document_schema_mismatch",
+                    "document schema does not belong to the selected template",
+                    template_version_id=template_id,
+                )
             # Gate 1: a direct template request prepares recommendations and a
             # hash-bound proposal, but the explicit confirmation is the only
             # path into the Work Order/job pipeline.
@@ -733,10 +1119,19 @@ class DocumentAuthoringToolset:
                 template_id=v2_template_id,
                 purpose=purpose,
                 use_recommended_defaults=use_recommended_defaults,
+                generation_session_id=generation_session_id,
             )
             if error is not None:
                 return error
             return result
+
+        template, schema_id, schema_version, schema_error = self._resolve_template_schema(
+            template_id,
+            document_schema_id=document_schema_id,
+            document_schema_version=document_schema_version,
+        )
+        if schema_error is not None:
+            return schema_error
 
         try:
             analysis = self.pipeline.get_document_template_analysis_for_review(
@@ -1030,6 +1425,24 @@ class DocumentAuthoringToolset:
         template_id = str(raw_template).strip() if raw_template is not None else ""
         if template_id and template_id != self.context.template_version_id:
             return self._rejected(operation, "document_context_template_mismatch", "template reference does not match the attached context", template_version_id=template_id)
+        if _v2_enabled():
+            # The conversation owns one intake session.  A repeated start must
+            # resume that session instead of forking a new draft that discards
+            # recorded answers and re-asks questions already answered.
+            reusable = self._reusable_v2_session(
+                generation_session_id=None,
+                template_id=template_id or None,
+            )
+            if reusable is not None:
+                result = DocumentToolResult(
+                    status="succeeded", operation=operation, message="generation session resumed",
+                    template_version_id=reusable.template_version_id,
+                    generation_session_id=reusable.session_id,
+                    task_id=getattr(reusable, "document_task_id", None),
+                    data=_safe_session(reusable), next_actions=_session_next_actions(reusable),
+                )
+                self._emit_card("generation_session", result)
+                return result
         try:
             if _v2_enabled():
                 # A v2 intake session may be template-free; the layout source
@@ -1070,8 +1483,15 @@ class DocumentAuthoringToolset:
     ) -> DocumentToolResult:
         operation = "answer_clarification"
         self._authorize("write")
-        if self.context.generation_session_id and session_id != self.context.generation_session_id:
-            return self._rejected(operation, "document_context_session_mismatch", "session reference does not match the attached context", generation_session_id=session_id)
+        resolved = self._resolve_attached_clarification_session(session_id)
+        if resolved is None:
+            return self._rejected(
+                operation,
+                "clarification_session_unresolved",
+                "no active requirement session was found for this conversation",
+                generation_session_id=session_id,
+            )
+        session_id = resolved.session_id
         try:
             session = self.pipeline.answer_document_generation_session(
                 self.ctx,
@@ -1082,8 +1502,14 @@ class DocumentAuthoringToolset:
             )
         except PermissionError:
             raise
-        except (ValueError, KeyError):
-            return self._rejected(operation, "clarification_rejected", "clarification answer was rejected", generation_session_id=session_id)
+        except (ValueError, KeyError) as exc:
+            reason = str(exc).strip() or "validation failed"
+            return self._rejected(
+                operation,
+                "clarification_rejected",
+                f"clarification answer was rejected: {reason}",
+                generation_session_id=session_id,
+            )
         if session.template_version_id != self.context.template_version_id:
             return self._rejected(operation, "document_context_template_mismatch", "session does not belong to the attached template", generation_session_id=session_id)
         result = DocumentToolResult(
@@ -1364,6 +1790,279 @@ class DocumentAuthoringToolset:
         self._emit_card("output_spec_confirmation", result)
         return result
 
+    def resolve_icd_scope_exception(
+        self,
+        action: Literal["include", "exclude"],
+        comment: str,
+        exception_ids: list[str] | None = None,
+        refdes: list[str] | None = None,
+        work_order_id: str | None = None,
+    ) -> DocumentToolResult:
+        """Resolve a non-blocking ICD scope gate from the conversation.
+
+        Blocking exceptions (missing connector scope or EDF pin mapping) are
+        refused with the operator instruction: they can only be fixed by
+        completing the frozen sources or by restarting with an explicit target.
+        """
+
+        operation = "resolve_icd_scope_exception"
+        self._authorize("write")
+        order_id = str(work_order_id or "").strip() or self._context_work_order_id()
+        if not order_id:
+            return self._rejected(
+                operation,
+                "work_order_not_found",
+                "当前会话没有可处理的文档工单",
+                next_actions=["open_document_workbench"],
+            )
+        getter = getattr(self.pipeline, "get_icd_scope_review", None)
+        if not callable(getter):
+            return self._rejected(
+                operation,
+                "icd_scope_review_unavailable",
+                "当前环境不支持对话处理 ICD 范围待办，请在文档工作台处理。",
+                work_order_id=order_id,
+                next_actions=["open_document_workbench"],
+            )
+        try:
+            review = getter(self.ctx, order_id)
+        except PermissionError:
+            raise
+        except (KeyError, ValueError) as exc:
+            return self._rejected(
+                operation,
+                "icd_scope_review_unavailable",
+                str(exc) or "ICD 范围待办当前不可用",
+                work_order_id=order_id,
+                next_actions=["open_document_workbench"],
+            )
+        if review is None:
+            return self._rejected(
+                operation,
+                "icd_scope_review_not_found",
+                "当前工单没有待处理的 ICD 范围异常",
+                work_order_id=order_id,
+                next_actions=["open_document_workbench"],
+            )
+        if str(getattr(review, "status", "") or "") == "frozen":
+            # A previous attempt may have frozen the review and then failed to
+            # queue generation; submission is idempotent, so retry it.
+            return self._resume_scope_generation(operation, order_id)
+        if action == "use_edf_connectors":
+            rebuild = getattr(self.pipeline, "rebuild_icd_scope_from_edf", None)
+            if not callable(rebuild):
+                return self._rejected(
+                    operation,
+                    "edf_scope_rebuild_unavailable",
+                    "当前环境不支持按 EDF 实际位号重建范围，请在文档工作台处理。",
+                    work_order_id=order_id,
+                    next_actions=["open_document_workbench"],
+                )
+            try:
+                outcome = rebuild(
+                    self.ctx, order_id, comment=str(comment or "").strip(),
+                )
+            except PermissionError:
+                raise
+            except (KeyError, ValueError) as exc:
+                return self._rejected(
+                    operation,
+                    "edf_scope_rebuild_rejected",
+                    str(exc) or "按 EDF 实际位号重建范围未被接受",
+                    work_order_id=order_id,
+                    next_actions=["open_document_workbench"],
+                )
+            run_id = outcome.get("run_id") if isinstance(outcome, dict) else None
+            result = DocumentToolResult(
+                status="succeeded",
+                operation=operation,
+                message="已按冻结 EDF 的实际位号替换模板示例位号，生成已继续。",
+                work_order_id=order_id,
+                run_id=str(run_id or "").strip() or None,
+                data={
+                    "status": (
+                        outcome.get("status") if isinstance(outcome, dict) else None
+                    ),
+                    "run_id": str(run_id or "").strip() or None,
+                    "refdes_source": "edf",
+                },
+                next_actions=["await_generation", "get_document_task_status"],
+            )
+            self._emit_card("work_order_status", result)
+            return result
+        exceptions = [
+            item for item in list(getattr(review, "exceptions", None) or [])
+        ]
+        blocking = [
+            item for item in exceptions
+            if str(getattr(item, "kind", "") or "") in ICD_BLOCKING_SCOPE_EXCEPTION_KINDS
+        ]
+        if blocking:
+            instructions = [
+                str(getattr(item, "user_instruction", "") or "").strip()
+                or f"位号 {getattr(item, 'refdes', '') or '未知'} 缺少模板/EDF 范围映射"
+                for item in blocking
+            ]
+            return self._rejected(
+                operation,
+                "icd_scope_blocking",
+                "该 ICD 范围异常不能直接包含/排除："
+                + "；".join(instructions)
+                + "。请补齐冻结来源（例如包含该位号的 EDF 管脚映射）并重新解析，"
+                "或在对话中明确目标接插件位号后重新发起生成。",
+                work_order_id=order_id,
+                next_actions=["open_document_workbench"],
+            )
+        requested_refdes = {
+            str(item).strip().casefold() for item in (refdes or []) if str(item).strip()
+        }
+        selected_ids = {
+            str(item).strip() for item in (exception_ids or []) if str(item).strip()
+        }
+        if not selected_ids and requested_refdes:
+            selected_ids = {
+                str(getattr(item, "exception_id", "") or "").strip()
+                for item in exceptions
+                if str(getattr(item, "refdes", "") or "").strip().casefold()
+                in requested_refdes
+            }
+        if not selected_ids:
+            selected_ids = {
+                str(getattr(item, "exception_id", "") or "").strip()
+                for item in exceptions
+            }
+        resolutions = [
+            {
+                "exception_id": str(getattr(item, "exception_id", "") or "").strip(),
+                "action": action,
+            }
+            for item in exceptions
+            if str(getattr(item, "exception_id", "") or "").strip() in selected_ids
+        ]
+        if not resolutions:
+            return self._rejected(
+                operation,
+                "icd_scope_exception_not_found",
+                "没有匹配的 ICD 范围异常项",
+                work_order_id=order_id,
+            )
+        resolver = getattr(self.pipeline, "submit_icd_scope_resolution", None)
+        if not callable(resolver):
+            return self._rejected(
+                operation,
+                "icd_scope_review_unavailable",
+                "当前环境不支持对话处理 ICD 范围待办，请在文档工作台处理。",
+                work_order_id=order_id,
+                next_actions=["open_document_workbench"],
+            )
+        try:
+            resolver(
+                self.ctx,
+                order_id,
+                resolutions=resolutions,
+                comment=str(comment or "").strip(),
+            )
+        except PermissionError:
+            raise
+        except (KeyError, ValueError) as exc:
+            return self._rejected(
+                operation,
+                "icd_scope_resolution_rejected",
+                str(exc) or "ICD 范围处理未被接受",
+                work_order_id=order_id,
+                next_actions=["open_document_workbench"],
+            )
+        return self._resume_scope_generation(
+            operation,
+            order_id,
+            resolved_count=len(resolutions),
+            action=action,
+        )
+
+    def _resume_scope_generation(
+        self,
+        operation: str,
+        order_id: str,
+        *,
+        resolved_count: int = 0,
+        action: str | None = None,
+    ) -> DocumentToolResult:
+        """Queue the frozen scope decision for generation, idempotently."""
+
+        submitter = getattr(
+            self.pipeline, "submit_knowledge_base_document_generation", None,
+        )
+        if not callable(submitter):
+            return DocumentToolResult(
+                status="waiting_human",
+                operation=operation,
+                message="ICD 范围已处理，但当前环境未启用自动重启生成；请在文档工作台继续生成。",
+                work_order_id=order_id,
+                data={
+                    "status": "submission_unavailable",
+                    "review_status": "frozen",
+                    "resolved_count": resolved_count,
+                },
+                next_actions=["open_document_workbench"],
+            )
+        try:
+            run_id = submitter(self.ctx, order_id)
+        except PermissionError:
+            raise
+        except (KeyError, ValueError) as exc:
+            return DocumentToolResult(
+                status="waiting_human",
+                operation=operation,
+                error_code="icd_scope_submission_failed",
+                message=(
+                    "ICD 范围已处理，但生成任务重启失败："
+                    + (str(exc).strip() or "请稍后重试")
+                    + "；可回复“重试提交”或在文档工作台继续。"
+                ),
+                work_order_id=order_id,
+                data={
+                    "status": "submission_failed",
+                    "review_status": "frozen",
+                    "resolved_count": resolved_count,
+                    "action": action,
+                },
+                next_actions=["resolve_icd_scope_exception", "open_document_workbench"],
+            )
+        result = DocumentToolResult(
+            status="succeeded",
+            operation=operation,
+            message="ICD 范围异常已处理，生成已继续。",
+            work_order_id=order_id,
+            run_id=str(run_id or "").strip() or None,
+            data={
+                "status": "resumed",
+                "review_status": "frozen",
+                "resolved_count": resolved_count,
+                "action": action,
+                "run_id": str(run_id or "").strip() or None,
+            },
+            next_actions=["await_generation", "get_document_task_status"],
+        )
+        self._emit_card("work_order_status", result)
+        return result
+
+    def _context_work_order_id(self) -> str:
+        """Resolve the current conversation task's work order, server-side."""
+
+        task_id = str(getattr(self.context, "task_id", "") or "").strip()
+        if not task_id:
+            return ""
+        getter = getattr(self.pipeline, "get_document_task_projection", None)
+        if not callable(getter):
+            return ""
+        try:
+            projection = getter(self.ctx, task_id)
+        except (PermissionError, KeyError, ValueError):
+            return ""
+        if isinstance(projection, dict):
+            return str(projection.get("work_order_id") or "").strip()
+        return ""
+
     def get_document_task_status(self, task_id: str) -> DocumentToolResult:
         """Read the task aggregate by task id (planning + execution states)."""
         operation = "get_document_task_status"
@@ -1496,16 +2195,16 @@ class DocumentAuthoringToolset:
             )
 
         tools = [
-            wrap("generate_document_from_template", "按当前已批准模板和知识库证据创建最终文档填充任务；不要改用对话导出。", GenerateDocumentArgs, self.generate_document_from_template),
+            wrap("generate_document_from_template", "按当前已批准模板和知识库证据创建最终文档填充任务；不要改用对话导出。会自动复用当前会话已回答的澄清；后续补充信息时优先调用 answer_clarification，而不是再次调用本工具。", GenerateDocumentArgs, self.generate_document_from_template),
             wrap("get_document_template_analysis", "读取当前模板的结构化分析结果。", GetAnalysisArgs, self.get_document_template_analysis),
             wrap("start_document_generation_session", "开始当前模板的文档生成澄清会话。", StartSessionArgs, self.start_document_generation_session),
-            wrap("answer_clarification", "回答当前文档生成会话的澄清问题。", AnswerClarificationArgs, self.answer_clarification),
+            wrap("answer_clarification", "回答当前文档生成会话的澄清问题。question_id 必须使用会话待答问题本身的 id；answer 必须原样使用服务器返回的候选项文本（用户自拟说法也优先映射到最近一次候选原文）。", AnswerClarificationArgs, self.answer_clarification),
             wrap("confirm_generation_session", "确认已完成澄清的文档生成会话。", ConfirmSessionArgs, self.confirm_generation_session),
             wrap("create_document_work_order", "创建异步文档生成工单。", CreateWorkOrderArgs, self.create_document_work_order),
             wrap("create_document_revision", "记录对现有文档 Artifact 的受控修订请求；不要声称修订文件已经生成。", CreateDocumentRevisionArgs, self.create_document_revision),
             wrap("get_document_generation_status", "读取文档生成工单状态。", GetStatusArgs, self.get_document_generation_status),
         ]
-        if _v2_enabled():
+        if self._uses_v2_planning():
             # The low-level Work Order transition is owned by the submission
             # worker in v2; the model only proposes and confirms plans.
             tools = [tool for tool in tools if tool.name != "create_document_work_order"]
@@ -1513,6 +2212,7 @@ class DocumentAuthoringToolset:
                 wrap("propose_document_plan", "为已完成需求澄清的文档会话编译并返回计划提案（不创建工单）。", ProposePlanArgs, self.propose_document_plan),
                 wrap("confirm_document_plan", "以当前可见的 spec/plan 哈希显式确认文档计划；确认后由后台 worker 创建工单。", ConfirmPlanArgs, self.confirm_document_plan),
                 wrap("get_document_task_status", "按任务 ID 读取文档任务聚合状态。", TaskStatusArgs, self.get_document_task_status),
+                wrap("resolve_icd_scope_exception", "处理当前工单的 ICD 范围异常待办：用户明确给出包含/排除指示时提交范围处理并继续生成；阻塞型异常（缺少接插件/EDF 映射）会返回需补齐来源或更换目标位号的说明。", ResolveIcdScopeArgs, self.resolve_icd_scope_exception),
             ])
         return tools
 

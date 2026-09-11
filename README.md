@@ -76,7 +76,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 ```bash
 uv sync --all-groups
-uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8003（HDB_API_HOST/PORT 可改）
+uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8001（HDB_API_HOST/PORT 可改）
 ```
 
 另开终端启动前端（Node.js >= 18）：
@@ -84,7 +84,7 @@ uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8003（HDB
 ```bash
 cd frontend
 npm ci
-npm run dev                       # Vite dev server，默认 127.0.0.1:5175，经 proxy 转发 /api 到后端
+npm run dev                       # Vite dev server，默认 0.0.0.0:5176，经 proxy 转发 /api 到后端
 ```
 
 生产部署用 `npm run build` 产出 `frontend/dist/` 静态文件。

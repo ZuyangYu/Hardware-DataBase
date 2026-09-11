@@ -173,3 +173,31 @@ def test_cross_unit_conflicts_are_explicit_and_report_hash_is_order_stable():
     assert any(issue.code == "cross_unit_conflict" for issue in report.requirement_results["cross-voltage"].issues)
     assert report.report_hash == reordered.report_hash
 
+
+
+def test_table_without_declared_row_keys_accepts_server_owned_identities():
+    """Frozen connector rows are legitimate when the contract declares no keys."""
+    contract = CoverageContract(requirements=[
+        CoverageRequirement(
+            requirement_id="interfaces", unit_id="interfaces", kind="table",
+            row_keys=[], required_columns=["signal", "pin"],
+        ),
+    ])
+    rows = [
+        TypedTableRow(
+            row_key="X1900-1", cells={"signal": "CAN_TX", "pin": "P13.0"},
+            evidence_ids=["e2"], cell_evidence_ids={"signal": ["e2"], "pin": ["e2"]},
+        ),
+        TypedTableRow(
+            row_key="X1900-2", cells={"signal": "CAN_RX", "pin": "P13.1"},
+            evidence_ids=["e3"], cell_evidence_ids={"signal": ["e3"], "pin": ["e3"]},
+        ),
+    ]
+
+    result = CoverageEvaluator().evaluate(
+        contract, {"interfaces": _table(rows)}, EVIDENCE,
+    ).requirement_results["interfaces"]
+
+    assert result.status == "complete", [issue.code for issue in result.issues]
+    assert result.unexpected_row_keys == []
+    assert result.unexpected_row_keys == [] and result.missing_row_keys == []

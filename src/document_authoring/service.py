@@ -31,13 +31,22 @@ from src.document_authoring.conversion import (
     TemplateConversionError,
 )
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
-from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
+from src.document_authoring.harness.runtime import (
+    InternalDocumentHarnessRuntime,
+    _plan_field_execution_key,
+)
 from src.document_authoring.harness.idempotency import human_decision_key
 from src.document_authoring.aggregation import DocumentAggregator
-from src.document_authoring.icd_generation import render_icd_front_views
+from src.document_authoring.icd_generation import (
+    render_icd_front_views,
+    render_icd_pin_table,
+)
 from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.icd_validation import validate_icd_pin_set
-from src.document_authoring.icd_scope_decision import effective_frozen_pin_mappings
+from src.document_authoring.icd_scope_decision import (
+    ICD_BLOCKING_SCOPE_EXCEPTION_KINDS,
+    effective_frozen_pin_mappings,
+)
 from src.document_authoring.models import (
     AuthoringExecutionEvent,
     DeterministicRuleSpec,
@@ -52,6 +61,7 @@ from src.document_authoring.models import (
     DocumentSchema,
     DocumentWorkOrder,
     compute_input_fingerprint_v3,
+    icd_scope_decision_hash,
     RendererPolicy,
     TemplateSanitizationReport,
     TemplateUnitBinding,
@@ -128,7 +138,12 @@ from src.document_authoring.planning.service import DocumentPlanningService
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.worker import DocumentGenerationWorker
-from src.document_authoring.writers.managed import DeterministicEvidenceWriter, LLMManagedWriter, ManagedWriter
+from src.document_authoring.writers.managed import (
+    DeterministicEvidenceWriter,
+    LLMManagedWriter,
+    ManagedWriter,
+    _column_semantics,
+)
 from src.pipelines.document_rag.schemas import RequestContext
 from src.projects.service import ProjectService
 from src.attachments.models import SOURCE_SCOPES
@@ -149,6 +164,15 @@ _ATTACHMENT_REF_SNAPSHOT_FIELDS = (
     "extension", "size_bytes", "sha256", "usage_hint", "parse_status",
     "degraded_reason",
 )
+
+
+def _canonical_template_document_type(display_name: str, template_name: str) -> str:
+    """Keep an uploaded filename out of the document-family contract."""
+    supplied = str(display_name or "").strip()
+    hint = " ".join((supplied, str(template_name or "").strip())).casefold()
+    if re.search(r"(?:^|[^a-z0-9])icd(?:[^a-z0-9]|$)", hint) or "接口控制" in hint:
+        return "icd"
+    return supplied or str(template_name or "").strip()
 
 
 def _ref_value(ref: Any, key: str, default: Any = None) -> Any:
@@ -227,6 +251,20 @@ def _automatic_release_allowed(order: DocumentWorkOrder, report: Any, *, require
     that path is equivalent to a confirmed session; safety still requires a
     passed report and no blocking unit status.
     """
+    brief = getattr(order, "generation_brief", None)
+    brief = brief if isinstance(brief, dict) else {}
+    document_type = str(brief.get("document_type") or "").strip().casefold()
+    if document_type in {
+        "icd",
+        "fpt",
+        "requirements",
+        "requirements_spec",
+        "specification",
+    }:
+        # Controlled engineering documents always need an explicit release
+        # signature. Their review candidate can still be downloaded as a
+        # clearly identified draft by an authorized user.
+        return False
     if not src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED or requires_review:
         return False
     # A revision regeneration is a requested change to a released document;
@@ -1312,7 +1350,10 @@ class DocumentGenerationService:
         schema = DocumentSchema(
             document_schema_id=template.template_schema_id,
             version=template.template_schema_version,
-            document_type=display_name.strip() or template.template_id,
+            document_type=_canonical_template_document_type(
+                display_name,
+                template.template_id,
+            ),
             fields=[
                 self._field_for_suggestion(suggestion, analysis.units)
                 for suggestion in analysis.suggestions
@@ -1862,6 +1903,7 @@ class DocumentGenerationService:
         knowledge_base_name: str,
         idempotency_key: str,
         generation_session_id: str | None = None,
+        generation_brief: dict[str, Any] | None = None,
         source_scope: str = "knowledge_base_only",
     ) -> DocumentWorkOrder:
         """Create a v3 WorkOrder for an accepted server-owned recipe plan.
@@ -1988,6 +2030,7 @@ class DocumentGenerationService:
             created_by=ctx.user_id,
             idempotency_key=idempotency_key,
             generation_session_id=generation_session_id,
+            generation_brief=dict(generation_brief or {}),
             output_spec_id=output_spec.output_spec_id,
             output_spec_version=output_spec.version,
             output_spec_hash=output_spec.content_hash,
@@ -2229,7 +2272,7 @@ class DocumentGenerationService:
         if existing is not None:
             if existing.source_snapshot_hash != snapshot.content_hash:
                 raise ValueError("ICD scope review source snapshot differs from the work order")
-            if existing.decision_content_hash != content_hash(decision):
+            if existing.decision_content_hash != icd_scope_decision_hash(decision):
                 raise ValueError("ICD scope review is already bound to a different decision")
             return existing
         review = IcdScopeReview(
@@ -2265,12 +2308,8 @@ class DocumentGenerationService:
             raise KeyError("ICD scope review not found")
         if review.status == "frozen":
             raise ValueError("ICD scope review is already frozen")
-        blocking_scope_kinds = {
-            "connector_scope_unknown",
-            "connector_mapping_missing",
-        }
         if any(
-            exception.kind in blocking_scope_kinds
+            exception.kind in ICD_BLOCKING_SCOPE_EXCEPTION_KINDS
             for exception in review.exceptions
         ):
             raise ValueError(
@@ -2636,6 +2675,7 @@ class DocumentGenerationService:
             template,
             rendered_content,
             integrity_manifest,
+            pin_functions=self._pin_functions_from_drafts(order, result.drafts),
         )
         self._assert_generated_artifact_clean(rendered_content, template.format)
         report = self.validator.validate(
@@ -2685,6 +2725,13 @@ class DocumentGenerationService:
                 error_message=f"confirmed brief blocks release for: {sorted(blocked_fields)}",
                 retryable=False,
                 next_actions=["provide_value", "view_error"],
+            )
+            self._publish_missing_data_clarification(
+                order,
+                [
+                    {"field_id": field_id, "message": f"必填内容尚未完成：{field_id}"}
+                    for field_id in blocked_fields
+                ],
             )
             return artifact
         if (
@@ -2759,6 +2806,7 @@ class DocumentGenerationService:
             raise ValueError("plan references do not match the frozen Work Order")
         layout = plan.layout_contract
         is_template_free = getattr(layout, "kind", None) == "structure"
+        icd_layout_issues: list[dict[str, Any]] = []
         if not is_template_free:
             if getattr(layout, "kind", None) != "template":
                 raise ValueError("plan-backed finalization requires a supported layout contract")
@@ -2817,9 +2865,13 @@ class DocumentGenerationService:
             },
         )
 
+        drafts_by_id = {draft.unit_id: draft for draft in result.drafts}
         draft_by_unit = {
-            draft.unit_id.removeprefix("field:").removeprefix("review:"): draft
-            for draft in result.drafts
+            unit.unit_id: (
+                drafts_by_id.get(unit.unit_id)
+                or drafts_by_id.get(_plan_field_execution_key(unit.unit_id))
+            )
+            for unit in plan.semantic_units
         }
         task_by_unit = {task.unit_id: task for task in plan.unit_tasks}
         unit_reviewer = UnitReviewer(self.validator)
@@ -2890,6 +2942,7 @@ class DocumentGenerationService:
             },
         )
 
+        icd_layout_issues: list[dict[str, Any]] = []
         if is_template_free:
             recipe_id = str(
                 (plan.render_spec or {}).get("recipe_id")
@@ -2916,6 +2969,15 @@ class DocumentGenerationService:
         else:
             fill_plan = self.build_plan_fill_plan(template, plan, document_model)
             rendered_content, integrity_manifest = self._render_fill_plan(template, fill_plan)
+            rendered_content, integrity_manifest, icd_layout_issues = (
+                self._apply_icd_front_view_layout(
+                    order,
+                    template,
+                    rendered_content,
+                    integrity_manifest,
+                    pin_functions=self._pin_functions_from_drafts(order, result.drafts),
+                )
+            )
             render_result = {
                 "content": rendered_content,
                 "integrity_manifest": integrity_manifest,
@@ -2958,6 +3020,10 @@ class DocumentGenerationService:
             for report in (pre_render, post_render)
             for issue in report.issues
         ]
+        review_issues.extend(
+            {"kind": str(issue.get("code") or issue.get("kind") or "icd_layout"), **issue}
+            for issue in icd_layout_issues
+        )
         required_issues = self._required_content_issues(
             order, result.unit_statuses, plan=plan,
         )
@@ -2969,6 +3035,12 @@ class DocumentGenerationService:
             integrity_manifest=integrity_manifest,
             additional_issues=review_issues,
         )
+        # The plan route must apply the same frozen-scope pin check as the
+        # legacy route; otherwise a template whose pin table could not be
+        # discovered can silently keep its example rows.  Structure-only plans
+        # have no template pin table, so the check stays template-scoped.
+        if not is_template_free:
+            validation = self._append_icd_pin_validation(order, validation, rendered_content)
         if decision.status == "blocked":
             validation = validation.model_copy(update={
                 "status": "requires_human" if not integrity_manifest.get("policy_violations") else "failed",
@@ -3058,6 +3130,7 @@ class DocumentGenerationService:
             retryable=False if decision.status == "blocked" else None,
             next_actions=["view_error", "provide_value"] if decision.status == "blocked" else ["approve"],
         )
+        self._publish_missing_data_clarification(order, required_issues)
         return artifact
 
     def _append_plan_execution_event(
@@ -3105,26 +3178,100 @@ class DocumentGenerationService:
                     "code": "required_content_incomplete",
                     "kind": "required_content_incomplete",
                     "field_id": requirement.unit_id,
-                    "unit_id": f"field:{requirement.unit_id}",
-                    "coverage_status": statuses.get(f"field:{requirement.unit_id}", "unsearched"),
+                    "unit_id": _plan_field_execution_key(requirement.unit_id),
+                    "coverage_status": statuses.get(
+                        _plan_field_execution_key(requirement.unit_id), "unsearched"
+                    ),
                     "severity": "blocking",
                     "message": f"必填内容尚未完成：{requirement.unit_id}",
                 }
                 for requirement in plan.coverage_contract.requirements
                 if requirement.required
-                and statuses.get(f"field:{requirement.unit_id}") != "ready_to_render"
+                and statuses.get(_plan_field_execution_key(requirement.unit_id)) != "ready_to_render"
             ]
         schema = self.store.get_document_schema(order.document_schema_id, order.document_schema_version)
         if schema is None:
             return [{"code": "required_content_incomplete", "kind": "missing_schema", "severity": "blocking"}]
         return [
             {"code": "required_content_incomplete", "kind": "required_content_incomplete",
-             "field_id": field.field_id, "unit_id": f"field:{field.field_id}",
-             "coverage_status": statuses.get(f"field:{field.field_id}", "unsearched"),
+             "field_id": field.field_id, "unit_id": _plan_field_execution_key(field.field_id),
+             "coverage_status": statuses.get(_plan_field_execution_key(field.field_id), "unsearched"),
              "severity": "blocking", "message": f"必填内容尚未完成：{field.label}"}
             for field in schema.fields
-            if field.required and statuses.get(f"field:{field.field_id}") != "ready_to_render"
+            if field.required and statuses.get(_plan_field_execution_key(field.field_id)) != "ready_to_render"
         ]
+
+    def _publish_missing_data_clarification(
+        self,
+        order: DocumentWorkOrder,
+        issues: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        """Hand required evidence gaps back to the owning chat session.
+
+        A blocked release is an execution fact, not an instruction for the
+        user to open the workbench and edit cells.  When the order belongs to
+        an OutputSpec session, persist one deterministic question so the next
+        chat turn can choose a policy or add a value and re-plan safely.
+        """
+        session_id = str(getattr(order, "generation_session_id", None) or "").strip()
+        if not session_id:
+            return False
+        sessions = getattr(self.store, "generation_sessions", None)
+        if sessions is None or not callable(getattr(sessions, "get_session", None)):
+            return False
+        try:
+            session = sessions.get_session(session_id)
+        except (KeyError, PermissionError, ValueError):
+            return False
+        if str(getattr(session, "contract_version", "") or "") != "output_spec_v1":
+            return False
+        field_labels: list[str] = []
+        for issue in issues or ():
+            field_id = str(issue.get("field_id") or issue.get("unit_id") or "").strip()
+            if field_id and field_id not in field_labels:
+                field_labels.append(field_id)
+        if not field_labels:
+            return False
+        question_id = "missing_data_resolution"
+        # Do not append the same unanswered question on every status poll.
+        messages = list(getattr(session, "messages", None) or [])
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if getattr(message, "role", None) != "assistant" or getattr(message, "question_id", None) != question_id:
+                continue
+            answered = any(
+                getattr(item, "role", None) == "user"
+                and getattr(item, "question_id", None) == question_id
+                for item in messages[index + 1:]
+            )
+            if not answered:
+                return False
+            break
+        content = (
+            "知识库中暂未找到以下必填字段的可靠资料："
+            + "、".join(field_labels[:20])
+            + "。请选择处理方式："
+        )
+        try:
+            setter = getattr(sessions, "set_status", None)
+            if callable(setter):
+                setter(session_id, "needs_clarification")
+            sessions.append_message(
+                session_id,
+                role="assistant",
+                content=content,
+                question_id=question_id,
+                options=["标记为未提供，继续生成", "补充说明", "暂停等待资料"],
+                reason="必填字段缺少可靠证据，需由对话确认处理方式。",
+            )
+            task_id = str(getattr(order, "task_id", None) or "").strip()
+            task_store = getattr(getattr(self, "task_service", None), "store", None)
+            if task_id and callable(getattr(task_store, "update_status", None)):
+                task_store.update_status(task_id, "needs_clarification")
+        except (KeyError, PermissionError, ValueError):
+            logger.warning("failed to persist missing-data clarification for %s", session_id, exc_info=True)
+            return False
+        return True
 
     def _block_generation_fields(self, order: DocumentWorkOrder, result) -> list[str]:
         """Fields whose confirmed brief forces block_generation on unresolved
@@ -3150,7 +3297,7 @@ class DocumentGenerationService:
         missing_statuses = {"requires_human", "blocked", "conflicting", "retrieval_failed", "insufficient_evidence", "tbd"}
         blocked: list[str] = []
         for field in schema.fields:
-            unit_id = f"field:{field.field_id}"
+            unit_id = _plan_field_execution_key(field.field_id)
             status = result.unit_statuses.get(unit_id)
             if (
                 field.required
@@ -3185,7 +3332,11 @@ class DocumentGenerationService:
     ) -> DocumentArtifact:
         if not src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED:
             return candidate
-        if report.status != "passed" or self._has_icd_blocking_issue(report.issues):
+        if (
+            report.status != "passed"
+            or self._has_icd_blocking_issue(report.issues)
+            or self._has_blocking_validation_issue(report.issues)
+        ):
             return candidate
         if hashlib.sha256(candidate_content).hexdigest() != candidate.content_hash:
             raise ValueError("candidate content hash changed before automatic publication")
@@ -3300,34 +3451,160 @@ class DocumentGenerationService:
             value=value, actor_id=ctx.user_id, actor_role=actor_role, comment=comment,
         )
         return self.store.save_human_event(event)
+    def _pin_functions_from_drafts(
+        self,
+        order: DocumentWorkOrder,
+        drafts: list[DocumentUnitDraft],
+    ) -> dict[str, str]:
+        """Collect evidence-backed function text from validated table drafts.
+
+        The render overlay must not replace an evidence-verified function with
+        the TBD placeholder, so the draft's function column is forwarded to
+        the workbook pin-table renderer.
+        """
+
+        try:
+            schema = self._schema(order.document_schema_id, order.document_schema_version)
+        except (KeyError, ValueError):
+            return {}
+        function_columns: set[str] = set()
+        for field in getattr(schema, "fields", []) or []:
+            columns = getattr(field, "table_columns", None)
+            if not columns:
+                continue
+            for column_id, kind in _column_semantics(dict(columns)).items():
+                if kind == "function":
+                    function_columns.add(column_id)
+        if not function_columns:
+            return {}
+        functions: dict[str, str] = {}
+        for draft in drafts:
+            typed = getattr(draft, "typed_value", None)
+            if typed is None or typed.kind != "table":
+                continue
+            for row in typed.rows:
+                row_key = str(row.row_key or "").strip()
+                if not row_key:
+                    continue
+                for column_id in function_columns:
+                    value = str(row.cells.get(column_id) or "").strip()
+                    if value and not value.upper().startswith("TBD"):
+                        functions.setdefault(row_key, value)
+                        break
+        return functions
+
     def _apply_icd_front_view_layout(
         self,
         order: DocumentWorkOrder,
         template: TemplateVersion,
         rendered_content: bytes,
         integrity_manifest: dict[str, Any],
+        *,
+        pin_functions: Mapping[str, str] | None = None,
     ) -> tuple[bytes, dict[str, Any], list[dict[str, str]]]:
-        """Overlay detected ICD front views using the same frozen pin facts.
+        """Overlay ICD pin tables/front views using the same frozen pin facts.
 
-        The normal semantic writer owns document prose and Pin Definition rows.
-        This deterministic post-render pass owns only a template's physical
-        connector-view slots, so an LLM can never reverse or redraw their
-        numbering.  It is intentionally a no-op outside a frozen ICD scope.
+        Template example rows are layout samples, not product truth.  This
+        deterministic post-render pass replaces the pin table and physical
+        connector-view slots, so an old connector such as X302 cannot survive
+        into an X1900 deliverable.  It is a no-op outside a frozen ICD scope.
         """
         review = self.store.get_icd_scope_review(order.work_order_id)
         if review is None or review.pending_count:
             return rendered_content, integrity_manifest, []
         if template.format.casefold() not in {"xlsx", "xlsm"}:
             return rendered_content, integrity_manifest, []
-        front_view = render_icd_front_views(
+        mappings = effective_frozen_pin_mappings(review)
+        brief = dict(getattr(order, "generation_brief", {}) or {})
+        inference_policy = str(brief.get("inference_policy") or "forbid").strip().casefold()
+        target_identity = brief.get("target_identity") or {}
+        target_metadata, assembly_erp = self._icd_target_metadata(
+            target_identity,
+            mappings,
+        )
+        pin_table = render_icd_pin_table(
             rendered_content,
-            effective_frozen_pin_mappings(review),
+            mappings,
+            target_format=template.format,
+            template_version_id=template.template_version_id,
+            allow_rule_inference=inference_policy in {"allow_labeled", "allow_limited"},
+            assembly_erp=assembly_erp,
+            metadata=target_metadata,
+            function_by_pin=pin_functions,
+        )
+        current_content = pin_table.content
+        current_manifest = integrity_manifest
+        if pin_table.integrity_manifest is not None:
+            current_manifest = self._combine_icd_overlay_manifests(
+                current_manifest,
+                pin_table.integrity_manifest,
+                overlay_kind="pin_table",
+            )
+        front_view = render_icd_front_views(
+            current_content,
+            mappings,
             target_format=template.format,
             template_version_id=template.template_version_id,
         )
         if front_view.integrity_manifest is None:
-            return front_view.content, integrity_manifest, front_view.issues
-        overlay_manifest = front_view.integrity_manifest
+            return front_view.content, current_manifest, [*pin_table.issues, *front_view.issues]
+        combined_manifest = self._combine_icd_overlay_manifests(
+            current_manifest,
+            front_view.integrity_manifest,
+            overlay_kind="front_view",
+        )
+        return front_view.content, combined_manifest, [*pin_table.issues, *front_view.issues]
+
+    @staticmethod
+    def _icd_target_metadata(
+        target_identity: Any,
+        mappings: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], str | None]:
+        values = target_identity if isinstance(target_identity, Mapping) else {}
+
+        def by_key(*tokens: str) -> str:
+            for key, value in values.items():
+                normalized_key = str(key).strip().casefold()
+                if any(token in normalized_key for token in tokens):
+                    text = str(value or "").strip()
+                    if text:
+                        return text
+            return ""
+
+        raw_identity = (
+            str(target_identity or "").strip()
+            if isinstance(target_identity, str)
+            else " ".join(str(value or "").strip() for value in values.values())
+        )
+        assembly_erp = by_key("erp")
+        if not assembly_erp:
+            match = re.search(r"(?<!\d)(6\d{6,11})(?!\d)", raw_identity)
+            assembly_erp = match.group(1) if match else ""
+        product_name = by_key("product", "hardware", "device", "产品", "硬件", "总成")
+        if product_name == assembly_erp:
+            product_name = ""
+        if not product_name and isinstance(target_identity, str):
+            product_name = target_identity.strip()
+        location_number = "、".join(dict.fromkeys(
+            str(mapping.get("refdes") or "").strip()
+            for mapping in mappings
+            if str(mapping.get("refdes") or "").strip()
+        ))
+        return {
+            "product_name": product_name or "TBD",
+            "customer_number": by_key("customer", "客户") or "TBD",
+            "pcb_connector": by_key("pcb_connector", "board_connector", "板端") or "TBD",
+            "harness_connector": by_key("harness_connector", "线束端") or "TBD",
+            "location_number": location_number or "TBD",
+        }, assembly_erp or None
+
+    @staticmethod
+    def _combine_icd_overlay_manifests(
+        integrity_manifest: dict[str, Any],
+        overlay_manifest: dict[str, Any],
+        *,
+        overlay_kind: str,
+    ) -> dict[str, Any]:
         combined_manifest = {
             **integrity_manifest,
             "after_content_hash": overlay_manifest.get("after_content_hash"),
@@ -3351,10 +3628,10 @@ class DocumentGenerationService:
         }
         combined_manifest["manifest_hash"] = content_hash({
             "base_manifest_hash": integrity_manifest.get("manifest_hash"),
-            "front_view_manifest_hash": overlay_manifest.get("manifest_hash"),
+            f"{overlay_kind}_manifest_hash": overlay_manifest.get("manifest_hash"),
             "after_content_hash": overlay_manifest.get("after_content_hash"),
         })
-        return front_view.content, combined_manifest, front_view.issues
+        return combined_manifest
 
 
     def submit_document_feedback(
@@ -3384,6 +3661,8 @@ class DocumentGenerationService:
         report = self.store.get_validation_report(candidate.validation_report_id)
         if report is not None and self._has_icd_blocking_issue(report.issues):
             raise ValueError("candidate has an ICD blocking validation issue")
+        if report is not None and self._has_blocking_validation_issue(report.issues):
+            raise ValueError("candidate has a blocking validation issue")
         snapshot = self.resolve_source_snapshot(order)
         if report is None or report.status == "failed":
             raise ValueError("candidate does not have a releasable validation result")
@@ -3470,6 +3749,15 @@ class DocumentGenerationService:
             issue.get("severity") == "blocking"
             and str(issue.get("code") or "").startswith("icd_")
             for issue in issues
+        )
+
+    @staticmethod
+    def _has_blocking_validation_issue(issues: list[dict[str, Any]]) -> bool:
+        return any(
+            bool(issue.get("blocking"))
+            or str(issue.get("severity") or "").strip().casefold() == "blocking"
+            for issue in issues
+            if isinstance(issue, Mapping)
         )
 
     @staticmethod
@@ -3732,6 +4020,12 @@ class DocumentGenerationService:
             query_terms=list(suggestion.retrieval_terms),
             authoring_policy="managed_writer",
             table_columns=inferred.get("table_columns"),
+            # Template-backed tables receive rows from the frozen source set;
+            # their row keys are discovered from evidence at execution time.
+            # Persist the bounded scope so planning does not confuse a
+            # dynamic table with an unresolved table contract.
+            table_row_scope=("template_rows" if value_type == "table" else None),
+            table_row_order="input" if value_type == "table" else "declared",
         )
 
     @staticmethod
@@ -4267,6 +4561,36 @@ class DocumentGenerationService:
             return DocxFillPlan(template_version_id=template.template_version_id, fills=fills)
         return WorkbookFillPlan(template_version_id=template.template_version_id, fills=fills)
 
+    @staticmethod
+    def _table_schemas_for_fill_plan(
+        table_schemas: list[Any],
+        fill_plan: Any,
+    ) -> list[Any]:
+        """Allow validated table fills to exceed an activation-time row bound.
+
+        ``max_output_rows`` was recorded when the template mapping was
+        activated, but a frozen dynamic table (for example the EDF connector
+        pin set) may legitimately contain more rows than the template sample.
+        The fill rows have already passed coverage and unit review, so the
+        renderer bound is widened to the validated row count instead of
+        rejecting the deliverable.
+        """
+
+        schemas = list(table_schemas)
+        table_fills = list(getattr(fill_plan, "table_fills", []) or [])
+        if not table_fills:
+            return schemas
+        by_id = {schema.table_region_id: index for index, schema in enumerate(schemas)}
+        for fill in table_fills:
+            index = by_id.get(fill.table_region_id)
+            if index is None:
+                continue
+            schema = schemas[index]
+            row_count = len(list(getattr(fill, "rows", []) or []))
+            if row_count > int(getattr(schema, "max_output_rows", 0) or 0):
+                schemas[index] = schema.model_copy(update={"max_output_rows": row_count})
+        return schemas
+
     def _render_fill_plan(
         self,
         template: TemplateVersion,
@@ -4285,9 +4609,16 @@ class DocumentGenerationService:
                 fill_plan,
                 policy,
                 security_approved=True,
-                table_schemas=[binding.table_schema for binding in self.store.list_unit_bindings(
-                    template.template_schema_id, template.template_schema_version,
-                ) if binding.table_schema is not None],
+                table_schemas=self._table_schemas_for_fill_plan(
+                    [
+                        binding.table_schema
+                        for binding in self.store.list_unit_bindings(
+                            template.template_schema_id, template.template_schema_version,
+                        )
+                        if binding.table_schema is not None
+                    ],
+                    fill_plan,
+                ),
             )
         elif template.format == "docx":
             if not isinstance(fill_plan, DocxFillPlan):

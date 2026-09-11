@@ -1067,6 +1067,43 @@ class DocumentAuthoringStore:
                 raise
         return review
 
+    def replace_pending_icd_scope_review(self, review: IcdScopeReview) -> IcdScopeReview:
+        """Replace an unresolved scope review after the frozen inputs were re-read.
+
+        Only a pending review may be replaced: a frozen review is a durable
+        user decision and must never be rewritten.  The replacement is bound
+        to the same source snapshot and carries its own decision hash.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    """SELECT status, source_snapshot_hash
+                       FROM document_icd_scope_reviews WHERE work_order_id = ?""",
+                    (review.work_order_id,),
+                ).fetchone()
+                if existing is None:
+                    raise KeyError("ICD scope review not found")
+                if str(existing["status"]) != "pending":
+                    raise ValueError("a frozen ICD scope review cannot be replaced")
+                if str(existing["source_snapshot_hash"]) != review.source_snapshot_hash:
+                    raise ValueError("ICD scope replacement must keep the frozen source snapshot")
+                conn.execute(
+                    "DELETE FROM document_icd_scope_reviews WHERE work_order_id = ?",
+                    (review.work_order_id,),
+                )
+                self._put(conn, "document_icd_scope_reviews", {
+                    "work_order_id": review.work_order_id,
+                    "decision_content_hash": review.decision_content_hash,
+                    "source_snapshot_hash": review.source_snapshot_hash,
+                    "status": review.status,
+                }, review)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return review
+
     def get_icd_scope_review(self, work_order_id: str) -> IcdScopeReview | None:
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -2288,6 +2325,8 @@ class DocumentAuthoringStore:
                 )
                 conn.execute("DELETE FROM document_human_events WHERE work_order_id = ?", (work_order_id,))
                 conn.execute("DELETE FROM document_artifacts WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM authoring_execution_events WHERE harness_run_id IN "
+                             "(SELECT harness_run_id FROM harness_runs WHERE work_order_id = ?)", (work_order_id,))
                 conn.execute("DELETE FROM node_execution_receipts WHERE harness_run_id IN "
                              "(SELECT harness_run_id FROM harness_runs WHERE work_order_id = ?)", (work_order_id,))
                 conn.execute("DELETE FROM harness_checkpoints WHERE work_order_id = ?", (work_order_id,))

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+import src.settings
 
 from src.agents.tools.document_authoring_tools import DocumentAuthoringToolset
 from src.agents.tools.document_authoring_tools import GenerateDocumentArgs
@@ -460,6 +461,23 @@ def test_document_card_session_kinds_and_analysis_silent(tmp_path):
     )
 
 
+def test_answer_clarification_returns_the_validation_reason(tmp_path):
+    toolset = _toolset(tmp_path)
+
+    def reject(_ctx, _session_id, **_kwargs):
+        raise ValueError("invalid missing-data policy answer: A")
+
+    toolset.pipeline.answer_document_generation_session = reject
+
+    result = toolset.answer_clarification(
+        "generation-session-a", "missing_data_policy", "A",
+    )
+
+    assert result.status == "rejected"
+    assert result.error_code == "clarification_rejected"
+    assert "invalid missing-data policy answer: A" in result.message
+
+
 def test_document_card_sink_failure_never_breaks_tool_result(tmp_path):
     def _boom(_evt):
         raise RuntimeError("sink down")
@@ -585,7 +603,23 @@ def _v2_session(*, status: str = "awaiting_plan") -> GenerationSession:
         status=status,
         output_spec_id="output-spec-a",
         output_spec_version=3,
-        output_spec_draft={"output_spec_id": "output-spec-a", "version": 3},
+        output_spec_draft={
+            "output_spec_id": "output-spec-a",
+            "version": 3,
+            "purpose": "生成评审报告",
+            "document_type": "report",
+            "artifact": {"deliverables": [{"format": "xlsx", "role": "primary"}]},
+            "layout_source": {
+                "mode": "provided_template",
+                "template_version_id": "template-a",
+                "template_schema_id": "schema-a",
+                "template_schema_version": "1",
+            },
+            "outline": [{"unit_id": "summary", "kind": "section", "required": True}],
+            "missing_data_policy": "mark_tbd",
+            "inference_policy": "forbid",
+            "approval_policy_id": "default-document-v1",
+        },
     )
 
 
@@ -675,6 +709,12 @@ def _v2_toolset(tmp_path, monkeypatch, *, template=True, permission="write"):
     import src.settings
 
     monkeypatch.setattr(src.settings, "DOCUMENT_PLANNING_V2_ENABLED", True)
+    monkeypatch.setattr(
+        src.settings,
+        "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED",
+        False,
+        raising=False,
+    )
     ctx = _request_context(permission=permission)
     if template:
         context = build_document_context(
@@ -736,6 +776,343 @@ def test_v2_direct_template_request_returns_proposal_not_work_order(tmp_path, mo
     assert "auto_confirm_recommended" not in toolset.pipeline.create_kwargs
 
 
+def test_v2_low_risk_direct_request_auto_confirms_the_hash_bound_plan(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        src.settings,
+        "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED",
+        True,
+        raising=False,
+    )
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成 ICD 文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "succeeded"
+    assert result.data["confirmation_required"] is False
+    assert result.data["status"] == "pending"
+    assert result.next_actions == ["await_generation"]
+    assert toolset.pipeline.confirm_kwargs["expected_output_spec_hash"] == "sha256:spec"
+    assert toolset.pipeline.confirm_kwargs["expected_plan_hash"] == "sha256:plan"
+
+
+def test_v2_risky_direct_request_keeps_confirmation_and_explains_why(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        src.settings,
+        "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED",
+        True,
+        raising=False,
+    )
+    toolset.pipeline.proposal["warnings"] = ["template_mapping_requires_review"]
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成 ICD 文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "waiting_human"
+    assert result.data["confirmation_required"] is True
+    assert "proposal_has_warnings" in result.data["confirmation_reasons"]
+    assert not hasattr(toolset.pipeline, "confirm_kwargs")
+
+
+def test_v2_direct_template_request_surfaces_pending_intake_question(tmp_path, monkeypatch):
+    """An incomplete direct request asks for intake data before compiling."""
+    sink = []
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.event_sink = sink.append
+    toolset.pipeline.v2_session = toolset.pipeline.v2_session.model_copy(update={
+        "output_spec_draft": {
+            "output_spec_id": "output-spec-a",
+            "version": 3,
+            "purpose": "参考模板生成文档",
+            "document_type": "report",
+            "layout_source": {
+                "mode": "provided_template",
+                "template_version_id": "template-a",
+                "template_schema_id": "schema-a",
+                "template_schema_version": "1",
+            },
+            "missing_data_policy": "mark_tbd",
+            "inference_policy": "forbid",
+            "approval_policy_id": "default-document-v1",
+        },
+    })
+    toolset.pipeline.create_document_plan_proposal = lambda *_args, **_kwargs: pytest.fail(
+        "an incomplete output spec must not be compiled"
+    )
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "waiting_human"
+    assert result.data["status"] == "needs_clarification"
+    assert result.data["question_id"] == "deliverables"
+    assert result.data["content"] == "希望交付什么格式？"
+    assert result.next_actions == ["answer_clarification"]
+    # The card channel is progress-only: the question lives in the chat turn,
+    # so the popup must not duplicate it as a second input surface.
+    card = sink[-1]["card"]
+    assert card["kind"] == "generation_session"
+    assert card["status"] == "needs_clarification"
+    assert card["generation_session_id"] == "generation-session-a"
+    assert "question_id" not in card
+    assert "content" not in card
+    assert "options" not in card
+
+
+def test_v2_direct_request_honors_persisted_content_confirmation_question(tmp_path, monkeypatch):
+    """A persisted clarification question wins over draft-derived planning."""
+    from src.document_authoring.generation_sessions import ClarificationMessage
+
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    session = toolset.pipeline.v2_session.model_copy(update={
+        "status": "needs_clarification",
+        "messages": [ClarificationMessage(
+            role="assistant",
+            content="请确认文档正文范围。",
+            question_id="content_confirmation",
+            options=["仅使用已确认资料", "允许补充资料"],
+            reason="正文范围需要人工确认。",
+        )],
+    })
+    toolset.pipeline.v2_session = session
+    toolset.pipeline.create_document_plan_proposal = lambda *_args, **_kwargs: pytest.fail(
+        "a persisted clarification must not be compiled into a plan"
+    )
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "waiting_human"
+    assert result.data["status"] == "needs_clarification"
+    assert result.data["question_id"] == "content_confirmation"
+    assert result.data["content"] == "请确认文档正文范围。"
+    assert result.data["options"] == ["仅使用已确认资料", "允许补充资料"]
+    assert result.next_actions == ["answer_clarification"]
+
+
+def test_v2_pending_question_does_not_revive_answered_persisted_question(tmp_path, monkeypatch):
+    """An answer recorded after a question makes that question ineligible."""
+    from src.document_authoring.generation_sessions import ClarificationMessage
+
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    session = toolset.pipeline.v2_session.model_copy(update={
+        "status": "needs_clarification",
+        "messages": [
+            ClarificationMessage(
+                role="assistant", content="请确认文档正文范围。",
+                question_id="content_confirmation",
+            ),
+            ClarificationMessage(
+                role="user", content="仅使用已确认资料。",
+                question_id="content_confirmation", answer="仅使用已确认资料。",
+            ),
+        ],
+    })
+
+    assert DocumentAuthoringToolset._pending_output_spec_question(session) is None
+
+
+def test_direct_request_reports_unapproved_template_as_human_waiting_state(tmp_path, monkeypatch):
+    """Template mapping review is surfaced without pretending the tool can approve it."""
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLANNING_V2_ENABLED", False)
+    toolset = _toolset(tmp_path)
+    toolset.pipeline.document_generation.store.get_template = lambda _template_id: SimpleNamespace(
+        template_schema_id="schema-a",
+        template_schema_version="1",
+        status="pending_review",
+        format="xlsx",
+    )
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "rejected"
+    assert result.error_code == "template_not_approved"
+    assert "模板映射" in result.message
+    assert "人工" in result.message
+    assert result.next_actions == ["get_document_template_analysis"]
+    assert result.data["mapping_status"] == "pending_review"
+
+
+def test_v2_direct_request_can_open_intake_for_draft_template(tmp_path, monkeypatch):
+    """v2 discovery may plan against a draft template without approving it."""
+    from src.document_authoring.generation_sessions import ClarificationMessage
+
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.pipeline.document_generation.store.get_template = lambda _template_id: SimpleNamespace(
+        template_schema_id="",
+        template_schema_version="",
+        status="pending_review",
+        format="xlsx",
+    )
+    toolset.pipeline.v2_session = toolset.pipeline.v2_session.model_copy(update={
+        "status": "needs_clarification",
+        "messages": [ClarificationMessage(
+            role="assistant", content="请确认文档正文范围。",
+            question_id="content_confirmation",
+        )],
+    })
+    toolset.pipeline.create_document_plan_proposal = lambda *_args, **_kwargs: pytest.fail(
+        "draft-template intake must stop for clarification"
+    )
+
+    result = toolset.generate_document_from_template(purpose="发现模板生成文档")
+
+    assert result.status == "waiting_human"
+    assert result.data["status"] == "needs_clarification"
+    assert result.next_actions == ["answer_clarification"]
+    assert not hasattr(toolset.pipeline, "confirm_kwargs")
+
+
+def test_v2_direct_request_surfaces_persisted_blocked_mapping_state(tmp_path, monkeypatch):
+    """An unrepairable mapping block is reported without restarting intake."""
+    from src.document_authoring.generation_sessions import ClarificationMessage
+
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    blocked = toolset.pipeline.v2_session.model_copy(update={
+        "status": "blocked",
+        "messages": [ClarificationMessage(
+            role="assistant",
+            content="模板映射无法可靠确定，当前无法继续。",
+            question_id="",
+            reason="template_mapping_unresolved",
+        )],
+    })
+    toolset.pipeline.v2_session = blocked
+    toolset.context = toolset.context.model_copy(update={
+        "generation_session_id": "generation-session-a",
+    })
+    toolset.pipeline.create_document_generation_session = lambda *_args, **_kwargs: pytest.fail(
+        "blocked intake must not create a replacement session"
+    )
+    toolset.pipeline.create_document_plan_proposal = lambda *_args, **_kwargs: pytest.fail(
+        "blocked intake must not compile a replacement plan"
+    )
+
+    result = toolset.generate_document_from_template(purpose="继续生成文档")
+
+    assert result.status == "waiting_human"
+    assert result.error_code == "template_mapping_unresolved"
+    assert result.data["status"] == "blocked"
+    assert result.message == "模板映射无法可靠确定，当前无法继续。"
+    assert result.next_actions == []
+
+
+def test_legacy_direct_request_still_rejects_draft_template(tmp_path, monkeypatch):
+    """The legacy artifact path remains fail-closed until template approval."""
+    monkeypatch.setattr(src.settings, "DOCUMENT_PLANNING_V2_ENABLED", False)
+    toolset = _toolset(tmp_path)
+    toolset.pipeline.document_generation.store.get_template = lambda _template_id: SimpleNamespace(
+        template_schema_id="schema-a", template_schema_version="1",
+        status="pending_review", format="xlsx",
+    )
+
+    result = toolset.generate_document_from_template(purpose="发现模板生成文档")
+
+    assert result.status == "rejected"
+    assert result.error_code == "template_not_approved"
+
+
+def test_v2_direct_template_request_reuses_the_attached_intake_session(tmp_path, monkeypatch):
+    """The conversation owns one intake session; a direct request must not fork it.
+
+    Recreating a session per tool call discarded the already-recorded
+    clarification answers and made the flow re-ask them.
+    """
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.context = toolset.context.model_copy(update={
+        "generation_session_id": "generation-session-a",
+    })
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "waiting_human"
+    assert "confirm_document_plan" in result.next_actions
+    # The existing session was reused: no new session, no repeated
+    # recommendation answer, and the proposal binds the current version.
+    assert toolset.pipeline.create_kwargs == {}
+    assert not hasattr(toolset.pipeline, "answer_v2_kwargs")
+    assert toolset.pipeline.propose_kwargs["session_id"] == "generation-session-a"
+    assert toolset.pipeline.propose_kwargs["expected_output_spec_version"] == 3
+
+
+def test_v2_direct_request_applies_recommendations_once_for_a_fresh_session(tmp_path, monkeypatch):
+    """A fresh session gets the safe defaults exactly once, then never again."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    draft = dict(toolset.pipeline.v2_session.output_spec_draft)
+    for key in ("missing_data_policy", "inference_policy", "approval_policy_id"):
+        draft.pop(key, None)
+    fresh = toolset.pipeline.v2_session.model_copy(update={
+        "output_spec_draft": draft,
+        "output_spec_version": 4,
+    })
+    pipeline = toolset.pipeline
+    pipeline.v2_session = fresh
+
+    def _answer(_ctx, session_id, **kwargs):
+        pipeline.answer_v2_kwargs = {"session_id": session_id, **kwargs}
+        revised_draft = dict(fresh.output_spec_draft)
+        revised_draft.update({
+            "missing_data_policy": "mark_tbd",
+            "inference_policy": "forbid",
+            "approval_policy_id": "default-document-v1",
+        })
+        answered = fresh.model_copy(update={
+            "output_spec_draft": revised_draft,
+            "output_spec_version": 5,
+        })
+        # Simulate the durable store update so the post-answer re-read sees it.
+        pipeline.v2_session = answered
+        return answered
+
+    pipeline.answer_document_generation_session = _answer
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "waiting_human"
+    assert pipeline.answer_v2_kwargs["question_id"] == "recommendations"
+    # The proposal binds the version produced by the advisory answer.
+    assert pipeline.propose_kwargs["expected_output_spec_version"] == 5
+
+
+def test_v2_proposal_failure_surfaces_the_pipeline_reason(tmp_path, monkeypatch):
+    """A rejected proposal carries the real pipeline reason, never a canned hint."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+
+    def _boom(_ctx, _session_id, **_kwargs):
+        raise ValueError("generation session is not awaiting a plan proposal")
+
+    toolset.pipeline.create_document_plan_proposal = _boom
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "rejected"
+    assert result.error_code == "plan_proposal_rejected"
+    assert "generation session is not awaiting a plan proposal" in result.message
+    assert "pending clarification" not in result.message
+    assert result.next_actions == ["propose_document_plan"]
+
+
 def test_v2_propose_document_plan_tool_forwards_session_and_request_id(tmp_path, monkeypatch):
     toolset = _v2_toolset(tmp_path, monkeypatch)
 
@@ -785,6 +1162,235 @@ def test_v2_get_document_task_status_reads_aggregate_by_task_id(tmp_path, monkey
     assert result.data["next_actions"] == ["confirm_document_plan"]
 
 
+def test_v2_scope_exception_tool_resolves_and_resumes_generation(tmp_path, monkeypatch):
+    """A non-blocking scope exception can be resolved from the conversation."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    review = SimpleNamespace(
+        status="pending",
+        exceptions=[SimpleNamespace(
+            exception_id="exception-a",
+            kind="connector_scope_ambiguous",
+            refdes="X301",
+            user_instruction="请确认使用 X301 还是 X302。",
+        )],
+    )
+    calls: dict = {}
+    toolset.pipeline.get_icd_scope_review = lambda _ctx, work_order_id: review
+    toolset.pipeline.submit_icd_scope_resolution = (
+        lambda _ctx, work_order_id, *, resolutions, comment: calls.update({
+            "work_order_id": work_order_id,
+            "resolutions": resolutions,
+            "comment": comment,
+        }) or SimpleNamespace(status="frozen")
+    )
+    toolset.pipeline.submit_knowledge_base_document_generation = (
+        lambda _ctx, work_order_id: "run-resumed"
+    )
+
+    result = toolset.resolve_icd_scope_exception(
+        action="exclude",
+        exception_ids=["exception-a"],
+        comment="排除 X301",
+        work_order_id="wo-scope",
+    )
+
+    assert result.status == "succeeded"
+    assert calls["work_order_id"] == "wo-scope"
+    assert calls["resolutions"] == [{"exception_id": "exception-a", "action": "exclude"}]
+    assert calls["comment"] == "排除 X301"
+    assert result.data["run_id"] == "run-resumed"
+    assert result.next_actions == ["await_generation", "get_document_task_status"]
+
+
+def test_v2_scope_exception_tool_refuses_blocking_kind_with_instruction(tmp_path, monkeypatch):
+    """connector_mapping_missing cannot be waved through from chat."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.pipeline.get_icd_scope_review = lambda _ctx, _work_order_id: SimpleNamespace(
+        status="pending",
+        exceptions=[SimpleNamespace(
+            exception_id="exception-b",
+            kind="connector_mapping_missing",
+            refdes="X302",
+            user_instruction="已确定接插件 X302，但当前冻结来源中未找到其 EDF 管脚映射。",
+        )],
+    )
+    toolset.pipeline.submit_icd_scope_resolution = lambda *_args, **_kwargs: pytest.fail(
+        "blocking scope exceptions must not be resolved from chat"
+    )
+
+    result = toolset.resolve_icd_scope_exception(
+        action="include",
+        comment="包含 X302",
+        work_order_id="wo-scope",
+    )
+
+    assert result.status == "rejected"
+    assert result.error_code == "icd_scope_blocking"
+    assert "X302" in result.message
+    assert "EDF" in result.message
+    assert result.next_actions == ["open_document_workbench"]
+
+
+def test_v2_scope_exception_tool_confirms_edf_connector_replacement(tmp_path, monkeypatch):
+    """A user-confirmed EDF replacement bypasses include/exclude resolution."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.pipeline.get_icd_scope_review = lambda _ctx, _order_id: SimpleNamespace(
+        status="pending",
+        exceptions=[SimpleNamespace(
+            exception_id="exception-a",
+            kind="connector_mapping_missing",
+            refdes="X302",
+            user_instruction="模板示例位号，冻结 EDF 实际为 X1900。",
+            suggested_refdes=["X1900", "X1902"],
+        )],
+    )
+    calls: dict = {}
+    toolset.pipeline.rebuild_icd_scope_from_edf = (
+        lambda _ctx, order_id, *, comment: calls.update({
+            "order_id": order_id,
+            "comment": comment,
+        }) or {"status": "resumed", "run_id": "run-edf"}
+    )
+    toolset.pipeline.submit_icd_scope_resolution = lambda *_args, **_kwargs: pytest.fail(
+        "EDF replacement must not use include/exclude"
+    )
+
+    result = toolset.resolve_icd_scope_exception(
+        action="use_edf_connectors",
+        comment="按 EDF 实际位号生成",
+        work_order_id="wo-scope",
+    )
+
+    assert result.status == "succeeded"
+    assert calls["order_id"] == "wo-scope"
+    assert calls["comment"] == "按 EDF 实际位号生成"
+    assert result.data["run_id"] == "run-edf"
+    assert result.data["refdes_source"] == "edf"
+    assert "已按冻结 EDF 的实际位号替换模板示例位号" in result.message
+
+
+def test_v2_scope_exception_tool_selects_by_refdes(tmp_path, monkeypatch):
+    """A per-connector instruction must not silently resolve every exception."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    review = SimpleNamespace(
+        status="pending",
+        exceptions=[
+            SimpleNamespace(
+                exception_id="exception-a",
+                kind="connector_scope_ambiguous",
+                refdes="X301",
+                user_instruction="请确认 X301。",
+            ),
+            SimpleNamespace(
+                exception_id="exception-b",
+                kind="connector_scope_ambiguous",
+                refdes="X302",
+                user_instruction="请确认 X302。",
+            ),
+        ],
+    )
+    calls: dict = {}
+    toolset.pipeline.get_icd_scope_review = lambda _ctx, _order_id: review
+    toolset.pipeline.submit_icd_scope_resolution = (
+        lambda _ctx, _order_id, *, resolutions, comment: calls.update({
+            "resolutions": resolutions,
+        }) or SimpleNamespace(status="frozen")
+    )
+    toolset.pipeline.submit_knowledge_base_document_generation = (
+        lambda _ctx, _order_id: "run-refdes"
+    )
+
+    result = toolset.resolve_icd_scope_exception(
+        action="exclude",
+        refdes=["x302"],
+        comment="排除 X302",
+        work_order_id="wo-scope",
+    )
+
+    assert result.status == "succeeded"
+    assert calls["resolutions"] == [{"exception_id": "exception-b", "action": "exclude"}]
+
+
+def test_v2_scope_exception_tool_retries_submission_when_review_already_frozen(tmp_path, monkeypatch):
+    """A frozen review still needs its generation submission retried."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.pipeline.get_icd_scope_review = lambda _ctx, _order_id: SimpleNamespace(
+        status="frozen",
+        exceptions=[],
+    )
+    toolset.pipeline.submit_icd_scope_resolution = lambda *_args, **_kwargs: pytest.fail(
+        "a frozen review must not be resolved again"
+    )
+    calls: dict = {}
+    toolset.pipeline.submit_knowledge_base_document_generation = (
+        lambda _ctx, order_id: calls.update({"order_id": order_id}) or "run-retry"
+    )
+
+    result = toolset.resolve_icd_scope_exception(
+        action="include",
+        comment="重试提交",
+        work_order_id="wo-scope",
+    )
+
+    assert result.status == "succeeded"
+    assert calls["order_id"] == "wo-scope"
+    assert result.data["run_id"] == "run-retry"
+
+
+def test_v2_scope_exception_tool_reports_queue_failure_without_claiming_success(tmp_path, monkeypatch):
+    """Freezing the review and failing to queue must stay recoverable."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.pipeline.get_icd_scope_review = lambda _ctx, _order_id: SimpleNamespace(
+        status="pending",
+        exceptions=[SimpleNamespace(
+            exception_id="exception-a",
+            kind="connector_scope_ambiguous",
+            refdes="X301",
+            user_instruction="请确认 X301。",
+        )],
+    )
+    toolset.pipeline.submit_icd_scope_resolution = (
+        lambda *_args, **_kwargs: SimpleNamespace(status="frozen")
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise ValueError("queue unavailable")
+
+    toolset.pipeline.submit_knowledge_base_document_generation = _boom
+
+    result = toolset.resolve_icd_scope_exception(
+        action="include",
+        comment="包含 X301",
+        work_order_id="wo-scope",
+    )
+
+    assert result.status == "waiting_human"
+    assert "queue unavailable" in result.message
+    assert "重试" in result.message
+    assert "resolve_icd_scope_exception" in result.next_actions
+
+
+def test_v2_scope_exception_tool_reports_when_generation_cannot_be_resumed(tmp_path, monkeypatch):
+    """Compat pipelines without the submission worker must fail closed."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.pipeline.get_icd_scope_review = lambda _ctx, _order_id: SimpleNamespace(
+        status="frozen",
+        exceptions=[],
+    )
+    if hasattr(toolset.pipeline, "submit_knowledge_base_document_generation"):
+        delattr(toolset.pipeline, "submit_knowledge_base_document_generation")
+
+    result = toolset.resolve_icd_scope_exception(
+        action="include",
+        comment="继续",
+        work_order_id="wo-scope",
+    )
+
+    assert result.status == "waiting_human"
+    assert "工作台" in result.message
+    assert result.data["status"] == "submission_unavailable"
+
+
 def test_v2_start_session_without_template_creates_intake_session(tmp_path, monkeypatch):
     toolset = _v2_toolset(tmp_path, monkeypatch, template=False)
 
@@ -818,8 +1424,76 @@ def test_v2_answer_clarification_emits_requirement_clarification_card(tmp_path, 
     )
 
     assert result.status == "succeeded"
+    assert result.data["output_spec_id"] == "output-spec-a"
+    assert result.data["output_spec_version"] == 3
+    assert result.data["output_spec_draft"]["document_type"] == "report"
     kinds = [event["card"]["kind"] for event in sink]
     assert "requirement_clarification" in kinds
+
+
+def test_v2_answer_clarification_result_carries_the_canonical_next_options(tmp_path, monkeypatch):
+    """The tool result must expose the server-published options verbatim.
+
+    Without them the model invents its own option labels, which the intake
+    rejects three times before giving up.
+    """
+    from src.document_authoring.generation_sessions import ClarificationMessage
+
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    session = toolset.pipeline.v2_session.model_copy(update={
+        "messages": [
+            ClarificationMessage(
+                role="assistant",
+                content="找不到可靠资料时如何处理？",
+                question_id="missing_data_policy",
+                options=["标记未提供", "保留空白", "停止并提示"],
+                reason="缺失数据策略决定是否允许继续生成。",
+            ),
+        ],
+    })
+    toolset.pipeline.v2_session = session
+    toolset.pipeline.answer_document_generation_session = (
+        lambda _ctx, _session_id, **_kw: session
+    )
+
+    result = toolset.answer_clarification(
+        "generation-session-a", "deliverables", "excel",
+    )
+
+    assert result.status == "succeeded"
+    pending = result.data["pending_question"]
+    assert pending["question_id"] == "missing_data_policy"
+    assert pending["content"] == "找不到可靠资料时如何处理？"
+    assert pending["options"] == ["标记未提供", "保留空白", "停止并提示"]
+
+
+def test_v2_direct_request_resumes_the_conversation_intake_session(tmp_path, monkeypatch):
+    """A tool call without the session pointer resumes the conversation's intake.
+
+    Forking a fresh session discarded the recorded answers and restarted the
+    whole clarification flow from scratch.
+    """
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    pipeline = toolset.pipeline
+    finder_calls: list[dict] = []
+
+    def _find(_ctx, **kwargs):
+        finder_calls.append(kwargs)
+        return pipeline.v2_session
+
+    pipeline.find_reusable_document_generation_session = _find
+
+    result = toolset.generate_document_from_template(
+        purpose="参考模板生成文档",
+        use_recommended_defaults=True,
+    )
+
+    assert result.status == "waiting_human"
+    assert "confirm_document_plan" in result.next_actions
+    assert finder_calls and finder_calls[0]["knowledge_base_name"] == "hardware"
+    assert pipeline.create_kwargs == {}
+    assert not hasattr(pipeline, "answer_v2_kwargs")
+    assert pipeline.propose_kwargs["session_id"] == "generation-session-a"
 
 
 def test_v2_proposal_card_carries_safe_plan_summary(tmp_path, monkeypatch):
@@ -837,3 +1511,91 @@ def test_v2_proposal_card_carries_safe_plan_summary(tmp_path, monkeypatch):
     assert proposal["document_plan_id"] == "plan-a"
     assert "source_names" not in json.dumps(card)
     assert "evidence" not in json.dumps(card)
+
+
+def test_v2_answer_clarification_recovers_from_a_stale_session_reference(tmp_path, monkeypatch):
+    """A lost pointer must resume the conversation session, not reject or fork.
+
+    The observed incident submitted "采用推荐方案" against a reference that no
+    longer existed; the tool answered ``clarification_rejected`` and the model
+    then created a second intake session that re-asked answered questions.
+    """
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    pipeline = toolset.pipeline
+    finder_calls: list[str] = []
+
+    def _get_session(_ctx, session_id):
+        if session_id != "generation-session-a":
+            raise KeyError("generation session not found")
+        return pipeline.v2_session
+
+    def _find(_ctx, **_kwargs):
+        finder_calls.append("called")
+        return pipeline.v2_session
+
+    pipeline.get_document_generation_session = _get_session
+    pipeline.find_reusable_document_generation_session = _find
+
+    result = toolset.answer_clarification(
+        "generation-session-stale", "recommendations", "采用推荐方案",
+    )
+
+    assert result.status == "succeeded"
+    assert result.generation_session_id == "generation-session-a"
+    assert pipeline.answer_v2_kwargs["session_id"] == "generation-session-a"
+    assert finder_calls == ["called"]
+
+
+def test_v2_answer_clarification_uses_the_conversation_session_without_a_pointer(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    pipeline = toolset.pipeline
+
+    def _get_session(_ctx, _session_id):
+        raise KeyError("generation session not found")
+
+    def _find(_ctx, **_kwargs):
+        return pipeline.v2_session
+
+    pipeline.get_document_generation_session = _get_session
+    pipeline.find_reusable_document_generation_session = _find
+
+    result = toolset.answer_clarification(
+        "generation-session-fabricated", "target_identity", "X1900",
+    )
+
+    assert result.status == "succeeded"
+    assert pipeline.answer_v2_kwargs["session_id"] == "generation-session-a"
+
+
+def test_v2_answer_clarification_fails_closed_without_any_live_session(tmp_path, monkeypatch):
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    pipeline = toolset.pipeline
+
+    def _get_session(_ctx, _session_id):
+        raise KeyError("generation session not found")
+
+    pipeline.get_document_generation_session = _get_session
+    pipeline.find_reusable_document_generation_session = lambda _ctx, **_kwargs: None
+
+    result = toolset.answer_clarification(
+        "generation-session-stale", "recommendations", "采用推荐方案",
+    )
+
+    assert result.status == "rejected"
+    assert result.error_code == "clarification_session_unresolved"
+
+
+def test_v2_start_session_resumes_the_conversation_intake_session(tmp_path, monkeypatch):
+    """Repeated start must not fork a new draft over a live intake session."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    pipeline = toolset.pipeline
+    pipeline.find_reusable_document_generation_session = (
+        lambda _ctx, **_kwargs: pipeline.v2_session
+    )
+
+    result = toolset.start_document_generation_session(purpose="参考模板生成文档")
+
+    assert result.status == "succeeded"
+    assert result.message == "generation session resumed"
+    assert result.generation_session_id == "generation-session-a"
+    assert pipeline.create_kwargs == {}

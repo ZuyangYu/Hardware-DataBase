@@ -54,15 +54,32 @@ export interface UploadAck {
  * bridge can still send this stable object without changing the legacy chat
  * payload when no template has been attached.
  */
-export interface DocumentContext {
+export interface DocumentContextV1 {
   analysis_id: string;
   template_version_id: string;
   knowledge_base_name: string;
-  version: string | number;
+  version: 1 | 'v1';
   expiry: string;
   client_request_id: string;
   generation_session_id?: string | null;
 }
+
+export interface DocumentContextV2 {
+  version: 'v2';
+  knowledge_base_name?: string | null;
+  attachment_ids?: string[];
+  source_scope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
+  task_id?: string | null;
+  generation_session_id?: string | null;
+  output_spec_id?: string | null;
+  output_spec_version?: number | null;
+  template_version_id?: string | null;
+  analysis_id?: string | null;
+  expiry: string;
+  client_request_id: string;
+}
+
+export type DocumentContext = DocumentContextV1 | DocumentContextV2;
 
 export interface AssetEvidenceView {
   id: number;
@@ -1061,7 +1078,16 @@ export type ClarificationMessage = {
 export type GenerationSession = {
   session_id: string;
   knowledge_base_name?: string;
-  status: 'needs_clarification' | 'ready_to_generate' | 'generating' | 'completed' | 'cancelled';
+  status:
+    | 'needs_clarification'
+    | 'ready_to_generate'
+    | 'generating'
+    | 'completed'
+    | 'cancelled'
+    | 'awaiting_plan'
+    | 'awaiting_plan_confirmation'
+    | 'planned'
+    | 'blocked';
   brief: GenerationBriefView;
   messages: ClarificationMessage[];
   work_order_id?: string | null;
@@ -1130,7 +1156,7 @@ export type DocumentCoverage = {
 };
 
 export type WorkOrderStatus = {
-  work_order_id: string;
+  work_order_id: string | null;
   task_id?: string | null;
   status: string;
   phase?: string;
@@ -1154,6 +1180,7 @@ export type WorkOrderStatus = {
   coverage?: DocumentCoverage;
   harness_run?: HarnessRunView;
   validation?: { status?: string; issues?: unknown[] };
+  pending_review?: Record<string, unknown> | null;
   artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
   [k: string]: unknown;
 };
@@ -1161,6 +1188,7 @@ export type WorkOrderStatus = {
 /** Durable document-authoring task projected back into a chat session. */
 export type DocumentChatTaskView = {
   session_id: number;
+  conversation_revision?: number | null;
   task_id?: string | null;
   work_order_id?: string | null;
   kb_name: string;
@@ -1230,8 +1258,19 @@ export type DocumentTaskProjection = {
   updated_at: string;
 };
 
+export type IcdScopeException = {
+  exception_id?: string;
+  kind?: string;
+  refdes?: string | null;
+  pin_name?: string | null;
+  recommended_action?: string;
+  user_instruction?: string;
+  source_names?: string[];
+};
+
 export type IcdScopeReview = {
   status?: string;
-  exceptions?: Array<{ exception_id?: string; kind?: string; pin?: string }>;
+  pending_count?: number;
+  exceptions?: IcdScopeException[];
   [k: string]: unknown;
 } | null;

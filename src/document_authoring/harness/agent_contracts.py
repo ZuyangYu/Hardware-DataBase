@@ -14,6 +14,7 @@ writer and agent consumers must share these, never re-approximate them.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -41,6 +42,11 @@ CLARIFICATION_POLICY_MAP: dict[str, dict[str, str]] = {
         "允许有限推断": "allow_limited",
     },
 }
+
+_CLARIFICATION_OPTION_MARKER = re.compile(
+    r"^\s*(?:选择|选)?\s*([A-Da-d])"
+    r"(?:\s*(?:[.、:：,，)\]）-]\s*|\s+)(.*))?\s*$"
+)
 
 BRIEF_TO_FIELD_MISSING_POLICY: dict[str, str] = {
     "block_generation": "block_section",
@@ -78,7 +84,32 @@ def normalize_clarification_policy(question_id: str, raw: Any) -> str | None:
     if text in mapping:
         return mapping[text]
     canonical = {value: value for value in mapping.values()}
-    return canonical.get(text)
+    if text in canonical:
+        return canonical[text]
+    if question_id == "missing_data_policy":
+        if any(term in text for term in ("待补充", "数据缺失", "保留占位", "明确标注")):
+            return "mark_tbd"
+        if any(term in text for term in ("保留空白", "跳过缺失", "仅输出已有")):
+            return "keep_blank"
+        if "停止" in text:
+            return "block_generation"
+    if question_id == "inference_policy":
+        if any(term in text for term in ("禁止", "不推断", "不进行推断")):
+            return "forbid"
+        if "有限" in text and "推断" in text:
+            return "allow_limited"
+        if "推断" in text and any(term in text for term in ("标注", "注明", "加注")):
+            return "allow_labeled"
+    match = _CLARIFICATION_OPTION_MARKER.match(text)
+    if match is None:
+        return None
+    index = ord(match.group(1).lower()) - ord("a")
+    values = list(mapping.values())
+    if index < 0 or index >= len(values):
+        return None
+    # The option text is retained by the caller for audit; the letter is the
+    # stable position in the server-issued option list.
+    return values[index]
 
 
 def effective_missing_policy(brief_missing: str | None, field_missing: str | None) -> str | None:

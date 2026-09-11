@@ -405,27 +405,62 @@ class InternalDocumentHarnessRuntime:
                 "repeating_table": "table",
             }.get(raw_type, raw_type or "text")
             requirement = coverage_by_unit.get(unit.unit_id)
+            # Coverage requirements carry stable physical column IDs.  Prefer
+            # them over presentation labels so duplicate headers (e.g. ERP
+            # columns) remain distinct at render time.
             columns = list(
-                output.get("columns")
-                or (requirement.required_columns if requirement is not None else [])
+                (requirement.required_columns if requirement is not None else [])
+                or output.get("columns")
                 or []
             )
-            table_columns = {str(column): str(column) for column in columns} or None
+            # Preserve the frozen template's presentation labels so the
+            # writer can classify pin/definition/function columns.  The plan
+            # only carries physical column IDs; without the original labels
+            # every table cell would degrade to a TBD scalar.
+            original_field = next(
+                (
+                    item for item in original_schema.fields
+                    if str(getattr(item, "field_id", "") or "") == str(unit.unit_id)
+                ),
+                None,
+            )
+            original_columns = dict(
+                getattr(original_field, "table_columns", None) or {}
+            )
+            if original_columns:
+                table_columns = {
+                    str(column): str(original_columns.get(str(column)) or column)
+                    for column in columns
+                } or None
+            else:
+                table_columns = {str(column): str(column) for column in columns} or None
+            raw_capabilities = output.get("required_capabilities") or list(unit.source_capabilities or [])
+            capabilities = [
+                str(capability).rsplit("@", 1)[0]
+                for capability in raw_capabilities
+                if str(capability).strip()
+            ]
             fields.append(DocumentFieldSchema(
                 field_id=unit.unit_id,
                 label=str(output.get("label") or unit.unit_id),
                 description=str(output.get("description") or ""),
                 required=unit.required,
                 value_type=value_type,
-                required_capabilities=[],
-                preferred_source_roles=[],
+                required_capabilities=capabilities,
+                preferred_source_roles=[
+                    str(role) for role in output.get("preferred_source_roles", [])
+                    if str(role).strip()
+                ],
                 retrieval_policy_id=f"plan:{plan.document_plan_id}:{unit.unit_id}:retrieval",
                 query_terms=[str(term) for term in output.get("query_terms", []) if str(term).strip()],
-                subject_aliases=[],
+                subject_aliases=[
+                    str(alias) for alias in output.get("subject_aliases", [])
+                    if str(alias).strip()
+                ],
                 max_evidence_items=5,
                 verification_policy_id=f"plan:{plan.document_plan_id}:{unit.unit_id}:verification",
                 allow_derivation=False,
-                missing_policy="mark_tbd",
+                missing_policy=str(output.get("missing_policy") or "mark_tbd"),
                 authoring_policy="managed_writer",
                 table_columns=table_columns,
                 table_row_scope=(
@@ -593,7 +628,7 @@ class InternalDocumentHarnessRuntime:
         }
         field_by_unit = {field.field_id: field for field in plan_schema.fields}
         for unit in plan.semantic_units:
-            unit_key = f"field:{unit.unit_id}"
+            unit_key = _plan_field_execution_key(unit.unit_id)
             requirement = _requirement_for_unit(
                 {"unit_id": unit_key, "kind": "field", "schema": field_by_unit[unit.unit_id]},
                 work_order,
@@ -608,6 +643,14 @@ class InternalDocumentHarnessRuntime:
             for receipt in self.store.list_node_execution_receipts(
                 run.harness_run_id, node_name="plan_node", status="committed",
             )
+        }
+        # A unit is counted only after its plan-node receipt is durably
+        # committed.  Counting in-memory drafts would report progress ahead of
+        # what a restarted worker can recover.
+        committed_unit_node_ids: set[str] = {
+            receipt_id
+            for receipt_id, payload in committed.items()
+            if isinstance(payload, dict) and payload.get("kind") == "unit"
         }
         for payload in committed.values():
             if not isinstance(payload, dict) or payload.get("kind") != "unit":
@@ -634,7 +677,7 @@ class InternalDocumentHarnessRuntime:
         def execute_unit(node: CompiledTaskNode, attempt: int) -> dict[str, Any]:
             if node.unit_id is None:
                 raise PlanExecutionRouteError(f"plan unit node has no unit_id: {node.node_id}")
-            unit_key = f"field:{node.unit_id}"
+            unit_key = _plan_field_execution_key(node.unit_id)
             field = field_by_unit.get(node.unit_id)
             if field is None:
                 raise PlanExecutionRouteError(f"plan graph references unknown semantic unit: {node.unit_id}")
@@ -805,6 +848,24 @@ class InternalDocumentHarnessRuntime:
                 running=run, lease_owner=lease_owner,
                 persistence_lock=persistence_lock,
             )
+            with result_lock:
+                committed_unit_node_ids.add(node.node_id)
+                completed_units = len(committed_unit_node_ids)
+                unit_statuses = dict(result.unit_statuses)
+                draft_ids = [draft.unit_id for draft in result.drafts]
+                step_count = result.step_count
+                retrieval_round_count = result.retrieval_round_count
+            # Plan-DAG execution does not use the legacy LangGraph reducer, so
+            # publish its durable progress explicitly after each receipt.
+            run_context.save_progress({
+                "current_node": "plan_dag:units",
+                "completed_units": completed_units,
+                "total_units": len(plan.semantic_units),
+                "unit_statuses": unit_statuses,
+                "draft_ids": draft_ids,
+                "step_count": step_count,
+                "retrieval_round_count": retrieval_round_count,
+            })
             return output
 
         dag = PlanDAGExecutor(max_workers=policy.max_parallel_units).run(
@@ -817,7 +878,7 @@ class InternalDocumentHarnessRuntime:
         by_unit = {draft.unit_id: draft for draft in persisted_drafts}
         for draft in result.drafts:
             by_unit[draft.unit_id] = draft
-        ordered_unit_ids = [f"field:{unit.unit_id}" for unit in plan.semantic_units]
+        ordered_unit_ids = [_plan_field_execution_key(unit.unit_id) for unit in plan.semantic_units]
         result.drafts = [
             by_unit[key] for key in ordered_unit_ids if key in by_unit
         ] + [
@@ -831,12 +892,15 @@ class InternalDocumentHarnessRuntime:
                         f"committed plan unit receipt has no durable draft: {unit_id}"
                     )
         unit_order = {
-            f"field:{unit.unit_id}": index
+            _plan_field_execution_key(unit.unit_id): index
             for index, unit in enumerate(plan.semantic_units)
         }
         result.matrix_rows.sort(
             key=lambda row: (
-                unit_order.get(f"field:{row.get('field_id')}", len(unit_order)),
+                unit_order.get(
+                    _plan_field_execution_key(str(row.get("field_id") or "")),
+                    len(unit_order),
+                ),
                 str(row.get("field_id") or row.get("review_item_id") or ""),
             )
         )
@@ -859,6 +923,9 @@ class InternalDocumentHarnessRuntime:
             if key in dag.outputs
         }
         result.step_count = max(result.step_count, len(dag.completed_nodes))
+        result.completed_units = len(committed_unit_node_ids)
+        result.total_units = len(plan.semantic_units)
+        result.draft_ids = [draft.unit_id for draft in result.drafts]
         return result
 
     def create_run(
@@ -1405,16 +1472,26 @@ class InternalDocumentHarnessRuntime:
             lease_owner=lease_owner,
             fencing_token=running.fencing_token,
         )
+        progress_updates: dict[str, Any] = {
+            "status": final_status,
+            "current_node": "complete",
+            "step_count": result.step_count,
+            "retrieval_round_count": result.retrieval_round_count,
+            "lease_owner": None,
+            "lease_expires_at": None,
+        }
+        if execution_route == "plan_dag":
+            progress_updates.update({
+                "completed_units": int(getattr(result, "completed_units", 0) or 0),
+                "total_units": int(getattr(result, "total_units", 0) or 0),
+                "unit_statuses": dict(result.unit_statuses),
+                "draft_ids": list(getattr(result, "draft_ids", None) or [draft.unit_id for draft in result.drafts]),
+            })
         self.store.update_harness_run_owned(
             running.harness_run_id,
             lease_owner,
             running.fencing_token,
-            status=final_status,
-            current_node="complete",
-            step_count=result.step_count,
-            retrieval_round_count=result.retrieval_round_count,
-            lease_owner=None,
-            lease_expires_at=None,
+            **progress_updates,
         )
         evidence_hashes = {
             evidence.id: sha256(evidence.content.encode("utf-8")).hexdigest()
@@ -1431,3 +1508,16 @@ class InternalDocumentHarnessRuntime:
             payload={"status": final_status, "draft_count": len(result.drafts)},
         )
         return result
+
+def _plan_field_execution_key(unit_id: str) -> str:
+    """Map one plan semantic identity to the field execution namespace once.
+
+    Older activated workbook templates persisted semantic IDs such as
+    ``field:sheet:Sheet1!C16`` while ordinary plans use IDs such as ``cover``.
+    Both are valid durable identities; blindly prepending ``field:`` turns the
+    former into a different unit and disconnects its draft from its binding.
+    """
+    normalized = str(unit_id or "").strip()
+    if normalized.startswith(("field:", "review:")):
+        return normalized
+    return f"field:{normalized}"

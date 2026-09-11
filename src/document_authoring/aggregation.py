@@ -47,27 +47,26 @@ class DocumentAggregator:
             unit_id = str(_value(unit, "unit_id", "")).strip()
             if not unit_id:
                 continue
-            normalized_unit_id = unit_id.removeprefix("field:").removeprefix("review:")
-            draft = _draft_for_unit(drafts, normalized_unit_id)
-            review = _review_for_unit(review_map, normalized_unit_id)
+            draft = _draft_for_unit(drafts, unit_id)
+            review = _review_for_unit(review_map, unit_id)
             if draft is not None:
-                draft_hashes[normalized_unit_id] = content_hash(draft.model_dump(mode="json"))
+                draft_hashes[unit_id] = content_hash(draft.model_dump(mode="json"))
             if review is not None:
-                review_hashes[normalized_unit_id] = str(_value(review, "report_hash", ""))
+                review_hashes[unit_id] = str(_value(review, "report_hash", ""))
             if review is not None and str(_value(review, "status", "")) != "pass":
                 review_issues = _review_issues(review)
                 issues.extend(review_issues)
-                missing = _missing_from_review(normalized_unit_id, review, requirements.get(normalized_unit_id))
+                missing = _missing_from_review(unit_id, review, requirements.get(unit_id))
                 missing_items.extend(missing)
                 continue
             if draft is None:
-                missing_items.extend(_missing_for_requirement(normalized_unit_id, requirements.get(normalized_unit_id)))
+                missing_items.extend(_missing_for_requirement(unit_id, requirements.get(unit_id)))
                 continue
             typed = draft.typed_value
-            requirement = requirements.get(normalized_unit_id)
+            requirement = requirements.get(unit_id)
             if _is_table_unit(unit, typed, requirement):
                 block, table_missing, table_issues = self._table_block(
-                    normalized_unit_id, draft, requirement,
+                    unit_id, draft, requirement,
                 )
                 blocks.append(block)
                 missing_items.extend(table_missing)
@@ -81,29 +80,26 @@ class DocumentAggregator:
             block_kind = str(_value(unit, "kind", "paragraph"))
             if block_kind == "section":
                 blocks.append(SectionBlock(
-                    block_id=f"block:{normalized_unit_id}", unit_id=normalized_unit_id,
+                    block_id=f"block:{unit_id}", unit_id=unit_id,
                     title=str(_value(unit, "title", "") or ""), content=str(display),
                     citations=_citations_for_draft(draft),
                 ))
             elif block_kind == "list":
                 items = [item.strip() for item in str(display).split(",") if item.strip()]
                 blocks.append(ListBlock(
-                    block_id=f"block:{normalized_unit_id}", unit_id=normalized_unit_id,
+                    block_id=f"block:{unit_id}", unit_id=unit_id,
                     items=items, citations=_citations_for_draft(draft),
                 ))
             else:
                 blocks.append(ParagraphBlock(
-                    block_id=f"block:{normalized_unit_id}", unit_id=normalized_unit_id,
+                    block_id=f"block:{unit_id}", unit_id=unit_id,
                     content=str(display), citations=_citations_for_draft(draft),
                 ))
             citations.extend(_citations_for_draft(draft))
 
         # If a plan adapter exposes drafts without semantic unit rows, retain
         # them in stable id order rather than silently dropping accepted facts.
-        known_units = {
-            str(_value(unit, "unit_id", "")).removeprefix("field:").removeprefix("review:")
-            for unit in semantic_units
-        }
+        known_units = {str(_value(unit, "unit_id", "")) for unit in semantic_units}
         for unit_id in sorted(set(drafts) - known_units):
             if unit_id.startswith("field:") or unit_id.startswith("review:"):
                 continue
@@ -236,13 +232,13 @@ def _draft_map(drafts: Mapping[str, DocumentUnitDraft] | Sequence[DocumentUnitDr
     for draft in values:
         if not isinstance(draft, DocumentUnitDraft):
             draft = DocumentUnitDraft.model_validate(draft)
-        normalized = draft.unit_id.removeprefix("field:").removeprefix("review:")
         result[draft.unit_id] = draft
-        result[normalized] = draft
     return result
 
 
 def _draft_for_unit(drafts: Mapping[str, DocumentUnitDraft], unit_id: str) -> DocumentUnitDraft | None:
+    if unit_id.startswith(("field:", "review:")):
+        return drafts.get(unit_id)
     return drafts.get(unit_id) or drafts.get(f"field:{unit_id}") or drafts.get(f"review:{unit_id}")
 
 
@@ -256,6 +252,8 @@ def _review_map(reviews: Mapping[str, UnitReviewResult | Mapping[str, Any]] | No
 
 
 def _review_for_unit(reviews: Mapping[str, Any], unit_id: str) -> Any | None:
+    if unit_id.startswith(("field:", "review:")):
+        return reviews.get(unit_id)
     return reviews.get(unit_id) or reviews.get(f"field:{unit_id}") or reviews.get(f"review:{unit_id}")
 
 
@@ -344,4 +342,3 @@ def _missing_for_requirement(unit_id: str, requirement: CoverageRequirement | No
         required=bool(requirement.required) if requirement is not None else True,
         issue_code="missing_requirement",
     )]
-

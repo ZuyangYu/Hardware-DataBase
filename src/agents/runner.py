@@ -264,9 +264,18 @@ _DOCUMENT_FLOW_PROMPT = """你是 Hardware DataBase 的文档生成流程助手�
 对话负责理解需求、提出建议与展示状态；服务器负责计划、校验、执行与产物。流程：
 1. 用 start_document_generation_session 开始（有模板或无模板均可，创建 OutputSpec 需求草案）。
 2. 用 answer_clarification 逐题回填用户给出的澄清答案（question_id + answer），一次一题；不要替用户编造答案。
+   answer 必须保留用户原话以及所选项的完整文字。用户只说 A/B/C 时，若当前问题是你补充说明过的长选项，
+   将“字母 + 被选项原文”一并传给工具；同一条消息中的 ERP、范围、来源、格式等额外要求也要原样保留。
+   服务器会把选项归一化为规范值，无法确定的自由文本不会被强行写入章节或策略字段。
+   澄清问题的 options 必须原样采用工具返回的选项，不要另造一套 A/B/C/D 长选项；若需要解释领域背景，
+   放在问题说明中，不要让用户选择一个服务器没有发布过的选项。
 3. 需求完整后调用 propose_document_plan 生成"将生成什么"的计划提案；把提案中的文档类型、交付格式、章节/表格、来源与政策摘要转述给用户。
 4. 只有当用户明确确认后，才调用 confirm_document_plan，并且必须原样传递提案返回的 expected_output_spec_hash 与 expected_plan_hash，以及一个稳定的 client_request_id。确认前绝不创建工单，也不得由推荐默认值代替用户确认。
 5. 确认成功后告知：提交已受理，后台 worker 将创建工单并异步生成；可用 get_document_task_status（按任务）或 get_document_generation_status（按工单）查询进度；绝不声称生成已完成。
+6. 任务返回 ICD 范围异常待办时，先向用户说明异常位置与服务器给出的处理指引。位号一律使用状态/工具返回的实际 refdes，
+   不要假设、替换或写死示例位号。用户明确给出包含/排除指示后调用 resolve_icd_scope_exception（可用 refdes 精确选择，
+   或 work_order_id/当前任务上下文）提交并继续生成。阻塞型异常（connector_scope_unknown、connector_mapping_missing）会被拒绝，
+   此时如实转述指引并请用户确认实际目标接插件/模块，按用户确认的要求重新发起生成，不要承诺放行。
 
 如果模板引用显示"未挂载"，这是模板无关的文档创作对话：不要调用模板检查、模板填充或通用对话导出，按上述流程从需求收集开始。
 只有当用户明确表达"参考/按照模板生成、填充、回填、创建最终文档"且模板引用存在时，generate_document_from_template
@@ -274,6 +283,7 @@ _DOCUMENT_FLOW_PROMPT = """你是 Hardware DataBase 的文档生成流程助手�
 
 约束：
 - 生成是分钟级后台任务；对话只负责发起、澄清、提案与查询，不等待也不假装完成。
+- 工单已创建后，用户要求“填充/生成/修改/导出”时，只报告工单状态、待办或调用工具；绝不把文档正文、章节或表格内容直接写进聊天回复。
 - 最终可下载文件只能来自受治理工单的 document artifact；"导出当前回答"走对话导出，不能冒充文档创作。
 - 工具返回 status=rejected 时，如实转述 error_code 与 message 并给出下一步；同一操作不要重试超过 2 次。
 - 计划确认与产物发布是人工门（Gate 1/Gate 2），必须由用户完成，你不能代替确认或审批。
@@ -335,6 +345,374 @@ def is_direct_document_generation_query(query: str) -> bool:
     return classify_intent(query, has_template_context=True).intent == "template_generation"
 
 
+def is_explicit_document_plan_confirmation_query(query: str) -> bool:
+    """Recognize a standalone affirmative control command, fail-closed."""
+
+    raw = str(query or "").strip().casefold()
+    if (
+        not raw
+        or any(marker in raw for marker in ("?", "？", "为什么", "怎么", "是否", "能否"))
+        or raw.rstrip("。.!！ ").endswith(("吗", "么"))
+    ):
+        return False
+    if any(marker in raw for marker in (
+        "不要", "不确认", "不生成", "暂不", "先不", "取消", "停止", "别",
+        "如果", "要是", "除非", "之后再", "但", "不过", "修改", "调整", "改成", "换成",
+    )):
+        return False
+    normalized = re.sub(r"[\s，,。.!！]+", "", raw)
+    return normalized in {
+        "确认",
+        "确认生成",
+        "确认并生成",
+        "同意",
+        "同意生成",
+        "同意按此方案生成",
+        "按此方案生成",
+        "按这个方案生成",
+        "按此方案执行",
+        "按这个方案执行",
+        "可以",
+        "可以生成",
+        "可以开始",
+        "好的",
+        "好",
+        "没问题",
+        "开始吧",
+        "执行吧",
+        "生成吧",
+        "就这么做",
+        "继续生成",
+        "yes",
+        "ok",
+        "okay",
+    }
+
+
+_CLARIFICATION_NEGATION_MARKERS = (
+    "不要", "不确认", "不生成", "暂不", "先不", "取消", "停止", "别",
+    "如果", "要是", "除非", "之后再", "但", "不过",
+)
+_CLARIFICATION_QUESTION_MARKERS = (
+    "?", "？", "为什么", "怎么", "如何", "是否", "能否", "什么意思", "吗", "呢",
+)
+_CLARIFICATION_REQUEST_MARKERS = (
+    "帮我", "帮忙", "麻烦", "新建", "重新生成", "重新做", "生成一个", "生成一份",
+    "创建文档", "创建一份", "改成", "换成", "修改", "调整",
+)
+_FREETEXT_CLARIFICATION_QUESTION_IDS = {
+    "target_identity", "source_scope", "outline", "purpose",
+}
+_KNOWLEDGE_BASE_DELEGATION_RE = re.compile(
+    r"(?:根据|按照|按|基于|来自|从|依据)[^。；;，,\n]{0,32}?知识库"
+    r"|由知识库[^。；;，,\n]{0,16}?(?:确定|决定|判断)"
+    r"|你(?:自己)?(?:来)?(?:判断|决定|定)"
+    r"|自行(?:判断|决定)"
+    r"|自动(?:确定|判断|决定)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_clarification_text(value: str) -> str:
+    return re.sub(r"[\s，,。.!！;；:：]+", "", str(value or "").strip().casefold())
+
+
+def _looks_like_clarification_question(raw: str) -> bool:
+    text = str(raw or "").strip()
+    if not text:
+        return True
+    if any(marker in text for marker in _CLARIFICATION_QUESTION_MARKERS):
+        return True
+    if any(marker in text for marker in _CLARIFICATION_NEGATION_MARKERS):
+        return True
+    return text.rstrip("。.!！ ").endswith(("吗", "么", "呢"))
+
+
+def match_pending_clarification_answer(
+    query: str,
+    pending: dict[str, Any] | None,
+) -> str | None:
+    """Map an unambiguous chat reply to the pending intake question answer.
+
+    Canonical option text always wins.  Free-text questions additionally
+    accept an explicit knowledge-base delegation or a short plain value; any
+    question, negation or new request stays with the model so the server
+    never invents a clarification the user did not give.
+    """
+
+    if not isinstance(pending, dict):
+        return None
+    raw = str(query or "").strip()
+    if not raw:
+        return None
+    normalized = _normalize_clarification_text(raw)
+    options = [
+        str(item).strip()
+        for item in (pending.get("options") or [])
+        if str(item).strip()
+    ]
+    for option in options:
+        if normalized and normalized == _normalize_clarification_text(option):
+            return option
+    if _looks_like_clarification_question(raw):
+        return None
+    for option in options:
+        canonical = _normalize_clarification_text(option)
+        if canonical and canonical in normalized:
+            return option
+    question_id = str(pending.get("question_id") or "").strip()
+    if not options and question_id in _FREETEXT_CLARIFICATION_QUESTION_IDS:
+        # An explicit knowledge-base delegation is always an answer; a short,
+        # single-line reply without a new request is treated as the free-text
+        # value the question asked for (for example a connector refdes).
+        if _KNOWLEDGE_BASE_DELEGATION_RE.search(raw):
+            return raw
+        if (
+            len(raw) <= 120
+            and "\n" not in raw
+            and not any(marker in raw for marker in _CLARIFICATION_REQUEST_MARKERS)
+        ):
+            return raw
+    return None
+
+
+def _coerce_tool_payload(raw: Any) -> dict[str, Any]:
+    """Normalize a tool return value to a JSON object.
+
+    Tools normally return an object-shaped JSON string, but a defensive
+    normalization keeps a malformed payload from escaping the continuation
+    handler and flipping an already-recorded clarification answer to rejected.
+    """
+
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _direct_clarification_answer(
+    payload: dict[str, Any],
+    question: dict[str, Any] | None,
+    answer_text: str,
+) -> str:
+    """Describe a server-side clarification submission without inventing state."""
+
+    question_id = str((question or {}).get("question_id") or "").strip()
+    label = f"「{question_id}」" if question_id else ""
+    status = str(payload.get("status") or "").strip()
+    if status != "succeeded":
+        error_code = str(payload.get("error_code") or "").strip()
+        message = str(payload.get("message") or "澄清回答未被接受").strip()
+        return f"澄清回答未能提交：{message}" + (f"（{error_code}）" if error_code else "")
+    lines = [f"已记录{label}的回答：{answer_text}"]
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    next_question = data.get("pending_question")
+    if isinstance(next_question, dict) and str(next_question.get("content") or "").strip():
+        lines.append("")
+        lines.append(str(next_question["content"]).strip())
+        options = [
+            str(item).strip()
+            for item in (next_question.get("options") or [])
+            if str(item).strip()
+        ]
+        if options:
+            lines.append(f"可选：{'、'.join(options)}")
+        lines.append("请直接在对话中回答，系统会继续完善文档计划。")
+        return "\n".join(lines)
+    proposal = data.get("proposal")
+    if isinstance(proposal, dict) and str(proposal.get("status") or "").strip() == "succeeded":
+        proposal_next_actions = {
+            str(item).strip()
+            for item in (proposal.get("next_actions") or [])
+            if str(item).strip()
+        }
+        lines.append("")
+        if "confirm_document_plan" in proposal_next_actions:
+            lines.append("已生成文档计划提案，确认前不会创建生成工单或写入内容。")
+            lines.append("请回复“确认生成”完成确认，或直接说明需要修改的内容。")
+        else:
+            lines.append("计划提案已生成，但当前仍有未满足的执行条件；请在对话中补充或调整需求。")
+        return "\n".join(lines)
+    next_actions = {
+        str(item).strip()
+        for item in (payload.get("next_actions") or [])
+        if str(item).strip()
+    }
+    if "confirm_document_plan" in next_actions or "propose_document_plan" in next_actions:
+        lines.append("需求信息已齐备，可以生成文档计划提案。")
+    elif "create_document_work_order" in next_actions:
+        lines.append("需求信息已确认，可以创建生成工单。")
+    elif "start_document_generation_session" in next_actions:
+        lines.append("系统会继续推进需求澄清。")
+    else:
+        lines.append("系统会继续推进文档计划。")
+    return "\n".join(lines)
+
+
+def _document_gate_lines(projection: dict[str, Any]) -> list[str]:
+    """Explain a pending human gate and the action that actually unblocks it."""
+
+    pending = projection.get("pending_review")
+    if not isinstance(pending, dict):
+        return []
+    kind = str(pending.get("review_kind") or "").strip()
+    scope = pending.get("scope_review")
+    if kind == "icd_scope" and isinstance(scope, dict):
+        lines = ["ICD 范围异常待办："]
+        refdes_values: list[str] = []
+        suggested_values: list[str] = []
+        for item in [
+            entry for entry in (scope.get("exceptions") or []) if isinstance(entry, dict)
+        ][:5]:
+            refdes = str(item.get("refdes") or "").strip()
+            if refdes:
+                refdes_values.append(refdes)
+            for value in item.get("suggested_refdes") or []:
+                text = str(value).strip()
+                if text and text not in suggested_values:
+                    suggested_values.append(text)
+            instruction = str(item.get("user_instruction") or "").strip()
+            label = f"- {refdes}：" if refdes else "- "
+            lines.append(label + (instruction or str(item.get("kind") or "范围异常")))
+        pending_label = "、".join(refdes_values) if refdes_values else "（未指定位号）"
+        if scope.get("blocking"):
+            if suggested_values:
+                lines.append(
+                    "冻结 EDF 中的实际位号为 " + "、".join(suggested_values) + "。"
+                    "请直接回复“确认”（或“按 EDF 实际位号生成”；直接要求填充/继续生成也可以），"
+                    "我会用 EDF 实际位号替换模板示例位号并继续生成；"
+                    "若实际目标不同，请在对话中明确目标位号或模块。"
+                    "当前工单保持等待，不会写入候选文件。"
+                )
+            else:
+                lines.append(
+                    f"请确认实际目标接插件后按你的要求重新生成：当前系统解析到的待处理位号为 {pending_label}。"
+                    "若这些位号应包含，请补齐对应的 EDF 管脚映射并重新解析；"
+                    "若实际目标不是这些位号，请在对话中明确目标位号或模块，我会据此重新发起生成。"
+                    "当前工单保持等待，不会写入候选文件。"
+                )
+        else:
+            lines.append(
+                f"请按实际情况确认要包含或排除的位号（待处理：{pending_label}），"
+                "然后直接回复“包含/排除 <位号>，继续生成”，由我提交范围处理并继续生成；"
+                "也可以到文档工作台处理。"
+            )
+        return lines
+    if kind:
+        return [f"待处理人工审核：{kind}。请在文档工作台完成审核，或在对话中说明处理意见。"]
+    return []
+
+
+def _confirmed_document_task_answer(projection: dict[str, Any]) -> str:
+    """Describe the latest already-confirmed task without inventing output."""
+
+    status = str(projection.get("status") or "").strip()
+    labels = {
+        "planned": "已提交，后台正在创建生成工单",
+        "queued": "排队中",
+        "running": "生成中",
+        "waiting_human": "等待人工处理",
+        "awaiting_release": "等待发布审核",
+        "needs_review": "待审核",
+        "needs_clarification": "等待对话澄清",
+        "blocked": "生成被阻止",
+        "completed": "已完成",
+        "complete": "已完成",
+        "failed": "执行失败",
+        "cancelled": "已取消",
+    }
+    display_label = labels.get(status, status or "处理中")
+    pending_review = projection.get("pending_review")
+    scope_pending = (
+        pending_review.get("scope_review")
+        if isinstance(pending_review, dict)
+        and str(pending_review.get("review_kind") or "") == "icd_scope"
+        else None
+    )
+    if isinstance(scope_pending, dict) and scope_pending.get("blocking"):
+        display_label = "ICD 范围异常待处理"
+    lines = [f"该文档计划已经确认，当前状态：{display_label}。"]
+    work_order_id = str(projection.get("work_order_id") or "").strip()
+    if work_order_id:
+        lines.append(f"- 工单：`{work_order_id}`")
+    clarification_state = projection.get("clarification_state")
+    pending_question = (
+        clarification_state.get("pending_question")
+        if isinstance(clarification_state, dict)
+        else None
+    )
+    if status == "needs_clarification" and isinstance(pending_question, dict):
+        content = str(pending_question.get("content") or "").strip()
+        if content:
+            lines.append(content)
+        options = [str(item).strip() for item in (pending_question.get("options") or []) if str(item).strip()]
+        if options:
+            lines.append(f"可选：{'、'.join(options)}")
+        lines.append("请直接在对话中回答，系统会据此重新生成计划；无需打开工作台手工填写。")
+    elif status == "blocked":
+        error = str(projection.get("error_message") or "").strip()
+        if error:
+            lines.append(f"原因：{error}")
+        gate_lines = _document_gate_lines(projection)
+        if gate_lines:
+            lines.extend(gate_lines)
+        elif isinstance(pending_question, dict):
+            lines.append("知识库缺少必填字段资料，请直接在对话中补充或确认处理方式。")
+        else:
+            lines.append("字段填充或发布审核未通过，请稍后刷新或重试；无需手工修改工作台字段。")
+    elif status == "needs_review":
+        gate_lines = _document_gate_lines(projection)
+        if gate_lines:
+            lines.extend(gate_lines)
+        else:
+            lines.append("请在文档工作台完成产物审核；审核通过前不会提供正式发布文件。")
+    elif status in {"planned", "queued", "running", "waiting_human", "awaiting_release"}:
+        lines.append("下方状态卡会自动刷新生成进度，无需重复确认。")
+    return "\n".join(lines)
+
+
+def _looks_like_edf_scope_replacement(query: str) -> bool:
+    """Recognize an explicit instruction to use the frozen EDF's actual refdes."""
+
+    raw = str(query or "").strip().casefold()
+    if not raw or "edf" not in raw:
+        return False
+    return any(
+        marker in raw
+        for marker in ("替换", "实际", "按", "用", "根据", "位号")
+    )
+
+
+def _direct_edf_scope_answer(payload: dict[str, Any]) -> str:
+    """Report a server-side EDF scope replacement without inventing state."""
+
+    status = str(payload.get("status") or "").strip()
+    if status == "succeeded":
+        lines = ["已按冻结 EDF 的实际位号替换模板示例位号，生成已继续。"]
+        work_order_id = str(payload.get("work_order_id") or "").strip()
+        if work_order_id:
+            lines.append(f"- 工单：`{work_order_id}`")
+        lines.append("下方状态卡会自动刷新生成进度。")
+        return "\n".join(lines)
+    message = str(payload.get("message") or "按 EDF 实际位号替换失败").strip()
+    error_code = str(payload.get("error_code") or "").strip()
+    return f"未能按 EDF 实际位号替换：{message}" + (f"（{error_code}）" if error_code else "")
+
+
+def _direct_plan_confirmation_answer(payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "").strip()
+    if status == "succeeded":
+        lines = ["文档计划已确认，提交已受理。"]
+        work_order_id = str(payload.get("work_order_id") or "").strip()
+        if work_order_id:
+            lines.append(f"- 工单：`{work_order_id}`")
+        else:
+            lines.append("后台正在创建生成工单，下方状态卡会自动刷新进度。")
+        return "\n".join(lines)
+    error_code = str(payload.get("error_code") or "").strip()
+    message = str(payload.get("message") or "计划确认失败").strip()
+    return f"计划未能确认：{message}" + (f"（{error_code}）" if error_code else "")
+
+
 def _direct_generation_answer(payload: dict[str, Any]) -> str:
     """Turn the structured tool result into a short, honest chat message."""
 
@@ -353,18 +731,38 @@ def _direct_generation_answer(payload: dict[str, Any]) -> str:
         lines.append("生成完成后，结果会出现在下方的“文档产物”卡片中，可直接下载最终文件。")
         return "\n".join(lines)
     if status == "waiting_human":
+        if (
+            str(data.get("status") or "").strip() == "needs_clarification"
+            and str(data.get("question_id") or "").strip()
+        ):
+            message = str(data.get("content") or payload.get("message") or "请补充文档生成需求")
+            lines = [message]
+            options = [str(item).strip() for item in (data.get("options") or []) if str(item).strip()]
+            if options:
+                lines.append(f"可选：{'、'.join(options)}")
+            lines.append("请直接回答这个问题，系统会继续完善文档计划。")
+            return "\n".join(lines)
         message = str(payload.get("message") or "模板生成前需要人工处理待办")
         lines = [message]
         if work_order_id:
             lines.append(f"- 工单：`{work_order_id}`")
         if stage:
             lines.append(f"- 待办阶段：`{stage}`")
-        lines.append("请打开文档工作台处理待办，完成后再继续生成；当前没有伪造可下载文件。")
+        data_status = str(data.get("status") or "").strip()
+        if data_status in {"awaiting_plan_confirmation", "awaiting_confirmation"}:
+            lines.append("请在下方对话输入“确认生成”或说明需要修改的内容；确认前不会创建工单。")
+        elif any(
+            action in {"review_template_mapping", "confirm_document_template", "open_document_workbench"}
+            for action in (payload.get("next_actions") or [])
+        ):
+            lines.append("请在文档工作台查看模板映射或审核详情；如需补充资料，直接在下方对话回复。")
+        else:
+            lines.append("请直接在下方对话补充或确认资料；工作台仅用于查看详情、审核和下载。")
         return "\n".join(lines)
     message = str(payload.get("message") or "模板生成任务未提交")
     code = str(payload.get("error_code") or "").strip()
     suffix = f"（{code}）" if code else ""
-    return f"{message}{suffix}。请先按提示修正模板或权限后重试。"
+    return f"{message}{suffix}。请根据上述原因处理后重试。"
 
 
 def _build_messages(query: str, history: list[tuple[str, str]]) -> list[dict[str, str]]:
@@ -671,6 +1069,58 @@ class MultiSourceAgentRunner:
             add(raw_query)
         return candidates[:6]
 
+    def _recover_pending_document_context(
+        self,
+        *,
+        ctx: Any,
+        conversation_id: str,
+        kb_name: str | None,
+    ) -> Any | None:
+        """Rebuild a server-owned authoring context from the conversation state.
+
+        A browser refresh or a lost client pointer must not unmount the
+        document tools while an intake question is still pending: without
+        them the model can neither see nor answer the recorded clarification.
+        The context is rebuilt from the durable session, never from client
+        input, and stays scoped to the authenticated owner and knowledge base.
+        """
+
+        pipeline = self.document_authoring_pipeline
+        if pipeline is None or not conversation_id:
+            return None
+        finder = getattr(pipeline, "find_reusable_document_generation_session", None)
+        if not callable(finder):
+            return None
+        try:
+            session = finder(
+                ctx,
+                knowledge_base_name=kb_name or "",
+                template_version_id=None,
+            )
+        except Exception:  # noqa: BLE001 - recovery is additive and fail-soft
+            return None
+        if session is None:
+            return None
+        from src.document_authoring.chat_context import (
+            DocumentAuthoringContextInput,
+            build_document_context,
+        )
+
+        try:
+            return build_document_context(
+                DocumentAuthoringContextInput(
+                    knowledge_base_name=str(getattr(session, "knowledge_base_name", "") or "") or None,
+                    task_id=getattr(session, "document_task_id", None),
+                    generation_session_id=str(getattr(session, "session_id", "") or "") or None,
+                    template_version_id=str(getattr(session, "template_version_id", "") or "") or None,
+                    client_request_id=f"document-context-recovery:{conversation_id}",
+                ),
+                ctx=ctx,
+                expected_kb=kb_name,
+            )
+        except (PermissionError, ValueError):
+            return None
+
     def _prefetch_attachment_context(
         self,
         *,
@@ -918,6 +1368,20 @@ class MultiSourceAgentRunner:
         if (
             document_context is None
             and document_flow is not False
+            and ctx is not None
+            and (not is_general or has_attachments)
+        ):
+            if bool(getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False)):
+                # A pending intake session survives a lost browser context;
+                # remount it so clarification answers keep reaching the tool.
+                document_context = self._recover_pending_document_context(
+                    ctx=ctx,
+                    conversation_id=str(thread_id or getattr(ctx, "session_id", "") or ""),
+                    kb_name=None if is_general else scope_kb,
+                )
+        if (
+            document_context is None
+            and document_flow is not False
             and (document_flow is True or intent_candidate.intent in {"template_generation", "document_authoring"})
             and ctx is not None
             and (not is_general or has_attachments)
@@ -1028,7 +1492,10 @@ class MultiSourceAgentRunner:
                         "confirm_document_plan",
                     })
                 if task_id:
-                    allowed_without_template.update({"get_document_generation_status"})
+                    allowed_without_template.update({
+                        "get_document_generation_status",
+                        "resolve_icd_scope_exception",
+                    })
                 document_tools = [
                     tool for tool in document_tools
                     if str(getattr(tool, "name", "") or "") in allowed_without_template
@@ -1193,6 +1660,480 @@ class MultiSourceAgentRunner:
                     },
                 }
             )
+
+        # Gate 1 confirmation is a control command, not a knowledge question.
+        # Resolve it against the newest task in this authenticated conversation
+        # and keep the plan hashes server-side.  This prevents a bare “确认”
+        # from starting a second authoring session or producing model-written
+        # pseudo documents after a browser refresh.
+        direct_control_answer: str | None = None
+        if (
+            authoring_capable
+            and ctx is not None
+            and str(thread_id or "").strip()
+            and is_explicit_document_plan_confirmation_query(query)
+            and callable(
+                getattr(
+                    self.document_authoring_pipeline,
+                    "get_current_chat_document_task_projection",
+                    None,
+                )
+            )
+        ):
+            try:
+                latest = self.document_authoring_pipeline.get_current_chat_document_task_projection(
+                    ctx,
+                    knowledge_base_name=scope_kb,
+                    conversation_id=str(thread_id),
+                )
+            except (PermissionError, KeyError, ValueError):
+                latest = None
+            latest = latest if isinstance(latest, dict) else None
+            latest_status = str((latest or {}).get("status") or "").strip()
+            if latest_status == "awaiting_plan_confirmation":
+                planning_state = (latest or {}).get("planning_state")
+                planning_state = planning_state if isinstance(planning_state, dict) else {}
+                session_id = str((latest or {}).get("generation_session_id") or "").strip()
+                spec_hash = str(planning_state.get("output_spec_hash") or "").strip()
+                plan_hash = str(planning_state.get("plan_hash") or "").strip()
+                confirm_tool = next(
+                    (
+                        tool for tool in document_tools
+                        if str(getattr(tool, "name", "") or "") == "confirm_document_plan"
+                    ),
+                    None,
+                )
+                if confirm_tool is None or not session_id or not spec_hash or not plan_hash:
+                    direct_control_answer = "当前计划缺少可验证的确认引用，请刷新计划后重新确认。"
+                else:
+                    emit_event({
+                        "type": "stage",
+                        "payload": {
+                            "key": "document_plan_confirmation",
+                            "label": "确认文档计划",
+                            "status": "running",
+                        },
+                    })
+                    try:
+                        raw_result = confirm_tool.invoke({
+                            "session_id": session_id,
+                            "expected_output_spec_hash": spec_hash,
+                            "expected_plan_hash": plan_hash,
+                            "client_request_id": (
+                                f"chat-plan-confirm:{str(thread_id).strip()}:{plan_hash}"
+                            ),
+                        })
+                        if isinstance(raw_result, str):
+                            confirmation_payload = json.loads(raw_result)
+                        elif isinstance(raw_result, dict):
+                            confirmation_payload = raw_result
+                        else:
+                            confirmation_payload = {}
+                    except Exception as exc:
+                        confirmation_payload = {
+                            "status": "rejected",
+                            "error_code": "plan_confirmation_failed",
+                            "message": str(exc)[:300] or "计划确认失败",
+                        }
+                    direct_control_answer = _direct_plan_confirmation_answer(confirmation_payload)
+                    emit_event({
+                        "type": "stage",
+                        "payload": {
+                            "key": "document_plan_confirmation",
+                            "label": "确认文档计划",
+                            "status": (
+                                "done"
+                                if confirmation_payload.get("status") == "succeeded"
+                                else "error"
+                            ),
+                            "detail": str(confirmation_payload.get("message") or ""),
+                        },
+                    })
+            elif latest_status in {
+                "planned", "queued", "running", "waiting_human", "awaiting_release",
+                "needs_review", "completed", "complete", "failed", "cancelled",
+            }:
+                direct_control_answer = _confirmed_document_task_answer(latest or {})
+
+        # A blocking ICD scope gate whose refdes came from the template's
+        # example data can be replaced with the frozen EDF's actual connectors
+        # on an explicit user instruction.  Keep this deterministic: a model
+        # turn cannot be trusted to notice the gate before retrieval hangs.
+        direct_edf_scope_answer: str | None = None
+        fill_document_command = is_direct_document_generation_query(query)
+        scope_confirm_command = is_explicit_document_plan_confirmation_query(query)
+        if (
+            direct_control_answer is None
+            and self.document_authoring_pipeline is not None
+            and ctx is not None
+            and str(thread_id or "").strip()
+            and bool(getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False))
+            and (
+                _looks_like_edf_scope_replacement(query)
+                or fill_document_command
+                or scope_confirm_command
+            )
+            and callable(getattr(
+                self.document_authoring_pipeline,
+                "get_current_chat_document_task_projection",
+                None,
+            ))
+        ):
+            try:
+                edf_projection = (
+                    self.document_authoring_pipeline.get_current_chat_document_task_projection(
+                        ctx,
+                        knowledge_base_name=scope_kb or None,
+                        conversation_id=str(thread_id),
+                    )
+                )
+            except (PermissionError, KeyError, ValueError):
+                edf_projection = None
+            edf_pending = (
+                edf_projection.get("pending_review")
+                if isinstance(edf_projection, dict)
+                else None
+            )
+            edf_scope = (
+                edf_pending.get("scope_review")
+                if isinstance(edf_pending, dict)
+                else None
+            )
+            edf_order_id = (
+                str(edf_projection.get("work_order_id") or "").strip()
+                if isinstance(edf_projection, dict)
+                else ""
+            )
+            edf_tool = next(
+                (
+                    tool for tool in document_tools
+                    if str(getattr(tool, "name", "") or "") == "resolve_icd_scope_exception"
+                ),
+                None,
+            )
+            suggested_present = any(
+                item.get("suggested_refdes")
+                for item in (
+                    (edf_scope or {}).get("exceptions") or []
+                    if isinstance(edf_scope, dict) else []
+                )
+                if isinstance(item, dict)
+            )
+            if (
+                isinstance(edf_scope, dict)
+                and bool(edf_scope.get("blocking"))
+                and edf_order_id
+                and edf_tool is not None
+                and (
+                    _looks_like_edf_scope_replacement(query)
+                    or (
+                        suggested_present
+                        and (fill_document_command or scope_confirm_command)
+                    )
+                )
+            ):
+                emit_event({
+                    "type": "stage",
+                    "payload": {
+                        "key": "document_edf_scope_replacement",
+                        "label": "按 EDF 实际位号替换",
+                        "status": "running",
+                    },
+                })
+                try:
+                    raw_edf = edf_tool.invoke({
+                        "action": "use_edf_connectors",
+                        "comment": query,
+                        "work_order_id": edf_order_id,
+                    })
+                    edf_payload = _coerce_tool_payload(raw_edf)
+                except Exception as exc:  # noqa: BLE001 - control path must not kill the turn
+                    edf_payload = {
+                        "status": "unavailable",
+                        "message": str(exc)[:300] or "按 EDF 实际位号替换失败",
+                    }
+                emit_event({
+                    "type": "stage",
+                    "payload": {
+                        "key": "document_edf_scope_replacement",
+                        "label": "按 EDF 实际位号替换",
+                        "status": (
+                            "done"
+                            if str(edf_payload.get("status") or "") == "succeeded"
+                            else "error"
+                        ),
+                        "detail": str(edf_payload.get("message") or ""),
+                    },
+                })
+                direct_edf_scope_answer = _direct_edf_scope_answer(edf_payload)
+
+        if direct_edf_scope_answer is not None:
+            direct_control_answer = direct_edf_scope_answer
+
+        # Once the conversation has a confirmed document task, a later
+        # "fill/generate/export" command must report that task instead of
+        # forking a new plan proposal or letting the model author a pseudo
+        # document in chat.  Unconfirmed states (needs_clarification,
+        # awaiting_plan_confirmation) keep their dedicated control branches.
+        if (
+            direct_control_answer is None
+            and (fill_document_command or scope_confirm_command)
+            and self.document_authoring_pipeline is not None
+            and ctx is not None
+            and str(thread_id or "").strip()
+            and bool(getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False))
+            and callable(getattr(
+                self.document_authoring_pipeline,
+                "get_current_chat_document_task_projection",
+                None,
+            ))
+        ):
+            try:
+                existing_projection = (
+                    self.document_authoring_pipeline.get_current_chat_document_task_projection(
+                        ctx,
+                        knowledge_base_name=scope_kb or None,
+                        conversation_id=str(thread_id),
+                    )
+                )
+            except (PermissionError, KeyError, ValueError):
+                existing_projection = None
+            existing_status = (
+                str(existing_projection.get("status") or "").strip()
+                if isinstance(existing_projection, dict)
+                else ""
+            )
+            if existing_status in {
+                "planned", "queued", "running", "waiting_human", "awaiting_release",
+                "needs_review", "completed", "complete", "failed", "cancelled", "blocked",
+            }:
+                direct_control_answer = _confirmed_document_task_answer(existing_projection)
+
+        # A pending requirement clarification is a control question, not a
+        # knowledge question.  When the reply is unambiguously the answer
+        # (canonical option or an explicit knowledge-base delegation), submit
+        # it at the server boundary.  This keeps the answer from being lost in
+        # a retrieval spiral and works even when the browser lost the mounted
+        # document context.
+        direct_clarification_answer: str | None = None
+        if (
+            direct_control_answer is None
+            and self.document_authoring_pipeline is not None
+            and ctx is not None
+            and str(thread_id or "").strip()
+            and bool(getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False))
+        ):
+            try:
+                clarification_projection = (
+                    self.document_authoring_pipeline.get_current_chat_document_task_projection(
+                        ctx,
+                        knowledge_base_name=scope_kb or None,
+                        conversation_id=str(thread_id),
+                    )
+                )
+            except (PermissionError, KeyError, ValueError):
+                clarification_projection = None
+            clarification_state = (
+                clarification_projection.get("clarification_state")
+                if isinstance(clarification_projection, dict)
+                else None
+            )
+            pending_question = (
+                clarification_state.get("pending_question")
+                if isinstance(clarification_state, dict)
+                else None
+            )
+            session_id = (
+                str(clarification_state.get("session_id") or "").strip()
+                if isinstance(clarification_state, dict)
+                else ""
+            )
+            matched_answer = match_pending_clarification_answer(query, pending_question)
+            if (
+                matched_answer is not None
+                and isinstance(pending_question, dict)
+                and session_id
+            ):
+                question_id = str(pending_question.get("question_id") or "")
+                emit_event({
+                    "type": "stage",
+                    "payload": {
+                        "key": "document_clarification_answer",
+                        "label": "提交澄清回答",
+                        "status": "running",
+                    },
+                })
+                try:
+                    ctx.metadata.setdefault("document_template_kb_name", scope_kb or None)
+                    answered = self.document_authoring_pipeline.answer_document_generation_session(
+                        ctx,
+                        session_id,
+                        question_id=question_id,
+                        answer=matched_answer,
+                        client_request_id=(
+                            f"chat-clarification:{str(thread_id).strip()}:{question_id}"
+                        ),
+                    )
+                    next_question: dict[str, Any] | None = None
+                    next_actions: list[str] = []
+                    try:
+                        after = (
+                            self.document_authoring_pipeline.get_current_chat_document_task_projection(
+                                ctx,
+                                knowledge_base_name=scope_kb or None,
+                                conversation_id=str(thread_id),
+                            )
+                        )
+                        after_state = (
+                            after.get("clarification_state")
+                            if isinstance(after, dict)
+                            else None
+                        )
+                        candidate = (
+                            after_state.get("pending_question")
+                            if isinstance(after_state, dict)
+                            else None
+                        )
+                        next_question = candidate if isinstance(candidate, dict) else None
+                        if isinstance(after, dict):
+                            for item in (after.get("next_actions") or []):
+                                text = str(item).strip()
+                                if text:
+                                    next_actions.append(text)
+                    except Exception:  # noqa: BLE001 - post-answer projection is optional enrichment
+                        next_question = None
+                        next_actions = []
+                    # The intake is complete and no further question is pending:
+                    # continue deterministically into the plan proposal instead
+                    # of leaving the user on an idle status card.
+                    proposal_payload: dict[str, Any] | None = None
+                    if next_question is None and "propose_document_plan" in next_actions:
+                        propose_tool = next(
+                            (
+                                tool for tool in document_tools
+                                if str(getattr(tool, "name", "") or "") == "propose_document_plan"
+                            ),
+                            None,
+                        )
+                        if propose_tool is not None:
+                            emit_event({
+                                "type": "stage",
+                                "payload": {
+                                    "key": "document_plan_proposal",
+                                    "label": "生成计划提案",
+                                    "status": "running",
+                                },
+                            })
+                            try:
+                                proposal_payload = _coerce_tool_payload(
+                                    propose_tool.invoke({"session_id": session_id})
+                                )
+                            except Exception as exc:  # noqa: BLE001 - continuation is additive
+                                proposal_payload = {
+                                    "status": "unavailable",
+                                    "message": str(exc)[:300] or "计划提案暂时无法生成",
+                                }
+                            emit_event({
+                                "type": "stage",
+                                "payload": {
+                                    "key": "document_plan_proposal",
+                                    "label": "生成计划提案",
+                                    "status": (
+                                        "done"
+                                        if str(proposal_payload.get("status") or "") == "succeeded"
+                                        else "error"
+                                    ),
+                                    "detail": str(proposal_payload.get("message") or ""),
+                                },
+                            })
+                    clarification_payload: dict[str, Any] = {
+                        "status": "succeeded",
+                        "generation_session_id": getattr(answered, "session_id", session_id),
+                        "next_actions": next_actions,
+                        "data": {
+                            "status": getattr(answered, "status", None),
+                            "pending_question": next_question,
+                        },
+                    }
+                    if proposal_payload is not None:
+                        clarification_payload["data"]["proposal"] = proposal_payload
+                except PermissionError as exc:
+                    clarification_payload = {
+                        "status": "rejected",
+                        "error_code": "clarification_rejected",
+                        "message": str(exc) or "澄清回答没有权限提交",
+                    }
+                except (ValueError, KeyError) as exc:
+                    clarification_payload = {
+                        "status": "rejected",
+                        "error_code": "clarification_rejected",
+                        "message": str(exc) or "澄清回答未被接受",
+                    }
+                except Exception as exc:  # noqa: BLE001 - control path must not kill the turn
+                    clarification_payload = {
+                        "status": "rejected",
+                        "error_code": "clarification_unavailable",
+                        "message": str(exc)[:300] or "澄清服务暂时不可用",
+                    }
+                direct_clarification_answer = _direct_clarification_answer(
+                    clarification_payload, pending_question, matched_answer,
+                )
+                emit_event({
+                    "type": "stage",
+                    "payload": {
+                        "key": "document_clarification_answer",
+                        "label": "提交澄清回答",
+                        "status": (
+                            "done" if clarification_payload.get("status") == "succeeded" else "error"
+                        ),
+                        "detail": str(clarification_payload.get("message") or ""),
+                    },
+                })
+
+        if direct_clarification_answer is not None:
+            direct_control_answer = direct_clarification_answer
+            direct_answer_grounding = "document_clarification"
+        else:
+            direct_answer_grounding = "document_plan_control"
+
+        if direct_control_answer is not None:
+            record.answer = direct_control_answer
+            _current_run().answer = direct_control_answer
+            record.footer = ""
+            record.token_usage_summary = TokenUsageSummary(
+                provider="document_authoring",
+                model="server-controlled",
+            )
+            record.retrieval_summary = {
+                "status": "success",
+                "error_stage": "",
+                "error_message": "",
+                "rewritten_queries": [],
+                "retriever_type": "document_authoring",
+                "final_top_k": 0,
+                "evidence": [],
+                "memory_context": [],
+                "missing": [],
+                "retrieval_rounds": 0,
+                "sufficiency_status": "not_applicable",
+                "trace": [],
+                "tool_diagnostics": [],
+                "claim_coverage": [],
+                "retrieval_ledger": [],
+                "evidence_quality": [],
+                "verification": {
+                    "grounded": False,
+                    "grounding_method": direct_answer_grounding,
+                    "unsupported_claims": [],
+                    "weak_claims": [],
+                    "conflicts": [],
+                    "citation_coverage": 0.0,
+                },
+                "intent_plan": intent_plan.to_dict(),
+                "conversation_plan": conversation_plan.to_dict(),
+            }
+            yield direct_control_answer
+            return
 
         # A generation request is a command, not a request for prose.  Do not
         # rely on the model to notice and call the one-shot tool: when the

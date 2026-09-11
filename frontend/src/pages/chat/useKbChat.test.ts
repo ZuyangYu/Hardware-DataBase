@@ -2,10 +2,71 @@ import { describe, expect, it } from 'vitest';
 
 import { ApiError } from '@/api/client';
 import {
+  documentTaskPollDelay,
   isPlanConfirmationStale,
+  latestDocumentChatTasks,
   mergeDocumentCardsFromSseEvent,
   planConfirmationStaleKey,
 } from './useKbChat';
+
+describe('document task polling lifecycle', () => {
+  it('keeps polling an empty active session so a task created after confirmation is discovered', () => {
+    expect(documentTaskPollDelay([], true)).toBe(3000);
+    expect(documentTaskPollDelay([], false)).toBeNull();
+  });
+
+  it('stops only after every discovered task reaches a terminal user-visible phase', () => {
+    const task = (phase: string) => ({
+      session_id: 85,
+      task_id: `task-${phase}`,
+      work_order_id: null,
+      kb_name: 'ADAS',
+      job_status: phase,
+      created_at: '',
+      updated_at: '',
+      status: {
+        work_order_id: null,
+        status: phase,
+        phase,
+        scope_type: 'knowledge_base',
+        unit_statuses: {},
+        artifacts: [],
+      },
+    });
+
+    expect(documentTaskPollDelay([task('running')])).toBe(3000);
+    expect(documentTaskPollDelay([task('needs_review')])).toBeNull();
+  });
+
+  it('keeps the status tray on the newest task instead of an older pending confirmation', () => {
+    const task = (taskId: string, phase: string, updatedAt: string) => ({
+      session_id: 85,
+      task_id: taskId,
+      work_order_id: null,
+      kb_name: 'ADAS',
+      job_status: phase,
+      created_at: updatedAt,
+      updated_at: updatedAt,
+      status: {
+        work_order_id: null,
+        status: phase,
+        phase,
+        scope_type: 'knowledge_base',
+        unit_statuses: {},
+        artifacts: [],
+      },
+    });
+
+    const selected = latestDocumentChatTasks([
+      task('task-older', 'awaiting_plan_confirmation', '2026-09-09T09:38:16Z'),
+      task('task-newer', 'needs_review', '2026-09-09T09:40:35Z'),
+    ]);
+
+    expect(selected).toHaveLength(1);
+    expect(selected[0].task_id).toBe('task-newer');
+    expect(selected[0].status.phase).toBe('needs_review');
+  });
+});
 
 describe('useKbChat document clarification SSE projection', () => {
   it('uses the same task card for question, ready, and duplicate replay events', () => {

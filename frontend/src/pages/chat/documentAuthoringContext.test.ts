@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { DocumentContextV2 } from '../../api/types';
 
 import {
   buildDocumentContext,
@@ -142,5 +143,51 @@ describe('document authoring chat context', () => {
     });
     expect(request.document_context).not.toHaveProperty('tenant_id');
     expect(request.document_context).not.toHaveProperty('owner_user_id');
+  });
+
+  it('round-trips all client-owned v2 references for a follow-up turn', () => {
+    const v2Context = {
+      version: 'v2',
+      knowledge_base_name: 'shared',
+      attachment_ids: ['attachment-1'],
+      source_scope: 'attachment_and_knowledge_base',
+      task_id: 'task-1',
+      generation_session_id: 'generation-1',
+      output_spec_id: 'output-spec-1',
+      output_spec_version: 2,
+      template_version_id: 'template-v2',
+      analysis_id: 'analysis-2',
+      expiry: '2026-09-01T00:30:00.000Z',
+      client_request_id: 'context-key-2',
+      tenant_id: 'tenant-a',
+      owner_user_id: 'user-a',
+      created_at: '2026-08-31T00:00:00.000Z',
+      permission_use: 'read',
+    } satisfies DocumentContextV2 & {
+      tenant_id: string;
+      owner_user_id: string;
+      created_at: string;
+      permission_use: string;
+    };
+
+    const request = buildTurnRequest('确认', 'turn-key-8', 'deep', v2Context, true);
+    expect(request.document_context).toEqual({
+      version: 'v2',
+      knowledge_base_name: 'shared',
+      attachment_ids: ['attachment-1'],
+      source_scope: 'attachment_and_knowledge_base',
+      task_id: 'task-1',
+      generation_session_id: 'generation-1',
+      output_spec_id: 'output-spec-1',
+      output_spec_version: 2,
+      template_version_id: 'template-v2',
+      analysis_id: 'analysis-2',
+      expiry: '2026-09-01T00:30:00.000Z',
+      client_request_id: 'context-key-2',
+    });
+    expect(request.document_context).not.toHaveProperty('tenant_id');
+    expect(request.document_context).not.toHaveProperty('owner_user_id');
+    expect(request.document_context).not.toHaveProperty('created_at');
+    expect(request.document_context).not.toHaveProperty('permission_use');
   });
 });

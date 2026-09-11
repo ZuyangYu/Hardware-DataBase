@@ -10,6 +10,7 @@ and its durable associations.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import uuid
@@ -172,6 +173,32 @@ class DocumentTaskStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_document_task_events_task
                     ON document_task_events(task_id, created_at, event_id);
+                CREATE TABLE IF NOT EXISTS conversation_document_states (
+                    tenant_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    current_task_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, user_id, conversation_id),
+                    FOREIGN KEY(current_task_id) REFERENCES document_tasks(task_id)
+                );
+                CREATE TABLE IF NOT EXISTS document_task_stream_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    projection_hash TEXT,
+                    created_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES document_tasks(task_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_document_task_stream_scope
+                    ON document_task_stream_events(
+                        tenant_id, user_id, conversation_id, seq
+                    );
                 """
             )
             for column, ddl in (
@@ -181,6 +208,12 @@ class DocumentTaskStore:
                 ("document_plan_version", "INTEGER"),
             ):
                 self._ensure_column(conn, "document_tasks", column, ddl)
+            self._ensure_column(
+                conn,
+                "document_task_stream_events",
+                "projection_hash",
+                "TEXT",
+            )
 
     @staticmethod
     def _normalize(value: Any) -> str | None:
@@ -206,6 +239,59 @@ class DocumentTaskStore:
         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    @staticmethod
+    def _append_stream_event(
+        conn: sqlite3.Connection,
+        task: DocumentTask,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if task.origin != "chat" or not task.conversation_id:
+            return
+        conn.execute(
+            """INSERT INTO document_task_stream_events (
+                   tenant_id, user_id, conversation_id, task_id,
+                   event_type, created_at, payload_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                task.tenant_id,
+                task.user_id,
+                task.conversation_id,
+                task.task_id,
+                str(event_type),
+                _iso(),
+                _json(payload),
+            ),
+        )
+
+    @staticmethod
+    def _activate_chat_task(conn: sqlite3.Connection, task: DocumentTask) -> None:
+        if task.origin != "chat" or not task.conversation_id:
+            return
+        conn.execute(
+            """INSERT INTO conversation_document_states (
+                   tenant_id, user_id, conversation_id, current_task_id,
+                   revision, updated_at
+               ) VALUES (?, ?, ?, ?, 1, ?)
+               ON CONFLICT(tenant_id, user_id, conversation_id) DO UPDATE SET
+                   current_task_id = excluded.current_task_id,
+                   revision = conversation_document_states.revision + 1,
+                   updated_at = excluded.updated_at""",
+            (
+                task.tenant_id,
+                task.user_id,
+                task.conversation_id,
+                task.task_id,
+                _iso(),
+            ),
+        )
+        DocumentTaskStore._append_stream_event(
+            conn,
+            task,
+            "task_activated",
+            {"task_id": task.task_id},
+        )
 
     def create_task(
         self,
@@ -285,6 +371,7 @@ class DocumentTaskStore:
                         task.updated_at.isoformat(), _json(task),
                     ),
                 )
+                self._activate_chat_task(conn, task)
                 conn.execute("COMMIT")
                 return task
             except Exception:
@@ -307,6 +394,200 @@ class DocumentTaskStore:
                 "SELECT * FROM document_tasks WHERE task_id = ?", (str(task_id),)
             ).fetchone()
         return _row_to_task(row) if row else None
+
+    def get_conversation_document_state(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str | int,
+        conversation_id: str | int,
+    ) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT current_task_id, revision
+                     FROM conversation_document_states
+                    WHERE tenant_id = ? AND user_id = ? AND conversation_id = ?""",
+                (str(tenant_id), str(user_id), str(conversation_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "current_task_id": str(row["current_task_id"]),
+            "revision": int(row["revision"]),
+        }
+
+    def get_current_chat_task(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str | int,
+        conversation_id: str | int,
+        knowledge_base_name: str | None = None,
+    ) -> DocumentTask | None:
+        tenant = str(tenant_id)
+        owner = str(user_id)
+        conversation = str(conversation_id)
+        kb_name = self._normalize(knowledge_base_name)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    """SELECT t.*
+                         FROM conversation_document_states s
+                         JOIN document_tasks t ON t.task_id = s.current_task_id
+                        WHERE s.tenant_id = ? AND s.user_id = ?
+                          AND s.conversation_id = ?""",
+                    (tenant, owner, conversation),
+                ).fetchone()
+                if row is not None:
+                    conn.execute("COMMIT")
+                    task = _row_to_task(row)
+                    if kb_name and task.knowledge_base_name != kb_name:
+                        return None
+                    return task
+
+                params = [tenant, owner, conversation]
+                kb_clause = ""
+                if kb_name:
+                    kb_clause = " AND knowledge_base_name = ?"
+                    params.append(kb_name)
+                row = conn.execute(
+                    """SELECT * FROM document_tasks
+                        WHERE tenant_id = ? AND user_id = ? AND conversation_id = ?
+                          AND origin = 'chat' AND status != 'cancelled'"""
+                    + kb_clause
+                    + " ORDER BY updated_at DESC, task_id DESC LIMIT 1",
+                    params,
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return None
+                task = _row_to_task(row)
+                conn.execute(
+                    """INSERT INTO conversation_document_states (
+                           tenant_id, user_id, conversation_id, current_task_id,
+                           revision, updated_at
+                       ) VALUES (?, ?, ?, ?, 1, ?)
+                       ON CONFLICT(tenant_id, user_id, conversation_id) DO UPDATE SET
+                           current_task_id = excluded.current_task_id,
+                           revision = conversation_document_states.revision + 1,
+                           updated_at = excluded.updated_at""",
+                    (tenant, owner, conversation, task.task_id, _iso()),
+                )
+                self._append_stream_event(
+                    conn,
+                    task,
+                    "task_pointer_backfilled",
+                    {"task_id": task.task_id},
+                )
+                conn.execute("COMMIT")
+                return task
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def list_conversation_stream_events(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str | int,
+        conversation_id: str | int,
+        after_seq: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT seq, task_id, event_type, created_at, payload_json
+                     FROM document_task_stream_events
+                    WHERE tenant_id = ? AND user_id = ? AND conversation_id = ?
+                      AND seq > ?
+                    ORDER BY seq ASC LIMIT ?""",
+                (
+                    str(tenant_id),
+                    str(user_id),
+                    str(conversation_id),
+                    max(0, int(after_seq)),
+                    max(1, min(int(limit), 1000)),
+                ),
+            ).fetchall()
+        return [
+            {
+                "seq": int(row["seq"]),
+                "task_id": str(row["task_id"]),
+                "event_type": str(row["event_type"]),
+                "created_at": str(row["created_at"]),
+                "payload": _load(row["payload_json"], {}),
+            }
+            for row in rows
+        ]
+
+    def append_projection_snapshot(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str | int,
+        conversation_id: str | int,
+        task_id: str,
+        projection: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Append a changed full projection for replayable progress streaming."""
+        tenant = str(tenant_id)
+        owner = str(user_id)
+        conversation = str(conversation_id)
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            raise ValueError("task_id is required")
+        payload = {"projection": dict(projection)}
+        payload_json = _json(payload)
+        projection_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        created_at = _iso()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = conn.execute(
+                    """SELECT current_task_id FROM conversation_document_states
+                        WHERE tenant_id = ? AND user_id = ? AND conversation_id = ?""",
+                    (tenant, owner, conversation),
+                ).fetchone()
+                if current is None or str(current["current_task_id"]) != normalized_task_id:
+                    raise ValueError("task is not the current conversation document task")
+                previous = conn.execute(
+                    """SELECT projection_hash FROM document_task_stream_events
+                        WHERE tenant_id = ? AND user_id = ? AND conversation_id = ?
+                          AND task_id = ? AND event_type = 'projection'
+                        ORDER BY seq DESC LIMIT 1""",
+                    (tenant, owner, conversation, normalized_task_id),
+                ).fetchone()
+                if previous is not None and previous["projection_hash"] == projection_hash:
+                    conn.execute("COMMIT")
+                    return None
+                cursor = conn.execute(
+                    """INSERT INTO document_task_stream_events (
+                           tenant_id, user_id, conversation_id, task_id,
+                           event_type, projection_hash, created_at, payload_json
+                       ) VALUES (?, ?, ?, ?, 'projection', ?, ?, ?)""",
+                    (
+                        tenant,
+                        owner,
+                        conversation,
+                        normalized_task_id,
+                        projection_hash,
+                        created_at,
+                        payload_json,
+                    ),
+                )
+                event = {
+                    "seq": int(cursor.lastrowid),
+                    "task_id": normalized_task_id,
+                    "event_type": "projection",
+                    "created_at": created_at,
+                    "payload": payload,
+                }
+                conn.execute("COMMIT")
+                return event
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def get_by_idempotency(
         self, tenant_id: str, user_id: str | int, idempotency_key: str,
@@ -403,6 +684,12 @@ class DocumentTaskStore:
                         _json({"work_order_id": work_order_id}),
                     ),
                 )
+                self._append_stream_event(
+                    conn,
+                    updated,
+                    "work_order_bound",
+                    {"work_order_id": work_order_id},
+                )
                 conn.execute("COMMIT")
                 return updated
             except Exception:
@@ -469,6 +756,15 @@ class DocumentTaskStore:
                         }),
                     ),
                 )
+                self._append_stream_event(
+                    conn,
+                    updated,
+                    "work_order_restarted",
+                    {
+                        "previous_work_order_id": expected_work_order_id,
+                        "work_order_id": work_order_id,
+                    },
+                )
                 conn.execute("COMMIT")
                 return updated
             except Exception:
@@ -510,6 +806,7 @@ class DocumentTaskStore:
                         "run_bound", f"run:{run_id}", _iso(), _json({"run_id": run_id}),
                     ),
                 )
+                self._append_stream_event(conn, updated, "run_bound", {"run_id": run_id})
                 conn.execute("COMMIT")
                 return updated
             except Exception:
@@ -553,6 +850,12 @@ class DocumentTaskStore:
                         _json({"artifact_id": artifact_id}),
                     ),
                 )
+                self._append_stream_event(
+                    conn,
+                    updated,
+                    "artifact_bound",
+                    {"artifact_id": artifact_id},
+                )
                 conn.execute("COMMIT")
                 return updated
             except Exception:
@@ -590,6 +893,12 @@ class DocumentTaskStore:
                         updated.updated_at.isoformat(),
                         _json({"from": task.status, "to": updated.status}),
                     ),
+                )
+                self._append_stream_event(
+                    conn,
+                    updated,
+                    "status_changed",
+                    {"from": task.status, "to": updated.status},
                 )
                 conn.execute("COMMIT")
                 return updated
@@ -666,6 +975,17 @@ class DocumentTaskStore:
                         }),
                     ),
                 )
+                self._append_stream_event(
+                    conn,
+                    updated,
+                    "plan_bound",
+                    {
+                        "output_spec_id": spec_id,
+                        "output_spec_version": output_spec_version,
+                        "document_plan_id": plan_id,
+                        "document_plan_version": document_plan_version,
+                    },
+                )
                 conn.execute("COMMIT")
                 return updated
             except Exception:
@@ -711,6 +1031,7 @@ class DocumentTaskStore:
                         "plan_cleared", f"plan-clear:{uuid.uuid4().hex}", _iso(), _json({}),
                     ),
                 )
+                self._append_stream_event(conn, updated, "plan_cleared", {})
                 conn.execute("COMMIT")
                 return updated
             except Exception:

@@ -9,6 +9,8 @@ from src.document_authoring.template_analysis import (
     TemplateAnalysisSuggestion,
     TemplateAnalysisUnit,
 )
+from src.document_authoring.template_analyzers import analyze_template
+from tests.test_template_analyzers import _xlsx_with_pin_function_table
 
 
 def _analysis(
@@ -142,6 +144,47 @@ def test_repeating_table_requires_explicit_schema():
     decision = decide_template_activation(_analysis(suggestion=suggestion))
 
     assert "repeating_table_requires_schema" in decision.reason_codes
+
+
+def test_broad_repeating_table_mapping_is_repaired_before_activation():
+    analysis = analyze_template(_xlsx_with_pin_function_table(), "xlsx")
+    body_ids = [
+        f"sheet:Pinout!{column}{row}"
+        for row in (2, 3)
+        for column in "ABCD"
+    ]
+    analysis.suggestions = [TemplateAnalysisSuggestion(
+        semantic_unit_id="pinout",
+        label="Pinout table",
+        target_unit_ids=[unit.unit_id for unit in analysis.units],
+        confidence=0.99,
+        value_shape="repeating_table",
+        overwrite_basis="sample_value",
+    )]
+    analysis.approved_overwrite_unit_ids = [
+        unit_id for unit_id in body_ids
+        if unit_id.endswith(("A2", "B2", "A3", "B3"))
+    ]
+
+    decision = decide_template_activation(analysis)
+
+    assert "repeating_table_requires_schema" not in decision.reason_codes
+    assert decision.status == "auto_accepted"
+    assert analysis.suggestions[0].target_unit_ids == body_ids
+
+
+def test_human_confirmed_repeating_table_targets_are_not_rewritten():
+    analysis = analyze_template(_xlsx_with_pin_function_table(), "xlsx")
+    original_ids = [unit.unit_id for unit in analysis.units]
+    analysis.suggestions = [TemplateAnalysisSuggestion(
+        semantic_unit_id="human-table", label="Human table", target_unit_ids=original_ids,
+        confidence=0.99, value_shape="repeating_table",
+    )]
+    analysis.human_confirmed_target_unit_ids = original_ids
+
+    decide_template_activation(analysis)
+
+    assert analysis.suggestions[0].target_unit_ids == original_ids
 
 
 def test_low_confidence_requires_human_review():

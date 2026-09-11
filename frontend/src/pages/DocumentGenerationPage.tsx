@@ -701,20 +701,25 @@ export function StatusView({
   const [approve, setApprove] = useState<Record<string, string>>({});
   const [conversionBusy, setConversionBusy] = useState<string | null>(null);
   const [taskProjection, setTaskProjection] = useState<DocumentTaskProjection | null>(null);
+  const [taskProjectionFailed, setTaskProjectionFailed] = useState(false);
 
   const loadTaskProjection = useCallback(async () => {
     const taskId = status.task_id?.trim() ?? '';
     if (!taskId || !kb) {
       setTaskProjection(null);
+      setTaskProjectionFailed(false);
       return;
     }
     try {
       const projection = await fetchDocumentTaskProjection(kb, taskId);
       setTaskProjection(projection);
+      setTaskProjectionFailed(false);
     } catch {
       // The task projection is additive; the legacy WorkOrder status remains
-      // usable when an upgraded API is temporarily unavailable.
+      // usable when an upgraded API is temporarily unavailable, but the
+      // resume affordance must not be inferred from a stale page parameter.
       setTaskProjection(null);
+      setTaskProjectionFailed(true);
     }
   }, [kb, status.task_id]);
 
@@ -725,7 +730,12 @@ export function StatusView({
   const hasTaskResumeAction = Boolean(
     onTaskResume
     && status.task_id
-    && (taskProjection?.next_actions.includes('resume_document_task') || status.status === 'planned'),
+    && taskProjection
+    && !taskProjection.pending_review
+    && taskProjection.next_actions.includes('resume_document_task'),
+  );
+  const showProjectionUnavailable = Boolean(
+    status.task_id && taskProjectionFailed && status.status === 'planned',
   );
 
   async function loadPreview(artifact_id: string) {
@@ -786,6 +796,11 @@ export function StatusView({
             {actionBusy ? '提交中…' : '继续生成'}
           </Button>
         </div>
+      )}
+      {showProjectionUnavailable && (
+        <p className="rounded-lg border bg-muted/30 p-3 text-sm text-muted-foreground">
+          任务状态投影暂时不可用，无法确认是否可以直接继续；请刷新页面后重试。
+        </p>
       )}
       {taskProjection && (
         <DocumentRevisionStatusPanel revisions={taskProjection.revisions ?? []} />
@@ -911,26 +926,58 @@ function DocumentRevisionStatusPanel({ revisions }: { revisions: ArtifactRevisio
   );
 }
 
-function ScopeReviewView({ review, kb, workOrderId }: { review: IcdScopeReview; kb: string; workOrderId: string }) {
+const ICD_BLOCKING_SCOPE_KINDS = new Set(['connector_scope_unknown', 'connector_mapping_missing']);
+
+export function ScopeReviewView({ review, kb, workOrderId }: { review: IcdScopeReview; kb: string; workOrderId: string }) {
   const [comment, setComment] = useState('');
+  const [busy, setBusy] = useState(false);
   const exceptions = Array.isArray(review?.exceptions) ? review.exceptions : [];
   if (exceptions.length === 0) return null;
+  const frozen = review?.status === 'frozen';
+  const blocking = exceptions.some((ex) => ICD_BLOCKING_SCOPE_KINDS.has(String(ex.kind ?? '')));
+  const canResolve = !frozen && !blocking;
+
+  function submitResolution() {
+    setBusy(true);
+    const resolutions = exceptions.map((ex) => ({ exception_id: ex.exception_id, action: 'include' }));
+    void api.post(
+      `/api/v1/document-generation/work-orders/${workOrderId}/icd-scope-resolution?kb=${encodeURIComponent(kb)}`,
+      { resolutions, comment },
+    ).then(() => notify.success('已应用范围处理并继续生成'))
+      .catch((e) => notify.error(e instanceof Error ? e.message : '应用范围处理失败'))
+      .finally(() => setBusy(false));
+  }
+
   return (
     <div className="space-y-2 rounded-md border p-3 text-sm">
       <p className="font-semibold">ICD 范围异常待办</p>
       {exceptions.map((ex, i) => (
-        <div key={ex.exception_id ?? i}>发现：{ex.kind ?? '-'}</div>
+        <div key={ex.exception_id ?? i} className="space-y-1 rounded-md border bg-background p-2">
+          <p className="font-medium">
+            类型：{ex.kind ?? '-'}
+            {ex.refdes ? ` · 位号：${ex.refdes}` : ''}
+          </p>
+          {ex.user_instruction ? (
+            <p className="text-xs text-muted-foreground">{ex.user_instruction}</p>
+          ) : null}
+        </div>
       ))}
-      <Label>处理说明</Label>
-      <Textarea value={comment} onChange={(e) => setComment(e.target.value)} />
-      <Button size="sm" onClick={() => {
-        const resolutions = exceptions.map((ex) => ({ exception_id: ex.exception_id, action: 'include' }));
-        void api.post(
-          `/api/v1/document-generation/work-orders/${workOrderId}/icd-scope-resolution?kb=${encodeURIComponent(kb)}`,
-          { resolutions, comment },
-        ).then(() => notify.success('已应用范围处理并继续生成'))
-          .catch((e) => notify.error(e instanceof Error ? e.message : '应用范围处理失败'));
-      }}>应用处理结果并继续生成</Button>
+      {blocking ? (
+        <p className="rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900">
+          该异常不能通过“包含/排除”直接放行：请先补齐冻结来源（例如包含该位号的 EDF 管脚映射），
+          或在计划中明确目标接插件位号后重新发起生成；当前工单保持等待，不会写入候选文件。
+        </p>
+      ) : frozen ? (
+        <p className="text-xs text-muted-foreground">范围已冻结，无需重复处理。</p>
+      ) : (
+        <>
+          <Label>处理说明</Label>
+          <Textarea value={comment} onChange={(e) => setComment(e.target.value)} disabled={busy} />
+          <Button size="sm" onClick={submitResolution} disabled={busy || !canResolve}>
+            {busy ? '提交中…' : '应用处理结果并继续生成'}
+          </Button>
+        </>
+      )}
     </div>
   );
 }

@@ -323,6 +323,72 @@ def test_artifact_review_projection_uses_the_approval_subject_hash_contract(tmp_
     assert reviews[0].subject_hash == expected_subject_hash
 
 
+def test_blocking_artifact_is_not_projected_as_a_pending_review(tmp_path):
+    task_store = DocumentTaskStore(str(tmp_path / "authoring.db"))
+    task = task_store.create_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        origin="workbench",
+        created_by="user-a",
+        knowledge_base_name="hardware",
+    )
+    review_store = DocumentReviewStore(tmp_path / "authoring.db")
+    artifact = type(
+        "Artifact",
+        (),
+        {
+            "artifact_id": "artifact-blocked",
+            "stage": "review_candidate",
+            "content_hash": "artifact-content-hash",
+            "approval_subject_hash": None,
+            "validation_report_id": "report-blocked",
+        },
+    )()
+    report = type(
+        "Report",
+        (),
+        {
+            "status": "requires_human",
+            "issues": [{"code": "draft_unit_mismatch", "blocking": True}],
+            "content_hash": "validation-report-hash",
+        },
+    )()
+    order = type(
+        "WorkOrder",
+        (),
+        {
+            "work_order_id": "work-order-blocked",
+            "template_version_id": "template-b",
+            "document_schema_id": "schema-b",
+            "document_schema_version": "1",
+            "baseline_content_hash": "",
+        },
+    )()
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = type(
+        "DocumentGeneration",
+        (),
+        {
+            "review_store": review_store,
+            "store": type(
+                "Store",
+                (),
+                {
+                    "get_icd_scope_review": lambda _self, _work_order_id: None,
+                    "list_artifacts": lambda _self, _work_order_id: [artifact],
+                    "get_validation_report": lambda _self, _report_id: report,
+                },
+            )(),
+            "resolve_source_snapshot": lambda _self, _order: type(
+                "Snapshot", (), {"content_hash": "source-content-hash"}
+            )(),
+        },
+    )()
+
+    assert pipeline._document_reviews_for_task(None, task, order) == []
+    assert review_store.list_for_task(task.task_id) == []
+
+
 def test_approved_artifact_review_releases_the_candidate_once(tmp_path):
     task_store = DocumentTaskStore(str(tmp_path / "authoring.db"))
     task = task_store.create_task(

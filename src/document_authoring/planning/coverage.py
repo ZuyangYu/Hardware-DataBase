@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from src.document_authoring.models import DocumentUnitDraft, TypedTableRow
+from src.document_authoring.models import DocumentUnitDraft
 
 from .models import CoverageContract, CoverageRequirement
 from .review_contracts import CoverageReport, CoverageRequirementResult, ReviewIssue
@@ -170,7 +170,12 @@ class CoverageEvaluator:
         rows = list(typed.rows)
         actual_keys = [row.row_key.strip() for row in rows]
         missing_keys = [key for key in expected_keys if key not in set(actual_keys)]
-        unexpected_keys = [key for key in actual_keys if key and key not in set(expected_keys)]
+        # An empty ``row_keys`` contract means identity is server-owned per
+        # row (for example frozen EDF connectors), not that no rows may exist.
+        unexpected_keys = [
+            key for key in actual_keys
+            if expected_keys and key and key not in set(expected_keys)
+        ]
         duplicate_keys = sorted({key for key in actual_keys if key and actual_keys.count(key) > 1})
         if expected_keys and any(not key for key in actual_keys):
             for index, key in enumerate(actual_keys):

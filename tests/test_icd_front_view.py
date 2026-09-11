@@ -261,6 +261,67 @@ def test_harness_front_view_issue_becomes_an_icd_approval_blocker(tmp_path: Path
     assert service._has_icd_blocking_issue(report.issues)
 
 
+def test_harness_icd_overlay_replaces_example_pin_table_rows(tmp_path: Path):
+    template_path = tmp_path / "template.xlsx"
+    _xlsx(template_path, [
+        ["管脚号 Pin Number", "管脚定义 Pin Definition", "功能描述 Function", "备注 Notice"],
+        ["X302-1", "OLD_1", "旧功能", "旧备注"],
+        ["X302-2", "OLD_2", "旧功能", "旧备注"],
+    ])
+    review = IcdScopeReview(
+        work_order_id="work-pin-table",
+        source_snapshot_hash="snapshot",
+        status="frozen",
+        decision=IcdScopeDecision(frozen_pin_mappings=[
+            {"refdes": "X1900", "pin_name": "1", "net_name": "CAN0_H"},
+            {"refdes": "X1900", "pin_name": "2", "net_name": "NC"},
+        ]),
+    )
+    service = object.__new__(DocumentGenerationService)
+    service.store = Mock()
+    service.store.get_icd_scope_review.return_value = review
+
+    content, _manifest, issues = service._apply_icd_front_view_layout(
+        SimpleNamespace(
+            work_order_id="work-pin-table",
+            generation_brief={"inference_policy": "forbid"},
+        ),
+        SimpleNamespace(format="xlsx", template_version_id="template-pin-table"),
+        template_path.read_bytes(),
+        {"manifest_hash": "base-manifest"},
+    )
+
+    rows = _values(content, tmp_path)
+    assert rows[1][:4] == [
+        "X1900-1",
+        "CAN0_H",
+        "TBD（知识库未提供可靠功能描述）",
+        "",
+    ]
+    assert rows[2][:4] == ["X1900-2", "NC", "未连接（NC）", ""]
+    assert issues == []
+
+
+def test_icd_target_metadata_uses_confirmed_identity_and_never_sample_defaults():
+    metadata, erp = DocumentGenerationService._icd_target_metadata(
+        {
+            "hardware": "EQ6 ADAS 控制器",
+            "assembly_erp": "600608964",
+            "customer_number": "CHERY-EQ6",
+        },
+        [{"refdes": "X1900", "pin_name": "1", "net_name": "CAN0_H"}],
+    )
+
+    assert metadata == {
+        "product_name": "EQ6 ADAS 控制器",
+        "customer_number": "CHERY-EQ6",
+        "pcb_connector": "TBD",
+        "harness_connector": "TBD",
+        "location_number": "X1900",
+    }
+    assert erp == "600608964"
+
+
 def test_front_view_reports_unknown_or_unparsed_slots_as_blocking(tmp_path: Path):
     template = tmp_path / "template.xlsx"
     _xlsx(template, [

@@ -1,22 +1,15 @@
 /**
  * OutputSpecConfirmationCard -- Gate 1 计划确认卡。
  *
- * 只渲染服务器下发的安全提案摘要(格式/章节数/表格数/警告/阻塞),确认动作
- * 携带用户看到过的精确哈希;阻塞项存在或请求进行中时禁用确认。哈希值本身
- * 不出现在界面上。
+ * 只渲染服务器下发的安全提案摘要(格式/章节数/表格数/警告/阻塞)。
+ * 用户确认统一通过主对话输入框完成，避免卡片与对话维护两套交互状态；
+ * 哈希值本身不出现在界面上。
  */
 import type { DocumentCardData } from './documentCardModel';
 
 type Props = {
   card: DocumentCardData;
-  confirming: boolean;
   stale?: boolean;
-  onConfirm: (input: {
-    expected_output_spec_hash: string;
-    expected_plan_hash: string;
-    client_request_id: string;
-  }) => void;
-  confirmDisabled?: boolean;
 };
 
 function formatLabel(format: string): string {
@@ -26,17 +19,13 @@ function formatLabel(format: string): string {
 
 export default function OutputSpecConfirmationCard({
   card,
-  confirming,
   stale = false,
-  onConfirm,
-  confirmDisabled = false,
 }: Props) {
   const proposal = card.proposal;
   const blockers = proposal?.blockers ?? [];
   const warnings = proposal?.warnings ?? [];
   const deliverables = proposal?.deliverables ?? [];
   const primary = deliverables.find((item) => item.role === 'primary');
-  const confirmBlocked = blockers.length > 0 || confirming || confirmDisabled;
 
   return (
     <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-slate-800">
@@ -66,35 +55,10 @@ export default function OutputSpecConfirmationCard({
           ))}
         </ul>
       ) : null}
-      <div className="flex flex-wrap gap-2">
-        <button
-          type="button"
-          disabled={confirmBlocked}
-          onClick={() =>
-            onConfirm({
-              expected_output_spec_hash: proposal?.output_spec_hash ?? '',
-              expected_plan_hash: proposal?.plan_hash ?? '',
-              client_request_id: card.generation_session_id
-                ? `confirm-plan:${card.generation_session_id}:${proposal?.document_plan_version ?? 0}`
-                : '',
-            })
-          }
-          className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {confirming ? '确认中…' : '确认生成'}
-        </button>
-        <button
-          type="button"
-          className="rounded border border-slate-300 px-3 py-1 text-xs text-slate-600"
-        >
-          修改需求
-        </button>
-        <button
-          type="button"
-          className="rounded border border-slate-300 px-3 py-1 text-xs text-slate-600"
-        >
-          采用推荐方案
-        </button>
+      <div className="rounded border border-amber-200 bg-white/70 px-2 py-1.5 text-xs text-slate-600">
+        {blockers.length > 0
+          ? '请在下方对话输入框补充或修改需求。'
+          : '请在下方对话输入“确认生成”，或直接说明需要修改的内容。'}
       </div>
     </div>
   );

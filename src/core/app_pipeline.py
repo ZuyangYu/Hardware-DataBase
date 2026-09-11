@@ -3,10 +3,12 @@ import os
 import hashlib
 import re
 import shutil
+import ssl
 import tempfile
+import time
 import traceback
 import uuid
-from typing import Any, Callable, Generator, List, Tuple
+from typing import Any, Callable, Generator, Iterable, List, Mapping, Tuple
 
 import src.settings
 from src.agents.runner import MultiSourceAgentRunner, forget_thread
@@ -32,6 +34,7 @@ from src.document_authoring.evidence import (
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
 from src.document_authoring.icd_scope_decision import (
+    ICD_BLOCKING_SCOPE_EXCEPTION_KINDS,
     build_icd_scope_decision,
     build_unknown_connector_scope_decision,
     effective_frozen_pin_mappings,
@@ -39,13 +42,26 @@ from src.document_authoring.icd_scope_decision import (
 )
 from src.document_authoring.icd_generation import connector_refdes_from_front_view_template
 from src.document_authoring.icd_profile import classify_icd_template
+from src.document_authoring.pin_function_evidence import (
+    compose_function_evidence_text,
+    extract_pin_function_candidates,
+    extract_spreadsheet_pin_function_candidates,
+    pin_function_queries,
+)
 from src.document_authoring.template_progress import TemplateProgressCallback
+from src.document_authoring.template_mapping_review import prepare_mapping_review, apply_mapping_review
 from src.document_authoring.generation_sessions import GenerationBrief
 from src.document_authoring.models import content_hash
-from src.document_authoring.models import DocumentFieldSchema, DocumentSchema
+from src.document_authoring.models import (
+    DocumentFieldSchema,
+    DocumentSchema,
+    IcdScopeResolution,
+    IcdScopeReview,
+    utc_now,
+)
 from src.document_authoring.compatibility import CompatibilityClosureError
 from src.document_authoring.planning.models import OutputSpec
-from src.document_authoring.planning.intake import OutputSpecIntakeService
+from src.document_authoring.planning.intake import IntakeQuestion, OutputSpecIntakeService
 from src.document_authoring.requirement_clarifier import RequirementClarifier
 from src.document_authoring.requirement_resolver import RequirementResolver
 from src.document_authoring.reviews import resolve_review_decision_status
@@ -77,6 +93,79 @@ _EXPLICIT_REFDES = re.compile(
 _COMMON_CONNECTOR_REFDES = re.compile(r"\b(?:x|j|p|cn|con)\d+[a-z0-9_.-]*\b", re.IGNORECASE)
 
 
+class DocumentPreviewRetrievalError(ValueError):
+    """Transient evidence-retrieval failure while preparing the preview.
+
+    The accepted clarification answers are already durable; callers must
+    publish a retryable question instead of failing the whole turn.
+    """
+
+
+def _is_retryable_retrieval_error(exc: BaseException) -> bool:
+    """Classify transient evidence-retrieval failures worth a short retry."""
+
+    if isinstance(exc, PermissionError):
+        return False
+    try:
+        from src.pipelines.document_rag.ragflow_backend import RAGFlowAPIError
+
+        if isinstance(exc, RAGFlowAPIError):
+            # Authentication/ownership rejections are permanent; everything
+            # else (embedding/transport failures) is retried.
+            return int(getattr(exc, "code", 0) or 0) not in {102, 401, 403}
+    except Exception:
+        pass
+    try:
+        import httpx
+
+        if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+            return True
+    except Exception:
+        pass
+    return isinstance(exc, (ConnectionError, TimeoutError, ssl.SSLError))
+
+
+def _retrieve_preview_evidence_with_retry(
+    provider: Any,
+    *,
+    query: str,
+    knowledge_base_name: str,
+    ctx: Any,
+) -> list[Any]:
+    """Retrieve the bounded preview with a short transient-failure retry.
+
+    The deployment's embedding provider can fail intermittently; retrying the
+    same bounded, source-scoped query turns a transient outage into a slow but
+    successful turn instead of asking the user to answer again.
+    """
+
+    attempts = max(1, int(getattr(src.settings, "DOCUMENT_PREVIEW_RETRIEVAL_ATTEMPTS", 3) or 1))
+    backoff = max(
+        0.0,
+        float(getattr(src.settings, "DOCUMENT_PREVIEW_RETRIEVAL_BACKOFF_SECONDS", 0.5) or 0.0),
+    )
+    for attempt in range(attempts):
+        try:
+            return provider.retrieve(
+                query=query,
+                source_scope="knowledge_base_only",
+                attachment_ids=[],
+                kb_name=knowledge_base_name,
+                ctx=ctx,
+            )
+        except Exception as exc:
+            if not _is_retryable_retrieval_error(exc) or attempt == attempts - 1:
+                raise
+            delay = min(backoff * (2 ** attempt), 4.0)
+            warn(
+                "document preview retrieval retry "
+                f"{attempt + 1}/{attempts - 1} after {type(exc).__name__}"
+            )
+            if delay > 0:
+                time.sleep(delay)
+    raise AssertionError("retrieval retry loop exited without a result")
+
+
 def _is_file_like(obj) -> bool:
     """True for uploaded file objects exposing a binary buffer."""
     return hasattr(obj, "getbuffer") or (hasattr(obj, "read") and not isinstance(obj, (str, bytes)))
@@ -101,6 +190,30 @@ def _materialize_to_temp(file_obj) -> str:
     return temp_path
 
 
+_CONNECTOR_REFDES_FALLBACK_PREFIXES = frozenset({"X", "J", "P", "CN", "CONN", "PL"})
+
+
+def _is_connector_refdes(value: str, prefixes: set[str]) -> bool:
+    """Heuristically decide whether an EDF identity is an external connector.
+
+    Component refdes (C/R/U/L/D/Q/TP/...) share the pin-mapping table with the
+    connectors; only the template's naming prefix may enter the ICD scope.
+    """
+
+    text = str(value or "").strip().upper()
+    if not text:
+        return False
+    candidates = prefixes or set(_CONNECTOR_REFDES_FALLBACK_PREFIXES)
+    for prefix in sorted(candidates, key=len, reverse=True):
+        if (
+            text.startswith(prefix)
+            and len(text) > len(prefix)
+            and text[len(prefix)].isdigit()
+        ):
+            return True
+    return False
+
+
 def _connector_refdes_from_schema(schema: Any) -> list[str]:
     """Extract explicitly declared connector designators from ICD pin fields."""
     candidates: list[str] = []
@@ -121,6 +234,50 @@ def _connector_refdes_from_schema(schema: Any) -> list[str]:
     return list(dict.fromkeys(value.upper() for value in candidates if value.strip()))
 
 
+def _connector_refdes_from_generation_brief(order: Any) -> list[str]:
+    """Read the user's confirmed target connector before template examples."""
+    brief = getattr(order, "generation_brief", {}) or {}
+    if not isinstance(brief, Mapping):
+        return []
+    target_identity = brief.get("target_identity") or {}
+    text = " ".join(_string_values(target_identity))
+    candidates = [match.group(1) for match in _EXPLICIT_REFDES.finditer(text)]
+    candidates.extend(match.group(0) for match in _COMMON_CONNECTOR_REFDES.finditer(text))
+    return list(dict.fromkeys(value.upper() for value in candidates if value.strip()))
+
+
+def _generation_brief_from_output_spec(output_spec: Any) -> dict[str, Any]:
+    """Project the accepted planning contract into the execution brief.
+
+    Plan submissions deliberately carry identifiers only, so dispatch reloads
+    the accepted OutputSpec and freezes the user-confirmed scope and policies
+    onto the WorkOrder. Keeping this projection small avoids copying layout
+    coordinates or mutable source content into the writer contract.
+    """
+    additional_requirements = []
+    for item in getattr(output_spec, "additional_requirements", []) or []:
+        additional_requirements.append(
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+        )
+    return {
+        "confirmed": str(getattr(output_spec, "status", "") or "") == "accepted",
+        "purpose": str(getattr(output_spec, "purpose", "") or ""),
+        "document_type": str(getattr(output_spec, "document_type", "") or ""),
+        "target_identity": dict(getattr(output_spec, "target_identity", {}) or {}),
+        "missing_data_policy": str(
+            getattr(output_spec, "missing_data_policy", "mark_tbd") or "mark_tbd"
+        ),
+        "inference_policy": str(
+            getattr(output_spec, "inference_policy", "forbid") or "forbid"
+        ),
+        "approval_policy_id": str(
+            getattr(output_spec, "approval_policy_id", "") or ""
+        ),
+        "language": str(getattr(output_spec, "language", "") or ""),
+        "additional_requirements": additional_requirements,
+    }
+
+
 def _schema_has_icd_pin_field(schema: Any) -> bool:
     for field in getattr(schema, "fields", []) or []:
         text = " ".join(
@@ -135,6 +292,27 @@ def _schema_has_icd_pin_field(schema: Any) -> bool:
         if any(term in text for term in _PIN_FIELD_TERMS):
             return True
     return False
+
+
+def _canonical_document_type(value: Any, *hints: Any, schema: Any = None) -> str:
+    """Return the stable policy identifier for a known document family.
+
+    Template names and human-facing schema labels are useful discovery hints,
+    but execution allowlists are keyed by canonical identifiers such as
+    ``icd``.  Unknown document families keep their supplied value so normal
+    clarification can still handle them.
+    """
+    supplied = str(value or "").strip()
+    text = " ".join(str(item or "").strip() for item in (value, *hints)).casefold()
+    if re.search(r"(?:^|[^a-z0-9])icd(?:[^a-z0-9]|$)", text) or any(
+        term in text for term in ("接口控制", "连接器管脚", "管脚定义")
+    ) or _schema_has_icd_pin_field(schema):
+        return "icd"
+    if re.search(r"(?:^|[^a-z0-9])fpt(?:[^a-z0-9]|$)", text):
+        return "fpt"
+    if any(term in text for term in ("requirements", "requirement specification", "需求规格")):
+        return "requirements"
+    return supplied
 
 
 def _string_values(value: Any) -> list[str]:
@@ -162,6 +340,34 @@ def _template_free_allowlisted(value: Any, configured: Any) -> bool:
     }
     normalized = str(value or "").strip().casefold()
     return bool(allowed) and normalized in allowed
+
+
+def _document_plan_allowlisted(value: Any, configured: Any) -> bool:
+    """Mirror the runtime DAG allowlist check during plan preflight."""
+    if isinstance(configured, str):
+        values = configured.split(",")
+    elif isinstance(configured, (list, tuple, set, frozenset)):
+        values = configured
+    else:
+        values = ()
+    allowed = {
+        str(item).strip().casefold()
+        for item in values
+        if str(item).strip()
+    }
+    normalized = str(value or "").strip().casefold()
+    return bool(allowed) and ("*" in allowed or normalized in allowed)
+
+
+def _completed_document_coverage_is_valid(coverage: Mapping[str, Any]) -> bool:
+    """A completed read model may not contain unresolved required units."""
+    fields = coverage.get("fields") if isinstance(coverage, Mapping) else None
+    return bool(fields) and all(
+        not bool(field.get("required"))
+        or str(field.get("status") or "").strip() in {"ready_to_render", "passed", "committed"}
+        for field in fields
+        if isinstance(field, Mapping)
+    )
 
 
 class AppPipeline:
@@ -1145,6 +1351,90 @@ class AppPipeline:
                 )
         return session
 
+    def _prepare_document_content_preview(self, ctx, knowledge_base_name, draft):
+        """Retrieve an initial, source-scoped evidence preview, not filled values.
+
+        This bounded preview is persisted on the conversation draft. It does
+        not grant template approval or claim exhaustive field coverage.
+        """
+        scope = draft.get("source_scope") or {}
+        if scope.get("attachments") or scope.get("projects") or scope.get("structured_inputs"):
+            raise ValueError("当前初步资料预览尚不支持附件、项目或结构化输入范围；不会擅自替换为知识库检索")
+        if set(scope.get("knowledge_bases") or []) - {knowledge_base_name}:
+            raise ValueError("当前初步资料预览不能跨知识库检索，不会擅自改变来源范围")
+        snapshot, _ = self._planning_source_snapshot(ctx, knowledge_base_name=knowledge_base_name)
+        source_names = list(snapshot.source_names)
+        provider = KnowledgeBaseEvidenceProvider(self.backend, top_k=5, source_names=source_names)
+        outline = draft.get("outline") or []
+        query = " ".join([
+            str(draft.get("purpose") or ""),
+            *[str(value) for value in (draft.get("target_identity") or {}).values()],
+            *[str(unit.get("title") or "") for unit in outline[:12]],
+        ])[:8000]
+        try:
+            evidence = _retrieve_preview_evidence_with_retry(
+                provider,
+                query=query,
+                knowledge_base_name=knowledge_base_name,
+                ctx=ctx,
+            )
+        except PermissionError:
+            raise
+        except Exception as exc:
+            warn(f"document preview retrieval failed: {type(exc).__name__}")
+            raise DocumentPreviewRetrievalError(
+                "知识库资料检索暂未完成，不能将检索失败当成资料缺失；请稍后重试，无需手工补齐字段"
+            ) from exc
+        excerpts = []
+        seen = set()
+        for item in evidence:
+            # Enforce the frozen boundary even if a backend ignores filters.
+            if item.source_name not in source_names or not item.content.strip():
+                continue
+            key = (item.source_name, item.id, item.content)
+            if key in seen:
+                continue
+            seen.add(key)
+            excerpts.append({
+                "evidence_id": item.id, "source_name": item.source_name,
+                "excerpt": item.content[:800],
+            })
+            if len(excerpts) == 5:
+                break
+        preview = {
+            "kind": "initial_evidence_review",
+            "source_snapshot_id": snapshot.source_set_snapshot_id,
+            "evidence_count": len(excerpts), "excerpts": excerpts,
+            "table_count": sum(unit.get("kind") == "table" for unit in outline),
+            "field_count": sum(unit.get("kind") != "table" for unit in outline),
+        }
+        draft["content_preview"] = preview
+        draft["content_preview_confirmed"] = False
+        auto_scope = (
+            isinstance(draft.get("target_identity"), dict)
+            and draft["target_identity"].get("mode") == "knowledge_base_discovery"
+        )
+        scope_note = (
+            "未指定单一硬件/连接器；系统将按当前知识库自动发现相关模块、连接器和接口，"
+            "并从电路设计资料（如 EDF/网表）自动识别实际连接器位号，无需手工提供。\n"
+            if auto_scope else ""
+        )
+        if excerpts:
+            message = scope_note + "已从当前知识库检索到以下初步资料（来源摘录，不是已填好的文档）：\n" + "\n".join(
+                f"{index}. {item['source_name']}：{item['excerpt']}"
+                for index, item in enumerate(excerpts, 1)
+            )
+        else:
+            message = scope_note + "本次在当前知识库来源范围内未检索到可展示的证据；这不代表原始资料一定不存在。"
+        message += (
+            "\n这只是初步检索，不代表全部字段已有证据，尚未写入模板。"
+            "请确认资料方向，或直接说明需要调整的范围；确认后继续规划，缺失内容按所选策略处理。"
+        )
+        return IntakeQuestion(
+            question_id="content_confirmation", prompt=message,
+            options=["确认", "调整范围"], reason="initial_evidence_review",
+        )
+
     def _create_output_spec_generation_session(
         self,
         ctx: RequestContext,
@@ -1185,13 +1475,28 @@ class AppPipeline:
             "purpose", "audience", "document_type", "deliverables", "artifact", "outline",
             "layout_source", "table_requirements", "source_scope", "target_identity", "language", "style",
             "missing_data_policy", "inference_policy", "approval_policy_id",
-            "accepted_recommendations",
+            "accepted_recommendations", "additional_requirements",
         }
         draft_kwargs = {key: raw[key] for key in allowed if key in raw}
         draft_kwargs.setdefault("purpose", purpose.strip() or raw.get("purpose"))
+        draft_kwargs.update(self._inherited_output_spec_scope(
+            ctx,
+            knowledge_base_name=knowledge_base_name,
+            template_version_id=template_version_id or None,
+            current=draft_kwargs,
+        ))
         if schema is not None:
             draft_kwargs.setdefault("document_type", schema.document_type)
         if template is not None:
+            template_schema = schema
+            if template_schema is None:
+                try:
+                    template_schema = self.document_generation.store.get_document_schema(
+                        template.template_schema_id,
+                        template.template_schema_version,
+                    )
+                except Exception:
+                    template_schema = None
             draft_kwargs["layout_source"] = {
                 "mode": "provided_template",
                 "template_version_id": template.template_version_id,
@@ -1199,6 +1504,43 @@ class AppPipeline:
                 "template_schema_version": template.template_schema_version,
             }
             draft_kwargs.setdefault("document_type", schema.document_type if schema else template.template_id)
+            draft_kwargs["document_type"] = _canonical_document_type(
+                draft_kwargs.get("document_type"),
+                draft_kwargs.get("purpose"),
+                template.template_id,
+                getattr(template_schema, "document_type", None),
+                schema=template_schema,
+            )
+            # When the user explicitly delegates object selection to the
+            # knowledge base ("根据/按照知识库"), do not force a second
+            # hardware/connector question.  Freeze that delegation as a
+            # server-owned target identity so retrieval can discover all
+            # relevant modules and connectors, while the evidence preview
+            # remains the human confirmation gate before template writes.
+            purpose_text = str(draft_kwargs.get("purpose") or "").strip()
+            auto_scope_requested = bool(re.search(
+                r"(?:根据|按照|按|基于|来自|从|依据)\s*(?:当前|本次)?\s*[^。；;，,\n]{0,32}?知识库"
+                r"|knowledge\s*base",
+                purpose_text,
+                re.IGNORECASE,
+            ))
+            if (
+                draft_kwargs.get("document_type") == "icd"
+                and not draft_kwargs.get("target_identity")
+                and auto_scope_requested
+            ):
+                draft_kwargs["target_identity"] = {
+                    "mode": "knowledge_base_discovery",
+                    "value": "按知识库中的模块、连接器和接口数据确定",
+                }
+            if not draft_kwargs.get("artifact") and not draft_kwargs.get("deliverables"):
+                draft_kwargs["artifact"] = {
+                    "deliverables": [{
+                        "format": template.format,
+                        "role": "primary",
+                        "required": True,
+                    }],
+                }
         elif "layout_source" in raw:
             draft_kwargs["layout_source"] = raw["layout_source"]
         # Template references are server-owned.  A client cannot smuggle a
@@ -1206,6 +1548,33 @@ class AppPipeline:
         layout = draft_kwargs.get("layout_source")
         if isinstance(layout, dict) and layout.get("mode") == "provided_template" and template is None:
             raise ValueError("provided-template layout requires template_version_id")
+        # A bound template owns the outline: seed it from the approved schema
+        # so the conversation never asks the user to restate template facts.
+        if template is not None and draft_kwargs.get("outline") is None:
+            if template_schema is not None and template_schema.fields:
+                draft_kwargs["outline"] = [
+                    {
+                        "unit_id": field.field_id,
+                        "kind": "table" if str(getattr(field, "value_type", "") or "") == "table" else "field",
+                        "title": str(getattr(field, "label", "") or "").strip() or field.field_id,
+                        "required": bool(getattr(field, "required", True)),
+                    }
+                    for field in template_schema.fields
+                ]
+            elif template.status != "approved":
+                # Tentative semantic labels are enough to search for content.
+                # They are NOT renderer bindings or permission to overwrite.
+                analysis = self.document_generation.store.get_template_analysis(template.template_version_id)
+                if analysis is not None and analysis.status != "failed":
+                    draft_kwargs["outline"] = [
+                        {
+                            "unit_id": suggestion.semantic_unit_id,
+                            "kind": "table" if suggestion.value_shape == "repeating_table" else "field",
+                            "title": suggestion.label or suggestion.semantic_unit_id,
+                            "required": True,
+                        }
+                        for suggestion in analysis.suggestions
+                    ] or None
         draft = intake.start_draft(
             output_spec_id=f"output-spec-{uuid.uuid4().hex}",
             template_version_id=template.template_version_id if template else None,
@@ -1214,13 +1583,16 @@ class AppPipeline:
             **draft_kwargs,
         )
         sessions = self.document_generation.store.generation_sessions
+        question = intake.next_question(draft)
         session = sessions.create_session(
             tenant_id=ctx.tenant_id or "default",
             user_id=ctx.user_id,
             knowledge_base_name=knowledge_base_name,
             template_version_id=template.template_version_id if template else None,
             contract_version="output_spec_v1",
-            status="awaiting_plan",
+            # The status must mirror the intake state: a session with an open
+            # question is not awaiting a plan proposal yet.
+            status="awaiting_plan" if question is None else "needs_clarification",
             output_spec_id=draft["output_spec_id"],
             output_spec_version=draft["version"],
             output_spec_draft=draft,
@@ -1240,16 +1612,27 @@ class AppPipeline:
         )
         if task is not None:
             session = sessions.bind_document_task(session.session_id, task.task_id)
-        question = intake.next_question(draft)
         if question is None:
+            # Do not jump directly to plan confirmation.  Run the same
+            # conversation-level content gate used after the final answer so
+            # users can review what will be extracted from the knowledge base.
+            question = self._prepare_document_content_preview(ctx, knowledge_base_name, draft)
+            draft["version"] = int(draft.get("version", 1)) + 1
+            sessions.update_output_spec_draft(
+                session.session_id, draft,
+                expected_version=int(draft.get("version", 2)) - 1,
+                status="needs_clarification",
+            )
             sessions.append_message(
                 session.session_id,
                 role="assistant",
-                content="需求已经明确，可以生成文档计划提案。",
-                reason="awaiting_plan",
+                content=question.prompt,
+                question_id="content_confirmation",
+                options=question.options,
+                reason=question.reason,
             )
             if task is not None:
-                self.document_generation.task_service.store.update_status(task.task_id, "planned")
+                self.document_generation.task_service.store.update_status(task.task_id, "needs_clarification")
         else:
             sessions.append_message(
                 session.session_id,
@@ -1270,6 +1653,91 @@ class AppPipeline:
         requested_kb = ctx.metadata.get("document_template_kb_name")
         if requested_kb is not None and session.knowledge_base_name != requested_kb:
             raise PermissionError("generation session belongs to another knowledge base")
+        return session
+
+    def _inherited_output_spec_scope(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+        template_version_id: str | None,
+        current: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Carry the conversation's server-owned scope into a new intake draft.
+
+        The first turn may delegate object selection to the knowledge base
+        ("根据知识库内容").  Later turns have no such keyword, so without this
+        inheritance a new draft would ask the hardware/connector identity
+        question again and contradict the recorded delegation.
+        """
+
+        finder = getattr(
+            self.document_generation.store.generation_sessions,
+            "find_latest_output_spec_session",
+            None,
+        )
+        if not callable(finder):
+            return {}
+        try:
+            previous = finder(
+                tenant_id=ctx.tenant_id or "default",
+                user_id=ctx.user_id,
+                knowledge_base_name=knowledge_base_name,
+                conversation_id=(getattr(ctx, "metadata", {}) or {}).get("conversation_id"),
+                template_version_id=template_version_id,
+            )
+        except Exception:  # noqa: BLE001 - inheritance is additive and fail-soft
+            return {}
+        previous_draft = getattr(previous, "output_spec_draft", None)
+        if not isinstance(previous_draft, dict):
+            return {}
+        inherited: dict[str, Any] = {}
+        target_identity = previous_draft.get("target_identity")
+        if (
+            not current.get("target_identity")
+            and isinstance(target_identity, dict)
+            and target_identity
+        ):
+            inherited["target_identity"] = dict(target_identity)
+        for key in ("missing_data_policy", "inference_policy"):
+            if not current.get(key) and previous_draft.get(key):
+                inherited[key] = previous_draft[key]
+        return inherited
+
+    def find_reusable_document_generation_session(
+        self,
+        ctx: RequestContext,
+        *,
+        knowledge_base_name: str,
+        template_version_id: str | None,
+    ):
+        """Resume the conversation's live intake session, or ``None``.
+
+        Chat-led intake owns one session per conversation; when a tool call
+        loses the session pointer (fresh page state, model omission), the
+        conversation lookup keeps the recorded clarification answers alive
+        instead of forking a new draft.
+        """
+
+        store = self.document_generation.store.generation_sessions
+        finder = getattr(store, "find_recent_active_output_spec_session", None)
+        if not callable(finder):
+            return None
+        try:
+            session = finder(
+                tenant_id=ctx.tenant_id or "default",
+                user_id=ctx.user_id,
+                knowledge_base_name=knowledge_base_name,
+                conversation_id=(getattr(ctx, "metadata", {}) or {}).get("conversation_id"),
+                template_version_id=template_version_id,
+            )
+        except Exception:
+            return None
+        if session is None:
+            return None
+        requested_kb = ctx.metadata.get("document_template_kb_name")
+        if requested_kb is not None and session.knowledge_base_name != requested_kb:
+            return None
         return session
 
     @staticmethod
@@ -1340,6 +1808,7 @@ class AppPipeline:
             "layout_summary": layout_summary,
             "outline_count": len(summary.get("outline_unit_ids") or []),
             "table_count": len(summary.get("table_unit_ids") or []),
+            "additional_requirements": list(summary.get("additional_requirements") or []),
             "source_summary": dict(source_summary or {"snapshot_bound": True}),
             "policies": policies,
             "warnings": warning_items,
@@ -1484,6 +1953,30 @@ class AppPipeline:
             source_snapshot_id=str(snapshot.source_set_snapshot_id),
             source_snapshot_hash=str(source_summary["snapshot_content_hash"]),
         )
+        primary_deliverables = [
+            item for item in spec.artifact.deliverables if item.role == "primary"
+        ]
+        primary_format = primary_deliverables[0].format if len(primary_deliverables) == 1 else ""
+        if not all(
+            _document_plan_allowlisted(value, configured)
+            for value, configured in (
+                (ctx.tenant_id or "default", getattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS", ())),
+                (spec.document_type, getattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES", ())),
+                (primary_format, getattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS", ())),
+            )
+        ):
+            plan_payload = plan.model_dump(mode="json", exclude={"plan_hash"})
+            plan_payload["issues"] = [
+                *list(plan_payload.get("issues") or []),
+                {
+                    "code": "execution_scope_not_allowlisted",
+                    "severity": "error",
+                    "message": "文档生成范围未通过执行白名单预检，请联系管理员检查租户、文档类型和格式配置。",
+                    "path": "execution_scope",
+                    "blocking": True,
+                },
+            ]
+            plan = type(plan).model_validate(plan_payload)
         summary = dict(plan.output_spec_summary)
         summary.update({
             "template_content_hash": template_hash,
@@ -1723,11 +2216,187 @@ class AppPipeline:
         if not isinstance(draft, dict):
             raise ValueError("output spec draft is missing")
         expected_version = int(session.output_spec_version or draft.get("version") or 0)
-        if answer.strip().casefold() in {"采用推荐方案", "use recommended", "accept recommendations"}:
+        if question_id == "template_mapping_confirmation":
+            review = draft.get("template_mapping_review")
+            if (
+                session.status != "needs_clarification" or not isinstance(review, dict)
+                or review.get("template_version_id") != session.template_version_id
+                or not draft.get("content_preview_confirmed")
+            ):
+                raise ValueError("no template mapping review is awaiting consent")
+            sessions = self.document_generation.store.generation_sessions
+            revised_draft = dict(draft)
+            revised_draft["version"] = expected_version + 1
+            allowed = answer.strip().strip("。.!！ ") == "允许替换模板示例数据"
+            if allowed:
+                template = apply_mapping_review(
+                    self.document_generation, ctx, {**review, "consent": "允许替换模板示例数据"},
+                )
+                schema = self.document_generation.store.get_document_schema(
+                    template.template_schema_id, template.template_schema_version,
+                )
+                revised_draft["outline"] = [
+                    {"unit_id": field.field_id,
+                     "kind": "table" if field.value_type == "table" else "field",
+                     "title": field.label or field.field_id, "required": field.required}
+                    for field in schema.fields
+                ]
+                revised_draft.pop("template_mapping_review", None)
+                revised_draft["additional_requirements"] = [
+                    *list(draft.get("additional_requirements") or []),
+                    {"field": "confirmed_template_mapping_hash", "value": content_hash(review),
+                     "meaning": "用户明确允许替换所展示模板数据区的示例值"},
+                ]
+            revised = sessions.update_output_spec_draft(
+                session.session_id, revised_draft, expected_version=expected_version,
+                status="awaiting_plan" if allowed else "needs_clarification",
+            )
+            sessions.append_message(
+                session.session_id, role="user", content=answer.strip(), question_id=question_id,
+                answer=answer.strip(), client_request_id=client_request_id,
+            )
+            sessions.append_message(
+                session.session_id, role="assistant",
+                content=(
+                    "模板填充区域已确认，接下来生成文档计划供你确认；尚未创建生成工单或写入内容。"
+                    if allowed else
+                    "尚未授权替换，模板示例数据保持不变。若允许替换上述数据区，请明确回复“允许替换模板示例数据”；也可以说明要保留的内容。"
+                ),
+                question_id=None if allowed else question_id,
+                reason="awaiting_plan" if allowed else "template_mapping_consent",
+                options=[] if allowed else ["允许替换模板示例数据", "保留模板示例数据"],
+            )
+            if revised.document_task_id:
+                self.document_generation.task_service.store.update_status(
+                    revised.document_task_id, "planned" if allowed else "needs_clarification",
+                )
+            return self.get_document_generation_session(ctx, session.session_id)
+        # Content confirmation is a conversation-level gate between intake and
+        # plan compilation.  It lets the system discover/organize KB content
+        # automatically instead of asking users to understand template
+        # internals (semantic_units, table_count, etc.).
+        if question_id == "content_confirmation":
+            if session.status != "needs_clarification" or not isinstance(draft.get("content_preview"), dict):
+                raise ValueError("no content review is awaiting confirmation")
+            normalized = answer.strip().strip("。.!！ ").casefold()
+            if normalized not in {"确认", "确认生成", "继续", "同意", "确认，按以上内容生成", "confirm", "yes"}:
+                sessions = self.document_generation.store.generation_sessions
+                revised_draft = dict(draft)
+                revised_draft["version"] = expected_version + 1
+                revised_draft["content_preview_confirmed"] = False
+                revised_draft["additional_requirements"] = [
+                    *list(draft.get("additional_requirements") or []),
+                    {"field": "content_review_feedback", "value": answer.strip(),
+                     "raw_text": answer.strip(), "meaning": "用户对初步资料预览的反馈，尚未确认生成"},
+                ]
+                # Keep refusal distinct from a requested content change.
+                prompt = "已保留当前资料预览，尚未确认生成。你可以继续说明需要修改的内容。"
+                if normalized not in {"不要生成", "不确认", "不同意", "暂停", "取消", "no"}:
+                    revised_draft["purpose"] = f"{draft.get('purpose', '')}\n用户最新调整：{answer.strip()}"
+                    question = self._prepare_document_content_preview(ctx, session.knowledge_base_name, revised_draft)
+                    prompt = question.prompt
+                sessions.update_output_spec_draft(
+                    session.session_id, revised_draft, expected_version=expected_version,
+                    status="needs_clarification",
+                )
+                sessions.append_message(
+                    session.session_id, role="user", content=answer.strip(),
+                    question_id=question_id, answer=answer.strip(),
+                    client_request_id=client_request_id,
+                )
+                sessions.append_message(
+                    session.session_id, role="assistant",
+                    content=prompt,
+                    question_id="content_confirmation", reason="content_confirmation",
+                )
+                return self.get_document_generation_session(ctx, session.session_id)
+            revised_draft = dict(draft)
+            revised_draft["content_preview_confirmed"] = True
+            revised_draft["additional_requirements"] = [
+                *[item for item in draft.get("additional_requirements", [])
+                  if item.get("field") != "confirmed_preview_hash"],
+                {"field": "confirmed_preview_hash", "value": content_hash(draft["content_preview"]),
+                 "meaning": "用户确认的初步资料预览版本，不代表字段已填充或模板已批准"},
+            ]
+            revised_draft["version"] = expected_version + 1
+            sessions = self.document_generation.store.generation_sessions
+            next_status = "awaiting_plan"
+            next_message = "初步资料方向已确认，可以生成文档计划提案；尚未写入模板或生成文件。"
+            next_question_id = None
+            next_reason = "awaiting_plan"
+            next_options = []
+            if session.template_version_id:
+                template = self.document_generation.store.get_template(session.template_version_id)
+                if template is None or template.status != "approved":
+                    try:
+                        review = prepare_mapping_review(self.document_generation, ctx, session.template_version_id)
+                    except KeyError:
+                        review = None
+                    if review is None:
+                        next_status = "blocked"
+                        next_reason = "template_mapping_unresolved"
+                        next_message = (
+                            "资料方向已记录，但系统尚未建立安全的模板填充区域，因此暂停写入。"
+                            "这是模板解析问题，不是缺少知识库资料；无需你补齐字段或重复确认。"
+                        )
+                    else:
+                        revised_draft["template_mapping_review"] = review
+                        next_status = "needs_clarification"
+                        next_question_id = "template_mapping_confirmation"
+                        next_reason = "template_mapping_consent"
+                        next_options = ["允许替换模板示例数据", "保留模板示例数据"]
+                        next_message = (
+                            review["summary"] + " 本授权仅针对该填充区域，不会创建生成工单。"
+                            "\n是否允许替换这些示例数据？请回复“允许替换模板示例数据”或“保留模板示例数据”。"
+                        )
+            revised = sessions.update_output_spec_draft(
+                session.session_id, revised_draft,
+                expected_version=expected_version,
+                status=next_status,
+            )
+            sessions.append_message(
+                session.session_id, role="user", content=answer.strip(),
+                question_id=question_id, answer=answer.strip(),
+                client_request_id=client_request_id,
+            )
+            sessions.append_message(
+                session.session_id, role="assistant",
+                content=next_message, question_id=next_question_id,
+                reason=next_reason, options=next_options,
+            )
+            if revised.document_task_id:
+                try:
+                    self.document_generation.task_service.store.update_status(
+                        revised.document_task_id,
+                        "planned" if next_status == "awaiting_plan" else "waiting_human",
+                    )
+                except Exception:
+                    warn("failed to project content confirmation status")
+            return self.get_document_generation_session(ctx, session.session_id)
+        resolution_pause = question_id == "missing_data_resolution" and (
+            "暂停" in answer or "等待资料" in answer
+        )
+        if question_id == "content_preview_retry":
+            # The previous answer (for example the recommended defaults) is
+            # already durable; this turn only retries the bounded evidence
+            # preview that a transient retrieval failure skipped.
+            if (
+                session.status != "needs_clarification"
+                or str(session.last_question_id or "") != "content_preview_retry"
+            ):
+                raise ValueError("no content preview retry is awaiting confirmation")
+            revised_draft = dict(draft)
+        elif answer.strip().casefold() in {"采用推荐方案", "use recommended", "accept recommendations"}:
             revised_draft = intake.accept_recommendation(
                 draft,
                 recommendation_id=OutputSpecIntakeService._RECOMMENDATION_ID,
                 expected_version=expected_version,
+            )
+        elif question_id == "missing_data_resolution":
+            revised_draft = intake.merge_missing_data_resolution(
+                draft,
+                expected_version=expected_version,
+                answer=answer,
             )
         else:
             revised_draft = intake.merge_answer(
@@ -1737,11 +2406,40 @@ class AppPipeline:
                 answer=answer,
             )
         sessions = self.document_generation.store.generation_sessions
+        question = intake.next_question(revised_draft)
+        # Once requirement intake is complete, automatically prepare a compact
+        # evidence-oriented preview for the user.  The actual retrieval and
+        # template writing remain downstream of the explicit confirmation.
+        needs_content_confirmation = (
+            question is None and not revised_draft.get("content_preview_confirmed")
+        )
+        if needs_content_confirmation:
+            try:
+                question = self._prepare_document_content_preview(ctx, session.knowledge_base_name, revised_draft)
+            except DocumentPreviewRetrievalError as exc:
+                # A transient retrieval outage must not discard the answer
+                # that was just accepted.  Persist the applied draft and ask
+                # for an explicit retry instead of failing the whole turn.
+                warn(f"document content preview deferred: {exc}")
+                question = IntakeQuestion(
+                    question_id="content_preview_retry",
+                    prompt=(
+                        "知识库资料检索暂未完成，尚未进入资料预览确认；"
+                        "已确认的需求会保留。请稍后回复“重试”继续，无需重新回答已确认的问题。"
+                    ),
+                    options=["重试"],
+                    reason="content_preview_retry",
+                )
+            revised_draft["version"] = int(revised_draft.get("version", expected_version)) + 1
         revised = sessions.update_output_spec_draft(
             session.session_id,
             revised_draft,
             expected_version=expected_version,
-            status="awaiting_plan",
+            status=(
+                "blocked" if resolution_pause
+                else "needs_clarification" if needs_content_confirmation
+                else "awaiting_plan" if question is None else "needs_clarification"
+            ),
         )
         try:
             sessions.append_message(
@@ -1757,8 +2455,15 @@ class AppPipeline:
             # browser request must not turn a successful draft update into a
             # failed authoring session.
             pass
-        question = intake.next_question(revised_draft)
-        if question is None:
+        if resolution_pause:
+            sessions.append_message(
+                session.session_id,
+                role="assistant",
+                content="已暂停生成，等待你补充缺失资料后再继续。",
+                reason="missing_data_waiting_for_user_material",
+            )
+            task_status = "blocked"
+        elif question is None:
             sessions.append_message(
                 session.session_id,
                 role="assistant",
@@ -1783,7 +2488,27 @@ class AppPipeline:
                 )
             except Exception:
                 warn("failed to project output spec clarification status")
-        return self.get_document_generation_session(ctx, session.session_id)
+        revised_session = self.get_document_generation_session(ctx, session.session_id)
+        # Project the next canonical question so the chat card updates in the
+        # same turn instead of waiting for a manual refresh.
+        if task_status == "planned":
+            self._project_generation_session_event(
+                revised_session,
+                "document_clarification_ready",
+                {"reason": "ready_to_generate"},
+            )
+        elif question is not None:
+            self._project_generation_session_event(
+                revised_session,
+                "document_clarification_question",
+                {
+                    "question_id": question.question_id,
+                    "options": list(question.options),
+                    "reason": question.reason,
+                    "content": question.prompt,
+                },
+            )
+        return revised_session
 
     def confirm_document_generation_session(self, ctx: RequestContext, session_id: str):
         session = self.get_document_generation_session(ctx, session_id)
@@ -1995,6 +2720,8 @@ class AppPipeline:
         knowledge_base_name: str,
         document_schema_id: str,
         document_schema_version: str,
+        force_edf_connector_scope: bool = False,
+        force_scope_comment: str = "",
     ):
         """Run the shared fast preflight for a frozen KB document Work Order.
 
@@ -2064,46 +2791,148 @@ class AppPipeline:
                 kb_name=knowledge_base_name,
                 ctx=ctx,
             )
-            connector_refdes = (
-                list(dict.fromkeys(
+            circuit_service = getattr(self, "circuit_service", None)
+            circuit_scope_allowed = bool(
+                circuit_service is not None
+                and scope_allows_kb(effective_scope)
+                and snapshot.source_names
+            )
+            available_refdes: list[str] = []
+            confirmed_target_refdes = _connector_refdes_from_generation_brief(order)
+            hint_refdes = list(dict.fromkeys([
+                *confirmed_target_refdes,
+                *(
+                    block.location_number
+                    for block in (profile.connector_blocks if profile is not None else [])
+                    if block.location_number
+                ),
+                *_connector_refdes_from_schema(icd_schema),
+                *self._icd_front_view_connector_refdes(order),
+            ]))
+            if force_edf_connector_scope:
+                # The user explicitly asked to replace template-example refdes
+                # with the frozen EDF's actual connectors.
+                available_refdes = self._edf_connector_refdes(
+                    knowledge_base_name, snapshot, ctx, refdes_hint=hint_refdes,
+                )
+                if not available_refdes:
+                    raise ValueError(
+                        "冻结来源中没有可用的 EDF 管脚映射，无法按实际位号替换"
+                    )
+                connector_refdes = available_refdes
+            elif confirmed_target_refdes:
+                connector_refdes = confirmed_target_refdes
+            elif profile is not None and profile.kind == "icd":
+                connector_refdes = list(dict.fromkeys(
                     block.location_number
                     for block in profile.connector_blocks
                     if block.location_number
                 ))
-                if profile is not None and profile.kind == "icd"
-                else list(dict.fromkeys([
+            else:
+                connector_refdes = list(dict.fromkeys([
                     *_connector_refdes_from_schema(icd_schema),
                     *supported_connector_refdes(supporting_evidences),
                     *self._icd_front_view_connector_refdes(order),
                 ]))
-            )
             if connector_refdes:
                 circuit_evidences = (
-                    self.circuit_service.list_pin_mapping_evidence(
+                    circuit_service.list_pin_mapping_evidence(
                         knowledge_base_name,
                         list(snapshot.source_names),
                         ctx,
                         refdes=connector_refdes,
                     )
-                    if (
-                        getattr(self, "circuit_service", None) is not None
-                        and scope_allows_kb(effective_scope)
-                        and snapshot.source_names
-                    )
+                    if circuit_scope_allowed
                     else []
                 )
+                if not circuit_evidences and not force_edf_connector_scope:
+                    # Template-declared refdes may be examples; report the
+                    # frozen EDF's actual connectors so the user can confirm
+                    # an evidence-led replacement.
+                    available_refdes = self._edf_connector_refdes(
+                        knowledge_base_name, snapshot, ctx,
+                        refdes_hint=connector_refdes,
+                    )
                 decision = build_icd_scope_decision(
                     circuit_evidences,
                     supporting_evidences,
                     connector_refdes=connector_refdes,
+                    available_refdes=available_refdes,
                 )
+                if force_edf_connector_scope:
+                    scope_review = self._freeze_scope_review_from_edf(
+                        ctx,
+                        order,
+                        snapshot,
+                        decision,
+                        comment=force_scope_comment,
+                    )
+                else:
+                    scope_review = self.document_generation.prepare_icd_scope_review(
+                        ctx,
+                        order.work_order_id,
+                        decision,
+                    )
             else:
                 decision = build_unknown_connector_scope_decision()
-            scope_review = self.document_generation.prepare_icd_scope_review(
-                ctx,
-                order.work_order_id,
-                decision,
-            )
+                scope_review = self.document_generation.prepare_icd_scope_review(
+                    ctx,
+                    order.work_order_id,
+                    decision,
+                )
+            if (
+                scope_review.pending_count
+                and not force_edf_connector_scope
+                and self._template_example_replacement_authorized(order)
+                and self._pending_scope_allows_edf_replacement(scope_review)
+            ):
+                # The user already authorized replacing the template's sample
+                # data and delegated object selection to the knowledge base.
+                # When the only blocker is a template-example refdes with real
+                # EDF connectors available, freezing the EDF-derived scope here
+                # fulfills that delegation instead of parking the submission.
+                auto_refdes = list(dict.fromkeys([
+                    *available_refdes,
+                    *(
+                        str(value)
+                        for exception in scope_review.exceptions
+                        for value in (getattr(exception, "suggested_refdes", None) or [])
+                    ),
+                ]))
+                if auto_refdes:
+                    auto_evidences = (
+                        circuit_service.list_pin_mapping_evidence(
+                            knowledge_base_name,
+                            list(snapshot.source_names),
+                            ctx,
+                            refdes=auto_refdes,
+                        )
+                        if circuit_scope_allowed
+                        else []
+                    )
+                    auto_decision = build_icd_scope_decision(
+                        auto_evidences,
+                        supporting_evidences,
+                        connector_refdes=auto_refdes,
+                        available_refdes=auto_refdes,
+                    )
+                    blocking_auto = [
+                        exception
+                        for exception in auto_decision.exceptions
+                        if str(getattr(exception, "kind", "") or "")
+                        in ICD_BLOCKING_SCOPE_EXCEPTION_KINDS
+                    ]
+                    if not blocking_auto:
+                        scope_review = self._freeze_scope_review_from_edf(
+                            ctx,
+                            order,
+                            snapshot,
+                            auto_decision,
+                            comment=(
+                                "系统按知识库自动发现的实际 EDF 位号替换模板示例位号"
+                                "（用户已授权替换模板示例数据）"
+                            ),
+                        )
             if scope_review.pending_count:
                 return self._attach_requirement_resolution(
                     {
@@ -2127,6 +2956,166 @@ class AppPipeline:
             },
             requirement_resolution,
         )
+
+    def _edf_connector_refdes(
+        self,
+        knowledge_base_name: str,
+        snapshot,
+        ctx: RequestContext,
+        *,
+        refdes_hint: Iterable[str] | None = None,
+    ) -> list[str]:
+        """Return the connector identities actually declared by the frozen EDF.
+
+        The EDF also contains component pin mappings (capacitors, ICs, ...);
+        only identities sharing the template's connector naming prefix (for
+        example ``X`` for ``X302``) may become ICD scope candidates.
+        """
+
+        circuit_service = getattr(self, "circuit_service", None)
+        if circuit_service is None or not getattr(snapshot, "source_names", None):
+            return []
+        try:
+            evidences = circuit_service.list_pin_mapping_evidence(
+                knowledge_base_name,
+                list(snapshot.source_names),
+                ctx,
+            )
+        except Exception:  # noqa: BLE001 - optional discovery, never a gate itself
+            return []
+        all_refdes: list[str] = []
+        for evidence in evidences:
+            metadata = getattr(evidence, "metadata", None) or {}
+            locator = getattr(evidence, "locator", None) or {}
+            evidence_refdes = str(locator.get("entity_id") or "").strip()
+            for mapping in metadata.get("pin_mappings") or []:
+                value = str(mapping.get("refdes") or evidence_refdes).strip()
+                if value and value not in all_refdes:
+                    all_refdes.append(value)
+        prefixes: set[str] = set()
+        for hint in refdes_hint or []:
+            match = re.match(r"[A-Za-z]+", str(hint).strip())
+            if match:
+                prefixes.add(match.group(0).upper())
+        connectors = [
+            value for value in all_refdes
+            if _is_connector_refdes(value, prefixes)
+        ]
+        return connectors
+
+    @staticmethod
+    def _template_example_replacement_authorized(order: Any) -> bool:
+        """Whether the user explicitly allowed replacing template sample data."""
+
+        brief = dict(getattr(order, "generation_brief", {}) or {})
+        return any(
+            isinstance(item, dict)
+            and str(item.get("field") or "").strip() == "confirmed_template_mapping_hash"
+            and str(item.get("value") or "").strip()
+            for item in (brief.get("additional_requirements") or [])
+        )
+
+    @staticmethod
+    def _pending_scope_allows_edf_replacement(review: Any) -> bool:
+        """Only connector-identity blockers may be auto-replaced from the EDF."""
+
+        resolved_ids = {
+            str(getattr(item, "exception_id", "") or "")
+            for item in (getattr(review, "resolutions", []) or [])
+        }
+        pending = [
+            exception
+            for exception in (getattr(review, "exceptions", []) or [])
+            if str(getattr(exception, "exception_id", "") or "") not in resolved_ids
+        ]
+        if not pending:
+            return False
+        return all(
+            str(getattr(exception, "kind", "") or "").strip()
+            in {"connector_mapping_missing", "connector_scope_unknown"}
+            for exception in pending
+        )
+
+    def _freeze_scope_review_from_edf(
+        self,
+        ctx: RequestContext,
+        order,
+        snapshot,
+        decision,
+        *,
+        comment: str,
+    ) -> IcdScopeReview:
+        """Freeze an EDF-derived scope decision over the pending review."""
+
+        resolutions = [
+            IcdScopeResolution(
+                exception_id=exception.exception_id,
+                action="include",
+                actor_id=str(getattr(ctx, "user_id", "") or "user"),
+            )
+            for exception in decision.exceptions
+        ]
+        review = IcdScopeReview(
+            work_order_id=order.work_order_id,
+            decision=decision,
+            source_snapshot_hash=snapshot.content_hash,
+            status="frozen",
+            resolutions=resolutions,
+            resolution_comment=(comment.strip() or "按 EDF 实际位号生成"),
+            frozen_at=utc_now(),
+        )
+        store = self.document_generation.store
+        existing = store.get_icd_scope_review(order.work_order_id)
+        if existing is None:
+            store.save_icd_scope_review(review)
+        elif str(getattr(existing, "status", "")) == "pending":
+            store.replace_pending_icd_scope_review(review)
+        else:
+            raise ValueError("ICD 范围已冻结，不能按 EDF 位号替换")
+        return review
+
+    def rebuild_icd_scope_from_edf(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        comment: str = "",
+    ) -> dict[str, Any]:
+        """Replace template-example connector refdes with the frozen EDF's own.
+
+        This is a user-confirmed action: it re-derives the connector scope from
+        the frozen EDF pin mappings, freezes the resulting review, and queues
+        generation on the same work order.
+        """
+
+        order = self.document_generation.store.get_work_order(work_order_id)
+        if order is None:
+            raise KeyError("document work order was not found")
+        self.document_generation.require_work_order_capability(
+            ctx, order, "run_deterministic_work_order",
+        )
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("EDF scope replacement requires a knowledge-base work order")
+        snapshot = self.document_generation.resolve_source_snapshot(order)
+        stage = self._kb_document_generation_stages(
+            ctx,
+            order,
+            snapshot,
+            knowledge_base_name=order.knowledge_base_name,
+            document_schema_id=str(getattr(order, "document_schema_id", "") or ""),
+            document_schema_version=str(getattr(order, "document_schema_version", "") or ""),
+            force_edf_connector_scope=True,
+            force_scope_comment=comment,
+        )
+        if stage.get("stage") != "ready":
+            return {"status": "waiting_human", **stage}
+        run_id = self.submit_knowledge_base_document_generation(ctx, work_order_id)
+        return {
+            "status": "resumed",
+            "stage": "ready",
+            "work_order_id": work_order_id,
+            "run_id": run_id,
+        }
 
     def dispatch_confirmed_document_plan(
         self,
@@ -2246,6 +3235,7 @@ class AppPipeline:
         idempotency_key = (
             f"document-plan:{plan.document_plan_id}:{plan.version}:{plan.plan_hash}"
         )
+        generation_brief = _generation_brief_from_output_spec(output_spec)
         order = self.document_generation._find_knowledge_base_work_order_by_idempotency(
             submission.tenant_id,
             knowledge_base_name,
@@ -2262,6 +3252,7 @@ class AppPipeline:
                     knowledge_base_name=knowledge_base_name,
                     idempotency_key=idempotency_key,
                     generation_session_id=submission.session_id,
+                    generation_brief=generation_brief,
                     source_scope="knowledge_base_only",
                 )
             else:
@@ -2275,6 +3266,7 @@ class AppPipeline:
                     document_schema_version=schema.version,
                     idempotency_key=idempotency_key,
                     generation_session_id=submission.session_id,
+                    generation_brief=generation_brief,
                     source_scope="knowledge_base_only",
                     output_spec_id=submission.output_spec_id,
                     output_spec_version=submission.output_spec_version,
@@ -2896,11 +3888,170 @@ class AppPipeline:
             cross_unit_cache=CrossUnitEvidenceCache(),
         )
 
+        # Second-stage retrieval for connector pin functions.  The frozen EDF
+        # only knows pin identity and net names, so the function column must
+        # be retrieved per connector after the first pass.  Candidates are
+        # anchored to the same connector identity; net-only matches are
+        # rejected so a template/other-product pin table cannot leak in.
+        pin_function_groups: dict[str, list[dict[str, str]]] = {}
+        for evidence in frozen_pin_evidence:
+            for mapping in (getattr(evidence, "metadata", None) or {}).get("pin_mappings") or []:
+                if not isinstance(mapping, dict):
+                    continue
+                refdes = str(mapping.get("refdes") or "").strip()
+                pin_name = str(mapping.get("pin_name") or "").strip()
+                if not (refdes and pin_name):
+                    continue
+                pin_function_groups.setdefault(refdes, []).append({
+                    "refdes": refdes,
+                    "pin_name": pin_name,
+                    "net_name": str(mapping.get("net_name") or "").strip(),
+                })
+        pin_function_loaded = False
+        pin_function_hits: dict[str, dict[str, str]] = {}
+        pin_function_evidence: dict[str, Any] = {}
+
+        def _augment_pin_function_evidence(requirement: Any, evidences: list[Any]) -> list[Any]:
+            nonlocal pin_function_loaded
+            if pin_function_loaded or not pin_function_groups:
+                return _merge_pin_function_evidence(evidences)
+            terms = " ".join(str(term) for term in (requirement.retrieval_query_terms or []))
+            if not any(
+                token in terms
+                for token in ("管脚", "引脚", "针脚", "Pin", "pin", "功能", "Function", "function")
+            ):
+                return evidences
+            pin_function_loaded = True
+            for refdes, mappings in pin_function_groups.items():
+                for query in pin_function_queries(refdes):
+                    try:
+                        hits = composite_provider.retrieve(
+                            query=query,
+                            source_scope=effective_source_scope,
+                            attachment_ids=attachment_ids,
+                            kb_name=kb_name,
+                            ctx=ctx,
+                        )
+                    except Exception:  # noqa: BLE001 - additive retrieval, never a gate
+                        hits = []
+                    for hit in hits:
+                        evidence_id = str(getattr(hit, "id", "") or "").strip()
+                        if not evidence_id:
+                            continue
+                        found = extract_pin_function_candidates(
+                            str(getattr(hit, "content", "") or ""), mappings,
+                        )
+                        if not found:
+                            continue
+                        merged = dict(pin_function_hits.get(evidence_id) or {})
+                        for key, value in found.items():
+                            merged.setdefault(key, value)
+                        pin_function_hits[evidence_id] = merged
+                        pin_function_evidence[evidence_id] = hit
+            spreadsheet_hits: dict[str, str] = {}
+            spreadsheet_rows: list[str] = []
+            spreadsheet_source = ""
+            spreadsheet_locator: dict[str, Any] = {}
+            if spreadsheet_tool is not None and scope_allows_kb(effective_source_scope):
+                for refdes, mappings in pin_function_groups.items():
+                    try:
+                        rows = spreadsheet_tool.run(
+                            refdes,
+                            kb_name,
+                            ctx,
+                            top_k=max(int(src.settings.FINAL_TOP_K), 20),
+                            filters=None,
+                        )
+                    except Exception:  # noqa: BLE001 - additive retrieval, never a gate
+                        rows = []
+                    for row in rows:
+                        source_name = str(getattr(row, "source_name", "") or "")
+                        if source_name not in frozen_source_names:
+                            continue
+                        metadata = dict(getattr(row, "metadata", None) or {})
+                        values = (
+                            metadata.get("values")
+                            if isinstance(metadata.get("values"), dict)
+                            else {}
+                        )
+                        raw_text = str(
+                            metadata.get("raw_text")
+                            or getattr(row, "content", "")
+                            or ""
+                        )
+                        found = extract_spreadsheet_pin_function_candidates(
+                            values, raw_text, mappings,
+                        )
+                        if not found:
+                            continue
+                        for key, value in found.items():
+                            spreadsheet_hits.setdefault(key, value)
+                        if raw_text and raw_text not in spreadsheet_rows:
+                            spreadsheet_rows.append(raw_text)
+                        if not spreadsheet_source:
+                            spreadsheet_source = source_name
+                        if not spreadsheet_locator:
+                            spreadsheet_locator = dict(
+                                getattr(row, "locator", None) or {}
+                            )
+            if spreadsheet_hits:
+                # One aggregated, internally-anchored evidence item: the
+                # harness caps per-unit evidence, so the function hits must
+                # travel together and survive selection as a single record.
+                evidence_id = "pin-function:frozen-icd-connectors"
+                merged_rows = " | ".join(spreadsheet_rows)
+                synthetic = Evidence(
+                    id=evidence_id,
+                    content=compose_function_evidence_text(spreadsheet_hits, merged_rows),
+                    source_name=spreadsheet_source or (
+                        frozen_source_names[0] if frozen_source_names else ""
+                    ),
+                    content_kind="spreadsheet_table",
+                    processor_kind="spreadsheet_table",
+                    score=1.0,
+                    locator=spreadsheet_locator,
+                    metadata={
+                        "tool": "pin_function_evidence",
+                        "pin_function_hits": spreadsheet_hits,
+                        "raw_text": merged_rows,
+                    },
+                )
+                pin_function_hits[evidence_id] = spreadsheet_hits
+                pin_function_evidence[evidence_id] = synthetic
+            return _merge_pin_function_evidence(evidences)
+
+        def _merge_pin_function_evidence(evidences: list[Any]) -> list[Any]:
+            if not pin_function_hits:
+                return evidences
+            merged: list[Any] = []
+            seen: set[str] = set()
+            for evidence in evidences:
+                evidence_id = str(getattr(evidence, "id", "") or "").strip()
+                hits = pin_function_hits.get(evidence_id)
+                if hits:
+                    metadata = dict(getattr(evidence, "metadata", None) or {})
+                    metadata["pin_function_hits"] = hits
+                    evidence = evidence.model_copy(update={"metadata": metadata})
+                if evidence_id:
+                    seen.add(evidence_id)
+                merged.append(evidence)
+            for evidence_id, hits in pin_function_hits.items():
+                if evidence_id in seen:
+                    continue
+                hit = pin_function_evidence.get(evidence_id)
+                if hit is None:
+                    continue
+                metadata = dict(getattr(hit, "metadata", None) or {})
+                metadata["pin_function_hits"] = hits
+                merged.append(hit.model_copy(update={"metadata": metadata}))
+            return merged
+
         def retrieve(requirement, _attempt, query_override=None, *, relaxed: bool = False):
             query = query_override or " ".join(requirement.retrieval_query_terms) or " ".join(
                 value for value in (requirement.subject, requirement.predicate, requirement.object_hint) if value
             )
             evidences = registry.retrieve(requirement, query, balanced_route=relaxed)
+            evidences = _augment_pin_function_evidence(requirement, evidences)
             return self.document_generation.build_knowledge_base_retrieval_outcome(
                 kb_name,
                 frozen_source_names,
@@ -2946,7 +4097,12 @@ class AppPipeline:
         if not schema_id or not schema_version:
             return None
         schema = self.document_generation._schema(schema_id, schema_version)
-        if str(getattr(schema, "document_type", "")).casefold() != "icd":
+        document_type = _canonical_document_type(
+            getattr(schema, "document_type", ""),
+            getattr(order, "template_version_id", ""),
+            schema=schema,
+        )
+        if document_type != "icd":
             return None
         return schema if _schema_has_icd_pin_field(schema) else None
 
@@ -3362,7 +4518,7 @@ class AppPipeline:
         summary = {"covered": 0, "missing": 0, "conflicting": 0, "failed": 0, "pending": 0}
 
         def _entry(kind: str, unit_id: str, label: str, required: bool) -> dict[str, Any]:
-            unit_key = f"{kind}:{unit_id}"
+            unit_key = unit_id if unit_id.startswith(f"{kind}:") else f"{kind}:{unit_id}"
             status_value = (
                 unit_statuses.get(unit_key)
                 or unit_statuses.get(unit_id)
@@ -3393,6 +4549,8 @@ class AppPipeline:
                 entries.append(_entry("review", item.review_item_id, item.label, False))
         for key, _status_value in unit_statuses.items():
             kind = "review" if key.startswith("review:") else "field"
+            if key in schema_unit_ids:
+                continue
             unit_id = key.removeprefix("field:").removeprefix("review:")
             if unit_id in schema_unit_ids:
                 continue
@@ -3428,6 +4586,7 @@ class AppPipeline:
                     task_projection = None
             elif callable(getattr(task_service, "legacy_view_for_work_order", None)):
                 task_projection = task_service.legacy_view_for_work_order(order)
+        coverage = self._document_coverage_block(order)
         status = {
             "work_order_id": order.work_order_id,
             "task_id": (
@@ -3447,7 +4606,7 @@ class AppPipeline:
             "project_id": order.project_id,
             "target_format": order.target_format,
             "unit_statuses": dict(order.unit_statuses),
-            "coverage": self._document_coverage_block(order),
+            "coverage": coverage,
             "validation_report_id": order.validation_report_id,
             "clarification_session_id": getattr(order, "generation_session_id", None),
             "generation_brief": dict(getattr(order, "generation_brief", {}) or {}),
@@ -3456,6 +4615,15 @@ class AppPipeline:
             "retryable": getattr(order, "retryable", None),
             "next_actions": list(getattr(order, "next_actions", []) or []),
         }
+        if order.status == "complete" and not _completed_document_coverage_is_valid(coverage):
+            status.update({
+                "status": "blocked",
+                "phase": "blocked",
+                "error_code": "completed_with_incomplete_required_content",
+                "error_message": "任务被错误标记为完成，但仍有必填内容未生成；请重新生成。",
+                "retryable": True,
+                "next_actions": ["retry_generation", "view_error"],
+            })
         if task_projection is not None:
             status["task"] = task_projection.model_dump(mode="json")
         if order.run_manifest_id:
@@ -3534,8 +4702,39 @@ class AppPipeline:
                 "policy_status": artifact.policy_status,
             }
             for artifact in self.document_generation.store.list_artifacts(order.work_order_id)
+            if self._document_artifact_is_user_visible(artifact)
         ]
+        # A pending ICD scope gate is a first-class human gate on the work
+        # order; status refreshes must keep explaining it (and must stop
+        # showing it once it is frozen).  The projection carries only the
+        # operator-facing fields, never review hashes.
+        try:
+            scope_details = self._document_icd_scope_pending_details(order.work_order_id)
+        except Exception:  # noqa: BLE001 - additive/fail-soft read model
+            scope_details = None
+        if (
+            isinstance(scope_details, dict)
+            and str(scope_details.get("status") or "") == "pending"
+        ):
+            status["pending_review"] = {
+                "review_kind": "icd_scope",
+                "status": "pending",
+                "scope_review": scope_details,
+            }
         return status
+
+    def _document_artifact_is_user_visible(self, artifact: Any) -> bool:
+        """Hide artifacts that deterministic validation says cannot be used.
+
+        Older workers could persist or even release an empty candidate before
+        projecting the blocking report.  Keeping the immutable record is useful
+        for audit, but it must not be advertised to an end user as a document
+        they can preview or download.
+        """
+        report_id = str(getattr(artifact, "validation_report_id", "") or "").strip()
+        get_report = getattr(self.document_generation.store, "get_validation_report", None)
+        report = get_report(report_id) if report_id and callable(get_report) else None
+        return not self._document_validation_report_blocks_review(report)
 
     def get_document_task_projection(
         self,
@@ -3585,6 +4784,8 @@ class AppPipeline:
             list_artifacts = getattr(self.document_generation.store, "list_artifacts", None)
             if callable(list_artifacts):
                 for artifact in list_artifacts(order.work_order_id) or []:
+                    if not self._document_artifact_is_user_visible(artifact):
+                        continue
                     artifacts.append(self._safe_document_task_artifact(artifact, order))
 
         reviews = self._document_reviews_for_task(ctx, task, order)
@@ -3620,6 +4821,29 @@ class AppPipeline:
                 next_actions = ["propose_document_plan", "confirm_document_plan"]
             elif task.status == "planned":
                 next_actions = ["await_generation", "get_document_task_status"]
+
+        projected_error_code = status.get("error_code")
+        projected_error_message = status.get("error_message")
+        projected_retryable = status.get("retryable")
+        # A work-order release block is authoritative over a stale task row
+        # (older deployments may have left the task at ``failed``/``pending``).
+        if str(status.get("status") or "").strip().casefold() == "blocked":
+            projected_status = "blocked"
+        job = status.get("job") or {}
+        job_status = str(job.get("status") or "").strip().casefold()
+        if job_status == "failed":
+            # The durable execution job is authoritative once it reaches a
+            # terminal failure, even if the task/work-order read models have
+            # not caught up yet.
+            projected_status = "failed"
+            projected_error_code = projected_error_code or "document_job_failed"
+            projected_error_message = projected_error_message or job.get("last_error")
+            if projected_retryable is None:
+                projected_retryable = False
+            next_actions = ["retry_document_generation"] if projected_retryable else []
+        elif job_status == "cancelled":
+            projected_status = "cancelled"
+            next_actions = []
 
         planning_state = None
         submission_state = None
@@ -3699,14 +4923,73 @@ class AppPipeline:
                 ),
                 None,
             )
-        if pending_review and pending_review.get("revision_id"):
-            next_actions = ["review_revision", "open_document_workbench"]
-        elif pending_review and pending_review.get("review_kind") not in {None, "icd_scope"}:
-            next_actions = ["review_document", "open_document_workbench"]
+        if pending_review is not None and pending_review.get("review_kind") == "icd_scope" and order is not None:
+            scope_details = self._document_icd_scope_pending_details(order.work_order_id)
+            if scope_details is not None:
+                pending_review["scope_review"] = scope_details
+        pending_question = (session_projection or {}).get("pending_question")
+        clarification_pending = (
+            (session_projection or {}).get("status") == "needs_clarification"
+            and isinstance(pending_question, dict)
+            and bool(str(pending_question.get("question_id") or "").strip())
+        )
+        if clarification_pending:
+            # Conversation clarification is the primary recovery path.  Keep
+            # the underlying release error for diagnostics, but do not route
+            # the user to the workbench to edit cells by hand.
+            projected_status = "needs_clarification"
+            next_actions = ["answer_clarification"]
+        elif (
+            pending_review is not None
+            and job_status not in {"failed", "cancelled"}
+            and projected_status not in {"blocked", "failed"}
+            and projected_error_code not in {
+                "plan_release_blocked", "block_generation_unresolved_missing",
+            }
+        ):
+            # A deterministic release gate is a normal human-review state,
+            # but it must never erase a real execution/release block.
+            projected_status = "needs_review"
+            projected_error_code = None
+            projected_error_message = None
+            projected_retryable = None
+        if not clarification_pending:
+            if pending_review and pending_review.get("revision_id"):
+                if projected_status not in {"blocked", "failed"}:
+                    next_actions = ["review_revision", "open_document_workbench"]
+            elif pending_review and pending_review.get("review_kind") == "icd_scope":
+                # The dedicated scope-resolution endpoint is the recovery
+                # path; a bare resume is rejected while the review is pending.
+                if projected_status not in {"blocked", "failed"}:
+                    next_actions = ["submit_icd_scope_resolution", "open_document_workbench"]
+            elif pending_review and pending_review.get("review_kind") not in {None, "icd_scope"}:
+                if projected_status not in {"blocked", "failed"}:
+                    next_actions = ["review_document", "open_document_workbench"]
+        if projected_status == "blocked" and not next_actions:
+            next_actions = ["view_error", "provide_value"]
+        if projected_status == "draft":
+            lifecycle_phase = "draft"
+        elif projected_status == "needs_clarification":
+            lifecycle_phase = "needs_input"
+        elif projected_status == "awaiting_plan_confirmation":
+            lifecycle_phase = "awaiting_confirmation"
+        elif projected_status == "planned":
+            lifecycle_phase = "queued" if plan_ref[0] else "draft"
+        elif projected_status in {"waiting_human", "awaiting_release", "needs_review"}:
+            lifecycle_phase = "needs_review"
+        elif projected_status == "blocked":
+            lifecycle_phase = "blocked"
+        elif projected_status in {"completed", "complete", "succeeded"}:
+            lifecycle_phase = "completed"
+        elif projected_status in {"queued", "running", "failed", "cancelled"}:
+            lifecycle_phase = projected_status
+        else:
+            lifecycle_phase = "draft"
         projection = {
             "task_id": task.task_id,
             "origin": task.origin,
             "status": projected_status,
+            "lifecycle_phase": lifecycle_phase,
             "conversation_refs": {
                 key: value
                 for key, value in {
@@ -3735,11 +5018,16 @@ class AppPipeline:
                 else None
             ),
             "run": status.get("harness_run"),
+            "coverage": status.get("coverage"),
+            "validation": status.get("validation"),
             "artifacts": artifacts,
             "reviews": reviews,
             "revisions": revisions,
             "pending_review": pending_review,
             "next_actions": next_actions,
+            "error_code": projected_error_code,
+            "error_message": projected_error_message,
+            "retryable": projected_retryable,
             "planning_state": planning_state,
             "submission": submission_state,
             "created_at": task.created_at,
@@ -4034,8 +5322,16 @@ class AppPipeline:
             raise PermissionError("knowledge base write permission is required")
 
         reviews = self._document_reviews_for_task(ctx, task, order)
-        if any(review.get("status") in {"pending", "changes_requested"} for review in reviews):
-            raise ValueError("document task has pending human review")
+        pending_kinds = sorted({
+            str(review.get("review_kind") or "").strip()
+            for review in reviews
+            if review.get("status") in {"pending", "changes_requested"}
+            and str(review.get("review_kind") or "").strip()
+        })
+        if pending_kinds:
+            raise ValueError(
+                "document task has pending human review: " + ", ".join(pending_kinds)
+            )
 
         if order.status == "paused":
             run_id = self.resume_knowledge_base_document_generation(ctx, work_order_id)
@@ -4084,7 +5380,56 @@ class AppPipeline:
             return []
         if order is not None:
             self._materialize_document_reviews(task, order, review_store)
-        return [review.model_dump(mode="json") for review in review_store.list_for_task(task.task_id)]
+        reviews = review_store.list_for_task(task.task_id)
+        if order is None:
+            return [review.model_dump(mode="json") for review in reviews]
+
+        list_artifacts = getattr(self.document_generation.store, "list_artifacts", None)
+        artifacts = list_artifacts(order.work_order_id) if callable(list_artifacts) else []
+        artifact_by_id = {
+            str(getattr(artifact, "artifact_id", "")): artifact
+            for artifact in artifacts or []
+        }
+        released_parent_ids = {
+            str(getattr(artifact, "parent_artifact_id", ""))
+            for artifact in artifacts or []
+            if getattr(artifact, "stage", None) == "approved_release"
+        }
+        get_report = getattr(self.document_generation.store, "get_validation_report", None)
+        visible = []
+        for review in reviews:
+            if not str(getattr(review, "review_kind", "")).startswith("artifact_approval:"):
+                visible.append(review)
+                continue
+            artifact_id = str(getattr(review, "artifact_id", "") or "")
+            artifact = artifact_by_id.get(artifact_id)
+            if artifact is None:
+                visible.append(review)
+                continue
+            if artifact_id in released_parent_ids:
+                continue
+            report = (
+                get_report(getattr(artifact, "validation_report_id", None))
+                if callable(get_report)
+                else None
+            )
+            if self._document_validation_report_blocks_review(report):
+                continue
+            visible.append(review)
+        return [review.model_dump(mode="json") for review in visible]
+
+    @staticmethod
+    def _document_validation_report_blocks_review(report: Any | None) -> bool:
+        if report is None:
+            return False
+        if str(getattr(report, "status", "") or "").strip().casefold() == "failed":
+            return True
+        return any(
+            bool(issue.get("blocking"))
+            or str(issue.get("severity") or "").strip().casefold() == "blocking"
+            for issue in (getattr(report, "issues", None) or [])
+            if isinstance(issue, Mapping)
+        )
 
     def _materialize_document_reviews(self, task: Any, order: Any, review_store: Any) -> None:
         """Adapt legacy ICD/artifact gates into the generic review namespace."""
@@ -4163,6 +5508,8 @@ class AppPipeline:
             get_report = getattr(self.document_generation.store, "get_validation_report", None)
             if callable(get_report):
                 report = get_report(getattr(artifact, "validation_report_id", None))
+                if self._document_validation_report_blocks_review(report):
+                    continue
                 report_hash = str(getattr(report, "content_hash", None) or "").strip()
             if artifact_content_hash and report_hash:
                 subject_hash = content_hash({
@@ -4224,6 +5571,51 @@ class AppPipeline:
                 projections.append(projection)
         return projections
 
+    def get_current_chat_document_task_projection(
+        self,
+        ctx: RequestContext,
+        *,
+        conversation_id: str | int,
+        knowledge_base_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the task selected by the conversation's durable pointer.
+
+        Updated timestamps are intentionally not consulted here: a delayed
+        update to an older task must never make a subsequent confirmation act
+        on that historical task.
+        """
+        task_service = getattr(self.document_generation, "task_service", None)
+        task_store = getattr(task_service, "store", None)
+        if task_store is None or not getattr(src.settings, "DOCUMENT_TASK_READ_ENABLED", True):
+            return None
+        requested_kb = str(knowledge_base_name or "").strip() or None
+        if requested_kb and not ctx.has_kb_permission(requested_kb, "read"):
+            raise PermissionError("knowledge base read permission is required")
+        requested_conversation = str(conversation_id or "").strip()
+        if not requested_conversation:
+            raise ValueError("conversation_id is required")
+        tenant_id = str(getattr(ctx, "tenant_id", None) or "default")
+        user_id = str(getattr(ctx, "user_id", None) or "")
+        task = task_store.get_current_chat_task(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=requested_conversation,
+            knowledge_base_name=requested_kb,
+        )
+        if task is None:
+            return None
+        projection = self.get_document_task_projection(ctx, task.task_id)
+        if projection is None:
+            return None
+        state = task_store.get_conversation_document_state(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=requested_conversation,
+        )
+        if state is not None:
+            projection["conversation_revision"] = int(state["revision"])
+        return projection
+
     def _document_clarification_projection(
         self,
         ctx: RequestContext,
@@ -4248,13 +5640,24 @@ class AppPipeline:
             return None
         if session is None:
             return None
-        pending = next(
-            (
-                item for item in reversed(session.messages)
-                if item.role == "assistant" and item.question_id
-            ),
-            None,
-        )
+        # Walk backwards so an answered question can never be resurfaced as
+        # the current prompt.  A session may retain the full immutable
+        # clarification history (including the initial recommendation
+        # question) after the plan has been accepted or execution has been
+        # blocked.  Only an assistant question without a later user answer
+        # is actionable in the conversation.
+        answered_question_ids: set[str] = set()
+        pending = None
+        for item in reversed(session.messages):
+            question_id = str(getattr(item, "question_id", "") or "").strip()
+            if not question_id:
+                continue
+            if item.role == "user":
+                answered_question_ids.add(question_id)
+                continue
+            if item.role == "assistant" and question_id not in answered_question_ids:
+                pending = item
+                break
         return {
             "session_id": session.session_id,
             "status": session.status,
@@ -4289,6 +5692,48 @@ class AppPipeline:
         if revision_id:
             projection["revision_id"] = revision_id
         return projection
+
+    def _document_icd_scope_pending_details(
+        self,
+        work_order_id: str,
+    ) -> dict[str, Any] | None:
+        """Project the frozen-scope stop so callers can explain the next step.
+
+        The generic review row only carries the review kind; the actionable
+        details (blocked connector/refdes and the operator instruction) live in
+        the legacy ICD scope store and must not be reduced to a bare code.
+        """
+        getter = getattr(
+            getattr(self.document_generation, "store", None),
+            "get_icd_scope_review",
+            None,
+        )
+        if not callable(getter):
+            return None
+        try:
+            review = getter(str(work_order_id))
+        except (KeyError, PermissionError, ValueError):
+            return None
+        if review is None:
+            return None
+        exceptions = []
+        for exception in list(getattr(review, "exceptions", None) or []):
+            exceptions.append({
+                "kind": getattr(exception, "kind", None),
+                "refdes": getattr(exception, "refdes", None),
+                "pin_name": getattr(exception, "pin_name", None),
+                "recommended_action": getattr(exception, "recommended_action", None),
+                "user_instruction": getattr(exception, "user_instruction", None),
+            })
+        return {
+            "status": getattr(review, "status", None),
+            "pending_count": int(getattr(review, "pending_count", 0) or 0),
+            "blocking": any(
+                item["kind"] in ICD_BLOCKING_SCOPE_EXCEPTION_KINDS
+                for item in exceptions
+            ),
+            "exceptions": exceptions,
+        }
 
     @staticmethod
     def _document_task_next_actions(
