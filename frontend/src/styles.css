@@ -212,6 +212,13 @@ select,
     transform 180ms ease;
 }
 
+/* 隐藏 Edge/IE 在密码输入框内渲染的原生显码按钮与清除叉号,
+   避免与页面自定义的眼睛切换按钮重复(登录页/用户管理)。 */
+input[type='password']::-ms-reveal,
+input[type='password']::-ms-clear {
+  display: none;
+}
+
 /* AppIcon 的 SVG 基础样式(stroke 描边图标,缺这个会渲染成黑色实心) */
 .app-icon {
   width: 18px;
@@ -324,7 +331,7 @@ select,
 
 .login-graph-line {
   stroke: var(--login-graph-line);
-  stroke-width: 0.12;
+  stroke-width: 1;
   stroke-linecap: round;
   stroke-dasharray: 1;
   stroke-dashoffset: 1;
@@ -335,7 +342,6 @@ select,
   position: absolute;
   border-radius: 50%;
   background: var(--login-graph-ink);
-  box-shadow: none;
   transform: translate(-50%, -50%) translate(var(--drift-x), var(--drift-y)) scale(0.7);
   animation: login-graph-node-gather 7.4s cubic-bezier(0.45, 0, 0.15, 1) infinite;
 }
@@ -364,11 +370,13 @@ select,
   20% {
     opacity: 0;
     stroke-dashoffset: 1;
+    animation-timing-function: steps(26, end);
   }
   42%,
   72% {
     opacity: 1;
     stroke-dashoffset: 0;
+    animation-timing-function: steps(20, end);
   }
   100% {
     opacity: 0;

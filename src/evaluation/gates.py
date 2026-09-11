@@ -11,13 +11,11 @@ from .schemas import GateResult, SampleResult
 DEFAULT_THRESHOLDS: dict[str, float] = {
     "answer_correctness": 0.75,
     "faithfulness": 0.75,
-    "completeness": 0.75,
     "evidence_consistency": 0.75,
     "answer_relevancy": 0.70,
     "context_precision": 0.70,
     "context_recall": 0.70,
-    "missing_information_honesty": 0.90,
-    "conflict_disclosure": 0.90,
+    "forbidden_claims": 1.0,
 }
 
 DOCUMENT_GENERATION_HARD_ZERO_METRICS = {

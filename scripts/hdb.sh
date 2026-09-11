@@ -142,12 +142,57 @@ wait_for() {
   return 1
 }
 
+NODEENV="${NODEENV:-/tmp/opencode/nodeenv}"
+
+ensure_node() {
+  if [ -x "${NODEENV}/lib/python3.12/site-packages/nodejs_wheel/bin/node" ]; then return 0; fi
+  echo "[node] 便携 Node 不存在(${NODEENV} 已清)，重新安装..."
+  rm -rf "${NODEENV}"
+  uv venv "${NODEENV}" -q && uv pip install -q --python "${NODEENV}/bin/python" nodejs-wheel-binaries
+}
+
+start_front() {
+  ensure_node
+  export PATH="${NODEENV}/lib/python3.12/site-packages/nodejs_wheel/bin:$PATH"
+  if [ ! -x "$APP_ROOT/frontend/node_modules/.bin/vite" ]; then
+    echo "[front]  缺少前端依赖，请先在 frontend 执行 npm ci"
+    return 1
+  fi
+  echo "[front]  启动中 (:$FRONT_PORT)..."
+  start_process frontend "$APP_ROOT/frontend" "$FRONT_PID_FILE" \
+    env VITE_API_PROXY_TARGET="http://127.0.0.1:$API_PORT" \
+    ./node_modules/.bin/vite --host 0.0.0.0 --port "$FRONT_PORT" --strictPort
+  if ! wait_for front_ok 10; then
+    echo "[front]  启动失败，查看 $LOG_DIR/frontend.log"
+    return 1
+  fi
+}
+
 do_start() {
   mkdir -p "$LOG_DIR" "$PID_DIR"
   # 先清理历史残留的未纳管 worker,避免旧代码实例继续消费队列。
   cleanup_stale_workers
   if api_ok; then
-    echo "[api]    已在运行 (:$API_PORT)"
+    if managed_pid "$API_PID_FILE" "$APP_ROOT" >/dev/null; then
+      echo "[api]    已在运行 (:$API_PORT, pid $(cat "$API_PID_FILE"))"
+    else
+      # 端口被没有 pid 文件的进程占用（多为手动启动的旧进程）：自动清理，
+      # 否则 stop 永远杀不到它，新代码也永远加载不上。
+      echo "[api]    检测到未知进程占用 :$API_PORT，自动清理..."
+      fuser -k "${API_PORT}/tcp" 2>/dev/null || true
+      sleep 2
+      if api_ok; then
+        echo "[api]    未知进程清理失败，请手动处理: fuser -k ${API_PORT}/tcp"
+        return 1
+      fi
+      echo "[api]    启动中 (:$API_PORT)..."
+      start_process api "$APP_ROOT" "$API_PID_FILE" \
+        env HDB_API_HOST="$API_HOST" HDB_API_PORT="$API_PORT" uv run hardware-database-server
+      if ! wait_for api_ok 15; then
+        echo "[api]    启动失败，查看 $LOG_DIR/api.log"
+        return 1
+      fi
+    fi
   else
     echo "[api]    启动中 (:$API_PORT)..."
     start_process api "$APP_ROOT" "$API_PID_FILE" \
@@ -159,20 +204,34 @@ do_start() {
   fi
 
   if front_ok; then
-    echo "[front]  已在运行 (:$FRONT_PORT)"
+    if managed_pid "$FRONT_PID_FILE" "$APP_ROOT/frontend" >/dev/null; then
+      echo "[front]  已在运行 (:$FRONT_PORT, pid $(cat "$FRONT_PID_FILE"))"
+    else
+      echo "[front]  检测到未知进程占用 :$FRONT_PORT，自动清理..."
+      fuser -k "${FRONT_PORT}/tcp" 2>/dev/null || true
+      sleep 2
+      start_front
+    fi
   else
-    if [ ! -x "$APP_ROOT/frontend/node_modules/.bin/vite" ]; then
-      echo "[front]  缺少前端依赖，请先在 frontend 执行 npm ci"
-      return 1
-    fi
-    echo "[front]  启动中 (:$FRONT_PORT)..."
-    start_process frontend "$APP_ROOT/frontend" "$FRONT_PID_FILE" \
-      env VITE_API_PROXY_TARGET="http://127.0.0.1:$API_PORT" \
-      ./node_modules/.bin/vite --host 0.0.0.0 --port "$FRONT_PORT" --strictPort
-    if ! wait_for front_ok 10; then
-      echo "[front]  启动失败，查看 $LOG_DIR/frontend.log"
-      return 1
-    fi
+    start_front
+  fi
+
+  # 对话 turns 执行器：没有它，前端对话会一直停留或报错。
+  if managed_pid "$WORKER_PID_FILE" "$APP_ROOT" >/dev/null; then
+    echo "[worker] 已在运行 (pid $(cat "$WORKER_PID_FILE"))"
+  else
+    echo "[worker] 启动中..."
+    start_process worker "$APP_ROOT" "$WORKER_PID_FILE" \
+      uv run hardware-database-worker
+  fi
+
+  # 长期记忆提炼器：没有它，"创建个人记忆/自动提炼"会永远停在 pending。
+  if managed_pid "$MEMORY_WORKER_PID_FILE" "$APP_ROOT" >/dev/null; then
+    echo "[memory] 已在运行 (pid $(cat "$MEMORY_WORKER_PID_FILE"))"
+  else
+    echo "[memory] 启动中..."
+    start_process memory-worker "$APP_ROOT" "$MEMORY_WORKER_PID_FILE" \
+      uv run hardware-database-memory-worker
   fi
   start_worker_processes
   do_status
@@ -225,15 +284,16 @@ do_status() {
 }
 
 do_logs() {
-  for log in "$LOG_DIR/api.log" "$LOG_DIR/frontend.log" "$LOG_DIR/worker.log"; do
+  for log in "$LOG_DIR/api.log" "$LOG_DIR/frontend.log" "$LOG_DIR/worker.log" "$LOG_DIR/memory-worker.log"; do
     [ -f "$log" ] && tail -n 30 "$log"
   done
 }
 
 case "${1:-status}" in
-  status) do_status ;;
-  start)  do_start ;;
-  stop)   do_stop ;;
-  logs)   do_logs ;;
-  *) echo "用法: bash scripts/hdb.sh [status|start|stop|logs]" ;;
+  status)  do_status ;;
+  start)   do_start ;;
+  stop)    do_stop ;;
+  restart) do_stop; do_start ;;
+  logs)    do_logs ;;
+  *) echo "用法: bash scripts/hdb.sh [status|start|stop|restart|logs]" ;;
 esac

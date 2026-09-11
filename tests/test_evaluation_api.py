@@ -75,7 +75,6 @@ def test_get_run_keeps_summary_when_sample_diagnostics_are_unavailable(tmp_path,
         dataset_path="dataset.jsonl",
         snapshot_path="",
         total_samples=1,
-        score_enabled=True,
     ).model_copy(update={"status": "completed"})
     (run_dir / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
     (run_dir / "summary.json").write_text(
@@ -117,7 +116,6 @@ def test_get_run_reads_incremental_diagnostics_while_scoring(tmp_path, monkeypat
         dataset_path="dataset.jsonl",
         snapshot_path="",
         total_samples=1,
-        score_enabled=True,
     ).model_copy(update={"status": "running"})
     checkpoint = tmp_path / "run-1" / ".checkpoint"
     checkpoint.mkdir(parents=True)
@@ -172,7 +170,6 @@ def test_delete_run_removes_failed_run_artifacts(tmp_path, monkeypatch):
         dataset_path="dataset.jsonl",
         snapshot_path="",
         total_samples=1,
-        score_enabled=True,
     ).model_copy(update={"status": "failed"})
     (run_dir / "run_state.json").write_text(state.model_dump_json(), encoding="utf-8")
     (run_dir / "summary.json").write_text("partial report", encoding="utf-8")
@@ -258,7 +255,6 @@ def test_preflight_reports_selected_kb_counts_and_normalizes_dataset_scope(tmp_p
             dataset_path=str(dataset),
             kb_id=7,
             kb_name="shared",
-            score_enabled=False,
         ),
         output_root="storage/evaluations",
         _actor=_evaluation_admin(),
@@ -294,7 +290,6 @@ def test_create_run_uses_selected_kb_and_run_local_normalized_samples(tmp_path, 
                 dataset_path=str(tmp_path / "runs" / "run-1" / "execution_dataset.jsonl"),
                 snapshot_path=str(tmp_path / "runs" / "run-1" / "snapshot.jsonl"),
                 total_samples=len(kwargs["samples"]),
-                score_enabled=kwargs["score_enabled"],
                 metadata={
                     "kb_id": kwargs["kb_id"],
                     "kb_name": kwargs["kb_name"],
@@ -308,7 +303,6 @@ def test_create_run_uses_selected_kb_and_run_local_normalized_samples(tmp_path, 
             dataset_path=str(dataset),
             kb_id=7,
             kb_name="shared",
-            score_enabled=False,
         ),
         output_root="storage/evaluations",
         _actor=_evaluation_admin(),
@@ -334,7 +328,7 @@ def test_create_run_rejects_kb_id_and_name_mismatch(tmp_path, monkeypatch):
     with pytest.raises(evaluation.HTTPException) as exc_info:
         evaluation.create_run(
             CreateEvaluationRunRequest(
-                dataset_path=str(dataset), kb_id=7, kb_name="other", score_enabled=False
+                dataset_path=str(dataset), kb_id=7, kb_name="other"
             ),
             output_root="storage/evaluations",
             _actor=_evaluation_admin(),
@@ -359,7 +353,6 @@ def test_start_run_rejects_modified_run_local_execution_dataset(tmp_path, monkey
         dataset_path=str(execution_dataset),
         snapshot_path=str(tmp_path / "run-1" / "snapshot.jsonl"),
         total_samples=1,
-        score_enabled=False,
         metadata={
             "kb_id": 7,
             "kb_name": "shared",
@@ -412,7 +405,6 @@ def test_start_run_revalidates_filtered_cohort_using_saved_filters(tmp_path, mon
         dataset_path=str(execution_dataset),
         snapshot_path=str(tmp_path / "run-1" / "snapshot.jsonl"),
         total_samples=1,
-        score_enabled=False,
         sample_ids=["case-1"],
         metadata={
             "kb_id": 7,

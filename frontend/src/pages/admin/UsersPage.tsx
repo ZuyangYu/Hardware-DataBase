@@ -157,6 +157,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
         key: 'status',
         title: '状态',
         width: 110,
+        className: 'whitespace-nowrap',
         render: (u) => {
           const isSelf = u.username === auth.user.username;
           return (
@@ -165,7 +166,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
               disabled={isSelf}
               onClick={() => handleToggleActive(u, !u.is_active)}
               className={cn(
-                'inline-flex h-[24px] items-center gap-[6px] rounded-full px-[10px] text-[11px] transition-colors',
+                'inline-flex h-[24px] items-center gap-[6px] whitespace-nowrap rounded-full px-[10px] text-[11px] transition-colors',
                 u.is_active
                   ? 'bg-[#e6f6ec] text-[#138a55]'
                   : 'bg-[#f3f4f6] text-[#858b9c]',

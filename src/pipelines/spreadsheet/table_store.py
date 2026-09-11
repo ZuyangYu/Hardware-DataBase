@@ -253,6 +253,9 @@ class TableIndexStore:
                     if progress_callback:
                         progress = 35 + int(((sheet_number - 1) / total_sheets) * 50)
                         progress_callback(progress, f"写入工作表 {sheet_number}/{total_sheets}: {sheet.name}")
+                    if src.settings.SPREADSHEET_SKIP_BOILERPLATE_SHEETS and _is_boilerplate_sheet(sheet.name, sheet.rows):
+                        stats.warnings.append(f"已跳过样板工作表: {sheet.name}")
+                        continue
                     profile = _sheet_profile(sheet.rows)
                     semantic_rows = _sheet_semantic_rows(sheet, profile)
                     profile["semantic_row_count"] = len(semantic_rows)
@@ -543,6 +546,48 @@ def _workbook_warnings(stats: TableIndexStats) -> list[str]:
     if embedded_parts:
         warnings.append(f"检测到 {', '.join(embedded_parts)}；当前记录对象数量，嵌入文档、图片和绘图内容暂未展开。")
     return warnings
+
+
+_BOILERPLATE_SHEET_NAME_PATTERNS = (
+    "模板使用说明",
+    "模板变更历史",
+    "template instructions",
+    "template change history",
+    "instruction manual",
+    "填写说明",
+)
+
+_BOILERPLATE_CONTENT_SIGNATURES = (
+    "变更单号",
+    "变更原因",
+    "填写说明",
+    "revision note",
+    "fill in instructions",
+)
+
+
+def is_boilerplate_sheet(name: str, rows: list[list[str]]) -> bool:
+    """识别模板文书类工作表(使用说明/变更历史等)。
+
+    双重判定:sheet 名命中模式,或前几行内容命中至少两个样板特征词。
+    只用于跳过行索引,不删除源数据。
+    """
+
+    name_l = str(name or "").strip().casefold()
+    if any(pattern in name_l for pattern in _BOILERPLATE_SHEET_NAME_PATTERNS):
+        return True
+    sample: list[str] = []
+    for row in rows[:6]:
+        sample.extend(str(value or "") for value in row[:8])
+    joined = " ".join(sample).casefold()
+    hits = sum(1 for signature in _BOILERPLATE_CONTENT_SIGNATURES if signature in joined)
+    return hits >= 2
+
+
+def _is_boilerplate_sheet(name: str, rows: list[list[str]]) -> bool:
+    if not src.settings.SPREADSHEET_SKIP_BOILERPLATE_SHEETS:
+        return False
+    return is_boilerplate_sheet(name, rows)
 
 
 def _sheet_profile(rows: list[list[str]]) -> dict:

@@ -73,6 +73,7 @@ def _message_view(m) -> MessageView:
         memory_context=getattr(m, "memory_context", []),
         document_context=getattr(m, "document_context", None),
         attachments=attachments,
+        citations=getattr(m, "citations", []) or [],
     )
 
 

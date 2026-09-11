@@ -200,6 +200,8 @@ export interface MessageView {
   document_context?: DocumentContext | null;
   /** Frozen attachment snapshots of the owning turn (user messages). */
   attachments?: AttachmentSnapshot[];
+  /** 紧凑引用列表（随消息持久化），刷新后"参考来源"面板的数据源。 */
+  citations?: EvidenceItem[];
 }
 
 export interface SessionMemorySummary {
@@ -759,12 +761,51 @@ export type EvaluationRunStatus =
   | 'running'
   | 'pause_requested'
   | 'paused'
+  | 'collected'
   | 'cancel_requested'
   | 'cancelled'
   | 'completed'
   | 'failed'
   | 'invalid';
-export type EvaluationRunStage = 'idle' | 'collecting' | 'scoring' | 'reporting';
+export type EvaluationRunStage = 'idle' | 'collecting' | 'collected' | 'scoring' | 'reporting';
+
+export interface EvaluationDatasetKbBinding {
+  kb_name: string;
+  count: number;
+}
+
+export interface EvaluationDatasetSummary {
+  name: string;
+  path: string;
+  sample_count: number;
+  malformed_lines: number;
+  kb_bindings: EvaluationDatasetKbBinding[];
+  tags: string[];
+  expected_denied_count: number;
+  critical_count: number;
+}
+
+export interface CollectionQcReport {
+  verdict: 'pass' | 'pass_with_warnings' | 'fail';
+  checked_at: string;
+  totals: {
+    samples: number;
+    snapshots: number;
+    failed: number;
+    degraded: number;
+    zero_evidence: number;
+    expected_denied: number;
+  };
+  issues: string[];
+  warnings: string[];
+  samples: Array<{
+    sample_id: string;
+    status: string;
+    evidence_count: number;
+    duration_seconds: number;
+    flags: string[];
+  }>;
+}
 
 export interface EvaluationKnowledgeBase {
   kb_id: number;
@@ -788,7 +829,6 @@ export interface EvaluationRunListItem {
   dataset_path: string;
   source_dataset_path: string;
   mode: string;
-  score_enabled: boolean;
   report_path: string;
   dataset_sample_count: number;
   normal_sample_count: number;
@@ -805,7 +845,6 @@ export interface CreateEvaluationRunPayload {
   kb_id: number;
   kb_name: string;
   mode: EvaluationMode;
-  score_enabled: boolean;
   sample_ids?: string[] | null;
   tags?: string[] | null;
   snapshot_path?: string | null;
@@ -904,7 +943,6 @@ export interface EvaluationRunDetail {
   dataset_path: string;
   snapshot_path: string;
   mode: EvaluationMode;
-  score_enabled: boolean;
   sample_ids: string[];
   tags: string[];
   status: EvaluationRunStatus;
@@ -948,6 +986,7 @@ export interface EvaluationRunDetail {
   summary?: EvaluationSummary | null;
   sample_results: EvaluationSampleResult[];
   sample_results_error: string;
+  collection_qc?: CollectionQcReport | null;
 }
 
 export interface EvaluationCompareResponse {

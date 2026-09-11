@@ -14,6 +14,8 @@ from typing import Any
 import src.settings as settings
 from langchain.chat_models import init_chat_model
 
+from src.core.llm_headers import opencode_extra_headers
+
 
 _SETTINGS_GENERATION = 0
 _PROFILE_NAMES = frozenset({
@@ -222,6 +224,11 @@ def _build_cached_chat_model(generation: int, config: ChatModelConfig) -> object
         max_tokens=config.max_tokens,
         max_retries=config.max_retries,
         timeout=config.timeout,
+        **(
+            {"default_headers": headers}
+            if (headers := opencode_extra_headers(config.endpoint))
+            else {}
+        ),
     )
     _apply_model_profile(model, config.max_input_tokens)
     return model

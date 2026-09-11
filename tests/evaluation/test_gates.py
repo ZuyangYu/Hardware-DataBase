@@ -11,7 +11,7 @@ def _result(sample_id, score=None, *, critical=False, status="success"):
         metrics=[
             MetricResult(
                 sample_id=sample_id,
-                metric_name="completeness",
+                metric_name="evidence_consistency",
                 score=score,
                 status=status,
             )
@@ -24,7 +24,7 @@ def _ragas_and_policy_result(sample_id: str) -> SampleResult:
         sample_id=sample_id,
         metrics=[
             MetricResult(sample_id=sample_id, metric_name="answer_relevancy", score=0.0),
-            MetricResult(sample_id=sample_id, metric_name="completeness", score=1.0),
+            MetricResult(sample_id=sample_id, metric_name="evidence_consistency", score=1.0),
         ],
     )
 
@@ -33,16 +33,16 @@ class GateTests(unittest.TestCase):
     def test_gate_ignores_not_applicable(self):
         gate = evaluate_gate(
             [_result("ok", 0.8), _result("na", status="not_applicable")],
-            {"completeness": 0.75},
+            {"evidence_consistency": 0.75},
             fail_on_threshold=True,
         )
         self.assertTrue(gate.passed)
-        self.assertEqual(gate.metric_counts["completeness"], 1)
+        self.assertEqual(gate.metric_counts["evidence_consistency"], 1)
 
     def test_critical_sample_failure_fails_gate(self):
         gate = evaluate_gate(
             [_result("ok", 0.8), _result("critical", 0.5, critical=True)],
-            {"completeness": 0.75},
+            {"evidence_consistency": 0.75},
             fail_on_threshold=True,
         )
         self.assertFalse(gate.passed)
@@ -57,7 +57,7 @@ class GateTests(unittest.TestCase):
     def test_failed_metric_on_critical_sample_fails_gate(self):
         gate = evaluate_gate(
             [_result("critical", status="failed", critical=True)],
-            {"completeness": 0.75},
+            {"evidence_consistency": 0.75},
             fail_on_threshold=True,
         )
         self.assertFalse(gate.passed)
@@ -69,12 +69,12 @@ class GateTests(unittest.TestCase):
 
         gate = evaluate_gate(
             [result],
-            {"answer_relevancy": 0.7, "completeness": 0.75},
+            {"answer_relevancy": 0.7, "evidence_consistency": 0.75},
             sample_cohorts={"direct": "non_retrieval"},
         )
 
         self.assertNotIn("answer_relevancy", gate.metric_scores)
-        self.assertEqual(gate.metric_scores["completeness"], 1.0)
+        self.assertEqual(gate.metric_scores["evidence_consistency"], 1.0)
 
     def test_document_generation_hard_zero_metrics_fail_on_any_violation(self):
         result = SampleResult(

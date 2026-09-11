@@ -150,8 +150,9 @@ export default function GovernancePage({ auth, onLogout }: Props) {
       {
         key: 'actions',
         title: '处理',
-        width: 100,
+        width: 110,
         align: 'right',
+        className: 'whitespace-nowrap',
         render: (r) => (
           <button
             type="button"
@@ -160,7 +161,7 @@ export default function GovernancePage({ auth, onLogout }: Props) {
               navigate(`/admin/kb-permissions?kb=${encodeURIComponent(r.name)}`);
             }}
             title="进入授权/重挂页"
-            className="inline-flex h-[28px] items-center gap-[4px] rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
+            className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
           >
             <AppIcon name="lock" size={13} />
             授权

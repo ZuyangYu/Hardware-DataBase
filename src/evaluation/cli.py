@@ -47,7 +47,12 @@ def _add_filters(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_scoring(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--metric", action="append", default=None)
+    parser.add_argument(
+        "--metric",
+        action="append",
+        default=None,
+        help="RAGAS metric to run (repeatable); pass 'none' to skip all LLM metrics",
+    )
     parser.add_argument("--threshold", action="append", default=[])
     parser.add_argument("--fail-on-threshold", action="store_true")
 
@@ -187,7 +192,6 @@ def _write_run_state(
         dataset_path=dataset_path,
         snapshot_path="",
         mode=mode,
-        score_enabled=bool(metrics),
         status="completed",
         total_samples=total_samples,
         completed_samples=total_samples,
@@ -217,6 +221,8 @@ def main(
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "metric", None) == ["none"]:
+        args.metric = []
     try:
         if args.command == "validate":
             errors = validate_dataset(args.dataset)

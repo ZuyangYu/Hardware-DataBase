@@ -249,6 +249,9 @@ class MessageView(BaseModel):
     document_context: DocumentContextView | None = None
     # Attachment snapshots of the owning turn (user messages only, optional).
     attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
+    # 紧凑引用列表（assistant 消息；来自 turn summary，内容为预览长度），
+    # 刷新页面后"参考来源"面板仍可用，不依赖 done 事件重放。
+    citations: list[dict] = Field(default_factory=list)
 
 
 class AddMessageRequest(BaseModel):
@@ -913,8 +916,7 @@ class EvidenceView(BaseModel):
 # ---------------------------------------------------------------------------
 
 class CreateEvaluationRunRequest(BaseModel):
-    """Body for POST /evaluation/runs. Replaces the loose dict so pydantic
-    validates types (mode enum, score_enabled bool, sample_ids/tags lists).
+    """Body for POST /evaluation/runs.
 
     ``kb_id`` is the authoritative binding for new callers. ``kb_name`` is
     retained as a display/redundant consistency field and for the short
@@ -924,7 +926,6 @@ class CreateEvaluationRunRequest(BaseModel):
     kb_id: int | None = None
     kb_name: str | None = None
     mode: Literal["online", "offline"] = "online"
-    score_enabled: bool = True
     sample_ids: list[str] | None = None
     tags: list[str] | None = None
     snapshot_path: str | None = None  # required when mode == "offline"
@@ -976,7 +977,6 @@ class EvaluationRunListItemView(BaseModel):
     dataset_path: str = ""
     source_dataset_path: str = ""
     mode: str = ""
-    score_enabled: bool = True
     report_path: str = ""
     dataset_sample_count: int = 0
     normal_sample_count: int = 0

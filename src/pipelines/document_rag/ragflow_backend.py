@@ -1467,6 +1467,18 @@ class RAGFlowBackend(RAGBackend):
         self.store.update_document_status_by_id(record.id, RAGFLOW_STATUS_FAILED, timeout_msg)
         return timeout_msg
 
+    def requeue_dead_letter_parse_tasks(
+        self, kb_name: str, ctx: RequestContext | None = None
+    ) -> list[str]:
+        """Reset dead-lettered parse records of a KB back to queued."""
+
+        self._check_kb_access(kb_name, ctx, "write")
+        scope = _scope_for_kb(kb_name, ctx).require_department("requeue parse tasks in")
+        return self.store.requeue_dead_letter_records(
+            kb_name=scope.kb_name,
+            department_id=scope.department_id,
+        )
+
     def list_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None) -> list[ParseTask]:
         if kb_name:
             self._check_kb_access(kb_name, ctx, "read")
