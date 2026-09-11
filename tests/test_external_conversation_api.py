@@ -138,8 +138,8 @@ class ExternalConversationApiTests(unittest.TestCase):
         r = self.client.get("/api/v1/kbs/shared/external-conversations/nope", headers=self._auth(t))
         self.assertEqual(r.status_code, 404)
 
-    def test_delete_requires_write_permission(self):
-        t = self._token("user1")  # read-only user
+    def test_delete_system_admin_forbidden(self):
+        t = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.delete("/api/v1/kbs/shared/external-conversations/c1", headers=self._auth(t))
         self.assertEqual(r.status_code, 403)
 
@@ -157,8 +157,8 @@ class ExternalConversationApiTests(unittest.TestCase):
         self.assertIn("LDO压差", body["summary"])
         self.assertEqual(self.stub.summarized, ["c1"])
 
-    def test_regenerate_summary_user_forbidden(self):
-        t = self._token("user1")
+    def test_regenerate_summary_system_admin_forbidden(self):
+        t = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.post("/api/v1/kbs/shared/external-conversations/c1/summary", headers=self._auth(t))
         self.assertEqual(r.status_code, 403)
 

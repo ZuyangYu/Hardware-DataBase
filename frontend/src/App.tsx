@@ -14,7 +14,7 @@ import type { KbView, OkResponse, UserInfo } from './api/types';
 import {
   clearAuthSession,
   getAuthSession,
-  isAnyAdmin,
+  hasDashboardAccess,
   isSystemAdmin,
   setAuthSession,
   subscribeAuthCrossTab,
@@ -29,11 +29,12 @@ import LoginPage from './pages/LoginPage';
 import KbListPage from './pages/KbListPage';
 import ChatPage from './pages/chat/ChatPage';
 import KbFilesPage from './pages/KbFilesPage';
-import AssetsPage from './pages/AssetsPage';
+import DocumentAssetsPage from './pages/DocumentAssetsPage';
+import WikiPage from './pages/WikiPage';
 import DocumentGenerationPage from './pages/DocumentGenerationPage';
 import UsersPage from './pages/admin/UsersPage';
 import DepartmentsPage from './pages/admin/DepartmentsPage';
-import KbPermissionsPage from './pages/admin/KbPermissionsPage';
+import KbMountPage from './pages/admin/KbMountPage';
 import GovernancePage from './pages/admin/GovernancePage';
 import LogsPage from './pages/admin/LogsPage';
 import ConfigPage from './pages/admin/ConfigPage';
@@ -86,7 +87,7 @@ function KbContentRoute({
   return <>{children}</>;
 }
 
-/** 管理路由守卫:非任意 admin -> 回 /kbs;部门管理页仅 sysadmin。 */
+/** 管理路由守卫:治理面板/日志/系统状态对员工开放(部门级);账号/配置等仅 sysadmin。 */
 function AdminRoute({
   auth,
   requireSysAdmin,
@@ -96,7 +97,7 @@ function AdminRoute({
   requireSysAdmin?: boolean;
   children: React.ReactNode;
 }) {
-  if (!isAnyAdmin(auth.user)) {
+  if (!hasDashboardAccess(auth.user)) {
     return <Navigate to="/kbs" replace />;
   }
   if (requireSysAdmin && !isSystemAdmin(auth.user)) {
@@ -164,7 +165,15 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               path="/assets"
               element={
                 <KbContentRoute auth={auth}>
-                  <AssetsPage auth={auth} onLogout={onLogout} kbs={kbs} />
+                  <DocumentAssetsPage auth={auth} onLogout={onLogout} kbs={kbs} />
+                </KbContentRoute>
+              }
+            />
+            <Route
+              path="/wiki"
+              element={
+                <KbContentRoute auth={auth}>
+                  <WikiPage auth={auth} onLogout={onLogout} kbs={kbs} />
                 </KbContentRoute>
               }
             />
@@ -221,7 +230,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
             <Route
               path="/admin/users"
               element={
-                <AdminRoute auth={auth}>
+                <AdminRoute auth={auth} requireSysAdmin>
                   <UsersPage auth={auth} onLogout={onLogout} />
                 </AdminRoute>
               }
@@ -235,10 +244,10 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               }
             />
             <Route
-              path="/admin/kb-permissions"
+              path="/admin/kb-mount"
               element={
-                <AdminRoute auth={auth}>
-                  <KbPermissionsPage auth={auth} onLogout={onLogout} />
+                <AdminRoute auth={auth} requireSysAdmin>
+                  <KbMountPage auth={auth} onLogout={onLogout} />
                 </AdminRoute>
               }
             />

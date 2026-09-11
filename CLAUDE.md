@@ -57,7 +57,7 @@ uv run hardware-database-server             # 启动 API（默认 127.0.0.1:8000
 uv run hardware-database login --user <u>   # 登录，令牌存 ~/.config/hardware-database/
 uv run hardware-database list-kb            # 列出可访问知识库
 uv run hardware-database query --kb <name> "问题"                  # 检索（流式）；--json 输出结构化结果
-uv run hardware-database upload --kb <name> --group <g> FILE...    # 上传（部门管理员；--group 缺省自动分类）
+uv run hardware-database upload --kb <name> --group <g> FILE...    # 上传（员工；--group 缺省自动分类）
 uv run hardware-database list-files --kb <name>
 uv run hardware-database delete --kb <name> --file <name>          # 需 admin
 
@@ -215,14 +215,15 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 `src/api/routes/evaluation.py`.
 
 ### API 层 (`src/api/`)
-前后端分离的后端。`src/api/` 是 FastAPI 服务(**就是后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务。所有业务路由挂在 `/api/v1` 前缀下(`/health` 保留根路径探针)。CORS 由 `HDB_API_CORS_ORIGINS`(逗号分隔)配置,默认放行本地开发 origin(5173/5174/3000),**生产部署必须显式设为前端实际域名**。RAGFlow key / `.env` / `auth.db` 只在服务侧。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:普通用户只能检索,部门管理员才能上传/建库/删除。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。查询走 **turns 执行模型**:`POST /conversations/{id}/turns` 创建轮次(服务端自动落库 user 消息)-> `POST /turns/{turn_id}/start` 由 worker 轮询执行 -> `GET /turns/{turn_id}/events` SSE 流式返回;旧的直连 `POST /query`(SSE delta/done/error)仍保留。上传 `POST /kbs/{kb}/files`(multipart,分片写盘 + 大小上限 `HDB_API_MAX_UPLOAD_BYTES`)。
+前后端分离的后端。`src/api/` 是 FastAPI 服务(**就是后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务。所有业务路由挂在 `/api/v1` 前缀下(`/health` 保留根路径探针)。CORS 由 `HDB_API_CORS_ORIGINS`(逗号分隔)配置,默认放行本地开发 origin(5173/5174/3000),**生产部署必须显式设为前端实际域名**。RAGFlow key / `.env` / `auth.db` 只在服务侧。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:员工对本部门 KB 隐式 admin,系统管理员不参与内容访问。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。查询走 **turns 执行模型**:`POST /conversations/{id}/turns` 创建轮次(服务端自动落库 user 消息)-> `POST /turns/{turn_id}/start` 由 worker 轮询执行 -> `GET /turns/{turn_id}/events` SSE 流式返回;旧的直连 `POST /query`(SSE delta/done/error)仍保留。上传 `POST /kbs/{kb}/files`(multipart,分片写盘 + 大小上限 `HDB_API_MAX_UPLOAD_BYTES`)。
 
 **审计下沉**:管理写操作的 `record_audit` 住在 `AuthService._audit` / `AppPipeline._audit` 内部(fail-soft),所有入口自动覆盖、无双写。唯一例外是 `change_settings`(`apply_settings` 是 staticmethod 无 actor),由 `PUT /config` 路由层记一次。
 
-**角色权力分离**(三个角色的可达范围与前端 admin 页面严格对齐):
-- `system_admin` = **治理角色**,只碰元数据。可用:部门/用户/KB 挂载(`assign_kb`)/权限清单查看/系统配置/日志中心/RAGAS 评估/治理面板。**不能**访问任何 KB 内容(检索、上传、看文件、删文件、看解析任务)。`RequestContext.has_kb_permission` 对 sysadmin 恒返回 False;API 路由用 `deps.reject_system_admin_kb_access(ctx)` 提前拒并给明确错误信息("system_admin 是治理角色,不能访问知识库内容")。这条铁律的目的是防"平台管理员静默窥视各部门私有数据"。
-- `dept_admin` = **部门治理 + 部门内容**。可用:本部门用户管理、本部门 KB 建/删/权限授予撤销、本部门文件上传/删除/查看、检索。
-- `user` = **纯消费**。可用:对已被授权的 KB 检索、查看文件、看自己的会话。
+**角色权力分离**(两级角色,与前端 admin 页面严格对齐):
+- `system_admin` = **治理角色**,只碰元数据。可用:部门管理、注册员工(仅创建 `employee` 账号并绑定部门; 系统管理员账号由部署环境 `AUTH_DEFAULT_ADMIN_*` 管理, API 不可创建)、KB 挂载(`assign_kb`)、系统配置、日志中心、RAGAS 评估、治理面板。**不能**访问任何 KB 内容(检索、上传、看文件、删文件、看解析任务)。`RequestContext.has_kb_permission` 对 sysadmin 恒返回 False;API 路由用 `deps.reject_system_admin_kb_access(ctx)` 提前拒并给明确错误信息("system_admin 是治理角色,不能访问知识库内容")。这条铁律的目的是防"平台管理员静默窥视各部门私有数据"。
+- `employee` = **部门员工**(部门内唯一角色)。可用:本部门 KB 全部隐式可见(admin,不落授权表)、建/删 KB、上传/删除/查看文件、检索、文档资产/Wiki/图谱、本部门治理面板/日志/系统状态。**不能**创建或管理账号(注册员工是系统管理员的治理动作)。逐库授权(`kb_permissions`)已废弃:员工之间没有可授对象,表保留但不再读写。
+
+**两级角色迁移**:`AuthService._init_db` 启动时幂等执行 `UPDATE users SET role='employee' WHERE role IN ('dept_admin','user')`;旧普通用户与旧部门管理员统一并入员工。`tests/test_auth_kb_scope.py::test_legacy_role_and_permission_rows_migrate` 覆盖。
 
 **会话持久化**:查询走 turns 执行模型时,服务端自动把 user/assistant 消息写入 `conversations`(见 `src/api/routes/query.py`);旧的直连 `POST /query` 只流式返回答案并写 query trace + 证据到日志中心,**不**落库消息。
 
@@ -234,10 +235,18 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
   `storage/test_data/`). **Ingest-only** today (registered via `parser_registry`);
   not yet queryable through the agent.
 - `src/core/` - `app_pipeline.py` (orchestrator), `llm_client.py` (provider-neutral
-  chat client), `auth.py` (role-based access: system_admin / dept_admin / user,
+  chat client), `llm_governor.py` (process-wide LLM admission control:
+  `interactive` keeps reserved capacity, `batch` is capped separately; queue
+  timeout/warn + metrics via `GET /system/status` -> `llm`),
+  `model_gateway.py` (model access seam: explicit governed LangChain adapter
+  classes + process-wide usage ledger per channel/model; `build_chat_model` /
+  `govern_model`), `auth.py` (role-based access: system_admin / employee,
   backed by `storage/auth.db`; `build_request_context`), `conversation.py` (chat
   sessions in `auth.db`), `source_group_router.py` (query -> source-group weights,
   consumed by `RAGFlowBackend.retrieve`), `logger.py` / `app_logs.py`.
+  LLM concurrency settings: `LLM_MAX_CONCURRENCY` / `LLM_BATCH_MAX_CONCURRENCY` /
+  `LLM_QUEUE_TIMEOUT_SECONDS` / `LLM_QUEUE_WARN_SECONDS` (editable in system
+  config).
 
 ### Persisted state (`storage/`, gitignored, auto-generated)
 `pipeline_documents.db`, `table_indexes/`, `circuits/`, `pipeline_archives/`,

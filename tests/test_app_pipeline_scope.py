@@ -30,7 +30,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src.core.app_pipeline import AppPipeline
-from src.core.auth import AuthUser, ROLE_DEPT_ADMIN
+from src.core.auth import AuthUser, ROLE_EMPLOYEE
 from src.pipelines.document_rag.schemas import BackendResult, DocumentInfo, RequestContext
 
 
@@ -57,7 +57,7 @@ class _Auth:
         return AuthUser(
             id=1,
             username=username,
-            role=ROLE_DEPT_ADMIN,
+            role=ROLE_EMPLOYEE,
             is_active=True,
             department_id=7,
         )
@@ -89,7 +89,7 @@ class AppPipelineScopeTests(unittest.TestCase):
     def test_create_kb_checks_existence_by_department_scope(self):
         pipeline = self._pipeline()
         auth = _Auth()
-        ctx = RequestContext(user_id="admin_a", roles=[ROLE_DEPT_ADMIN], metadata={"department_id": "dept_a"})
+        ctx = RequestContext(user_id="admin_a", roles=[ROLE_EMPLOYEE], metadata={"department_id": "dept_a"})
 
         with patch("src.core.app_pipeline.AuthService", return_value=auth):
             ok, message = pipeline.create_kb("shared", ctx=ctx)
@@ -100,7 +100,7 @@ class AppPipelineScopeTests(unittest.TestCase):
 
     def test_create_kb_rejects_existing_in_same_department(self):
         pipeline = self._pipeline()
-        ctx = RequestContext(user_id="admin_a", roles=[ROLE_DEPT_ADMIN], metadata={"department_id": "dept_existing"})
+        ctx = RequestContext(user_id="admin_a", roles=[ROLE_EMPLOYEE], metadata={"department_id": "dept_existing"})
 
         with patch("src.core.app_pipeline.AuthService", return_value=_Auth()):
             ok, message = pipeline.create_kb("shared", ctx=ctx)
@@ -113,7 +113,7 @@ class AppPipelineScopeTests(unittest.TestCase):
         auth = _Auth()
         ctx = RequestContext(
             user_id="admin_a",
-            roles=[ROLE_DEPT_ADMIN],
+            roles=[ROLE_EMPLOYEE],
             metadata={"department_id": "dept_a", "kb_id": 42},
         )
 
@@ -186,7 +186,7 @@ class AppPipelineScopeTests(unittest.TestCase):
         pipeline.documents = mock_docs
         pipeline._audit = MagicMock()
 
-        ctx = RequestContext(user_id="admin_a", roles=[ROLE_DEPT_ADMIN])
+        ctx = RequestContext(user_id="admin_a", roles=[ROLE_EMPLOYEE])
         # Returns the message string; does NOT raise (BackendResult carries
         # the failure signal in .ok, not by raising).
         msg = pipeline.delete_document("d1", "kb", ctx=ctx)

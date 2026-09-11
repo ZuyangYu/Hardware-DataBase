@@ -1,6 +1,6 @@
 /** 后端 /api/v1 的 DTO 镜像(对齐 src/api/schemas.py) */
 
-export type Role = 'system_admin' | 'dept_admin' | 'user';
+export type Role = 'system_admin' | 'employee';
 
 export interface UserInfo {
   username: string;
@@ -113,6 +113,137 @@ export interface AssetSourceLinkView {
   source_category: 'circuit_design' | 'structured_table' | 'hardware_requirement' | 'hardware_architecture' | 'document_rag';
   extraction_target: string;
   asset_eligible: boolean;
+}
+
+export type DocLifecycleStatus = 'draft' | 'effective' | 'in_revision' | 'obsolete' | 'archived';
+export type DocCategory =
+  | 'design_doc'
+  | 'schematic'
+  | 'bom'
+  | 'netlist'
+  | 'test_report'
+  | 'requirement'
+  | 'standard'
+  | 'other';
+export type DocRelationType = 'derived_from' | 'companion' | 'references' | 'verified_by';
+
+export interface DocAssetVersionView {
+  id: number;
+  asset_id: number;
+  version_no: number;
+  file_id: string;
+  file_name: string;
+  content_hash: string;
+  parse_status: string;
+  note: string;
+  state: 'draft' | 'effective' | 'superseded';
+  uploaded_by_user_id: number | null;
+  uploaded_at: string;
+}
+
+export interface DocAssetEventView {
+  id: number;
+  asset_id: number;
+  version_id: number | null;
+  event: string;
+  actor_user_id: number | null;
+  comment: string;
+  created_at: string;
+}
+
+export interface DocAssetLinkView {
+  id: number;
+  from_asset_id: number;
+  to_asset_id: number;
+  rel_type: DocRelationType;
+  note: string;
+  source: 'manual' | 'ai' | 'structure';
+  status: 'suggested' | 'confirmed' | 'dismissed';
+  created_at: string;
+  to_title: string;
+  to_category: string;
+  to_kb_name: string;
+}
+
+export interface DocAssetView {
+  id: number;
+  department_id: number;
+  kb_id: number;
+  kb_name: string;
+  project: string;
+  doc_no: string;
+  title: string;
+  category: DocCategory;
+  description: string;
+  tags: string[];
+  lifecycle_status: DocLifecycleStatus;
+  current_version_id: number | null;
+  owner_user_id: number | null;
+  version_count: number;
+  effective_version_no: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DocAssetDetailView extends DocAssetView {
+  versions: DocAssetVersionView[];
+  events: DocAssetEventView[];
+  links_out: DocAssetLinkView[];
+  links_in: DocAssetLinkView[];
+}
+
+export type WikiPageType = 'summary' | 'entity' | 'concept' | 'index';
+export type WikiPageStatus = 'draft' | 'published' | 'archived';
+
+export interface WikiPageView {
+  id: number;
+  kb_id: number;
+  slug: string;
+  title: string;
+  page_type: WikiPageType;
+  status: WikiPageStatus;
+  summary: string;
+  aliases: string[];
+  source_refs: string[];
+  chunk_refs: string[];
+  in_links: string[];
+  out_links: string[];
+  version: number;
+  last_edit_source: 'pipeline' | 'agent' | 'user' | 'revert';
+  updated_at: string;
+}
+
+export interface WikiRevisionView {
+  version: number;
+  title: string;
+  page_type: string;
+  status: string;
+  edit_source: string;
+  editor_id: number | null;
+  edited_at: string;
+  created_at: string;
+}
+
+export interface WikiPageDetailView extends WikiPageView {
+  content: string;
+  backlinks: { slug: string; title: string }[];
+  revisions: WikiRevisionView[];
+}
+
+export interface WikiGraphView {
+  nodes: { slug: string; title: string; page_type: string; link_count: number }[];
+  edges: { source: string; target: string }[];
+  total: number;
+  truncated: boolean;
+}
+
+export interface WikiJobState {
+  running: boolean;
+  stage: string;
+  error?: string;
+  stats?: { documents: number; candidates: number; cited: number; pages_written: number; uncited: number; skipped_user_edited?: number; errors: string[] };
+  started_at?: string;
+  finished_at?: string;
 }
 
 export interface SessionView {
@@ -473,13 +604,6 @@ export interface DepartmentView {
   name: string;
 }
 
-export interface KbPermissionView {
-  username: string;
-  role: Role;
-  permission: string;
-  department_name?: string | null;
-}
-
 export interface CreateUserPayload {
   username: string;
   password: string;
@@ -489,11 +613,6 @@ export interface CreateUserPayload {
 
 export interface CreateDepartmentPayload {
   name: string;
-}
-
-export interface GrantKbPermissionPayload {
-  user_id: number;
-  permission: 'read' | 'write' | 'admin';
 }
 
 export interface AssignKbPayload {
@@ -511,8 +630,7 @@ export interface KbSummaryView {
   department_name?: string | null;
   owner_user_id?: number | null;
   owner_username?: string | null;
-  permission_count: number;
-  dept_admin_count: number;
+  employee_count: number;
   registered: boolean;
   physical_exists: boolean;
   created_at: string;

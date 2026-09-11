@@ -14,51 +14,29 @@ from __future__ import annotations
 from functools import lru_cache
 
 import src.settings as settings
-from langchain.chat_models import init_chat_model
 
-from src.core.llm_headers import opencode_extra_headers
+from src.core.llm_governor import PRIORITY_INTERACTIVE
+from src.core.model_gateway import build_chat_model
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def create_chat_model(
     provider: str = "",
     model: str = "",
+    priority: str = PRIORITY_INTERACTIVE,
 ) -> "object":
-    """Build and cache a LangChain chat model from AGENT_* settings.
+    """Build and cache a governed LangChain chat model from AGENT_* settings.
+
+    ``priority`` selects the admission class in the process-wide LLM governor
+    (``interactive`` keeps reserved capacity; ``batch`` is capped separately).
+    Construction and usage accounting live in ``src/core/model_gateway.py``.
 
     Cached because model construction is cheap but repeated per-request
     construction adds latency to the first token. Settings live-reload
     (PUT /api/v1/config) changes the env, so callers that must observe fresh
     settings pass explicit overrides or call ``create_chat_model.cache_clear()``.
     """
-    provider = (provider or str(settings.AGENT_LLM_PROVIDER)).lower()
-    temperature = float(settings.AGENT_TEMPERATURE)
-    max_retries = int(settings.AGENT_RATE_LIMIT_MAX_RETRIES)
-    timeout = int(settings.AGENT_TIMEOUT_SECONDS)
-
-    if provider == "ollama":
-        # ChatOllama has no max_retries/timeout fields (langchain_ollama
-        # silently drops them); reach the backend via the httpx client's
-        # request timeout instead.
-        model = init_chat_model(
-            f"ollama:{model or settings.AGENT_OLLAMA_MODEL}",
-            base_url=str(settings.AGENT_OLLAMA_BASE_URL),
-            temperature=temperature,
-            client_kwargs={"timeout": timeout},
-        )
-        _apply_model_profile(model)
-        return model
-
-    model = init_chat_model(
-        f"openai:{model or settings.AGENT_CUSTOM_MODEL}",
-        base_url=str(settings.AGENT_CUSTOM_BASE_URL) or None,
-        api_key=str(settings.AGENT_CUSTOM_API_KEY),
-        temperature=temperature,
-        max_tokens=int(settings.AGENT_CUSTOM_MAX_TOKENS),
-        max_retries=max_retries,
-        timeout=timeout,
-        default_headers=opencode_extra_headers(settings.AGENT_CUSTOM_BASE_URL) or None,
-    )
+    model = build_chat_model(provider=provider, model=model, priority=priority)
     _apply_model_profile(model)
     return model
 

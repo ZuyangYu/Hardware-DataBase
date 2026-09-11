@@ -22,11 +22,12 @@ from src.api.routes import (
     config,
     conversations,
     departments,
+    doc_assets,
     document_generation,
     evaluation,
     files,
     governance,
-    kb_permissions,
+    kb_assign,
     kbs,
     logs,
     memories,
@@ -37,6 +38,7 @@ from src.api.routes import (
     structured,
     upload,
     users,
+    wiki,
 )
 from src.observability import init_observability, instrument_fastapi, shutdown_observability
 from src.observability.health import check_dependencies, check_live, check_ready
@@ -199,6 +201,8 @@ def create_app() -> FastAPI:
     api_v1 = "/api/v1"
     app.include_router(auth.router, prefix=api_v1)
     app.include_router(assets.router, prefix=api_v1)
+    app.include_router(doc_assets.router, prefix=api_v1)
+    app.include_router(wiki.router, prefix=api_v1)
     app.include_router(conversations.router, prefix=api_v1)
     app.include_router(kbs.router, prefix=api_v1)
     app.include_router(files.router, prefix=api_v1)
@@ -208,7 +212,7 @@ def create_app() -> FastAPI:
     app.include_router(users.router, prefix=api_v1)
     app.include_router(departments.router, prefix=api_v1)
     app.include_router(document_generation.router, prefix=api_v1)
-    app.include_router(kb_permissions.router, prefix=api_v1)
+    app.include_router(kb_assign.router, prefix=api_v1)
     app.include_router(governance.router, prefix=api_v1)
     app.include_router(config.router, prefix=api_v1)
     app.include_router(logs.router, prefix=api_v1)

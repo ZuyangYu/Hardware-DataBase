@@ -140,10 +140,10 @@ class AnswerRunnerTests(unittest.TestCase):
         AnswerRunner(lambda: pipeline).collect(sample)
 
         # Security posture: dataset-supplied identity is untrusted. user_id is
-        # pinned to "evaluation", roles are pinned to plain user, and the
+        # pinned to "evaluation", roles are pinned to employee, and the
         # declared identity survives only as metadata.
         self.assertEqual(pipeline.received_ctx.user_id, "evaluation")
-        self.assertEqual(pipeline.received_ctx.roles, ["user"])
+        self.assertEqual(pipeline.received_ctx.roles, ["employee"])
         self.assertEqual(pipeline.received_ctx.metadata["department_id"], 96)
         self.assertEqual(pipeline.received_ctx.metadata.get("declared_user"), "evaluator")
 

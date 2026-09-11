@@ -84,16 +84,16 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["run_id"], "bg-resume")
 
-    def test_delete_requires_write_permission_and_forwards_reason(self):
+    def test_delete_system_admin_forbidden_and_employee_forwards_reason(self):
         self.stub.delete_knowledge_base_document_work_order = lambda ctx, work_order_id, *, reason: {
             "work_order_id": work_order_id,
             "reason": reason,
         }
-        reader = self._token("user1")
+        system_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         denied = self.client.request(
             "DELETE",
             "/api/v1/document-generation/work-orders/wo-1?kb=shared",
-            headers=self._auth(reader),
+            headers=self._auth(system_token),
             json={"reason": "重复任务"},
         )
         self.assertEqual(denied.status_code, 403, denied.text)

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import src.settings
-from src.core.auth import ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER, AuthUser
+from src.core.auth import ROLE_EMPLOYEE, ROLE_SYSTEM_ADMIN, AuthUser
 
 
 @dataclass
@@ -626,7 +626,7 @@ class AppLogService:
         keyword: str | None = None,
         limit: int = 50,
     ) -> list[tuple[str, int]]:
-        """当前筛选下按 action 分组计数（不含 action 过滤本身），按 count 降序。部门管理员只看本部门。"""
+        """当前筛选下按 action 分组计数（不含 action 过滤本身），按 count 降序。员工只看本部门。"""
         where, params = _audit_where(viewer, None, kb_name, success, keyword)
         params.append(max(1, min(limit, 200)))
         sql = (
@@ -638,7 +638,7 @@ class AppLogService:
         return [(row[0], int(row[1])) for row in rows if row[0]]
 
     def audit_recent_daily(self, viewer: AuthUser, days: int = 7) -> list[tuple[str, int]]:
-        """近 N 日每日审计事件计数（按本地日期分组），部门管理员只看本部门。
+        """近 N 日每日审计事件计数（按本地日期分组），员工只看本部门。
 
         created_at 存的是 UTC ISO 串；用 SQLite 的 substr 取日期前 10 位即可按日聚合。
         """
@@ -692,7 +692,7 @@ class AppLogService:
         keyword: str | None = None,
         limit: int = 5,
     ) -> list[tuple[str, int]]:
-        """失败查询的原因 Top-N，按归一化安全类目分组，按 count 降序。部门管理员只看本部门。
+        """失败查询的原因 Top-N，按归一化安全类目分组，按 count 降序。员工只看本部门。
 
         固定 status='failed'。reason 永远是 failure_category 的输出（异常标识或
         [unclassified]），不含 error_message 原文——失败信息常带用户查询原文。
@@ -728,15 +728,16 @@ class AppLogService:
 def scoped_where(viewer: AuthUser, user_column: str = "actor_user_id") -> tuple[list[str], list[Any]]:
     if viewer.role == ROLE_SYSTEM_ADMIN:
         return ["1 = 1"], []
-    if viewer.role == ROLE_DEPT_ADMIN:
+    if viewer.role == ROLE_EMPLOYEE:
         return ["department_id = ?"], [viewer.department_id]
+    # 兜底: 未知角色只看自己的行(结构上不应出现, 防御性保留)
     return [f"{user_column} = ?"], [viewer.id]
 
 
 def can_view_row(viewer: AuthUser, user_id: int | None, department_id: int | None) -> bool:
     if viewer.role == ROLE_SYSTEM_ADMIN:
         return True
-    if viewer.role == ROLE_DEPT_ADMIN:
+    if viewer.role == ROLE_EMPLOYEE:
         return department_id == viewer.department_id
     return user_id == viewer.id
 
@@ -787,16 +788,9 @@ def _query_where(
         params.append(status)
     if keyword:
         like = f"%{keyword}%"
-        if viewer.role == ROLE_USER:
-            where.append(
-                "(username LIKE ? OR kb_name LIKE ? OR original_query LIKE ? "
-                "OR rewritten_query LIKE ? OR error_message LIKE ? OR metadata_json LIKE ?)"
-            )
-            params.extend([like, like, like, like, like, like])
-        else:
-            # 管理员能看他人查询状态，但不能用原文/错误/metadata 做侧信道探测。
-            where.append("(username LIKE ? OR kb_name LIKE ? OR backend LIKE ? OR retriever_type LIKE ?)")
-            params.extend([like, like, like, like])
+        # 员工能看部门内他人查询状态，但不能用原文/错误/metadata 做侧信道探测。
+        where.append("(username LIKE ? OR kb_name LIKE ? OR backend LIKE ? OR retriever_type LIKE ?)")
+        params.extend([like, like, like, like])
     return where, params
 
 

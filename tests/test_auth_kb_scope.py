@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 import src.settings
-from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_USER
+from src.core.auth import AuthService, ROLE_EMPLOYEE, ROLE_SYSTEM_ADMIN
 
 
 class AuthKnowledgeBaseScopeTests(unittest.TestCase):
@@ -26,15 +26,11 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department("dept_a")
             dept_b = auth.create_department("dept_b")
-            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
-            admin_b = auth.create_user_as(system_admin, "admin_b", "password123", ROLE_DEPT_ADMIN, dept_b.id)
-            user_a = auth.create_user_as(admin_a, "user_a", "password123", ROLE_USER, dept_a.id)
-            user_b = auth.create_user_as(admin_b, "user_b", "password123", ROLE_USER, dept_b.id)
+            emp_a = auth.create_user_as(system_admin, "emp_a", "password123", ROLE_EMPLOYEE, dept_a.id)
+            emp_b = auth.create_user_as(system_admin, "emp_b", "password123", ROLE_EMPLOYEE, dept_b.id)
 
-            auth.register_knowledge_base("shared", owner=admin_a)
-            auth.register_knowledge_base("shared", owner=admin_b)
-            auth.grant_kb_permission_as(admin_a, "shared", user_a.id, "read")
-            auth.grant_kb_permission_as(admin_b, "shared", user_b.id, "write")
+            auth.register_knowledge_base("shared", owner=emp_a)
+            auth.register_knowledge_base("shared", owner=emp_b)
 
             summaries = auth.list_knowledge_base_summaries(["shared"])
             scoped = {(item.department_id, item.name): item for item in summaries if item.registered}
@@ -42,16 +38,19 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             self.assertIn((dept_b.id, "shared"), scoped)
             self.assertNotEqual(scoped[(dept_a.id, "shared")].kb_id, scoped[(dept_b.id, "shared")].kb_id)
 
-            perms_a = auth.list_knowledge_base_permissions("shared", department_id=dept_a.id)
-            perms_b = auth.list_knowledge_base_permissions("shared", department_id=dept_b.id)
-            self.assertEqual({item.username for item in perms_a}, {"admin_a", "user_a"})
-            self.assertEqual({item.username for item in perms_b}, {"admin_b", "user_b"})
-            user_a_permissions = auth.get_kb_permissions_for_user(user_a)
-            user_b_permissions = auth.get_kb_permissions_for_user(user_b)
-            self.assertEqual(user_a_permissions[f"{dept_a.id}:shared"], "read")
-            self.assertEqual(user_b_permissions[f"{dept_b.id}:shared"], "write")
-            self.assertNotIn("shared", user_a_permissions)
-            self.assertNotIn("shared", user_b_permissions)
+            # 员工对本部门 KB 隐式 admin; 跨部门互不可见
+            perms_a = auth.get_kb_permissions_for_user(emp_a)
+            perms_b = auth.get_kb_permissions_for_user(emp_b)
+            self.assertEqual(perms_a[f"{dept_a.id}:shared"], "admin")
+            self.assertEqual(perms_b[f"{dept_b.id}:shared"], "admin")
+            self.assertEqual(len(perms_a), 1)
+            self.assertEqual(len(perms_b), 1)
+
+            accessible_a = auth.list_accessible_kbs(emp_a, ["shared"])
+            accessible_b = auth.list_accessible_kbs(emp_b, ["shared"])
+            self.assertEqual(accessible_a, ["shared"])
+            self.assertEqual(accessible_b, ["shared"])
+            self.assertEqual(auth.get_kb_permissions_for_user(system_admin), {})
 
             del auth
             gc.collect()
@@ -62,11 +61,11 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department("dept_a")
             dept_b = auth.create_department("dept_b")
-            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
-            admin_b = auth.create_user_as(system_admin, "admin_b", "password123", ROLE_DEPT_ADMIN, dept_b.id)
+            emp_a = auth.create_user_as(system_admin, "emp_a", "password123", ROLE_EMPLOYEE, dept_a.id)
+            emp_b = auth.create_user_as(system_admin, "emp_b", "password123", ROLE_EMPLOYEE, dept_b.id)
 
-            auth.register_knowledge_base("shared", owner=admin_a)
-            auth.register_knowledge_base("shared", owner=admin_b)
+            auth.register_knowledge_base("shared", owner=emp_a)
+            auth.register_knowledge_base("shared", owner=emp_b)
             auth.delete_knowledge_base_record("shared", department_id=dept_a.id)
 
             summaries = [item for item in auth.list_knowledge_base_summaries(["shared"]) if item.registered]
@@ -75,11 +74,9 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             conn = sqlite3.connect(auth.db_path)
             try:
                 kb_count = conn.execute("SELECT COUNT(*) FROM knowledge_bases").fetchone()[0]
-                perm_count = conn.execute("SELECT COUNT(*) FROM kb_permissions").fetchone()[0]
             finally:
                 conn.close()
             self.assertEqual(kb_count, 1)
-            self.assertEqual(perm_count, 1)
 
             del auth
             gc.collect()
@@ -90,8 +87,8 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             system_dept = next(dept for dept in auth.list_departments() if dept.name == "system")
             dept_a = auth.create_department("dept_a")
-            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
-            auth.register_knowledge_base("shared", owner=admin_a)
+            emp_a = auth.create_user_as(system_admin, "emp_a", "password123", ROLE_EMPLOYEE, dept_a.id)
+            auth.register_knowledge_base("shared", owner=emp_a)
 
             with self.assertRaises(ValueError):
                 auth.assign_knowledge_base_as(system_admin, "shared", system_dept.id)
@@ -105,8 +102,8 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department("dept_a")
             dept_b = auth.create_department("dept_b")
-            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
-            auth.register_knowledge_base("shared", owner=admin_a)
+            emp_a = auth.create_user_as(system_admin, "emp_a", "password123", ROLE_EMPLOYEE, dept_a.id)
+            auth.register_knowledge_base("shared", owner=emp_a)
             source_id = auth.get_knowledge_base_id("shared", department_id=dept_a.id)
 
             with self.assertRaises(ValueError):
@@ -126,10 +123,10 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department("dept_a")
             dept_b = auth.create_department("dept_b")
-            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
-            admin_b = auth.create_user_as(system_admin, "admin_b", "password123", ROLE_DEPT_ADMIN, dept_b.id)
-            auth.register_knowledge_base("shared", owner=admin_a)
-            auth.register_knowledge_base("shared", owner=admin_b)
+            emp_a = auth.create_user_as(system_admin, "emp_a", "password123", ROLE_EMPLOYEE, dept_a.id)
+            emp_b = auth.create_user_as(system_admin, "emp_b", "password123", ROLE_EMPLOYEE, dept_b.id)
+            auth.register_knowledge_base("shared", owner=emp_a)
+            auth.register_knowledge_base("shared", owner=emp_b)
             source_id = auth.get_knowledge_base_id("shared", department_id=dept_a.id)
 
             with self.assertRaises(ValueError):
@@ -138,7 +135,23 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             del auth
             gc.collect()
 
-    def test_legacy_permission_migration_maps_by_user_department(self):
+    def test_assign_kb_owner_must_be_department_employee(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = self._service(tmp)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            dept_a = auth.create_department("dept_a")
+            dept_b = auth.create_department("dept_b")
+            emp_b = auth.create_user_as(system_admin, "emp_b", "password123", ROLE_EMPLOYEE, dept_b.id)
+
+            with self.assertRaises(ValueError):
+                auth.assign_knowledge_base_as(system_admin, "shared", dept_a.id, owner_user_id=emp_b.id)
+            with self.assertRaises(ValueError):
+                auth.assign_knowledge_base_as(system_admin, "shared", dept_a.id, owner_user_id=system_admin.id)
+
+            del auth
+            gc.collect()
+
+    def test_legacy_role_and_permission_rows_migrate(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "auth.db")
             conn = sqlite3.connect(db_path)
@@ -184,8 +197,8 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
                     "INSERT INTO users (id, username, password_hash, role, department_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [
                         (1, src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "placeholder", ROLE_SYSTEM_ADMIN, 1, now, now),
-                        (2, "user_a", "placeholder", ROLE_USER, 2, now, now),
-                        (3, "user_b", "placeholder", ROLE_USER, 3, now, now),
+                        (2, "legacy_admin", "placeholder", "dept_admin", 2, now, now),
+                        (3, "legacy_user", "placeholder", "user", 3, now, now),
                     ],
                 )
                 conn.executemany(
@@ -201,7 +214,12 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
                 conn.close()
 
             auth = self._service(tmp)
-            rows = []
+            # 旧角色统一并入 employee
+            roles = {user.username: user.role for user in auth.list_users()}
+            self.assertEqual(roles["legacy_admin"], ROLE_EMPLOYEE)
+            self.assertEqual(roles["legacy_user"], ROLE_EMPLOYEE)
+
+            # 旧授权行仍按用户部门映射到 kb_id (schema 迁移未破坏)
             conn = sqlite3.connect(db_path)
             try:
                 rows = conn.execute(
@@ -219,36 +237,49 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             del auth
             gc.collect()
 
-    def test_admin_management_requires_actor_scope(self):
+    def test_management_requires_system_admin_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)
             system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
             dept_a = auth.create_department_as(system_admin, "dept_a")
-            dept_b = auth.create_department_as(system_admin, "dept_b")
             empty_dept = auth.create_department_as(system_admin, "empty_dept")
-            admin_a = auth.create_user_as(system_admin, "admin_a", "password123", ROLE_DEPT_ADMIN, dept_a.id)
-            admin_b = auth.create_user_as(system_admin, "admin_b", "password123", ROLE_DEPT_ADMIN, dept_b.id)
-            user_a = auth.create_user_as(admin_a, "user_a", "password123", ROLE_USER, dept_a.id)
-            user_b = auth.create_user_as(admin_b, "user_b", "password123", ROLE_USER, dept_b.id)
+            emp_a = auth.create_user_as(system_admin, "emp_a", "password123", ROLE_EMPLOYEE, dept_a.id)
+            emp_b = auth.create_user_as(system_admin, "emp_b", "password123", ROLE_EMPLOYEE, dept_a.id)
 
+            # 员工不能创建账号 / 管理账号 / 列用户
             with self.assertRaises(PermissionError):
-                auth.list_users_as(user_a)
-            self.assertEqual({user.username for user in auth.list_users_as(admin_a)}, {"admin_a", "user_a"})
+                auth.create_user_as(emp_a, "emp_c", "password123", ROLE_EMPLOYEE, dept_a.id)
+            with self.assertRaises(PermissionError):
+                auth.list_users_as(emp_a)
+            with self.assertRaises(PermissionError):
+                auth.set_user_active_as(emp_a, emp_b.id, False)
+            with self.assertRaises(PermissionError):
+                auth.reset_user_password_as(emp_a, emp_b.id, "password456")
 
-            auth.set_user_active_as(admin_a, user_a.id, False)
-            self.assertFalse(auth.get_user_by_username("user_a").is_active)
-            with self.assertRaises(PermissionError):
-                auth.set_user_active_as(admin_a, user_b.id, False)
-            with self.assertRaises(PermissionError):
-                auth.set_user_active_as(admin_a, admin_b.id, False)
+            # 系统管理员可以管理账号
+            self.assertEqual({u.username for u in auth.list_users_as(system_admin)} >= {"emp_a", "emp_b"}, True)
+            auth.set_user_active_as(system_admin, emp_b.id, False)
+            self.assertFalse(auth.get_user_by_username("emp_b").is_active)
 
+            # 部门管理仍是系统管理员专属
             with self.assertRaises(PermissionError):
-                auth.create_department_as(admin_a, "blocked_dept")
+                auth.create_department_as(emp_a, "blocked_dept")
             with self.assertRaises(PermissionError):
-                auth.delete_department_as(admin_a, empty_dept.id)
-
+                auth.delete_department_as(emp_a, empty_dept.id)
             auth.delete_department_as(system_admin, empty_dept.id)
             self.assertNotIn("empty_dept", {dept.name for dept in auth.list_departments()})
+
+            # 员工必须归属业务部门
+            with self.assertRaises(ValueError):
+                auth.create_user_as(system_admin, "emp_no_dept", "password123", ROLE_EMPLOYEE, None)
+            system_dept = next(dept for dept in auth.list_departments() if dept.name == "system")
+            with self.assertRaises(ValueError):
+                auth.create_user_as(system_admin, "emp_sys", "password123", ROLE_EMPLOYEE, system_dept.id)
+
+            # 系统管理员账号由部署环境管理, 不能通过 API 自增殖
+            with self.assertRaises(ValueError):
+                auth.create_user_as(system_admin, "admin_2", "password123", ROLE_SYSTEM_ADMIN, None)
+            self.assertNotIn("admin_2", {u.username for u in auth.list_users()})
 
             del auth
             gc.collect()

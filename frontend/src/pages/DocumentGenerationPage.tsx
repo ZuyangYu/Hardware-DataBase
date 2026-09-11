@@ -192,7 +192,7 @@ function TemplateSection({ kbs }: { kbs: KbView[] }) {
         </Button>
         {!kb && (
           <p className="text-sm text-muted-foreground">
-            {kbs.length === 0 ? '当前账号无可访问的知识库，请联系管理员授权后再试。' : '请先选择知识库。'}
+            {kbs.length === 0 ? '当前账号无可访问的知识库，请联系系统管理员挂载。' : '请先选择知识库。'}
           </p>
         )}
         {kb && !file && <p className="text-sm text-muted-foreground">请先选择模板文件（.xlsx/.xlsm/.docx）。</p>}
@@ -487,7 +487,7 @@ function RunsSection({ kbs, onPhaseChange }: { kbs: KbView[]; onPhaseChange: (ph
         <KbSelect kbs={kbs} value={kb} onChange={setKb} />
         {!kb && (
           <p className="text-sm text-muted-foreground">
-            {kbs.length === 0 ? '当前账号无可访问的知识库，请联系管理员授权后再试。' : '请先选择知识库以加载工作单。'}
+            {kbs.length === 0 ? '当前账号无可访问的知识库，请联系系统管理员挂载。' : '请先选择知识库以加载工作单。'}
           </p>
         )}
         {orders.length > 0 && (

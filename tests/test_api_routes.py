@@ -10,7 +10,8 @@ import httpx
 
 from src.api.app import create_app
 from src.api.deps import get_auth_service, get_pipeline
-from src.core.auth import ROLE_USER
+from src.core.auth import ROLE_EMPLOYEE
+from src.core.conversation import ConversationService
 
 from tests._api_stub import Server, StubPipeline, make_auth
 
@@ -58,6 +59,28 @@ class ApiRoutesTests(unittest.TestCase):
         r = self.client.post("/api/v1/login", json={"username": "admin1", "password": "bad"})
         self.assertEqual(r.status_code, 401)
 
+    def test_login_failure_reason_is_specific(self):
+        # 密码错误 -> 中文原因(不暴露用户名是否存在)
+        r = self.client.post("/api/v1/login", json={"username": "user1", "password": "bad"})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["detail"], "用户名或密码错误")
+
+        # 账号被停用 -> 明确提示, 用户知道重试无意义
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        self.auth.set_user_active_as(sysadmin, self.user.id, False)
+        r2 = self.client.post("/api/v1/login", json={"username": "user1", "password": "pw123456"})
+        self.assertEqual(r2.status_code, 401)
+        self.assertIn("停用", r2.json()["detail"])
+
+    def test_login_lockout_reason_reports_wait(self):
+        from src.core.auth import LOGIN_MAX_FAILURES
+
+        for _ in range(LOGIN_MAX_FAILURES):
+            self.client.post("/api/v1/login", json={"username": "user1", "password": "bad"})
+        r = self.client.post("/api/v1/login", json={"username": "user1", "password": "pw123456"})
+        self.assertEqual(r.status_code, 401)
+        self.assertIn("锁定", r.json()["detail"])
+
     def test_whoami_requires_token(self):
         self.assertEqual(self.client.get("/api/v1/whoami").status_code, 401)
 
@@ -67,7 +90,7 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertEqual(body["username"], "admin1")
-        self.assertEqual(body["role"], "dept_admin")
+        self.assertEqual(body["role"], "employee")
 
     def test_list_kb_returns_accessible(self):
         t = self._token("user1")
@@ -75,7 +98,7 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         kbs = r.json()
         self.assertEqual([k["name"] for k in kbs], ["shared"])
-        self.assertEqual(kbs[0]["permission"], "read")
+        self.assertEqual(kbs[0]["permission"], "admin")
 
     def test_evaluation_knowledge_base_list_is_system_admin_only(self):
         user_token = self._token("user1")
@@ -133,14 +156,21 @@ class ApiRoutesTests(unittest.TestCase):
         r = self.client.get("/api/v1/kbs/shared/structured/spreadsheets", headers=self._auth(t))
         self.assertEqual(r.status_code, 403)
 
-    def test_upload_user_forbidden(self):
+    def test_upload_employee_ok_system_admin_forbidden(self):
         t = self._token("user1")
         r = self.client.post(
             "/api/v1/kbs/shared/files",
             headers=self._auth(t),
             files=[("files", ("a.txt", b"hello"))],
         )
-        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.status_code, 200, r.text)
+        system_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r2 = self.client.post(
+            "/api/v1/kbs/shared/files",
+            headers=self._auth(system_token),
+            files=[("files", ("a.txt", b"hello"))],
+        )
+        self.assertEqual(r2.status_code, 403)
 
     def test_upload_admin_ok(self):
         t = self._token("admin1")
@@ -154,9 +184,9 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(self.stub.uploaded[0][0], "shared")
         self.assertEqual(self.stub.uploaded[0][2], "文档资料")
 
-    def test_create_kb_requires_dept_admin(self):
-        t = self._token("user1")
-        r = self.client.post("/api/v1/kbs", json={"name": "newkb"}, headers=self._auth(t))
+    def test_create_kb_system_admin_forbidden(self):
+        system_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.post("/api/v1/kbs", json={"name": "newkb"}, headers=self._auth(system_token))
         self.assertEqual(r.status_code, 403)
 
     def test_create_kb_admin_ok(self):
@@ -165,9 +195,9 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.stub.created, ["newkb"])
 
-    def test_delete_requires_admin(self):
-        t = self._token("user1")
-        r = self.client.delete("/api/v1/kbs/shared/files/a.pdf", headers=self._auth(t))
+    def test_delete_system_admin_forbidden(self):
+        system_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.delete("/api/v1/kbs/shared/files/a.pdf", headers=self._auth(system_token))
         self.assertEqual(r.status_code, 403)
 
     def test_delete_admin_ok(self):
@@ -175,6 +205,33 @@ class ApiRoutesTests(unittest.TestCase):
         r = self.client.delete("/api/v1/kbs/shared/files/a.pdf", headers=self._auth(t))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.stub.deleted, [("shared", "a.pdf")])
+
+    def test_system_status_task_counts_are_department_scoped(self):
+        # 员工在系统状态页只看本部门任务计数; 系统管理员看全局。
+        conv = ConversationService(db_path=self.db_path)
+        kb_id = self.auth.get_knowledge_base_id("shared", department_id=self.dept.id)
+        session = conv.create_session(self.user.id, "shared", department_id=self.dept.id, kb_id=kb_id)
+        turn = conv.create_turn(self.user.id, session.id, "本部门任务", client_request_id="status-dept")
+        conv.complete_turn(self.user.id, turn.id, "done", {"status": "ok"})
+
+        other_dept = self.auth.create_department("other")
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        other = self.auth.create_user_as(sysadmin, "other1", "pw123456", ROLE_EMPLOYEE, other_dept.id)
+        self.auth.register_knowledge_base("other-kb", owner=other)
+        other_kb_id = self.auth.get_knowledge_base_id("other-kb", department_id=other_dept.id)
+        other_session = conv.create_session(other.id, "other-kb", department_id=other_dept.id, kb_id=other_kb_id)
+        other_turn = conv.create_turn(other.id, other_session.id, "其它部门任务", client_request_id="status-other")
+        conv.complete_turn(other.id, other_turn.id, "done", {"status": "ok"})
+
+        emp_token = self._token("user1")
+        r = self.client.get("/api/v1/system/status", headers=self._auth(emp_token))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["tasks"]["total"], 1)
+
+        sys_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r2 = self.client.get("/api/v1/system/status", headers=self._auth(sys_token))
+        self.assertEqual(r2.status_code, 200)
+        self.assertGreaterEqual(r2.json()["tasks"]["total"], 2)
 
     def test_query_no_permission(self):
         t = self._token("user1")
@@ -387,8 +444,8 @@ class ApiRoutesTests(unittest.TestCase):
         )
 
     def test_turn_cancel_does_not_disclose_another_users_turn(self):
-        other = self.auth.create_user_as(self.admin, "user2", "pw123456", ROLE_USER, self.dept.id)
-        self.auth.grant_kb_permission_as(self.admin, "shared", other.id, "read")
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        self.auth.create_user_as(sysadmin, "user2", "pw123456", ROLE_EMPLOYEE, self.dept.id)
         owner_token = self._token("user1")
         other_token = self._token("user2")
         session = self.client.post(

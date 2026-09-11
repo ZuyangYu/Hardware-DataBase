@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import { api } from '../api/client';
-import { isDeptAdmin, isSystemAdmin, type AuthSession } from '../auth';
+import { isEmployee, isSystemAdmin, type AuthSession } from '../auth';
 import type { KbView, OkResponse } from '../api/types';
 import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
@@ -36,7 +36,7 @@ type Props = {
 export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }: Props) {
   const navigate = useNavigate();
   const sysAdmin = isSystemAdmin(auth.user);
-  const deptAdmin = isDeptAdmin(auth.user);
+  const employee = isEmployee(auth.user);
   const [page, setPage] = useState(1);
   const [createOpen, setCreateOpen] = useState(false);
   const [newKbName, setNewKbName] = useState('');
@@ -47,8 +47,8 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
     (kb: KbView) =>
       kb.permission === 'write' ||
       kb.permission === 'admin' ||
-      (deptAdmin && kb.department_id != null && kb.department_id === auth.user.department_id),
-    [auth.user.department_id, deptAdmin],
+      (employee && kb.department_id != null && kb.department_id === auth.user.department_id),
+    [auth.user.department_id, employee],
   );
 
   function openKb(kb: KbView, target: 'chat' | 'content') {
@@ -112,7 +112,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
         render: (kb) => (
           <div className="flex max-w-[320px] min-w-0 flex-col gap-[2px]">
             <span className="truncate font-medium text-[#18181a]">{kb.name}</span>
-            {(kb.permission || deptAdmin) && kb.department_name && (
+            {(kb.permission || employee) && kb.department_name && (
               <span className="truncate text-[11px] text-[#858b9c]">{kb.department_name}</span>
             )}
           </div>
@@ -185,7 +185,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
         ),
       },
     ],
-    [canManageContent, deptAdmin, sysAdmin],
+    [canManageContent, employee, sysAdmin],
   );
 
   const pageCount = Math.max(1, Math.ceil(kbs.length / PAGE_SIZE));
@@ -213,7 +213,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
           <AppIcon name="refresh" size={14} />
           刷新
         </Button>
-        {deptAdmin && (
+        {employee && (
           <Button
             onClick={() => setCreateOpen(true)}
             className="h-[36px] gap-[6px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] text-white hover:bg-[#303030]"
@@ -239,7 +239,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
           </div>
         ) : kbs.length === 0 ? (
           <div className="py-[48px] text-center text-[13px] text-[#858b9c]">
-            暂无可访问的知识库,请联系部门管理员授权。
+            暂无可访问的知识库,请联系系统管理员挂载。
           </div>
         ) : (
           <>

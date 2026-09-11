@@ -47,16 +47,16 @@ export function isSystemAdmin(user: UserInfo): boolean {
   return user.role === 'system_admin';
 }
 
-export function isDeptAdmin(user: UserInfo): boolean {
-  return user.role === 'dept_admin';
+export function isEmployee(user: UserInfo): boolean {
+  return user.role === 'employee';
 }
 
-export function isAnyAdmin(user: UserInfo): boolean {
-  return user.role === 'system_admin' || user.role === 'dept_admin';
+/** 治理面板/日志/系统状态可见性: 系统管理员看全局, 员工看本部门。 */
+export function hasDashboardAccess(user: UserInfo): boolean {
+  return user.role === 'system_admin' || user.role === 'employee';
 }
 
 export const ROLE_LABELS: Record<UserInfo['role'], string> = {
   system_admin: '系统管理员',
-  dept_admin: '部门管理员',
-  user: '普通用户',
+  employee: '员工',
 };

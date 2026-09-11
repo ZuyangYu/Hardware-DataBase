@@ -1,4 +1,4 @@
-"""Governance endpoints (system_admin: global, dept_admin: department-scoped).
+"""Governance endpoints (system_admin: global, employee: department-scoped).
 
 Combines ``AppPipeline.governance_stats`` (per-KB document counts) with
 ``AuthService.list_knowledge_base_summaries`` (KB registration + ownership).
@@ -11,7 +11,7 @@ from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
 
 from src.api.context import build_context_for_user
-from src.api.deps import get_auth_service, get_pipeline, require_any_admin
+from src.api.deps import get_auth_service, get_pipeline, require_dashboard_access
 from src.api.schemas import GovernanceStatsResponse, KbStatsEntry, KbSummaryView
 
 router = APIRouter(tags=["governance"])
@@ -19,15 +19,15 @@ router = APIRouter(tags=["governance"])
 
 @router.get("/governance/stats", response_model=GovernanceStatsResponse)
 def governance_stats(
-    user: AuthUser = Depends(require_any_admin),
+    user: AuthUser = Depends(require_dashboard_access),
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
 ) -> GovernanceStatsResponse:
     """Per-KB document statistics.
 
     - system_admin: keyed by stable KB identity across all departments
-    - dept_admin: keyed by KB name, scoped to their department
-    - plain users: rejected (mirrors the former Streamlit governance tab, now the React admin GovernancePage)
+    - employee: keyed by KB name, scoped to their department
+    - unauthenticated: rejected (mirrors the former Streamlit governance tab, now the React admin GovernancePage)
     """
     ctx = build_context_for_user(user, auth=auth)
     raw = pipeline.governance_stats(ctx=ctx) or {}
@@ -60,18 +60,16 @@ def _issue_flags(s, stats: dict) -> list[str]:
         flags.append("未登记")
     if not s.department_id:
         flags.append("未分配部门")
-    if s.department_id and s.dept_admin_count == 0:
-        flags.append("无部门管理员")
+    if s.department_id and s.employee_count == 0:
+        flags.append("部门无员工")
     if failed:
         flags.append(f"解析失败 {failed}")
-    if s.permission_count == 0:
-        flags.append("未授权")
     return flags
 
 
 @router.get("/governance/kb-summaries", response_model=list[KbSummaryView])
 def kb_summaries(
-    user: AuthUser = Depends(require_any_admin),
+    user: AuthUser = Depends(require_dashboard_access),
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
 ):
@@ -97,8 +95,7 @@ def kb_summaries(
                 department_name=s.department_name,
                 owner_user_id=s.owner_user_id,
                 owner_username=s.owner_username,
-                permission_count=s.permission_count,
-                dept_admin_count=s.dept_admin_count,
+                employee_count=s.employee_count,
                 registered=s.registered,
                 physical_exists=s.physical_exists,
                 created_at=s.created_at,

@@ -110,11 +110,11 @@ export default function GovernancePage({ auth, onLogout }: Props) {
           ),
       },
       {
-        key: 'permission_count',
-        title: '授权',
-        width: 70,
+        key: 'employee_count',
+        title: '员工数',
+        width: 80,
         align: 'right',
-        render: (r) => <span className="text-[13px] text-[#464c5e]">{r.permission_count}</span>,
+        render: (r) => <span className="text-[13px] text-[#464c5e]">{r.employee_count}</span>,
       },
       {
         key: 'registered',
@@ -158,13 +158,13 @@ export default function GovernancePage({ auth, onLogout }: Props) {
             type="button"
             onClick={(event) => {
               event.stopPropagation();
-              navigate(`/admin/kb-permissions?kb=${encodeURIComponent(r.name)}`);
+              navigate(`/admin/kb-mount?kb=${encodeURIComponent(r.name)}`);
             }}
-            title="进入授权/重挂页"
+            title="进入知识库挂载页"
             className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
           >
             <AppIcon name="lock" size={13} />
-            授权
+            挂载
           </button>
         ),
       },
@@ -178,7 +178,7 @@ export default function GovernancePage({ auth, onLogout }: Props) {
         title="知识库治理"
         description={
           sysAdmin
-            ? '全局知识库治理视图:文件统计、解析异常、授权与归属问题。'
+            ? '全局知识库治理视图:文件统计、解析异常、挂载与归属问题。'
             : '本部门知识库治理视图:文件统计与解析异常。'
         }
         userName={auth.user.username}

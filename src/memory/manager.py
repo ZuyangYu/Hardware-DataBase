@@ -37,6 +37,8 @@ def _memory_model(settings):
 
     from langchain.chat_models import init_chat_model
 
+    from src.core.model_gateway import PRIORITY_BATCH, govern_model
+
     provider = str(getattr(settings, "MEMORY_MODEL_PROVIDER", "") or "").strip().lower()
     configured_model = str(getattr(settings, "MEMORY_MODEL", "") or "").strip()
     if not provider:
@@ -46,7 +48,7 @@ def _memory_model(settings):
         model = configured_model or str(getattr(settings, "AGENT_CUSTOM_MODEL", "") or "")
         if not model:
             raise MemoryExtractionError("memory model is not configured")
-        return init_chat_model(
+        return govern_model(init_chat_model(
             f"openai:{model}",
             base_url=str(getattr(settings, "MEMORY_MODEL_BASE_URL", "") or getattr(settings, "AGENT_CUSTOM_BASE_URL", "") or "") or None,
             api_key=str(getattr(settings, "MEMORY_MODEL_API_KEY", "") or getattr(settings, "AGENT_CUSTOM_API_KEY", "") or "") or None,
@@ -54,18 +56,18 @@ def _memory_model(settings):
             max_tokens=int(getattr(settings, "AGENT_CUSTOM_MAX_TOKENS", 4096)),
             max_retries=int(getattr(settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)),
             timeout=int(getattr(settings, "MEMORY_REFLECTION_TIMEOUT_SECONDS", 120)),
-        )
+        ), PRIORITY_BATCH)
     if provider == "ollama":
         model = configured_model or str(getattr(settings, "AGENT_OLLAMA_MODEL", "") or "")
         if not model:
             raise MemoryExtractionError("memory model is not configured")
-        return init_chat_model(
+        return govern_model(init_chat_model(
             f"ollama:{model}",
             base_url=str(getattr(settings, "MEMORY_MODEL_BASE_URL", "") or getattr(settings, "AGENT_OLLAMA_BASE_URL", "")),
             temperature=float(getattr(settings, "AGENT_TEMPERATURE", 0.2)),
             max_retries=int(getattr(settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)),
             timeout=int(getattr(settings, "MEMORY_REFLECTION_TIMEOUT_SECONDS", 120)),
-        )
+        ), PRIORITY_BATCH)
     raise MemoryExtractionError(f"unsupported memory model provider: {provider}")
 
 

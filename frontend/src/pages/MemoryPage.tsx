@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { api } from '../api/client';
 import type { KbView, MemoryConsentListResponse, MemoryConsentView, MemoryListResponse, MemoryStatus, MemoryView, UserMemorySettingsView } from '../api/types';
-import type { AuthSession } from '../auth';
+import { isEmployee, type AuthSession } from '../auth';
 import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
 import { Button } from '@/components/ui/button';
@@ -266,7 +266,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
                   </div>
                   <p className="mt-[8px] whitespace-pre-wrap text-[13px] leading-[1.7] text-[#464c5e]">{memoryText(memory)}</p>
                 </div>
-                {memory.status === 'candidate' && (memory.scope === 'user' || auth.user.role !== 'user') && (
+                {memory.status === 'candidate' && (memory.scope === 'user' || isEmployee(auth.user)) && (
                   <div className="flex shrink-0 flex-wrap justify-end gap-[6px]">
                     <Button type="button" size="sm" variant="outline" onClick={() => void editDraft(memory)}>编辑</Button>
                     <Button type="button" size="sm" onClick={() => void govern(memory, 'verify')}>审核通过</Button>

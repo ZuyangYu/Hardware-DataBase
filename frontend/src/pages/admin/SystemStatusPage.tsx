@@ -21,6 +21,26 @@ type StatusPayload = {
     avg_first_token_ms?: number | null;
     avg_total_ms?: number | null;
   };
+  llm?: {
+    max_concurrency?: number;
+    batch_max_concurrency?: number;
+    active?: number;
+    active_interactive?: number;
+    active_batch?: number;
+    queued?: number;
+    queued_interactive?: number;
+    queued_batch?: number;
+    completed?: number;
+    timeouts?: number;
+    max_wait_ms?: number;
+    usage?: {
+      calls?: number;
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+      by_channel?: Record<string, { calls?: number; total_tokens?: number }>;
+    };
+  };
 };
 
 const statusText: Record<string, string> = { up: '正常', ready: '就绪', degraded: '降级', down: '故障', not_ready: '未就绪' };
@@ -70,6 +90,32 @@ export default function SystemStatusPage({ auth, onLogout }: Props) {
             {item.error && <div className="mt-[4px] text-[12px] text-[#d20b0b]">{item.error}</div>}
           </div>
         ))}
+      </div>
+      <div className="mt-[16px] rounded-[16px] bg-white p-[18px] shadow-[0_2px_10px_rgba(0,0,0,0.05)]">
+        <div className="mb-[12px] text-[14px] font-semibold text-[#18181a]">LLM 并发闸门</div>
+        <div className="flex flex-wrap gap-[12px]">
+          <StatCard
+            label="进行中 / 上限"
+            value={`${payload?.llm?.active ?? 0} / ${payload?.llm?.max_concurrency ?? 0}`}
+          />
+          <StatCard label="排队中" value={payload?.llm?.queued ?? 0} tone={(payload?.llm?.queued ?? 0) > 0 ? 'green' : 'default'} />
+          <StatCard label="批量并发上限" value={payload?.llm?.batch_max_concurrency ?? 0} />
+          <StatCard label="排队超时次数" value={payload?.llm?.timeouts ?? 0} tone={(payload?.llm?.timeouts ?? 0) > 0 ? 'red' : 'default'} />
+          <StatCard label="最长排队(ms)" value={payload?.llm?.max_wait_ms ?? 0} />
+          <StatCard label="累计完成" value={payload?.llm?.completed ?? 0} />
+        </div>
+        <div className="mt-[12px] flex flex-wrap gap-[12px]">
+          <StatCard label="模型调用数" value={payload?.llm?.usage?.calls ?? 0} />
+          <StatCard
+            label="交互 token"
+            value={payload?.llm?.usage?.by_channel?.interactive?.total_tokens ?? 0}
+          />
+          <StatCard
+            label="批量 token"
+            value={payload?.llm?.usage?.by_channel?.batch?.total_tokens ?? 0}
+          />
+          <StatCard label="总 token" value={payload?.llm?.usage?.total_tokens ?? 0} tone="green" />
+        </div>
       </div>
       <div className="mt-[16px] rounded-[16px] bg-white p-[18px] shadow-[0_2px_10px_rgba(0,0,0,0.05)]">
         <div className="mb-[12px] text-[14px] font-semibold text-[#18181a]">最近 24 小时任务</div>

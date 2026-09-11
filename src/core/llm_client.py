@@ -11,7 +11,9 @@ from typing import Any, Callable, Generator
 import requests
 
 import src.settings as settings
+from src.core.llm_governor import PRIORITY_INTERACTIVE, get_llm_governor
 from src.core.llm_headers import opencode_extra_headers
+from src.core.model_gateway import get_usage_ledger
 from src.observability import observe
 from src.observability.metrics import record_llm
 
@@ -157,12 +159,17 @@ class LLMClient:
     document retrieval backend implementation.
     """
 
-    def __init__(self, config: LLMClientConfig | None = None):
+    def __init__(self, config: LLMClientConfig | None = None, *, priority: str = PRIORITY_INTERACTIVE):
         self.config = config
+        self.priority = priority
         # Reset this context's usage log so a freshly constructed client
         # (incl. one built per test) never inherits stale records left in the
         # current thread's context. Goes through the property setter below.
         self._usage_records = []
+
+    def _slot(self):
+        """Admission slot in the process-wide LLM governor (see llm_governor)."""
+        return get_llm_governor().slot(self.priority)
 
     @property
     def _usage_records(self) -> list[LLMUsageRecord]:
@@ -201,12 +208,13 @@ class LLMClient:
         ) as observation:
             _set_llm_input(observation, messages)
             try:
-                if config.provider == settings.Provider.OLLAMA:
-                    result = self._chat_ollama(config, messages, **kwargs)
-                elif config.provider == settings.Provider.CUSTOM:
-                    result = self._chat_openai_compatible(config, messages, **kwargs)
-                else:
-                    raise ValueError(f"Unsupported provider: {config.provider}")
+                with self._slot():
+                    if config.provider == settings.Provider.OLLAMA:
+                        result = self._chat_ollama(config, messages, **kwargs)
+                    elif config.provider == settings.Provider.CUSTOM:
+                        result = self._chat_openai_compatible(config, messages, **kwargs)
+                    else:
+                        raise ValueError(f"Unsupported provider: {config.provider}")
                 _set_usage_attributes(observation, self._usage_records[before_count:])
                 _set_llm_output(observation, result)
                 return result
@@ -231,7 +239,13 @@ class LLMClient:
             stream = self._stream_chat_openai_compatible(config, messages, **kwargs)
         else:
             raise ValueError(f"Unsupported provider: {config.provider}")
-        return self._observe_stream(stream, config, kwargs, operation="hdb.llm.chat", messages=messages)
+        observed = self._observe_stream(stream, config, kwargs, operation="hdb.llm.chat", messages=messages)
+        return self._governed_stream(observed)
+
+    def _governed_stream(self, stream: Generator[str, None, str]) -> Generator[str, None, str]:
+        """Hold one governor slot for the whole stream (released on close/error)."""
+        with self._slot():
+            yield from stream
 
     def chat_with_tools(
         self,
@@ -265,14 +279,15 @@ class LLMClient:
         ) as observation:
             _set_llm_input(observation, messages, tools=tools)
             try:
-                if config.provider == settings.Provider.OLLAMA:
-                    result = self._chat_tools_ollama(config, messages, tools, tool_choice, usage_stage, **kwargs)
-                elif config.provider == settings.Provider.CUSTOM:
-                    result = self._chat_tools_openai_compatible(
-                        config, messages, tools, tool_choice, usage_stage, **kwargs
-                    )
-                else:
-                    raise ValueError(f"Unsupported provider: {config.provider}")
+                with self._slot():
+                    if config.provider == settings.Provider.OLLAMA:
+                        result = self._chat_tools_ollama(config, messages, tools, tool_choice, usage_stage, **kwargs)
+                    elif config.provider == settings.Provider.CUSTOM:
+                        result = self._chat_tools_openai_compatible(
+                            config, messages, tools, tool_choice, usage_stage, **kwargs
+                        )
+                    else:
+                        raise ValueError(f"Unsupported provider: {config.provider}")
                 _set_usage_attributes(observation, self._usage_records[before_count:])
                 _set_llm_output(observation, result)
                 return result
@@ -329,16 +344,17 @@ class LLMClient:
         ) as observation:
             _set_llm_input(observation, messages, tools=tools)
             try:
-                if config.provider == settings.Provider.OLLAMA:
-                    result = self._stream_chat_tools_ollama(
-                        config, messages, tools, tool_choice, usage_stage, observed_delta, **kwargs
-                    )
-                elif config.provider == settings.Provider.CUSTOM:
-                    result = self._stream_chat_tools_openai_compatible(
-                        config, messages, tools, tool_choice, usage_stage, observed_delta, **kwargs
-                    )
-                else:
-                    raise ValueError(f"Unsupported provider: {config.provider}")
+                with self._slot():
+                    if config.provider == settings.Provider.OLLAMA:
+                        result = self._stream_chat_tools_ollama(
+                            config, messages, tools, tool_choice, usage_stage, observed_delta, **kwargs
+                        )
+                    elif config.provider == settings.Provider.CUSTOM:
+                        result = self._stream_chat_tools_openai_compatible(
+                            config, messages, tools, tool_choice, usage_stage, observed_delta, **kwargs
+                        )
+                    else:
+                        raise ValueError(f"Unsupported provider: {config.provider}")
                 _set_usage_attributes(observation, self._usage_records[before_count:])
                 _set_llm_output(observation, result)
                 return result
@@ -1008,6 +1024,17 @@ class LLMClient:
                 usage_returned=usage is not None,
             )
         )
+        try:
+            get_usage_ledger().record(
+                channel=self.priority,
+                model=config.model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                usage_returned=usage is not None,
+            )
+        except Exception:  # noqa: BLE001 - 记账失败不影响模型调用
+            pass
 
 
 def _provider_name(config: LLMClientConfig) -> str:

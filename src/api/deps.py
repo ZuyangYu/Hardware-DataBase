@@ -6,7 +6,7 @@ import threading
 from fastapi import Depends, Header, HTTPException
 
 from src.core.app_pipeline import AppPipeline
-from src.core.auth import ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, AuthService, AuthUser
+from src.core.auth import ROLE_EMPLOYEE, ROLE_SYSTEM_ADMIN, AuthService, AuthUser
 from src.pipelines.document_rag.schemas import RequestContext
 
 from src.api.context import build_context_for_user
@@ -99,9 +99,10 @@ def current_user(
     return user
 
 
-def require_dept_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
-    if user.role != ROLE_DEPT_ADMIN:
-        raise HTTPException(status_code=403, detail="department admin role required")
+def require_employee(user: AuthUser = Depends(current_user)) -> AuthUser:
+    """部门内容操作依赖: 员工可建库/上传/删除; 系统管理员被拒(kb 铁律)。"""
+    if user.role != ROLE_EMPLOYEE:
+        raise HTTPException(status_code=403, detail="employee role required")
     return user
 
 
@@ -111,20 +112,20 @@ def require_system_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
     return user
 
 
-def require_any_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
-    if user.role not in (ROLE_SYSTEM_ADMIN, ROLE_DEPT_ADMIN):
-        raise HTTPException(status_code=403, detail="admin role required")
+def require_dashboard_access(user: AuthUser = Depends(current_user)) -> AuthUser:
+    """治理面板/日志/系统状态依赖: 系统管理员看全局, 员工看本部门。"""
+    if user.role not in (ROLE_SYSTEM_ADMIN, ROLE_EMPLOYEE):
+        raise HTTPException(status_code=403, detail="dashboard access required")
     return user
 
 
 # Standard error used by every KB-content endpoint when a system_admin tries
 # to reach it. system_admin is a governance role by design (manage departments,
-# users, KB mounting, config, logs, evaluation) and does NOT get access to KB
-# contents -- that would let the platform admin silently read every department's
-# private data. See CLAUDE.md > "角色权力分离". Streamlit enforces the same
-# split at the tab level (system_admin sees governance/logs/eval tabs only).
+# employees, KB mounting, config, logs, evaluation) and does NOT get access to
+# KB contents -- that would let the platform admin silently read every
+# department's private data. See CLAUDE.md > "角色权力分离".
 SYSTEM_ADMIN_KB_CONTENT_FORBIDDEN = (
-    "system_admin 是治理角色,不能访问知识库内容;请用 dept_admin 或 user 账号"
+    "system_admin 是治理角色,不能访问知识库内容;请用员工账号"
 )
 
 

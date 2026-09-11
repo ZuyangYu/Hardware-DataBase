@@ -6,7 +6,7 @@ import time
 import src.settings
 import httpx
 import uvicorn
-from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_USER
+from src.core.auth import AuthService, ROLE_EMPLOYEE
 from src.pipelines.document_rag.schemas import DocumentInfo, IngestResult, ParsedChunk, ParseResult
 
 
@@ -206,18 +206,19 @@ class StubPipeline:
 
 
 def make_auth(db_path: str):
-    """Build a temp auth.db: one dept, dept_admin 'admin1', user 'user1', KB 'shared'.
+    """Build a temp auth.db: one dept, employees 'admin1'/'user1', KB 'shared'.
 
-    Assumes AUTH_DEFAULT_ADMIN_PASSWORD has already been raised to a non-default
-    value by the caller's setUp.
+    Two-role model: ``admin1`` (owner) and ``user1`` are both department
+    employees with implicit admin access to the department KB. Assumes
+    AUTH_DEFAULT_ADMIN_PASSWORD has already been raised to a non-default value
+    by the caller's setUp.
     """
     auth = AuthService(db_path=db_path)
     sysadmin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
     dept = auth.create_department("hw")
-    admin = auth.create_user_as(sysadmin, "admin1", "pw123456", ROLE_DEPT_ADMIN, dept.id)
-    user = auth.create_user_as(admin, "user1", "pw123456", ROLE_USER, dept.id)
+    admin = auth.create_user_as(sysadmin, "admin1", "pw123456", ROLE_EMPLOYEE, dept.id)
+    user = auth.create_user_as(sysadmin, "user1", "pw123456", ROLE_EMPLOYEE, dept.id)
     auth.register_knowledge_base("shared", owner=admin)
-    auth.grant_kb_permission_as(admin, "shared", user.id, "read")
     return auth, dept, admin, user
 
 

@@ -849,8 +849,9 @@ class ExternalConversationHandler(PipelineHandler):
 
             if self._llm_client is None:
                 from src.core.llm_client import LLMClient
+                from src.core.llm_governor import PRIORITY_BATCH
 
-                self._llm_client = LLMClient()
+                self._llm_client = LLMClient(priority=PRIORITY_BATCH)
 
             changed = False
             if not conversation.turns and conversation.blocks:

@@ -468,7 +468,7 @@ class AppPipeline:
                 return False, "权限不足：请先登录再创建知识库。"
             if ctx is not None and ctx.is_system_admin():
                 self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="系统管理员不能创建内容知识库")
-                return False, "系统管理员不能创建内容知识库，请由部门管理员创建。"
+                return False, "系统管理员不能创建内容知识库，请用员工账号创建。"
             auth_service = AuthService()
             scope = kb_scope_from_context(name, ctx).require_department("create")
             if auth_service.knowledge_base_exists(scope.kb_name, department_id=scope.department_id):

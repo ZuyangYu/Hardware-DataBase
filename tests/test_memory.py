@@ -7,7 +7,7 @@ import pytest
 from langgraph.store.base import SearchItem
 
 import src.settings as app_settings
-from src.core.auth import AuthService, ROLE_DEPT_ADMIN, ROLE_USER
+from src.core.auth import AuthService, ROLE_EMPLOYEE
 from src.core.conversation import ConversationService
 from src.memory.catalog import MemoryCatalogRepository, scope_fingerprint
 from src.memory.jobs import MemoryJobRepository
@@ -32,10 +32,9 @@ def memory_context(tmp_path, monkeypatch):
     system_admin = auth.get_user_by_username("admin")
     assert system_admin is not None
     department = auth.create_department("hardware")
-    dept_admin = auth.create_user_as(system_admin, "dept-admin", "password-123", ROLE_DEPT_ADMIN, department.id)
-    user = auth.create_user_as(dept_admin, "engineer", "password-123", ROLE_USER, department.id)
-    auth.register_knowledge_base("design", owner=dept_admin)
-    auth.grant_kb_permission_as(dept_admin, "design", user.id, "read")
+    employee = auth.create_user_as(system_admin, "dept-admin", "password-123", ROLE_EMPLOYEE, department.id)
+    user = auth.create_user_as(system_admin, "engineer", "password-123", ROLE_EMPLOYEE, department.id)
+    auth.register_knowledge_base("design", owner=employee)
     kb_id = auth.get_knowledge_base_id("design", department_id=department.id)
     assert kb_id is not None
 
@@ -46,7 +45,7 @@ def memory_context(tmp_path, monkeypatch):
     return SimpleNamespace(
         db_path=db_path,
         auth=auth,
-        dept_admin=dept_admin,
+        employee=employee,
         user=user,
         department=department,
         kb_id=kb_id,
@@ -142,9 +141,9 @@ def test_memory_service_draft_and_verify_use_revision_and_projection_fences(memo
     ctx = memory_context
     _worker, runtime, _fake = run_project_worker(ctx, tmp_path)
     service = MemoryService(db_path=ctx.db_path, store_runtime=runtime, auth=ctx.auth)
-    record = service.list_memories(actor=ctx.dept_admin, scope="project", kb_name="design")[0]
+    record = service.list_memories(actor=ctx.employee, scope="project", kb_name="design")[0]
     draft = service.update_draft(
-        actor=ctx.dept_admin,
+        actor=ctx.employee,
         memory_id=record["memory_id"],
         expected_revision=record["revision"],
         content={
@@ -161,17 +160,17 @@ def test_memory_service_draft_and_verify_use_revision_and_projection_fences(memo
     assert draft["revision"] == 2
     with pytest.raises(Exception):
         service.update_draft(
-            actor=ctx.dept_admin,
+            actor=ctx.employee,
             memory_id=record["memory_id"],
             expected_revision=1,
             content={"memory_type": "decision", "title": "stale", "content": "stale", "confidence": 0.1},
             reason="stale",
             request_id="draft-stale",
         )
-    latest = service.get_memory(record["memory_id"], actor=ctx.dept_admin)
+    latest = service.get_memory(record["memory_id"], actor=ctx.employee)
     verified = service.verify(
         record["memory_id"],
-        actor=ctx.dept_admin,
+        actor=ctx.employee,
         expected_revision=latest["revision"],
         evidence_refs=["datasheet:LM76003"],
         reason="已核对 Datasheet",
@@ -199,7 +198,7 @@ def test_memory_service_draft_and_verify_use_revision_and_projection_fences(memo
     assert worker.run_once() is True
     while worker.run_once():
         pass
-    assert service.get_memory(record["memory_id"], actor=ctx.dept_admin)["status"] == "verified"
+    assert service.get_memory(record["memory_id"], actor=ctx.employee)["status"] == "verified"
     with MemoryJobRepository(ctx.db_path)._connect() as conn:
         run_status = conn.execute("SELECT status FROM memory_reflection_runs ORDER BY created_at DESC LIMIT 1").fetchone()
         assert run_status is None or run_status["status"] in {"projected", "failed"}
@@ -257,7 +256,7 @@ def test_stale_deletion_outbox_is_a_noop(memory_context, tmp_path, monkeypatch):
     service = MemoryService(db_path=ctx.db_path, auth=ctx.auth, store_runtime=runtime)
     service.delete(
         record.memory_id,
-        actor=ctx.dept_admin,
+        actor=ctx.employee,
         expected_revision=record.current_revision,
         reason="测试陈旧删除",
         request_id="stale-delete-1",
@@ -455,7 +454,7 @@ def test_memory_search_continues_bounded_pages_after_orphans(memory_context, tmp
             MEMORY_ITEM_MAX_TOKENS=350,
         ),
     )
-    result = service.search("LM76003", actor=ctx.dept_admin, scope="project", kb_name="design", top_k=20)
+    result = service.search("LM76003", actor=ctx.employee, scope="project", kb_name="design", top_k=20)
 
     assert [item["memory_id"] for item in result] == [record.memory_id]
     candidate_calls = [call for call in calls if call[0][-1] == "candidate"]

@@ -1,9 +1,8 @@
 """Log query endpoints.
 
 Both audit and query-trace logs use the same viewer-scoping enforced inside
-:class:`AppLogService` — ``system_admin`` sees everything, ``dept_admin``
-sees their department only, ordinary users don't reach this router (guarded
-by :func:`require_any_admin`).
+:class:`AppLogService` — ``system_admin`` sees everything, ``employee``
+sees their department only (guarded by :func:`require_dashboard_access`).
 """
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ import src.settings as settings
 from src.core.app_logs import AppLogService
 from src.core.auth import AuthUser
 
-from src.api.deps import require_any_admin
+from src.api.deps import require_dashboard_access
 from src.api.schemas import (
     AuditEventView,
     AuditStatsResponse,
@@ -115,7 +114,7 @@ def list_audit(
     success: bool | None = None,
     keyword: str | None = None,
     limit: int = Query(default=300, ge=1, le=1000),
-    viewer: AuthUser = Depends(require_any_admin),
+    viewer: AuthUser = Depends(require_dashboard_access),
     logs: AppLogService = Depends(_log_service),
 ):
     """Return audit events matching the filters (scoped to viewer)."""
@@ -129,7 +128,7 @@ def audit_stats(
     kb_name: str | None = None,
     success: bool | None = None,
     keyword: str | None = None,
-    viewer: AuthUser = Depends(require_any_admin),
+    viewer: AuthUser = Depends(require_dashboard_access),
     logs: AppLogService = Depends(_log_service),
 ):
     """Audit totals, success/failure breakdown, top actions, and 7-day trend."""
@@ -147,7 +146,7 @@ def audit_stats(
 
 @router.get("/logs/audit/actions", response_model=list[str])
 def list_audit_actions(
-    viewer: AuthUser = Depends(require_any_admin),
+    viewer: AuthUser = Depends(require_dashboard_access),
     logs: AppLogService = Depends(_log_service),
 ):
     """List distinct audit action names visible to this viewer (for filters)."""
@@ -164,7 +163,7 @@ def list_query_traces(
     status: str | None = None,
     keyword: str | None = None,
     limit: int = Query(default=300, ge=1, le=1000),
-    viewer: AuthUser = Depends(require_any_admin),
+    viewer: AuthUser = Depends(require_dashboard_access),
     logs: AppLogService = Depends(_log_service),
 ):
     """Return query traces matching the filters (scoped + redacted per viewer)."""
@@ -177,7 +176,7 @@ def query_stats(
     kb_name: str | None = None,
     status: str | None = None,
     keyword: str | None = None,
-    viewer: AuthUser = Depends(require_any_admin),
+    viewer: AuthUser = Depends(require_dashboard_access),
     logs: AppLogService = Depends(_log_service),
 ):
     """Query totals, per-status breakdown, and top failure reasons."""
@@ -194,7 +193,7 @@ def query_stats(
 @router.get("/logs/query/{trace_id}/evidence", response_model=list[EvidenceView])
 def get_trace_evidence(
     trace_id: int,
-    viewer: AuthUser = Depends(require_any_admin),
+    viewer: AuthUser = Depends(require_dashboard_access),
     logs: AppLogService = Depends(_log_service),
 ):
     """Return retrieved evidence for a query trace.
