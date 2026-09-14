@@ -135,6 +135,48 @@ def test_stream_wrapper_marks_failure_status(monkeypatch):
     assert record_agent.call_args.kwargs["status"] == "failed"
 
 
+def test_attachment_sessions_get_a_larger_evidence_budget():
+    from src.agents.runner import _agent_evidence_budget
+
+    base = _agent_evidence_budget([])
+    with_attachment = _agent_evidence_budget([object()])
+
+    assert with_attachment > base
+
+
+def test_graph_recursion_error_completes_with_actionable_notice(monkeypatch):
+    """步数上限是执行预算，不是系统故障：轮次必须完成并给出可操作提示。"""
+    from langgraph.errors import GraphRecursionError
+
+    from src.agents import runner as runner_mod
+
+    def _boom(*args, **kwargs):
+        raise GraphRecursionError(
+            "Recursion limit of 36 reached without hitting a stop condition."
+        )
+
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = _boom
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(query="完善附件第6章", kb_name="kb_hw", history=[], event_callback=events.append)
+    )
+
+    assert len(deltas) == 1
+    assert "单轮步数上限" in deltas[0]
+    assert "系统错误" not in deltas[0]
+    assert runner_mod._current_run().answer == deltas[0]
+    summary = runner.get_last_retrieval_summary()
+    assert summary["status"] == "no_evidence"
+    degraded = [event for event in events if event["type"] == "degraded"]
+    assert degraded and degraded[-1]["payload"]["stage"] == "agent_loop"
+
+
 def test_general_chat_runs_through_agent_without_retrieval_tools(monkeypatch):
     """未挂载知识库的通用对话与 KB 问答共用同一条 deepagents 链路：
     同一个模型接口与系统提示词来源，只是不注册知识库检索工具。"""

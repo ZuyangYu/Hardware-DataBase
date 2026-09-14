@@ -15,6 +15,9 @@ import {
   documentCardStatusTone,
   documentCardTitle,
   documentCardWorkbenchActions,
+  documentCardReviewCandidateArtifact,
+  canRequestDocumentRelease,
+  documentCardAfterReleaseRequest,
   documentCurrentChatTaskPath,
   documentChatTaskEventsPath,
   nextActionLabel,
@@ -41,6 +44,34 @@ const workOrderCard: DocumentCardData = {
 };
 
 describe('documentCardModel', () => {
+  it('exposes a release request only for an unrequested review candidate', () => {
+    const card: DocumentCardData = {
+      kind: 'work_order_status',
+      status: 'blocked',
+      next_actions: ['download_candidate', 'request_release'],
+      kb_name: 'hardware',
+      work_order_id: 'wo-candidate',
+      releaseState: 'not_requested',
+      artifacts: [
+        { artifact_id: 'draft-1', stage: 'draft_preview' },
+        { artifact_id: 'candidate-1', stage: 'review_candidate', output_format: 'docx' },
+      ],
+    };
+
+    expect(documentCardReviewCandidateArtifact(card)).toEqual({
+      artifact_id: 'candidate-1',
+      stage: 'review_candidate',
+      output_format: 'docx',
+    });
+    expect(canRequestDocumentRelease(card)).toBe(true);
+    expect(canRequestDocumentRelease({ ...card, releaseState: 'pending' })).toBe(false);
+    expect(canRequestDocumentRelease({ ...card, next_actions: ['download_candidate'] })).toBe(false);
+    expect(documentCardAfterReleaseRequest(card)).toMatchObject({
+      releaseState: 'pending',
+      next_actions: ['download_candidate'],
+    });
+  });
+
   it('builds the durable current-task snapshot path for one conversation', () => {
     expect(documentCurrentChatTaskPath(85)).toBe(
       '/api/v1/document-generation/chat-tasks/current?session_id=85',
@@ -96,6 +127,74 @@ describe('documentCardModel', () => {
       kb_name: 'kb',
       work_order_id: null,
       generation_session_id: null,
+    });
+  });
+
+  it('keeps an attachment revision candidate and its download reference', () => {
+    const parsed = parseDocumentCardEvent(cardEvent({
+      kind: 'attachment_revision',
+      status: 'review_candidate',
+      next_actions: [],
+      kb_name: 'hardware',
+      candidate_state: 'available',
+      release_state: 'not_requested',
+      artifacts: [{
+        artifact_id: 'att-child-1',
+        stage: 'review_candidate',
+        output_format: 'docx',
+        download_url: '/api/v1/conversations/7/attachments/att-child-1/download',
+      }],
+    }));
+
+    expect(parsed?.kind).toBe('attachment_revision');
+    expect(documentCardTitle('attachment_revision')).toBe('附件修订候选');
+    expect(parsed?.candidateState).toBe('available');
+    expect(parsed?.artifacts?.[0]).toEqual({
+      artifact_id: 'att-child-1',
+      stage: 'review_candidate',
+      output_format: 'docx',
+      download_url: '/api/v1/conversations/7/attachments/att-child-1/download',
+    });
+  });
+
+  it('keeps generic decision groups and candidate/release state from a task projection', () => {
+    const parsed = parseDocumentCardEvent(cardEvent({
+      kind: 'work_order_status',
+      status: 'blocked',
+      next_actions: ['download_candidate', 'request_release'],
+      kb_name: 'hardware',
+      task_id: 'task-grouped',
+      work_order_id: 'wo-grouped',
+      candidate_state: 'available',
+      release_state: 'pending',
+      pending_decisions: [
+        {
+          decision_id: 'decision:pin_exposure:X1900',
+          group_key: 'X1900',
+          kind: 'pin_exposure',
+          title: '位号 X1900 待确认',
+          options: ['include', 'exclude', 3],
+          default_option: 'include',
+          count: 15,
+          blocking: false,
+        },
+        { group_key: ' ', count: 99 },
+      ],
+    }));
+
+    expect(parsed).toMatchObject({
+      candidateState: 'available',
+      releaseState: 'pending',
+      pendingDecisions: [{
+        decision_id: 'decision:pin_exposure:X1900',
+        group_key: 'X1900',
+        kind: 'pin_exposure',
+        title: '位号 X1900 待确认',
+        options: ['include', 'exclude'],
+        default_option: 'include',
+        count: 15,
+        blocking: false,
+      }],
     });
   });
 

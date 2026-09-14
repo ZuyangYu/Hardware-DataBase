@@ -235,6 +235,18 @@ export async function fetchDocumentTaskProjection(
   return api.get<DocumentTaskProjection>(documentTaskProjectionPath(knowledgeBaseName, taskId));
 }
 
+/** Submit an explicit release-review request; this endpoint never approves or publishes. */
+export async function requestDocumentRelease(
+  knowledgeBaseName: string,
+  artifactId: string,
+  comment = '',
+): Promise<{ event_id: string; [key: string]: unknown }> {
+  return api.post<{ event_id: string; [key: string]: unknown }>(
+    `/api/v1/document-generation/artifacts/${encodeURIComponent(artifactId)}/release-request?kb=${encodeURIComponent(knowledgeBaseName)}`,
+    { comment },
+  );
+}
+
 export function documentTaskReviewsPath(knowledgeBaseName: string, taskId: string): string {
   return `/api/v1/document-generation/tasks/${encodeURIComponent(taskId)}/reviews?kb=${encodeURIComponent(knowledgeBaseName)}`;
 }

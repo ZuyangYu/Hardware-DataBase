@@ -1206,6 +1206,18 @@ export type WorkOrderStatus = {
   error_message?: string;
   retryable?: boolean;
   next_actions?: string[];
+  pending_decisions?: Array<{
+    decision_id?: string;
+    group_key: string;
+    kind?: string;
+    title?: string;
+    options?: string[];
+    default_option?: string;
+    count?: number;
+    blocking?: boolean;
+  }>;
+  candidate_state?: 'none' | 'available' | 'blocked';
+  release_state?: 'not_requested' | 'pending' | 'approved' | 'rejected';
   can_pause?: boolean;
   can_resume?: boolean;
   can_cancel?: boolean;
@@ -1291,6 +1303,18 @@ export type DocumentTaskProjection = {
   artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
   reviews: DocumentReview[];
   revisions: ArtifactRevision[];
+  pending_decisions?: Array<{
+    decision_id?: string;
+    group_key: string;
+    kind?: string;
+    title?: string;
+    options?: string[];
+    default_option?: string;
+    count?: number;
+    blocking?: boolean;
+  }>;
+  candidate_state?: 'none' | 'available' | 'blocked';
+  release_state?: 'not_requested' | 'pending' | 'approved' | 'rejected';
   pending_review?: Record<string, unknown> | null;
   next_actions: string[];
   created_at: string;

@@ -10,8 +10,10 @@
 import { cn } from '@/lib/utils';
 import type { DocumentStatusTone } from '../../documentGenerationModel';
 import {
-  documentCardStatusTone,
-  documentCardStatusLabel,
+  documentCardLifecycleLabel,
+  documentCardLifecycleTone,
+  canRequestDocumentRelease,
+  documentCardReviewCandidateArtifact,
   documentCardTitle,
   documentCardWorkbenchActions,
   downloadDocumentArtifact,
@@ -75,6 +77,8 @@ type Props = {
   card: DocumentCardData;
   refreshing?: boolean;
   onRefreshStatus?: (card: DocumentCardData) => void;
+  requestingRelease?: boolean;
+  onRequestRelease?: (card: DocumentCardData, artifactId: string) => void;
   stale?: boolean;
 };
 
@@ -82,16 +86,31 @@ export default function DocumentStatusCard({
   card,
   refreshing = false,
   onRefreshStatus,
+  requestingRelease = false,
+  onRequestRelease,
   stale = false,
 }: Props) {
   const workOrderId = card.work_order_id?.trim() ?? '';
-  const tone = documentCardStatusTone(card.status);
+  const tone = documentCardLifecycleTone(card);
+  const reviewCandidate = documentCardReviewCandidateArtifact(card);
+  const canRequestRelease = Boolean(onRequestRelease)
+    && canRequestDocumentRelease(card)
+    && Boolean(reviewCandidate);
   const workbenchActions = documentCardWorkbenchActions(card)
     .filter(({ action }) => !CONVERSATION_ONLY_ACTIONS.has(action));
-  const pendingRefdes = (card.gateReview?.scopeExceptions ?? [])
+  const pendingGroups = card.pendingDecisions ?? [];
+  const groupedPending = pendingGroups
+    .map((group) => `${group.group_key}（${group.count} 项）`)
+    .join('、');
+  const uniqueRefdes = (card.gateReview?.scopeExceptions ?? [])
     .map((exception) => exception.refdes?.trim() ?? '')
     .filter((value) => value !== '')
-    .join('、') || '（未指定位号）';
+    .filter((value, index, values) => values.indexOf(value) === index);
+  const pendingRefdes = groupedPending || uniqueRefdes.join('、') || '（未指定位号）';
+  const hasCandidateArtifact = card.candidateState === 'available' || (card.artifacts ?? []).some((artifact) => {
+    const stage = (artifact.stage || '').trim().toLowerCase();
+    return stage === 'review_candidate' || stage === 'draft_preview';
+  });
   const suggestedRefdes = (card.gateReview?.scopeExceptions ?? [])
     .flatMap((exception) => exception.suggested_refdes ?? [])
     .map((value) => value.trim())
@@ -124,7 +143,7 @@ export default function DocumentStatusCard({
           )}
         >
           <span aria-hidden="true" className="size-[6px] rounded-full bg-current" />
-          {documentCardStatusLabel(card.status)}
+          {documentCardLifecycleLabel(card)}
         </span>
         {card.kb_name && <span className="min-w-0 truncate text-[11px] text-[#757f9c]">知识库 {card.kb_name}</span>}
       </div>
@@ -168,7 +187,15 @@ export default function DocumentStatusCard({
               ? 'ICD 范围异常待办'
               : `待处理人工审核：${card.gateReview.reviewKind}`}
           </p>
-          {card.gateReview.scopeExceptions.length > 0 && (
+          {pendingGroups.length > 0 ? (
+            <ul className="mt-[4px] list-disc pl-[16px]">
+              {pendingGroups.map((group) => (
+                <li key={group.decision_id || `${group.kind}:${group.group_key}`}>
+                  {group.title}（{group.count} 项）
+                </li>
+              ))}
+            </ul>
+          ) : card.gateReview.scopeExceptions.length > 0 && (
             <ul className="mt-[4px] list-disc pl-[16px]">
               {card.gateReview.scopeExceptions.map((exception, index) => (
                 <li key={`${exception.refdes ?? exception.kind ?? 'exception'}-${index}`}>
@@ -183,17 +210,19 @@ export default function DocumentStatusCard({
               ? '请在文档工作台完成审核，或在对话中说明处理意见。'
               : card.gateReview.scopeBlocking
                 ? suggestedRefdes
-                  ? `冻结 EDF 中的实际位号为 ${suggestedRefdes}。请直接回复“确认”（或“按 EDF 实际位号生成”；直接要求填充/继续生成也可以），由助手用 EDF 实际位号替换模板示例位号并继续生成；若实际目标不同，请在对话中明确目标位号或模块。`
+                  ? `冻结 EDF 中的实际位号为 ${suggestedRefdes}。可直接说“按 EDF 实际位号生成”，由助手替换模板示例位号并继续生成；若实际目标不同，请说明目标位号或模块。`
                   : `请确认实际目标接插件后按你的要求重新生成：当前系统解析到的待处理位号为 ${pendingRefdes}。若这些位号应包含，请补齐对应的 EDF 管脚映射并重新解析；若实际目标不是这些位号，请在对话中明确目标位号或模块。`
-                : `请按实际情况确认要包含或排除的位号（待处理：${pendingRefdes}），在对话中回复“包含/排除 <位号>，继续生成”，由助手提交范围处理。`}
+                : `待处理：${pendingRefdes}。可按实际情况直接用自然语言说明，例如“${pendingGroups[0]?.group_key ?? uniqueRefdes[0] ?? '这组'} 全部包含”或“全部排除”；也可以逐项说明处理意见。`}
           </p>
         </div>
       )}
       {card.status === 'blocked' && (
         <p className="mt-[6px] text-[11px] text-[#68728a]">
-          {card.errorCode === 'document_job_failed' || card.progress?.completedUnits === 0
-            ? '字段填充阶段未完成，请稍后刷新或重试；暂不需要你手工补齐字段。'
-            : '请在下方对话中补充或确认缺失信息；工作台仅用于查看候选稿和审核详情。'}
+          {hasCandidateArtifact
+            ? '候选文档已生成，可在上方下载；正式发布被门禁阻止，处理完待办后即可申请发布。'
+            : card.errorCode === 'document_job_failed' || card.progress?.completedUnits === 0
+              ? '字段填充阶段未完成，请稍后刷新或重试；暂不需要你手工补齐字段。'
+              : '请在下方对话中补充或确认缺失信息；工作台仅用于查看候选稿和审核详情。'}
         </p>
       )}
       {card.status === 'needs_review' && !card.gateReview && (
@@ -223,7 +252,7 @@ export default function DocumentStatusCard({
           )}
         </div>
       )}
-      {((onRefreshStatus && (workOrderId || card.generation_session_id)) || workbenchActions.length > 0) && (
+      {((onRefreshStatus && (workOrderId || card.generation_session_id)) || canRequestRelease || workbenchActions.length > 0) && (
         <div className="mt-[6px] flex flex-wrap items-center gap-[8px]">
           {onRefreshStatus && (workOrderId || card.generation_session_id) && (
             <button
@@ -234,6 +263,17 @@ export default function DocumentStatusCard({
               className="rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] py-[3px] text-[12px] font-medium text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-50"
             >
               {refreshing ? '刷新中…' : workOrderId ? '刷新状态' : '刷新问题'}
+            </button>
+          )}
+          {canRequestRelease && reviewCandidate && (
+            <button
+              type="button"
+              aria-label={`申请正式发布审核（工单 ${workOrderId}）`}
+              disabled={requestingRelease}
+              onClick={() => onRequestRelease?.(card, reviewCandidate.artifact_id)}
+              className="rounded-[8px] border border-[#0b6cf5] bg-[#0b6cf5] px-[10px] py-[3px] text-[12px] font-medium text-white transition-colors hover:bg-[#095ccc] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {requestingRelease ? '申请中…' : '申请正式发布审核'}
             </button>
           )}
           {workbenchActions.map((action) => (
@@ -248,14 +288,33 @@ export default function DocumentStatusCard({
           ))}
         </div>
       )}
-      {workOrderId && card.artifacts && card.artifacts.length > 0 && (
+      {card.kind === 'attachment_revision' && (
+        <p className="mt-[6px] text-[11px] text-[#68728a]" data-attachment-release-state={card.releaseState ?? 'not_requested'}>
+          {card.releaseState === 'pending'
+            ? '已提交正式发布审核，等待审核人处理；候选仍可下载。'
+            : card.releaseState === 'rejected'
+              ? '发布申请被拒绝，候选仍可下载；可在对话中修改后重新申请。'
+              : card.releaseState === 'approved'
+                ? '已通过审核：正式文件与候选分开保存。'
+                : '候选未发布；可在对话中申请正式发布审核。'}
+        </p>
+      )}
+      {(workOrderId || card.kind === 'attachment_revision')
+        && card.artifacts
+        && card.artifacts.length > 0 && (
         <div className="mt-[6px] flex flex-wrap items-center gap-[6px]">
-          <span className="text-[11px] text-[#858b9c]">文档产物</span>
+          <span className="text-[11px] text-[#858b9c]">
+            {card.kind === 'attachment_revision' ? '候选附件' : '文档产物'}
+          </span>
           {card.artifacts.map((artifact) => (
             <button
               key={artifact.artifact_id}
               type="button"
-              aria-label={`下载 ${artifact.stage}（工单 ${workOrderId}）`}
+              aria-label={
+                card.kind === 'attachment_revision'
+                  ? `下载 ${artifactStageLabel(artifact.stage)}`
+                  : `下载 ${artifactStageLabel(artifact.stage)}（工单 ${workOrderId}）`
+              }
               onClick={() => void downloadDocumentArtifact(card, artifact)}
               className="rounded-[8px] border border-[#e3e7f1] bg-white px-[8px] py-[2px] text-[11px] font-medium text-[#0b6cf5] transition-colors hover:border-[#c9d2e4] hover:bg-[#f4f8ff]"
             >

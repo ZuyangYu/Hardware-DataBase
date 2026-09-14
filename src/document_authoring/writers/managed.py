@@ -55,7 +55,10 @@ class ManagedWriter:
             raise ValueError("writer returned a draft for a different unit or run")
         if draft.generated_by not in {"managed_writer", "external_agent"}:
             raise ValueError("managed writer returned an invalid generated_by value")
-        return draft
+        # Apply server-compiled edits at the provider boundary.  A provider
+        # may propose the baseline wording, but it cannot acknowledge a
+        # revision while silently returning the old renderable value.
+        return _apply_server_revision_edit(draft, request)
 
 
 class DeterministicEvidenceWriter:
@@ -109,6 +112,136 @@ def _deterministic_draft(request: WriterRequest) -> DocumentUnitDraft:
         )],
         proposed_status="draft",
     )
+
+
+def _apply_server_revision_edit(
+    draft: DocumentUnitDraft,
+    request: WriterRequest,
+) -> DocumentUnitDraft:
+    """Apply a narrow, server-owned text edit to a semantic draft.
+
+    Only scalar and enumeration values are supported by this deterministic
+    bridge.  Tables and complex structures need their own typed patch
+    contract; returning the original draft for those would make a revision
+    look successful without changing the artifact.  Assertions intentionally
+    remain anchored to the original evidence wording and the applied edit is
+    recorded in coordinator metadata for audit.
+    """
+
+    raw_edit = request.revision_edit
+    if raw_edit is None:
+        return draft
+
+    edit = {
+        "kind": str(raw_edit.get("kind") or "").strip(),
+        "before": str(raw_edit.get("before") or "").strip(),
+        "after": str(raw_edit.get("after") or "").strip(),
+    }
+    if edit["kind"] != "replace_text":
+        raise ValueError("unsupported server revision edit")
+    if not edit["before"] or not edit["after"] or edit["before"] == edit["after"]:
+        raise ValueError("server revision edit requires different non-empty values")
+
+    existing = (draft.metadata or {}).get("revision_edit")
+    if (
+        isinstance(existing, dict)
+        and existing.get("kind") == edit["kind"]
+        and existing.get("before") == edit["before"]
+        and existing.get("after") == edit["after"]
+        and existing.get("applied") is True
+    ):
+        return draft
+    if existing is not None:
+        raise ValueError("draft already contains a different revision edit")
+
+    value_type = str(request.field_value_type or "").strip().casefold()
+    typed = draft.typed_value
+    if (
+        request.table_mode == "typed_rows"
+        or value_type in {"table", "repeating_table"}
+        or (typed is not None and typed.kind == "table")
+    ):
+        raise ValueError("server text replacement is not supported for table units")
+    if typed is None or typed.kind not in {"scalar", "enumeration"}:
+        raise ValueError("server text replacement requires a scalar or enumeration value")
+
+    before = edit["before"]
+    after = edit["after"]
+    target_fields: list[str] = []
+
+    content, content_changed = _replace_nested_text(draft.content, before, after)
+    if content_changed:
+        target_fields.append("content")
+    proposed_value, proposed_changed = _replace_nested_text(
+        draft.proposed_value, before, after,
+    )
+    if proposed_changed:
+        target_fields.append("proposed_value")
+
+    display_value = typed.display_value.replace(before, after)
+    if display_value != typed.display_value:
+        target_fields.append("typed_value.display_value")
+    normalized_values: list[str] = []
+    for index, value in enumerate(typed.normalized_values):
+        original = str(value)
+        replaced = original.replace(before, after)
+        normalized_values.append(replaced)
+        if replaced != original:
+            target_fields.append(f"typed_value.normalized_values[{index}]")
+
+    # Content is reviewable prose; only a changed typed value guarantees that
+    # the renderer will receive the requested edit.
+    renderable_fields = [
+        field for field in target_fields
+        if field == "typed_value.display_value"
+        or field.startswith("typed_value.normalized_values[")
+    ]
+    if not renderable_fields:
+        raise ValueError(
+            f"server revision edit target text not found in renderable draft: {before!r}"
+        )
+
+    metadata = dict(draft.metadata or {})
+    metadata["revision_edit"] = {
+        **edit,
+        "applied": True,
+        "target_fields": target_fields,
+    }
+    updated_typed = typed.model_copy(update={
+        "display_value": display_value,
+        "normalized_values": normalized_values,
+    })
+    return draft.model_copy(update={
+        "content": content,
+        "proposed_value": proposed_value,
+        "typed_value": updated_typed,
+        "metadata": metadata,
+    })
+
+
+def _replace_nested_text(value: Any, before: str, after: str) -> tuple[Any, bool]:
+    """Replace string values in JSON-shaped presentation values, not keys."""
+
+    if isinstance(value, str):
+        replaced = value.replace(before, after)
+        return replaced, replaced != value
+    if isinstance(value, list):
+        changed = False
+        replaced_values: list[Any] = []
+        for item in value:
+            replaced, item_changed = _replace_nested_text(item, before, after)
+            replaced_values.append(replaced)
+            changed = changed or item_changed
+        return replaced_values, changed
+    if isinstance(value, dict):
+        changed = False
+        replaced_values: dict[Any, Any] = {}
+        for key, item in value.items():
+            replaced, item_changed = _replace_nested_text(item, before, after)
+            replaced_values[key] = replaced
+            changed = changed or item_changed
+        return replaced_values, changed
+    return value, False
 
 
 def _extract_typed_value(
@@ -999,6 +1132,24 @@ def _build_user_prompt(request: WriterRequest, last_error: str | None) -> str:
         "Example structure (copy the shape, fill with real content):",
         example,
     ]
+    if request.revision_instruction:
+        parts[2:2] = [
+            "",
+            "REVISION INSTRUCTION (apply this change to this unit; it supersedes "
+            "the previous unit wording where they conflict):",
+            request.revision_instruction,
+        ]
+    if request.revision_edit:
+        parts[2:2] = [
+            "",
+            "SERVER-COMPILED EDIT CONTRACT:",
+            "The server will apply the exact text replacement after validating "
+            "your draft. Return the baseline renderable value containing the "
+            "`before` text; do not replace it yourself and do not claim the "
+            "`after` text is already applied.",
+            "The exact baseline and requested replacement are in "
+            "`revision_edit` in the Request JSON.",
+        ]
     if request.table_mode == "typed_rows":
         parts[4:4] = [
             "TABLE OUTPUT REQUIREMENT: return typed rows with row_key, cells, "

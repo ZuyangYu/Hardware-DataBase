@@ -31,6 +31,7 @@ from src.attachments.models import (
     PART_TYPE_TEXT,
     PARSER_VERSION,
 )
+from src.attachments.docx_revision import heading_level
 from src.attachments.ocr import OcrEngine, default_ocr_engine
 from src.attachments.router import ParseOutcome
 
@@ -449,11 +450,12 @@ class LocalDocumentParser:
             text = (item.text or "").strip()
             if not text:
                 continue
-            if style_name.startswith("Heading"):
-                try:
-                    level = int(style_name.split()[-1])
-                except ValueError:
-                    level = 1
+            # Built-in, localized and custom styles based on a heading style
+            # are all recognized (see ``heading_level``), so parts of real
+            # corporate documents carry a heading path even when no style is
+            # literally named "Heading N".
+            level = heading_level(item)
+            if level is not None:
                 heading_path = heading_path[: max(0, level - 1)]
                 heading_path.append(text[:200])
             parts.append(
@@ -467,6 +469,108 @@ class LocalDocumentParser:
                 )
             )
             ordinal += 1
+
+        # Embedded OOXML workbooks (``word/embeddings/*.xlsx``) hold real data
+        # that python-docx never exposes (for example pin maps and safety
+        # mechanism lists).  Extract them as bounded table parts with an
+        # ``embedded`` locator so retrieval, the agent and the audit trail can
+        # cite them.  Legacy OLE2 ``.xls`` needs an external converter and is
+        # reported as degraded instead of being silently dropped.
+        embedded_workbooks: list[str] = []
+        embedded_sheet_count = 0
+        max_cell_text_length = max(
+            1, int(src.settings.CHAT_ATTACHMENT_MAX_CELL_TEXT_LENGTH)
+        )
+        import io as _io
+        import zipfile as _zipfile
+
+        from src.pipelines.spreadsheet.xlsx_parser import parse_xlsx
+
+        try:
+            with _zipfile.ZipFile(source_path) as archive:
+                embedded_members = sorted(
+                    name
+                    for name in archive.namelist()
+                    if name.lower().startswith("word/embeddings/")
+                )
+        except (OSError, _zipfile.BadZipFile) as exc:
+            embedded_members = []
+            degraded_reasons.append(f"embedded objects could not be inspected: {exc}")
+        for member in embedded_members:
+            base_name = os.path.basename(member)
+            if not member.lower().endswith((".xlsx", ".xlsm")):
+                degraded_reasons.append(
+                    f"embedded object not indexed (legacy/binary format): {base_name}"
+                )
+                continue
+            try:
+                with _zipfile.ZipFile(source_path) as archive:
+                    payload = archive.read(member)
+                workbook = parse_xlsx(_io.BytesIO(payload))
+            except Exception as exc:  # noqa: BLE001 - one bad workbook must not kill the doc
+                degraded_reasons.append(
+                    f"embedded workbook parse failed: {base_name} ({exc.__class__.__name__})"
+                )
+                continue
+            embedded_workbooks.append(base_name)
+            embedded_sheet_count += len(workbook.sheets)
+            for sheet in workbook.sheets:
+                source_rows = [
+                    [str(value) for value in row] for row in sheet.rows
+                ]
+                if not source_rows or rows_remaining <= 0 or cells_remaining <= 0:
+                    continue
+                taken: list[list[str]] = []
+                used_cells = 0
+                for row in source_rows:
+                    if len(taken) >= rows_remaining:
+                        degraded_reasons.append(
+                            f"embedded sheet {sheet.name} exceeds row limit; "
+                            "remaining rows not indexed"
+                        )
+                        break
+                    if used_cells + len(row) > cells_remaining:
+                        degraded_reasons.append(
+                            f"embedded sheet {sheet.name} exceeds cell limit; "
+                            "remaining rows not indexed"
+                        )
+                        break
+                    taken.append(row)
+                    used_cells += len(row)
+                if not taken:
+                    continue
+                rows_remaining -= len(taken)
+                cells_remaining -= used_cells
+                for table_text, row_start, row_end in _docx_table_chunks(
+                    taken, max_cell_text_length
+                ):
+                    payload_rows = json.loads(table_text)
+                    parts.append(
+                        _part(
+                            asset.asset_id,
+                            ordinal,
+                            PART_TYPE_TABLE,
+                            table_text,
+                            locator={
+                                "embedded": base_name,
+                                "sheet": sheet.name,
+                                "row_start": row_start,
+                                "row_end": row_end,
+                            },
+                            metadata={
+                                "format": "docx-embedded-xlsx",
+                                "kind": "embedded_workbook",
+                                "embedded_part": member,
+                                "sheet": sheet.name,
+                                "rows": len(payload_rows),
+                                "table_rows": len(source_rows),
+                                "row_start": row_start,
+                                "row_end": row_end,
+                            },
+                        )
+                    )
+                    ordinal += 1
+                    table_part_count += 1
 
         # Relationships are metadata only: external hyperlinks are never
         # fetched and embedded image bytes are never executed. Keeping them as
@@ -524,6 +628,9 @@ class LocalDocumentParser:
             "table_count": table_index,
             "table_part_count": table_part_count,
             "degraded_table_count": degraded_table_count,
+            "embedded_workbook_count": len(embedded_workbooks),
+            "embedded_workbooks": embedded_workbooks,
+            "embedded_sheet_count": embedded_sheet_count,
         }
         status = PARSE_STATUS_DEGRADED if degraded_reasons else PARSE_STATUS_READY
         return ParseOutcome(

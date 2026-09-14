@@ -19,6 +19,13 @@ class WriterRequest(BaseModel):
     unit_id: str
     unit_label: str
     unit_description: str = ""
+    # Only a server-compiled child plan can set this.  The writer never
+    # receives free-form revision text directly from the conversation/API.
+    revision_instruction: str = ""
+    # Optional server-compiled deterministic edit.  Free-form instructions
+    # remain available to the managed model, while this field is limited to
+    # exact replacements that an offline writer can execute safely.
+    revision_edit: dict[str, str] | None = None
     field_value_type: str = "text"
     table_columns: dict[str, str] | None = None
     # ``typed_rows`` is selected by the server for table fields.  A model is
@@ -39,6 +46,17 @@ class WriterRequest(BaseModel):
 
     @model_validator(mode="after")
     def normalize_table_contract(self) -> "WriterRequest":
+        if self.revision_edit is not None:
+            allowed = {"kind", "before", "after"}
+            if set(self.revision_edit) != allowed:
+                raise ValueError("revision_edit must contain exactly kind, before and after")
+            if self.revision_edit.get("kind") != "replace_text":
+                raise ValueError("unsupported revision_edit kind")
+            before = str(self.revision_edit.get("before") or "").strip()
+            after = str(self.revision_edit.get("after") or "").strip()
+            if not before or not after or before == after:
+                raise ValueError("revision_edit requires different non-empty before and after values")
+            self.revision_edit = {"kind": "replace_text", "before": before, "after": after}
         is_table = self.field_value_type.strip().casefold() in {"table", "repeating_table"}
         if is_table:
             if self.table_mode != "typed_rows" and self.table_mode != "scalar":

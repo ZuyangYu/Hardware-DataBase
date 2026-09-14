@@ -56,6 +56,28 @@ const ATTACHMENT_STATUS_POLL_INTERVAL_MS = 2_000;
 const DOCUMENT_COMPARISON_PATTERN = /对比|比较|区别|差异|差别|异同|对照|compare|comparison|difference|diff/i;
 
 /**
+ * Attachments stay mounted for the whole session: opening a session selects
+ * every parseable attachment by default (failed parses are excluded so they
+ * cannot block sending), and the selection is intentionally NOT cleared after
+ * a turn.  Users can still uncheck a chip for an attachment-free question.
+ */
+export function defaultSelectedAttachmentIds(attachments: AttachmentView[]): string[] {
+  return attachments
+    .filter((item) => item.parse_status !== 'failed')
+    .map((item) => item.attachment_id);
+}
+
+/** Keep only ids that are still present in the session, preserving order. */
+export function retainExistingAttachmentIds(
+  previous: string[],
+  attachments: AttachmentView[],
+): string[] {
+  return previous.filter((id) =>
+    attachments.some((item) => item.attachment_id === id),
+  );
+}
+
+/**
  * Detect the natural-language command that means "use the attached office
  * file as a template and produce a filled document".  The backend remains
  * authoritative; this client hint only removes the extra manual "作为模板"
@@ -68,6 +90,14 @@ export function isTemplateGenerationChatIntent(query: string): boolean {
   // such as “模板” and “生成” so the UI never converts a comparison into a
   // template-fill request before the server sees the turn.
   if (DOCUMENT_COMPARISON_PATTERN.test(text)) return false;
+  // Auto-conversion to a template is an expensive server analysis (structure
+  // plus batched LLM suggestions, minutes on large documents).  It only runs
+  // when the user explicitly talks about a template or a fill operation;
+  // generic “生成/整理成文档” requests go straight to the server, which owns
+  // the authoritative route decision.
+  const explicitTemplate = /模板|模版|template/i.test(text);
+  const fillVerb = /填充|填写|回填|\bfill\b/i.test(text);
+  if (!explicitTemplate && !fillVerb) return false;
   const action = '(?:参考|按照|按|基于|根据|填充|填写|回填|生成|创建|制作|撰写|起草|导出|输出|整理成|generate|create|fill|draft|produce|write|export|output)';
   const target = '(?:模板|模版|文档|文件|报告|ICD|表格|表单|template|document|report|sheet|form)';
   // Users naturally place the object first ("将模板…回填") or the
@@ -260,6 +290,8 @@ export default function ChatPage({
     degradedNotes,
     documentCards,
     documentCardRefreshingId,
+    documentCardReleaseRequestingId,
+    requestDocumentCardRelease,
     refreshDocumentCardStatus,
     documentCardStaleKeys,
     send,
@@ -267,8 +299,6 @@ export default function ChatPage({
     forbidden,
     documentContext,
     setDocumentContext,
-    documentFlowEnabled,
-    setDocumentFlowEnabled,
   } = chat;
 
   const documentQuickReplies = useMemo(() => {
@@ -418,6 +448,11 @@ export default function ChatPage({
       if (!context) throw new Error('分析响应缺少可用的模板引用');
       setDocumentContext(context);
       setDocumentContextLabel(attachment.filename);
+      // The file is now the document context, not per-turn evidence; keep the
+      // other session attachments mounted.
+      setSelectedAttachmentIds((previous) =>
+        previous.filter((id) => id !== attachment.attachment_id),
+      );
       notify.success(`附件已转换为模板：${analysis.analysis_id}`);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '附件转换模板失败');
@@ -440,12 +475,18 @@ export default function ChatPage({
     'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base'
   >('auto');
   const attachmentMutationVersionRef = useRef(0);
+  const attachmentSessionRef = useRef<number | null>(null);
 
   // 会话切换/新建后重新加载服务端附件;轮询让解析状态和失败原因最终
-  // 反映到当前会话,而不要求用户刷新页面。
+  // 反映到当前会话,而不要求用户刷新页面。附件默认在会话内持续挂载：
+  // 首次打开会话自动勾选可解析附件，发送后不再清空勾选。
   useEffect(() => {
+    const sessionChanged = attachmentSessionRef.current !== activeSessionId;
     setDraftAttachments([]);
-    setSelectedAttachmentIds([]);
+    if (sessionChanged) {
+      setSelectedAttachmentIds([]);
+      attachmentSessionRef.current = null;
+    }
     setAttachmentRetryingId(null);
     setSourceScope('auto');
     if (!chatAttachmentsEnabled || activeSessionId == null) return undefined;
@@ -458,9 +499,14 @@ export default function ChatPage({
         const attachments = await listAttachments(activeSessionId);
         if (disposed || mutationVersion !== attachmentMutationVersionRef.current) return;
         setDraftAttachments(attachments);
-        setSelectedAttachmentIds((previous) =>
-          previous.filter((id) => attachments.some((item) => item.attachment_id === id)),
-        );
+        if (attachmentSessionRef.current !== activeSessionId) {
+          attachmentSessionRef.current = activeSessionId;
+          setSelectedAttachmentIds(defaultSelectedAttachmentIds(attachments));
+        } else {
+          setSelectedAttachmentIds((previous) =>
+            retainExistingAttachmentIds(previous, attachments),
+          );
+        }
       } catch {
         // The backend flag is independently configurable; a transient list
         // failure must not interrupt normal chat input.
@@ -553,7 +599,7 @@ export default function ChatPage({
     // unrelated Office attachments remain evidence.  Otherwise inspect all
     // draft attachments: one eligible candidate can be auto-selected, while
     // multiple candidates must be chosen with the explicit “作为模板” action.
-    let templateRoute = resolveTemplateAttachmentRoute(query, currentAttachments, documentContext != null);
+    let templateRoute = resolveTemplateAttachmentRoute(query, selectedAttachments, documentContext != null);
     if (templateRoute.waitingForTemplate) {
       if (activeSessionId == null) {
         notify.error('模板附件仍在解析，请稍后再试');
@@ -570,7 +616,7 @@ export default function ChatPage({
           notify.error(`附件“${failed.filename}”解析失败，请先重试或移除`);
           return;
         }
-        templateRoute = resolveTemplateAttachmentRoute(query, currentAttachments, documentContext != null);
+        templateRoute = resolveTemplateAttachmentRoute(query, selectedAttachments, documentContext != null);
       } catch {
         notify.error('无法刷新模板解析状态，请稍后再试');
         return;
@@ -625,7 +671,11 @@ export default function ChatPage({
           documentContextOverride: context,
           documentFlowOverride: true,
         });
-        setSelectedAttachmentIds([]);
+        // The template is now mounted as document context; keep the other
+        // attachments selected so they stay available for later turns.
+        setSelectedAttachmentIds((previous) =>
+          previous.filter((id) => id !== autoTemplate.attachment_id),
+        );
         setSourceScope('auto');
       } catch (error) {
         notify.error(error instanceof Error ? error.message : '附件自动转换模板失败');
@@ -638,7 +688,6 @@ export default function ChatPage({
     const ids = selectedAttachments.map((item) => item.attachment_id);
     if (ids.length === 0) {
       void send();
-      setSelectedAttachmentIds([]);
       setSourceScope('auto');
       return;
     }
@@ -649,7 +698,8 @@ export default function ChatPage({
       parse_status: item.parse_status,
     }));
     void send({ attachmentIds: ids, sourceScope, snapshots });
-    setSelectedAttachmentIds([]);
+    // Session attachments stay mounted by default; the chips remain checked
+    // so the next turn does not require re-selecting them.
     setSourceScope('auto');
   }
 
@@ -800,8 +850,10 @@ export default function ChatPage({
                     <DocumentStatusCard
                       card={card}
                       refreshing={documentCardRefreshingId === documentCardIdentity(card)}
+                      requestingRelease={documentCardReleaseRequestingId === documentCardIdentity(card)}
                       stale={documentCardStaleKeys.has(planConfirmationStaleKey(card))}
                       onRefreshStatus={(target) => void refreshDocumentCardStatus(target)}
+                      onRequestRelease={(target, artifactId) => void requestDocumentCardRelease(target, artifactId)}
                     />
                   </div>
                 </div>
@@ -823,8 +875,6 @@ export default function ChatPage({
           canUploadDocumentTemplate={canUploadDocumentTemplate}
           documentContext={documentContext}
           documentContextLabel={documentContextLabel ?? undefined}
-          documentFlowEnabled={documentFlowEnabled}
-          onToggleDocumentFlow={setDocumentFlowEnabled}
           documentUploadPending={documentUploadPending}
           onClearDocumentContext={clearDocumentContext}
           attachmentsEnabled={chatAttachmentsEnabled}

@@ -41,6 +41,19 @@ from deepagents import (
 from langchain_core.messages import AIMessage
 
 from src.agents.schemas import Evidence
+from src.agents.orchestration.capabilities import (
+    CapabilityResolver,
+    authorized_capabilities_for_conversation,
+    deployed_capabilities_from_settings,
+)
+from src.agents.orchestration.contracts import ConversationActionPlan, validate_action_plan
+from src.agents.orchestration.adapters import GovernedToolActionAdapters
+from src.agents.orchestration.executor import ConversationActionExecutor
+from src.agents.orchestration.intent_parser import StructuredActionPlanParser
+from src.agents.orchestration.tool_assembly import (
+    filter_tools_by_capability,
+    filter_tools_for_action_plan_narration,
+)
 from src.agents.tools.circuit_tools import make_circuit_search
 from src.agents.tools.document_rag_tool import make_document_search, make_document_search_batch
 from src.agents.tools.document_authoring_tools import make_document_authoring_tools
@@ -57,7 +70,7 @@ from src.circuit.index_service import CircuitIndexService
 from src.core.cancellation import QueryCancelled
 from src.core.conversation import GENERAL_CHAT_KB_NAME
 from src.core.conversation_orchestrator import ConversationOrchestrator
-from src.core.intent import classify_intent
+from src.core.intent import IntentPlan, classify_intent
 from src.core.model_factory import create_chat_model
 from src.document_authoring.chat_context import (
     build_document_context,
@@ -133,6 +146,182 @@ class _PromptDict(dict):
 
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+_ATTACHMENT_PROPOSAL_CONFIRM_PATTERN = re.compile(
+    r"确认.{0,6}(?:修改|替换|章节|提案)|"
+    r"按(?:照)?(?:此|该).{0,4}(?:修改|替换)|"
+    r"同意.{0,6}(?:修改|替换|章节)",
+    re.IGNORECASE,
+)
+_ATTACHMENT_PROPOSAL_CANCEL_PATTERN = re.compile(
+    r"取消|放弃|撤销|不要修改|别改|不修改",
+    re.IGNORECASE,
+)
+_ATTACHMENT_EDIT_ACTION_PATTERN = re.compile(
+    r"完善|补充|改写|修改|修订|替换|更新|补齐|重写",
+    re.IGNORECASE,
+)
+_ATTACHMENT_SECTION_TARGET_PATTERN = re.compile(
+    r"第\s*[0-9一二三四五六七八九十百两]+\s*(?:章|节|部分|篇)"
+    r"|章节|整节|小节|文档内容|正文",
+    re.IGNORECASE,
+)
+_DOCUMENT_TASK_FOLLOW_UP_PATTERN = re.compile(
+    r"取消|撤销|终止|暂停|继续(?:生成|执行)?|恢复|重试|"
+    r"申请(?:正式)?(?:发布|上线)|请求(?:正式)?发布|提交(?:正式)?发布|"
+    r"(?:查看|查询|获取|显示).{0,12}(?:任务|文档)?(?:状态|进度)|"
+    r"候选.{0,12}(?:下载|发布)|"
+    r"cancel|pause|resume|retry|release|status|candidate",
+    re.IGNORECASE,
+)
+
+
+def _agent_evidence_budget(attachment_refs: list[Any]) -> int:
+    """Return the per-run evidence budget for the assembled tool runtime.
+
+    Long attachments are parsed into many parts and completing a chapter can
+    legitimately need more registered evidence than an ordinary Q&A turn, so
+    attachment sessions use the larger of the two configured budgets.
+    """
+
+    base = int(getattr(settings, "AGENT_EVIDENCE_BUDGET", 30) or 30)
+    if not attachment_refs:
+        return base
+    attachment_budget = int(
+        getattr(settings, "AGENT_ATTACHMENT_EVIDENCE_BUDGET", 80) or 80
+    )
+    return max(base, attachment_budget)
+
+
+def _agent_step_budget_answer(rt: Any) -> str:
+    """Explain a clean stop after the agent loop exhausted its step budget."""
+
+    evidence = list(getattr(rt, "evidence", []) or [])
+    sources = [
+        name
+        for name in dict.fromkeys(
+            str(getattr(item, "source_name", "") or "").strip() for item in evidence
+        )
+        if name
+    ]
+    lines = ["本轮工具调用已达到单轮步数上限，为避免无限循环已停止继续检索。"]
+    if evidence and sources:
+        listed = "、".join(sources[:5]) + (" 等" if len(sources) > 5 else "")
+        lines.append(f"已登记 {len(evidence)} 条证据（来源：{listed}），但尚未完成全部任务。")
+    elif evidence:
+        lines.append(f"已登记 {len(evidence)} 条证据，但尚未完成全部任务。")
+    else:
+        lines.append("本轮尚未登记可用证据。")
+    lines.append(
+        "请缩小任务范围后重试：例如直接指明目标章节标题/编号、要读取的附件序号范围，"
+        "或先让系统只完成其中一个小节。"
+    )
+    return "\n".join(lines)
+
+
+def _direct_attachment_proposal_answer(
+    *,
+    rt: Any,
+    query: str,
+    emit_event: Callable[[dict], None],
+) -> str | None:
+    """Confirm or cancel a pending governed attachment proposal.
+
+    Returns ``None`` when the turn is unrelated to a pending proposal so the
+    normal agent loop keeps handling it.  This path is deterministic and never
+    calls the model: nothing is written until the user explicitly confirms.
+    """
+
+    confirm_requested = bool(_ATTACHMENT_PROPOSAL_CONFIRM_PATTERN.search(query))
+    cancel_requested = bool(_ATTACHMENT_PROPOSAL_CANCEL_PATTERN.search(query)) and not confirm_requested
+    if not confirm_requested and not cancel_requested:
+        return None
+    service = getattr(rt, "attachment_service", None)
+    session_id = int(getattr(rt, "attachment_session_id", 0) or 0)
+    user_id = int(getattr(rt, "attachment_user_id", 0) or 0)
+    if service is None or not session_id or not user_id:
+        return None
+    try:
+        proposal = service.get_pending_attachment_proposal(
+            session_id=session_id, user_id=user_id
+        )
+    except Exception:  # noqa: BLE001 - control path is fail-soft
+        return None
+    if proposal is None:
+        return None
+
+    if cancel_requested:
+        try:
+            service.reject_attachment_proposal(
+                proposal_id=proposal.proposal_id,
+                session_id=session_id,
+                user_id=user_id,
+                note="用户在对话中取消",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"取消章节修改提案失败：{str(exc)[:200]}"
+        emit_event({
+            "type": "stage",
+            "payload": {
+                "key": "attachment_edit",
+                "label": "附件修订",
+                "status": "done",
+                "detail": "已取消章节修改提案",
+            },
+        })
+        return "已取消该附件章节修改提案，未生成候选，原附件保持不变。"
+
+    try:
+        revision = service.confirm_attachment_proposal(
+            proposal_id=proposal.proposal_id,
+            session_id=session_id,
+            user_id=user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"确认章节修改提案失败：{str(exc)[:200]}"
+
+    from src.attachments.service import revision_change_summary
+
+    change_summary = revision_change_summary(revision)
+    download_url = (
+        f"/api/v1/conversations/{session_id}/attachments/"
+        f"{revision.child_attachment_id}/download"
+    )
+    message = (
+        f"已确认章节修改提案并生成候选（变更：{change_summary}）；"
+        "原附件未修改，可下载候选复核。"
+    )
+    emit_event({
+        "type": "attachment_revision",
+        "payload": {
+            "revision_id": revision.revision_id,
+            "parent_attachment_id": revision.parent_attachment_id,
+            "child_attachment_id": revision.child_attachment_id,
+            "operation": revision.operation,
+            "change_summary": change_summary,
+            "download_url": download_url,
+        },
+    })
+    emit_event({
+        "type": "document_card",
+        "payload": {
+            "card": {
+                "kind": "attachment_revision",
+                "status": revision.status,
+                "next_actions": [],
+                "kb_name": str(getattr(rt, "kb_name", "") or ""),
+                "content": message,
+                "candidate_state": "available",
+                "release_state": revision.release_state,
+                "artifacts": [{
+                    "artifact_id": revision.child_attachment_id,
+                    "stage": revision.status,
+                    "output_format": str((revision.details or {}).get("format") or ""),
+                    "download_url": download_url,
+                }],
+            },
+        },
+    })
+    return message
 
 
 def _build_evidence_quality(evidence: list[Evidence]) -> list[dict]:
@@ -765,6 +954,231 @@ def _direct_generation_answer(payload: dict[str, Any]) -> str:
     return f"{message}{suffix}。请根据上述原因处理后重试。"
 
 
+_READ_ONLY_ACTION_KINDS = frozenset({"search", "inspect", "compare", "summarize"})
+
+
+def _mapping_from_value(value: Any) -> dict[str, Any] | None:
+    """Return a JSON-like mapping from common tool result shapes."""
+
+    if isinstance(value, dict):
+        return value
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            result = dump(mode="json")
+        except TypeError:
+            result = dump()
+        return result if isinstance(result, dict) else None
+    return None
+
+
+def _walk_action_payload(value: Any):
+    """Yield bounded mapping/list values nested in an action receipt."""
+
+    mapping = _mapping_from_value(value)
+    if mapping is not None:
+        yield mapping
+        for nested in mapping.values():
+            yield from _walk_action_payload(nested)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            yield from _walk_action_payload(nested)
+
+
+def _action_plan_artifact_ids(receipts: list[Any]) -> list[str]:
+    """Collect candidate ids from server receipts without trusting prose."""
+
+    found: list[str] = []
+    for receipt in reversed(receipts):
+        for payload in _walk_action_payload(getattr(receipt, "data", {})):
+            artifacts = payload.get("artifacts")
+            if not isinstance(artifacts, list):
+                continue
+            for artifact in artifacts:
+                artifact_map = _mapping_from_value(artifact)
+                artifact_id = str((artifact_map or {}).get("artifact_id") or "").strip()
+                if artifact_id and artifact_id not in found:
+                    found.append(artifact_id)
+    return found
+
+
+def _action_plan_status_values(receipts: list[Any]) -> set[str]:
+    values: set[str] = set()
+    for receipt in receipts:
+        for payload in _walk_action_payload(getattr(receipt, "data", {})):
+            for key in ("status", "candidate_state", "release_state"):
+                value = str(payload.get(key) or "").strip().casefold()
+                if value:
+                    values.add(value)
+    return values
+
+
+_OUTPUT_FORMAT_LABELS = {
+    "md": "Markdown",
+    "markdown": "Markdown",
+    "docx": "Word/DOCX",
+    "xlsx": "Excel/XLSX",
+    "xlsm": "Excel XLSM",
+    "pdf": "PDF",
+    "pptx": "PowerPoint/PPTX",
+}
+
+
+def _direct_intent_clarification_answer(plan: IntentPlan | None) -> str | None:
+    """Return a safe clarification for an underspecified document request.
+
+    Legacy turns do not execute the action-plan executor, so known output
+    contract errors need a server-owned answer before the model loop gets any
+    document writer.  Only deterministic reason codes are handled here; an
+    unrecognised model/intent clarification is left to the normal assistant.
+    """
+
+    if plan is None or plan.action != "clarify":
+        return None
+    reasons = set(str(item).strip() for item in plan.reason_codes if str(item).strip())
+    if "multiple_output_formats" in reasons:
+        labels = [
+            _OUTPUT_FORMAT_LABELS.get(str(item).strip().casefold(), str(item).strip())
+            for item in plan.requested_formats
+            if str(item).strip()
+        ]
+        requested = "、".join(dict.fromkeys(labels)) or "多个格式"
+        return (
+            f"这条文档请求同时指定了 {requested}，一次只能选择一种输出格式。"
+            "请明确选择 Word/DOCX、PDF、Excel/XLSX、PowerPoint/PPTX 或 Markdown；"
+            "系统不会自动选择格式，也不会先生成其中一种。"
+        )
+    if "unsupported_output_format" in reasons:
+        return (
+            "当前文档生成不支持你指定的输出格式。"
+            "支持 Word/DOCX、PDF、Excel/XLSX、PowerPoint/PPTX 或 Markdown；"
+            "请改选一种支持的格式后再生成。"
+        )
+    if "ambiguous_document_request" in reasons:
+        return (
+            "请先明确希望生成的格式：Word/DOCX、PDF、Excel/XLSX、"
+            "PowerPoint/PPTX 或 Markdown；确认后我再提交候选文档任务。"
+        )
+    return None
+
+
+def _conversation_action_audit_fields(
+    mode: str,
+    plan: ConversationActionPlan | None,
+    issues: list[Any],
+    execution: Any | None,
+) -> dict[str, Any]:
+    """Project the governed plan and receipts into the durable turn summary."""
+
+    if str(mode or "off").strip().lower() == "off":
+        return {}
+    return {
+        "conversation_action_plan_mode": str(mode or "off").strip().lower(),
+        "conversation_action_plan": (
+            plan.model_dump(mode="json") if plan is not None else None
+        ),
+        "conversation_action_plan_issues": [
+            issue.model_dump(mode="json")
+            if hasattr(issue, "model_dump")
+            else dict(issue)
+            if isinstance(issue, dict)
+            else {"detail": str(issue)}
+            for issue in (issues or [])
+        ],
+        "conversation_action_execution": (
+            execution.model_dump(mode="json")
+            if execution is not None and hasattr(execution, "model_dump")
+            else execution
+        ),
+    }
+
+
+def _direct_action_plan_feedback(
+    plan: ConversationActionPlan | None,
+    *,
+    receipts: list[Any] | None = None,
+    issues: list[Any] | None = None,
+) -> str | None:
+    """Give deterministic feedback for ambiguity and command-only plans.
+
+    Read plans still go through the normal model loop so evidence can be
+    synthesized.  Plans that only control a task, or that cannot safely be
+    executed, get a server-owned response instead; otherwise an empty model
+    response would look like an unexplained failure and could invite a second
+    write attempt in the same turn.
+    """
+
+    if plan is None:
+        return "本轮没有生成可验证的动作计划，未执行任何写操作；请稍后重试或补充更明确的目标。"
+    unresolved = [str(item).strip() for item in plan.unresolved_refs if str(item).strip()]
+    if unresolved:
+        if {"multiple_output_formats", "unsupported_output_format"} & set(unresolved):
+            format_answer = _direct_intent_clarification_answer(
+                classify_intent(plan.goal, has_kb=True),
+            )
+            if format_answer is not None:
+                return format_answer
+        return (
+            "目前无法确定你说的对象对应哪个待确认项，本轮暂不修改或生成文档。"
+            "请从下方待确认卡片中指出具体分组或对象（例如某一组全部包含或排除），"
+            "我会按你明确的范围处理。"
+        )
+    blocking_issues = [issue for issue in (issues or []) if getattr(issue, "blocking", True)]
+    if blocking_issues:
+        details = "；".join(
+            str(getattr(issue, "detail", "") or getattr(issue, "code", "动作校验失败")).strip()
+            for issue in blocking_issues
+        )
+        return (
+            "本轮动作未执行，原因是服务端校验未通过"
+            + (f"：{details}" if details else "。")
+            + "未写入或发布任何文档内容。"
+        )
+    action_list = list(plan.actions)
+    if not action_list or any(action.kind in _READ_ONLY_ACTION_KINDS for action in action_list):
+        return None
+    action_receipts = list(receipts or [])
+    failed = [
+        receipt for receipt in action_receipts
+        if str(getattr(receipt, "status", "")).strip().casefold()
+        not in {"accepted", "completed", "skipped"}
+    ]
+    if failed:
+        details = "；".join(
+            str(getattr(receipt, "message", "") or getattr(receipt, "error_code", "动作未完成")).strip()
+            for receipt in failed
+        )
+        return "本轮动作没有完成" + (f"：{details}" if details else "。") + "未继续提交其他写操作。"
+
+    statuses = _action_plan_status_values(action_receipts)
+    lines: list[str] = []
+    if any(action.kind == "cancel" for action in action_list):
+        lines.append("任务已取消；已有候选文档保持不变。")
+    elif any(action.kind == "retry" for action in action_list):
+        lines.append("任务已重新排队重试，将继续使用冻结的来源和计划。")
+    elif any(action.kind == "resume" for action in action_list):
+        lines.append("任务已重新排队，将继续使用冻结的来源和计划。")
+    elif "paused" in statuses:
+        lines.append("任务已暂停。")
+    elif any(action.kind == "request_release" for action in action_list):
+        lines.append("已提交正式发布审核申请；审核通过前不会发布正式文件。")
+    elif any(action.kind == "resolve_decision" for action in action_list):
+        lines.append("已按你指定的范围处理待确认项。")
+    else:
+        lines.append("受控动作已完成。")
+    artifact_ids = _action_plan_artifact_ids(action_receipts)
+    if artifact_ids:
+        lines.append("已有候选文档可下载：" + "、".join(f"`{item}`" for item in artifact_ids) + "。")
+        if "approved" not in statuses:
+            lines.append("候选与正式发布状态分离，当前不会把候选误报为已发布。")
+    elif "available" in statuses:
+        lines.append("候选已存在，可在下方文档产物卡片中下载。")
+    elif any(action.kind == "get_status" for action in action_list):
+        lines.append("当前没有可下载的候选文档，状态卡会显示下一步。")
+    return "\n".join(lines)
+
+
 def _build_messages(query: str, history: list[tuple[str, str]]) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
     for user_text, assistant_text in (history or [])[-6:]:
@@ -936,6 +1350,10 @@ class MultiSourceAgentRunner:
         self.document_authoring_pipeline = document_authoring_pipeline
         self.document_job_store = document_job_store
         self.conversation_orchestrator = ConversationOrchestrator()
+        # A deployment may inject a structured model caller here.  The
+        # default parser is deliberately deterministic unless one is supplied,
+        # so merely enabling the route never grants a model arbitrary writes.
+        self.action_plan_parser: StructuredActionPlanParser | None = None
         self._model_lock = threading.Lock()
 
     @staticmethod
@@ -955,6 +1373,196 @@ class MultiSourceAgentRunner:
         # first concurrent requests after startup.
         with self._model_lock:
             return create_chat_model()
+
+    @staticmethod
+    def _action_plan_mode() -> str:
+        mode = str(getattr(settings, "CONVERSATION_ACTION_PLAN_MODE", "off") or "off").strip().lower()
+        return mode if mode in {"off", "shadow", "enabled"} else "off"
+
+    @staticmethod
+    def _context_has_permission(ctx: RequestContext | None, kb_name: str, permission: str) -> bool:
+        if ctx is None or not str(kb_name or "").strip():
+            return False
+        try:
+            return bool(ctx.has_kb_permission(str(kb_name), permission))
+        except Exception:
+            return False
+
+    def _document_task_projection_for_context(
+        self,
+        *,
+        ctx: RequestContext | None,
+        document_context: Any | None,
+    ) -> dict[str, Any] | None:
+        """Resolve current task/artifact references from the server projection.
+
+        The v2 client context deliberately contains no artifact authority.  A
+        follow-up revision therefore needs this authenticated read to bind
+        “the current document” to the task's current artifact.  If the
+        projection cannot be read, returning ``None`` makes the capability
+        resolver fail closed instead of guessing from chat text.
+        """
+
+        task_id = str(getattr(document_context, "task_id", "") or "").strip()
+        pipeline = self.document_authoring_pipeline
+        getter = getattr(pipeline, "get_document_task_projection", None)
+        if not task_id or not callable(getter) or ctx is None:
+            return None
+        try:
+            projection = getter(ctx, task_id)
+        except Exception:  # noqa: BLE001 - missing projection must not widen access
+            return None
+        if not isinstance(projection, dict):
+            return None
+        return projection
+
+    def _conversation_capabilities(
+        self,
+        *,
+        ctx: RequestContext | None,
+        kb_name: str,
+        has_attachments: bool,
+        document_context: Any | None,
+        allow_document_write: bool,
+        document_projection: dict[str, Any] | None = None,
+    ) -> tuple[CapabilityResolver, set[str], dict[str, object]]:
+        """Resolve the server-owned capability boundary for this turn."""
+
+        projection = document_projection or self._document_task_projection_for_context(
+            ctx=ctx,
+            document_context=document_context,
+        ) or {}
+        task_ref = str(
+            getattr(document_context, "task_id", "")
+            or projection.get("task_id")
+            or ""
+        ).strip()
+        artifact_ref = str(
+            getattr(document_context, "candidate_artifact_id", "")
+            or getattr(document_context, "artifact_id", "")
+            or projection.get("current_artifact_id")
+            or ""
+        ).strip()
+        has_context = document_context is not None and not bool(
+            getattr(document_context, "expired", False)
+        )
+        has_kb_read = self._context_has_permission(ctx, kb_name, "read")
+        has_kb_write = self._context_has_permission(ctx, kb_name, "write") and allow_document_write
+        authorized = authorized_capabilities_for_conversation(
+            has_kb_read=has_kb_read,
+            has_kb_write=has_kb_write,
+            has_attachments=has_attachments,
+            has_document_context=has_context,
+            has_task=bool(task_ref),
+            has_candidate_artifact=bool(artifact_ref),
+            allow_document_write=allow_document_write,
+        )
+        state: dict[str, object] = {
+            "task_ref": task_ref,
+            "artifact_ref": artifact_ref,
+        }
+        resolver = CapabilityResolver(deployed=deployed_capabilities_from_settings())
+        return resolver, authorized, state
+
+    def _complete_action_plan(self, messages: list[dict[str, str]]) -> str:
+        """Ask the shared chat model for a strict plan candidate.
+
+        This is deliberately a narrow adapter: it exposes only the structured
+        planner prompt, converts common LangChain content shapes to text, and
+        leaves schema/ACL/constraint validation to ``StructuredActionPlanParser``
+        and the executor.  An invocation failure is allowed to bubble to the
+        parser, which deterministically falls back without executing a write.
+        """
+
+        response = self._get_model().invoke(
+            messages,
+            max_tokens=1200,
+            temperature=0,
+            timeout=30,
+        )
+        content = getattr(response, "content", response)
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text") or "")
+                if isinstance(block, dict)
+                else str(block or "")
+                for block in content
+            )
+        return str(content or "")
+
+    def _build_action_plan(
+        self,
+        *,
+        query: str,
+        thread_id: str,
+        has_attachments: bool,
+        has_kb: bool,
+        document_context: Any | None,
+        available_capabilities: set[str],
+        context_revision: str = "",
+        document_projection: dict[str, Any] | None = None,
+        history: list[tuple[str, str]] | None = None,
+    ) -> ConversationActionPlan | None:
+        """Ask a constrained parser for a plan, with deterministic fallback."""
+
+        parser = self.action_plan_parser or StructuredActionPlanParser(
+            complete=self._complete_action_plan,
+        )
+        parser_context: dict[str, Any] = {
+            "has_kb": bool(has_kb),
+            "has_attachments": bool(has_attachments),
+            "has_template_context": bool(
+                document_context is not None
+                and getattr(document_context, "template_version_id", None)
+                and not bool(getattr(document_context, "expired", False))
+            ),
+            "conversation_id": str(thread_id or ""),
+            "context_revision": str(context_revision or ""),
+        }
+        if isinstance(document_projection, dict):
+            # Only stable, user-actionable identity/state crosses into the
+            # planner prompt.  Review hashes, source details and item-level
+            # payloads remain inside the authenticated domain projection.
+            current: dict[str, Any] = {}
+            for key in (
+                "task_id", "work_order_id", "current_artifact_id",
+                "generation_session_id", "status", "candidate_state",
+                "release_state", "next_actions",
+            ):
+                value = document_projection.get(key)
+                if value not in (None, "", []):
+                    current[key] = value
+            pending = document_projection.get("pending_decisions")
+            if isinstance(pending, list):
+                current["pending_decisions"] = [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "decision_id", "group_key", "kind", "title",
+                            "options", "default_option", "count", "blocking",
+                        )
+                        if item.get(key) not in (None, "", [])
+                    }
+                    for item in pending[:32]
+                    if isinstance(item, dict) and str(item.get("group_key") or "").strip()
+                ]
+            if current:
+                parser_context["current_document_task"] = current
+        if history:
+            parser_context["recent_conversation"] = [
+                {
+                    "user": str(user_text or "")[:1_500],
+                    "assistant": str(assistant_text or "")[:1_500],
+                }
+                for user_text, assistant_text in history[-4:]
+                if str(user_text or "").strip() or str(assistant_text or "").strip()
+            ]
+        return parser.parse(
+            query,
+            context=parser_context,
+            available_capabilities=available_capabilities,
+            fallback=True,
+        )
 
     def _prefetch_memory_context(
         self,
@@ -1120,6 +1728,102 @@ class MultiSourceAgentRunner:
             )
         except (PermissionError, ValueError):
             return None
+
+    def _recover_document_context_for_follow_up(
+        self,
+        *,
+        query: str,
+        ctx: Any,
+        conversation_id: str,
+        kb_name: str | None,
+        document_context: Any | None,
+    ) -> Any | None:
+        """Bind a follow-up to the conversation's current server task.
+
+        The browser context is intentionally only a source/template lease and
+        does not carry artifact authority.  After a generation turn it may
+        therefore still be valid while lacking ``task_id``.  A revision or
+        task-control command must use the durable conversation pointer in that
+        case; falling through to a fresh v2 context would leave the action
+        without a candidate, while trusting an artifact id from the client
+        would be unsafe.
+        """
+        current = document_context
+        has_task = bool(str(getattr(current, "task_id", "") or "").strip())
+        is_revision = classify_intent(
+            query,
+            has_template_context=bool(
+                current is not None
+                and getattr(current, "template_version_id", None)
+                and not bool(getattr(current, "expired", False))
+            ),
+            has_attachments=bool(getattr(current, "attachment_ids", None)),
+            has_kb=bool(str(kb_name or getattr(current, "knowledge_base_name", "") or "").strip()),
+        ).action == "revise"
+        is_task_follow_up = bool(_DOCUMENT_TASK_FOLLOW_UP_PATTERN.search(str(query or "")))
+        if has_task or not (is_revision or is_task_follow_up):
+            return current
+
+        pipeline = self.document_authoring_pipeline
+        getter = getattr(pipeline, "get_current_chat_document_task_projection", None)
+        if callable(getter) and str(conversation_id or "").strip():
+            try:
+                projection = getter(
+                    ctx,
+                    knowledge_base_name=kb_name or None,
+                    conversation_id=str(conversation_id),
+                )
+            except (PermissionError, KeyError, ValueError):
+                projection = None
+            except Exception:  # noqa: BLE001 - recovery must fail closed
+                projection = None
+            if isinstance(projection, dict):
+                task_id = str(projection.get("task_id") or "").strip()
+                if task_id:
+                    from src.document_authoring.chat_context import DocumentAuthoringContextInput
+
+                    attachment_ids = list(getattr(current, "attachment_ids", None) or [])
+                    raw_context = {
+                        "version": "v2",
+                        "knowledge_base_name": (
+                            projection.get("knowledge_base_name")
+                            or getattr(current, "knowledge_base_name", None)
+                            or (kb_name or None)
+                        ),
+                        "attachment_ids": attachment_ids,
+                        "source_scope": getattr(current, "source_scope", "auto") or "auto",
+                        "task_id": task_id,
+                        "generation_session_id": (
+                            projection.get("generation_session_id")
+                            or getattr(current, "generation_session_id", None)
+                        ),
+                        "output_spec_id": getattr(current, "output_spec_id", None),
+                        "output_spec_version": getattr(current, "output_spec_version", None),
+                        "template_version_id": (
+                            projection.get("template_version_id")
+                            or getattr(current, "template_version_id", None)
+                        ),
+                        "analysis_id": getattr(current, "analysis_id", None),
+                        "client_request_id": f"document-context-task-recovery:{conversation_id}",
+                    }
+                    try:
+                        return build_document_context(
+                            DocumentAuthoringContextInput.model_validate(raw_context),
+                            ctx=ctx,
+                            expected_kb=kb_name,
+                        )
+                    except (PermissionError, ValueError):
+                        return None
+
+        # Pending intake sessions predate the task projection in some stores;
+        # retain that recovery path for clarification answers and old tasks.
+        if current is None:
+            return self._recover_pending_document_context(
+                ctx=ctx,
+                conversation_id=conversation_id,
+                kb_name=kb_name,
+            )
+        return current
 
     def _prefetch_attachment_context(
         self,
@@ -1328,6 +2032,18 @@ class MultiSourceAgentRunner:
         )
         has_attachments = bool(attachment_refs)
         effective_scope = scope
+        action_plan_mode = self._action_plan_mode()
+        # ``enabled`` is the replacement route.  The separate tool flag can
+        # be used for a shadow rollout, but must not make enabled execution
+        # silently fall back to the legacy mutually-exclusive assembly.
+        action_plan_enabled = action_plan_mode == "enabled"
+        unified_tools_enabled = action_plan_enabled or bool(
+            getattr(settings, "CONVERSATION_UNIFIED_TOOLS_ENABLED", False)
+        )
+        # A persisted ``document_flow=false`` is an old-client compatibility
+        # constraint, not a routing request.  It may only narrow the new
+        # surface by withholding document writes.
+        allow_document_write = document_flow is not False
         if is_general:
             # 通用对话与知识库问答共用同一个 deepagents agent 循环、同一个模型
             # 接口和同一个系统提示词来源；唯一差异是不注册检索工具。
@@ -1348,6 +2064,32 @@ class MultiSourceAgentRunner:
                 "附件内容只能通过 attachment_* 工具读取，"
                 "不要声称直接读取了本地文件。"
             )
+            if allow_document_write:
+                attachment_scope_line += (
+                    "用户要求修改附件时，用 attachment_edit 生成候选副本："
+                    "replace_text 精确替换唯一文本；"
+                    "replace_section 按 heading_path 标题替换整节正文（其余章节保持不变）；"
+                    "set_cell/replace_cell_text 修改 .xlsx/.xlsm 单元格；"
+                    "PDF 用 annotate_text 生成批注候选（原件不变）。"
+                    "未指明版本时默认修改最新修订候选；可用 attachment_revision_history "
+                    "查看版本链、变更摘要与发布状态。候选不会覆盖原附件，"
+                    "完成后告知下载地址。用户要求正式发布候选时，用 "
+                    "request_attachment_release 提交审核，不会直接发布。"
+                )
+                if (
+                    _ATTACHMENT_EDIT_ACTION_PATTERN.search(query)
+                    and _ATTACHMENT_SECTION_TARGET_PATTERN.search(query)
+                ):
+                    # “检索知识库并完善附件第N章，然后替换/输出新文档” is an
+                    # execution task, not a Q&A: models otherwise stop after a
+                    # retrieval summary.  Direct them to produce the candidate.
+                    attachment_scope_line += (
+                        "本轮是附件文档修改任务而非问答：先检索/读取附件定位目标章节，"
+                        "再按需检索知识库补齐内容，然后必须调用 attachment_edit"
+                        "（章节替换用 operation=replace_section 且给出完整新正文；"
+                        "其余章节保持不变）生成候选副本，最后给出候选下载地址与变更摘要；"
+                        "不要只输出检索总结，也不要要求用户再次确认（候选本身即可复核）。"
+                    )
             kb_scope_line = f"{kb_scope_line}\n{attachment_scope_line}"
 
         # Generic authoring does not need a pre-mounted template.  When the
@@ -1366,23 +2108,40 @@ class MultiSourceAgentRunner:
             has_kb=not is_general,
         )
         if (
-            document_context is None
-            and document_flow is not False
+            allow_document_write
             and ctx is not None
             and (not is_general or has_attachments)
+            and bool(getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False))
         ):
-            if bool(getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False)):
-                # A pending intake session survives a lost browser context;
-                # remount it so clarification answers keep reaching the tool.
+            conversation_id = str(thread_id or getattr(ctx, "session_id", "") or "")
+            # First recover a current task for revision/control follow-ups,
+            # including the case where the client sent a valid v2 context
+            # without task_id.  If that is not applicable, preserve the older
+            # pending-intake recovery behavior.
+            recovered_context = self._recover_document_context_for_follow_up(
+                query=query,
+                ctx=ctx,
+                conversation_id=conversation_id,
+                kb_name=None if is_general else scope_kb,
+                document_context=document_context,
+            )
+            if recovered_context is not None:
+                document_context = recovered_context
+            elif document_context is None:
                 document_context = self._recover_pending_document_context(
                     ctx=ctx,
-                    conversation_id=str(thread_id or getattr(ctx, "session_id", "") or ""),
+                    conversation_id=conversation_id,
                     kb_name=None if is_general else scope_kb,
                 )
         if (
             document_context is None
-            and document_flow is not False
+            and allow_document_write
             and (document_flow is True or intent_candidate.intent in {"template_generation", "document_authoring"})
+            # A revision command such as “完善附件第6章并替换” edits the
+            # attachment itself through attachment_edit; synthesizing a
+            # governed document context here would hijack it into the
+            # document-authoring flow (and can fail on missing task refs).
+            and intent_candidate.action != "revise"
             and ctx is not None
             and (not is_general or has_attachments)
         ):
@@ -1420,7 +2179,7 @@ class MultiSourceAgentRunner:
             top_k=8 if query_mode == "deep" else 5,
             query_mode=query_mode,
             question=query,
-            evidence_budget=int(getattr(settings, "AGENT_EVIDENCE_BUDGET", 30) or 30),
+            evidence_budget=_agent_evidence_budget(attachment_refs),
             should_cancel=should_cancel,
             on_event=emit_event,
             attachment_refs=attachment_refs,
@@ -1432,6 +2191,7 @@ class MultiSourceAgentRunner:
             attachment_session_id=self._numeric_identity(
                 thread_id or getattr(ctx, "session_id", None)
             ),
+            attachment_edit_enabled=allow_document_write,
         )
         if attachment_refs:
             from src.attachments.service import AttachmentService
@@ -1480,7 +2240,7 @@ class MultiSourceAgentRunner:
                 getattr(document_context, "template_version_id", None)
                 and getattr(document_context, "analysis_id", None)
             )
-            if not template_available:
+            if not template_available and not unified_tools_enabled:
                 task_id = str(getattr(document_context, "task_id", "") or "").strip()
                 allowed_without_template = set()
                 if bool(getattr(settings, "DOCUMENT_PLANNING_V2_ENABLED", False)):
@@ -1497,7 +2257,14 @@ class MultiSourceAgentRunner:
                     allowed_without_template.update({
                         "get_document_generation_status",
                         "resolve_icd_scope_exception",
+                        "request_document_release",
                     })
+                    if intent_plan.action == "revise":
+                        # Template-free documents still have a governed
+                        # semantic plan and candidate Artifact.  Revision is
+                        # bound to that task/artifact, so it must not be
+                        # hidden merely because no template is mounted.
+                        allowed_without_template.add("create_document_revision")
                 document_tools = [
                     tool for tool in document_tools
                     if str(getattr(tool, "name", "") or "") in allowed_without_template
@@ -1527,7 +2294,120 @@ class MultiSourceAgentRunner:
         elif conversation_plan.routed_by == "fallback":
             routed_by = "explicit"
 
-        if document_flow_routed:
+        document_projection = self._document_task_projection_for_context(
+            ctx=ctx,
+            document_context=document_context,
+        )
+        capability_resolver, authorized_capabilities, object_state = self._conversation_capabilities(
+            ctx=ctx,
+            kb_name=scope_kb,
+            has_attachments=has_attachments,
+            document_context=document_context,
+            allow_document_write=allow_document_write,
+            document_projection=document_projection,
+        )
+        initial_capabilities = capability_resolver.effective(
+            authorized=authorized_capabilities,
+            source_scope=effective_scope,
+            object_state=object_state,
+        )
+        action_plan: ConversationActionPlan | None = None
+        action_plan_issues: list[Any] = []
+        if action_plan_mode != "off":
+            try:
+                action_plan = self._build_action_plan(
+                    query=query,
+                    thread_id=str(thread_id or ""),
+                    has_attachments=has_attachments,
+                    has_kb=not is_general,
+                    document_context=document_context,
+                    available_capabilities=initial_capabilities,
+                    context_revision=str(
+                        (getattr(ctx, "metadata", {}) or {}).get("conversation_revision", "")
+                    ),
+                    document_projection=document_projection,
+                    history=history,
+                )
+            except Exception:  # noqa: BLE001 - plan collection may not break a turn
+                action_plan = None
+            if action_plan is not None:
+                effective_capabilities = capability_resolver.effective(
+                    authorized=authorized_capabilities,
+                    source_scope=effective_scope,
+                    object_state=object_state,
+                    accepted_constraints=action_plan.constraints,
+                )
+                action_plan_issues = validate_action_plan(
+                    action_plan,
+                    available_capabilities=effective_capabilities,
+                )
+            else:
+                effective_capabilities = initial_capabilities
+            emit_event({
+                "type": "stage",
+                "payload": {
+                    "key": "conversation_action_plan",
+                    "mode": action_plan_mode,
+                    "plan": action_plan.model_dump(mode="json") if action_plan else None,
+                    "issues": [issue.model_dump(mode="json") for issue in action_plan_issues],
+                },
+            })
+        else:
+            effective_capabilities = initial_capabilities
+        # The compatibility shortcuts below predate action receipts and can
+        # invoke a command directly.  They must never race the enabled plan
+        # executor or become a second authority for the same user turn.
+        legacy_direct_shortcuts = not action_plan_enabled
+
+        if unified_tools_enabled:
+            # New conversation path: retrieval, attachment, document and task
+            # controls coexist.  Capability filtering below is the sole model
+            # visibility boundary; no old route flag selects a separate agent.
+            tools = []
+            from src.attachments.models import scope_allows_kb
+
+            if not is_general and scope_allows_kb(effective_scope):
+                tools.extend([
+                    make_catalog_tool(
+                        rt,
+                        document_store=self.document_store,
+                        spreadsheet_service=self.spreadsheet_service,
+                        circuit_service=self.circuit_service,
+                        rag_backend=self.rag_backend,
+                    ),
+                    make_document_search(rt, self.rag_backend, self.document_store),
+                    make_document_search_batch(rt, self.rag_backend, self.document_store),
+                    make_circuit_search(rt, self.circuit_service),
+                    *make_spreadsheet_tools(rt, self.spreadsheet_service),
+                    *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
+                    make_conversation_search(rt, self.conversation_service),
+                ])
+            if attachment_refs:
+                from src.agents.tools.attachment_tools import build_attachment_tools
+
+                tools.extend(build_attachment_tools(rt))
+            tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
+            tools.extend(document_tools)
+            tools = filter_tools_by_capability(
+                tools,
+                available_capabilities=effective_capabilities,
+            )
+            base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
+            system_prompt = (
+                f"{kb_scope_line}\n\n"
+                f"{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}\n\n"
+                "本轮按受控动作计划执行：只能调用当前可见的业务工具；"
+                "附件、知识库和文档产物均须通过这些工具访问，绝不可访问任意文件系统。"
+            )
+            memory_context = self._prefetch_memory_context(
+                query=query,
+                kb_name=scope_kb,
+                ctx=ctx,
+                rt=rt,
+            )
+            if memory_context:
+                system_prompt = f"{system_prompt}\n\n{memory_context}"
+        elif document_flow_routed:
             tools: list[Any] = list(document_tools)
             # Document Flow multi-source bridge (design §13.7): the authoring
             # agent gathers attachment evidence through the same scoped tools
@@ -1537,21 +2417,27 @@ class MultiSourceAgentRunner:
                     make_attachment_circuit_search,
                     make_attachment_list,
                     make_attachment_read,
+                    make_attachment_release,
+                    make_attachment_revision_history,
                     make_attachment_search,
                     make_attachment_table_query,
                     make_attachment_visual_analyze,
+                    make_attachment_edit,
                 )
 
-                tools.extend(
-                    [
-                        make_attachment_list(rt),
-                        make_attachment_search(rt),
-                        make_attachment_read(rt),
-                        make_attachment_table_query(rt),
-                        make_attachment_circuit_search(rt),
-                        make_attachment_visual_analyze(rt),
-                    ]
-                )
+                attachment_tools = [
+                    make_attachment_list(rt),
+                    make_attachment_search(rt),
+                    make_attachment_read(rt),
+                    make_attachment_table_query(rt),
+                    make_attachment_circuit_search(rt),
+                    make_attachment_visual_analyze(rt),
+                ]
+                if bool(getattr(rt, "attachment_edit_enabled", True)):
+                    attachment_tools.append(make_attachment_edit(rt))
+                attachment_tools.append(make_attachment_release(rt))
+                attachment_tools.append(make_attachment_revision_history(rt))
+                tools.extend(attachment_tools)
             system_prompt = _DOCUMENT_FLOW_PROMPT.format(
                 kb_name=scope_kb or kb_name,
                 analysis_id=getattr(document_context, "analysis_id", None) or "未挂载",
@@ -1613,6 +2499,102 @@ class MultiSourceAgentRunner:
         if attachment_context:
             system_prompt = f"{system_prompt}\n\n{attachment_context}"
 
+        action_execution: Any | None = None
+        action_plan_feedback: str | None = None
+        if action_plan_enabled:
+            if action_plan is None:
+                emit_event({
+                    "type": "stage",
+                    "payload": {
+                        "key": "conversation_action_execution",
+                        "status": "error",
+                        "plan_id": "",
+                        "receipts": [],
+                        "detail": "no valid action plan was available",
+                    },
+                })
+                action_plan_feedback = _direct_action_plan_feedback(None)
+            elif action_plan_issues:
+                emit_event({
+                    "type": "stage",
+                    "payload": {
+                        "key": "conversation_action_execution",
+                        "status": "blocked",
+                        "plan_id": action_plan.plan_id,
+                        "receipts": [],
+                        "issues": [issue.model_dump(mode="json") for issue in action_plan_issues],
+                    },
+                })
+                action_plan_feedback = _direct_action_plan_feedback(
+                    action_plan,
+                    issues=action_plan_issues,
+                )
+            else:
+                action_execution = ConversationActionExecutor(
+                    handlers=GovernedToolActionAdapters(
+                        tools=tools,
+                        query=query,
+                        document_context=document_context,
+                        document_projection=document_projection,
+                        attachment_service=getattr(rt, "attachment_service", None),
+                        attachment_session_id=int(
+                            getattr(rt, "attachment_session_id", 0) or 0
+                        )
+                        or None,
+                        attachment_user_id=int(
+                            getattr(rt, "attachment_user_id", 0) or 0
+                        )
+                        or None,
+                        evidence_ids=frozenset(
+                            str(getattr(item, "id", "") or "")
+                            for item in (getattr(rt, "evidence", None) or [])
+                        ),
+                    ).handlers(),
+                    available_capabilities=effective_capabilities,
+                ).execute(action_plan)
+                receipts = [receipt.model_dump(mode="json") for receipt in action_execution.receipts]
+                successful = all(
+                    receipt["status"] in {"accepted", "completed", "skipped"}
+                    for receipt in receipts
+                )
+                emit_event({
+                    "type": "stage",
+                    "payload": {
+                        "key": "conversation_action_execution",
+                        "status": "done" if successful else "blocked",
+                        "plan_id": action_plan.plan_id,
+                        "receipts": receipts,
+                    },
+                })
+                action_plan_feedback = _direct_action_plan_feedback(
+                    action_plan,
+                    receipts=action_execution.receipts,
+                )
+                # The model sees only a bounded receipt summary, never raw
+                # domain payloads.  It can explain completed work and retrieve
+                # further authorized evidence without pretending a blocked
+                # command succeeded.
+                receipt_lines = [
+                    f"- {receipt.action_id}: {receipt.status}"
+                    + (f" ({receipt.message})" if receipt.message else "")
+                    + (f" refs={','.join(receipt.result_refs)}" if receipt.result_refs else "")
+                    for receipt in action_execution.receipts
+                ]
+                if receipt_lines:
+                    system_prompt = (
+                        f"{system_prompt}\n\n本轮服务器已执行的受控动作回执：\n"
+                        + "\n".join(receipt_lines)
+                        + "\n不要重复提交已完成的写操作；如需下一步，请先解释依据和结果。"
+                    )
+
+        if action_plan_enabled:
+            # The action executor above receives the full capability-filtered
+            # toolset.  The subsequent deep-agent loop must never receive a
+            # writer or task-control command directly: it may explain the
+            # receipts and perform further scoped reads, but all mutations
+            # require a newly validated plan on a later turn.
+            tools = filter_tools_for_action_plan_narration(tools)
+
         # Export intent is server-owned and persisted independently of the
         # model's prose. Append this protocol after untrusted memory/
         # attachment context so a custom SYSTEM_PROMPT cannot accidentally
@@ -1623,7 +2605,7 @@ class MultiSourceAgentRunner:
         if export_plan is not None:
             system_prompt = f"{system_prompt}\n\n{_EXPORT_PROMPT}"
 
-        if document_flow_routed:
+        if legacy_direct_shortcuts and document_flow_routed:
             emit_event(
                 {
                     "type": "stage",
@@ -1641,7 +2623,7 @@ class MultiSourceAgentRunner:
                     },
                 }
             )
-        elif document_flow is True:
+        elif legacy_direct_shortcuts and document_flow is True:
             # Explicit opt-in must not degrade silently: report why the
             # document flow could not start before continuing on the general
             # path.
@@ -1669,8 +2651,14 @@ class MultiSourceAgentRunner:
         # from starting a second authoring session or producing model-written
         # pseudo documents after a browser refresh.
         direct_control_answer: str | None = None
+        direct_answer_grounding = "document_plan_control"
+        if legacy_direct_shortcuts:
+            direct_control_answer = _direct_intent_clarification_answer(intent_plan)
+            if direct_control_answer is not None:
+                direct_answer_grounding = "intent_clarification"
         if (
-            authoring_capable
+            legacy_direct_shortcuts
+            and authoring_capable
             and ctx is not None
             and str(thread_id or "").strip()
             and is_explicit_document_plan_confirmation_query(query)
@@ -1765,7 +2753,8 @@ class MultiSourceAgentRunner:
         fill_document_command = is_direct_document_generation_query(query)
         scope_confirm_command = is_explicit_document_plan_confirmation_query(query)
         if (
-            direct_control_answer is None
+            legacy_direct_shortcuts
+            and direct_control_answer is None
             and self.document_authoring_pipeline is not None
             and ctx is not None
             and str(thread_id or "").strip()
@@ -1878,7 +2867,8 @@ class MultiSourceAgentRunner:
         # document in chat.  Unconfirmed states (needs_clarification,
         # awaiting_plan_confirmation) keep their dedicated control branches.
         if (
-            direct_control_answer is None
+            legacy_direct_shortcuts
+            and direct_control_answer is None
             and (fill_document_command or scope_confirm_command)
             and self.document_authoring_pipeline is not None
             and ctx is not None
@@ -1919,7 +2909,13 @@ class MultiSourceAgentRunner:
         # document context.
         direct_clarification_answer: str | None = None
         if (
-            direct_control_answer is None
+            legacy_direct_shortcuts
+            and direct_control_answer is None
+            and callable(getattr(
+                self.document_authoring_pipeline,
+                "get_current_chat_document_task_projection",
+                None,
+            ))
             and self.document_authoring_pipeline is not None
             and ctx is not None
             and str(thread_id or "").strip()
@@ -2095,8 +3091,22 @@ class MultiSourceAgentRunner:
         if direct_clarification_answer is not None:
             direct_control_answer = direct_clarification_answer
             direct_answer_grounding = "document_clarification"
-        else:
+        elif direct_control_answer is None:
             direct_answer_grounding = "document_plan_control"
+
+        if direct_control_answer is None and has_attachments:
+            # Governed two-stage section edits: the user's confirmation (or
+            # cancellation) executes deterministically, never via the model.
+            proposal_answer = _direct_attachment_proposal_answer(
+                rt=rt, query=query, emit_event=emit_event
+            )
+            if proposal_answer is not None:
+                direct_control_answer = proposal_answer
+                direct_answer_grounding = "attachment_proposal"
+
+        if direct_control_answer is None and action_plan_feedback is not None:
+            direct_control_answer = action_plan_feedback
+            direct_answer_grounding = "conversation_action_plan"
 
         if direct_control_answer is not None:
             record.answer = direct_control_answer
@@ -2133,6 +3143,9 @@ class MultiSourceAgentRunner:
                 },
                 "intent_plan": intent_plan.to_dict(),
                 "conversation_plan": conversation_plan.to_dict(),
+                **_conversation_action_audit_fields(
+                    action_plan_mode, action_plan, action_plan_issues, action_execution,
+                ),
             }
             yield direct_control_answer
             return
@@ -2153,7 +3166,8 @@ class MultiSourceAgentRunner:
         )
         direct_pipeline = self.document_authoring_pipeline
         direct_pipeline_ready = (
-            document_flow_routed
+            legacy_direct_shortcuts
+            and document_flow_routed
             and is_direct_document_generation_query(query)
             and direct_tool is not None
             and callable(getattr(direct_pipeline, "create_document_generation_session", None))
@@ -2246,6 +3260,9 @@ class MultiSourceAgentRunner:
                 },
                 "intent_plan": intent_plan.to_dict(),
                 "conversation_plan": conversation_plan.to_dict(),
+                **_conversation_action_audit_fields(
+                    action_plan_mode, action_plan, action_plan_issues, action_execution,
+                ),
             }
             emit_event(
                 {
@@ -2297,6 +3314,7 @@ class MultiSourceAgentRunner:
         splitter = _AnswerSplitter(
             on_narration=lambda text: emit_event({"type": "narration", "payload": {"text": text}})
         )
+        recursion_stopped = False
         try:
             for chunk, metadata in agent.stream(
                 {"messages": messages},
@@ -2318,22 +3336,49 @@ class MultiSourceAgentRunner:
         except QueryCancelled:
             return
         except Exception as exc:
-            from src.core.error_friendly import friendly_error_message
-            emit_event(
-                {
-                    "type": "degraded",
-                    "payload": {
-                        "stage": "agent_loop",
-                        "reason": friendly_error_message(exc),
-                    },
-                }
-            )
-            raise
+            from langgraph.errors import GraphRecursionError
+
+            if isinstance(exc, GraphRecursionError):
+                # A runaway tool-call loop must not surface as an opaque
+                # system error: stop cleanly, keep the evidence already
+                # gathered and tell the user what to narrow down.
+                recursion_stopped = True
+                emit_event(
+                    {
+                        "type": "degraded",
+                        "payload": {
+                            "stage": "agent_loop",
+                            "reason": "单轮工具调用步数已达上限，已停止继续检索。",
+                        },
+                    }
+                )
+            else:
+                from src.core.error_friendly import friendly_error_message
+
+                emit_event(
+                    {
+                        "type": "degraded",
+                        "payload": {
+                            "stage": "agent_loop",
+                            "reason": friendly_error_message(exc),
+                        },
+                    }
+                )
+                raise
 
         # The final message's text was already streamed live above; finish()
         # only returns it for the observability record, nothing is re-yielded.
         answer_text = splitter.finish()
-        if answer_text:
+        if recursion_stopped:
+            # Append the step-budget notice to any partial answer so the turn
+            # completes with an actionable message instead of a failure.
+            notice = _agent_step_budget_answer(rt)
+            combined = f"{answer_text.rstrip()}\n\n{notice}" if answer_text else notice
+            record.answer = combined
+            _current_run().answer = combined
+            answer_text = combined
+            yield notice
+        elif answer_text:
             record.answer = answer_text
             _current_run().answer = answer_text
 
@@ -2369,6 +3414,9 @@ class MultiSourceAgentRunner:
         record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
         record.retrieval_summary["intent_plan"] = intent_plan.to_dict()
         record.retrieval_summary["conversation_plan"] = conversation_plan.to_dict()
+        record.retrieval_summary.update(_conversation_action_audit_fields(
+            action_plan_mode, action_plan, action_plan_issues, action_execution,
+        ))
         record.footer = "" if is_general else self._format_footer(rt, verification, timeline)
 
         if not answer_text:

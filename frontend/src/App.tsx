@@ -36,6 +36,7 @@ import UsersPage from './pages/admin/UsersPage';
 import DepartmentsPage from './pages/admin/DepartmentsPage';
 import KbPermissionsPage from './pages/admin/KbPermissionsPage';
 import GovernancePage from './pages/admin/GovernancePage';
+import AttachmentReleasesPage from './pages/admin/AttachmentReleasesPage';
 import LogsPage from './pages/admin/LogsPage';
 import ConfigPage from './pages/admin/ConfigPage';
 import EvaluationPage from './pages/admin/EvaluationPage';
@@ -249,6 +250,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               element={
                 <AdminRoute auth={auth}>
                   <GovernancePage auth={auth} onLogout={onLogout} />
+                </AdminRoute>
+              }
+            />
+            <Route
+              path="/admin/attachment-releases"
+              element={
+                <AdminRoute auth={auth}>
+                  <AttachmentReleasesPage auth={auth} onLogout={onLogout} />
                 </AdminRoute>
               }
             />

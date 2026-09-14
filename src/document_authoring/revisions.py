@@ -51,6 +51,67 @@ def _normalize_list(values: Any) -> list[str]:
     return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
 
 
+def _execution_draft_id(unit_id: str) -> str:
+    text = str(unit_id or "").strip()
+    if text.startswith(("field:", "review:")):
+        return text
+    return f"field:{text}"
+
+
+def _draft_preservation_fingerprint(draft: Any) -> str:
+    """Hash only user-visible draft content, excluding run-specific identity."""
+    typed = getattr(draft, "typed_value", None)
+    return content_hash({
+        "content": getattr(draft, "content", None),
+        "proposed_value": getattr(draft, "proposed_value", None),
+        "typed_value": typed.model_dump(mode="json") if hasattr(typed, "model_dump") else typed,
+    })
+
+
+def _draft_for_unit(drafts: Mapping[str, Any], unit_id: str) -> Any | None:
+    """Resolve a semantic unit against both legacy and plan execution ids."""
+    normalized = str(unit_id or "").strip()
+    candidates = [normalized]
+    if normalized.startswith(("field:", "review:")):
+        candidates.append(normalized.split(":", 1)[1])
+    else:
+        candidates.extend((f"field:{normalized}", f"review:{normalized}"))
+    return next((drafts[key] for key in candidates if key in drafts), None)
+
+
+def preservation_result(
+    *,
+    reused_unit_ids: list[str],
+    parent_drafts: Mapping[str, Any],
+    child_drafts: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify that every requested preserved unit really remained unchanged.
+
+    Missing drafts are a failure rather than an implicit pass.  This keeps a
+    partial recovery from silently claiming that an unaffected section was
+    preserved.
+    """
+    verified: list[str] = []
+    failed: list[str] = []
+    missing: list[str] = []
+    for unit_id in reused_unit_ids:
+        parent = parent_drafts.get(unit_id)
+        child = child_drafts.get(unit_id)
+        if parent is None or child is None:
+            missing.append(unit_id)
+        elif _draft_preservation_fingerprint(parent) == _draft_preservation_fingerprint(child):
+            verified.append(unit_id)
+        else:
+            failed.append(unit_id)
+    return {
+        "reused": list(reused_unit_ids),
+        "verified": verified,
+        "failed": failed,
+        "missing": missing,
+        "passed": not failed and not missing,
+    }
+
+
 _DIFF_CHANGE_LIMIT = 200
 _DIFF_TEXT_LIMIT = 500
 
@@ -561,6 +622,39 @@ class DocumentRevisionService:
         execution_scope_hash = None
         frozen_strategy_hash = str(strategy_hash or "").strip() or None
         frozen_policy_hash = str(policy_hash or "").strip() or None
+        metadata_payload = dict(metadata or {})
+        revision_identity = self._revision_identity(
+            task_id=task.task_id,
+            work_order_id=work_order_id,
+            client_request_id=str(client_request_id or "").strip(),
+        )
+        # A plan-backed order must never silently restart the parent plan.  If
+        # the caller did not explicitly supply a child plan, compile one from
+        # the frozen parent plan and the validated revision scope now.
+        if parent_plan is None and child_plan is None and plan_diff is None:
+            plan_refs = (
+                str(getattr(order, "document_plan_id", "") or "").strip(),
+                int(getattr(order, "document_plan_version", 0) or 0),
+                str(getattr(order, "document_plan_hash", "") or "").strip(),
+            )
+            if any(plan_refs):
+                (
+                    parent_plan,
+                    child_plan,
+                    plan_diff,
+                    metadata_payload,
+                ) = self._compile_executable_revision(
+                    order=order,
+                    task=task,
+                    parent_artifact_id=parent_id,
+                    parent_artifact_content_hash=str(getattr(parent, "content_hash", "") or ""),
+                    request_kind=request_kind,
+                    normalized_request=normalized_request,
+                    fields=fields,
+                    sections=sections,
+                    revision_id=revision_identity,
+                    metadata=metadata_payload,
+                )
         if parent_plan is not None or child_plan is not None or plan_diff is not None:
             from src.document_authoring.planning.diff import compile_affected_subgraph, diff_document_plans
             from src.document_authoring.planning.models import DocumentPlan, PlanDiff
@@ -663,8 +757,9 @@ class DocumentRevisionService:
             impact_scope=impact_scope,
             revalidation_scope=revalidation_scope,
             invalidated_approval_event_ids=list(getattr(parent, "approval_event_ids", []) or []),
-            metadata=dict(metadata or {}),
+            metadata=metadata_payload,
             client_request_id=str(client_request_id or "").strip(),
+            revision_id=revision_identity,
         )
         update_artifact = getattr(self.authoring_store, "update_artifact", None)
         if callable(update_artifact):
@@ -677,6 +772,126 @@ class DocumentRevisionService:
         if callable(update_task_status):
             update_task_status(task.task_id, "waiting_human")
         return revision
+
+    @staticmethod
+    def _revision_identity(*, task_id: str, work_order_id: str, client_request_id: str) -> str:
+        """Return a stable revision identity for idempotent command retries."""
+        request_key = str(client_request_id or "").strip()
+        if request_key:
+            return "artifact-revision-" + content_hash({
+                "task_id": str(task_id),
+                "work_order_id": str(work_order_id),
+                "client_request_id": request_key,
+            })[:32]
+        return f"artifact-revision-{uuid.uuid4().hex}"
+
+    def _compile_executable_revision(
+        self,
+        *,
+        order: Any,
+        task: Any,
+        parent_artifact_id: str,
+        parent_artifact_content_hash: str,
+        request_kind: str,
+        normalized_request: str,
+        fields: list[str],
+        sections: list[str],
+        revision_id: str,
+        metadata: dict[str, Any],
+    ) -> tuple[Any, Any, Any, dict[str, Any]]:
+        """Compile and durably accept a child plan for this revision.
+
+        The free-form request is copied only into the affected semantic units
+        of the immutable child plan.  The worker later consumes that plan,
+        rather than receiving arbitrary text directly from an API caller.
+        """
+        from src.document_authoring.planning.revision import (
+            RevisionNotExecutable,
+            RevisionPatch,
+            compile_revision_plan,
+            make_revision_patch_id,
+        )
+
+        planning = getattr(self.authoring_store, "planning", None)
+        plan_id = str(getattr(order, "document_plan_id", "") or "").strip()
+        plan_version = int(getattr(order, "document_plan_version", 0) or 0)
+        plan_hash = str(getattr(order, "document_plan_hash", "") or "").strip()
+        if planning is None or not plan_id or plan_version < 1 or not plan_hash:
+            raise RevisionNotExecutable(
+                "当前文档缺少完整计划基线，修订无法执行；请转为新建文档"
+            )
+        parent_plan = planning.get_plan(plan_id, plan_version)
+        if parent_plan is None:
+            raise RevisionNotExecutable("修订基线计划不存在或不可读")
+        if parent_plan.plan_hash != plan_hash:
+            raise RevisionNotExecutable("修订基线计划已变化；请基于最新版本重试")
+        spec = planning.get_output_spec(
+            parent_plan.output_spec_id, parent_plan.output_spec_version,
+        )
+        patch_id = make_revision_patch_id(
+            parent_artifact_id=parent_artifact_id,
+            parent_artifact_content_hash=parent_artifact_content_hash,
+            parent_plan_id=parent_plan.document_plan_id,
+            parent_plan_version=parent_plan.version,
+            parent_plan_hash=parent_plan.plan_hash,
+            operation=request_kind,
+            instruction=normalized_request,
+            changed_fields=fields,
+            changed_sections=sections,
+        )
+        patch = RevisionPatch(
+            patch_id=patch_id,
+            revision_id=revision_id,
+            parent_artifact_id=parent_artifact_id,
+            parent_artifact_content_hash=parent_artifact_content_hash,
+            parent_plan_id=parent_plan.document_plan_id,
+            parent_plan_version=parent_plan.version,
+            parent_plan_hash=parent_plan.plan_hash,
+            operation=request_kind,
+            instruction=normalized_request,
+            changed_fields=fields,
+            changed_sections=sections,
+        )
+        compilation = compile_revision_plan(parent_plan, spec, patch)
+        owner_tenant = str(
+            getattr(order, "tenant_id", "")
+            or getattr(task, "tenant_id", "")
+            or "default"
+        )
+        owner_user = str(
+            getattr(task, "user_id", "")
+            or getattr(task, "created_by", "")
+            or "system"
+        )
+        child_plan = compilation.child_plan
+        try:
+            planning.create_plan(
+                child_plan,
+                tenant_id=owner_tenant,
+                user_id=owner_user,
+                task_id=task.task_id,
+            )
+        except ValueError:
+            # Deterministic child identity makes a command retry safe.
+            existing = planning.get_plan(
+                child_plan.document_plan_id, child_plan.version,
+            )
+            if existing is None or existing.plan_hash != child_plan.plan_hash:
+                raise
+        planning.accept_plan_for_revision(
+            child_plan.document_plan_id,
+            child_plan.version,
+            expected_plan_hash=child_plan.plan_hash,
+            revision_id=revision_id,
+            tenant_id=owner_tenant,
+            user_id=owner_user,
+        )
+        enriched_metadata = dict(metadata)
+        enriched_metadata["revision_patch"] = patch.model_dump(mode="json")
+        enriched_metadata["patch_id"] = patch.patch_id
+        enriched_metadata["target_unit_ids"] = list(compilation.target_unit_ids)
+        enriched_metadata["preserved_unit_ids"] = list(compilation.preserved_unit_ids)
+        return parent_plan, child_plan, compilation.plan_diff, enriched_metadata
 
     def get_revision(self, ctx: Any, revision_id: str) -> ArtifactRevision | None:
         revision = self.store.get(revision_id)
@@ -741,7 +956,106 @@ class DocumentRevisionService:
         diff_report = self._diff_report_for(revision, child)
         if diff_report is not None:
             result["diff_report"] = diff_report
+        preservation = self._preservation_report(revision, child)
+        if preservation is not None:
+            result["preservation"] = preservation
+            if not preservation["passed"]:
+                normalized_status = "failed"
+                result["error_code"] = "preservation_failed"
+        target_change = self._target_change_report(revision, child)
+        if target_change is not None:
+            result["target_change"] = target_change
+            if not target_change["passed"]:
+                normalized_status = "failed"
+                result["error_code"] = "revision_content_unchanged"
         return self._apply_child_binding(revision, child, normalized_status, result)
+
+    def _preservation_report(self, revision: ArtifactRevision, child: Any) -> dict[str, Any] | None:
+        reused = [
+            str(unit_id) for unit_id in (revision.reused_unit_ids or [])
+            if str(unit_id).strip()
+        ]
+        if not reused:
+            return None
+        parent = self.authoring_store.get_artifact(revision.parent_artifact_id)
+        parent_run = str(getattr(parent, "run_id", "") or "")
+        child_run = str(getattr(child, "run_id", "") or "")
+
+        def drafts_for(run_id: str) -> dict[str, Any]:
+            if not run_id:
+                return {}
+            try:
+                return {
+                    draft.unit_id: draft
+                    for draft in self.authoring_store.list_unit_drafts(run_id)
+                }
+            except Exception:
+                return {}
+
+        parent_drafts = drafts_for(parent_run)
+        child_drafts = drafts_for(child_run)
+        return preservation_result(
+            reused_unit_ids=reused,
+            parent_drafts={
+                unit_id: _draft_for_unit(parent_drafts, unit_id)
+                for unit_id in reused
+            },
+            child_drafts={
+                unit_id: _draft_for_unit(child_drafts, unit_id)
+                for unit_id in reused
+            },
+        )
+
+    def _target_change_report(self, revision: ArtifactRevision, child: Any) -> dict[str, Any] | None:
+        """Prove each requested semantic unit differs from its parent draft.
+
+        A plan-bound revision may not claim success merely because a child
+        file was rendered.  Draft fingerprints are the stable semantic
+        boundary: package bytes can differ for unrelated OOXML metadata, and
+        files can be byte-identical despite a writer receiving an instruction.
+        """
+        target_ids = _normalize_list(
+            (revision.metadata or {}).get("target_unit_ids")
+            or revision.affected_unit_ids
+        )
+        if not target_ids:
+            return None
+        parent = self.authoring_store.get_artifact(revision.parent_artifact_id)
+        parent_run = str(getattr(parent, "run_id", "") or "").strip()
+        child_run = str(getattr(child, "run_id", "") or "").strip()
+
+        def drafts_for(run_id: str) -> dict[str, Any]:
+            if not run_id:
+                return {}
+            try:
+                return {
+                    str(draft.unit_id): draft
+                    for draft in self.authoring_store.list_unit_drafts(run_id)
+                }
+            except Exception:
+                return {}
+
+        parent_drafts = drafts_for(parent_run)
+        child_drafts = drafts_for(child_run)
+        changed: list[str] = []
+        unchanged: list[str] = []
+        missing: list[str] = []
+        for unit_id in target_ids:
+            parent_draft = _draft_for_unit(parent_drafts, unit_id)
+            child_draft = _draft_for_unit(child_drafts, unit_id)
+            if parent_draft is None or child_draft is None:
+                missing.append(unit_id)
+            elif _draft_preservation_fingerprint(parent_draft) == _draft_preservation_fingerprint(child_draft):
+                unchanged.append(unit_id)
+            else:
+                changed.append(unit_id)
+        return {
+            "targets": target_ids,
+            "changed": changed,
+            "unchanged": unchanged,
+            "missing": missing,
+            "passed": bool(changed) and not unchanged and not missing,
+        }
 
     def _child_in_revision_lineage(self, revision: ArtifactRevision, child: Any) -> bool:
         """True when the child was produced by the revision work order itself
@@ -869,6 +1183,18 @@ class DocumentRevisionService:
         diff_report = self._diff_report_for(revision, child)
         if diff_report is not None:
             result["diff_report"] = diff_report
+        preservation = self._preservation_report(revision, child)
+        if preservation is not None:
+            result["preservation"] = preservation
+            if not preservation["passed"]:
+                normalized_status = "failed"
+                result["error_code"] = "preservation_failed"
+        target_change = self._target_change_report(revision, child)
+        if target_change is not None:
+            result["target_change"] = target_change
+            if not target_change["passed"]:
+                normalized_status = "failed"
+                result["error_code"] = "revision_content_unchanged"
         return self._apply_child_binding(revision, child, normalized_status, result)
 
     def _apply_child_binding(

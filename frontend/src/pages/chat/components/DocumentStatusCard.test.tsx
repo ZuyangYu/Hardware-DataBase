@@ -116,8 +116,8 @@ describe('DocumentStatusCard', () => {
     expect(markup).toContain('X302');
     expect(markup).toContain('EDF');
     expect(markup).toContain('X1900');
-    expect(markup).toContain('请直接回复“确认”');
     expect(markup).toContain('按 EDF 实际位号生成');
+    expect(markup).not.toContain('请直接回复“确认”');
     expect(markup).not.toContain('候选文档已生成');
   });
 
@@ -152,6 +152,56 @@ describe('DocumentStatusCard', () => {
     expect(markup).toContain('排除');
     expect(markup).toContain('实际情况');
     expect(markup).toContain('待处理：X301');
+  });
+
+  it('renders aggregated decisions and lets the user give a natural-language group instruction', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'work_order_status',
+          status: 'blocked',
+          next_actions: [],
+          kb_name: 'ADAS',
+          work_order_id: 'wo-grouped',
+          gateReview: {
+            reviewKind: 'icd_scope',
+            status: 'pending',
+            scopePendingCount: 20,
+            scopeBlocking: false,
+            scopeExceptions: [],
+          },
+          pendingDecisions: [
+            {
+              decision_id: 'decision:pin_exposure:X1900',
+              group_key: 'X1900',
+              kind: 'pin_exposure',
+              title: '位号 X1900 待确认',
+              options: ['include', 'exclude'],
+              default_option: 'include',
+              count: 15,
+              blocking: false,
+            },
+            {
+              decision_id: 'decision:pin_exposure:X1902',
+              group_key: 'X1902',
+              kind: 'pin_exposure',
+              title: '位号 X1902 待确认',
+              options: ['include', 'exclude'],
+              default_option: 'include',
+              count: 5,
+              blocking: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(markup).toContain('位号 X1900 待确认（15 项）');
+    expect(markup).toContain('位号 X1902 待确认（5 项）');
+    expect(markup).toContain('待处理：X1900（15 项）、X1902（5 项）');
+    expect(markup).toContain('自然语言');
+    expect(markup).toContain('X1900 全部包含');
+    expect(markup).not.toContain('包含/排除 &lt;位号&gt;，继续生成');
   });
 
   it('renders a generic review gate without ICD include/exclude copy', () => {
@@ -276,6 +326,65 @@ describe('DocumentStatusCard', () => {
     expect(noWorkOrder).not.toContain('下载');
   });
 
+  it('renders an attachment revision candidate with download and no work order', () => {
+    const card = parseDocumentCardEvent(cardEvent({
+      kind: 'attachment_revision',
+      status: 'review_candidate',
+      next_actions: [],
+      kb_name: 'hardware',
+      candidate_state: 'available',
+      release_state: 'not_requested',
+      content: '已创建附件修订候选；原附件未修改，可下载候选文件复核。',
+      artifacts: [{
+        artifact_id: 'att-child-1',
+        stage: 'review_candidate',
+        output_format: 'docx',
+        download_url: '/api/v1/conversations/7/attachments/att-child-1/download',
+      }],
+    }));
+
+    const markup = renderToStaticMarkup(<DocumentStatusCard card={card!} />);
+
+    expect(markup).toContain('附件修订候选');
+    expect(markup).toContain('候选已生成');
+    expect(markup).toContain('候选附件');
+    expect(markup).toContain('aria-label="下载 候选文档（待审核）"');
+    expect(markup).toContain('下载 候选文档（待审核）（DOCX）');
+    expect(markup).toContain('原附件未修改');
+    expect(markup).not.toContain('工单');
+  });
+
+  it('shows attachment release review state as the next conversational step', () => {
+    const pending = parseDocumentCardEvent(cardEvent({
+      kind: 'attachment_revision',
+      status: 'review_candidate',
+      next_actions: [],
+      kb_name: 'hardware',
+      candidate_state: 'available',
+      release_state: 'pending',
+    }));
+    const pendingMarkup = renderToStaticMarkup(
+      <DocumentStatusCard card={pending!} />,
+    );
+    expect(pendingMarkup).toContain('data-attachment-release-state="pending"');
+    expect(pendingMarkup).toContain('已提交正式发布审核');
+    expect(pendingMarkup).toContain('候选仍可下载');
+
+    const rejected = parseDocumentCardEvent(cardEvent({
+      kind: 'attachment_revision',
+      status: 'review_candidate',
+      next_actions: [],
+      kb_name: 'hardware',
+      candidate_state: 'available',
+      release_state: 'rejected',
+    }));
+    const rejectedMarkup = renderToStaticMarkup(
+      <DocumentStatusCard card={rejected!} />,
+    );
+    expect(rejectedMarkup).toContain('data-attachment-release-state="rejected"');
+    expect(rejectedMarkup).toContain('发布申请被拒绝');
+  });
+
   it('renders live unit progress and the terminal execution error inline', () => {
     const markup = renderToStaticMarkup(
       <DocumentStatusCard
@@ -320,10 +429,55 @@ describe('DocumentStatusCard', () => {
       />,
     );
 
-    expect(markup).toContain('生成被阻止');
-    expect(markup).toContain('请在下方对话中补充或确认缺失信息');
+    expect(markup).toContain('候选已生成（发布受阻）');
+    expect(markup).toContain('候选文档已生成，可在上方下载');
     expect(markup).toContain('候选文档（待审核）');
     expect(markup).not.toContain('0 / 210%');
+  });
+
+  it('labels a blocked downloadable candidate as a release gate, not a failed generation', () => {
+    const card = parseDocumentCardEvent(cardEvent({
+      kind: 'work_order_status',
+      status: 'blocked',
+      next_actions: ['download_candidate', 'request_release'],
+      kb_name: 'ADAS',
+      work_order_id: 'wo-candidate-blocked',
+      candidate_state: 'available',
+      release_state: 'pending',
+      artifacts: [{ artifact_id: 'candidate-2', stage: 'review_candidate' }],
+    }));
+    const markup = renderToStaticMarkup(<DocumentStatusCard card={card!} />);
+
+    expect(markup).toContain('候选已生成（发布受阻）');
+    expect(markup).toContain('候选文档已生成，可在上方下载');
+    expect(markup).not.toContain('生成被阻止');
+  });
+
+  it('offers direct candidate download and an explicit release-review request', () => {
+    const markup = renderToStaticMarkup(
+      <DocumentStatusCard
+        card={{
+          kind: 'work_order_status',
+          status: 'blocked',
+          next_actions: ['download_candidate', 'request_release'],
+          kb_name: 'ADAS',
+          work_order_id: 'wo-direct-candidate',
+          candidateState: 'available',
+          releaseState: 'not_requested',
+          artifacts: [{
+            artifact_id: 'candidate-direct-1',
+            stage: 'review_candidate',
+            output_format: 'docx',
+          }],
+        }}
+        onRequestRelease={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('下载 候选文档（待审核）');
+    expect(markup).toContain('申请正式发布审核');
+    expect(markup).toContain('aria-label="下载 候选文档（待审核）（工单 wo-direct-candidate）"');
+    expect(markup).toContain('aria-label="申请正式发布审核（工单 wo-direct-candidate）"');
   });
 
   it('does not call a blocked terminal node completed', () => {

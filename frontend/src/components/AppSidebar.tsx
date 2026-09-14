@@ -232,6 +232,16 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   onClick={() => navigate('/admin/governance')}
                   tooltip="知识库治理"
                 />
+                {!sysAdmin && (
+                  <PrimaryNavButton
+                    label="附件发布审核"
+                    iconName="file"
+                    active={location.pathname === '/admin/attachment-releases'}
+                    collapsed={collapsed}
+                    onClick={() => navigate('/admin/attachment-releases')}
+                    tooltip="附件发布审核"
+                  />
+                )}
                 <PrimaryNavButton
                   label="日志中心"
                   iconName="history"

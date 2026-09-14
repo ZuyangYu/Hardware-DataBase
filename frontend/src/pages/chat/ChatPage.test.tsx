@@ -5,12 +5,14 @@ import { MemoryRouter } from 'react-router-dom';
 import type { AuthSession } from '../../auth';
 import type { AttachmentView, DocumentContext, KbView } from '../../api/types';
 import ChatPage, {
+  defaultSelectedAttachmentIds,
   isChatAttachmentsUiEnabled,
   isDocumentAuthoringChatEnabled,
   isTemplateGenerationChatIntent,
   listTemplateCandidateAttachments,
   pickAutoTemplateAttachment,
   resolveTemplateAttachmentRoute,
+  retainExistingAttachmentIds,
 } from './ChatPage';
 import Composer from './components/Composer';
 
@@ -46,6 +48,24 @@ function renderChat(documentAuthoringEnabled?: boolean, availableKbs: KbView[] =
     </MemoryRouter>,
   );
 }
+
+describe('session attachment selection stays mounted', () => {
+  const ready = { attachment_id: 'a1', parse_status: 'ready' } as unknown as AttachmentView;
+  const failed = { attachment_id: 'a2', parse_status: 'failed' } as unknown as AttachmentView;
+  const queued = { attachment_id: 'a3', parse_status: 'queued' } as unknown as AttachmentView;
+
+  it('selects parseable attachments and skips failed parses', () => {
+    expect(defaultSelectedAttachmentIds([ready, failed, queued])).toEqual(['a1', 'a3']);
+    expect(defaultSelectedAttachmentIds([])).toEqual([]);
+  });
+
+  it('retains only existing selections in their original order', () => {
+    expect(
+      retainExistingAttachmentIds(['a3', 'gone', 'a1'], [ready, failed, queued]),
+    ).toEqual(['a3', 'a1']);
+    expect(retainExistingAttachmentIds(['a3'], [])).toEqual([]);
+  });
+});
 
 describe('isDocumentAuthoringChatEnabled flag resolution (opt-out semantics)', () => {
   afterEach(() => {
@@ -118,6 +138,16 @@ describe('natural-language template generation routing', () => {
     expect(isTemplateGenerationChatIntent('将模板按照知识库内容回填')).toBe(true);
     expect(isTemplateGenerationChatIntent('参考模板，比较知识库和附件中的 HSI 文档差异')).toBe(false);
     expect(isTemplateGenerationChatIntent('这个 PDF 里有哪些接口？')).toBe(false);
+    // Generic generation/export wording must not trigger the expensive
+    // template analysis; the backend owns the route decision.
+    expect(isTemplateGenerationChatIntent('根据附件生成第6章的内容')).toBe(false);
+    expect(isTemplateGenerationChatIntent('把检索结果整理成文档')).toBe(false);
+    expect(isTemplateGenerationChatIntent('帮我生成一份 ICD 文档')).toBe(false);
+    expect(
+      isTemplateGenerationChatIntent(
+        '帮我检索知识库，完善附件中文档的第6章的内容，然后将完善后的第6章内容，替换掉原来第6章，最终输出修改后的docx文档',
+      ),
+    ).toBe(false);
   });
 
   it('auto-selects one ready office attachment and stays fail-closed for ambiguity', () => {
@@ -220,7 +250,7 @@ function renderComposer(overrides: Partial<ComposerProps> = {}) {
   return renderToStaticMarkup(<Composer {...props} />);
 }
 
-describe('Composer document generation toggle', () => {
+describe('Composer document context', () => {
   it('renders document quick replies beside the main conversation input', () => {
     const markup = renderComposer({ quickReplies: ['确认生成', '修改计划'] });
 
@@ -236,8 +266,8 @@ describe('Composer document generation toggle', () => {
     expect(markup).not.toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="挂载知识库"/);
   });
 
-  it('hides the generation toggle when no document context is attached', () => {
-    const markup = renderComposer({ onToggleDocumentFlow: () => undefined });
+  it('does not render a legacy generation-mode toggle when no document context is attached', () => {
+    const markup = renderComposer();
 
     expect(markup).toContain('添加附件');
     expect(markup).not.toContain('上传模板');
@@ -245,27 +275,14 @@ describe('Composer document generation toggle', () => {
     expect(markup).not.toContain('chat-document-flow-toggle');
   });
 
-  it('renders the generation toggle checked by default with context attached', () => {
+  it('shows the attached document reference without a mode toggle', () => {
     const markup = renderComposer({
       documentContext: attachedContext,
       documentContextLabel: '评审表.xlsx',
-      documentFlowEnabled: true,
-      onToggleDocumentFlow: () => undefined,
     });
 
-    expect(markup).toContain('文档生成模式');
-    expect(markup).toContain('chat-document-flow-toggle');
-    expect(markup).toMatch(/id="chat-document-flow-toggle"[^>]*checked/);
-  });
-
-  it('renders the generation toggle unchecked when the mode is turned off', () => {
-    const markup = renderComposer({
-      documentContext: attachedContext,
-      documentFlowEnabled: false,
-      onToggleDocumentFlow: () => undefined,
-    });
-
-    expect(markup).toContain('文档生成模式');
+    expect(markup).toContain('模板引用');
+    expect(markup).not.toContain('文档生成模式');
     expect(markup).not.toMatch(/id="chat-document-flow-toggle"[^>]*checked/);
   });
 });

@@ -58,7 +58,8 @@ PART_TYPE_VISUAL_EVIDENCE = "visual_evidence"
 # Current deterministic local parser implementation tag. Bumping this value
 # re-enqueues parse jobs for existing assets (parts are rebuilt; the source
 # file is never re-uploaded).
-PARSER_VERSION = "local_doc_v1"
+# v2: DOCX heading paths now cover localized/custom heading styles.
+PARSER_VERSION = "local_doc_v2"
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".pdf", ".docx", ".txt", ".md", ".xlsx", ".xlsm", ".edf", ".edif"}
@@ -156,6 +157,73 @@ class AttachmentAsset:
     manifest: dict[str, Any] = field(default_factory=dict)
     error_code: str = ""
     error_message: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class AttachmentRevision:
+    """Immutable candidate produced from one authorized attachment.
+
+    The parent attachment and its asset remain unchanged.  The child is a
+    normal session attachment so the existing ACL, retention and download
+    boundaries continue to apply, while this row is the explicit audit link
+    between the two versions.
+    """
+
+    revision_id: str
+    parent_attachment_id: str
+    child_attachment_id: str
+    session_id: int
+    user_id: int
+    tenant_id: str
+    operation: str
+    before: str
+    after: str
+    parent_content_hash: str
+    child_content_hash: str
+    status: str = "review_candidate"
+    release_state: str = "not_requested"
+    idempotency_key: str = ""
+    # Structured audit record for the edit (mode/locator/section scope and
+    # removal counts).  Empty for legacy revisions created before the column
+    # existed; never trusted as authority by itself.
+    details: dict[str, Any] = field(default_factory=dict)
+    # Release governance: explicit request → independent review.  The
+    # candidate stays a candidate; approval creates a separate released copy.
+    release_requested_by: int | None = None
+    release_requested_at: str | None = None
+    release_comment: str = ""
+    reviewed_by: int | None = None
+    reviewed_at: str | None = None
+    review_comment: str = ""
+    released_attachment_id: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class AttachmentEditProposal:
+    """A governed, user-confirmable attachment edit proposal.
+
+    The model may propose a section rewrite, but nothing is written until the
+    user explicitly confirms; confirmation executes ``attachment_edit`` and
+    the resulting candidate stays separate from any release.
+    """
+
+    proposal_id: str
+    session_id: int
+    user_id: int
+    tenant_id: str
+    parent_attachment_id: str
+    operation: str
+    heading_path: list[str]
+    after_text: str
+    before_text: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    status: str = "pending"
+    note: str = ""
+    confirmed_revision_id: str | None = None
     created_at: str = ""
     updated_at: str = ""
 

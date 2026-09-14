@@ -908,6 +908,50 @@ def _safe_pending_review(value: Any) -> dict | None:
     return reviewed or None
 
 
+def _safe_pending_decisions(value: Any) -> list[dict[str, Any]]:
+    """Project grouped decisions without exposing their item-level payloads.
+
+    The task projection is the chat client's durable source of truth.  It may
+    contain domain-specific ``items`` for audit and server-side expansion, but
+    the chat only needs the group contract (label, options, default and
+    count).  Keep this boundary defensive because it is also used while
+    replaying historical projection snapshots.
+    """
+    if not isinstance(value, list):
+        return []
+    safe: list[dict[str, Any]] = []
+    for raw in value[:32]:
+        if not isinstance(raw, dict):
+            continue
+        group_key = str(raw.get("group_key") or "").strip()
+        if not group_key:
+            continue
+        decision_id = str(raw.get("decision_id") or "").strip()
+        kind = str(raw.get("kind") or "").strip()
+        title = str(raw.get("title") or group_key).strip() or group_key
+        options = list(dict.fromkeys(
+            str(option).strip()
+            for option in (raw.get("options") or [])[:16]
+            if str(option).strip()
+        ))
+        default_option = str(raw.get("default_option") or "").strip()
+        try:
+            count = max(1, min(int(raw.get("count") or 1), 1_000_000))
+        except (TypeError, ValueError):
+            count = 1
+        safe.append({
+            "decision_id": decision_id,
+            "group_key": group_key,
+            "kind": kind,
+            "title": title,
+            "options": options,
+            "default_option": default_option,
+            "count": count,
+            "blocking": bool(raw.get("blocking")),
+        })
+    return safe
+
+
 def _safe_chat_task_status(status: dict) -> dict:
     """Project only status/card fields needed by the chat task center."""
     return {
@@ -924,6 +968,13 @@ def _safe_chat_task_status(status: dict) -> dict:
         "error_code": status.get("error_code"),
         "error_message": status.get("error_message"),
         "retryable": status.get("retryable"),
+        "pending_decisions": _safe_pending_decisions(status.get("pending_decisions")),
+        "candidate_state": status.get("candidate_state")
+        if status.get("candidate_state") in {"none", "available", "blocked"}
+        else None,
+        "release_state": status.get("release_state")
+        if status.get("release_state") in {"not_requested", "pending", "approved", "rejected"}
+        else None,
         "harness_run": _safe_harness_run(status.get("harness_run")),
         "pending_review": _safe_pending_review(status.get("pending_review")),
         "planning_state": (
@@ -984,6 +1035,9 @@ def _safe_chat_task_projection(projection: dict) -> dict:
         "error_code": projection.get("error_code"),
         "error_message": projection.get("error_message"),
         "retryable": projection.get("retryable"),
+        "pending_decisions": projection.get("pending_decisions"),
+        "candidate_state": projection.get("candidate_state"),
+        "release_state": projection.get("release_state"),
         "harness_run": run or None,
         "clarification_state": projection.get("clarification_state"),
         "pending_review": projection.get("pending_review"),
@@ -1599,6 +1653,26 @@ def artifact_approve(
     ctx = _write_ctx(user, auth, kb)
     try:
         return pipeline.approve_document_artifact(ctx, artifact_id, comment=payload.comment)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/document-generation/artifacts/{artifact_id}/release-request")
+def artifact_release_request(
+    artifact_id: str,
+    kb: str,
+    payload: FeedbackRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Record explicit release-review intent without approving the candidate."""
+
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        return pipeline.request_document_release(ctx, artifact_id, comment=payload.comment)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (ValueError, KeyError) as exc:

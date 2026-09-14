@@ -14,6 +14,7 @@ from src.document_authoring.models import (
     DocumentSchema,
     DocxFillPlan,
     RendererPolicy,
+    TemplateSanitizationReport,
     TemplateUnitBinding,
     WorkbookFillPlan,
 )
@@ -72,6 +73,41 @@ def _docx_with_text(text: str) -> bytes:
 def test_template_filename_is_canonicalized_to_document_family():
     assert _canonical_template_document_type("icd_example.xlsx", "icd_example.xlsx") == "icd"
     assert _canonical_template_document_type("Review", "review.docx") == "Review"
+
+
+def test_template_sanitization_summary_names_removed_embedded_objects():
+    from types import SimpleNamespace
+
+    report = TemplateSanitizationReport(
+        template_version_id="template-1",
+        source_format="docx",
+        source_content_hash="source-hash",
+        source_storage_ref="",
+        sanitized_format="docx",
+        sanitized_content_hash="safe-hash",
+        removed_parts=[
+            "word/embeddings/Microsoft_Excel____.xlsx",
+            "word/embeddings/Microsoft_Excel_97-2003____.xls",
+        ],
+        removed_relationships=["word/_rels/document.xml.rels#rId77"],
+        status="sanitized",
+    )
+    service = SimpleNamespace(
+        _get_template_sanitization_report=lambda _template_version_id: report
+    )
+
+    summary = DocumentGenerationService.get_template_sanitization_summary(
+        service,
+        SimpleNamespace(user_id="tester"),
+        "template-1",
+    )
+
+    assert summary["已移除嵌入/控件"] == 2
+    assert summary["已移除内嵌对象"] == [
+        "Microsoft_Excel_97-2003____.xls",
+        "Microsoft_Excel____.xlsx",
+    ]
+    assert summary["安全模板格式"] == "docx"
 
 
 class _SuggestedSemanticUnit:

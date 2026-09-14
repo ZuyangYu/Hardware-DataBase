@@ -332,6 +332,111 @@ def test_document_task_projection_preserves_release_block_over_pending_review(tm
     assert projection["error_message"] == "release is blocked by deterministic review gates"
 
 
+def test_document_task_projection_groups_pending_decisions_and_keeps_candidate_downloadable(tmp_path):
+    task_store = DocumentTaskStore(str(tmp_path / "authoring.db"))
+    task = task_store.create_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        origin="chat",
+        created_by="user-a",
+        conversation_id="88",
+        initiating_turn_id="turn-candidate",
+        knowledge_base_name="hardware",
+        status="failed",
+    )
+    task_store.attach_work_order(task.task_id, "wo-candidate")
+    order = SimpleNamespace(
+        work_order_id="wo-candidate",
+        task_id=task.task_id,
+        generation_session_id=None,
+        knowledge_base_name="hardware",
+        status="blocked",
+        target_format="docx",
+        document_schema_id="icd",
+    )
+    exceptions = [
+        {
+            "exception_id": f"x1900-{pin}",
+            "refdes": "X1900",
+            "kind": "extra_pin_exposure",
+            "recommended_action": "include",
+            "user_instruction": "确认该脚是否需要在对外 ICD 中暴露。",
+        }
+        for pin in range(15)
+    ] + [
+        {
+            "exception_id": f"x1902-{pin}",
+            "refdes": "X1902",
+            "kind": "extra_pin_exposure",
+            "recommended_action": "include",
+            "user_instruction": "确认该脚是否需要在对外 ICD 中暴露。",
+        }
+        for pin in range(5)
+    ]
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = SimpleNamespace(
+        task_service=SimpleNamespace(store=task_store),
+        store=SimpleNamespace(
+            get_work_order=lambda work_order_id: order if work_order_id == "wo-candidate" else None,
+            list_artifacts=lambda _work_order_id: [
+                SimpleNamespace(
+                    artifact_id="candidate-1",
+                    run_id="run-candidate",
+                    stage="review_candidate",
+                    output_format="docx",
+                    parent_artifact_id=None,
+                    validity_status="current",
+                    policy_status="active",
+                    validation_report_id="",
+                ),
+            ],
+        ),
+    )
+    pipeline.get_document_run_status = lambda _work_order_id, _ctx: {
+        "status": "blocked",
+        "phase": "blocked",
+        "error_code": "plan_release_blocked",
+        "error_message": "release is blocked by deterministic review gates",
+        "next_actions": [],
+        "job": {"status": "succeeded"},
+    }
+    pipeline._document_reviews_for_task = lambda _ctx, _task, _order: [{
+        "review_id": "review-scope",
+        "review_kind": "icd_scope",
+        "status": "pending",
+    }]
+    pipeline._document_icd_scope_pending_details = lambda _work_order_id: {
+        "status": "pending",
+        "pending_count": 20,
+        "blocking": False,
+        "exceptions": exceptions,
+    }
+
+    projection = pipeline.get_document_task_projection(_ctx(), task.task_id)
+
+    assert [(decision["group_key"], decision["count"], decision["default_option"]) for decision in projection["pending_decisions"]] == [
+        ("X1900", 15, "include"),
+        ("X1902", 5, "include"),
+    ]
+    assert projection["candidate_state"] == "available"
+    # A candidate exists, but nobody has requested its formal release yet.
+    # Conflating this with a pending request hides the only useful next step.
+    assert projection["release_state"] == "not_requested"
+    assert projection["next_actions"] == [
+        "download_candidate",
+        "resolve_scope_exception",
+        "request_release",
+    ]
+
+    pipeline.document_generation.store.list_human_events = lambda artifact_id: [
+        SimpleNamespace(artifact_id=artifact_id, event_type="request_release"),
+    ]
+    requested = pipeline.get_document_task_projection(_ctx(), task.task_id)
+
+    assert requested["release_state"] == "pending"
+    assert "request_release" not in requested["next_actions"]
+
+
 def test_document_task_projection_allows_pending_review_for_non_blocked_candidate(tmp_path):
     task_store = DocumentTaskStore(str(tmp_path / "authoring.db"))
     task = task_store.create_task(

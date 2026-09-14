@@ -484,6 +484,144 @@ class InternalDocumentHarnessRuntime:
             execution_mode="internal_harness",
         )
 
+    def _plan_reuse_drafts(
+        self,
+        work_order: Any,
+        snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return validated parent drafts eligible for a local revision reuse.
+
+        Reuse is an optimisation, never an authority escalation: unavailable
+        parent drafts merely fall back to a normal re-computation.  The later
+        revision binding independently verifies preserved content.
+        """
+        revision_id = str(getattr(work_order, "revision_id", "") or "").strip()
+        if not revision_id:
+            return {}, {}
+        try:
+            from src.document_authoring.revisions import ArtifactRevisionStore
+
+            revision = ArtifactRevisionStore(self.store.db_path).get(revision_id)
+        except Exception:
+            return {}, {}
+        if revision is None or not revision.reused_unit_ids:
+            return {}, {}
+        current_snapshot_hash = str(getattr(snapshot, "content_hash", "") or "").strip()
+        revision_snapshot_hash = str(
+            getattr(revision, "source_snapshot_hash", "") or ""
+        ).strip()
+        if (
+            current_snapshot_hash
+            and revision_snapshot_hash
+            and current_snapshot_hash != revision_snapshot_hash
+        ):
+            # Reusing a draft against a different frozen source snapshot would
+            # make the child appear unchanged while silently changing its
+            # evidence basis.  Let the normal route recompute it instead.
+            return {}, {}
+        parent = self.store.get_artifact(revision.parent_artifact_id)
+        parent_run_id = str(getattr(parent, "run_id", "") or "").strip()
+        if not parent_run_id:
+            return {}, {}
+        try:
+            parent_drafts = {
+                draft.unit_id: draft
+                for draft in self.store.list_unit_drafts(parent_run_id)
+            }
+        except Exception:
+            return {}, {}
+        try:
+            parent_evidence = {
+                str(entry.evidence_id): entry
+                for entry in self.store.list_evidence_entries(parent_run_id)
+                if str(getattr(entry, "evidence_id", "") or "").strip()
+            }
+        except Exception:
+            parent_evidence = {}
+        selected: dict[str, Any] = {}
+        for unit_id in revision.reused_unit_ids:
+            execution_id = _plan_field_execution_key(unit_id)
+            draft = parent_drafts.get(execution_id) or parent_drafts.get(unit_id)
+            if draft is None:
+                continue
+            # Only a previously supported draft with a complete parent
+            # evidence registry is eligible for local reuse.  Otherwise the
+            # child must retrieve and validate the unit again.
+            if str(getattr(draft, "validation_status", "") or "") != "supported":
+                continue
+            draft_evidence_ids = {
+                str(evidence_id).strip()
+                for evidence_id in (getattr(draft, "evidence_ids", []) or [])
+                if str(evidence_id).strip()
+            }
+            if draft_evidence_ids and not draft_evidence_ids <= set(parent_evidence):
+                continue
+            selected[unit_id] = draft
+        return selected, {
+            "parent_artifact_id": revision.parent_artifact_id,
+            "parent_run_id": parent_run_id,
+            "requested_reuse": list(revision.reused_unit_ids),
+            "resolved_reuse": sorted(selected),
+            "resolved_evidence_ids": sorted({
+                str(evidence_id)
+                for draft in selected.values()
+                for evidence_id in (getattr(draft, "evidence_ids", []) or [])
+                if str(evidence_id).strip()
+            }),
+        }
+
+    def _register_reused_evidence(
+        self,
+        *,
+        work_order: DocumentWorkOrder,
+        snapshot: SourceSetSnapshot | KnowledgeBaseSourceSnapshot,
+        running: HarnessRun,
+        reuse_meta: dict[str, Any],
+    ) -> None:
+        """Clone opaque parent evidence ownership into the child run.
+
+        Source text is never copied into the registry.  The child receives a
+        new run-scoped handle while retaining the parent snapshot and content
+        hashes, so coverage can verify a reused draft without granting it
+        access to a different source version.
+        """
+        parent_run_id = str(reuse_meta.get("parent_run_id") or "").strip()
+        evidence_ids = {
+            str(evidence_id).strip()
+            for evidence_id in (reuse_meta.get("resolved_evidence_ids") or [])
+            if str(evidence_id).strip()
+        }
+        if not parent_run_id or not evidence_ids:
+            return
+        entries = {
+            str(entry.evidence_id): entry
+            for entry in self.store.list_evidence_entries(parent_run_id)
+        }
+        for evidence_id in sorted(evidence_ids):
+            entry = entries.get(evidence_id)
+            if entry is None:
+                raise PlanExecutionRouteError(
+                    f"reused evidence registry entry is missing: {evidence_id}"
+                )
+            if entry.source_set_snapshot_id != snapshot.source_set_snapshot_id:
+                raise PlanExecutionRouteError(
+                    f"reused evidence snapshot mismatch: {evidence_id}"
+                )
+            if (
+                getattr(snapshot, "content_hash", "")
+                and entry.snapshot_content_hash != snapshot.content_hash
+            ):
+                raise PlanExecutionRouteError(
+                    f"reused evidence content snapshot mismatch: {evidence_id}"
+                )
+            child_entry = entry.model_copy(update={
+                "harness_run_id": running.harness_run_id,
+                "work_order_id": work_order.work_order_id,
+                "reload_handle": f"evidence-{uuid.uuid4().hex}",
+                "registered_at": datetime.now(timezone.utc),
+            })
+            self.store.register_evidence(child_entry)
+
     @staticmethod
     def _plan_receipt_payload(node: CompiledTaskNode, output: Any) -> dict[str, Any]:
         """Project a node result to bounded, non-evidence receipt facts."""
@@ -613,6 +751,25 @@ class InternalDocumentHarnessRuntime:
         del rewriter, reranker, fit_checker
         plan, graph = self._load_bound_plan_graph(work_order, run, manifest, snapshot)
         plan_schema = self._plan_execution_schema(plan, schema)
+        reuse_drafts, reuse_meta = self._plan_reuse_drafts(work_order, snapshot)
+        if reuse_drafts:
+            try:
+                self._register_reused_evidence(
+                    work_order=work_order,
+                    snapshot=snapshot,
+                    running=run,
+                    reuse_meta=reuse_meta,
+                )
+            except (KeyError, PlanExecutionRouteError, PermissionError, ValueError):
+                # Reuse is an optimisation.  If its child-scoped evidence
+                # ownership cannot be reconstructed safely, recompute the
+                # affected child plan instead of weakening validation.
+                reuse_meta = {
+                    **reuse_meta,
+                    "resolved_reuse": [],
+                    "reuse_fallback": "parent_evidence_not_rebindable",
+                }
+                reuse_drafts = {}
         tool_policy = HarnessToolPolicy(policy)
         result = HarnessExecutionResult(
             execution_route="plan_dag",
@@ -625,6 +782,20 @@ class InternalDocumentHarnessRuntime:
             requirement.unit_id: requirement
             for requirement in plan.coverage_contract.requirements
             if requirement.kind == "table"
+        }
+        # The revision instruction is read solely from the accepted child
+        # plan.  This keeps free-form user text outside the worker boundary
+        # unless it was first resolved to a registered semantic unit.
+        revision_instructions = {
+            unit.unit_id: str(
+                (unit.output_schema or {}).get("revision_instruction") or ""
+            ).strip()
+            for unit in plan.semantic_units
+        }
+        revision_edits = {
+            unit.unit_id: dict(edit)
+            for unit in plan.semantic_units
+            if isinstance((edit := (unit.output_schema or {}).get("revision_edit")), dict)
         }
         field_by_unit = {field.field_id: field for field in plan_schema.fields}
         for unit in plan.semantic_units:
@@ -682,6 +853,64 @@ class InternalDocumentHarnessRuntime:
             if field is None:
                 raise PlanExecutionRouteError(f"plan graph references unknown semantic unit: {node.unit_id}")
             requirement = requirements_by_unit[unit_key]
+            # A child run owns a new receipt even when it safely reuses a
+            # previously validated unaffected draft.  Target units always
+            # recompute because they carry a revision instruction.
+            reused = reuse_drafts.get(node.unit_id)
+            if reused is not None and not revision_instructions.get(node.unit_id):
+                reused_metadata = dict(getattr(reused, "metadata", {}) or {})
+                reused_metadata["revision_reuse"] = {
+                    "parent_artifact_id": reuse_meta.get("parent_artifact_id"),
+                    "parent_run_id": reuse_meta.get("parent_run_id"),
+                    "parent_draft_hash": content_hash(
+                        reused.model_dump(mode="json")
+                    ),
+                }
+                reused = reused.model_copy(update={
+                    "run_id": run.harness_run_id,
+                    "metadata": reused_metadata,
+                })
+                reused_status = (
+                    "ready_to_render"
+                    if str(getattr(reused, "validation_status", "")) == "supported"
+                    else "requires_human"
+                )
+                reused_matrix_row = {
+                    "field_id": node.unit_id,
+                    "review_item_id": None,
+                    "requirement_id": requirement.requirement_id,
+                    "coverage_status": "reused",
+                    "evidence_ids": list(getattr(reused, "evidence_ids", []) or []),
+                    "display_value": (
+                        reused.typed_value.display_value
+                        if getattr(reused, "typed_value", None) is not None
+                        else reused.content
+                    ),
+                    "diagnostics": [],
+                }
+                with result_lock:
+                    result.drafts.append(reused)
+                    result.unit_statuses[unit_key] = reused_status
+                    result.matrix_rows.append(reused_matrix_row)
+                with persistence_lock:
+                    self.store.save_unit_drafts(
+                        work_order.work_order_id,
+                        run.harness_run_id,
+                        [reused],
+                        lease_owner=lease_owner,
+                        fencing_token=run.fencing_token,
+                    )
+                return {
+                    "draft": reused,
+                    "receipt_payload": {
+                        "unit_id": unit_key,
+                        "draft_id": reused.unit_id,
+                        "status": reused_status,
+                        "evidence_ids": list(getattr(reused, "evidence_ids", []) or []),
+                        "matrix_row": reused_matrix_row,
+                        "reuse": reuse_meta,
+                    },
+                }
             step("retrieve_evidence")
             tool_policy.require_tool("retrieve_evidence")
             last = None
@@ -757,6 +986,8 @@ class InternalDocumentHarnessRuntime:
                 evidence=evidence,
                 prompt_version=policy.prompt_version,
                 table_requirement=table_requirements.get(node.unit_id),
+                revision_instruction=revision_instructions.get(node.unit_id, ""),
+                revision_edit=revision_edits.get(node.unit_id),
             )
             draft = run_context.draft_with_receipt(request)
             step("validate_unit_draft")

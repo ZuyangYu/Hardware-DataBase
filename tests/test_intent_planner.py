@@ -81,6 +81,74 @@ def test_generic_document_authoring_does_not_require_a_template(query, kwargs):
     assert plan.template_required is False
 
 
+def test_materials_to_named_design_document_are_authoring_not_attachment_qa():
+    plan = classify_intent(
+        "请把这些材料整理成一份设计说明书",
+        has_attachments=True,
+        has_kb=True,
+    )
+
+    assert plan.intent == "document_authoring"
+    assert plan.action == "generate"
+    assert plan.target == "document"
+
+
+def test_deterministic_action_plan_retrieves_materials_before_named_document_creation():
+    from src.agents.orchestration.contracts import compile_deterministic_action_plan
+
+    plan = compile_deterministic_action_plan(
+        "请把这些材料整理成一份设计说明书",
+        has_attachments=True,
+        has_kb=True,
+    )
+
+    assert [action.kind for action in plan.actions] == ["search", "create_document"]
+    assert plan.actions[-1].depends_on == ["a1"]
+
+
+def test_document_revision_is_classified_as_authoring_with_a_revision_action():
+    plan = classify_intent(
+        "把上一版报告第三章改成表格，其他章节保持不变",
+        has_kb=True,
+    )
+
+    assert plan.intent == "document_authoring"
+    assert plan.action == "revise"
+    assert plan.template_required is False
+
+
+def test_multiple_document_output_formats_require_clarification():
+    plan = classify_intent("请生成 PDF 和 Word 报告", has_kb=True)
+
+    assert plan.intent == "document_authoring"
+    assert plan.action == "clarify"
+    assert plan.requested_formats == ("docx", "pdf")
+    assert plan.reason_codes == ("multiple_output_formats",)
+
+
+def test_unsupported_document_output_format_requires_clarification():
+    plan = classify_intent("请生成 TXT 报告", has_kb=True)
+
+    assert plan.intent == "document_authoring"
+    assert plan.action == "clarify"
+    assert plan.requested_formats == ()
+    assert plan.reason_codes == ("unsupported_output_format",)
+
+
+def test_xlsm_is_preserved_as_an_explicit_document_output_format():
+    plan = classify_intent("请生成 XLSM 表格", has_kb=True)
+
+    assert plan.requested_formats == ("xlsm",)
+    assert plan.action == "generate"
+
+
+def test_revision_question_remains_knowledge_base_qa():
+    plan = classify_intent("更新报告的原因是什么？", has_kb=True)
+
+    assert plan.intent == "knowledge_base_qa"
+    assert plan.action == "answer"
+
+
 def test_current_result_pdf_is_conversational_export():
     plan = classify_intent("请把当前结果另存为 PDF", has_kb=True)
 

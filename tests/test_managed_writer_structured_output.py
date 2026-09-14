@@ -5,7 +5,7 @@ import json
 import pytest
 
 from src.document_authoring.models import ManagedDraftPayload
-from src.document_authoring.writers.managed import LLMManagedWriter
+from src.document_authoring.writers.managed import LLMManagedWriter, _build_user_prompt
 from src.document_authoring.writers.provider import WriterRequest
 
 
@@ -142,3 +142,21 @@ def test_missing_model_usage_is_unknown_and_not_zero():
     assert observation["prompt_tokens"] == "unknown"
     assert observation["completion_tokens"] == "unknown"
     assert observation["total_tokens"] == "unknown"
+
+
+def test_revision_prompt_assigns_exact_text_edit_to_server_boundary():
+    request = _request().model_copy(update={
+        "revision_instruction": '将“10A”替换为“12A”',
+        "revision_edit": {
+            "kind": "replace_text",
+            "before": "10A",
+            "after": "12A",
+        },
+    })
+
+    prompt = _build_user_prompt(request, None)
+
+    assert "server" in prompt.casefold()
+    assert "10A" in prompt
+    assert "12A" in prompt
+    assert "baseline" in prompt.casefold()

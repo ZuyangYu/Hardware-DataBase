@@ -469,37 +469,13 @@ def test_revision_restart_creates_linked_work_order_and_is_idempotent(tmp_path):
         client_request_id="revision-request-1",
     )
 
-    restarted = service.restart_work_order_for_revision(
-        ctx, original.work_order_id, revision_id=revision.revision_id,
-    )
-    replay = service.restart_work_order_for_revision(
-        ctx, original.work_order_id, revision_id=revision.revision_id,
-    )
+    from src.document_authoring.planning.revision import RevisionNotExecutable
 
-    assert restarted.revision_id == revision.revision_id
-    assert restarted.restart_of_work_order_id == original.work_order_id
-    assert restarted.idempotency_key == f"revision:{revision.revision_id}"
-    assert restarted.work_order_id != original.work_order_id
-    assert replay.work_order_id == restarted.work_order_id
-    assert service.revision_service.store.get(revision.revision_id).status == "generating"
-    task = service.task_service.store.get(original.task_id)
-    assert task.work_order_id == restarted.work_order_id
-
-    child = DocumentArtifact(
-        artifact_id="artifact-child", tenant_id="tenant-a", work_order_id=restarted.work_order_id,
-        run_id="run-x", output_format="xlsx", stage="review_candidate",
-        content_hash="child-hash", validation_report_id="vr-x",
-        integrity_manifest_id="im-x", parent_artifact_id="artifact-parent",
-    )
-    authoring_store.save_artifact(child, b"child", "xlsx")
-    completed = service.revision_service.bind_generated_child(
-        restarted, child, revalidation_status="passed",
-    )
-    assert completed.child_artifact_id == "artifact-child"
-    with pytest.raises(ValueError, match="already generated"):
+    with pytest.raises(RevisionNotExecutable, match="可执行的子计划"):
         service.restart_work_order_for_revision(
             ctx, original.work_order_id, revision_id=revision.revision_id,
         )
+    assert service.revision_service.store.get(revision.revision_id).status == "planned"
 
 
 def test_revision_child_artifacts_carry_parent_lineage(tmp_path):
@@ -568,6 +544,7 @@ def test_revision_child_artifacts_carry_parent_lineage(tmp_path):
     )
 
     assert saved.parent_artifact_id == "artifact-parent"
+    assert saved.revision_id == revision.revision_id
 
 
 def test_revision_orders_never_auto_publish():

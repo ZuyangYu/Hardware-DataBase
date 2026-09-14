@@ -88,7 +88,7 @@ describe('document authoring chat context', () => {
     expect(legacy).not.toHaveProperty('document_context');
   });
 
-  it('sends document_flow true when generation mode is on and context attached', () => {
+  it('does not send legacy document_flow when a new client has document context', () => {
     const context = buildDocumentContext(
       { analysis_id: 'analysis-1', template_version_id: 'template-v1' },
       'shared',
@@ -96,10 +96,10 @@ describe('document authoring chat context', () => {
       now,
     );
     const request = buildTurnRequest('请生成评审表', 'turn-key-4', 'deep', context, true);
-    expect(request.document_flow).toBe(true);
+    expect(request).not.toHaveProperty('document_flow');
   });
 
-  it('sends document_flow false when generation mode is off with context attached', () => {
+  it('does not turn the legacy mode toggle into a new-client wire contract', () => {
     const context = buildDocumentContext(
       { analysis_id: 'analysis-1', template_version_id: 'template-v1' },
       'shared',
@@ -107,7 +107,7 @@ describe('document authoring chat context', () => {
       now,
     );
     const request = buildTurnRequest('仅提问', 'turn-key-5', 'deep', context, false);
-    expect(request.document_flow).toBe(false);
+    expect(request).not.toHaveProperty('document_flow');
   });
 
   it('omits document_flow when no document context attached', () => {

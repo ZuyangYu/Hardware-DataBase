@@ -46,9 +46,6 @@ type Props = {
   canUploadDocumentTemplate?: boolean;
   documentContext?: DocumentContext | null;
   documentContextLabel?: string;
-  /** 本次对话是否驱动文档生成(默认开);仅当模板上下文已附加时渲染。 */
-  documentFlowEnabled?: boolean;
-  onToggleDocumentFlow?: (enabled: boolean) => void;
   documentUploadPending?: boolean;
   onClearDocumentContext?: () => void;
   /** 会话附件(默认开):后端 CHAT_ATTACHMENTS_ENABLED 打开时由 ChatPage 传入。 */
@@ -87,8 +84,6 @@ export default function Composer({
   canUploadDocumentTemplate = false,
   documentContext = null,
   documentContextLabel,
-  documentFlowEnabled = true,
-  onToggleDocumentFlow,
   documentUploadPending = false,
   onClearDocumentContext,
   // Attachment support is on by default; ChatPage passes the explicit
@@ -190,30 +185,6 @@ export default function Composer({
                 </button>
               )}
             </div>
-          )}
-          {showDocumentControls && onToggleDocumentFlow && (
-            <label
-              title="开启后本次对话将驱动文档生成流程；关闭后本次回答不会进入文档流程"
-              className="flex w-fit cursor-pointer select-none items-center gap-[7px] rounded-[10px] border border-[#e3e7f1] bg-[#fafbfc] px-[9px] py-[6px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4]"
-            >
-              <input
-                id="chat-document-flow-toggle"
-                type="checkbox"
-                checked={documentFlowEnabled}
-                disabled={streaming || disabled}
-                onChange={(event) => onToggleDocumentFlow(event.currentTarget.checked)}
-                aria-label="文档生成模式"
-              />
-              <span>文档生成模式</span>
-              <span
-                className={cn(
-                  'shrink-0 rounded-full px-[7px] py-[1px] text-[10px] font-semibold',
-                  documentFlowEnabled ? 'bg-[#eef8f0] text-[#166534]' : 'bg-[#eef0f4] text-[#858b9c]',
-                )}
-              >
-                {documentFlowEnabled ? '开' : '关'}
-              </span>
-            </label>
           )}
           {attachmentsEnabled && (
             <div className="flex min-w-0 flex-col gap-[6px]">
@@ -351,7 +322,7 @@ export default function Composer({
                 </label>
                 {documentUploadPending && (
                   <span className="shrink-0 text-[11px] text-[#68728a]" role="status" aria-live="polite">
-                    模板分析中…
+                    模板分析中…（结构分析 + 分批 LLM 语义建议，大文档可能数分钟）
                   </span>
                 )}
                 {selectedIds.length > 0 && onSourceScopeChange && (

@@ -17,7 +17,11 @@ import zipfile
 from contextlib import closing
 
 import src.settings
-from src.agents.tools.attachment_tools import build_attachment_tools, make_attachment_list
+from src.agents.tools.attachment_tools import (
+    build_attachment_tools,
+    make_attachment_list,
+    make_attachment_read,
+)
 from src.agents.tools.runtime import ToolRuntime
 from src.attachments.coordinator import AttachmentTurnCoordinator
 from src.attachments.index import AttachmentIndex, fts5_available
@@ -79,6 +83,9 @@ def test_attachment_tools_can_be_registered_as_langchain_tools():
         "attachment_table_query",
         "attachment_circuit_search",
         "attachment_visual_analyze",
+        "attachment_edit",
+        "request_attachment_release",
+        "attachment_revision_history",
     }
     for function in tools:
         assert inspect.getdoc(function)
@@ -589,6 +596,29 @@ class JobTests(AttachmentDomainTestBase):
         self.assertEqual(self.conv.get_turn_unscoped(turn.id).status, "failed")
 
 
+def _docx_with_embedded_workbook(*, legacy: bool = False) -> bytes:
+    """A docx whose package embeds an OOXML workbook (and optionally an .xls)."""
+
+    from docx import Document
+
+    document = Document()
+    document.add_paragraph("主机说明")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    source = zipfile.ZipFile(io.BytesIO(buffer.getvalue()))
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for info in source.infolist():
+            archive.writestr(info, source.read(info.filename))
+        archive.writestr("word/embeddings/embedded.xlsx", _minimal_xlsx_bytes())
+        if legacy:
+            archive.writestr(
+                "word/embeddings/legacy.xls",
+                b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64,
+            )
+    return output.getvalue()
+
+
 class ParsingAndRetrievalTests(AttachmentDomainTestBase):
     def _parsed_txt_asset(self, text: str):
         record = self._upload("board.md", text.encode())
@@ -730,6 +760,43 @@ class ParsingAndRetrievalTests(AttachmentDomainTestBase):
         parts = self.store.list_parts(record.asset_id)
         self.assertTrue(any(part.part_type == PART_TYPE_IMAGE for part in parts))
 
+    def test_docx_embedded_workbook_is_indexed_and_searchable(self):
+        record = self._upload("embedded.docx", _docx_with_embedded_workbook())
+        result = AttachmentParseExecutor(store=self.store).process_asset(record.asset_id)
+
+        self.assertTrue(result["ok"], result)
+        parts = self.store.list_parts(record.asset_id)
+        embedded = [part for part in parts if part.locator.get("embedded")]
+        self.assertTrue(embedded, "embedded workbook parts are missing")
+        self.assertTrue(
+            any(part.locator.get("sheet") == "Parts" for part in embedded),
+            [part.locator for part in embedded],
+        )
+        self.assertTrue(any("Reference" in part.text_content for part in embedded))
+        self.assertEqual(result["manifest"]["embedded_workbook_count"], 1)
+        self.assertEqual(result["manifest"]["embedded_sheet_count"], 1)
+
+        found = AttachmentRetrievalService().search(
+            "Reference", asset_ids=[record.asset_id], limit=5
+        )
+        self.assertTrue(found.chunks, "embedded workbook text is not retrievable")
+
+    def test_docx_legacy_embedded_object_is_reported_degraded(self):
+        record = self._upload(
+            "legacy-embedded.docx", _docx_with_embedded_workbook(legacy=True)
+        )
+        result = AttachmentParseExecutor(store=self.store).process_asset(record.asset_id)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["parse_status"], "degraded")
+        self.assertTrue(
+            any("legacy.xls" in reason for reason in result["degraded_reasons"]),
+            result["degraded_reasons"],
+        )
+        # The readable OOXML workbook is still indexed alongside it.
+        parts = self.store.list_parts(record.asset_id)
+        self.assertTrue(any(part.locator.get("embedded") == "embedded.xlsx" for part in parts))
+
     def test_pdf_ocr_disabled_does_not_call_engine_or_fabricate_text(self):
         pdf = _empty_pdf_bytes()
         record = self._upload("scanned.pdf", pdf)
@@ -808,6 +875,30 @@ class ParsingAndRetrievalTests(AttachmentDomainTestBase):
         self.assertFalse(any(part.part_type == PART_TYPE_OCR_TEXT for part in outcome.parts))
         self.assertEqual(outcome.manifest["ocr_failed_pages"], [1])
         self.assertTrue(any("OCR" in reason for reason in outcome.degraded_reasons))
+
+    def test_office_lock_files_are_rejected_with_clear_guidance(self):
+        from src.attachments.models import AttachmentUnsupportedType
+
+        with self.assertRaises(AttachmentUnsupportedType) as ctx:
+            self._upload(
+                "~$600608964_ADAS_HSI.docx",
+                b"\x06\xd5\xc5\xc8\xce\xb7\xe5\x20" + b"\x00" * 154,
+            )
+        self.assertIn("临时锁文件", str(ctx.exception))
+
+    def test_office_signature_errors_explain_the_real_cause(self):
+        from src.attachments.models import AttachmentUnsupportedType
+
+        with self.assertRaises(AttachmentUnsupportedType) as ole_ctx:
+            self._upload(
+                "legacy.docx",
+                b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64,
+            )
+        self.assertIn("OLE2", str(ole_ctx.exception))
+
+        with self.assertRaises(AttachmentUnsupportedType) as broken_ctx:
+            self._upload("broken.docx", b"this is not a zip container")
+        self.assertIn("不是有效的 ZIP", str(broken_ctx.exception))
 
     def test_upload_records_mime_and_rejects_signature_mismatch(self):
         text = self._upload("notes.txt", b"plain text")
@@ -919,6 +1010,82 @@ class ParsingAndRetrievalTests(AttachmentDomainTestBase):
             os.path.abspath(storage.resolve_storage_key(circuit_key)),
             os.path.abspath(storage.asset_circuit_root(self.session.id)),
         )
+
+
+class AttachmentReadRangeTests(AttachmentDomainTestBase):
+    """attachment_read 的越界/预算反馈：模型翻页探测不应得到误导性空结果。"""
+
+    def _runtime(self, record, **overrides):
+        ref = self.service.build_refs([self.store.get_attachment(
+            attachment_id=record.attachment_id,
+            session_id=self.session.id,
+            user_id=self.user_id,
+        )])[0]
+        return ToolRuntime(
+            kb_name="",
+            ctx=None,
+            chat_session_id=str(self.session.id),
+            attachment_refs=[ref],
+            source_scope="attachment_only",
+            attachment_service=self.service,
+            attachment_user_id=self.user_id,
+            attachment_session_id=self.session.id,
+            **overrides,
+        )
+
+    def _seed_parts(self, record, count: int = 5) -> None:
+        parts = [
+            AttachmentPart(
+                part_id=f"part-{index}",
+                asset_id=record.asset_id,
+                ordinal=index,
+                part_type="text",
+                text_content=f"正文片段 {index}",
+            )
+            for index in range(count)
+        ]
+        parts.append(
+            AttachmentPart(
+                part_id="image-tail",
+                asset_id=record.asset_id,
+                ordinal=count,
+                part_type=PART_TYPE_IMAGE,
+                text_content="",
+            )
+        )
+        self.store.replace_parts(record.asset_id, parts)
+
+    def test_read_beyond_text_range_reports_the_valid_range(self):
+        record = self._upload("hsi.txt", b"body")
+        self._seed_parts(record)
+        runtime = self._runtime(record)
+
+        output = make_attachment_read(runtime)(ordinal_from=10)
+
+        self.assertIn("超出附件可读文本范围", output)
+        self.assertIn("最大有效序号 4", output)
+
+    def test_read_returns_text_parts_and_skips_image_parts(self):
+        record = self._upload("hsi.txt", b"body")
+        self._seed_parts(record)
+        runtime = self._runtime(record)
+
+        output = make_attachment_read(runtime)(ordinal_from=0, limit=10)
+
+        self.assertIn("正文片段 0", output)
+        self.assertIn("正文片段 4", output)
+        self.assertNotIn("image-tail", output)
+
+    def test_read_reports_budget_exhaustion_not_missing_content(self):
+        record = self._upload("hsi.txt", b"body")
+        self._seed_parts(record)
+        runtime = self._runtime(record, evidence_budget=1)
+
+        make_attachment_read(runtime)(ordinal_from=0, limit=1)
+        output = make_attachment_read(runtime)(ordinal_from=1, limit=1)
+
+        self.assertIn("证据已达上限", output)
+        self.assertNotIn("没有读取到附件内容", output)
 
 
 class ScopeResolutionTests(AttachmentDomainTestBase):

@@ -20,6 +20,7 @@ import {
   fetchDocumentTaskProjection,
   isDocumentContextExpired,
   requestDocumentArtifactConversion,
+  requestDocumentRelease,
   resumeDocumentTask,
   submitDocumentReviewDecision,
 } from './documentAuthoring';
@@ -193,6 +194,18 @@ describe('buildClarificationAnswerRequest', () => {
 });
 
 describe('DocumentTask projection and revision requests', () => {
+  it('requests release review without using the approval endpoint', async () => {
+    const request = { event_id: 'release-request-1' };
+    vi.mocked(api.post).mockResolvedValue(request);
+
+    await expect(requestDocumentRelease('硬件 KB', 'candidate/a')).resolves.toBe(request);
+
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/document-generation/artifacts/candidate%2Fa/release-request?kb=%E7%A1%AC%E4%BB%B6%20KB',
+      { comment: '' },
+    );
+  });
+
   it('fetches the task aggregate through the shared projection endpoint', async () => {
     const projection = { task_id: 'task-1' };
     vi.mocked(api.get).mockResolvedValue(projection);

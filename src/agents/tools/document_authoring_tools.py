@@ -158,6 +158,13 @@ class TaskStatusArgs(BaseModel):
     task_id: str = Field(min_length=1, max_length=200)
 
 
+class TaskControlArgs(BaseModel):
+    """A control request is always bound to a durable DocumentTask identity."""
+
+    model_config = ConfigDict(extra="forbid")
+    task_id: str = Field(min_length=1, max_length=200)
+
+
 class ResolveIcdScopeArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -171,6 +178,7 @@ class ResolveIcdScopeArgs(BaseModel):
     exception_ids: list[str] = Field(default_factory=list, max_length=50)
     refdes: list[str] = Field(default_factory=list, max_length=50)
     work_order_id: str | None = Field(default=None, max_length=200)
+    continue_generation: bool = True
 
 
 class CreateDocumentRevisionArgs(BaseModel):
@@ -183,6 +191,15 @@ class CreateDocumentRevisionArgs(BaseModel):
     changed_fields: list[str] = Field(default_factory=list)
     changed_sections: list[str] = Field(default_factory=list)
     client_request_id: str = Field(min_length=1, max_length=128)
+
+
+class RequestDocumentReleaseArgs(BaseModel):
+    """A request enters review; it never approves or publishes an artifact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str = Field(min_length=1, max_length=200)
+    comment: str = Field(default="", max_length=2000)
 
 
 def _safe_analysis(analysis: Any) -> dict[str, Any]:
@@ -303,6 +320,32 @@ def _session_next_actions(session: Any) -> list[str]:
 
 
 def _safe_status(status: dict[str, Any]) -> dict[str, Any]:
+    pending_decisions = []
+    for raw in (status.get("pending_decisions") or [])[:32]:
+        if not isinstance(raw, dict):
+            continue
+        group_key = str(raw.get("group_key") or "").strip()
+        if not group_key:
+            continue
+        options = list(dict.fromkeys(
+            str(option).strip()
+            for option in (raw.get("options") or [])[:16]
+            if str(option).strip()
+        ))
+        try:
+            count = max(1, min(int(raw.get("count") or 1), 1_000_000))
+        except (TypeError, ValueError):
+            count = 1
+        pending_decisions.append({
+            "decision_id": str(raw.get("decision_id") or ""),
+            "group_key": group_key,
+            "kind": str(raw.get("kind") or ""),
+            "title": str(raw.get("title") or group_key),
+            "options": options,
+            "default_option": str(raw.get("default_option") or ""),
+            "count": count,
+            "blocking": bool(raw.get("blocking")),
+        })
     harness = status.get("harness_run") or {}
     safe_artifacts = []
     for artifact in (status.get("artifacts") or [])[:8]:
@@ -338,6 +381,17 @@ def _safe_status(status: dict[str, Any]) -> dict[str, Any]:
         "scope_type": status.get("scope_type"),
         "knowledge_base_name": status.get("knowledge_base_name"),
         "target_format": status.get("target_format"),
+        "pending_decisions": pending_decisions,
+        "candidate_state": (
+            status.get("candidate_state")
+            if status.get("candidate_state") in {"none", "available", "blocked"}
+            else None
+        ),
+        "release_state": (
+            status.get("release_state")
+            if status.get("release_state") in {"not_requested", "pending", "approved", "rejected"}
+            else None
+        ),
         "unit_statuses": dict(status.get("unit_statuses") or {}),
         "run_id": harness.get("run_id"),
         "harness_status": harness.get("status"),
@@ -461,6 +515,12 @@ class DocumentAuthoringToolset:
                 card["target_format"] = result.data.get("target_format")
             if result.data.get("artifacts"):
                 card["artifacts"] = result.data.get("artifacts")
+            if result.data.get("pending_decisions"):
+                card["pending_decisions"] = result.data.get("pending_decisions")
+            if result.data.get("candidate_state") is not None:
+                card["candidate_state"] = result.data.get("candidate_state")
+            if result.data.get("release_state") is not None:
+                card["release_state"] = result.data.get("release_state")
         if kind == "output_spec_confirmation":
             # Gate 1 card: only the safe plan-proposal projection crosses the
             # wire (ids/versions/hashes/counts/policies), never sources.
@@ -1797,6 +1857,7 @@ class DocumentAuthoringToolset:
         exception_ids: list[str] | None = None,
         refdes: list[str] | None = None,
         work_order_id: str | None = None,
+        continue_generation: bool = True,
     ) -> DocumentToolResult:
         """Resolve a non-blocking ICD scope gate from the conversation.
 
@@ -1847,6 +1908,12 @@ class DocumentAuthoringToolset:
         if str(getattr(review, "status", "") or "") == "frozen":
             # A previous attempt may have frozen the review and then failed to
             # queue generation; submission is idempotent, so retry it.
+            if not continue_generation:
+                return self._deferred_scope_resolution_result(
+                    operation,
+                    order_id,
+                    action=action,
+                )
             return self._resume_scope_generation(operation, order_id)
         if action == "use_edf_connectors":
             rebuild = getattr(self.pipeline, "rebuild_icd_scope_from_edf", None)
@@ -1972,12 +2039,44 @@ class DocumentAuthoringToolset:
                 work_order_id=order_id,
                 next_actions=["open_document_workbench"],
             )
+        if not continue_generation:
+            return self._deferred_scope_resolution_result(
+                operation,
+                order_id,
+                resolved_count=len(resolutions),
+                action=action,
+            )
         return self._resume_scope_generation(
             operation,
             order_id,
             resolved_count=len(resolutions),
             action=action,
         )
+
+    def _deferred_scope_resolution_result(
+        self,
+        operation: str,
+        order_id: str,
+        *,
+        resolved_count: int = 0,
+        action: str | None = None,
+    ) -> DocumentToolResult:
+        """Return a durable decision receipt without starting a partial run."""
+
+        result = DocumentToolResult(
+            status="succeeded",
+            operation=operation,
+            message="ICD 范围异常已处理，等待其余待办处理完成后再继续生成。",
+            work_order_id=order_id,
+            data={
+                "status": "resolved",
+                "resolved_count": resolved_count,
+                "action": action,
+            },
+            next_actions=["resume_document_task", "get_document_task_status"],
+        )
+        self._emit_card("work_order_status", result)
+        return result
 
     def _resume_scope_generation(
         self,
@@ -2077,14 +2176,186 @@ class DocumentAuthoringToolset:
             return self._rejected(operation, "task_association_mismatch", "document task is bound to another execution lineage", task_id=task_id)
         if projection is None:
             return self._rejected(operation, "task_not_found", "document task was not found", task_id=task_id)
-        return DocumentToolResult(
+        result = DocumentToolResult(
             status="succeeded",
             operation=operation,
             message="document task status loaded",
             task_id=str(task_id).strip(),
+            work_order_id=str(projection.get("work_order_id") or "").strip() or None,
             data=projection,
             next_actions=list(projection.get("next_actions") or []),
         )
+        self._emit_card("work_order_status", result)
+        return result
+
+    def _control_document_task(
+        self,
+        operation: str,
+        task_id: str,
+        *,
+        success_message: str,
+        next_actions: list[str],
+    ) -> DocumentToolResult:
+        """Call one task-bound pipeline control without leaking run identities.
+
+        The action-plan adapter passes only a ``DocumentTask`` reference.  The
+        pipeline then resolves the WorkOrder and HarnessRun under the current
+        ACL, so a model cannot pause or resume a run it learned about from a
+        different conversation.
+        """
+
+        self._authorize("write")
+        normalized_task = str(task_id or "").strip()
+        if not normalized_task:
+            return self._rejected(
+                operation,
+                "task_ref_missing",
+                "a document task reference is required",
+            )
+        controller = getattr(self.pipeline, operation, None)
+        if not callable(controller):
+            return self._unavailable(
+                operation,
+                "document task control is temporarily unavailable",
+                task_id=normalized_task,
+            )
+        try:
+            outcome = controller(self.ctx, normalized_task)
+        except PermissionError:
+            raise
+        except (KeyError, ValueError) as exc:
+            return self._rejected(
+                operation,
+                "task_control_rejected",
+                str(exc) or "document task control was rejected",
+                task_id=normalized_task,
+            )
+        except Exception:
+            return self._unavailable(
+                operation,
+                "document task control is temporarily unavailable",
+                task_id=normalized_task,
+            )
+        if isinstance(outcome, BaseModel):
+            data = outcome.model_dump(mode="json")
+        elif isinstance(outcome, dict):
+            data = dict(outcome)
+        else:
+            return self._unavailable(
+                operation,
+                "document task control returned an invalid response",
+                task_id=normalized_task,
+            )
+        returned_task = str(data.get("task_id") or "").strip()
+        if returned_task and returned_task != normalized_task:
+            return self._rejected(
+                operation,
+                "task_control_task_mismatch",
+                "document task control returned another task identity",
+                task_id=normalized_task,
+            )
+        result = DocumentToolResult(
+            status="succeeded",
+            operation=operation,
+            message=success_message,
+            task_id=normalized_task,
+            work_order_id=str(data.get("work_order_id") or "").strip() or None,
+            run_id=str(data.get("run_id") or "").strip() or None,
+            data=data,
+            next_actions=list(next_actions),
+        )
+        self._emit_card("work_order_status", result)
+        return result
+
+    def pause_document_task(self, task_id: str) -> DocumentToolResult:
+        """Safely pause the current task while retaining its downloadable candidate."""
+
+        return self._control_document_task(
+            "pause_document_task",
+            task_id,
+            success_message="任务已暂停；已有候选文档不会被删除，可继续查看或下载。",
+            next_actions=["resume_document_task", "get_document_task_status"],
+        )
+
+    def cancel_document_task(self, task_id: str) -> DocumentToolResult:
+        """Cancel only the caller-owned task through the governed pipeline."""
+
+        return self._control_document_task(
+            "cancel_document_task",
+            task_id,
+            success_message="任务已取消；已有候选文档保持不变。",
+            next_actions=["get_document_task_status"],
+        )
+
+    def resume_document_task(self, task_id: str) -> DocumentToolResult:
+        """Resume a paused or ready task through its server-owned identity."""
+
+        return self._control_document_task(
+            "resume_document_task",
+            task_id,
+            success_message="任务已重新排队，将继续按冻结的来源和计划执行。",
+            next_actions=["await_generation", "get_document_task_status"],
+        )
+
+    def retry_document_task(self, task_id: str) -> DocumentToolResult:
+        """Retry only a task whose frozen execution service permits retrying."""
+
+        return self._control_document_task(
+            "retry_document_task",
+            task_id,
+            success_message="任务已重新排队重试；仍会使用冻结的来源和计划。",
+            next_actions=["await_generation", "get_document_task_status"],
+        )
+
+    def request_document_release(
+        self,
+        artifact_id: str,
+        comment: str = "",
+    ) -> DocumentToolResult:
+        """Record a release-review request without approving the candidate."""
+
+        operation = "request_document_release"
+        self._authorize("write")
+        normalized_artifact = str(artifact_id or "").strip()
+        if not normalized_artifact:
+            return self._rejected(
+                operation,
+                "candidate_ref_missing",
+                "a candidate artifact reference is required to request release",
+            )
+        requester = getattr(self.pipeline, "request_document_release", None)
+        if not callable(requester):
+            return self._unavailable(
+                operation,
+                "release request service is temporarily unavailable",
+            )
+        try:
+            event = requester(
+                self.ctx,
+                normalized_artifact,
+                comment=str(comment or "").strip(),
+            )
+        except PermissionError:
+            raise
+        except (KeyError, ValueError) as exc:
+            return self._rejected(
+                operation,
+                "release_request_rejected",
+                str(exc) or "release request was rejected",
+            )
+        event_id = str(getattr(event, "event_id", "") or "").strip()
+        result = DocumentToolResult(
+            status="succeeded",
+            operation=operation,
+            message="已申请正式发布审核；候选文档保持不变，审核通过前不会发布。",
+            data={
+                **({"event_id": event_id} if event_id else {}),
+                "release_state": "pending",
+            },
+            next_actions=["review_document", "get_document_task_status"],
+        )
+        self._emit_card("work_order_status", result)
+        return result
 
     def create_document_revision(
         self,
@@ -2213,7 +2484,17 @@ class DocumentAuthoringToolset:
                 wrap("confirm_document_plan", "以当前可见的 spec/plan 哈希显式确认文档计划；确认后由后台 worker 创建工单。", ConfirmPlanArgs, self.confirm_document_plan),
                 wrap("get_document_task_status", "按任务 ID 读取文档任务聚合状态。", TaskStatusArgs, self.get_document_task_status),
                 wrap("resolve_icd_scope_exception", "处理当前工单的 ICD 范围异常待办：用户明确给出包含/排除指示时提交范围处理并继续生成；阻塞型异常（缺少接插件/EDF 映射）会返回需补齐来源或更换目标位号的说明。", ResolveIcdScopeArgs, self.resolve_icd_scope_exception),
+                wrap("request_document_release", "为候选文档申请正式发布审核；此操作只记录申请，不会自动批准或发布。", RequestDocumentReleaseArgs, self.request_document_release),
             ])
+            task_controls = (
+                ("pause_document_task", "安全暂停当前文档任务；已有候选文档仍可查看和下载。", self.pause_document_task),
+                ("cancel_document_task", "取消当前文档任务；不会删除已有候选文档。", self.cancel_document_task),
+                ("resume_document_task", "继续执行当前已暂停或已准备好的文档任务。", self.resume_document_task),
+                ("retry_document_task", "重试当前失败的文档任务，仍使用冻结的来源和计划。", self.retry_document_task),
+            )
+            for name, description, method in task_controls:
+                if callable(getattr(self.pipeline, name, None)):
+                    tools.append(wrap(name, description, TaskControlArgs, method))
         return tools
 
 

@@ -102,6 +102,13 @@ def _authoring_context_candidate(
         has_attachments=has_attachments,
         has_kb=bool(str(kb_name or "").strip()) and kb_name != GENERAL_CHAT_KB_NAME,
     )
+    if plan.action == "revise" and document_flow is not True:
+        # “完善附件第N章并替换” edits the attachment itself through
+        # attachment_edit; mounting a governed document context here would
+        # hijack it into the document-authoring flow (and can fail on
+        # unrelated task references).  Only an explicit document_flow=true
+        # still requests the governed route.
+        return False
     return plan.intent in {"template_generation", "document_authoring"}
 
 

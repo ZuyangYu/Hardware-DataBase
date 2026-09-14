@@ -56,6 +56,8 @@ hardware-database-server = "src.api.app:main"
 hardware-database-worker = "src.workers.main:main"
 hardware-database-export-worker = "src.result_exports.worker:main"
 hardware-database-memory-worker = "src.memory.worker:main"
+hardware-database-maintenance = "src.maintenance.cli:main"
+hardware-database-e2e = "src.evaluation.e2e_runner:main"
 
 [build-system]
 requires = ["setuptools>=77"]

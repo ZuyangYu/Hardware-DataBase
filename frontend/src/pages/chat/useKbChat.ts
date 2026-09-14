@@ -33,6 +33,7 @@ import {
   confirmDocumentPlan,
   createClientRequestId,
   fetchGenerationSession,
+  requestDocumentRelease,
 } from '@/api/documentAuthoring';
 import {
   documentCardFromChatTask,
@@ -47,6 +48,7 @@ import {
   parseDocumentTaskStreamEvent,
   planConfirmationInput,
   documentCardIdentity,
+  documentCardAfterReleaseRequest,
   type DocumentCardData,
 } from './components/documentCardModel';
 import { shouldCancelServerTurn, type ChatStreamDetachReason } from './chatTaskLifecycle';
@@ -142,10 +144,9 @@ export function mergeDocumentCardsFromSseEvent(
  * the user query. Keeping the property absent for null context preserves the
  * legacy request body for servers that predate Task 8.
  *
- * `documentFlow` is only serialized when a context is attached: with context
- * the explicit switch (true forces the document flow, false strips document
- * tools) reaches the server; without context the field stays absent so the
- * server keeps its regex fallback.
+ * New clients use the server-owned document context and user language as the
+ * authority.  The legacy ``document_flow`` switch remains accepted by the
+ * backend during migration, but is intentionally never emitted here.
  */
 export function buildTurnRequest(
   query: string,
@@ -197,9 +198,7 @@ export function buildTurnRequest(
           : {}),
       };
     }
-    if (typeof documentFlow === 'boolean') {
-      request.document_flow = documentFlow;
-    }
+    void documentFlow;
   }
   if (attachments && attachments.attachmentIds.length > 0) {
     request.attachment_ids = [...attachments.attachmentIds];
@@ -336,20 +335,14 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const [documentCards, setDocumentCards] = useState<DocumentCardData[]>([]);
   const [documentCardRefreshingId, setDocumentCardRefreshingId] = useState<string | null>(null);
   const [documentCardAnsweringId, setDocumentCardAnsweringId] = useState<string | null>(null);
+  const [documentCardReleaseRequestingId, setDocumentCardReleaseRequestingId] = useState<string | null>(null);
   const [evidenceByMessageId, setEvidenceByMessageId] = useState<Record<number, EvidenceItem[]>>({});
   const [memorySummary, setMemorySummary] = useState<SessionMemorySummary | null>(null);
   const [sessionConsents, setSessionConsents] = useState<MemoryConsentView[] | null>(null);
   const [forbidden, setForbidden] = useState<string | null>(null);
   const [documentContext, setDocumentContextState] = useState<DocumentContext | null>(null);
-  // 文档生成模式开关:默认开;仅当模板上下文已附加时才有意义。
-  // 每次新附加上下文时重置为默认开,避免上次关闭的选择影响新模板。
-  const [documentFlowEnabled, setDocumentFlowEnabledState] = useState(true);
   const setDocumentContext = useCallback((context: DocumentContext | null) => {
     setDocumentContextState(context);
-    if (context) setDocumentFlowEnabledState(true);
-  }, []);
-  const setDocumentFlowEnabled = useCallback((enabled: boolean) => {
-    setDocumentFlowEnabledState(enabled);
   }, []);
   const abortRef = useRef<AbortController | null>(null);
   const currentTurnRef = useRef<string | null>(null);
@@ -465,8 +458,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           if (restoredContext) {
             // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
             setDocumentContextState(restoredContext);
-            // 恢复的上下文同样遵循"新附加即默认开"的不变式,避免上个模板遗留的关闭选择泄漏。
-            setDocumentFlowEnabledState(true);
           }
           return next;
         });
@@ -820,7 +811,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       }
       // set-or-clear:目标会话最新 turn 有持久化上下文则恢复,没有则清空,避免跨会话残留。
       setDocumentContextState(documentContextEnabled && turn.document_context ? turn.document_context : null);
-      if (turn.document_context) setDocumentFlowEnabledState(true);
       currentTurnRef.current = turn.id;
       controller = new AbortController();
       abortRef.current = controller;
@@ -930,7 +920,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       setMessages([]);
       // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
       setDocumentContextState(null);
-      setDocumentFlowEnabledState(true);
       return session;
     },
     [scopeKbName],
@@ -1039,6 +1028,39 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     }
   }, [documentCardAnsweringId]);
 
+  /** Submit the explicit release-review action from a candidate card. */
+  const requestDocumentCardRelease = useCallback(async (
+    card: DocumentCardData,
+    artifactId: string,
+  ) => {
+    const normalizedArtifact = artifactId.trim();
+    if (!normalizedArtifact || documentCardReleaseRequestingId) return;
+    const activeSessionIdAtStart = activeSessionRef.current;
+    const requestKey = documentCardIdentity(card);
+    setDocumentCardReleaseRequestingId(requestKey);
+    try {
+      await requestDocumentRelease(
+        card.kb_name,
+        normalizedArtifact,
+        '从聊天候选卡申请正式发布审核',
+      );
+      if (activeSessionRef.current !== activeSessionIdAtStart) return;
+      setDocumentCards((prev) => mergeDocumentCards(
+        prev,
+        documentCardAfterReleaseRequest(card),
+      ));
+      // Reconcile the optimistic state with the authoritative projection.  A
+      // successful request is durable, but the server may also add review
+      // metadata or a more precise next-action list in the same response.
+      await refreshDocumentCardStatus(documentCardAfterReleaseRequest(card));
+      notify.success('已申请正式发布审核，候选文档保持可下载');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '申请发布审核失败，请稍后重试');
+    } finally {
+      setDocumentCardReleaseRequestingId(null);
+    }
+  }, [documentCardReleaseRequestingId, refreshDocumentCardStatus]);
+
   const [documentCardConfirmingId, setDocumentCardConfirmingId] = useState<string | null>(null);
   const [documentCardStaleKeys, setDocumentCardStaleKeys] = useState<ReadonlySet<string>>(new Set());
   const planConfirmInFlightRef = useRef(false);
@@ -1108,6 +1130,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       snapshots?: AttachmentSnapshot[];
       /** A same-tick template conversion can provide the fresh context here. */
       documentContextOverride?: DocumentContext | null;
+      /** Retained only for callers compiled during the protocol migration. */
       documentFlowOverride?: boolean;
     } | null,
   ) => {
@@ -1176,11 +1199,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
               ? attachments?.documentContextOverride ?? null
               : documentContext)
             : null,
-          documentContextEnabled
-            ? (Object.prototype.hasOwnProperty.call(attachments ?? {}, 'documentFlowOverride')
-              ? attachments?.documentFlowOverride
-              : documentFlowEnabled)
-            : undefined,
+          undefined,
           attachments ?? null,
         ),
       );
@@ -1340,7 +1359,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         resetStreamingText();
       }
     }
-  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, documentFlowEnabled, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary]);
+  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary]);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
@@ -1371,8 +1390,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     revokeSessionConsent,
     documentContext,
     setDocumentContext,
-    documentFlowEnabled,
-    setDocumentFlowEnabled,
     // 输入
     input,
     setInput,
@@ -1385,8 +1402,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     documentCards,
     documentCardRefreshingId,
     documentCardAnsweringId,
+    documentCardReleaseRequestingId,
     refreshDocumentCardStatus,
     answerDocumentCard,
+    requestDocumentCardRelease,
     documentCardConfirmingId,
     documentCardStaleKeys,
     confirmDocumentPlanCard,

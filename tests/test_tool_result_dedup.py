@@ -103,6 +103,53 @@ class TimedToolCallRepeatTests(unittest.TestCase):
         )
 
 
+class EvidenceBudgetVisibilityTests(unittest.TestCase):
+    """证据预算耗尽必须显式告知模型，而不是伪装成“没有内容”。"""
+
+    def test_exhausted_budget_explains_limit_instead_of_empty_content(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None, evidence_budget=1)
+        first, _ = timed_tool_call(
+            rt, "document_search", "q1", None, lambda: [_evidence("document:1")]
+        )
+        self.assertEqual(len(rt.evidence), 1)
+        self.assertFalse(first.budget_blocked)
+
+        items, adds_nothing = timed_tool_call(
+            rt, "document_search", "q2", None, lambda: [_evidence("document:2")]
+        )
+
+        self.assertEqual(items, [])
+        self.assertTrue(items.budget_blocked)
+        rendered = format_tool_result(rt, adds_nothing, items)
+        self.assertIn("证据已达上限", rendered)
+        self.assertIn("不代表知识库或附件中没有相关内容", rendered)
+        self.assertNotIn("（未找到相关内容）", rendered)
+
+    def test_empty_source_result_is_not_reported_as_budget_limit(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None, evidence_budget=5)
+        items, adds_nothing = timed_tool_call(
+            rt, "document_search", "q1", None, lambda: []
+        )
+
+        self.assertFalse(items.budget_blocked)
+        self.assertEqual(format_tool_result(rt, adds_nothing, items), "（未找到相关内容）")
+
+    def test_budget_flag_is_not_shared_with_other_calls(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None, evidence_budget=1)
+        timed_tool_call(rt, "document_search", "q1", None, lambda: [_evidence("document:1")])
+        blocked, _ = timed_tool_call(
+            rt, "document_search", "q2", None, lambda: [_evidence("document:2")]
+        )
+        self.assertTrue(blocked.budget_blocked)
+
+        items, adds_nothing = timed_tool_call(
+            rt, "document_search", "q3", None, lambda: [_evidence("document:1")]
+        )
+
+        self.assertFalse(items.budget_blocked)
+        self.assertEqual(len(items), 1)
+
+
 class SqlEvidenceIdTests(unittest.TestCase):
     """回归：不同 SQL 的结果不能共享静态 evidence id（否则引用编号错位）。"""
 

@@ -454,8 +454,17 @@ class DocumentGenerationService:
         pre_render_report: DocumentReviewReport,
         post_render_report: DocumentReviewReport,
         release_decision: ReleaseDecision,
+        effective_release_status: str | None = None,
     ) -> Any:
-        """Bind review hashes to one run manifest without mutating old fields."""
+        """Bind review hashes to one run manifest without mutating old fields.
+
+        ``ReleaseDecision`` describes what the machine gates found.  It is not
+        by itself the publication authorization: controlled document types and
+        revisions may be forced through human review even when the decision is
+        ``release``.  Callers that apply that policy pass the effective status
+        explicitly so the manifest cannot claim a release that the artifact
+        state machine did not perform.
+        """
 
         if pre_render_report.stage != "pre_render" or post_render_report.stage != "post_render":
             raise ValueError("run manifest requires one pre-render and one post-render report")
@@ -465,7 +474,11 @@ class DocumentGenerationService:
             raise ValueError("release decision is not bound to the document model")
         if release_decision.pre_render_report_hash != pre_render_report.report_hash or release_decision.post_render_report_hash != post_render_report.report_hash:
             raise ValueError("release decision is not bound to the review reports")
-        release_status = "released" if release_decision.release_allowed else release_decision.status
+        release_status = effective_release_status or (
+            "released" if release_decision.release_allowed else release_decision.status
+        )
+        if release_status not in {"pending", "blocked", "needs_review", "released"}:
+            raise ValueError("invalid effective release status")
         update = {
             "document_model_hash": document_model.model_hash,
             "pre_render_review_hash": pre_render_report.report_hash,
@@ -1203,7 +1216,7 @@ class DocumentGenerationService:
         self,
         ctx: RequestContext,
         template_version_id: str,
-    ) -> dict[str, int | str] | None:
+    ) -> dict[str, int | str | list[str]] | None:
         """Return only safe aggregate sanitization results to application callers."""
         if not ctx.user_id or ctx.user_id == "anonymous":
             raise PermissionError("authenticated user is required to view template sanitization results")
@@ -1222,7 +1235,23 @@ class DocumentGenerationService:
         displayed_counts = counts if not any(counts.values()) else {
             label: count for label, count in counts.items() if count
         }
-        return {**displayed_counts, "安全模板格式": report.sanitized_format}
+        summary: dict[str, int | str | list[str]] = {
+            **displayed_counts,
+            "安全模板格式": report.sanitized_format,
+        }
+        removed_embedded = sorted({
+            part.rsplit("/", 1)[-1]
+            for part in report.removed_parts
+            if any(
+                marker in part.lower()
+                for marker in ("embedding", "ole", "activex")
+            )
+        })
+        if removed_embedded:
+            # Name the removed objects (bounded) so the user knows which
+            # embedded data will not be part of the generated document.
+            summary["已移除内嵌对象"] = removed_embedded[:10]
+        return summary
 
     def _get_template_sanitization_report(self, template_version_id: str) -> TemplateSanitizationReport | None:
         """Read the complete audit record only within the document-authoring service."""
@@ -1617,6 +1646,18 @@ class DocumentGenerationService:
             raise ValueError("artifact revision does not belong to this work order")
         if original.scope_type != "knowledge_base" or not original.knowledge_base_name:
             raise ValueError("revision regeneration currently supports knowledge-base work orders")
+        from src.document_authoring.planning.revision import RevisionNotExecutable
+
+        child_plan_id = str(getattr(revision, "child_plan_id", "") or "").strip()
+        child_plan_version = int(getattr(revision, "child_plan_version", 0) or 0)
+        child_plan_hash = str(getattr(revision, "child_plan_hash", "") or "").strip()
+        if not child_plan_id or child_plan_version < 1 or not child_plan_hash:
+            # Never restart the parent plan while presenting the operation as
+            # a successful revision.  Legacy revisions remain inspectable but
+            # must be re-proposed against an executable plan baseline.
+            raise RevisionNotExecutable(
+                "该修订没有可执行的子计划；已拒绝原样重跑，请转为新建文档或重新提案"
+            )
         idempotency_key = f"revision:{revision.revision_id}"
         existing = self._find_knowledge_base_work_order_by_idempotency(
             original.tenant_id,
@@ -1650,9 +1691,9 @@ class DocumentGenerationService:
             output_spec_id=original.output_spec_id,
             output_spec_version=original.output_spec_version,
             output_spec_hash=original.output_spec_hash,
-            document_plan_id=original.document_plan_id,
-            document_plan_version=original.document_plan_version,
-            document_plan_hash=original.document_plan_hash,
+            document_plan_id=child_plan_id,
+            document_plan_version=child_plan_version,
+            document_plan_hash=child_plan_hash,
         )
         revision_service.store.update_status(revision.revision_id, "generating")
         return order
@@ -2896,10 +2937,28 @@ class DocumentGenerationService:
             if raw_type in {"object", "section", "paragraph"}:
                 task_output["type"] = "text"
             task_payload["output_schema"] = task_output
-            review_evidence = raw_evidence or None
+            # Review each unit against only the evidence that belongs to its
+            # draft.  A revision child may reuse a durable parent draft: its
+            # opaque evidence registry is sufficient for coverage, but raw
+            # evidence from another newly-generated unit must not make the
+            # reused draft look unsupported.
+            unit_draft = draft_by_unit.get(unit.unit_id)
+            if raw_evidence and unit_draft is not None:
+                unit_evidence_ids = {
+                    str(evidence_id).strip()
+                    for evidence_id in (unit_draft.evidence_ids or [])
+                    if str(evidence_id).strip()
+                }
+                review_evidence = {
+                    evidence_id: raw_evidence[evidence_id]
+                    for evidence_id in unit_evidence_ids
+                    if evidence_id in raw_evidence
+                } or None
+            else:
+                review_evidence = raw_evidence or None
             report = unit_reviewer.review(
                 task_payload,
-                draft_by_unit.get(unit.unit_id),
+                unit_draft,
                 coverage,
                 review_evidence,
                 attempt=1,
@@ -3073,6 +3132,15 @@ class DocumentGenerationService:
         result.artifact = artifact
         self._bind_revision_child(order, artifact, report_status=validation.status)
 
+        requires_review = not decision.release_allowed
+        automatic_release_allowed = _automatic_release_allowed(
+            order, validation, requires_review=requires_review,
+        )
+        effective_release_status = (
+            "released"
+            if automatic_release_allowed
+            else decision.status if decision.status in {"blocked", "needs_review"} else "pending"
+        )
         bound_manifest = self.bind_document_review_manifest(
             self.store.get_run_manifest(
                 self.store.get_harness_run(harness_run_id).run_manifest_id
@@ -3081,6 +3149,7 @@ class DocumentGenerationService:
             pre_render_report=pre_render,
             post_render_report=post_render,
             release_decision=decision,
+            effective_release_status=effective_release_status,
         )
         if bound_manifest is not None:
             self.store.replace_run_manifest(bound_manifest)
@@ -3093,17 +3162,12 @@ class DocumentGenerationService:
                 "artifact_hash": post_render.artifact_hash,
                 "release_decision_hash": content_hash(decision),
                 "release_status": (
-                    "released" if decision.release_allowed and src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED
+                    "released" if automatic_release_allowed
                     else decision.status if decision.status in {"blocked", "needs_review"} else "pending"
                 ),
             }))
 
-        requires_review = not decision.release_allowed
-        if (
-            decision.release_allowed
-            and src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED
-            and validation.status == "passed"
-        ):
+        if automatic_release_allowed:
             return self._auto_publish_verified_candidate(
                 order,
                 artifact,
@@ -3651,6 +3715,31 @@ class DocumentGenerationService:
             unit_id="artifact",
             event_type="feedback",
             comment=normalized_comment,
+        )
+
+    def request_document_release(
+        self,
+        ctx: RequestContext,
+        artifact_id: str,
+        *,
+        comment: str = "",
+    ) -> DocumentHumanEvent:
+        """Record an explicit request for review without approving a candidate.
+
+        The event is deliberately distinct from ``approve``/``sign``: it is
+        auditable user intent for a future reviewer and cannot create an
+        ``approved_release`` artifact or satisfy a release gate by itself.
+        """
+
+        candidate = self._artifact_for_context(ctx, artifact_id)
+        if candidate.stage != "review_candidate":
+            raise ValueError("only a review candidate may request release")
+        return self.submit_document_human_event(
+            ctx,
+            artifact_id=candidate.artifact_id,
+            unit_id="artifact",
+            event_type="request_release",
+            comment=str(comment or "").strip(),
         )
 
     def approve_document_artifact(self, ctx: RequestContext, artifact_id: str, *, comment: str = "") -> DocumentArtifact:
@@ -4392,12 +4481,16 @@ class DocumentGenerationService:
         suffix: str,
     ) -> DocumentArtifact:
         revision_id = str(getattr(order, "revision_id", None) or "").strip()
-        if revision_id and not str(getattr(artifact, "parent_artifact_id", None) or "").strip():
+        if revision_id:
             revision = self.revision_service.store.get(revision_id)
             if revision is not None:
-                artifact = artifact.model_copy(update={
-                    "parent_artifact_id": revision.parent_artifact_id,
-                })
+                artifact_revision_id = str(getattr(artifact, "revision_id", None) or "").strip()
+                if artifact_revision_id and artifact_revision_id != revision_id:
+                    raise ValueError("artifact revision id does not match the work order revision")
+                updates = {"revision_id": revision_id}
+                if not str(getattr(artifact, "parent_artifact_id", None) or "").strip():
+                    updates["parent_artifact_id"] = revision.parent_artifact_id
+                artifact = artifact.model_copy(update=updates)
         persisted = self.store.save_artifact(artifact, content, suffix)
         task_id = str(getattr(order, "task_id", None) or "").strip()
         if task_id:

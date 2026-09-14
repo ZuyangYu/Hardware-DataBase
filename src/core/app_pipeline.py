@@ -4729,6 +4729,17 @@ class AppPipeline:
             for artifact in self.document_generation.store.list_artifacts(order.work_order_id)
             if self._document_artifact_is_user_visible(artifact)
         ]
+        artifact_stages = {
+            str(item.get("stage") or "").strip()
+            for item in status["artifacts"]
+        }
+        has_candidate = bool(artifact_stages & {"review_candidate", "draft_preview"})
+        status["candidate_state"] = (
+            "available" if has_candidate
+            else "blocked" if order.status in {"blocked", "failed"} or status.get("error_code")
+            else "none"
+        )
+        status["release_state"] = self._document_task_release_state(status["artifacts"])
         # A pending ICD scope gate is a first-class human gate on the work
         # order; status refreshes must keep explaining it (and must stop
         # showing it once it is frozen).  The projection carries only the
@@ -4746,6 +4757,10 @@ class AppPipeline:
                 "status": "pending",
                 "scope_review": scope_details,
             }
+        status["pending_decisions"] = self._document_pending_decisions_for_review(
+            order,
+            status.get("pending_review"),
+        )
         return status
 
     def _document_artifact_is_user_visible(self, artifact: Any) -> bool:
@@ -4952,6 +4967,14 @@ class AppPipeline:
             scope_details = self._document_icd_scope_pending_details(order.work_order_id)
             if scope_details is not None:
                 pending_review["scope_review"] = scope_details
+        # The underlying review models remain item-granular for audit.  The
+        # chat/workbench projection groups them generically so any domain
+        # (pins, fields, chapters, sources) can avoid flooding the user with
+        # repeated rows.  ICD is only the first adapter here.
+        pending_decisions = self._document_pending_decisions_for_review(
+            order,
+            pending_review,
+        )
         pending_question = (session_projection or {}).get("pending_question")
         clarification_pending = (
             (session_projection or {}).get("status") == "needs_clarification"
@@ -5010,6 +5033,28 @@ class AppPipeline:
             lifecycle_phase = projected_status
         else:
             lifecycle_phase = "draft"
+        artifact_stages = {
+            str(item.get("stage") or "").strip()
+            for item in artifacts
+        }
+        has_candidate = bool(artifact_stages & {"review_candidate", "draft_preview"})
+        release_state = self._document_task_release_state(artifacts)
+        if has_candidate:
+            candidate_state = "available"
+        elif projected_error_code:
+            candidate_state = "blocked"
+        else:
+            candidate_state = "none"
+        if projected_status == "blocked" and has_candidate:
+            # Candidate delivery is independent of formal release.  Avoid
+            # generic "provide value" instructions that hide the usable
+            # artifact behind an unrelated release gate.
+            next_actions = [
+                "download_candidate",
+                "resolve_scope_exception" if pending_decisions else "view_error",
+            ]
+            if release_state == "not_requested":
+                next_actions.append("request_release")
         projection = {
             "task_id": task.task_id,
             "origin": task.origin,
@@ -5046,6 +5091,9 @@ class AppPipeline:
             "coverage": status.get("coverage"),
             "validation": status.get("validation"),
             "artifacts": artifacts,
+            "pending_decisions": pending_decisions,
+            "candidate_state": candidate_state,
+            "release_state": release_state,
             "reviews": reviews,
             "revisions": revisions,
             "pending_review": pending_review,
@@ -5315,6 +5363,147 @@ class AppPipeline:
             raise KeyError("document revision service is unavailable")
         revision = revision_service.complete_revision(ctx, revision_id, **kwargs)
         return revision.model_dump(mode="json")
+
+    def _document_task_work_order_for_control(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+    ) -> tuple[Any, Any]:
+        """Resolve a write-authorized task and its own KB WorkOrder.
+
+        Conversation controls receive a task id, never a raw WorkOrder or
+        HarnessRun id.  Keeping the association and ACL checks here prevents a
+        copied/stale run reference from controlling another task.
+        """
+
+        task = self._document_task_for_context(
+            ctx,
+            task_id,
+            required_permission="write",
+        )
+        work_order_id = str(getattr(task, "work_order_id", None) or "").strip()
+        if not work_order_id:
+            raise ValueError("document task has no work order to control")
+        order = self.document_generation.store.get_work_order(work_order_id)
+        if order is None:
+            raise KeyError("document task work order not found")
+        if getattr(order, "task_id", None) not in {None, task.task_id}:
+            raise ValueError("document task/work-order association mismatch")
+        self.document_generation.require_work_order_capability(
+            ctx, order, "run_deterministic_work_order",
+        )
+        if order.scope_type != "knowledge_base" or not order.knowledge_base_name:
+            raise ValueError("task control currently supports knowledge-base document work orders")
+        if not ctx.has_kb_permission(order.knowledge_base_name, "write"):
+            raise PermissionError("knowledge base write permission is required")
+        return task, order
+
+    def pause_document_task(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+    ) -> dict[str, Any]:
+        """Pause the active run bound to one caller-owned document task.
+
+        The underlying state transition fences any worker that still holds an
+        old lease.  A task without an active run is rejected rather than
+        fabricating a paused state that could not later be resumed safely.
+        """
+
+        task, order = self._document_task_work_order_for_control(ctx, task_id)
+        runs = list(self.document_generation.store.list_harness_runs(order.work_order_id) or [])
+        active_runs = [
+            run
+            for run in runs
+            if str(getattr(run, "work_order_id", "") or "") == order.work_order_id
+            and str(getattr(run, "status", "") or "") in {"queued", "running", "retrying"}
+        ]
+        if not active_runs:
+            raise ValueError("document task has no active Harness run to pause")
+        active_run = active_runs[-1]
+        paused = self.document_generation.pause_harness_run(
+            ctx,
+            active_run.harness_run_id,
+        )
+        return {
+            "task_id": task.task_id,
+            "work_order_id": order.work_order_id,
+            "run_id": str(getattr(paused, "harness_run_id", "") or active_run.harness_run_id),
+            "status": "paused",
+        }
+
+    def cancel_document_task(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+    ) -> dict[str, Any]:
+        """Cancel the active run bound to one caller-owned document task.
+
+        Cancellation stops execution through the fenced Harness transition; it
+        does not delete any candidate Artifact already associated with the
+        task.
+        """
+
+        task, order = self._document_task_work_order_for_control(ctx, task_id)
+        runs = list(self.document_generation.store.list_harness_runs(order.work_order_id) or [])
+        active_runs = [
+            run
+            for run in runs
+            if str(getattr(run, "work_order_id", "") or "") == order.work_order_id
+            and str(getattr(run, "status", "") or "") in {"queued", "running", "retrying", "paused"}
+        ]
+        if not active_runs:
+            raise ValueError("document task has no active Harness run to cancel")
+        active_run = active_runs[-1]
+        cancelled = self.document_generation.cancel_harness_run(
+            ctx,
+            active_run.harness_run_id,
+        )
+        return {
+            "task_id": task.task_id,
+            "work_order_id": order.work_order_id,
+            "run_id": str(getattr(cancelled, "harness_run_id", "") or active_run.harness_run_id),
+            "status": "cancelled",
+        }
+
+    def retry_document_task(
+        self,
+        ctx: RequestContext,
+        task_id: str,
+    ) -> dict[str, Any]:
+        """Queue a retry for the latest retryable run of one document task.
+
+        This is deliberately a resume job, not a new generation request: the
+        worker reuses the selected HarnessRun and its frozen manifest, source
+        snapshot and fencing protocol.
+        """
+
+        task, order = self._document_task_work_order_for_control(ctx, task_id)
+        runs = list(self.document_generation.store.list_harness_runs(order.work_order_id) or [])
+        retryable_runs = [
+            run
+            for run in runs
+            if str(getattr(run, "work_order_id", "") or "") == order.work_order_id
+            and str(getattr(run, "status", "") or "") in {"failed", "paused"}
+        ]
+        if not retryable_runs:
+            raise ValueError("document task has no failed or paused Harness run to retry")
+        retry_run = retryable_runs[-1]
+        job = self._queue_document_authoring_resume(
+            ctx,
+            order,
+            retry_run.harness_run_id,
+            client_request_id=(
+                f"task:{task.task_id}:retry:{retry_run.harness_run_id}"
+            ),
+        )
+        return {
+            "task_id": task.task_id,
+            "work_order_id": order.work_order_id,
+            "run_id": job.job_id,
+            "harness_run_id": retry_run.harness_run_id,
+            "status": "queued",
+        }
 
     def resume_document_task(
         self,
@@ -5718,6 +5907,50 @@ class AppPipeline:
             projection["revision_id"] = revision_id
         return projection
 
+    def _document_task_release_state(self, artifacts: Iterable[Mapping[str, Any]]) -> str:
+        """Project release state from immutable artifacts and explicit intent.
+
+        A review candidate is not itself a release request.  The candidate
+        remains downloadable immediately, while a transition to ``pending``
+        occurs only after a durable ``request_release`` human event.  This
+        keeps the card's direct action honest and prevents an unrequested
+        candidate from looking as though formal review has already started.
+        """
+
+        entries = [dict(item) for item in artifacts]
+        stages = {
+            str(item.get("stage") or "").strip()
+            for item in entries
+        }
+        if "approved_release" in stages:
+            return "approved"
+        candidate_ids = [
+            str(item.get("artifact_id") or "").strip()
+            for item in entries
+            if str(item.get("stage") or "").strip() in {"review_candidate", "draft_preview"}
+            and str(item.get("artifact_id") or "").strip()
+        ]
+        if not candidate_ids:
+            return "not_requested"
+        store = getattr(self.document_generation, "store", None)
+        list_human_events = getattr(store, "list_human_events", None)
+        if not callable(list_human_events):
+            return "not_requested"
+        for artifact_id in candidate_ids:
+            try:
+                events = list_human_events(artifact_id) or []
+            except (KeyError, PermissionError, ValueError):
+                continue
+            for event in events:
+                event_type = (
+                    str(event.get("event_type") or "")
+                    if isinstance(event, Mapping)
+                    else str(getattr(event, "event_type", "") or "")
+                ).strip()
+                if event_type == "request_release":
+                    return "pending"
+        return "not_requested"
+
     def _document_icd_scope_pending_details(
         self,
         work_order_id: str,
@@ -5761,6 +5994,52 @@ class AppPipeline:
         }
 
     @staticmethod
+    def _document_pending_decisions_for_review(
+        order: Any,
+        pending_review: Mapping[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Project a generic grouped decision contract for a human gate.
+
+        The underlying review remains item-granular for audit.  This read-model
+        helper is shared by work-order status and chat-task projections so a
+        refresh cannot lose the grouped scope or invent a different default.
+        """
+        scope_review = (
+            pending_review.get("scope_review")
+            if isinstance(pending_review, Mapping)
+            else None
+        )
+        if not isinstance(scope_review, Mapping):
+            return []
+        from src.agents.orchestration.decisions import (
+            DecisionPolicyMode,
+            decisions_from_grouped_items,
+            resolve_decision_policy,
+        )
+
+        policy = resolve_decision_policy(
+            document_type=str(getattr(order, "document_schema_id", "") or ""),
+            kind="pin_exposure",
+        )
+        default_option = (
+            "include"
+            if policy is DecisionPolicyMode.CONTINUE_WITH_DEFAULTS
+            else "exclude"
+        )
+        return [
+            decision.model_dump(mode="json")
+            for decision in decisions_from_grouped_items(
+                scope_review.get("exceptions") or [],
+                kind="pin_exposure",
+                group_field="refdes",
+                title="位号 {group} 待确认",
+                options=["include", "exclude"],
+                default_option=default_option,
+                summary_field="user_instruction",
+            )
+        ]
+
+    @staticmethod
     def _document_task_next_actions(
         task: Any,
         clarification: dict[str, Any] | None,
@@ -5792,6 +6071,10 @@ class AppPipeline:
 
     def approve_document_artifact(self, ctx: RequestContext, artifact_id: str, *, comment: str = ""):
         return self.document_generation.approve_document_artifact(ctx, artifact_id, comment=comment)
+
+    def request_document_release(self, ctx: RequestContext, artifact_id: str, *, comment: str = ""):
+        """Record a candidate's release-review request without publishing it."""
+        return self.document_generation.request_document_release(ctx, artifact_id, comment=comment)
 
     def download_document_artifact(self, ctx: RequestContext, artifact_id: str) -> bytes:
         return self.document_generation.download_document_artifact(ctx, artifact_id)

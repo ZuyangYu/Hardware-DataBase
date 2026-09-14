@@ -35,6 +35,7 @@ DOCUMENT_TOOL_NAMES = {
     "get_document_generation_status",
     "get_document_task_status",
     "resolve_icd_scope_exception",
+    "request_document_release",
 }
 
 RETRIEVAL_TOOL_NAMES = {
@@ -537,6 +538,20 @@ def test_direct_generation_answer_keeps_plan_confirmation_in_conversation():
     assert "文档工作台" not in answer
 
 
+def test_ambiguous_document_intent_gets_server_owned_format_clarification():
+    from src.agents.runner import _direct_intent_clarification_answer
+    from src.core.intent import classify_intent
+
+    plan = classify_intent("请把附件整理成 PDF 和 Word", has_attachments=True, has_kb=True)
+
+    answer = _direct_intent_clarification_answer(plan)
+
+    assert answer is not None
+    assert "只能选择一种" in answer
+    assert "PDF" in answer and "Word" in answer
+    assert "不会自动选择格式" in answer
+
+
 def test_confirmed_task_answer_keeps_missing_data_in_conversation():
     from src.agents.runner import _confirmed_document_task_answer
 
@@ -744,6 +759,39 @@ def test_document_flow_mounts_structured_attachment_tools(monkeypatch):
     assert {"attachment_table_query", "attachment_circuit_search"} <= names
 
 
+def test_attachment_scope_prompt_advertises_structured_edit(monkeypatch):
+    captured = _install_fake_agent(monkeypatch)
+    monkeypatch.setattr("src.attachments.service.AttachmentService", lambda: Mock())
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    ref = AttachmentRef(
+        attachment_id="att-1",
+        asset_id="asset-1",
+        session_id=42,
+        filename="hsi.docx",
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        extension=".docx",
+        size_bytes=100,
+        sha256="hash",
+        parse_status="ready",
+    )
+
+    list(
+        runner.stream(
+            query="完善附件文档的第6章",
+            kb_name="kb_hw",
+            history=[],
+            thread_id="42",
+            attachments=[ref],
+            source_scope="attachment_only",
+        )
+    )
+
+    prompt = str(captured["system_prompt"])
+    assert "attachment_edit" in prompt
+    assert "replace_section" in prompt
+    assert "其余章节保持不变" in prompt
+
+
 def test_explicit_true_without_document_tools_emits_unavailable_event(monkeypatch):
     captured = _install_fake_agent(monkeypatch)
     runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
@@ -925,6 +973,28 @@ def test_template_free_v2_context_mounts_scope_resolution_when_task_exists(monke
 
     names = {_tool_name(tool) for tool in captured["tools"]}
     assert "resolve_icd_scope_exception" in names
+
+
+def test_template_free_v2_revision_mounts_revision_tool_for_existing_task(monkeypatch):
+    captured = _stream_once(
+        monkeypatch,
+        query="把上一版报告第三章改成表格，其他章节保持不变",
+        context=_template_free_task_context(),
+    )
+
+    names = {_tool_name(tool) for tool in captured["tools"]}
+    assert "create_document_revision" in names
+
+
+def test_template_free_v2_existing_task_mounts_release_request_tool(monkeypatch):
+    captured = _stream_once(
+        monkeypatch,
+        query="请为当前候选申请正式发布",
+        context=_template_free_task_context(),
+    )
+
+    names = {_tool_name(tool) for tool in captured["tools"]}
+    assert "request_document_release" in names
 
 
 def test_template_free_v2_context_without_task_omits_scope_resolution(monkeypatch):

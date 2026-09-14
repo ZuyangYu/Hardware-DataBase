@@ -376,6 +376,47 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         self.assertEqual(projected["planning_state"]["output_spec_hash"], "sha256:spec")
         self.assertEqual(projected["planning_state"]["plan_hash"], "sha256:plan")
 
+    def test_chat_task_projection_preserves_candidate_release_and_grouped_decisions(self):
+        projected = _safe_chat_task_projection({
+            "task_id": "task-candidate",
+            "status": "blocked",
+            "lifecycle_phase": "blocked",
+            "knowledge_base_name": "shared",
+            "candidate_state": "available",
+            "release_state": "not_requested",
+            "pending_decisions": [{
+                "decision_id": "decision:pin_exposure:X1900",
+                "group_key": "X1900",
+                "kind": "pin_exposure",
+                "title": "位号 X1900 待确认",
+                "options": ["include", "exclude"],
+                "default_option": "include",
+                "count": 15,
+                "blocking": False,
+                "items": [{"pin_name": "1", "secret": "must not cross the chat boundary"}],
+            }],
+            "next_actions": ["download_candidate", "request_release"],
+            "artifacts": [{
+                "artifact_id": "candidate-1",
+                "stage": "review_candidate",
+                "output_format": "docx",
+            }],
+        })
+
+        self.assertEqual(projected["candidate_state"], "available")
+        self.assertEqual(projected["release_state"], "not_requested")
+        self.assertEqual(projected["pending_decisions"], [{
+            "decision_id": "decision:pin_exposure:X1900",
+            "group_key": "X1900",
+            "kind": "pin_exposure",
+            "title": "位号 X1900 待确认",
+            "options": ["include", "exclude"],
+            "default_option": "include",
+            "count": 15,
+            "blocking": False,
+        }])
+        self.assertNotIn("secret", json.dumps(projected))
+
     def test_current_chat_task_endpoint_returns_only_the_durable_pointer_target(self):
         current = SimpleNamespace(
             task_id="task-current",
@@ -745,3 +786,32 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(captured["generation_session_id"], "generation-session-1")
+
+
+def test_authoring_context_candidate_skips_attachment_revision_commands():
+    """“完善附件第N章并替换” must stay an attachment edit, not a document task."""
+
+    from src.api.routes.query import _authoring_context_candidate
+
+    assert _authoring_context_candidate(
+        query="参考模板生成 ICD 文档",
+        document_flow=None,
+        kb_name="ADAS",
+        has_attachments=True,
+    ) is True
+    assert _authoring_context_candidate(
+        query=(
+            "帮我检索知识库，完善附件中文档的第6章的内容，"
+            "然后将完善后的第6章内容，替换掉原来第6章，最终输出修改后的docx文档"
+        ),
+        document_flow=None,
+        kb_name="ADAS",
+        has_attachments=True,
+    ) is False
+    # An explicit governed-flow request still mounts the authoring context.
+    assert _authoring_context_candidate(
+        query="把文档第3章改成表格",
+        document_flow=True,
+        kb_name="ADAS",
+        has_attachments=True,
+    ) is True

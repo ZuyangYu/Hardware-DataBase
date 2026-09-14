@@ -55,6 +55,21 @@ export type DocumentCardGateReview = {
   scopeExceptions: DocumentCardGateException[];
 };
 
+/** A server-grouped, domain-neutral set of decisions still needing review. */
+export type DocumentPendingDecision = {
+  decision_id: string;
+  group_key: string;
+  kind: string;
+  title: string;
+  options: string[];
+  default_option: string;
+  count: number;
+  blocking: boolean;
+};
+
+export type DocumentCandidateState = 'none' | 'available' | 'blocked';
+export type DocumentReleaseState = 'not_requested' | 'pending' | 'approved' | 'rejected';
+
 export type DocumentCardData = {
   kind: string;
   status: string;
@@ -71,6 +86,9 @@ export type DocumentCardData = {
   artifacts?: DocumentCardArtifact[];
   proposal?: DocumentPlanProposalSummary;
   gateReview?: DocumentCardGateReview;
+  pendingDecisions?: DocumentPendingDecision[];
+  candidateState?: DocumentCandidateState;
+  releaseState?: DocumentReleaseState;
   errorCode?: string;
   errorMessage?: string;
   retryable?: boolean;
@@ -149,6 +167,7 @@ const CARD_TITLES: Record<string, string> = {
   generation_session: '需求会话',
   output_spec_confirmation: '计划确认',
   requirement_clarification: '需求澄清',
+  attachment_revision: '附件修订候选',
 };
 
 const CARD_STATUS_LABELS: Record<string, string> = {
@@ -310,6 +329,10 @@ export function parseDocumentCardEvent(data: string): DocumentCardData | null {
       ? card.harness_run as { current_node?: unknown; error?: unknown }
       : null;
     const progress = parseCardProgress(card.progress) ?? progressFromHarness(harnessRun);
+    const pendingDecisions = parsePendingDecisions(card.pending_decisions);
+    const candidateState = parseCandidateState(card.candidate_state);
+    const releaseState = parseReleaseState(card.release_state);
+    const gateReview = parseGateReview(card.pending_review);
     const status = normalizeDocumentCardStatus({
       status: card.status,
       phase: card.phase,
@@ -339,6 +362,10 @@ export function parseDocumentCardEvent(data: string): DocumentCardData | null {
       ...(errorCode ? { errorCode } : {}),
       ...(errorMessage ? { errorMessage } : {}),
       ...(progress ? { progress } : {}),
+      ...(pendingDecisions ? { pendingDecisions } : {}),
+      ...(candidateState ? { candidateState } : {}),
+      ...(releaseState ? { releaseState } : {}),
+      ...(gateReview ? { gateReview } : {}),
       ...(kind === 'output_spec_confirmation' ? { proposal: parsePlanProposal(card.proposal) } : {}),
     };
   } catch {
@@ -462,6 +489,44 @@ export function parseGateReview(value: unknown): DocumentCardGateReview | undefi
   };
 }
 
+/** Fail closed on malformed decision groups; detailed item data stays server-side. */
+export function parsePendingDecisions(value: unknown): DocumentPendingDecision[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const parsed = value
+    .filter((entry): entry is Record<string, unknown> => (
+      Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry)
+    ))
+    .filter((entry): entry is Record<string, unknown> & { group_key: string } => (
+      typeof entry.group_key === 'string' && entry.group_key.trim() !== ''
+    ))
+    .slice(0, 32)
+    .map((entry) => ({
+      decision_id: typeof entry.decision_id === 'string' ? entry.decision_id : '',
+      group_key: entry.group_key.trim(),
+      kind: typeof entry.kind === 'string' ? entry.kind : '',
+      title: typeof entry.title === 'string' && entry.title.trim()
+        ? entry.title
+        : entry.group_key.trim(),
+      options: Array.isArray(entry.options)
+        ? entry.options.filter((option): option is string => typeof option === 'string')
+        : [],
+      default_option: typeof entry.default_option === 'string' ? entry.default_option : '',
+      count: typeof entry.count === 'number' && entry.count > 0 ? Math.round(entry.count) : 1,
+      blocking: entry.blocking === true,
+    }));
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+function parseCandidateState(value: unknown): DocumentCandidateState | undefined {
+  return value === 'none' || value === 'available' || value === 'blocked' ? value : undefined;
+}
+
+function parseReleaseState(value: unknown): DocumentReleaseState | undefined {
+  return value === 'not_requested' || value === 'pending' || value === 'approved' || value === 'rejected'
+    ? value
+    : undefined;
+}
+
 export function documentCardFromChatTask(task: DocumentChatTaskView): DocumentCardData {
   const status = task.status;
   const rawPhase = String(status.phase || status.status || task.job_status || '');
@@ -530,6 +595,13 @@ export function documentCardFromChatTask(task: DocumentChatTaskView): DocumentCa
   if (typeof status.retryable === 'boolean') card.retryable = status.retryable;
   const gateReview = parseGateReview(status.pending_review);
   if (gateReview) card.gateReview = gateReview;
+  const statusProjection = status as Record<string, unknown>;
+  const pendingDecisions = parsePendingDecisions(statusProjection.pending_decisions);
+  if (pendingDecisions) card.pendingDecisions = pendingDecisions;
+  const candidateState = parseCandidateState(statusProjection.candidate_state);
+  if (candidateState) card.candidateState = candidateState;
+  const releaseState = parseReleaseState(statusProjection.release_state);
+  if (releaseState) card.releaseState = releaseState;
   const progress = parseCardProgress(status.progress) ?? progressFromHarness(status.harness_run);
   if (progress) card.progress = progress;
   if (clarificationQuestion) {
@@ -578,6 +650,25 @@ export function documentCardFromWorkOrderStatus(
     // The authoritative status no longer reports a pending gate: clear the
     // stale block instead of keeping it until the next stream event.
     delete next.gateReview;
+  }
+  const statusProjection = status as Record<string, unknown>;
+  const pendingDecisions = parsePendingDecisions(statusProjection.pending_decisions);
+  if (pendingDecisions) {
+    next.pendingDecisions = pendingDecisions;
+  } else {
+    delete next.pendingDecisions;
+  }
+  const candidateState = parseCandidateState(statusProjection.candidate_state);
+  if (candidateState) {
+    next.candidateState = candidateState;
+  } else {
+    delete next.candidateState;
+  }
+  const releaseState = parseReleaseState(statusProjection.release_state);
+  if (releaseState) {
+    next.releaseState = releaseState;
+  } else {
+    delete next.releaseState;
   }
   const progress = parseCardProgress(status.progress) ?? progressFromHarness(status.harness_run);
   if (progress) next.progress = progress;
@@ -745,6 +836,96 @@ export function documentCardStatusTone(status: string): DocumentStatusTone {
   return CARD_STATUS_TONES[status] ?? describeWorkOrderStatus(status).tone;
 }
 
+/**
+ * Collapse wire-level task state into the outcome a user can act on.  The
+ * candidate and release projections are authoritative when supplied, while
+ * artifact stages retain compatibility with older task projections.
+ */
+export type DocumentLifecycleState =
+  | 'needs_input'
+  | 'awaiting_confirmation'
+  | 'queued'
+  | 'running'
+  | 'pausing'
+  | 'paused'
+  | 'needs_review'
+  | 'candidate_ready'
+  | 'candidate_blocked'
+  | 'released'
+  | 'completed'
+  | 'blocked'
+  | 'failed'
+  | 'cancelled';
+
+const LIFECYCLE_LABELS: Record<DocumentLifecycleState, string> = {
+  needs_input: '等待补充信息',
+  awaiting_confirmation: '等待确认计划',
+  queued: '排队中',
+  running: '执行中',
+  pausing: '暂停处理中',
+  paused: '已暂停',
+  needs_review: '候选稿待审核',
+  candidate_ready: '候选已生成',
+  candidate_blocked: '候选已生成（发布受阻）',
+  released: '正式已发布',
+  completed: '已完成',
+  blocked: '生成被阻止',
+  failed: '已失败',
+  cancelled: '已取消',
+};
+
+const LIFECYCLE_TONES: Record<DocumentLifecycleState, DocumentStatusTone> = {
+  needs_input: 'warning',
+  awaiting_confirmation: 'warning',
+  queued: 'info',
+  running: 'info',
+  pausing: 'warning',
+  paused: 'warning',
+  needs_review: 'warning',
+  candidate_ready: 'info',
+  candidate_blocked: 'warning',
+  released: 'success',
+  completed: 'success',
+  blocked: 'danger',
+  failed: 'danger',
+  cancelled: 'neutral',
+};
+
+export function documentLifecycleState(card: DocumentCardData): DocumentLifecycleState {
+  const status = (card.status || '').trim().toLowerCase();
+  const stages = new Set(
+    (card.artifacts ?? []).map((artifact) => (artifact.stage || '').trim().toLowerCase()),
+  );
+  const hasCandidate = card.candidateState === 'available'
+    || stages.has('review_candidate')
+    || stages.has('draft_preview');
+  const isReleased = card.releaseState === 'approved' || stages.has('approved_release');
+
+  if (status === 'cancelled' || status === 'canceled') return 'cancelled';
+  if (status === 'failed') return 'failed';
+  if (status === 'blocked') return hasCandidate ? 'candidate_blocked' : 'blocked';
+  if (status === 'needs_input' || status === 'needs_clarification') return 'needs_input';
+  if (status === 'awaiting_confirmation' || status === 'awaiting_plan_confirmation') {
+    return 'awaiting_confirmation';
+  }
+  if (status === 'pausing') return 'pausing';
+  if (status === 'paused') return 'paused';
+  if (status === 'queued' || status === 'pending') return 'queued';
+  if (isReleased) return 'released';
+  if (status === 'needs_review') return 'needs_review';
+  if (hasCandidate) return 'candidate_ready';
+  if (status === 'completed' || status === 'succeeded') return 'completed';
+  return 'running';
+}
+
+export function documentCardLifecycleLabel(card: DocumentCardData): string {
+  return LIFECYCLE_LABELS[documentLifecycleState(card)];
+}
+
+export function documentCardLifecycleTone(card: DocumentCardData): DocumentStatusTone {
+  return LIFECYCLE_TONES[documentLifecycleState(card)];
+}
+
 export function buildWorkbenchDeepLink(
   kbName: string,
   workOrderId = '',
@@ -828,6 +1009,36 @@ export async function downloadDocumentArtifact(
   );
 }
 
+/** The release service accepts only immutable review candidates, never drafts. */
+export function documentCardReviewCandidateArtifact(
+  card: DocumentCardData,
+): DocumentCardArtifact | undefined {
+  return (card.artifacts ?? []).find(
+    (artifact) => artifact.stage.trim().toLowerCase() === 'review_candidate',
+  );
+}
+
+/** A card button is an explicit request; hide it after the request is durable. */
+export function canRequestDocumentRelease(card: DocumentCardData): boolean {
+  if (!card.next_actions.includes('request_release')) return false;
+  if (card.releaseState === 'pending' || card.releaseState === 'approved') return false;
+  return Boolean(documentCardReviewCandidateArtifact(card));
+}
+
+/** Optimistic card projection after the request is durably accepted. */
+export function documentCardAfterReleaseRequest(card: DocumentCardData): DocumentCardData {
+  return {
+    ...card,
+    releaseState: 'pending',
+    next_actions: card.next_actions.filter((action) => action !== 'request_release'),
+  };
+}
+
+const DOCUMENT_CARD_DIRECT_ACTIONS: ReadonlySet<string> = new Set([
+  'download_candidate',
+  'request_release',
+]);
+
 export function documentCardWorkbenchActions(
   card: DocumentCardData,
 ): Array<{ action: string; label: string; href: string }> {
@@ -835,7 +1046,9 @@ export function documentCardWorkbenchActions(
   const sessionId = card.generation_session_id?.trim() ?? '';
   const taskId = card.task_id?.trim() ?? '';
   if (!workOrderId && !sessionId && !taskId) return [];
-  const gates = card.next_actions.filter((action) => !DOCUMENT_CARD_REFRESH_ACTIONS.has(action));
+  const gates = card.next_actions.filter(
+    (action) => !DOCUMENT_CARD_REFRESH_ACTIONS.has(action) && !DOCUMENT_CARD_DIRECT_ACTIONS.has(action),
+  );
   // A session/task that only asks the client to poll has no workbench action;
   // keep the legacy card compact until a human action is available.
   if (!workOrderId && gates.length === 0) return [];

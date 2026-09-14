@@ -318,6 +318,21 @@ class ConversationService:
             ).fetchone()
         return row_to_session(row) if row else None
 
+    def get_session_unscoped(self, session_id: int) -> ChatSession | None:
+        """Look up a session without an owner filter.
+
+        Reserved for governance paths (release review, audit) that must first
+        resolve the session's knowledge base and then enforce KB permission
+        themselves; ordinary content reads must keep using ``get_session``.
+        """
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        return row_to_session(row) if row else None
+
     def get_or_create_session(self, user_id: int, kb_name: str, session_id: int | None = None) -> ChatSession:
         if session_id is not None:
             session = self.get_session(user_id, session_id)

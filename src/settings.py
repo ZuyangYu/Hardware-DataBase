@@ -71,6 +71,17 @@ SPREADSHEET_SKIP_BOILERPLATE_SHEETS = os.getenv("SPREADSHEET_SKIP_BOILERPLATE_SH
 
 # Agent 单题证据堆上限:超出后按问题词法相关性准入新证据(已入堆不淘汰)。
 AGENT_EVIDENCE_BUDGET = int(os.getenv("AGENT_EVIDENCE_BUDGET", "30") or 30)
+# 对话附件(长文档分片)精读需要比普通问答更多的证据槽位; 附件在场时取两者较大值。
+AGENT_ATTACHMENT_EVIDENCE_BUDGET = int(
+    os.getenv("AGENT_ATTACHMENT_EVIDENCE_BUDGET", "80") or 80
+)
+
+# 站内通知的可选外发 webhook（企业微信/钉钉/邮件网关等）。留空则仅站内通知。
+NOTIFY_WEBHOOK_URL = os.getenv("NOTIFY_WEBHOOK_URL", "").strip()
+NOTIFY_WEBHOOK_TOKEN = os.getenv("NOTIFY_WEBHOOK_TOKEN", "").strip()
+NOTIFY_WEBHOOK_TIMEOUT_SECONDS = float(
+    os.getenv("NOTIFY_WEBHOOK_TIMEOUT_SECONDS", "2") or 2
+)
 
 AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
 # LangGraph checkpointer：agent 会话状态（thread 级完整消息历史）的持久化库。
@@ -140,6 +151,18 @@ DOCUMENT_TASK_ASSOCIATION_REQUIRED = _env_bool("DOCUMENT_TASK_ASSOCIATION_REQUIR
 # enable it for controlled pilots without changing deployment-wide behavior.
 DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED = _env_bool(
     "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED", False
+)
+# Conversation plans are proposed by a model but accepted and executed only at
+# the server boundary.  ``shadow`` records a plan without changing behaviour;
+# ``enabled`` replaces legacy document-flow routing for that turn.  The tool
+# flag may also be enabled in shadow to inspect the resulting capability view.
+CONVERSATION_ACTION_PLAN_MODE = os.getenv(
+    "CONVERSATION_ACTION_PLAN_MODE", "off"
+).strip().lower()
+if CONVERSATION_ACTION_PLAN_MODE not in {"off", "shadow", "enabled"}:
+    CONVERSATION_ACTION_PLAN_MODE = "off"
+CONVERSATION_UNIFIED_TOOLS_ENABLED = _env_bool(
+    "CONVERSATION_UNIFIED_TOOLS_ENABLED", False
 )
 # Phase 0 planning is observational only.  Keep the shadow compiler and the
 # later execution path independently gated so a rollout can be measured and
@@ -412,6 +435,8 @@ DEFAULT_VALUES = {
     "DOCUMENT_TASK_STREAM_ENABLED": "true",
     "DOCUMENT_TASK_ASSOCIATION_REQUIRED": "false",
     "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED": "false",
+    "CONVERSATION_ACTION_PLAN_MODE": "off",
+    "CONVERSATION_UNIFIED_TOOLS_ENABLED": "false",
     "DOCUMENT_PLANNING_SHADOW_ENABLED": "false",
     "DOCUMENT_PLANNING_V2_ENABLED": "false",
     "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED": "false",
@@ -575,6 +600,7 @@ def reload_settings():
     global DOCUMENT_TASK_WRITE_ENABLED, DOCUMENT_TASK_READ_ENABLED, DOCUMENT_TASK_STREAM_ENABLED
     global DOCUMENT_TASK_ASSOCIATION_REQUIRED
     global DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED
+    global CONVERSATION_ACTION_PLAN_MODE, CONVERSATION_UNIFIED_TOOLS_ENABLED
     global DOCUMENT_PLANNING_SHADOW_ENABLED, DOCUMENT_PLANNING_V2_ENABLED
     global DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED
     global DOCUMENT_PLAN_DAG_EXECUTION_ENABLED
@@ -693,6 +719,14 @@ def reload_settings():
     DOCUMENT_TASK_ASSOCIATION_REQUIRED = _env_bool("DOCUMENT_TASK_ASSOCIATION_REQUIRED", False)
     DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED = _env_bool(
         "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED", False
+    )
+    CONVERSATION_ACTION_PLAN_MODE = os.getenv(
+        "CONVERSATION_ACTION_PLAN_MODE", "off"
+    ).strip().lower()
+    if CONVERSATION_ACTION_PLAN_MODE not in {"off", "shadow", "enabled"}:
+        CONVERSATION_ACTION_PLAN_MODE = "off"
+    CONVERSATION_UNIFIED_TOOLS_ENABLED = _env_bool(
+        "CONVERSATION_UNIFIED_TOOLS_ENABLED", False
     )
     DOCUMENT_PLANNING_SHADOW_ENABLED = _env_bool("DOCUMENT_PLANNING_SHADOW_ENABLED", False)
     DOCUMENT_PLANNING_V2_ENABLED = _env_bool("DOCUMENT_PLANNING_V2_ENABLED", False)

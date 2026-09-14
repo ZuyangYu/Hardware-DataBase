@@ -24,9 +24,11 @@ from typing import Any
 import src.settings
 from src.attachments.models import (
     AttachmentAsset,
+    AttachmentEditProposal,
     AttachmentJob,
     AttachmentPart,
     AttachmentRecord,
+    AttachmentRevision,
     PARSER_VERSION,
 )
 
@@ -106,6 +108,94 @@ class AttachmentStore:
                     """
                     CREATE INDEX IF NOT EXISTS idx_chat_attachments_session_status
                     ON chat_attachments(session_id, status, created_at)
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS chat_attachment_revisions (
+                        revision_id TEXT PRIMARY KEY,
+                        parent_attachment_id TEXT NOT NULL,
+                        child_attachment_id TEXT NOT NULL UNIQUE,
+                        session_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
+                        operation TEXT NOT NULL,
+                        before_text TEXT NOT NULL,
+                        after_text TEXT NOT NULL,
+                        parent_content_hash TEXT NOT NULL,
+                        child_content_hash TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'review_candidate',
+                        release_state TEXT NOT NULL DEFAULT 'not_requested',
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        release_requested_by INTEGER,
+                        release_requested_at TEXT,
+                        release_comment TEXT NOT NULL DEFAULT '',
+                        reviewed_by INTEGER,
+                        reviewed_at TEXT,
+                        review_comment TEXT NOT NULL DEFAULT '',
+                        released_attachment_id TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(parent_attachment_id) REFERENCES chat_attachments(attachment_id),
+                        FOREIGN KEY(child_attachment_id) REFERENCES chat_attachments(attachment_id)
+                    )
+                    """
+                )
+                # Forward migration for databases created before structured
+                # revision details and release governance existed.
+                revision_columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(chat_attachment_revisions)"
+                    ).fetchall()
+                }
+                for column, ddl in (
+                    ("details_json", "TEXT NOT NULL DEFAULT '{}'"),
+                    ("release_requested_by", "INTEGER"),
+                    ("release_requested_at", "TEXT"),
+                    ("release_comment", "TEXT NOT NULL DEFAULT ''"),
+                    ("reviewed_by", "INTEGER"),
+                    ("reviewed_at", "TEXT"),
+                    ("review_comment", "TEXT NOT NULL DEFAULT ''"),
+                    ("released_attachment_id", "TEXT"),
+                ):
+                    if column not in revision_columns:
+                        conn.execute(
+                            f"ALTER TABLE chat_attachment_revisions "
+                            f"ADD COLUMN {column} {ddl}"
+                        )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_chat_attachment_revisions_parent
+                    ON chat_attachment_revisions(parent_attachment_id, created_at)
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS chat_attachment_edit_proposals (
+                        proposal_id TEXT PRIMARY KEY,
+                        session_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
+                        parent_attachment_id TEXT NOT NULL,
+                        operation TEXT NOT NULL,
+                        heading_path_json TEXT NOT NULL DEFAULT '[]',
+                        after_text TEXT NOT NULL,
+                        before_text TEXT NOT NULL DEFAULT '',
+                        evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        note TEXT NOT NULL DEFAULT '',
+                        confirmed_revision_id TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_chat_attachment_edit_proposals_pending
+                    ON chat_attachment_edit_proposals(session_id, user_id, status, created_at)
                     """
                 )
                 conn.execute(
@@ -415,6 +505,431 @@ class AttachmentStore:
             ).fetchone()
         return self._row_to_attachment(row) if row else None
 
+    # -- attachment revisions ---------------------------------------------
+
+    def get_attachment_revision(
+        self,
+        revision_id: str,
+        *,
+        session_id: int | None = None,
+        user_id: int | None = None,
+    ) -> AttachmentRevision | None:
+        clauses = ["revision_id = ?"]
+        params: list[Any] = [str(revision_id or "").strip()]
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(int(session_id))
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(int(user_id))
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f"SELECT * FROM chat_attachment_revisions WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
+        return self._row_to_revision(row) if row else None
+
+    def get_attachment_revision_by_idempotency(
+        self,
+        idempotency_key: str,
+        *,
+        session_id: int,
+        user_id: int,
+    ) -> AttachmentRevision | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM chat_attachment_revisions
+                WHERE idempotency_key = ? AND session_id = ? AND user_id = ?
+                """,
+                (str(idempotency_key or "").strip(), int(session_id), int(user_id)),
+            ).fetchone()
+        return self._row_to_revision(row) if row else None
+
+    def create_attachment_revision(
+        self,
+        *,
+        revision_id: str,
+        parent_attachment_id: str,
+        child_attachment_id: str,
+        session_id: int,
+        user_id: int,
+        tenant_id: str,
+        operation: str,
+        before: str,
+        after: str,
+        parent_content_hash: str,
+        child_content_hash: str,
+        idempotency_key: str,
+        details: dict[str, Any] | None = None,
+    ) -> tuple[AttachmentRevision, bool]:
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT * FROM chat_attachment_revisions WHERE idempotency_key = ?",
+                    (str(idempotency_key or "").strip(),),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute("COMMIT")
+                    return self._row_to_revision(existing), False
+                conn.execute(
+                    """
+                    INSERT INTO chat_attachment_revisions (
+                        revision_id, parent_attachment_id, child_attachment_id,
+                        session_id, user_id, tenant_id, operation, before_text,
+                        after_text, parent_content_hash, child_content_hash,
+                        status, release_state, idempotency_key, details_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'review_candidate',
+                              'not_requested', ?, ?, ?, ?)
+                    """,
+                    (
+                        str(revision_id), str(parent_attachment_id),
+                        str(child_attachment_id), int(session_id), int(user_id),
+                        str(tenant_id or "default"), str(operation), str(before),
+                        str(after), str(parent_content_hash), str(child_content_hash),
+                        str(idempotency_key),
+                        json.dumps(details or {}, ensure_ascii=False, default=str),
+                        now, now,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM chat_attachment_revisions WHERE revision_id = ?",
+                    (str(revision_id),),
+                ).fetchone()
+                conn.execute("COMMIT")
+                return self._row_to_revision(row), True
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def get_attachment_revision_by_child(
+        self,
+        child_attachment_id: str,
+        *,
+        session_id: int,
+        user_id: int,
+    ) -> AttachmentRevision | None:
+        """Find the revision whose immutable child is this attachment."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM chat_attachment_revisions
+                WHERE child_attachment_id = ? AND session_id = ? AND user_id = ?
+                """,
+                (str(child_attachment_id or "").strip(), int(session_id), int(user_id)),
+            ).fetchone()
+        return self._row_to_revision(row) if row else None
+
+    def request_attachment_revision_release(
+        self,
+        *,
+        revision_id: str,
+        session_id: int,
+        user_id: int,
+        comment: str = "",
+    ) -> AttachmentRevision | None:
+        """Record release-review intent; never releases by itself.
+
+        Only ``not_requested``/``rejected`` rows may transition to
+        ``pending``.  Returns ``None`` when the guard no longer holds so the
+        service can report a concurrent review instead of overwriting it.
+        """
+
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE chat_attachment_revisions
+                    SET release_state = 'pending',
+                        release_requested_by = ?,
+                        release_requested_at = ?,
+                        release_comment = ?,
+                        updated_at = ?
+                    WHERE revision_id = ? AND session_id = ? AND user_id = ?
+                      AND status = 'review_candidate'
+                      AND release_state IN ('not_requested', 'rejected')
+                    """,
+                    (
+                        int(user_id),
+                        now,
+                        str(comment or "")[:2000],
+                        now,
+                        str(revision_id or "").strip(),
+                        int(session_id),
+                        int(user_id),
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    conn.execute("COMMIT")
+                    return None
+                row = conn.execute(
+                    "SELECT * FROM chat_attachment_revisions WHERE revision_id = ?",
+                    (str(revision_id or "").strip(),),
+                ).fetchone()
+                conn.execute("COMMIT")
+                return self._row_to_revision(row)
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def review_attachment_revision_release(
+        self,
+        *,
+        revision_id: str,
+        session_id: int,
+        approve: bool,
+        reviewer_id: int,
+        comment: str = "",
+        released_attachment_id: str | None = None,
+    ) -> AttachmentRevision | None:
+        """Approve or reject a pending release request exactly once."""
+
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE chat_attachment_revisions
+                    SET release_state = ?,
+                        reviewed_by = ?,
+                        reviewed_at = ?,
+                        review_comment = ?,
+                        released_attachment_id = ?,
+                        updated_at = ?
+                    WHERE revision_id = ? AND session_id = ?
+                      AND status = 'review_candidate'
+                      AND release_state = 'pending'
+                    """,
+                    (
+                        "approved" if approve else "rejected",
+                        int(reviewer_id),
+                        now,
+                        str(comment or "")[:2000],
+                        str(released_attachment_id) if released_attachment_id else None,
+                        now,
+                        str(revision_id or "").strip(),
+                        int(session_id),
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    conn.execute("COMMIT")
+                    return None
+                row = conn.execute(
+                    "SELECT * FROM chat_attachment_revisions WHERE revision_id = ?",
+                    (str(revision_id or "").strip(),),
+                ).fetchone()
+                conn.execute("COMMIT")
+                return self._row_to_revision(row)
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def list_attachment_revisions(
+        self,
+        *,
+        session_id: int,
+        user_id: int,
+        limit: int = 50,
+    ) -> list[AttachmentRevision]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM chat_attachment_revisions
+                WHERE session_id = ? AND user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (int(session_id), int(user_id), max(1, int(limit))),
+            ).fetchall()
+        return [self._row_to_revision(row) for row in rows]
+
+    # -- governed edit proposals ------------------------------------------
+
+    def create_attachment_edit_proposal(
+        self,
+        *,
+        proposal_id: str,
+        session_id: int,
+        user_id: int,
+        tenant_id: str,
+        parent_attachment_id: str,
+        operation: str,
+        heading_path: list[str],
+        after_text: str,
+        before_text: str = "",
+        evidence_refs: list[str] | None = None,
+        note: str = "",
+    ) -> AttachmentEditProposal:
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_attachment_edit_proposals (
+                    proposal_id, session_id, user_id, tenant_id,
+                    parent_attachment_id, operation, heading_path_json,
+                    after_text, before_text, evidence_refs_json, status,
+                    note, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    str(proposal_id),
+                    int(session_id),
+                    int(user_id),
+                    str(tenant_id or "default"),
+                    str(parent_attachment_id),
+                    str(operation),
+                    json.dumps(list(heading_path or []), ensure_ascii=False),
+                    str(after_text),
+                    str(before_text or ""),
+                    json.dumps(list(evidence_refs or []), ensure_ascii=False),
+                    str(note or ""),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM chat_attachment_edit_proposals WHERE proposal_id = ?",
+                (str(proposal_id),),
+            ).fetchone()
+        return self._row_to_proposal(row)
+
+    def get_attachment_edit_proposal(
+        self,
+        proposal_id: str,
+        *,
+        session_id: int | None = None,
+        user_id: int | None = None,
+    ) -> AttachmentEditProposal | None:
+        clauses = ["proposal_id = ?"]
+        params: list[Any] = [str(proposal_id or "").strip()]
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(int(session_id))
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(int(user_id))
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f"SELECT * FROM chat_attachment_edit_proposals WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
+        return self._row_to_proposal(row) if row else None
+
+    def get_pending_attachment_edit_proposal(
+        self,
+        *,
+        session_id: int,
+        user_id: int,
+    ) -> AttachmentEditProposal | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM chat_attachment_edit_proposals
+                WHERE session_id = ? AND user_id = ? AND status = 'pending'
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT 1
+                """,
+                (int(session_id), int(user_id)),
+            ).fetchone()
+        return self._row_to_proposal(row) if row else None
+
+    def decide_attachment_edit_proposal(
+        self,
+        *,
+        proposal_id: str,
+        session_id: int,
+        user_id: int,
+        status: str,
+        confirmed_revision_id: str | None = None,
+        note: str = "",
+    ) -> AttachmentEditProposal | None:
+        if status not in {"confirmed", "rejected"}:
+            raise ValueError("proposal decision must be confirmed or rejected")
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE chat_attachment_edit_proposals
+                SET status = ?, confirmed_revision_id = ?, note = ?, updated_at = ?
+                WHERE proposal_id = ? AND session_id = ? AND user_id = ?
+                  AND status = 'pending'
+                """,
+                (
+                    status,
+                    str(confirmed_revision_id) if confirmed_revision_id else None,
+                    str(note or ""),
+                    utc_now(),
+                    str(proposal_id or "").strip(),
+                    int(session_id),
+                    int(user_id),
+                ),
+            )
+            changed = int(cursor.rowcount or 0)
+            if not changed:
+                return None
+            row = conn.execute(
+                "SELECT * FROM chat_attachment_edit_proposals WHERE proposal_id = ?",
+                (str(proposal_id or "").strip(),),
+            ).fetchone()
+        return self._row_to_proposal(row) if row else None
+
+    @staticmethod
+    def _row_to_proposal(row) -> AttachmentEditProposal:
+        try:
+            heading_path = json.loads(row["heading_path_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            heading_path = []
+        try:
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            evidence_refs = []
+        return AttachmentEditProposal(
+            proposal_id=row["proposal_id"],
+            session_id=int(row["session_id"]),
+            user_id=int(row["user_id"]),
+            tenant_id=row["tenant_id"],
+            parent_attachment_id=row["parent_attachment_id"],
+            operation=row["operation"],
+            heading_path=[str(item) for item in heading_path if str(item).strip()],
+            after_text=row["after_text"],
+            before_text=row["before_text"] or "",
+            evidence_refs=[str(item) for item in evidence_refs if str(item).strip()],
+            status=row["status"],
+            note=row["note"] or "",
+            confirmed_revision_id=row["confirmed_revision_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def list_pending_attachment_revisions(
+        self,
+        *,
+        limit: int = 200,
+    ) -> list[AttachmentRevision]:
+        """Pending release requests across sessions (governance queue).
+
+        Session/KB resolution deliberately stays outside this store: the
+        attachment index database has no access to the control-plane tables.
+        """
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM chat_attachment_revisions
+                WHERE status = 'review_candidate' AND release_state = 'pending'
+                ORDER BY release_requested_at, created_at
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [self._row_to_revision(row) for row in rows]
+
     def list_attachments(
         self,
         *,
@@ -605,6 +1120,40 @@ class AttachmentStore:
                 (asset_id,),
             ).fetchone()
         return self._row_to_asset(row) if row else None
+
+    def list_stale_assets(
+        self,
+        *,
+        current_version_prefix: str,
+        extensions: list[str] | None = None,
+        limit: int = 200,
+    ) -> list[AttachmentAsset]:
+        """Assets whose parse predates the current parser generation.
+
+        Used by the maintenance backfill: re-parsing restores derived data
+        (for example DOCX heading paths) without touching the source bytes.
+        """
+
+        clauses = [
+            "(parser_version IS NULL OR parser_version = '' OR parser_version NOT LIKE ?)"
+        ]
+        params: list[Any] = [f"{str(current_version_prefix).strip()}%"]
+        if extensions:
+            placeholders = ", ".join("?" for _ in extensions)
+            clauses.append(f"extension IN ({placeholders})")
+            params.extend(str(extension).lower() for extension in extensions)
+        params.append(max(1, int(limit)))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM chat_attachment_assets
+                WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at, asset_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_asset(row) for row in rows]
 
     def create_asset(
         self,
@@ -1344,6 +1893,45 @@ class AttachmentStore:
             manifest=manifest if isinstance(manifest, dict) else {},
             error_code=row["error_code"] or "",
             error_message=row["error_message"] or "",
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_revision(row) -> AttachmentRevision:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            details = {}
+        return AttachmentRevision(
+            revision_id=row["revision_id"],
+            parent_attachment_id=row["parent_attachment_id"],
+            child_attachment_id=row["child_attachment_id"],
+            session_id=int(row["session_id"]),
+            user_id=int(row["user_id"]),
+            tenant_id=row["tenant_id"],
+            operation=row["operation"],
+            before=row["before_text"],
+            after=row["after_text"],
+            parent_content_hash=row["parent_content_hash"],
+            child_content_hash=row["child_content_hash"],
+            status=row["status"],
+            release_state=row["release_state"],
+            idempotency_key=row["idempotency_key"],
+            details=details if isinstance(details, dict) else {},
+            release_requested_by=(
+                int(row["release_requested_by"])
+                if row["release_requested_by"] is not None
+                else None
+            ),
+            release_requested_at=row["release_requested_at"],
+            release_comment=row["release_comment"] or "",
+            reviewed_by=(
+                int(row["reviewed_by"]) if row["reviewed_by"] is not None else None
+            ),
+            reviewed_at=row["reviewed_at"],
+            review_comment=row["review_comment"] or "",
+            released_attachment_id=row["released_attachment_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

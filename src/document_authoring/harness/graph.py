@@ -1721,6 +1721,8 @@ def build_writer_request(
     evidence: list[dict[str, Any]],
     prompt_version: str,
     table_requirement: Any | None = None,
+    revision_instruction: str = "",
+    revision_edit: dict[str, str] | None = None,
 ) -> WriterRequest:
     """Assemble the WriterRequest, translating the confirmed brief into
     canonical writer constraints. Work orders without a brief keep the legacy
@@ -1829,6 +1831,8 @@ def build_writer_request(
         unit_id=unit_id,
         unit_label=_unit_label(unit_id, schema),
         unit_description=_unit_description(unit_id, schema),
+        revision_instruction=str(revision_instruction or "").strip(),
+        revision_edit=revision_edit,
         field_value_type=_unit_value_type(unit_id, schema),
         table_columns=table_columns,
         table_mode="typed_rows" if is_table else "scalar",

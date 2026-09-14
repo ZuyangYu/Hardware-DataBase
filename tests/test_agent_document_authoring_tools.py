@@ -369,6 +369,19 @@ def test_status_card_carries_sanitized_artifacts_and_target_format(tmp_path):
         "scope_type": "knowledge_base",
         "knowledge_base_name": "hardware",
         "target_format": "xlsx",
+        "candidate_state": "blocked",
+        "release_state": "not_requested",
+        "pending_decisions": [
+            {
+                "group_key": "refdes:X1900",
+                "kind": "connector_scope_ambiguous",
+                "options": ["include", "exclude"],
+                "default_option": "include",
+                "count": 2,
+                "blocking": False,
+                "items": [{"secret": "must not cross the card boundary"}],
+            }
+        ],
         "unit_statuses": {},
         "next_actions": ["view_result"],
         "harness_run": {},
@@ -395,12 +408,25 @@ def test_status_card_carries_sanitized_artifacts_and_target_format(tmp_path):
     assert len(sink) == 1
     card = sink[0]["card"]
     assert card["target_format"] == "xlsx"
+    assert card["candidate_state"] == "blocked"
+    assert card["release_state"] == "not_requested"
+    assert card["pending_decisions"] == [{
+        "decision_id": "",
+        "group_key": "refdes:X1900",
+        "kind": "connector_scope_ambiguous",
+        "title": "refdes:X1900",
+        "options": ["include", "exclude"],
+        "default_option": "include",
+        "count": 2,
+        "blocking": False,
+    }]
     assert card["artifacts"] == [
         {"artifact_id": f"artifact-{index}", "stage": f"stage-{index}"} for index in range(8)
     ]
     assert set(card) <= {
         "kind", "task_id", "work_order_id", "generation_session_id", "status", "next_actions", "kb_name",
         "target_format", "artifacts",
+        "candidate_state", "release_state", "pending_decisions",
     }
 
 
@@ -754,6 +780,48 @@ def test_v2_tool_surface_swaps_work_order_for_plan_confirmation(tmp_path, monkey
     assert "create_document_work_order" not in names
     assert "generate_document_from_template" in names
     assert {"propose_document_plan", "confirm_document_plan", "get_document_task_status"} <= names
+
+
+def test_v2_pause_task_tool_uses_the_task_bound_pipeline_operation(tmp_path, monkeypatch):
+    """A conversational pause must not expose a raw HarnessRun identifier."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    calls: list[tuple[object, str]] = []
+    toolset.pipeline.pause_document_task = (
+        lambda ctx, task_id: calls.append((ctx, task_id)) or {
+            "task_id": task_id,
+            "work_order_id": "work-order-a",
+            "run_id": "run-paused-a",
+            "status": "paused",
+        }
+    )
+
+    result = toolset.pause_document_task("document-task-a")
+
+    assert calls == [(toolset.ctx, "document-task-a")]
+    assert result.status == "succeeded"
+    assert result.task_id == "document-task-a"
+    assert result.work_order_id == "work-order-a"
+    assert result.run_id == "run-paused-a"
+    assert result.data["status"] == "paused"
+    assert result.next_actions == ["resume_document_task", "get_document_task_status"]
+
+
+def test_v2_task_control_tools_are_visible_to_the_governed_action_adapter(tmp_path, monkeypatch):
+    """A plan action can only execute if its controlled public tool is mounted."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.pipeline.pause_document_task = lambda *_args: {"status": "paused"}
+    toolset.pipeline.cancel_document_task = lambda *_args: {"status": "cancelled"}
+    toolset.pipeline.resume_document_task = lambda *_args: {"status": "queued"}
+    toolset.pipeline.retry_document_task = lambda *_args: {"status": "queued"}
+
+    names = {tool.name for tool in toolset.as_tools()}
+
+    assert {
+        "pause_document_task",
+        "cancel_document_task",
+        "resume_document_task",
+        "retry_document_task",
+    } <= names
 
 
 def test_v2_direct_template_request_returns_proposal_not_work_order(tmp_path, monkeypatch):
@@ -1162,6 +1230,39 @@ def test_v2_get_document_task_status_reads_aggregate_by_task_id(tmp_path, monkey
     assert result.data["next_actions"] == ["confirm_document_plan"]
 
 
+def test_v2_task_status_refresh_emits_the_downloadable_candidate_card(tmp_path, monkeypatch):
+    """Without a refreshed card, “暂停后看看候选” has no download affordance."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    events: list[dict] = []
+    toolset.event_sink = events.append
+    toolset.pipeline.get_document_task_projection = lambda _ctx, task_id: {
+        "task_id": task_id,
+        "work_order_id": "work-order-a",
+        "status": "paused",
+        "knowledge_base_name": "hardware",
+        "target_format": "docx",
+        "artifacts": [{"artifact_id": "candidate-a", "stage": "review_candidate"}],
+        "next_actions": ["resume_document_task"],
+    }
+
+    result = toolset.get_document_task_status("document-task-a")
+
+    assert result.work_order_id == "work-order-a"
+    assert events == [{
+        "type": "document_card",
+        "card": {
+            "kind": "work_order_status",
+            "status": "paused",
+            "next_actions": ["resume_document_task"],
+            "kb_name": "hardware",
+            "task_id": "document-task-a",
+            "work_order_id": "work-order-a",
+            "target_format": "docx",
+            "artifacts": [{"artifact_id": "candidate-a", "stage": "review_candidate"}],
+        },
+    }]
+
+
 def test_v2_scope_exception_tool_resolves_and_resumes_generation(tmp_path, monkeypatch):
     """A non-blocking scope exception can be resolved from the conversation."""
     toolset = _v2_toolset(tmp_path, monkeypatch)
@@ -1200,6 +1301,62 @@ def test_v2_scope_exception_tool_resolves_and_resumes_generation(tmp_path, monke
     assert calls["comment"] == "排除 X301"
     assert result.data["run_id"] == "run-resumed"
     assert result.next_actions == ["await_generation", "get_document_task_status"]
+
+
+def test_v2_scope_exception_tool_can_defer_resume_for_a_compound_group_command(tmp_path, monkeypatch):
+    """Queuing after the first of several group choices would race the scope freeze."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    toolset.pipeline.get_icd_scope_review = lambda _ctx, _work_order_id: SimpleNamespace(
+        status="pending",
+        exceptions=[SimpleNamespace(
+            exception_id="exception-a",
+            kind="connector_scope_ambiguous",
+            refdes="X1900",
+            user_instruction="请确认 X1900。",
+        )],
+    )
+    toolset.pipeline.submit_icd_scope_resolution = lambda *_args, **_kwargs: SimpleNamespace(status="pending")
+    toolset.pipeline.submit_knowledge_base_document_generation = lambda *_args, **_kwargs: pytest.fail(
+        "a deferred group decision must not queue generation"
+    )
+
+    result = toolset.resolve_icd_scope_exception(
+        action="include",
+        refdes=["X1900"],
+        comment="X1900 包含，X1902 排除，然后给我候选",
+        work_order_id="wo-scope",
+        continue_generation=False,
+    )
+
+    assert result.status == "succeeded"
+    assert result.data["status"] == "resolved"
+    assert result.data["resolved_count"] == 1
+    assert result.next_actions == ["resume_document_task", "get_document_task_status"]
+
+
+def test_v2_release_request_tool_records_review_intent_without_approval(tmp_path, monkeypatch):
+    """The conversational release action must not use the immediate approval API."""
+    toolset = _v2_toolset(tmp_path, monkeypatch)
+    calls: dict = {}
+    toolset.pipeline.request_document_release = (
+        lambda _ctx, artifact_id, *, comment: calls.update({
+            "artifact_id": artifact_id,
+            "comment": comment,
+        }) or SimpleNamespace(event_id="event-release-a")
+    )
+    toolset.pipeline.approve_document_artifact = lambda *_args, **_kwargs: pytest.fail(
+        "requesting release must not approve or publish"
+    )
+
+    result = toolset.request_document_release(
+        artifact_id="candidate-a",
+        comment="请申请发布",
+    )
+
+    assert result.status == "succeeded"
+    assert calls == {"artifact_id": "candidate-a", "comment": "请申请发布"}
+    assert result.data == {"event_id": "event-release-a", "release_state": "pending"}
+    assert result.next_actions == ["review_document", "get_document_task_status"]
 
 
 def test_v2_scope_exception_tool_refuses_blocking_kind_with_instruction(tmp_path, monkeypatch):

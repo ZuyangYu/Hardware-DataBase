@@ -791,7 +791,13 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
 
         items, adds_nothing = timed_tool_call(rt, "spreadsheet_schema_lookup", query, None, _run)
         if not items:
-            return "当前知识库没有可用的 SQL 物化表。"
+            from src.agents.tools.runtime import empty_result_message
+
+            return empty_result_message(
+                rt,
+                "当前知识库没有可用的 SQL 物化表。",
+                budget_blocked=bool(getattr(items, "budget_blocked", False)),
+            )
         from src.agents.tools.runtime import format_tool_result
 
         return format_tool_result(rt, adds_nothing, items)

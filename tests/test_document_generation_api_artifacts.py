@@ -191,3 +191,27 @@ class DocGenArtifactApiTests(unittest.TestCase):
             headers=self._auth(t), json={"comment": "批准"},
         )
         self.assertEqual(r2.status_code, 200, r.text)
+
+    def test_release_request_records_review_intent_without_approving_or_publishing(self):
+        calls = {}
+        self.stub.request_document_release = lambda ctx, artifact_id, *, comment="": calls.update({
+            "artifact_id": artifact_id,
+            "comment": comment,
+        }) or {"event_id": "release-request-1"}
+        self.stub.approve_document_artifact = lambda *_args, **_kwargs: self.fail(
+            "a release request must not approve or publish the candidate",
+        )
+
+        token = self._token("admin1")
+        response = self.client.post(
+            "/api/v1/document-generation/artifacts/candidate-1/release-request?kb=shared",
+            headers=self._auth(token),
+            json={"comment": "从对话候选卡申请正式发布审核"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"event_id": "release-request-1"})
+        self.assertEqual(calls, {
+            "artifact_id": "candidate-1",
+            "comment": "从对话候选卡申请正式发布审核",
+        })

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -682,3 +683,170 @@ def test_approved_task_can_be_resumed_through_the_task_identity(tmp_path):
     job = pipeline.document_job_store.get(result["run_id"])
     assert job is not None
     assert job.operation == "generate_work_order"
+
+
+def test_running_task_can_be_paused_through_its_task_identity(tmp_path):
+    """A chat pause must resolve the caller-owned task before touching a run."""
+    task_store = DocumentTaskStore(str(tmp_path / "authoring.db"))
+    task = task_store.create_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        origin="workbench",
+        created_by="user-a",
+        knowledge_base_name="hardware",
+        status="running",
+    )
+    task_store.attach_work_order(task.task_id, "work-order-pause")
+    active_run = SimpleNamespace(
+        harness_run_id="run-pause-a",
+        work_order_id="work-order-pause",
+        status="running",
+    )
+    order = SimpleNamespace(
+        work_order_id="work-order-pause",
+        task_id=task.task_id,
+        scope_type="knowledge_base",
+        knowledge_base_name="hardware",
+        status="retrieving",
+    )
+    paused_runs: list[str] = []
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = SimpleNamespace(
+        task_service=SimpleNamespace(store=task_store),
+        store=SimpleNamespace(
+            get_work_order=lambda _work_order_id: order,
+            list_harness_runs=lambda _work_order_id: [active_run],
+        ),
+        require_work_order_capability=lambda *_args: None,
+        pause_harness_run=lambda _ctx, run_id: paused_runs.append(run_id) or active_run,
+    )
+    pipeline._document_task_for_context = AppPipeline._document_task_for_context.__get__(pipeline)
+
+    result = pipeline.pause_document_task(
+        RequestContext(
+            user_id="user-a",
+            tenant_id="tenant-a",
+            kb_permissions={"1:hardware": "write"},
+            metadata={"resource_department_id": 1, "kb_id": 1},
+        ),
+        task.task_id,
+    )
+
+    assert paused_runs == ["run-pause-a"]
+    assert result == {
+        "task_id": task.task_id,
+        "work_order_id": "work-order-pause",
+        "run_id": "run-pause-a",
+        "status": "paused",
+    }
+
+
+def test_running_task_can_be_cancelled_through_its_task_identity(tmp_path):
+    """Cancelling a task may stop its run but must not address another task."""
+    task_store = DocumentTaskStore(str(tmp_path / "authoring.db"))
+    task = task_store.create_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        origin="workbench",
+        created_by="user-a",
+        knowledge_base_name="hardware",
+        status="running",
+    )
+    task_store.attach_work_order(task.task_id, "work-order-cancel")
+    active_run = SimpleNamespace(
+        harness_run_id="run-cancel-a",
+        work_order_id="work-order-cancel",
+        status="running",
+    )
+    order = SimpleNamespace(
+        work_order_id="work-order-cancel",
+        task_id=task.task_id,
+        scope_type="knowledge_base",
+        knowledge_base_name="hardware",
+        status="retrieving",
+    )
+    cancelled_runs: list[str] = []
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = SimpleNamespace(
+        task_service=SimpleNamespace(store=task_store),
+        store=SimpleNamespace(
+            get_work_order=lambda _work_order_id: order,
+            list_harness_runs=lambda _work_order_id: [active_run],
+        ),
+        require_work_order_capability=lambda *_args: None,
+        cancel_harness_run=lambda _ctx, run_id: cancelled_runs.append(run_id) or active_run,
+    )
+    pipeline._document_task_for_context = AppPipeline._document_task_for_context.__get__(pipeline)
+
+    result = pipeline.cancel_document_task(
+        RequestContext(
+            user_id="user-a",
+            tenant_id="tenant-a",
+            kb_permissions={"1:hardware": "write"},
+            metadata={"resource_department_id": 1, "kb_id": 1},
+        ),
+        task.task_id,
+    )
+
+    assert cancelled_runs == ["run-cancel-a"]
+    assert result == {
+        "task_id": task.task_id,
+        "work_order_id": "work-order-cancel",
+        "run_id": "run-cancel-a",
+        "status": "cancelled",
+    }
+
+
+def test_failed_task_retry_queues_its_own_fenced_harness_run(tmp_path):
+    """Retry must preserve task/run ownership instead of spawning a fresh plan."""
+    task_store = DocumentTaskStore(str(tmp_path / "authoring.db"))
+    task = task_store.create_task(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        origin="workbench",
+        created_by="user-a",
+        knowledge_base_name="hardware",
+        status="failed",
+    )
+    task_store.attach_work_order(task.task_id, "work-order-retry")
+    failed_run = SimpleNamespace(
+        harness_run_id="run-failed-a",
+        work_order_id="work-order-retry",
+        status="failed",
+    )
+    order = SimpleNamespace(
+        work_order_id="work-order-retry",
+        task_id=task.task_id,
+        scope_type="knowledge_base",
+        knowledge_base_name="hardware",
+        status="failed",
+    )
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = SimpleNamespace(
+        task_service=SimpleNamespace(store=task_store),
+        store=SimpleNamespace(
+            get_work_order=lambda _work_order_id: order,
+            list_harness_runs=lambda _work_order_id: [failed_run],
+        ),
+        require_work_order_capability=lambda *_args: None,
+    )
+    pipeline.document_job_store = DocumentAuthoringJobStore(str(tmp_path / "jobs.db"))
+    pipeline._document_task_for_context = AppPipeline._document_task_for_context.__get__(pipeline)
+
+    result = pipeline.retry_document_task(
+        RequestContext(
+            user_id="user-a",
+            tenant_id="tenant-a",
+            kb_permissions={"1:hardware": "write"},
+            metadata={"resource_department_id": 1, "kb_id": 1},
+        ),
+        task.task_id,
+    )
+
+    assert result["task_id"] == task.task_id
+    assert result["work_order_id"] == "work-order-retry"
+    assert result["status"] == "queued"
+    job = pipeline.document_job_store.get(result["run_id"])
+    assert job is not None
+    assert job.operation == "resume_work_order"
+    assert job.payload["harness_run_id"] == "run-failed-a"
