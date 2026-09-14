@@ -150,9 +150,33 @@ def revision_change_summary(revision) -> str:
             inserted = 0
         if removed:
             parts.append("移除 " + "、".join(removed))
+        preserved: list[str] = []
+        for key, label in (
+            ("preserved_tables", "个表格"),
+            ("preserved_drawings", "个嵌入对象"),
+        ):
+            try:
+                count = int(details.get(key) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count:
+                preserved.append(f"{count} {label}")
+        if preserved:
+            parts.append("保留 " + "、".join(preserved) + "（移至节末）")
         if inserted:
             parts.append(f"新增 {inserted} 段")
         return "；".join(parts)
+    if operation == "append_paragraphs":
+        heading = ""
+        heading_path = details.get("heading_path")
+        if isinstance(heading_path, list) and heading_path:
+            heading = str(heading_path[-1] or "")
+        try:
+            inserted = int(details.get("inserted_paragraphs") or 0)
+        except (TypeError, ValueError):
+            inserted = 0
+        where = f"章节「{heading}」末尾" if heading else "文档末尾"
+        return f"在{where}追加 {inserted} 段"
     if operation == "annotate_text":
         page = details.get("page")
         return (
@@ -610,6 +634,7 @@ class AttachmentService:
         row: int = 0,
         count: int = 1,
         values: list[list[str]] | None = None,
+        preserve_embedded: bool = True,
     ):
         """Create a candidate child from one exact attachment edit.
 
@@ -621,7 +646,14 @@ class AttachmentService:
           (paragraphs and table cells, run formatting preserved).
         - ``replace_section``: the body under the ``heading_path`` heading is
           replaced by ``after`` (one paragraph per line).  DOCX only; the
-          heading itself and every other section are preserved.
+          heading itself and every other section are preserved.  New
+          paragraphs inherit the original body style and run formatting;
+          tables and embedded objects are kept (moved to the end of the new
+          body, or placed where an ``[[embed]]``/``[[embed:N]]`` line asks)
+          unless ``preserve_embedded=False``.
+        - ``append_paragraphs``: ``after`` paragraphs are appended at the end
+          of the ``heading_path`` section, or of the document when no heading
+          is given.  DOCX only; nothing else changes.
 
         Missing or ambiguous targets fail closed so no candidate is created
         from a guess.  A caller asking for any other Office/PDF edit receives
@@ -633,6 +665,7 @@ class AttachmentService:
         if normalized_operation not in {
             "replace_text",
             "replace_section",
+            "append_paragraphs",
             "set_cell",
             "replace_cell_text",
             "annotate_text",
@@ -700,9 +733,10 @@ class AttachmentService:
                 ".edf/.edif validated text edits; use a governed document "
                 "revision for other formats"
             )
-        if normalized_operation == "replace_section" and parent.extension != ".docx":
+        if normalized_operation in {"replace_section", "append_paragraphs"} and parent.extension != ".docx":
             raise AttachmentUnsupportedType(
-                "section replacement is available for .docx attachments only"
+                "section replacement and paragraph append are available for "
+                ".docx attachments only"
             )
         if normalized_operation in {
             "set_cell",
@@ -857,6 +891,7 @@ class AttachmentService:
         else:
             from src.attachments.docx_revision import (
                 DocxRevisionError,
+                append_paragraphs_in_docx,
                 replace_section_in_docx,
                 replace_text_in_docx,
             )
@@ -864,11 +899,20 @@ class AttachmentService:
             try:
                 if normalized_operation == "replace_section":
                     child_bytes, payload = replace_section_in_docx(
-                        source_bytes, heading_ref, after_text
+                        source_bytes,
+                        heading_ref,
+                        after_text,
+                        preserve_embedded=bool(preserve_embedded),
                     )
                     removed_text = str(payload.pop("removed_text", "") or "")
                     if not before_text:
                         before_text = removed_text[:8000]
+                elif normalized_operation == "append_paragraphs":
+                    child_bytes, payload = append_paragraphs_in_docx(
+                        source_bytes,
+                        heading_ref,
+                        after_text,
+                    )
                 else:
                     child_bytes, payload = replace_text_in_docx(
                         source_bytes, before_text, after_text

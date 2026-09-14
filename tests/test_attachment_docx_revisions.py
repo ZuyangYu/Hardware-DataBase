@@ -17,6 +17,7 @@ from src.agents.tools.attachment_tools import make_attachment_edit
 from src.agents.tools.runtime import ToolRuntime
 from src.attachments.docx_revision import (
     DocxRevisionError,
+    append_paragraphs_in_docx,
     heading_level,
     replace_section_in_docx,
     replace_text_in_docx,
@@ -67,6 +68,17 @@ def _runtime(service, record) -> ToolRuntime:
         attachment_service=service,
         attachment_user_id=record.user_id,
         attachment_session_id=record.session_id,
+    )
+
+
+def _add_embedded_run(paragraph) -> None:
+    """Attach an OLE-object run (the HSI embedded-workbook shape)."""
+
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+
+    paragraph._p.append(
+        parse_xml(f'<w:r {nsdecls("w")}><w:object><w:embed/></w:object></w:r>')
     )
 
 
@@ -146,6 +158,34 @@ def test_replace_text_multiline_expands_a_whole_paragraph():
     assert audit["mode"] == "block"
 
 
+def test_replace_text_multiline_inherits_first_run_formatting():
+    from docx import Document
+    from docx.shared import Pt
+
+    def build(document):
+        paragraph = document.add_paragraph()
+        run = paragraph.add_run("旧段落")
+        run.font.size = Pt(14)
+
+    source = _build_docx(build)
+    child, _audit = replace_text_in_docx(source, "旧段落", "第一行\n第二行")
+
+    document = Document(io.BytesIO(child))
+    assert [paragraph.text for paragraph in document.paragraphs] == ["第一行", "第二行"]
+    assert document.paragraphs[0].runs[0].font.size == Pt(14)
+    assert document.paragraphs[1].runs[0].font.size == Pt(14)
+
+
+def test_replace_text_refuses_whole_block_with_ole_object():
+    def build(document):
+        paragraph = document.add_paragraph("旧对象段")
+        _add_embedded_run(paragraph)
+
+    source = _build_docx(build)
+    with pytest.raises(DocxRevisionError, match="embedded object"):
+        replace_text_in_docx(source, "旧对象段", "新\n内容")
+
+
 # ---------------------------------------------------------------------------
 # replace_section
 # ---------------------------------------------------------------------------
@@ -190,6 +230,95 @@ def test_replace_section_only_replaces_the_target_section_body():
     assert "旧架构内容一" in audit["removed_text"]
     assert "2.1 子系统" in audit["removed_text"]
     assert "2.1 子系统" not in texts
+
+
+def _embedded_section_docx() -> bytes:
+    def build(document):
+        document.add_heading("1 概述", level=1)
+        document.add_paragraph("概述正文")
+        table = document.add_table(rows=1, cols=1)
+        table.cell(0, 0).text = "原表"
+        holder = document.add_paragraph("对象说明")
+        _add_embedded_run(holder)
+        document.add_heading("2 其他", level=1)
+        document.add_paragraph("其他内容")
+
+    return _build_docx(build)
+
+
+def test_replace_section_preserves_tables_and_embedded_objects():
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    source = _embedded_section_docx()
+    child, audit = replace_section_in_docx(source, ["1 概述"], "新概述一\n新概述二")
+
+    document = Document(io.BytesIO(child))
+    texts = [paragraph.text for paragraph in document.paragraphs]
+    assert texts == ["1 概述", "新概述一", "新概述二", "", "2 其他", "其他内容"]
+    assert "概述正文" not in texts
+    assert "对象说明" not in texts
+    assert document.tables[0].cell(0, 0).text == "原表"
+    holder = document.paragraphs[3]
+    assert holder._p.find(f".//{qn('w:object')}") is not None
+    assert audit["embedded_policy"] == "preserve"
+    assert audit["preserved_tables"] == 1
+    assert audit["preserved_drawings"] == 1
+    assert audit["removed_tables"] == 0
+    assert audit["removed_drawings"] == 0
+    assert audit["removed_paragraphs"] == 1
+    assert "概述正文" in audit["removed_text"]
+
+
+def test_replace_section_can_drop_embedded_objects_when_explicit():
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    source = _embedded_section_docx()
+    child, audit = replace_section_in_docx(
+        source, ["1 概述"], "新概述", preserve_embedded=False
+    )
+
+    document = Document(io.BytesIO(child))
+    assert document.tables == []
+    assert all(
+        paragraph._p.find(f".//{qn('w:object')}") is None
+        for paragraph in document.paragraphs
+    )
+    assert audit["embedded_policy"] == "drop"
+    assert audit["removed_tables"] == 1
+    assert audit["removed_drawings"] == 1
+    assert audit["preserved_tables"] == 0
+    assert audit["preserved_drawings"] == 0
+
+
+def test_replace_section_inherits_body_style_and_run_formatting():
+    from docx import Document
+    from docx.shared import Pt
+
+    def build(document):
+        document.add_heading("1 概述", level=1)
+        paragraph = document.add_paragraph()
+        run = paragraph.add_run("旧正文")
+        run.font.size = Pt(16)
+        run.font.name = "宋体"
+        run.bold = True
+        document.add_heading("2 其他", level=1)
+        document.add_paragraph("其他内容")
+
+    source = _build_docx(build)
+    child, _audit = replace_section_in_docx(source, ["1 概述"], "新正文一\n新正文二")
+
+    document = Document(io.BytesIO(child))
+    assert document.paragraphs[0].text == "1 概述"
+    new_paragraphs = document.paragraphs[1:3]
+    assert [paragraph.text for paragraph in new_paragraphs] == ["新正文一", "新正文二"]
+    for paragraph in new_paragraphs:
+        run = paragraph.runs[0]
+        assert run.font.size == Pt(16)
+        assert run.font.name == "宋体"
+        assert run.bold is True
+    assert new_paragraphs[0].style == new_paragraphs[1].style
 
 
 def test_custom_localized_heading_styles_are_recognized():
@@ -470,3 +599,291 @@ def test_attachment_edit_tool_blocks_ambiguous_section(tmp_path, monkeypatch):
     assert payload["status"] == "blocked"
     assert payload["error_code"] == "attachment_revision_rejected"
     assert "not found" in payload["message"]
+
+
+def test_service_section_revision_summary_reports_preserved_objects(
+    tmp_path, monkeypatch
+):
+    service, _store = _service(tmp_path, monkeypatch)
+    parent = service.upload(
+        session_id=7,
+        user_id=11,
+        filename="hsi.docx",
+        stream=io.BytesIO(_embedded_section_docx()),
+    )
+
+    revision = service.create_attachment_revision(
+        parent_attachment_id=parent.attachment_id,
+        session_id=7,
+        user_id=11,
+        operation="replace_section",
+        heading_path=["1 概述"],
+        after="新概述",
+        client_request_id="section-preserve-1",
+    )
+
+    summary = revision_change_summary(revision)
+    assert "保留 1 个表格、1 个嵌入对象（移至节末）" in summary
+    assert revision.details["embedded_policy"] == "preserve"
+    assert revision.details["preserved_drawings"] == 1
+
+
+def test_attachment_edit_blocks_unconfirmed_embedded_removal(tmp_path, monkeypatch):
+    service, _store = _service(tmp_path, monkeypatch)
+    parent = service.upload(
+        session_id=7,
+        user_id=11,
+        filename="hsi.docx",
+        stream=io.BytesIO(_embedded_section_docx()),
+    )
+    runtime = _runtime(service, parent)
+    runtime.question = "完善第1章的内容并替换掉原来的第1章"
+
+    payload = json.loads(
+        make_attachment_edit(runtime)(
+            operation="replace_section",
+            heading_path=["1 概述"],
+            after="新概述",
+            preserve_embedded=False,
+        )
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["error_code"] == "attachment_embedded_removal_unconfirmed"
+
+
+def test_attachment_edit_drops_embedded_when_user_asked(tmp_path, monkeypatch):
+    service, _store = _service(tmp_path, monkeypatch)
+    parent = service.upload(
+        session_id=7,
+        user_id=11,
+        filename="hsi.docx",
+        stream=io.BytesIO(_embedded_section_docx()),
+    )
+    runtime = _runtime(service, parent)
+    runtime.question = "把第1章的表格和插图都删除，重写这章内容"
+
+    payload = json.loads(
+        make_attachment_edit(runtime)(
+            operation="replace_section",
+            heading_path=["1 概述"],
+            after="新概述",
+            preserve_embedded=False,
+        )
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["details"]["embedded_policy"] == "drop"
+    assert payload["details"]["removed_tables"] == 1
+    assert payload["details"]["removed_drawings"] == 1
+
+
+def test_replace_section_places_objects_with_placeholders():
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    source = _embedded_section_docx()
+    child, audit = replace_section_in_docx(
+        source,
+        ["1 概述"],
+        "开头\n[[embed:2]]\n中间\n[[embed:1]]\n结尾",
+    )
+
+    document = Document(io.BytesIO(child))
+    tags: list[str] = []
+    for element in document.element.body.iterchildren():
+        if element.tag == qn("w:p"):
+            tags.append("p:" + "".join(node.text or "" for node in element.iter(qn("w:t"))))
+        elif element.tag == qn("w:tbl"):
+            tags.append("tbl")
+    assert tags == [
+        "p:1 概述",
+        "p:开头",
+        "p:",
+        "p:中间",
+        "tbl",
+        "p:结尾",
+        "p:2 其他",
+        "p:其他内容",
+    ]
+    assert document.tables[0].cell(0, 0).text == "原表"
+    assert document.paragraphs[2]._p.find(f".//{qn('w:object')}") is not None
+    assert audit["placed_objects"] == 2
+    assert audit["preserved_tables"] == 1
+    assert audit["preserved_drawings"] == 1
+
+
+def test_replace_section_placeholder_errors():
+    source = _embedded_section_docx()
+    with pytest.raises(DocxRevisionError, match="out of range"):
+        replace_section_in_docx(source, ["1 概述"], "[[embed:3]]")
+    with pytest.raises(DocxRevisionError, match="more than once"):
+        replace_section_in_docx(source, ["1 概述"], "[[embed:1]]\n[[embed:1]]")
+    with pytest.raises(DocxRevisionError, match="own line"):
+        replace_section_in_docx(source, ["1 概述"], "如图 [[embed:1]] 所示")
+
+
+def test_replace_section_inherits_direct_paragraph_formatting():
+    from docx import Document
+    from docx.shared import Pt
+
+    def build(document):
+        document.add_heading("1 概述", level=1)
+        paragraph = document.add_paragraph("旧正文")
+        paragraph.paragraph_format.left_indent = Pt(24)
+        paragraph.paragraph_format.space_after = Pt(12)
+        paragraph.paragraph_format.page_break_before = True
+        document.add_heading("2 其他", level=1)
+        document.add_paragraph("其他内容")
+
+    source = _build_docx(build)
+    child, _audit = replace_section_in_docx(source, ["1 概述"], "新一\n新二")
+
+    document = Document(io.BytesIO(child))
+    for paragraph in document.paragraphs[1:3]:
+        assert paragraph.paragraph_format.left_indent == Pt(24)
+        assert paragraph.paragraph_format.space_after == Pt(12)
+        assert not paragraph.paragraph_format.page_break_before
+
+
+def test_replace_text_multiline_inherits_direct_paragraph_formatting():
+    from docx import Document
+    from docx.shared import Pt
+
+    def build(document):
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.left_indent = Pt(18)
+        paragraph.add_run("旧段落")
+
+    source = _build_docx(build)
+    child, _audit = replace_text_in_docx(source, "旧段落", "第一行\n第二行")
+
+    document = Document(io.BytesIO(child))
+    assert [paragraph.text for paragraph in document.paragraphs] == ["第一行", "第二行"]
+    assert document.paragraphs[1].paragraph_format.left_indent == Pt(18)
+
+
+def test_append_paragraphs_at_section_end_inherits_formatting():
+    from docx import Document
+    from docx.shared import Pt
+
+    def build(document):
+        document.add_heading("1 概述", level=1)
+        paragraph = document.add_paragraph("原有正文")
+        paragraph.paragraph_format.left_indent = Pt(18)
+        document.add_heading("2 其他", level=1)
+        document.add_paragraph("其他内容")
+
+    source = _build_docx(build)
+    child, audit = append_paragraphs_in_docx(source, ["1 概述"], "追加一\n追加二")
+
+    document = Document(io.BytesIO(child))
+    assert [paragraph.text for paragraph in document.paragraphs] == [
+        "1 概述",
+        "原有正文",
+        "追加一",
+        "追加二",
+        "2 其他",
+        "其他内容",
+    ]
+    for paragraph in document.paragraphs[2:4]:
+        assert paragraph.paragraph_format.left_indent == Pt(18)
+    assert audit["operation"] == "append_paragraphs"
+    assert audit["anchor"] == "section_end"
+    assert audit["inserted_paragraphs"] == 2
+
+
+def test_append_paragraphs_at_document_end():
+    from docx import Document
+
+    source = _sectioned_docx()
+    child, audit = append_paragraphs_in_docx(source, None, "文末一\n文末二")
+
+    document = Document(io.BytesIO(child))
+    assert [paragraph.text for paragraph in document.paragraphs][-2:] == [
+        "文末一",
+        "文末二",
+    ]
+    assert audit["anchor"] == "document_end"
+    assert audit["heading_path"] == []
+
+
+def test_service_append_revision_creates_candidate(tmp_path, monkeypatch):
+    service, _store = _service(tmp_path, monkeypatch)
+    parent = service.upload(
+        session_id=7,
+        user_id=11,
+        filename="hsi.docx",
+        stream=io.BytesIO(_sectioned_docx()),
+    )
+
+    revision = service.create_attachment_revision(
+        parent_attachment_id=parent.attachment_id,
+        session_id=7,
+        user_id=11,
+        operation="append_paragraphs",
+        heading_path=["2 硬件架构"],
+        after="补充一\n补充二",
+        client_request_id="append-1",
+    )
+
+    assert revision.operation == "append_paragraphs"
+    assert revision.details["anchor"] == "section_end"
+    summary = revision_change_summary(revision)
+    assert "章节「2 硬件架构」末尾追加 2 段" in summary
+
+    _record, child_bytes = service.read_source_bytes(
+        attachment_id=revision.child_attachment_id, session_id=7, user_id=11
+    )
+    texts = _paragraph_texts(child_bytes)
+    assert texts.index("补充一") < texts.index("3 其他")
+
+
+def test_attachment_edit_tool_exposes_append_operation(tmp_path, monkeypatch):
+    service, _store = _service(tmp_path, monkeypatch)
+    parent = service.upload(
+        session_id=7,
+        user_id=11,
+        filename="hsi.docx",
+        stream=io.BytesIO(_sectioned_docx()),
+    )
+    runtime = _runtime(service, parent)
+
+    payload = json.loads(
+        make_attachment_edit(runtime)(
+            operation="append_paragraphs",
+            heading_path=["2 硬件架构"],
+            after="工具追加段落",
+        )
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["details"]["anchor"] == "section_end"
+    _record, child_bytes = service.read_source_bytes(
+        attachment_id=payload["child_attachment_id"], session_id=7, user_id=11
+    )
+    texts = _paragraph_texts(child_bytes)
+    assert texts.index("工具追加段落") < texts.index("3 其他")
+
+
+def test_attachment_edit_tool_blocks_invalid_placeholder(tmp_path, monkeypatch):
+    service, _store = _service(tmp_path, monkeypatch)
+    parent = service.upload(
+        session_id=7,
+        user_id=11,
+        filename="hsi.docx",
+        stream=io.BytesIO(_embedded_section_docx()),
+    )
+    runtime = _runtime(service, parent)
+
+    payload = json.loads(
+        make_attachment_edit(runtime)(
+            operation="replace_section",
+            heading_path=["1 概述"],
+            after="[[embed:9]]",
+        )
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["error_code"] == "attachment_revision_rejected"
+    assert "out of range" in payload["message"]

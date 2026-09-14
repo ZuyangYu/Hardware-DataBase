@@ -8,7 +8,11 @@ construction so the server never has to guess what the user meant:
   replacement adopts the formatting of the run where the match starts.
 - ``replace_section``: the body under one heading is replaced.  The heading
   paragraph itself, every other section and all non-body content (styles,
-  headers/footers, embedded objects outside the section) stay untouched.
+  headers/footers, embedded objects outside the section) stay untouched.  New
+  paragraphs inherit the original body style and its first run's direct
+  character formatting; tables and embedded objects (pictures, OLE objects)
+  inside the section are moved to the end of the new body instead of being
+  dropped unless the caller explicitly opts into ``preserve_embedded=False``.
 
 The parent document is never mutated: callers receive new bytes plus a JSON
 audit record describing the target, the removed range and the inserted
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import io
 import re
+from copy import deepcopy
 from typing import Any, Iterator
 
 
@@ -159,10 +164,35 @@ def _iter_paragraphs(document) -> Iterator[Any]:
                         yield candidate
 
 
-def _has_drawing(paragraph) -> bool:
+_EMBEDDED_TAGS = ("w:drawing", "w:object", "w:pict", "w:oleObject")
+
+
+def _embedded_tag_names() -> set[str]:
     from docx.oxml.ns import qn
 
-    return paragraph._p.find(f".//{qn('w:drawing')}") is not None
+    return {qn(tag) for tag in _EMBEDDED_TAGS}
+
+
+def _element_embedded_count(element: Any) -> int:
+    tags = _embedded_tag_names()
+    return sum(1 for node in element.iter() if node.tag in tags)
+
+
+def _paragraph_has_embedded(paragraph) -> bool:
+    return _element_embedded_count(paragraph._p) > 0
+
+
+def _embedded_run_elements(paragraph) -> list[Any]:
+    """Return the ``w:r`` elements carrying drawings/OLE objects."""
+
+    from docx.oxml.ns import qn
+
+    tags = _embedded_tag_names()
+    return [
+        run_element
+        for run_element in paragraph._p.iter(qn("w:r"))
+        if any(node.tag in tags for node in run_element.iter())
+    ]
 
 
 def _replace_span(paragraph, start: int, end: int, after: str) -> None:
@@ -188,43 +218,114 @@ def _replace_span(paragraph, start: int, end: int, after: str) -> None:
         raise DocxRevisionError("replacement target runs could not be located")
 
 
-def _paragraphs_after(paragraph, lines: list[str], style: Any = None):
+_PLACEHOLDER_RE = re.compile(
+    r"^\s*\[\[\s*(?:embed|嵌入(?:对象)?)\s*(?::|：)?\s*(\d*)\s*\]\]\s*$",
+    re.IGNORECASE,
+)
+_PPR_EXCLUDED_TAGS = ("w:sectPr", "w:pageBreakBefore")
+
+
+def _sanitized_paragraph_properties(pPr: Any) -> Any:
+    """Copy direct paragraph formatting without section/page-break controls."""
+
+    from docx.oxml.ns import qn
+
+    if pPr is None:
+        return None
+    copy = deepcopy(pPr)
+    for tag in _PPR_EXCLUDED_TAGS:
+        for node in copy.findall(qn(tag)):
+            copy.remove(node)
+    return copy
+
+
+def _new_paragraph_after(
+    cursor_element,
+    parent,
+    line: str,
+    style: Any = None,
+    run_properties: Any = None,
+    paragraph_properties: Any = None,
+):
+    """Create one ``w:p`` after ``cursor_element`` and return the element."""
+
     from docx.oxml import OxmlElement
     from docx.text.paragraph import Paragraph
 
+    element = OxmlElement("w:p")
+    if paragraph_properties is not None:
+        element.append(deepcopy(paragraph_properties))
+    cursor_element.addnext(element)
+    new_paragraph = Paragraph(element, parent)
+    if style is not None:
+        try:
+            new_paragraph.style = style
+        except Exception:  # noqa: BLE001 - style may be unavailable
+            pass
+    if line:
+        run = new_paragraph.add_run(line)
+        if run_properties is not None:
+            # ``w:rPr`` must be the first child of ``w:r``: the new run
+            # only carries ``w:t`` at this point.
+            run._r.insert(0, deepcopy(run_properties))
+    return element
+
+
+def _paragraphs_after(
+    paragraph,
+    lines: list[str],
+    style: Any = None,
+    run_properties: Any = None,
+    paragraph_properties: Any = None,
+):
+    """Insert one paragraph per line after ``paragraph``.
+
+    Returns the last inserted ``w:p`` element (``None`` for empty input) so
+    callers can continue appending content after the new body.
+    """
+
     cursor = paragraph._p
+    last_element: Any = None
     for line in lines:
-        new_element = OxmlElement("w:p")
-        cursor.addnext(new_element)
-        cursor = new_element
-        new_paragraph = Paragraph(new_element, paragraph._parent)
-        target_style = style if style is not None else paragraph.style
-        if target_style is not None:
-            try:
-                new_paragraph.style = target_style
-            except Exception:  # noqa: BLE001 - style may be unavailable
-                pass
-        if line:
-            new_paragraph.add_run(line)
+        last_element = _new_paragraph_after(
+            cursor,
+            paragraph._parent,
+            line,
+            style=style if style is not None else paragraph.style,
+            run_properties=run_properties,
+            paragraph_properties=paragraph_properties,
+        )
+        cursor = last_element
+    return last_element
 
 
 def _replace_block_with_lines(paragraph, lines: list[str]) -> None:
     """Replace a whole paragraph, expanding ``after`` lines into paragraphs."""
 
-    if _has_drawing(paragraph):
+    from docx.oxml.ns import qn
+
+    if _paragraph_has_embedded(paragraph):
         raise DocxRevisionError(
             "the target paragraph contains an embedded object; "
             "whole-paragraph replacement would drop it"
         )
     first, rest = lines[0], lines[1:]
     runs = paragraph.runs
+    run_properties = None
     if runs:
         runs[0].text = first
+        run_properties = runs[0]._r.find(qn("w:rPr"))
         for run in runs[1:]:
             run.text = ""
     elif first:
         paragraph.add_run(first)
-    _paragraphs_after(paragraph, rest, style=paragraph.style)
+    _paragraphs_after(
+        paragraph,
+        rest,
+        style=paragraph.style,
+        run_properties=deepcopy(run_properties) if run_properties is not None else None,
+        paragraph_properties=_sanitized_paragraph_properties(paragraph._p.pPr),
+    )
 
 
 def replace_text_in_docx(source: bytes, before: str, after: str) -> tuple[bytes, dict[str, Any]]:
@@ -252,7 +353,7 @@ def replace_text_in_docx(source: bytes, before: str, after: str) -> tuple[bytes,
         raise DocxRevisionError(
             "multi-line replacement requires the target to be a whole paragraph"
         )
-    if whole_block and _has_drawing(paragraph):
+    if whole_block and _paragraph_has_embedded(paragraph):
         raise DocxRevisionError(
             "the target paragraph contains an embedded object; "
             "replacing its text would drop it"
@@ -293,12 +394,6 @@ def _elements_text(elements: list[Any]) -> str:
     return "\n".join(lines)
 
 
-def _count_drawings(elements: list[Any]) -> int:
-    from docx.oxml.ns import qn
-
-    return sum(1 for element in elements for _ in element.iter(qn("w:drawing")))
-
-
 def _find_section_heading(document, heading_path: list[str]):
     path = [str(item).strip() for item in (heading_path or []) if str(item).strip()]
     if not path:
@@ -328,13 +423,25 @@ def replace_section_in_docx(
     source: bytes,
     heading_path: list[str],
     after: str,
+    preserve_embedded: bool = True,
 ) -> tuple[bytes, dict[str, Any]]:
     """Replace one heading's body and return ``(child_bytes, audit)``.
 
     The heading paragraph keeps its identity and formatting.  Everything from
     the element after the heading up to (excluding) the next heading of the
     same or a higher level is removed, then ``after`` is inserted as one
-    paragraph per line, copying the first removed paragraph's style.
+    paragraph per line.
+
+    New paragraphs copy the first removed body paragraph's style, its direct
+    paragraph formatting (indentation, spacing, alignment, ...) and its first
+    run's direct character formatting (font name, size, bold, colour, ...), so
+    the replacement text matches the original section formatting.  With
+    ``preserve_embedded=True`` (the default) tables and runs carrying embedded
+    objects (pictures, OLE objects) are preserved.  A placeholder line
+    (``[[embed]]`` or ``[[embed:N]]``, N = 1-based original order) puts the next
+    or the numbered object at that position; everything not placed stays, in
+    original order, at the end of the new body.  The audit reports both the
+    removal and the preservation counts.
     """
 
     from docx.oxml.ns import qn
@@ -345,7 +452,7 @@ def replace_section_in_docx(
     body = document.element.body
     siblings = list(body.iterchildren())
     start_index = siblings.index(heading._p)
-    removed: list[Any] = []
+    section_elements: list[Any] = []
     for element in siblings[start_index + 1 :]:
         if element.tag == qn("w:p"):
             from docx.text.paragraph import Paragraph
@@ -355,21 +462,35 @@ def replace_section_in_docx(
                 break
         if element.tag == qn("w:sectPr"):
             break
-        removed.append(element)
+        section_elements.append(element)
 
-    removed_text = _elements_text(removed)
-    removed_drawings = _count_drawings(removed)
-    removed_paragraphs = sum(1 for element in removed if element.tag == qn("w:p"))
-    removed_tables = sum(1 for element in removed if element.tag == qn("w:tbl"))
+    # Format samples must be read before anything is detached: the first body
+    # paragraph with a style and the first run with direct character
+    # formatting represent "the original format" of this section.
     body_style: Any = None
-    for element in removed:
+    run_properties: Any = None
+    paragraph_properties: Any = None
+    for element in section_elements:
         if element.tag != qn("w:p"):
             continue
         from docx.text.paragraph import Paragraph
 
         candidate = Paragraph(element, heading._parent)
-        if candidate.style is not None:
+        if body_style is None and candidate.style is not None:
             body_style = candidate.style
+        if paragraph_properties is None:
+            paragraph_properties = _sanitized_paragraph_properties(element.pPr)
+        if run_properties is None:
+            for run_element in element.iter(qn("w:r")):
+                found = run_element.find(qn("w:rPr"))
+                if found is not None:
+                    run_properties = deepcopy(found)
+                    break
+        if (
+            body_style is not None
+            and run_properties is not None
+            and paragraph_properties is not None
+        ):
             break
     if body_style is None:
         # An empty section must not inherit the heading style for its new
@@ -379,20 +500,131 @@ def replace_section_in_docx(
         except KeyError:
             body_style = None
 
-    for element in removed:
+    removed: list[Any] = []
+    preserved: list[tuple[str, Any, list[Any]]] = []
+    removed_paragraphs = 0
+    preserved_paragraphs = 0
+    preserved_tables = 0
+    preserved_drawings = 0
+    for element in section_elements:
+        from docx.text.paragraph import Paragraph
+
+        if element.tag == qn("w:p"):
+            paragraph = Paragraph(element, heading._parent)
+            embedded_runs = (
+                _embedded_run_elements(paragraph) if preserve_embedded else []
+            )
+            if embedded_runs:
+                preserved.append(("runs", paragraph, embedded_runs))
+                preserved_paragraphs += 1
+                preserved_drawings += sum(
+                    _element_embedded_count(run_element)
+                    for run_element in embedded_runs
+                )
+                continue
+            removed.append(element)
+            removed_paragraphs += 1
+            continue
+        if element.tag == qn("w:tbl") and preserve_embedded:
+            preserved.append(("table", element, []))
+            preserved_tables += 1
+            continue
+        removed.append(element)
+
+    # The ``before`` audit field always describes the full original body.
+    removed_text = _elements_text(section_elements)
+    removed_tables = sum(1 for element in removed if element.tag == qn("w:tbl"))
+    removed_drawings = sum(_element_embedded_count(element) for element in removed)
+
+    for element in section_elements:
         body.remove(element)
 
+    from docx.oxml import OxmlElement
+    from docx.text.paragraph import Paragraph
+
+    def _place_item(cursor_element, item):
+        kind, element, embedded_runs = item
+        if kind == "table":
+            cursor_element.addnext(element)
+            return element
+        holder = OxmlElement("w:p")
+        holder_paragraph = Paragraph(holder, heading._parent)
+        try:
+            holder_paragraph.style = element.style
+        except Exception:  # noqa: BLE001 - style may be unavailable
+            pass
+        for run_element in embedded_runs:
+            holder.append(run_element)
+        cursor_element.addnext(holder)
+        return holder
+
     lines = after.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    _paragraphs_after(heading, lines, style=body_style)
+    placed_flags = [False] * len(preserved)
+    placed_objects = 0
+    inserted_paragraphs = 0
+    cursor = heading._p
+    for line in lines:
+        match = _PLACEHOLDER_RE.match(line)
+        if match is None:
+            if "[[" in line and "]]" in line:
+                raise DocxRevisionError(
+                    "an object placeholder must occupy its own line "
+                    "（每个 [[embed]] 占位符必须单独一行）"
+                )
+            cursor = _new_paragraph_after(
+                cursor,
+                heading._parent,
+                line,
+                style=body_style,
+                run_properties=run_properties,
+                paragraph_properties=paragraph_properties,
+            )
+            inserted_paragraphs += 1
+            continue
+        raw_index = str(match.group(1) or "").strip()
+        if raw_index:
+            index = int(raw_index)
+            if index < 1 or index > len(preserved):
+                raise DocxRevisionError(
+                    f"object placeholder index out of range: {index} "
+                    f"(原节共有 {len(preserved)} 个可保留对象)"
+                )
+            chosen = index - 1
+            if placed_flags[chosen]:
+                raise DocxRevisionError(
+                    f"object placeholder {index} was used more than once "
+                    "（同一对象不能重复放置）"
+                )
+        else:
+            remaining = [i for i, placed in enumerate(placed_flags) if not placed]
+            if not remaining:
+                raise DocxRevisionError(
+                    "there is no preserved object left for this placeholder "
+                    "（占位符数量超过原节可保留对象数量）"
+                )
+            chosen = remaining[0]
+        placed_flags[chosen] = True
+        placed_objects += 1
+        cursor = _place_item(cursor, preserved[chosen])
+
+    for index, item in enumerate(preserved):
+        if placed_flags[index]:
+            continue
+        cursor = _place_item(cursor, item)
 
     audit = {
         "operation": "replace_section",
         "heading_path": full_path,
         "heading_level": level,
+        "embedded_policy": "preserve" if preserve_embedded else "drop",
         "removed_paragraphs": removed_paragraphs,
         "removed_tables": removed_tables,
         "removed_drawings": removed_drawings,
-        "inserted_paragraphs": len(lines),
+        "preserved_paragraphs": preserved_paragraphs,
+        "preserved_tables": preserved_tables,
+        "preserved_drawings": preserved_drawings,
+        "placed_objects": placed_objects,
+        "inserted_paragraphs": inserted_paragraphs,
         # Consumed by the service for the revision's ``before`` audit field;
         # never persisted twice.
         "removed_text": removed_text,
@@ -400,8 +632,127 @@ def replace_section_in_docx(
     return _save(document), audit
 
 
+def append_paragraphs_in_docx(
+    source: bytes,
+    heading_path: list[str] | None,
+    after: str,
+) -> tuple[bytes, dict[str, Any]]:
+    """Append paragraphs at the end of a section or of the document.
+
+    With ``heading_path`` the paragraphs are inserted after the last element
+    of that section (before the next heading of the same or a higher level).
+    Without it they go to the end of the document body, before the final
+    ``w:sectPr``.  The inserted paragraphs copy the preceding paragraph's
+    style, direct paragraph formatting and first run formatting, so appended
+    text matches the surrounding body.  Nothing else in the document changes.
+    """
+
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+
+    document = _load(source)
+    body = document.element.body
+    full_path: list[str] = []
+    level = 0
+    heading = None
+    if [item for item in (heading_path or []) if str(item).strip()]:
+        heading, level, full_path = _find_section_heading(document, heading_path)
+
+    siblings = list(body.iterchildren())
+    if heading is not None:
+        cursor = heading._p
+        for element in siblings[siblings.index(heading._p) + 1 :]:
+            if element.tag == qn("w:p"):
+                candidate = Paragraph(element, heading._parent)
+                if _is_heading(candidate) and _heading_level(candidate) <= level:
+                    break
+            if element.tag == qn("w:sectPr"):
+                break
+            cursor = element
+        anchor = "section_end"
+    else:
+        cursor = None
+        for element in siblings:
+            if element.tag == qn("w:sectPr"):
+                break
+            cursor = element
+        anchor = "document_end"
+
+    sample = None
+    if cursor is not None and cursor.tag == qn("w:p"):
+        sample = Paragraph(cursor, heading._parent if heading is not None else document)
+    elif cursor is not None:
+        previous = cursor.getprevious()
+        while previous is not None:
+            if previous.tag == qn("w:p"):
+                sample = Paragraph(
+                    previous,
+                    heading._parent if heading is not None else document,
+                )
+                break
+            previous = previous.getprevious()
+
+    style: Any = None
+    run_properties: Any = None
+    paragraph_properties: Any = None
+    if sample is not None:
+        style = sample.style
+        paragraph_properties = _sanitized_paragraph_properties(sample._p.pPr)
+        for run_element in sample._p.iter(qn("w:r")):
+            found = run_element.find(qn("w:rPr"))
+            if found is not None:
+                run_properties = deepcopy(found)
+                break
+    if style is None:
+        try:
+            style = document.styles["Normal"]
+        except KeyError:
+            style = None
+
+    lines = after.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if cursor is None:
+        sectPr = body.find(qn("w:sectPr"))
+        for line in lines:
+            element = OxmlElement("w:p")
+            if sectPr is not None:
+                sectPr.addprevious(element)
+            else:
+                body.append(element)
+            paragraph = Paragraph(element, document)
+            if style is not None:
+                try:
+                    paragraph.style = style
+                except Exception:  # noqa: BLE001 - style may be unavailable
+                    pass
+            if line:
+                run = paragraph.add_run(line)
+                if run_properties is not None:
+                    run._r.insert(0, deepcopy(run_properties))
+    else:
+        for line in lines:
+            cursor = _new_paragraph_after(
+                cursor,
+                heading._parent if heading is not None else document,
+                line,
+                style=style,
+                run_properties=run_properties,
+                paragraph_properties=paragraph_properties,
+            )
+
+    audit = {
+        "operation": "append_paragraphs",
+        "heading_path": full_path,
+        "heading_level": level,
+        "anchor": anchor,
+        "inserted_paragraphs": len(lines),
+    }
+    return _save(document), audit
+
+
 __all__ = [
     "DocxRevisionError",
+    "append_paragraphs_in_docx",
     "replace_section_in_docx",
     "replace_text_in_docx",
 ]

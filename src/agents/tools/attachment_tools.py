@@ -51,6 +51,16 @@ _REPLACE_INTENT_PATTERN = re.compile(
     r"替换|改成|改为|修改|replace|change", re.IGNORECASE
 )
 _QUOTED_SEGMENT_RE = re.compile(r"[「“\"']([^」”\"']{1,200})[」”\"']")
+_EMBEDDED_REMOVAL_INTENT_PATTERN = re.compile(
+    r"(?:"
+    r"(?:删除|删掉|移除|去掉|清除|不要|不需要|丢弃)[^。；\n]{0,12}"
+    r"(?:图片?|插图|图表?|表格?|表|嵌入|对象|附件|公式|流程图|示意图)"
+    r"|"
+    r"(?:图片?|插图|图表?|表格?|表|嵌入|对象|附件|公式|流程图|示意图)[^。；\n]{0,12}"
+    r"(?:删除|删掉|移除|去掉|清除|不要|不需要)"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _lineage_revisions(rt: ToolRuntime, refs: list[Any]) -> list[Any]:
@@ -712,6 +722,7 @@ def make_attachment_edit(rt: ToolRuntime):
         row: int = 0,
         count: int = 1,
         values: list[list[str]] | None = None,
+        preserve_embedded: bool = True,
     ) -> str:
         """按精确文本替换、按标题替换整节或按单元格修改，创建附件候选副本，原附件保持不变。
 
@@ -720,6 +731,16 @@ def make_attachment_edit(rt: ToolRuntime):
           支持 .txt/.md/.docx（DOCX 段落与表格单元格，保留原有格式）。
         - replace_section：把 heading_path 指定标题下的整节正文替换为 after
           （after 中每个换行生成一个段落）；仅 .docx，标题本身与其余章节保持不变。
+          新段落自动沿用原标题格式与原正文样式/段落格式（缩进、间距）/首个 run 的
+          字体格式（字号、字体、加粗等）；默认 preserve_embedded=true，把原节中的
+          表格、图片、嵌入对象按原顺序移到新节末尾而不是丢弃。需要把对象放回指定
+          位置时，用单独一行的占位符 [[embed]]（按原顺序取下一个对象）或
+          [[embed:N]]（N 为原节内表格/嵌入对象按出现顺序的 1 起编号）；未放置的
+          对象仍移到节末。若用户明确要求删除这些对象，才传
+          preserve_embedded=false（否则会被拒绝并要求先向用户确认）。
+        - append_paragraphs：在 heading_path 指定标题章节的末尾追加 after 段落
+          （每个换行一段）；不传 heading_path 则追加到文档末尾。仅 .docx，
+          其余内容保持不变；新段落沿用相邻段落的样式与格式。
         - set_cell：把 sheet 工作表的 cell（如 B3）设为 after 文本；仅 .xlsx/.xlsm，
           保留工作簿其余部件与单元格样式。
         - replace_cell_text：在 sheet 内把唯一出现的 before 单元格文本替换为 after；
@@ -770,6 +791,21 @@ def make_attachment_edit(rt: ToolRuntime):
                         ),
                     })
 
+        # Dropping tables/pictures/OLE objects from a section must be an
+        # explicit user request: the default is to preserve them, so a model
+        # that sets preserve_embedded=false on its own is sent back to ask.
+        if operation_name == "replace_section" and not bool(preserve_embedded):
+            question_text = str(getattr(rt, "question", "") or "")
+            if not _EMBEDDED_REMOVAL_INTENT_PATTERN.search(question_text):
+                return _blocked({
+                    "error_code": "attachment_embedded_removal_unconfirmed",
+                    "message": (
+                        "原节可能包含表格、图片或嵌入对象，而用户未明确要求删除它们。"
+                        "请保留这些对象（preserve_embedded=true，默认），"
+                        "或先向用户确认要删除哪些对象后再调用。"
+                    ),
+                })
+
         if not bool(getattr(rt, "attachment_edit_enabled", True)):
             return _blocked({
                 "error_code": "attachment_edit_disabled",
@@ -805,6 +841,7 @@ def make_attachment_edit(rt: ToolRuntime):
                 row=row,
                 count=count,
                 values=values,
+                preserve_embedded=bool(preserve_embedded),
             )
         except AttachmentError as exc:
             return _blocked({
@@ -821,7 +858,8 @@ def make_attachment_edit(rt: ToolRuntime):
         if revision.operation == "replace_section":
             message = (
                 f"已替换章节正文并创建候选（变更：{change_summary}）；"
-                "标题及未指定的其他章节保持不变，可下载候选文件复核。"
+                "标题及未指定的其他章节保持不变，新正文沿用原节样式与字体格式，"
+                "可下载候选文件复核。"
             )
         elif revision.operation == "annotate_text":
             message = (
