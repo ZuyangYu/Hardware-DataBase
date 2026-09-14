@@ -283,6 +283,57 @@ def test_sanitize_docx_removes_embedded_object_and_external_relationship():
         assert b"safe text" in document
 
 
+def test_sanitize_docx_removes_ole_wrapper_with_layout_attributes():
+    """Word writes layout attributes on <w:object>; the wrapper must still go."""
+
+    source = _package(
+        {
+            "[Content_Types].xml": _content_types(
+                (
+                    "word/document.xml",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                ),
+                ("word/embeddings/oleObject1.xlsx", "application/vnd.openxmlformats-officedocument.oleObject"),
+                ("word/media/image1.emf", "image/x-emf"),
+            ),
+            "_rels/.rels": _relationships(
+                _relationship("rRoot", "officeDocument", "word/document.xml"),
+            ),
+            "word/document.xml": _xml(
+                f'<w:document xmlns:w="{WORDPROCESSING_NS}" xmlns:r="{OFFICE_REL_NS}" '
+                'xmlns:v="urn:schemas-microsoft-com:vml" '
+                'xmlns:o="urn:schemas-microsoft-com:office:office">'
+                "<w:body><w:p>"
+                '<w:object w:dxaOrig="1534" w:dyaOrig="1113">'
+                '<v:shape id="_x0000_i1025" type="#_x0000_t75" style="width:1pt;height:1pt">'
+                '<v:imagedata r:id="rIcon" o:title="Excel"/>'
+                "</v:shape>"
+                '<o:OLEObject Type="Embed" ProgID="Excel.Sheet.12" '
+                'ShapeID="_x0000_i1025" r:id="rOle"/>'
+                "</w:object>"
+                "<w:r><w:t>safe text</w:t></w:r>"
+                "</w:p></w:body></w:document>",
+            ),
+            "word/_rels/document.xml.rels": _relationships(
+                _relationship("rOle", "oleObject", "embeddings/oleObject1.xlsx"),
+                _relationship("rIcon", "image", "media/image1.emf"),
+            ),
+            "word/embeddings/oleObject1.xlsx": b"synthetic-ole",
+            "word/media/image1.emf": b"synthetic-emf",
+        },
+    )
+
+    result = sanitize_template(source, "docx")
+
+    assert result.format == "docx"
+    assert _active_parts(result.content) == []
+    with ZipFile(BytesIO(result.content)) as archive:
+        document = archive.read("word/document.xml")
+        assert b"w:object" not in document
+        assert b"OLEObject" not in document
+        assert b"safe text" in document
+
+
 def test_sanitize_docx_removes_an_external_relationship_consumed_by_r_link():
     content = _package(
         {
@@ -745,7 +796,9 @@ def test_sanitize_rejects_a_dangling_content_type_override():
         sanitize_template(content, "xlsx")
 
 
-def test_sanitize_rejects_residual_active_xml_without_a_relationship():
+def test_sanitize_strips_active_xml_without_a_relationship():
+    """An orphan active element is stripped, never left for the validator."""
+
     content = _package(
         {
             "[Content_Types].xml": _content_types(
@@ -759,13 +812,18 @@ def test_sanitize_rejects_residual_active_xml_without_a_relationship():
             ),
             "word/document.xml": _xml(
                 f'<w:document xmlns:w="{WORDPROCESSING_NS}">'
-                "<w:body><w:object/></w:body></w:document>",
+                "<w:body><w:object/><w:r><w:t>safe</w:t></w:r></w:body></w:document>",
             ),
         },
     )
 
-    with pytest.raises(TemplateSanitizationError, match="residual active XML"):
-        sanitize_template(content, "docx")
+    result = sanitize_template(content, "docx")
+
+    assert result.format == "docx"
+    with ZipFile(BytesIO(result.content)) as archive:
+        document = archive.read("word/document.xml")
+        assert b"w:object" not in document
+        assert b"safe" in document
 
 
 @pytest.mark.parametrize(

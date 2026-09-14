@@ -3,7 +3,7 @@
  * 删掉重命名按钮/员工 handoff;保留会话标题 + KB 名 + 记忆提炼信息 + 退出。
  * 另含本会话授权台账入口(查看/撤销个人记忆授权)与长期记忆页链接。
  */
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
 import UserMenu from '@/components/UserMenu';
@@ -49,6 +49,8 @@ type Props = {
   onWikiAssistChange?: (enabled: boolean) => void;
   /** Wiki 是否有内容; false 时禁用开关并提示。null/undefined = 未知(不禁用)。 */
   wikiAvailable?: boolean | null;
+  /** 页面级附加操作(如嵌入的导出任务中心),渲染在用户菜单之前。 */
+  actions?: ReactNode;
 };
 
 function HeaderToggle({
@@ -103,6 +105,7 @@ export default function ChatHeader({
   wikiAssist = false,
   onWikiAssistChange,
   wikiAvailable,
+  actions = null,
 }: Props) {
   const [toggling, setToggling] = useState(false);
   const [consentsOpen, setConsentsOpen] = useState(false);
@@ -175,6 +178,7 @@ export default function ChatHeader({
             )}
           </label>
         )}
+        {actions}
         {memorySummary && (
           <label
             className="flex cursor-pointer items-center gap-[6px] rounded-[8px] px-[8px] py-[4px] text-[11px] transition-colors hover:bg-[#f6f7fa]"

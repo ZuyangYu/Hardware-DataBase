@@ -5,15 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Protocol
+from collections.abc import Callable
+from typing import Literal, Protocol
 
-from src.core.llm_client import LLMClient
+from pydantic import BaseModel, ConfigDict, Field
+
+from src.core.chat_model_runtime import ChatModelLike, invoke_structured
+from src.core.model_factory import create_chat_model
 from src.document_authoring.template_analysis import (
     TemplateAnalysis,
     TemplateAnalysisSuggestion,
     TemplateAnalysisUnit,
 )
 from src.document_authoring.template_progress import TemplateProgressCallback
+from src.document_authoring.table_contracts import repair_repeating_table_targets
 
 
 logger = logging.getLogger(__name__)
@@ -30,21 +35,62 @@ class TemplateSuggestionTechnicalFailure(Exception):
         super().__init__(message)
         self.template_version_id = template_version_id
 
+
+class TemplateSuggestionItem(BaseModel):
+    """Strict model-owned portion of one template suggestion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    semantic_unit_id: str
+    label: str
+    target_unit_ids: list[str]
+    retrieval_terms: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+    value_shape: Literal["scalar", "repeating_table"] = "scalar"
+    overwrite_basis: Literal["placeholder", "sample_value"] | None = None
+    value_type: str | None = None
+    required_capabilities: list[str] = Field(default_factory=list)
+    preferred_source_roles: list[str] = Field(default_factory=list)
+    missing_policy: str | None = None
+    allow_derivation: bool = False
+    description: str = ""
+
+
+class TemplateSuggestionBatch(BaseModel):
+    """Strict envelope used by native structured-output providers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    suggestions: list[TemplateSuggestionItem] = Field(default_factory=list)
+
 _SUGGESTION_FIELDS = {
     "semantic_unit_id", "label", "target_unit_ids", "retrieval_terms", "confidence",
 }
+# Optional semantic-contract hints (Task 2): value_type/capabilities/... are
+# accepted from the LLM but only override deterministic inference when the
+# suggestion confidence clears the gate and values pass the allowlist
+# (enforced in service._field_for_suggestion via contract_registry).
+_SUGGESTION_OPTIONAL_CONTRACT_FIELDS = (
+    "value_type", "required_capabilities", "preferred_source_roles",
+    "missing_policy", "allow_derivation", "description",
+)
 # 大模板（数百可写单元）一次性交给 LLM 会让输出超过 max_tokens 被截断成非法 JSON，
 # 进而整体回退到 requires_human。按固定批量分块调用、逐块解析合并，使每块输出
 # 远小于 max_tokens，单块失败只丢该块而非整份分析。
 _SUGGESTION_CHUNK_SIZE = 50
 _FUNCTION_HEADER_RE = re.compile(
-    r"(?:\bfunction\b|\bdescription\b|功能描述|功能说明|功能)",
+    r"(?:^|[/\s])(?:function|description)(?:$|[/\s])|功能描述|功能说明",
     re.IGNORECASE,
 )
 _SYSTEM_PROMPT = """You analyze a safe template structural inventory and decide how each proposed semantic unit will be generated.
 You receive one CHUNK of writable units. For each unit that is a field to be filled during document generation, judge its semantic meaning from its label, value preview, neighborhood, and style.
 Return only a JSON array. Each item must contain exactly these keys:
 semantic_unit_id, label, target_unit_ids, retrieval_terms, confidence, overwrite_basis.
+You may additionally include optional semantic hints per item: value_type
+(text|number|integer|float|date|version|boolean|enum|table), required_capabilities
+(entity_lookup|relationship_lookup|tabular_lookup|document_claim_lookup|revision_lookup),
+preferred_source_roles, missing_policy (mark_tbd|keep_blank|block_section),
+allow_derivation (boolean), description. Hints are advisory and validated server-side.
 For workbook (xlsx/xlsm) units, target_unit_ids must contain exactly one entry: the unit_id of that same unit, and each semantic_unit_id must be unique per unit.
 For docx units, target_unit_ids may list multiple region unit_ids that share one semantic meaning.
 retrieval_terms must be the most effective keywords to retrieve that unit's content from the knowledge base; they drive content acquisition during generation.
@@ -61,8 +107,23 @@ class TemplateSuggestionProvider(Protocol):
 class LLMTemplateSuggestionProvider:
     """Suggest bindings without providing the model any OOXML bytes or paths."""
 
-    def __init__(self, client: LLMClient):
-        self._client = client
+    def __init__(
+        self,
+        model: ChatModelLike | None = None,
+        *,
+        model_factory: Callable[[], ChatModelLike] | None = None,
+    ):
+        self._model = model
+        self._model_factory = model_factory
+
+    def _get_model(self) -> ChatModelLike:
+        if self._model is None:
+            self._model = (
+                self._model_factory()
+                if self._model_factory is not None
+                else create_chat_model(profile="template_suggestion")
+            )
+        return self._model
 
     def suggest(
         self,
@@ -114,19 +175,25 @@ class LLMTemplateSuggestionProvider:
         chunk_failures: list[str] = []
         for index, chunk in enumerate(chunks, start=1):
             try:
-                response = self._client.chat(
+                response = invoke_structured(
+                    self._get_model(),
+                    TemplateSuggestionBatch,
                     [
                         {"role": "system", "content": _SYSTEM_PROMPT},
                         {"role": "user", "content": _chunk_payload(analysis, chunk)},
                     ],
-                    usage_stage="template_analysis",
-                    # Template mapping is a bounded, recoverable preflight. Do
-                    # not inherit the long document-generation timeout here;
-                    # a slow model must fall back to the deterministic table
-                    # mapper instead of holding the upload request open.
-                    timeout=60,
+                    operation="template_analysis",
+                    profile="template_suggestion",
+                    text_fallback=_parse_text_suggestion_batch,
                 )
-                parsed = _parse_suggestions(json.loads(response))
+                parsed = [
+                    _to_analysis_suggestion(item)
+                    for item in response.value.suggestions
+                ]
+                parsed = [
+                    repair_repeating_table_targets(analysis, suggestion)
+                    for suggestion in parsed
+                ]
                 for suggestion in parsed:
                     valid_targets: list[str] = []
                     for unit_id in suggestion.target_unit_ids:
@@ -290,6 +357,74 @@ def _deterministic_function_table_suggestions(
         if sheet_name and column is not None:
             function_headers[(sheet_name, column)] = header.value_preview
     suggestions: list[TemplateAnalysisSuggestion] = []
+    # A fully populated example table is still a valid template region when
+    # its header row describes the values to be replaced. Require a rectangular
+    # run with at least three populated cells per row so ordinary label/value
+    # examples are not promoted accidentally.
+    from collections import defaultdict
+    from src.document_authoring.template_analysis import workbook_cell_coordinates
+    headers_by_row: dict[tuple[str, int], list[tuple[TemplateAnalysisUnit, int]]] = defaultdict(list)
+    for candidate in analysis.units:
+        if candidate.structural_role_hint != "table_header" or not candidate.value_preview:
+            continue
+        try:
+            column, row = workbook_cell_coordinates(str(candidate.locator.get("cell", "")))
+        except ValueError:
+            continue
+        headers_by_row[(str(candidate.locator.get("sheet_name") or ""), row)].append((candidate, column))
+    for (sheet_name, header_row), header_run in headers_by_row.items():
+        header_run.sort(key=lambda value: value[1])
+        header_columns = [column for _unit_id, column in header_run]
+        if len(header_columns) < 3 or not any(
+            _FUNCTION_HEADER_RE.search(classified_id.value_preview or "")
+            for classified_id, _column in header_run
+        ):
+            continue
+        by_row_cells: dict[int, list[tuple[TemplateAnalysisUnit, int]]] = {}
+        for candidate in analysis.units:
+            if str(candidate.locator.get("sheet_name") or "") != sheet_name:
+                continue
+            try:
+                candidate_column, candidate_row = workbook_cell_coordinates(str(candidate.locator.get("cell", "")))
+            except ValueError:
+                continue
+            if candidate_row > header_row and candidate_column in header_columns:
+                by_row_cells.setdefault(candidate_row, []).append((candidate, candidate_column))
+        body_rows = [
+            row for row, row_cells in sorted(by_row_cells.items())
+            if len(row_cells) == len(header_columns)
+            and sum(bool(item.value_preview) for item, _column in row_cells) >= 3
+        ]
+        if not body_rows:
+            continue
+        # Keep only the contiguous body prefix below the header.
+        contiguous_rows: list[int] = []
+        for row in body_rows:
+            if contiguous_rows and row != contiguous_rows[-1] + 1:
+                break
+            contiguous_rows.append(row)
+        if not contiguous_rows:
+            continue
+        target_ids = [
+            item.unit_id
+            for row in contiguous_rows
+            for item, _column in sorted(by_row_cells[row], key=lambda value: value[1])
+            if item.writable and item.value_kind != "formula"
+        ]
+        if len(target_ids) != len(contiguous_rows) * len(header_columns):
+            continue
+        labels = [item.value_preview for item, _column in header_run if item.value_preview]
+        suggestions.append(TemplateAnalysisSuggestion(
+            semantic_unit_id=f"table:{sheet_name}:{header_row}",
+            label=" / ".join(labels),
+            target_unit_ids=target_ids,
+            retrieval_terms=labels[:8],
+            confidence=0.94,
+            value_shape="repeating_table",
+            overwrite_basis="sample_value",
+            description="Template data table inferred from a descriptive header row",
+        ))
+        return suggestions
     for unit in analysis.units:
         if (
             not unit.writable
@@ -298,12 +433,19 @@ def _deterministic_function_table_suggestions(
             or not unit.candidate_for_auto_fill
         ):
             continue
-        neighborhood_values = [
+        same_row_values = [
+            neighbor.value_preview
+            for neighbor in unit.neighborhood
+            if neighbor.value_preview and neighbor.relative_row == 0
+        ]
+        headers = [
             neighbor.value_preview
             for neighbor in unit.neighborhood
             if neighbor.value_preview
+            and neighbor.relative_column == 0
+            and neighbor.relative_row < 0
+            and _FUNCTION_HEADER_RE.search(neighbor.value_preview)
         ]
-        headers = [value for value in neighborhood_values if _FUNCTION_HEADER_RE.search(value)]
         sheet_name = str(unit.locator.get("sheet_name") or "")
         column = _cell_column_index(str(unit.locator.get("cell") or ""))
         if not headers and sheet_name and column is not None:
@@ -313,11 +455,11 @@ def _deterministic_function_table_suggestions(
         if not headers:
             continue
         terms: list[str] = []
-        for value in [*headers, *neighborhood_values]:
+        for value in [*headers, *same_row_values]:
             if value and value not in terms:
                 terms.append(value)
         suggestions.append(TemplateAnalysisSuggestion(
-            semantic_unit_id=f"field:{unit.unit_id}",
+            semantic_unit_id=unit.unit_id,
             label=unit.label,
             target_unit_ids=[unit.unit_id],
             retrieval_terms=terms[:8],
@@ -334,6 +476,28 @@ def _cell_column_index(cell: str) -> int | None:
     for character in match.group(1):
         value = value * 26 + ord(character) - ord("A") + 1
     return value
+
+
+def _to_analysis_suggestion(item: TemplateSuggestionItem) -> TemplateAnalysisSuggestion:
+    return TemplateAnalysisSuggestion.model_validate(item.model_dump())
+
+
+def _parse_text_suggestion_batch(value: str) -> TemplateSuggestionBatch:
+    """Parse the explicitly allowed text compatibility response."""
+
+    cleaned = str(value or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    parsed = json.loads(cleaned)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("suggestions")
+    return TemplateSuggestionBatch(
+        suggestions=[
+            TemplateSuggestionItem.model_validate(item.model_dump())
+            for item in _parse_suggestions(parsed)
+        ]
+    )
 
 
 def _parse_suggestions(value: object) -> list[TemplateAnalysisSuggestion]:
@@ -403,7 +567,30 @@ def _parse_suggestion(value: object) -> TemplateAnalysisSuggestion:
         retrieval_terms=retrieval_terms,
         confidence=float(confidence),
         overwrite_basis=overwrite_basis,
+        **_contract_hints(value),
     )
+
+
+def _contract_hints(value: dict) -> dict:
+    """Pass through optional semantic-contract hints, tolerating format drift."""
+    hints: dict = {}
+    for key in _SUGGESTION_OPTIONAL_CONTRACT_FIELDS:
+        if key not in value or value[key] is None:
+            continue
+        raw = value[key]
+        if key in {"required_capabilities", "preferred_source_roles"}:
+            coerced = _coerce_string_list(raw)
+            if coerced:
+                hints[key] = coerced
+        elif key == "allow_derivation":
+            if isinstance(raw, bool):
+                hints[key] = raw
+        elif key == "description":
+            if isinstance(raw, str) and raw.strip():
+                hints[key] = raw.strip()
+        elif isinstance(raw, str) and raw.strip():
+            hints[key] = raw.strip().casefold() if key == "value_type" else raw.strip()
+    return hints
 
 
 def _unit_inventory(unit: TemplateAnalysisUnit) -> dict[str, object]:
@@ -447,7 +634,7 @@ def _split_multi_target(
     """
     split: list[TemplateAnalysisSuggestion] = []
     for suggestion in suggestions:
-        if len(suggestion.target_unit_ids) <= 1:
+        if suggestion.value_shape == "repeating_table" or len(suggestion.target_unit_ids) <= 1:
             split.append(suggestion)
             continue
         for unit_id in suggestion.target_unit_ids:

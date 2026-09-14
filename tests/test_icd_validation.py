@@ -117,6 +117,33 @@ def test_approval_rejects_icd_blocking_issue_even_when_report_is_passed():
         service.approve_document_artifact(SimpleNamespace(), "candidate-1")
 
 
+def test_approval_rejects_any_blocking_validation_issue():
+    service = object.__new__(DocumentGenerationService)
+    candidate = SimpleNamespace(
+        stage="review_candidate",
+        validation_report_id="report-1",
+        work_order_id="work-1",
+    )
+    service._artifact_for_context = Mock(return_value=candidate)
+    service._order = Mock(return_value=SimpleNamespace())
+    service.store = SimpleNamespace(
+        get_validation_report=Mock(return_value=ValidationReport(
+            validation_report_id="report-1",
+            work_order_id="work-1",
+            status="requires_human",
+            issues=[{
+                "code": "draft_unit_mismatch",
+                "severity": "blocking",
+                "blocking": True,
+            }],
+            evidence_matrix_hash="matrix-hash",
+        )),
+    )
+
+    with pytest.raises(ValueError, match="blocking validation"):
+        service.approve_document_artifact(SimpleNamespace(), "candidate-1")
+
+
 def test_validation_uses_effective_scope_after_user_excludes_pgnd():
     review = IcdScopeReview(
         work_order_id="work-1",

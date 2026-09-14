@@ -179,6 +179,11 @@ def sanitize_template(content: bytes, source_format: SourceFormat) -> SanitizedT
     retained = _remove_parts_and_relationships(package, removal)
     _remove_content_type_entries(retained, removal.parts)
     _remove_relationship_consumers(retained, removal.relationship_ids)
+    # Relationship-consumer pruning can leave active wrappers behind when the
+    # wrapper itself carries layout attributes (Word writes e.g.
+    # ``<w:object w:dxaOrig=... w14:anchorId=...>``).  Strip every element the
+    # validator rejects so the sanitized package is clean by construction.
+    _strip_active_xml_elements(retained)
     safe_format = _target_format(source_format)
     _normalize_main_content_type(retained, safe_format)
     sanitized = _write_package(retained)
@@ -877,13 +882,42 @@ def _validate_sanitized_package(content: bytes, safe_format: SafeFormat) -> None
                 )
 
 
+def _is_active_xml_element(element: ElementTree.Element) -> bool:
+    return (
+        _local_name(element.tag).lower() in _ACTIVE_XML_ELEMENTS
+        and _namespace(element.tag) in _OFFICE_DOCUMENT_NAMESPACES
+    )
+
+
+def _strip_active_xml_elements(package: _Package) -> None:
+    """Remove active XML elements (OLE objects, controls, external refs)."""
+
+    content_types = _content_types(package)
+    for part_name, entry in package.entries.items():
+        if not _part_is_xml(part_name, content_types) or part_name.endswith(".rels"):
+            continue
+        root, mce_namespace_bindings = _parse_xml_with_namespace_scopes(
+            entry.content,
+            part_name,
+        )
+        changed = False
+        for parent in list(root.iter()):
+            for child in list(parent):
+                if _is_active_xml_element(child):
+                    parent.remove(child)
+                    changed = True
+        if changed:
+            entry.content = _serialize_xml_preserving_mce_namespaces(
+                root,
+                mce_namespace_bindings,
+                part_name,
+            )
+
+
 def _validate_no_active_xml_elements(content: bytes, part_name: str) -> None:
     root = _parse_xml(content, part_name)
     for element in root.iter():
-        if (
-            _local_name(element.tag).lower() in _ACTIVE_XML_ELEMENTS
-            and _namespace(element.tag) in _OFFICE_DOCUMENT_NAMESPACES
-        ):
+        if _is_active_xml_element(element):
             raise TemplateSanitizationError(f"residual active XML content in {part_name}")
 
 

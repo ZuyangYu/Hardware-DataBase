@@ -4,13 +4,12 @@ Layering (agent/wiki/memory/authoring depend on this module, not on a provider
 SDK directly):
 
 - :class:`UsageLedger` -- process-wide token/call accounting per channel and
-  model, shared by the LangChain path (agent/wiki/assets) and ``LLMClient``
+  model (the factory is the only construction entry)
   (authoring/external/ingestion).
 - :class:`_GovernedChatOpenAI` / :class:`_GovernedChatOllama` -- real adapter
   classes that hold one governor slot for the duration of each generate/stream
   call, replacing the old post-construction class swap.
 - :func:`build_chat_model` -- construction entry used by ``model_factory``.
-- :func:`govern_model` -- class-swap fallback for models built elsewhere
   (memory worker's independent model settings).
 
 Fail-open: any accounting/metadata failure must never break a model call.
@@ -33,8 +32,6 @@ from src.core.llm_governor import (
     PRIORITY_INTERACTIVE,
     get_llm_governor,
 )
-
-_GOVERNED_MARKER = "_HDBGoverned"
 
 
 class UsageLedger:
@@ -361,47 +358,82 @@ class _GovernedChatOllama(ChatOllama):
             yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
 
 
+def build_governed_model(
+    *,
+    provider: str,
+    model: str,
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    max_retries: int = 4,
+    timeout: int = 120,
+    base_url: str = "",
+    api_key: str = "",
+    default_headers: dict[str, str] | None = None,
+    client_kwargs: dict[str, Any] | None = None,
+    priority: str = PRIORITY_INTERACTIVE,
+) -> Any:
+    """显式参数版受治理模型构造: 工厂 (create_chat_model) 的唯一构建入口。
+
+    真实 adapter 类(非构造后换类), 闸门与用量账本都在 adapter 内生效。
+    """
+    callbacks = [_UsageLedgerCallback(channel=priority, model=model)]
+    if provider == "ollama":
+        kwargs = dict(client_kwargs or {})
+        kwargs.setdefault("timeout", timeout)
+        return _GovernedChatOllama(
+            model=model,
+            base_url=base_url or None,
+            temperature=temperature,
+            client_kwargs=kwargs,
+            callbacks=callbacks,
+            hdb_priority=priority,
+        )
+    return _GovernedChatOpenAI(
+        model=model,
+        base_url=base_url or None,
+        api_key=api_key or None,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_retries=max_retries,
+        timeout=timeout,
+        default_headers=default_headers or None,
+        callbacks=callbacks,
+        hdb_priority=priority,
+    )
+
+
 def build_chat_model(
     *,
     provider: str = "",
     model: str = "",
     priority: str = PRIORITY_INTERACTIVE,
 ) -> Any:
-    """Construct a governed LangChain chat model from AGENT_* settings.
-
-    Mirrors what ``init_chat_model`` produced before, but as a real adapter
-    class (no post-construction ``__class__`` swap) and with a usage-ledger
-    callback attached.
-    """
+    """settings 版壳: 解析 AGENT_* 后调用 :func:`build_governed_model`。"""
     provider = (provider or str(settings.AGENT_LLM_PROVIDER)).lower()
-    temperature = float(settings.AGENT_TEMPERATURE)
-    max_retries = int(settings.AGENT_RATE_LIMIT_MAX_RETRIES)
-    timeout = int(settings.AGENT_TIMEOUT_SECONDS)
     model_name = model or (
         str(settings.AGENT_OLLAMA_MODEL) if provider == "ollama" else str(settings.AGENT_CUSTOM_MODEL)
     )
-
     if provider == "ollama":
-        return _GovernedChatOllama(
+        return build_governed_model(
+            provider="ollama",
             model=model_name,
+            temperature=float(settings.AGENT_TEMPERATURE),
+            max_tokens=int(settings.AGENT_CUSTOM_MAX_TOKENS),
+            timeout=int(settings.AGENT_TIMEOUT_SECONDS),
             base_url=str(settings.AGENT_OLLAMA_BASE_URL),
-            temperature=temperature,
-            client_kwargs={"timeout": timeout},
-            callbacks=[_UsageLedgerCallback(channel=priority, model=model_name)],
-            hdb_priority=priority,
+            priority=priority,
         )
-
-    return _GovernedChatOpenAI(
+    return build_governed_model(
+        provider="custom",
         model=model_name,
-        base_url=str(settings.AGENT_CUSTOM_BASE_URL) or None,
-        api_key=str(settings.AGENT_CUSTOM_API_KEY),
-        temperature=temperature,
+        temperature=float(settings.AGENT_TEMPERATURE),
         max_tokens=int(settings.AGENT_CUSTOM_MAX_TOKENS),
-        max_retries=max_retries,
-        timeout=timeout,
+        max_retries=int(settings.AGENT_RATE_LIMIT_MAX_RETRIES),
+        timeout=int(settings.AGENT_TIMEOUT_SECONDS),
+        base_url=str(settings.AGENT_CUSTOM_BASE_URL),
+        api_key=str(settings.AGENT_CUSTOM_API_KEY),
         default_headers=_extra_headers(settings.AGENT_CUSTOM_BASE_URL) or None,
-        callbacks=[_UsageLedgerCallback(channel=priority, model=model_name)],
-        hdb_priority=priority,
+        priority=priority,
     )
 
 
@@ -412,58 +444,6 @@ def _extra_headers(base_url: object) -> dict[str, str]:
         return opencode_extra_headers(base_url)
     except Exception:  # noqa: BLE001
         return {}
-
-
-# -- fallback wrapping for models built outside build_chat_model ------------
-
-_GOVERNED_CLASSES: dict[tuple[type, str], type] = {}
-
-
-def _governed_class(base: type, priority: str) -> type:
-    key = (base, priority)
-    cached = _GOVERNED_CLASSES.get(key)
-    if cached is not None:
-        return cached
-
-    def _generate(self, *args, **kwargs):  # noqa: ANN001
-        with get_llm_governor().slot(priority):
-            return base._generate(self, *args, **kwargs)
-
-    def _stream(self, *args, **kwargs):  # noqa: ANN001
-        with get_llm_governor().slot(priority):
-            timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
-            yield from _iter_with_idle_timeout(base._stream(self, *args, **kwargs), timeout)
-
-    async def _agenerate(self, *args, **kwargs):  # noqa: ANN001
-        cm = get_llm_governor().slot(priority)
-        await asyncio.to_thread(cm.__enter__)
-        try:
-            return await base._agenerate(self, *args, **kwargs)
-        finally:
-            await asyncio.to_thread(cm.__exit__, None, None, None)
-
-    async def _astream(self, *args, **kwargs):  # noqa: ANN001
-        cm = get_llm_governor().slot(priority)
-        await asyncio.to_thread(cm.__enter__)
-        try:
-            async for chunk in base._astream(self, *args, **kwargs):
-                yield chunk
-        finally:
-            await asyncio.to_thread(cm.__exit__, None, None, None)
-
-    governed = type(
-        f"{_GOVERNED_MARKER}{base.__name__.lstrip('_')}_{priority}",
-        (base,),
-        {
-            "__module__": __name__,
-            "_generate": _generate,
-            "_stream": _stream,
-            "_agenerate": _agenerate,
-            "_astream": _astream,
-        },
-    )
-    _GOVERNED_CLASSES[key] = governed
-    return governed
 
 
 def _record_ragas_usage(result: Any) -> None:
@@ -525,27 +505,14 @@ def govern_ragas_llm(llm: Any) -> Any:
     return llm
 
 
-def govern_model(model: Any, priority: str = PRIORITY_INTERACTIVE) -> Any:
-    """Route a model built elsewhere through the governor (fail-open swap)."""
-    if isinstance(model, (_GovernedChatOpenAI, _GovernedChatOllama)):
-        return model
-    if type(model).__name__.startswith(_GOVERNED_MARKER):
-        return model
-    try:
-        model.__class__ = _governed_class(type(model), priority)
-    except Exception:  # noqa: BLE001 - 治理层绝不阻塞主流程
-        return model
-    return model
-
-
 __all__ = [
     "PRIORITY_BATCH",
     "PRIORITY_INTERACTIVE",
     "UsageLedger",
     "build_chat_model",
+    "build_governed_model",
     "get_persisted_usage",
     "get_usage_ledger",
-    "govern_model",
     "govern_ragas_llm",
     "reset_usage_ledger",
 ]

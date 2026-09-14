@@ -6,6 +6,7 @@ import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import src.settings
 
@@ -24,12 +25,14 @@ class ChatSession:
     title: str
     created_at: str
     updated_at: str
+    document_context: dict | None = None
 
 
 @dataclass
 class ChatMessage:
     id: int
     session_id: int
+    turn_id: str | None
     role: str
     content: str
     footer: str
@@ -37,6 +40,7 @@ class ChatMessage:
     edited_at: str | None = None
     redacted: bool = False
     memory_context: list[dict] = field(default_factory=list)
+    document_context: dict | None = None
     # 紧凑引用列表（来自 turn summary.evidence，内容截断），让"参考来源"
     # 面板在刷新后仍可用，而不必重放 turn 事件。
     citations: list[dict] = field(default_factory=list)
@@ -70,6 +74,15 @@ class ChatTurn:
     created_at: str
     started_at: str | None
     finished_at: str | None
+    document_context: dict | None = None
+    export_plan: dict = field(default_factory=dict)
+    source_scope: str = "auto"
+    required_attachment_ids: list[str] = field(default_factory=list)
+    attachments: list[dict] = field(default_factory=list)
+
+
+# A turn waits here while its required chat attachments are still parsing.
+TURN_STATUS_WAITING_FOR_ATTACHMENTS = "waiting_for_attachments"
 
 
 @dataclass
@@ -105,6 +118,7 @@ class ConversationService:
                     department_id INTEGER,
                     kb_id INTEGER,
                     title TEXT NOT NULL,
+                    document_context_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -148,6 +162,8 @@ class ConversationService:
                     footer TEXT NOT NULL DEFAULT '',
                     metrics_json TEXT NOT NULL DEFAULT '{}',
                     trace_context_json TEXT NOT NULL DEFAULT '{}',
+                    document_context_json TEXT NOT NULL DEFAULT '{}',
+                    export_plan_json TEXT NOT NULL DEFAULT '{}',
                     error_message TEXT NOT NULL DEFAULT '',
                     worker_id TEXT NOT NULL DEFAULT '',
                     worker_heartbeat_at TEXT,
@@ -200,8 +216,31 @@ class ConversationService:
                     FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
                 )
             """)
+            # Frozen attachment views per turn (design §4.5). History must
+            # still render "file.pdf（已删除）" after the attachment is gone;
+            # snapshots duplicate metadata instead of joining live rows.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS turn_attachments (
+                    turn_id TEXT NOT NULL,
+                    attachment_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL DEFAULT 0,
+                    filename_snapshot TEXT NOT NULL,
+                    media_type_snapshot TEXT NOT NULL DEFAULT '',
+                    usage_hint_snapshot TEXT NOT NULL DEFAULT 'reference',
+                    content_hash_snapshot TEXT NOT NULL DEFAULT '',
+                    parser_version_snapshot TEXT NOT NULL DEFAULT '',
+                    asset_id TEXT NOT NULL DEFAULT '',
+                    parse_status_snapshot TEXT NOT NULL DEFAULT 'queued',
+                    PRIMARY KEY(turn_id, attachment_id)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_turn_attachments_asset "
+                "ON turn_attachments(asset_id)"
+            )
             self._ensure_column(conn, "chat_sessions", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "kb_id", "INTEGER")
+            self._ensure_column(conn, "chat_sessions", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
             self._ensure_column(conn, "chat_turns", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "kb_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "worker_id", "TEXT NOT NULL DEFAULT ''")
@@ -210,9 +249,13 @@ class ConversationService:
             self._ensure_column(conn, "chat_turns", "query_mode", "TEXT NOT NULL DEFAULT 'fast'")
             self._ensure_column(conn, "chat_turns", "metrics_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "chat_turns", "trace_context_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "chat_turns", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
+            self._ensure_column(conn, "chat_turns", "export_plan_json", "TEXT NOT NULL DEFAULT '{}'" )
             self._ensure_column(conn, "chat_messages", "edited_at", "TEXT")
             self._ensure_column(conn, "chat_messages", "redacted", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "chat_sessions", "auto_memory", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(conn, "chat_turns", "source_scope", "TEXT NOT NULL DEFAULT 'auto'")
+            self._ensure_column(conn, "chat_turns", "required_attachment_ids", "TEXT NOT NULL DEFAULT '[]'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_turns_status_created ON chat_turns(status, created_at)")
             has_users = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
@@ -279,6 +322,21 @@ class ConversationService:
                 SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?
                 """,
                 (session_id, user_id),
+            ).fetchone()
+        return row_to_session(row) if row else None
+
+    def get_session_unscoped(self, session_id: int) -> ChatSession | None:
+        """Look up a session without an owner filter.
+
+        Reserved for governance paths (release review, audit) that must first
+        resolve the session's knowledge base and then enforce KB permission
+        themselves; ordinary content reads must keep using ``get_session``.
+        """
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_sessions WHERE id = ?",
+                (session_id,),
             ).fetchone()
         return row_to_session(row) if row else None
 
@@ -355,9 +413,12 @@ class ConversationService:
             rows = conn.execute(
                 """
                 SELECT m.*, COALESCE(t.footer, '') AS footer,
-                       COALESCE(t.summary_json, '{}') AS turn_summary
+                       t.id AS turn_id,
+                       COALESCE(t.summary_json, '{}') AS turn_summary,
+                       COALESCE(t.document_context_json, '{}') AS turn_document_context
                 FROM chat_messages m
-                LEFT JOIN chat_turns t ON t.assistant_message_id = m.id
+                LEFT JOIN chat_turns t
+                  ON t.assistant_message_id = m.id OR t.user_message_id = m.id
                 WHERE m.session_id = ?
                 ORDER BY m.id
                 """,
@@ -422,6 +483,23 @@ class ConversationService:
         """
         if not self.get_session(user_id, session_id):
             return False
+        # Reserve a durable cleanup task before deleting the session row. The
+        # attachment database is separate from the conversation database, so
+        # a post-delete best-effort enqueue could permanently lose the only
+        # reference needed to reclaim private files. If the outbox cannot be
+        # written, abort the deletion and let the caller retry safely.
+        from src.attachments.store import AttachmentStore
+
+        attachment_store = AttachmentStore()
+        attachment_store.enqueue_session_cleanup(
+            session_id=session_id,
+            user_id=user_id,
+            targets={
+                "attachments": True,
+                "storage": True,
+                "require_session_absent": True,
+            },
+        )
         with closing(self._connect()) as conn:
             from src.memory.jobs import invalidate_session_memory_in_connection
 
@@ -651,28 +729,94 @@ class ConversationService:
         query_mode: str = "fast",
         trace_context: dict[str, str] | None = None,
         wiki_assist: bool = False,
+        document_context: dict | Any | None = None,
+        attachment_ids: list[str] | None = None,
+        source_scope: str = "auto",
     ) -> ChatTurn:
         """Persist one user request and its assistant placeholder atomically.
 
         The idempotency key makes browser retries safe: the same request returns
         the original turn instead of incurring a second model invocation.
+
+        With attachments, the turn starts as ``waiting_for_attachments`` while
+        any referenced asset is still parsing, and frozen attachment snapshots
+        are stored for history rendering.
         """
         query = query.strip()
         if not query:
             raise ValueError("query must not be empty")
         request_id = (client_request_id or "").strip()[:128] or None
         query_mode = query_mode if query_mode in {"fast", "deep"} else "fast"
+        if hasattr(document_context, "model_dump"):
+            document_context = document_context.model_dump(mode="json")
+        if document_context is not None and not isinstance(document_context, dict):
+            raise ValueError("document_context must be an object")
+        document_context_json = json.dumps(
+            document_context or {}, ensure_ascii=False, sort_keys=True, default=str,
+        )
+        attachment_ids = [str(item or "").strip() for item in (attachment_ids or []) if str(item or "").strip()]
+        session = self.get_session(user_id, session_id)
+        if session is None:
+            raise PermissionError("chat session does not belong to current user")
+        from src.attachments.models import (
+            resolve_source_scope,
+            scope_allows_attachments,
+        )
+
+        effective_scope = resolve_source_scope(
+            requested_scope=source_scope,
+            has_attachments=bool(attachment_ids),
+            is_general_chat=session.kb_name == GENERAL_CHAT_KB_NAME,
+        )
+        attachment_refs: list[dict] = []
+        if attachment_ids and scope_allows_attachments(effective_scope):
+            # Lazy import keeps the conversation module independent of the
+            # attachment domain (same pattern as memory/result_exports).
+            from src.attachments.service import AttachmentService
+
+            service = AttachmentService()
+            refs, blocked = service.resolve_refs_for_turn(
+                user_id=user_id, session_id=session_id, attachment_ids=attachment_ids
+            )
+            if blocked:
+                raise ValueError(
+                    "attachment_unavailable: " + ", ".join(blocked[:10])
+                )
+            attachment_refs = [
+                {
+                    "attachment_id": ref.attachment_id,
+                    "asset_id": ref.asset_id,
+                    "filename": ref.filename,
+                    "media_type": ref.media_type,
+                    "extension": ref.extension,
+                    "size_bytes": ref.size_bytes,
+                    "sha256": ref.sha256,
+                    "usage_hint": ref.usage_hint,
+                    "parse_status": ref.parse_status,
+                    "parser_version": ref.parser_version,
+                    "degraded_reason": ref.degraded_reason,
+                }
+                for ref in refs
+            ]
+        from src.result_exports import infer_export_intent
+
+        export_plan = infer_export_intent(query)
+        export_plan_json = json.dumps(
+            export_plan.to_dict() if export_plan is not None else {},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         now = utc_now()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                session = conn.execute(
+                session_row = conn.execute(
                     """
                     SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?
                     """,
                     (session_id, user_id),
                 ).fetchone()
-                if session is None:
+                if session_row is None:
                     raise PermissionError("chat session does not belong to current user")
                 if request_id:
                     existing = conn.execute(
@@ -691,37 +835,85 @@ class ConversationService:
                     (session_id, now),
                 )
                 conn.execute(
-                    "UPDATE chat_sessions SET updated_at = ?, title = CASE WHEN title = '新对话' THEN ? ELSE title END WHERE id = ?",
-                    (now, query.replace("\n", " ")[:32] or "新对话", session_id),
+                    """UPDATE chat_sessions
+                       SET updated_at = ?,
+                           title = CASE WHEN title = '新对话' THEN ? ELSE title END,
+                           document_context_json = CASE WHEN ? = '{}' THEN document_context_json ELSE ? END
+                       WHERE id = ?""",
+                    (
+                        now, query.replace("\n", " ")[:32] or "新对话",
+                        document_context_json, document_context_json, session_id,
+                    ),
                 )
                 turn_id = str(uuid.uuid4())
+                # A turn waits while any required attachment is still parsing.
+                waiting = any(
+                    ref.get("parse_status") in {"queued", "running"}
+                    for ref in attachment_refs
+                )
+                initial_status = (
+                    TURN_STATUS_WAITING_FOR_ATTACHMENTS if waiting else "pending"
+                )
+                required_ids = [ref["attachment_id"] for ref in attachment_refs]
                 conn.execute(
                     """
                     INSERT INTO chat_turns (
                         id, session_id, user_message_id, assistant_message_id, kb_name, query, query_mode,
                         department_id, kb_id, status, client_request_id, trace_context_json, created_at,
+                        document_context_json, export_plan_json, source_scope, required_attachment_ids,
                         wiki_assist
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
                         session_id,
                         user_cursor.lastrowid,
                         assistant_cursor.lastrowid,
-                        session["kb_name"],
+                        session_row["kb_name"],
                         query,
                         query_mode,
-                        session["department_id"],
-                        session["kb_id"],
+                        session_row["department_id"],
+                        session_row["kb_id"],
+                        initial_status,
                         request_id,
                         json.dumps(trace_context or {}, ensure_ascii=False),
                         now,
+                        document_context_json,
+                        export_plan_json,
+                        effective_scope,
+                        json.dumps(required_ids, ensure_ascii=False),
                         1 if wiki_assist else 0,
                     ),
                 )
+                if attachment_refs:
+                    for ordinal, ref in enumerate(attachment_refs):
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO turn_attachments (
+                                turn_id, attachment_id, ordinal, filename_snapshot,
+                                media_type_snapshot, usage_hint_snapshot,
+                                content_hash_snapshot, parser_version_snapshot,
+                                asset_id, parse_status_snapshot
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                turn_id,
+                                ref["attachment_id"],
+                                ordinal,
+                                ref["filename"],
+                                ref["media_type"],
+                                ref["usage_hint"],
+                                ref["sha256"],
+                                ref["parser_version"],
+                                ref["asset_id"],
+                                ref["parse_status"],
+                            ),
+                        )
                 row = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
+                turn = row_to_turn(row)
                 conn.execute("COMMIT")
-                return row_to_turn(row)
+                turn.attachments = attachment_refs
+                return turn
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
@@ -738,6 +930,18 @@ class ConversationService:
             ).fetchone()
         return row_to_turn(row) if row else None
 
+    def get_turn_by_message(self, user_id: int, message_id: int) -> ChatTurn | None:
+        """Resolve a persisted user/assistant message to its owning turn."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT t.* FROM chat_turns t
+                   JOIN chat_sessions s ON s.id = t.session_id
+                   WHERE s.user_id = ? AND (t.user_message_id = ? OR t.assistant_message_id = ?)
+                   ORDER BY t.created_at DESC LIMIT 1""",
+                (user_id, message_id, message_id),
+            ).fetchone()
+        return row_to_turn(row) if row else None
+
     def list_active_turns(self, user_id: int, session_id: int) -> list[ChatTurn]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
@@ -745,10 +949,206 @@ class ConversationService:
                 SELECT t.* FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 WHERE t.session_id = ? AND s.user_id = ?
-                  AND t.status IN ('pending', 'streaming', 'cancelling')
+                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
                 ORDER BY t.created_at
                 """,
                 (session_id, user_id),
+            ).fetchall()
+        return [row_to_turn(row) for row in rows]
+
+    def list_recent_turns(
+        self, user_id: int, session_id: int, limit: int = 1
+    ) -> list[ChatTurn]:
+        """Newest turns regardless of status (refresh/reopen recovery)."""
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT t.* FROM chat_turns t
+                JOIN chat_sessions s ON s.id = t.session_id
+                WHERE t.session_id = ? AND s.user_id = ?
+                ORDER BY t.created_at DESC, t.rowid DESC
+                LIMIT ?
+                """,
+                (session_id, user_id, max(1, int(limit))),
+            ).fetchall()
+        return [row_to_turn(row) for row in rows]
+
+    def list_session_document_cards(
+        self, user_id: int, session_id: int
+    ) -> dict[str, list[dict]]:
+        """Persisted ``document_card`` payloads per turn, oldest first.
+
+        History rehydration reads these so candidate/document cards survive a
+        page refresh; the live SSE path remains the primary source.
+        """
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT e.turn_id, e.payload_json FROM chat_turn_events e
+                JOIN chat_turns t ON t.id = e.turn_id
+                JOIN chat_sessions s ON s.id = t.session_id
+                WHERE t.session_id = ? AND s.user_id = ?
+                  AND e.event_type = 'document_card'
+                ORDER BY e.turn_id, e.seq
+                """,
+                (session_id, user_id),
+            ).fetchall()
+        cards: dict[str, list[dict]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            card = payload.get("card") if isinstance(payload, dict) else None
+            if isinstance(card, dict) and card:
+                cards.setdefault(str(row["turn_id"]), []).append(card)
+        return cards
+
+    def get_turn_unscoped(self, turn_id: str) -> ChatTurn | None:
+        """Turn lookup without a user binding, for background coordinators."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+        return row_to_turn(row) if row else None
+
+    def transition_waiting_turn(
+        self,
+        turn_id: str,
+        *,
+        to_status: str,
+        error_message: str = "",
+    ) -> bool:
+        """Atomically move a waiting turn out of the attachment wait state.
+
+        Only ``pending`` and ``failed`` destinations are accepted; the update
+        is a no-op when a user cancelled the turn while it was waiting.
+        """
+        if to_status not in {"pending", "failed"}:
+            raise ValueError("waiting turns can only transition to pending or failed")
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE chat_turns
+                    SET status = ?,
+                        error_message = ?,
+                        finished_at = CASE WHEN ? = 'failed' THEN ? ELSE finished_at END
+                    WHERE id = ? AND status = 'waiting_for_attachments'
+                    """,
+                    (
+                        to_status,
+                        error_message[:1000] if to_status == "failed" else "",
+                        to_status, now, turn_id,
+                    ),
+                )
+                if to_status == "failed":
+                    conn.execute(
+                        """
+                        UPDATE chat_messages SET content = ?
+                        WHERE id = (
+                            SELECT assistant_message_id FROM chat_turns WHERE id = ?
+                        ) AND content = ''
+                        """,
+                        (f"附件解析失败：{error_message[:400]}", turn_id),
+                    )
+                conn.execute("COMMIT")
+                return int(cursor.rowcount or 0) > 0
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def list_turn_attachments(self, turn_id: str) -> list[dict]:
+        """Frozen attachment snapshots for one turn (history rendering)."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM turn_attachments WHERE turn_id = ? ORDER BY ordinal
+                """,
+                (turn_id,),
+            ).fetchall()
+        snapshots = [dict(row) for row in rows]
+        self._mark_deleted_attachment_snapshots(snapshots)
+        return snapshots
+
+    def list_turn_attachments_for_session(self, session_id: int) -> dict[str, list[dict]]:
+        """Snapshots grouped by turn_id for list views."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT ta.* FROM turn_attachments ta
+                JOIN chat_turns t ON t.id = ta.turn_id
+                WHERE t.session_id = ?
+                ORDER BY ta.turn_id, ta.ordinal
+                """,
+                (session_id,),
+            ).fetchall()
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(row["turn_id"], []).append(dict(row))
+        for snapshots in grouped.values():
+            self._mark_deleted_attachment_snapshots(snapshots)
+        return grouped
+
+    @staticmethod
+    def _mark_deleted_attachment_snapshots(snapshots: list[dict]) -> None:
+        """Overlay current attachment lifecycle state onto frozen snapshots."""
+        for snapshot in snapshots:
+            snapshot["deleted"] = False
+        if not snapshots:
+            return
+        attachment_ids = [
+            str(snapshot.get("attachment_id") or "").strip()
+            for snapshot in snapshots
+            if str(snapshot.get("attachment_id") or "").strip()
+        ]
+        if not attachment_ids:
+            return
+        try:
+            from src.attachments.store import AttachmentStore
+
+            store = AttachmentStore()
+            placeholders = ",".join("?" for _ in attachment_ids)
+            with closing(store._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT att.attachment_id, att.status, asset.parse_status
+                    FROM chat_attachments att
+                    LEFT JOIN chat_attachment_assets asset ON asset.asset_id = att.asset_id
+                    WHERE att.attachment_id IN ({placeholders})
+                    """,
+                    attachment_ids,
+                ).fetchall()
+            statuses = {
+                row["attachment_id"]: (row["status"], row["parse_status"] or "")
+                for row in rows
+            }
+        except Exception:
+            # Attachment history must remain readable if the optional
+            # attachment database is temporarily unavailable.
+            return
+        for snapshot in snapshots:
+            attachment_id = str(snapshot.get("attachment_id") or "").strip()
+            status, parse_status = statuses.get(attachment_id, ("missing", ""))
+            snapshot["deleted"] = status != "active"
+            if status == "active" and parse_status:
+                snapshot["parse_status_snapshot"] = parse_status
+
+    def list_waiting_turns_for_asset(self, asset_id: str) -> list[ChatTurn]:
+        """Waiting turns that reference attachments built from this asset."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT t.* FROM chat_turns t
+                JOIN turn_attachments ta ON ta.turn_id = t.id
+                WHERE ta.asset_id = ? AND t.status = 'waiting_for_attachments'
+                ORDER BY t.created_at
+                """,
+                (asset_id,),
             ).fetchall()
         return [row_to_turn(row) for row in rows]
 
@@ -938,6 +1338,25 @@ class ConversationService:
         footer: str = "",
         metrics: dict | None = None,
     ) -> ChatTurn:
+        # Initialize the export schema before opening the completion
+        # transaction. The actual snapshot/jobs are inserted through the
+        # caller's connection below, so a completed answer and its requested
+        # exports commit or roll back together.
+        existing_turn = self.get_turn(user_id, turn_id)
+        if existing_turn is None:
+            raise KeyError("turn not found")
+        # Export requests are completed by the server-side export worker.  A
+        # stale model answer may still contain the old browser-print HTML
+        # workaround; normalize it before persisting the canonical turn so
+        # the chat UI, snapshot and every renderer share the same clean text.
+        from src.result_exports.answer import normalize_export_answer
+
+        answer = normalize_export_answer(answer, existing_turn.export_plan)
+        export_store = None
+        if existing_turn.export_plan:
+            from src.result_exports.store import ResultExportStore
+
+            export_store = ResultExportStore(self.db_path)
         now = utc_now()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -966,6 +1385,25 @@ class ConversationService:
                      json.dumps(metrics or {}, ensure_ascii=False, default=str), now, turn_id),
                 )
                 conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (now, row["session_id"]))
+                completed = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
+                completed_turn = row_to_turn(completed)
+                if export_store is not None and completed_turn.export_plan:
+                    from src.result_exports.content import envelope_from_turn
+
+                    export_store.enqueue_completed_turn_in_connection(
+                        conn,
+                        owner_user_id=user_id,
+                        tenant_id="default",
+                        department_id=completed_turn.department_id,
+                        knowledge_base_name=(
+                            "" if completed_turn.kb_name == GENERAL_CHAT_KB_NAME else completed_turn.kb_name
+                        ),
+                        session_id=completed_turn.session_id,
+                        turn_id=completed_turn.id,
+                        assistant_message_id=completed_turn.assistant_message_id,
+                        envelope=envelope_from_turn(completed_turn),
+                        export_plan=completed_turn.export_plan,
+                    )
                 # Project Reflection is deliberately outside the realtime
                 # query path, but its durable outbox entry is part of the
                 # same transaction as the completed turn.  Generic chats and
@@ -1000,7 +1438,6 @@ class ConversationService:
                         target_message_id=int(row["assistant_message_id"]),
                         available_at=available_at,
                     )
-                completed = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
                 conn.execute("COMMIT")
                 return row_to_turn(completed)
             except Exception:
@@ -1079,15 +1516,16 @@ class ConversationService:
                   status = CASE
                     WHEN status = 'pending' THEN 'cancelled'
                     WHEN status = 'streaming' THEN 'cancelling'
+                    WHEN status = 'waiting_for_attachments' THEN 'cancelled'
                     ELSE status
                   END,
-                  finished_at = CASE WHEN status = 'pending' THEN ? ELSE finished_at END,
-                  error_message = CASE WHEN status = 'pending' THEN '已停止生成' ELSE error_message END
+                  finished_at = CASE WHEN status IN ('pending', 'waiting_for_attachments') THEN ? ELSE finished_at END,
+                  error_message = CASE WHEN status IN ('pending', 'waiting_for_attachments') THEN '已停止生成' ELSE error_message END
                 WHERE id = ? AND session_id IN (
                     SELECT id FROM chat_sessions
                     WHERE user_id = ?
                 )
-                  AND status IN ('pending', 'streaming', 'cancelling')
+                  AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
                 """,
                 (now, turn_id, user_id),
                 )
@@ -1160,6 +1598,11 @@ def utc_now() -> str:
 
 
 def row_to_session(row) -> ChatSession:
+    try:
+        raw_context = json.loads(row["document_context_json"] or "{}") if "document_context_json" in row.keys() else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_context = {}
+    context = raw_context if isinstance(raw_context, dict) and raw_context else None
     return ChatSession(
         id=int(row["id"]),
         user_id=int(row["user_id"]),
@@ -1169,6 +1612,7 @@ def row_to_session(row) -> ChatSession:
         title=row["title"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        document_context=context,
     )
 
 
@@ -1208,12 +1652,18 @@ def row_to_message(row) -> ChatMessage:
                         },
                     }
                 )
+    try:
+        raw_context = json.loads(row["turn_document_context"] or "{}") if "turn_document_context" in row.keys() else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_context = {}
+    document_context = raw_context if isinstance(raw_context, dict) and raw_context else None
     legacy_suffix = f"\n\n---\n{footer}" if footer else ""
     if legacy_suffix and content.endswith(legacy_suffix):
         content = content[:-len(legacy_suffix)]
     return ChatMessage(
         id=int(row["id"]),
         session_id=int(row["session_id"]),
+        turn_id=(str(row["turn_id"]) if row["turn_id"] else None) if "turn_id" in row.keys() else None,
         role=row["role"],
         content=content,
         footer=footer,
@@ -1221,6 +1671,7 @@ def row_to_message(row) -> ChatMessage:
         edited_at=row["edited_at"] if "edited_at" in row.keys() else None,
         redacted=bool(row["redacted"]) if "redacted" in row.keys() else False,
         memory_context=memory_context,
+        document_context=document_context,
         citations=citations,
     )
 
@@ -1240,6 +1691,30 @@ def row_to_turn(row) -> ChatTurn:
         trace_context = {}
     if not isinstance(trace_context, dict):
         trace_context = {}
+    try:
+        raw_document_context = (
+            json.loads(row["document_context_json"] or "{}")
+            if "document_context_json" in row.keys() else {}
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_document_context = {}
+    document_context = raw_document_context if isinstance(raw_document_context, dict) and raw_document_context else None
+    try:
+        raw_export_plan = (
+            json.loads(row["export_plan_json"] or "{}")
+            if "export_plan_json" in row.keys() else {}
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_export_plan = {}
+    export_plan = raw_export_plan if isinstance(raw_export_plan, dict) else {}
+    try:
+        raw_required = (
+            json.loads(row["required_attachment_ids"] or "[]")
+            if "required_attachment_ids" in row.keys() else []
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_required = []
+    required_ids = [str(item) for item in raw_required] if isinstance(raw_required, list) else []
     return ChatTurn(
         id=row["id"],
         session_id=int(row["session_id"]),
@@ -1267,4 +1742,8 @@ def row_to_turn(row) -> ChatTurn:
         created_at=row["created_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+        document_context=document_context,
+        export_plan=export_plan,
+        source_scope=row["source_scope"] if "source_scope" in row.keys() else "auto",
+        required_attachment_ids=required_ids,
     )

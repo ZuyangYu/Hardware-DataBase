@@ -3,22 +3,29 @@
 Only used for marker-less text (no 用户:/assistant:/Q:/A: markers found by the
 deterministic parser). Strictly fail-open: any error, garbage output or
 disabled setting returns ``None`` and the caller keeps the plain-blocks
-fallback. One LLM call per upload, bounded by a character cap.
+fallback. One LLM call per operation, bounded by a character cap and an outer
+timeout.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 import src.settings
+from src.core.chat_model_runtime import ChatModelLike, invoke_structured
+from src.core.model_factory import create_chat_model
 from src.external_conversations.models import ConversationTurn
 
-# Single-worker pool: LLM sockets cannot be force-killed on timeout, but the
-# caller stops waiting after EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS and the
-# orphaned call is discarded (bounded by the client's own AGENT_TIMEOUT).
+# Two independent background operations may be waiting on the provider. A
+# timed-out call cannot be force-killed, so callers stop waiting and discard
+# its result; the profile timeout is shorter than the outer wait window.
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ext-conv-llm")
 
 _PROMPT = """你是对话记录结构化解析器。下面是一段没有明确角色标记的文本，请推断其中的对话轮次。
@@ -38,6 +45,29 @@ _PROMPT = """你是对话记录结构化解析器。下面是一段没有明确�
 _MAX_TURNS = 200
 
 
+class ConversationTurnPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=12000)
+
+
+class ConversationStructurePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(default="", max_length=40)
+    turns: list[ConversationTurnPayload] = Field(
+        default_factory=list, max_length=_MAX_TURNS,
+    )
+
+
+class ConversationSummaryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(default="", max_length=600)
+    key_points: list[str] = Field(default_factory=list, max_length=8)
+
+
 def llm_structure_enabled() -> bool:
     return bool(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_STRUCTURE", False))
 
@@ -46,20 +76,44 @@ def llm_summary_enabled() -> bool:
     return bool(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_SUMMARY", False))
 
 
-def _chat_with_timeout(llm_client, prompt: str) -> str | None:
-    """One LLM round-trip bounded by EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS.
+def _invoke_with_timeout(
+    chat_model: ChatModelLike,
+    schema: type[BaseModel],
+    prompt: str,
+    *,
+    operation: str,
+    text_fallback: Callable[[str], BaseModel | Mapping[str, Any]],
+) -> Any | None:
+    """Run one runtime invocation while preserving the external fail-open window."""
 
-    Returns raw text or None on timeout/error."""
     timeout = float(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS", 60))
     try:
         future = _EXECUTOR.submit(
-            llm_client.chat,
+            invoke_structured,
+            chat_model,
+            schema,
             [{"role": "user", "content": prompt}],
-            usage_stage="external_conversation_llm",
+            operation=operation,
+            profile="external_conversation",
+            text_fallback=text_fallback,
         )
         return future.result(timeout=timeout)
     except FuturesTimeout:
         return None
+    except Exception:
+        return None
+
+
+def _resolve_model(
+    chat_model: ChatModelLike | None,
+    model_factory: Callable[[], ChatModelLike] | None,
+) -> ChatModelLike | None:
+    if chat_model is not None:
+        return chat_model
+    try:
+        return model_factory() if model_factory is not None else create_chat_model(
+            profile="external_conversation"
+        )
     except Exception:
         return None
 
@@ -85,48 +139,105 @@ def _extract_json_object(raw: str) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def infer_structure(text: str, llm_client=None) -> dict | None:
+def _parse_text_structure(response: str) -> ConversationStructurePayload:
+    """Parse the explicit compatibility JSON path and validate its shape."""
+
+    payload = _extract_json_object(response)
+    if payload is None:
+        raise ValueError("structure response is not a JSON object")
+
+    # Keep the historical fail-open filtering for malformed individual turns;
+    # the resulting bounded payload still goes through the strict schema.
+    raw_turns = payload.get("turns")
+    if not isinstance(raw_turns, list):
+        raise ValueError("structure response turns is not a list")
+    valid_turns: list[dict[str, str]] = []
+    for item in raw_turns[:_MAX_TURNS]:
+        if not isinstance(item, Mapping):
+            continue
+        role = str(item.get("role") or "").strip().casefold()
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        valid_turns.append({"role": role, "content": content})
+    normalized = dict(payload)
+    normalized["title"] = str(payload.get("title") or "").strip()[:40]
+    normalized["turns"] = valid_turns
+    try:
+        return ConversationStructurePayload.model_validate(normalized)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _parse_text_summary(response: str) -> ConversationSummaryPayload:
+    payload = _extract_json_object(response)
+    if payload is None:
+        raise ValueError("summary response is not a JSON object")
+    raw_points = payload.get("key_points")
+    if raw_points is None:
+        raw_points = []
+    if not isinstance(raw_points, list):
+        raise ValueError("summary response key_points is not a list")
+    # Preserve the old compatibility parser's useful primitive coercion while
+    # making the final object pass through the strict Pydantic schema.
+    normalized = dict(payload)
+    normalized["summary"] = str(payload.get("summary") or "").strip()[:600]
+    normalized["key_points"] = [
+        str(item).strip()
+        for item in raw_points[:8]
+        if isinstance(item, (str, int, float)) and str(item).strip()
+    ]
+    try:
+        return ConversationSummaryPayload.model_validate(normalized)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def infer_structure(
+    text: str,
+    chat_model: ChatModelLike | None = None,
+    *,
+    model_factory: Callable[[], ChatModelLike] | None = None,
+) -> dict | None:
     """Return ``{"title": str|None, "turns": [ConversationTurn]}`` or None.
 
     Offsets are unknown for inferred turns and left at -1 on purpose — they
     point into an LLM-normalized view, not the raw file.
     """
+
     if not llm_structure_enabled():
         return None
     body = str(text or "").strip()
     if len(body) < 80:
-        return None  # too short to be worth a model call; blocks fallback is fine
+        return None
     body = body[: int(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_MAX_CHARS", 12000))]
-
-    if llm_client is None:
-        try:
-            from src.core.llm_client import LLMClient
-
-            llm_client = LLMClient()
-        except Exception:
-            return None
-
-    raw = _chat_with_timeout(llm_client, _PROMPT.format(body=body))
-    if raw is None:
+    model = _resolve_model(chat_model, model_factory)
+    if model is None:
         return None
 
-    payload = _extract_json_object(raw)
-    if not payload:
+    result = _invoke_with_timeout(
+        model,
+        ConversationStructurePayload,
+        _PROMPT.format(body=body),
+        operation="external_conversation_llm",
+        text_fallback=_parse_text_structure,
+    )
+    if result is None or not result.value.turns:
         return None
 
-    turns: list[ConversationTurn] = []
-    for item in (payload.get("turns") or [])[:_MAX_TURNS]:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        content = str(item.get("content") or "").strip()
-        if role not in {"user", "assistant"} or not content:
-            continue
-        turns.append(ConversationTurn(role=role, content=content, ts="", start_offset=-1, end_offset=-1))
+    turns = [
+        ConversationTurn(
+            role=item.role,
+            content=item.content.strip(),
+            ts="",
+            start_offset=-1,
+            end_offset=-1,
+        )
+        for item in result.value.turns[:_MAX_TURNS]
+    ]
     if not turns:
         return None
-
-    title = str(payload.get("title") or "").strip()[:40] or None
+    title = result.value.title.strip()[:40] or None
     return {"title": title, "turns": turns}
 
 
@@ -143,34 +254,36 @@ _SUMMARY_PROMPT = """你是硬件知识库的资料提炼助手。下面是一�
 {body}"""
 
 
-def summarize_content(text: str, llm_client=None, min_chars: int = 10) -> dict | None:
+def summarize_content(
+    text: str,
+    chat_model: ChatModelLike | None = None,
+    *,
+    model_factory: Callable[[], ChatModelLike] | None = None,
+    min_chars: int = 10,
+) -> dict | None:
     """Return ``{"summary": str, "key_points": [str]}`` or None (fail-open)."""
+
     if not llm_summary_enabled():
         return None
     body = str(text or "").strip()
     if len(body) < min_chars:
         return None
     body = body[: int(getattr(src.settings, "EXTERNAL_CONVERSATION_LLM_MAX_CHARS", 12000))]
-
-    if llm_client is None:
-        try:
-            from src.core.llm_client import LLMClient
-
-            llm_client = LLMClient()
-        except Exception:
-            return None
-
-    raw = _chat_with_timeout(llm_client, _SUMMARY_PROMPT.format(body=body))
-    if raw is None:
+    model = _resolve_model(chat_model, model_factory)
+    if model is None:
         return None
 
-    payload = _extract_json_object(raw)
-    if not payload:
+    result = _invoke_with_timeout(
+        model,
+        ConversationSummaryPayload,
+        _SUMMARY_PROMPT.format(body=body),
+        operation="external_conversation_llm",
+        text_fallback=_parse_text_summary,
+    )
+    if result is None:
         return None
-    summary = str(payload.get("summary") or "").strip()
-    key_points = [
-        str(k).strip() for k in (payload.get("key_points") or []) if isinstance(k, (str, int, float)) and str(k).strip()
-    ][:8]
+    summary = result.value.summary.strip()[:600]
+    key_points = [str(item).strip() for item in result.value.key_points if str(item).strip()][:8]
     if not summary and not key_points:
         return None
-    return {"summary": summary[:600], "key_points": key_points}
+    return {"summary": summary, "key_points": key_points}

@@ -21,6 +21,7 @@ import {
   type AuthSession,
 } from './auth';
 import AppSidebar from './components/AppSidebar';
+import ExportTaskCenter from './components/ExportTaskCenter';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -31,11 +32,11 @@ import ChatPage from './pages/chat/ChatPage';
 import KbFilesPage from './pages/KbFilesPage';
 import DocumentAssetsPage from './pages/DocumentAssetsPage';
 import WikiPage from './pages/WikiPage';
-import DocumentGenerationPage from './pages/DocumentGenerationPage';
 import UsersPage from './pages/admin/UsersPage';
 import DepartmentsPage from './pages/admin/DepartmentsPage';
 import KbMountPage from './pages/admin/KbMountPage';
 import GovernancePage from './pages/admin/GovernancePage';
+import AttachmentReleasesPage from './pages/admin/AttachmentReleasesPage';
 import LogsPage from './pages/admin/LogsPage';
 import ConfigPage from './pages/admin/ConfigPage';
 import EvaluationPage from './pages/admin/EvaluationPage';
@@ -107,6 +108,7 @@ function AdminRoute({
 }
 
 function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) {
+  const location = useLocation();
   const [kbs, setKbs] = useState<KbView[]>([]);
   const [kbsLoaded, setKbsLoaded] = useState(false);
   const sysAdmin = isSystemAdmin(auth.user);
@@ -174,14 +176,6 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               element={
                 <KbContentRoute auth={auth}>
                   <WikiPage auth={auth} onLogout={onLogout} kbs={kbs} />
-                </KbContentRoute>
-              }
-            />
-            <Route
-              path="/document-generation"
-              element={
-                <KbContentRoute auth={auth}>
-                  <DocumentGenerationPage auth={auth} onLogout={onLogout} kbs={kbs} />
                 </KbContentRoute>
               }
             />
@@ -260,6 +254,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               }
             />
             <Route
+              path="/admin/attachment-releases"
+              element={
+                <AdminRoute auth={auth}>
+                  <AttachmentReleasesPage auth={auth} onLogout={onLogout} />
+                </AdminRoute>
+              }
+            />
+            <Route
               path="/admin/logs"
               element={
                 <AdminRoute auth={auth}>
@@ -295,6 +297,10 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
           </Routes>
         </div>
       </div>
+      {/* 聊天页在页头内嵌导出任务中心,避免悬浮入口遮挡右侧会话侧栏 */}
+      {!((location.pathname === '/chat' || /^\/kbs\/[^/]+\/chat(?:\/.*)?$/.test(location.pathname))) && (
+        <ExportTaskCenter />
+      )}
     </SidebarProvider>
   );
 }

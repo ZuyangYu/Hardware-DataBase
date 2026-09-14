@@ -19,6 +19,10 @@ _MEMORY_INDEX_STATE: dict[str, dict[str, int | str]] = {}
 _MEMORY_PROJECTION_STATE: dict[str, float] = {"pending": 0.0, "lag_seconds": 0.0}
 _MEMORY_GAUGES: dict[str, Any] = {}
 
+_EXPORT_FORMATS = frozenset({"md", "xlsx", "docx", "pdf", "pptx"})
+_EXPORT_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled", "dead_letter"})
+_EXPORT_QUEUES = frozenset({"result-export", "result_exports", "export"})
+
 
 def _enabled() -> bool:
     try:
@@ -33,8 +37,9 @@ def metric_attributes(attributes: Mapping[str, Any] | None) -> dict[str, str]:
     """Drop high-cardinality labels before they can reach Prometheus."""
 
     result: dict[str, str] = {}
+    allowed_keys = METRIC_LABEL_KEYS | {"format"}
     for key, value in (attributes or {}).items():
-        if key not in METRIC_LABEL_KEYS or value is None:
+        if key not in allowed_keys or value is None:
             continue
         result[str(key)] = str(value)[:80]
     return result
@@ -191,7 +196,16 @@ def record_agent(*, status: str, mode: str, duration_s: float, retrieval_rounds:
 
 
 def record_agent_stage(*, stage: str, duration_s: float, status: str = "success") -> None:
-    pass
+    normalized_stage = str(stage or "unknown").strip()[:80] or "unknown"
+    normalized_status = str(status or "success").strip()[:40] or "success"
+    attrs = {"stage": normalized_stage, "status": normalized_status}
+    counter("hdb.agent.stage.completed", attributes=attrs, description="Agent pipeline stages")
+    histogram(
+        "hdb.agent.stage.duration",
+        duration_s,
+        attributes={"stage": normalized_stage, "status": normalized_status},
+        description="Agent pipeline stage duration",
+    )
 
 
 def record_llm(*, provider: str, status: str, duration_s: float, streaming: bool, ttft_s: float | None = None) -> None:
@@ -208,6 +222,46 @@ def record_worker(*, status: str, duration_s: float | None = None) -> None:
         counter("hdb.worker.task.failed", description="Failed worker tasks")
     if duration_s is not None:
         histogram("hdb.worker.task.duration", duration_s, attributes={"status": status})
+
+
+_ATTACHMENT_EVENT_LABELS = frozenset(
+    {
+        "upload",
+        "asset_reuse",
+        "parse",
+        "search",
+        "read",
+        "waiting_turn",
+        "degraded",
+        "cleanup",
+        "cleanup_retry",
+        "visual",
+        "visual_failure",
+        "dense",
+        "ocr",
+    }
+)
+
+
+def record_attachment(
+    event: str,
+    *,
+    status: str = "ok",
+    duration_s: float | None = None,
+    scope: str = "",
+) -> None:
+    """Domain metrics for chat attachments (design §20).
+
+    Labels are low-cardinality (event/status/scope) — ids, filenames and
+    hashes never enter metric attributes.
+    """
+    event = event if event in _ATTACHMENT_EVENT_LABELS else "other"
+    attrs = {"event": event, "status": status}
+    if scope:
+        attrs["scope"] = scope
+    counter("hdb.attachment.events", attributes=attrs, description="Chat attachment events")
+    if duration_s is not None:
+        histogram("hdb.attachment.duration", duration_s, attributes={"event": event, "status": status})
 
 
 def record_evaluation(*, status: str, mode: str) -> None:
@@ -235,3 +289,199 @@ def record_authoring_unit(*, operation: str, status: str, duration_s: float | No
     counter("hdb.authoring.unit.outcome", attributes={"operation": operation, "status": status}, description="Authoring unit outcomes")
     if duration_s is not None:
         histogram("hdb.authoring.unit.duration", duration_s, attributes={"operation": operation, "status": status})
+
+
+def record_document_compatibility(*, event_type: str, route: str) -> None:
+    """Count compatibility-boundary events with bounded labels only."""
+
+    known = {
+        "legacy_direct_execution", "plan_backed_execution",
+        "auto_confirmation_attempt", "new_write", "legacy_write",
+    }
+    kind = str(event_type or "other").strip().lower()
+    if kind not in known:
+        kind = "other"
+    normalized_route = str(route or "system").strip().lower()
+    if normalized_route not in {"legacy", "plan_backed", "conversation", "system"}:
+        normalized_route = "system"
+    counter(
+        "hdb.document.authoring.compatibility.events",
+        attributes={"kind": kind, "mode": normalized_route},
+        description="Document authoring compatibility boundary events",
+    )
+
+
+def record_authoring_agent(*, status: str, mode: str = "external_agent", duration_s: float | None = None) -> None:
+    """Record low-cardinality Agent executor metrics.
+
+    Run, field, evidence and proposal identifiers intentionally never become
+    metric labels; they belong on spans and the append-only execution events.
+    """
+
+    counter(
+        "hdb.authoring.agent.runs",
+        attributes={"status": status, "mode": mode},
+        description="Document authoring agent runs",
+    )
+    if duration_s is not None:
+        histogram(
+            "hdb.authoring.agent.duration",
+            duration_s,
+            attributes={"mode": mode},
+            description="Document authoring agent duration",
+        )
+
+
+def record_authoring_tool(*, tool: str, status: str, duration_s: float | None = None) -> None:
+    """Record one bounded agent-tool outcome using only tool/status labels."""
+
+    counter(
+        "hdb.authoring.agent.tool.calls",
+        attributes={"tool": tool, "status": status},
+        description="Document authoring agent tool calls",
+    )
+    if duration_s is not None:
+        histogram(
+            "hdb.authoring.agent.tool.duration",
+            duration_s,
+            attributes={"tool": tool},
+            description="Document authoring agent tool duration",
+        )
+
+
+_PLANNING_SHADOW_STATUSES = frozenset({"succeeded", "failed"})
+_PLANNING_SHADOW_VALIDITIES = frozenset({"valid", "invalid"})
+
+
+def record_planning_shadow(
+    *,
+    status: str,
+    validity: str,
+    blocking_issue_count: int = 0,
+    blocking_issue_codes: list[str] | tuple[str, ...] | None = None,
+    units: int = 0,
+    tables: int = 0,
+    duration_s: float | None = None,
+) -> None:
+    """Record shadow-planning quality without exposing document data.
+
+    Issue *codes* are deliberately represented as a bounded count rather than
+    metric labels: a schema or plugin must not be able to turn arbitrary
+    identifiers into a high-cardinality telemetry dimension.  The codes are
+    retained only in the sanitized planning event emitted by the coordinator.
+    """
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status not in _PLANNING_SHADOW_STATUSES:
+        normalized_status = "failed"
+    normalized_validity = str(validity or "").strip().lower()
+    if normalized_validity not in _PLANNING_SHADOW_VALIDITIES:
+        normalized_validity = "invalid"
+    attrs = {"status": normalized_status}
+    counter("hdb.document.planning.shadow.runs", attributes=attrs, description="Document planning shadow runs")
+    counter(
+        "hdb.document.planning.shadow.blocking_issues",
+        attributes=attrs,
+        value=max(0, int(blocking_issue_count)),
+        description="Blocking issues observed by document planning shadow mode",
+    )
+    counter(
+        "hdb.document.planning.shadow.issue_codes",
+        attributes=attrs,
+        value=len({str(code).strip() for code in (blocking_issue_codes or ()) if str(code).strip()}),
+        description="Distinct blocking issue codes observed by document planning shadow mode",
+    )
+    histogram(
+        "hdb.document.planning.shadow.validity",
+        1 if normalized_validity == "valid" else 0,
+        attributes=attrs,
+        unit="1",
+        description="Whether a document planning shadow plan is executable",
+    )
+    histogram(
+        "hdb.document.planning.shadow.units",
+        max(0, int(units)),
+        attributes=attrs,
+        unit="{units}",
+        description="Semantic units in document planning shadow plans",
+    )
+    histogram(
+        "hdb.document.planning.shadow.tables",
+        max(0, int(tables)),
+        attributes=attrs,
+        unit="{tables}",
+        description="Table units in document planning shadow plans",
+    )
+    if duration_s is not None:
+        histogram(
+            "hdb.document.planning.shadow.duration",
+            max(0.0, float(duration_s)),
+            attributes=attrs,
+            description="Document planning shadow compilation duration",
+        )
+
+
+def _export_format(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _EXPORT_FORMATS else "other"
+
+
+def _export_status(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _EXPORT_STATUSES else "other"
+
+
+def record_export_job(
+    *,
+    format: str,
+    status: str,
+    duration_s: float,
+    queue_s: float | None = None,
+    job_id: str | None = None,
+) -> None:
+    """Record one export task without turning identifiers into metric labels."""
+    del job_id
+    attrs = {"format": _export_format(format), "status": _export_status(status)}
+    counter("hdb.export.jobs", attributes=attrs, description="Export jobs")
+    histogram("hdb.export.job.duration", duration_s, attributes=attrs, description="Export job duration")
+    if queue_s is not None:
+        histogram("hdb.export.queue.wait", queue_s, attributes={"format": attrs["format"]}, description="Export queue wait")
+
+
+def record_export_render(*, format: str, status: str, duration_s: float) -> None:
+    """Record renderer latency by bounded format and outcome."""
+    histogram(
+        "hdb.export.render.duration",
+        duration_s,
+        attributes={"format": _export_format(format), "status": _export_status(status)},
+        description="Export rendering duration",
+    )
+
+
+def record_export_bytes(*, format: str, byte_count: int) -> None:
+    """Record produced artifact size; IDs and filenames are intentionally excluded."""
+    histogram(
+        "hdb.export.artifact.bytes",
+        max(0, int(byte_count)),
+        attributes={"format": _export_format(format)},
+        unit="By",
+        description="Export artifact size",
+    )
+
+
+def record_export_download(*, format: str, status: str = "succeeded") -> None:
+    """Count artifact downloads by bounded format and outcome."""
+    counter(
+        "hdb.export.downloads",
+        attributes={"format": _export_format(format), "status": _export_status(status)},
+        description="Export artifact downloads",
+    )
+
+
+def set_export_queue_state(*, queue: str, depth: int, oldest_age_s: float) -> None:
+    """Publish export queue depth through the shared low-cardinality queue gauges."""
+    normalized = str(queue or "").strip().lower()
+    set_queue_state(
+        queue=normalized if normalized in _EXPORT_QUEUES else "other",
+        depth=depth,
+        oldest_age_s=oldest_age_s,
+    )

@@ -18,6 +18,7 @@ from src.api.errors import install_error_handlers
 from src.api.deps import require_system_admin
 from src.api.routes import (
     assets,
+    attachments,
     auth,
     config,
     conversations,
@@ -32,8 +33,10 @@ from src.api.routes import (
     logs,
     memories,
     metrics,
+    notifications,
     parse_tasks,
     query,
+    exports,
     status,
     structured,
     upload,
@@ -112,8 +115,10 @@ async def lifespan(app: FastAPI):
     _prune_query_traces_once()
 
     worker_proc: subprocess.Popen | None = None
+    export_worker_proc: subprocess.Popen | None = None
     memory_worker_proc: subprocess.Popen | None = None
     worker_log_file = None
+    export_log_file = None
     memory_log_file = None
     if _should_spawn_worker():
         log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
@@ -127,6 +132,18 @@ async def lifespan(app: FastAPI):
             stderr=worker_log_file,
         )
         print(f"[hardware-database] spawned parse worker pid={worker_proc.pid} log={log_path}")
+    if os.getenv("HDB_API_SPAWN_EXPORT_WORKER", "1").lower() not in {"0", "false", "no", "off"}:
+        log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        export_log_path = os.path.join(log_dir, "export-worker.log")
+        export_log_file = open(export_log_path, "ab", buffering=0)
+        export_worker_proc = subprocess.Popen(
+            [sys.executable, "-m", "src.result_exports.worker"],
+            cwd=src.settings.BASE_DIR,
+            stdout=export_log_file,
+            stderr=export_log_file,
+        )
+        print(f"[hardware-database] spawned export worker pid={export_worker_proc.pid} log={export_log_path}")
     if _should_spawn_memory_worker():
         log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -148,6 +165,12 @@ async def lifespan(app: FastAPI):
                 worker_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 worker_proc.kill()
+        if export_worker_proc is not None and export_worker_proc.poll() is None:
+            export_worker_proc.terminate()
+            try:
+                export_worker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                export_worker_proc.kill()
         if memory_worker_proc is not None and memory_worker_proc.poll() is None:
             memory_worker_proc.terminate()
             try:
@@ -158,6 +181,8 @@ async def lifespan(app: FastAPI):
             worker_log_file.close()
         if memory_log_file is not None:
             memory_log_file.close()
+        if export_log_file is not None:
+            export_log_file.close()
         shutdown_observability()
 
 
@@ -189,6 +214,8 @@ def create_app() -> FastAPI:
             "http://127.0.0.1:3000",
             "http://localhost:5175",
             "http://127.0.0.1:5175",
+            "http://localhost:5176",
+            "http://127.0.0.1:5176",
         ]
     app.add_middleware(
         CORSMiddleware,
@@ -203,11 +230,13 @@ def create_app() -> FastAPI:
     app.include_router(assets.router, prefix=api_v1)
     app.include_router(doc_assets.router, prefix=api_v1)
     app.include_router(wiki.router, prefix=api_v1)
+    app.include_router(attachments.router, prefix=api_v1)
     app.include_router(conversations.router, prefix=api_v1)
     app.include_router(kbs.router, prefix=api_v1)
     app.include_router(files.router, prefix=api_v1)
     app.include_router(parse_tasks.router, prefix=api_v1)
     app.include_router(query.router, prefix=api_v1)
+    app.include_router(exports.router, prefix=api_v1)
     app.include_router(upload.router, prefix=api_v1)
     app.include_router(users.router, prefix=api_v1)
     app.include_router(departments.router, prefix=api_v1)
@@ -217,6 +246,7 @@ def create_app() -> FastAPI:
     app.include_router(config.router, prefix=api_v1)
     app.include_router(logs.router, prefix=api_v1)
     app.include_router(memories.router, prefix=api_v1)
+    app.include_router(notifications.router, prefix=api_v1)
     app.include_router(metrics.router, prefix=api_v1)
     app.include_router(status.router, prefix=api_v1)
     app.include_router(evaluation.router, prefix=api_v1)
@@ -249,5 +279,5 @@ def main() -> None:
     import uvicorn
 
     host = os.getenv("HDB_API_HOST", "127.0.0.1")
-    port = int(os.getenv("HDB_API_PORT", "8003"))
+    port = int(os.getenv("HDB_API_PORT", "8001"))
     uvicorn.run("src.api.app:app", host=host, port=port)

@@ -21,6 +21,9 @@ dependencies = [
     # langgraph meta-package does not install it.
     "langgraph-checkpoint-sqlite==3.1.1",
     "llama-index-core>=0.12.52,<0.13",
+    # Parse assistant Markdown into a portable block model before rendering
+    # Word/PDF/Excel/PowerPoint exports.
+    "markdown-it-py>=4,<5",
     "networkx>=3.5",
     "opentelemetry-api>=1.38,<2",
     "opentelemetry-exporter-otlp>=1.38,<2",
@@ -32,20 +35,29 @@ dependencies = [
     "openinference-semantic-conventions>=0.1.27,<1",
     "pandas>=2.3.3,<3",
     "pydantic>=2.11.10,<3",
+    # Result exports use the maintained OOXML/PDF renderers instead of
+    # assembling office packages by hand.
+    "python-docx>=1.1,<2",
     "python-dotenv>=1.2.1,<2",
     "python-multipart>=0.0.9,<1",
+    "python-pptx>=1.0,<2",
+    "reportlab>=4.2,<5",
     # spreadsheet_sql_query: LLM 生成 SQL 的只读校验(单条 SELECT/表白名单)
     "sqlglot>=27,<29",
     # kept: vendored SpyDrNet imports requests at module top level
     "requests>=2.32.3,<3",
     "uvicorn[standard]>=0.30,<1",
+    "pypdf>=4,<6",
 ]
 
 [project.scripts]
 hardware-database-eval = "src.evaluation.cli:main"
 hardware-database-server = "src.api.app:main"
 hardware-database-worker = "src.workers.main:main"
+hardware-database-export-worker = "src.result_exports.worker:main"
 hardware-database-memory-worker = "src.memory.worker:main"
+hardware-database-maintenance = "src.maintenance.cli:main"
+hardware-database-e2e = "src.evaluation.e2e_runner:main"
 
 [build-system]
 requires = ["setuptools>=77"]
@@ -88,3 +100,7 @@ norecursedirs = ["build", "src/circuit/vendor/spydrnet"]
 [tool.ruff]
 # vendored SpyDrNet (含 sch_parse / spydrnet_extension 等 upstream 风格代码) 不属于本应用源码,不纳入 lint。
 extend-exclude = ["src/circuit/vendor", ".claude"]
+
+[tool.ruff.lint.per-file-ignores]
+# 基准脚本必须先设置环境变量/sys.path 再 import src.*, E402 是有意为之。
+"benchmarks/spreadsheet/*" = ["E402"]

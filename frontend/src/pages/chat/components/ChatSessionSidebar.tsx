@@ -42,7 +42,7 @@ export default function ChatSessionSidebar({
       if (!dragRef.current) return;
       const { startX, startW } = dragRef.current;
       // 侧栏在右侧:向左拖动加宽。
-      setWidth(Math.min(420, Math.max(180, startW + startX - e.clientX)));
+      setWidth(Math.min(420, Math.max(180, startW - (e.clientX - startX))));
     }
     function onUp() {
       dragRef.current = null;
@@ -98,8 +98,8 @@ export default function ChatSessionSidebar({
             <button
               type="button"
               onClick={onNew}
-              disabled={streaming}
               aria-label="新对话"
+              title="新建会话"
               className="inline-grid size-[28px] shrink-0 place-items-center rounded-[8px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
             >
               <AppIcon name="plus" size={16} />
@@ -122,12 +122,12 @@ export default function ChatSessionSidebar({
                 key={session.id}
                 className={cn(
                   'group flex min-w-0 items-center gap-[6px] overflow-hidden rounded-[8px] px-[10px] py-[8px] text-[13px] transition-colors',
-                  !streaming && 'cursor-pointer',
+                  'cursor-pointer',
                   active
                     ? 'bg-[#f6f6f6] text-[#18181a]'
                     : 'text-[#858b9c] hover:bg-[#f6f6f6] hover:text-[#18181a]',
                 )}
-                onClick={() => !streaming && onSelect(session.id)}
+                onClick={() => onSelect(session.id)}
               >
                 <span className="min-w-0 flex-1 truncate">{session.title}</span>
                 <button

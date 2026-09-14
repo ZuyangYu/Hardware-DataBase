@@ -14,8 +14,6 @@ from src.agents.tools.spreadsheet_tools import (
     _format_sql_result,
     _validate_readonly_sql,
 )
-
-
 def _semantic_row(row_index: int, values: dict, raw_values: dict | None = None) -> dict:
     return {
         "sheet_name": "S",

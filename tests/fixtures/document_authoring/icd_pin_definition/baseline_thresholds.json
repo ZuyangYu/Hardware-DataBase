@@ -1,0 +1,19 @@
+{
+  "threshold_version": "icd-pin-definition-thresholds-v1",
+  "metric_version": "icd-pin-definition-v1",
+  "fixture_id": "icd-pin-definition-baseline-v1",
+  "thresholds": {
+    "row_key_precision": {"direction": "minimum", "value": 1.0},
+    "row_key_recall": {"direction": "minimum", "value": 1.0},
+    "row_key_f1": {"direction": "minimum", "value": 1.0},
+    "required_column_completeness": {"direction": "minimum", "value": 1.0},
+    "exact_order_rate": {"direction": "minimum", "value": 1.0},
+    "relative_order_rate": {"direction": "minimum", "value": 1.0},
+    "duplicate_rate": {"direction": "maximum", "value": 0.0},
+    "missing_row_rate": {"direction": "maximum", "value": 0.0},
+    "extra_row_rate": {"direction": "maximum", "value": 0.0},
+    "cross_field_consistency_rate": {"direction": "minimum", "value": 1.0},
+    "evidence_support_rate": {"direction": "minimum", "value": 1.0},
+    "physical_protection_rate": {"direction": "minimum", "value": 1.0}
+  }
+}

@@ -7,7 +7,6 @@ import unittest
 from types import SimpleNamespace
 
 import src.settings as settings
-from src.core.llm_client import LLMClient, LLMClientConfig
 from src.core.llm_governor import PRIORITY_BATCH, PRIORITY_INTERACTIVE
 from src.core.model_gateway import (
     _GovernedChatOpenAI,
@@ -65,12 +64,21 @@ class UsageLedgerTests(unittest.TestCase):
         self.assertEqual(snapshot["total_tokens"], 50)
         self.assertEqual(snapshot["by_channel"]["batch"]["calls"], 1)
 
-    def test_llm_client_reports_to_ledger(self) -> None:
-        client = LLMClient(
-            LLMClientConfig(provider=settings.Provider.CUSTOM, base_url="http://127.0.0.1:1/v1", model="authoring"),
+    def test_governed_model_reports_to_ledger(self) -> None:
+        from src.core.model_gateway import build_governed_model
+
+        model = build_governed_model(
+            provider="custom", model="authoring",
+            base_url="http://127.0.0.1:1/v1", api_key="test-key",
             priority=PRIORITY_BATCH,
         )
-        client._record_usage(client.config, "summary", {"prompt_tokens": 5, "completion_tokens": 3})
+        callback = model.callbacks[0]
+        self.assertIsInstance(callback, _UsageLedgerCallback)
+        self.assertEqual(callback.channel, PRIORITY_BATCH)
+        callback.on_llm_end(SimpleNamespace(
+            llm_output={"token_usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}},
+            generations=[],
+        ))
         snapshot = get_usage_ledger().snapshot()
         self.assertEqual(snapshot["by_channel"]["batch"]["total_tokens"], 8)
         self.assertEqual(snapshot["by_model"]["authoring"]["calls"], 1)
@@ -109,6 +117,17 @@ class BuildChatModelTests(unittest.TestCase):
     def test_interactive_priority_default(self) -> None:
         model = build_chat_model(provider="custom", model="test-model")
         self.assertEqual(model.hdb_priority, PRIORITY_INTERACTIVE)
+
+    def test_priority_is_part_of_factory_cache_key(self) -> None:
+        from src.core.model_factory import create_chat_model, invalidate_chat_model_cache
+
+        invalidate_chat_model_cache()
+        batch = create_chat_model(priority=PRIORITY_BATCH)
+        interactive = create_chat_model(priority=PRIORITY_INTERACTIVE)
+        self.assertIsNot(batch, interactive)
+        self.assertIs(create_chat_model(priority=PRIORITY_BATCH), batch)
+        self.assertEqual(batch.hdb_priority, PRIORITY_BATCH)
+        self.assertEqual(interactive.hdb_priority, PRIORITY_INTERACTIVE)
 
     def test_govern_ragas_llm_records_and_slots(self) -> None:
         import asyncio

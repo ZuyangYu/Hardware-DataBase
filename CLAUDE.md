@@ -78,9 +78,9 @@ via `PUT /api/v1/config`), which persists back to `.env` via
 Two axes matter most:
 
 - `AGENT_LLM_PROVIDER` (`ollama` | `custom`) - the model provider for the agent's
-  `LLMClient` (`src/core/llm_client.py`). `custom` covers any OpenAI-compatible
-  API (OpenRouter, DeepSeek, SiliconFlow, …). On HTTP 429 it retries with backoff
-  retries with backoff (no cross-model fallback exists). This is the **live** provider axis;
+  `default` model profile. `custom` covers any OpenAI-compatible API (OpenRouter,
+  DeepSeek, SiliconFlow, …). Retry policy is owned by the model profile and
+  LangChain adapter (no cross-model fallback exists). This is the **live** provider axis;
   the old `PROVIDER` variable is dead.
 - Retrieval backend is **fixed to RAGFlow** - there is no local vector backend and
   no `RAG_BACKEND` switch. Embedding/parse happen RAGFlow-side; the project no
@@ -237,13 +237,14 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 - `src/test_data/` - structured test-data domain (CSV/JSON ->
   `storage/test_data/`). **Ingest-only** today (registered via `parser_registry`);
   not yet queryable through the agent.
-- `src/core/` - `app_pipeline.py` (orchestrator), `llm_client.py` (provider-neutral
-  chat client), `llm_governor.py` (process-wide LLM admission control:
-  `interactive` keeps reserved capacity, `batch` is capped separately; queue
-  timeout/warn + metrics via `GET /system/status` -> `llm`),
-  `model_gateway.py` (model access seam: explicit governed LangChain adapter
-  classes + process-wide usage ledger per channel/model; `build_chat_model` /
-  `govern_model`), `auth.py` (role-based access: system_admin / employee,
+- `src/core/` - `app_pipeline.py` (orchestrator), `model_factory.py` (the only
+  provider-construction entry: profiles + `priority`) and `chat_model_runtime.py`
+  (invocation/observability boundary), `llm_governor.py` (process-wide LLM admission
+  control: `interactive` keeps reserved capacity, `batch` is capped separately; queue
+  timeout/warn + metrics via `GET /system/status` -> `llm`), `model_gateway.py`
+  (governed adapter classes built by the factory via `build_governed_model` +
+  process-wide usage ledger per channel/model), `auth.py` (role-based access:
+  system_admin / employee,
   backed by `storage/auth.db`; `build_request_context`), `conversation.py` (chat
   sessions in `auth.db`), `source_group_router.py` (query -> source-group weights,
   consumed by `RAGFlowBackend.retrieve`), `logger.py` / `app_logs.py`.

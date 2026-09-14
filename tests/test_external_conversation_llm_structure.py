@@ -10,7 +10,7 @@ class _FakeLLM:
         self.reply = reply
         self.calls: list = []
 
-    def chat(self, messages, **kwargs):
+    def invoke(self, messages, **kwargs):
         self.calls.append(messages)
         if isinstance(self.reply, Exception):
             raise self.reply
@@ -31,7 +31,7 @@ class LlmStructureTests(unittest.TestCase):
 
     def test_parses_fenced_json_into_turns_and_title(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_STRUCTURE = True
-        result = llm_structure.infer_structure("一段" * 60 + "没有标记的对话文本", llm_client=_FakeLLM(_VALID))
+        result = llm_structure.infer_structure("一段" * 60 + "没有标记的对话文本", chat_model=_FakeLLM(_VALID))
         self.assertIsNotNone(result)
         self.assertEqual(result["title"], "LDO 压差讨论")
         roles = [t.role for t in result["turns"]]
@@ -41,29 +41,29 @@ class LlmStructureTests(unittest.TestCase):
     def test_disabled_flag_returns_none_without_calling_llm(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_STRUCTURE = False
         fake = _FakeLLM(_VALID)
-        self.assertIsNone(llm_structure.infer_structure("一段" * 60 + "文本", llm_client=fake))
+        self.assertIsNone(llm_structure.infer_structure("一段" * 60 + "文本", chat_model=fake))
         self.assertEqual(fake.calls, [])
 
     def test_short_text_skips_llm(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_STRUCTURE = True
         fake = _FakeLLM(_VALID)
-        self.assertIsNone(llm_structure.infer_structure("太短了", llm_client=fake))
+        self.assertIsNone(llm_structure.infer_structure("太短了", chat_model=fake))
         self.assertEqual(fake.calls, [])
 
     def test_llm_failure_returns_none(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_STRUCTURE = True
-        result = llm_structure.infer_structure("一段" * 60 + "文本", llm_client=_FakeLLM(RuntimeError("boom")))
+        result = llm_structure.infer_structure("一段" * 60 + "文本", chat_model=_FakeLLM(RuntimeError("boom")))
         self.assertIsNone(result)
 
     def test_garbage_json_returns_none(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_STRUCTURE = True
-        result = llm_structure.infer_structure("一段" * 60 + "文本", llm_client=_FakeLLM("抱歉我不能输出 JSON"))
+        result = llm_structure.infer_structure("一段" * 60 + "文本", chat_model=_FakeLLM("抱歉我不能输出 JSON"))
         self.assertIsNone(result)
 
     def test_invalid_roles_filtered(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_STRUCTURE = True
         bad = '{"title": "t", "turns": [{"role": "system", "content": "x"}, {"role": "user", "content": ""}, {"role": "user", "content": "ok"}]}'
-        result = llm_structure.infer_structure("一段" * 60 + "文本", llm_client=_FakeLLM(bad))
+        result = llm_structure.infer_structure("一段" * 60 + "文本", chat_model=_FakeLLM(bad))
         self.assertIsNotNone(result)
         self.assertEqual([t.role for t in result["turns"]], ["user"])
 
@@ -84,15 +84,15 @@ class SummarizeContentTests(unittest.TestCase):
     def test_summarize_returns_summary_and_points(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_SUMMARY = True
         reply = '{"summary": "讨论了LDO压差与静态电流。", "key_points": ["最大压差0.3V", "静态电流12uA"]}'
-        result = llm_structure.summarize_content("一段" * 60, llm_client=_FakeLLM(reply))
+        result = llm_structure.summarize_content("一段" * 60, chat_model=_FakeLLM(reply))
         self.assertIsNotNone(result)
         self.assertIn("LDO", result["summary"])
         self.assertEqual(len(result["key_points"]), 2)
 
     def test_summarize_disabled_returns_none(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_SUMMARY = False
-        self.assertIsNone(llm_structure.summarize_content("一段" * 60, llm_client=_FakeLLM("{}")))
+        self.assertIsNone(llm_structure.summarize_content("一段" * 60, chat_model=_FakeLLM("{}")))
 
     def test_summarize_garbage_returns_none(self):
         src.settings.EXTERNAL_CONVERSATION_LLM_SUMMARY = True
-        self.assertIsNone(llm_structure.summarize_content("一段" * 60, llm_client=_FakeLLM("不会")))
+        self.assertIsNone(llm_structure.summarize_content("一段" * 60, chat_model=_FakeLLM("不会")))

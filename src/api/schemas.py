@@ -6,9 +6,21 @@ not redefine business schemas here.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
+
+from src.document_authoring.chat_context import (
+    DocumentAuthoringContext,
+    DocumentAuthoringContextInput,
+    DocumentContext,
+    DocumentContextInput,
+)
+from src.result_exports.models import normalize_export_format
+
+
+DocumentContextRequest = DocumentContextInput | DocumentAuthoringContextInput
+DocumentContextView = DocumentContext | DocumentAuthoringContext
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +346,8 @@ class QueryRequest(BaseModel):
     # (and blocks DoS-shaped requests before the body is even read).
     history: list[tuple[str, str]] = Field(default_factory=list, max_length=100)
     thread_id: str = ""
+    document_context: DocumentContextRequest | None = None
+    document_flow: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +366,7 @@ class SessionView(BaseModel):
     title: str
     created_at: str
     updated_at: str
+    document_context: DocumentContextView | None = None
 
 
 class MemoryContextView(BaseModel):
@@ -368,9 +383,23 @@ class MemoryContextView(BaseModel):
     score: float | None = None
 
 
+class AttachmentSnapshotView(BaseModel):
+    """Frozen attachment view rendered with historical messages."""
+
+    attachment_id: str
+    filename: str
+    media_type: str = ""
+    usage_hint: str = "reference"
+    content_hash: str = ""
+    ordinal: int = 0
+    parse_status: str = "queued"
+    deleted: bool = False
+
+
 class MessageView(BaseModel):
     id: int
     session_id: int
+    turn_id: str | None = None
     role: str
     content: str
     footer: str = ""
@@ -378,9 +407,15 @@ class MessageView(BaseModel):
     edited_at: str | None = None
     redacted: bool = False
     memory_context: list[MemoryContextView] = Field(default_factory=list)
+    document_context: DocumentContextView | None = None
+    # Attachment snapshots of the owning turn (user messages only, optional).
+    attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
     # 紧凑引用列表（assistant 消息；来自 turn summary，内容为预览长度），
     # 刷新页面后"参考来源"面板仍可用，不依赖 done 事件重放。
     citations: list[dict] = Field(default_factory=list)
+    # 该 turn 持久化的 document_card 事件（历史回填用；刷新/重开会话后
+    # 候选卡片与文档状态卡不丢失，前端按引用去重合并）。
+    cards: list[dict] = Field(default_factory=list)
 
 
 class AddMessageRequest(BaseModel):
@@ -414,6 +449,22 @@ class CreateTurnRequest(BaseModel):
     query_mode: Literal["fast", "deep"] = "deep"
     # Wiki 辅助开关(每轮): False 时不注册 wiki_search 工具。
     wiki_assist: bool = False
+    document_context: DocumentContextRequest | None = None
+    # Explicit document-flow routing: True forces the document flow when the
+    # context is valid, False blocks it (and strips document tools from the
+    # general toolset); None keeps the legacy intent-keyword fallback.
+    document_flow: bool | None = None
+    # Chat attachments (design §5.1): session-scoped references; the server
+    # re-verifies ownership and parse state before persisting the turn.
+    attachment_ids: list[str] = Field(default_factory=list, max_length=20)
+    # "auto" expands deterministically server-side; explicit values may only
+    # narrow the resolved scope, never widen it.
+    source_scope: Literal[
+        "auto",
+        "attachment_only",
+        "knowledge_base_only",
+        "attachment_and_knowledge_base",
+    ] = "auto"
 
 
 class TurnView(BaseModel):
@@ -436,11 +487,116 @@ class TurnView(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    document_context: DocumentContextView | None = None
+    source_scope: str = "auto"
+    attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
 
 
 class TurnStartResponse(BaseModel):
     turn: TurnView
     user_message: MessageView
+
+
+# ---------------------------------------------------------------------------
+# Generic result exports
+# ---------------------------------------------------------------------------
+
+ExportFormat = Literal["md", "xlsx", "docx", "pdf", "pptx"]
+
+
+def _normalize_export_format_input(value: Any) -> str:
+    try:
+        return normalize_export_format(str(value))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+ExportRequestFormat = Annotated[ExportFormat, BeforeValidator(_normalize_export_format_input)]
+
+
+class ExportSourceRef(BaseModel):
+    kind: Literal["turn", "message", "snapshot"] = "turn"
+    id: str = Field(min_length=1, max_length=200)
+
+
+class CreateExportRequest(BaseModel):
+    source_ref: ExportSourceRef
+    formats: list[ExportRequestFormat] = Field(min_length=1, max_length=5)
+    content_shape: Literal["report", "data", "raw"] = "report"
+    title: str | None = Field(default=None, max_length=160)
+    client_request_id: str | None = Field(default=None, max_length=128)
+    include_citations: bool = True
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExportArtifactView(BaseModel):
+    artifact_id: str
+    export_job_id: str
+    session_id: int
+    format: ExportFormat
+    filename: str
+    mime_type: str
+    size: int
+    sha256: str
+    preview: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    expires_at: str | None = None
+    preview_url: str
+    download_url: str
+    tenant_id: str = "default"
+    department_id: str | None = None
+    knowledge_base_name: str = ""
+    snapshot_id: str = ""
+    turn_id: str | None = None
+    available: bool = True
+
+
+class LegacyArtifactView(BaseModel):
+    """Unified projection for a template-document artifact."""
+
+    artifact_id: str
+    artifact_kind: Literal["document_generation"] = "document_generation"
+    work_order_id: str
+    stage: str
+    format: str
+    filename: str
+    mime_type: str
+    size: int
+    sha256: str
+    preview: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    preview_url: str
+    download_url: str
+    tenant_id: str = "default"
+    department_id: str | None = None
+    knowledge_base_name: str = ""
+    available: bool = True
+
+
+class ExportJobView(BaseModel):
+    export_job_id: str
+    snapshot_id: str
+    session_id: int
+    turn_id: str | None = None
+    format: ExportFormat
+    content_shape: str
+    status: str
+    attempt: int
+    error_message: str = ""
+    artifact: ExportArtifactView | None = None
+    created_at: str
+    updated_at: str
+    completed_at: str | None = None
+    tenant_id: str = "default"
+    department_id: str | None = None
+    knowledge_base_name: str = ""
+
+
+class ExportBatchView(BaseModel):
+    snapshot_id: str
+    session_id: int
+    source_ref: ExportSourceRef
+    jobs: list[ExportJobView]
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +606,20 @@ class TurnStartResponse(BaseModel):
 MemoryScope = Literal["project", "user"]
 MemoryListScope = Literal["all", "project", "user"]
 MemoryStatus = Literal[
+    "candidate",
+    "verification_pending",
+    "supersede_pending",
+    "needs_rebuild",
+    "verified",
+    "superseded",
+    "rejected",
+    "deleted",
+    "provenance_missing",
+]
+
+MemoryListStatus = Literal[
+    "all",
+    "active",
     "candidate",
     "verification_pending",
     "supersede_pending",
@@ -1009,6 +1179,15 @@ class TemplateAnalysisView(BaseModel):
     auto_activated: bool = False
 
 
+class AnalyzeTemplateFromAttachmentRequest(BaseModel):
+    """JSON contract for converting an existing session attachment to a template."""
+
+    kb: str
+    session_id: int
+    attachment_id: str
+    template_name: str
+
+
 class TemplateReviewUnitView(TemplateUnitView):
     """Safe unit metadata used only by the human mapping-correction screen."""
 
@@ -1044,6 +1223,7 @@ class TemplateMappingCorrectionRequest(BaseModel):
 
 class ConfirmTemplateRequest(BaseModel):
     display_name: str
+    execution_mode: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
 
 
 class CreateWorkOrderRequest(BaseModel):
@@ -1051,21 +1231,101 @@ class CreateWorkOrderRequest(BaseModel):
     document_schema_id: str
     document_schema_version: str
     generation_session_id: str | None = None
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    execution_mode: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
 
 
 class DeleteDocumentWorkOrderRequest(BaseModel):
     reason: str = ""
 
 
+class ConvertDocumentArtifactRequest(BaseModel):
+    target_format: Literal["pdf", "pptx"]
+
+
 class CreateGenerationSessionRequest(BaseModel):
-    template_version_id: str = Field(min_length=1)
+    template_version_id: str | None = Field(default=None, min_length=1)
+    contract_version: Literal["legacy_brief_v1", "output_spec_v1"] = "legacy_brief_v1"
     purpose: str = ""
     output_policy: dict[str, Any] = Field(default_factory=dict)
+    output_spec: dict[str, Any] | None = None
+    # Optional until all existing callers select a schema before clarification.
+    # When supplied, the resolver can attach field-level requirements to the
+    # GenerationSession without changing the legacy fixed-question flow.
+    document_schema_id: str | None = Field(default=None, min_length=1)
+    document_schema_version: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_contract_input(self):
+        if self.contract_version == "legacy_brief_v1" and not self.template_version_id:
+            raise ValueError("legacy generation sessions require template_version_id")
+        if self.output_spec is not None and not isinstance(self.output_spec, dict):
+            raise ValueError("output_spec must be an object")
+        return self
 
 
 class AnswerGenerationSessionRequest(BaseModel):
     question_id: str = Field(min_length=1)
     answer: str = Field(min_length=1)
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class CreatePlanProposalRequest(BaseModel):
+    """Hash-bound proposal request; all semantic values come from the session draft."""
+
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    expected_output_spec_version: int = Field(default=1, ge=1)
+
+
+class PlanProposalView(BaseModel):
+    """Safe projection of a plan; no source names, evidence or storage refs."""
+
+    session_id: str | None = None
+    task_id: str | None = None
+    document_plan_id: str
+    document_plan_version: int = Field(ge=1)
+    plan_hash: str | None = None
+    output_spec_id: str | None = None
+    output_spec_version: int | None = Field(default=None, ge=1)
+    output_spec_hash: str | None = None
+    status: str
+    executable: bool = False
+    deliverables: list[dict[str, Any]] = Field(default_factory=list)
+    layout_summary: dict[str, Any] = Field(default_factory=dict)
+    outline_count: int = Field(default=0, ge=0)
+    table_count: int = Field(default=0, ge=0)
+    source_summary: dict[str, int | str | bool] = Field(default_factory=dict)
+    policies: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    blockers: list[dict[str, Any] | str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+
+
+class ConfirmPlanRequest(BaseModel):
+    """Hash-bound Gate 1 confirmation; every semantic value is server-owned."""
+
+    expected_output_spec_hash: str = Field(min_length=1, max_length=256)
+    expected_plan_hash: str = Field(min_length=1, max_length=256)
+    client_request_id: str = Field(min_length=1, max_length=128)
+
+
+class PlanSubmissionView(BaseModel):
+    """Safe projection of a plan-submission outbox row.
+
+    The confirmation HTTP response must not claim a job exists before the
+    outbox worker creates one, so Work Order/job refs stay optional.
+    """
+
+    submission_id: str
+    status: str
+    session_id: str | None = None
+    task_id: str | None = None
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
+    plan_hash: str | None = None
+    work_order_id: str | None = None
+    job_id: str | None = None
+    next_actions: list[str] = Field(default_factory=list)
 
 
 class IcdResolutionItem(BaseModel):
@@ -1080,3 +1340,37 @@ class IcdResolutionRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     comment: str
+
+
+class DocumentReviewDecisionRequest(BaseModel):
+    subject_hash: str = Field(min_length=1, max_length=256)
+    decision: Any
+    client_request_id: str = Field(min_length=1, max_length=128)
+    status: str | None = Field(default=None, min_length=1, max_length=64)
+    decision_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateDocumentRevisionRequest(BaseModel):
+    parent_artifact_id: str = Field(min_length=1, max_length=200)
+    request_type: Literal["field_update", "section_update", "full_regeneration"]
+    request: str = Field(min_length=1, max_length=4000)
+    changed_fields: list[str] = Field(default_factory=list)
+    changed_sections: list[str] = Field(default_factory=list)
+    client_request_id: str = Field(min_length=1, max_length=128)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CompleteDocumentRevisionRequest(BaseModel):
+    """Worker completion contract for a generated revision child artifact."""
+
+    child_artifact_id: str = Field(min_length=1, max_length=200)
+    revalidation_status: Literal["passed", "failed", "requires_human"]
+    revalidation_result: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentHumanDecisionRequest(BaseModel):
+    """One-time approve/reject decision for a pending agent proposal."""
+
+    pending_event_id: str = Field(min_length=1, max_length=200)
+    proposal_hash: str = Field(min_length=1, max_length=200)
+    decision: Literal["approve", "reject"]

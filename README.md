@@ -8,7 +8,8 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化�
 - **多源 pipeline**：普通文档进入 RAGFlow 检索链路；Excel 进入结构化表格索引；EDF 网表进入电路结构化索引；外部对话记录单独索引；均由 agent 统一调度。
 - **RAGFlow 后端固定化**：文档上传、解析任务、检索、删除和知识库治理都通过 RAGFlow 后端适配层完成。
 - **权限与治理**：支持部门、用户、知识库权限、审计日志、查询 trace 和文件处理状态。
-- **统一模型配置**：答案生成与工具决策统一走 `src.core.model_factory`（`init_chat_model`），支持 Ollama 或 OpenAI-compatible API。提示词 `SYSTEM_PROMPT` / `NO_CONTEXT_PROMPT` 可在系统配置中覆盖。
+- **统一模型配置**：答案生成、工具决策和后台模型任务统一走 `src.core.model_factory` profile，并由 chat runtime 负责调用归一化与观测，支持 Ollama 或 OpenAI-compatible API。提示词 `SYSTEM_PROMPT` / `NO_CONTEXT_PROMPT` 可在系统配置中覆盖。
+- **结果 Artifact 导出**：已完成的对话/知识库检索结果先固化为不可变 ResultSnapshot，再由独立 export worker 生成 Markdown、Excel、Word、PDF 或 PowerPoint Artifact；聊天消息和全局任务中心提供带权限校验的后台任务状态、重试和下载入口。导出任务不依赖浏览器 SSE，切换会话、页面或刷新页面不会丢失。
 
 ## 界面示例
 
@@ -75,7 +76,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 ```bash
 uv sync --all-groups
-uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8003（HDB_API_HOST/PORT 可改）
+uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8001（HDB_API_HOST/PORT 可改）
 ```
 
 另开终端启动前端（Node.js >= 18）：
@@ -83,7 +84,7 @@ uv run hardware-database-server   # FastAPI 后端，默认 127.0.0.1:8003（HDB
 ```bash
 cd frontend
 npm ci
-npm run dev                       # Vite dev server，默认 127.0.0.1:5175，经 proxy 转发 /api 到后端
+npm run dev                       # Vite dev server，默认 0.0.0.0:5176，经 proxy 转发 /api 到后端
 ```
 
 生产部署用 `npm run build` 产出 `frontend/dist/` 静态文件。
@@ -187,6 +188,14 @@ uv run hardware-database-memory-worker
   -> 统一模型封装 (src.core.model_factory)
 ```
 
+已完成助手消息的“导出结果”菜单支持 Markdown、Excel、Word、PDF、PowerPoint；同一回答可以分别提交多个格式，格式失败不会影响其他任务。用户在对话中明确说“导出/输出/生成为 Excel、PDF”等格式时，服务端会在 turn 完成事务内登记对应后台任务，浏览器只负责订阅和展示；普通提到某种文件格式的检索问题不会误触发。导出 API 为 `POST /api/v1/exports`，任务状态、预览和下载分别通过 `/api/v1/exports/{export_job_id}`、`/api/v1/artifacts/{artifact_id}/preview` 和 `/api/v1/artifacts/{artifact_id}/download` 获取。单机 API 默认拉起独立 export worker；多实例部署可设置 `HDB_API_SPAWN_EXPORT_WORKER=false`，单独运行：
+
+```bash
+uv run hardware-database-export-worker
+```
+
+Word/PDF 使用后端受控渲染器，PowerPoint 支持 light/dark/blue 主题和从真实数值表生成的柱状图；文件生成不执行用户脚本、不访问用户本地路径或外部网络。`RESULT_EXPORT_ENABLED` 和 `RESULT_EXPORT_{MD,XLSX,DOCX,PDF,PPTX}_ENABLED` 控制灰度发布，前端菜单从 `/api/v1/exports/formats` 获取可用格式，后端仍会强制校验。`RESULT_EXPORT_RETENTION_DAYS` 控制产物保留期，`RESULT_EXPORT_MAX_RUNNING_JOBS` 控制并发运行配额，过期文件由 export worker 清理二进制但保留 Artifact 历史元数据、任务历史和下载审计。Artifact 历史可通过 `GET /api/v1/artifacts` 查询；旧模板文档还可通过 `/api/v1/artifacts/document/{artifact_id}/preview|download` 使用统一访问协议，底层记录保持兼容。
+
 ## 常见问题
 
 **Q: 运行 `uv sync` 时提示 lock file is not up to date？**
@@ -200,6 +209,9 @@ A: 当前检索后端为 RAGFlow，请按顺序排查：1) RAGFlow 服务是否�
 
 **Q: Agent 响应很慢或超时？**
 A: 可适当调大 `AGENT_TIMEOUT_SECONDS`；`AGENT_MAX_RETRIEVAL_ROUNDS` 现在直接决定 agent 循环的 `recursion_limit` 预算——调大检索会更充分但更慢，调小则更快但可能检索不足；确认 LLM 模型（Ollama 或 custom API）的响应速度。
+
+**Q: RAGFlow 日志出现 SiliconFlow `connect timeout=30`？**
+A: 这是 RAGFlow 容器内部到 SiliconFlow 的请求超时，不是本项目的 `RAGFLOW_TIMEOUT_SECONDS`。部署配置在 RAGFlow compose 目录的 `.env` 中设置 `SILICONFLOW_EMBEDDING_TIMEOUT_SECONDS=100`；`deploy/ragflow/embedding_model.py` 通过只读挂载覆盖 RAGFlow v0.26.4 的硬编码值。修改后需重建 `ragflow-cpu` 容器。
 
 **Q: 首次启动后无法使用问答？**
 A: 请先以系统管理员进入「系统配置」检查并补全 RAGFlow 与 Agent 模型配置，保存后生效。

@@ -11,16 +11,20 @@ import copy
 import hashlib
 import io
 import posixpath
+import re
 import zipfile
 from dataclasses import dataclass
 from typing import Any
 from xml.etree import ElementTree as ET
 
+from src.document_authoring.ooxml import sanitize_xml10_text, validate_ooxml_package
 from src.document_authoring.models import (
     RendererPolicy,
     TemplateSecurityReport,
     WorkbookFillPlan,
     WorkbookRegionSchema,
+    WorkbookTableRowFill,
+    WorkbookTableSchema,
     content_hash,
 )
 from src.document_authoring.template_analysis import (
@@ -79,6 +83,7 @@ class XlsmRenderer:
         policy: RendererPolicy,
         *,
         security_approved: bool = False,
+        table_schemas: list[WorkbookTableSchema] | None = None,
     ) -> XlsmRenderResult:
         report = self.inspect(template_content)
         self._validate_active_content(report, policy, security_approved)
@@ -108,8 +113,127 @@ class XlsmRenderer:
                 raise ValueError(f"formula-like text is not allowed in generated content: {fill.region_id}")
             fills.append((region, value, fill.semantic_unit_id))
 
+        schemas = list(table_schemas or [])
+        if len({schema.table_region_id for schema in schemas}) != len(schemas):
+            raise ValueError("duplicate workbook table region ids are not allowed")
+        table_schema_by_id = {schema.table_region_id: schema for schema in schemas}
+        table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]], list[str]]] = []
+        seen_table_ids: set[str] = set()
+        table_locators: set[tuple[str, str]] = set()
+        table_values: list[str] = []
+        for table_fill in getattr(fill_plan, "table_fills", []) or []:
+            schema = table_schema_by_id.get(table_fill.table_region_id)
+            if schema is None:
+                raise ValueError(
+                    "table fill references an unregistered table region: "
+                    f"{table_fill.table_region_id}"
+                )
+            if table_fill.table_region_id in seen_table_ids:
+                raise ValueError(f"duplicate workbook table fill target: {table_fill.table_region_id}")
+            if table_fill.semantic_unit_id != schema.semantic_unit_id:
+                raise ValueError(
+                    f"table fill semantic unit does not match schema: {table_fill.table_region_id}"
+                )
+            if len(table_fill.rows) > schema.max_output_rows:
+                raise ValueError(
+                    f"table output exceeds max rows: {table_fill.table_region_id}"
+                )
+            column_ids = {column.column_id for column in schema.columns}
+            if len(column_ids) != len(schema.columns):
+                raise ValueError(f"duplicate workbook table columns: {schema.table_region_id}")
+            normalized_rows: list[dict[str, str]] = []
+            row_keys: list[str] = []
+            typed_row_count = 0
+            legacy_row_count = 0
+            for row in table_fill.rows:
+                if isinstance(row, WorkbookTableRowFill):
+                    typed_row_count += 1
+                    row_key = row.row_key.strip()
+                    values = dict(row.cells)
+                elif isinstance(row, dict):
+                    legacy_row_count += 1
+                    row_key = ""
+                    values = row
+                else:
+                    raise ValueError("workbook table rows must be objects")
+                unknown_columns = set(values) - column_ids
+                if unknown_columns:
+                    raise ValueError(
+                        f"table row contains unknown columns: {sorted(unknown_columns)}"
+                    )
+                missing_columns = set(schema.required_columns) - set(values)
+                if missing_columns:
+                    raise ValueError(
+                        f"table row is missing required columns: {sorted(missing_columns)}"
+                    )
+                normalized = {
+                    column.column_id: str(values.get(column.column_id, ""))
+                    for column in schema.columns
+                }
+                if policy.reject_formula_like_text and any(
+                    value.startswith(_FORMULA_PREFIXES) for value in normalized.values()
+                ):
+                    raise ValueError(
+                        "formula-like text is not allowed in generated table content: "
+                        f"{table_fill.table_region_id}"
+                    )
+                table_values.extend(normalized.values())
+                normalized_rows.append(normalized)
+                row_keys.append(row_key)
+            if typed_row_count and legacy_row_count:
+                raise ValueError("workbook table rows may not mix typed and legacy row payloads")
+            if schema.expected_row_keys:
+                if any(not row_key for row_key in row_keys):
+                    raise ValueError(
+                        f"table rows require non-empty row keys: {schema.table_region_id}"
+                    )
+                expected = list(schema.expected_row_keys)
+                if set(row_keys) != set(expected):
+                    missing = [key for key in expected if key not in set(row_keys)]
+                    unexpected = [key for key in row_keys if key not in set(expected)]
+                    raise ValueError(
+                        f"table row keys do not match expected scope: "
+                        f"missing={missing}, unexpected={unexpected}"
+                    )
+                if schema.duplicate_policy == "reject" and len(row_keys) != len(set(row_keys)):
+                    raise ValueError("duplicate workbook table row keys are not allowed")
+                if schema.row_order == "declared" and row_keys != expected:
+                    raise ValueError("workbook table rows are not in declared row-key order")
+            elif schema.row_order == "stable_key":
+                if any(not row_key for row_key in row_keys):
+                    raise ValueError("stable workbook table ordering requires row keys")
+                if schema.duplicate_policy == "reject" and len(row_keys) != len(set(row_keys)):
+                    raise ValueError("duplicate workbook table row keys are not allowed")
+                if row_keys != sorted(row_keys):
+                    raise ValueError("workbook table rows are not in stable row-key order")
+            elif schema.duplicate_policy == "reject" and any(row_keys) and len(row_keys) != len(set(row_keys)):
+                raise ValueError("duplicate workbook table row keys are not allowed")
+            if schema.first_data_row < 1 or schema.last_template_row < schema.first_data_row:
+                raise ValueError(f"invalid workbook table row bounds: {schema.table_region_id}")
+            for column in schema.columns:
+                try:
+                    workbook_cell_coordinates(f"{column.column_letter}{schema.first_data_row}")
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid workbook table column locator: {column.column_letter}"
+                    ) from exc
+            for row_number in range(
+                schema.first_data_row,
+                max(schema.last_template_row, schema.first_data_row + len(normalized_rows) - 1) + 1,
+            ):
+                for column in schema.columns:
+                    locator = (schema.sheet_name, f"{column.column_letter}{row_number}".upper())
+                    if locator in seen_locators or locator in table_locators:
+                        raise ValueError(f"duplicate workbook fill target: {locator[0]}!{locator[1]}")
+                    table_locators.add(locator)
+            seen_table_ids.add(table_fill.table_region_id)
+            table_fills.append((schema, normalized_rows, row_keys))
+
         long_value_counts: dict[str, int] = {}
         for _region, value, _semantic_unit_id in fills:
+            if len(value) >= 80:
+                long_value_counts[value] = long_value_counts.get(value, 0) + 1
+        for value in table_values:
             if len(value) >= 80:
                 long_value_counts[value] = long_value_counts.get(value, 0) + 1
         if any(count > 1 for count in long_value_counts.values()):
@@ -118,6 +242,9 @@ class XlsmRenderer:
         sheet_fills: dict[str, list[tuple[WorkbookRegionSchema, str]]] = {}
         for region, value, _semantic_unit_id in fills:
             sheet_fills.setdefault(region.sheet_name, []).append((region, value))
+        sheet_table_fills: dict[str, list[tuple[WorkbookTableSchema, list[dict[str, str]], list[str]]]] = {}
+        for schema, rows, row_keys in table_fills:
+            sheet_table_fills.setdefault(schema.sheet_name, []).append((schema, rows, row_keys))
 
         source = io.BytesIO(template_content)
         output = io.BytesIO()
@@ -130,7 +257,7 @@ class XlsmRenderer:
                 if "xl/sharedStrings.xml" in src.namelist()
                 else []
             )
-            required_sheets = set(sheet_fills)
+            required_sheets = set(sheet_fills) | set(sheet_table_fills)
             missing_sheets = required_sheets - set(worksheet_map)
             if missing_sheets:
                 raise ValueError(f"template sheets not found: {sorted(missing_sheets)}")
@@ -172,10 +299,55 @@ class XlsmRenderer:
                     "semantic_unit_id": semantic_unit_id,
                     "region_id": region.region_id,
                 })
+            for schema, rows, row_keys in table_fills:
+                worksheet = src.read(worksheet_map[schema.sheet_name])
+                end_row = max(
+                    schema.last_template_row,
+                    schema.first_data_row + len(rows) - 1,
+                )
+                for row_number in range(schema.first_data_row, end_row + 1):
+                    row_values = rows[row_number - schema.first_data_row] if row_number - schema.first_data_row < len(rows) else {}
+                    for column in schema.columns:
+                        ref = f"{column.column_letter}{row_number}".upper()
+                        baseline_value = self._cell_value(worksheet, ref, shared_strings)
+                        baseline_hash = workbook_value_hash(baseline_value)
+                        expected_hash = schema.expected_value_hashes.get(ref)
+                        if expected_hash is not None and baseline_hash != expected_hash:
+                            raise PermissionError(f"workbook table cell baseline changed: {schema.sheet_name}!{ref}")
+                        if expected_hash is None and baseline_value is not None:
+                            raise PermissionError(
+                                f"workbook table cell has no frozen baseline for non-empty cell: "
+                                f"{schema.sheet_name}!{ref}"
+                            )
+                        if (
+                            baseline_value is not None
+                            and not schema.allow_example_region_replacement
+                        ):
+                            raise PermissionError(
+                                f"non-empty workbook table overwrite is not authorized: "
+                                f"{schema.sheet_name}!{ref}"
+                            )
+                        generated_value = str(row_values.get(column.column_id, ""))
+                        cell_changes.append({
+                            "sheet_name": schema.sheet_name,
+                            "cell": ref,
+                            "baseline_value_hash": baseline_hash,
+                            "generated_value_hash": workbook_value_hash(generated_value or None),
+                            "baseline_empty": baseline_value is None,
+                            "semantic_unit_id": schema.semantic_unit_id,
+                            "region_id": schema.table_region_id,
+                            "row_key": row_keys[row_number - schema.first_data_row]
+                            if row_number - schema.first_data_row < len(row_keys) else "",
+                        })
             replacements: dict[str, bytes] = {}
             for sheet_name, fill_values in sheet_fills.items():
                 part = worksheet_map[sheet_name]
                 replacements[part] = self._patch_worksheet(src.read(part), fill_values)
+                changed_parts.add(part)
+            for sheet_name, table_fill_values in sheet_table_fills.items():
+                part = worksheet_map[sheet_name]
+                source_part = replacements.get(part, src.read(part))
+                replacements[part] = self._patch_tables(source_part, table_fill_values)
                 changed_parts.add(part)
             for info in src.infolist():
                 data = replacements.get(info.filename)
@@ -187,6 +359,13 @@ class XlsmRenderer:
                 dst.writestr(cloned, data)
 
         rendered = output.getvalue()
+        # ElementTree preserves Python control characters unless they are
+        # removed before serialization.  Validate every XML part before the
+        # result is handed to the service/store boundary.
+        # Some legacy templates omit the package content-types part.  The
+        # renderer can still verify every present XML member; the persisted
+        # artifact/store boundary applies the complete-package requirement.
+        validate_ooxml_package(rendered, "xlsx", require_content_types=False)
         after = self.inspect(rendered)
         if after.active_content_status != "clean":
             raise ValueError("generated artifact contains active content")
@@ -278,6 +457,7 @@ class XlsmRenderer:
 
     @staticmethod
     def _patch_worksheet(source: bytes, fills: list[tuple[WorkbookRegionSchema, str]]) -> bytes:
+        XlsmRenderer._register_source_namespaces(source)
         root = ET.fromstring(source)
         sheet_data = root.find("x:sheetData", NS)
         if sheet_data is None:
@@ -307,15 +487,163 @@ class XlsmRenderer:
                 row.append(cell)
             if region.preserve_formula or cell.find("x:f", NS) is not None:
                 raise ValueError(f"renderer will not replace a formula cell: {ref}")
-            for child in list(cell):
-                cell.remove(child)
-            cell.attrib["t"] = "inlineStr"
-            inline = ET.SubElement(cell, f"{{{MAIN_NS}}}is")
-            text = ET.SubElement(inline, f"{{{MAIN_NS}}}t")
-            if value[:1].isspace() or value[-1:].isspace():
-                text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            text.text = value
-        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            XlsmRenderer._set_inline_string(cell, value)
+        serialized = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return XlsmRenderer._repair_markup_compatibility_prefixes(serialized)
+
+    @staticmethod
+    def _set_inline_string(cell: ET.Element, value: str) -> None:
+        """Replace a cell value while preserving its style and attributes."""
+        value = sanitize_xml10_text(value)
+        for child in list(cell):
+            cell.remove(child)
+        if not value:
+            cell.attrib.pop("t", None)
+            return
+        cell.attrib["t"] = "inlineStr"
+        inline = ET.SubElement(cell, f"{{{MAIN_NS}}}is")
+        text = ET.SubElement(inline, f"{{{MAIN_NS}}}t")
+        if value[:1].isspace() or value[-1:].isspace():
+            text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        text.text = value
+
+    @staticmethod
+    def _patch_tables(
+        source: bytes,
+        table_fills: list[tuple[WorkbookTableSchema, list[dict[str, str]], list[str]]],
+    ) -> bytes:
+        """Patch discovered table rows without changing other OOXML parts."""
+        XlsmRenderer._register_source_namespaces(source)
+        root = ET.fromstring(source)
+        sheet_data = root.find("x:sheetData", NS)
+        if sheet_data is None:
+            sheet_data = ET.SubElement(root, f"{{{MAIN_NS}}}sheetData")
+        rows = {
+            int(row.attrib["r"]): row
+            for row in sheet_data.findall("x:row", NS)
+            if row.attrib.get("r", "").isdigit()
+        }
+        for schema, values, _row_keys in table_fills:
+            end_row = max(schema.last_template_row, schema.first_data_row + len(values) - 1)
+            style_row = rows.get(schema.style_source_row)
+            for row_number in range(schema.first_data_row, end_row + 1):
+                row = rows.get(row_number)
+                if row is None:
+                    row = XlsmRenderer._new_table_row(row_number, style_row, schema)
+                    inserted = False
+                    for index, candidate in enumerate(list(sheet_data)):
+                        candidate_row = candidate.attrib.get("r", "0")
+                        if candidate_row.isdigit() and int(candidate_row) > row_number:
+                            sheet_data.insert(index, row)
+                            inserted = True
+                            break
+                    if not inserted:
+                        sheet_data.append(row)
+                    rows[row_number] = row
+                row_values = values[row_number - schema.first_data_row] if row_number - schema.first_data_row < len(values) else {}
+                for column in schema.columns:
+                    ref = f"{column.column_letter}{row_number}".upper()
+                    cell = next(
+                        (candidate for candidate in row.findall("x:c", NS)
+                         if candidate.attrib.get("r", "").upper() == ref),
+                        None,
+                    )
+                    if cell is None:
+                        cell = ET.Element(f"{{{MAIN_NS}}}c", {"r": ref})
+                        row.append(cell)
+                    if cell.find("x:f", NS) is not None:
+                        raise ValueError(f"renderer will not replace a formula table cell: {ref}")
+                    XlsmRenderer._set_inline_string(
+                        cell,
+                        str(row_values.get(column.column_id, "")),
+                    )
+        serialized = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        return XlsmRenderer._repair_markup_compatibility_prefixes(serialized)
+
+    @staticmethod
+    def _register_source_namespaces(source: bytes) -> None:
+        """Keep source prefixes used by markup-compatibility attributes.
+
+        ``mc:Ignorable`` stores prefixes as text rather than QName-valued XML
+        attributes.  ElementTree otherwise renames unknown prefixes to
+        ``nsN`` while leaving that text unchanged, yielding a package that is
+        XML-well-formed but rejected by Excel.  Registering the source
+        namespace declarations before serialization preserves those prefixes.
+        """
+        for _event, (prefix, uri) in ET.iterparse(io.BytesIO(source), events=("start-ns",)):
+            ET.register_namespace(prefix or "", uri)
+
+    @staticmethod
+    def _repair_markup_compatibility_prefixes(serialized: bytes) -> bytes:
+        """Drop stale ``mc:Ignorable`` tokens after ElementTree serialization.
+
+        ElementTree omits namespace declarations that are no longer used by
+        an element/attribute and may rename the remaining ones.  The value of
+        ``mc:Ignorable`` is a whitespace-separated list of prefix *strings*,
+        so it is not rewritten automatically.  Keep only prefixes declared in
+        the serialized root, preventing Excel from treating the worksheet as a
+        malformed package.
+        """
+        declared_prefixes = {
+            prefix or ""
+            for _event, (prefix, _uri) in ET.iterparse(
+                io.BytesIO(serialized), events=("start-ns",)
+            )
+        }
+        pattern = re.compile(
+            rb"(?P<attribute>(?:[A-Za-z_][A-Za-z0-9_.-]*:)?Ignorable)"
+            rb"(?P<equals>\s*=\s*)(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+            re.DOTALL,
+        )
+
+        def replace(match: re.Match[bytes]) -> bytes:
+            value = match.group("value").decode("utf-8")
+            retained = " ".join(
+                token for token in value.split() if token in declared_prefixes
+            )
+            if not retained:
+                return b""
+            return (
+                match.group("attribute")
+                + match.group("equals")
+                + match.group("quote")
+                + retained.encode("utf-8")
+                + match.group("quote")
+            )
+
+        return pattern.sub(replace, serialized)
+
+    @staticmethod
+    def _new_table_row(
+        row_number: int,
+        style_row: ET.Element | None,
+        schema: WorkbookTableSchema,
+    ) -> ET.Element:
+        """Create an output row carrying only the registered column styles."""
+        if style_row is None:
+            row = ET.Element(f"{{{MAIN_NS}}}row", {"r": str(row_number)})
+            source_cells: dict[str, ET.Element] = {}
+        else:
+            attributes = {
+                key: value for key, value in style_row.attrib.items() if key != "r"
+            }
+            attributes["r"] = str(row_number)
+            row = ET.Element(style_row.tag, attributes)
+            source_cells = {
+                str(cell.attrib.get("r", "")).rstrip("0123456789").upper(): cell
+                for cell in style_row.findall("x:c", NS)
+            }
+        for column in schema.columns:
+            cell = source_cells.get(column.column_letter.upper())
+            if cell is None:
+                cell = ET.Element(f"{{{MAIN_NS}}}c")
+            else:
+                cell = copy.deepcopy(cell)
+                for child in list(cell):
+                    cell.remove(child)
+            cell.attrib["r"] = f"{column.column_letter}{row_number}".upper()
+            row.append(cell)
+        return row
 
     @staticmethod
     def _integrity_manifest(
@@ -348,6 +676,12 @@ class XlsmRenderer:
         return {
             "before_content_hash": before.content_hash,
             "after_content_hash": after.content_hash,
+            # Package-part hashes are persisted in the integrity manifest so
+            # the independent post-render reviewer can verify VBA, external
+            # links, relationships and unknown parts without receiving the
+            # template bytes as a second mutable input.
+            "before_parts": dict(before.parts),
+            "after_parts": dict(after.parts),
             "changed_parts": changed,
             "part_count_before": len(before.parts),
             "part_count_after": len(after.parts),

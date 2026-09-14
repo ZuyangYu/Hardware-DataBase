@@ -6,7 +6,6 @@ import time
 import unittest
 
 import src.settings as settings
-from src.core.llm_client import LLMClient, LLMClientConfig
 from src.core.llm_governor import (
     LLMQueueTimeoutError,
     PRIORITY_BATCH,
@@ -14,7 +13,6 @@ from src.core.llm_governor import (
     get_llm_governor,
     reset_llm_governor,
 )
-from src.core.model_gateway import govern_model
 
 
 class _SettingsGuard(unittest.TestCase):
@@ -146,81 +144,40 @@ class LLMGovernorTests(_SettingsGuard):
 
 
 class GovernedModelTests(_SettingsGuard):
-    def test_govern_model_gates_generate_and_stream(self) -> None:
-        settings.LLM_MAX_CONCURRENCY = 1
-        settings.LLM_BATCH_MAX_CONCURRENCY = 1
-        governor = get_llm_governor()
+    def test_governed_adapter_holds_slot_around_generate_and_stream(self) -> None:
+        from unittest import mock
 
-        class FakeModel:
-            def _generate(self, *args, **kwargs):
-                return "generated"
+        from langchain_openai import ChatOpenAI
 
-            def _stream(self, *args, **kwargs):
-                yield "a"
-                yield "b"
-
-        model = govern_model(FakeModel(), PRIORITY_BATCH)
-        self.assertNotEqual(type(model).__name__, "FakeModel")
-        self.assertEqual(model._generate(), "generated")
-        self.assertEqual(governor.snapshot()["active"], 0)
-
-        observed: list[int] = []
-
-        def consume() -> None:
-            for _chunk in model._stream():
-                observed.append(governor.snapshot()["active"])
-
-        consume()
-        self.assertEqual(observed, [1, 1])
-        self.assertEqual(governor.snapshot()["active"], 0)
-        # 幂等: 已治理模型不会被二次包装
-        self.assertIs(govern_model(model, PRIORITY_INTERACTIVE), model)
-
-
-class LLMClientGovernanceTests(_SettingsGuard):
-    @staticmethod
-    def _client() -> LLMClient:
-        return LLMClient(LLMClientConfig(
-            provider=settings.Provider.CUSTOM, base_url="http://127.0.0.1:1/v1", model="fake",
-        ))
-
-    def test_chat_acquires_one_slot(self) -> None:
-        import types
+        from src.core.model_gateway import build_governed_model
 
         settings.LLM_MAX_CONCURRENCY = 2
         settings.LLM_BATCH_MAX_CONCURRENCY = 1
         governor = get_llm_governor()
         seen: list[int] = []
 
-        def fake_chat(self, config, messages, **kwargs):  # noqa: ANN001
+        def fake_generate(self, *args, **kwargs):  # noqa: ANN001
             seen.append(governor.snapshot()["active"])
-            return "ok"
+            return "generated"
 
-        client = self._client()
-        client._chat_openai_compatible = types.MethodType(fake_chat, client)
-        self.assertEqual(client.chat([{"role": "user", "content": "hi"}]), "ok")
-        self.assertEqual(seen, [1])
-        self.assertEqual(governor.snapshot()["active"], 0)
-
-    def test_stream_holds_slot_until_exhausted(self) -> None:
-        import types
-
-        settings.LLM_MAX_CONCURRENCY = 2
-        settings.LLM_BATCH_MAX_CONCURRENCY = 1
-        governor = get_llm_governor()
-        seen: list[int] = []
-
-        def fake_stream(self, config, messages, **kwargs):  # noqa: ANN001
+        def fake_stream(self, *args, **kwargs):  # noqa: ANN001
             seen.append(governor.snapshot()["active"])
-            yield "one"
+            yield "a"
             seen.append(governor.snapshot()["active"])
-            yield "two"
+            yield "b"
 
-        client = self._client()
-        client._stream_chat_openai_compatible = types.MethodType(fake_stream, client)
-        chunks = list(client.stream_chat([{"role": "user", "content": "hi"}]))
-        self.assertEqual(chunks, ["one", "two"])
-        self.assertEqual(seen, [1, 1])
+        model = build_governed_model(
+            provider="custom",
+            model="fake",
+            base_url="http://127.0.0.1:1/v1",
+            api_key="test-key",
+            priority=PRIORITY_BATCH,
+        )
+        with mock.patch.object(ChatOpenAI, "_generate", fake_generate), \
+                mock.patch.object(ChatOpenAI, "_stream", fake_stream):
+            self.assertEqual(model._generate([]), "generated")
+            self.assertEqual(list(model._stream([])), ["a", "b"])
+        self.assertEqual(seen, [1, 1, 1])
         self.assertEqual(governor.snapshot()["active"], 0)
 
 

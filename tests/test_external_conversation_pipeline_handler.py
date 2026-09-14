@@ -167,7 +167,7 @@ class ExternalConversationHandlerTests(unittest.TestCase):
             f.write("今天讨论了 LDO 压差问题。\n结论是最大 0.3V,需要注意散热。\n" * 5)
 
         class FakeLLM:
-            def chat(self, messages, **kwargs):
+            def invoke(self, messages, **kwargs):
                 text = messages[0]["content"]
                 if "资料提炼助手" in text:
                     return '{"summary": "讨论了LDO压差结论。", "key_points": ["最大压差0.3V", "注意散热"]}'
@@ -178,7 +178,7 @@ class ExternalConversationHandlerTests(unittest.TestCase):
             store=self.ledger,
             conversation_store=self.store,
             conversation_indexes=self.engine,
-            llm_client=FakeLLM(),
+            chat_model=FakeLLM(),
         )
         archived = self._archived()
         archived.filename = "notes.md"

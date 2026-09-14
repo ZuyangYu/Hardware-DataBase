@@ -10,12 +10,15 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import re
 import sqlite3
 import uuid
 import zipfile
 from copy import copy
 from datetime import datetime, timezone
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from time import perf_counter
+from types import SimpleNamespace
 from typing import Any
 
 import requests
@@ -23,13 +26,29 @@ import requests
 import src.settings
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
 from src.document_authoring.artifact_preview import preview_artifact
+from src.document_authoring.conversion import (
+    TemplateArtifactConversionService,
+    TemplateConversionError,
+)
 from src.document_authoring.deterministic_rules import DeterministicRuleExecutor
-from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
-from src.document_authoring.icd_generation import render_icd_front_views
+from src.document_authoring.harness.runtime import (
+    InternalDocumentHarnessRuntime,
+    _plan_field_execution_key,
+)
+from src.document_authoring.harness.idempotency import human_decision_key
+from src.document_authoring.aggregation import DocumentAggregator
+from src.document_authoring.icd_generation import (
+    render_icd_front_views,
+    render_icd_pin_table,
+)
 from src.document_authoring.icd_profile import classify_icd_template
 from src.document_authoring.icd_validation import validate_icd_pin_set
-from src.document_authoring.icd_scope_decision import effective_frozen_pin_mappings
+from src.document_authoring.icd_scope_decision import (
+    ICD_BLOCKING_SCOPE_EXCEPTION_KINDS,
+    effective_frozen_pin_mappings,
+)
 from src.document_authoring.models import (
+    AuthoringExecutionEvent,
     DeterministicRuleSpec,
     DocumentArtifact,
     DocumentHumanEvent,
@@ -41,19 +60,50 @@ from src.document_authoring.models import (
     LegacyTemplateClaim,
     DocumentSchema,
     DocumentWorkOrder,
+    compute_input_fingerprint_v3,
+    icd_scope_decision_hash,
     RendererPolicy,
     TemplateSanitizationReport,
     TemplateUnitBinding,
     TemplateVersion,
     DocxFill,
     DocxFillPlan,
+    ValidationReport,
     WorkbookFill,
     WorkbookFillPlan,
+    WorkbookTableFill,
+    WorkbookTableRowFill,
     WorkbookRegionSchema,
     content_hash,
 )
+from src.document_authoring.ooxml import validate_ooxml_package
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
+from src.document_authoring.renderers.structured import (
+    StructuredDocxRenderer,
+    StructuredPdfRenderer,
+    StructuredXlsxRenderer,
+)
+from src.document_authoring.planning.recipes import (
+    StructureBindingCompiler,
+    build_builtin_recipe_registry,
+)
+from src.document_authoring.render_bindings import (
+    LegacyFillPlanAdapter,
+    RenderBindingResolver,
+)
+from src.document_authoring.document_model import DocumentModel
+from src.document_authoring.planning.document_review import (
+    DocumentReleaseGate,
+    DocumentReviewReport,
+    DocumentReviewer,
+    DocumentReworkRouter,
+    ReleaseDecision,
+    ReworkDecision,
+)
+from src.document_authoring.planning.coverage import CoverageEvaluator
+from src.document_authoring.planning.unit_review import UnitReviewer
+from src.document_authoring.planning.review_contracts import safe_review_projection
 from src.document_authoring.template_activation import (
     TemplateActivationPolicy,
     decide_template_activation,
@@ -76,13 +126,28 @@ from src.document_authoring.template_suggester import (
     TemplateSuggestionProvider,
     TemplateSuggestionTechnicalFailure,
 )
+from src.document_authoring.tasks import DocumentTask, DocumentTaskService, DocumentTaskStore
+from src.document_authoring.reviews import DocumentReviewStore
+from src.document_authoring.revisions import ArtifactRevisionStore, DocumentRevisionService
+from src.document_authoring.compatibility import (
+    CompatibilityClosureError,
+    DocumentAuthoringCompatibilityService,
+)
+from src.document_authoring.planning.legacy import legacy_brief_to_output_spec
+from src.document_authoring.planning.service import DocumentPlanningService
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.worker import DocumentGenerationWorker
-from src.document_authoring.writers.managed import DeterministicEvidenceWriter, LLMManagedWriter, ManagedWriter
-from src.core.llm_client import LLMClient
+from src.document_authoring.writers.managed import (
+    DeterministicEvidenceWriter,
+    LLMManagedWriter,
+    ManagedWriter,
+    _column_semantics,
+)
 from src.pipelines.document_rag.schemas import RequestContext
 from src.projects.service import ProjectService
+from src.attachments.models import SOURCE_SCOPES
+from src.observability.metrics import record_planning_shadow
 
 
 logger = logging.getLogger(__name__)
@@ -93,6 +158,67 @@ _MAX_AUTO_HARNESS_RETRIEVAL_ROUNDS = 1_000
 # that is 3002, so the ceiling must leave headroom for the rewrite step.
 _MAX_AUTO_HARNESS_STEPS = 3_600
 _DEFAULT_RETRIEVAL_ATTEMPTS_PER_UNIT = 2
+
+_ATTACHMENT_REF_SNAPSHOT_FIELDS = (
+    "attachment_id", "asset_id", "session_id", "filename", "media_type",
+    "extension", "size_bytes", "sha256", "usage_hint", "parse_status",
+    "degraded_reason",
+)
+
+
+def _canonical_template_document_type(display_name: str, template_name: str) -> str:
+    """Keep an uploaded filename out of the document-family contract."""
+    supplied = str(display_name or "").strip()
+    hint = " ".join((supplied, str(template_name or "").strip())).casefold()
+    if re.search(r"(?:^|[^a-z0-9])icd(?:[^a-z0-9]|$)", hint) or "接口控制" in hint:
+        return "icd"
+    return supplied or str(template_name or "").strip()
+
+
+def _ref_value(ref: Any, key: str, default: Any = None) -> Any:
+    if isinstance(ref, Mapping):
+        return ref.get(key, default)
+    return getattr(ref, key, default)
+
+
+def _freeze_attachment_ref_snapshot(refs: Sequence[Any] | None) -> list[dict[str, Any]]:
+    """Copy only server-issued attachment reference fields into a work order."""
+    snapshot: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in refs or ():
+        attachment_id = str(_ref_value(ref, "attachment_id", "") or "").strip()
+        asset_id = str(_ref_value(ref, "asset_id", "") or "").strip()
+        if not attachment_id or not asset_id:
+            raise ValueError("document attachment references require attachment_id and asset_id")
+        if attachment_id in seen:
+            continue
+        seen.add(attachment_id)
+        item: dict[str, Any] = {}
+        for field_name in _ATTACHMENT_REF_SNAPSHOT_FIELDS:
+            value = _ref_value(ref, field_name, "")
+            if field_name in {"session_id", "size_bytes"}:
+                try:
+                    value = int(value or 0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid document attachment reference {field_name}") from exc
+            elif value is None:
+                value = ""
+            item[field_name] = value
+        snapshot.append(item)
+    return snapshot
+
+
+def _resolve_document_source_scope(source_scope: Any, *, has_attachments: bool) -> str:
+    requested = str(source_scope or "knowledge_base_only").strip()
+    if requested not in SOURCE_SCOPES:
+        raise ValueError(f"unsupported document source scope: {requested}")
+    if requested == "auto":
+        return "attachment_and_knowledge_base" if has_attachments else "knowledge_base_only"
+    if requested == "attachment_only" and not has_attachments:
+        raise ValueError("attachment_only document generation requires attachment references")
+    if requested == "attachment_and_knowledge_base" and not has_attachments:
+        return "knowledge_base_only"
+    return requested
 
 
 def _requires_human_review(
@@ -125,7 +251,26 @@ def _automatic_release_allowed(order: DocumentWorkOrder, report: Any, *, require
     that path is equivalent to a confirmed session; safety still requires a
     passed report and no blocking unit status.
     """
+    brief = getattr(order, "generation_brief", None)
+    brief = brief if isinstance(brief, dict) else {}
+    document_type = str(brief.get("document_type") or "").strip().casefold()
+    if document_type in {
+        "icd",
+        "fpt",
+        "requirements",
+        "requirements_spec",
+        "specification",
+    }:
+        # Controlled engineering documents always need an explicit release
+        # signature. Their review candidate can still be downloaded as a
+        # clearly identified draft by an authorized user.
+        return False
     if not src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED or requires_review:
+        return False
+    # A revision regeneration is a requested change to a released document;
+    # its candidate always passes the human release gate even when every
+    # machine check is green.
+    if getattr(order, "revision_id", None):
         return False
     if getattr(report, "status", None) != "passed":
         return False
@@ -164,6 +309,9 @@ class DocumentGenerationService:
     ):
         self.projects = project_service or ProjectService()
         self.store = store or DocumentAuthoringStore()
+        self.planning = DocumentPlanningService(
+            store=getattr(self.store, "planning", None),
+        )
         self.workbook_renderer = renderer or XlsmRenderer()
         # Keep the existing public attribute for callers that supplied the
         # XLSX/XLSM renderer before DOCX support was introduced.
@@ -171,9 +319,379 @@ class DocumentGenerationService:
         self.docx_renderer = docx_renderer or DocxRenderer()
         self.rules = DeterministicRuleExecutor()
         self.validator = DocumentValidator()
+        self.document_aggregator = DocumentAggregator()
+        self.render_binding_resolver = RenderBindingResolver()
+        self.document_reviewer = DocumentReviewer()
+        self.document_release_gate = DocumentReleaseGate()
+        self.document_rework_router = DocumentReworkRouter()
         self.worker = worker or DocumentGenerationWorker()
         self.harness_runtime = InternalDocumentHarnessRuntime(self.store, self.validator)
-        self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider(LLMClient())
+        self.template_suggester = suggestion_provider or LLMTemplateSuggestionProvider()
+        self.converter = TemplateArtifactConversionService()
+        # DocumentTask shares the authoring database but owns only the
+        # user-facing aggregate identity. WorkOrder, Job and Run retain their
+        # existing execution responsibilities.
+        self.task_service = DocumentTaskService(DocumentTaskStore(self.store.db_path))
+        # Generic review state is a task-bound adapter over the existing
+        # ICD/artifact review flows; it shares the authoring DB but has its
+        # own command-idempotency namespace.
+        self.review_store = DocumentReviewStore(self.store.db_path)
+        # Compatibility events share the authoring database so rollout
+        # counters and legacy classifications survive process restarts.
+        self.compatibility = DocumentAuthoringCompatibilityService(
+            db_path=self.store.db_path,
+        )
+        self.revision_service = DocumentRevisionService(
+            authoring_store=self.store,
+            task_store=self.task_service.store,
+            revision_store=ArtifactRevisionStore(self.store.db_path),
+            source_snapshot_resolver=self.resolve_source_snapshot,
+        )
+
+    def build_document_model(
+        self,
+        plan: Any,
+        accepted_drafts: Mapping[str, DocumentUnitDraft] | Sequence[DocumentUnitDraft],
+        reviews: Mapping[str, Any] | None = None,
+    ) -> DocumentModel:
+        """Aggregate accepted plan outputs before any format-specific render."""
+
+        return self.document_aggregator.aggregate(plan, accepted_drafts, reviews)
+
+    def build_plan_fill_plan(
+        self,
+        template: TemplateVersion,
+        plan: Any,
+        document_model: DocumentModel,
+        *,
+        bindings: Sequence[TemplateUnitBinding] | Mapping[str, TemplateUnitBinding] | None = None,
+    ):
+        """Resolve server-owned bindings and adapt a model for the legacy renderer."""
+
+        registered = list(bindings) if bindings is not None else list(
+            self.store.list_unit_bindings(
+                template.template_schema_id, template.template_schema_version,
+            )
+        )
+        contract = getattr(plan, "layout_contract", None)
+        if contract is None and isinstance(plan, Mapping):
+            contract = plan.get("layout_contract")
+        if contract is None:
+            raise ValueError("plan-backed document model requires a template layout contract")
+        regions: Sequence[Any] = []
+        if template.format == "docx":
+            regions = list(self.store.list_docx_regions(
+                template.template_schema_id, template.template_schema_version,
+            ))
+        else:
+            regions = list(self.store.list_workbook_regions(
+                template.template_schema_id, template.template_schema_version,
+            ))
+        self.render_binding_resolver.resolve(
+            contract, document_model, registered, regions=regions,
+        )
+        return LegacyFillPlanAdapter.to_fill_plan(
+            document_model,
+            template_version_id=template.template_version_id,
+            output_format=template.format,
+            bindings=registered,
+        )
+
+    def review_document_pre_render(
+        self,
+        plan: Any,
+        document_model: DocumentModel,
+        coverage_report: Any,
+        unit_reports: Mapping[str, Any] | Sequence[Any] | None,
+    ) -> DocumentReviewReport:
+        """Run the independent semantic gate before any binary renderer call."""
+
+        return self.document_reviewer.pre_render(
+            plan, document_model, coverage_report, unit_reports,
+        )
+
+    def review_document_post_render(
+        self,
+        plan: Any,
+        document_model: DocumentModel,
+        render_result: Any,
+        artifact_bytes: bytes,
+    ) -> DocumentReviewReport:
+        """Run the independent physical-package gate for one artifact hash."""
+
+        return self.document_reviewer.post_render(
+            plan, document_model, render_result, artifact_bytes,
+        )
+
+    def evaluate_document_release(
+        self,
+        pre_render_report: DocumentReviewReport,
+        post_render_report: DocumentReviewReport,
+    ) -> ReleaseDecision:
+        """Return a fail-closed decision bound to both review reports."""
+
+        return self.document_release_gate.evaluate(pre_render_report, post_render_report)
+
+    def route_document_rework(
+        self,
+        report: DocumentReviewReport,
+        *,
+        attempt: int,
+        max_attempts: int | None = None,
+    ) -> ReworkDecision:
+        """Select a bounded semantic/layout route or human review."""
+
+        router = self.document_rework_router
+        if max_attempts is not None and max_attempts != router.max_attempts:
+            router = DocumentReworkRouter(max_attempts=max_attempts)
+        return router.route(report, attempt=attempt)
+
+    @staticmethod
+    def bind_document_review_manifest(
+        manifest: Any,
+        *,
+        document_model: DocumentModel,
+        pre_render_report: DocumentReviewReport,
+        post_render_report: DocumentReviewReport,
+        release_decision: ReleaseDecision,
+        effective_release_status: str | None = None,
+    ) -> Any:
+        """Bind review hashes to one run manifest without mutating old fields.
+
+        ``ReleaseDecision`` describes what the machine gates found.  It is not
+        by itself the publication authorization: controlled document types and
+        revisions may be forced through human review even when the decision is
+        ``release``.  Callers that apply that policy pass the effective status
+        explicitly so the manifest cannot claim a release that the artifact
+        state machine did not perform.
+        """
+
+        if pre_render_report.stage != "pre_render" or post_render_report.stage != "post_render":
+            raise ValueError("run manifest requires one pre-render and one post-render report")
+        if pre_render_report.model_hash != document_model.model_hash or post_render_report.model_hash != document_model.model_hash:
+            raise ValueError("review reports are not bound to the document model")
+        if release_decision.model_hash != document_model.model_hash:
+            raise ValueError("release decision is not bound to the document model")
+        if release_decision.pre_render_report_hash != pre_render_report.report_hash or release_decision.post_render_report_hash != post_render_report.report_hash:
+            raise ValueError("release decision is not bound to the review reports")
+        release_status = effective_release_status or (
+            "released" if release_decision.release_allowed else release_decision.status
+        )
+        if release_status not in {"pending", "blocked", "needs_review", "released"}:
+            raise ValueError("invalid effective release status")
+        update = {
+            "document_model_hash": document_model.model_hash,
+            "pre_render_review_hash": pre_render_report.report_hash,
+            "post_render_review_hash": post_render_report.report_hash,
+            "artifact_hash": post_render_report.artifact_hash,
+            "release_decision_hash": content_hash(release_decision),
+            "release_status": release_status,
+        }
+        if hasattr(manifest, "model_copy"):
+            return manifest.model_copy(update=update)
+        if isinstance(manifest, Mapping):
+            return {**manifest, **update}
+        raise TypeError("run manifest must be a mapping or model_copy-compatible object")
+
+    @staticmethod
+    def _shadow_issue_codes(plan: Any) -> list[str]:
+        """Return bounded issue codes suitable for an audit event/metric."""
+        safe_code = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,79}$")
+        codes: list[str] = []
+        for issue in getattr(plan, "issues", []) or []:
+            if not getattr(issue, "blocking", False):
+                continue
+            code = str(getattr(issue, "code", "other") or "other").strip().lower()
+            codes.append(code if safe_code.fullmatch(code) else "other")
+        return list(dict.fromkeys(codes))
+
+    def _run_shadow_planning(
+        self,
+        ctx: RequestContext,
+        order: DocumentWorkOrder,
+        *,
+        snapshot: Any | None = None,
+        schema: DocumentSchema | None = None,
+        template: TemplateVersion | None = None,
+        template_analysis: TemplateAnalysis | None = None,
+        bindings: Sequence[TemplateUnitBinding] | None = None,
+    ) -> Any | None:
+        """Compile and persist a non-executing plan for an existing WorkOrder.
+
+        This method is deliberately called after the legacy WorkOrder is
+        durable.  Every exception is converted into a sanitized planning event
+        and a metric; no execution state, queue entry or renderer input is
+        touched by the shadow path.
+        """
+        if not getattr(src.settings, "DOCUMENT_PLANNING_SHADOW_ENABLED", False):
+            return None
+        task_id = str(getattr(order, "task_id", "") or "").strip()
+        if not task_id:
+            # Legacy rows created while task writes were disabled have no safe
+            # owner for the planning tables, so leave them entirely unchanged.
+            return None
+        started = perf_counter()
+        planning = getattr(self, "planning", None)
+        if planning is None:
+            planning = DocumentPlanningService(
+                store=getattr(getattr(self, "store", None), "planning", None),
+            )
+        planning_store = getattr(planning, "store", None)
+        if planning_store is None:
+            return None
+        event_key = f"planning-shadow:{order.work_order_id}:v1"
+        try:
+            frozen_snapshot = snapshot or self.resolve_source_snapshot(order)
+            document_schema = schema or self._schema(
+                order.document_schema_id, order.document_schema_version,
+            )
+            document_template = template or self._template(order.template_version_id)
+            analysis = template_analysis
+            backing_store = getattr(self, "store", None)
+            if analysis is None and backing_store is not None:
+                analysis = backing_store.get_template_analysis(order.template_version_id)
+            if bindings is not None:
+                physical_bindings = list(bindings)
+            elif backing_store is not None:
+                physical_bindings = list(
+                    backing_store.list_unit_bindings(
+                        order.template_schema_id, order.template_schema_version,
+                    )
+                )
+            else:
+                physical_bindings = []
+            output_spec = legacy_brief_to_output_spec(
+                getattr(order, "generation_brief", {}) or {},
+                template_version_id=document_template.template_version_id,
+                template_schema_id=document_template.template_schema_id,
+                template_schema_version=document_template.template_schema_version,
+                document_type=document_schema.document_type,
+                target_format=order.target_format,
+                output_spec_id=f"shadow-output:{order.work_order_id}",
+                output_spec_version=1,
+                document_schema=document_schema,
+            )
+            plan = planning.propose_shadow(
+                tenant_id=str(getattr(order, "tenant_id", None) or "default"),
+                user_id=str(
+                    getattr(ctx, "user_id", None)
+                    or getattr(order, "created_by", None)
+                    or "system"
+                ),
+                task_id=task_id,
+                output_spec=output_spec,
+                document_schema=document_schema,
+                template_analysis=analysis,
+                bindings=physical_bindings,
+                source_snapshot_id=str(frozen_snapshot.source_set_snapshot_id),
+                source_snapshot_hash=str(frozen_snapshot.content_hash),
+            )
+            issue_codes = self._shadow_issue_codes(plan)
+            blocking_count = sum(
+                1 for issue in (getattr(plan, "issues", []) or [])
+                if getattr(issue, "blocking", False)
+            )
+            validity = "valid" if bool(getattr(plan, "is_executable", False)) else "invalid"
+            payload = {
+                "plan_status": str(getattr(plan, "status", "proposed")),
+                "validity": validity,
+                "blocking_issue_count": blocking_count,
+                "blocking_issue_codes": issue_codes,
+                "unit_count": len(getattr(plan, "semantic_units", []) or []),
+                "table_count": sum(
+                    1 for unit in (getattr(plan, "semantic_units", []) or [])
+                    if getattr(unit, "kind", None) == "table"
+                ),
+            }
+            planning_store.append_event(
+                task_id=task_id,
+                event_type="planning_shadow_succeeded",
+                idempotency_key=event_key,
+                payload=payload,
+            )
+            record_planning_shadow(
+                status="succeeded",
+                validity=validity,
+                blocking_issue_count=blocking_count,
+                blocking_issue_codes=issue_codes,
+                units=payload["unit_count"],
+                tables=payload["table_count"],
+                duration_s=perf_counter() - started,
+            )
+            return plan
+        except Exception:
+            # Deliberately omit exception text, source names, paths and
+            # evidence from both the event and telemetry.  The legacy caller
+            # receives its original result regardless of compiler failure.
+            try:
+                planning_store.append_event(
+                    task_id=task_id,
+                    event_type="planning_shadow_failed",
+                    idempotency_key=event_key,
+                    payload={
+                        "plan_status": "unavailable",
+                        "validity": "invalid",
+                        "blocking_issue_count": 1,
+                        "blocking_issue_codes": ["shadow_compiler_failed"],
+                        "unit_count": 0,
+                        "table_count": 0,
+                    },
+                )
+            except Exception:
+                pass
+            record_planning_shadow(
+                status="failed",
+                validity="invalid",
+                blocking_issue_count=1,
+                blocking_issue_codes=["shadow_compiler_failed"],
+                units=0,
+                tables=0,
+                duration_s=perf_counter() - started,
+            )
+            logger.warning(
+                "document planning shadow failed for work order %s",
+                str(getattr(order, "work_order_id", "")),
+            )
+            return None
+
+    def ensure_document_task(
+        self,
+        ctx: RequestContext,
+        *,
+        template_version_id: str | None = None,
+        generation_session_id: str | None = None,
+        project_id: str | None = None,
+        knowledge_base_name: str | None = None,
+        idempotency_key: str | None = None,
+        status: str = "planned",
+    ) -> DocumentTask | None:
+        """Create or reuse the user-level task for a generation request."""
+        if not getattr(src.settings, "DOCUMENT_TASK_WRITE_ENABLED", True):
+            return None
+        return self.task_service.ensure_task(
+            ctx,
+            template_version_id=template_version_id,
+            generation_session_id=generation_session_id,
+            project_id=project_id,
+            knowledge_base_name=knowledge_base_name,
+            idempotency_key=idempotency_key,
+            status=status,
+        )
+
+    def mark_document_task_queued(self, task_id: str | None) -> DocumentTask | None:
+        """Project successful queue submission to the user-level task."""
+        normalized = str(task_id or "").strip()
+        if not normalized or not getattr(src.settings, "DOCUMENT_TASK_WRITE_ENABLED", True):
+            return None
+        try:
+            return self.task_service.store.update_status(normalized, "queued")
+        except Exception:
+            logger.warning(
+                "failed to mark DocumentTask %s as queued",
+                normalized,
+                exc_info=True,
+            )
+            return None
 
     @staticmethod
     def _require_template_kb_scope(
@@ -203,14 +721,173 @@ class DocumentGenerationService:
     def register_renderer_policy(self, policy: RendererPolicy) -> RendererPolicy:
         return self.store.save_renderer_policy(policy)
 
-    def register_document_schema(self, schema: DocumentSchema) -> DocumentSchema:
-        return self.store.save_document_schema(schema)
+    def register_document_schema(
+        self,
+        schema: DocumentSchema,
+        *,
+        plan_backed: bool = False,
+        output_spec: Any | None = None,
+        document_plan: Any | None = None,
+        references: Mapping[str, Any] | None = None,
+    ) -> DocumentSchema:
+        """Persist a schema, subject to the Phase 5 direct-write closure."""
+        if plan_backed:
+            references_value = self.compatibility.accepted_plan_references(
+                output_spec=output_spec,
+                document_plan=document_plan,
+                references=references,
+            )
+            self.compatibility.record_plan_backed_execution(
+                operation="register_document_schema",
+                entity_type="document_schema",
+                entity_id=schema.document_schema_id,
+                plan_id=references_value.document_plan_id,
+                plan_version=references_value.document_plan_version,
+                plan_hash=references_value.document_plan_hash,
+            )
+            self.compatibility.record_new_write(
+                operation="register_document_schema",
+                entity_type="document_schema",
+                entity_id=schema.document_schema_id,
+                plan_id=references_value.document_plan_id,
+                plan_version=references_value.document_plan_version,
+                plan_hash=references_value.document_plan_hash,
+                route="plan_backed",
+            )
+        else:
+            if self.compatibility.closure_enabled:
+                raise CompatibilityClosureError(
+                    "direct document schema writes are closed; use an accepted document plan"
+                )
+            self.compatibility.record_legacy_write(
+                operation="register_document_schema",
+                entity_type="document_schema",
+                entity_id=schema.document_schema_id,
+            )
+        return self.store.save_document_schema(schema, allow_plan_backed=plan_backed)
 
     def register_deterministic_rule(self, spec: DeterministicRuleSpec) -> DeterministicRuleSpec:
         return self.store.save_rule_spec(spec)
 
     def register_harness_policy(self, policy: HarnessPolicy) -> HarnessPolicy:
         return self.store.save_harness_policy(policy)
+
+    def _record_compatibility_work_order_write(
+        self,
+        ctx: RequestContext,
+        *,
+        operation: str,
+        entity_id: str,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
+        output_spec: Any | None = None,
+        document_plan: Any | None = None,
+    ) -> None:
+        """Classify a new WorkOrder write and enforce Phase 5 closure."""
+        supplied = any(value is not None for value in (
+            output_spec_id, output_spec_version, output_spec_hash,
+            document_plan_id, document_plan_version, document_plan_hash,
+        )) or output_spec is not None or document_plan is not None
+        if supplied and (output_spec is None or document_plan is None):
+            planning_store = getattr(self.planning, "store", None)
+            if planning_store is None:
+                raise CompatibilityClosureError(
+                    "plan-backed WorkOrder writes require the planning store"
+                )
+            output_spec = planning_store.get_output_spec(
+                str(output_spec_id or ""), int(output_spec_version or 0),
+                tenant_id=ctx.tenant_id or "default", user_id=ctx.user_id,
+            )
+            document_plan = planning_store.get_plan(
+                str(document_plan_id or ""), int(document_plan_version or 0),
+                tenant_id=ctx.tenant_id or "default", user_id=ctx.user_id,
+            )
+            if output_spec is None or document_plan is None:
+                raise CompatibilityClosureError(
+                    "plan-backed WorkOrder references do not resolve to persisted rows"
+                )
+        refs = self.compatibility.validate_new_document_write(
+            operation=operation,
+            output_spec=output_spec,
+            document_plan=document_plan,
+        )
+        if refs is not None:
+            self.compatibility.record_plan_backed_execution(
+                operation=operation,
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="work_order",
+                entity_id=entity_id,
+                plan_id=refs.document_plan_id,
+                plan_version=refs.document_plan_version,
+                plan_hash=refs.document_plan_hash,
+            )
+            self.compatibility.record_new_write(
+                operation=operation,
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="work_order",
+                entity_id=entity_id,
+                plan_id=refs.document_plan_id,
+                plan_version=refs.document_plan_version,
+                plan_hash=refs.document_plan_hash,
+            )
+        else:
+            self.compatibility.record_legacy_direct_execution(
+                operation=operation,
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="work_order",
+                entity_id=entity_id,
+            )
+            self.compatibility.record_legacy_write(
+                operation=operation,
+                tenant_id=ctx.tenant_id or "default",
+                entity_type="work_order",
+                entity_id=entity_id,
+            )
+
+    def _validate_compatibility_work_order_inputs(
+        self,
+        ctx: RequestContext,
+        *,
+        operation: str,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
+    ) -> None:
+        """Run the closure check before creating any source snapshot rows."""
+        supplied = any(value is not None for value in (
+            output_spec_id, output_spec_version, output_spec_hash,
+            document_plan_id, document_plan_version, document_plan_hash,
+        ))
+        if not supplied:
+            self.compatibility.validate_new_document_write(operation=operation)
+            return
+        planning_store = getattr(self.planning, "store", None)
+        if planning_store is None:
+            raise CompatibilityClosureError("plan-backed WorkOrder writes require the planning store")
+        output_spec = planning_store.get_output_spec(
+            str(output_spec_id or ""), int(output_spec_version or 0),
+            tenant_id=ctx.tenant_id or "default", user_id=ctx.user_id,
+        )
+        document_plan = planning_store.get_plan(
+            str(document_plan_id or ""), int(document_plan_version or 0),
+            tenant_id=ctx.tenant_id or "default", user_id=ctx.user_id,
+        )
+        if output_spec is None or document_plan is None:
+            raise CompatibilityClosureError(
+                "plan-backed WorkOrder references do not resolve to persisted rows"
+            )
+        self.compatibility.validate_new_document_write(
+            operation=operation,
+            output_spec=output_spec,
+            document_plan=document_plan,
+        )
 
     def register_template(
         self,
@@ -259,6 +936,15 @@ class DocumentGenerationService:
         if len(seen_regions) != len(regions):
             raise ValueError("template region ids must be unique")
         for binding in bindings:
+            if binding.table_schema is not None:
+                if template.format == "docx" or binding.semantic_unit_id != binding.table_schema.semantic_unit_id:
+                    raise ValueError("table binding does not match workbook semantic unit")
+                if binding.target_region_ids != [binding.table_schema.table_region_id]:
+                    raise ValueError("table binding must reference its exact table region")
+                if binding.table_schema.table_region_id in seen_regions:
+                    raise ValueError("duplicate table region id")
+                seen_regions.add(binding.table_schema.table_region_id)
+        for binding in bindings:
             if binding.template_schema_id != template.template_schema_id or binding.template_schema_version != template.template_schema_version:
                 raise ValueError("template unit binding schema version mismatch")
             if not set(binding.target_region_ids) <= seen_regions:
@@ -297,6 +983,10 @@ class DocumentGenerationService:
         content: bytes,
         template_name: str,
         progress_callback: TemplateProgressCallback | None = None,
+        origin_source_type: str | None = None,
+        origin_attachment_id: str | None = None,
+        origin_session_id: int | None = None,
+        origin_content_hash: str | None = None,
     ) -> TemplateAnalysis:
         """Persist an immutable draft then analyze its structure, never its bytes by LLM."""
         report_template_progress(progress_callback, TemplateProgress(stage="upload_started"))
@@ -338,6 +1028,10 @@ class DocumentGenerationService:
             knowledge_base_name=ctx.metadata.get("document_template_kb_name"),
             resource_department_id=ctx.metadata.get("resource_department_id"),
             knowledge_base_id=ctx.metadata.get("kb_id"),
+            origin_source_type=origin_source_type,
+            origin_attachment_id=origin_attachment_id,
+            origin_session_id=origin_session_id,
+            origin_content_hash=origin_content_hash,
         )
         sanitization_report = TemplateSanitizationReport(
             template_version_id=template_version_id,
@@ -522,7 +1216,7 @@ class DocumentGenerationService:
         self,
         ctx: RequestContext,
         template_version_id: str,
-    ) -> dict[str, int | str] | None:
+    ) -> dict[str, int | str | list[str]] | None:
         """Return only safe aggregate sanitization results to application callers."""
         if not ctx.user_id or ctx.user_id == "anonymous":
             raise PermissionError("authenticated user is required to view template sanitization results")
@@ -541,7 +1235,23 @@ class DocumentGenerationService:
         displayed_counts = counts if not any(counts.values()) else {
             label: count for label, count in counts.items() if count
         }
-        return {**displayed_counts, "安全模板格式": report.sanitized_format}
+        summary: dict[str, int | str | list[str]] = {
+            **displayed_counts,
+            "安全模板格式": report.sanitized_format,
+        }
+        removed_embedded = sorted({
+            part.rsplit("/", 1)[-1]
+            for part in report.removed_parts
+            if any(
+                marker in part.lower()
+                for marker in ("embedding", "ole", "activex")
+            )
+        })
+        if removed_embedded:
+            # Name the removed objects (bounded) so the user knows which
+            # embedded data will not be part of the generated document.
+            summary["已移除内嵌对象"] = removed_embedded[:10]
+        return summary
 
     def _get_template_sanitization_report(self, template_version_id: str) -> TemplateSanitizationReport | None:
         """Read the complete audit record only within the document-authoring service."""
@@ -639,6 +1349,7 @@ class DocumentGenerationService:
         *,
         analysis_id: str,
         display_name: str,
+        execution_mode: str | None = None,
     ) -> TemplateVersion:
         analysis = self.store.get_template_analysis_by_id(analysis_id)
         if analysis is None:
@@ -659,16 +1370,25 @@ class DocumentGenerationService:
             raise ValueError("template content hash changed since analysis")
         analysis.validate_suggestions()
         regions, bindings = self._regions_and_bindings(template, analysis)
+        inferred_execution_mode = "internal_harness" if analysis.suggestions else "deterministic_only"
+        requested_execution_mode = execution_mode or inferred_execution_mode
+        if requested_execution_mode not in {
+            "deterministic_only", "internal_harness", "external_agent"
+        }:
+            raise ValueError("unsupported document execution mode")
         schema = DocumentSchema(
             document_schema_id=template.template_schema_id,
             version=template.template_schema_version,
-            document_type=display_name.strip() or template.template_id,
+            document_type=_canonical_template_document_type(
+                display_name,
+                template.template_id,
+            ),
             fields=[
-                self._field_for_suggestion(suggestion)
+                self._field_for_suggestion(suggestion, analysis.units)
                 for suggestion in analysis.suggestions
             ],
             status="approved",
-            execution_mode="internal_harness" if analysis.suggestions else "deterministic_only",
+            execution_mode=requested_execution_mode,
         )
         approved = template.model_copy(update={
             "status": "approved", "approved_by": ctx.user_id,
@@ -693,6 +1413,15 @@ class DocumentGenerationService:
         idempotency_key: str | None = None,
         processing_artifact_ids: list[str] | None = None,
         harness_policy_id: str | None = None,
+        execution_mode: str | None = None,
+        generation_session_id: str | None = None,
+        generation_brief: dict[str, Any] | None = None,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
     ) -> DocumentWorkOrder:
         tenant_id = ctx.tenant_id or "default"
         self.projects.access.require(ctx, project_id, "create_work_order")
@@ -700,11 +1429,22 @@ class DocumentGenerationService:
             existing = self.store.find_work_order_by_idempotency(tenant_id, project_id, idempotency_key)
             if existing is not None:
                 return existing
+        self._validate_compatibility_work_order_inputs(
+            ctx,
+            operation="create_work_order",
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
+        )
         self._validate_work_order_definition(
             template_version_id,
             document_schema_id,
             document_schema_version,
             harness_policy_id,
+            execution_mode,
         )
         baseline = self.projects.store.get_baseline(baseline_id, tenant_id)
         if baseline is None:
@@ -723,6 +1463,15 @@ class DocumentGenerationService:
             document_schema_version=document_schema_version,
             idempotency_key=idempotency_key,
             harness_policy_id=harness_policy_id,
+            execution_mode=execution_mode,
+            generation_session_id=generation_session_id,
+            generation_brief=generation_brief,
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
         )
 
     def create_knowledge_base_work_order(
@@ -735,9 +1484,22 @@ class DocumentGenerationService:
         document_schema_id: str,
         document_schema_version: str,
         idempotency_key: str | None = None,
+        harness_policy_id: str | None = None,
+        execution_mode: str | None = None,
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
+        source_scope: str = "knowledge_base_only",
+        attachment_refs: Sequence[Any] | None = None,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
     ) -> DocumentWorkOrder:
+        # Work-order creation only snapshots sources the caller can read.
+        # Execution, approval, resume and artifact actions re-check write
+        # access at their own mutation boundaries.
         if not ctx.has_kb_permission(knowledge_base_name, "read"):
             raise PermissionError("knowledge base read permission is required")
         tenant_id = ctx.tenant_id or "default"
@@ -750,10 +1512,22 @@ class DocumentGenerationService:
             )
             if existing is not None:
                 return existing
+        self._validate_compatibility_work_order_inputs(
+            ctx,
+            operation="create_knowledge_base_work_order",
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
+        )
         self._validate_work_order_definition(
             template_version_id,
             document_schema_id,
             document_schema_version,
+            harness_policy_id,
+            execution_mode,
         )
         snapshot = self._create_knowledge_base_source_snapshot(
             ctx, knowledge_base_name, source_names
@@ -768,8 +1542,18 @@ class DocumentGenerationService:
                 document_schema_id=document_schema_id,
                 document_schema_version=document_schema_version,
                 idempotency_key=idempotency_key,
+                harness_policy_id=harness_policy_id,
+                execution_mode=execution_mode,
                 generation_session_id=generation_session_id,
                 generation_brief=generation_brief,
+                source_scope=source_scope,
+                attachment_refs=attachment_refs,
+                output_spec_id=output_spec_id,
+                output_spec_version=output_spec_version,
+                output_spec_hash=output_spec_hash,
+                document_plan_id=document_plan_id,
+                document_plan_version=document_plan_version,
+                document_plan_hash=document_plan_hash,
             )
         except sqlite3.IntegrityError:
             if idempotency_key:
@@ -806,8 +1590,113 @@ class DocumentGenerationService:
             generation_session_id=original.generation_session_id,
             generation_brief=original.generation_brief,
             restart_of_work_order_id=original.work_order_id,
+            existing_task=self._bound_task(original),
             max_parallel_units=max_parallel_units,
+            execution_mode=original.execution_mode,
+            harness_policy_id=original.harness_policy_id,
+            source_scope=original.source_scope_snapshot or "knowledge_base_only",
+            attachment_refs=original.attachment_refs_snapshot,
+            kb_scope_snapshot=original.kb_scope_snapshot,
+            output_spec_id=original.output_spec_id,
+            output_spec_version=original.output_spec_version,
+            output_spec_hash=original.output_spec_hash,
+            document_plan_id=original.document_plan_id,
+            document_plan_version=original.document_plan_version,
+            document_plan_hash=original.document_plan_hash,
         )
+
+    def _bound_task(self, order: DocumentWorkOrder) -> DocumentTask | None:
+        task_id = str(getattr(order, "task_id", None) or "").strip()
+        if not task_id:
+            return None
+        task = self.task_service.store.get(task_id)
+        if task is None:
+            return None
+        if getattr(task, "work_order_id", None) not in {None, order.work_order_id}:
+            # The task has already advanced to a newer work order; do not fork
+            # the user-facing aggregate back to this lineage.
+            return None
+        return task
+
+    def restart_work_order_for_revision(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+        *,
+        revision_id: str,
+        max_parallel_units: int = 8,
+    ) -> DocumentWorkOrder:
+        """Freeze the controlled regeneration work order for an artifact revision.
+
+        Revisions never mutate the released parent.  This method is the
+        execution bridge requested by the optimization plan: the revision
+        record becomes a queued background generation that produces a fresh
+        candidate artifact, which is bound back to the revision on completion.
+        The work order is idempotent per revision, so client replays cannot
+        fork the lineage.
+        """
+        revision_service = getattr(self, "revision_service", None)
+        revision = revision_service.store.get(str(revision_id or "").strip()) if revision_service else None
+        if revision is None:
+            raise KeyError("artifact revision not found")
+        if revision.child_artifact_id:
+            raise ValueError("artifact revision already generated its child artifact")
+        original = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        if revision.work_order_id != original.work_order_id:
+            raise ValueError("artifact revision does not belong to this work order")
+        if original.scope_type != "knowledge_base" or not original.knowledge_base_name:
+            raise ValueError("revision regeneration currently supports knowledge-base work orders")
+        from src.document_authoring.planning.revision import RevisionNotExecutable
+
+        child_plan_id = str(getattr(revision, "child_plan_id", "") or "").strip()
+        child_plan_version = int(getattr(revision, "child_plan_version", 0) or 0)
+        child_plan_hash = str(getattr(revision, "child_plan_hash", "") or "").strip()
+        if not child_plan_id or child_plan_version < 1 or not child_plan_hash:
+            # Never restart the parent plan while presenting the operation as
+            # a successful revision.  Legacy revisions remain inspectable but
+            # must be re-proposed against an executable plan baseline.
+            raise RevisionNotExecutable(
+                "该修订没有可执行的子计划；已拒绝原样重跑，请转为新建文档或重新提案"
+            )
+        idempotency_key = f"revision:{revision.revision_id}"
+        existing = self._find_knowledge_base_work_order_by_idempotency(
+            original.tenant_id,
+            original.knowledge_base_name,
+            idempotency_key,
+            department_id=original.resource_department_id,
+        )
+        if existing is not None:
+            return existing
+        snapshot = self.resolve_source_snapshot(original)
+        order = self._create_frozen_work_order(
+            ctx,
+            scope_type="knowledge_base",
+            snapshot=snapshot,
+            knowledge_base_name=original.knowledge_base_name,
+            template_version_id=original.template_version_id,
+            document_schema_id=original.document_schema_id,
+            document_schema_version=original.document_schema_version,
+            idempotency_key=idempotency_key,
+            generation_session_id=original.generation_session_id,
+            generation_brief=original.generation_brief,
+            restart_of_work_order_id=original.work_order_id,
+            revision_id=revision.revision_id,
+            existing_task=self._bound_task(original),
+            max_parallel_units=max_parallel_units,
+            execution_mode=original.execution_mode,
+            harness_policy_id=original.harness_policy_id,
+            source_scope=original.source_scope_snapshot or "knowledge_base_only",
+            attachment_refs=original.attachment_refs_snapshot,
+            kb_scope_snapshot=original.kb_scope_snapshot,
+            output_spec_id=original.output_spec_id,
+            output_spec_version=original.output_spec_version,
+            output_spec_hash=original.output_spec_hash,
+            document_plan_id=child_plan_id,
+            document_plan_version=child_plan_version,
+            document_plan_hash=child_plan_hash,
+        )
+        revision_service.store.update_status(revision.revision_id, "generating")
+        return order
 
     def _find_knowledge_base_work_order_by_idempotency(
         self,
@@ -840,21 +1729,54 @@ class DocumentGenerationService:
         knowledge_base_name: str | None = None,
         idempotency_key: str | None = None,
         harness_policy_id: str | None = None,
+        execution_mode: str | None = None,
         generation_session_id: str | None = None,
         generation_brief: dict[str, Any] | None = None,
-         restart_of_work_order_id: str | None = None,
-         max_parallel_units: int = 3,
+        restart_of_work_order_id: str | None = None,
+        revision_id: str | None = None,
+        existing_task: DocumentTask | None = None,
+        max_parallel_units: int = 3,
+        source_scope: str = "knowledge_base_only",
+        attachment_refs: Sequence[Any] | None = None,
+        kb_scope_snapshot: dict[str, Any] | None = None,
+        output_spec_id: str | None = None,
+        output_spec_version: int | None = None,
+        output_spec_hash: str | None = None,
+        document_plan_id: str | None = None,
+        document_plan_version: int | None = None,
+        document_plan_hash: str | None = None,
     ) -> DocumentWorkOrder:
+        prospective_work_order_id = (
+            snapshot.work_order_id
+            if scope_type != "knowledge_base"
+            else f"wo-{uuid.uuid4().hex}"
+        )
+        self._record_compatibility_work_order_write(
+            ctx,
+            operation="create_work_order",
+            entity_id=prospective_work_order_id,
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
+        )
         template = self._template(template_version_id)
         schema = self._schema(document_schema_id, document_schema_version)
         if template.status != "approved" or schema.status != "approved":
             raise ValueError(
                 "document generation requires approved template and document schema"
             )
-        if schema.execution_mode not in {"deterministic_only", "internal_harness"}:
-            raise ValueError("external-agent work orders are not enabled before P3")
+        if schema.execution_mode not in {
+            "deterministic_only", "internal_harness", "external_agent"
+        }:
+            raise ValueError("unsupported document execution mode")
+        if execution_mode is not None and execution_mode != schema.execution_mode:
+            raise ValueError("requested execution_mode does not match the approved schema")
+        requested_executor = execution_mode or schema.execution_mode
         harness_policy = None
-        if schema.execution_mode == "internal_harness":
+        if requested_executor in {"internal_harness", "external_agent"}:
             if harness_policy_id:
                 harness_policy = self.store.get_harness_policy(harness_policy_id)
             else:
@@ -862,12 +1784,56 @@ class DocumentGenerationService:
                 harness_policy_id = harness_policy.harness_policy_id
             if harness_policy is None or harness_policy.status != "approved":
                 raise ValueError(
-                    "internal-harness work orders require an approved HarnessPolicy"
+                    "Harness-backed work orders require an approved HarnessPolicy"
                 )
         is_knowledge_base = scope_type == "knowledge_base"
+        frozen_attachment_refs = (
+            _freeze_attachment_ref_snapshot(attachment_refs)
+            if is_knowledge_base
+            else []
+        )
+        frozen_source_scope = (
+            _resolve_document_source_scope(
+                source_scope,
+                has_attachments=bool(frozen_attachment_refs),
+            )
+            if is_knowledge_base
+            else ""
+        )
+        frozen_kb_scope = (
+            dict(kb_scope_snapshot)
+            if kb_scope_snapshot
+            else {
+                "tenant_id": snapshot.tenant_id,
+                "knowledge_base_name": knowledge_base_name,
+                "resource_department_id": self._ctx_department_id(ctx),
+                "knowledge_base_id": self._ctx_kb_id(ctx),
+            }
+            if is_knowledge_base
+            else {}
+        )
+        if existing_task is not None:
+            # Restart/regeneration lineages must reuse the exact task bound to
+            # the parent work order; a fresh idempotency lookup could otherwise
+            # fork the user-facing aggregate.
+            task = existing_task
+        else:
+            task = self.ensure_document_task(
+                ctx,
+                template_version_id=template.template_version_id,
+                generation_session_id=generation_session_id,
+                project_id=None if is_knowledge_base else snapshot.project_id,
+                knowledge_base_name=knowledge_base_name if is_knowledge_base else None,
+                idempotency_key=(
+                    idempotency_key
+                    or (f"generation-session:{generation_session_id}" if generation_session_id else None)
+                ),
+            )
+        if task is None and getattr(src.settings, "DOCUMENT_TASK_ASSOCIATION_REQUIRED", False):
+            raise RuntimeError("document task association is required but task writes are disabled")
         order = DocumentWorkOrder(
             work_order_id=(
-                f"wo-{uuid.uuid4().hex}"
+                prospective_work_order_id
                 if is_knowledge_base
                 else snapshot.work_order_id
             ),
@@ -884,6 +1850,9 @@ class DocumentGenerationService:
                 "" if is_knowledge_base else snapshot.baseline_content_hash
             ),
             source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            source_scope_snapshot=frozen_source_scope,
+            attachment_refs_snapshot=frozen_attachment_refs,
+            kb_scope_snapshot=frozen_kb_scope,
             template_version_id=template.template_version_id,
             document_schema_id=schema.document_schema_id,
             document_schema_version=schema.version,
@@ -892,9 +1861,12 @@ class DocumentGenerationService:
             retrieval_policy_version="1",
             renderer_policy_version=self._policy(template).version,
             target_format=template.format,
-            execution_mode=schema.execution_mode,
+            execution_mode=requested_executor,
             harness_policy_id=harness_policy_id,
             harness_policy_version=harness_policy.version if harness_policy else None,
+            requested_executor=requested_executor,
+            task_id=task.task_id if task is not None else None,
+            revision_id=revision_id,
             unit_statuses={
                 **{item.field_id: "planned" for item in schema.fields},
                 **{item.review_item_id: "planned" for item in schema.review_items},
@@ -903,9 +1875,288 @@ class DocumentGenerationService:
             idempotency_key=idempotency_key,
             generation_session_id=generation_session_id,
             generation_brief=dict(generation_brief or {}),
-             restart_of_work_order_id=restart_of_work_order_id,
+            output_spec_id=output_spec_id,
+            output_spec_version=output_spec_version,
+            output_spec_hash=output_spec_hash,
+            document_plan_id=document_plan_id,
+            document_plan_version=document_plan_version,
+            document_plan_hash=document_plan_hash,
+            restart_of_work_order_id=restart_of_work_order_id,
         )
-        return self.store.create_work_order(order)
+        # New plan-backed work orders use the v3 preimage, which binds the
+        # accepted OutputSpec/DocumentPlan references.  Legacy callers retain
+        # the v2 preimage and historical v1 rows remain untouched.
+        if any(
+            value is not None
+            for value in (
+                output_spec_id, output_spec_version, output_spec_hash,
+                document_plan_id, document_plan_version, document_plan_hash,
+            )
+        ):
+            if not all(
+                value is not None
+                for value in (
+                    output_spec_id, output_spec_version, output_spec_hash,
+                    document_plan_id, document_plan_version, document_plan_hash,
+                )
+            ):
+                raise ValueError("plan-backed work orders require complete planning references")
+            order = order.model_copy(update={"input_fingerprint_version": 3})
+            order = order.model_copy(update={
+                "input_fingerprint": compute_input_fingerprint_v3(order),
+            })
+        else:
+            from src.document_authoring.models import compute_input_fingerprint_v2
+
+            order = order.model_copy(update={"input_fingerprint_version": 2})
+            order = order.model_copy(update={
+                "input_fingerprint": compute_input_fingerprint_v2(order),
+            })
+        persisted = self.store.create_work_order(order)
+        if task is not None:
+            if restart_of_work_order_id and task.work_order_id == restart_of_work_order_id:
+                self.task_service.store.advance_work_order(
+                    task.task_id,
+                    persisted.work_order_id,
+                    expected_work_order_id=restart_of_work_order_id,
+                )
+            else:
+                self.task_service.store.attach_work_order(task.task_id, persisted.work_order_id)
+        # Phase 0 planning is observational only.  It runs after both the
+        # WorkOrder and its task association are durable, and is fail-soft by
+        # construction so the legacy execution contract remains untouched.
+        self._run_shadow_planning(
+            ctx,
+            persisted,
+            snapshot=snapshot,
+            template=template,
+            schema=schema,
+        )
+        return persisted
+
+    def _create_template_free_work_order(
+        self,
+        ctx: RequestContext,
+        *,
+        plan: Any,
+        output_spec: Any,
+        snapshot: KnowledgeBaseSourceSnapshot,
+        knowledge_base_name: str,
+        idempotency_key: str,
+        generation_session_id: str | None = None,
+        generation_brief: dict[str, Any] | None = None,
+        source_scope: str = "knowledge_base_only",
+    ) -> DocumentWorkOrder:
+        """Create a v3 WorkOrder for an accepted server-owned recipe plan.
+
+        Template-free execution still uses the existing WorkOrder, HarnessRun
+        and task stores.  The required template/schema columns carry
+        server-owned sentinel identities so legacy fingerprints and readers
+        remain compatible; no template bytes or caller-supplied package data
+        are introduced into this route.
+        """
+        from src.document_authoring.planning.recipes import build_builtin_recipe_registry
+
+        if getattr(plan, "status", None) != "accepted" or getattr(output_spec, "status", None) != "accepted":
+            raise ValueError("template-free WorkOrder requires accepted planning rows")
+        layout = getattr(plan, "layout_contract", None)
+        if getattr(layout, "kind", None) != "structure":
+            raise ValueError("template-free WorkOrder requires a structure layout contract")
+        prospective_work_order_id = f"wo-{uuid.uuid4().hex}"
+        refs = self.compatibility.validate_new_document_write(
+            operation="create_template_free_work_order",
+            output_spec=output_spec,
+            document_plan=plan,
+        )
+        if refs is not None:
+            self.compatibility.record_plan_backed_execution(
+                operation="create_template_free_work_order",
+                tenant_id=snapshot.tenant_id,
+                entity_type="work_order",
+                entity_id=prospective_work_order_id,
+                plan_id=refs.document_plan_id,
+                plan_version=refs.document_plan_version,
+                plan_hash=refs.document_plan_hash,
+            )
+            self.compatibility.record_new_write(
+                operation="create_template_free_work_order",
+                tenant_id=snapshot.tenant_id,
+                entity_type="work_order",
+                entity_id=prospective_work_order_id,
+                plan_id=refs.document_plan_id,
+                plan_version=refs.document_plan_version,
+                plan_hash=refs.document_plan_hash,
+            )
+        render_spec = dict(getattr(plan, "render_spec", {}) or {})
+        recipe_id = str(
+            render_spec.get("recipe_id") or getattr(layout, "structure_profile_id", "")
+        ).strip()
+        recipe_version = str(
+            render_spec.get("recipe_version") or getattr(layout, "structure_profile_version", "")
+        ).strip()
+        recipe = build_builtin_recipe_registry().resolve(recipe_id, recipe_version)
+        primary_deliverables = [
+            item for item in output_spec.artifact.deliverables
+            if item.role == "primary"
+        ]
+        if len(primary_deliverables) != 1:
+            raise ValueError("template-free OutputSpec requires exactly one primary deliverable")
+        target_format = str(primary_deliverables[0].format).strip().casefold().lstrip(".")
+        if target_format not in recipe.supported_formats:
+            raise ValueError("template-free recipe does not support the primary deliverable")
+
+        template_version_id = f"system-recipe:{recipe_id}@{recipe_version}"
+        schema_id = f"system-recipe-schema:{recipe_id}@{recipe_version}"
+        base_schema = DocumentSchema(
+            document_schema_id=schema_id,
+            version=recipe_version,
+            document_type=output_spec.document_type,
+            status="approved",
+            execution_mode="internal_harness",
+        )
+        schema = self.harness_runtime._plan_execution_schema(plan, base_schema)
+        harness_policy = self._schema_harness_policy(schema)
+        task = self.ensure_document_task(
+            ctx,
+            template_version_id=template_version_id,
+            generation_session_id=generation_session_id,
+            project_id=None,
+            knowledge_base_name=knowledge_base_name,
+            idempotency_key=idempotency_key,
+        )
+        if task is None and getattr(src.settings, "DOCUMENT_TASK_ASSOCIATION_REQUIRED", False):
+            raise RuntimeError("document task association is required but task writes are disabled")
+
+        frozen_attachment_refs: list[dict[str, Any]] = []
+        frozen_source_scope = _resolve_document_source_scope(
+            source_scope,
+            has_attachments=False,
+        )
+        frozen_kb_scope = {
+            "tenant_id": snapshot.tenant_id,
+            "knowledge_base_name": knowledge_base_name,
+            "resource_department_id": self._ctx_department_id(ctx),
+            "knowledge_base_id": self._ctx_kb_id(ctx),
+        }
+        order = DocumentWorkOrder(
+            work_order_id=prospective_work_order_id,
+            tenant_id=snapshot.tenant_id,
+            scope_type="knowledge_base",
+            knowledge_base_name=knowledge_base_name,
+            resource_department_id=self._ctx_department_id(ctx),
+            knowledge_base_id=self._ctx_kb_id(ctx),
+            project_id=None,
+            baseline_id=None,
+            baseline_content_hash="",
+            source_set_snapshot_id=snapshot.source_set_snapshot_id,
+            source_scope_snapshot=frozen_source_scope,
+            attachment_refs_snapshot=frozen_attachment_refs,
+            kb_scope_snapshot=frozen_kb_scope,
+            template_version_id=template_version_id,
+            document_schema_id=schema.document_schema_id,
+            document_schema_version=schema.version,
+            template_schema_id=schema_id,
+            template_schema_version=recipe_version,
+            retrieval_policy_version="1",
+            renderer_policy_version=plan.renderer_capability_version,
+            target_format=target_format,
+            execution_mode="internal_harness",
+            harness_policy_id=harness_policy.harness_policy_id,
+            harness_policy_version=harness_policy.version,
+            requested_executor="internal_harness",
+            task_id=task.task_id if task is not None else None,
+            unit_statuses={
+                **{unit.unit_id: "planned" for unit in plan.semantic_units},
+            },
+            created_by=ctx.user_id,
+            idempotency_key=idempotency_key,
+            generation_session_id=generation_session_id,
+            generation_brief=dict(generation_brief or {}),
+            output_spec_id=output_spec.output_spec_id,
+            output_spec_version=output_spec.version,
+            output_spec_hash=output_spec.content_hash,
+            document_plan_id=plan.document_plan_id,
+            document_plan_version=plan.version,
+            document_plan_hash=plan.plan_hash,
+        )
+        order = order.model_copy(update={
+            "input_fingerprint_version": 3,
+            "input_fingerprint": compute_input_fingerprint_v3(order.model_copy(update={
+                "input_fingerprint_version": 3,
+            })),
+        })
+        persisted = self.store.create_work_order(order)
+        if task is not None:
+            self.task_service.store.attach_work_order(task.task_id, persisted.work_order_id)
+        return persisted
+
+    def _template_free_execution_inputs(
+        self,
+        order: DocumentWorkOrder,
+    ) -> tuple[Any, DocumentSchema, Any, Any]:
+        """Reload the accepted recipe plan and build request-local run inputs."""
+        planning_store = getattr(self.planning, "store", None)
+        if planning_store is None:
+            raise ValueError("template-free execution requires a planning store")
+        plan = planning_store.get_plan(
+            str(order.document_plan_id or ""),
+            int(order.document_plan_version or 0),
+            tenant_id=order.tenant_id,
+            user_id=order.created_by,
+        )
+        output_spec = planning_store.get_output_spec(
+            str(order.output_spec_id or ""),
+            int(order.output_spec_version or 0),
+            tenant_id=order.tenant_id,
+            user_id=order.created_by,
+        )
+        if plan is None or plan.status != "accepted":
+            raise ValueError("accepted DocumentPlan is unavailable for template-free execution")
+        if output_spec is None or output_spec.status != "accepted":
+            raise ValueError("accepted OutputSpec is unavailable for template-free execution")
+        if (
+            plan.plan_hash != order.document_plan_hash
+            or plan.output_spec_id != order.output_spec_id
+            or plan.output_spec_version != order.output_spec_version
+            or plan.output_spec_hash != order.output_spec_hash
+            or output_spec.content_hash != order.output_spec_hash
+        ):
+            raise ValueError("template-free planning references do not match the WorkOrder")
+        layout = plan.layout_contract
+        if getattr(layout, "kind", None) != "structure":
+            raise ValueError("template-free execution requires a structure layout contract")
+        from src.document_authoring.planning.recipes import build_builtin_recipe_registry
+
+        render_spec = dict(plan.render_spec or {})
+        recipe_id = str(
+            render_spec.get("recipe_id") or getattr(layout, "structure_profile_id", "")
+        ).strip()
+        recipe_version = str(
+            render_spec.get("recipe_version") or getattr(layout, "structure_profile_version", "")
+        ).strip()
+        recipe = build_builtin_recipe_registry().resolve(recipe_id, recipe_version)
+        primary = [item for item in output_spec.artifact.deliverables if item.role == "primary"]
+        if len(primary) != 1 or str(primary[0].format).strip().casefold() != order.target_format:
+            raise ValueError("template-free primary deliverable does not match the WorkOrder")
+        base_schema = DocumentSchema(
+            document_schema_id=order.document_schema_id,
+            version=order.document_schema_version,
+            document_type=output_spec.document_type,
+            status="approved",
+            execution_mode="internal_harness",
+        )
+        schema = self.harness_runtime._plan_execution_schema(plan, base_schema)
+        template = SimpleNamespace(
+            template_version_id=order.template_version_id,
+            template_id=f"system-recipe:{recipe_id}",
+            format=order.target_format,
+            content_hash=recipe.recipe_hash or "",
+            template_schema_id=order.template_schema_id,
+            template_schema_version=order.template_schema_version,
+            renderer_policy_id=f"system-recipe-renderer:{recipe_id}@{recipe_version}",
+            status="approved",
+        )
+        return template, schema, plan, recipe
 
     def _validate_work_order_definition(
         self,
@@ -913,6 +2164,7 @@ class DocumentGenerationService:
         document_schema_id: str,
         document_schema_version: str,
         harness_policy_id: str | None = None,
+        execution_mode: str | None = None,
     ) -> None:
         template = self._template(template_version_id)
         schema = self._schema(document_schema_id, document_schema_version)
@@ -920,13 +2172,17 @@ class DocumentGenerationService:
             raise ValueError(
                 "document generation requires approved template and document schema"
             )
-        if schema.execution_mode not in {"deterministic_only", "internal_harness"}:
-            raise ValueError("external-agent work orders are not enabled before P3")
-        if schema.execution_mode == "internal_harness" and harness_policy_id:
+        if schema.execution_mode not in {
+            "deterministic_only", "internal_harness", "external_agent"
+        }:
+            raise ValueError("unsupported document execution mode")
+        if execution_mode is not None and execution_mode != schema.execution_mode:
+            raise ValueError("requested execution_mode does not match the approved schema")
+        if schema.execution_mode in {"internal_harness", "external_agent"} and harness_policy_id:
             policy = self.store.get_harness_policy(harness_policy_id)
             if policy is None or policy.status != "approved":
                 raise ValueError(
-                    "internal-harness work orders require an approved HarnessPolicy"
+                    "work orders using a Harness executor require an approved HarnessPolicy"
                 )
 
     def auto_generate_document(
@@ -1029,11 +2285,13 @@ class DocumentGenerationService:
         artifact = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=order.tenant_id,
             work_order_id=order.work_order_id, run_id=f"run-{uuid.uuid4().hex}",
+            output_format=template.format,
             stage="review_candidate", content_hash=hashlib.sha256(rendered_content).hexdigest(),
             validation_report_id=report.validation_report_id,
             integrity_manifest_id=integrity_manifest["manifest_hash"],
         )
-        artifact = self.store.save_artifact(artifact, rendered_content, template.format)
+        artifact = self._save_artifact_for_task(order, artifact, rendered_content, template.format)
+        self._bind_revision_child(order, artifact, report_status=report.status)
         next_status = "waiting_human_approval" if report.status in {"passed", "requires_human"} else "blocked"
         self._replace_order(order, status=next_status, unit_statuses=statuses,
                             evidence_matrix_id=f"matrix-{order.work_order_id}", validation_report_id=report.validation_report_id)
@@ -1055,7 +2313,7 @@ class DocumentGenerationService:
         if existing is not None:
             if existing.source_snapshot_hash != snapshot.content_hash:
                 raise ValueError("ICD scope review source snapshot differs from the work order")
-            if existing.decision_content_hash != content_hash(decision):
+            if existing.decision_content_hash != icd_scope_decision_hash(decision):
                 raise ValueError("ICD scope review is already bound to a different decision")
             return existing
         review = IcdScopeReview(
@@ -1091,12 +2349,8 @@ class DocumentGenerationService:
             raise KeyError("ICD scope review not found")
         if review.status == "frozen":
             raise ValueError("ICD scope review is already frozen")
-        blocking_scope_kinds = {
-            "connector_scope_unknown",
-            "connector_mapping_missing",
-        }
         if any(
-            exception.kind in blocking_scope_kinds
+            exception.kind in ICD_BLOCKING_SCOPE_EXCEPTION_KINDS
             for exception in review.exceptions
         ):
             raise ValueError(
@@ -1182,6 +2436,7 @@ class DocumentGenerationService:
         *,
         retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome],
         writer: ManagedWriter | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> DocumentArtifact:
         order = self._order(ctx, work_order_id, "run_deterministic_work_order")
         scope_review = self.store.get_icd_scope_review(work_order_id)
@@ -1191,8 +2446,8 @@ class DocumentGenerationService:
                 raise ValueError("ICD scope review source snapshot differs from the work order")
             if scope_review.pending_count:
                 raise ValueError("unresolved ICD scope exceptions block Harness execution")
-        if order.execution_mode != "internal_harness" or not order.harness_policy_id:
-            raise ValueError("work order is not configured for the internal Harness")
+        if order.execution_mode not in {"internal_harness", "external_agent"} or not order.harness_policy_id:
+            raise ValueError("work order is not configured for a Harness executor")
         if order.status not in {"planned", "retrieving", "blocked", "waiting_human_input"}:
             raise ValueError(f"work order cannot run from status {order.status}")
         policy = self.store.get_harness_policy(order.harness_policy_id, order.harness_policy_version)
@@ -1204,22 +2459,28 @@ class DocumentGenerationService:
         rewriter = self._rewriter_for_policy(policy)
         reranker = self._reranker_for_policy(policy)
         fit_checker = self._fit_checker_for_policy(policy)
-        schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
-        template = self._template(order.template_version_id)
+        if str(order.template_version_id).startswith("system-recipe:"):
+            template, schema, _plan, _recipe = self._template_free_execution_inputs(order)
+        else:
+            schema = self._schema(order.document_schema_id, order.document_schema_version)
+            template = self._template(order.template_version_id)
         run, manifest = self.harness_runtime.create_run(order, policy, snapshot, template, schema)
+        self._associate_task_run(order, run.harness_run_id)
         order = self._replace_order(order, status="retrieving", run_manifest_id=manifest.run_manifest_id)
         try:
             result = self.harness_runtime.execute(
                 work_order=order, run=run, manifest=manifest, policy=policy, schema=schema, snapshot=snapshot,
                 legacy_claims=self.store.list_legacy_template_claims(template.template_version_id),
                 writer=writer, retrieve=retrieve, rewriter=rewriter, reranker=reranker,
-                fit_checker=fit_checker,
+                fit_checker=fit_checker, should_cancel=should_cancel,
             )
         except Exception:
             current_run = self.store.get_harness_run(run.harness_run_id)
             if current_run is not None and current_run.status == "failed":
                 self._replace_order(order, status="blocked")
+            elif current_run is not None and current_run.status == "cancelled":
+                self._replace_order(order, status="cancelled")
             raise
         return self._finalize_internal_harness_safely(
             order,
@@ -1231,8 +2492,6 @@ class DocumentGenerationService:
     def pause_harness_run(self, ctx: RequestContext, harness_run_id: str):
         run = self._harness_run_for_context(ctx, harness_run_id)
         paused = self.store.request_harness_run_state(harness_run_id, "paused")
-        if paused.checkpoint_id:
-            self.store.finalize_harness_checkpoint(paused.checkpoint_id, "paused")
         order = self._order_raw(run.work_order_id)
         if order.status != "cancelled":
             self._replace_order(order, status="paused")
@@ -1241,8 +2500,6 @@ class DocumentGenerationService:
     def cancel_harness_run(self, ctx: RequestContext, harness_run_id: str):
         run = self._harness_run_for_context(ctx, harness_run_id)
         cancelled = self.store.request_harness_run_state(harness_run_id, "cancelled")
-        if cancelled.checkpoint_id:
-            self.store.finalize_harness_checkpoint(cancelled.checkpoint_id, "cancelled")
         order = self._order_raw(run.work_order_id)
         self._replace_order(order, status="cancelled")
         return cancelled
@@ -1268,11 +2525,12 @@ class DocumentGenerationService:
         *,
         retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome],
         writer: ManagedWriter | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> DocumentArtifact:
         run = self._harness_run_for_context(ctx, harness_run_id)
         order = self._order_raw(run.work_order_id)
-        if order.execution_mode != "internal_harness" or not order.harness_policy_id:
-            raise ValueError("work order is not configured for the internal Harness")
+        if order.execution_mode not in {"internal_harness", "external_agent"} or not order.harness_policy_id:
+            raise ValueError("work order is not configured for a Harness executor")
         snapshot = self.resolve_source_snapshot(order)
         scope_review = self.store.get_icd_scope_review(order.work_order_id)
         if scope_review is not None:
@@ -1298,21 +2556,27 @@ class DocumentGenerationService:
         rewriter = self._rewriter_for_policy(policy)
         reranker = self._reranker_for_policy(policy)
         fit_checker = self._fit_checker_for_policy(policy)
-        schema = self._schema(order.document_schema_id, order.document_schema_version)
         snapshot = self.resolve_source_snapshot(order)
-        template = self._template(order.template_version_id)
+        if str(order.template_version_id).startswith("system-recipe:"):
+            template, schema, _plan, _recipe = self._template_free_execution_inputs(order)
+        else:
+            schema = self._schema(order.document_schema_id, order.document_schema_version)
+            template = self._template(order.template_version_id)
+        self._associate_task_run(order, run.harness_run_id)
         order = self._replace_order(order, status="retrieving", run_manifest_id=manifest.run_manifest_id)
         try:
             result = self.harness_runtime.execute(
                 work_order=order, run=run, manifest=manifest, policy=policy, schema=schema, snapshot=snapshot,
                 legacy_claims=self.store.list_legacy_template_claims(template.template_version_id),
                 writer=writer, retrieve=retrieve, rewriter=rewriter, reranker=reranker,
-                fit_checker=fit_checker,
+                fit_checker=fit_checker, should_cancel=should_cancel,
             )
         except Exception:
             current_run = self.store.get_harness_run(run.harness_run_id)
             if current_run is not None and current_run.status == "failed":
                 self._replace_order(order, status="blocked")
+            elif current_run is not None and current_run.status == "cancelled":
+                self._replace_order(order, status="cancelled")
             raise
         return self._finalize_internal_harness_safely(
             order,
@@ -1320,6 +2584,68 @@ class DocumentGenerationService:
             run.harness_run_id,
             result,
         )
+
+    def resolve_agent_human_decision(
+        self,
+        ctx: RequestContext,
+        harness_run_id: str,
+        *,
+        pending_event_id: str,
+        proposal_hash: str,
+        decision: str,
+        retrieve: Callable[[Any, int, "str | None"], RetrievalOutcome] | None = None,
+        writer: ManagedWriter | None = None,
+    ) -> dict[str, Any]:
+        """Consume a low-confidence proposal decision on the same HarnessRun.
+
+        The Store performs the tenant/hash/expiry/single-use check and fences
+        the state transition.  Approval may then resume the same logical run;
+        it never creates a second business run.  A missing retriever leaves an
+        approved run in ``retrying`` for an explicit worker retry rather than
+        pretending that approval completed generation.
+        """
+        run = self._harness_run_for_context(ctx, harness_run_id)
+        order = self._order_raw(run.work_order_id)
+        if order.scope_type == "knowledge_base":
+            if not order.knowledge_base_name or not ctx.has_kb_permission(order.knowledge_base_name, "write"):
+                raise PermissionError("knowledge base write permission is required for an agent decision")
+        try:
+            decision_key = human_decision_key(
+                harness_run_id=run.harness_run_id,
+                pending_event_id=str(pending_event_id),
+                proposal_hash=str(proposal_hash),
+                decision=decision,
+            )
+        except ValueError:
+            raise
+        updated, event = self.store.resolve_harness_human_decision(
+            run.harness_run_id,
+            pending_event_id=str(pending_event_id),
+            proposal_hash=str(proposal_hash),
+            decision=decision,
+            decision_key=decision_key,
+            actor_id=str(ctx.user_id),
+            tenant_id=ctx.tenant_id or "default",
+        )
+        result: dict[str, Any] = {
+            "decision": str(decision).strip().casefold(),
+            "decision_key": decision_key,
+            "event_id": event.event_id,
+            "harness_run": updated.model_dump(mode="json"),
+        }
+        if str(decision).strip().casefold() != "approve" or retrieve is None:
+            return result
+        artifact = self.resume_internal_harness(
+            ctx,
+            run.harness_run_id,
+            retrieve=retrieve,
+            writer=writer,
+        )
+        result["artifact"] = artifact.model_dump(mode="json") if hasattr(artifact, "model_dump") else artifact
+        latest = self.store.get_harness_run(run.harness_run_id)
+        if latest is not None:
+            result["harness_run"] = latest.model_dump(mode="json")
+        return result
 
     def _finalize_internal_harness_safely(
         self,
@@ -1376,6 +2702,11 @@ class DocumentGenerationService:
         harness_run_id: str,
         result,
     ) -> DocumentArtifact:
+        if getattr(result, "execution_route", "legacy_schema") == "plan_dag":
+            return self._finalize_plan_internal_harness_result(
+                order, template, harness_run_id, result,
+            )
+        blocked_fields = self._block_generation_fields(order, result)
         bindings = self.store.list_unit_bindings(order.template_schema_id, order.template_schema_version)
         binding_by_unit = {binding.semantic_unit_id: binding for binding in bindings}
         fills = self._semantic_fills(template, result.drafts, result.unit_statuses, binding_by_unit)
@@ -1385,6 +2716,7 @@ class DocumentGenerationService:
             template,
             rendered_content,
             integrity_manifest,
+            pin_functions=self._pin_functions_from_drafts(order, result.drafts),
         )
         self._assert_generated_artifact_clean(rendered_content, template.format)
         report = self.validator.validate(
@@ -1398,19 +2730,51 @@ class DocumentGenerationService:
         )
         self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
         report = self._append_icd_validation_issues(report, front_view_issues)
+        required_issues = self._required_content_issues(order, result.unit_statuses)
+        if required_issues:
+            report = report.model_copy(update={
+                "issues": [*report.issues, *required_issues],
+                "status": "requires_human" if report.status != "failed" else "failed",
+            })
+        if blocked_fields:
+            report = self._append_block_generation_issues(report, blocked_fields)
         self.store.save_validation_report(report)
         artifact = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=order.tenant_id,
             work_order_id=order.work_order_id, run_id=harness_run_id,
+            output_format=template.format,
             stage="review_candidate", content_hash=hashlib.sha256(rendered_content).hexdigest(),
             validation_report_id=report.validation_report_id,
             integrity_manifest_id=integrity_manifest["manifest_hash"],
         )
-        artifact = self.store.save_artifact(artifact, rendered_content, template.format)
+        artifact = self._save_artifact_for_task(order, artifact, rendered_content, template.format)
+        self._bind_revision_child(order, artifact, report_status=report.status)
         requires_review = _requires_human_review(
             result.unit_statuses,
             auto_publish_verified=src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED,
-        )
+        ) or bool(required_issues)
+        if blocked_fields:
+            # Coordinator-level block_generation: unresolved required missing /
+            # conflicts under a confirmed block_generation brief never reach
+            # rendering or automatic publication. The review/status record and
+            # queries stay available while a human decides.
+            self._replace_order(
+                order, status="blocked", unit_statuses=result.unit_statuses,
+                evidence_matrix_id=f"matrix-{order.work_order_id}",
+                validation_report_id=report.validation_report_id,
+                error_code="block_generation_unresolved_missing",
+                error_message=f"confirmed brief blocks release for: {sorted(blocked_fields)}",
+                retryable=False,
+                next_actions=["provide_value", "view_error"],
+            )
+            self._publish_missing_data_clarification(
+                order,
+                [
+                    {"field_id": field_id, "message": f"必填内容尚未完成：{field_id}"}
+                    for field_id in blocked_fields
+                ],
+            )
+            return artifact
         if (
             _automatic_release_allowed(order, report, requires_review=requires_review)
         ):
@@ -1430,6 +2794,595 @@ class DocumentGenerationService:
         )
         return artifact
 
+    def _finalize_plan_internal_harness_result(
+        self,
+        order: DocumentWorkOrder,
+        template: TemplateVersion,
+        harness_run_id: str,
+        result,
+    ) -> DocumentArtifact:
+        """Run the plan-only quality pipeline after unit DAG execution.
+
+        The legacy finalizer above deliberately remains untouched.  This
+        branch consumes only the accepted plan and typed drafts, then performs
+        coverage, unit review, deterministic aggregation, both review gates,
+        and the existing allowlisted renderer in that order.
+        """
+        planning_store = getattr(self.planning, "store", None)
+        if planning_store is None:
+            raise ValueError("plan-backed finalization requires a planning store")
+        plan = planning_store.get_plan(
+            str(order.document_plan_id),
+            int(order.document_plan_version),
+            tenant_id=order.tenant_id,
+            user_id=order.created_by,
+        )
+        if plan is None or plan.status != "accepted":
+            raise ValueError("accepted DocumentPlan is unavailable during finalization")
+        output_spec = planning_store.get_output_spec(
+            str(order.output_spec_id),
+            int(order.output_spec_version),
+            tenant_id=order.tenant_id,
+            user_id=order.created_by,
+        )
+        if output_spec is None or output_spec.status != "accepted":
+            raise ValueError("accepted OutputSpec is unavailable during finalization")
+        if (
+            output_spec.output_spec_id != order.output_spec_id
+            or output_spec.version != int(order.output_spec_version)
+            or output_spec.content_hash != order.output_spec_hash
+            or plan.output_spec_id != output_spec.output_spec_id
+            or plan.output_spec_version != output_spec.version
+            or plan.output_spec_hash != output_spec.content_hash
+        ):
+            raise ValueError(
+                "accepted OutputSpec identity or hash does not match the frozen Work Order and plan"
+            )
+        if (
+            plan.plan_hash != order.document_plan_hash
+            or plan.output_spec_id != order.output_spec_id
+            or plan.output_spec_version != order.output_spec_version
+            or plan.output_spec_hash != order.output_spec_hash
+        ):
+            raise ValueError("plan references do not match the frozen Work Order")
+        layout = plan.layout_contract
+        is_template_free = getattr(layout, "kind", None) == "structure"
+        icd_layout_issues: list[dict[str, Any]] = []
+        if not is_template_free:
+            if getattr(layout, "kind", None) != "template":
+                raise ValueError("plan-backed finalization requires a supported layout contract")
+            if (
+                layout.template_version_id != template.template_version_id
+                or layout.template_schema_id != template.template_schema_id
+                or layout.template_schema_version != template.template_schema_version
+            ):
+                raise ValueError("plan layout contract does not match the frozen template")
+            declared_template_hash = str(
+                (plan.output_spec_summary or {}).get("template_content_hash") or ""
+            )
+            if declared_template_hash and declared_template_hash != template.content_hash:
+                raise ValueError("plan template content hash does not match the frozen template")
+        else:
+            # The synthetic template object is only the compatibility input
+            # required by HarnessRun/manifest schemas. Binding and rendering
+            # below use the accepted recipe, never template bytes or regions.
+            if not str(order.template_version_id).startswith("system-recipe:"):
+                raise ValueError("structure plan requires a server-owned recipe WorkOrder")
+
+        evidence_entries = self.store.list_evidence_entries(harness_run_id)
+        raw_evidence: dict[str, dict[str, Any]] = {}
+        for outcome in (getattr(result, "outcomes", {}) or {}).values():
+            for evidence in getattr(outcome, "evidences", []) or []:
+                evidence_id = str(getattr(evidence, "id", "") or "").strip()
+                if not evidence_id:
+                    continue
+                raw_evidence[evidence_id] = {
+                    "id": evidence_id,
+                    "content": str(getattr(evidence, "content", "") or ""),
+                    "metadata": dict(getattr(evidence, "metadata", {}) or {}),
+                }
+        # On a restarted run the registry is intentionally opaque and does
+        # not contain source text.  Coverage can still verify ownership and
+        # presence; the already validated durable drafts are reviewed by the
+        # deterministic unit reports without re-reading source content.
+        coverage_evidence: Any = evidence_entries
+        coverage = CoverageEvaluator().evaluate(
+            plan, result.drafts, coverage_evidence,
+        )
+        result.coverage_report = coverage
+        self._append_plan_execution_event(
+            harness_run_id=harness_run_id,
+            order=order,
+            event_type="coverage_evaluated",
+            node_name="coverage",
+            subject_hash=coverage.report_hash,
+            payload={
+                "report_hash": coverage.report_hash,
+                "expected_count": coverage.expected_count,
+                "covered_count": coverage.covered_count,
+                "missing_count": coverage.missing_count,
+                "unsupported_count": coverage.unsupported_count,
+                "duplicate_count": coverage.duplicate_count,
+            },
+        )
+
+        drafts_by_id = {draft.unit_id: draft for draft in result.drafts}
+        draft_by_unit = {
+            unit.unit_id: (
+                drafts_by_id.get(unit.unit_id)
+                or drafts_by_id.get(_plan_field_execution_key(unit.unit_id))
+            )
+            for unit in plan.semantic_units
+        }
+        task_by_unit = {task.unit_id: task for task in plan.unit_tasks}
+        unit_reviewer = UnitReviewer(self.validator)
+        unit_reports: dict[str, Any] = {}
+        for unit in plan.semantic_units:
+            task = task_by_unit[unit.unit_id]
+            task_payload = task.model_dump(mode="json")
+            task_output = dict(task_payload.get("output_schema") or {})
+            requirement = next(
+                (
+                    item for item in plan.coverage_contract.requirements
+                    if item.unit_id == unit.unit_id
+                ),
+                None,
+            )
+            if requirement is not None:
+                task_output.setdefault("row_keys", list(requirement.row_keys))
+                task_output.setdefault("required_columns", list(requirement.required_columns))
+                task_output.setdefault("row_order", requirement.row_order)
+                task_output.setdefault("duplicate_policy", requirement.duplicate_policy)
+            raw_type = str(task_output.get("type") or "text").casefold()
+            if raw_type in {"object", "section", "paragraph"}:
+                task_output["type"] = "text"
+            task_payload["output_schema"] = task_output
+            # Review each unit against only the evidence that belongs to its
+            # draft.  A revision child may reuse a durable parent draft: its
+            # opaque evidence registry is sufficient for coverage, but raw
+            # evidence from another newly-generated unit must not make the
+            # reused draft look unsupported.
+            unit_draft = draft_by_unit.get(unit.unit_id)
+            if raw_evidence and unit_draft is not None:
+                unit_evidence_ids = {
+                    str(evidence_id).strip()
+                    for evidence_id in (unit_draft.evidence_ids or [])
+                    if str(evidence_id).strip()
+                }
+                review_evidence = {
+                    evidence_id: raw_evidence[evidence_id]
+                    for evidence_id in unit_evidence_ids
+                    if evidence_id in raw_evidence
+                } or None
+            else:
+                review_evidence = raw_evidence or None
+            report = unit_reviewer.review(
+                task_payload,
+                unit_draft,
+                coverage,
+                review_evidence,
+                attempt=1,
+            )
+            unit_reports[unit.unit_id] = report
+            self._append_plan_execution_event(
+                harness_run_id=harness_run_id,
+                order=order,
+                event_type="unit_reviewed",
+                node_name=f"unit:{task.task_id}",
+                unit_id=unit.unit_id,
+                subject_hash=report.report_hash,
+                payload={
+                    "unit_id": unit.unit_id,
+                    "status": report.status,
+                    "report_hash": report.report_hash,
+                    "issue_codes": report.issue_codes if hasattr(report, "issue_codes") else [
+                        issue.code for issue in report.issues
+                    ],
+                },
+            )
+        result.unit_reports = unit_reports
+
+        document_model = self.build_document_model(plan, result.drafts, unit_reports)
+        result.document_model = document_model
+        pre_render = self.review_document_pre_render(
+            plan, document_model, coverage, unit_reports,
+        )
+        result.pre_render_report = pre_render
+        self._append_plan_execution_event(
+            harness_run_id=harness_run_id,
+            order=order,
+            event_type="pre_render_reviewed",
+            node_name="pre-render-review",
+            subject_hash=pre_render.report_hash,
+            payload={
+                "report_hash": pre_render.report_hash,
+                "status": pre_render.status,
+                "issue_codes": pre_render.issue_codes,
+            },
+        )
+
+        icd_layout_issues: list[dict[str, Any]] = []
+        if is_template_free:
+            recipe_id = str(
+                (plan.render_spec or {}).get("recipe_id")
+                or getattr(layout, "structure_profile_id", "")
+            ).strip()
+            recipe_version = str(
+                (plan.render_spec or {}).get("recipe_version")
+                or getattr(layout, "structure_profile_version", "")
+            ).strip()
+            recipe = build_builtin_recipe_registry().resolve(recipe_id, recipe_version)
+            binding = StructureBindingCompiler().compile(plan, document_model, recipe)
+            renderers = {
+                "docx": StructuredDocxRenderer(),
+                "pdf": StructuredPdfRenderer(),
+                "xlsx": StructuredXlsxRenderer(),
+            }
+            renderer = renderers.get(order.target_format)
+            if renderer is None:
+                raise ValueError(f"no template-free renderer is registered for {order.target_format}")
+            structured = renderer.render(document_model, recipe, binding)
+            rendered_content = structured.content
+            integrity_manifest = structured.integrity_manifest
+            render_result = structured
+        else:
+            fill_plan = self.build_plan_fill_plan(template, plan, document_model)
+            rendered_content, integrity_manifest = self._render_fill_plan(template, fill_plan)
+            rendered_content, integrity_manifest, icd_layout_issues = (
+                self._apply_icd_front_view_layout(
+                    order,
+                    template,
+                    rendered_content,
+                    integrity_manifest,
+                    pin_functions=self._pin_functions_from_drafts(order, result.drafts),
+                )
+            )
+            render_result = {
+                "content": rendered_content,
+                "integrity_manifest": integrity_manifest,
+            }
+        post_render = self.review_document_post_render(
+            plan, document_model, render_result, rendered_content,
+        )
+        result.post_render_report = post_render
+        self._append_plan_execution_event(
+            harness_run_id=harness_run_id,
+            order=order,
+            event_type="post_render_reviewed",
+            node_name="post-render-review",
+            subject_hash=post_render.report_hash,
+            payload={
+                "report_hash": post_render.report_hash,
+                "status": post_render.status,
+                "artifact_hash": post_render.artifact_hash,
+                "issue_codes": post_render.issue_codes,
+            },
+        )
+        decision = self.evaluate_document_release(pre_render, post_render)
+        result.release_decision = decision
+        self._append_plan_execution_event(
+            harness_run_id=harness_run_id,
+            order=order,
+            event_type="release_gated",
+            node_name="release",
+            subject_hash=content_hash(decision),
+            payload={
+                "status": decision.status,
+                "release_allowed": decision.release_allowed,
+                "issue_codes": decision.issue_codes,
+                "subject_hash": decision.subject_hash,
+            },
+        )
+
+        review_issues = [
+            {"kind": issue.code, **issue.model_dump(mode="json")}
+            for report in (pre_render, post_render)
+            for issue in report.issues
+        ]
+        review_issues.extend(
+            {"kind": str(issue.get("code") or issue.get("kind") or "icd_layout"), **issue}
+            for issue in icd_layout_issues
+        )
+        required_issues = self._required_content_issues(
+            order, result.unit_statuses, plan=plan,
+        )
+        review_issues.extend(required_issues)
+        self.store.save_evidence_matrix(order.work_order_id, result.matrix_rows)
+        validation = self.validator.validate(
+            work_order_id=order.work_order_id,
+            matrix_rows=result.matrix_rows,
+            integrity_manifest=integrity_manifest,
+            additional_issues=review_issues,
+        )
+        # The plan route must apply the same frozen-scope pin check as the
+        # legacy route; otherwise a template whose pin table could not be
+        # discovered can silently keep its example rows.  Structure-only plans
+        # have no template pin table, so the check stays template-scoped.
+        if not is_template_free:
+            validation = self._append_icd_pin_validation(order, validation, rendered_content)
+        if decision.status == "blocked":
+            validation = validation.model_copy(update={
+                "status": "requires_human" if not integrity_manifest.get("policy_violations") else "failed",
+                "issues": [*validation.issues, {
+                    "kind": "plan_release_blocked",
+                    "code": "plan_release_blocked",
+                    "severity": "blocking",
+                    "issue_codes": decision.issue_codes,
+                }],
+            })
+        elif decision.status == "needs_review" and validation.status == "passed":
+            validation = validation.model_copy(update={"status": "requires_human"})
+        self.store.save_validation_report(validation)
+
+        artifact = DocumentArtifact(
+            artifact_id=f"artifact-{uuid.uuid4().hex}",
+            tenant_id=order.tenant_id,
+            work_order_id=order.work_order_id,
+            run_id=harness_run_id,
+            output_format=order.target_format if is_template_free else template.format,
+            stage="review_candidate",
+            content_hash=hashlib.sha256(rendered_content).hexdigest(),
+            validation_report_id=validation.validation_report_id,
+            integrity_manifest_id=integrity_manifest["manifest_hash"],
+        )
+        artifact = self._save_artifact_for_task(
+            order, artifact, rendered_content,
+            order.target_format if is_template_free else template.format,
+        )
+        result.artifact = artifact
+        self._bind_revision_child(order, artifact, report_status=validation.status)
+
+        requires_review = not decision.release_allowed
+        automatic_release_allowed = _automatic_release_allowed(
+            order, validation, requires_review=requires_review,
+        )
+        effective_release_status = (
+            "released"
+            if automatic_release_allowed
+            else decision.status if decision.status in {"blocked", "needs_review"} else "pending"
+        )
+        bound_manifest = self.bind_document_review_manifest(
+            self.store.get_run_manifest(
+                self.store.get_harness_run(harness_run_id).run_manifest_id
+            ) if self.store.get_harness_run(harness_run_id) is not None else None,
+            document_model=document_model,
+            pre_render_report=pre_render,
+            post_render_report=post_render,
+            release_decision=decision,
+            effective_release_status=effective_release_status,
+        )
+        if bound_manifest is not None:
+            self.store.replace_run_manifest(bound_manifest)
+        current_run = self.store.get_harness_run(harness_run_id)
+        if current_run is not None:
+            self.store.replace_harness_run(current_run.model_copy(update={
+                "document_model_hash": document_model.model_hash,
+                "pre_render_review_hash": pre_render.report_hash,
+                "post_render_review_hash": post_render.report_hash,
+                "artifact_hash": post_render.artifact_hash,
+                "release_decision_hash": content_hash(decision),
+                "release_status": (
+                    "released" if automatic_release_allowed
+                    else decision.status if decision.status in {"blocked", "needs_review"} else "pending"
+                ),
+            }))
+
+        if automatic_release_allowed:
+            return self._auto_publish_verified_candidate(
+                order,
+                artifact,
+                validation,
+                rendered_content,
+                unit_statuses=result.unit_statuses,
+                evidence_matrix_id=f"matrix-{order.work_order_id}",
+                validation_report_id=validation.validation_report_id,
+            )
+        next_status = (
+            "blocked" if decision.status == "blocked" else "waiting_human_approval"
+        ) if requires_review else "waiting_human_approval"
+        self._replace_order(
+            order,
+            status=next_status,
+            unit_statuses=result.unit_statuses,
+            evidence_matrix_id=f"matrix-{order.work_order_id}",
+            validation_report_id=validation.validation_report_id,
+            error_code=("plan_release_blocked" if decision.status == "blocked" else None),
+            error_message=(
+                "plan-backed release is blocked by deterministic review gates"
+                if decision.status == "blocked" else None
+            ),
+            retryable=False if decision.status == "blocked" else None,
+            next_actions=["view_error", "provide_value"] if decision.status == "blocked" else ["approve"],
+        )
+        self._publish_missing_data_clarification(order, required_issues)
+        return artifact
+
+    def _append_plan_execution_event(
+        self,
+        *,
+        harness_run_id: str,
+        order: DocumentWorkOrder,
+        event_type: str,
+        node_name: str,
+        subject_hash: str,
+        payload: dict[str, Any],
+        unit_id: str | None = None,
+    ) -> AuthoringExecutionEvent:
+        """Append one idempotent, sanitized plan-review business fact."""
+        event = AuthoringExecutionEvent(
+            event_id=f"authoring-event-{uuid.uuid4().hex}",
+            event_type=event_type,
+            tenant_id=order.tenant_id,
+            work_order_id=order.work_order_id,
+            harness_run_id=harness_run_id,
+            idempotency_key=f"plan:{harness_run_id}:{event_type}:{node_name}:{subject_hash}",
+            executor="authoring_graph",
+            node_name=node_name,
+            unit_id=unit_id,
+            sanitized_payload=safe_review_projection(payload),
+        )
+        return self.store.append_execution_event(event)
+
+    def _required_content_issues(
+        self,
+        order: DocumentWorkOrder,
+        statuses: dict[str, str],
+        *,
+        plan: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """A usable candidate is not a complete release when required content is absent.
+
+        The brief's mark_tbd policy permits drafting, never silently relaxing
+        the frozen schema's release requirements. Missing execution statuses
+        are gaps too; otherwise a skipped field would evade the gate.
+        """
+        if plan is not None and getattr(getattr(plan, "layout_contract", None), "kind", None) == "structure":
+            return [
+                {
+                    "code": "required_content_incomplete",
+                    "kind": "required_content_incomplete",
+                    "field_id": requirement.unit_id,
+                    "unit_id": _plan_field_execution_key(requirement.unit_id),
+                    "coverage_status": statuses.get(
+                        _plan_field_execution_key(requirement.unit_id), "unsearched"
+                    ),
+                    "severity": "blocking",
+                    "message": f"必填内容尚未完成：{requirement.unit_id}",
+                }
+                for requirement in plan.coverage_contract.requirements
+                if requirement.required
+                and statuses.get(_plan_field_execution_key(requirement.unit_id)) != "ready_to_render"
+            ]
+        schema = self.store.get_document_schema(order.document_schema_id, order.document_schema_version)
+        if schema is None:
+            return [{"code": "required_content_incomplete", "kind": "missing_schema", "severity": "blocking"}]
+        return [
+            {"code": "required_content_incomplete", "kind": "required_content_incomplete",
+             "field_id": field.field_id, "unit_id": _plan_field_execution_key(field.field_id),
+             "coverage_status": statuses.get(_plan_field_execution_key(field.field_id), "unsearched"),
+             "severity": "blocking", "message": f"必填内容尚未完成：{field.label}"}
+            for field in schema.fields
+            if field.required and statuses.get(_plan_field_execution_key(field.field_id)) != "ready_to_render"
+        ]
+
+    def _publish_missing_data_clarification(
+        self,
+        order: DocumentWorkOrder,
+        issues: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        """Hand required evidence gaps back to the owning chat session.
+
+        A blocked release is an execution fact, not an instruction for the
+        user to open the workbench and edit cells.  When the order belongs to
+        an OutputSpec session, persist one deterministic question so the next
+        chat turn can choose a policy or add a value and re-plan safely.
+        """
+        session_id = str(getattr(order, "generation_session_id", None) or "").strip()
+        if not session_id:
+            return False
+        sessions = getattr(self.store, "generation_sessions", None)
+        if sessions is None or not callable(getattr(sessions, "get_session", None)):
+            return False
+        try:
+            session = sessions.get_session(session_id)
+        except (KeyError, PermissionError, ValueError):
+            return False
+        if str(getattr(session, "contract_version", "") or "") != "output_spec_v1":
+            return False
+        field_labels: list[str] = []
+        for issue in issues or ():
+            field_id = str(issue.get("field_id") or issue.get("unit_id") or "").strip()
+            if field_id and field_id not in field_labels:
+                field_labels.append(field_id)
+        if not field_labels:
+            return False
+        question_id = "missing_data_resolution"
+        # Do not append the same unanswered question on every status poll.
+        messages = list(getattr(session, "messages", None) or [])
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if getattr(message, "role", None) != "assistant" or getattr(message, "question_id", None) != question_id:
+                continue
+            answered = any(
+                getattr(item, "role", None) == "user"
+                and getattr(item, "question_id", None) == question_id
+                for item in messages[index + 1:]
+            )
+            if not answered:
+                return False
+            break
+        content = (
+            "知识库中暂未找到以下必填字段的可靠资料："
+            + "、".join(field_labels[:20])
+            + "。请选择处理方式："
+        )
+        try:
+            setter = getattr(sessions, "set_status", None)
+            if callable(setter):
+                setter(session_id, "needs_clarification")
+            sessions.append_message(
+                session_id,
+                role="assistant",
+                content=content,
+                question_id=question_id,
+                options=["标记为未提供，继续生成", "补充说明", "暂停等待资料"],
+                reason="必填字段缺少可靠证据，需由对话确认处理方式。",
+            )
+            task_id = str(getattr(order, "task_id", None) or "").strip()
+            task_store = getattr(getattr(self, "task_service", None), "store", None)
+            if task_id and callable(getattr(task_store, "update_status", None)):
+                task_store.update_status(task_id, "needs_clarification")
+        except (KeyError, PermissionError, ValueError):
+            logger.warning("failed to persist missing-data clarification for %s", session_id, exc_info=True)
+            return False
+        return True
+
+    def _block_generation_fields(self, order: DocumentWorkOrder, result) -> list[str]:
+        """Fields whose confirmed brief forces block_generation on unresolved
+        required missing/conflicts. Data-complete runs are never blocked."""
+        from src.document_authoring.harness.agent_contracts import (
+            effective_missing_policy,
+            normalize_clarification_policy,
+        )
+
+        brief = dict(order.generation_brief or {})
+        if not brief.get("confirmed"):
+            return []
+        brief_missing = normalize_clarification_policy(
+            "missing_data_policy", brief.get("missing_data_policy")
+        )
+        if brief_missing != "block_generation":
+            return []
+        schema = self.store.get_document_schema(
+            order.document_schema_id, order.document_schema_version
+        )
+        if schema is None:
+            return []
+        missing_statuses = {"requires_human", "blocked", "conflicting", "retrieval_failed", "insufficient_evidence", "tbd"}
+        blocked: list[str] = []
+        for field in schema.fields:
+            unit_id = _plan_field_execution_key(field.field_id)
+            status = result.unit_statuses.get(unit_id)
+            if (
+                field.required
+                and effective_missing_policy(brief_missing, field.missing_policy) == "block_section"
+                and status in missing_statuses
+            ):
+                blocked.append(field.field_id)
+        return blocked
+
+    def _append_block_generation_issues(self, report, blocked_fields: list[str]):
+        issues = list(getattr(report, "issues", []) or [])
+        for field_id in blocked_fields:
+            issues.append({
+                "code": "block_generation_unresolved_missing",
+                "field_id": field_id,
+                "message": "confirmed brief blocks release until this required field resolves",
+                "severity": "blocking",
+            })
+        return report.model_copy(update={"issues": issues, "status": "requires_human"}) \
+            if hasattr(report, "model_copy") else report
+
     def _auto_publish_verified_candidate(
         self,
         order: DocumentWorkOrder,
@@ -1443,7 +3396,11 @@ class DocumentGenerationService:
     ) -> DocumentArtifact:
         if not src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED:
             return candidate
-        if report.status != "passed" or self._has_icd_blocking_issue(report.issues):
+        if (
+            report.status != "passed"
+            or self._has_icd_blocking_issue(report.issues)
+            or self._has_blocking_validation_issue(report.issues)
+        ):
             return candidate
         if hashlib.sha256(candidate_content).hexdigest() != candidate.content_hash:
             raise ValueError("candidate content hash changed before automatic publication")
@@ -1458,6 +3415,7 @@ class DocumentGenerationService:
             tenant_id=candidate.tenant_id,
             work_order_id=candidate.work_order_id,
             run_id=candidate.run_id,
+            output_format=getattr(candidate, "output_format", None) or order.target_format,
             stage="approved_release",
             content_hash=candidate.content_hash,
             approval_subject_hash=subject_hash,
@@ -1471,10 +3429,11 @@ class DocumentGenerationService:
             }],
             released_at=datetime.now(timezone.utc),
         )
-        released = self.store.save_artifact(
+        released = self._save_artifact_for_task(
+            order,
             released,
             candidate_content,
-            order.target_format,
+            getattr(candidate, "output_format", None) or order.target_format,
         )
         self._replace_order(
             order,
@@ -1556,34 +3515,160 @@ class DocumentGenerationService:
             value=value, actor_id=ctx.user_id, actor_role=actor_role, comment=comment,
         )
         return self.store.save_human_event(event)
+    def _pin_functions_from_drafts(
+        self,
+        order: DocumentWorkOrder,
+        drafts: list[DocumentUnitDraft],
+    ) -> dict[str, str]:
+        """Collect evidence-backed function text from validated table drafts.
+
+        The render overlay must not replace an evidence-verified function with
+        the TBD placeholder, so the draft's function column is forwarded to
+        the workbook pin-table renderer.
+        """
+
+        try:
+            schema = self._schema(order.document_schema_id, order.document_schema_version)
+        except (KeyError, ValueError):
+            return {}
+        function_columns: set[str] = set()
+        for field in getattr(schema, "fields", []) or []:
+            columns = getattr(field, "table_columns", None)
+            if not columns:
+                continue
+            for column_id, kind in _column_semantics(dict(columns)).items():
+                if kind == "function":
+                    function_columns.add(column_id)
+        if not function_columns:
+            return {}
+        functions: dict[str, str] = {}
+        for draft in drafts:
+            typed = getattr(draft, "typed_value", None)
+            if typed is None or typed.kind != "table":
+                continue
+            for row in typed.rows:
+                row_key = str(row.row_key or "").strip()
+                if not row_key:
+                    continue
+                for column_id in function_columns:
+                    value = str(row.cells.get(column_id) or "").strip()
+                    if value and not value.upper().startswith("TBD"):
+                        functions.setdefault(row_key, value)
+                        break
+        return functions
+
     def _apply_icd_front_view_layout(
         self,
         order: DocumentWorkOrder,
         template: TemplateVersion,
         rendered_content: bytes,
         integrity_manifest: dict[str, Any],
+        *,
+        pin_functions: Mapping[str, str] | None = None,
     ) -> tuple[bytes, dict[str, Any], list[dict[str, str]]]:
-        """Overlay detected ICD front views using the same frozen pin facts.
+        """Overlay ICD pin tables/front views using the same frozen pin facts.
 
-        The normal semantic writer owns document prose and Pin Definition rows.
-        This deterministic post-render pass owns only a template's physical
-        connector-view slots, so an LLM can never reverse or redraw their
-        numbering.  It is intentionally a no-op outside a frozen ICD scope.
+        Template example rows are layout samples, not product truth.  This
+        deterministic post-render pass replaces the pin table and physical
+        connector-view slots, so an old connector such as X302 cannot survive
+        into an X1900 deliverable.  It is a no-op outside a frozen ICD scope.
         """
         review = self.store.get_icd_scope_review(order.work_order_id)
         if review is None or review.pending_count:
             return rendered_content, integrity_manifest, []
         if template.format.casefold() not in {"xlsx", "xlsm"}:
             return rendered_content, integrity_manifest, []
-        front_view = render_icd_front_views(
+        mappings = effective_frozen_pin_mappings(review)
+        brief = dict(getattr(order, "generation_brief", {}) or {})
+        inference_policy = str(brief.get("inference_policy") or "forbid").strip().casefold()
+        target_identity = brief.get("target_identity") or {}
+        target_metadata, assembly_erp = self._icd_target_metadata(
+            target_identity,
+            mappings,
+        )
+        pin_table = render_icd_pin_table(
             rendered_content,
-            effective_frozen_pin_mappings(review),
+            mappings,
+            target_format=template.format,
+            template_version_id=template.template_version_id,
+            allow_rule_inference=inference_policy in {"allow_labeled", "allow_limited"},
+            assembly_erp=assembly_erp,
+            metadata=target_metadata,
+            function_by_pin=pin_functions,
+        )
+        current_content = pin_table.content
+        current_manifest = integrity_manifest
+        if pin_table.integrity_manifest is not None:
+            current_manifest = self._combine_icd_overlay_manifests(
+                current_manifest,
+                pin_table.integrity_manifest,
+                overlay_kind="pin_table",
+            )
+        front_view = render_icd_front_views(
+            current_content,
+            mappings,
             target_format=template.format,
             template_version_id=template.template_version_id,
         )
         if front_view.integrity_manifest is None:
-            return front_view.content, integrity_manifest, front_view.issues
-        overlay_manifest = front_view.integrity_manifest
+            return front_view.content, current_manifest, [*pin_table.issues, *front_view.issues]
+        combined_manifest = self._combine_icd_overlay_manifests(
+            current_manifest,
+            front_view.integrity_manifest,
+            overlay_kind="front_view",
+        )
+        return front_view.content, combined_manifest, [*pin_table.issues, *front_view.issues]
+
+    @staticmethod
+    def _icd_target_metadata(
+        target_identity: Any,
+        mappings: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], str | None]:
+        values = target_identity if isinstance(target_identity, Mapping) else {}
+
+        def by_key(*tokens: str) -> str:
+            for key, value in values.items():
+                normalized_key = str(key).strip().casefold()
+                if any(token in normalized_key for token in tokens):
+                    text = str(value or "").strip()
+                    if text:
+                        return text
+            return ""
+
+        raw_identity = (
+            str(target_identity or "").strip()
+            if isinstance(target_identity, str)
+            else " ".join(str(value or "").strip() for value in values.values())
+        )
+        assembly_erp = by_key("erp")
+        if not assembly_erp:
+            match = re.search(r"(?<!\d)(6\d{6,11})(?!\d)", raw_identity)
+            assembly_erp = match.group(1) if match else ""
+        product_name = by_key("product", "hardware", "device", "产品", "硬件", "总成")
+        if product_name == assembly_erp:
+            product_name = ""
+        if not product_name and isinstance(target_identity, str):
+            product_name = target_identity.strip()
+        location_number = "、".join(dict.fromkeys(
+            str(mapping.get("refdes") or "").strip()
+            for mapping in mappings
+            if str(mapping.get("refdes") or "").strip()
+        ))
+        return {
+            "product_name": product_name or "TBD",
+            "customer_number": by_key("customer", "客户") or "TBD",
+            "pcb_connector": by_key("pcb_connector", "board_connector", "板端") or "TBD",
+            "harness_connector": by_key("harness_connector", "线束端") or "TBD",
+            "location_number": location_number or "TBD",
+        }, assembly_erp or None
+
+    @staticmethod
+    def _combine_icd_overlay_manifests(
+        integrity_manifest: dict[str, Any],
+        overlay_manifest: dict[str, Any],
+        *,
+        overlay_kind: str,
+    ) -> dict[str, Any]:
         combined_manifest = {
             **integrity_manifest,
             "after_content_hash": overlay_manifest.get("after_content_hash"),
@@ -1607,10 +3692,10 @@ class DocumentGenerationService:
         }
         combined_manifest["manifest_hash"] = content_hash({
             "base_manifest_hash": integrity_manifest.get("manifest_hash"),
-            "front_view_manifest_hash": overlay_manifest.get("manifest_hash"),
+            f"{overlay_kind}_manifest_hash": overlay_manifest.get("manifest_hash"),
             "after_content_hash": overlay_manifest.get("after_content_hash"),
         })
-        return front_view.content, combined_manifest, front_view.issues
+        return combined_manifest
 
 
     def submit_document_feedback(
@@ -1632,6 +3717,31 @@ class DocumentGenerationService:
             comment=normalized_comment,
         )
 
+    def request_document_release(
+        self,
+        ctx: RequestContext,
+        artifact_id: str,
+        *,
+        comment: str = "",
+    ) -> DocumentHumanEvent:
+        """Record an explicit request for review without approving a candidate.
+
+        The event is deliberately distinct from ``approve``/``sign``: it is
+        auditable user intent for a future reviewer and cannot create an
+        ``approved_release`` artifact or satisfy a release gate by itself.
+        """
+
+        candidate = self._artifact_for_context(ctx, artifact_id)
+        if candidate.stage != "review_candidate":
+            raise ValueError("only a review candidate may request release")
+        return self.submit_document_human_event(
+            ctx,
+            artifact_id=candidate.artifact_id,
+            unit_id="artifact",
+            event_type="request_release",
+            comment=str(comment or "").strip(),
+        )
+
     def approve_document_artifact(self, ctx: RequestContext, artifact_id: str, *, comment: str = "") -> DocumentArtifact:
         candidate = self._artifact_for_context(ctx, artifact_id)
         if candidate.stage != "review_candidate":
@@ -1640,11 +3750,18 @@ class DocumentGenerationService:
         report = self.store.get_validation_report(candidate.validation_report_id)
         if report is not None and self._has_icd_blocking_issue(report.issues):
             raise ValueError("candidate has an ICD blocking validation issue")
+        if report is not None and self._has_blocking_validation_issue(report.issues):
+            raise ValueError("candidate has a blocking validation issue")
         snapshot = self.resolve_source_snapshot(order)
         if report is None or report.status == "failed":
             raise ValueError("candidate does not have a releasable validation result")
-        candidate_content = self.store.read_artifact_content(candidate.artifact_id)
-        self._assert_generated_artifact_clean(candidate_content, order.target_format)
+        read_for_validation = getattr(
+            self.store,
+            "read_artifact_content_for_validation",
+            self.store.read_artifact_content,
+        )
+        candidate_content = read_for_validation(candidate.artifact_id)
+        self._assert_artifact_content_clean(candidate_content, getattr(candidate, "output_format", None) or order.target_format)
         if hashlib.sha256(candidate_content).hexdigest() != candidate.content_hash:
             raise ValueError("candidate content hash changed since validation")
         subject_hash = _approval_subject_hash(candidate.content_hash, report.content_hash, snapshot.content_hash)
@@ -1659,12 +3776,18 @@ class DocumentGenerationService:
         released = DocumentArtifact(
             artifact_id=f"artifact-{uuid.uuid4().hex}", tenant_id=candidate.tenant_id,
             work_order_id=candidate.work_order_id, run_id=candidate.run_id, stage="approved_release",
+            output_format=getattr(candidate, "output_format", None) or order.target_format,
             content_hash=candidate.content_hash, approval_subject_hash=subject_hash,
             parent_artifact_id=candidate.artifact_id, validation_report_id=candidate.validation_report_id,
             approval_event_ids=[event.event_id for event in approvals], integrity_manifest_id=candidate.integrity_manifest_id,
             released_at=datetime.now(timezone.utc),
         )
-        released = self.store.save_artifact(released, candidate_content, order.target_format)
+        released = self._save_artifact_for_task(
+            order,
+            released,
+            candidate_content,
+            getattr(candidate, "output_format", None) or order.target_format,
+        )
         self._replace_order(order, status="complete")
         return released
 
@@ -1718,6 +3841,15 @@ class DocumentGenerationService:
         )
 
     @staticmethod
+    def _has_blocking_validation_issue(issues: list[dict[str, Any]]) -> bool:
+        return any(
+            bool(issue.get("blocking"))
+            or str(issue.get("severity") or "").strip().casefold() == "blocking"
+            for issue in issues
+            if isinstance(issue, Mapping)
+        )
+
+    @staticmethod
     def _append_icd_validation_issues(report, issues: list[dict[str, Any]]):
         if not issues:
             return report
@@ -1731,7 +3863,133 @@ class DocumentGenerationService:
         order = self._order_raw(artifact.work_order_id)
         capability = "download_approved_release" if artifact.stage == "approved_release" else "download_review_candidate"
         self.require_work_order_capability(ctx, order, capability)
-        return self.store.read_artifact_content(artifact_id)
+        content = self.store.read_artifact_content(artifact_id)
+        artifact_format = getattr(artifact, "output_format", None) or order.target_format
+        self._assert_artifact_content_clean(content, artifact_format)
+        return content
+
+    def convert_document_artifact(
+        self,
+        ctx: RequestContext,
+        artifact_id: str,
+        *,
+        target_format: str,
+    ) -> DocumentArtifact:
+        """Create a validated PDF/PPTX child artifact from a native result.
+
+        Conversion is a separate immutable operation.  The source artifact is
+        hash-checked before reading, the output receives its own validation
+        report and the parent/source hash is recorded in the idempotency key.
+        A candidate remains a candidate; an approved release can produce an
+        approved derived artifact without silently changing the work order.
+        """
+        source = self._artifact_for_context(ctx, artifact_id)
+        order = self._order(ctx, source.work_order_id, "run_deterministic_work_order")
+        if order.scope_type == "knowledge_base" and (
+            not order.knowledge_base_name
+            or not ctx.has_kb_permission(order.knowledge_base_name, "write")
+        ):
+            raise PermissionError("knowledge base write permission is required for artifact conversion")
+        normalized_target = str(target_format or "").strip().lower().lstrip(".")
+        if normalized_target not in self.converter.supported_targets:
+            raise ValueError("document artifact conversion supports only pdf or pptx")
+        source_format = str(getattr(source, "output_format", None) or order.target_format or "").strip().lower().lstrip(".")
+        if source_format == normalized_target:
+            raise ValueError("artifact is already in the requested output format")
+        get_validation_report = getattr(self.store, "get_validation_report", None)
+        source_report = (
+            get_validation_report(source.validation_report_id)
+            if callable(get_validation_report)
+            else None
+        )
+        if source_report is not None and source_report.status == "failed":
+            raise ValueError("source artifact validation failed; conversion is blocked")
+        source_content = self.store.read_artifact_content(source.artifact_id)
+        try:
+            converted = self.converter.convert(
+                source_content,
+                source_format=source_format,
+                target_format=normalized_target,
+            )
+        except TemplateConversionError:
+            raise
+        report = ValidationReport(
+            validation_report_id=f"validation-{uuid.uuid4().hex}",
+            work_order_id=order.work_order_id,
+            status="passed",
+            issues=[
+                {"code": "template_conversion_warning", "message": warning, "severity": "warning"}
+                for warning in converted.warnings
+            ],
+            evidence_matrix_hash=content_hash({
+                "source_artifact_id": source.artifact_id,
+                "source_content_hash": source.content_hash,
+                "target_format": normalized_target,
+            }),
+            renderer_manifest_hash=content_hash(converted.metadata),
+        )
+        self.store.save_validation_report(report)
+        subject_hash = None
+        if source.stage == "approved_release":
+            snapshot = self.resolve_source_snapshot(order)
+            subject_hash = _approval_subject_hash(
+                converted.metadata["content_hash"], report.content_hash, snapshot.content_hash,
+            )
+        child = DocumentArtifact(
+            artifact_id=f"artifact-{uuid.uuid4().hex}",
+            tenant_id=source.tenant_id,
+            work_order_id=source.work_order_id,
+            run_id=f"conversion-{uuid.uuid4().hex}",
+            output_format=normalized_target,
+            stage=source.stage,
+            validity_status="current",
+            policy_status="active",
+            access_status=source.access_status,
+            content_hash=converted.metadata["content_hash"],
+            approval_subject_hash=subject_hash,
+            parent_artifact_id=source.artifact_id,
+            validation_report_id=report.validation_report_id,
+            approval_event_ids=list(source.approval_event_ids) if source.stage == "approved_release" else [],
+            integrity_manifest_id=content_hash({
+                "source_artifact_id": source.artifact_id,
+                "source_content_hash": source.content_hash,
+                "conversion": converted.metadata,
+            }),
+            idempotency_fingerprint=content_hash({
+                "conversion": "template-artifact",
+                "source_artifact_id": source.artifact_id,
+                "source_content_hash": source.content_hash,
+                "target_format": normalized_target,
+                "converter_version": converted.metadata["converter_version"],
+            }),
+            status_reasons=[{
+                "code": "semantic_template_conversion",
+                "message": "模板成品已按段落/表格语义转换，并完成输出制品校验。",
+                "source_artifact_id": source.artifact_id,
+                "source_format": source_format,
+                "target_format": normalized_target,
+                "converter_version": converted.metadata["converter_version"],
+                "warnings": list(converted.warnings),
+            }],
+            released_at=datetime.now(timezone.utc) if source.stage == "approved_release" else None,
+        )
+        return self._save_artifact_for_task(order, child, converted.content, normalized_target)
+
+    def _assert_artifact_content_clean(self, content: bytes, artifact_format: str) -> None:
+        normalized = str(artifact_format or "").strip().lower().lstrip(".")
+        if normalized in {"md", "markdown"}:
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("generated Markdown artifact is not valid UTF-8") from exc
+            return
+        if normalized in {"pdf", "pptx"}:
+            if normalized == "pdf":
+                self.converter._validate_pdf(content)
+            else:
+                self.converter._validate_pptx(content)
+            return
+        self._assert_generated_artifact_clean(content, normalized)
 
     def preview_document_artifact(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
         """Return a bounded, read-only artifact preview after download-equivalent checks."""
@@ -1741,7 +3999,7 @@ class DocumentGenerationService:
         self.require_work_order_capability(ctx, order, capability)
         return preview_artifact(
             self.store.read_artifact_content(artifact_id),
-            order.target_format,
+            getattr(artifact, "output_format", None) or order.target_format,
         )
 
     # Internal helpers -----------------------------------------------------------------
@@ -1764,7 +4022,7 @@ class DocumentGenerationService:
     def _schema_harness_policy(self, schema: DocumentSchema, *, max_parallel_units: int = 3) -> HarnessPolicy:
         """Persist the bounded policy required by one approved semantic schema."""
         unit_count = (
-            sum(field.authoring_policy == "managed_writer" for field in schema.fields)
+            sum(field.authoring_policy in {"managed_writer", "external_agent_draft"} for field in schema.fields)
             + sum(item.evaluation_mode == "semantic_assisted" for item in schema.review_items)
         )
         attempts = _DEFAULT_RETRIEVAL_ATTEMPTS_PER_UNIT
@@ -1797,19 +4055,66 @@ class DocumentGenerationService:
             # each _step call keep the actual usage well below this ceiling.
             lease_seconds=max(300, unit_count * 120),
             writer_provider_id=LLMManagedWriter.provider_id,
+            agent_tools=(
+                [
+                    "read_field_brief", "retrieve_evidence", "propose_field_value", "mark_missing",
+                ]
+                if schema.execution_mode == "external_agent" else []
+            ),
         ))
 
     @staticmethod
-    def _field_for_suggestion(suggestion) -> Any:
+    def _field_for_suggestion(suggestion, units: list | None = None) -> Any:
+        from src.document_authoring.contract_registry import (
+            normalized_missing_policy,
+            normalized_source_roles,
+            normalized_value_type,
+            supported_capabilities,
+        )
         from src.document_authoring.models import DocumentFieldSchema
+        from src.document_authoring.template_analysis import infer_field_contract
 
+        inferred = infer_field_contract(suggestion, units or [])
+        llm_eligible = suggestion.confidence >= 0.7
+        value_type = normalized_value_type(
+            suggestion.value_type if llm_eligible else None
+        ) or normalized_value_type(inferred["value_type"]) or "text"
+        raw_capabilities = list(suggestion.required_capabilities or []) or list(inferred["required_capabilities"])
+        capabilities, unsupported = supported_capabilities(raw_capabilities)
+        if unsupported:
+            import logging
+            logging.getLogger(__name__).warning(
+                "suggestion %s carries unsupported capabilities %s; kept deterministic set",
+                suggestion.semantic_unit_id, unsupported,
+            )
+            capabilities, _ = supported_capabilities(list(inferred["required_capabilities"]))
+        missing_policy = normalized_missing_policy(
+            suggestion.missing_policy if llm_eligible else None
+        ) or normalized_missing_policy(inferred["missing_policy"]) or "mark_tbd"
+        description = suggestion.description or inferred["description"]
         return DocumentFieldSchema(
             field_id=suggestion.semantic_unit_id,
             label=suggestion.label,
+            description=description,
+            value_type=value_type,
+            required_capabilities=capabilities,
+            preferred_source_roles=normalized_source_roles(
+                suggestion.preferred_source_roles if llm_eligible else inferred["preferred_source_roles"]
+            ),
+            missing_policy=missing_policy,
+            allow_derivation=bool(suggestion.allow_derivation) if llm_eligible else inferred["allow_derivation"],
+            max_evidence_items=5,
             retrieval_policy_id=f"retrieval-{suggestion.semantic_unit_id}",
             verification_policy_id=f"verification-{suggestion.semantic_unit_id}",
             query_terms=list(suggestion.retrieval_terms),
             authoring_policy="managed_writer",
+            table_columns=inferred.get("table_columns"),
+            # Template-backed tables receive rows from the frozen source set;
+            # their row keys are discovered from evidence at execution time.
+            # Persist the bounded scope so planning does not confuse a
+            # dynamic table with an unresolved table contract.
+            table_row_scope=("template_rows" if value_type == "table" else None),
+            table_row_order="input" if value_type == "table" else "declared",
         )
 
     @staticmethod
@@ -1819,6 +4124,20 @@ class DocumentGenerationService:
         bindings: list[TemplateUnitBinding] = []
         seen_targets: set[str] = set()
         for suggestion in analysis.suggestions:
+            if template.format != "docx" and suggestion.value_shape == "repeating_table":
+                from src.document_authoring.table_contracts import table_schema_from_targets
+                table = table_schema_from_targets(analysis, suggestion)
+                if seen_targets.intersection(suggestion.target_unit_ids):
+                    raise ValueError("suggested template targets may only be bound once")
+                seen_targets.update(suggestion.target_unit_ids)
+                bindings.append(TemplateUnitBinding(
+                    binding_id=f"binding-{table.table_region_id}",
+                    template_schema_id=template.template_schema_id,
+                    template_schema_version=template.template_schema_version,
+                    semantic_unit_type="field", semantic_unit_id=suggestion.semantic_unit_id,
+                    target_region_ids=[table.table_region_id], table_schema=table,
+                ))
+                continue
             if template.format != "docx":
                 if suggestion.value_shape != "scalar":
                     raise ValueError("workbook repeating tables require an explicit table schema")
@@ -1866,7 +4185,12 @@ class DocumentGenerationService:
         if policy.writer_provider_id == DeterministicEvidenceWriter.provider_id:
             return ManagedWriter(DeterministicEvidenceWriter())
         if policy.writer_provider_id == LLMManagedWriter.provider_id:
-            return ManagedWriter(LLMManagedWriter())
+            # Production managed writing is backed by the shared LangChain
+            # model factory. The normal service path probes native structured
+            # output first and keeps compatibility behavior inside the writer.
+            from src.core.model_factory import create_chat_model
+
+            return ManagedWriter(LLMManagedWriter(model=create_chat_model()))
         raise PermissionError("approved HarnessPolicy references an unsupported managed writer provider")
 
     @staticmethod
@@ -1988,23 +4312,54 @@ class DocumentGenerationService:
         *,
         requirement_id: str = "knowledge-base-retrieval",
         source_set_snapshot_id: str = "",
+        attachment_ids: Sequence[str] = (),
     ) -> RetrievalOutcome:
-        """Bind backend evidence to one selected knowledge base and source set."""
+        """Bind KB and chat-attachment evidence to frozen source references."""
         frozen_source_names = list(dict.fromkeys(source_names))
+        frozen_attachment_ids = {
+            str(attachment_id).strip()
+            for attachment_id in attachment_ids
+            if str(attachment_id).strip()
+        }
         accepted = []
+        attachment_evidence_by_id: dict[str, list[str]] = {}
         for evidence in evidences:
+            metadata = dict(getattr(evidence, "metadata", {}) or {})
+            source_type = str(
+                metadata.get("source_type")
+                or getattr(evidence, "source_type", "")
+                or ""
+            ).strip()
+            if source_type == "chat_attachment":
+                attachment_id = str(metadata.get("attachment_id") or "").strip()
+                if not attachment_id or attachment_id not in frozen_attachment_ids:
+                    raise PermissionError(
+                        "retrieval evidence attachment is outside the frozen attachment set"
+                    )
+                bound_evidence = copy(evidence)
+                bound_evidence.metadata = {
+                    **metadata,
+                    "source_type": "chat_attachment",
+                    "attachment_id": attachment_id,
+                }
+                accepted.append(bound_evidence)
+                attachment_evidence_by_id.setdefault(attachment_id, []).append(
+                    str(getattr(evidence, "id", ""))
+                )
+                continue
             if evidence.source_name not in frozen_source_names:
                 raise PermissionError("retrieval evidence is outside the frozen source set")
             declared_kb_names = {
-                str(evidence.metadata.get(key) or "").strip()
+                str(metadata.get(key) or "").strip()
                 for key in ("knowledge_base_name", "kb_name")
             } - {""}
             if any(name != knowledge_base_name for name in declared_kb_names):
                 raise PermissionError("retrieval evidence knowledge base does not match selection")
             bound_evidence = copy(evidence)
             bound_evidence.metadata = {
-                **evidence.metadata,
+                **metadata,
                 "knowledge_base_name": knowledge_base_name,
+                "source_type": "knowledge_base",
             }
             accepted.append(bound_evidence)
         evidence_by_source = {
@@ -2030,6 +4385,13 @@ class DocumentGenerationService:
                     evidence_ids=evidence_by_source[source_name],
                 )
                 for source_name in frozen_source_names
+            ] + [
+                RetrievalSourceOutcome(
+                    source_version_id=f"attachment:{attachment_id}",
+                    status="success_with_hits" if evidence_ids else "success_empty",
+                    evidence_ids=evidence_ids,
+                )
+                for attachment_id, evidence_ids in attachment_evidence_by_id.items()
             ],
             query_fingerprint=hashlib.sha256(
                 (
@@ -2102,7 +4464,108 @@ class DocumentGenerationService:
             "updated_at": datetime.now(timezone.utc),
             "lock_version": order.lock_version + 1,
         })
-        return self.store.replace_work_order(revised)
+        persisted = self.store.replace_work_order(revised)
+        self._sync_task_status(persisted, persisted.status)
+        return persisted
+
+    def _associate_task_run(self, order: Any, run_id: str) -> None:
+        task_id = str(getattr(order, "task_id", None) or "").strip()
+        if task_id:
+            self.task_service.store.attach_run(task_id, run_id)
+
+    def _save_artifact_for_task(
+        self,
+        order: Any,
+        artifact: DocumentArtifact,
+        content: bytes,
+        suffix: str,
+    ) -> DocumentArtifact:
+        revision_id = str(getattr(order, "revision_id", None) or "").strip()
+        if revision_id:
+            revision = self.revision_service.store.get(revision_id)
+            if revision is not None:
+                artifact_revision_id = str(getattr(artifact, "revision_id", None) or "").strip()
+                if artifact_revision_id and artifact_revision_id != revision_id:
+                    raise ValueError("artifact revision id does not match the work order revision")
+                updates = {"revision_id": revision_id}
+                if not str(getattr(artifact, "parent_artifact_id", None) or "").strip():
+                    updates["parent_artifact_id"] = revision.parent_artifact_id
+                artifact = artifact.model_copy(update=updates)
+        persisted = self.store.save_artifact(artifact, content, suffix)
+        task_id = str(getattr(order, "task_id", None) or "").strip()
+        if task_id:
+            if getattr(persisted, "run_id", None):
+                self.task_service.store.attach_run(task_id, persisted.run_id)
+            self.task_service.store.attach_artifact(task_id, persisted.artifact_id)
+        return persisted
+
+    def _bind_revision_child(self, order: Any, artifact: Any, *, report_status: str) -> None:
+        """Bind a finalized candidate as the child of the order's revision.
+
+        Worker-path completion: no user context exists here, so lineage is
+        re-verified inside ``bind_generated_child`` against stored facts.  A
+        failure must not lose the generated artifact, so binding errors are
+        logged and surfaced through the revision state instead.
+        """
+        if not str(getattr(order, "revision_id", None) or "").strip():
+            return
+        revalidation_status = {
+            "passed": "passed",
+            "requires_human": "requires_human",
+            "failed": "failed",
+        }.get(str(report_status or "").casefold())
+        if revalidation_status is None:
+            return
+        try:
+            self.revision_service.bind_generated_child(
+                order,
+                artifact,
+                revalidation_status=revalidation_status,
+                revalidation_result={
+                    "validation_report_id": str(getattr(artifact, "validation_report_id", "") or ""),
+                    "work_order_status_report": str(report_status),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "failed to bind revision child artifact %s for work order %s",
+                getattr(artifact, "artifact_id", "?"), getattr(order, "work_order_id", "?"),
+            )
+            raise
+
+    def _sync_task_status(self, order: Any, work_order_status: str) -> None:
+        task_id = str(getattr(order, "task_id", None) or "").strip()
+        if not task_id:
+            return
+        task_status = {
+            "planned": "planned",
+            "retrieving": "running",
+            "ready_to_draft": "running",
+            "drafting": "running",
+            "validating": "running",
+            "ready_to_render": "running",
+            "rendering": "running",
+            "waiting_human_input": "needs_clarification",
+            "waiting_human_approval": "waiting_human",
+            "paused": "waiting_human",
+            "complete": "completed",
+            "failed": "failed",
+            "blocked": "failed",
+            "cancelled": "cancelled",
+        }.get(str(work_order_status or "").strip(), "running")
+        try:
+            self.task_service.store.update_status(task_id, task_status)
+        except Exception:
+            # The task projection is additive during migration.  Do not turn
+            # a successfully persisted WorkOrder transition into a failed
+            # generation request if the projection store is temporarily
+            # unavailable; reconciliation can replay the status event.
+            logger.warning(
+                "failed to project WorkOrder %s status to DocumentTask %s",
+                getattr(order, "work_order_id", ""),
+                task_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _semantic_fills(
@@ -2112,6 +4575,7 @@ class DocumentGenerationService:
         bindings: dict[str, TemplateUnitBinding],
     ) -> WorkbookFillPlan | DocxFillPlan:
         fills: list[WorkbookFill] | list[DocxFill] = []
+        table_fills: list[WorkbookTableFill] = []
         for draft in drafts:
             if draft.validation_status != "supported" or statuses.get(draft.unit_id) != "ready_to_render":
                 continue
@@ -2121,6 +4585,53 @@ class DocumentGenerationService:
                 continue
             if draft.typed_value is None:
                 continue
+            if binding.table_schema is not None:
+                if draft.typed_value.kind != "table":
+                    raise ValueError("table binding requires a typed table draft")
+                columns = {col.column_id for col in binding.table_schema.columns}
+                if not draft.typed_value.rows or any(set(row.cells) != columns for row in draft.typed_value.rows):
+                    raise ValueError("table rows must match all mapped columns exactly")
+                rows = list(draft.typed_value.rows)
+                expected_row_keys = list(binding.table_schema.expected_row_keys)
+                row_keys = [row.row_key.strip() for row in rows]
+                if expected_row_keys:
+                    if any(not row_key for row_key in row_keys):
+                        raise ValueError("table rows require server-owned row keys")
+                    if set(row_keys) != set(expected_row_keys):
+                        missing = [key for key in expected_row_keys if key not in set(row_keys)]
+                        unexpected = [key for key in row_keys if key not in set(expected_row_keys)]
+                        raise ValueError(
+                            "table row keys do not match expected scope: "
+                            f"missing={missing}, unexpected={unexpected}"
+                        )
+                    if len(row_keys) != len(set(row_keys)) and binding.table_schema.duplicate_policy == "reject":
+                        raise ValueError("duplicate table row keys are not allowed")
+                    order = {key: index for index, key in enumerate(expected_row_keys)}
+                    rows.sort(key=lambda row: order[row.row_key])
+                elif binding.table_schema.row_order == "stable_key":
+                    if any(not row_key for row_key in row_keys):
+                        raise ValueError("stable table row ordering requires row keys")
+                    rows.sort(key=lambda row: row.row_key)
+                    if len(row_keys) != len(set(row_keys)) and binding.table_schema.duplicate_policy == "reject":
+                        raise ValueError("duplicate table row keys are not allowed")
+                elif len(row_keys) != len(set(row_keys)) and any(row_keys) and binding.table_schema.duplicate_policy == "reject":
+                    raise ValueError("duplicate table row keys are not allowed")
+                table_fills.append(WorkbookTableFill(
+                    table_region_id=binding.table_schema.table_region_id,
+                    semantic_unit_id=semantic_unit_id,
+                    rows=[WorkbookTableRowFill(
+                        row_key=row.row_key,
+                        cells=dict(row.cells),
+                        evidence_ids=list(row.evidence_ids),
+                        cell_evidence_ids={
+                            column: list(evidence_ids)
+                            for column, evidence_ids in row.cell_evidence_ids.items()
+                        },
+                    ) for row in rows],
+                ))
+                continue
+            if draft.typed_value.kind == "table":
+                raise ValueError("typed table requires a registered table binding")
             if template.format != "docx" and len(binding.target_region_ids) != 1:
                 raise ValueError("workbook scalar bindings require exactly one target")
             value = draft.typed_value.display_value
@@ -2129,7 +4640,10 @@ class DocumentGenerationService:
                     fills.append(DocxFill(region_id=region_id, value=str(value), semantic_unit_id=semantic_unit_id))
                 else:
                     fills.append(WorkbookFill(region_id=region_id, value=str(value), semantic_unit_id=semantic_unit_id))
-        return DocumentGenerationService._fill_plan(template, fills)
+        plan = DocumentGenerationService._fill_plan(template, fills)
+        if isinstance(plan, WorkbookFillPlan):
+            plan.table_fills = table_fills
+        return plan
 
     @staticmethod
     def _fill_plan(
@@ -2139,6 +4653,36 @@ class DocumentGenerationService:
         if template.format == "docx":
             return DocxFillPlan(template_version_id=template.template_version_id, fills=fills)
         return WorkbookFillPlan(template_version_id=template.template_version_id, fills=fills)
+
+    @staticmethod
+    def _table_schemas_for_fill_plan(
+        table_schemas: list[Any],
+        fill_plan: Any,
+    ) -> list[Any]:
+        """Allow validated table fills to exceed an activation-time row bound.
+
+        ``max_output_rows`` was recorded when the template mapping was
+        activated, but a frozen dynamic table (for example the EDF connector
+        pin set) may legitimately contain more rows than the template sample.
+        The fill rows have already passed coverage and unit review, so the
+        renderer bound is widened to the validated row count instead of
+        rejecting the deliverable.
+        """
+
+        schemas = list(table_schemas)
+        table_fills = list(getattr(fill_plan, "table_fills", []) or [])
+        if not table_fills:
+            return schemas
+        by_id = {schema.table_region_id: index for index, schema in enumerate(schemas)}
+        for fill in table_fills:
+            index = by_id.get(fill.table_region_id)
+            if index is None:
+                continue
+            schema = schemas[index]
+            row_count = len(list(getattr(fill, "rows", []) or []))
+            if row_count > int(getattr(schema, "max_output_rows", 0) or 0):
+                schemas[index] = schema.model_copy(update={"max_output_rows": row_count})
+        return schemas
 
     def _render_fill_plan(
         self,
@@ -2158,6 +4702,16 @@ class DocumentGenerationService:
                 fill_plan,
                 policy,
                 security_approved=True,
+                table_schemas=self._table_schemas_for_fill_plan(
+                    [
+                        binding.table_schema
+                        for binding in self.store.list_unit_bindings(
+                            template.template_schema_id, template.template_schema_version,
+                        )
+                        if binding.table_schema is not None
+                    ],
+                    fill_plan,
+                ),
             )
         elif template.format == "docx":
             if not isinstance(fill_plan, DocxFillPlan):
@@ -2179,6 +4733,9 @@ class DocumentGenerationService:
         return self.workbook_renderer.inspect(content, format)
 
     def _assert_generated_artifact_clean(self, content: bytes, format: str) -> None:
+        normalized = str(format or "").strip().lower().lstrip(".")
+        if normalized in {"xlsx", "xlsm", "docx"}:
+            validate_ooxml_package(content, normalized)
         if self._inspect(content, format).active_content_status != "clean":
             raise ValueError("generated artifact contains active content")
 
@@ -2203,8 +4760,48 @@ class DocumentGenerationService:
                 raise PermissionError(
                     "knowledge base retrieval outcome used unexpected region policies"
                 )
+            source_scope = order.source_scope_snapshot or "knowledge_base_only"
+            if source_scope == "auto":
+                source_scope = (
+                    "attachment_and_knowledge_base"
+                    if order.attachment_refs_snapshot
+                    else "knowledge_base_only"
+                )
+            allowed_attachment_refs = {
+                str(ref.get("attachment_id") or "").strip(): ref
+                for ref in order.attachment_refs_snapshot
+                if str(ref.get("attachment_id") or "").strip()
+            }
             for evidence in outcome.evidences:
-                if evidence.metadata.get("knowledge_base_name") != order.knowledge_base_name:
+                metadata = dict(getattr(evidence, "metadata", {}) or {})
+                source_type = str(
+                    metadata.get("source_type")
+                    or getattr(evidence, "source_type", "")
+                    or ""
+                ).strip()
+                if source_type == "chat_attachment":
+                    if source_scope not in {"attachment_only", "attachment_and_knowledge_base"}:
+                        raise PermissionError(
+                            "retrieval outcome contains attachment evidence outside its source scope"
+                        )
+                    attachment_id = str(metadata.get("attachment_id") or "").strip()
+                    frozen_ref = allowed_attachment_refs.get(attachment_id)
+                    if frozen_ref is None:
+                        raise PermissionError(
+                            "retrieval evidence attachment is outside the work order snapshot"
+                        )
+                    asset_id = str(metadata.get("asset_id") or "").strip()
+                    frozen_asset_id = str(frozen_ref.get("asset_id") or "").strip()
+                    if asset_id and frozen_asset_id and asset_id != frozen_asset_id:
+                        raise PermissionError(
+                            "retrieval evidence attachment asset does not match the work order snapshot"
+                        )
+                    continue
+                if source_scope == "attachment_only":
+                    raise PermissionError(
+                        "retrieval outcome contains knowledge-base evidence outside its source scope"
+                    )
+                if metadata.get("knowledge_base_name") != order.knowledge_base_name:
                     raise PermissionError(
                         "retrieval evidence knowledge base does not match work order"
                     )

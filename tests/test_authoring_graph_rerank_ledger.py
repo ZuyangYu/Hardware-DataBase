@@ -302,6 +302,39 @@ def test_long_evidence_without_a_field_specific_anchor_is_not_sent_to_writer():
     assert discarded == ["irrelevant"]
 
 
+def test_long_evidence_is_retained_when_no_candidate_contains_the_semantic_anchor():
+    """Semantic reranking/writer must get a chance when lexical anchors are absent."""
+    evidences = [
+        {"id": "hsi", "content": "hardware system interface connector mapping " * 20, "score": 0.9},
+        {"id": "datasheet", "content": "electrical characteristics and pin assignment " * 20, "score": 0.8},
+    ]
+    selected, discarded = _select_field_evidence(
+        evidences,
+        max_items=5,
+        preserve_rerank_order=False,
+        retrieval_query_terms=["Sheet1!C16", "功能描述 Function"],
+    )
+
+    assert [item["id"] for item in selected] == ["hsi", "datasheet"]
+    assert discarded == []
+
+
+def test_template_sample_anchor_does_not_drop_all_long_candidates_when_unmatched():
+    """Neighboring sample values guide retrieval but are not proof of relevance."""
+    selected, discarded = _select_field_evidence(
+        [
+            {"id": "hsi", "content": "hardware system interface connector mapping " * 20, "score": 0.9},
+            {"id": "datasheet", "content": "electrical characteristics and pin assignment " * 20, "score": 0.8},
+        ],
+        max_items=5,
+        preserve_rerank_order=False,
+        retrieval_query_terms=["X302-1", "功能描述 Function"],
+    )
+
+    assert [item["id"] for item in selected] == ["hsi", "datasheet"]
+    assert discarded == []
+
+
 def test_non_reranked_evidence_uses_preferred_role_then_score_then_id_order():
     evidences = [
         _evidence("high-score", "high", score=0.9),
