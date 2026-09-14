@@ -6,7 +6,7 @@ from src.api.deps import require_dashboard_access
 from src.core.auth import ROLE_SYSTEM_ADMIN, AuthUser
 from src.core.conversation import ConversationService
 from src.core.llm_governor import get_llm_governor
-from src.core.model_gateway import get_usage_ledger
+from src.core.model_gateway import get_persisted_usage, get_usage_ledger
 from src.observability.health import check_dependencies, check_ready
 
 
@@ -29,5 +29,6 @@ def system_status(
         "llm": {
             **get_llm_governor().snapshot(),
             "usage": get_usage_ledger().snapshot(),
+            "persisted_usage": get_persisted_usage(),
         },
     }

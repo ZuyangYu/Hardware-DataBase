@@ -385,6 +385,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             turn.query_mode,
             cancelled,
             persist_thread=True,
+            wiki_assist=turn.wiki_assist,
         )
         try:
             for chunk in gen:
@@ -536,6 +537,7 @@ def create_turn(
         body.client_request_id,
         query_mode,
         trace_context=inject_trace_context(),
+        wiki_assist=body.wiki_assist,
     )
     messages = conv.list_messages(user.id, session_id)
     user_message = next((message for message in messages if message.id == turn.user_message_id), None)
@@ -797,7 +799,8 @@ async def query(
                 body.thread_id,
                 _forward_event,
                 "deep",
-                None,
+                cancel.is_set,
+                wiki_assist=body.wiki_assist,
             )
             for chunk in gen:
                 if cancel.is_set():
@@ -940,6 +943,7 @@ def _query_generator(
     query_mode="deep",
     should_cancel=None,
     persist_thread=False,
+    wiki_assist=False,
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -953,6 +957,8 @@ def _query_generator(
             kwargs["should_cancel"] = should_cancel
         if persist_thread and "persist_thread" in params:
             kwargs["persist_thread"] = True
+        if "wiki_assist" in params:
+            kwargs["wiki_assist"] = wiki_assist
         return pipeline.query(
             query,
             kb_name,
@@ -967,6 +973,8 @@ def _query_generator(
         kwargs["should_cancel"] = should_cancel
     if persist_thread and "persist_thread" in params:
         kwargs["persist_thread"] = True
+    if "wiki_assist" in params:
+        kwargs["wiki_assist"] = wiki_assist
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 

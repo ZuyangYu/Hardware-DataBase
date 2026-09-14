@@ -4,6 +4,7 @@ import signal
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import src.settings
 from src.api.context import build_context_for_user
@@ -66,28 +67,47 @@ class HardwareWorker:
     def stop(self, *_args) -> None:
         self.running = False
 
+    def _process_turn(self, turn, user_id) -> None:
+        user = self.auth.get_user_by_id(user_id)
+        if user is None or not user.is_active:
+            return
+        started = time.monotonic()
+        try:
+            heartbeat(self.worker_id, task_kind="chat", task_id=str(turn.id))
+            ctx = build_context_for_user(user, turn.kb_name, auth=self.auth)
+            _run_turn(turn_id=turn.id, user=user, ctx=ctx, pipeline=self.pipeline)
+            record_worker(status="success", duration_s=time.monotonic() - started)
+        except Exception as exc:
+            record_worker(status="failed", duration_s=time.monotonic() - started)
+            error(f"Chat worker failed for turn {turn.id}: {exc}")
+        finally:
+            heartbeat(self.worker_id)
+
     def run_once(self) -> bool:
         self._reload_runtime_settings_if_changed()
         did_work = False
         self.conversations.requeue_stale_turns()
         depth, oldest_age_s = self.conversations.pending_turn_queue_state()
         set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
-        for turn, user_id in self.conversations.list_pending_turn_work(limit=8):
-            user = self.auth.get_user_by_id(user_id)
-            if user is None or not user.is_active:
-                continue
-            try:
-                started = time.monotonic()
-                heartbeat(self.worker_id, task_kind="chat", task_id=str(turn.id))
-                ctx = build_context_for_user(user, turn.kb_name, auth=self.auth)
-                _run_turn(turn_id=turn.id, user=user, ctx=ctx, pipeline=self.pipeline)
-                did_work = True
-                record_worker(status="success", duration_s=time.monotonic() - started)
-            except Exception as exc:
-                record_worker(status="failed", duration_s=time.monotonic() - started)
-                error(f"Chat worker failed for turn {turn.id}: {exc}")
-            finally:
-                heartbeat(self.worker_id)
+        claims = list(self.conversations.list_pending_turn_work(limit=8))
+        concurrency = max(1, int(getattr(src.settings, "WORKER_TURN_CONCURRENCY", 1) or 1))
+        if claims:
+            if concurrency <= 1:
+                for turn, user_id in claims:
+                    self._process_turn(turn, user_id)
+                    did_work = True
+            else:
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    futures = [
+                        pool.submit(self._process_turn, turn, user_id)
+                        for turn, user_id in claims
+                    ]
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as exc:  # noqa: BLE001 - 单轮失败不影响其他轮
+                            error(f"Chat worker turn future failed: {exc}")
+                        did_work = True
         depth, oldest_age_s = self.conversations.pending_turn_queue_state()
         set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
         if self.runtime is not None:

@@ -20,6 +20,23 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
     def _service(self, tmp):
         return AuthService(db_path=os.path.join(tmp, "auth.db"))
 
+    def test_knowledge_base_owner_roundtrip_and_legacy_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = self._service(tmp)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            dept = auth.create_department("dept_owner")
+            emp = auth.create_user_as(system_admin, "emp_owner", "password123", ROLE_EMPLOYEE, dept.id)
+
+            auth.register_knowledge_base("owned", owner=emp)
+            auth.register_knowledge_base("legacy")
+
+            self.assertEqual(auth.get_knowledge_base_owner("owned", department_id=dept.id), emp.id)
+            self.assertIsNone(auth.get_knowledge_base_owner("legacy"))
+            self.assertIsNone(auth.get_knowledge_base_owner("missing"))
+
+            del auth
+            gc.collect()
+
     def test_same_kb_name_is_scoped_by_department_and_kb_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth = self._service(tmp)

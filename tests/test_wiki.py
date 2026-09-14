@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 
 import src.settings
 from src.core.auth import AuthService, ROLE_EMPLOYEE
-from src.core.wiki import WikiService
+from src.core.wiki import WikiService, _normalize_wiki_links
 
 
 class WikiServiceTests(unittest.TestCase):
@@ -32,6 +34,115 @@ class WikiServiceTests(unittest.TestCase):
         src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = self.old_password
         self._tmp.cleanup()
         gc.collect()
+
+    def _insert_page(
+        self, *, slug: str, title: str, page_type: str = "entity", content: str = "",
+        aliases: list[str] | None = None, source_refs: list[str] | None = None,
+        chunk_refs: list[str] | None = None,
+    ) -> None:
+        with closing(self.service._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO wiki_pages (
+                    department_id, kb_id, kb_name, slug, title, page_type, status,
+                    content, summary, aliases_json, source_refs_json, chunk_refs_json,
+                    version, last_edit_source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'published', ?, '', ?, ?, ?, 1, 'pipeline', ?, ?)
+                """,
+                (
+                    self.department.id, self.kb_a, "KB-A", slug, title, page_type, content,
+                    json.dumps(aliases or [], ensure_ascii=False),
+                    json.dumps(source_refs or [], ensure_ascii=False),
+                    json.dumps(chunk_refs or [], ensure_ascii=False),
+                    "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            conn.commit()
+
+    def test_pass0_resolves_synonym_to_existing_page(self) -> None:
+        self._insert_page(slug="entity/eyeq6l", title="EYEQ6L", aliases=["EQ6L"])
+        chat_fn = self._fake_chat({
+            "_default": '{"entities": [{"name": "EQ6L", "slug": "entity/eq6l", '
+                        '"aliases": ["EyeQ6L"], "description": "同义实体"}], "concepts": []}',
+        })
+        items = self.service._pass0_candidates(chat_fn, "材料", "standard", self.kb_a)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["slug"], "entity/eyeq6l")
+
+    def test_pass0_does_not_merge_across_page_types(self) -> None:
+        self._insert_page(slug="concept/watchdog", title="看门狗", page_type="concept",
+                          aliases=["watchdog"])
+        chat_fn = self._fake_chat({
+            "_default": '{"entities": [{"name": "watchdog", "slug": "entity/watchdog", '
+                        '"aliases": [], "description": "d"}], '
+                        '"concepts": [{"name": "看门狗机制", "slug": "concept/wdt", '
+                        '"aliases": ["watchdog"], "description": "d"}]}',
+        })
+        items = self.service._pass0_candidates(chat_fn, "材料", "standard", self.kb_a)
+        by_kind = {item["kind"]: item["slug"] for item in items}
+        # entity 候选不被同名 concept 页吞并
+        self.assertEqual(by_kind["entity"], "entity/watchdog")
+        # concept 候选命中同类型页的别名 → 归并
+        self.assertEqual(by_kind["concept"], "concept/watchdog")
+
+    def test_merge_pages_folds_content_and_archives_source(self) -> None:
+        self._insert_page(slug="entity/eyeq6l", title="EYEQ6L", aliases=["EQ6L"],
+                          content="目标页正文: EYEQ6L 是视觉芯片\n\n## 来源\n[1] x")
+        self._insert_page(
+            slug="entity/eq6l", title="EQ6L", aliases=["EyeQ6L"],
+            content="源页独有事实: R541~R545 电阻\n\n## 来源\n[1] net.edf",
+            source_refs=["35|net.edf"], chunk_refs=["35#digest-1"],
+        )
+        self._insert_page(slug="entity/adas", title="ADAS", content="见 [[entity/eq6l]] 页")
+        result = self.service.merge_pages(
+            kb_id=self.kb_a, source_slug="entity/eq6l", target_slug="entity/eyeq6l"
+        )
+        pages = {p["slug"]: p for p in self.service.list_pages(
+            kb_id=self.kb_a, department_id=self.department.id)}
+        self.assertNotIn("entity/eq6l", pages)  # 已归档, 默认列表不含
+        target = self.service.get_page(
+            kb_id=self.kb_a, department_id=self.department.id, slug="entity/eyeq6l")
+        self.assertIn("EQ6L", target["aliases"])
+        self.assertIn("35|net.edf", target["source_refs"])
+        self.assertIn("源页独有事实: R541~R545 电阻", target["content"])
+        self.assertIn("## 合并自《EQ6L》", target["content"])
+        # 源页归档保留, 修订历史不删除
+        archived = self.service.get_page(
+            kb_id=self.kb_a, department_id=self.department.id, slug="entity/eq6l")
+        self.assertIsNotNone(archived)
+        with closing(self.service._connect()) as conn:
+            status = conn.execute(
+                "SELECT status FROM wiki_pages WHERE kb_id = ? AND slug = ?",
+                (self.kb_a, "entity/eq6l"),
+            ).fetchone()["status"]
+        self.assertEqual(status, "archived")
+        adas = self.service.get_page(
+            kb_id=self.kb_a, department_id=self.department.id, slug="entity/adas")
+        self.assertIn("[[entity/eyeq6l]]", adas["content"])
+        self.assertEqual(result["links_rewritten"], 1)
+
+    def test_markdown_wiki_links_normalized(self) -> None:
+        out = _normalize_wiki_links("见 [entity/tp40](entity/tp40) 与 [x](concept/pmic)")
+        self.assertEqual(out, "见 [[entity/tp40]] 与 [[concept/pmic]]")
+
+    def test_job_state_roundtrip(self) -> None:
+        self.assertIsNone(self.service.get_job_state(self.kb_a))
+        self.service.save_job_state(
+            kb_id=self.kb_a, department_id=self.department.id,
+            state={"running": True, "stage": "写入词条 3/9", "started_at": "2026-01-01T00:00:00+00:00"},
+        )
+        state = self.service.get_job_state(self.kb_a)
+        self.assertTrue(state["running"])
+        self.assertEqual(state["stage"], "写入词条 3/9")
+        self.service.save_job_state(
+            kb_id=self.kb_a, department_id=self.department.id,
+            state={"running": False, "stage": "完成", "stats": {"pages_written": 9},
+                   "finished_at": "2026-01-01T01:00:00+00:00"},
+        )
+        state = self.service.get_job_state(self.kb_a)
+        self.assertFalse(state["running"])
+        self.assertEqual(state["stats"]["pages_written"], 9)
+        self.assertEqual(state["started_at"], "2026-01-01T00:00:00+00:00")
 
     @staticmethod
     def _fake_chat(responses: dict[str, str]):
@@ -81,7 +192,7 @@ class WikiServiceTests(unittest.TestCase):
         self.assertIn("index", pages)
         # 引文块级溯源
         detail = self.service.get_page(kb_id=self.kb_a, department_id=self.department.id, slug="entity/tcan1145dmtrq1")
-        self.assertEqual(detail["chunk_refs"], ["entity/tcan1145dmtrq1#chunk-1"])
+        self.assertEqual(detail["chunk_refs"], ["34#chunk-1"])
         self.assertEqual(detail["source_refs"], ["34|HWDebug.xlsx"])
         # 互链: 页面正文提及 [[entity/r1618]] → 出链; r1618 反链
         self.assertIn("entity/r1618", detail["out_links"])
@@ -100,7 +211,7 @@ class WikiServiceTests(unittest.TestCase):
             chat_fn=chat_fn, granularity="standard",
         )
         detail = self.service.get_page(kb_id=self.kb_a, department_id=self.department.id, slug="entity/tcan1145dmtrq1")
-        self.assertEqual(detail["chunk_refs"], ["entity/tcan1145dmtrq1#chunk-1"])
+        self.assertEqual(detail["chunk_refs"], ["1#chunk-1"])
 
     def test_citation_material_keeps_original_chunk_mapping(self) -> None:
         """回归: 引用批次曾用"全文重新分段"的索引去截原始块, 导致张冠李戴。"""
@@ -339,6 +450,17 @@ class SpreadsheetBlocksTests(unittest.TestCase):
         self.assertNotIn("参考样例", joined)
         self.assertIn("项目2真实数据", joined)
 
+    def test_example_only_document_falls_back(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO table_sheets VALUES (9, 'Example', 86)")
+        conn.execute(
+            "INSERT INTO table_text_blocks VALUES (9, 'Example', 0, "
+            "'Sheet: Example Rows: 1-10 仅有示例内容 配置A=1')")
+        conn.commit()
+        conn.close()
+        blocks = self.service._spreadsheet_blocks("9", kb_id=9, department_id=7, kb_name=self.kb_name)
+        self.assertIn("仅有示例内容", "\n".join(blocks))
+
 
 class GatherDocumentsRouteTests(unittest.TestCase):
     """回归: 路由曾把 ctx 当 kb_name 传给 gather_documents; 采集又用本地主键调
@@ -405,12 +527,13 @@ class GatherDocumentsRouteTests(unittest.TestCase):
                 )]
 
         with mock.patch.object(wiki_routes, "WikiService", lambda: WikiService(db_path=self.wiki_path)), \
-                mock.patch.object(WikiService, "_spreadsheet_blocks", return_value=["块A"]) as blocks:
+                mock.patch.object(WikiService, "_spreadsheet_blocks", return_value=[("块A", "硬件需求!0")]) as blocks:
             docs = wiki_routes._gather_documents(Pipeline(), self.ctx, "KB-A", kb_id=9, department_id=7)
 
-        blocks.assert_called_once_with("30", 9, 7, "KB-A")
+        blocks.assert_called_once_with("30", 9, 7, "KB-A", with_refs=True)
         self.assertEqual(docs[0]["doc_id"], "30")
         self.assertEqual(docs[0]["chunks"], ["块A"])
+        self.assertEqual(docs[0]["chunk_refs"], ["硬件需求!0"])
 
     def test_circuit_branch_builds_structured_digest(self) -> None:
         from types import SimpleNamespace
@@ -475,14 +598,14 @@ class GatherDocumentsRouteTests(unittest.TestCase):
 
         self.assertEqual(len(docs), 1)
         chunks = docs[0]["chunks"]
-        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks), 5)
         self.assertIn("edf-abc", chunks[0])
         self.assertIn("Power", chunks[0])
-        self.assertIn("VCC3V3", chunks[0])
-        self.assertIn("时钟网", chunks[0])
-        self.assertIn("TPS62872 × 2", chunks[1])
-        self.assertIn("X1", chunks[1])
-        self.assertIn("unresolved cell", chunks[1])
+        self.assertIn("VCC3V3", chunks[1])
+        self.assertIn("CLK_24M", chunks[2])
+        self.assertIn("TPS62872 × 2", chunks[3])
+        self.assertIn("X1", chunks[4])
+        self.assertIn("unresolved cell", chunks[4])
 
 
     def test_ragflow_template_chunks_filtered_from_material(self) -> None:
@@ -520,3 +643,106 @@ class GatherDocumentsRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WikiLintAndGraphTests(unittest.TestCase):
+    """lint_pages 只读质量报告 + 图谱文档视图投影。"""
+
+    def setUp(self) -> None:
+        self.old_password = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self._tmp = tempfile.TemporaryDirectory(prefix="_test_wiki_lint_")
+        self.db_path = os.path.join(self._tmp.name, "wiki.db")
+        self.auth = AuthService(db_path=self.db_path)
+        system_admin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        self.department = self.auth.create_department("hw")
+        self.admin = self.auth.create_user_as(
+            system_admin, "hw_admin", "password123", ROLE_EMPLOYEE, self.department.id
+        )
+        self.auth.register_knowledge_base("KB-L", owner=self.admin)
+        self.kb_id = self.auth.get_knowledge_base_id("KB-L", department_id=self.department.id)
+        self.service = WikiService(db_path=self.db_path)
+
+    def tearDown(self) -> None:
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = self.old_password
+        self._tmp.cleanup()
+        gc.collect()
+
+    def _page(self, slug, title, *, page_type="entity", content=None, aliases=None,
+              in_links=None, out_links=None, source_refs=None, chunk_refs=None):
+        with closing(self.service._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO wiki_pages (
+                    department_id, kb_id, kb_name, slug, title, page_type, status,
+                    content, summary, aliases_json, in_links_json, out_links_json,
+                    source_refs_json, chunk_refs_json, version, last_edit_source,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'published', ?, '', ?, ?, ?, ?, ?, 1, 'pipeline', ?, ?)
+                """,
+                (
+                    self.department.id, self.kb_id, "KB-L", slug, title, page_type,
+                    content if content is not None else "内容" * 60,
+                    json.dumps(aliases or [], ensure_ascii=False),
+                    json.dumps(in_links or [], ensure_ascii=False),
+                    json.dumps(out_links or [], ensure_ascii=False),
+                    json.dumps(source_refs or [], ensure_ascii=False),
+                    json.dumps(chunk_refs or [], ensure_ascii=False),
+                    "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            conn.commit()
+
+    def test_lint_flags_issues_and_scores(self) -> None:
+        self._page("entity/a", "A", in_links=["entity/b"], out_links=["entity/b"],
+                   source_refs=["32|doc.xlsx"], chunk_refs=["32#sheet!0"])
+        self._page("entity/b", "B", in_links=["entity/a"], out_links=["entity/a", "entity/missing"],
+                   source_refs=["32|doc.xlsx"], chunk_refs=["32#sheet!1"])
+        self._page("entity/empty", "空页", content="太短", in_links=["entity/a"],
+                   source_refs=["99|gone.xlsx"],
+                   chunk_refs=["entity/empty#chunk-1"])
+        self._page("entity/dup", "A", aliases=["A 别名"], in_links=["entity/b"],
+                   source_refs=["32|doc.xlsx"], chunk_refs=["32#sheet!2"])
+        report = self.service.lint_pages(
+            kb_id=self.kb_id, department_id=self.department.id,
+            known_source_ids={"32"},
+        )
+        types = {i["type"] for i in report["issues"]}
+        self.assertIn("broken_link", types)
+        self.assertIn("empty_content", types)
+        self.assertIn("stale_source", types)
+        self.assertIn("placeholder_refs", types)
+        self.assertIn("duplicate_alias", types)
+        self.assertLess(report["health_score"], 100)
+        self.assertGreaterEqual(report["health_score"], 0)
+        self.assertEqual(report["stats"]["pages"], 4)
+
+    def test_pages_for_source_returns_summary_and_referencing_pages(self) -> None:
+        self._page("summary/32", "doc.xlsx", page_type="summary",
+                   source_refs=["32|doc.xlsx"], chunk_refs=["32#sheet!1"])
+        self._page("entity/a", "A", source_refs=["32|doc.xlsx"], in_links=["summary/32"],
+                   chunk_refs=["32#sheet!2"])
+        self._page("entity/b", "B", source_refs=["36|other.pdf"], in_links=["summary/32"],
+                   chunk_refs=["36#c-1"])
+        refs = self.service.pages_for_source(
+            kb_id=self.kb_id, department_id=self.department.id, source_id="32"
+        )
+        self.assertEqual(refs["summary"]["slug"], "summary/32")
+        self.assertEqual([p["slug"] for p in refs["pages"]], ["entity/a"])
+
+    def test_graph_documents_view_projects_shared_pages(self) -> None:
+        self._page("entity/shared", "共享器件", source_refs=["32|a.xlsx", "36|b.pdf"],
+                   in_links=["entity/x"], chunk_refs=["32#s!1"])
+        self._page("entity/only32", "仅A", source_refs=["32|a.xlsx"], in_links=["entity/x"],
+                   chunk_refs=["32#s!2"])
+        self._page("entity/x", "X", source_refs=["36|b.pdf"], in_links=[], chunk_refs=["36#c-1"])
+        graph = self.service.get_graph(
+            kb_id=self.kb_id, department_id=self.department.id, view="documents"
+        )
+        self.assertEqual(graph["view"], "documents")
+        titles = {n["slug"]: n["title"] for n in graph["nodes"]}
+        self.assertEqual(titles.get("32"), "a.xlsx")
+        self.assertEqual(titles.get("36"), "b.pdf")
+        edge = next(e for e in graph["edges"] if {e["source"], e["target"]} == {"32", "36"})
+        self.assertEqual(edge["weight"], 1)
+        self.assertIn("entity/shared", edge["pages"])

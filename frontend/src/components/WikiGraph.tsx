@@ -7,6 +7,7 @@ const NODE_FILL: Record<string, string> = {
   entity: '#3d5a91',
   concept: '#b45309',
   index: '#5b6478',
+  document: '#6b4fa0',
 };
 
 const TYPE_LABEL: Record<string, string> = {
@@ -21,16 +22,20 @@ type Props = {
   onSelect: (slug: string) => void;
 };
 
-/** 零依赖 SVG 知识图谱: 中心为链接最多的枢纽, 其余按环形排布, 点击节点打开详情。 */
+/** 零依赖 SVG 知识图谱: 词条视图(互链) / 文档视图(共享词条投影), 点击节点打开详情。 */
 export default function WikiGraph({ graph, onSelect }: Props) {
+  const isDocs = graph.view === 'documents';
+  const degree = (node: WikiGraphView['nodes'][number]) =>
+    node.link_count ?? node.page_count ?? 0;
+
   const layout = useMemo(() => {
-    const ordered = [...graph.nodes].sort((a, b) => b.link_count - a.link_count);
+    const ordered = [...graph.nodes].sort((a, b) => degree(b) - degree(a));
     const pos = new Map<string, { x: number; y: number; r: number }>();
     const [center, ...rest] = ordered;
     if (!center) {
       return { pos, viewBox: '0 0 640 360', labeled: new Set<string>() };
     }
-    pos.set(center.slug, { x: 0, y: 0, r: 11 + Math.min(center.link_count, 12) });
+    pos.set(center.slug, { x: 0, y: 0, r: 11 + Math.min(degree(center), 12) });
     let idx = 0;
     let ring = 1;
     while (idx < rest.length) {
@@ -42,7 +47,7 @@ export default function WikiGraph({ graph, onSelect }: Props) {
         pos.set(node.slug, {
           x: radius * Math.cos(angle),
           y: radius * 0.8 * Math.sin(angle),
-          r: 5 + Math.min(node.link_count, 8),
+          r: 5 + Math.min(degree(node), 8),
         });
       });
       idx += batch.length;
@@ -69,14 +74,23 @@ export default function WikiGraph({ graph, onSelect }: Props) {
   return (
     <div>
       <div className="mb-[10px] flex flex-wrap items-center gap-[12px] text-[11px] text-[#5b6478]">
-        {Object.keys(TYPE_LABEL).map((type) => (
-          <span key={type} className="inline-flex items-center gap-[5px]">
-            <span className="inline-block size-[8px] rounded-full" style={{ background: NODE_FILL[type] }} />
-            {TYPE_LABEL[type]}
+        {isDocs ? (
+          <span className="inline-flex items-center gap-[5px]">
+            <span className="inline-block size-[8px] rounded-full" style={{ background: NODE_FILL.document }} />
+            来源文档
           </span>
-        ))}
+        ) : (
+          Object.keys(TYPE_LABEL).map((type) => (
+            <span key={type} className="inline-flex items-center gap-[5px]">
+              <span className="inline-block size-[8px] rounded-full" style={{ background: NODE_FILL[type] }} />
+              {TYPE_LABEL[type]}
+            </span>
+          ))
+        )}
         <span className="ml-auto">
-          {graph.total} 个节点{graph.truncated ? '(仅显示前 200)' : ''} · 圆圈越大链接越多 · 箭头为引用方向 · 点击节点查看详情
+          {isDocs
+            ? `${graph.total} 份文档 · 节点大小=贡献词条数 · 连线粗细=共享词条数 · 点击查看该文档摘要`
+            : `${graph.total} 个节点${graph.truncated ? '(仅显示前 200)' : ''} · 圆圈越大链接越多 · 箭头为引用方向 · 点击节点查看详情`}
         </span>
       </div>
       <div className="overflow-hidden rounded-[14px] border border-[#f2f3f7] bg-white">
@@ -90,12 +104,27 @@ export default function WikiGraph({ graph, onSelect }: Props) {
             const from = layout.pos.get(edge.source);
             const to = layout.pos.get(edge.target);
             if (!from || !to) return null;
-            return <line key={index} x1={from.x} y1={from.y} x2={to.x} y2={to.y} stroke="#dfe4ee" strokeWidth={1} markerEnd="url(#wiki-edge-arrow)" />;
+            const width = isDocs ? 1 + Math.min(3, (edge.weight ?? 1) / 3) : 1;
+            return (
+              <line
+                key={index}
+                x1={from.x}
+                y1={from.y}
+                x2={to.x}
+                y2={to.y}
+                stroke="#dfe4ee"
+                strokeWidth={width}
+                markerEnd={isDocs ? undefined : 'url(#wiki-edge-arrow)'}
+              >
+                {isDocs && edge.weight ? <title>{`共享 ${edge.weight} 个词条`}</title> : null}
+              </line>
+            );
           })}
           {graph.nodes.map((node) => {
             const point = layout.pos.get(node.slug);
             if (!point) return null;
-            const dimmed = node.link_count === 0;
+            const dimmed = degree(node) === 0;
+            const fill = isDocs ? NODE_FILL.document : (node.page_type ? NODE_FILL[node.page_type] : undefined) ?? '#5b6478';
             return (
               <g
                 key={node.slug}
@@ -103,11 +132,11 @@ export default function WikiGraph({ graph, onSelect }: Props) {
                 className="cursor-pointer"
                 onClick={() => onSelect(node.slug)}
               >
-                <title>{node.title}</title>
-                <circle cx={point.x} cy={point.y} r={point.r} fill={NODE_FILL[node.page_type] ?? '#5b6478'} opacity={0.88} />
+                <title>{isDocs ? `${node.title} · ${node.page_count ?? 0} 个词条` : node.title}</title>
+                <circle cx={point.x} cy={point.y} r={point.r} fill={fill} opacity={0.88} />
                 {layout.labeled.has(node.slug) && (
                   <text x={point.x} y={point.y + point.r + 12} textAnchor="middle" fontSize={10} fill="#5b6478">
-                    {(node.title || node.slug).slice(0, 9)}
+                    {(node.title || node.slug).slice(0, isDocs ? 14 : 9)}
                   </text>
                 )}
               </g>

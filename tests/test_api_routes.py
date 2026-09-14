@@ -10,7 +10,7 @@ import httpx
 
 from src.api.app import create_app
 from src.api.deps import get_auth_service, get_pipeline
-from src.core.auth import ROLE_EMPLOYEE
+from src.core.auth import ROLE_EMPLOYEE, AuthService
 from src.core.conversation import ConversationService
 
 from tests._api_stub import Server, StubPipeline, make_auth
@@ -511,3 +511,35 @@ class ApiRoutesTests(unittest.TestCase):
             self.client.get(f"/api/v1/turns/{turn['id']}", headers=self._auth(token)).json()["status"],
             "completed",
         )
+
+
+class TurnWikiAssistFlagTests(unittest.TestCase):
+    """per-turn Wiki 辅助开关: 默认关闭, 可开启并持久化。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="_test_turn_wiki_")
+        self.db_path = os.path.join(self._tmp.name, "auth.db")
+        self.auth = AuthService(db_path=self.db_path)
+        self.conv = ConversationService(db_path=self.db_path)
+        admin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        self.dept = self.auth.create_department("hw")
+        self.user = self.auth.create_user_as(
+            admin, "wiki_flag_user", "password123", ROLE_EMPLOYEE, self.dept.id
+        )
+        self.auth.register_knowledge_base("KB-WF", owner=self.user)
+        self.session = self.conv.create_session(self.user.id, "KB-WF")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        gc.collect()
+
+    def test_wiki_assist_defaults_false_and_persists_on(self) -> None:
+        turn_default = self.conv.create_turn(self.user.id, self.session.id, "默认问题")
+        self.assertFalse(turn_default.wiki_assist)
+        turn_on = self.conv.create_turn(
+            self.user.id, self.session.id, "开启辅助", wiki_assist=True
+        )
+        self.assertTrue(turn_on.wiki_assist)
+        fetched = self.conv.get_turn(self.user.id, turn_on.id)
+        self.assertIsNotNone(fetched)
+        self.assertTrue(fetched.wiki_assist)

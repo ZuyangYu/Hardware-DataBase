@@ -637,7 +637,7 @@ export function useKbChat(kbName: string) {
     abortRef.current?.abort();
   }, []);
 
-  const send = useCallback(async () => {
+  const send = useCallback(async (wikiAssist: boolean = false) => {
     const query = input.trim();
     if (!query || streaming) return;
     sendingRef.current = true;
@@ -676,6 +676,7 @@ export function useKbChat(kbName: string) {
         query,
         client_request_id: requestUuid(),
         query_mode: scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
+        wiki_assist: wikiAssist,
       });
       setMessages((prev) => prev.map((m) => (m.id === optimisticId ? created.user_message : m)));
 

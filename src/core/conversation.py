@@ -53,6 +53,7 @@ class ChatTurn:
     kb_id: int | None
     query: str
     query_mode: str
+    wiki_assist: bool
     status: str
     client_request_id: str | None
     cancel_requested: bool
@@ -159,6 +160,12 @@ class ConversationService:
                     FOREIGN KEY(assistant_message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
                 )
             """)
+            try:
+                conn.execute(
+                    "ALTER TABLE chat_turns ADD COLUMN wiki_assist INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError:
+                pass  # 列已存在
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_turns_session_request
                 ON chat_turns(session_id, client_request_id)
@@ -643,6 +650,7 @@ class ConversationService:
         client_request_id: str | None = None,
         query_mode: str = "fast",
         trace_context: dict[str, str] | None = None,
+        wiki_assist: bool = False,
     ) -> ChatTurn:
         """Persist one user request and its assistant placeholder atomically.
 
@@ -691,8 +699,9 @@ class ConversationService:
                     """
                     INSERT INTO chat_turns (
                         id, session_id, user_message_id, assistant_message_id, kb_name, query, query_mode,
-                        department_id, kb_id, status, client_request_id, trace_context_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                        department_id, kb_id, status, client_request_id, trace_context_json, created_at,
+                        wiki_assist
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -707,6 +716,7 @@ class ConversationService:
                         request_id,
                         json.dumps(trace_context or {}, ensure_ascii=False),
                         now,
+                        1 if wiki_assist else 0,
                     ),
                 )
                 row = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
@@ -1240,6 +1250,7 @@ def row_to_turn(row) -> ChatTurn:
         kb_id=row["kb_id"],
         query=row["query"],
         query_mode=row["query_mode"] if "query_mode" in row.keys() else "fast",
+        wiki_assist=bool(row["wiki_assist"]) if "wiki_assist" in row.keys() else True,
         status=row["status"],
         client_request_id=row["client_request_id"],
         cancel_requested=bool(row["cancel_requested"]),

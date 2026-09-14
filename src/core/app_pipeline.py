@@ -246,6 +246,7 @@ class AppPipeline:
         query_mode: str = "deep",
         should_cancel: Callable[[], bool] | None = None,
         persist_thread: bool = False,
+        wiki_assist: bool = False,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -264,6 +265,7 @@ class AppPipeline:
                 query_mode=query_mode,
                 should_cancel=should_cancel,
                 persist_thread=persist_thread,
+                wiki_assist=wiki_assist,
             )
         except QueryCancelled:
             return
@@ -498,6 +500,19 @@ class AppPipeline:
         if ctx is None or not ctx.has_kb_permission(kb_name, "admin"):
             self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message="权限不足：删除知识库需要 admin 权限。")
             return False, "权限不足：删除知识库需要 admin 权限。"
+
+        # Owner 保护: 部门内员工对 KB 隐式 admin, 但删除只允许创建者,
+        # 防止同事互删各自建立的知识库(历史无 owner 的库保持可删, 兼容旧数据)。
+        try:
+            scope = kb_scope_from_context(kb_name, ctx)
+            owner_id = AuthService().get_knowledge_base_owner(
+                kb_name, department_id=scope.department_id, kb_id=scope.kb_id
+            )
+        except Exception:  # noqa: BLE001 - 解析失败时回退到原有 admin 校验
+            owner_id = None
+        if owner_id is not None and str(owner_id) != str(ctx.user_id):
+            self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message="仅知识库创建者可删除。")
+            return False, "仅知识库创建者可删除该知识库。"
 
         log(f"准备彻底删除知识库: {kb_name}")
         try:

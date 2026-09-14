@@ -16,6 +16,7 @@ from src.api.schemas import (
 )
 from src.core.auth import AuthService, AuthUser
 from src.core.doc_assets import DocumentAssetError, DocumentAssetService
+from src.core.wiki import WikiService
 from src.core.app_pipeline import AppPipeline
 from src.pipelines.document_rag.schemas import TASK_STATUS_COMPLETED, normalize_parse_status
 
@@ -81,6 +82,29 @@ def get_doc_asset(
     if asset is None:
         raise HTTPException(status_code=404, detail="doc asset not found")
     return DocAssetDetailView(**asset)
+
+
+@router.get("/kbs/{kb_name}/doc-assets/{asset_id}/wiki")
+def get_doc_asset_wiki_refs(
+    kb_name: str, asset_id: int,
+    user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """资产↔Wiki 只读关联: 该资产当前版本的来源文档对应的摘要页与词条页。"""
+    _ctx, kb_id, department_id = _scope(user, kb_name, "read", auth)
+    asset = _service().get_asset(asset_id=asset_id, kb_id=kb_id, department_id=department_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="doc asset not found")
+    current_id = asset.get("current_version_id")
+    versions = asset.get("versions") or []
+    version = next(
+        (v for v in versions if v.get("id") == current_id),
+        versions[-1] if versions else None,
+    )
+    source_id = str((version or {}).get("file_id") or "")
+    return WikiService().pages_for_source(
+        kb_id=kb_id, department_id=department_id, source_id=source_id
+    )
 
 
 @router.patch("/kbs/{kb_name}/doc-assets/{asset_id}", response_model=DocAssetView)

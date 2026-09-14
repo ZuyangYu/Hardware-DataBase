@@ -86,6 +86,13 @@ class UsageLedger:
             for bucket in (self._total, self._by_channel[str(channel or "unknown")], self._by_model[str(model or "unknown")]):
                 for key, value in entry.items():
                     bucket[key] += value
+        persist_usage_record(
+            channel=str(channel or "unknown"),
+            model=str(model or "unknown"),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -97,6 +104,155 @@ class UsageLedger:
 
 
 _usage_ledger = UsageLedger()
+
+
+_USAGE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS llm_usage_ledger (
+    channel TEXT NOT NULL,
+    model TEXT NOT NULL,
+    calls INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(channel, model)
+)
+"""
+
+
+def _usage_db_path() -> str:
+    return str(getattr(settings, "LLM_USAGE_LEDGER_DB", "") or settings.AUTH_DB_PATH)
+
+
+def persist_usage_record(
+    *, channel: str, model: str, prompt_tokens: int, completion_tokens: int, total_tokens: int
+) -> None:
+    """把一笔调用累加进 auth.db 的 llm_usage_ledger(fail-soft, 跨进程共享)。"""
+    try:
+        import os
+        import sqlite3
+
+        path = _usage_db_path()
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=5)
+        try:
+            conn.execute(_USAGE_TABLE_SQL)
+            conn.execute(
+                """
+                INSERT INTO llm_usage_ledger
+                    (channel, model, calls, prompt_tokens, completion_tokens, total_tokens, updated_at)
+                VALUES (?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(channel, model) DO UPDATE SET
+                    calls = calls + 1,
+                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    total_tokens = total_tokens + excluded.total_tokens,
+                    updated_at = excluded.updated_at
+                """,
+                (channel, model, prompt_tokens, completion_tokens, total_tokens, _utc_now()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - 账本落库绝不阻塞调用
+        pass
+
+
+def get_persisted_usage() -> dict[str, Any]:
+    """读取跨进程累计用量(重启不清零); 不可用时返回空。"""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(_usage_db_path(), timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT channel, model, calls, prompt_tokens, completion_tokens, total_tokens "
+                "FROM llm_usage_ledger ORDER BY channel, model"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return {}
+    total = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    by_channel: dict[str, dict[str, int]] = {}
+    for row in rows:
+        data = dict(row)
+        channel = str(data.pop("channel"))
+        data.pop("model", None)
+        bucket = by_channel.setdefault(channel, dict(total))
+        for key in total:
+            bucket[key] += int(data.get(key) or 0)
+            total[key] += int(data.get(key) or 0)
+    return {"total": total, "by_channel": by_channel}
+
+
+def _iter_with_idle_timeout(iterator: Any, timeout_seconds: float) -> Any:
+    """迭代 LLM 流并施加空闲超时: 超过 N 秒没有新块则中断, 防止挂死吃满槽位。"""
+    timeout_seconds = float(timeout_seconds or 0)
+    if timeout_seconds <= 0:
+        yield from iterator
+        return
+    import queue as _queue
+    import threading as _threading
+
+    box: "_queue.Queue[Any]" = _queue.Queue(maxsize=16)
+    sentinel = object()
+    stopped = _threading.Event()
+
+    def pump() -> None:
+        try:
+            for item in iterator:
+                if stopped.is_set():
+                    return
+                while not stopped.is_set():
+                    try:
+                        box.put(item, timeout=0.5)
+                        break
+                    except _queue.Full:
+                        continue
+        except Exception as exc:  # noqa: BLE001
+            if not stopped.is_set():
+                try:
+                    box.put(exc, timeout=0.5)
+                except _queue.Full:
+                    pass
+        finally:
+            if not stopped.is_set():
+                try:
+                    box.put(sentinel, timeout=0.5)
+                except _queue.Full:
+                    pass
+
+    _threading.Thread(target=pump, daemon=True, name="llm-stream-pump").start()
+    try:
+        while True:
+            try:
+                item = box.get(timeout=timeout_seconds)
+            except _queue.Empty:
+                stopped.set()
+                close = getattr(iterator, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise TimeoutError(f"LLM stream idle for more than {timeout_seconds:.0f}s") from None
+            if item is sentinel:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stopped.set()
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 def get_usage_ledger() -> UsageLedger:
@@ -171,7 +327,8 @@ class _GovernedChatOpenAI(ChatOpenAI):
 
     def _stream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
         with get_llm_governor().slot(self.hdb_priority):
-            yield from super()._stream(*args, **kwargs)
+            timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
+            yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
 
     async def _agenerate(self, *args: Any, **kwargs: Any):  # noqa: ANN401
         cm = get_llm_governor().slot(self.hdb_priority)
@@ -200,7 +357,8 @@ class _GovernedChatOllama(ChatOllama):
 
     def _stream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
         with get_llm_governor().slot(self.hdb_priority):
-            yield from super()._stream(*args, **kwargs)
+            timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
+            yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
 
 
 def build_chat_model(
@@ -273,7 +431,8 @@ def _governed_class(base: type, priority: str) -> type:
 
     def _stream(self, *args, **kwargs):  # noqa: ANN001
         with get_llm_governor().slot(priority):
-            yield from base._stream(self, *args, **kwargs)
+            timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
+            yield from _iter_with_idle_timeout(base._stream(self, *args, **kwargs), timeout)
 
     async def _agenerate(self, *args, **kwargs):  # noqa: ANN001
         cm = get_llm_governor().slot(priority)
@@ -307,6 +466,65 @@ def _governed_class(base: type, priority: str) -> type:
     return governed
 
 
+def _record_ragas_usage(result: Any) -> None:
+    """尽力从 RAGAS LLMResult 提取 token 用量; 提取不到也要记调用次数。"""
+    usage: Any = None
+    llm_output = getattr(result, "llm_output", None)
+    if isinstance(llm_output, dict):
+        usage = llm_output.get("token_usage") or llm_output.get("usage")
+    elif isinstance(llm_output, str):
+        usage = None
+    model = "ragas-judge"
+    prompt = completion = total = 0
+    if usage is not None:
+        if isinstance(usage, dict):
+            model = str(usage.get("model") or model)
+            prompt = int(usage.get("prompt_tokens") or 0)
+            completion = int(usage.get("completion_tokens") or 0)
+            total = int(usage.get("total_tokens") or 0)
+        else:
+            model = str(getattr(usage, "model", None) or model)
+            prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion = int(getattr(usage, "completion_tokens", 0) or 0)
+            total = int(getattr(usage, "total_tokens", 0) or 0)
+    get_usage_ledger().record(
+        channel=PRIORITY_BATCH, model=model,
+        prompt_tokens=prompt, completion_tokens=completion, total_tokens=total,
+        usage_returned=usage is not None,
+    )
+
+
+def govern_ragas_llm(llm: Any) -> Any:
+    """把 RAGAS judge 纳入闸门。
+
+    不能在 client 层包代理: ragas 的 instructor 适配器要求真 ``AsyncOpenAI``
+    实例(isinstance 校验)。因此在 LLM 对象的 generate/agenerate 层包裹,
+    让评测(批量)与在线问答共享准入控制。
+    """
+    try:
+        for name in ("agenerate", "generate"):
+            original = getattr(llm, name, None)
+            if original is None or getattr(original, "_hdb_governed", False):
+                continue
+            if asyncio.iscoroutinefunction(original):
+                async def wrapped(*args: Any, _orig=original, **kwargs: Any) -> Any:
+                    with get_llm_governor().slot(PRIORITY_BATCH):
+                        result = await _orig(*args, **kwargs)
+                    _record_ragas_usage(result)
+                    return result
+            else:
+                def wrapped(*args: Any, _orig=original, **kwargs: Any) -> Any:
+                    with get_llm_governor().slot(PRIORITY_BATCH):
+                        result = _orig(*args, **kwargs)
+                    _record_ragas_usage(result)
+                    return result
+            wrapped._hdb_governed = True  # type: ignore[attr-defined]
+            setattr(llm, name, wrapped)
+    except Exception:  # noqa: BLE001 - 治理层绝不阻塞评测
+        return llm
+    return llm
+
+
 def govern_model(model: Any, priority: str = PRIORITY_INTERACTIVE) -> Any:
     """Route a model built elsewhere through the governor (fail-open swap)."""
     if isinstance(model, (_GovernedChatOpenAI, _GovernedChatOllama)):
@@ -325,7 +543,9 @@ __all__ = [
     "PRIORITY_INTERACTIVE",
     "UsageLedger",
     "build_chat_model",
+    "get_persisted_usage",
     "get_usage_ledger",
     "govern_model",
+    "govern_ragas_llm",
     "reset_usage_ledger",
 ]

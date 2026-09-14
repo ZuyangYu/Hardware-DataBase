@@ -40,26 +40,56 @@ def _service() -> WikiService:
     return WikiService()
 
 
-def _gather_documents(pipeline, ctx, kb_name: str, kb_id: int, department_id: int) -> list[dict]:
+def _gather_documents(
+    pipeline, ctx, kb_name: str, kb_id: int, department_id: int,
+    file_ids: list[str] | None = None,
+) -> list[dict]:
     return WikiService().gather_documents(
-        pipeline, kb_name=kb_name, ctx=ctx, kb_id=kb_id, department_id=department_id
+        pipeline, kb_name=kb_name, ctx=ctx, kb_id=kb_id, department_id=department_id,
+        file_ids=file_ids,
     )
+
+
+def _persist_job_state(service: WikiService, kb_id: int, department_id: int, state: dict) -> None:
+    try:
+        service.save_job_state(kb_id=kb_id, department_id=department_id, state=state)
+    except Exception:  # noqa: BLE001 - 状态持久化失败不阻断蒸馏
+        pass
+
+
+def _current_job_state(service: WikiService, kb_id: int, department_id: int) -> dict:
+    """内存优先(正在运行的线程), 否则读持久化状态; 重启后残留 running 视为中断。"""
+    with _WIKI_JOB_LOCK:
+        state = WIKI_JOB_STATE.get(kb_id)
+    if state is not None:
+        return dict(state)
+    persisted = service.get_job_state(kb_id)
+    if persisted is None:
+        return {"running": False, "stage": "从未运行"}
+    if persisted.get("running"):
+        persisted.update(running=False, stage="中断（服务重启）", error="服务重启导致任务中断")
+        _persist_job_state(service, kb_id, department_id, persisted)
+    return persisted
 
 
 def _run_ingest_job(
     kb_id: int, kb_name: str, department_id: int, pipeline, ctx,
-    granularity: str, max_pages: int,
+    granularity: str, max_pages: int, file_ids: list[str] | None = None,
 ) -> None:
+    service = _service()
     with _WIKI_JOB_LOCK:
         WIKI_JOB_STATE[kb_id] = {"running": True, "stage": "准备", "started_at": _now(), "error": ""}
+    _persist_job_state(service, kb_id, department_id, WIKI_JOB_STATE[kb_id])
     try:
-        service = _service()
         chat_model = create_chat_model(priority=PRIORITY_BATCH)
 
         def chat_fn(prompt: str) -> str:
             return str(chat_model.invoke(prompt).content)
 
-        documents = _gather_documents(pipeline, ctx, kb_name, kb_id=kb_id, department_id=department_id)
+        documents = _gather_documents(
+            pipeline, ctx, kb_name, kb_id=kb_id, department_id=department_id,
+            file_ids=file_ids,
+        )
         with _WIKI_JOB_LOCK:
             WIKI_JOB_STATE[kb_id]["stage"] = f"蒸馏 {len(documents)} 份文档"
 
@@ -68,20 +98,25 @@ def _run_ingest_job(
                 state = WIKI_JOB_STATE.get(kb_id)
                 if state and state.get("running"):
                     state["stage"] = message
+                    _persist_job_state(service, kb_id, department_id, state)
 
         stats = service.ingest(
             kb_id=kb_id, kb_name=kb_name, department_id=department_id,
             documents=documents, chat_fn=chat_fn, granularity=granularity,
             max_pages_per_ingest=max_pages, progress_fn=progress,
         )
+        final = {
+            "running": False, "stage": "完成", "error": "",
+            "stats": stats, "finished_at": _now(),
+        }
         with _WIKI_JOB_LOCK:
-            WIKI_JOB_STATE[kb_id] = {
-                "running": False, "stage": "完成", "error": "",
-                "stats": stats, "finished_at": _now(),
-            }
+            WIKI_JOB_STATE[kb_id] = final
+        _persist_job_state(service, kb_id, department_id, final)
     except Exception as exc:  # noqa: BLE001
+        failed = {"running": False, "stage": "失败", "error": str(exc)}
         with _WIKI_JOB_LOCK:
-            WIKI_JOB_STATE[kb_id] = {"running": False, "stage": "失败", "error": str(exc)}
+            WIKI_JOB_STATE[kb_id] = failed
+        _persist_job_state(service, kb_id, department_id, failed)
 
 
 def _now() -> str:
@@ -99,14 +134,20 @@ def ingest_wiki(
     auth: AuthService = Depends(get_auth_service),
 ):
     ctx, kb_id, department_id = _scope(user, kb_name, "write", auth)
+    service = _service()
     with _WIKI_JOB_LOCK:
         state = WIKI_JOB_STATE.get(kb_id, {})
         if state.get("running"):
             raise HTTPException(status_code=409, detail="该知识库的 Wiki 生成正在进行中")
+    current = _current_job_state(service, kb_id, department_id)
+    if current.get("running"):
+        raise HTTPException(status_code=409, detail="该知识库的 Wiki 生成正在进行中")
+    with _WIKI_JOB_LOCK:
         WIKI_JOB_STATE[kb_id] = {"running": True, "stage": "排队中"}
     thread = threading.Thread(
         target=_run_ingest_job,
-        args=(kb_id, kb_name, department_id, pipeline, ctx, body.granularity, body.max_pages_per_ingest),
+        args=(kb_id, kb_name, department_id, pipeline, ctx, body.granularity,
+              body.max_pages_per_ingest, body.file_ids or None),
         daemon=True,
     )
     thread.start()
@@ -119,10 +160,8 @@ def wiki_status(
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ):
-    _ctx, kb_id, _department_id = _scope(user, kb_name, "read", auth)
-    with _WIKI_JOB_LOCK:
-        state = dict(WIKI_JOB_STATE.get(kb_id, {"running": False, "stage": "从未运行"}))
-    return state
+    _ctx, kb_id, department_id = _scope(user, kb_name, "read", auth)
+    return _current_job_state(_service(), kb_id, department_id)
 
 
 @router.get("/kbs/{kb_name}/wiki/pages", response_model=list[WikiPageView])
@@ -230,9 +269,49 @@ def revert_wiki_page(
 
 @router.get("/kbs/{kb_name}/wiki/graph", response_model=WikiGraphView)
 def wiki_graph(
-    kb_name: str, limit: int = Query(default=200, ge=1, le=1000),
+    kb_name: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+    view: str = Query(default="pages", pattern="^(pages|documents)$"),
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ):
     _ctx, kb_id, department_id = _scope(user, kb_name, "read", auth)
-    return WikiGraphView(**_service().get_graph(kb_id=kb_id, department_id=department_id, limit=limit))
+    return WikiGraphView(
+        **_service().get_graph(
+            kb_id=kb_id, department_id=department_id, limit=limit, view=view
+        )
+    )
+
+
+@router.get("/kbs/{kb_name}/wiki/stats")
+def wiki_stats(
+    kb_name: str,
+    user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """轻量统计: 按类型页数 + 孤立页数(供前端判断 Wiki 是否可用)。"""
+    _ctx, kb_id, department_id = _scope(user, kb_name, "read", auth)
+    return _service().get_stats(kb_id=kb_id, department_id=department_id)
+
+
+@router.get("/kbs/{kb_name}/wiki/lint")
+def wiki_lint(
+    kb_name: str,
+    user: AuthUser = Depends(current_user),
+    pipeline=Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """只读质量报告: 孤儿/死链/空页/占位出处/过期来源/别名重叠 + 健康分。"""
+    ctx, kb_id, department_id = _scope(user, kb_name, "read", auth)
+    known_ids: set[str] = set()
+    try:
+        for info in pipeline.list_file_infos(kb_name, ctx=ctx):
+            store_id = (info.metadata or {}).get("store_id")
+            if store_id not in (None, ""):
+                known_ids.add(str(store_id))
+    except Exception:  # noqa: BLE001 - 台账不可用时跳过 stale 检查
+        known_ids = set()
+    return _service().lint_pages(
+        kb_id=kb_id, department_id=department_id,
+        known_source_ids=known_ids or None,
+    )

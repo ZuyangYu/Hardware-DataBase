@@ -291,6 +291,7 @@ class WikiPageDetailView(WikiPageView):
 class WikiIngestRequest(BaseModel):
     granularity: Literal["focused", "standard", "exhaustive"] = "standard"
     max_pages_per_ingest: int = Field(default=0, ge=0, le=2000)
+    file_ids: list[str] = Field(default_factory=list)
 
 
 class WikiPageUpsertRequest(BaseModel):
@@ -313,6 +314,7 @@ class WikiPageUpdateRequest(BaseModel):
 
 
 class WikiGraphView(BaseModel):
+    view: str = "pages"
     nodes: list[dict] = Field(default_factory=list)
     edges: list[dict] = Field(default_factory=list)
     total: int = 0
@@ -326,6 +328,7 @@ class WikiGraphView(BaseModel):
 class QueryRequest(BaseModel):
     kb_name: str
     query: str
+    wiki_assist: bool = False
     # Route also slices [-5:] as defence in depth; the schema cap keeps a
     # misconfigured client from wasting bandwidth on multi-MB history bodies
     # (and blocks DoS-shaped requests before the body is even read).
@@ -409,6 +412,8 @@ class CreateTurnRequest(BaseModel):
     # Retained for wire compatibility; the route normalizes KB turns to deep
     # retrieval and general chat bypasses the knowledge-base agent entirely.
     query_mode: Literal["fast", "deep"] = "deep"
+    # Wiki 辅助开关(每轮): False 时不注册 wiki_search 工具。
+    wiki_assist: bool = False
 
 
 class TurnView(BaseModel):
@@ -419,6 +424,7 @@ class TurnView(BaseModel):
     kb_name: str
     query: str
     query_mode: Literal["fast", "deep"] = "fast"
+    wiki_assist: bool = False
     status: str
     cancel_requested: bool = False
     last_event_seq: int = 0

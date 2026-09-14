@@ -75,6 +75,8 @@ const GROUPS: Group[] = [
       ['LLM_BATCH_MAX_CONCURRENCY', '批量任务并发上限'],
       ['LLM_QUEUE_TIMEOUT_SECONDS', '排队超时(秒)'],
       ['LLM_QUEUE_WARN_SECONDS', '排队告警阈值(秒)'],
+      ['LLM_STREAM_IDLE_TIMEOUT_SECONDS', '流空闲超时(秒, 0=关闭)'],
+      ['WORKER_TURN_CONCURRENCY', 'Worker 轮次并发'],
     ],
   },
   {
@@ -133,6 +135,8 @@ const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: number; 
   AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS: { min: 0, max: 120 },
   AGENT_RATE_LIMIT_MAX_DELAY_SECONDS: { min: 0, max: 600 },
   LLM_MAX_CONCURRENCY: { min: 1, max: 64, integer: true },
+  LLM_STREAM_IDLE_TIMEOUT_SECONDS: { min: 0, max: 3600, integer: true },
+  WORKER_TURN_CONCURRENCY: { min: 1, max: 16, integer: true },
   LLM_BATCH_MAX_CONCURRENCY: { min: 0, max: 64, integer: true },
   LLM_QUEUE_TIMEOUT_SECONDS: { min: 0, max: 3600, integer: true },
   LLM_QUEUE_WARN_SECONDS: { min: 0, max: 600, integer: true },

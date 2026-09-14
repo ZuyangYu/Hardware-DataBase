@@ -882,6 +882,20 @@ class AuthService:
             row = self._get_kb_row(conn, kb_name, department_id, kb_id)
         return int(row["id"]) if row else None
 
+    def get_knowledge_base_owner(
+        self,
+        kb_name: str,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ) -> int | None:
+        """返回知识库创建者 user id；历史库无 owner 时返回 None。"""
+        with closing(self._connect()) as conn:
+            kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
+            if kb is None:
+                return None
+            owner = kb["owner_user_id"]
+            return int(owner) if owner is not None else None
+
     def delete_knowledge_base_record(
         self,
         kb_name: str,

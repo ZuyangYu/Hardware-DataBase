@@ -44,26 +44,35 @@ type Props = {
   sessionConsents?: MemoryConsentView[] | null;
   /** 撤销一条授权;返回是否成功。 */
   onRevokeConsent?: (consentEventId: string, reason: string) => Promise<boolean>;
+  /** Wiki 辅助开关(仅挂载 KB 时显示): 检索知识 Wiki 蒸馏页。 */
+  wikiAssist?: boolean;
+  onWikiAssistChange?: (enabled: boolean) => void;
+  /** Wiki 是否有内容; false 时禁用开关并提示。null/undefined = 未知(不禁用)。 */
+  wikiAvailable?: boolean | null;
 };
 
-function MemoryToggle({
+function HeaderToggle({
   enabled,
   disabled,
   onToggle,
+  ariaLabel,
+  title,
 }: {
   enabled: boolean;
   disabled: boolean;
   onToggle: (enabled: boolean) => void;
+  ariaLabel: string;
+  title: string;
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={enabled}
-      aria-label="自动提炼项目记忆"
+      aria-label={ariaLabel}
       disabled={disabled}
       onClick={() => onToggle(!enabled)}
-      title="开启后每轮对话结束将自动后台提炼项目长期记忆"
+      title={title}
       className={cn(
         'relative inline-flex h-[16px] w-[28px] shrink-0 items-center rounded-full border border-[#e3e7f1] transition-colors',
         'disabled:cursor-not-allowed disabled:opacity-45',
@@ -91,6 +100,9 @@ export default function ChatHeader({
   onToggleAutoExtract,
   sessionConsents = null,
   onRevokeConsent,
+  wikiAssist = false,
+  onWikiAssistChange,
+  wikiAvailable,
 }: Props) {
   const [toggling, setToggling] = useState(false);
   const [consentsOpen, setConsentsOpen] = useState(false);
@@ -132,15 +144,48 @@ export default function ChatHeader({
         <span className={CHAT_HEADER_TITLE_META_CLASS}>{kbName}</span>
       </div>
       <div className="flex items-center gap-[8px]">
+        {kbName && onWikiAssistChange && (
+          <label
+            className={cn(
+              'flex items-center gap-[6px] rounded-[8px] px-[8px] py-[4px] text-[11px] transition-colors',
+              wikiAvailable === false ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-[#f6f7fa]',
+            )}
+            title={
+              wikiAvailable === false
+                ? '该知识库还没有 Wiki 内容: 请先到「资产中心 → 知识 Wiki」生成'
+                : '开启后本轮问答会检索知识 Wiki 蒸馏页(摘要/实体/概念);默认关闭'
+            }
+          >
+            <HeaderToggle
+              enabled={Boolean(wikiAssist)}
+              disabled={wikiAvailable === false}
+              onToggle={onWikiAssistChange}
+              ariaLabel="Wiki 辅助"
+              title={
+                wikiAvailable === false
+                  ? '该知识库还没有 Wiki 内容: 请先到「资产中心 → 知识 Wiki」生成'
+                  : '开启后本轮问答会检索知识 Wiki 蒸馏页(摘要/实体/概念);默认关闭'
+              }
+            />
+            <span className={cn('select-none whitespace-nowrap', wikiAvailable === false && 'text-[#a5adc0]')}>
+              Wiki 辅助
+            </span>
+            {wikiAvailable === false && (
+              <span className="select-none whitespace-nowrap text-[11px] text-[#b45309]">暂无内容</span>
+            )}
+          </label>
+        )}
         {memorySummary && (
           <label
             className="flex cursor-pointer items-center gap-[6px] rounded-[8px] px-[8px] py-[4px] text-[11px] transition-colors hover:bg-[#f6f7fa]"
             title="开启后每轮对话结束将自动后台提炼项目长期记忆"
           >
-            <MemoryToggle
+            <HeaderToggle
               enabled={memorySummary.auto_extract_enabled}
               disabled={toggling}
               onToggle={(next) => void handleToggle(next)}
+              ariaLabel="自动提炼项目记忆"
+              title="开启后每轮对话结束将自动后台提炼项目长期记忆"
             />
             <span className="select-none whitespace-nowrap">自动提炼</span>
           </label>

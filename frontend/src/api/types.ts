@@ -230,11 +230,57 @@ export interface WikiPageDetailView extends WikiPageView {
   revisions: WikiRevisionView[];
 }
 
+export type WikiGraphViewMode = 'pages' | 'documents';
+
+export interface WikiGraphNode {
+  slug: string;
+  title: string;
+  page_type?: WikiPageType;
+  link_count?: number;
+  page_count?: number;
+}
+
+export interface WikiGraphEdge {
+  source: string;
+  target: string;
+  weight?: number;
+  pages?: string[];
+}
+
 export interface WikiGraphView {
-  nodes: { slug: string; title: string; page_type: string; link_count: number }[];
-  edges: { source: string; target: string }[];
+  view?: WikiGraphViewMode;
+  nodes: WikiGraphNode[];
+  edges: WikiGraphEdge[];
   total: number;
   truncated: boolean;
+}
+
+export interface WikiLintIssue {
+  type: string;
+  severity: 'error' | 'warning' | 'info';
+  slug: string;
+  target: string;
+  detail: string;
+}
+
+export interface WikiLintReport {
+  kb_id: number;
+  health_score: number;
+  stats: { pages: number; entity: number; concept: number; summary: number; index: number; links: number };
+  by_type: Record<string, number>;
+  issues: WikiLintIssue[];
+  summary: string;
+}
+
+export interface WikiStats {
+  total_pages: number;
+  pages_by_type: Record<string, number>;
+  orphan_count: number;
+}
+
+export interface DocAssetWikiRefs {
+  summary: { slug: string; title: string } | null;
+  pages: { slug: string; title: string; page_type: string }[];
 }
 
 export interface WikiJobState {

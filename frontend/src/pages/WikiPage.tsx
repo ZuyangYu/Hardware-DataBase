@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 import { useNavigate, useSearchParams } from 'react-router-dom';
 
 import { api } from '../api/client';
-import type { KbView, WikiJobState, WikiPageDetailView, WikiPageType, WikiPageView } from '../api/types';
+import type { KbView, WikiJobState, WikiLintReport, WikiPageDetailView, WikiPageType, WikiPageView } from '../api/types';
 import { isEmployee, type AuthSession } from '../auth';
 import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
@@ -26,6 +26,17 @@ const TYPE_TONE: Record<WikiPageType, string> = {
   entity: 'border-[#dbe4f5] bg-[#eef2fa] text-[#3d5a91]',
   concept: 'border-[#f0dfc0] bg-[#fdf6ea] text-[#b45309]',
   index: 'border-[#e3e7f1] bg-[#f6f7fb] text-[#5b6478]',
+};
+
+const LINT_TYPE_LABEL: Record<string, string> = {
+  orphan_page: '孤立页',
+  broken_link: '死链',
+  empty_content: '空页',
+  missing_provenance: '无出处',
+  placeholder_refs: '旧占位出处',
+  missing_sources: '缺来源',
+  stale_source: '来源已删除',
+  duplicate_alias: '别名重叠',
 };
 
 const EDIT_SOURCE_LABEL: Record<string, string> = {
@@ -70,6 +81,27 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
   const [saving, setSaving] = useState(false);
   const [archiveTarget, setArchiveTarget] = useState<WikiPageView | null>(null);
   const [revertVersion, setRevertVersion] = useState<number | null>(null);
+  const [lint, setLint] = useState<WikiLintReport | null>(null);
+  const [lintOpen, setLintOpen] = useState(false);
+  const [lintLoading, setLintLoading] = useState(false);
+
+  const loadLint = useCallback(() => {
+    if (!kbName) {
+      setLint(null);
+      return;
+    }
+    setLintLoading(true);
+    api
+      .get<WikiLintReport>(`/api/v1/kbs/${encodeURIComponent(kbName)}/wiki/lint`)
+      .then((data) => setLint(data))
+      .catch((error) => notify.error(error instanceof Error ? error.message : '加载质量报告失败'))
+      .finally(() => setLintLoading(false));
+  }, [kbName]);
+
+  useEffect(() => {
+    setLint(null);
+    setLintOpen(false);
+  }, [kbName]);
 
   const load = useCallback(() => {
     if (!kbName) {
@@ -410,8 +442,76 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
               </Button>
             </>
           )}
+          <Button
+            variant="outline"
+            className={OUTLINE_ACTION_BUTTON_CLASS}
+            disabled={!kbName || lintLoading}
+            onClick={() => {
+              const next = !lintOpen;
+              setLintOpen(next);
+              if (next) loadLint();
+            }}
+          >
+            <AppIcon name="search" size={14} />
+            {lintLoading ? '体检中…' : '质量报告'}
+          </Button>
         </div>
       </div>
+
+      {lintOpen && lint && (
+        <div className="mt-[14px] rounded-[10px] border border-[#e3e7f1] bg-white px-[16px] py-[14px]">
+          <div className="flex flex-wrap items-center gap-[10px]">
+            <span
+              className={`inline-flex h-[26px] items-center rounded-full px-[10px] text-[12px] font-medium ${
+                lint.health_score >= 85
+                  ? 'bg-[#eef6ef] text-[#2b7a57]'
+                  : lint.health_score >= 60
+                    ? 'bg-[#fdf6ea] text-[#b45309]'
+                    : 'bg-[#fdefec] text-[#b3261e]'
+              }`}
+            >
+              健康分 {lint.health_score}
+            </span>
+            <span className="text-[12px] text-[#5b6478]">{lint.summary}</span>
+            <span className="ml-auto text-[11px] text-[#a5adc0]">
+              共 {lint.stats.pages} 页 · 实体 {lint.stats.entity} · 概念 {lint.stats.concept} · 摘要 {lint.stats.summary}
+            </span>
+          </div>
+          {Object.keys(lint.by_type).length > 0 && (
+            <div className="mt-[10px] flex flex-wrap gap-[6px]">
+              {Object.entries(lint.by_type).map(([type, count]) => (
+                <span key={type} className="rounded-[6px] bg-[#f4f5f9] px-[8px] py-[3px] text-[11px] text-[#5b6478]">
+                  {LINT_TYPE_LABEL[type] ?? type} {count}
+                </span>
+              ))}
+            </div>
+          )}
+          {lint.issues.length > 0 && (
+            <div className="nice-scroll mt-[10px] max-h-[240px] overflow-auto border-t border-[#f2f3f7] pt-[8px]">
+              {lint.issues.slice(0, 60).map((issue, index) => (
+                <div key={`${issue.type}-${issue.slug}-${index}`} className="flex items-start gap-[8px] py-[4px] text-[12px]">
+                  <span
+                    className={`mt-[3px] inline-block size-[7px] shrink-0 rounded-full ${
+                      issue.severity === 'error' ? 'bg-[#b3261e]' : issue.severity === 'warning' ? 'bg-[#d98a1f]' : 'bg-[#9aa2b5]'
+                    }`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void openDetail(issue.slug)}
+                    className="min-w-0 shrink-0 truncate text-[12px] text-[#3d5a91] hover:underline"
+                  >
+                    {issue.slug}
+                  </button>
+                  <span className="min-w-0 flex-1 text-[#757f9c]">{issue.detail}</span>
+                </div>
+              ))}
+              {lint.issues.length > 60 && (
+                <div className="py-[4px] text-[11px] text-[#a5adc0]">另有 {lint.issues.length - 60} 条未展示</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {job?.running && (
         <div className="mt-[14px] rounded-[8px] border border-[#dbe4f5] bg-[#eef2fa] px-[14px] py-[10px] text-[12px] text-[#3d5a91]">

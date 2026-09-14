@@ -10,7 +10,9 @@ import type {
   DocRelationType,
   FileView,
   KbView,
+  DocAssetWikiRefs,
   WikiGraphView,
+  WikiGraphViewMode,
   WikiPageType,
 } from '../api/types';
 import { isEmployee, type AuthSession } from '../auth';
@@ -152,6 +154,8 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
   const [graph, setGraph] = useState<WikiGraphView | null>(null);
   const [graphLoaded, setGraphLoaded] = useState(false);
   const [graphTypeFilter, setGraphTypeFilter] = useState<'' | WikiPageType>('');
+  const [graphView, setGraphView] = useState<WikiGraphViewMode>('pages');
+  const [wikiRefs, setWikiRefs] = useState<DocAssetWikiRefs | null>(null);
 
   const load = useCallback(() => {
     if (!kbName) {
@@ -190,11 +194,11 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
     }
     setGraphLoaded(false);
     api
-      .get<WikiGraphView>(`/api/v1/kbs/${encodeURIComponent(kbName)}/wiki/graph?limit=200`)
+      .get<WikiGraphView>(`/api/v1/kbs/${encodeURIComponent(kbName)}/wiki/graph?limit=200&view=${graphView}`)
       .then((data) => setGraph(data))
       .catch((error) => notify.error(error instanceof Error ? error.message : '加载图谱失败'))
       .finally(() => setGraphLoaded(true));
-  }, [kbName]);
+  }, [kbName, graphView]);
 
   useEffect(() => {
     if (tab === 'graph') loadGraph();
@@ -203,7 +207,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
   /** 图谱跟随类型筛选: 只保留该类节点及两端都在的边 */
   const visibleGraph = useMemo<WikiGraphView | null>(() => {
     if (!graph) return null;
-    if (!graphTypeFilter) return graph;
+    if (graph.view === 'documents' || !graphTypeFilter) return graph;
     const nodes = graph.nodes.filter((node) => node.page_type === graphTypeFilter);
     const alive = new Set(nodes.map((node) => node.slug));
     return {
@@ -216,7 +220,8 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
 
   function openGraphNode(slug: string) {
     if (!kbName) return;
-    navigate(`/assets?tab=wiki&kb=${encodeURIComponent(kbName)}&open=${encodeURIComponent(slug)}`);
+    const target = graph?.view === 'documents' ? `summary/${slug}` : slug;
+    navigate(`/assets?tab=wiki&kb=${encodeURIComponent(kbName)}&open=${encodeURIComponent(target)}`);
   }
 
   const loadFiles = useCallback(async () => {
@@ -229,10 +234,23 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
     }
   }, [kbName]);
 
+  const loadWikiRefs = useCallback(async (assetId: number) => {
+    if (!kbName) {
+      setWikiRefs(null);
+      return;
+    }
+    try {
+      setWikiRefs(await api.get<DocAssetWikiRefs>(`/api/v1/kbs/${encodeURIComponent(kbName)}/doc-assets/${assetId}/wiki`));
+    } catch {
+      setWikiRefs(null);
+    }
+  }, [kbName]);
+
   async function openDetail(asset: DocAssetView) {
     if (!kbName) return;
     try {
       setDetail(await api.get<DocAssetDetailView>(`/api/v1/kbs/${encodeURIComponent(kbName)}/doc-assets/${asset.id}`));
+      void loadWikiRefs(asset.id);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '加载资产详情失败');
     }
@@ -242,8 +260,10 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
     if (!kbName) return;
     try {
       setDetail(await api.get<DocAssetDetailView>(`/api/v1/kbs/${encodeURIComponent(kbName)}/doc-assets/${assetId}`));
+      void loadWikiRefs(assetId);
     } catch {
       setDetail(null);
+      setWikiRefs(null);
     }
     load();
   }
@@ -450,10 +470,22 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
       ) : tab === 'graph' ? (
         <>
           <div className="mt-[16px] flex flex-wrap items-center gap-[8px]">
+            {([['pages', '词条视图'], ['documents', '文档视图']] as const).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setGraphView(key)}
+                className={`h-[30px] rounded-full border px-[12px] text-[12px] ${graphView === key ? 'border-[#2b7a57] bg-[#eef6ef] text-[#2b7a57]' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
+              >
+                {label}
+              </button>
+            ))}
+            <span className="mx-[2px] h-[18px] w-px bg-[#e8ebf2]" />
             <button
               type="button"
+              disabled={graphView === 'documents'}
               onClick={() => setGraphTypeFilter('')}
-              className={`h-[30px] rounded-full border px-[12px] text-[12px] ${graphTypeFilter === '' ? 'border-[#18181a] bg-[#18181a] text-white' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
+              className={`h-[30px] rounded-full border px-[12px] text-[12px] disabled:opacity-40 ${graphTypeFilter === '' ? 'border-[#18181a] bg-[#18181a] text-white' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
             >
               全部
             </button>
@@ -531,7 +563,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
         </>
       )}
 
-      <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open && !saving) setDetail(null); }}>
+      <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open && !saving) { setDetail(null); setWikiRefs(null); } }}>
         <DialogContent className="nice-scroll flex max-h-[88vh] w-[min(960px,calc(100vw-32px))] max-w-none flex-col gap-0 overflow-auto rounded-[12px] p-0 sm:max-w-none">
           {detail && (
             <>
@@ -654,6 +686,53 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
 
                 {/* 侧列: 关联 + 变更 */}
                 <div className="grid content-start gap-0 border-t border-[#eef0f4] bg-[#fbfcfe] px-[20px] py-[18px] min-[760px]:border-t-0">
+                  {(wikiRefs?.summary || (wikiRefs?.pages.length ?? 0) > 0) && (
+                    <div className="mb-[16px] border-b border-[#eef0f4] pb-[14px]">
+                      <div className="flex items-center justify-between">
+                        <div className="text-[12px] font-medium text-[#757f9c]">
+                          知识 Wiki
+                          <span className="ml-[6px] text-[11px] font-normal text-[#a5adc0]">
+                            摘要 1 · 词条 {wikiRefs?.pages.length ?? 0}
+                          </span>
+                        </div>
+                        {kbName && (
+                          <button
+                            type="button"
+                            onClick={() => navigate(`/assets?tab=wiki&kb=${encodeURIComponent(kbName)}`)}
+                            className="text-[11px] text-[#2b7a57] hover:opacity-80"
+                          >
+                            打开 Wiki
+                          </button>
+                        )}
+                      </div>
+                      <div className="mt-[8px] grid gap-[5px]">
+                        {wikiRefs?.summary && (
+                          <button
+                            type="button"
+                            onClick={() => kbName && navigate(`/assets?tab=wiki&kb=${encodeURIComponent(kbName)}&open=${encodeURIComponent(wikiRefs.summary!.slug)}`)}
+                            className="flex min-w-0 items-center gap-[6px] text-left text-[12px] text-[#2b7a57] hover:opacity-80"
+                          >
+                            <span className="inline-block size-[6px] shrink-0 rounded-full bg-[#2b7a57]" />
+                            <span className="truncate">摘要 · {wikiRefs.summary.title}</span>
+                          </button>
+                        )}
+                        {(wikiRefs?.pages ?? []).slice(0, 8).map((page) => (
+                          <button
+                            key={page.slug}
+                            type="button"
+                            onClick={() => kbName && navigate(`/assets?tab=wiki&kb=${encodeURIComponent(kbName)}&open=${encodeURIComponent(page.slug)}`)}
+                            className="flex min-w-0 items-center gap-[6px] text-left text-[12px] text-[#5b6478] hover:text-[#18181a]"
+                          >
+                            <span className={`inline-block size-[6px] shrink-0 rounded-full ${page.page_type === 'entity' ? 'bg-[#3d5a91]' : 'bg-[#b45309]'}`} />
+                            <span className="truncate">{page.title}</span>
+                          </button>
+                        ))}
+                        {(wikiRefs?.pages.length ?? 0) > 8 && (
+                          <span className="text-[11px] text-[#a5adc0]">另有 {(wikiRefs?.pages.length ?? 0) - 8} 个词条未展示</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
                   <div>
                     <div className="flex items-center justify-between">
                       <div className="text-[12px] font-medium text-[#757f9c]">

@@ -12,7 +12,7 @@ from src.pipelines.spreadsheet.table_store import (
     is_boilerplate_sheet,
 )
 from src.pipelines.spreadsheet.pipeline import SpreadsheetPipeline
-from src.pipelines.spreadsheet.xlsx_parser import ParsedSheet, ParsedWorkbook
+from src.pipelines.spreadsheet.xlsx_parser import ParsedWorkbook
 
 
 class SpreadsheetTableStoreTests(unittest.TestCase):

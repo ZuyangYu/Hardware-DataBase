@@ -140,6 +140,9 @@ leak state. Registered in `runner.py`:
 - `circuit_search` (`make_circuit_search`) - `CircuitIndexService.query` -> structured circuit `Evidence`.
 - `spreadsheet_row_search` / `spreadsheet_cell_lookup` (`make_spreadsheet_tools`) - SQL over the per-KB spreadsheet index.
 - `conversation_search` (`make_conversation_search`) - external conversation records.
+- `wiki_search` (`make_wiki_search`) - distilled Wiki pages (summary/entity/concept) ranked by
+  title/slug/summary/aliases/content, expanded one hop along wiki links; feeds distilled knowledge
+  back into Q&A.
 - `list_kb_sources` (`make_catalog_tool`) - lists available doc/spreadsheet/circuit sources; not a retrieval tool.
 
 ### Backend layer (`src/pipelines/document_rag/`)

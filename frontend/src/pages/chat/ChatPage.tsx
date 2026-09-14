@@ -54,6 +54,50 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
     setMountedKbName(kbName);
   }, [kbName]);
 
+  const wikiAssistKey = `hdb.wikiAssist.${mountedKbName || '__general__'}`;
+  const [wikiAvailable, setWikiAvailable] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!mountedKbName) {
+      setWikiAvailable(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get<{ total_pages: number }>(`/api/v1/kbs/${encodeURIComponent(mountedKbName)}/wiki/stats`)
+      .then((stats) => {
+        if (!cancelled) setWikiAvailable((stats.total_pages ?? 0) > 0);
+      })
+      .catch(() => {
+        if (!cancelled) setWikiAvailable(null); // 查询失败不阻塞开关
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mountedKbName]);
+
+  const [wikiAssist, setWikiAssist] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(wikiAssistKey) === '1';
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      setWikiAssist(window.localStorage.getItem(`hdb.wikiAssist.${mountedKbName || '__general__'}`) === '1');
+    } catch {
+      setWikiAssist(false);
+    }
+  }, [mountedKbName]);
+  const updateWikiAssist = (value: boolean) => {
+    setWikiAssist(value);
+    try {
+      window.localStorage.setItem(wikiAssistKey, value ? '1' : '0');
+    } catch {
+      // localStorage 不可用时仅当前会话生效
+    }
+  };
+
   const chat = useKbChat(mountedKbName);
   const {
     sessions,
@@ -199,6 +243,9 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           onToggleAutoExtract={handleToggleAutoExtract}
           sessionConsents={sessionConsents}
           onRevokeConsent={revokeSessionConsent}
+          wikiAssist={mountedKbName ? wikiAssist : undefined}
+          onWikiAssistChange={mountedKbName ? updateWikiAssist : undefined}
+          wikiAvailable={mountedKbName ? wikiAvailable : undefined}
         />
         <MessageList
           messages={messages}
@@ -223,7 +270,7 @@ export default function ChatPage({ auth, kbName = '', availableKbs = [], onLogou
           setInput={setInput}
           streaming={streaming}
           onKbChange={handleKbChange}
-          onSend={() => void send()}
+          onSend={() => void send(wikiAssist)}
           onStop={abortStream}
         />
       </main>

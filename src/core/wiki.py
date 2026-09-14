@@ -31,6 +31,7 @@ from contextlib import closing
 from typing import Any, Callable
 
 import src.settings
+from src.core.query_tokens import tokenize_hardware_query
 
 
 PAGE_TYPES = ("summary", "entity", "concept", "index")
@@ -84,6 +85,47 @@ def _first_paragraph(content: str, limit: int = 200) -> str:
     return ""
 
 
+def _name_key(value: str) -> str:
+    """实体解析用归一: 忽略大小写/空白/连字符/间隔号。"""
+    return re.sub(r"[\s_\-·.]+", "", str(value or "")).lower()
+
+
+def _escape_like(value: str) -> str:
+    """转义 LIKE 通配符(配合 ESCAPE '\\')。"""
+    return str(value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _merge_page_bodies(target: str, source: str, source_title: str) -> str:
+    """把源页正文并入目标: 去掉源页的"## 来源"尾节, 目标已含同样内容则跳过。"""
+    body = str(source or "")
+    if not body.strip():
+        return str(target or "")
+    cut = body.rfind("## 来源")
+    if cut > 0:
+        body = body[:cut].rstrip()
+    if not body.strip():
+        return str(target or "")
+    normalized_target = re.sub(r"\s+", "", str(target or ""))
+    if re.sub(r"\s+", "", body) in normalized_target:
+        return str(target or "")
+    block = f"## 合并自《{str(source_title).strip()}》\n\n{body.strip()}"
+    return f"{str(target or '').rstrip()}\n\n{block}"
+
+
+def _is_source_ref(ref: str) -> bool:
+    """真实块级出处形如 ``<doc_id>#<块>``; 旧占位符 ``<slug>#chunk-n`` 前缀含 '/'。"""
+    head, sep, _ = str(ref or "").partition("#")
+    return bool(sep) and "/" not in head
+
+
+_WIKI_MD_LINK_RE = re.compile(r"\[[^\]\[]*\]\(((?:entity|concept|summary)/[^)\s]+)\)")
+
+
+def _normalize_wiki_links(content: str) -> str:
+    """模型偶发的 markdown 链接 [x](entity/foo) 归一为 [[entity/foo]]（前端只渲染后者）。"""
+    return _WIKI_MD_LINK_RE.sub(lambda m: f"[[{m.group(1).strip()}]]", str(content or ""))
+
+
 def _batch_chunks(chunks: list[str], max_chars: int) -> list[str]:
     """把原始素材块按顺序合并成批次, 保证 handle→原始块 的映射不丢失。
 
@@ -104,6 +146,25 @@ def _batch_chunks(chunks: list[str], max_chars: int) -> list[str]:
     if current:
         batches.append("\n\n".join(current))
     return batches
+
+
+def _batch_chunk_ranges(chunks: list[str], max_chars: int) -> list[list[int]]:
+    """与 _batch_chunks 同规则, 返回每个批次覆盖的原始块下标(用于块级出处)。"""
+    ranges: list[list[int]] = []
+    current: list[int] = []
+    size = 0
+    for idx, chunk in enumerate(chunks):
+        text = str(chunk).strip()
+        if not text:
+            continue
+        if current and size + len(text) > max_chars:
+            ranges.append(current)
+            current, size = [], 0
+        current.append(idx)
+        size += len(text) + 2
+    if current:
+        ranges.append(current)
+    return ranges
 
 
 CANDIDATE_PROMPT = """你是硬件知识库的 Wiki 编辑。阅读以下文档内容,抽取值得建词条的实体与概念。
@@ -144,7 +205,7 @@ PAGE_PROMPT = """为 Wiki 词条《{title}》撰写页面。
 
 要求:
 1. 用 Markdown, 中文; 结构化组织(概述 / 关键事实 / 出处), 忠实于材料, 不要编造
-2. 提到其他词条时用 [[slug]] 形式做互链(只允许这些 slug: {known_slugs})
+2. 提到其他词条时用 [[slug]] 形式做互链(只允许这些 slug: {known_slugs}); 不要用 [slug](slug) 这类 markdown 链接
 3. 保留材料中的关键数值/型号/位号原文
 4. 页面末尾加一行 "## 来源" 列出支撑材料编号
 5. 直接输出页面内容, 不要其他说明。"""
@@ -258,8 +319,62 @@ class WikiService:
                     FOREIGN KEY(page_id) REFERENCES wiki_pages(id) ON DELETE CASCADE,
                     UNIQUE(page_id, version)
                 );
+
+                CREATE TABLE IF NOT EXISTS wiki_jobs (
+                    kb_id INTEGER PRIMARY KEY,
+                    department_id INTEGER,
+                    running INTEGER NOT NULL DEFAULT 0,
+                    stage TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    stats_json TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
+
+    # -- job state (persisted across restarts) -------------------------------
+
+    def save_job_state(self, *, kb_id: int, department_id: int, state: dict[str, Any]) -> None:
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO wiki_jobs (
+                    kb_id, department_id, running, stage, error, stats_json,
+                    started_at, finished_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(kb_id) DO UPDATE SET
+                    department_id = excluded.department_id,
+                    running = excluded.running,
+                    stage = excluded.stage,
+                    error = excluded.error,
+                    stats_json = excluded.stats_json,
+                    started_at = CASE WHEN excluded.started_at != '' THEN excluded.started_at ELSE wiki_jobs.started_at END,
+                    finished_at = excluded.finished_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    kb_id, department_id, 1 if state.get("running") else 0,
+                    str(state.get("stage") or ""), str(state.get("error") or ""),
+                    json.dumps(state.get("stats") or {}, ensure_ascii=False) if state.get("stats") else "",
+                    str(state.get("started_at") or ""), str(state.get("finished_at") or ""), now,
+                ),
+            )
+
+    def get_job_state(self, kb_id: int) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT * FROM wiki_jobs WHERE kb_id = ?", (kb_id,)).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["running"] = bool(data.get("running"))
+        try:
+            data["stats"] = json.loads(data.pop("stats_json") or "{}")
+        except Exception:  # noqa: BLE001
+            data["stats"] = {}
+        return data
 
     # -- reading -------------------------------------------------------------
 
@@ -343,7 +458,9 @@ class WikiService:
                 "orphan_count": int(orphan),
             }
 
-    def get_graph(self, *, kb_id: int, department_id: int, limit: int = 200) -> dict[str, Any]:
+    def get_graph(self, *, kb_id: int, department_id: int, limit: int = 200, view: str = "pages") -> dict[str, Any]:
+        if view == "documents":
+            return self._graph_documents(kb_id=kb_id, department_id=department_id)
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
@@ -369,9 +486,196 @@ class WikiService:
                     edges.append({"source": r["slug"], "target": target})
         nodes.sort(key=lambda n: n["link_count"], reverse=True)
         truncated = len(nodes) > limit
-        return {"nodes": nodes[:limit], "edges": edges, "total": len(nodes), "truncated": truncated}
+        return {
+            "view": "pages", "nodes": nodes[:limit], "edges": edges,
+            "total": len(nodes), "truncated": truncated,
+        }
+
+    def _graph_documents(self, *, kb_id: int, department_id: int) -> dict[str, Any]:
+        """文档视图: 节点=来源文档, 边=共享实体/概念页数(由 source_refs 投影)。"""
+        from collections import defaultdict
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT slug, page_type, source_refs_json
+                FROM wiki_pages
+                WHERE kb_id = ? AND department_id = ? AND status = 'published'
+                  AND page_type IN ('entity', 'concept', 'summary')
+                """,
+                (kb_id, department_id),
+            ).fetchall()
+        doc_names: dict[str, str] = {}
+        doc_pages: dict[str, set[str]] = defaultdict(set)
+        page_docs: dict[str, list[str]] = {}
+        for r in rows:
+            refs = json.loads(r["source_refs_json"] or "[]")
+            docs: list[str] = []
+            for ref in refs:
+                doc_id, _, doc_name = str(ref).partition("|")
+                if not doc_id:
+                    continue
+                if doc_id not in doc_names:
+                    doc_names[doc_id] = doc_name or doc_id
+                docs.append(doc_id)
+            docs = sorted(set(docs))
+            page_docs[str(r["slug"])] = docs
+            for doc_id in docs:
+                doc_pages[doc_id].add(str(r["slug"]))
+        edge_map: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for slug, docs in page_docs.items():
+            for i in range(len(docs)):
+                for j in range(i + 1, len(docs)):
+                    edge_map[(docs[i], docs[j])].add(slug)
+        nodes = [
+            {"slug": doc_id, "title": doc_names.get(doc_id, doc_id), "page_count": len(pages)}
+            for doc_id, pages in doc_pages.items()
+        ]
+        nodes.sort(key=lambda n: n["page_count"], reverse=True)
+        edges = [
+            {"source": a, "target": b, "weight": len(slugs), "pages": sorted(slugs)[:3]}
+            for (a, b), slugs in sorted(edge_map.items(), key=lambda kv: -len(kv[1]))
+        ]
+        return {"view": "documents", "nodes": nodes, "edges": edges, "total": len(nodes), "truncated": False}
+
+    def pages_for_source(
+        self, *, kb_id: int, department_id: int, source_id: str, limit: int = 100,
+    ) -> dict[str, Any]:
+        """资产↔Wiki 只读关联: 该来源文档的摘要页 + 引用它的实体/概念页。"""
+        source_id = str(source_id or "").strip()
+        if not source_id:
+            return {"summary": None, "pages": []}
+        like = f'%"{source_id}|%'
+        with closing(self._connect()) as conn:
+            summary_row = conn.execute(
+                "SELECT slug, title, page_type FROM wiki_pages "
+                "WHERE kb_id = ? AND department_id = ? AND slug = ? AND status = 'published'",
+                (kb_id, department_id, f"summary/{source_id}"),
+            ).fetchone()
+            rows = conn.execute(
+                "SELECT slug, title, page_type FROM wiki_pages "
+                "WHERE kb_id = ? AND department_id = ? AND status = 'published' "
+                "AND page_type IN ('entity', 'concept') AND source_refs_json LIKE ? "
+                "ORDER BY page_type, title LIMIT ?",
+                (kb_id, department_id, like, max(1, min(int(limit or 100), 200))),
+            ).fetchall()
+        summary = (
+            {"slug": str(summary_row["slug"]), "title": str(summary_row["title"])}
+            if summary_row is not None else None
+        )
+        pages = [
+            {"slug": str(r["slug"]), "title": str(r["title"]), "page_type": str(r["page_type"])}
+            for r in rows
+        ]
+        return {"summary": summary, "pages": pages}
 
     # -- manual edits --------------------------------------------------------
+
+    def lint_pages(
+        self, *, kb_id: int, department_id: int,
+        known_source_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """只读质量报告: 孤儿/死链/空页/占位出处/过期来源/缺出处/别名重叠 + 健康分。
+
+        ``known_source_ids`` 由调用方从文档台账传入(store_id 字符串); 传 None 时
+        跳过"来源已删除"检查。不做任何写入。
+        """
+        with closing(self._connect()) as conn:
+            rows = [
+                dict(r) for r in conn.execute(
+                    "SELECT slug, title, page_type, content, aliases_json, in_links_json, "
+                    "out_links_json, source_refs_json, chunk_refs_json "
+                    "FROM wiki_pages WHERE kb_id = ? AND department_id = ? AND status = 'published'",
+                    (kb_id, department_id),
+                )
+            ]
+        live = {str(r["slug"]) for r in rows}
+        issues: list[dict[str, Any]] = []
+
+        def add(issue_type: str, severity: str, slug: str, detail: str, target: str = "") -> None:
+            issues.append({
+                "type": issue_type, "severity": severity, "slug": slug,
+                "target": target, "detail": detail,
+            })
+
+        page_counts = {"entity": 0, "concept": 0, "summary": 0, "index": 0}
+        total_links = 0
+        name_map: dict[str, str] = {}
+        for r in rows:
+            slug = str(r["slug"])
+            ptype = str(r["page_type"])
+            page_counts[ptype] = page_counts.get(ptype, 0) + 1
+            content = str(r["content"] or "")
+            in_links = json.loads(r["in_links_json"] or "[]")
+            out_links = json.loads(r["out_links_json"] or "[]")
+            total_links += len(out_links)
+            source_refs = json.loads(r["source_refs_json"] or "[]")
+            chunk_refs = json.loads(r["chunk_refs_json"] or "[]")
+
+            if ptype != "index" and not in_links:
+                add("orphan_page", "warning", slug, f"页面《{r['title']}》没有任何入链")
+            for target in out_links:
+                if str(target) not in live:
+                    add("broken_link", "error", slug, f"链接 [[{target}]] 指向不存在的页面", str(target))
+            if ptype != "index" and len(content.strip()) < 50:
+                add("empty_content", "warning", slug, f"页面《{r['title']}》内容过短({len(content.strip())} 字)")
+            if not chunk_refs:
+                add("missing_provenance", "warning", slug, "没有块级出处(chunk_refs 为空)")
+            elif any("#" in ref and "/" in str(ref).split("#")[0] for ref in chunk_refs):
+                add("placeholder_refs", "info", slug, "仍使用旧占位出处, 尚未按新管线重新蒸馏")
+            if not source_refs and ptype != "index":
+                add("missing_sources", "info", slug, "没有来源文档(source_refs 为空)")
+            if known_source_ids is not None and ptype != "index":
+                for ref in source_refs:
+                    doc_id = str(ref).partition("|")[0]
+                    if doc_id and doc_id not in known_source_ids:
+                        add("stale_source", "error", slug, f"引用的来源文档 {doc_id} 已不存在", doc_id)
+            if ptype in ("entity", "concept"):
+                for name in [r["title"], *json.loads(r["aliases_json"] or "[]")]:
+                    key = _name_key(name)
+                    if not key:
+                        continue
+                    if key in name_map and name_map[key] != slug:
+                        other = name_map[key]
+                        pair = tuple(sorted((other, slug)))
+                        if not any(
+                            i["type"] == "duplicate_alias" and tuple(sorted((i["slug"], i["target"]))) == pair
+                            for i in issues
+                        ):
+                            add("duplicate_alias", "info", slug,
+                                f"与 [[{other}]] 名称/别名重叠({str(name).strip()})", other)
+                    else:
+                        name_map.setdefault(key, slug)
+
+        error_count = sum(1 for i in issues if i["severity"] == "error")
+        warning_count = sum(1 for i in issues if i["severity"] == "warning")
+        info_count = sum(1 for i in issues if i["severity"] == "info")
+        by_type: dict[str, int] = {}
+        for issue in issues:
+            by_type[issue["type"]] = by_type.get(issue["type"], 0) + 1
+
+        health = 100
+        health -= min(20, by_type.get("orphan_page", 0) * 2)
+        health -= min(30, by_type.get("broken_link", 0) * 5)
+        health -= min(15, by_type.get("empty_content", 0) * 3)
+        health -= min(10, by_type.get("placeholder_refs", 0))
+        health -= min(30, by_type.get("stale_source", 0) * 3)
+        health -= min(10, by_type.get("duplicate_alias", 0))
+        health -= min(10, by_type.get("missing_provenance", 0))
+        health = max(0, min(100, health))
+        return {
+            "kb_id": kb_id,
+            "health_score": health,
+            "stats": {
+                "pages": len(rows), **page_counts, "links": total_links,
+            },
+            "by_type": by_type,
+            "issues": issues,
+            "summary": (
+                f"发现 {len(issues)} 个问题: {error_count} 错误 / {warning_count} 警告 / {info_count} 建议"
+                if issues else "Wiki 状态健康, 未发现问题"
+            ),
+        }
 
     def upsert_manual(
         self, *, kb_id: int, department_id: int, kb_name: str, actor_user_id: int | None,
@@ -548,8 +852,9 @@ class WikiService:
                 raise
 
     def _spreadsheet_blocks(
-        self, doc_id: str, kb_id: int, department_id: int, kb_name: str
-    ) -> list[str]:
+        self, doc_id: str, kb_id: int, department_id: int, kb_name: str,
+        *, with_refs: bool = False,
+    ) -> list[Any]:
         """选高密度、非样板 sheet 的 text_blocks 作为蒸馏素材。
 
         三层过滤, 全部通用(不依赖任何领域词表):
@@ -564,6 +869,7 @@ class WikiService:
         同时剔除审批表单行(批准人/保存期限/密级等), 虽然这些术语是中文工程
         特有的, 但 WeKnora 面向通用文档没有这个问题; 保留正则是防御层,
         主要通用信号是 ②(检测到重复 -> 去掉)。
+        ``with_refs=True`` 时返回 (文本, 块出处) 元组, 出处用于块级可回溯。
         """
         from collections import defaultdict
 
@@ -585,6 +891,7 @@ class WikiService:
         boiler_keys = {key for key, doc_set in doc_sets.items() if len(doc_set) >= 3}
 
         blocks: list[dict] = []
+        all_blocks: list[dict] = []
         densities: dict[str, int] = {}
         for row in conn.execute(
             "SELECT sheet_name, non_empty_cell_count FROM table_sheets WHERE record_id = ?", (int(doc_id),)
@@ -596,12 +903,14 @@ class WikiService:
             "SELECT block_index, block_text, sheet_name FROM table_text_blocks WHERE record_id = ?",
             (int(doc_id),),
         ):
+            entry = dict(row)
+            all_blocks.append(entry)
             if _TEMPLATE_SHEET_RE.search(str(row["sheet_name"])):
                 continue
-            blocks.append(dict(row))
+            blocks.append(entry)
         conn.close()
 
-        scored: list[tuple[str, str]] = []
+        scored: list[tuple[str, str, str]] = []
         for b in blocks:
             text = str(b["block_text"])
             if text[:240] in boiler_keys:
@@ -611,11 +920,23 @@ class WikiService:
             density = densities.get(str(b["sheet_name"]), WIKI_MIN_CELL_DENSITY)
             if density < WIKI_MIN_CELL_DENSITY:
                 continue
-            scored.append((str(b["sheet_name"]), text))
+            scored.append((str(b["sheet_name"]), text, f"{b['sheet_name']}!{b.get('block_index', '')}"))
 
-        by_sheet: dict[str, list[str]] = defaultdict(list)
-        for sheet, text in scored:
-            by_sheet[sheet].append(text)
+        if not scored:
+            # 兜底: 文档只有示例/模板 sheet 时, 放宽 sheet 名与密度过滤,
+            # 否则整份文档没有任何摘要页(示例内容仍好过缺失)。
+            scored = [
+                (str(b["sheet_name"]), str(b["block_text"]),
+                 f"{b['sheet_name']}!{b.get('block_index', '')}")
+                for b in all_blocks
+                if str(b["block_text"]).strip()
+                and not _APPROVAL_RE.search(str(b["block_text"]))
+                and not _BOILERPLATE_TEXT_RE.search(str(b["block_text"]))
+            ]
+
+        by_sheet: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for sheet, text, ref in scored:
+            by_sheet[sheet].append((text, ref))
         if not by_sheet:
             return []
 
@@ -625,9 +946,9 @@ class WikiService:
             densities.get(s, WIKI_MIN_CELL_DENSITY) for s in by_sheet
         ) or 1
         alloc = {
-            s: min(len(texts), max(1, round(
+            s: min(len(entries), max(1, round(
                 WIKI_MAX_BLOCKS_PER_DOC * densities.get(s, WIKI_MIN_CELL_DENSITY) / total_density)))
-            for s, texts in by_sheet.items()
+            for s, entries in by_sheet.items()
         }
         while sum(alloc.values()) > WIKI_MAX_BLOCKS_PER_DOC:
             victims = [s for s in alloc if alloc[s] > 1]
@@ -641,18 +962,21 @@ class WikiService:
             if room > 0:
                 alloc[sheet] += min(room, WIKI_MAX_BLOCKS_PER_DOC - sum(alloc.values()))
 
-        selected: list[str] = []
+        selected: list[tuple[str, str]] = []
         for sheet in sorted(by_sheet, key=lambda s: -densities.get(s, 0)):
-            texts = by_sheet[sheet]
+            entries = by_sheet[sheet]
             k = alloc[sheet]
             if k <= 0:
                 continue
             indices = (
-                [i * len(texts) // k for i in range(k)]
-                if k < len(texts) else list(range(len(texts)))
+                [i * len(entries) // k for i in range(k)]
+                if k < len(entries) else list(range(len(entries)))
             )
-            selected.extend(texts[i] for i in indices)
-        return selected[:WIKI_MAX_BLOCKS_PER_DOC]
+            selected.extend(entries[i] for i in indices)
+        selected = selected[:WIKI_MAX_BLOCKS_PER_DOC]
+        if with_refs:
+            return selected
+        return [text for text, _ in selected]
 
     def _circuit_blocks(self, pipeline: Any, kb_name: str, *, file_name: str) -> list[str]:
         """电路网表 → 结构化摘要(规模/模块/电源时钟网/器件构成)。
@@ -751,12 +1075,17 @@ class WikiService:
                 clock_nets = [n.name for n in design.nets if n.net_type == "clock"]
         power_nets = list(dict.fromkeys(power_nets))
         clock_nets = list(dict.fromkeys(clock_nets))
-        if power_nets:
-            first.append(f"电源/地网（{len(power_nets)} 个，前 30）：{'、'.join(power_nets[:30])}")
-        if clock_nets:
-            first.append(f"时钟网（{len(clock_nets)} 个，前 15）：{'、'.join(clock_nets[:15])}")
-
         blocks = ["\n".join(first)]
+        if power_nets:
+            blocks.append(
+                f"【电路网表电源/地网】{file_name}\n"
+                f"电源/地网共 {len(power_nets)} 个（前 30）：{'、'.join(power_nets[:30])}"
+            )
+        if clock_nets:
+            blocks.append(
+                f"【电路网表时钟网】{file_name}\n"
+                f"时钟网共 {len(clock_nets)} 个（前 15）：{'、'.join(clock_nets[:15])}"
+            )
         if design is not None:
             def model_label(inst: Any) -> str:
                 base = str(getattr(inst, "library_cell", None) or getattr(inst, "part_number", None) or "").strip()
@@ -766,40 +1095,46 @@ class WikiService:
             models = Counter(
                 label for label in (model_label(inst) for inst in design.instances) if label
             )
+            if models:
+                lines = [f"【电路网表器件构成】{file_name}", "主要器件（类型+参数，按实例数前 20）："]
+                for name, count in models.most_common(20):
+                    lines.append(f"- {name} × {count}")
+                blocks.append("\n".join(lines))
             connectors = [
                 str(inst.refdes)
                 for inst in design.instances
                 if str(inst.refdes or "").upper().startswith(("X", "J"))
             ]
-            second = [f"【电路网表器件构成】{file_name}"]
-            if models:
-                second.append("主要器件（类型+参数，按实例数前 20）：")
-                for name, count in models.most_common(20):
-                    second.append(f"- {name} × {count}")
-            if connectors:
-                second.append(f"连接器位号（{len(connectors)} 个）：{'、'.join(sorted(connectors)[:30])}")
             warnings = [str(w) for w in (overview or {}).get("warnings") or []] or [
                 str(w) for w in getattr(design, "parse_warnings", None) or []
             ]
+            lines = [f"【电路网表接口与告警】{file_name}"]
+            if connectors:
+                lines.append(f"连接器位号（{len(connectors)} 个）：{'、'.join(sorted(connectors)[:30])}")
             if warnings:
-                second.append(f"解析告警（{len(warnings)} 条，前 5）：{'；'.join(warnings[:5])}")
-            if len(second) > 1:
-                blocks.append("\n".join(second))
+                lines.append(f"解析告警（{len(warnings)} 条，前 5）：{'；'.join(warnings[:5])}")
+            if len(lines) > 1:
+                blocks.append("\n".join(lines))
         return [b for b in blocks if b.strip()]
 
     def gather_documents(
         self, pipeline: Any, kb_name: str, ctx: Any,
         *, kb_id: int, department_id: int,
         max_blocks_per_doc: int = WIKI_MAX_BLOCKS_PER_DOC,
+        file_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """确定性素材采集: 表格文件→高密度非样板 sheet 的 text_blocks;
         ragflow 文档 → 解析 chunks; 电路 → 结构化索引摘要(位号/型号统计)。
-        与资产中心同一份数据链路, 保证页面可回溯到解析产物。"""
+        与资产中心同一份数据链路, 保证页面可回溯到解析产物。
+        ``file_ids`` 非空时只采集这些文件(按规范 file id 匹配, 用于增量蒸馏)。"""
         from src.pipelines.document_rag.schemas import normalize_parse_status
         from src.pipelines.document_rag.schemas import TASK_STATUS_COMPLETED
 
+        wanted = {str(f) for f in file_ids or [] if str(f).strip()}
         docs: list[dict[str, Any]] = []
         for info in pipeline.list_file_infos(kb_name, ctx=ctx):
+            if wanted and str(info.id) not in wanted:
+                continue
             if normalize_parse_status(info.status, info.processor_kind) != TASK_STATUS_COMPLETED:
                 continue
             # 页面/slug 稳定用本地主键; 取解析结果必须用资产中心的规范 file id
@@ -807,17 +1142,24 @@ class WikiService:
             doc_id = str((info.metadata or {}).get("store_id") or info.id)
             kind = (info.processor_kind or "").lower()
             chunks: list[str] = []
+            chunk_refs: list[str] = []
             if "spreadsheet" in kind:
-                rows = self._spreadsheet_blocks(doc_id, kb_id, department_id, kb_name)
-                for b in rows[:max_blocks_per_doc]:
-                    c = str(b).strip()
+                rows = self._spreadsheet_blocks(
+                    doc_id, kb_id, department_id, kb_name, with_refs=True
+                )
+                for text, ref in rows[:max_blocks_per_doc]:
+                    c = str(text).strip()
                     if c:
                         chunks.append(c[:2500])
+                        chunk_refs.append(str(ref))
             elif "circuit" in kind:
-                for block in self._circuit_blocks(pipeline, kb_name, file_name=str(info.name)):
+                for index, block in enumerate(
+                    self._circuit_blocks(pipeline, kb_name, file_name=str(info.name)), start=1
+                ):
                     content = block.strip()
                     if content:
                         chunks.append(content[:2500])
+                        chunk_refs.append(f"digest-{index}")
             else:
                 try:
                     result = pipeline.get_parse_result(kb_name, str(info.id), ctx=ctx)
@@ -826,18 +1168,233 @@ class WikiService:
                         if not content or _BOILERPLATE_TEXT_RE.search(content):
                             continue
                         chunks.append(content)
+                        chunk_refs.append(f"chunk-{getattr(chunk, 'index', len(chunks))}")
                         if len(chunks) >= 8:
                             break
                 except Exception:  # noqa: BLE001 - 不可解析类型跳过
                     chunks = []
+                    chunk_refs = []
             if chunks:
                 docs.append({
                     "doc_id": doc_id, "name": str(info.name),
-                    "processor_kind": kind, "chunks": chunks,
+                    "processor_kind": kind, "chunks": chunks, "chunk_refs": chunk_refs,
                 })
         return docs
 
     # -- ingest pipeline -----------------------------------------------------
+
+    def _page_name_index(self, kb_id: int) -> dict[str, str]:
+        """既有页的 标题/别名/slug 末段 → slug 索引, 供实体解析(防同义页劈裂)。"""
+        index: dict[str, str] = {}
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT slug, title, aliases_json FROM wiki_pages "
+                "WHERE kb_id = ? AND status = 'published' ORDER BY id",
+                (kb_id,),
+            ).fetchall()
+        for row in rows:
+            names = [row["title"], str(row["slug"]).rsplit("/", 1)[-1]]
+            try:
+                names.extend(json.loads(row["aliases_json"] or "[]"))
+            except Exception:  # noqa: BLE001
+                pass
+            for name in names:
+                key = _name_key(name)
+                if key:
+                    index.setdefault(key, str(row["slug"]))
+        return index
+
+    @staticmethod
+    def _register_names(index: dict[str, str], slug: str, name: str, aliases: list[str]) -> None:
+        for candidate in [name, str(slug).rsplit("/", 1)[-1], *(aliases or [])]:
+            key = _name_key(candidate)
+            if key:
+                index.setdefault(key, slug)
+
+    @staticmethod
+    def _resolve_slug(
+        index: dict[str, str], slug: str, name: str, aliases: list[str],
+        page_type: str = "",
+    ) -> str:
+        """命中既有页的标题/别名时返回既有 slug, 否则保留 LLM 提议的 slug。
+
+        仅在页面类型一致时归并(entity 候选不会并进同名 concept 页)。
+        """
+        prefix = f"{page_type}/" if page_type else ""
+        for candidate in [name, str(slug).rsplit("/", 1)[-1], *(aliases or [])]:
+            key = _name_key(candidate)
+            if not key or key not in index:
+                continue
+            matched = index[key]
+            if not prefix or matched.startswith(prefix):
+                return matched
+        return slug
+
+    def search_pages(
+        self, *, kb_id: int, department_id: int, query: str,
+        limit: int = 10, status: str = "published",
+        expand_links: bool = True, expand_limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Wiki 回灌检索: 标题/别名/摘要/正文分级匹配 + 互链一跳扩展。
+
+        返回原样行 + ``match_rank``/``score``/``hop``/``via`` 注解;
+        ``hop=1`` 的邻居页仅作背景补充, 分数按衰减系数降低。
+        index 页(巨型目录)不参与检索。
+        """
+        needle = str(query or "").strip()
+        limit = max(1, min(int(limit or 10), 30))
+        tokens = [t for t in tokenize_hardware_query(needle, max_tokens=8) if t]
+        if not tokens and len(needle) >= 2:
+            tokens = [needle]
+        if not tokens:
+            return []
+        with closing(self._connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            where = ["kb_id = ?", "department_id = ?", "page_type != 'index'"]
+            where_params: list[Any] = [kb_id, department_id]
+            if status:
+                where.append("status = ?")
+                where_params.append(status)
+            rank_terms: list[str] = []
+            match_terms: list[str] = []
+            select_params: list[Any] = []
+            for token in tokens:
+                like = f"%{_escape_like(token)}%"
+                rank_terms.append(
+                    "(CASE WHEN title LIKE ? ESCAPE '\\' THEN 3 "
+                    "WHEN slug LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' "
+                    "OR aliases_json LIKE ? ESCAPE '\\' THEN 2 "
+                    "WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)"
+                )
+                select_params.extend([like] * 5)
+                match_terms.append(
+                    "(title LIKE ? ESCAPE '\\' OR slug LIKE ? ESCAPE '\\' "
+                    "OR summary LIKE ? ESCAPE '\\' OR aliases_json LIKE ? ESCAPE '\\' "
+                    "OR content LIKE ? ESCAPE '\\')"
+                )
+                where_params.extend([like] * 5)
+            select_rank = " + ".join(rank_terms)
+            where.append("(" + " OR ".join(match_terms) + ")")
+            sql = (
+                f"SELECT *, {select_rank} AS match_rank FROM wiki_pages "
+                f"WHERE {' AND '.join(where)} "
+                f"ORDER BY match_rank DESC, updated_at DESC LIMIT ?"
+            )
+            rows = [dict(r) for r in conn.execute(sql, [*select_params, *where_params, limit])]
+            if rows and expand_links and int(expand_limit) > 0:
+                base = {str(r["slug"]) for r in rows}
+                neighbors: dict[str, str] = {}
+                for r in rows:
+                    for key in ("out_links_json", "in_links_json"):
+                        try:
+                            targets = json.loads(r.get(key) or "[]")
+                        except Exception:  # noqa: BLE001
+                            targets = []
+                        for target in targets:
+                            target = str(target)
+                            if target in base or target in neighbors:
+                                continue
+                            neighbors[target] = str(r["slug"])
+                if neighbors:
+                    placeholders = ",".join("?" for _ in neighbors)
+                    nsql = (
+                        f"SELECT *, 0 AS match_rank FROM wiki_pages "
+                        f"WHERE kb_id = ? AND department_id = ? AND status = ? "
+                        f"AND page_type != 'index' AND slug IN ({placeholders}) LIMIT ?"
+                    )
+                    nrows = [
+                        dict(r) for r in conn.execute(
+                            nsql,
+                            [kb_id, department_id, status or "published",
+                             *neighbors.keys(), int(expand_limit)],
+                        )
+                    ]
+                    for r in nrows:
+                        r["hop"] = 1
+                        r["via"] = neighbors.get(str(r["slug"]), "")
+                        rows.append(r)
+        for r in rows:
+            r.setdefault("hop", 0)
+            r.setdefault("via", "")
+            rank = int(r.get("match_rank") or 0)
+            base_score = min(1.0, 0.25 + 0.25 * rank) if rank else 0.25
+            r["score"] = round(base_score * (0.5 if r["hop"] else 1.0), 4)
+        return rows
+
+    def merge_pages(self, *, kb_id: int, source_slug: str, target_slug: str) -> dict[str, Any]:
+        """把同义页 source 并入 target: 别名/来源/块引用合并, 正文保留 target,
+        其余页面里的 [[source]] 链接改写为 [[target]], 最后删除 source。"""
+        if source_slug == target_slug:
+            raise ValueError("source and target must differ")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                src = conn.execute(
+                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?", (kb_id, source_slug)
+                ).fetchone()
+                tgt = conn.execute(
+                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?", (kb_id, target_slug)
+                ).fetchone()
+                if src is None or tgt is None:
+                    raise ValueError("page not found")
+                aliases = list(json.loads(tgt["aliases_json"] or "[]"))
+                candidates = [src["title"], str(src["slug"]).rsplit("/", 1)[-1]]
+                try:
+                    candidates.extend(json.loads(src["aliases_json"] or "[]"))
+                except Exception:  # noqa: BLE001
+                    pass
+                for name in candidates:
+                    name = str(name or "").strip()
+                    if name and name != str(tgt["title"]).strip() and name not in aliases:
+                        aliases.append(name)
+                sources = sorted(set(json.loads(tgt["source_refs_json"] or "[]"))
+                                 | set(json.loads(src["source_refs_json"] or "[]")))
+                refs = sorted(
+                    r for r in (set(json.loads(tgt["chunk_refs_json"] or "[]"))
+                                | set(json.loads(src["chunk_refs_json"] or "[]")))
+                    if _is_source_ref(r)
+                )
+                now = utc_now()
+                merged_content = _merge_page_bodies(
+                    str(tgt["content"] or ""), str(src["content"] or ""), str(src["title"] or "")
+                )
+                if merged_content != str(tgt["content"] or ""):
+                    self._snapshot_revision(conn, tgt, "pipeline", None, now)
+                conn.execute(
+                    "UPDATE wiki_pages SET aliases_json = ?, source_refs_json = ?, "
+                    "chunk_refs_json = ?, content = ?, summary = ?, "
+                    "version = version + 1, last_edit_source = 'pipeline', "
+                    "updated_at = ? WHERE id = ?",
+                    (json.dumps(aliases, ensure_ascii=False),
+                     json.dumps(sources, ensure_ascii=False),
+                     json.dumps(refs, ensure_ascii=False),
+                     merged_content,
+                     _first_paragraph(merged_content) or str(tgt["summary"] or ""),
+                     now, tgt["id"]),
+                )
+                marker = f"[[{source_slug}]]"
+                replacement = f"[[{target_slug}]]"
+                rewrites = conn.execute(
+                    "SELECT id, content FROM wiki_pages WHERE kb_id = ? AND content LIKE ?",
+                    (kb_id, f"%{marker}%"),
+                ).fetchall()
+                for row in rewrites:
+                    conn.execute(
+                        "UPDATE wiki_pages SET content = ? WHERE id = ?",
+                        (str(row["content"]).replace(marker, replacement), row["id"]),
+                    )
+                # 源页归档保留(正文已并入目标), 不删除修订历史, 便于追溯/恢复
+                conn.execute(
+                    "UPDATE wiki_pages SET status = 'archived', updated_at = ? WHERE id = ?",
+                    (now, src["id"]),
+                )
+                self._rebuild_links(conn, kb_id)
+                conn.execute("COMMIT")
+                return {"merged": source_slug, "into": target_slug, "aliases": aliases,
+                        "links_rewritten": len(rewrites), "archived": source_slug}
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def _is_user_locked(self, kb_id: int, slug: str) -> bool:
         """人工编辑过的页视为锁定: 重蒸馏时跳过覆盖, 只读不上写。"""
@@ -881,46 +1438,80 @@ class WikiService:
 
         stats = {"documents": len(documents), "candidates": 0, "cited": 0,
                  "pages_written": 0, "uncited": 0, "skipped_user_edited": 0,
-                 "errors": []}
+                 "skipped_user_edited_slugs": [], "errors": []}
         slug_updates: dict[str, dict[str, Any]] = {}
+        name_index = self._page_name_index(kb_id)
         for doc_index, doc in enumerate(documents, start=1):
             text = "\n\n".join(str(c) for c in doc.get("chunks") or [] if str(c).strip())
             if not text.strip():
                 continue
             report(f"蒸馏 {doc_index}/{len(documents)}: {str(doc.get('name') or '')[:40]}")
             try:
-                candidates = self._pass0_candidates(chat_fn, text, granularity, kb_id)
+                candidates = self._pass0_candidates(
+                    chat_fn, text, granularity, kb_id, name_index=name_index
+                )
                 stats["candidates"] += len(candidates)
+                raw_chunks = list(doc.get("chunks") or [])
+                raw_refs = [str(r) for r in doc.get("chunk_refs") or []]
+                if len(raw_refs) != len(raw_chunks):
+                    raw_refs = [f"chunk-{i + 1}" for i in range(len(raw_chunks))]
+                batch_ranges = _batch_chunk_ranges(raw_chunks, MAX_CHUNK_CHARS_PER_BATCH)
+                doc_key = str(doc["doc_id"])
+
+                def refs_for_batches(batch_indices: list[int]) -> list[str]:
+                    refs: list[str] = []
+                    for batch_index in batch_indices:
+                        if 0 <= batch_index < len(batch_ranges):
+                            refs.extend(
+                                f"{doc_key}#{raw_refs[i]}"
+                                for i in batch_ranges[batch_index] if i < len(raw_refs)
+                            )
+                    return refs
+
                 cited, new_slugs, cited_texts = self._citation_pass(
                     chat_fn, doc.get("chunks") or [], candidates
                 )
                 stats["cited"] += sum(len(v) for v in cited.values())
                 stats["uncited"] += sum(1 for c in candidates if not cited.get(c["slug"]))
                 for c in candidates:
+                    self._register_names(name_index, c["slug"], c["name"], c["aliases"])
                     item = slug_updates.setdefault(
-                        c["slug"], {**c, "chunks": [], "chunk_texts": [], "docs": set()}
+                        c["slug"], {**c, "chunks": [], "chunk_texts": [], "chunk_refs": [], "docs": set()}
                     )
-                    item["docs"].add((str(doc["doc_id"]), str(doc["name"])))
+                    for alias in c.get("aliases") or []:
+                        if alias and alias not in item["aliases"]:
+                            item["aliases"].append(alias)
+                    item["docs"].add((doc_key, str(doc["name"])))
                     cited_idx = cited.get(c["slug"], [])
                     item["chunks"].extend(cited_idx)
                     item["chunk_texts"].extend(
                         [str(cited_texts[i]) for i in cited_idx if 0 <= i < len(cited_texts)]
                     )
+                    item["chunk_refs"].extend(refs_for_batches(cited_idx))
                 for ns in new_slugs:
-                    item = slug_updates.setdefault(
-                        ns["slug"], {**ns, "chunks": [], "chunk_texts": [], "docs": set()}
+                    ns["slug"] = self._resolve_slug(
+                        name_index, ns["slug"], ns["name"], ns["aliases"], ns.get("kind", "")
                     )
-                    item["docs"].add((str(doc["doc_id"]), str(doc["name"])))
+                    self._register_names(name_index, ns["slug"], ns["name"], ns["aliases"])
+                    item = slug_updates.setdefault(
+                        ns["slug"], {**ns, "chunks": [], "chunk_texts": [], "chunk_refs": [], "docs": set()}
+                    )
+                    for alias in ns.get("aliases") or []:
+                        if alias and alias not in item["aliases"]:
+                            item["aliases"].append(alias)
+                    item["docs"].add((doc_key, str(doc["name"])))
                     ns_idx = ns.get("chunks", [])
                     item["chunks"].extend(ns_idx)
                     item["chunk_texts"].extend(
                         [str(cited_texts[i]) for i in ns_idx if 0 <= i < len(cited_texts)]
                     )
+                    item["chunk_refs"].extend(refs_for_batches(ns_idx))
                 # WeKnora: 每文档一页摘要(summary), 引用采样块;
                 # 人工编辑过的页视为已锁定, 管线不再覆盖(防"改完→重跑→又坏")
                 summary_slug = f"summary/{doc['doc_id']}"
                 if self._is_user_locked(kb_id, summary_slug):
                     stats["skipped_user_edited"] += 1
+                    stats["skipped_user_edited_slugs"].append(summary_slug)
                 elif self._write_summary_page(
                     kb_id=kb_id, kb_name=kb_name, department_id=department_id, doc=doc, chat_fn=chat_fn,
                 ):
@@ -934,6 +1525,7 @@ class WikiService:
         for page_index, (slug, item) in enumerate(slug_updates.items(), start=1):
             if self._is_user_locked(kb_id, slug):
                 stats["skipped_user_edited"] += 1
+                stats["skipped_user_edited_slugs"].append(slug)
                 continue
             report(f"写入词条 {page_index}/{len(slug_updates)}: {slug[:40]}")
             try:
@@ -951,9 +1543,14 @@ class WikiService:
         self._ensure_index_page(kb_id=kb_id, kb_name=kb_name, department_id=department_id)
         return stats
 
-    def _pass0_candidates(self, chat_fn: Callable[[str], str], text: str, granularity: str, kb_id: int) -> list[dict[str, Any]]:
+    def _pass0_candidates(
+        self, chat_fn: Callable[[str], str], text: str, granularity: str, kb_id: int,
+        *, name_index: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         raw = chat_fn(CANDIDATE_PROMPT.format(text=_clip(text), granularity_hint=GRANULARITY_HINTS[granularity]))
         data = _parse_json_object(raw)
+        if name_index is None:
+            name_index = self._page_name_index(kb_id)
         items: list[dict[str, Any]] = []
         seen: set[str] = set()
         for kind, key in (("entity", "entities"), ("concept", "concepts")):
@@ -967,18 +1564,18 @@ class WikiService:
                 if not token:
                     token = slugify(name)
                 slug = f"{kind}/{slugify(token)}"
+                aliases = [str(a).strip() for a in e.get("aliases") or [] if str(a).strip()]
+                # 同义实体解析: 命中同类型既有页标题/别名时并入, 避免图谱劈裂
+                slug = self._resolve_slug(name_index, slug, name, aliases, kind)
                 if slug in seen:
                     continue
                 seen.add(slug)
-                item: dict[str, Any] = {
+                items.append({
                     "slug": slug, "name": name, "kind": kind,
-                    "aliases": [str(a).strip() for a in e.get("aliases") or [] if str(a).strip()],
+                    "aliases": aliases,
                     "description": str(e.get("description", "")).strip(),
                     "chunks": [],
-                }
-                if item["aliases"] and name not in item["aliases"]:
-                    pass
-                items.append(item)
+                })
         return items
 
     def _citation_pass(
@@ -1035,10 +1632,13 @@ class WikiService:
         slug = f"summary/{doc['doc_id']}"
         material = "\n\n".join(f"[{i + 1}] {c[:1600]}" for i, c in enumerate(chunks[:8]))
         now = utc_now()
-        content = chat_fn(SUMMARY_PROMPT.format(chunks=material)).strip()
+        content = _normalize_wiki_links(chat_fn(SUMMARY_PROMPT.format(chunks=material)).strip())
         summary = _first_paragraph(content)
         source_refs = [f"{doc['doc_id']}|{doc.get('name') or ''}"]
-        chunk_refs = sorted({f"{slug}#chunk-{i + 1}" for i in range(len(chunks[:8]))})
+        doc_refs = [str(r) for r in doc.get("chunk_refs") or []]
+        if len(doc_refs) != len(chunks):
+            doc_refs = [f"chunk-{i + 1}" for i in range(len(chunks))]
+        chunk_refs = sorted({f"{doc['doc_id']}#{r}" for r in doc_refs[:8]})
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1107,12 +1707,14 @@ class WikiService:
             title=item.get("name") or slug, existing=existing_content or "(尚无页面)",
             chunks=material, known_slugs=known_text,
         )).strip()
+        content = _normalize_wiki_links(content)
         summary = _first_paragraph(content)
         aliases = list(item.get("aliases") or [])
         if row is not None:
             aliases = list(dict.fromkeys(aliases + (json.loads(row["aliases_json"] or "[]"))))
         source_refs = sorted({f"{doc_id}|{doc_name}" for doc_id, doc_name in item.get("docs", set())})
-        chunk_refs = sorted({f"{slug}#chunk-{i + 1}" for i in range(len(chunk_texts[:8]))})
+        real_refs = sorted({str(r) for r in item.get("chunk_refs") or [] if str(r).strip()})
+        chunk_refs = real_refs or sorted({f"{slug}#chunk-{i + 1}" for i in range(len(chunk_texts[:8]))})
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1138,7 +1740,11 @@ class WikiService:
                     if str(row["content"]).strip() != content.strip():
                         self._snapshot_revision(conn, row, "pipeline", None, now)
                     merged_sources = sorted(set(source_refs) | set(json.loads(row["source_refs_json"] or "[]")))
-                    merged_chunks = sorted(set(chunk_refs) | set(json.loads(row["chunk_refs_json"] or "[]")))
+                    existing_chunks = [
+                        str(r) for r in json.loads(row["chunk_refs_json"] or "[]")
+                        if _is_source_ref(r)
+                    ]
+                    merged_chunks = sorted(set(chunk_refs) | set(existing_chunks))
                     conn.execute(
                         """
                         UPDATE wiki_pages SET content = ?, summary = ?, aliases_json = ?,

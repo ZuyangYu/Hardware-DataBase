@@ -30,6 +30,7 @@ TOOL_LABELS = {
     "spreadsheet_schema_lookup": "表格SQL结构",
     "spreadsheet_sql_query": "表格SQL查询",
     "list_kb_sources": "读取知识库目录",
+    "wiki_search": "Wiki 检索",
 }
 
 MAX_MEMORY_CONTEXT_CONTENT_CHARS = 2_000
