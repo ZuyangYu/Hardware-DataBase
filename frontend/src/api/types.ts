@@ -46,6 +46,41 @@ export interface UploadAck {
   messages: string[];
 }
 
+/**
+ * Versioned reference passed from the chat shell to document-authoring tools.
+ *
+ * The field is intentionally optional at every API boundary below: older
+ * servers do not persist or return document context yet, while the enabled
+ * bridge can still send this stable object without changing the legacy chat
+ * payload when no template has been attached.
+ */
+export interface DocumentContextV1 {
+  analysis_id: string;
+  template_version_id: string;
+  knowledge_base_name: string;
+  version: 1 | 'v1';
+  expiry: string;
+  client_request_id: string;
+  generation_session_id?: string | null;
+}
+
+export interface DocumentContextV2 {
+  version: 'v2';
+  knowledge_base_name?: string | null;
+  attachment_ids?: string[];
+  source_scope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
+  task_id?: string | null;
+  generation_session_id?: string | null;
+  output_spec_id?: string | null;
+  output_spec_version?: number | null;
+  template_version_id?: string | null;
+  analysis_id?: string | null;
+  expiry: string;
+  client_request_id: string;
+}
+
+export type DocumentContext = DocumentContextV1 | DocumentContextV2;
+
 export interface AssetEvidenceView {
   id: number;
   file_id: string;
@@ -122,6 +157,8 @@ export interface SessionView {
   title: string;
   created_at: string;
   updated_at: string;
+  /** Optional until the conversation API exposes persisted document context. */
+  document_context?: DocumentContext | null;
 }
 
 export interface MemoryContextItem {
@@ -137,9 +174,21 @@ export interface MemoryContextItem {
   [key: string]: unknown;
 }
 
+export interface AttachmentSnapshot {
+  attachment_id: string;
+  filename: string;
+  media_type?: string;
+  usage_hint?: string;
+  content_hash?: string;
+  ordinal?: number;
+  parse_status?: string;
+  deleted?: boolean;
+}
+
 export interface MessageView {
   id: number;
   session_id: number;
+  turn_id?: string | null;
   role: 'user' | 'assistant' | 'system';
   content: string;
   footer?: string;
@@ -147,8 +196,14 @@ export interface MessageView {
   edited_at?: string | null;
   created_at: string;
   memory_context?: MemoryContextItem[];
+  /** Optional future projection; current servers omit this field. */
+  document_context?: DocumentContext | null;
+  /** Frozen attachment snapshots of the owning turn (user messages). */
+  attachments?: AttachmentSnapshot[];
   /** 紧凑引用列表（随消息持久化），刷新后"参考来源"面板的数据源。 */
   citations?: EvidenceItem[];
+  /** 该 turn 持久化的 document_card 事件（刷新后卡片回填；原始线格式）。 */
+  cards?: Record<string, unknown>[];
 }
 
 export interface SessionMemorySummary {
@@ -164,7 +219,7 @@ export interface TurnView {
   kb_name: string;
   query: string;
   query_mode: 'fast' | 'deep';
-  status: 'pending' | 'streaming' | 'cancelling' | 'completed' | 'cancelled' | 'failed';
+  status: 'pending' | 'streaming' | 'cancelling' | 'waiting_for_attachments' | 'completed' | 'cancelled' | 'failed';
   cancel_requested: boolean;
   last_event_seq: number;
   answer: string;
@@ -175,6 +230,44 @@ export interface TurnView {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  /** Optional until Task 8 adds turn-context persistence to the API. */
+  document_context?: DocumentContext | null;
+  source_scope?: string;
+  attachments?: AttachmentSnapshot[];
+}
+
+/** Chat attachment lifecycle DTO (aligned with src/api/routes/attachments.py). */
+export interface AttachmentView {
+  attachment_id: string;
+  asset_id: string;
+  filename: string;
+  media_type: string;
+  extension: string;
+  size_bytes: number;
+  sha256: string;
+  usage_hint: string;
+  status: 'active' | 'deleted' | 'expired';
+  parse_status: 'queued' | 'running' | 'ready' | 'degraded' | 'failed';
+  error_code?: string;
+  error_message?: string;
+  manifest?: Record<string, unknown>;
+  degraded_reasons?: string[];
+  created_at: string;
+  updated_at?: string;
+}
+
+/** Request body accepted by the persistent turn endpoint. */
+export interface CreateTurnRequest {
+  query: string;
+  client_request_id?: string | null;
+  query_mode?: 'fast' | 'deep';
+  document_context?: DocumentContext | null;
+  /** Explicit document-flow override; sent only alongside document_context; absent keeps the server's regex fallback. */
+  document_flow?: boolean;
+  /** Session attachment references; server re-verifies ownership + parse state. */
+  attachment_ids?: string[];
+  /** Scope selector; "auto" expands deterministically server-side. */
+  source_scope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
 }
 
 export interface TurnStartResponse {
@@ -192,6 +285,8 @@ export type MemoryStatus =
   | 'rejected'
   | 'deleted'
   | 'provenance_missing';
+
+export type MemoryListStatus = MemoryStatus | 'active' | 'all';
 
 export interface MemorySourceView {
   source_id: string;
@@ -446,6 +541,58 @@ export interface QueryDonePayload {
   } | null;
   footer?: string;
   token_usage?: unknown;
+}
+
+export type ExportFormat = 'md' | 'xlsx' | 'docx' | 'pdf' | 'pptx';
+
+export interface ExportArtifactView {
+  artifact_id: string;
+  export_job_id: string;
+  session_id: number;
+  format: ExportFormat;
+  filename: string;
+  mime_type: string;
+  size: number;
+  sha256: string;
+  preview: Record<string, unknown>;
+  created_at: string;
+  expires_at?: string | null;
+  preview_url: string;
+  download_url: string;
+  tenant_id: string;
+  department_id?: string | null;
+  knowledge_base_name: string;
+  snapshot_id?: string;
+  turn_id?: string | null;
+  available?: boolean;
+}
+
+export interface ExportJobView {
+  export_job_id: string;
+  snapshot_id: string;
+  session_id: number;
+  turn_id?: string | null;
+  format: ExportFormat;
+  content_shape: 'report' | 'data' | 'raw' | string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'dead_letter' | string;
+  attempt: number;
+  error_message: string;
+  artifact: ExportArtifactView | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  tenant_id: string;
+  department_id?: string | null;
+  knowledge_base_name: string;
+}
+
+export type ExportFormatsResponse = ExportFormat[];
+
+export interface ExportBatchResponse {
+  snapshot_id: string;
+  session_id: number;
+  source_ref: { kind: 'turn' | 'message' | 'snapshot'; id: string };
+  jobs: ExportJobView[];
 }
 
 export type QueryTraceStatus = 'pending' | 'running' | 'done' | 'error';
@@ -886,6 +1033,9 @@ export type DocumentAnalysis = {
   suggestions: DocumentSuggestion[];
   reason_codes?: string[];
   auto_activated?: boolean;
+  /** Optional server-provided context lifetime; older responses omit it. */
+  expiry?: string | null;
+  expires_at?: string | null;
 };
 
 export type TemplateReviewUnit = DocumentUnit & {
@@ -949,6 +1099,8 @@ export type GenerationBriefView = {
   inference_policy: string | null;
   confirmed: boolean;
   confidence: number;
+  unresolved_requirements?: Array<Record<string, unknown>>;
+  resolved_fields?: Record<string, unknown>;
   updated_at?: string;
 };
 
@@ -960,15 +1112,31 @@ export type ClarificationMessage = {
   options?: string[];
   answer?: string | null;
   reason?: string | null;
+  client_request_id?: string | null;
   created_at?: string;
 };
 
 export type GenerationSession = {
   session_id: string;
-  status: 'needs_clarification' | 'ready_to_generate' | 'generating' | 'completed' | 'cancelled';
+  knowledge_base_name?: string;
+  status:
+    | 'needs_clarification'
+    | 'ready_to_generate'
+    | 'generating'
+    | 'completed'
+    | 'cancelled'
+    | 'awaiting_plan'
+    | 'awaiting_plan_confirmation'
+    | 'planned'
+    | 'blocked';
   brief: GenerationBriefView;
   messages: ClarificationMessage[];
   work_order_id?: string | null;
+  conversation_id?: string | null;
+  initiating_turn_id?: string | null;
+  document_task_id?: string | null;
+  last_question_id?: string | null;
+  clarification_revision?: number;
 };
 
 export type WorkOrderStage =
@@ -978,6 +1146,7 @@ export type WorkOrderStage =
 
 export type CreateWorkOrderResult = {
   work_order_id: string;
+  task_id?: string | null;
   stage: WorkOrderStage;
   exceptions?: unknown[];
   issues?: unknown[];
@@ -985,6 +1154,7 @@ export type CreateWorkOrderResult = {
 
 export type WorkOrder = {
   work_order_id: string;
+  task_id?: string | null;
   status: string;
   scope_type: string;
   target_format?: string;
@@ -1000,8 +1170,35 @@ export type HarnessRunView = {
   error?: string;
 } & Record<string, unknown>;
 
+/** One schema unit projected for the workbench coverage panel. */
+export type DocumentCoverageField = {
+  kind: 'field' | 'review';
+  field_id: string;
+  unit_id: string;
+  label: string;
+  required: boolean;
+  status: string;
+  coverage_status?: string | null;
+  display_value?: string | null;
+  evidence_count: number;
+};
+
+/** Per-field coverage projection served with the work-order status. */
+export type DocumentCoverage = {
+  fields: DocumentCoverageField[];
+  summary: {
+    covered: number;
+    missing: number;
+    conflicting: number;
+    failed: number;
+    pending: number;
+  };
+  total: number;
+};
+
 export type WorkOrderStatus = {
-  work_order_id: string;
+  work_order_id: string | null;
+  task_id?: string | null;
   status: string;
   phase?: string;
   display_label?: string;
@@ -1011,6 +1208,18 @@ export type WorkOrderStatus = {
   error_message?: string;
   retryable?: boolean;
   next_actions?: string[];
+  pending_decisions?: Array<{
+    decision_id?: string;
+    group_key: string;
+    kind?: string;
+    title?: string;
+    options?: string[];
+    default_option?: string;
+    count?: number;
+    blocking?: boolean;
+  }>;
+  candidate_state?: 'none' | 'available' | 'blocked';
+  release_state?: 'not_requested' | 'pending' | 'approved' | 'rejected';
   can_pause?: boolean;
   can_resume?: boolean;
   can_cancel?: boolean;
@@ -1021,14 +1230,112 @@ export type WorkOrderStatus = {
   knowledge_base_name?: string;
   target_format?: string;
   unit_statuses: Record<string, string>;
+  coverage?: DocumentCoverage;
   harness_run?: HarnessRunView;
   validation?: { status?: string; issues?: unknown[] };
+  pending_review?: Record<string, unknown> | null;
   artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
   [k: string]: unknown;
 };
 
+/** Durable document-authoring task projected back into a chat session. */
+export type DocumentChatTaskView = {
+  session_id: number;
+  conversation_revision?: number | null;
+  task_id?: string | null;
+  work_order_id?: string | null;
+  kb_name: string;
+  job_status: string;
+  created_at: string;
+  updated_at: string;
+  status: WorkOrderStatus;
+};
+
+export type DocumentReview = {
+  review_id: string;
+  task_id: string;
+  work_order_id?: string | null;
+  artifact_id?: string | null;
+  review_kind: string;
+  status: string;
+  subject_hash: string;
+  source_snapshot_hash: string;
+  schema_hash: string;
+  decision?: unknown;
+  decision_client_request_id?: string | null;
+  client_request_id?: string | null;
+  [k: string]: unknown;
+};
+
+export type ArtifactRevision = {
+  revision_id: string;
+  task_id: string;
+  work_order_id?: string | null;
+  parent_artifact_id: string;
+  child_artifact_id?: string | null;
+  status: string;
+  request_type: 'field_update' | 'section_update' | 'full_regeneration';
+  input_snapshot_hash: string;
+  source_snapshot_hash: string;
+  schema_hash: string;
+  impact_scope: Record<string, unknown>;
+  revalidation_scope: string[];
+  revalidation_status?: 'pending' | 'passed' | 'failed' | 'requires_human' | string;
+  revalidation_result?: Record<string, unknown>;
+  invalidated_approval_event_ids: string[];
+  client_request_id?: string | null;
+  [k: string]: unknown;
+};
+
+export type DocumentTaskProjection = {
+  task_id: string;
+  origin: string;
+  status: string;
+  conversation_refs: Record<string, string>;
+  generation_session_id?: string | null;
+  work_order_id?: string | null;
+  current_run_id?: string | null;
+  current_artifact_id?: string | null;
+  artifact_ids: string[];
+  knowledge_base_name?: string | null;
+  template_version_id?: string | null;
+  clarification_state?: Record<string, unknown> | null;
+  work_order?: Record<string, unknown> | null;
+  run?: Record<string, unknown> | null;
+  artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
+  reviews: DocumentReview[];
+  revisions: ArtifactRevision[];
+  pending_decisions?: Array<{
+    decision_id?: string;
+    group_key: string;
+    kind?: string;
+    title?: string;
+    options?: string[];
+    default_option?: string;
+    count?: number;
+    blocking?: boolean;
+  }>;
+  candidate_state?: 'none' | 'available' | 'blocked';
+  release_state?: 'not_requested' | 'pending' | 'approved' | 'rejected';
+  pending_review?: Record<string, unknown> | null;
+  next_actions: string[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type IcdScopeException = {
+  exception_id?: string;
+  kind?: string;
+  refdes?: string | null;
+  pin_name?: string | null;
+  recommended_action?: string;
+  user_instruction?: string;
+  source_names?: string[];
+};
+
 export type IcdScopeReview = {
   status?: string;
-  exceptions?: Array<{ exception_id?: string; kind?: string; pin?: string }>;
+  pending_count?: number;
+  exceptions?: IcdScopeException[];
   [k: string]: unknown;
 } | null;

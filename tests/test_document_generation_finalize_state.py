@@ -141,6 +141,30 @@ def test_verified_candidate_is_auto_published_without_human_event(monkeypatch):
     )
 
 
+def test_candidate_with_generic_blocking_issue_is_not_auto_published(monkeypatch):
+    monkeypatch.setattr(src.settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
+    service = object.__new__(DocumentGenerationService)
+    candidate = SimpleNamespace(artifact_id="candidate-blocked")
+    report = SimpleNamespace(
+        status="passed",
+        issues=[{"code": "draft_unit_mismatch", "blocking": True}],
+    )
+    service.store = SimpleNamespace(save_artifact=Mock())
+
+    result = service._auto_publish_verified_candidate(
+        SimpleNamespace(),
+        candidate,
+        report,
+        b"invalid workbook",
+        unit_statuses={},
+        evidence_matrix_id="matrix-1",
+        validation_report_id="report-1",
+    )
+
+    assert result is candidate
+    service.store.save_artifact.assert_not_called()
+
+
 def test_auto_publish_policy_does_not_route_missing_tbd_fields_to_human_review():
     assert _requires_human_review(
         {"field:unavailable_pin": "tbd", "field:verified": "ready_to_render"},
@@ -155,6 +179,32 @@ def test_auto_publish_policy_does_not_route_missing_tbd_fields_to_human_review()
 def test_direct_verified_work_order_can_be_auto_released_without_chat_session(monkeypatch):
     monkeypatch.setattr(src.settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
     order = SimpleNamespace(generation_session_id=None, generation_brief={})
+    report = SimpleNamespace(status="passed")
+
+    assert _automatic_release_allowed(order, report, requires_review=False) is True
+
+
+@pytest.mark.parametrize("document_type", ["icd", "fpt", "requirements", "requirements_spec"])
+def test_controlled_engineering_documents_always_require_release_review(
+    monkeypatch,
+    document_type,
+):
+    monkeypatch.setattr(src.settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
+    order = SimpleNamespace(
+        generation_session_id=None,
+        generation_brief={"document_type": document_type},
+    )
+    report = SimpleNamespace(status="passed")
+
+    assert _automatic_release_allowed(order, report, requires_review=False) is False
+
+
+def test_ordinary_report_may_still_auto_release_when_verified(monkeypatch):
+    monkeypatch.setattr(src.settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
+    order = SimpleNamespace(
+        generation_session_id=None,
+        generation_brief={"document_type": "report"},
+    )
     report = SimpleNamespace(status="passed")
 
     assert _automatic_release_allowed(order, report, requires_review=False) is True

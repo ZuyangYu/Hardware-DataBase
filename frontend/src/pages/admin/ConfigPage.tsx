@@ -66,6 +66,7 @@ const GROUPS: Group[] = [
       ['AGENT_CUSTOM_BASE_URL', 'Custom Base URL'],
       ['AGENT_CUSTOM_MODEL', 'Custom Model'],
       ['AGENT_CUSTOM_MAX_TOKENS', 'Custom Max Tokens'],
+      ['AGENT_MODEL_MAX_INPUT_TOKENS', '模型输入上下文上限'],
       ['AGENT_TEMPERATURE', 'Temperature'],
       ['AGENT_TIMEOUT_SECONDS', '超时(秒)'],
       ['AGENT_RATE_LIMIT_MAX_RETRIES', '限流重试次数'],
@@ -78,6 +79,18 @@ const GROUPS: Group[] = [
     fields: [
       ['FINAL_TOP_K', 'Final Top K'],
       ['AGENT_MAX_RETRIEVAL_ROUNDS', '最大检索轮数'],
+    ],
+  },
+  {
+    title: '文档 Agent（受控灰度）',
+    fields: [
+      ['DOCUMENT_AUTHORING_AGENT_MODE_ENABLED', '启用 external_agent'],
+      ['AGENT_DOCUMENT_TOOLS_ENABLED', '启用聊天文档工具'],
+      ['DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND', 'Checkpointer 后端'],
+      ['DOCUMENT_AUTHORING_CHECKPOINTER_PATH', 'Checkpointer 路径'],
+      ['DOCUMENT_AUTHORING_JOB_LEASE_SECONDS', '文档任务租约(秒)'],
+      ['DOCUMENT_AUTHORING_JOB_BATCH_SIZE', '文档任务批量数'],
+      ['DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS', '文档任务时间预算(秒)'],
     ],
   },
   {
@@ -123,6 +136,7 @@ const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: number; 
   RAGFLOW_VECTOR_WEIGHT: { min: 0, max: 1, step: 0.05 },
   AUTH_SESSION_TTL_HOURS: { min: 1, max: 720, integer: true },
   AGENT_CUSTOM_MAX_TOKENS: { min: 256, max: 65536, step: 256, integer: true },
+  AGENT_MODEL_MAX_INPUT_TOKENS: { min: 0, max: 1000000, step: 1024, integer: true },
   AGENT_TEMPERATURE: { min: 0, max: 2, step: 0.1 },
   AGENT_TIMEOUT_SECONDS: { min: 10, max: 600, step: 10, integer: true },
   AGENT_RATE_LIMIT_MAX_RETRIES: { min: 0, max: 20, integer: true },
@@ -130,6 +144,9 @@ const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: number; 
   AGENT_RATE_LIMIT_MAX_DELAY_SECONDS: { min: 0, max: 600 },
   FINAL_TOP_K: { min: 1, max: 50, integer: true },
   AGENT_MAX_RETRIEVAL_ROUNDS: { min: 1, max: 20, integer: true },
+  DOCUMENT_AUTHORING_JOB_LEASE_SECONDS: { min: 15, max: 3600, integer: true },
+  DOCUMENT_AUTHORING_JOB_BATCH_SIZE: { min: 1, max: 100, integer: true },
+  DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS: { min: 0.1, max: 600, step: 0.5 },
   OBS_TRACE_SAMPLE_RATIO: { min: 0, max: 1, step: 0.05 },
   OBS_CONTENT_MAX_CHARS: { min: 1000, max: 200000, integer: true },
   OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS: { min: 1, max: 300 },
@@ -189,8 +206,9 @@ export default function ConfigPage({ auth, onLogout }: Props) {
         ...group,
         fields: group.fields.filter(([key]) => {
           if (key === 'AGENT_LLM_PROVIDER') return true;
-          if (provider === 'ollama') return key.startsWith('AGENT_OLLAMA');
-          return !key.startsWith('AGENT_OLLAMA');
+          if (key.startsWith('AGENT_OLLAMA')) return provider === 'ollama';
+          if (key.startsWith('AGENT_CUSTOM')) return provider !== 'ollama';
+          return true;
         }),
       };
     });

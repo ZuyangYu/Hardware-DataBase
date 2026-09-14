@@ -62,6 +62,47 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         self.assertEqual(r.json()["stage"], "ready")
         self.assertEqual(r.json()["work_order_id"], "wo-1")
 
+    def test_workbench_work_order_context_declares_its_origin(self):
+        captured = {}
+
+        def prepare(ctx, *, knowledge_base_name, **kwargs):
+            captured.update(ctx.metadata)
+            return {"stage": "ready", "work_order_id": "wo-1"}
+
+        self.stub.prepare_knowledge_base_document_generation = prepare
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders?kb=shared",
+            headers=self._auth(t),
+            json={"template_version_id": "t1", "document_schema_id": "s1", "document_schema_version": "1"},
+        )
+
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(captured["document_task_origin"], "workbench")
+
+    def test_work_order_forwards_client_request_id_as_idempotency_key(self):
+        captured = {}
+
+        def prepare(ctx, *, knowledge_base_name, **kwargs):
+            captured.update(kwargs)
+            return {"stage": "ready", "work_order_id": "wo-1"}
+
+        self.stub.prepare_knowledge_base_document_generation = prepare
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/document-generation/work-orders?kb=shared",
+            headers=self._auth(t),
+            json={
+                "template_version_id": "t1",
+                "document_schema_id": "s1",
+                "document_schema_version": "1",
+                "client_request_id": "workbench-request-1",
+            },
+        )
+
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(captured["idempotency_key"], "workbench-request-1")
+
     def test_generate_submits_background(self):
         self.stub.submit_knowledge_base_document_generation = lambda ctx, work_order_id: "bg-7"
         t = self._token("admin1")

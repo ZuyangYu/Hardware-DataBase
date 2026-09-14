@@ -30,6 +30,14 @@ TOOL_LABELS = {
     "spreadsheet_schema_lookup": "表格SQL结构",
     "spreadsheet_sql_query": "表格SQL查询",
     "list_kb_sources": "读取知识库目录",
+    "attachment_list": "附件清单",
+    "attachment_search": "附件检索",
+    "attachment_read": "附件精读",
+    "attachment_table_query": "附件表格查询",
+    "attachment_circuit_search": "附件电路查询",
+    "attachment_visual_analyze": "附件视觉分析",
+    "request_attachment_release": "附件发布申请",
+    "attachment_revision_history": "附件修订历史",
 }
 
 MAX_MEMORY_CONTEXT_CONTENT_CHARS = 2_000
@@ -120,16 +128,51 @@ class ToolDiagnostics:
     filters: dict[str, Any] = field(default_factory=dict)
 
 
+class AdmittedEvidence(list):
+    """Admitted evidence rows plus the reason an empty result is empty.
+
+    ``timed_tool_call`` returns a plain list-like value so existing callers can
+    keep unpacking ``(items, adds_nothing)``.  Carrying the budget flag on the
+    result itself (instead of on the shared runtime) keeps concurrent parallel
+    tool calls from attributing another call's budget rejection to themselves.
+    """
+
+    budget_blocked: bool = False
+
+
 @dataclass
 class ToolRuntime:
     kb_name: str
     ctx: RequestContext | None
+    # Server-normalized, owner-bound document context.  It is intentionally
+    # opaque to ordinary retrieval tools; only the explicitly gated document
+    # tool factory consumes it.
+    document_context: Any | None = None
+    chat_session_id: str = ""
     top_k: int = 6
     query_mode: str = "deep"
     question: str = ""
     evidence_budget: int = 30
     should_cancel: Callable[[], bool] | None = None
     on_event: Callable[[dict], None] | None = None
+
+    # Server-resolved chat attachment scope (design §11.1).  The refs are
+    # frozen after ACL verification in the turn path; tools derive every
+    # allowed asset id from this list and can never widen it.
+    attachment_refs: list[Any] = field(default_factory=list)
+    source_scope: str = "auto"
+    # Numeric identities are copied from the authenticated request into the
+    # runtime so attachment tools can re-check ownership on every invocation.
+    # Missing identities intentionally fail closed in the tool layer.
+    attachment_user_id: int | None = None
+    attachment_session_id: int | None = None
+    attachment_service: Any | None = None
+    # Explicit write gate for legacy/document-flow tool assembly.  The
+    # default keeps direct tool tests and older callers backwards compatible;
+    # the runner binds it to the authenticated turn's document-write policy.
+    attachment_edit_enabled: bool = True
+    attachment_retrieval: Any | None = None
+    attachment_visual_analyzer: Any | None = None
 
     evidence: list[Evidence] = field(default_factory=list)
     evidence_index: dict[str, int] = field(default_factory=dict)
@@ -268,7 +311,7 @@ def timed_tool_call(
     query: str,
     filters: dict[str, Any] | None,
     fn: Callable[[], list[Evidence]],
-) -> tuple[list[Evidence], bool]:
+) -> tuple[AdmittedEvidence, bool]:
     """Shared wrapper: cancel-check, timing, diagnostics and event emission.
 
     Returns ``(items, adds_nothing)`` — ``adds_nothing`` marks a call that is
@@ -277,6 +320,10 @@ def timed_tool_call(
     byte-for-byte repeat of something already in the message history. The
     snapshot is taken before ``add_evidence`` registers this call's items, so
     genuinely new evidence always falls through to a full render.
+
+    ``items`` is an ``AdmittedEvidence`` list whose ``budget_blocked`` flag is
+    set when the source returned rows but the run's evidence budget rejected
+    all of them.
     """
     rt.check_cancel()
     was_repeat = rt.has_query(tool_name, query)
@@ -316,16 +363,20 @@ def timed_tool_call(
                 "reason": friendly_error_message(exc),
             },
         )
-        return [], False
+        return AdmittedEvidence(), False
     latency_ms = int((time.monotonic() - started) * 1000)
     rt.log_query(tool_name, query)
     numbers = rt.add_evidence(items)
-    admitted_items: list[Evidence] = []
+    admitted_items: AdmittedEvidence = AdmittedEvidence()
     for item, number in zip(items, numbers):
         if number is None:
             continue
         item.metadata = {**item.metadata, "citation_number": number}
         admitted_items.append(item)
+    # Distinguish "the source has nothing" from "the run already holds its
+    # full evidence budget": only the latter is an execution limit, and the
+    # model must be told so it can answer with the evidence it already has.
+    admitted_items.budget_blocked = bool(items) and not admitted_items
     rt.record_diagnostic(
         ToolDiagnostics(
             tool_name=tool_name,
@@ -381,6 +432,30 @@ def format_evidence_for_llm(items: list[Evidence]) -> str:
     return "\n\n".join(blocks)
 
 
+def evidence_budget_message(rt: ToolRuntime) -> str:
+    """Explain a tool call that was dropped because the evidence budget is full."""
+
+    budget = int(getattr(rt, "evidence_budget", 0) or 0)
+    held = len(getattr(rt, "evidence", []) or [])
+    return (
+        f"本轮可登记的证据已达上限（{budget} 条，当前 {held} 条），"
+        "本次调用返回的新内容因超出预算未纳入证据集。"
+        "这是单轮执行预算限制，不代表知识库或附件中没有相关内容。"
+        "请勿继续调用检索/读取类工具翻找；请基于已获得的证据直接作答，"
+        "并在回答中说明当前结论的证据范围与仍缺失的信息。"
+    )
+
+
+def empty_result_message(
+    rt: ToolRuntime, default: str, *, budget_blocked: bool = False
+) -> str:
+    """Return the accurate reason for an empty tool result."""
+
+    if budget_blocked:
+        return evidence_budget_message(rt)
+    return default
+
+
 def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence]) -> str:
     """Render a tool result for the model, collapsing no-op repeat calls.
 
@@ -390,8 +465,19 @@ def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence
     This keeps per-round context growth bounded when the model re-issues
     identical retrieval calls. Any new evidence id falls through to the full
     render so fresh content always reaches the model.
+
+    An empty render after a call that did fetch items means the evidence
+    budget rejected all of them; that execution limit is reported explicitly
+    instead of the generic "no content" text, which the model would otherwise
+    misread as a retrieval failure and retry.
     """
-    if adds_nothing and items:
+    if not items:
+        return empty_result_message(
+            rt,
+            "（未找到相关内容）",
+            budget_blocked=bool(getattr(items, "budget_blocked", False)),
+        )
+    if adds_nothing:
         with rt._lock:
             numbers = sorted({int(rt.evidence_index[item.id]) for item in items})
         cited = " ".join(f"[{number}]" for number in numbers)

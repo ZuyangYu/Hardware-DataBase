@@ -4,10 +4,17 @@ import json
 
 from src.document_authoring.template_analysis import (
     TemplateAnalysis,
+    TemplateAnalysisSuggestion,
     TemplateAnalysisUnit,
     TemplateNeighbor,
 )
-from src.document_authoring.template_suggester import LLMTemplateSuggestionProvider
+from src.document_authoring.template_suggester import (
+    LLMTemplateSuggestionProvider,
+    TemplateSuggestionBatch,
+)
+from src.document_authoring.table_contracts import repair_repeating_table_targets
+from src.document_authoring.template_analyzers import analyze_template
+from tests.test_template_analyzers import _xlsx_with_pin_function_table
 
 
 class RecordingClient:
@@ -16,7 +23,7 @@ class RecordingClient:
         self.messages: list[dict[str, str]] = []
         self.usage_stage: str | None = None
 
-    def chat(self, messages: list[dict[str, str]], **kwargs: object) -> str:
+    def invoke(self, messages: list[dict[str, str]], **kwargs: object) -> str:
         self.messages = messages
         self.usage_stage = str(kwargs.get("usage_stage"))
         return self.response
@@ -26,9 +33,63 @@ class FailingClient:
     def __init__(self):
         self.calls = 0
 
-    def chat(self, messages: list[dict[str, str]], **kwargs: object) -> str:
+    def invoke(self, messages: list[dict[str, str]], **kwargs: object) -> str:
         self.calls += 1
         raise TimeoutError("template analysis timed out")
+
+
+class _SuggestionRunnable:
+    def __init__(self, response):
+        self.response = response
+
+    def invoke(self, messages, **kwargs):
+        return self.response
+
+
+class _StructuredSuggestionModel:
+    provider = "custom"
+    model_name = "suggestion-test"
+
+    def __init__(self, response):
+        self.response = response
+        self.schema = None
+
+    def with_structured_output(self, schema):
+        self.schema = schema
+        return _SuggestionRunnable(self.response)
+
+
+def test_llm_suggester_prefers_native_structured_output():
+    model = _StructuredSuggestionModel({
+        "suggestions": [{
+            "semantic_unit_id": "summary",
+            "label": "摘要",
+            "target_unit_ids": ["p-1"],
+            "retrieval_terms": ["summary"],
+            "confidence": 0.9,
+        }],
+    })
+
+    suggestions = LLMTemplateSuggestionProvider(model=model).suggest(_safe_docx_analysis())
+
+    assert model.schema is TemplateSuggestionBatch
+    assert [item.semantic_unit_id for item in suggestions] == ["summary"]
+
+
+def test_llm_suggester_uses_explicit_text_compatibility_model():
+    class _TextOnlyModel:
+        provider = "ollama"
+        model_name = "text-only"
+
+        def with_structured_output(self, schema):
+            raise NotImplementedError("structured output is not supported")
+
+        def invoke(self, messages, **kwargs):
+            return '[{"semantic_unit_id":"summary","label":"摘要","target_unit_ids":["p-1"],"retrieval_terms":["summary"],"confidence":0.9}]'
+
+    suggestions = LLMTemplateSuggestionProvider(model=_TextOnlyModel()).suggest(_safe_docx_analysis())
+
+    assert [item.semantic_unit_id for item in suggestions] == ["summary"]
 
 
 def _safe_docx_analysis() -> TemplateAnalysis:
@@ -55,7 +116,6 @@ def test_llm_suggester_only_sends_structural_inventory_and_parses_valid_json():
     assert "content_hash" in client.messages[1]["content"]
     assert "PK" not in client.messages[1]["content"]
     assert "template-safe" in client.messages[1]["content"]
-    assert client.usage_stage == "template_analysis"
     assert suggestions[0].semantic_unit_id == "summary"
 
 
@@ -70,6 +130,55 @@ def test_llm_suggester_approves_only_server_confirmed_sample_value_targets():
 
     assert suggestions[0].semantic_unit_id == "summary"
     assert analysis.approved_overwrite_unit_ids == []
+
+
+def test_repeating_table_mapping_discards_headers_and_uses_inspected_body_rectangle():
+    analysis = analyze_template(_xlsx_with_pin_function_table(), "xlsx")
+    broad = TemplateAnalysisSuggestion(
+        semantic_unit_id="pinout",
+        label="Pinout table",
+        target_unit_ids=[unit.unit_id for unit in analysis.units],
+        retrieval_terms=["pin", "function"],
+        confidence=0.99,
+        value_shape="repeating_table",
+    )
+
+    repaired = repair_repeating_table_targets(analysis, broad)
+
+    assert repaired is not None
+    assert repaired.target_unit_ids == [
+        f"sheet:Pinout!{column}{row}"
+        for row in (2, 3)
+        for column in "ABCD"
+    ]
+
+
+def test_repeating_table_repair_stays_fail_closed_for_competing_tables():
+    units = []
+    for sheet in ("Left", "Right"):
+        for column in "ABC":
+            units.append(TemplateAnalysisUnit(
+                unit_id=f"sheet:{sheet}!{column}1", locator={"sheet_name": sheet, "cell": f"{column}1"},
+                value_preview=f"{sheet} {column}", value_kind="text", writable=True,
+                structural_role_hint="table_header",
+            ))
+            units.append(TemplateAnalysisUnit(
+                unit_id=f"sheet:{sheet}!{column}2", locator={"sheet_name": sheet, "cell": f"{column}2"},
+                value_kind="blank", writable=True, structural_role_hint="scalar_input",
+                candidate_for_auto_fill=True,
+            ))
+    analysis = TemplateAnalysis(
+        analysis_id="ambiguous", template_version_id="ambiguous", content_hash="a" * 64,
+        format="xlsx", status="ready_for_confirmation", units=units,
+    )
+    broad = TemplateAnalysisSuggestion(
+        semantic_unit_id="tables", label="Tables", target_unit_ids=[unit.unit_id for unit in units],
+        confidence=0.99, value_shape="repeating_table",
+    )
+
+    repaired = repair_repeating_table_targets(analysis, broad)
+
+    assert repaired.target_unit_ids == broad.target_unit_ids
 
 
 def test_llm_suggester_marks_only_sample_value_basis_as_approved_overwrite():
@@ -195,7 +304,7 @@ def test_llm_suggester_chunks_large_template_and_merges():
             self.calls = 0
             self.payloads: list[dict] = []
 
-        def chat(self, messages, **kwargs):
+        def invoke(self, messages, **kwargs):
             self.calls += 1
             payload = json.loads(messages[1]["content"])
             self.payloads.append(payload)
@@ -242,7 +351,7 @@ def test_llm_suggester_survives_partial_chunk_failure():
         def __init__(self):
             self.calls = 0
 
-        def chat(self, messages, **kwargs):
+        def invoke(self, messages, **kwargs):
             self.calls += 1
             if self.calls == 2:
                 return "not json"  # 第二块整体失败
@@ -346,5 +455,11 @@ def test_llm_suggester_falls_back_to_function_table_cells_when_model_is_unavaila
         suggestion for suggestion in suggestions
         if suggestion.target_unit_ids == ["sheet:Pinout!C2"]
     ).retrieval_terms
+    c2 = next(
+        suggestion for suggestion in suggestions
+        if suggestion.target_unit_ids == ["sheet:Pinout!C2"]
+    )
+    assert c2.semantic_unit_id == "sheet:Pinout!C2"
+    assert "GND" not in c2.retrieval_terms
     assert analysis.status == "ready_for_confirmation"
     assert client.calls == 0

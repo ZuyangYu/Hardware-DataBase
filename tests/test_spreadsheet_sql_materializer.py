@@ -1,4 +1,3 @@
-import json
 import os
 import sqlite3
 import tempfile
@@ -15,9 +14,6 @@ from src.agents.tools.spreadsheet_tools import (
     _format_sql_result,
     _validate_readonly_sql,
 )
-from src.pipelines.spreadsheet.table_store import TableIndexStore
-
-
 def _semantic_row(row_index: int, values: dict, raw_values: dict | None = None) -> dict:
     return {
         "sheet_name": "S",

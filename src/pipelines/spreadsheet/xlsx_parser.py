@@ -2,6 +2,7 @@
 import re
 import zipfile
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -48,6 +49,44 @@ class ParsedWorkbook:
     embedded_object_count: int = 0
     media_object_count: int = 0
     drawing_object_count: int = 0
+
+
+@dataclass(frozen=True)
+class XlsxParseLimits:
+    """Optional safety limits for untrusted attachment workbooks.
+
+    The legacy KB parser intentionally has no implicit attachment limits. A
+    caller handling untrusted uploads passes this value explicitly so the
+    feature flag cannot change existing KB parsing behavior.
+    """
+
+    max_rows: int | None = None
+    max_cells: int | None = None
+    max_sheets: int | None = None
+    max_shared_strings: int | None = None
+    max_cell_text_length: int | None = None
+    max_uncompressed_bytes: int | None = None
+
+    @classmethod
+    def from_value(
+        cls,
+        value: "XlsxParseLimits | Mapping[str, int | None] | None",
+    ) -> "XlsxParseLimits":
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, Mapping):
+            fields = {
+                "max_rows",
+                "max_cells",
+                "max_sheets",
+                "max_shared_strings",
+                "max_cell_text_length",
+                "max_uncompressed_bytes",
+            }
+            return cls(**{key: value.get(key) for key in fields if key in value})
+        raise TypeError("limits must be XlsxParseLimits, a mapping, or None")
 
 
 # --- Number format resolution & value display ---------------------------------
@@ -244,22 +283,56 @@ def _format_value(raw: str, format_code: str) -> str:
     return raw
 
 
-def parse_xlsx(file_path: str | os.PathLike[str] | object) -> ParsedWorkbook:
+def parse_xlsx(
+    file_path: str | os.PathLike[str] | object,
+    *,
+    limits: XlsxParseLimits | Mapping[str, int | None] | None = None,
+) -> ParsedWorkbook:
     """Parse an XLSX package from a path or a seekable binary stream."""
+    limits = XlsxParseLimits.from_value(limits)
     if not zipfile.is_zipfile(file_path):
         raise ValueError("Not a valid .xlsx package")
 
     with zipfile.ZipFile(file_path) as archive:
         names = archive.namelist()
-        shared_strings = _read_shared_strings(archive)
+        _check_package_limits(archive, limits.max_uncompressed_bytes)
+        shared_strings = _read_shared_strings(
+            archive,
+            max_count=limits.max_shared_strings,
+            max_text_length=limits.max_cell_text_length,
+        )
         sheet_refs = _read_sheet_refs(archive)
+        if limits.max_sheets is not None and len(sheet_refs) > max(1, int(limits.max_sheets)):
+            raise ValueError("Excel sheet limit exceeded")
         styles_bytes = archive.read("xl/styles.xml") if "xl/styles.xml" in names else None
         resolver = _NumberFormatResolver.from_styles_xml(styles_bytes)
         sheets = []
+        rows_remaining = (
+            max(1, int(limits.max_rows)) if limits.max_rows is not None else None
+        )
+        cells_remaining = (
+            max(1, int(limits.max_cells)) if limits.max_cells is not None else None
+        )
         for sheet_name, sheet_path in sheet_refs:
             if sheet_path not in names:
                 continue
-            rows, row_indices, cells, merged_ranges = _read_sheet_rows(archive, sheet_path, shared_strings, resolver)
+            if rows_remaining is not None and rows_remaining <= 0:
+                raise ValueError("Excel row limit exceeded")
+            if cells_remaining is not None and cells_remaining <= 0:
+                raise ValueError("Excel cell limit exceeded")
+            rows, row_indices, cells, merged_ranges = _read_sheet_rows(
+                archive,
+                sheet_path,
+                shared_strings,
+                resolver,
+                max_rows=rows_remaining,
+                max_cells=cells_remaining,
+                max_cell_text_length=limits.max_cell_text_length,
+            )
+            if rows_remaining is not None:
+                rows_remaining -= len(row_indices)
+            if cells_remaining is not None:
+                cells_remaining -= len(cells)
             sheets.append(
                 ParsedSheet(
                     name=sheet_name,
@@ -283,14 +356,47 @@ def parse_xlsx(file_path: str | os.PathLike[str] | object) -> ParsedWorkbook:
     )
 
 
-def _read_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+def _check_package_limits(
+    archive: zipfile.ZipFile,
+    max_uncompressed_bytes: int | None = None,
+) -> None:
+    """Reject oversized or suspicious OOXML packages before XML expansion."""
+    if max_uncompressed_bytes is None:
+        return
+    max_uncompressed = max(1, int(max_uncompressed_bytes))
+    total_uncompressed = 0
+    for info in archive.infolist():
+        total_uncompressed += max(0, int(info.file_size))
+        if total_uncompressed > max_uncompressed:
+            raise ValueError("OOXML package exceeds the uncompressed size limit")
+        if info.compress_size and info.file_size / max(1, info.compress_size) > 200:
+            raise ValueError("OOXML package has a suspicious compression ratio")
+
+
+def _read_shared_strings(
+    archive: zipfile.ZipFile,
+    *,
+    max_count: int | None = None,
+    max_text_length: int | None = None,
+) -> list[str]:
     if "xl/sharedStrings.xml" not in archive.namelist():
         return []
-    root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
     values = []
-    for item in root.findall("main:si", NS):
-        texts = [node.text or "" for node in item.findall(".//main:t", NS)]
-        values.append("".join(texts))
+    with archive.open("xl/sharedStrings.xml") as stream:
+        for _event, item in ET.iterparse(stream, events=("end",)):
+            if item.tag != f"{{{NS['main']}}}si":
+                continue
+            if max_count is not None and len(values) >= max(1, int(max_count)):
+                raise ValueError("Excel shared-string limit exceeded")
+            value = "".join(
+                node.text or ""
+                for node in item.iter()
+                if node.tag == f"{{{NS['main']}}}t"
+            )
+            if max_text_length is not None and len(value) > max(1, int(max_text_length)):
+                raise ValueError("Excel cell text length limit exceeded")
+            values.append(value)
+            item.clear()
     return values
 
 
@@ -324,30 +430,54 @@ def _read_sheet_rows(
     sheet_path: str,
     shared_strings: list[str],
     resolver: _NumberFormatResolver,
+    max_rows: int | None = None,
+    max_cells: int | None = None,
+    max_cell_text_length: int | None = None,
 ) -> tuple[list[list[str]], list[int], list[ParsedCell], list[str]]:
-    root = ET.fromstring(archive.read(sheet_path))
-    merged_ranges = [
-        node.attrib.get("ref", "")
-        for node in root.findall(".//main:mergeCell", NS)
-        if node.attrib.get("ref")
-    ]
-
-    # Pass 1: 收集稀疏 cell(保留真实 row_index),value 用可读显示值。
-    # 结构: row_index -> {col_index(0-based): (raw, display, number_format)}
+    # Pass 1: stream rows directly from the ZIP member.  Do not call
+    # ``archive.read``/``ET.fromstring`` here: an attacker can otherwise make
+    # a single sheet consume the entire uncompressed package before the row
+    # or cell limits are observed.  ``iterparse`` lets us reject the next row
+    # as soon as the configured bound is reached while retaining only the
+    # sparse row map needed for merge expansion below.
     row_by_index: dict[int, dict[int, tuple[str, str, str]]] = {}
     row_order: list[int] = []
-    for row in root.findall(".//main:sheetData/main:row", NS):
-        row_index = _row_index(row.attrib.get("r", "")) or len(row_order) + 1
-        row_cells: dict[int, tuple[str, str, str]] = {}
-        for cell in row.findall("main:c", NS):
-            ref = cell.attrib.get("r", "")
-            col_index = _column_index(ref)
-            if col_index is None:
+    merged_ranges: list[str] = []
+    parsed_cell_count = 0
+    with archive.open(sheet_path) as stream:
+        for _event, element in ET.iterparse(stream, events=("end",)):
+            if element.tag == f"{{{NS['main']}}}mergeCell":
+                merged_ref = element.attrib.get("ref", "")
+                if merged_ref:
+                    merged_ranges.append(merged_ref)
+                element.clear()
                 continue
-            raw_value, display_value, number_format = _cell_value(cell, shared_strings, resolver)
-            row_cells[col_index] = (raw_value, display_value, number_format)
-        row_by_index[row_index] = row_cells
-        row_order.append(row_index)
+            if element.tag != f"{{{NS['main']}}}row":
+                continue
+            if max_rows is not None and len(row_order) >= max_rows:
+                raise ValueError("Excel row limit exceeded")
+            row_index = _row_index(element.attrib.get("r", "")) or len(row_order) + 1
+            row_cells: dict[int, tuple[str, str, str]] = {}
+            for cell in element.findall("main:c", NS):
+                if max_cells is not None and parsed_cell_count >= max_cells:
+                    raise ValueError("Excel cell limit exceeded")
+                ref = cell.attrib.get("r", "")
+                col_index = _column_index(ref)
+                if col_index is None:
+                    continue
+                raw_value, display_value, number_format = _cell_value(cell, shared_strings, resolver)
+                if (
+                    max_cell_text_length is not None
+                    and len(display_value) > max(1, int(max_cell_text_length))
+                ):
+                    raise ValueError("Excel cell text length limit exceeded")
+                row_cells[col_index] = (raw_value, display_value, number_format)
+                parsed_cell_count += 1
+            row_by_index[row_index] = row_cells
+            row_order.append(row_index)
+            # Release the row subtree before iterparse advances to the next
+            # row.  Parent containers retain only empty row placeholders.
+            element.clear()
 
     # Pass 2(合并扩展,修复核心): 对每个合并区,把左上格的值结构化填充到
     # XML 中缺失的格子(不覆盖 authored cell)。被 sheetData 省略的空行跳过。

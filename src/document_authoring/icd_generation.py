@@ -10,11 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+import logging
 import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 import zipfile
 
 from src.circuit.models import ComponentInstance
@@ -32,6 +33,9 @@ from src.document_authoring.pin_function_inference import resolve_pin_function
 from src.document_authoring.renderers.xlsm import XlsmRenderer
 from src.document_authoring.template_analysis import workbook_value_hash
 from src.pipelines.spreadsheet.xlsx_parser import ParsedSheet, parse_xlsx
+
+
+logger = logging.getLogger(__name__)
 
 
 _PIN_REFERENCE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z]+\d+)\s*-\s*(\d+)(?![A-Za-z0-9_])")
@@ -62,6 +66,16 @@ class IcdFrontViewRenderResult:
     content: bytes
     issues: list[dict[str, str]]
     detected_layout_count: int
+    integrity_manifest: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class IcdPinTableRenderResult:
+    """Result of replacing example pin rows with one frozen connector scope."""
+
+    content: bytes
+    issues: list[dict[str, str]]
+    detected_table: bool
     integrity_manifest: dict[str, Any] | None = None
 
 
@@ -230,6 +244,167 @@ def render_icd_front_views(
         content=rendered.content,
         issues=[],
         detected_layout_count=front_view.detected_layout_count,
+        integrity_manifest=rendered.integrity_manifest,
+    )
+
+
+def render_icd_pin_table(
+    artifact_content: bytes,
+    frozen_pin_mappings: Iterable[dict[str, Any]],
+    *,
+    target_format: str = "xlsx",
+    template_version_id: str = "icd-pin-table",
+    allow_rule_inference: bool = False,
+    assembly_erp: str | None = None,
+    metadata: dict[str, str] | None = None,
+    function_by_pin: Mapping[str, str] | None = None,
+) -> IcdPinTableRenderResult:
+    """Replace an ICD template's example rows with the frozen pin mapping.
+
+    The table coordinates and columns are discovered from the workbook.  Pin
+    identity and net definition come only from the frozen circuit scope; an
+    old X302/sample row can therefore never survive into an X1900 deliverable.
+    Evidence-backed function text (already validated in the unit draft) takes
+    precedence; otherwise unknown function descriptions remain explicit TBD
+    values unless the confirmed brief permits deterministic rule inference.
+    """
+
+    mappings = [
+        {
+            "refdes": str(item.get("refdes") or "").strip(),
+            "pin_name": _normalize_pin(str(item.get("pin_name") or "")),
+            "net_name": str(item.get("net_name") or "").strip() or "NC",
+        }
+        for item in frozen_pin_mappings
+        if isinstance(item, dict)
+        and str(item.get("refdes") or "").strip()
+        and str(item.get("pin_name") or "").strip()
+    ]
+    if not mappings:
+        return IcdPinTableRenderResult(
+            content=artifact_content,
+            issues=[],
+            detected_table=False,
+        )
+    try:
+        workbook = parse_xlsx(BytesIO(artifact_content))
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        # A corrupted/unreadable workbook is not an "absent table" case: the
+        # frozen pin mappings cannot be written and the failure must stay
+        # observable instead of silently returning the original artifact.
+        logger.warning(
+            "ICD pin table workbook could not be parsed: %s", exc
+        )
+        return IcdPinTableRenderResult(
+            content=artifact_content,
+            issues=[{
+                "kind": "icd_pin_table_unreadable",
+                "code": "icd_pin_table_unreadable",
+                "severity": "blocking",
+                "message": "ICD 文档无法解析，冻结管脚映射未能写入；请检查模板文件是否损坏。",
+            }],
+            detected_table=False,
+        )
+    try:
+        sheet, header_index, columns = _discover_pin_table(workbook.sheets)
+        table_schema = _build_table_schema(sheet, header_index, columns)
+    except (KeyError, ValueError) as exc:
+        # No recognizable pin table: a template may legitimately ship only a
+        # front view, so this stays a non-blocking no-op.  The frozen-scope
+        # pin-set validation downstream still rejects stale example rows.
+        logger.warning(
+            "ICD pin table was not detected in the template artifact: %s", exc
+        )
+        return IcdPinTableRenderResult(
+            content=artifact_content,
+            issues=[],
+            detected_table=False,
+        )
+
+    source_rows: list[dict[str, str]] = []
+    provided_functions = {
+        str(key).strip(): str(value).strip()
+        for key, value in (function_by_pin or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    for mapping in mappings:
+        net_name = mapping["net_name"]
+        provided = provided_functions.get(f"{mapping['refdes']}-{mapping['pin_name']}", "")
+        if provided and not _is_missing_marker(provided):
+            function = provided
+        elif net_name.casefold() in {"nc", "n/c", "no_connect"}:
+            function = "未连接（NC）"
+        elif allow_rule_inference:
+            function = resolve_pin_function(
+                refdes=mapping["refdes"],
+                pin_name=mapping["pin_name"],
+                net_name=net_name,
+            ).function or "TBD（知识库未提供可靠功能描述）"
+        else:
+            function = "TBD（知识库未提供可靠功能描述）"
+        source_rows.append({
+            "pin": f"{mapping['refdes']}-{mapping['pin_name']}",
+            "definition": net_name,
+            "function": function,
+            "notice": "",
+        })
+    table_rows = [_map_table_row(columns, row) for row in source_rows]
+    regions: list[WorkbookRegionSchema] = []
+    fills: list[WorkbookFill] = []
+    if metadata is not None:
+        metadata_regions, metadata_fills = _build_scalar_fills(
+            workbook.sheets,
+            metadata,
+        )
+        regions.extend(metadata_regions)
+        fills.extend(metadata_fills)
+    erp_column = next(
+        (
+            column for column in columns
+            if "erp" in str(column.get("label") or "").casefold()
+            and ("总成" in str(column.get("label") or "") or "assembly" in str(column.get("label") or "").casefold())
+        ),
+        None,
+    )
+    if erp_column is not None:
+        header_cell = f"{erp_column['column_letter']}{header_index + 1}"
+        header_value = str(erp_column.get("label") or "")
+        erp_value = str(assembly_erp or "").strip() or "TBD"
+        region_id = "discovered-assembly-erp"
+        regions.append(WorkbookRegionSchema(
+            region_id=region_id,
+            sheet_name=sheet.name,
+            locator={"cell": header_cell},
+            role="evidence_derived",
+            write_policy="validated_draft",
+            expected_value_hash=workbook_value_hash(header_value),
+            allow_nonempty_overwrite=True,
+        ))
+        fills.append(WorkbookFill(
+            region_id=region_id,
+            semantic_unit_id="assembly_erp",
+            value=f"总成ERP\n{erp_value}",
+        ))
+    rendered = XlsmRenderer().render(
+        artifact_content,
+        regions,
+        WorkbookFillPlan(
+            template_version_id=template_version_id,
+            fills=fills,
+            table_fills=[WorkbookTableFill(
+                table_region_id=table_schema.table_region_id,
+                semantic_unit_id=table_schema.semantic_unit_id,
+                rows=table_rows,
+            )],
+        ),
+        RendererPolicy(renderer_policy_id="icd-pin-table"),
+        security_approved=True,
+        table_schemas=[table_schema],
+    )
+    return IcdPinTableRenderResult(
+        content=rendered.content,
+        issues=[],
+        detected_table=True,
         integrity_manifest=rendered.integrity_manifest,
     )
 
@@ -863,6 +1038,10 @@ def _model_after_label(text: str, label: str) -> str:
 
 def _normalize_pin(value: str) -> str:
     return str(value).strip().removeprefix("&")
+
+
+def _is_missing_marker(value: str) -> bool:
+    return str(value or "").strip().upper().startswith("TBD")
 
 
 def _pin_key(refdes: str, pin: str) -> str:

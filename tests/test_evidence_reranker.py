@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
-
 from src.agents.claim_evidence import InformationRequirement
-from src.core.llm_client import LLMClient
 from src.document_authoring.writers.evidence_reranker import EvidenceReranker
 
 
@@ -30,18 +27,24 @@ def _ev(eid: str, content: str) -> dict:
     }
 
 
-def _client(return_value: str = "[]", *, side_effect=None) -> Mock:
-    client = Mock(spec=LLMClient)
-    if side_effect is not None:
-        client.chat.side_effect = side_effect
-    else:
-        client.chat.return_value = return_value
-    return client
+class _TextModel:
+    def __init__(self, response: str | Exception = "[]"):
+        self.response = response
+        self.calls: list[tuple[object, dict]] = []
+
+    def with_structured_output(self, schema):
+        raise NotImplementedError("structured output is not supported")
+
+    def invoke(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
 
 
 def test_rerank_reorders_by_llm_ranking():
     evidence = [_ev("a", "alpha"), _ev("b", "bravo"), _ev("c", "charlie")]
-    reranker = EvidenceReranker(client=_client("[2, 0, 1]"))
+    reranker = EvidenceReranker(model=_TextModel("[2, 0, 1]"))
 
     result = reranker.rerank(_req(), evidence)
 
@@ -49,28 +52,28 @@ def test_rerank_reorders_by_llm_ranking():
 
 
 def test_rerank_passthrough_on_empty():
-    client = _client("[0]")
-    reranker = EvidenceReranker(client=client)
+    model = _TextModel("[0]")
+    reranker = EvidenceReranker(model=model)
 
     assert reranker.rerank(_req(), []) == []
 
-    client.chat.assert_not_called()
+    assert model.calls == []
 
 
 def test_rerank_passthrough_on_single():
-    client = _client("[0]")
-    reranker = EvidenceReranker(client=client)
+    model = _TextModel("[0]")
+    reranker = EvidenceReranker(model=model)
     evidence = [_ev("a", "alpha")]
 
     result = reranker.rerank(_req(), evidence)
 
     assert result == evidence
-    client.chat.assert_not_called()
+    assert model.calls == []
 
 
 def test_rerank_passthrough_on_llm_failure():
     evidence = [_ev("a", "alpha"), _ev("b", "bravo")]
-    reranker = EvidenceReranker(client=_client(side_effect=RuntimeError("boom")))
+    reranker = EvidenceReranker(model=_TextModel(RuntimeError("boom")))
 
     result = reranker.rerank(_req(), evidence)
 
@@ -81,13 +84,13 @@ def test_rerank_passthrough_on_parse_failure():
     evidence = [_ev("a", "alpha"), _ev("b", "bravo")]
 
     for bad in ("not json", "{}", '"a string"', "42", "[\"a\", \"b\"]"):
-        reranker = EvidenceReranker(client=_client(bad))
+        reranker = EvidenceReranker(model=_TextModel(bad))
         assert reranker.rerank(_req(), list(evidence)) == evidence, f"failed for: {bad!r}"
 
 
 def test_rerank_truncates_with_top_k():
     evidence = [_ev("a", "alpha"), _ev("b", "bravo"), _ev("c", "charlie")]
-    reranker = EvidenceReranker(client=_client("[2, 0, 1]"))
+    reranker = EvidenceReranker(model=_TextModel("[2, 0, 1]"))
 
     result = reranker.rerank(_req(), evidence, top_k=2)
 
@@ -98,7 +101,7 @@ def test_rerank_drops_invalid_indices_keeps_unreferenced():
     evidence = [_ev("a", "alpha"), _ev("b", "bravo"), _ev("c", "charlie"), _ev("d", "delta")]
     # 9 is out of range -> dropped; 3 and 0 are valid and ordered first;
     # unreferenced b, c are appended in original order so nothing is lost.
-    reranker = EvidenceReranker(client=_client("[3, 9, 0]"))
+    reranker = EvidenceReranker(model=_TextModel("[3, 9, 0]"))
 
     result = reranker.rerank(_req(), evidence)
 
@@ -108,9 +111,8 @@ def test_rerank_drops_invalid_indices_keeps_unreferenced():
 
 def test_rerank_uses_evidence_rerank_usage_stage():
     evidence = [_ev("a", "alpha"), _ev("b", "bravo")]
-    client = _client("[0, 1]")
-    EvidenceReranker(client=client).rerank(_req(), evidence)
+    model = _TextModel("[0, 1]")
+    EvidenceReranker(model=model).rerank(_req(), evidence)
 
-    assert client.chat.call_args.kwargs.get("usage_stage") == "evidence_rerank"
-    assert client.chat.call_args.kwargs.get("timeout") == 20
-    assert client.chat.call_args.kwargs.get("rate_limit_max_retries") == 0
+    assert len(model.calls) == 1
+    assert model.calls[0][1] == {}

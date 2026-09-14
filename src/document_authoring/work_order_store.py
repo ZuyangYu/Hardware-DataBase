@@ -15,8 +15,10 @@ from typing import Any, TypeVar
 
 import src.settings
 from src.document_authoring.harness.policy import HarnessLeaseLost
+from src.document_authoring.harness.idempotency import execution_event_key
 from src.document_authoring.generation_sessions import GenerationSessionStore
 from src.document_authoring.models import (
+    AuthoringExecutionEvent,
     DeterministicRuleSpec,
     DocumentUnitDraft,
     DocumentArtifact,
@@ -33,6 +35,7 @@ from src.document_authoring.models import (
     LegacyTemplateClaim,
     NodeExecutionReceipt,
     AuthoringRunManifest,
+    EvidenceRegistryEntry,
     content_hash,
     RendererPolicy,
     TemplateSanitizationReport,
@@ -42,6 +45,7 @@ from src.document_authoring.models import (
     ValidationReport,
     WorkbookRegionSchema,
 )
+from src.document_authoring.planning.store import DocumentPlanningStore
 from src.document_authoring.template_analysis import DocxRegionSchema, TemplateAnalysis
 
 
@@ -65,6 +69,7 @@ class DocumentAuthoringStore:
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         os.makedirs(self.artifact_root, exist_ok=True)
         self._init_db()
+        self.planning = DocumentPlanningStore(self.db_path)
         self.generation_sessions = GenerationSessionStore(self.db_path)
 
     def _connect(self):
@@ -192,12 +197,32 @@ class DocumentAuthoringStore:
                     receipt_id TEXT PRIMARY KEY, harness_run_id TEXT NOT NULL,
                     node_name TEXT NOT NULL, unit_id TEXT NOT NULL,
                     input_fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+                    action_key TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL DEFAULT 1,
                     payload_json TEXT NOT NULL,
                     UNIQUE(harness_run_id, node_name, unit_id, input_fingerprint),
                     FOREIGN KEY(harness_run_id) REFERENCES harness_runs(harness_run_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_node_execution_receipts_run
                     ON node_execution_receipts(harness_run_id, status);
+                CREATE TABLE IF NOT EXISTS authoring_execution_events (
+                    event_id TEXT PRIMARY KEY, harness_run_id TEXT NOT NULL,
+                    work_order_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL, idempotency_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    UNIQUE(harness_run_id, idempotency_key),
+                    FOREIGN KEY(harness_run_id) REFERENCES harness_runs(harness_run_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_authoring_execution_events_scope
+                    ON authoring_execution_events(tenant_id, work_order_id, harness_run_id, sequence);
+                CREATE TABLE IF NOT EXISTS evidence_registry (
+                    evidence_id TEXT NOT NULL, harness_run_id TEXT NOT NULL,
+                    work_order_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                    source_set_snapshot_id TEXT NOT NULL, registered_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY(harness_run_id, evidence_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_evidence_registry_scope
+                    ON evidence_registry(tenant_id, harness_run_id, source_set_snapshot_id);
                 CREATE TABLE IF NOT EXISTS legacy_template_claims (
                     template_version_id TEXT NOT NULL, claim_id TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
@@ -251,6 +276,7 @@ class DocumentAuthoringStore:
             )
             self._migrate_docx_regions(conn)
             self._migrate_document_work_orders(conn)
+            self._migrate_node_execution_receipts(conn)
             conn.execute(
                 """INSERT OR IGNORE INTO template_analysis_revisions
                    (analysis_id, template_version_id, content_hash, payload_json)
@@ -325,6 +351,21 @@ class DocumentAuthoringStore:
             raise
         finally:
             conn.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _migrate_node_execution_receipts(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(node_execution_receipts)").fetchall()
+        }
+        if "action_key" not in columns:
+            conn.execute("ALTER TABLE node_execution_receipts ADD COLUMN action_key TEXT NOT NULL DEFAULT ''")
+        if "attempt" not in columns:
+            conn.execute("ALTER TABLE node_execution_receipts ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_node_execution_receipts_action_key
+               ON node_execution_receipts(harness_run_id, action_key)
+               WHERE action_key != ''"""
+        )
 
     @staticmethod
     def _put(conn, table: str, columns: dict[str, Any], payload: Any) -> None:
@@ -738,7 +779,18 @@ class DocumentAuthoringStore:
             row = conn.execute(sql, params).fetchone()
         return RendererPolicy.model_validate(_payload(row)) if row else None
 
-    def save_document_schema(self, schema: DocumentSchema) -> DocumentSchema:
+    def save_document_schema(
+        self,
+        schema: DocumentSchema,
+        *,
+        allow_plan_backed: bool = False,
+    ) -> DocumentSchema:
+        if getattr(src.settings, "DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED", False) and not allow_plan_backed:
+            from src.document_authoring.compatibility import CompatibilityClosureError
+
+            raise CompatibilityClosureError(
+                "direct document schema writes are closed; use an accepted document plan"
+            )
         with closing(self._connect()) as conn:
             self._put(conn, "document_schemas", {
                 "document_schema_id": schema.document_schema_id, "version": schema.version, "status": schema.status,
@@ -916,6 +968,42 @@ class DocumentAuthoringStore:
         return f"project:{work_order.project_id}"
 
     def create_work_order(self, work_order: DocumentWorkOrder) -> DocumentWorkOrder:
+        if getattr(src.settings, "DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED", False):
+            from src.document_authoring.compatibility import (
+                CompatibilityClosureError,
+                DocumentAuthoringCompatibilityService,
+            )
+
+            references = (
+                work_order.output_spec_id, work_order.output_spec_version,
+                work_order.output_spec_hash, work_order.document_plan_id,
+                work_order.document_plan_version, work_order.document_plan_hash,
+            )
+            if not all(value is not None and str(value).strip() for value in references):
+                raise CompatibilityClosureError(
+                    "direct WorkOrder writes are closed; accepted plan references are required"
+                )
+            planning_store = getattr(self, "planning", None)
+            output_spec = planning_store.get_output_spec(
+                work_order.output_spec_id,
+                int(work_order.output_spec_version),
+                tenant_id=work_order.tenant_id,
+                user_id=work_order.created_by,
+            ) if planning_store is not None else None
+            document_plan = planning_store.get_plan(
+                work_order.document_plan_id,
+                int(work_order.document_plan_version),
+                tenant_id=work_order.tenant_id,
+                user_id=work_order.created_by,
+            ) if planning_store is not None else None
+            if output_spec is None or document_plan is None:
+                raise CompatibilityClosureError(
+                    "WorkOrder plan references do not resolve to persisted rows"
+                )
+            DocumentAuthoringCompatibilityService(db_path=self.db_path).accepted_plan_references(
+                output_spec=output_spec,
+                document_plan=document_plan,
+            )
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -967,6 +1055,43 @@ class DocumentAuthoringStore:
                         raise ValueError("ICD scope review is already bound to different frozen inputs")
                     conn.execute("COMMIT")
                     return persisted
+                self._put(conn, "document_icd_scope_reviews", {
+                    "work_order_id": review.work_order_id,
+                    "decision_content_hash": review.decision_content_hash,
+                    "source_snapshot_hash": review.source_snapshot_hash,
+                    "status": review.status,
+                }, review)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return review
+
+    def replace_pending_icd_scope_review(self, review: IcdScopeReview) -> IcdScopeReview:
+        """Replace an unresolved scope review after the frozen inputs were re-read.
+
+        Only a pending review may be replaced: a frozen review is a durable
+        user decision and must never be rewritten.  The replacement is bound
+        to the same source snapshot and carries its own decision hash.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    """SELECT status, source_snapshot_hash
+                       FROM document_icd_scope_reviews WHERE work_order_id = ?""",
+                    (review.work_order_id,),
+                ).fetchone()
+                if existing is None:
+                    raise KeyError("ICD scope review not found")
+                if str(existing["status"]) != "pending":
+                    raise ValueError("a frozen ICD scope review cannot be replaced")
+                if str(existing["source_snapshot_hash"]) != review.source_snapshot_hash:
+                    raise ValueError("ICD scope replacement must keep the frozen source snapshot")
+                conn.execute(
+                    "DELETE FROM document_icd_scope_reviews WHERE work_order_id = ?",
+                    (review.work_order_id,),
+                )
                 self._put(conn, "document_icd_scope_reviews", {
                     "work_order_id": review.work_order_id,
                     "decision_content_hash": review.decision_content_hash,
@@ -1275,6 +1400,139 @@ class DocumentAuthoringStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def resolve_harness_human_decision(
+        self,
+        run_id: str,
+        *,
+        pending_event_id: str,
+        proposal_hash: str,
+        decision: str,
+        decision_key: str,
+        actor_id: str,
+        tenant_id: str | None = None,
+    ) -> tuple[HarnessRun, AuthoringExecutionEvent]:
+        """Atomically consume one pending agent proposal decision.
+
+        The pending event is single-use.  Repeating the same decision key
+        returns the original event and current run (idempotent HTTP retry);
+        another decision, a different tenant, a mismatched proposal, or an
+        expired event is rejected without changing the run.
+        """
+        normalized_decision = str(decision or "").strip().casefold()
+        if normalized_decision not in {"approve", "reject"}:
+            raise ValueError("decision must be approve or reject")
+        event_key = execution_event_key(decision_key, "human_resumed")
+        now = datetime.now(timezone.utc)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM harness_runs WHERE harness_run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"harness run not found: {run_id}")
+                current = HarnessRun.model_validate(_payload(row))
+                existing_row = conn.execute(
+                    "SELECT payload_json FROM authoring_execution_events "
+                    "WHERE harness_run_id = ? AND idempotency_key = ?",
+                    (run_id, event_key),
+                ).fetchone()
+                if existing_row is not None:
+                    stored_event = AuthoringExecutionEvent.model_validate(_payload(existing_row))
+                    conn.execute("COMMIT")
+                    return current, stored_event
+                if tenant_id is not None and current.tenant_id != str(tenant_id):
+                    raise PermissionError("human decision tenant does not match the HarnessRun")
+                if current.status != "waiting_human":
+                    raise ValueError(f"harness run is not waiting for a human decision: {current.status}")
+                pending = current.pending_human_event
+                if not isinstance(pending, dict):
+                    raise ValueError("harness run has no pending human event")
+                if str(pending.get("event_id") or "") != str(pending_event_id):
+                    raise ValueError("pending human event does not match the HarnessRun")
+                if str(pending.get("proposal_hash") or "") != str(proposal_hash):
+                    raise ValueError("proposal hash does not match the pending human event")
+                expires_at = pending.get("expires_at")
+                if expires_at:
+                    try:
+                        expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                        if expires.tzinfo is None:
+                            expires = expires.replace(tzinfo=timezone.utc)
+                        if expires.astimezone(timezone.utc) <= now:
+                            raise ValueError("pending human event has expired")
+                    except ValueError as exc:
+                        if str(exc) == "pending human event has expired":
+                            raise
+                        raise ValueError("pending human event expiry is invalid") from exc
+
+                field_id = str(pending.get("field_id") or "").strip()
+                unit_statuses = dict(current.unit_statuses or {})
+                if field_id:
+                    unit_statuses[f"field:{field_id}"] = (
+                        "ready_to_render" if normalized_decision == "approve" else "requires_human"
+                    )
+                updated = current.model_copy(update={
+                    "status": "retrying" if normalized_decision == "approve" else "failed",
+                    "current_node": "agent_field_harness_resume" if normalized_decision == "approve" else "human_rejected",
+                    "pending_human_event": None,
+                    "unit_statuses": unit_statuses,
+                    "error": None if normalized_decision == "approve" else {
+                        "type": "HumanDecisionRejected",
+                        "message": "agent proposal was rejected by a human reviewer",
+                    },
+                    "last_error_code": None if normalized_decision == "approve" else "human_decision_rejected",
+                    "updated_at": now,
+                })
+                conn.execute(
+                    "UPDATE harness_runs SET status = ?, payload_json = ? WHERE harness_run_id = ?",
+                    (updated.status, _json(updated), run_id),
+                )
+                event = AuthoringExecutionEvent(
+                    event_id=f"authoring-event-{uuid.uuid4().hex}",
+                    event_type="human_resumed",
+                    tenant_id=current.tenant_id,
+                    work_order_id=current.work_order_id,
+                    harness_run_id=current.harness_run_id,
+                    idempotency_key=event_key,
+                    attempt=max(1, current.retry_count + 1),
+                    executor="agent_field_harness",
+                    node_name="agent_field_harness",
+                    field_id=field_id or None,
+                    unit_id=f"field:{field_id}" if field_id else None,
+                    status="resumed" if normalized_decision == "approve" else "rejected",
+                    error_code=None if normalized_decision == "approve" else "human_decision_rejected",
+                    sanitized_payload={
+                        "decision": normalized_decision,
+                        "pending_event_id": str(pending_event_id),
+                        "proposal_hash": str(proposal_hash),
+                        "actor_id": str(actor_id)[:200],
+                        "agent_thread_id": str(current.agent_thread_id or "")[:200],
+                    },
+                    occurred_at=now,
+                )
+                sequence = conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM authoring_execution_events "
+                    "WHERE harness_run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                event = event.model_copy(update={"sequence": int(sequence)})
+                self._put(conn, "authoring_execution_events", {
+                    "event_id": event.event_id,
+                    "harness_run_id": event.harness_run_id,
+                    "work_order_id": event.work_order_id,
+                    "tenant_id": event.tenant_id,
+                    "sequence": event.sequence,
+                    "idempotency_key": event.idempotency_key,
+                    "event_type": event.event_type,
+                    "occurred_at": event.occurred_at.isoformat(),
+                }, event)
+                conn.execute("COMMIT")
+                return updated, event
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def save_harness_checkpoint_owned(
         self,
         checkpoint: HarnessCheckpoint,
@@ -1333,6 +1591,129 @@ class DocumentAuthoringStore:
             )
         return checkpoint
 
+    def append_execution_event(self, event: AuthoringExecutionEvent) -> AuthoringExecutionEvent:
+        """Append one sanitized business fact with a run-scoped monotonic sequence.
+
+        The sequence is allocated inside the Store transaction (never wall-clock)
+        and a duplicate ``idempotency_key`` replays the stored event instead of
+        writing a second row.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM authoring_execution_events "
+                    "WHERE harness_run_id = ? AND idempotency_key = ?",
+                    (event.harness_run_id, event.idempotency_key),
+                ).fetchone()
+                if row is not None:
+                    stored = AuthoringExecutionEvent.model_validate(_payload(row))
+                    conn.execute("COMMIT")
+                    return stored
+                sequence = conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM authoring_execution_events "
+                    "WHERE harness_run_id = ?",
+                    (event.harness_run_id,),
+                ).fetchone()[0]
+                event = event.model_copy(update={"sequence": int(sequence)})
+                self._put(conn, "authoring_execution_events", {
+                    "event_id": event.event_id,
+                    "harness_run_id": event.harness_run_id,
+                    "work_order_id": event.work_order_id,
+                    "tenant_id": event.tenant_id,
+                    "sequence": event.sequence,
+                    "idempotency_key": event.idempotency_key,
+                    "event_type": event.event_type,
+                    "occurred_at": event.occurred_at.isoformat(),
+                }, event)
+                conn.execute("COMMIT")
+                return event
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def get_execution_event(self, harness_run_id: str, idempotency_key: str) -> AuthoringExecutionEvent | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM authoring_execution_events "
+                "WHERE harness_run_id = ? AND idempotency_key = ?",
+                (harness_run_id, idempotency_key),
+            ).fetchone()
+        return AuthoringExecutionEvent.model_validate(_payload(row)) if row else None
+
+    def list_execution_events(
+        self,
+        harness_run_id: str,
+        *,
+        tenant_id: str | None = None,
+        work_order_id: str | None = None,
+    ) -> list[AuthoringExecutionEvent]:
+        query = "SELECT payload_json FROM authoring_execution_events WHERE harness_run_id = ?"
+        params: list[Any] = [harness_run_id]
+        if tenant_id is not None:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if work_order_id is not None:
+            query += " AND work_order_id = ?"
+            params.append(work_order_id)
+        query += " ORDER BY sequence"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [AuthoringExecutionEvent.model_validate(_payload(row)) for row in rows]
+
+    def register_evidence(self, entry: EvidenceRegistryEntry) -> EvidenceRegistryEntry:
+        """Immutably register one evidence reference for a run.
+
+        Re-registering the identical (run, evidence_id, content_hash) triple is
+        idempotent; a different content hash for the same id is rejected because
+        registry records are immutable.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM evidence_registry "
+                    "WHERE harness_run_id = ? AND evidence_id = ?",
+                    (entry.harness_run_id, entry.evidence_id),
+                ).fetchone()
+                if row is not None:
+                    stored = EvidenceRegistryEntry.model_validate(_payload(row))
+                    if stored.content_hash != entry.content_hash:
+                        raise ValueError(
+                            f"evidence registry record is immutable: {entry.evidence_id}"
+                        )
+                    conn.execute("COMMIT")
+                    return stored
+                self._put(conn, "evidence_registry", {
+                    "evidence_id": entry.evidence_id,
+                    "harness_run_id": entry.harness_run_id,
+                    "work_order_id": entry.work_order_id,
+                    "tenant_id": entry.tenant_id,
+                    "source_set_snapshot_id": entry.source_set_snapshot_id,
+                    "registered_at": entry.registered_at.isoformat(),
+                }, entry)
+                conn.execute("COMMIT")
+                return entry
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def get_evidence_entry(self, harness_run_id: str, evidence_id: str) -> EvidenceRegistryEntry | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM evidence_registry WHERE harness_run_id = ? AND evidence_id = ?",
+                (harness_run_id, evidence_id),
+            ).fetchone()
+        return EvidenceRegistryEntry.model_validate(_payload(row)) if row else None
+
+    def list_evidence_entries(self, harness_run_id: str) -> list[EvidenceRegistryEntry]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM evidence_registry WHERE harness_run_id = ? ORDER BY registered_at",
+                (harness_run_id,),
+            ).fetchall()
+        return [EvidenceRegistryEntry.model_validate(_payload(row)) for row in rows]
+
     def begin_node_execution_owned(
         self,
         receipt: NodeExecutionReceipt,
@@ -1369,6 +1750,8 @@ class DocumentAuthoringStore:
                         "unit_id": receipt.unit_id,
                         "input_fingerprint": receipt.input_fingerprint,
                         "status": receipt.status,
+                        "action_key": receipt.action_key,
+                        "attempt": receipt.attempt,
                     }, receipt)
                 conn.execute("COMMIT")
                 return receipt
@@ -1443,6 +1826,35 @@ class DocumentAuthoringStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def list_node_execution_receipts(
+        self,
+        harness_run_id: str,
+        *,
+        node_name: str | None = None,
+        status: str | None = "committed",
+    ) -> list[NodeExecutionReceipt]:
+        """Return durable node receipts in deterministic creation order.
+
+        The plan-backed coordinator uses this read-only projection to rebuild
+        its in-memory result after a worker restart.  Legacy callers do not
+        need to know about the new ``plan_node`` namespace.
+        """
+        query = (
+            "SELECT payload_json FROM node_execution_receipts "
+            "WHERE harness_run_id = ?"
+        )
+        params: list[Any] = [harness_run_id]
+        if node_name is not None:
+            query += " AND node_name = ?"
+            params.append(node_name)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY rowid, receipt_id"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [NodeExecutionReceipt.model_validate(_payload(row)) for row in rows]
+
     @staticmethod
     def _require_active_lease(
         run: HarnessRun,
@@ -1516,15 +1928,19 @@ class DocumentAuthoringStore:
         return ValidationReport.model_validate(_payload(row)) if row else None
 
     def save_artifact(self, artifact: DocumentArtifact, content: bytes, suffix: str) -> DocumentArtifact:
-        fingerprint = artifact.idempotency_fingerprint or content_hash({
+        fingerprint_payload = {
             "work_order_id": artifact.work_order_id,
             "run_id": artifact.run_id,
             "stage": artifact.stage,
+            "output_format": artifact.output_format,
             "content_hash": artifact.content_hash,
             "parent_artifact_id": artifact.parent_artifact_id,
             "validation_report_id": artifact.validation_report_id,
             "approval_subject_hash": artifact.approval_subject_hash,
-        })
+        }
+        if artifact.revision_id:
+            fingerprint_payload["revision_id"] = artifact.revision_id
+        fingerprint = artifact.idempotency_fingerprint or content_hash(fingerprint_payload)
         artifact = artifact.model_copy(update={"idempotency_fingerprint": fingerprint})
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1533,7 +1949,10 @@ class DocumentAuthoringStore:
                 if existing is not None:
                     conn.execute("COMMIT")
                     return existing
-                target = self._storage_path("artifacts", artifact.work_order_id, f"{fingerprint}.{suffix}")
+                safe_suffix = str(suffix or artifact.output_format or "bin").strip().lower().lstrip(".")
+                if not safe_suffix or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in safe_suffix):
+                    raise ValueError("artifact suffix is invalid")
+                target = self._storage_path("artifacts", artifact.work_order_id, f"{fingerprint}.{safe_suffix}")
                 self._atomic_write(target, content)
                 artifact = artifact.model_copy(update={"storage_ref": target})
                 self._put(conn, "document_artifacts", {
@@ -1553,11 +1972,90 @@ class DocumentAuthoringStore:
             row = conn.execute("SELECT payload_json FROM document_artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
         return DocumentArtifact.model_validate(_payload(row)) if row else None
 
-    def read_artifact_content(self, artifact_id: str) -> bytes:
+    def update_artifact(self, artifact_id: str, **updates: Any) -> DocumentArtifact:
+        """Update only governed lifecycle metadata on an immutable artifact.
+
+        Content, hashes and storage references are intentionally not writable
+        here.  Controlled revision completion may bind the already persisted
+        child to a revision through this metadata-only boundary; revision
+        planning still preserves the original bytes for audit.
+        """
+        allowed = {
+            "validity_status", "policy_status", "regeneration_status", "status_reasons", "revision_id",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"unsupported artifact metadata updates: {sorted(unknown)}")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM document_artifacts WHERE artifact_id = ?",
+                    (str(artifact_id or "").strip(),),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("artifact not found")
+                current = DocumentArtifact.model_validate(_payload(row))
+                revised = current.model_copy(update={**updates})
+                conn.execute(
+                    "UPDATE document_artifacts SET payload_json = ? WHERE artifact_id = ?",
+                    (_json(revised), revised.artifact_id),
+                )
+                event = DocumentOutboxEvent(
+                    event_id=f"outbox-{uuid.uuid4().hex}",
+                    event_key=f"artifact:{revised.artifact_id}:metadata:{content_hash(updates)}",
+                    aggregate_type="artifact",
+                    aggregate_id=revised.artifact_id,
+                    event_type="document_artifact.metadata_updated",
+                    payload={
+                        "artifact_id": revised.artifact_id,
+                        "work_order_id": revised.work_order_id,
+                        "validity_status": revised.validity_status,
+                        "regeneration_status": revised.regeneration_status,
+                    },
+                )
+                existing_event = conn.execute(
+                    "SELECT 1 FROM document_outbox_events WHERE event_key = ?",
+                    (event.event_key,),
+                ).fetchone()
+                if existing_event is None:
+                    self._put_outbox_event(conn, event)
+                conn.execute("COMMIT")
+                return revised
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def _read_artifact_content(self, artifact_id: str, *, verify_integrity: bool) -> bytes:
         artifact = self.get_artifact(artifact_id)
         if artifact is None or not artifact.storage_ref:
             raise KeyError(f"artifact not found: {artifact_id}")
-        return Path(artifact.storage_ref).read_bytes()
+        path = Path(artifact.storage_ref).resolve()
+        root = Path(self.artifact_root).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise PermissionError("artifact storage reference is outside artifact storage") from exc
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise KeyError(f"artifact file is unavailable: {artifact_id}") from exc
+        if verify_integrity and hashlib.sha256(content).hexdigest() != artifact.content_hash:
+            raise ValueError("artifact integrity check failed")
+        return content
+
+    def read_artifact_content(self, artifact_id: str) -> bytes:
+        """Read a stored artifact and verify its persisted content hash."""
+        return self._read_artifact_content(artifact_id, verify_integrity=True)
+
+    def read_artifact_content_for_validation(self, artifact_id: str) -> bytes:
+        """Read bytes for the approval validator's own ordered checks.
+
+        Approval intentionally inspects active content before reporting a
+        content-hash mismatch.  External preview/download callers must use
+        ``read_artifact_content`` instead.
+        """
+        return self._read_artifact_content(artifact_id, verify_integrity=False)
 
     def list_artifacts(self, work_order_id: str) -> list[DocumentArtifact]:
         with closing(self._connect()) as conn:
@@ -1565,6 +2063,213 @@ class DocumentAuthoringStore:
                 "SELECT payload_json FROM document_artifacts WHERE work_order_id = ? ORDER BY rowid", (work_order_id,)
             ).fetchall()
         return [DocumentArtifact.model_validate(_payload(row)) for row in rows]
+
+    def cleanup_work_orders(self, work_order_ids: list[str] | tuple[str, ...]) -> None:
+        """Reclaim operational authoring state for deleted chat sessions.
+
+        Formal templates, schemas and source snapshots are shared assets and
+        are deliberately retained.  Work-order-owned runs, checkpoints,
+        drafts, evidence, outbox rows and generated artifact files are not.
+        The operation is safe to repeat after a partial cleanup.
+        """
+        ids = sorted({str(value or "").strip() for value in work_order_ids if str(value or "").strip()})
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        artifact_paths: list[str] = []
+        thread_ids: set[str] = set()
+        generation_session_ids: set[str] = set()
+        run_ids: set[str] = set()
+        now = datetime.now(timezone.utc)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                order_rows = conn.execute(
+                    "SELECT payload_json FROM document_work_orders WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                ).fetchall()
+                for row in order_rows:
+                    payload = _payload(row)
+                    generation_session_id = str(payload.get("generation_session_id") or "").strip()
+                    if generation_session_id:
+                        generation_session_ids.add(generation_session_id)
+
+                artifact_rows = conn.execute(
+                    """SELECT payload_json FROM document_artifacts
+                       WHERE work_order_id IN (""" + placeholders + ")",
+                    ids,
+                ).fetchall()
+                artifact_paths.extend(
+                    str(_payload(row).get("storage_ref") or "")
+                    for row in artifact_rows
+                    if str(_payload(row).get("storage_ref") or "")
+                )
+                run_rows = conn.execute(
+                    """SELECT harness_run_id, payload_json FROM harness_runs
+                       WHERE work_order_id IN (""" + placeholders + ")",
+                    ids,
+                ).fetchall()
+                for row in run_rows:
+                    run_id = str(row["harness_run_id"] or "").strip()
+                    if run_id:
+                        run_ids.add(run_id)
+                    payload = _payload(row)
+                    thread = str(payload.get("agent_thread_id") or "").strip()
+                    if thread:
+                        thread_ids.add(thread)
+                    for value in (payload.get("agent_thread_ids") or {}).values():
+                        value = str(value or "").strip()
+                        if value:
+                            thread_ids.add(value)
+                    # Revoke any in-flight graph lease before files/rows are
+                    # reclaimed.  Persist the payload change as well as the
+                    # indexed status column so readers stay consistent.
+                    payload.update({
+                        "status": "cancelled",
+                        "lease_owner": None,
+                        "lease_expires_at": None,
+                        "heartbeat_at": now.isoformat(),
+                        "fencing_token": int(payload.get("fencing_token") or 0) + 1,
+                        "updated_at": now.isoformat(),
+                    })
+                    conn.execute(
+                        "UPDATE harness_runs SET status = 'cancelled', payload_json = ? WHERE harness_run_id = ?",
+                        (_json(payload), run_id),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        self._delete_harness_threads(thread_ids)
+        root = Path(self.artifact_root).resolve()
+        for raw_path in artifact_paths:
+            path = Path(raw_path).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError as exc:
+                raise PermissionError("document artifact storage reference is outside artifact storage") from exc
+            path.unlink(missing_ok=True)
+
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if run_ids:
+                    run_placeholders = ",".join("?" for _ in run_ids)
+                    run_values = sorted(run_ids)
+                    conn.execute(
+                        "DELETE FROM node_execution_receipts WHERE harness_run_id IN ("
+                        + run_placeholders + ")",
+                        run_values,
+                    )
+                    conn.execute(
+                        "DELETE FROM authoring_execution_events WHERE harness_run_id IN ("
+                        + run_placeholders + ")",
+                        run_values,
+                    )
+                    conn.execute(
+                        "DELETE FROM evidence_registry WHERE harness_run_id IN ("
+                        + run_placeholders + ")",
+                        run_values,
+                    )
+                conn.execute(
+                    "DELETE FROM document_human_events WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM document_outbox_events WHERE aggregate_id IN ("
+                    + placeholders + ") OR json_extract(payload_json, '$.work_order_id') IN ("
+                    + placeholders + ")",
+                    [*ids, *ids],
+                )
+                conn.execute(
+                    "DELETE FROM document_artifacts WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM harness_checkpoints WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM document_unit_drafts WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM harness_runs WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM authoring_run_manifests WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM validation_reports WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM evidence_matrices WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM document_icd_scope_reviews WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                conn.execute(
+                    "DELETE FROM document_work_orders WHERE work_order_id IN ("
+                    + placeholders + ")",
+                    ids,
+                )
+                if generation_session_ids:
+                    session_values = sorted(generation_session_ids)
+                    session_placeholders = ",".join("?" for _ in session_values)
+                    conn.execute(
+                        "DELETE FROM document_generation_messages WHERE session_id IN ("
+                        + session_placeholders + ")",
+                        session_values,
+                    )
+                    conn.execute(
+                        "DELETE FROM document_generation_sessions WHERE session_id IN ("
+                        + session_placeholders + ")",
+                        session_values,
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _delete_harness_threads(thread_ids: set[str]) -> None:
+        if not thread_ids:
+            return
+        from src.document_authoring.harness.checkpointer import build_checkpointer
+
+        backend = str(getattr(src.settings, "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"))
+        path = getattr(
+            src.settings,
+            "DOCUMENT_AUTHORING_CHECKPOINTER_PATH",
+            os.path.join(src.settings.STORAGE_DIR, "document_authoring_checkpoints.sqlite"),
+        )
+        checkpointer = build_checkpointer(
+            backend,
+            sqlite_path=path if backend.strip().casefold() == "sqlite" else None,
+        )
+        try:
+            for thread_id in sorted(thread_ids):
+                checkpointer.delete_thread(thread_id)
+        finally:
+            close = getattr(checkpointer, "close", None)
+            if callable(close):
+                close()
 
     def delete_terminal_work_order(
         self,
@@ -1620,6 +2325,8 @@ class DocumentAuthoringStore:
                 )
                 conn.execute("DELETE FROM document_human_events WHERE work_order_id = ?", (work_order_id,))
                 conn.execute("DELETE FROM document_artifacts WHERE work_order_id = ?", (work_order_id,))
+                conn.execute("DELETE FROM authoring_execution_events WHERE harness_run_id IN "
+                             "(SELECT harness_run_id FROM harness_runs WHERE work_order_id = ?)", (work_order_id,))
                 conn.execute("DELETE FROM node_execution_receipts WHERE harness_run_id IN "
                              "(SELECT harness_run_id FROM harness_runs WHERE work_order_id = ?)", (work_order_id,))
                 conn.execute("DELETE FROM harness_checkpoints WHERE work_order_id = ?", (work_order_id,))

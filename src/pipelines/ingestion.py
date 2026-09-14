@@ -812,7 +812,8 @@ class ExternalConversationHandler(PipelineHandler):
         conversation_indexes=None,
         vector_index=None,
         parser=None,
-        llm_client=None,
+        chat_model=None,
+        model_factory=None,
     ):
         self.spec = spec
         self.store = store
@@ -836,7 +837,8 @@ class ExternalConversationHandler(PipelineHandler):
 
             parser = parse_external_conversation
         self._parser = parser
-        self._llm_client = llm_client
+        self._chat_model = chat_model
+        self._model_factory = model_factory
 
     def _postprocess_llm(self, conversation):
         """Background LLM refinement: structure inference for marker-less text,
@@ -847,16 +849,16 @@ class ExternalConversationHandler(PipelineHandler):
 
             from src.external_conversations import llm_structure
 
-            if self._llm_client is None:
-                from src.core.llm_client import LLMClient
-
-                self._llm_client = LLMClient()
-
+            needs_model = (
+                (not conversation.turns and conversation.blocks and llm_structure.llm_structure_enabled())
+                or llm_structure.llm_summary_enabled()
+            )
+            chat_model = self._get_chat_model() if needs_model else None
             changed = False
             if not conversation.turns and conversation.blocks:
                 inferred = llm_structure.infer_structure(
                     "\n\n".join(conversation.blocks),
-                    llm_client=self._llm_client,
+                    chat_model=chat_model,
                 )
                 if inferred:
                     conversation.turns = inferred["turns"]
@@ -868,7 +870,10 @@ class ExternalConversationHandler(PipelineHandler):
                     self.conversation_indexes.index_conversation(conversation)
 
             body = "\n".join(t.content for t in conversation.turns) or "\n".join(conversation.blocks)
-            result = llm_structure.summarize_content(body, llm_client=self._llm_client)
+            result = llm_structure.summarize_content(
+                body,
+                chat_model=chat_model,
+            )
             if result:
                 conversation.summary = result["summary"]
                 conversation.key_points = result["key_points"]
@@ -885,6 +890,16 @@ class ExternalConversationHandler(PipelineHandler):
             from src.core.logger import warn
 
             warn(f"External conversation LLM post-processing skipped: {exc}")
+
+    def _get_chat_model(self):
+        if self._chat_model is None:
+            if self._model_factory is not None:
+                self._chat_model = self._model_factory()
+            else:
+                from src.core.model_factory import create_chat_model
+
+                self._chat_model = create_chat_model(profile="external_conversation")
+        return self._chat_model
 
     def _spawn_postprocess(self, conversation):
         """Fire-and-forget background refinement, single-flight per id."""

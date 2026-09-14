@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import zipfile
 from pathlib import Path
@@ -13,12 +14,16 @@ from src.document_authoring.models import (
     DocumentSchema,
     DocxFillPlan,
     RendererPolicy,
+    TemplateSanitizationReport,
     TemplateUnitBinding,
     WorkbookFillPlan,
 )
 from src.document_authoring.renderers.docx import DocxRenderer
 from src.document_authoring.renderers.xlsm import XlsmRenderer
-from src.document_authoring.service import DocumentGenerationService
+from src.document_authoring.service import (
+    DocumentGenerationService,
+    _canonical_template_document_type,
+)
 from src.document_authoring.template_sanitizer import sanitize_template
 from src.document_authoring.template_analysis import TemplateAnalysisSuggestion, TemplateAnalysisUnit
 from src.document_authoring.template_progress import TemplateProgress
@@ -63,6 +68,46 @@ def _docx_with_text(text: str) -> bytes:
         for name, value in parts.items():
             package.writestr(name, value)
     return output.getvalue()
+
+
+def test_template_filename_is_canonicalized_to_document_family():
+    assert _canonical_template_document_type("icd_example.xlsx", "icd_example.xlsx") == "icd"
+    assert _canonical_template_document_type("Review", "review.docx") == "Review"
+
+
+def test_template_sanitization_summary_names_removed_embedded_objects():
+    from types import SimpleNamespace
+
+    report = TemplateSanitizationReport(
+        template_version_id="template-1",
+        source_format="docx",
+        source_content_hash="source-hash",
+        source_storage_ref="",
+        sanitized_format="docx",
+        sanitized_content_hash="safe-hash",
+        removed_parts=[
+            "word/embeddings/Microsoft_Excel____.xlsx",
+            "word/embeddings/Microsoft_Excel_97-2003____.xls",
+        ],
+        removed_relationships=["word/_rels/document.xml.rels#rId77"],
+        status="sanitized",
+    )
+    service = SimpleNamespace(
+        _get_template_sanitization_report=lambda _template_version_id: report
+    )
+
+    summary = DocumentGenerationService.get_template_sanitization_summary(
+        service,
+        SimpleNamespace(user_id="tester"),
+        "template-1",
+    )
+
+    assert summary["已移除嵌入/控件"] == 2
+    assert summary["已移除内嵌对象"] == [
+        "Microsoft_Excel_97-2003____.xls",
+        "Microsoft_Excel____.xlsx",
+    ]
+    assert summary["安全模板格式"] == "docx"
 
 
 class _SuggestedSemanticUnit:
@@ -117,7 +162,7 @@ class _TransportFailingSuggester:
 
 
 class _NonWritableTargetClient:
-    def chat(self, _messages, **_kwargs):
+    def invoke(self, _messages, **_kwargs):
         return json.dumps([{
             "semantic_unit_id": "protected",
             "label": "Protected",
@@ -128,7 +173,7 @@ class _NonWritableTargetClient:
 
 
 class _DuplicateTargetClient:
-    def chat(self, messages, **_kwargs):
+    def invoke(self, messages, **_kwargs):
         unit_id = json.loads(messages[1]["content"])["units"][0]["unit_id"]
         return json.dumps([
             {
@@ -213,6 +258,29 @@ def test_confirmed_docx_analysis_creates_hash_bound_approved_template_and_schema
     assert authoring_service.store.get_template_analysis(template.template_version_id).content_hash == template.content_hash
     schema = authoring_service.store.get_document_schema(template.template_schema_id, "1")
     assert schema is not None and schema.status == "approved"
+
+
+def test_attachment_template_persists_origin_provenance(authoring_service, author_ctx):
+    content = _docx_with_text("Attachment template")
+    source_hash = hashlib.sha256(content).hexdigest()
+
+    analysis = authoring_service.analyze_uploaded_template(
+        author_ctx,
+        filename="attachment-template.docx",
+        content=content,
+        template_name="Attachment template",
+        origin_source_type="chat_attachment",
+        origin_attachment_id="att-source-1",
+        origin_session_id=42,
+        origin_content_hash=source_hash,
+    )
+
+    template = authoring_service.store.get_template(analysis.template_version_id)
+    assert template is not None
+    assert template.origin_source_type == "chat_attachment"
+    assert template.origin_attachment_id == "att-source-1"
+    assert template.origin_session_id == 42
+    assert template.origin_content_hash == source_hash
 
 
 def test_auto_activation_approves_template_with_valid_suggestions(authoring_service, author_ctx):
@@ -685,10 +753,9 @@ def test_managed_llm_writer_rejects_model_supplied_validation_status():
     call_count = 0
 
     class _RecordingClient:
-        def chat(self, messages, **kwargs):
+        def invoke(self, messages, **kwargs):
             nonlocal call_count
             call_count += 1
-            assert kwargs["usage_stage"] == "document_authoring"
             return json.dumps({
                 "unit_id": "field:summary",
                 "run_id": "run-1",

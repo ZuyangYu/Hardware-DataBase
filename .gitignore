@@ -124,3 +124,6 @@ verify_recall.py
 
 # 本地运行残留
 run_state.json
+
+# Accidental test artifacts (Mock repr used as a filename)
+<Mock name=*

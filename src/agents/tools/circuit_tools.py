@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from src.agents.schemas import Evidence
+from src.agents.scopes import KnowledgeBaseCircuitScopeResolver
 from src.circuit.index_service import CircuitIndexService
 from src.pipelines.document_rag.schemas import RequestContext
 
@@ -24,11 +25,26 @@ _FORBIDDEN_RESOLVED_FILTERS = frozenset({"refdes", "component_refdes", "resolved
 
 
 def _require_department_context(ctx: RequestContext | None) -> None:
-    department_id = str((getattr(ctx, "metadata", {}) or {}).get("department_id") or "")
+    metadata = getattr(ctx, "metadata", {}) or {}
+    department_id = str(
+        metadata.get("resource_department_id") or metadata.get("department_id") or ""
+    )
     if not department_id:
         raise PermissionError(
             "circuit_query requires department context and knowledge-base read permission."
         )
+
+
+def _knowledge_base_scope(kb_name: str, ctx: RequestContext | None):
+    """Resolve the authorized KB circuit namespace before querying."""
+    metadata = getattr(ctx, "metadata", {}) or {}
+    department_id = metadata.get("resource_department_id") or metadata.get("department_id")
+    # Keep the historical error wording/guard for callers that rely on it,
+    # then hand the typed scope to the shared query path.
+    _require_department_context(ctx)
+    return KnowledgeBaseCircuitScopeResolver().resolve(
+        kb_name=str(kb_name or ""), department_id=department_id
+    )
 
 
 def _validate_operation(operation: str, filters: dict) -> None:
@@ -81,7 +97,8 @@ def _authorized_circuit_query(
 ) -> list[Evidence]:
     """Whitelist + department authorization shared by every circuit entrypoint."""
     _validate_operation(operation, dict(filters or {}))
-    _require_department_context(ctx)
+    scope = _knowledge_base_scope(kb_name, ctx)
+    kb_name = scope.kb_name
     if operation != "auto":
         return circuit_service.typed_query(
             kb_name=kb_name,

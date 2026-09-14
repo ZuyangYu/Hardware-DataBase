@@ -5,10 +5,20 @@
  */
 import { memo, useState, type ReactNode } from 'react';
 
-import type { EvidenceItem, MemoryContextItem, MessageView, QueryTraceStep } from '@/api/types';
+import type {
+  EvidenceItem,
+  ExportArtifactView,
+  ExportFormat,
+  ExportJobView,
+  MemoryContextItem,
+  MessageView,
+  QueryTraceStep,
+} from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { MarkdownMessage, citationDisplayTitle } from '../chatHelpers';
+import ExportMenu, { exportJobStatusLabel } from './ExportMenu';
+import { exportFormatLabel } from '../exportResultModel';
 import {
   CHAT_CITATION_HEADING_CLASS,
   CHAT_CITATIONS_CLASS,
@@ -34,6 +44,15 @@ type Props = {
   onCreateMemory?: (messageId: number) => void;
   /** 打开消息编辑对话框(仅本人 user 消息)。 */
   onEditMessage?: (messageId: number) => void;
+  /** 为已完成助手轮次创建一个后台导出任务。 */
+  onExport?: (message: MessageView, format: ExportFormat) => void;
+  /** 通过带认证的 API 下载已完成 Artifact。 */
+  onDownload?: (job: ExportJobView) => void;
+  /** 通过带认证的 API 读取安全的 Artifact 预览。 */
+  onPreview?: (job: ExportJobView) => void;
+  exportJobs?: ExportJobView[];
+  exportPreviews?: Record<string, ExportArtifactView>;
+  exportFormats?: ExportFormat[];
 };
 
 function CollapsibleSection({
@@ -236,6 +255,87 @@ function MemoryContextBlock({ memories }: { memories: MemoryContextItem[] }) {
   );
 }
 
+function ExportPreview({ artifact }: { artifact: ExportArtifactView }) {
+  const preview = artifact.preview ?? {};
+  const textPreview = typeof preview.text_preview === 'string' ? preview.text_preview : '';
+  const paragraphs = Array.isArray(preview.paragraphs) ? preview.paragraphs : [];
+  const sheets = Array.isArray(preview.sheets) ? preview.sheets : [];
+  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+  return (
+    <div className="mt-[6px] w-full rounded-[8px] bg-[#f8fafc] px-[8px] py-[7px] text-[11px] text-[#697187]">
+      {textPreview && <pre className="max-h-[180px] overflow-auto whitespace-pre-wrap break-words font-sans leading-[17px]">{textPreview}</pre>}
+      {paragraphs.length > 0 && (
+        <div className="space-y-[3px]">
+          {paragraphs.slice(0, 8).map((paragraph, index) => <p key={index}>{String(paragraph)}</p>)}
+        </div>
+      )}
+      {sheets.length > 0 && (
+        <div className="space-y-[3px]">
+          {sheets.slice(0, 5).map((sheet, index) => {
+            const rowCount = sheet && typeof sheet === 'object' && Array.isArray((sheet as { rows?: unknown[] }).rows)
+              ? (sheet as { rows: unknown[] }).rows.length
+              : 0;
+            const name = sheet && typeof sheet === 'object' ? String((sheet as { name?: unknown }).name ?? '') : '';
+            return <p key={index}>工作表：{name}（{rowCount} 行）</p>;
+          })}
+        </div>
+      )}
+      {warnings.map((warning, index) => <p key={`warning-${index}`} className="text-[#b42318]">{String(warning)}</p>)}
+      {preview.truncated === true && <p>预览已截断，下载文件可查看完整内容。</p>}
+      {!textPreview && paragraphs.length === 0 && sheets.length === 0 && warnings.length === 0 && (
+        <p>已生成 {artifact.filename}，当前格式仅提供摘要预览。</p>
+      )}
+    </div>
+  );
+}
+
+function ExportJobs({
+  jobs,
+  onDownload,
+  onPreview,
+  previews = {},
+}: {
+  jobs: ExportJobView[];
+  onDownload?: (job: ExportJobView) => void;
+  onPreview?: (job: ExportJobView) => void;
+  previews?: Record<string, ExportArtifactView>;
+}) {
+  if (jobs.length === 0) return null;
+  return (
+    <div className="border-t border-[#e3e7f1] pt-[10px]">
+      <div className="mb-[6px] text-[11px] font-semibold text-[#858b9c]">导出任务</div>
+      <div className="grid gap-[5px]">
+        {jobs.map((job) => (
+          <div key={job.export_job_id} className="flex flex-wrap items-center gap-[7px] text-[11px] text-[#858b9c]">
+            <span>{exportFormatLabel(job.format)}</span>
+            <span>{exportJobStatusLabel(job.status)}</span>
+            {job.status === 'succeeded' && job.artifact && onDownload && (
+              <button
+                type="button"
+                onClick={() => onDownload(job)}
+                className="font-medium text-[#0b6cf5] underline-offset-2 hover:underline"
+              >
+                下载 {job.artifact.filename}
+              </button>
+            )}
+            {job.status === 'succeeded' && job.artifact && onPreview && (
+              <button
+                type="button"
+                onClick={() => onPreview(job)}
+                className="font-medium text-[#0b6cf5] underline-offset-2 hover:underline"
+              >
+                {previews[job.export_job_id] ? '刷新预览' : '预览'}
+              </button>
+            )}
+            {job.error_message && <span className="text-[#b42318]">· {job.error_message}</span>}
+            {previews[job.export_job_id] && <ExportPreview artifact={previews[job.export_job_id]} />}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function citationPreview(item: EvidenceItem): string {
   const metadata = item.metadata ?? {};
   const candidates = [
@@ -279,6 +379,12 @@ function MessageBubble({
   showDiagnostics = true,
   onCreateMemory,
   onEditMessage,
+  onExport,
+  onDownload,
+  onPreview,
+  exportJobs = [],
+  exportPreviews = {},
+  exportFormats,
 }: Props) {
   // 流式临时气泡
   if (streaming) {
@@ -321,6 +427,17 @@ function MessageBubble({
               {msg.memory_context && msg.memory_context.length > 0 && (
                 <MemoryContextBlock memories={msg.memory_context} />
               )}
+              {onExport && msg.turn_id && (
+                <div className="border-t border-[#e3e7f1] pt-[10px]">
+                  <ExportMenu formats={exportFormats} onExport={(format) => onExport(msg, format)} />
+                </div>
+              )}
+              <ExportJobs
+                jobs={exportJobs ?? []}
+                onDownload={onDownload}
+                onPreview={onPreview}
+                previews={exportPreviews}
+              />
             </div>
           ) : (
             <div className="grid gap-[7px]">
@@ -330,6 +447,47 @@ function MessageBubble({
                 </div>
               ) : (
                 <div className={CHAT_PLAIN_ANSWER_CLASS}>{msg.content}</div>
+              )}
+              {msg.attachments && msg.attachments.length > 0 && (
+                <div className="flex flex-wrap items-center justify-end gap-[6px]">
+                  {msg.attachments.map((attachment) => {
+                    const deleted = Boolean(attachment.deleted);
+                    const stateLabel =
+                      deleted
+                        ? '已删除'
+                        : attachment.parse_status === 'ready'
+                          ? '已就绪'
+                          : attachment.parse_status === 'degraded'
+                            ? '部分可读'
+                            : attachment.parse_status === 'failed'
+                              ? '解析失败'
+                              : '解析中…';
+                    return (
+                      <span
+                        key={attachment.attachment_id}
+                        title={`${attachment.filename} · ${stateLabel}`}
+                        className="inline-flex min-w-0 items-center gap-[6px] rounded-full border border-[#e3e7f1] bg-[#fafbfc] px-[9px] py-[2px] text-[11px] text-[#464c5e]"
+                      >
+                        <span className="min-w-0 max-w-[200px] truncate">
+                          {attachment.filename}
+                          {deleted ? '（已删除）' : ''}
+                        </span>
+                        <span
+                          className={cn(
+                            'shrink-0 text-[10px]',
+                            deleted || attachment.parse_status === 'failed'
+                              ? 'text-[#b45309]'
+                              : attachment.parse_status === 'ready'
+                                ? 'text-[#166534]'
+                                : 'text-[#858b9c]',
+                          )}
+                        >
+                          {stateLabel}
+                        </span>
+                      </span>
+                    );
+                  })}
+                </div>
               )}
               {msg.role === 'user' && msg.id > 0 && !msg.redacted && (
                 <div className="flex items-center justify-end gap-[10px]">

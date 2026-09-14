@@ -204,6 +204,17 @@ class StubPipeline:
     def cancel_harness_run(self, ctx, harness_run_id):
         return {"harness_run_id": harness_run_id}
 
+    def resume_document_task(self, ctx, task_id):
+        return {"task_id": task_id, "work_order_id": "wo-1", "run_id": "bg-task-resume", "status": "queued"}
+
+    def complete_document_revision(self, ctx, revision_id, **kwargs):
+        return {
+            "revision_id": revision_id,
+            "child_artifact_id": kwargs["child_artifact_id"],
+            "revalidation_status": kwargs["revalidation_status"],
+            "status": "revalidated",
+        }
+
 
 def make_auth(db_path: str):
     """Build a temp auth.db: one dept, dept_admin 'admin1', user 'user1', KB 'shared'.

@@ -33,13 +33,37 @@ def _session_view(s) -> SessionView:
         title=s.title,
         created_at=s.created_at,
         updated_at=s.updated_at,
+        document_context=getattr(s, "document_context", None),
     )
 
 
-def _message_view(m) -> MessageView:
+def _attachment_snapshot_view(snapshot: dict):
+    from src.api.schemas import AttachmentSnapshotView
+
+    return AttachmentSnapshotView(
+        attachment_id=str(snapshot.get("attachment_id") or ""),
+        filename=str(snapshot.get("filename_snapshot") or ""),
+        media_type=str(snapshot.get("media_type_snapshot") or ""),
+        usage_hint=str(snapshot.get("usage_hint_snapshot") or "reference"),
+        content_hash=str(snapshot.get("content_hash_snapshot") or ""),
+        ordinal=int(snapshot.get("ordinal") or 0),
+        parse_status=str(snapshot.get("parse_status_snapshot") or "queued"),
+        deleted=bool(snapshot.get("deleted", False)),
+    )
+
+
+def _message_view(m, cards: list[dict] | None = None) -> MessageView:
+    attachments = []
+    if m.turn_id and m.role == "user":
+        try:
+            snapshots = _conv_service().list_turn_attachments(str(m.turn_id))
+            attachments = [_attachment_snapshot_view(snapshot) for snapshot in snapshots]
+        except Exception:
+            attachments = []
     return MessageView(
         id=m.id,
         session_id=m.session_id,
+        turn_id=getattr(m, "turn_id", None),
         role=m.role,
         content=m.content,
         footer=m.footer,
@@ -47,7 +71,10 @@ def _message_view(m) -> MessageView:
         edited_at=getattr(m, "edited_at", None),
         redacted=bool(getattr(m, "redacted", False)),
         memory_context=getattr(m, "memory_context", []),
+        document_context=getattr(m, "document_context", None),
+        attachments=attachments,
         citations=getattr(m, "citations", []) or [],
+        cards=list(cards or []),
     )
 
 
@@ -158,7 +185,25 @@ def list_messages(
     if s is None:
         raise HTTPException(status_code=404, detail="session not found")
     _ensure_history_access(user, auth)
-    return [_message_view(m) for m in conv.list_messages(user.id, session_id)]
+    messages = conv.list_messages(user.id, session_id)
+    cards_by_turn: dict[str, list[dict]] = {}
+    try:
+        cards_by_turn = conv.list_session_document_cards(user.id, session_id)
+    except Exception:
+        # History rehydration is best-effort: a card projection failure must
+        # never break the message list itself.
+        cards_by_turn = {}
+    assistant_turns = {
+        str(m.turn_id) for m in messages if m.role == "assistant" and m.turn_id
+    }
+    views: list[MessageView] = []
+    for m in messages:
+        turn_id = str(getattr(m, "turn_id", "") or "")
+        cards: list[dict] = []
+        if turn_id and (m.role == "assistant" or turn_id not in assistant_turns):
+            cards = cards_by_turn.get(turn_id, [])
+        views.append(_message_view(m, cards=cards))
+    return views
 
 
 @router.post("/conversations/{session_id}/messages", response_model=MessageView)

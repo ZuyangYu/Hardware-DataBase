@@ -76,6 +76,41 @@ def test_feedback_requires_non_empty_comment():
         service.submit_document_feedback("ctx", "candidate-1", comment=" ")
 
 
+def test_release_request_records_a_pending_intent_without_approving_or_publishing():
+    """A release request must never be interchangeable with an approval event."""
+    service = object.__new__(DocumentGenerationService)
+    artifact = SimpleNamespace(
+        work_order_id="wo-1",
+        artifact_id="candidate-1",
+        run_id="run-1",
+        stage="review_candidate",
+        content_hash="artifact-hash",
+        validation_report_id="report-1",
+    )
+    report = SimpleNamespace(content_hash="report-hash")
+    order = SimpleNamespace(work_order_id="wo-1", scope_type="knowledge_base")
+    event_store = Mock(side_effect=lambda event: event)
+    service._artifact_for_context = Mock(return_value=artifact)
+    service._order_raw = Mock(return_value=order)
+    service.require_work_order_capability = Mock()
+    service.approve_document_artifact = Mock()
+    service.store = SimpleNamespace(get_validation_report=Mock(return_value=report), save_human_event=event_store)
+    service.resolve_source_snapshot = Mock(return_value=SimpleNamespace(content_hash="snapshot-hash"))
+    ctx = RequestContext(user_id="alice", kb_permissions={"hardware": "read"})
+
+    event = service.request_document_release(
+        ctx,
+        "candidate-1",
+        comment="请进入正式发布审核",
+    )
+
+    assert event.event_type == "request_release"
+    assert event.subject_artifact_content_hash == "artifact-hash"
+    assert event.approval_subject_hash is None
+    service.require_work_order_capability.assert_called_once_with(ctx, order, "submit_human_event")
+    service.approve_document_artifact.assert_not_called()
+
+
 def test_candidate_preview_requires_the_same_review_access_as_download():
     service = object.__new__(DocumentGenerationService)
     artifact = SimpleNamespace(work_order_id="wo-1", stage="review_candidate")

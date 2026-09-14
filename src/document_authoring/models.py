@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.agents.claim_evidence import InformationRequirement
 from src.document_authoring.icd_scope_decision import IcdScopeDecision
@@ -90,6 +90,13 @@ class TemplateVersion(BaseModel):
     approved_by: str | None = None
     approved_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
+    # Optional chat-attachment provenance (design §13.5). The sanitized
+    # bytes remain self-contained: deleting the origin attachment never
+    # invalidates the TemplateVersion.
+    origin_source_type: str | None = None
+    origin_attachment_id: str | None = None
+    origin_session_id: int | None = None
+    origin_content_hash: str | None = None
 
 
 class LegacyTemplateClaim(BaseModel):
@@ -140,6 +147,7 @@ class TemplateUnitBinding(BaseModel):
     semantic_unit_id: str
     target_region_ids: list[str]
     render_transform_id: str | None = None
+    table_schema: "WorkbookTableSchema | None" = None
 
 
 class DocumentFieldSchema(BaseModel):
@@ -159,6 +167,19 @@ class DocumentFieldSchema(BaseModel):
     allow_derivation: bool = False
     missing_policy: Literal["mark_tbd", "block_section", "optional"] = "mark_tbd"
     authoring_policy: Literal["deterministic", "managed_writer", "external_agent_draft", "human_only"] = "managed_writer"
+    # Column letter -> header label, discovered from inspected template
+    # headers.  Present only for table-shaped fields so writers receive the
+    # exact column contract without scalar flattening.
+    table_columns: dict[str, str] | None = None
+    # Table identity/order is server-owned metadata.  Empty defaults preserve
+    # schemas written before typed table rows existed; such legacy rows are
+    # readable but are never assigned a guessed identity at render time.
+    table_row_scope: str | None = None
+    table_row_identity_fields: list[str] = Field(default_factory=list)
+    table_row_key_schema: dict[str, Any] = Field(default_factory=dict)
+    table_row_keys: list[str] = Field(default_factory=list)
+    table_row_order: Literal["declared", "stable_key", "input"] = "declared"
+    table_duplicate_policy: Literal["reject", "allow"] = "reject"
 
 
 class ReviewItemSchema(BaseModel):
@@ -277,6 +298,13 @@ class DocumentWorkOrder(BaseModel):
     baseline_id: str | None
     baseline_content_hash: str
     source_set_snapshot_id: str
+    # Document Flow source authorization is frozen alongside the source-set
+    # snapshot.  Empty defaults are intentional: payloads created before the
+    # attachment bridge was introduced must retain their historical
+    # fingerprints when they are rehydrated.
+    source_scope_snapshot: str = ""
+    attachment_refs_snapshot: list[dict[str, Any]] = Field(default_factory=list)
+    kb_scope_snapshot: dict[str, Any] = Field(default_factory=dict)
     template_version_id: str
     document_schema_id: str
     document_schema_version: str
@@ -284,7 +312,7 @@ class DocumentWorkOrder(BaseModel):
     template_schema_version: str
     retrieval_policy_version: str
     renderer_policy_version: str
-    target_format: Literal["xlsm", "xlsx", "markdown", "docx"]
+    target_format: Literal["xlsm", "xlsx", "markdown", "docx", "pdf"]
     execution_mode: Literal["internal_harness", "deterministic_only", "external_agent"]
     harness_policy_id: str | None = None
     harness_policy_version: str | None = None
@@ -294,9 +322,29 @@ class DocumentWorkOrder(BaseModel):
         "validating", "waiting_human_approval", "ready_to_render", "rendering", "blocked",
         "paused", "complete", "failed", "cancelled",
     ] = "planned"
+    # User-level aggregate association.  This is deliberately not a frozen
+    # input: adding a task after a legacy WorkOrder was created must not alter
+    # its reproducibility fingerprint.
+    task_id: str | None = None
+    # Governed revision lineage.  Historical artifacts remain readable with
+    # ``None``; a revision regeneration binds its candidate artifact after the
+    # immutable bytes exist.  Like ``task_id`` this never enters the frozen
+    # input fingerprint.
+    revision_id: str | None = None
     generation_session_id: str | None = None
     generation_brief: dict[str, Any] = Field(default_factory=dict)
+    # Phase 1 plan-backed work orders retain the accepted immutable planning
+    # references.  They are optional so historical v1/v2 payloads remain
+    # byte-compatible and are never retroactively assigned fictional plans.
+    output_spec_id: str | None = None
+    output_spec_version: int | None = Field(default=None, ge=1)
+    output_spec_hash: str | None = None
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
+    document_plan_hash: str | None = None
     restart_of_work_order_id: str | None = None
+    requested_executor: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
+    input_fingerprint_version: int = 1
     error_code: str | None = None
     error_message: str | None = None
     retryable: bool | None = None
@@ -314,6 +362,10 @@ class DocumentWorkOrder(BaseModel):
 
     @model_validator(mode="after")
     def calculate_input_fingerprint(self):
+        if self.source_scope_snapshot and self.source_scope_snapshot not in {
+            "auto", "attachment_only", "knowledge_base_only", "attachment_and_knowledge_base",
+        }:
+            raise ValueError("unsupported document source scope snapshot")
         if self.scope_type == "project":
             if not self.project_id or not self.baseline_id:
                 raise ValueError("project-scoped work orders require project_id and baseline_id")
@@ -326,14 +378,24 @@ class DocumentWorkOrder(BaseModel):
                 raise ValueError("knowledge-base work orders cannot name a project or baseline")
             if self.baseline_content_hash:
                 raise ValueError("knowledge-base work orders cannot bind a baseline content hash")
-        if self.execution_mode == "internal_harness" and (
+        if self.execution_mode in {"internal_harness", "external_agent"} and (
             not self.harness_policy_id or not self.harness_policy_version
         ):
-            raise ValueError("internal-harness work orders require a frozen HarnessPolicy version")
+            raise ValueError("Harness-backed work orders require a frozen HarnessPolicy version")
+        if self.requested_executor is not None and self.requested_executor != self.execution_mode:
+            raise ValueError("requested_executor conflicts with execution_mode")
         excluded = {
             "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
             "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
-            "error_message", "retryable", "next_actions",
+            "error_message", "retryable", "next_actions", "requested_executor", "input_fingerprint_version",
+            # Execution metadata, never a frozen generation input.  Excluding it
+            # unconditionally keeps every persisted pre-revision fingerprint
+            # byte-identical under the new schema.
+            "revision_id",
+            # These fields are included only in the explicit v3 preimage.
+            # Leaving them excluded for v1/v2 preserves historical hashes.
+            "output_spec_id", "output_spec_version", "output_spec_hash",
+            "document_plan_id", "document_plan_version", "document_plan_hash",
         }
         if self.scope_type == "project":
             # Preserve fingerprints from persisted project work orders created
@@ -348,11 +410,203 @@ class DocumentWorkOrder(BaseModel):
             # Preserve fingerprints for work orders stored before traceable
             # restart lineage was introduced.
             excluded.add("restart_of_work_order_id")
-        expected = content_hash(self.model_dump(mode="json", exclude=excluded))
+        if not self.source_scope_snapshot:
+            excluded.add("source_scope_snapshot")
+        if not self.attachment_refs_snapshot:
+            excluded.add("attachment_refs_snapshot")
+        if not self.kb_scope_snapshot:
+            excluded.add("kb_scope_snapshot")
+        if self.input_fingerprint_version >= 3:
+            if self.requested_executor is None:
+                raise ValueError("v3 input fingerprints require requested_executor")
+            if (
+                not self.output_spec_id or self.output_spec_version is None or not self.output_spec_hash
+                or not self.document_plan_id or self.document_plan_version is None
+                or not self.document_plan_hash
+            ):
+                raise ValueError("v3 input fingerprints require accepted OutputSpec and DocumentPlan references")
+            excluded.discard("requested_executor")
+            for field_name in (
+                "output_spec_id", "output_spec_version", "output_spec_hash",
+                "document_plan_id", "document_plan_version", "document_plan_hash",
+            ):
+                excluded.discard(field_name)
+            fingerprint_payload = self.model_dump(mode="json", exclude=excluded)
+            if "task_id" in fingerprint_payload:
+                fingerprint_payload["task_id"] = None
+            expected = content_hash({
+                "input_fingerprint_version": 3,
+                "frozen_inputs": fingerprint_payload,
+            })
+        elif self.input_fingerprint_version >= 2:
+            if self.requested_executor is None:
+                raise ValueError("v2 input fingerprints require requested_executor")
+            # v2 deliberately binds the normalized requested executor.  The
+            # historical v1 preimage excluded this compatibility field.
+            excluded.discard("requested_executor")
+            fingerprint_payload = self.model_dump(mode="json", exclude=excluded)
+            # Task identity is a user-facing association, not an execution
+            # input. Keep the key in the preimage as ``None`` so newly
+            # serialized models remain compatible with callers that calculated
+            # a legacy preimage from the post-schema model dump.
+            if "task_id" in fingerprint_payload:
+                fingerprint_payload["task_id"] = None
+            expected = content_hash({
+                "input_fingerprint_version": 2,
+                "frozen_inputs": fingerprint_payload,
+            })
+        else:
+            fingerprint_payload = self.model_dump(mode="json", exclude=excluded)
+            if "task_id" in fingerprint_payload:
+                fingerprint_payload["task_id"] = None
+            expected = content_hash(fingerprint_payload)
         if self.input_fingerprint and self.input_fingerprint != expected:
-            raise ValueError("work order input_fingerprint does not match frozen inputs")
-        self.input_fingerprint = expected
+            if self.input_fingerprint_version >= 3:
+                # There is no safe legacy variant for a v3 plan-backed order;
+                # accepting one would allow the planning references to drift
+                # from the frozen WorkOrder preimage.
+                raise ValueError("work order input_fingerprint does not match frozen inputs")
+            # A short compatibility window is needed for callers that built
+            # a v1 preimage from a post-schema model dump before the new
+            # snapshot fields were added to the exclusion list.  Persisted
+            # rows from before the bridge omit these fields entirely; accepting
+            # this alternate preimage keeps those rows readable while new
+            # orders still use ``expected``.
+            compatibility_excluded = set(excluded)
+            compatibility_excluded.difference_update({
+                "source_scope_snapshot", "attachment_refs_snapshot", "kb_scope_snapshot",
+            })
+            if self.input_fingerprint_version >= 2:
+                # The v2 preimage binds the requested executor; every v2
+                # compatibility variant must agree, otherwise persisted v2
+                # rows written before later optional fields existed would no
+                # longer validate (the base ``excluded`` set keeps the field
+                # excluded for the v1 branch only).
+                compatibility_excluded.discard("requested_executor")
+                compatibility_expected = content_hash({
+                    "input_fingerprint_version": 2,
+                    "frozen_inputs": self.model_dump(mode="json", exclude=compatibility_excluded),
+                })
+            else:
+                compatibility_expected = content_hash(
+                    self.model_dump(mode="json", exclude=compatibility_excluded)
+                )
+            if self.input_fingerprint != compatibility_expected:
+                # Rows written before task association was introduced do not
+                # contain the optional key at all.  Accept that second legacy
+                # preimage, but never accept a changed association as a new
+                # frozen input.
+                legacy_compatibility_excluded = set(compatibility_excluded)
+                legacy_compatibility_excluded.add("task_id")
+                if self.input_fingerprint_version >= 2:
+                    legacy_compatibility_expected = content_hash({
+                        "input_fingerprint_version": 2,
+                        "frozen_inputs": self.model_dump(
+                            mode="json", exclude=legacy_compatibility_excluded,
+                        ),
+                    })
+                else:
+                    legacy_compatibility_expected = content_hash(
+                        self.model_dump(mode="json", exclude=legacy_compatibility_excluded)
+                    )
+                if self.input_fingerprint != legacy_compatibility_expected:
+                    # The two variants above re-include the empty snapshot
+                    # keys as nulls.  Rows whose stored preimage omitted
+                    # those keys entirely (frozen snapshots were conditional
+                    # from the start) validate against the strict branch
+                    # preimage minus the task key only.
+                    strict_legacy_excluded = set(excluded)
+                    strict_legacy_excluded.add("task_id")
+                    if self.input_fingerprint_version >= 2:
+                        strict_legacy_expected = content_hash({
+                            "input_fingerprint_version": 2,
+                            "frozen_inputs": self.model_dump(
+                                mode="json", exclude=strict_legacy_excluded,
+                            ),
+                        })
+                    else:
+                        strict_legacy_expected = content_hash(
+                            self.model_dump(mode="json", exclude=strict_legacy_excluded)
+                        )
+                    if self.input_fingerprint != strict_legacy_expected:
+                        raise ValueError("work order input_fingerprint does not match frozen inputs")
+        else:
+            self.input_fingerprint = expected
         return self
+
+
+def compute_input_fingerprint_v2(order: DocumentWorkOrder) -> str:
+    """v2 work-order input fingerprint preimage.
+
+    v2 adds the immutable ``requested_executor`` (already normalized at work
+    order creation) on top of the v1 frozen-input preimage and a version tag.
+    Historical work orders keep their v1 fingerprint; the write-path switch to
+    v2 happens in Task 5c, not here.
+    """
+    if order.requested_executor is None:
+        raise ValueError("v2 input fingerprints require requested_executor")
+    excluded = {
+        "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
+        "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
+        "error_message", "retryable", "next_actions", "input_fingerprint_version", "revision_id",
+        "output_spec_id", "output_spec_version", "output_spec_hash",
+        "document_plan_id", "document_plan_version", "document_plan_hash",
+    }
+    if order.scope_type == "project":
+        excluded.update({"scope_type", "knowledge_base_name"})
+    if order.generation_session_id is None and not order.generation_brief:
+        excluded.update({"generation_session_id", "generation_brief"})
+    if order.restart_of_work_order_id is None:
+        excluded.add("restart_of_work_order_id")
+    if not order.source_scope_snapshot:
+        excluded.add("source_scope_snapshot")
+    if not order.attachment_refs_snapshot:
+        excluded.add("attachment_refs_snapshot")
+    if not order.kb_scope_snapshot:
+        excluded.add("kb_scope_snapshot")
+    fingerprint_payload = order.model_dump(mode="json", exclude=excluded)
+    if "task_id" in fingerprint_payload:
+        fingerprint_payload["task_id"] = None
+    return content_hash({
+        "input_fingerprint_version": 2,
+        "frozen_inputs": fingerprint_payload,
+    })
+
+
+def compute_input_fingerprint_v3(order: DocumentWorkOrder) -> str:
+    """v3 preimage for WorkOrders created from an accepted document plan."""
+    if order.requested_executor is None:
+        raise ValueError("v3 input fingerprints require requested_executor")
+    if (
+        not order.output_spec_id or order.output_spec_version is None or not order.output_spec_hash
+        or not order.document_plan_id or order.document_plan_version is None
+        or not order.document_plan_hash
+    ):
+        raise ValueError("v3 input fingerprints require accepted planning references")
+    excluded = {
+        "input_fingerprint", "created_at", "updated_at", "lock_version", "status", "unit_statuses",
+        "evidence_matrix_id", "validation_report_id", "run_manifest_id", "error_code",
+        "error_message", "retryable", "next_actions", "input_fingerprint_version", "revision_id",
+    }
+    if order.scope_type == "project":
+        excluded.update({"scope_type", "knowledge_base_name"})
+    if order.generation_session_id is None and not order.generation_brief:
+        excluded.update({"generation_session_id", "generation_brief"})
+    if order.restart_of_work_order_id is None:
+        excluded.add("restart_of_work_order_id")
+    if not order.source_scope_snapshot:
+        excluded.add("source_scope_snapshot")
+    if not order.attachment_refs_snapshot:
+        excluded.add("attachment_refs_snapshot")
+    if not order.kb_scope_snapshot:
+        excluded.add("kb_scope_snapshot")
+    fingerprint_payload = order.model_dump(mode="json", exclude=excluded)
+    if "task_id" in fingerprint_payload:
+        fingerprint_payload["task_id"] = None
+    return content_hash({
+        "input_fingerprint_version": 3,
+        "frozen_inputs": fingerprint_payload,
+    })
 
 
 class IcdScopeResolution(BaseModel):
@@ -372,6 +626,21 @@ class IcdScopeResolution(BaseModel):
             raise ValueError("ICD scope resolution action must be include or exclude")
         self.action = normalized_action
         return self
+
+
+def icd_scope_decision_hash(decision: "IcdScopeDecision") -> str:
+    """Hash the frozen scope identity, ignoring advisory presentation fields.
+
+    ``suggested_refdes`` is operator guidance derived from the frozen EDF, not
+    part of the decision identity; excluding it keeps previously persisted
+    reviews verifiable after the field was introduced.
+    """
+
+    payload = decision.model_dump(mode="json")
+    for exception in payload.get("exceptions") or []:
+        if isinstance(exception, dict):
+            exception.pop("suggested_refdes", None)
+    return content_hash(payload)
 
 
 class IcdScopeReview(BaseModel):
@@ -401,7 +670,7 @@ class IcdScopeReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_frozen_scope(self):
-        expected_hash = content_hash(self.decision)
+        expected_hash = icd_scope_decision_hash(self.decision)
         if self.decision_content_hash and self.decision_content_hash != expected_hash:
             raise ValueError("ICD scope decision hash does not match contents")
         self.decision_content_hash = expected_hash
@@ -443,6 +712,18 @@ class HarnessPolicy(BaseModel):
     # Zero disables it even when the tool is allowlisted; the tool + budget
     # form a double switch, mirroring rewrite_query + max_query_rewrite_rounds.
     max_adaptive_recovery_rounds: int = 0
+    max_agent_tool_calls: int = 60
+    max_proposal_retries_per_field: int = 2
+    # Agent confidence is a policy input, never an instruction supplied by
+    # the model.  ``agent_confidence_threshold`` is accepted as a backwards-
+    # compatible spelling at the model boundary; the persisted canonical name
+    # is ``min_agent_confidence``.
+    min_agent_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    agent_tools: list[str] = Field(default_factory=list)
+    backend_profile: Literal["restricted"] = "restricted"
+    excluded_tools: list[str] = Field(default_factory=lambda: [
+        "filesystem", "shell", "command", "task", "general-purpose",
+    ])
     allowed_tools: list[str] = Field(default_factory=lambda: [
         "retrieve_evidence", "draft_ready_unit", "validate_unit_draft",
         "detect_template_contamination", "validate_cross_unit", "rewrite_query",
@@ -451,6 +732,17 @@ class HarnessPolicy(BaseModel):
     writer_provider_id: str = "managed"
     prompt_version: str = "1"
     status: Literal["draft", "approved", "obsolete"] = "draft"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_agent_confidence_aliases(cls, value):
+        if isinstance(value, dict) and "min_agent_confidence" not in value:
+            for alias in ("agent_confidence_threshold", "confidence_threshold"):
+                if alias in value:
+                    value = dict(value)
+                    value["min_agent_confidence"] = value[alias]
+                    break
+        return value
 
     @model_validator(mode="after")
     def validate_budget(self):
@@ -469,9 +761,23 @@ class HarnessPolicy(BaseModel):
             raise ValueError("max_parallel_units must be between 1 and 8")
         if self.max_adaptive_recovery_rounds < 0:
             raise ValueError("harness policy max_adaptive_recovery_rounds cannot be negative")
+        if min(self.max_agent_tool_calls, self.max_proposal_retries_per_field) < 1:
+            raise ValueError("harness policy agent budgets must be positive")
+        if len(self.agent_tools) != len(set(self.agent_tools)):
+            raise ValueError("harness policy agent_tools must be unique")
+        if len(self.excluded_tools) != len(set(self.excluded_tools)):
+            raise ValueError("harness policy excluded_tools must be unique")
+        forbidden = {"filesystem", "shell", "command", "task", "general-purpose"}
+        if forbidden.intersection(self.agent_tools):
+            raise ValueError("harness policy agent_tools contain excluded capabilities")
         if len(self.allowed_tools) != len(set(self.allowed_tools)):
             raise ValueError("harness policy tools must be unique")
         return self
+
+    @property
+    def agent_confidence_threshold(self) -> float:
+        """Compatibility accessor used by executor/agent integrations."""
+        return self.min_agent_confidence
 
 
 class AuthoringRunManifest(BaseModel):
@@ -501,6 +807,23 @@ class AuthoringRunManifest(BaseModel):
     max_parallel_units: int | None = None
     validator_version: str = "p2b-1"
     renderer_version: str = "p2a-1"
+    input_fingerprint_version: int = 1
+    requested_executor: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
+    task_graph_id: str | None = None
+    task_graph_version: int | None = Field(default=None, ge=1)
+    task_graph_hash: str | None = None
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
+    document_plan_hash: str | None = None
+    execution_route: Literal["legacy_schema", "plan_dag"] = "legacy_schema"
+    # Phase 2 review lineage.  These are optional so legacy manifests remain
+    # readable; plan-backed runs populate every value before release routing.
+    document_model_hash: str | None = None
+    pre_render_review_hash: str | None = None
+    post_render_review_hash: str | None = None
+    artifact_hash: str | None = None
+    release_decision_hash: str | None = None
+    release_status: Literal["pending", "blocked", "needs_review", "released"] = "pending"
     created_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
 
@@ -526,6 +849,45 @@ class HarnessRun(BaseModel):
     heartbeat_at: datetime | None = None
     last_error_code: str | None = None
     error: dict[str, Any] | None = None
+    tenant_id: str = "default"
+    knowledge_base_id: str | None = None
+    input_fingerprint: str = ""
+    input_fingerprint_version: int = 1
+    source_set_snapshot_id: str | None = None
+    unit_statuses: dict[str, str] = Field(default_factory=dict)
+    unit_attempts: dict[str, int] = Field(default_factory=dict)
+    dispatch_cursor: int = 0
+    evidence_matrix_hash: str | None = None
+    draft_ids: list[str] = Field(default_factory=list)
+    pending_human_event: dict[str, Any] | None = None
+    requested_executor: Literal["internal_harness", "deterministic_only", "external_agent"] | None = None
+    effective_executor: Literal["deterministic_rule", "authoring_graph", "agent_field_harness"] | None = None
+    degraded_reasons: list[str] = Field(default_factory=list)
+    agent_thread_id: str | None = None
+    graph_state_version: int = 1
+    migration_state: Literal["native", "converted", "legacy_terminal"] | None = None
+    task_graph_id: str | None = None
+    task_graph_version: int | None = Field(default=None, ge=1)
+    task_graph_hash: str | None = None
+    document_plan_id: str | None = None
+    document_plan_version: int | None = Field(default=None, ge=1)
+    document_plan_hash: str | None = None
+    execution_route: Literal["legacy_schema", "plan_dag"] = "legacy_schema"
+    document_model_hash: str | None = None
+    pre_render_review_hash: str | None = None
+    post_render_review_hash: str | None = None
+    artifact_hash: str | None = None
+    release_decision_hash: str | None = None
+    release_status: Literal["pending", "blocked", "needs_review", "released"] = "pending"
+    last_agent_checkpoint_at: datetime | None = None
+    agent_token_usage: dict[str, Any] = Field(default_factory=lambda: {
+        "usage_returned": False,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "call_count": 0,
+    })
+    trace_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -561,6 +923,8 @@ class NodeExecutionReceipt(BaseModel):
     node_name: str
     unit_id: str
     input_fingerprint: str
+    action_key: str = ""
+    attempt: int = 1
     fencing_token: int
     status: Literal["started", "committed", "failed"] = "started"
     output_hash: str | None = None
@@ -583,12 +947,44 @@ class DraftAssertion(BaseModel):
     ] = "document_statement"
 
 
+class TypedTableRow(BaseModel):
+    """One table record and the exact evidence supporting its cells."""
+
+    # ``row_key`` intentionally defaults to empty for old serialized drafts.
+    # A plan-backed/table-contract validation pass requires a non-empty key;
+    # the compatibility default makes old payloads readable without inventing
+    # identity from display text.
+    row_key: str = ""
+    cells: dict[str, str]
+    evidence_ids: list[str] = Field(default_factory=list)
+    cell_evidence_ids: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class TypedFieldValue(BaseModel):
     """A compact, evidence-backed value eligible for template filling."""
 
-    kind: Literal["scalar", "enumeration"]
+    kind: Literal["scalar", "enumeration", "table"]
     normalized_values: list[str] = Field(default_factory=list)
     display_value: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    rows: list[TypedTableRow] = Field(default_factory=list, max_length=10000)
+
+
+class ManagedDraftPayload(BaseModel):
+    """The only portion of a managed draft that a model may author.
+
+    Runtime identity and lifecycle fields deliberately do not belong to this
+    model.  The coordinator constructs those fields from the current request
+    after validating this payload, so a provider cannot move a draft to another
+    unit/run or mark it as already validated.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str | None = None
+    proposed_value: Any | None = None
+    typed_value: TypedFieldValue | None = None
+    assertions: list[DraftAssertion] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
 
 
@@ -604,6 +1000,10 @@ class DocumentUnitDraft(BaseModel):
     proposed_status: str | None = None
     validation_status: Literal["pending", "supported", "partial", "unsupported", "requires_human"] = "pending"
     validation_notes: list[str] = Field(default_factory=list)
+    # Operational/audit metadata is coordinator-owned and intentionally kept
+    # outside FillPlan eligibility checks.  It records writer mode, fallback
+    # reason and bounded token observations without changing validation state.
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvidenceMatrixRow(BaseModel):
@@ -639,6 +1039,7 @@ class WorkbookFill(BaseModel):
 class WorkbookFillPlan(BaseModel):
     template_version_id: str
     fills: list[WorkbookFill] = Field(default_factory=list)
+    table_fills: list["WorkbookTableFill"] = Field(default_factory=list)
 
 
 class WorkbookTableColumnSchema(BaseModel):
@@ -663,6 +1064,75 @@ class WorkbookTableSchema(BaseModel):
     columns: list[WorkbookTableColumnSchema] = Field(default_factory=list)
     expected_value_hashes: dict[str, str] = Field(default_factory=dict)
     allow_example_region_replacement: bool = True
+    # Optional semantic row contract.  Empty values are the legacy table
+    # shape; they remain readable but cannot satisfy a closed row-key scope.
+    expected_row_keys: list[str] = Field(default_factory=list)
+    required_columns: list[str] = Field(default_factory=list)
+    row_order: Literal["declared", "stable_key", "input"] = "input"
+    duplicate_policy: Literal["reject", "allow"] = "reject"
+
+    @model_validator(mode="after")
+    def validate_table_row_contract(self) -> "WorkbookTableSchema":
+        self.expected_row_keys = _unique_nonempty_strings(
+            self.expected_row_keys, label="expected_row_keys",
+        )
+        self.required_columns = _unique_nonempty_strings(
+            self.required_columns, label="required_columns",
+        )
+        column_ids = {column.column_id for column in self.columns}
+        if len(column_ids) != len(self.columns):
+            raise ValueError("workbook table columns must be unique")
+        unknown_required = set(self.required_columns) - column_ids
+        if unknown_required:
+            raise ValueError(
+                "workbook table required columns are not mapped: "
+                f"{sorted(unknown_required)}"
+            )
+        return self
+
+    @property
+    def row_keys(self) -> list[str]:
+        """Compatibility spelling for the declared expected row-key order."""
+
+        return list(self.expected_row_keys)
+
+
+def _unique_nonempty_strings(values: list[str], *, label: str) -> list[str]:
+    normalized = [str(value).strip() for value in values]
+    if any(not value for value in normalized):
+        raise ValueError(f"{label} entries must be non-empty")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{label} entries must be unique")
+    return normalized
+
+
+class WorkbookTableRowFill(BaseModel):
+    """Typed semantic table row passed to the workbook renderer.
+
+    ``WorkbookTableFill`` still accepts the historical ``dict[column, value]``
+    representation.  New plan-backed writes use this model so row identity
+    and per-cell evidence survive the render-binding boundary.
+    """
+
+    row_key: str = ""
+    cells: dict[str, str] = Field(default_factory=dict)
+    evidence_ids: list[str] = Field(default_factory=list)
+    cell_evidence_ids: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_row(self) -> "WorkbookTableRowFill":
+        self.row_key = self.row_key.strip()
+        self.evidence_ids = _unique_nonempty_strings(self.evidence_ids, label="evidence_ids")
+        normalized: dict[str, list[str]] = {}
+        for column, evidence_ids in self.cell_evidence_ids.items():
+            column_id = str(column).strip()
+            if not column_id:
+                raise ValueError("cell evidence column ids must be non-empty")
+            normalized[column_id] = _unique_nonempty_strings(
+                evidence_ids, label=f"cell_evidence_ids[{column_id}]",
+            )
+        self.cell_evidence_ids = normalized
+        return self
 
 
 class WorkbookTableFill(BaseModel):
@@ -670,7 +1140,13 @@ class WorkbookTableFill(BaseModel):
 
     table_region_id: str
     semantic_unit_id: str
-    rows: list[dict[str, str]] = Field(default_factory=list)
+    # The union is deliberately additive: old serialized plans contain plain
+    # column/value dictionaries, while new plans carry typed row metadata.
+    rows: list[WorkbookTableRowFill | dict[str, str]] = Field(default_factory=list)
+
+
+WorkbookFillPlan.model_rebuild()
+TemplateUnitBinding.model_rebuild()
 
 
 class DocxFill(BaseModel):
@@ -707,6 +1183,10 @@ class DocumentArtifact(BaseModel):
     tenant_id: str = "default"
     work_order_id: str
     run_id: str
+    # Native template output (xlsx/xlsm/docx/markdown) and explicit semantic
+    # conversion output (pdf/pptx).  ``None`` keeps old persisted artifacts
+    # readable; callers fall back to the work-order template format.
+    output_format: Literal["xlsm", "xlsx", "markdown", "docx", "pdf", "pptx"] | None = None
     stage: Literal["draft_preview", "review_candidate", "approved_release"]
     validity_status: Literal["current", "artifact_stale", "revalidation_required"] = "current"
     policy_status: Literal["active", "policy_obsolete"] = "active"
@@ -716,6 +1196,10 @@ class DocumentArtifact(BaseModel):
     content_hash: str
     approval_subject_hash: str | None = None
     parent_artifact_id: str | None = None
+    # Optional governed revision lineage.  Historical artifacts remain
+    # readable with ``None``; a revision completion may bind an already saved
+    # child without changing its immutable bytes or hashes.
+    revision_id: str | None = None
     validation_report_id: str
     approval_event_ids: list[str] = Field(default_factory=list)
     integrity_manifest_id: str
@@ -743,7 +1227,7 @@ class DocumentHumanEvent(BaseModel):
     artifact_id: str
     unit_id: str
     event_type: Literal[
-        "provide_value", "approve_na", "confirm_result", "assign_owner", "close_action", "approve", "sign", "feedback",
+        "provide_value", "approve_na", "confirm_result", "assign_owner", "close_action", "approve", "sign", "feedback", "request_release",
     ]
     event_schema_version: str = "1"
     previous_value_hash: str | None = None
@@ -775,3 +1259,102 @@ class DocumentOutboxEvent(BaseModel):
     last_error: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     delivered_at: datetime | None = None
+
+
+EXECUTION_EVENT_TYPES = (
+    "run_started", "agent_started", "agent_succeeded", "agent_failed",
+    "tool_called", "tool_succeeded", "tool_rejected",
+    "llm_called", "llm_succeeded", "llm_failed",
+    "proposal_submitted", "proposal_accepted", "proposal_rejected",
+    "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
+    "human_waiting", "human_resumed", "coverage_evaluated", "unit_reviewed",
+    "unit_rework_requested", "pre_render_reviewed", "post_render_reviewed",
+    "release_gated", "run_finalized",
+)
+
+ExecutionEventType = Literal[
+    "run_started", "agent_started", "agent_succeeded", "agent_failed",
+    "tool_called", "tool_succeeded", "tool_rejected",
+    "llm_called", "llm_succeeded", "llm_failed",
+    "proposal_submitted", "proposal_accepted", "proposal_rejected",
+    "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
+    "human_waiting", "human_resumed", "coverage_evaluated", "unit_reviewed",
+    "unit_rework_requested", "pre_render_reviewed", "post_render_reviewed",
+    "release_gated", "run_finalized",
+]
+
+
+class AuthoringExecutionEvent(BaseModel):
+    """Append-only, sanitized business fact for the authoring execution.
+
+    Payloads carry IDs, issue codes, statuses, durations and token usage only.
+    Raw evidence, file contents, prompts, credentials and DB objects are
+    forbidden; the event log is the authoritative source for audits, evaluation
+    reconstruction and recovery -- OTel is cross-validation only.
+    """
+
+    event_id: str
+    event_type: ExecutionEventType
+    tenant_id: str = "default"
+    work_order_id: str
+    harness_run_id: str
+    idempotency_key: str
+    sequence: int = 0
+    attempt: int = 1
+    executor: Literal["deterministic_rule", "authoring_graph", "agent_field_harness"] | None = None
+    node_name: str | None = None
+    tool_name: str | None = None
+    field_id: str | None = None
+    unit_id: str | None = None
+    status: Literal["started", "succeeded", "failed", "rejected", "waiting", "resumed", "completed"] = "succeeded"
+    error_code: str | None = None
+    retryable: bool = False
+    trace_id: str | None = None
+    duration_seconds: float | None = None
+    sanitized_payload: dict[str, Any] = Field(default_factory=dict)
+    occurred_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_event(self):
+        if self.event_type not in EXECUTION_EVENT_TYPES:
+            raise ValueError(f"unknown authoring execution event type: {self.event_type}")
+        if not self.idempotency_key:
+            raise ValueError("authoring execution events require an idempotency_key")
+        forbidden = {"prompt", "content", "evidence_content", "credential", "password", "api_key"}
+        for key in self.sanitized_payload:
+            if str(key).casefold() in forbidden:
+                raise ValueError(f"sanitized payload must not contain key: {key}")
+        return self
+
+
+class EvidenceRegistryEntry(BaseModel):
+    """Run-scoped immutable registry record for evidence handed to agents.
+
+    Agents only ever see ``evidence_id``; raw evidence stays in the governed
+    evidence store and is re-read through the opaque handle server-side. The
+    registry binds every reference to tenant, run and frozen snapshot so
+    cross-tenant, cross-run or stale-snapshot proposals are rejected.
+    """
+
+    evidence_id: str
+    tenant_id: str = "default"
+    harness_run_id: str
+    work_order_id: str
+    knowledge_base_id: str | None = None
+    project_id: str | None = None
+    source_set_snapshot_id: str
+    snapshot_content_hash: str
+    content_hash: str
+    source_identity: str
+    redacted_summary: str = ""
+    reload_handle: str
+    registered_at: datetime = Field(default_factory=utc_now)
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_scope(self):
+        if not self.reload_handle or "/" in self.reload_handle or "\\" in self.reload_handle:
+            raise ValueError("reload_handle must be an opaque token without filesystem paths")
+        if bool(self.knowledge_base_id) == bool(self.project_id):
+            raise ValueError("evidence registry entries bind exactly one of KB or project scope")
+        return self

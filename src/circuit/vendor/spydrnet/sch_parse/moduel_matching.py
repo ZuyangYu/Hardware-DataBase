@@ -320,12 +320,65 @@ def cell_code(cell_list, pair_code, pair_net):
         code_list.append(middle_code_list)
     return code_list
 
-# 注意：此处为原图第 332-336 行缺失的函数头部对应的文档注释段落，为了保持原貌予以提取：
-    """
+def sim_calculate(list0, list1):
+    """计算待匹配器件与候选器件之间的最佳匹配结果。
+
     :param list0:单个模块器件列表: [位号, 端口编码列表, 网络连接标志, 类型, pin通道位置编码, 直连位置编码, 封装, 器件值]
     :param list1:待布局模块器件嵌套列表, 子列表: [位号, 端口编码列表, 网络连接标志, 类型, pin通道位置编码, 直连位置编码, 封装, 器件值]
     :return:编码后的器件列表
     """
+
+    # 类型、网络、封装和值相同的候选器件才进入位置编码比较。
+    process_result = []
+    for res in list1:
+        if (
+            lst_compare(res[1], list0[1])
+            and lst_compare(res[2], list0[2])
+            and clean_str(res[3]) == clean_str(list0[3])
+            and clean_str(res[6]) == clean_str(list0[6])
+        ):
+            process_result.append(res)
+
+    if not process_result:
+        return "pass"
+
+    # 先按 pin 通道编码相似度筛选，再按直连位置和位号消歧。
+    sim_result_pin = []
+    for res in process_result:
+        scored = res.copy()
+        scored.append(str_compare(list0[4], res[4]))
+        sim_result_pin.append(scored)
+
+    code_pin = [res[-1] for res in sim_result_pin]
+    index_pin = max_pos(code_pin)
+    if len(index_pin) == 1:
+        return sim_result_pin[index_pin[0]][0:7]
+
+    sim_result_dir = []
+    for ind_d in index_pin:
+        candidate = sim_result_pin[ind_d]
+        scored = candidate.copy()
+        sim_cd = str_compare(list0[5], candidate[5])
+        count_ind = 1 + abs(len(list0[5]) - len(candidate[5]))
+        scored.append(sim_cd / count_ind)
+        sim_result_dir.append(scored)
+
+    code_dir = [res[-1] for res in sim_result_dir]
+    index_dir = max_pos(code_dir)
+    if len(index_dir) == 1:
+        return sim_result_dir[index_dir[0]][0:7]
+
+    # 最后用位号数字部分的距离稳定消歧。
+    sim_dir_list = [sim_result_dir[ind_cd] for ind_cd in index_dir]
+    ref_distances = []
+    for candidate in sim_dir_list:
+        try:
+            distance = abs(float(extract_digits(list0[0])) - float(extract_digits(candidate[0])))
+        except (TypeError, ValueError):
+            distance = float("inf")
+        ref_distances.append(distance)
+    return sim_dir_list[ref_distances.index(min(ref_distances))][0:7]
+
 
 def max_pos(lst):
     """返回列表中所有最大值的位置序号"""
@@ -354,75 +407,6 @@ def clean_str(text):
     """匹配非字母数字、非-、非_的字符并替换为空字符串"""
     return re.sub(r'[^a-zA-Z0-9_-]', '', text)
 
-# 以下代码承接上方文档注释的功能实现（原图中这部分未包裹在显式的函数头内，根据原图缩进提取）
-# print('list0:', list0)
-# 类型相同的器件整合
-process_result = []
-for res in list1:
-    # 器件端口编码/网络编码/类型/封装/值相同
-    if ((lst_compare(res[1], list0[1]) and lst_compare(res[2], list0[2]) and
-         clean_str(res[3]) == clean_str(list0[3]) and
-         clean_str(res[6]) == clean_str(list0[6]))):
-        process_result.append(res)
-# (orphaned debug code removed - was outside function)
-
-# 相似度最高pin通道编码确定
-code_pin = []
-for res1 in sim_result_pin:
-    code_pin.append(res1[-1])
-index_pin = max_pos(code_pin)
-if len(index_pin) == 1: # 通过pin编码直接退出
-    ind_out = index_pin[0]
-    # print('sim_result_pin[index]:', sim_result_pin[ind_out])
-    # print('************************************************')
-    return sim_result_pin[ind_out][0:7]
-else:
-    # 通过直连位置编码进行进一步处理
-    sim_result_dir_pre = []
-    sim_result_dir = []
-    for ind_d in index_pin:
-        sim_result_dir_pre.append(sim_result_pin[ind_d])
-    # 直连编码进行计算向量相似度
-    for cd in sim_result_dir_pre:
-        cd1 = cd.copy()
-        sim_cd = str_compare(list0[5], cd[5]) # 直连位置编码相似度计算
-        if abs(len(list0[5]) - len(cd[5])) == 0:
-            count_ind = 1
-        else:
-            count_ind = 1 + abs(len(list0[5]) - len(cd[5]))
-        sim_res = sim_cd / count_ind # 加入器件连接数量的影响
-        cd1.append(sim_res)
-        sim_result_dir.append(cd1)
-    # print('sim_result_dir:')
-    # for c in sim_result_dir:
-    #     # print(c)
-    # 相似度最高编码确定
-    code_dir = []
-    for res1 in sim_result_dir:
-        code_dir.append(res1[-1])
-    # print('code_dir:', code_dir)
-    index_dir = max_pos(code_dir)
-    # print('index_dir:', index_dir)
-    if len(index_dir) <= 1:
-        ind_out = index_dir[0]
-        # print('sim_result_dir[index]:', sim_result_dir[ind_out])
-        # print('************************************************')
-        return process_result[ind_out][0:7]
-    else:
-        # 实在莫得办法，用位号的相似性进行最后定位
-        sim_dir_list = []
-        for ind_cd in index_dir:
-            sim_dir_list.append(sim_result_dir[ind_cd])
-        Ref_sim = []
-        for part_cd in sim_dir_list:
-            Ref_sim.append(abs(float(extract_digits(list0[0])) - float(extract_digits(part_cd[0]))))
-        sim_min = min(Ref_sim)
-        for i_ce in range(0, len(Ref_sim)):
-            if Ref_sim[i_ce] == sim_min:
-                # print('Ref_sim:', sim_dir_list[i_ce])
-                # print('************************************************')
-                return sim_dir_list[i_ce][0:7]
-
 def similarity_net_pair(list1, list2, min_similarity=0.3):
     """
     在两个字符串列表之间找到一一对应的最高相似度匹配对
@@ -437,47 +421,35 @@ def similarity_net_pair(list1, list2, min_similarity=0.3):
     # 检查空列表
     if not list1 or not list2:
         return []
-# 创建剩余索引集合
-remaining_i = set(range(len(list1)))
-remaining_j = set(range(len(list2)))
 
-# 用于存储匹配对
-matched_pairs = []
+    # 创建剩余索引集合。
+    remaining_i = set(range(len(list1)))
+    remaining_j = set(range(len(list2)))
+    matched_pairs = []
 
-# 继续寻找匹配直到没有可用的
-while remaining_i and remaining_j:
-    best_similarity = min_similarity
-    best_pair = None
-    best_i = None
-    best_j = None
+    while remaining_i and remaining_j:
+        best_similarity = min_similarity
+        best_pair = None
+        best_i = None
+        best_j = None
 
-    # 寻找当前最相似的匹配对
-    for i in list(remaining_i):
-        s1 = list1[i]
-        for j in list(remaining_j):
-            s2 = list2[j]
-            # 计算相似度
-            similarity = SequenceMatcher(None, s1, s2).ratio()
+        for i in list(remaining_i):
+            for j in list(remaining_j):
+                similarity = SequenceMatcher(None, list1[i], list2[j]).ratio()
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_pair = [list1[i], list2[j]]
+                    best_i = i
+                    best_j = j
 
-            # 更新最佳匹配
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_pair = [s1, s2]
-                best_i = i
-                best_j = j
+        if best_pair is None:
+            break
 
-    # 如果没有找到足够的匹配，停止
-    if best_pair is None:
-        break
+        matched_pairs.append(best_pair)
+        remaining_i.remove(best_i)
+        remaining_j.remove(best_j)
 
-    # 添加到结果
-    matched_pairs.append(best_pair)
-
-    # 移除已匹配的索引
-    remaining_i.remove(best_i)
-    remaining_j.remove(best_j)
-
-return matched_pairs
+    return matched_pairs
 
 
 def matching_con(dsn_list, model_list):

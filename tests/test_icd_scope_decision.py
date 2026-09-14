@@ -112,3 +112,19 @@ def test_direct_reference_from_design_or_legacy_icd_is_not_auto_adopted():
         )
 
         assert decision.auto_items == []
+
+
+def test_missing_template_refdes_reports_the_frozen_edf_actual_connectors():
+    decision = build_icd_scope_decision(
+        circuit_evidences=[],
+        supporting_evidences=[],
+        connector_refdes=["X302"],
+        available_refdes=["X1900", "X1902", "X1900"],
+    )
+
+    issue = decision.exceptions[0]
+    assert issue.kind == "connector_mapping_missing"
+    assert issue.refdes == "X302"
+    assert issue.suggested_refdes == ["X1900", "X1902"]
+    assert "X1900" in issue.user_instruction
+    assert "按 EDF 实际位号生成" in issue.user_instruction

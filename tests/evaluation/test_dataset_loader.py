@@ -94,7 +94,7 @@ class DatasetLoaderTests(unittest.TestCase):
             Path("evaluation/datasets/document_generation_v1.jsonl")
         )
 
-        self.assertEqual(len(records), 3)
+        self.assertGreaterEqual(len(records), 20)
         self.assertEqual(records[0].field_id, "rated_current")
 
 
