@@ -2,7 +2,6 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 
-import DocumentGenerationPage from '../../DocumentGenerationPage';
 import DocumentStatusCard from './DocumentStatusCard';
 import { parseDocumentCardEvent, type DocumentCardData } from './documentCardModel';
 
@@ -39,7 +38,7 @@ const workOrderCard: DocumentCardData = {
 };
 
 describe('DocumentStatusCard', () => {
-  it('renders work order card with deep link from document_card event', () => {
+  it('renders work order card from document_card event without a workbench link', () => {
     const card = parseDocumentCardEvent(cardEvent({
       kind: 'work_order_created',
       status: 'queued',
@@ -54,8 +53,8 @@ describe('DocumentStatusCard', () => {
     expect(markup).toContain('排队中');
     expect(markup).toContain('wo-123');
     expect(markup).toContain('刷新状态');
-    expect(markup).toContain('前往工作台');
-    expect(markup).toMatch(/href="\/document-generation\?kb=hardware(&amp;|&)workOrder=wo-123"/);
+    expect(markup).not.toContain('前往工作台');
+    expect(markup).not.toContain('/document-generation');
   });
 
   it('refresh status button calls REST endpoint directly, not the agent', () => {
@@ -503,16 +502,4 @@ describe('DocumentStatusCard', () => {
     expect(markup).not.toContain('生成完成 0 / 21');
   });
 
-  it('workbench preselects kb and work order from query params', () => {
-    const html = renderToStaticMarkup(
-      <MemoryRouter initialEntries={['/document-generation?kb=hardware&workOrder=wo-42']}>
-        <DocumentGenerationPage auth={auth} kbs={[hardwareKb]} onLogout={() => undefined} />
-      </MemoryRouter>,
-    );
-
-    expect(html).toContain('任务与下载');
-    expect(html).not.toContain('上传并分析受控模板');
-    expect(html).toMatch(/<option value="hardware"[^>]*selected/);
-    expect(html).toContain('已从会话预选工作单 wo-42');
-  });
 });

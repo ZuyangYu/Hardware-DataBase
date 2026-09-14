@@ -44,6 +44,7 @@ import {
   fetchDocumentCurrentChatTask,
   fetchDocumentWorkOrderStatus,
   mergeDocumentCards,
+  normalizeDocumentCard,
   parseDocumentCardEvent,
   parseDocumentTaskStreamEvent,
   planConfirmationInput,
@@ -490,7 +491,21 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     api
       .get<MessageView[]>(`/api/v1/conversations/${activeSessionId}/messages`)
       .then((rows) => {
-        if (!cancelled) setMessages(rows);
+        if (cancelled) return;
+        setMessages(rows);
+        // 历史卡片回填：服务端把每个 turn 的 document_card 事件投影到消息上，
+        // 刷新/重开会话后候选与文档状态卡不再消失（与实时事件同一合并规则）。
+        // 合并而非覆盖：并发的活跃 turn 实时事件不会被历史投影清掉。
+        const restoredCards = rows
+          .flatMap((row) => row.cards ?? [])
+          .map((card) => normalizeDocumentCard(card))
+          .filter((card): card is DocumentCardData => card !== null);
+        setDocumentCards((previous) =>
+          restoredCards.reduce<DocumentCardData[]>(
+            (merged, card) => mergeDocumentCards(merged, card),
+            previous,
+          ),
+        );
       })
       .catch((error) => {
         if (!cancelled) {
@@ -800,7 +815,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       streamTokenRef.current === generation &&
       currentTurnRef.current === turnId &&
       activeSessionRef.current === sessionId;
-    void api.get<TurnView[]>(`/api/v1/conversations/${activeSessionId}/turns`).then(async (turns) => {
+    void api.get<TurnView[]>(`/api/v1/conversations/${activeSessionId}/turns?include_terminal=true`).then(async (turns) => {
       const turn = turns[0];
       if (disposed || streamTokenRef.current !== generation || activeSessionRef.current !== activeSessionId) return;
       if (!turn) {
@@ -811,6 +826,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       }
       // set-or-clear:目标会话最新 turn 有持久化上下文则恢复,没有则清空,避免跨会话残留。
       setDocumentContextState(documentContextEnabled && turn.document_context ? turn.document_context : null);
+      if (turn.status === 'completed' || turn.status === 'failed' || turn.status === 'cancelled') {
+        // 已结束的 turn 不再接流:历史卡片与证据由消息投影恢复,避免重复重放。
+        return;
+      }
       currentTurnRef.current = turn.id;
       controller = new AbortController();
       abortRef.current = controller;
@@ -1149,7 +1168,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     toolActiveKeyRef.current.clear();
     setTraceSteps(createInitialTrace(scopeKbName === GENERAL_CHAT_KB_NAME));
     setDegradedNotes([]);
-    setDocumentCards([]);
     setDocumentCardRefreshingId(null);
 
     let sessionId = activeSessionId;

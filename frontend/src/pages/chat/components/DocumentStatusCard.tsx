@@ -8,16 +8,15 @@
  * URL 与文件名由 documentCardModel 前端拼装。
  */
 import { cn } from '@/lib/utils';
-import type { DocumentStatusTone } from '../../documentGenerationModel';
 import {
   documentCardLifecycleLabel,
   documentCardLifecycleTone,
   canRequestDocumentRelease,
   documentCardReviewCandidateArtifact,
   documentCardTitle,
-  documentCardWorkbenchActions,
   downloadDocumentArtifact,
   type DocumentCardData,
+  type DocumentStatusTone,
 } from './documentCardModel';
 import OutputSpecConfirmationCard from './OutputSpecConfirmationCard';
 
@@ -31,16 +30,6 @@ const STATUS_BADGE_TONE_CLASS: Record<DocumentStatusTone, string> = {
   warning: 'bg-[#fff8e6] text-[#8a6a1f]',
   danger: 'bg-[#fce7e7] text-[#b42318]',
 };
-
-// 这些动作依赖用户表达意图，必须回到主对话处理，不能从状态卡打开第二套交互。
-const CONVERSATION_ONLY_ACTIONS = new Set([
-  'answer_clarification',
-  'start_document_generation_session',
-  'propose_document_plan',
-  'confirm_document_plan',
-  'create_document_work_order',
-  'provide_value',
-]);
 
 const PROGRESS_NODE_LABELS: Record<string, string> = {
   load_context: '加载生成上下文',
@@ -96,8 +85,6 @@ export default function DocumentStatusCard({
   const canRequestRelease = Boolean(onRequestRelease)
     && canRequestDocumentRelease(card)
     && Boolean(reviewCandidate);
-  const workbenchActions = documentCardWorkbenchActions(card)
-    .filter(({ action }) => !CONVERSATION_ONLY_ACTIONS.has(action));
   const pendingGroups = card.pendingDecisions ?? [];
   const groupedPending = pendingGroups
     .map((group) => `${group.group_key}（${group.count} 项）`)
@@ -252,7 +239,7 @@ export default function DocumentStatusCard({
           )}
         </div>
       )}
-      {((onRefreshStatus && (workOrderId || card.generation_session_id)) || canRequestRelease || workbenchActions.length > 0) && (
+      {((onRefreshStatus && (workOrderId || card.generation_session_id)) || canRequestRelease) && (
         <div className="mt-[6px] flex flex-wrap items-center gap-[8px]">
           {onRefreshStatus && (workOrderId || card.generation_session_id) && (
             <button
@@ -276,16 +263,6 @@ export default function DocumentStatusCard({
               {requestingRelease ? '申请中…' : '申请正式发布审核'}
             </button>
           )}
-          {workbenchActions.map((action) => (
-            <a
-              key={action.action}
-              href={action.href}
-              aria-label={`${action.label}（工单 ${workOrderId}）`}
-              className="text-[12px] font-medium text-[#0b6cf5] underline-offset-2 hover:underline"
-            >
-              {action.label}
-            </a>
-          ))}
         </div>
       )}
       {card.kind === 'attachment_revision' && (

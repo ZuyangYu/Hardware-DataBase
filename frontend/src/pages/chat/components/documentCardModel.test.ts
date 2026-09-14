@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  buildWorkbenchDeepLink,
+  describeWorkOrderStatus,
   canAnswerClarification,
   clarificationAnswerValue,
   documentArtifactDownloadPath,
@@ -14,13 +14,11 @@ import {
   documentCardStatusLabel,
   documentCardStatusTone,
   documentCardTitle,
-  documentCardWorkbenchActions,
   documentCardReviewCandidateArtifact,
   canRequestDocumentRelease,
   documentCardAfterReleaseRequest,
   documentCurrentChatTaskPath,
   documentChatTaskEventsPath,
-  nextActionLabel,
   documentWorkOrderStatusPath,
   mergeDocumentCards,
   parseDocumentCardEvent,
@@ -359,6 +357,29 @@ describe('documentCardModel', () => {
     expect(documentCardIdentity(replaced[0])).toBe('task:task-123');
   });
 
+  it('describes work-order statuses with label/tone/action fallbacks', () => {
+    expect(describeWorkOrderStatus('blocked')).toEqual({
+      label: '生成被阻止',
+      tone: 'danger',
+      action: '查看原因并重试',
+    });
+    expect(describeWorkOrderStatus('complete')).toEqual({
+      label: '文档已生成',
+      tone: 'success',
+      action: '预览或下载文档',
+    });
+    expect(describeWorkOrderStatus('paused')).toEqual({
+      label: '任务已暂停',
+      tone: 'warning',
+      action: '可继续生成或取消任务',
+    });
+    expect(describeWorkOrderStatus('brand_new_status')).toEqual({
+      label: 'brand_new_status',
+      tone: 'neutral',
+      action: '刷新后查看最新状态',
+    });
+  });
+
   it('documentWorkOrderStatusPath targets the REST status endpoint, not the agent', () => {
     const path = documentWorkOrderStatusPath('hardware', 'wo-123');
     expect(path).toBe('/api/v1/document-generation/work-orders/wo-123/status?kb=hardware');
@@ -366,65 +387,6 @@ describe('documentCardModel', () => {
     expect(path).not.toContain('/api/v1/query');
     expect(path).not.toContain('/turns');
     expect(path).not.toContain('agent');
-  });
-
-  it('buildWorkbenchDeepLink encodes kb and work order', () => {
-    expect(buildWorkbenchDeepLink('硬件知识库', 'wo 9')).toBe(
-      `/document-generation?kb=${encodeURIComponent('硬件知识库')}&workOrder=${encodeURIComponent('wo 9')}`,
-    );
-  });
-
-  it('maps human-gate actions to workbench deep links and keeps refresh actions out', () => {
-    const gates = documentCardWorkbenchActions({
-      kind: 'work_order_status',
-      status: 'blocked',
-      next_actions: ['get_document_generation_status', 'submit_icd_scope_resolution', 'view_error'],
-      kb_name: '硬件知识库',
-      work_order_id: 'wo-9',
-      generation_session_id: null,
-    });
-    expect(gates.map((action) => action.action)).toEqual(['submit_icd_scope_resolution', 'view_error']);
-    expect(gates[0].label).toBe('处理 ICD 范围待办');
-    expect(gates[0].href).toBe(buildWorkbenchDeepLink('硬件知识库', 'wo-9'));
-
-    const plain = documentCardWorkbenchActions({ ...workOrderCard, work_order_id: 'wo-9' });
-    expect(plain).toEqual([
-      { action: 'open_workbench', label: '前往工作台', href: buildWorkbenchDeepLink('hardware', 'wo-9') },
-    ]);
-
-    expect(documentCardWorkbenchActions({ ...workOrderCard, work_order_id: null })).toEqual([]);
-  });
-
-  it('caps gate actions at three entries', () => {
-    const capped = documentCardWorkbenchActions({
-      ...workOrderCard,
-      work_order_id: 'wo-5',
-      next_actions: [
-        'get_document_generation_status',
-        'submit_icd_scope_resolution',
-        'answer_clarification',
-        'view_error',
-        'retry_generation',
-        'replace_template',
-      ],
-    });
-    expect(capped).toHaveLength(3);
-    expect(capped.map((action) => action.action)).toEqual([
-      'submit_icd_scope_resolution',
-      'answer_clarification',
-      'view_error',
-    ]);
-  });
-
-  it('labels unknown gate actions with the workbench fallback', () => {
-    const [fallback] = documentCardWorkbenchActions({
-      ...workOrderCard,
-      work_order_id: 'wo-6',
-      next_actions: ['brand_new_gate_action'],
-    });
-    expect(fallback.action).toBe('brand_new_gate_action');
-    expect(fallback.label).toBe('前往工作台处理');
-    expect(fallback.href).toBe(buildWorkbenchDeepLink('hardware', 'wo-6'));
   });
 
   it('parses card artifacts and target_format defensively', () => {
@@ -495,22 +457,6 @@ describe('documentCardModel', () => {
       content: '请选择生成范围',
       options: ['当前版本', '全部版本'],
     });
-  });
-
-  it('deep-links clarification cards with a session or task when no work order exists', () => {
-    expect(documentCardWorkbenchActions({
-      kind: 'generation_session',
-      status: 'needs_clarification',
-      next_actions: ['answer_clarification'],
-      kb_name: 'hardware',
-      generation_session_id: 'session/1',
-      question_id: 'scope',
-      work_order_id: null,
-    })).toEqual([{
-      action: 'answer_clarification',
-      label: '回答澄清问题',
-      href: '/document-generation?kb=hardware&session=session%2F1',
-    }]);
   });
 
   it('builds artifact download path and file name client-side', () => {
@@ -1180,9 +1126,7 @@ describe('output_spec_confirmation card', () => {
     expect(card?.proposal).toBeUndefined();
   });
 
-  it('labels the card 计划确认 and confirm action', () => {
+  it('labels the card 计划确认', () => {
     expect(documentCardTitle('output_spec_confirmation')).toBe('计划确认');
-    expect(nextActionLabel('confirm_document_plan')).toBe('确认生成');
-    expect(nextActionLabel('propose_document_plan')).toBe('生成计划提案');
   });
 });

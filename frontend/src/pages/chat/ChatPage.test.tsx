@@ -314,7 +314,7 @@ describe('Composer attachment status', () => {
     expect(markup).toContain('重试解析');
   });
 
-  it('offers template conversion only for an eligible ready attachment with write access', () => {
+  it('keeps template conversion inside the attach menu instead of an inline chip', () => {
     const attachment: AttachmentView = {
       attachment_id: 'att-template',
       asset_id: 'asset-template',
@@ -336,6 +336,12 @@ describe('Composer attachment status', () => {
       onUseAsTemplate: () => undefined,
     });
 
-    expect(markup).toContain('作为模板');
+    // 附件入口收敛为左侧"+"按钮;菜单内容由 Radix portal 在打开时渲染,
+    // 静态标记只断言入口与"不再有内联附件 chip / 检索范围选择"。
+    expect(markup).toContain('aria-label="添加附件"');
+    expect(markup).toContain('chat-attachment-upload');
+    expect(markup).not.toContain('检索范围');
+    expect(markup).not.toContain('已选');
+    expect(markup).not.toContain('未选');
   });
 });

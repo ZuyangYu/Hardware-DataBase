@@ -202,6 +202,8 @@ export interface MessageView {
   attachments?: AttachmentSnapshot[];
   /** 紧凑引用列表（随消息持久化），刷新后"参考来源"面板的数据源。 */
   citations?: EvidenceItem[];
+  /** 该 turn 持久化的 document_card 事件（刷新后卡片回填；原始线格式）。 */
+  cards?: Record<string, unknown>[];
 }
 
 export interface SessionMemorySummary {

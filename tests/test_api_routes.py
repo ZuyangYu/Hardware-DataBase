@@ -321,6 +321,63 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual([message["content"] for message in messages], ["问", "第一段第二段"])
         self.assertEqual(messages[1]["footer"], "footer")
 
+    def test_turns_include_terminal_and_messages_project_document_cards(self):
+        from src.core.conversation import ConversationService
+
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "卡片回填"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "生成候选", "client_request_id": "card-recovery-key"},
+            headers=self._auth(t),
+        ).json()
+        turn_id = created["turn"]["id"]
+        self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(t))
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(t)) as response:
+            b"".join(response.iter_bytes())
+
+        # The active-only list hides the finished turn (no SSE reconnect), while
+        # the recovery query returns it so the client can restore the context.
+        active = self.client.get(
+            f"/api/v1/conversations/{session['id']}/turns", headers=self._auth(t)
+        ).json()
+        self.assertEqual(active, [])
+        recent = self.client.get(
+            f"/api/v1/conversations/{session['id']}/turns?include_terminal=true",
+            headers=self._auth(t),
+        ).json()
+        self.assertEqual([turn["id"] for turn in recent], [turn_id])
+        self.assertEqual(recent[0]["status"], "completed")
+
+        # Persisted document_card events are projected onto the assistant
+        # message so a page refresh re-renders the candidate card.
+        conv = ConversationService(self.db_path)
+        conv.append_turn_event(
+            turn_id,
+            "document_card",
+            {
+                "card": {
+                    "kind": "attachment_revision",
+                    "status": "review_candidate",
+                    "next_actions": [],
+                    "kb_name": "shared",
+                    "content": "已创建候选",
+                }
+            },
+        )
+        messages = self.client.get(
+            f"/api/v1/conversations/{session['id']}/messages", headers=self._auth(t)
+        ).json()
+        assistant = [message for message in messages if message["role"] == "assistant"][-1]
+        self.assertEqual(len(assistant["cards"]), 1)
+        self.assertEqual(assistant["cards"][0]["kind"], "attachment_revision")
+        user_message = [message for message in messages if message["role"] == "user"][-1]
+        self.assertEqual(user_message["cards"], [])
+
     def test_knowledge_base_turn_forces_deep_retrieval(self):
         t = self._token("user1")
         session = self.client.post(

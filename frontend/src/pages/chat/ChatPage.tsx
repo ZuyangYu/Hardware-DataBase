@@ -471,9 +471,6 @@ export default function ChatPage({
   const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<string[]>([]);
   const [attachmentUploadPending, setAttachmentUploadPending] = useState(false);
   const [attachmentRetryingId, setAttachmentRetryingId] = useState<string | null>(null);
-  const [sourceScope, setSourceScope] = useState<
-    'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base'
-  >('auto');
   const attachmentMutationVersionRef = useRef(0);
   const attachmentSessionRef = useRef<number | null>(null);
 
@@ -488,7 +485,6 @@ export default function ChatPage({
       attachmentSessionRef.current = null;
     }
     setAttachmentRetryingId(null);
-    setSourceScope('auto');
     if (!chatAttachmentsEnabled || activeSessionId == null) return undefined;
 
     let disposed = false;
@@ -666,7 +662,6 @@ export default function ChatPage({
         }));
         void send({
           attachmentIds: sourceIds,
-          sourceScope: sourceIds.length > 0 ? sourceScope : 'auto',
           snapshots,
           documentContextOverride: context,
           documentFlowOverride: true,
@@ -676,7 +671,6 @@ export default function ChatPage({
         setSelectedAttachmentIds((previous) =>
           previous.filter((id) => id !== autoTemplate.attachment_id),
         );
-        setSourceScope('auto');
       } catch (error) {
         notify.error(error instanceof Error ? error.message : '附件自动转换模板失败');
       } finally {
@@ -688,7 +682,6 @@ export default function ChatPage({
     const ids = selectedAttachments.map((item) => item.attachment_id);
     if (ids.length === 0) {
       void send();
-      setSourceScope('auto');
       return;
     }
     const snapshots = selectedAttachments.map((item) => ({
@@ -697,10 +690,7 @@ export default function ChatPage({
       media_type: item.media_type,
       parse_status: item.parse_status,
     }));
-    void send({ attachmentIds: ids, sourceScope, snapshots });
-    // Session attachments stay mounted by default; the chips remain checked
-    // so the next turn does not require re-selecting them.
-    setSourceScope('auto');
+    void send({ attachmentIds: ids, snapshots });
   }
 
   // ---- 消息编辑 ----
@@ -879,19 +869,9 @@ export default function ChatPage({
           onClearDocumentContext={clearDocumentContext}
           attachmentsEnabled={chatAttachmentsEnabled}
           draftAttachments={draftAttachments}
-          selectedAttachmentIds={selectedAttachmentIds}
           attachmentUploadPending={attachmentUploadPending}
           attachmentRetryingId={attachmentRetryingId}
-          sourceScope={sourceScope}
-          onSourceScopeChange={setSourceScope}
           onUploadAttachment={handleAttachmentUpload}
-          onToggleAttachment={(attachmentId) =>
-            setSelectedAttachmentIds((previous) =>
-              previous.includes(attachmentId)
-                ? previous.filter((id) => id !== attachmentId)
-                : [...previous, attachmentId],
-            )
-          }
           onRetryAttachment={handleRetryAttachment}
           onUseAsTemplate={handleUseAttachmentAsTemplate}
           onRemoveAttachment={handleRemoveAttachment}

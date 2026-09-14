@@ -252,6 +252,9 @@ class MessageView(BaseModel):
     # 紧凑引用列表（assistant 消息；来自 turn summary，内容为预览长度），
     # 刷新页面后"参考来源"面板仍可用，不依赖 done 事件重放。
     citations: list[dict] = Field(default_factory=list)
+    # 该 turn 持久化的 document_card 事件（历史回填用；刷新/重开会话后
+    # 候选卡片与文档状态卡不丢失，前端按引用去重合并）。
+    cards: list[dict] = Field(default_factory=list)
 
 
 class AddMessageRequest(BaseModel):

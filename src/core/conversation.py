@@ -946,6 +946,56 @@ class ConversationService:
             ).fetchall()
         return [row_to_turn(row) for row in rows]
 
+    def list_recent_turns(
+        self, user_id: int, session_id: int, limit: int = 1
+    ) -> list[ChatTurn]:
+        """Newest turns regardless of status (refresh/reopen recovery)."""
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT t.* FROM chat_turns t
+                JOIN chat_sessions s ON s.id = t.session_id
+                WHERE t.session_id = ? AND s.user_id = ?
+                ORDER BY t.created_at DESC, t.rowid DESC
+                LIMIT ?
+                """,
+                (session_id, user_id, max(1, int(limit))),
+            ).fetchall()
+        return [row_to_turn(row) for row in rows]
+
+    def list_session_document_cards(
+        self, user_id: int, session_id: int
+    ) -> dict[str, list[dict]]:
+        """Persisted ``document_card`` payloads per turn, oldest first.
+
+        History rehydration reads these so candidate/document cards survive a
+        page refresh; the live SSE path remains the primary source.
+        """
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT e.turn_id, e.payload_json FROM chat_turn_events e
+                JOIN chat_turns t ON t.id = e.turn_id
+                JOIN chat_sessions s ON s.id = t.session_id
+                WHERE t.session_id = ? AND s.user_id = ?
+                  AND e.event_type = 'document_card'
+                ORDER BY e.turn_id, e.seq
+                """,
+                (session_id, user_id),
+            ).fetchall()
+        cards: dict[str, list[dict]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            card = payload.get("card") if isinstance(payload, dict) else None
+            if isinstance(card, dict) and card:
+                cards.setdefault(str(row["turn_id"]), []).append(card)
+        return cards
+
     def get_turn_unscoped(self, turn_id: str) -> ChatTurn | None:
         """Turn lookup without a user binding, for background coordinators."""
         with closing(self._connect()) as conn:

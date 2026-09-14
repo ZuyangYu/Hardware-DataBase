@@ -109,10 +109,10 @@ export type TemplateAnalyzeOptions = {
 };
 
 /**
- * Shared template upload/analyze contract for ChatPage.handleTemplateUpload and
- * DocumentGenerationPage's TemplateSection. template_name falls back to the
- * file name when omitted or empty; per-page request/UX differences (dedupe id,
- * progress bar) are expressed purely through the optional options above.
+ * Shared template upload/analyze contract for the chat template flow.
+ * template_name falls back to the file name when omitted or empty; request/UX
+ * differences (dedupe id, progress bar) are expressed purely through the
+ * optional options above.
  */
 export async function analyzeTemplate(
   kb: string,

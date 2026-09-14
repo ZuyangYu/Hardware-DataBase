@@ -911,6 +911,7 @@ def get_turn(
 @router.get("/conversations/{session_id}/turns", response_model=list[TurnView])
 def list_active_turns(
     session_id: int,
+    include_terminal: bool = False,
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
@@ -922,7 +923,14 @@ def list_active_turns(
     reject_system_admin_kb_access(ctx)
     if session.kb_name != GENERAL_CHAT_KB_NAME and not ctx.has_kb_permission(session.kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
-    return [_turn_view(turn) for turn in conv.list_active_turns(user.id, session_id)]
+    if include_terminal:
+        # Refresh/reopen recovery needs the newest turn even when it already
+        # finished (document context restore); live SSE remains for running
+        # turns only.
+        turns = conv.list_recent_turns(user.id, session_id)
+    else:
+        turns = conv.list_active_turns(user.id, session_id)
+    return [_turn_view(turn) for turn in turns]
 
 
 @router.post("/turns/{turn_id}/cancel", response_model=TurnView)

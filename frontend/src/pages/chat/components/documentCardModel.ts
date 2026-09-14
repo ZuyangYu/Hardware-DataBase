@@ -1,14 +1,63 @@
 /**
- * documentCardModel -- document_card 事件的纯数据模型(对齐 documentGenerationModel 约定)。
+ * documentCardModel -- document_card 事件的纯数据模型。
  *
  * 线格式 {"type":"document_card","payload":{"card":{...}}};卡片只携带不可变引用与
  * 状态枚举:kind / status / next_actions / kb_name / task_id / work_order_id / generation_session_id /
- * clarification fields / target_format / artifacts(仅 artifact_id+stage)。深链指向文档生成工作台;
+ * clarification fields / target_format / artifacts(仅 artifact_id+stage)。
  * 刷新动作直调 REST 工单状态接口;产物下载 URL 由前端拼装(REST 直链)。
+ * 文档生成工作台已下线,人工 gate 在对话内处理。
  */
 import { api, apiDownload } from '@/api/client';
 import type { DocumentChatTaskView, GenerationSession, WorkOrderStatus } from '@/api/types';
-import { describeWorkOrderStatus, type DocumentStatusTone } from '../../documentGenerationModel';
+
+export type DocumentStatusTone = 'neutral' | 'info' | 'warning' | 'success' | 'danger';
+
+type WorkOrderStatusDescription = {
+  label: string;
+  tone: DocumentStatusTone;
+  action: string;
+};
+
+/** WorkOrder/工单状态 -> 聊天卡片文案(工作台下线后仍被卡片兜底使用)。 */
+const WORK_ORDER_STATUS_LABELS: Record<string, WorkOrderStatusDescription> = {
+  draft: { label: '准备生成任务', tone: 'neutral', action: '选择模板和生成范围' },
+  analyzing_template: { label: '正在分析模板', tone: 'info', action: '等待模板结构分析完成' },
+  needs_clarification: { label: '需要补充需求', tone: 'warning', action: '回答 AI 的确认问题' },
+  ready_to_generate: { label: '需求已确认', tone: 'success', action: '确认并开始生成' },
+  retrieving: { label: '正在检索资料', tone: 'info', action: '查看当前字段和检索进度' },
+  generating: { label: '正在生成内容', tone: 'info', action: '查看字段生成进度' },
+  validating: { label: '正在校验内容', tone: 'info', action: '等待证据与一致性校验' },
+  rendering: { label: '正在写入模板', tone: 'info', action: '等待文件渲染完成' },
+  paused: { label: '任务已暂停', tone: 'warning', action: '可继续生成或取消任务' },
+  completed: { label: '文档已生成', tone: 'success', action: '预览或下载文档' },
+  needs_review: { label: '需要检查内容', tone: 'warning', action: '查看证据、冲突或缺失字段' },
+  blocked: { label: '生成被阻止', tone: 'danger', action: '查看原因并重试' },
+  failed: { label: '任务失败', tone: 'danger', action: '查看错误并重新运行' },
+  cancelled: { label: '任务已取消', tone: 'neutral', action: '可新建生成任务' },
+};
+
+const WORK_ORDER_STATUS_ALIASES: Record<string, string> = {
+  needs_input: 'needs_clarification',
+  awaiting_confirmation: 'ready_to_generate',
+  queued: 'generating',
+  running: 'generating',
+  planned: 'draft',
+  ready_to_draft: 'generating',
+  drafting: 'generating',
+  waiting_human_input: 'needs_review',
+  waiting_human_approval: 'needs_review',
+  complete: 'completed',
+  approved: 'completed',
+};
+
+export function describeWorkOrderStatus(status: string): WorkOrderStatusDescription {
+  const phase = WORK_ORDER_STATUS_ALIASES[status] ?? status;
+  return WORK_ORDER_STATUS_LABELS[phase] ?? {
+    label: status || '状态未知',
+    tone: 'neutral',
+    action: '刷新后查看最新状态',
+  };
+}
 
 export type DocumentCardArtifact = {
   artifact_id: string;
@@ -155,12 +204,6 @@ export type DocumentClarificationEventType =
   | 'document_clarification_question'
   | 'document_clarification_ready';
 
-/** 这些动作可以直接刷新状态(REST),其余 next_action 视为人工门,深链到工作台。 */
-export const DOCUMENT_CARD_REFRESH_ACTIONS: ReadonlySet<string> = new Set([
-  'get_document_generation_status',
-  'poll_status',
-]);
-
 const CARD_TITLES: Record<string, string> = {
   work_order_created: '工单已创建',
   work_order_status: '工单状态',
@@ -204,25 +247,6 @@ const CARD_STATUS_TONES: Record<string, DocumentStatusTone> = {
   completed: 'success',
   succeeded: 'success',
   failed: 'danger',
-};
-
-const NEXT_ACTION_LABELS: Record<string, string> = {
-  submit_icd_scope_resolution: '处理 ICD 范围待办',
-  answer_clarification: '回答澄清问题',
-  start_document_generation_session: '开始需求澄清',
-  create_document_work_order: '创建生成工单',
-  propose_document_plan: '生成计划提案',
-  confirm_document_plan: '确认生成',
-  await_generation: '等待后台生成',
-  get_document_task_status: '查询任务状态',
-  resume_document_task: '继续执行任务',
-  review_revision: '查看文档修订',
-  open_document_workbench: '打开文档工作台',
-  provide_value: '补充缺失字段',
-  replace_template: '更换模板',
-  retry_generation: '重试生成',
-  view_error: '查看错误',
-  view_result: '查看结果',
 };
 
 /** artifacts 只保留不可变引用:非数组→undefined;无字符串 artifact_id 的条目丢弃;上限 8。 */
@@ -318,7 +342,22 @@ export function parseDocumentCardEvent(data: string): DocumentCardData | null {
   try {
     const parsed = JSON.parse(data) as { card?: Record<string, unknown> | null } | null;
     const card = parsed && typeof parsed === 'object' ? parsed.card : null;
-    if (!card || typeof card !== 'object') return null;
+    return normalizeDocumentCard(card);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normalize one already-decoded card payload (history rehydration).
+ * ``parseDocumentCardEvent`` wraps this for the SSE wire format.
+ */
+export function normalizeDocumentCard(value: unknown): DocumentCardData | null {
+  try {
+    const card = value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : null;
+    if (!card) return null;
     const kind = typeof card.kind === 'string' ? card.kind.trim() : '';
     if (!kind) return null;
     const targetFormat = typeof card.target_format === 'string' ? card.target_format : undefined;
@@ -808,11 +847,6 @@ export function documentCardStatusLabel(status: string): string {
   return CARD_STATUS_LABELS[status] ?? describeWorkOrderStatus(status).label;
 }
 
-/** 暴露给卡片操作区使用的 next_action 文案。 */
-export function nextActionLabel(action: string): string {
-  return NEXT_ACTION_LABELS[action] ?? '前往工作台处理';
-}
-
 /**
  * Gate 1 确认输入:只允许提交用户看到过的 spec/plan 哈希。任一哈希缺失或
  * request id 为空时返回 null(提交为 no-op),前端绝不自行推导哈希。
@@ -926,18 +960,6 @@ export function documentCardLifecycleTone(card: DocumentCardData): DocumentStatu
   return LIFECYCLE_TONES[documentLifecycleState(card)];
 }
 
-export function buildWorkbenchDeepLink(
-  kbName: string,
-  workOrderId = '',
-  references: { sessionId?: string | null; taskId?: string | null } = {},
-): string {
-  const params = [`kb=${encodeURIComponent(kbName)}`];
-  if (workOrderId.trim()) params.push(`workOrder=${encodeURIComponent(workOrderId)}`);
-  else if (references.sessionId?.trim()) params.push(`session=${encodeURIComponent(references.sessionId)}`);
-  else if (references.taskId?.trim()) params.push(`task=${encodeURIComponent(references.taskId)}`);
-  return `/document-generation?${params.join('&')}`;
-}
-
 export function documentWorkOrderStatusPath(kbName: string, workOrderId: string): string {
   return `/api/v1/document-generation/work-orders/${encodeURIComponent(workOrderId)}/status?kb=${encodeURIComponent(kbName)}`;
 }
@@ -1032,32 +1054,4 @@ export function documentCardAfterReleaseRequest(card: DocumentCardData): Documen
     releaseState: 'pending',
     next_actions: card.next_actions.filter((action) => action !== 'request_release'),
   };
-}
-
-const DOCUMENT_CARD_DIRECT_ACTIONS: ReadonlySet<string> = new Set([
-  'download_candidate',
-  'request_release',
-]);
-
-export function documentCardWorkbenchActions(
-  card: DocumentCardData,
-): Array<{ action: string; label: string; href: string }> {
-  const workOrderId = card.work_order_id?.trim() ?? '';
-  const sessionId = card.generation_session_id?.trim() ?? '';
-  const taskId = card.task_id?.trim() ?? '';
-  if (!workOrderId && !sessionId && !taskId) return [];
-  const gates = card.next_actions.filter(
-    (action) => !DOCUMENT_CARD_REFRESH_ACTIONS.has(action) && !DOCUMENT_CARD_DIRECT_ACTIONS.has(action),
-  );
-  // A session/task that only asks the client to poll has no workbench action;
-  // keep the legacy card compact until a human action is available.
-  if (!workOrderId && gates.length === 0) return [];
-  if (!workOrderId && gates.includes('answer_clarification') && !card.question_id?.trim()) return [];
-  const href = buildWorkbenchDeepLink(card.kb_name, workOrderId, { sessionId, taskId });
-  if (gates.length === 0) {
-    return [{ action: 'open_workbench', label: '前往工作台', href }];
-  }
-  return gates
-    .slice(0, 3)
-    .map((action) => ({ action, label: NEXT_ACTION_LABELS[action] ?? '前往工作台处理', href }));
 }
