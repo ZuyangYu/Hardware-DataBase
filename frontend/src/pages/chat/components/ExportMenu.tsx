@@ -1,6 +1,13 @@
-import type { ChangeEvent } from 'react';
-
 import type { ExportFormat } from '@/api/types';
+import AppIcon from '@/components/AppIcon';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 const RELEASED_EXPORT_FORMATS: Array<{ value: ExportFormat; label: string }> = [
   { value: 'md', label: 'Markdown' },
@@ -14,6 +21,14 @@ export function exportFormatFromValue(value: string): ExportFormat | null {
   return RELEASED_EXPORT_FORMATS.some((item) => item.value === value)
     ? (value as ExportFormat)
     : null;
+}
+
+export function visibleExportFormats(
+  formats?: ExportFormat[],
+): Array<{ value: ExportFormat; label: string }> {
+  return formats
+    ? RELEASED_EXPORT_FORMATS.filter((item) => formats.includes(item.value))
+    : RELEASED_EXPORT_FORMATS;
 }
 
 export function exportJobStatusLabel(status: string): string {
@@ -42,31 +57,36 @@ type Props = {
 };
 
 export default function ExportMenu({ disabled = false, formats, onExport }: Props) {
-  const visibleFormats = formats
-    ? RELEASED_EXPORT_FORMATS.filter((item) => formats.includes(item.value))
-    : RELEASED_EXPORT_FORMATS;
-
-  function handleChange(event: ChangeEvent<HTMLSelectElement>) {
-    const format = exportFormatFromValue(event.target.value);
-    event.target.value = '';
-    if (format) onExport(format);
-  }
+  const visibleFormats = visibleExportFormats(formats);
 
   return (
-    <div className="flex items-center gap-[7px] text-[11px] text-[#858b9c]">
-      <span aria-hidden="true">导出结果</span>
-      <select
-        aria-label="导出格式"
-        defaultValue=""
-        disabled={disabled}
-        onChange={handleChange}
-        className="rounded-[7px] border border-[#e3e7f1] bg-white px-[7px] py-[3px] text-[11px] font-medium text-[#464c5e] outline-none transition-colors hover:border-[#c9d2e4] disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        <option value="" disabled>选择格式</option>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          disabled={disabled}
+          aria-label="导出对话"
+          title="导出本轮对话"
+          className="inline-flex items-center gap-[5px] border-0 bg-transparent p-0 text-[11px] text-[#858b9c] transition-colors hover:text-[#18181a] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
+        >
+          <AppIcon name="download" size={13} />
+          导出对话
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" side="bottom" sideOffset={6} className="min-w-[180px]">
+        <DropdownMenuLabel className="text-[11px] text-[#858b9c]">选择导出格式</DropdownMenuLabel>
+        <DropdownMenuSeparator />
         {visibleFormats.map((item) => (
-          <option key={item.value} value={item.value}>{item.label}</option>
+          <DropdownMenuItem
+            key={item.value}
+            className="gap-[8px] text-[12px]"
+            onSelect={() => onExport(item.value)}
+          >
+            <AppIcon name="file" size={14} className="text-[#68728a]" />
+            {item.label}
+          </DropdownMenuItem>
         ))}
-      </select>
-    </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

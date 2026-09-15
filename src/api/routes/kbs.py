@@ -7,7 +7,7 @@ from src.core.auth import AuthService, AuthUser
 from src.pipelines.document_rag.schemas import kb_scope_key
 
 from src.api.context import build_context_for_user
-from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access, require_dept_admin
+from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access, require_employee
 from src.api.schemas import CreateKbRequest, FileView, KbView, OkResponse
 
 router = APIRouter(tags=["kbs"])
@@ -77,7 +77,7 @@ def list_files(
 @router.post("/kbs", response_model=OkResponse)
 def create_kb(
     body: CreateKbRequest,
-    user=Depends(require_dept_admin),
+    user=Depends(require_employee),
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
 ):
@@ -97,7 +97,7 @@ def delete_kb(
 ):
     """Delete a knowledge base and all its documents / archives / indexes.
 
-    Requires ``admin`` permission on the KB (implicit for the owning dept_admin).
+    Requires ``admin`` permission on the KB (implicit for the employee).
     """
     ctx = build_context_for_user(user, kb_name, auth=auth)
     reject_system_admin_kb_access(ctx)

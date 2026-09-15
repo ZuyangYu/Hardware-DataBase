@@ -18,7 +18,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
-import { isAnyAdmin, isSystemAdmin, ROLE_LABELS, type AuthSession } from '../auth';
+import { hasDashboardAccess, isSystemAdmin, ROLE_LABELS, type AuthSession } from '../auth';
 import BrandLogo from './BrandLogo';
 
 type Props = {
@@ -102,7 +102,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
   const location = useLocation();
   const { toggleSidebar, state } = useSidebar();
   const sysAdmin = isSystemAdmin(auth.user);
-  const anyAdmin = isAnyAdmin(auth.user);
+  const anyAdmin = hasDashboardAccess(auth.user);
   const initial = auth.user.username.slice(0, 1).toUpperCase();
   const collapsed = state === 'collapsed';
 
@@ -190,14 +190,16 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   !collapsed && sysAdmin && 'mt-[6px]',
                 )}
               >
-                <PrimaryNavButton
-                  label="用户管理"
-                  iconName="user"
-                  active={location.pathname === '/admin/users'}
-                  collapsed={collapsed}
-                  onClick={() => navigate('/admin/users')}
-                  tooltip="用户管理"
-                />
+                {sysAdmin && (
+                  <PrimaryNavButton
+                    label="员工管理"
+                    iconName="user"
+                    active={location.pathname === '/admin/users'}
+                    collapsed={collapsed}
+                    onClick={() => navigate('/admin/users')}
+                    tooltip="员工管理"
+                  />
+                )}
                 {sysAdmin && (
                   <PrimaryNavButton
                     label="部门管理"
@@ -208,14 +210,16 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                     tooltip="部门管理"
                   />
                 )}
-                <PrimaryNavButton
-                  label="知识库授权"
-                  iconName="lock"
-                  active={location.pathname === '/admin/kb-permissions'}
-                  collapsed={collapsed}
-                  onClick={() => navigate('/admin/kb-permissions')}
-                  tooltip="知识库授权"
-                />
+                {sysAdmin && (
+                  <PrimaryNavButton
+                    label="知识库挂载"
+                    iconName="lock"
+                    active={location.pathname === '/admin/kb-mount'}
+                    collapsed={collapsed}
+                    onClick={() => navigate('/admin/kb-mount')}
+                    tooltip="知识库挂载"
+                  />
+                )}
                 <PrimaryNavButton
                   label="治理面板"
                   iconName="grid"
@@ -224,16 +228,6 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   onClick={() => navigate('/admin/governance')}
                   tooltip="知识库治理"
                 />
-                {!sysAdmin && (
-                  <PrimaryNavButton
-                    label="附件发布审核"
-                    iconName="file"
-                    active={location.pathname === '/admin/attachment-releases'}
-                    collapsed={collapsed}
-                    onClick={() => navigate('/admin/attachment-releases')}
-                    tooltip="附件发布审核"
-                  />
-                )}
                 <PrimaryNavButton
                   label="日志中心"
                   iconName="history"

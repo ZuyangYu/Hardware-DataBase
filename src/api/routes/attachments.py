@@ -19,7 +19,7 @@ from src.api.deps import (
     current_user,
     get_auth_service,
     reject_system_admin_kb_access,
-    require_dept_admin,
+    require_employee,
 )
 from src.api.context import build_context_for_user
 from src.api.schemas import OkResponse
@@ -347,7 +347,7 @@ def download_attachment_revision_candidate(
 def reparse_stale_attachments(
     limit: int = 200,
     extension: list[str] | None = Query(default=None),
-    actor: AuthUser = Depends(require_dept_admin),
+    actor: AuthUser = Depends(require_employee),
     auth: AuthService = Depends(get_auth_service),
 ):
     """Backfill derived parser data for stale assets in manageable KBs.

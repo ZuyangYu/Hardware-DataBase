@@ -4,6 +4,7 @@ export type AppIconName =
   | 'arrow'
   | 'close'
   | 'database'
+  | 'download'
   | 'eye'
   | 'eye-off'
   | 'file'
@@ -35,6 +36,7 @@ const iconPaths: Record<AppIconName, string[]> = {
   arrow: ['M9 5l6 7-6 7'],
   close: ['M6 6l12 12', 'M18 6 6 18'],
   database: ['M5 7c0 2 14 2 14 0S5 5 5 7Z', 'M5 7v5c0 2 14 2 14 0V7', 'M5 12v5c0 2 14 2 14 0v-5'],
+  download: ['M12 4v10', 'M8 11l4 4 4-4', 'M5 19h14'],
   eye: ['M3.5 12s3-5.5 8.5-5.5S20.5 12 20.5 12s-3 5.5-8.5 5.5S3.5 12 3.5 12Z', 'M12 14.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z'],
   'eye-off': ['M3.5 12s3-5.5 8.5-5.5c1.7 0 3.2.5 4.5 1.3', 'M20.5 12s-.9 1.7-2.5 3.2', 'M5 19L19 5'],
   file: ['M6 4h8l4 4v12H6V4Z', 'M14 4v5h5', 'M9 13h6', 'M9 16h4'],

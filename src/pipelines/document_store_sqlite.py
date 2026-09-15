@@ -8,7 +8,24 @@ from dataclasses import dataclass, field
 
 import src.settings
 from src.services.document_routing import PROCESSOR_KIND_SPREADSHEET, TABLE_STATUS_ARCHIVED, TABLE_STATUS_PROCESSING
-from src.pipelines.document_rag.schemas import TASK_STATUS_DEAD_LETTER, TASK_STATUS_QUEUED
+from src.pipelines.document_rag.schemas import (
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_DEAD_LETTER,
+    TASK_STATUS_QUEUED,
+    normalize_parse_status,
+)
+
+
+def _fire_shadow_asset_hook(record_id: int | None) -> None:
+    """解析首次到达 completed 时为文件立文档资产影子档(fail-soft, 不阻断主流程)。"""
+    if record_id is None:
+        return
+    try:
+        from src.core.doc_assets import ensure_shadow_asset_for_record
+
+        ensure_shadow_asset_for_record(int(record_id))
+    except Exception:  # noqa: BLE001
+        pass
 
 WORKER_STALE_SECONDS = 30 * 60
 WORKER_MAX_RETRIES = 3
@@ -727,6 +744,11 @@ class PipelineDocumentStore:
     def update_document_status(self, dataset_id: str, document_id: str, status: str, error_message: str = ""):
         completed_expr = "CURRENT_TIMESTAMP" if status in TERMINAL_PARSE_STATUSES else "parse_completed_at"
         with closing(self._connect()) as conn:
+            prev = conn.execute(
+                "SELECT id, status FROM pipeline_documents WHERE dataset_id = ? AND document_id = ?",
+                (dataset_id, document_id),
+            ).fetchone()
+            record_id = prev["id"] if prev is not None else None
             conn.execute(
                 f"""
                 UPDATE pipeline_documents
@@ -741,16 +763,16 @@ class PipelineDocumentStore:
                 """,
                 (status, status, error_message, error_message, dataset_id, document_id),
             )
-            row = conn.execute(
-                "SELECT id FROM pipeline_documents WHERE dataset_id = ? AND document_id = ?",
-                (dataset_id, document_id),
-            ).fetchone()
-            record_id = row["id"] if row is not None else None
             self._write_profile_event(conn, record_id, "parse_status", {"status": status})
+        if status == TASK_STATUS_COMPLETED and (prev is None or prev["status"] != TASK_STATUS_COMPLETED):
+            _fire_shadow_asset_hook(record_id)
 
     def update_document_status_by_id(self, record_id: int, status: str, error_message: str = ""):
         completed_expr = "CURRENT_TIMESTAMP" if status in TERMINAL_PARSE_STATUSES else "parse_completed_at"
         with closing(self._connect()) as conn:
+            prev = conn.execute(
+                "SELECT status FROM pipeline_documents WHERE id = ?", (record_id,)
+            ).fetchone()
             conn.execute(
                 f"""
                 UPDATE pipeline_documents
@@ -766,6 +788,8 @@ class PipelineDocumentStore:
                 (status, status, error_message, error_message, record_id),
             )
             self._write_profile_event(conn, record_id, "parse_status", {"status": status})
+        if status == TASK_STATUS_COMPLETED and (prev is None or prev["status"] != TASK_STATUS_COMPLETED):
+            _fire_shadow_asset_hook(record_id)
 
     def update_document_progress_by_id(
         self,
@@ -796,6 +820,9 @@ class PipelineDocumentStore:
             assignments.append("parse_completed_at = CURRENT_TIMESTAMP")
         params.append(record_id)
         with closing(self._connect()) as conn:
+            prev = conn.execute(
+                "SELECT status FROM pipeline_documents WHERE id = ?", (record_id,)
+            ).fetchone()
             conn.execute(
                 f"""
                 UPDATE pipeline_documents
@@ -804,6 +831,10 @@ class PipelineDocumentStore:
                 """,
                 params,
             )
+        if status == TASK_STATUS_COMPLETED and normalize_parse_status(
+            (prev["status"] if prev is not None else ""), PROCESSOR_KIND_SPREADSHEET
+        ) != TASK_STATUS_COMPLETED:
+            _fire_shadow_asset_hook(record_id)
 
     def claim_next_parse_record(
         self,

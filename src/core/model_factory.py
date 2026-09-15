@@ -12,9 +12,11 @@ from functools import lru_cache
 from typing import Any
 
 import src.settings as settings
-from langchain.chat_models import init_chat_model
 
+from src.core.llm_governor import PRIORITY_INTERACTIVE
 from src.core.llm_headers import opencode_extra_headers
+from src.core.model_gateway import build_governed_model
+
 
 
 _SETTINGS_GENERATION = 0
@@ -40,6 +42,7 @@ class ChatModelConfig:
     max_retries: int
     require_structured_tools: bool = False
     max_input_tokens: int = 0
+    priority: str = PRIORITY_INTERACTIVE
 
 
 def settings_generation() -> int:
@@ -76,6 +79,7 @@ def resolve_chat_model_config(
     provider: Any = "",
     model: str = "",
     settings_module: Any | None = None,
+    priority: str = PRIORITY_INTERACTIVE,
 ) -> ChatModelConfig:
     """Resolve one allowlisted profile from the application settings."""
 
@@ -159,6 +163,7 @@ def resolve_chat_model_config(
         max_input_tokens=max(
             0, int(getattr(settings_source, "AGENT_MODEL_MAX_INPUT_TOKENS", 0) or 0)
         ),
+        priority=str(priority or PRIORITY_INTERACTIVE),
     )
 
 
@@ -167,13 +172,19 @@ def create_chat_model(
     provider: Any = "",
     model: str = "",
     profile: str = "default",
+    priority: str = PRIORITY_INTERACTIVE,
 ) -> object:
-    """Build and cache a LangChain chat model for an allowlisted profile."""
+    """Build and cache a LangChain chat model for an allowlisted profile.
+
+    ``priority`` selects the governor admission class (interactive keeps
+    reserved capacity; batch is capped separately) and is part of the cache key.
+    """
 
     config = resolve_chat_model_config(
         profile=profile,
         provider=provider,
         model=model,
+        priority=priority,
     )
     return _build_cached_chat_model(_SETTINGS_GENERATION, config)
 
@@ -183,6 +194,7 @@ def create_chat_model_for_settings(
     provider: Any = "",
     model: str = "",
     profile: str = "default",
+    priority: str = PRIORITY_INTERACTIVE,
 ) -> object:
     """Build a model from an injected settings object.
 
@@ -195,6 +207,7 @@ def create_chat_model_for_settings(
         provider=provider,
         model=model,
         settings_module=settings_module,
+        priority=priority,
     )
     return _build_cached_chat_model(_SETTINGS_GENERATION, config)
 
@@ -206,31 +219,32 @@ def _build_cached_chat_model(generation: int, config: ChatModelConfig) -> object
         # ChatOllama has no max_retries/timeout fields. The sync/async httpx
         # clients enforce the bounded request timeout; transport retry is
         # intentionally disabled for Ollama by the profile contract.
-        model = init_chat_model(
-            f"ollama:{config.model}",
+        model = build_governed_model(
+            provider="ollama",
+            model=config.model,
             base_url=config.endpoint,
             temperature=config.temperature,
-            num_predict=config.max_tokens,
-            client_kwargs={"timeout": config.timeout},
+            max_tokens=config.max_tokens,
+            timeout=config.timeout,
+            priority=config.priority,
         )
         _apply_model_profile(model, config.max_input_tokens)
         return model
 
-    model = init_chat_model(
-        f"openai:{config.model}",
-        base_url=config.endpoint or None,
+    model = build_governed_model(
+        provider="custom",
+        model=config.model,
+        base_url=config.endpoint,
         api_key=config.api_key,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         max_retries=config.max_retries,
         timeout=config.timeout,
-        **(
-            {"default_headers": headers}
-            if (headers := opencode_extra_headers(config.endpoint))
-            else {}
-        ),
+        default_headers=opencode_extra_headers(config.endpoint) or None,
+        priority=config.priority,
     )
     _apply_model_profile(model, config.max_input_tokens)
+
     return model
 
 

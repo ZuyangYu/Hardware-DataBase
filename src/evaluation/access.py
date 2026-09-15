@@ -192,7 +192,7 @@ def normalize_sample_for_binding(
         "user_id": "evaluation",
         "session_id": session_id,
         "department_id": binding.department_id,
-        "roles": ["user"],
+        "roles": ["employee"],
         "allowed_kbs": [scope] if allowed else [],
         "kb_permissions": {scope: "read"} if allowed else {},
     }
@@ -214,7 +214,7 @@ def build_evaluation_context(sample: EvaluationSample) -> RequestContext:
     return RequestContext(
         user_id="evaluation",
         session_id=_normalized_name(raw.get("session_id")) or f"eval-{sample.id}",
-        roles=["user"],
+        roles=["employee"],
         allowed_kbs=[_normalized_name(value) for value in _iter_values(raw.get("allowed_kbs")) if _normalized_name(value)],
         kb_permissions={
             _normalized_name(key): _normalized_name(value)

@@ -1250,6 +1250,9 @@ class _NativeRagasBackend:
             client=llm_client,
             max_tokens=self.config.llm_max_tokens,
         )
+        from src.core.model_gateway import govern_ragas_llm
+
+        llm = govern_ragas_llm(llm)
         if primary:
             self._llm = llm
         return llm

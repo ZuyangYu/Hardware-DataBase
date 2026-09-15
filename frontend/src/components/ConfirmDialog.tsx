@@ -27,6 +27,8 @@ export type ConfirmDialogProps = {
   destructive?: boolean;
   /** 覆盖头部前置图标;传 `null` 隐藏。 */
   icon?: ReactNode;
+  /** 描述与按钮之间的自定义内容(如复选框等交互项)。 */
+  children?: ReactNode;
 };
 
 /**
@@ -44,6 +46,7 @@ export function ConfirmDialog({
   loading = false,
   destructive = true,
   icon,
+  children,
 }: ConfirmDialogProps) {
   const leadingIcon =
     icon === undefined ? (
@@ -74,6 +77,7 @@ export function ConfirmDialog({
             </AlertDialogDescription>
           </div>
         )}
+        {children != null && <div className="px-[24px] pb-[12px]">{children}</div>}
         <div className="flex items-center justify-end gap-[8px] pt-[12px] pr-[16px] pb-[16px] pl-[12px]">
           <AlertDialogPrimitive.Cancel asChild>
             <Button

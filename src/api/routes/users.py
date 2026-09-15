@@ -1,16 +1,16 @@
-"""User management endpoints (system_admin / dept_admin).
+"""Employee account management endpoints (system_admin only).
 
-Scoping is enforced by :class:`AuthService` methods, which read the caller's
-role and department off ``actor``. `system_admin` sees all users;
-`dept_admin` is confined to plain users in its own department.
+Account registration is governance: only the system administrator creates
+accounts. Department staff (``employee``) manage knowledge-base content, not
+accounts.
 """
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from src.core.auth import ROLE_DEPT_ADMIN, ROLE_USER, AuthService, AuthUser
+from src.core.auth import AuthService, AuthUser
 
-from src.api.deps import get_auth_service, require_any_admin
+from src.api.deps import get_auth_service, require_system_admin
 from src.api.schemas import (
     AuthUserView,
     CreateUserRequest,
@@ -35,29 +35,24 @@ def _user_view(u: AuthUser) -> AuthUserView:
 
 @router.get("/users", response_model=list[AuthUserView])
 def list_users(
-    include_admins: bool = Query(default=False),
-    actor: AuthUser = Depends(require_any_admin),
+    department_id: int | None = Query(default=None),
+    actor: AuthUser = Depends(require_system_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """List users. system_admin sees all; dept_admin sees own department only.
-
-    By default dept_admin sees only plain users (``ROLE_USER``), matching the
-    Streamlit department-management view. Pass ``include_admins=true`` to also
-    return dept_admin/system_admin rows in scope (e.g. for an admin picker).
-    """
+    """List all accounts; optional ``department_id`` filters employees by dept."""
     users = auth.list_users_as(actor)
-    if actor.role == ROLE_DEPT_ADMIN and not include_admins:
-        users = [u for u in users if u.role == ROLE_USER]
+    if department_id is not None:
+        users = [u for u in users if u.department_id == department_id]
     return [_user_view(u) for u in users]
 
 
 @router.post("/users", response_model=AuthUserView)
 def create_user(
     body: CreateUserRequest,
-    actor: AuthUser = Depends(require_any_admin),
+    actor: AuthUser = Depends(require_system_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """Create a user. Role/department scoping is enforced by AuthService."""
+    """Register an employee (bound to a department) or another system admin."""
     user = auth.create_user_as(
         actor,
         body.username,
@@ -72,10 +67,10 @@ def create_user(
 def set_user_active(
     user_id: int,
     body: SetUserActiveRequest,
-    actor: AuthUser = Depends(require_any_admin),
+    actor: AuthUser = Depends(require_system_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """Enable or disable a user account. Cannot target self."""
+    """Enable or disable an account. Cannot target self."""
     auth.set_user_active_as(actor, user_id, body.is_active)
     return OkResponse(ok=True, message="user active state updated")
 
@@ -84,9 +79,9 @@ def set_user_active(
 def reset_user_password(
     user_id: int,
     body: ResetPasswordRequest,
-    actor: AuthUser = Depends(require_any_admin),
+    actor: AuthUser = Depends(require_system_admin),
     auth: AuthService = Depends(get_auth_service),
 ):
-    """Reset a user's password. Cannot target self."""
+    """Reset an account password. Cannot target self."""
     auth.reset_user_password_as(actor, user_id, body.new_password)
     return OkResponse(ok=True, message="password reset")

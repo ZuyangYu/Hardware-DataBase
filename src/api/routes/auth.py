@@ -17,9 +17,9 @@ def login(
     auth: AuthService = Depends(get_auth_service),
 ) -> LoginResponse:
     client_ip = request.client.host if request.client else None
-    session = auth.authenticate(body.username, body.password, ip=client_ip)
+    session, reason = auth.authenticate(body.username, body.password, ip=client_ip)
     if session is None:
-        raise HTTPException(status_code=401, detail="invalid credentials")
+        raise HTTPException(status_code=401, detail=reason or "用户名或密码错误")
     u = session.user
     return LoginResponse(
         token=session.token,

@@ -57,6 +57,7 @@ class ChatTurn:
     kb_id: int | None
     query: str
     query_mode: str
+    wiki_assist: bool
     status: str
     client_request_id: str | None
     cancel_requested: bool
@@ -175,6 +176,12 @@ class ConversationService:
                     FOREIGN KEY(assistant_message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
                 )
             """)
+            try:
+                conn.execute(
+                    "ALTER TABLE chat_turns ADD COLUMN wiki_assist INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError:
+                pass  # 列已存在
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_turns_session_request
                 ON chat_turns(session_id, client_request_id)
@@ -721,6 +728,7 @@ class ConversationService:
         client_request_id: str | None = None,
         query_mode: str = "fast",
         trace_context: dict[str, str] | None = None,
+        wiki_assist: bool = False,
         document_context: dict | Any | None = None,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
@@ -851,9 +859,10 @@ class ConversationService:
                     """
                     INSERT INTO chat_turns (
                         id, session_id, user_message_id, assistant_message_id, kb_name, query, query_mode,
-                        department_id, kb_id, status, client_request_id, trace_context_json, created_at
-                        , document_context_json, export_plan_json, source_scope, required_attachment_ids
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        department_id, kb_id, status, client_request_id, trace_context_json, created_at,
+                        document_context_json, export_plan_json, source_scope, required_attachment_ids,
+                        wiki_assist
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -873,6 +882,7 @@ class ConversationService:
                         export_plan_json,
                         effective_scope,
                         json.dumps(required_ids, ensure_ascii=False),
+                        1 if wiki_assist else 0,
                     ),
                 )
                 if attachment_refs:
@@ -1715,6 +1725,7 @@ def row_to_turn(row) -> ChatTurn:
         kb_id=row["kb_id"],
         query=row["query"],
         query_mode=row["query_mode"] if "query_mode" in row.keys() else "fast",
+        wiki_assist=bool(row["wiki_assist"]) if "wiki_assist" in row.keys() else True,
         status=row["status"],
         client_request_id=row["client_request_id"],
         cancel_requested=bool(row["cancel_requested"]),

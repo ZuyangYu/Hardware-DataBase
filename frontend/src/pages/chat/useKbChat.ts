@@ -953,6 +953,14 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     }
   }, [createSession, detachClientStream]);
 
+  /** 无活动会话时先建一个空会话;附件上传与发送共用。 */
+  const ensureSession = useCallback(async (): Promise<number> => {
+    const current = activeSessionRef.current;
+    if (current != null) return current;
+    const session = await createSession('新对话');
+    return session.id;
+  }, [createSession]);
+
   const deleteSession = useCallback(
     async (sessionId: number) => {
       if (streaming) return;
@@ -1151,6 +1159,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       documentContextOverride?: DocumentContext | null;
       /** Retained only for callers compiled during the protocol migration. */
       documentFlowOverride?: boolean;
+      /** Wiki 辅助开关(本轮): 默认关闭。 */
+      wikiAssist?: boolean;
     } | null,
   ) => {
     const query = input.trim();
@@ -1206,20 +1216,22 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       if (!ownsGeneration()) return;
 
       // 2. 后端原子写入 user/assistant 占位消息并创建幂等 turn。
+      const turnRequest = buildTurnRequest(
+        query,
+        requestUuid(),
+        scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
+        documentContextEnabled
+          ? (Object.prototype.hasOwnProperty.call(attachments ?? {}, 'documentContextOverride')
+            ? attachments?.documentContextOverride ?? null
+            : documentContext)
+          : null,
+        undefined,
+        attachments ?? null,
+      );
+      turnRequest.wiki_assist = attachments?.wikiAssist ?? false;
       const created = await api.post<TurnStartResponse>(
         `/api/v1/conversations/${sessionId}/turns`,
-        buildTurnRequest(
-          query,
-          requestUuid(),
-          scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
-          documentContextEnabled
-            ? (Object.prototype.hasOwnProperty.call(attachments ?? {}, 'documentContextOverride')
-              ? attachments?.documentContextOverride ?? null
-              : documentContext)
-            : null,
-          undefined,
-          attachments ?? null,
-        ),
+        turnRequest,
       );
       if (documentContextEnabled && ownsGeneration()) {
         const returnedContext = created.turn.document_context ?? created.user_message.document_context;
@@ -1393,6 +1405,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     activeSessionId,
     selectSession,
     newConversation,
+    ensureSession,
     deleteSession,
     updateMessage,
     // 消息

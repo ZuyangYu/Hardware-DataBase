@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 from src.core.app_logs import AppLogService
-from src.core.auth import ROLE_DEPT_ADMIN, ROLE_USER, AuthUser
+from src.core.auth import ROLE_EMPLOYEE, AuthUser
 
 
 def _make_viewer(user_id: int, role: str, department_id: int | None = 1) -> AuthUser:
@@ -15,8 +15,8 @@ class RetrievedEvidenceLoggingTests(unittest.TestCase):
         self._tmpdir = tempfile.mkdtemp(prefix="applogs_")
         self.db_path = os.path.join(self._tmpdir, "logs.db")
         self.service = AppLogService(db_path=self.db_path)
-        self.owner = _make_viewer(101, ROLE_USER, department_id=7)
-        self.other = _make_viewer(202, ROLE_DEPT_ADMIN, department_id=7)
+        self.owner = _make_viewer(101, ROLE_EMPLOYEE, department_id=7)
+        self.other = _make_viewer(202, ROLE_EMPLOYEE, department_id=7)
 
     def tearDown(self):
         for name in os.listdir(self._tmpdir):

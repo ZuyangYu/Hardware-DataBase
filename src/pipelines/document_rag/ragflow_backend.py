@@ -1323,6 +1323,15 @@ class RAGFlowBackend(RAGBackend):
             else:
                 # spreadsheet：索引+归档+store 行原子化清理，避免孤儿
                 delete_result = self._delete_pipeline_record(record)
+            if delete_result.ok:
+                # 解析层删除 → 文档资产台账同步(版本标"源文件已删除",
+                # 生效版本被删则回退最近留存版本, 全删则资产转废止)。fail-soft。
+                try:
+                    from src.core.doc_assets import sync_file_deleted
+
+                    sync_file_deleted(kb_id=record.kb_id, file_id=str(record.id))
+                except Exception:  # noqa: BLE001
+                    pass
             self._audit(
                 delete_result.audit_action or f"{record.processor_kind}_delete_document",
                 ctx,

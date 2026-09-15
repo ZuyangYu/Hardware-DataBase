@@ -8,7 +8,12 @@ from typing import Any
 from src.document_authoring.models import DocumentUnitDraft, content_hash
 from src.document_authoring.validator import DocumentValidator
 
-from .review_contracts import CoverageRequirementResult, ReviewIssue, UnitReviewResult, safe_review_projection
+from .review_contracts import (  # noqa: F401 - safe_review_projection 供外部再导出
+    CoverageRequirementResult,
+    ReviewIssue,
+    UnitReviewResult,
+    safe_review_projection,
+)
 
 
 class UnitReviewer:

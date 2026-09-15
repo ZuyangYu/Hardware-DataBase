@@ -29,13 +29,36 @@ def _configure_agent(monkeypatch, *, provider=settings.Provider.OLLAMA):
 
 
 def _recording_init(monkeypatch):
+    """Spy on the factory's only construction entry (build_governed_model).
+
+    Kwargs are normalized back to the legacy ``init_chat_model`` shape so the
+    profile/transport contract assertions below stay readable.
+    """
     calls: list[tuple[str, dict]] = []
 
-    def init(model_name: str, **kwargs):
-        calls.append((model_name, kwargs))
-        return SimpleNamespace(model=model_name.split(":", 1)[1], provider=model_name.split(":", 1)[0])
+    def build(*, provider: str, model: str, **kwargs):
+        if provider == "ollama":
+            normalized = {
+                "base_url": kwargs.get("base_url"),
+                "temperature": kwargs.get("temperature"),
+                "num_predict": kwargs.get("max_tokens"),
+                "client_kwargs": {"timeout": kwargs.get("timeout")},
+            }
+            prefix = "ollama"
+        else:
+            normalized = {
+                "base_url": kwargs.get("base_url"),
+                "api_key": kwargs.get("api_key"),
+                "temperature": kwargs.get("temperature"),
+                "max_tokens": kwargs.get("max_tokens"),
+                "max_retries": kwargs.get("max_retries"),
+                "timeout": kwargs.get("timeout"),
+            }
+            prefix = "openai"
+        calls.append((f"{prefix}:{model}", normalized))
+        return SimpleNamespace(model=model, provider=provider)
 
-    monkeypatch.setattr(model_factory, "init_chat_model", init)
+    monkeypatch.setattr(model_factory, "build_governed_model", build)
     return calls
 
 

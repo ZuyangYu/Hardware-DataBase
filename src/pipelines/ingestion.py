@@ -896,9 +896,12 @@ class ExternalConversationHandler(PipelineHandler):
             if self._model_factory is not None:
                 self._chat_model = self._model_factory()
             else:
+                from src.core.llm_governor import PRIORITY_BATCH
                 from src.core.model_factory import create_chat_model
 
-                self._chat_model = create_chat_model(profile="external_conversation")
+                self._chat_model = create_chat_model(
+                    profile="external_conversation", priority=PRIORITY_BATCH
+                )
         return self._chat_model
 
     def _spawn_postprocess(self, conversation):

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 import src.settings
-from src.core.auth import ROLE_DEPT_ADMIN
+from src.core.auth import ROLE_EMPLOYEE
 from src.api.context import build_context_for_user
 
 from tests._api_stub import make_auth
@@ -29,7 +29,7 @@ class BuildContextForUserTests(unittest.TestCase):
         kb_id = self.auth.get_knowledge_base_id("shared", department_id=self.dept.id)
         self.assertEqual(ctx.metadata.get("kb_id"), kb_id)
         self.assertEqual(ctx.metadata.get("resource_department_id"), self.dept.id)
-        self.assertIn(ROLE_DEPT_ADMIN, ctx.roles)
+        self.assertIn(ROLE_EMPLOYEE, ctx.roles)
         self.assertIn("admin", ctx.kb_permissions.values())
 
     def test_no_kb_name_leaves_kb_id_none(self):

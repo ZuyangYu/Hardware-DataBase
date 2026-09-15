@@ -8,10 +8,8 @@ layout input and is produced by ``StructureBindingCompiler``.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import io
-import math
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,7 +24,7 @@ from src.document_authoring.document_model import (
     SectionBlock,
     TypedTableBlock,
 )
-from src.document_authoring.models import TypedTableRow, content_hash
+from src.document_authoring.models import content_hash
 from src.document_authoring.ooxml import sanitize_xml10_text, validate_ooxml_package
 from src.document_authoring.planning.recipes import (
     StructureBindingSet,
@@ -410,9 +408,6 @@ class StructuredPdfRenderer(_StructuredRenderer):
         body_style = ParagraphStyle(
             "RecipeBody", parent=styles["BodyText"], fontName="Helvetica",
             fontSize=10, leading=14, spaceAfter=6,
-        )
-        small_style = ParagraphStyle(
-            "RecipeSmall", parent=body_style, fontSize=8, leading=10,
         )
         story: list[Any] = [Paragraph("Generated document", title_style)]
         block_count = 0

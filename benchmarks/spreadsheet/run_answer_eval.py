@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 # 必须在 import src.settings 之前设置
-import os
+import os  # noqa: E402
 
 os.environ.setdefault("AGENT_TEMPERATURE", "0")
 

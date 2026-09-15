@@ -49,7 +49,7 @@ def list_parse_tasks(
     """List active parse tasks for a KB (auto-refreshes remote status).
 
     Requires write -- the Streamlit parse-task panel is only shown to users
-    with write on the KB (dept_admins managing ingestion). read-only users
+    with write on the KB (employees managing ingestion). read-only access
     see file status via GET /kbs/{kb}/files instead.
     """
     ctx = build_context_for_user(user, kb_name, auth=auth)

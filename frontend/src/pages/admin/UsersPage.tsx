@@ -5,11 +5,10 @@ import type {
   CreateUserPayload,
   DepartmentView,
   OkResponse,
-  Role,
   UserView,
 } from '../../api/types';
 import type { AuthSession } from '../../auth';
-import { isSystemAdmin, ROLE_LABELS } from '../../auth';
+import { ROLE_LABELS } from '../../auth';
 import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
@@ -40,10 +39,7 @@ type Props = {
   onLogout: () => void;
 };
 
-const SYSTEM_ADMIN_CREATE_ROLES: Role[] = ['dept_admin', 'system_admin'];
-
 export default function UsersPage({ auth, onLogout }: Props) {
-  const sysAdmin = isSystemAdmin(auth.user);
   const [users, setUsers] = useState<UserView[]>([]);
   const [departments, setDepartments] = useState<DepartmentView[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -56,9 +52,8 @@ export default function UsersPage({ auth, onLogout }: Props) {
   const load = useCallback(() => {
     let cancelled = false;
     setLoaded(false);
-    // sysadmin 看全部(含管理员);dept_admin 后端默认只返本部门 user
     api
-      .get<UserView[]>(`/api/v1/users?include_admins=${sysAdmin ? 'true' : 'false'}`)
+      .get<UserView[]>('/api/v1/users')
       .then((rows) => {
         if (!cancelled) setUsers(rows);
       })
@@ -68,7 +63,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
       .finally(() => {
         if (!cancelled) setLoaded(true);
       });
-    // 部门下拉(sysadmin 选;dept_admin 锁本部门,也加载用于显示)
+    // 部门下拉(注册员工时选择归属部门)
     api
       .get<DepartmentView[]>('/api/v1/departments')
       .then((rows) => {
@@ -78,7 +73,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [sysAdmin]);
+  }, []);
 
   useEffect(() => {
     const cancel = load();
@@ -216,8 +211,8 @@ export default function UsersPage({ auth, onLogout }: Props) {
   return (
     <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
       <AppHeader
-        title="用户管理"
-        description={sysAdmin ? '管理全部用户:创建、停用/启用、重置密码。' : '管理本部门用户:创建、停用/启用、重置密码。'}
+        title="员工管理"
+        description="注册员工到部门、创建系统管理员、停用/启用账号、重置密码。"
         userName={auth.user.username}
         onLogout={onLogout}
       />
@@ -232,7 +227,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
           className="h-[36px] gap-[6px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] text-white hover:bg-[#303030]"
         >
           <AppIcon name="plus" size={14} />
-          创建用户
+          注册员工
         </Button>
       </div>
 
@@ -263,9 +258,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
       <CreateUserDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
-        sysAdmin={sysAdmin}
         departments={departments}
-        myDepartmentId={auth.user.department_id}
         onCreated={() => load()}
       />
 
@@ -347,33 +340,23 @@ function ResetPasswordDialog({
   );
 }
 
-/** 创建用户对话框。sysadmin 创建管理员;dept_admin 锁 user 角色 + 本部门。 */
+/** 注册员工对话框(仅系统管理员可用; 系统管理员账号由部署环境管理)。 */
 function CreateUserDialog({
   open,
   onOpenChange,
-  sysAdmin,
   departments,
-  myDepartmentId,
   onCreated,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  sysAdmin: boolean;
   departments: DepartmentView[];
-  myDepartmentId?: number | null;
   onCreated: () => void;
 }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [role, setRole] = useState<Role>('dept_admin');
-  const [departmentId, setDepartmentId] = useState<string>(
-    myDepartmentId != null ? String(myDepartmentId) : '',
-  );
+  const [departmentId, setDepartmentId] = useState<string>('');
   const [submitting, setSubmitting] = useState(false);
 
-  // dept_admin 强制 user 角色 + 本部门
-  const effectiveRole: Role = sysAdmin ? role : 'user';
-  const effectiveDeptId: string = sysAdmin ? departmentId : (myDepartmentId != null ? String(myDepartmentId) : '');
   const businessDepartments = useMemo(
     () => departments.filter((d) => d.name !== 'system'),
     [departments],
@@ -384,28 +367,28 @@ function CreateUserDialog({
       notify.error('请输入用户名和密码');
       return;
     }
-    if (sysAdmin && effectiveRole === 'dept_admin' && !effectiveDeptId) {
+    if (!departmentId) {
       notify.error('请选择部门');
       return;
     }
     const payload: CreateUserPayload = {
       username: username.trim(),
       password,
-      role: effectiveRole,
-      department_id: effectiveRole === 'system_admin' ? null : (effectiveDeptId ? Number(effectiveDeptId) : null),
+      role: 'employee',
+      department_id: Number(departmentId),
     };
     setSubmitting(true);
     try {
       await api.post<UserView>('/api/v1/users', payload);
-      notify.success('用户已创建');
+      notify.success('员工已注册');
       onOpenChange(false);
       setUsername('');
       setPassword('');
-      setRole('dept_admin');
+      setDepartmentId('');
       onCreated();
     } catch (error) {
       if (isForbiddenError(error)) {
-        notify.error('无权创建用户');
+        notify.error('无权创建账号');
       } else {
         notify.error(error instanceof Error ? error.message : '创建失败');
       }
@@ -418,7 +401,7 @@ function CreateUserDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex w-[calc(100%-32px)] max-w-[440px] flex-col rounded-[16px] p-0">
         <DialogHeader className="px-[24px] pt-[20px]">
-          <DialogTitle className="text-[16px] font-semibold text-[#18181a]">创建用户</DialogTitle>
+          <DialogTitle className="text-[16px] font-semibold text-[#18181a]">注册员工</DialogTitle>
         </DialogHeader>
         <div className="grid gap-[14px] px-[24px] py-[16px]">
           <div className="grid gap-[6px]">
@@ -434,51 +417,21 @@ function CreateUserDialog({
               placeholder="初始密码"
             />
           </div>
-          {sysAdmin && (
-            <>
-              <div className="grid gap-[6px]">
-                <Label className="text-[12px] text-[#464c5e]">角色</Label>
-                <Select value={role} onValueChange={(v) => setRole(v as Role)}>
-                  <SelectTrigger className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {SYSTEM_ADMIN_CREATE_ROLES.map((r) => (
-                      <SelectItem key={r} value={r}>
-                        {ROLE_LABELS[r]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              {role === 'dept_admin' ? (
-                <div className="grid gap-[6px]">
-                  <Label className="text-[12px] text-[#464c5e]">部门</Label>
-                  <Select value={departmentId} onValueChange={setDepartmentId}>
-                    <SelectTrigger className="w-full">
-                      <SelectValue placeholder="选择业务部门" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {businessDepartments.map((d) => (
-                        <SelectItem key={d.id} value={String(d.id)}>
-                          {d.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              ) : (
-                <p className="rounded-[10px] bg-[#f6f6f6] px-[10px] py-[8px] text-[12px] text-[#858b9c]">
-                  系统管理员会自动归属到 system 部门。
-                </p>
-              )}
-            </>
-          )}
-          {!sysAdmin && (
-            <p className="text-[11px] text-[#858b9c]">
-              部门管理员只能创建本部门的普通用户。
-            </p>
-          )}
+          <div className="grid gap-[6px]">
+            <Label className="text-[12px] text-[#464c5e]">部门</Label>
+            <Select value={departmentId} onValueChange={setDepartmentId}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="选择业务部门" />
+              </SelectTrigger>
+              <SelectContent>
+                {businessDepartments.map((d) => (
+                  <SelectItem key={d.id} value={String(d.id)}>
+                    {d.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </div>
         <div className="flex items-center justify-end gap-[8px] px-[24px] pb-[20px]">
           <Button

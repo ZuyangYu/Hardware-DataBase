@@ -246,6 +246,27 @@ export default function ChatPage({
     setDocumentContextLabel(null);
   }, [kbName]);
 
+  const wikiAssistKey = `hdb.wikiAssist.${mountedKbName || '__general__'}`;
+  const [wikiAvailable, setWikiAvailable] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!mountedKbName) {
+      setWikiAvailable(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get<{ total_pages: number }>(`/api/v1/kbs/${encodeURIComponent(mountedKbName)}/wiki/stats`)
+      .then((stats) => {
+        if (!cancelled) setWikiAvailable((stats.total_pages ?? 0) > 0);
+      })
+      .catch(() => {
+        if (!cancelled) setWikiAvailable(null); // 查询失败不阻塞开关
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mountedKbName]);
+
   useEffect(() => {
     let cancelled = false;
     void api
@@ -262,6 +283,29 @@ export default function ChatPage({
     };
   }, []);
 
+  const [wikiAssist, setWikiAssist] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(wikiAssistKey) === '1';
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      setWikiAssist(window.localStorage.getItem(`hdb.wikiAssist.${mountedKbName || '__general__'}`) === '1');
+    } catch {
+      setWikiAssist(false);
+    }
+  }, [mountedKbName]);
+  const updateWikiAssist = (value: boolean) => {
+    setWikiAssist(value);
+    try {
+      window.localStorage.setItem(wikiAssistKey, value ? '1' : '0');
+    } catch {
+      // localStorage 不可用时仅当前会话生效
+    }
+  };
+
   const chat = useKbChat(mountedKbName, { documentContextEnabled: documentAuthoringEnabled });
   const {
     sessions,
@@ -270,6 +314,7 @@ export default function ChatPage({
     activeSessionId,
     selectSession,
     newConversation,
+    ensureSession,
     deleteSession,
     messages,
     messagesLoaded,
@@ -519,14 +564,12 @@ export default function ChatPage({
 
   async function handleAttachmentUpload(file: File) {
     if (attachmentUploadPending) return;
-    if (activeSessionId == null) {
-      notify.error('请先发送一条消息以创建会话，再添加附件');
-      return;
-    }
     attachmentMutationVersionRef.current += 1;
     setAttachmentUploadPending(true);
     try {
-      const created = await uploadAttachment(activeSessionId, file, {
+      // 空会话也允许挂附件:上传前按需建会话,不再要求先发一条消息。
+      const sessionId = await ensureSession();
+      const created = await uploadAttachment(sessionId, file, {
         clientRequestId: createClientRequestId(),
       });
       setDraftAttachments((previous) =>
@@ -665,6 +708,7 @@ export default function ChatPage({
           snapshots,
           documentContextOverride: context,
           documentFlowOverride: true,
+          wikiAssist,
         });
         // The template is now mounted as document context; keep the other
         // attachments selected so they stay available for later turns.
@@ -681,7 +725,7 @@ export default function ChatPage({
 
     const ids = selectedAttachments.map((item) => item.attachment_id);
     if (ids.length === 0) {
-      void send();
+      void send({ attachmentIds: [], wikiAssist });
       return;
     }
     const snapshots = selectedAttachments.map((item) => ({
@@ -690,7 +734,7 @@ export default function ChatPage({
       media_type: item.media_type,
       parse_status: item.parse_status,
     }));
-    void send({ attachmentIds: ids, snapshots });
+    void send({ attachmentIds: ids, snapshots, wikiAssist });
   }
 
   // ---- 消息编辑 ----
@@ -723,7 +767,7 @@ export default function ChatPage({
   // ---- 确认弹窗(单例 state,替代 window.confirm) ----
   const [extractConfirmOpen, setExtractConfirmOpen] = useState(false);
   const [extracting, setExtracting] = useState(false);
-  const [userMemoryTarget, setUserMemoryTarget] = useState<number | null>(null);
+  const [userMemoryTarget, setUserMemoryTarget] = useState<number[] | null>(null);
 
   async function runProjectExtraction() {
     if (activeSessionId == null || !mountedKbName) return;
@@ -743,11 +787,11 @@ export default function ChatPage({
     }
   }
 
-  async function runUserMemoryConsent(messageId: number) {
+  async function runUserMemoryConsent(messageIds: number[]) {
     if (activeSessionId == null) return;
     try {
       await api.post(`/api/v1/conversations/${activeSessionId}/memory-consents`, {
-        message_ids: [messageId],
+        message_ids: messageIds,
         reason: '对话页面明确创建个人记忆',
         request_id: `chat-consent-${Date.now()}`,
       });
@@ -806,6 +850,9 @@ export default function ChatPage({
           onToggleAutoExtract={handleToggleAutoExtract}
           sessionConsents={sessionConsents}
           onRevokeConsent={revokeSessionConsent}
+          wikiAssist={mountedKbName ? wikiAssist : undefined}
+          onWikiAssistChange={mountedKbName ? updateWikiAssist : undefined}
+          wikiAvailable={mountedKbName ? wikiAvailable : undefined}
           /* 导出任务中心嵌入页头,避免悬浮按钮遮挡右侧会话侧栏的新建按钮 */
           actions={<ExportTaskCenter variant="embedded" />}
         />
@@ -822,7 +869,7 @@ export default function ChatPage({
           traceSteps={traceSteps}
           traceByMessageId={traceByMessageId}
           degradedNotes={degradedNotes}
-          onCreateMemory={(messageId) => setUserMemoryTarget(messageId)}
+          onCreateMemory={(messageIds) => setUserMemoryTarget(messageIds)}
           onEditMessage={openEditMessage}
           onExport={handleExportMessage}
           onDownloadExport={(job) => void handleDownloadExport(job)}
@@ -905,7 +952,7 @@ export default function ChatPage({
           if (!next) setUserMemoryTarget(null);
         }}
         title="创建个人记忆"
-        description="记录所选消息为授权来源，提交后会生成可撤销的授权事件。"
+        description="记录本轮问答（提问与输出）为授权来源，提交后会生成可撤销的授权事件。"
         confirmText="创建个人记忆"
         destructive={false}
         onConfirm={() => {

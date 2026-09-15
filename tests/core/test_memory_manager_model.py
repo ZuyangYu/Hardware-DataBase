@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import src.settings as application_settings
+from src.core.llm_governor import PRIORITY_BATCH
 from src.memory import manager as memory_manager
 
 
@@ -17,7 +18,7 @@ def test_memory_model_uses_memory_profile_for_live_settings(monkeypatch):
     monkeypatch.setattr(memory_manager, "create_chat_model", fake_factory)
 
     assert memory_manager._memory_model(application_settings) is expected
-    assert calls == [{"profile": "memory"}]
+    assert calls == [{"profile": "memory", "priority": PRIORITY_BATCH}]
 
 
 def test_memory_model_keeps_injected_settings_inside_factory(monkeypatch):
@@ -32,4 +33,4 @@ def test_memory_model_keeps_injected_settings_inside_factory(monkeypatch):
     monkeypatch.setattr(memory_manager, "create_chat_model_for_settings", fake_factory)
 
     assert memory_manager._memory_model(injected) is expected
-    assert calls == [(injected, {"profile": "memory"})]
+    assert calls == [(injected, {"profile": "memory", "priority": PRIORITY_BATCH})]

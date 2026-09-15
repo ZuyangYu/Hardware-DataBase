@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterable
 from langmem import create_memory_store_manager
 
 from src.core.chat_model_runtime import ChatModelLike, instrument_chat_model
+from src.core.llm_governor import PRIORITY_BATCH
 from src.core.model_factory import create_chat_model, create_chat_model_for_settings
 from src.memory.catalog import MemoryCatalogRepository, memory_content_hash
 from src.memory.prompts import PROJECT_MEMORY_INSTRUCTIONS, USER_MEMORY_INSTRUCTIONS
@@ -41,11 +42,13 @@ def _memory_model(settings):
 
     try:
         if settings is application_settings:
-            return create_chat_model(profile="memory")
+            return create_chat_model(profile="memory", priority=PRIORITY_BATCH)
         # Isolated workers/tests may provide a settings object. Keep that
         # injection point inside the factory instead of rebuilding providers
         # in the memory domain module.
-        return create_chat_model_for_settings(settings, profile="memory")
+        return create_chat_model_for_settings(
+            settings, profile="memory", priority=PRIORITY_BATCH
+        )
     except Exception as exc:
         raise MemoryExtractionError(str(exc)) from exc
 

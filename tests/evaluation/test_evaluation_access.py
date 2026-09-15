@@ -89,7 +89,7 @@ def test_normalization_uses_selected_scope_and_drops_foreign_dataset_permissions
     context = build_evaluation_context(normalized)
 
     assert context.user_id == "evaluation"
-    assert context.roles == ["user"]
+    assert context.roles == ["employee"]
     assert context.metadata["department_id"] == 100
     assert context.allowed_kbs == ["100:ADAS"]
     assert context.kb_permissions == {"100:ADAS": "read"}

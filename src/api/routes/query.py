@@ -577,6 +577,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             turn.query_mode,
             cancelled,
             persist_thread=True,
+            wiki_assist=turn.wiki_assist,
             document_context=document_context,
             document_flow=document_flow,
             attachments=attachment_refs,
@@ -850,6 +851,7 @@ def create_turn(
         body.client_request_id,
         query_mode,
         trace_context=trace_context,
+        wiki_assist=body.wiki_assist,
         document_context=document_context,
         attachment_ids=[ref.attachment_id for ref in attachment_refs],
         source_scope=effective_scope,
@@ -1184,7 +1186,8 @@ async def query(
                 body.thread_id,
                 _forward_event,
                 "deep",
-                None,
+                cancel.is_set,
+                wiki_assist=body.wiki_assist,
                 document_context=document_context,
                 document_flow=body.document_flow,
             )
@@ -1329,6 +1332,7 @@ def _query_generator(
     query_mode="deep",
     should_cancel=None,
     persist_thread=False,
+    wiki_assist=False,
     document_context=None,
     document_flow=None,
     attachments=None,
@@ -1348,6 +1352,8 @@ def _query_generator(
             kwargs["should_cancel"] = should_cancel
         if persist_thread and "persist_thread" in params:
             kwargs["persist_thread"] = True
+        if "wiki_assist" in params:
+            kwargs["wiki_assist"] = wiki_assist
         if "document_context" in params:
             kwargs["document_context"] = document_context
         if "document_flow" in params:
@@ -1374,6 +1380,8 @@ def _query_generator(
         kwargs["should_cancel"] = should_cancel
     if persist_thread and "persist_thread" in params:
         kwargs["persist_thread"] = True
+    if "wiki_assist" in params:
+        kwargs["wiki_assist"] = wiki_assist
     if "document_context" in params:
         kwargs["document_context"] = document_context
     if "document_flow" in params:

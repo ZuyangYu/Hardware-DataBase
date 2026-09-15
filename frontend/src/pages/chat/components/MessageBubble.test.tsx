@@ -17,9 +17,49 @@ describe('assistant result exports', () => {
     const html = renderToStaticMarkup(
       <MessageBubble msg={message} onExport={() => undefined} exportJobs={[]} />,
     );
-    expect(html).toContain('导出结果');
-    expect(html).toContain('Markdown');
-    expect(html).toContain('Excel');
+    expect(html).toContain('导出对话');
+    expect(html).not.toContain('选择导出格式');
+  });
+
+  it('renders 创建个人记忆 alongside 导出对话 in the answer action row', () => {
+    const message: MessageView = {
+      id: 42,
+      session_id: 7,
+      turn_id: 'turn-42',
+      role: 'assistant',
+      content: '检索结果',
+      created_at: '2026-09-02T00:00:00Z',
+    };
+    const html = renderToStaticMarkup(
+      <MessageBubble
+        msg={message}
+        onCreateMemory={() => undefined}
+        memorySourceMessageIds={[41, 42]}
+        onExport={() => undefined}
+        exportJobs={[]}
+      />,
+    );
+    expect(html).toContain('创建个人记忆');
+    expect(html).toContain('导出对话');
+  });
+
+  it('places the export entry below the answer and above the retrieval overview', () => {
+    const message: MessageView = {
+      id: 42,
+      session_id: 7,
+      turn_id: 'turn-42',
+      role: 'assistant',
+      content: '检索结果',
+      footer: '检索来源：spec.docx',
+      created_at: '2026-09-02T00:00:00Z',
+    };
+    const html = renderToStaticMarkup(
+      <MessageBubble msg={message} onExport={() => undefined} exportJobs={[]} />,
+    );
+    const exportIndex = html.indexOf('导出对话');
+    const overviewIndex = html.indexOf('检索概览');
+    expect(exportIndex).toBeGreaterThan(html.indexOf('检索结果'));
+    expect(overviewIndex).toBeGreaterThan(exportIndex);
   });
 
   it('renders a downloadable artifact state from the durable export job', () => {

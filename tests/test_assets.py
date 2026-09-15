@@ -5,7 +5,7 @@ import unittest
 
 import src.settings
 from src.core.assets import AssetService, AssetSource, classify_asset_source
-from src.core.auth import AuthService, ROLE_DEPT_ADMIN
+from src.core.auth import AuthService, ROLE_EMPLOYEE
 
 
 class AssetServiceTests(unittest.TestCase):
@@ -17,7 +17,7 @@ class AssetServiceTests(unittest.TestCase):
         self.auth = AuthService(db_path=self.db_path)
         system_admin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         self.department = self.auth.create_department("hardware")
-        self.admin = self.auth.create_user_as(system_admin, "hardware_admin", "password123", ROLE_DEPT_ADMIN, self.department.id)
+        self.admin = self.auth.create_user_as(system_admin, "hardware_admin", "password123", ROLE_EMPLOYEE, self.department.id)
         self.auth.register_knowledge_base("hardware-kb", owner=self.admin)
         self.kb_id = self.auth.get_knowledge_base_id("hardware-kb", department_id=self.department.id)
         self.service = AssetService(db_path=self.db_path)

@@ -13,7 +13,6 @@ from src.document_authoring.generation_sessions import GenerationSessionStore
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.models import KnowledgeBaseSourceSnapshot
 from src.document_authoring.planning.intake import OutputSpecIntakeService
-from src.document_authoring.planning.models import OutputSpec
 from src.document_authoring.planning.service import TemplateFreePlanningAdapter
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.tasks import DocumentTaskStore

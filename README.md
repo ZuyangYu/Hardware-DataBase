@@ -210,9 +210,6 @@ A: 当前检索后端为 RAGFlow，请按顺序排查：1) RAGFlow 服务是否�
 **Q: Agent 响应很慢或超时？**
 A: 可适当调大 `AGENT_TIMEOUT_SECONDS`；`AGENT_MAX_RETRIEVAL_ROUNDS` 现在直接决定 agent 循环的 `recursion_limit` 预算——调大检索会更充分但更慢，调小则更快但可能检索不足；确认 LLM 模型（Ollama 或 custom API）的响应速度。
 
-**Q: RAGFlow 日志出现 SiliconFlow `connect timeout=30`？**
-A: 这是 RAGFlow 容器内部到 SiliconFlow 的请求超时，不是本项目的 `RAGFLOW_TIMEOUT_SECONDS`。部署配置在 RAGFlow compose 目录的 `.env` 中设置 `SILICONFLOW_EMBEDDING_TIMEOUT_SECONDS=100`；`deploy/ragflow/embedding_model.py` 通过只读挂载覆盖 RAGFlow v0.26.4 的硬编码值。修改后需重建 `ragflow-cpu` 容器。
-
 **Q: 首次启动后无法使用问答？**
 A: 请先以系统管理员进入「系统配置」检查并补全 RAGFlow 与 Agent 模型配置，保存后生效。
 
@@ -236,7 +233,7 @@ uv run hardware-database-eval score --dataset evaluation/datasets/hardware_qa_v1
 
 默认只生成 JSON、CSV 和 HTML 报告。需要在 CI 中启用阈值门禁时添加 `--fail-on-threshold`。可用 `--tag`、`--sample-id`、`--metric` 和 `--threshold faithfulness=0.8` 过滤或覆盖评分设置。
 
-裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。前端「RAGAS 评估」页面仅系统管理员可见。页面创建评估时会先选择已登记知识库并执行预检，服务端按稳定 `kb_id` 绑定知识库，部门管理员和普通用户仍没有 RAGAS 入口。
+裁判 LLM 默认复用 `AGENT_*`。Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY` 和 `EVAL_EMBEDDING_MODEL` 显式配置；完整示例见 `.env.example`。前端「RAGAS 评估」页面仅系统管理员可见。页面创建评估时会先选择已登记知识库并执行预检，服务端按稳定 `kb_id` 绑定知识库，员工没有 RAGAS 入口。
 
 管理员可在该页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”均为协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效；“取消”不会删除 `snapshot.jsonl`；“继续”会跳过其中已成功的样本。已完成、失败和已取消的历史运行可以删除，运行目录外的共享快照不受影响。历史对比默认严格校验知识库、样本集和模型配置，也可以明确选择带警告的“仅查看对比”。在线运行先采集回答和检索证据，进入采集质检状态后再由管理员点击“开始评分”；评分依赖和裁判模型预检只在真正进入评分阶段时执行。
 

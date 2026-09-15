@@ -20,7 +20,7 @@ from typing import Any, Iterable
 import src.settings as settings
 from langgraph.store.base import SearchItem
 
-from src.core.auth import ROLE_DEPT_ADMIN, ROLE_SYSTEM_ADMIN, AuthService, AuthUser
+from src.core.auth import ROLE_EMPLOYEE, ROLE_SYSTEM_ADMIN, AuthService, AuthUser
 from src.memory.catalog import (
     ACTIVE_MEMORY_STATUSES,
     MemoryCatalogRepository,
@@ -233,22 +233,11 @@ class MemoryService:
             if actor.role == ROLE_SYSTEM_ADMIN or str(actor.department_id) != str(record.department_id):
                 return False
             with closing(self.auth._connect()) as conn:
-                if actor.role == ROLE_DEPT_ADMIN:
-                    # Department admins have an implicit admin grant over
-                    # every KB in their department; that grant is not stored
-                    # as a row in kb_permissions.
-                    row = conn.execute(
-                        "SELECT 1 FROM knowledge_bases WHERE id = ? AND department_id = ?",
-                        (_safe_int(record.kb_id), _safe_int(actor.department_id)),
-                    ).fetchone()
-                else:
-                    row = conn.execute(
-                        """SELECT 1 FROM kb_permissions p
-                           JOIN knowledge_bases kb ON kb.id = p.kb_id
-                           WHERE p.user_id = ? AND p.kb_id = ?
-                             AND p.permission IN ('read', 'write', 'admin')""",
-                        (actor.id, _safe_int(record.kb_id)),
-                    ).fetchone()
+                # 员工对本部门全部知识库有隐式 admin 权限(不落授权表)。
+                row = conn.execute(
+                    "SELECT 1 FROM knowledge_bases WHERE id = ? AND department_id = ?",
+                    (_safe_int(record.kb_id), _safe_int(actor.department_id)),
+                ).fetchone()
             return row is not None
         try:
             scope = self._project_scope(request_context, kb_name=kb_name, require_read=True, actor=actor)
@@ -274,7 +263,7 @@ class MemoryService:
             return record.user_id == self._resolve_user_id(request_context, actor)
         if not isinstance(actor, AuthUser):
             return False
-        if actor.role == ROLE_DEPT_ADMIN and str(actor.department_id) == str(record.department_id):
+        if actor.role == ROLE_EMPLOYEE and str(actor.department_id) == str(record.department_id):
             return True
         if request_context is None:
             if str(actor.department_id) != str(record.department_id):
@@ -286,12 +275,7 @@ class MemoryService:
                 ).fetchone()
             if kb is None:
                 return False
-            if actor.role == ROLE_DEPT_ADMIN:
-                return True
-            permission = self.auth.get_kb_permissions_for_user(actor).get(
-                f"{actor.department_id}:{kb['name']}"
-            )
-            return permission == "admin"
+            return actor.role == ROLE_EMPLOYEE
         try:
             scope = self._project_scope(request_context, kb_name=kb_name, require_read=False, actor=actor)
         except MemoryAuthorizationError:

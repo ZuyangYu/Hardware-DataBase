@@ -20,7 +20,7 @@ const auth: AuthSession = {
   token: 'test-token',
   user: {
     username: 'alice',
-    role: 'user',
+    role: 'employee',
     department_id: null,
     department_name: null,
   },

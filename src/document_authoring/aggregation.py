@@ -75,7 +75,7 @@ class DocumentAggregator:
                 continue
             display = typed.display_value if typed is not None else (draft.content or "")
             if not str(display).strip():
-                missing_items.extend(_missing_for_requirement(normalized_unit_id, requirement))
+                missing_items.extend(_missing_for_requirement(unit_id, requirement))
                 continue
             block_kind = str(_value(unit, "kind", "paragraph"))
             if block_kind == "section":

@@ -54,6 +54,17 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return {"Authorization": f"Bearer {response.json()['token']}"}
 
+    def _system_headers(self):
+        response = self.client.post(
+            "/api/v1/login",
+            json={
+                "username": src.settings.AUTH_DEFAULT_ADMIN_USERNAME,
+                "password": "StrongTestPassword123!",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return {"Authorization": f"Bearer {response.json()['token']}"}
+
     def test_create_answer_and_confirm_clarification_session(self):
         calls: list[tuple[str, object]] = []
         self.stub.create_document_generation_session = lambda ctx, **kwargs: (
@@ -128,8 +139,9 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
             "clarification-request-1",
         )
 
-    def test_session_creation_requires_write_permission(self):
-        headers = self._headers()
+    def test_session_creation_system_admin_forbidden(self):
+        # 系统管理员是治理角色, 不得写 KB 内容; 员工才持有写权限。
+        headers = self._system_headers()
         response = self.client.post(
             "/api/v1/document-generation/sessions?kb=shared",
             headers=headers,
@@ -296,10 +308,10 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
         )
         self.assertEqual(missing.status_code, 404, missing.text)
 
-    def test_work_order_creation_requires_write_permission(self):
+    def test_work_order_creation_system_admin_forbidden(self):
         response = self.client.post(
             "/api/v1/document-generation/work-orders?kb=shared",
-            headers=self._headers(),
+            headers=self._system_headers(),
             json={
                 "template_version_id": "tv1",
                 "document_schema_id": "schema-1",
@@ -731,17 +743,17 @@ class DocumentGenerationSessionApiTests(unittest.TestCase):
             "status": "queued",
         })
 
-    def test_generation_start_requires_write_permission(self):
+    def test_generation_start_system_admin_forbidden(self):
         response = self.client.post(
             "/api/v1/document-generation/work-orders/wo-1/generate?kb=shared",
-            headers=self._headers(),
+            headers=self._system_headers(),
             json={},
         )
 
         self.assertEqual(response.status_code, 403, response.text)
 
-    def test_other_document_mutations_require_write_permission(self):
-        headers = self._headers()
+    def test_other_document_mutations_system_admin_forbidden(self):
+        headers = self._system_headers()
         requests = [
             (
                 "/api/v1/document-generation/work-orders/wo-1/icd-scope-resolution?kb=shared",

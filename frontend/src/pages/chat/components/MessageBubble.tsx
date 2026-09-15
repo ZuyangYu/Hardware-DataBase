@@ -41,7 +41,9 @@ type Props = {
   /** 通用对话不展示内部执行轨迹和检索概要。 */
   showDiagnostics?: boolean;
   /** 为当前用户把一条已完成消息提交到明确的个人记忆授权确认流。 */
-  onCreateMemory?: (messageId: number) => void;
+  onCreateMemory?: (messageIds: number[]) => void;
+  /** 本轮问答的消息 id(提问在前、输出在后);个人记忆授权来源必须包含输出。 */
+  memorySourceMessageIds?: number[];
   /** 打开消息编辑对话框(仅本人 user 消息)。 */
   onEditMessage?: (messageId: number) => void;
   /** 为已完成助手轮次创建一个后台导出任务。 */
@@ -378,6 +380,7 @@ function MessageBubble({
   degradedNotes = [],
   showDiagnostics = true,
   onCreateMemory,
+  memorySourceMessageIds,
   onEditMessage,
   onExport,
   onDownload,
@@ -419,18 +422,31 @@ function MessageBubble({
             <div className="grid gap-[12px]" data-i18n-ignore>
               {showDiagnostics && traceSteps.length > 0 && <StepGroup steps={traceSteps} />}
               <MarkdownMessage content={msg.content} />
+              {msg.memory_context && msg.memory_context.length > 0 && (
+                <MemoryContextBlock memories={msg.memory_context} />
+              )}
+              {((onCreateMemory && memorySourceMessageIds?.length) || (onExport && msg.turn_id)) && (
+                <div className="flex flex-wrap items-center gap-[14px]">
+                  {onCreateMemory && memorySourceMessageIds?.length ? (
+                    <button
+                      type="button"
+                      onClick={() => onCreateMemory(memorySourceMessageIds)}
+                      title="将本轮提问记录为个人记忆来源"
+                      className="inline-flex items-center gap-[5px] border-0 bg-transparent p-0 text-[11px] text-[#858b9c] transition-colors hover:text-[#18181a] hover:underline"
+                    >
+                      <AppIcon name="user" size={13} />
+                      创建个人记忆
+                    </button>
+                  ) : null}
+                  {onExport && msg.turn_id && (
+                    <ExportMenu formats={exportFormats} onExport={(format) => onExport(msg, format)} />
+                  )}
+                </div>
+              )}
               {showDiagnostics && msg.footer && (
                 <CollapsibleSection title="检索概览" className="border-t border-[#e3e7f1] pt-[10px]">
                   <MarkdownMessage content={msg.footer} />
                 </CollapsibleSection>
-              )}
-              {msg.memory_context && msg.memory_context.length > 0 && (
-                <MemoryContextBlock memories={msg.memory_context} />
-              )}
-              {onExport && msg.turn_id && (
-                <div className="border-t border-[#e3e7f1] pt-[10px]">
-                  <ExportMenu formats={exportFormats} onExport={(format) => onExport(msg, format)} />
-                </div>
               )}
               <ExportJobs
                 jobs={exportJobs ?? []}
@@ -489,26 +505,15 @@ function MessageBubble({
                   })}
                 </div>
               )}
-              {msg.role === 'user' && msg.id > 0 && !msg.redacted && (
+              {msg.role === 'user' && msg.id > 0 && !msg.redacted && onEditMessage && (
                 <div className="flex items-center justify-end gap-[10px]">
-                  {onEditMessage && (
-                    <button
-                      type="button"
-                      onClick={() => onEditMessage(msg.id)}
-                      className="w-fit text-[11px] text-[#858b9c] underline-offset-2 transition-colors hover:text-[#1d4ed8] hover:underline"
-                    >
-                      编辑
-                    </button>
-                  )}
-                  {onCreateMemory && (
-                    <button
-                      type="button"
-                      onClick={() => onCreateMemory(msg.id)}
-                      className="w-fit text-[11px] text-[#858b9c] underline-offset-2 transition-colors hover:text-[#1d4ed8] hover:underline"
-                    >
-                      创建个人记忆
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => onEditMessage(msg.id)}
+                    className="w-fit text-[11px] text-[#858b9c] underline-offset-2 transition-colors hover:text-[#1d4ed8] hover:underline"
+                  >
+                    编辑
+                  </button>
                 </div>
               )}
             </div>

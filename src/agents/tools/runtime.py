@@ -38,6 +38,7 @@ TOOL_LABELS = {
     "attachment_visual_analyze": "附件视觉分析",
     "request_attachment_release": "附件发布申请",
     "attachment_revision_history": "附件修订历史",
+    "wiki_search": "Wiki 检索",
 }
 
 MAX_MEMORY_CONTEXT_CONTENT_CHARS = 2_000

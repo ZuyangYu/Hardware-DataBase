@@ -4,7 +4,17 @@
 set -u
 
 APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$APP_ROOT"
+cd "$APP_ROOT" || exit 1
+
+# 允许 .env 中的 HDB_* 覆盖监听端口(只读取白名单键, 不 source 整个 .env,
+# 避免把带 $ 的提示词等应用配置展开进 shell)。多 checkout 共存时端口互不冲突。
+if [ -f "$APP_ROOT/.env" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT) export "$key=$value" ;;
+    esac
+  done < <(grep -E '^(HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT)=' "$APP_ROOT/.env" 2>/dev/null || true)
+fi
 
 API_HOST="${HDB_API_HOST:-127.0.0.1}"
 API_PORT="${HDB_API_PORT:-8001}"
@@ -75,7 +85,7 @@ worker_pid_files() {
 }
 
 is_managed_worker_pid() {
-  local pid="$1" pid_file candidate
+  local pid="$1" pid_file
   for pid_file in $(worker_pid_files); do
     if [ "$pid" = "$(sed -n '1p' "$pid_file" 2>/dev/null || true)" ]; then return 0; fi
   done
@@ -134,8 +144,8 @@ stop_worker_processes() {
 }
 
 wait_for() {
-  local check_fn="$1" attempts="$2" i
-  for i in $(seq 1 "$attempts"); do
+  local check_fn="$1" attempts="$2"
+  for _ in $(seq 1 "$attempts"); do
     if "$check_fn"; then return 0; fi
     sleep 1
   done

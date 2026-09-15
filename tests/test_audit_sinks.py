@@ -16,7 +16,7 @@ import httpx
 from src.api.app import create_app
 from src.api.deps import get_auth_service, get_pipeline
 from src.core.app_logs import AppLogService
-from src.core.auth import ROLE_DEPT_ADMIN, ROLE_USER
+from src.core.auth import ROLE_EMPLOYEE
 
 from tests._api_stub import Server, StubPipeline, make_auth
 
@@ -112,7 +112,7 @@ class AuditSinkTests(unittest.TestCase):
     def test_create_user_records_audit_no_double_write(self):
         sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
-        self.auth.create_user_as(sysadmin, "newuser", "pw123456", ROLE_DEPT_ADMIN, self.dept.id)
+        self.auth.create_user_as(sysadmin, "newuser", "pw123456", ROLE_EMPLOYEE, self.dept.id)
         new_events = self._new_actions(before)
         # Exactly one create_user audit row -- the UI call was removed, so only
         # the sunk backend audit remains.
@@ -123,13 +123,6 @@ class AuditSinkTests(unittest.TestCase):
         before = len(self._audit_actions())
         self.auth.create_department_as(sysadmin, "newdept")
         self.assertIn("create_department", self._new_actions(before))
-
-    def test_grant_kb_permission_records_audit(self):
-        # grant_kb_permission_as requires a dept_admin actor for content perms.
-        before = len(self._audit_actions())
-        self.auth.grant_kb_permission_as(self.admin, "shared", self.user.id, "write")
-        new_events = self._new_actions(before)
-        self.assertEqual(new_events.count("grant_kb_permission"), 1)
 
     def test_set_user_active_records_audit(self):
         sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
@@ -144,27 +137,22 @@ class AuditSinkTests(unittest.TestCase):
         self.assertIn("reset_user_password", self._new_actions(before))
 
     def test_assign_kb_records_audit(self):
-        # assign_knowledge_base_as strips cross-department perms and must be
-        # audited (was a silent gap before the fix).
+        # assign_knowledge_base_as (sysadmin KB mounting) must be audited.
         sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.assign_knowledge_base_as(sysadmin, "shared", self.dept.id)
         new_events = self._new_actions(before)
         self.assertIn("assign_kb", new_events)
-        # metadata must carry the removed_cross_dept_perms flag so an
-        # operator scanning the log can see the side effect.
         metadata = self._latest_metadata("assign_kb")
-        self.assertTrue(metadata.get("removed_cross_dept_perms"))
         self.assertEqual(metadata.get("department_id"), self.dept.id)
 
     def test_permission_denied_records_audit(self):
-        # Permission checks now live inside the audit-sunk try block (aligned
-        # with grant_kb_permission_as), so a denied attempt IS recorded with
-        # success=False -- useful for spotting a stolen token probing endpoints.
-        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        # Permission checks now live inside the audit-sunk try block, so a denied
+        # attempt IS recorded with success=False -- useful for spotting a stolen
+        # token probing endpoints. Employees cannot register accounts.
         before = len(self._audit_actions())
         with self.assertRaises(PermissionError):
-            self.auth.create_user_as(sysadmin, "should_fail", "pw123456", ROLE_USER)
+            self.auth.create_user_as(self.admin, "should_fail", "pw123456", ROLE_EMPLOYEE, self.dept.id)
         new_events = self._new_actions(before)
         self.assertIn("create_user", new_events)
 
@@ -215,13 +203,16 @@ class DepartmentPermissionTests(unittest.TestCase):
         r = self.client.get("/api/v1/departments", headers=self._auth(t))
         self.assertEqual(r.status_code, 403)
 
-    def test_dept_admin_lists_own_department_only(self):
+    def test_department_list_requires_system_admin(self):
         t = self._token("admin1")
         r = self.client.get("/api/v1/departments", headers=self._auth(t))
-        self.assertEqual(r.status_code, 200)
-        names = [d["name"] for d in r.json()]
-        # dept_admin sees only their own department, not system.
-        self.assertEqual(names, ["hw"])
+        self.assertEqual(r.status_code, 403)
+        admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r2 = self.client.get("/api/v1/departments", headers=self._auth(admin_token))
+        self.assertEqual(r2.status_code, 200)
+        names = [d["name"] for d in r2.json()]
+        self.assertIn("hw", names)
+        self.assertIn("system", names)
 
     def test_change_settings_records_audit(self):
         # PUT /config must record a change_settings audit (was missing on the
@@ -258,21 +249,13 @@ class DepartmentPermissionTests(unittest.TestCase):
         names = [k["name"] for k in r.json()]
         self.assertIn("shared", names)
 
-    def test_user_cannot_access_governance(self):
-        # governance endpoints must be admin-only (was: any authenticated user).
+    def test_employee_governance_is_department_scoped(self):
+        # 员工保留原部门管理员的部门级治理视图(统计只含本部门 KB)。
         t = self._token("user1")
         r1 = self.client.get("/api/v1/governance/stats", headers=self._auth(t))
         r2 = self.client.get("/api/v1/governance/kb-summaries", headers=self._auth(t))
-        self.assertEqual(r1.status_code, 403)
-        self.assertEqual(r2.status_code, 403)
-
-    def test_kb_permissions_requires_read(self):
-        # user1 has read on 'shared' -> can list perms; a KB they lack read on
-        # must 403. user1 has read on shared (granted in make_auth), so this
-        # asserts the read check passes for an authorised user.
-        t = self._token("user1")
-        r = self.client.get("/api/v1/kbs/shared/permissions", headers=self._auth(t))
-        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
 
     def test_kb_summaries_carry_anomaly_fields(self):
         # KbSummaryView must expose files/failed/parsing/issue_flags so the
@@ -286,30 +269,31 @@ class DepartmentPermissionTests(unittest.TestCase):
         for field in ("files", "failed", "parsing", "issue_flags"):
             self.assertIn(field, entry)
 
-    def test_dept_admin_users_excludes_admins_by_default(self):
-        # dept_admin should see only ROLE_USER unless include_admins=true.
+    def test_user_listing_is_system_admin_only(self):
         t = self._token("admin1")
         r = self.client.get("/api/v1/users", headers=self._auth(t))
-        self.assertEqual(r.status_code, 200)
-        roles = [u["role"] for u in r.json()]
-        self.assertTrue(roles, "expected at least one user")
-        self.assertNotIn("dept_admin", roles)
-        # Opt-in to admins.
-        r2 = self.client.get("/api/v1/users?include_admins=true", headers=self._auth(t))
-        roles2 = [u["role"] for u in r2.json()]
-        self.assertIn("dept_admin", roles2)
+        self.assertEqual(r.status_code, 403)
+        admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r2 = self.client.get("/api/v1/users", headers=self._auth(admin_token))
+        self.assertEqual(r2.status_code, 200)
+        roles = {u["role"] for u in r2.json()}
+        self.assertTrue(roles <= {"system_admin", "employee"})
+        self.assertIn("employee", roles)
 
-    def test_parse_tasks_requires_write(self):
-        # list_parse_tasks was tightened from read to write (mirrors Streamlit).
-        user_token = self._token("user1")  # read only on shared
-        admin_token = self._token("admin1")  # write (admin) on shared
+    def test_parse_tasks_requires_employee(self):
+        # 员工对部门 KB 隐式 admin -> parse-tasks 可读; 系统管理员被 kb 内容铁律拒绝。
         self.assertEqual(
-            self.client.get("/api/v1/kbs/shared/parse-tasks", headers=self._auth(user_token)).status_code,
-            403,
+            self.client.get("/api/v1/kbs/shared/parse-tasks", headers=self._auth(self._token("user1"))).status_code,
+            200,
         )
         self.assertEqual(
-            self.client.get("/api/v1/kbs/shared/parse-tasks", headers=self._auth(admin_token)).status_code,
+            self.client.get("/api/v1/kbs/shared/parse-tasks", headers=self._auth(self._token("admin1"))).status_code,
             200,
+        )
+        admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        self.assertEqual(
+            self.client.get("/api/v1/kbs/shared/parse-tasks", headers=self._auth(admin_token)).status_code,
+            403,
         )
 
     def test_evaluation_create_run_validates_body(self):
@@ -346,7 +330,6 @@ class DepartmentPermissionTests(unittest.TestCase):
         h = self._auth(token)
         for path in (
             "/api/v1/kbs",
-            "/api/v1/kbs/shared/permissions",
             "/api/v1/governance/stats",
             "/api/v1/governance/kb-summaries",
             "/api/v1/users",
@@ -420,21 +403,6 @@ class DepartmentPermissionTests(unittest.TestCase):
         finally:
             upload_mod.MAX_UPLOAD_BYTES = original
 
-    def test_revoke_kb_permission(self):
-        # After granting user1 read on shared (in make_auth), revoke and verify
-        # they lose access to /kbs/shared/files.
-        t_admin = self._token("admin1")
-        r = self.client.delete(
-            f"/api/v1/kbs/shared/permissions/{self.user.id}",
-            headers=self._auth(t_admin),
-        )
-        self.assertEqual(r.status_code, 200, r.text)
-        # user1 no longer has read.
-        t_user = self._token("user1")
-        r2 = self.client.get("/api/v1/kbs/shared/files", headers=self._auth(t_user))
-        self.assertEqual(r2.status_code, 403)
-
-
 class SchemaValidationTests(unittest.TestCase):
     """role/permission enums reject invalid values with 422."""
 
@@ -476,9 +444,18 @@ class SchemaValidationTests(unittest.TestCase):
     def _auth(self, token: str) -> dict:
         return {"Authorization": f"Bearer {token}"}
 
+    def test_system_admin_role_creation_rejected(self):
+        # 只允许注册员工; system_admin 账号由部署环境管理, API 直接 422。
+        admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.post(
+            "/api/v1/users",
+            json={"username": "admin2", "password": "pw123456", "role": "system_admin"},
+            headers=self._auth(admin_token),
+        )
+        self.assertEqual(r.status_code, 422)
+
     def test_invalid_role_rejected(self):
-        # Log in as system_admin to pass the require_any_admin guard, then try
-        # to create a user with an invalid role -> 422 from pydantic Literal.
+        # 系统管理员调 POST /users, 非法 role -> 422 from pydantic Literal.
         admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.post(
             "/api/v1/users",
@@ -486,16 +463,6 @@ class SchemaValidationTests(unittest.TestCase):
             headers=self._auth(admin_token),
         )
         self.assertEqual(r.status_code, 422)
-
-    def test_invalid_permission_rejected(self):
-        t = self._token("admin1")
-        r = self.client.post(
-            "/api/v1/kbs/shared/permissions",
-            json={"user_id": self.user.id, "permission": "owner"},
-            headers=self._auth(t),
-        )
-        self.assertEqual(r.status_code, 422)
-
 
 class QueryTraceTests(unittest.TestCase):
     """POST /query writes a query trace + evidence (fail-soft)."""

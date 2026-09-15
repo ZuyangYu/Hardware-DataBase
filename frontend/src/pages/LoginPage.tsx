@@ -1,6 +1,6 @@
 import { useState, type CSSProperties, type FormEvent } from 'react';
 
-import { api } from '../api/client';
+import { ApiError, api } from '../api/client';
 import type { LoginResponse } from '../api/types';
 import type { AuthSession } from '../auth';
 import { notify } from '@/components/ui/app-toast';
@@ -146,7 +146,8 @@ export default function LoginPage({ onLogin }: { onLogin: (session: AuthSession)
       onLogin({ token: resp.token, user: resp.user });
       notify.success(`欢迎,${resp.user.username}`);
     } catch (error) {
-      setErrorText(error instanceof Error ? error.message : '登录失败');
+      // 后端 401 detail 为具体中文原因(密码错误/账号停用/临时锁定)
+      setErrorText(error instanceof ApiError ? error.message : '无法连接服务器,请稍后重试');
     } finally {
       setSubmitting(false);
     }

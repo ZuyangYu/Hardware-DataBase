@@ -174,12 +174,173 @@ class ConfirmAssetCandidateRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Document assets: logical documents with version chain, lifecycle and links
+# ---------------------------------------------------------------------------
+
+DocCategory = Literal[
+    "design_doc", "schematic", "bom", "netlist", "test_report", "requirement", "standard", "other"
+]
+DocRelationType = Literal["derived_from", "companion", "references", "verified_by"]
+
+
+class DocAssetVersionView(BaseModel):
+    id: int
+    asset_id: int
+    version_no: int
+    file_id: str = ""
+    file_name: str = ""
+    content_hash: str = ""
+    parse_status: str = ""
+    note: str = ""
+    state: str = "draft"
+    uploaded_by_user_id: int | None = None
+    uploaded_at: str
+
+
+class DocAssetEventView(BaseModel):
+    id: int
+    asset_id: int
+    version_id: int | None = None
+    event: str
+    actor_user_id: int | None = None
+    comment: str = ""
+    created_at: str
+
+
+class DocAssetLinkView(BaseModel):
+    id: int
+    from_asset_id: int
+    to_asset_id: int
+    rel_type: str
+    note: str = ""
+    source: str = "manual"
+    status: str = "confirmed"
+    created_at: str
+    to_title: str = ""
+    to_category: str = ""
+    to_kb_name: str = ""
+
+
+class DocAssetView(BaseModel):
+    id: int
+    department_id: int
+    kb_id: int
+    kb_name: str = ""
+    project: str = ""
+    doc_no: str = ""
+    title: str
+    category: str = "other"
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    lifecycle_status: str = "draft"
+    current_version_id: int | None = None
+    owner_user_id: int | None = None
+    version_count: int = 0
+    effective_version_no: int | None = None
+    created_at: str
+    updated_at: str
+
+
+class DocAssetDetailView(DocAssetView):
+    versions: list[DocAssetVersionView] = Field(default_factory=list)
+    events: list[DocAssetEventView] = Field(default_factory=list)
+    links_out: list[DocAssetLinkView] = Field(default_factory=list)
+    links_in: list[DocAssetLinkView] = Field(default_factory=list)
+
+
+class UpdateDocAssetRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    doc_no: str | None = Field(default=None, max_length=100)
+    category: DocCategory | None = None
+    project: str | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    tags: list[str] | None = Field(default=None, max_length=20)
+
+
+class AddDocAssetVersionRequest(BaseModel):
+    file_id: str = Field(min_length=1, max_length=300)
+    note: str = Field(default="", max_length=500)
+
+
+class CreateDocAssetLinkRequest(BaseModel):
+    to_asset_id: int
+    rel_type: DocRelationType
+    note: str = Field(default="", max_length=500)
+
+
+# ---------------------------------------------------------------------------
+# Wiki knowledge layer (WeKnora-style distillation)
+# ---------------------------------------------------------------------------
+
+WikiPageType = Literal["summary", "entity", "concept", "index"]
+WikiPageStatus = Literal["draft", "published", "archived"]
+
+
+class WikiPageView(BaseModel):
+    id: int
+    kb_id: int
+    slug: str
+    title: str
+    page_type: str = "entity"
+    status: str = "published"
+    summary: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    source_refs: list[str] = Field(default_factory=list)
+    chunk_refs: list[str] = Field(default_factory=list)
+    in_links: list[str] = Field(default_factory=list)
+    out_links: list[str] = Field(default_factory=list)
+    version: int = 1
+    last_edit_source: str = "pipeline"
+    updated_at: str
+
+
+class WikiPageDetailView(WikiPageView):
+    content: str = ""
+    backlinks: list[dict] = Field(default_factory=list)
+    revisions: list[dict] = Field(default_factory=list)
+
+
+class WikiIngestRequest(BaseModel):
+    granularity: Literal["focused", "standard", "exhaustive"] = "standard"
+    max_pages_per_ingest: int = Field(default=0, ge=0, le=2000)
+    file_ids: list[str] = Field(default_factory=list)
+
+
+class WikiPageUpsertRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    page_type: WikiPageType = "concept"
+    slug: str = Field(default="", max_length=300)
+    content: str = Field(default="", max_length=100000)
+    summary: str = Field(default="", max_length=2000)
+    aliases: list[str] = Field(default_factory=list, max_length=20)
+    status: WikiPageStatus = "published"
+
+
+class WikiPageUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    content: str | None = Field(default=None, max_length=100000)
+    summary: str | None = Field(default=None, max_length=2000)
+    aliases: list[str] | None = Field(default=None, max_length=20)
+    status: WikiPageStatus | None = None
+    version: int | None = Field(default=None, ge=1)
+
+
+class WikiGraphView(BaseModel):
+    view: str = "pages"
+    nodes: list[dict] = Field(default_factory=list)
+    edges: list[dict] = Field(default_factory=list)
+    total: int = 0
+    truncated: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Query
 # ---------------------------------------------------------------------------
 
 class QueryRequest(BaseModel):
     kb_name: str
     query: str
+    wiki_assist: bool = False
     # Route also slices [-5:] as defence in depth; the schema cap keeps a
     # misconfigured client from wasting bandwidth on multi-MB history bodies
     # (and blocks DoS-shaped requests before the body is even read).
@@ -286,6 +447,8 @@ class CreateTurnRequest(BaseModel):
     # Retained for wire compatibility; the route normalizes KB turns to deep
     # retrieval and general chat bypasses the knowledge-base agent entirely.
     query_mode: Literal["fast", "deep"] = "deep"
+    # Wiki 辅助开关(每轮): False 时不注册 wiki_search 工具。
+    wiki_assist: bool = False
     document_context: DocumentContextRequest | None = None
     # Explicit document-flow routing: True forces the document flow when the
     # context is valid, False blocks it (and strips document tools from the
@@ -312,6 +475,7 @@ class TurnView(BaseModel):
     kb_name: str
     query: str
     query_mode: Literal["fast", "deep"] = "fast"
+    wiki_assist: bool = False
     status: str
     cancel_requested: bool = False
     last_event_seq: int = 0
@@ -729,7 +893,7 @@ class AuthUserView(BaseModel):
 class CreateUserRequest(BaseModel):
     username: str
     password: str
-    role: Literal["user", "dept_admin", "system_admin"] = "user"
+    role: Literal["employee"] = "employee"
     department_id: int | None = None
 
 
@@ -755,20 +919,8 @@ class CreateDepartmentRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# KB permissions (admin)
+# KB mounting (system_admin)
 # ---------------------------------------------------------------------------
-
-class KbPermissionView(BaseModel):
-    username: str
-    role: str
-    permission: str
-    department_name: str | None = None
-
-
-class GrantKbPermissionRequest(BaseModel):
-    user_id: int
-    permission: Literal["read", "write", "admin"] = "read"
-
 
 class AssignKbRequest(BaseModel):
     department_id: int
@@ -787,8 +939,7 @@ class KbSummaryView(BaseModel):
     department_name: str | None = None
     owner_user_id: int | None = None
     owner_username: str | None = None
-    permission_count: int = 0
-    dept_admin_count: int = 0
+    employee_count: int = 0
     registered: bool = False
     physical_exists: bool = False
     created_at: str = ""
@@ -841,7 +992,7 @@ class LlmHealthResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Logs (system_admin: global, dept_admin: department-scoped)
+# Logs (system_admin: global, employee: department-scoped)
 # ---------------------------------------------------------------------------
 
 class AuditEventView(BaseModel):

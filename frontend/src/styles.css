@@ -471,3 +471,27 @@ code {
   scrollbar-gutter: stable;
   background: var(--background);
 }
+
+/* 弹窗滚动区圆角细滚动条: 配 rounded 弹窗, 右侧不再出现方形系统滚动条 */
+.nice-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #c9cfdd transparent;
+}
+.nice-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.nice-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.nice-scroll::-webkit-scrollbar-thumb {
+  background: #c9cfdd;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.nice-scroll::-webkit-scrollbar-thumb:hover {
+  background: #9cabc8;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}

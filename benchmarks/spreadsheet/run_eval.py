@@ -23,8 +23,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.pipelines.spreadsheet.table_store import TableIndexStore
-from src.agents.tools.spreadsheet_tools import (
+from src.pipelines.spreadsheet.table_store import TableIndexStore  # noqa: E402
+from src.agents.tools.spreadsheet_tools import (  # noqa: E402
     _tokens, _like_clauses, _token_match_order, _rank_rows, _candidate_limit,
 )
 
