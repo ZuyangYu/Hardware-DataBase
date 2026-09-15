@@ -20,12 +20,6 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import {
   Tooltip,
@@ -35,6 +29,13 @@ import {
 } from '@/components/ui/tooltip';
 import { isDocumentContextExpired } from '../useKbChat';
 import {
+  CHAT_COMPOSER_ATTACHMENT_CHIP_CLASS,
+  CHAT_COMPOSER_ATTACHMENT_COPY_CLASS,
+  CHAT_COMPOSER_ATTACHMENT_ERROR_CLASS,
+  CHAT_COMPOSER_ATTACHMENT_NAME_CLASS,
+  CHAT_COMPOSER_ATTACHMENT_REMOVE_CLASS,
+  CHAT_COMPOSER_ATTACHMENT_STATUS_CLASS,
+  CHAT_COMPOSER_ATTACHMENTS_CLASS,
   CHAT_COMPOSER_FORM_CLASS,
   CHAT_COMPOSER_HINT_CLASS,
   CHAT_COMPOSER_MODEL_BTN_CLASS,
@@ -78,6 +79,12 @@ type Props = {
 
 const TEMPLATE_ATTACHMENT_EXTENSIONS = new Set(['.docx', '.xlsx', '.xlsm']);
 
+/** 与后端 CHAT_ATTACHMENT_MAX_FILES_PER_SESSION 对齐(单会话活动附件上限)。 */
+const ATTACHMENT_MAX_FILES = (() => {
+  const configured = Number(import.meta.env.VITE_CHAT_ATTACHMENT_MAX_FILES ?? '');
+  return Number.isFinite(configured) && configured > 0 ? configured : 20;
+})();
+
 function kbOptionLabel(kb: KbView): string {
   return kb.department_name ? `${kb.name} · ${kb.department_name}` : kb.name;
 }
@@ -119,7 +126,6 @@ export default function Composer({
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
-  const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
   const contextExpired = isDocumentContextExpired(documentContext);
   const contextReference = documentContext
     ? documentContextLabel
@@ -134,6 +140,8 @@ export default function Composer({
     : '';
   const showDocumentControls = documentAuthoringEnabled && documentContext;
   const failedAttachments = draftAttachments.filter((item) => item.parse_status === 'failed');
+  const attachmentCount = draftAttachments.length;
+  const attachmentLimitReached = attachmentCount >= ATTACHMENT_MAX_FILES;
   const uploadBlocked = streaming || disabled || attachmentUploadPending;
 
   // 自适应高度
@@ -153,7 +161,7 @@ export default function Composer({
     <div className={CHAT_INPUT_SHELL_CLASS}>
       <div className={CHAT_COMPOSER_STAGE_CLASS}>
         <form className={CHAT_COMPOSER_FORM_CLASS} onSubmit={handleSubmit}>
-          <div className="flex min-w-0 items-center gap-[8px]">
+          <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
             <Select
               value={kbName || '__none__'}
               onValueChange={(value) => onKbChange(value === '__none__' ? '' : value)}
@@ -161,7 +169,7 @@ export default function Composer({
             >
               <SelectTrigger
                 aria-label="挂载知识库"
-                title="挂载知识库"
+                title={kbName ? `当前挂载：${kbName}` : '未挂载知识库'}
                 className={cn(CHAT_COMPOSER_MODEL_BTN_CLASS)}
               >
                 <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
@@ -169,15 +177,89 @@ export default function Composer({
                 </span>
                 <SelectValue className="min-w-0 truncate" />
               </SelectTrigger>
-              <SelectContent>
+              <SelectContent
+                position="popper"
+                align="start"
+                sideOffset={6}
+                className="min-w-[240px] max-w-[min(560px,calc(100vw-48px))]"
+              >
                 <SelectItem value="__none__">不挂载</SelectItem>
-                {availableKbs.map((kb) => (
-                  <SelectItem key={kb.kb_id ?? `${kb.department_id ?? 'none'}:${kb.name}`} value={kb.name}>
-                    {kbOptionLabel(kb)}
-                  </SelectItem>
-                ))}
+                {availableKbs.map((kb) => {
+                  const label = kbOptionLabel(kb);
+                  return (
+                    <SelectItem key={kb.kb_id ?? `${kb.department_id ?? 'none'}:${kb.name}`} value={kb.name}>
+                      <span className="block max-w-[480px] truncate" title={label}>{label}</span>
+                    </SelectItem>
+                  );
+                })}
               </SelectContent>
             </Select>
+            {attachmentsEnabled && attachmentCount > 0 && (
+              <div className={CHAT_COMPOSER_ATTACHMENTS_CLASS} aria-label="会话附件">
+                {draftAttachments.map((attachment) => {
+                  const eligibleTemplate =
+                    documentAuthoringEnabled &&
+                    canUploadDocumentTemplate &&
+                    Boolean(onUseAsTemplate) &&
+                    TEMPLATE_ATTACHMENT_EXTENSIONS.has(attachment.extension.toLowerCase()) &&
+                    (attachment.parse_status === 'ready' || attachment.parse_status === 'degraded');
+                  return (
+                    <div
+                      key={attachment.attachment_id}
+                      className={cn(
+                        CHAT_COMPOSER_ATTACHMENT_CHIP_CLASS,
+                        attachment.parse_status === 'failed' && CHAT_COMPOSER_ATTACHMENT_ERROR_CLASS,
+                      )}
+                      title={attachment.error_message || attachment.filename}
+                    >
+                      <span className={CHAT_COMPOSER_ATTACHMENT_NAME_CLASS}>{attachment.filename}</span>
+                      <span className={CHAT_COMPOSER_ATTACHMENT_STATUS_CLASS}>
+                        {attachmentStateLabel(attachment)}
+                      </span>
+                      {attachment.parse_status === 'failed' && onRetryAttachment && (
+                        <button
+                          type="button"
+                          onClick={() => void onRetryAttachment(attachment.attachment_id)}
+                          disabled={streaming || disabled || attachmentRetryingId !== null}
+                          aria-label={`重试解析附件 ${attachment.filename}`}
+                          title="重试解析"
+                          className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
+                        >
+                          {attachmentRetryingId === attachment.attachment_id ? '重试中…' : '重试'}
+                        </button>
+                      )}
+                      {eligibleTemplate && (
+                        <button
+                          type="button"
+                          onClick={() => void onUseAsTemplate?.(attachment)}
+                          disabled={streaming || disabled || documentUploadPending}
+                          aria-label={`将附件 ${attachment.filename} 作为模板`}
+                          title="将附件转换为文档模板"
+                          className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
+                        >
+                          作为模板
+                        </button>
+                      )}
+                      {onRemoveAttachment && (
+                        <button
+                          type="button"
+                          onClick={() => void onRemoveAttachment(attachment.attachment_id)}
+                          disabled={streaming || disabled}
+                          aria-label={`移除附件 ${attachment.filename}`}
+                          title="移除附件"
+                          className={CHAT_COMPOSER_ATTACHMENT_REMOVE_CLASS}
+                        >
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                <span className="shrink-0 text-[10px] text-[#9aa1b1]">
+                  {attachmentCount}/{ATTACHMENT_MAX_FILES}
+                </span>
+              </div>
+            )}
           </div>
           {showDocumentControls && (
             <div
@@ -223,119 +305,7 @@ export default function Composer({
             </div>
           )}
           <div className="flex min-w-0 items-end gap-[8px]">
-            {attachmentsEnabled && (
-              <DropdownMenu open={attachmentMenuOpen} onOpenChange={setAttachmentMenuOpen}>
-                <TooltipProvider delayDuration={200}>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          type="button"
-                          aria-label="添加附件"
-                          title="添加附件"
-                          disabled={uploadBlocked}
-                          className={CHAT_COMPOSER_PLUS_BTN_CLASS}
-                        >
-                          <AppIcon name="plus" size={18} />
-                        </button>
-                      </DropdownMenuTrigger>
-                    </TooltipTrigger>
-                    <TooltipContent side="top">添加附件</TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-                <DropdownMenuContent align="start" side="top" className="w-[300px]">
-                  <DropdownMenuItem
-                    className="gap-[8px]"
-                    onSelect={(event) => {
-                      event.preventDefault();
-                      attachmentInputRef.current?.click();
-                    }}
-                    disabled={uploadBlocked}
-                  >
-                    <AppIcon name="file" size={14} />
-                    {attachmentUploadPending ? '上传中…' : '上传新附件'}
-                  </DropdownMenuItem>
-                  {draftAttachments.length > 0 && <DropdownMenuSeparator />}
-                  {draftAttachments.length > 0 && (
-                    <DropdownMenuLabel className="text-[11px] text-[#858b9c]">
-                      会话附件（发送时自动挂载）
-                    </DropdownMenuLabel>
-                  )}
-                  {draftAttachments.map((attachment) => {
-                    const eligibleTemplate =
-                      documentAuthoringEnabled &&
-                      canUploadDocumentTemplate &&
-                      onUseAsTemplate &&
-                      TEMPLATE_ATTACHMENT_EXTENSIONS.has(attachment.extension.toLowerCase()) &&
-                      (attachment.parse_status === 'ready' || attachment.parse_status === 'degraded');
-                    return (
-                      <div
-                        key={attachment.attachment_id}
-                        className="flex min-w-0 items-center gap-[6px] rounded-[8px] px-[8px] py-[6px] text-[12px] text-[#464c5e] hover:bg-[#f6f6f6]"
-                        aria-label={`附件 ${attachment.filename}`}
-                      >
-                        <AppIcon name="file" size={14} className="shrink-0 text-[#68728a]" />
-                        <span className="min-w-0 flex-1 truncate" title={attachment.filename}>
-                          {attachment.filename}
-                        </span>
-                        <span
-                          className={cn(
-                            'shrink-0 text-[11px]',
-                            attachment.parse_status === 'failed'
-                              ? 'text-[#d20b0b]'
-                              : attachment.parse_status === 'ready'
-                                ? 'text-[#166534]'
-                                : 'text-[#858b9c]',
-                          )}
-                        >
-                          {attachmentStateLabel(attachment)}
-                        </span>
-                        {attachment.parse_status === 'failed' && onRetryAttachment && (
-                          <button
-                            type="button"
-                            onClick={() => void onRetryAttachment(attachment.attachment_id)}
-                            disabled={
-                              streaming ||
-                              disabled ||
-                              (attachmentRetryingId !== null && attachmentRetryingId !== attachment.attachment_id)
-                            }
-                            aria-label={`重试解析附件 ${attachment.filename}`}
-                            title="重试解析"
-                            className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
-                          >
-                            {attachmentRetryingId === attachment.attachment_id ? '重试中…' : '重试解析'}
-                          </button>
-                        )}
-                        {eligibleTemplate && (
-                          <button
-                            type="button"
-                            onClick={() => void onUseAsTemplate(attachment)}
-                            disabled={streaming || disabled || documentUploadPending}
-                            aria-label={`将附件 ${attachment.filename} 作为模板`}
-                            title="将附件转换为模板"
-                            className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
-                          >
-                            作为模板
-                          </button>
-                        )}
-                        {onRemoveAttachment && (
-                          <button
-                            type="button"
-                            onClick={() => void onRemoveAttachment(attachment.attachment_id)}
-                            disabled={streaming || disabled}
-                            aria-label={`移除附件 ${attachment.filename}`}
-                            title="移除附件"
-                            className="inline-grid size-[18px] shrink-0 place-items-center rounded-full border-0 bg-transparent p-0 text-[14px] leading-none text-[#a2a8b8] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-45"
-                          >
-                            ×
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            )}
+
             <input
               ref={attachmentInputRef}
               id="chat-attachment-upload"
@@ -346,7 +316,6 @@ export default function Composer({
               onChange={(event) => {
                 const file = event.currentTarget.files?.[0];
                 event.currentTarget.value = '';
-                setAttachmentMenuOpen(false);
                 if (file && onUploadAttachment) void onUploadAttachment(file);
               }}
             />
@@ -414,7 +383,34 @@ export default function Composer({
             </div>
           )}
           <div className={CHAT_COMPOSER_TOOLBAR_CLASS}>
-            <span className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</span>
+            <div className="flex min-w-0 items-center gap-[2px]">
+              {attachmentsEnabled && (
+                <TooltipProvider delayDuration={200}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label="添加附件"
+                        title={
+                          attachmentLimitReached
+                            ? `单会话最多 ${ATTACHMENT_MAX_FILES} 个附件，请先移除部分附件`
+                            : attachmentUploadPending
+                              ? '上传中…'
+                              : '添加附件'
+                        }
+                        disabled={uploadBlocked || attachmentLimitReached}
+                        onClick={() => attachmentInputRef.current?.click()}
+                        className={CHAT_COMPOSER_PLUS_BTN_CLASS}
+                      >
+                        <AppIcon name={attachmentUploadPending ? 'refresh' : 'plus'} size={16} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">添加附件</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
+              <span className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</span>
+            </div>
             {documentUploadPending && (
               <span className="shrink-0 text-[11px] text-[#68728a]" role="status" aria-live="polite">
                 模板分析中…（结构分析 + 分批 LLM 语义建议，大文档可能数分钟）

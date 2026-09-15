@@ -1,23 +1,33 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
-import ExportMenu, { exportFormatFromValue, exportJobStatusLabel } from './ExportMenu';
+import ExportMenu, {
+  exportFormatFromValue,
+  exportJobStatusLabel,
+  visibleExportFormats,
+} from './ExportMenu';
 
 describe('ExportMenu', () => {
-  it('offers only released formats and reports the selected format', () => {
+  it('renders the 导出对话 entry and keeps the format chooser behind a click', () => {
     const onExport = vi.fn();
     const markup = renderToStaticMarkup(<ExportMenu disabled={false} onExport={onExport} />);
 
-    expect(markup).toContain('导出结果');
-    expect(markup).toContain('Markdown');
-    expect(markup).toContain('Excel');
-    expect(markup).toContain('Word');
-    expect(markup).toContain('PDF');
-    expect(markup).toContain('PowerPoint');
+    expect(markup).toContain('导出对话');
+    expect(markup).not.toContain('选择导出格式');
+    expect(onExport).not.toHaveBeenCalled();
+  });
 
+  it('offers only released formats', () => {
+    expect(visibleExportFormats().map((item) => item.value)).toEqual([
+      'md',
+      'xlsx',
+      'docx',
+      'pdf',
+      'pptx',
+    ]);
     expect(exportFormatFromValue('xlsx')).toBe('xlsx');
     expect(exportFormatFromValue('docx')).toBe('docx');
-    expect(onExport).not.toHaveBeenCalled();
+    expect(exportFormatFromValue('csv')).toBeNull();
   });
 
   it('maps durable job states to actionable Chinese labels', () => {
@@ -28,13 +38,9 @@ describe('ExportMenu', () => {
   });
 
   it('renders the server capability subset when rollout flags hide formats', () => {
-    const markup = renderToStaticMarkup(
-      <ExportMenu formats={['md', 'pdf']} onExport={() => undefined} />,
-    );
-
-    expect(markup).toContain('Markdown');
-    expect(markup).toContain('PDF');
-    expect(markup).not.toContain('Excel');
-    expect(markup).not.toContain('PowerPoint');
+    expect(visibleExportFormats(['md', 'pdf']).map((item) => item.label)).toEqual([
+      'Markdown',
+      'PDF',
+    ]);
   });
 });

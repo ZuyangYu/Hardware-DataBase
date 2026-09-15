@@ -235,7 +235,6 @@ def test_capability_resolution_uses_server_task_projection_for_current_candidate
 
 
 def test_revision_follow_up_recovers_current_task_when_client_context_has_no_task_id():
-    from src.agents import runner as runner_mod
 
     class _Pipeline:
         def get_current_chat_document_task_projection(

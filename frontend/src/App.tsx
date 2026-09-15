@@ -21,7 +21,6 @@ import {
   type AuthSession,
 } from './auth';
 import AppSidebar from './components/AppSidebar';
-import ExportTaskCenter from './components/ExportTaskCenter';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -36,7 +35,6 @@ import UsersPage from './pages/admin/UsersPage';
 import DepartmentsPage from './pages/admin/DepartmentsPage';
 import KbMountPage from './pages/admin/KbMountPage';
 import GovernancePage from './pages/admin/GovernancePage';
-import AttachmentReleasesPage from './pages/admin/AttachmentReleasesPage';
 import LogsPage from './pages/admin/LogsPage';
 import ConfigPage from './pages/admin/ConfigPage';
 import EvaluationPage from './pages/admin/EvaluationPage';
@@ -254,14 +252,6 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               }
             />
             <Route
-              path="/admin/attachment-releases"
-              element={
-                <AdminRoute auth={auth}>
-                  <AttachmentReleasesPage auth={auth} onLogout={onLogout} />
-                </AdminRoute>
-              }
-            />
-            <Route
               path="/admin/logs"
               element={
                 <AdminRoute auth={auth}>
@@ -297,10 +287,6 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
           </Routes>
         </div>
       </div>
-      {/* 聊天页在页头内嵌导出任务中心,避免悬浮入口遮挡右侧会话侧栏 */}
-      {!((location.pathname === '/chat' || /^\/kbs\/[^/]+\/chat(?:\/.*)?$/.test(location.pathname))) && (
-        <ExportTaskCenter />
-      )}
     </SidebarProvider>
   );
 }

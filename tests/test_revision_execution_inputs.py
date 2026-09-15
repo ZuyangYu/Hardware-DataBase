@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
 from src.document_authoring.models import (

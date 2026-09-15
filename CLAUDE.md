@@ -234,9 +234,9 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 
 
 ### Other subsystems
-- `src/test_data/` - structured test-data domain (CSV/JSON ->
-  `storage/test_data/`). **Ingest-only** today (registered via `parser_registry`);
-  not yet queryable through the agent.
+- `src/test_data/` - structured test-data domain (models/store/query engine,
+  queried through `GET /api/v1/structured`). The old CSV/JSON ingest parser and
+  its `parser_registry` manifest were removed (never wired into ingestion).
 - `src/core/` - `app_pipeline.py` (orchestrator), `model_factory.py` (the only
   provider-construction entry: profiles + `priority`) and `chat_model_runtime.py`
   (invocation/observability boundary), `llm_governor.py` (process-wide LLM admission

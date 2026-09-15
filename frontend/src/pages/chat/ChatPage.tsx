@@ -314,6 +314,7 @@ export default function ChatPage({
     activeSessionId,
     selectSession,
     newConversation,
+    ensureSession,
     deleteSession,
     messages,
     messagesLoaded,
@@ -563,14 +564,12 @@ export default function ChatPage({
 
   async function handleAttachmentUpload(file: File) {
     if (attachmentUploadPending) return;
-    if (activeSessionId == null) {
-      notify.error('请先发送一条消息以创建会话，再添加附件');
-      return;
-    }
     attachmentMutationVersionRef.current += 1;
     setAttachmentUploadPending(true);
     try {
-      const created = await uploadAttachment(activeSessionId, file, {
+      // 空会话也允许挂附件:上传前按需建会话,不再要求先发一条消息。
+      const sessionId = await ensureSession();
+      const created = await uploadAttachment(sessionId, file, {
         clientRequestId: createClientRequestId(),
       });
       setDraftAttachments((previous) =>
@@ -768,7 +767,7 @@ export default function ChatPage({
   // ---- 确认弹窗(单例 state,替代 window.confirm) ----
   const [extractConfirmOpen, setExtractConfirmOpen] = useState(false);
   const [extracting, setExtracting] = useState(false);
-  const [userMemoryTarget, setUserMemoryTarget] = useState<number | null>(null);
+  const [userMemoryTarget, setUserMemoryTarget] = useState<number[] | null>(null);
 
   async function runProjectExtraction() {
     if (activeSessionId == null || !mountedKbName) return;
@@ -788,11 +787,11 @@ export default function ChatPage({
     }
   }
 
-  async function runUserMemoryConsent(messageId: number) {
+  async function runUserMemoryConsent(messageIds: number[]) {
     if (activeSessionId == null) return;
     try {
       await api.post(`/api/v1/conversations/${activeSessionId}/memory-consents`, {
-        message_ids: [messageId],
+        message_ids: messageIds,
         reason: '对话页面明确创建个人记忆',
         request_id: `chat-consent-${Date.now()}`,
       });
@@ -870,7 +869,7 @@ export default function ChatPage({
           traceSteps={traceSteps}
           traceByMessageId={traceByMessageId}
           degradedNotes={degradedNotes}
-          onCreateMemory={(messageId) => setUserMemoryTarget(messageId)}
+          onCreateMemory={(messageIds) => setUserMemoryTarget(messageIds)}
           onEditMessage={openEditMessage}
           onExport={handleExportMessage}
           onDownloadExport={(job) => void handleDownloadExport(job)}
@@ -953,7 +952,7 @@ export default function ChatPage({
           if (!next) setUserMemoryTarget(null);
         }}
         title="创建个人记忆"
-        description="记录所选消息为授权来源，提交后会生成可撤销的授权事件。"
+        description="记录本轮问答（提问与输出）为授权来源，提交后会生成可撤销的授权事件。"
         confirmText="创建个人记忆"
         destructive={false}
         onConfirm={() => {

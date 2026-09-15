@@ -5,6 +5,7 @@ import type { ExportJobView } from '@/api/types';
 import ExportTaskCenter, {
   countActiveExportJobs,
   EXPORT_TASK_CENTER_PANEL_POSITION,
+  EXPORT_TASK_CENTER_TRIGGER_CLASS,
   isExportActive,
 } from './ExportTaskCenter';
 
@@ -35,12 +36,11 @@ describe('ExportTaskCenter', () => {
     expect(countActiveExportJobs([job('queued'), job('running'), job('failed')])).toBe(2);
   });
 
-  it('renders a global task-center affordance', () => {
+  it('keeps the floating affordance hidden until an export job is in flight', () => {
     const markup = renderToStaticMarkup(<ExportTaskCenter />);
-    expect(markup).toContain('导出任务中心');
-    expect(markup).toContain('查看后台导出任务');
-    // 全局悬浮入口必须与页面内容脱开(聊天页另有内嵌入口)。
-    expect(markup).toContain('fixed top-[18px] right-[22px]');
+    expect(markup).toBe('');
+    // 仅"进行中"任务才出现的全局悬浮入口仍锚定右上角(聊天页另有内嵌入口)。
+    expect(EXPORT_TASK_CENTER_TRIGGER_CLASS.floating).toContain('fixed top-[18px] right-[22px]');
   });
 
   it('renders an embedded header affordance that never floats over page chrome', () => {

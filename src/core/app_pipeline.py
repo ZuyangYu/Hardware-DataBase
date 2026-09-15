@@ -415,6 +415,17 @@ class AppPipeline:
             error(f"AppPipeline 初始化失败: {exc}")
             raise
 
+    @staticmethod
+    def _resolve_actor_user_id(ctx: RequestContext | None, auth_service: "AuthService") -> int | None:
+        """把 ctx.user_id(用户名或数字)解析为 users.id; 无法解析返回 None。"""
+        raw = str(getattr(ctx, "user_id", "") or "").strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return int(raw)
+        user = auth_service.get_user_by_username(raw)
+        return int(user.id) if user is not None else None
+
     def _audit(
         self,
         action: str,
@@ -771,14 +782,18 @@ class AppPipeline:
 
         # Owner 保护: 部门内员工对 KB 隐式 admin, 但删除只允许创建者,
         # 防止同事互删各自建立的知识库(历史无 owner 的库保持可删, 兼容旧数据)。
+        # 注意 RequestContext.user_id 存的是用户名, 必须解析成 users.id 再比较。
         try:
             scope = kb_scope_from_context(kb_name, ctx)
-            owner_id = AuthService().get_knowledge_base_owner(
+            auth_service = AuthService()
+            owner_id = auth_service.get_knowledge_base_owner(
                 kb_name, department_id=scope.department_id, kb_id=scope.kb_id
             )
+            actor_id = self._resolve_actor_user_id(ctx, auth_service)
         except Exception:  # noqa: BLE001 - 解析失败时回退到原有 admin 校验
             owner_id = None
-        if owner_id is not None and str(owner_id) != str(ctx.user_id):
+            actor_id = None
+        if owner_id is not None and actor_id != owner_id:
             self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message="仅知识库创建者可删除。")
             return False, "仅知识库创建者可删除该知识库。"
 

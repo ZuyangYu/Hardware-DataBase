@@ -20,6 +20,12 @@ const PANEL_CLASS =
 const FLOATING_PANEL_CLASS = `${PANEL_CLASS} fixed top-[62px] right-[22px] z-40`;
 const EMBEDDED_PANEL_CLASS = `${PANEL_CLASS} absolute right-0 top-[calc(100%+8px)] z-50`;
 
+/** 触发器定位契约;导出给测试锁定。floating 仅在确有导出任务时挂载。 */
+export const EXPORT_TASK_CENTER_TRIGGER_CLASS = {
+  floating: FLOATING_TRIGGER_CLASS,
+  embedded: EMBEDDED_TRIGGER_CLASS,
+} as const;
+
 /** 面板定位契约;导出给测试锁定,避免再出现遮挡页面 chrome 的回归。 */
 export const EXPORT_TASK_CENTER_PANEL_POSITION = {
   floating: FLOATING_PANEL_CLASS,
@@ -78,9 +84,11 @@ export default function ExportTaskCenter({ variant = 'floating' }: Props) {
 
   useEffect(() => {
     void loadJobs();
-    const timer = window.setInterval(() => void loadJobs(), 5000);
+    // 有任务时 5s 刷新进度; 空闲时降频到 30s, 避免每个页面都高频轮询。
+    const intervalMs = jobs.length > 0 ? 5000 : 30000;
+    const timer = window.setInterval(() => void loadJobs(), intervalMs);
     return () => window.clearInterval(timer);
-  }, [loadJobs]);
+  }, [loadJobs, jobs.length > 0]);
 
   const activeCount = useMemo(() => countActiveExportJobs(jobs), [jobs]);
 
@@ -223,6 +231,11 @@ export default function ExportTaskCenter({ variant = 'floating' }: Props) {
         )}
       </div>
     );
+  }
+
+  // 悬浮入口只在确有"进行中"导出任务时出现: 历史任务(含已完成/失败)不再常驻别的页面。
+  if (activeCount === 0 && !open) {
+    return null;
   }
 
   return (

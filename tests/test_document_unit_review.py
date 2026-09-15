@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from src.document_authoring.models import DocumentUnitDraft, DraftAssertion, TypedFieldValue
-from src.document_authoring.planning.models import CoverageRequirement, UnitTaskSpec
+from src.document_authoring.planning.models import UnitTaskSpec
 from src.document_authoring.planning.review_contracts import CoverageReport, CoverageRequirementResult
 from src.document_authoring.planning.unit_review import UnitReviewer, safe_review_projection
 

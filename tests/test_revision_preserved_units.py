@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 
 from src.document_authoring.harness.runtime import InternalDocumentHarnessRuntime
 from src.document_authoring.models import (
@@ -21,7 +20,7 @@ from src.document_authoring.models import (
     KnowledgeBaseSourceSnapshot,
     TemplateVersion,
 )
-from src.document_authoring.planning.models import DocumentPlan, OutputSpec
+from src.document_authoring.planning.models import OutputSpec
 from src.document_authoring.planning.revision import RevisionPatch, compile_revision_plan
 from src.document_authoring.revisions import (
     ArtifactRevisionStore,

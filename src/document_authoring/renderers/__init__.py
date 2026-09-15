@@ -23,16 +23,3 @@ __all__ = [
     "validate_structured_artifact",
     "visual_baseline_fingerprint",
 ]
-from .structured import (
-    StructuredDocxRenderer,
-    StructuredPdfRenderer,
-    StructuredRenderResult,
-    StructuredXlsxRenderer,
-)
-
-__all__ = [
-    "StructuredDocxRenderer",
-    "StructuredPdfRenderer",
-    "StructuredRenderResult",
-    "StructuredXlsxRenderer",
-]

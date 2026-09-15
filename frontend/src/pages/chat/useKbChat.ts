@@ -953,6 +953,14 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     }
   }, [createSession, detachClientStream]);
 
+  /** 无活动会话时先建一个空会话;附件上传与发送共用。 */
+  const ensureSession = useCallback(async (): Promise<number> => {
+    const current = activeSessionRef.current;
+    if (current != null) return current;
+    const session = await createSession('新对话');
+    return session.id;
+  }, [createSession]);
+
   const deleteSession = useCallback(
     async (sessionId: number) => {
       if (streaming) return;
@@ -1397,6 +1405,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     activeSessionId,
     selectSession,
     newConversation,
+    ensureSession,
     deleteSession,
     updateMessage,
     // 消息

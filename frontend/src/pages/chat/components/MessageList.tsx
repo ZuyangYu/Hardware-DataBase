@@ -2,7 +2,7 @@
  * 消息列表(对齐 MessageList:滚动容器 + 自动滚底 + 空态)。
  * 把会话侧栏选中状态、消息加载、流式气泡组合在这里。
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 
 import type { EvidenceItem, ExportArtifactView, ExportFormat, ExportJobView, MessageView, QueryTraceStep } from '@/api/types';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -24,7 +24,7 @@ type Props = {
   traceSteps: QueryTraceStep[];
   traceByMessageId: Record<number, QueryTraceStep[]>;
   degradedNotes: Array<{ stage: string; reason: string }>;
-  onCreateMemory?: (messageId: number) => void;
+  onCreateMemory?: (messageIds: number[]) => void;
   onEditMessage?: (messageId: number) => void;
   onExport?: (message: MessageView, format: ExportFormat) => void;
   onDownloadExport?: (job: ExportJobView) => void;
@@ -56,6 +56,26 @@ export default function MessageList({
   exportPreviewsByJobId = {},
   exportFormats,
 }: Props) {
+  // 个人记忆的授权来源是本轮问答(提问 + 输出),缺失输出时不提供入口。
+  const turnMessageIds = useMemo(() => {
+    const map = new Map<string, { user?: number; assistant?: number }>();
+    for (const msg of messages) {
+      if (!msg.turn_id || msg.id <= 0) continue;
+      const entry = map.get(msg.turn_id) ?? {};
+      if (msg.role === 'user' && !msg.redacted) entry.user = msg.id;
+      if (msg.role === 'assistant' && msg.content.trim()) entry.assistant = msg.id;
+      map.set(msg.turn_id, entry);
+    }
+    return map;
+  }, [messages]);
+
+  function memorySourceFor(msg: MessageView): number[] | undefined {
+    if (!msg.turn_id) return undefined;
+    const entry = turnMessageIds.get(msg.turn_id);
+    if (!entry?.assistant) return undefined;
+    return [entry.user, entry.assistant].filter((value): value is number => typeof value === 'number');
+  }
+
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const showDiagnostics = Boolean(kbName && kbName !== '__general__');
@@ -101,6 +121,7 @@ export default function MessageList({
                 : undefined
             }
             onCreateMemory={onCreateMemory}
+            memorySourceMessageIds={memorySourceFor(msg)}
             onEditMessage={onEditMessage}
             onExport={onExport}
             onDownload={onDownloadExport}
