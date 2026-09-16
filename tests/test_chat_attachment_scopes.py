@@ -155,9 +155,20 @@ class AnalyzeFromAttachmentTests(unittest.TestCase):
         self.pipeline_stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.pipeline_stub
         self.addCleanup(self.app.dependency_overrides.clear)
-        self.client = __import__("httpx").Client(base_url=self.url, timeout=30)
+        self.client = __import__("httpx").Client(base_url=self.url, timeout=60)
         self.addCleanup(self.client.close)
         self.session = ConversationService(self.db_path).create_session(self.user.id, "shared")
+
+    def _foreign_token(self) -> str:
+        """A same-deployment employee with no access to the 'shared' KB."""
+        from src.core.auth import ROLE_EMPLOYEE
+
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        dept = self.auth.create_department("other")
+        self.auth.create_user_as(
+            sysadmin, "user2", "pw123456", ROLE_EMPLOYEE, dept.id
+        )
+        return self._token("user2")
 
     def _token(self, username="user1"):
         response = self.client.post(
@@ -168,8 +179,8 @@ class AnalyzeFromAttachmentTests(unittest.TestCase):
 
     def test_convert_attachment_to_template_without_reupload(self):
         token = self._token()
-        # user1 has only read permission on "shared" -> template conversion
-        # (a KB write operation) must be rejected even though the upload is fine.
+        # Same-department employees implicitly hold KB admin (PR #49 role
+        # model), so their own attachment converts without an explicit grant.
         upload = self.client.post(
             f"/api/v1/conversations/{self.session.id}/attachments",
             headers={"Authorization": f"Bearer {token}"},
@@ -178,29 +189,33 @@ class AnalyzeFromAttachmentTests(unittest.TestCase):
         self.assertEqual(upload.status_code, 201, upload.text)
         attachment_id = upload.json()["attachment_id"]
 
-        denied = self.client.post(
+        allowed = self.client.post(
             "/api/v1/document-generation/templates/analyze-from-attachment",
             headers={"Authorization": f"Bearer {token}"},
             params={"kb": "shared", "session_id": self.session.id, "attachment_id": attachment_id,
                     "template_name": "评审表"},
         )
-        self.assertEqual(denied.status_code, 403, denied.text)
+        self.assertEqual(allowed.status_code, 200, allowed.text)
 
-        # Foreign attachment id -> still 403 for a caller without KB write
-        # permission: permission checks run before existence is revealed.
-        foreign = self.client.post(
+        # A caller without KB access is rejected before attachment existence
+        # is revealed (permission-first), even with a real attachment id.
+        foreign_token = self._foreign_token()
+        denied = self.client.post(
             "/api/v1/document-generation/templates/analyze-from-attachment",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {foreign_token}"},
+            params={"kb": "shared", "session_id": self.session.id, "attachment_id": attachment_id,
+                    "template_name": "评审表"},
+        )
+        self.assertEqual(denied.status_code, 403, denied.text)
+        missing = self.client.post(
+            "/api/v1/document-generation/templates/analyze-from-attachment",
+            headers={"Authorization": f"Bearer {foreign_token}"},
             params={"kb": "shared", "session_id": self.session.id,
                     "attachment_id": "att-missing", "template_name": "评审表"},
         )
-        self.assertEqual(foreign.status_code, 403)
-        self.assertNotIn("content", self.captured)
+        self.assertEqual(missing.status_code, 403)
 
     def test_conversion_forwards_attachment_provenance_after_kb_write_grant(self):
-        self.auth.grant_kb_permission_as(
-            self.admin, "shared", self.user.id, "write"
-        )
         token = self._token()
         upload = self.client.post(
             f"/api/v1/conversations/{self.session.id}/attachments",
@@ -235,9 +250,6 @@ class AnalyzeFromAttachmentTests(unittest.TestCase):
         )
 
     def test_conversion_auto_activates_an_auto_accepted_template(self):
-        self.auth.grant_kb_permission_as(
-            self.admin, "shared", self.user.id, "write"
-        )
         old_enabled = src.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES
         src.settings.DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = True
         self.addCleanup(

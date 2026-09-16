@@ -646,21 +646,25 @@ def run_case(
 def _create_identities(
     client: "E2EClient", *, kb_name: str, department_id: int
 ) -> tuple[str, str, str, int, int]:
+    import src.settings as settings
+
     run = uuid.uuid4().hex[:6]
-    admin_token = client.login(
-        os.getenv("HDB_E2E_ADMIN_USERNAME", "admin"),
-        os.getenv("HDB_E2E_ADMIN_PASSWORD", "123456"),
-    )
+    admin_username = os.getenv("HDB_E2E_ADMIN_USERNAME") or settings.AUTH_DEFAULT_ADMIN_USERNAME
+    admin_password = os.getenv("HDB_E2E_ADMIN_PASSWORD") or settings.AUTH_DEFAULT_ADMIN_PASSWORD
+    admin_token = client.login(admin_username, admin_password)
     reviewer_name = f"e2e_admin_{run}"
     owner_name = f"e2e_owner_{run}"
     password = os.getenv("HDB_E2E_PASSWORD", "E2ePass!2026")
+    # Two-role model (PR #49): only the system admin registers staff, accounts
+    # are always employees, and same-department employees hold implicit KB
+    # admin — no per-KB permission grant exists anymore.
     created_reviewer = client.requests.post(
         f"{client.base_url}/api/v1/users",
         headers=client.headers(admin_token),
         json={
             "username": reviewer_name,
             "password": password,
-            "role": "dept_admin",
+            "role": "employee",
             "department_id": department_id,
         },
         timeout=client.timeout,
@@ -670,20 +674,18 @@ def _create_identities(
     reviewer_token = client.login(reviewer_name, password)
     created_owner = client.requests.post(
         f"{client.base_url}/api/v1/users",
-        headers=client.headers(reviewer_token),
-        json={"username": owner_name, "password": password, "role": "user"},
+        headers=client.headers(admin_token),
+        json={
+            "username": owner_name,
+            "password": password,
+            "role": "employee",
+            "department_id": department_id,
+        },
         timeout=client.timeout,
     )
     created_owner.raise_for_status()
     owner_id = int(created_owner.json()["id"])
     owner_token = client.login(owner_name, password)
-    granted = client.requests.post(
-        f"{client.base_url}/api/v1/kbs/{kb_name}/permissions",
-        headers=client.headers(reviewer_token),
-        json={"user_id": owner_id, "permission": "read"},
-        timeout=client.timeout,
-    )
-    granted.raise_for_status()
     return admin_token, reviewer_token, owner_token, owner_id, reviewer_id
 
 
@@ -706,7 +708,7 @@ def _cleanup(
             )
         except Exception:  # noqa: BLE001
             pass
-    for user_id, token in ((owner_id, reviewer_token), (reviewer_id, admin_token)):
+    for user_id, token in ((owner_id, admin_token), (reviewer_id, admin_token)):
         try:
             client.requests.put(
                 f"{client.base_url}/api/v1/users/{user_id}/active",
