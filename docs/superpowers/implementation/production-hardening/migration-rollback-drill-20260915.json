@@ -1,0 +1,20 @@
+{
+  "recorded_at": "2026-09-16T01:22:20.362951+00:00",
+  "group": "authority",
+  "live_source": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/storage/auth.db",
+  "drilled_source": "/tmp/tmplq74m2wu/auth.db",
+  "mode": "snapshot-copy",
+  "dsn": "postgresql://postgres:postgres@127.0.0.1:55432/hdb",
+  "checks": {
+    "source_unchanged": true,
+    "first_ok": true,
+    "second_ok": true,
+    "second_copy_is_idempotent": true,
+    "hashes_still_match": true,
+    "derived_skipped": true
+  },
+  "source_sha256": "af9c8b561931ddb76a8778ef8ed1ae7ad45abaa60e641e5173970a0e5d0278a4",
+  "tables": 45,
+  "duration_seconds": 9.89,
+  "ok": true
+}

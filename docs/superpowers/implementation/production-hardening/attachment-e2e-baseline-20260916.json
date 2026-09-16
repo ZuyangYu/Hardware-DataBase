@@ -1,0 +1,462 @@
+{
+  "dataset": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/evaluation/datasets/attachment_editing_v1.jsonl",
+  "base_url": "http://127.0.0.1:8127",
+  "total": 50,
+  "passed": 50,
+  "failed": 0,
+  "pass_rate": 1.0,
+  "min_pass_rate": 0.9,
+  "gate_passed": true,
+  "cases": [
+    {
+      "case_id": "md-replace-001",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 396,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-df7559351df2e4329f5e8879"
+    },
+    {
+      "case_id": "txt-replace-002",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 397,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-d84e8430055be7a4b14b0f3f"
+    },
+    {
+      "case_id": "docx-replace-003",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 398,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-78fa344b2b18018a1f5ac408"
+    },
+    {
+      "case_id": "docx-substring-004",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 399,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-b76938326340ed7721c32595"
+    },
+    {
+      "case_id": "md-release-pending-005",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 400,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-63bdc060cb0d98e2a664a2bc"
+    },
+    {
+      "case_id": "txt-release-approve-006",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 401,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-556fdf875fcef26fea438a66"
+    },
+    {
+      "case_id": "docx-release-approve-007",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 402,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-57338b08de574abf38d3133d"
+    },
+    {
+      "case_id": "md-release-reject-008",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 403,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-78d10bc9feab75c1e298e4f8"
+    },
+    {
+      "case_id": "docx-section-replace-009",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 404,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-e3f3339931da775e526b9de9"
+    },
+    {
+      "case_id": "docx-section-followup-010",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 405,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-89c1a4d9d0d4b4f961534dcd"
+    },
+    {
+      "case_id": "docx-section-release-011",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 406,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-6b4f64ebc9e4462693ce4236"
+    },
+    {
+      "case_id": "txt-ambiguous-012",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 407,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "md-missing-target-013",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 408,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "docx-missing-heading-014",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 409,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "md-question-no-edit-015",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 410,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "docx-question-no-edit-016",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 411,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "md-version-binding-017",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 412,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-7b493178955a66e8e5fd578d"
+    },
+    {
+      "case_id": "md-keep-other-lines-018",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 413,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-8d0e616c7ccbd42671fe4fe0"
+    },
+    {
+      "case_id": "docx-release-reject-019",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 414,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-cd939e964bfeb03effcfe0ba"
+    },
+    {
+      "case_id": "docx-section-approve-020",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 415,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-c7ac0cd217111dc307ccc0ea"
+    },
+    {
+      "case_id": "replace-extra-021",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 416,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-557478dff91e376e46c95d7d"
+    },
+    {
+      "case_id": "replace-extra-022",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 417,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-63cb3acea3e13e51741884c7"
+    },
+    {
+      "case_id": "replace-extra-023",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 418,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-3a0b0cd40cccd99e079c1553"
+    },
+    {
+      "case_id": "replace-extra-024",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 419,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-175c4a41836c8a19b01d13be"
+    },
+    {
+      "case_id": "replace-extra-025",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 420,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-db25c31d39dfccd5cb3cd014"
+    },
+    {
+      "case_id": "replace-extra-026",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 421,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-be4dbe107999352d77d64e12"
+    },
+    {
+      "case_id": "replace-extra-027",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 422,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-e89b3be2ee2bb84862acce01"
+    },
+    {
+      "case_id": "replace-extra-028",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 423,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-58f54f6ec40cdec243130c98"
+    },
+    {
+      "case_id": "replace-extra-029",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 424,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-00ed1cd95c786e880bf1ad60"
+    },
+    {
+      "case_id": "replace-extra-030",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 425,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-96d59c30b352bebdcd0b7cc2"
+    },
+    {
+      "case_id": "section-extra-031",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 426,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-08ae619b48fb38bed56b1618"
+    },
+    {
+      "case_id": "section-extra-032",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 427,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-51bda2b45b0011ab980e038f"
+    },
+    {
+      "case_id": "section-extra-033",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 428,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-bdef5bdc0660b14b2a5bdc46"
+    },
+    {
+      "case_id": "section-release-extra-034",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 429,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-a94446f8dee0cbbba8a05d06"
+    },
+    {
+      "case_id": "section-release-extra-035",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 430,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-509823ee9b9c87c284284415"
+    },
+    {
+      "case_id": "section-release-extra-036",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 431,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-ad476d46778e080f02325cc5"
+    },
+    {
+      "case_id": "release-extra-037",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 432,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-8bb2f3bf93bdb0bd35650625"
+    },
+    {
+      "case_id": "release-extra-038",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 433,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-c84529eb07fb12a9e7cc0825"
+    },
+    {
+      "case_id": "blocked-extra-039",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 434,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "blocked-extra-040",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 435,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "no-edit-extra-041",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 436,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "version-extra-042",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 437,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-9ad5d2e710068ae7c990803c"
+    },
+    {
+      "case_id": "keep-extra-043",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 438,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-a91a326d77bec8fa0031322e"
+    },
+    {
+      "case_id": "docx-release-extra-044",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 439,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-35a6483cc07e51170d69a9e8"
+    },
+    {
+      "case_id": "docx-release-extra-045",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 440,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-0d83a060e3c1a88839628707"
+    },
+    {
+      "case_id": "section-release-pending-extra-046",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 441,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-4ced36771c32d3b1323147f0"
+    },
+    {
+      "case_id": "blocked-section-extra-047",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 442,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "no-edit-docx-extra-048",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 443,
+      "turn_status": "completed",
+      "revision_id": null
+    },
+    {
+      "case_id": "release-pending-txt-extra-049",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 444,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-896387c6583b1abbc2bd3652"
+    },
+    {
+      "case_id": "section-followup-extra-050",
+      "passed": true,
+      "failures": [],
+      "error": "",
+      "session_id": 445,
+      "turn_status": "completed",
+      "revision_id": "attachment-revision-205e87aadfc4aeb1c8e56b9d"
+    }
+  ]
+}

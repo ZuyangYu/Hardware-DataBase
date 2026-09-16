@@ -1,0 +1,98 @@
+{
+  "recorded_at": "2026-09-16T06:19:46.625724+00:00",
+  "kind": "small-sample-ragas",
+  "dataset": "evaluation/datasets/hardware_qa_v1.jsonl",
+  "kb": "ADAS_new",
+  "collection_snapshot": "storage/evaluations/20260916T025402Z-8f3cbdec/snapshot.jsonl",
+  "samples": [
+    {
+      "sample_id": "hw-v1-circuit-u1700-pins",
+      "metrics": {
+        "forbidden_claims": {
+          "status": "not_applicable",
+          "score": null
+        },
+        "evidence_consistency": {
+          "status": "success",
+          "score": 1.0
+        },
+        "faithfulness": {
+          "status": "success",
+          "score": 1.0
+        },
+        "answer_correctness": {
+          "status": "success",
+          "score": 0.5057876287759429
+        }
+      }
+    },
+    {
+      "sample_id": "hw-v1-document-hardware-modules",
+      "metrics": {
+        "forbidden_claims": {
+          "status": "not_applicable",
+          "score": null
+        },
+        "evidence_consistency": {
+          "status": "success",
+          "score": 1.0
+        },
+        "faithfulness": {
+          "status": "success",
+          "score": 0.9444444444444444
+        },
+        "answer_correctness": {
+          "status": "success",
+          "score": 0.5044790939619332
+        }
+      }
+    },
+    {
+      "sample_id": "hw-v1-joint-main-pmic",
+      "metrics": {
+        "forbidden_claims": {
+          "status": "not_applicable",
+          "score": null
+        },
+        "evidence_consistency": {
+          "status": "success",
+          "score": 1.0
+        },
+        "faithfulness": {
+          "status": "success",
+          "score": 0.7692307692307693
+        },
+        "answer_correctness": {
+          "status": "success",
+          "score": 0.6029617246996041
+        }
+      }
+    }
+  ],
+  "aggregate": {
+    "metric_scores": {
+      "evidence_consistency": 1.0,
+      "faithfulness": 0.9045584045584046,
+      "answer_correctness": 0.5377428158124934
+    },
+    "metric_counts": {
+      "evidence_consistency": 3,
+      "faithfulness": 3,
+      "answer_correctness": 3
+    },
+    "judge_governance": {
+      "assembled": true,
+      "bypassed": false,
+      "reason": "",
+      "wrapped_methods": [
+        "agenerate",
+        "generate"
+      ]
+    }
+  },
+  "notes": [
+    "Small-sample quality check on ADAS_new after local mapping repair; not a full 25-sample baseline.",
+    "Scoring ran with EVAL_MAX_WORKERS=2, LLM_BATCH_MAX_CONCURRENCY=2, LLM_QUEUE_TIMEOUT_SECONDS=900.",
+    "Full-suite scoring cost is ~3.6 min/metric-item with default budgets; full 25x6 needs a dedicated budget window."
+  ]
+}

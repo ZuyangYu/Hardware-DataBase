@@ -1,0 +1,165 @@
+{
+  "label": "p0a-complete-4",
+  "recorded_at": "2026-09-15T15:53:30.894911+00:00",
+  "storage": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/storage",
+  "databases": {
+    "auth.db": {
+      "present": true,
+      "bytes": 29831168,
+      "sha256": "b69b84052aa8dd3b541ae17605b5f0999f40b218152b8b29da8e57225d29d849",
+      "tables": {
+        "action_plans": 0,
+        "action_receipts": 0,
+        "asset_candidates": 0,
+        "asset_evidence": 0,
+        "audit_events": 8300,
+        "auth_sessions": 226,
+        "chat_message_edits": 3,
+        "chat_messages": 362,
+        "chat_sessions": 77,
+        "chat_turn_events": 27256,
+        "chat_turns": 181,
+        "conversation_execution_state": 7,
+        "departments": 4,
+        "document_authoring_job_outbox": 26,
+        "document_authoring_jobs": 26,
+        "document_resource_locks": 0,
+        "hardware_assets": 0,
+        "kb_permissions": 32,
+        "knowledge_bases": 1,
+        "llm_usage_ledger": 7,
+        "login_attempts": 4,
+        "memory_audit_events": 43,
+        "memory_checkpoints": 3,
+        "memory_consent_events": 5,
+        "memory_consent_source_items": 5,
+        "memory_deletion_outbox": 5,
+        "memory_jobs": 52,
+        "memory_projection_outbox": 10,
+        "memory_projections": 10,
+        "memory_records": 10,
+        "memory_reflection_runs": 66,
+        "memory_revisions": 12,
+        "memory_run_items": 10,
+        "memory_sources": 40,
+        "notifications": 52,
+        "query_traces": 540,
+        "result_artifacts": 20,
+        "result_export_jobs": 20,
+        "result_export_outbox": 20,
+        "result_snapshots": 13,
+        "retrieved_evidence": 4119,
+        "turn_attachments": 321,
+        "user_memory_settings": 1,
+        "users": 71,
+        "worker_instances": 47
+      }
+    },
+    "agent_checkpoints.db": {
+      "present": true,
+      "bytes": 3473408,
+      "sha256": "ce2ce3c53214b1198059bd728b7750dac7bd6737cda4099bb8953b892f5b18b4",
+      "tables": {
+        "checkpoints": 666,
+        "hdb_checkpoint_attempts": 7,
+        "hdb_checkpoint_pointers": 7,
+        "writes": 1343
+      }
+    },
+    "document_authoring_checkpoints.sqlite": {
+      "present": true,
+      "bytes": 209596416,
+      "sha256": "960ed3c280868ebd6513b3247c688f0141b5982d57f4af0ae21b36fe7e064fa6",
+      "tables": {
+        "checkpoints": 30208,
+        "writes": 245247
+      }
+    },
+    "document_authoring_compatibility.sqlite": {
+      "present": false
+    },
+    "memory.db": {
+      "present": true,
+      "bytes": 241664,
+      "sha256": "d88dcd4b31358f83618111e555cbcf069c3d43d203537424d562ba3d3359df63",
+      "tables": {
+        "store": 5,
+        "store_migrations": 5,
+        "store_vectors": 15,
+        "vector_migrations": 1
+      }
+    },
+    "chat_attachments.db": {
+      "present": true,
+      "bytes": 21835776,
+      "sha256": "9aa919c5ac5ba5405c329710d28ba132c9129a9054746dc7e2a4173894386032",
+      "tables": {
+        "attachment_parts_fts": 5081,
+        "attachment_parts_fts_config": 1,
+        "attachment_parts_fts_content": 5081,
+        "attachment_parts_fts_data": 259,
+        "attachment_parts_fts_docsize": 5081,
+        "attachment_parts_fts_idx": 254,
+        "attachment_parts_trigram": 5081,
+        "attachment_parts_trigram_config": 1,
+        "attachment_parts_trigram_content": 5081,
+        "attachment_parts_trigram_data": 1580,
+        "attachment_parts_trigram_docsize": 5081,
+        "attachment_parts_trigram_idx": 1501,
+        "chat_attachment_assets": 52,
+        "chat_attachment_edit_proposals": 0,
+        "chat_attachment_embeddings": 0,
+        "chat_attachment_jobs": 60,
+        "chat_attachment_parts": 3550,
+        "chat_attachment_revisions": 218,
+        "chat_attachment_visual_cache": 0,
+        "chat_attachments": 470,
+        "coordinator_leases": 1,
+        "session_cleanup_outbox": 285
+      }
+    },
+    "pipeline_documents.db": {
+      "present": true,
+      "bytes": 163840,
+      "sha256": "910f9c37808efad42b228f5baa92aed06667f799a9d29906ec1f97ca5f3c62ef",
+      "tables": {
+        "pipeline_datasets": 2,
+        "pipeline_document_profiles": 0,
+        "pipeline_documents": 9,
+        "pipeline_profile_outbox": 1751
+      }
+    }
+  },
+  "directories": {
+    "chat_attachments": {
+      "present": true,
+      "files": 454,
+      "bytes": 72493231,
+      "digest": "ca9a2acb09b2a806d3f3be89e52dac924e189686bf1cadd0c5883adce00e084f"
+    },
+    "pipeline_archives": {
+      "present": true,
+      "files": 10,
+      "bytes": 82001535,
+      "digest": "e2a0a4faddc000ea03b139b2740fad6b0edab60662a9ba27f1c4d7fdee4de401"
+    },
+    "exports": {
+      "present": true,
+      "files": 20,
+      "bytes": 1101041,
+      "digest": "0f34f6973d5b6103d540db533cf22f2babd916fb637f1752168db2d37bfeaf4f"
+    },
+    "circuits": {
+      "present": true,
+      "files": 5,
+      "bytes": 3393377,
+      "digest": "c9be30c4bb532764e923675416ba85a42fc493f8a9dbc7556a15e3cb5a232c89"
+    },
+    "table_indexes": {
+      "present": true,
+      "files": 1,
+      "bytes": 5304320,
+      "digest": "22861953d89b40424850613b75bf4fdc2437533ea62c3c0057632ef7c1156eb7"
+    }
+  }
+}

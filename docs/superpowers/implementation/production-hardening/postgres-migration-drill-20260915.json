@@ -1,0 +1,57 @@
+{
+  "recorded_at": "2026-09-15T15:21:27.695399+00:00",
+  "groups": {
+    "authority": {
+      "ok": true,
+      "tables": 45,
+      "rows": 41853,
+      "hash_mismatches": [
+        "audit_events",
+        "chat_messages",
+        "chat_sessions",
+        "chat_turn_events",
+        "chat_turns",
+        "query_traces",
+        "retrieved_evidence"
+      ]
+    },
+    "projection": {
+      "ok": true,
+      "tables": 4,
+      "rows": 26,
+      "hash_mismatches": [
+        "store"
+      ]
+    },
+    "attachments": {
+      "ok": true,
+      "tables": 22,
+      "rows": 38718,
+      "hash_mismatches": [
+        "attachment_parts_fts",
+        "attachment_parts_fts_config",
+        "attachment_parts_fts_content",
+        "attachment_parts_fts_data",
+        "attachment_parts_fts_idx",
+        "attachment_parts_trigram",
+        "attachment_parts_trigram_config",
+        "attachment_parts_trigram_content",
+        "attachment_parts_trigram_data",
+        "attachment_parts_trigram_idx",
+        "chat_attachment_jobs",
+        "chat_attachment_parts",
+        "chat_attachment_revisions",
+        "chat_attachments"
+      ]
+    },
+    "pipeline": {
+      "ok": true,
+      "tables": 4,
+      "rows": 1762,
+      "hash_mismatches": []
+    }
+  },
+  "compatibility": {
+    "skipped": "source database not present"
+  }
+}
