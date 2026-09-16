@@ -111,6 +111,24 @@ async def lifespan(app: FastAPI):
     """
     import src.settings
 
+    # P0-008: fail fast on provider selections that cannot run; never fall back
+    # to a silently created local database.
+    src.settings.validate_provider_configuration()
+    # P0-006: deployment-scope quota maintenance (reap/escalate uncertain).
+    try:
+        from src.core.concurrency import start_governor_maintenance
+
+        start_governor_maintenance()
+    except Exception as exc:  # pragma: no cover - governance must not block boot
+        print(f"[hardware-database] governor maintenance disabled: {exc}")
+    # P0-007: own the shared retrieval executor lifecycle for this process.
+    if bool(getattr(src.settings, "SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)):
+        try:
+            from src.agents.tools.retrieval_executor import get_retrieval_executor
+
+            get_retrieval_executor()
+        except Exception as exc:  # pragma: no cover
+            print(f"[hardware-database] shared retrieval executor disabled: {exc}")
     _harden_storage_permissions()
     _prune_query_traces_once()
 
@@ -183,6 +201,16 @@ async def lifespan(app: FastAPI):
             memory_log_file.close()
         if export_log_file is not None:
             export_log_file.close()
+        try:
+            from src.agents.tools.retrieval_executor import reset_retrieval_executor
+
+            reset_retrieval_executor(
+                deadline_seconds=float(
+                    getattr(src.settings, "RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS", 10)
+                )
+            )
+        except Exception:  # pragma: no cover - teardown is best-effort
+            pass
         shutdown_observability()
 
 

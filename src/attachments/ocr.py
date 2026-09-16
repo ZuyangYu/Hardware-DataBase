@@ -61,57 +61,60 @@ class LocalCpuOcrEngine:
             raise OcrUnavailableError("PDF source is unavailable")
 
         timeout = max(1, int(src.settings.CHAT_ATTACHMENT_PARSE_TIMEOUT_SECONDS))
-        with tempfile.TemporaryDirectory(prefix="hdb-attachment-ocr-") as temp_dir:
-            image_prefix = os.path.join(temp_dir, "page")
-            render = subprocess.run(
-                [
-                    self.renderer_command,
-                    "-f",
-                    str(page_number),
-                    "-l",
-                    str(page_number),
-                    "-singlefile",
-                    "-r",
-                    str(self.dpi),
-                    "-png",
-                    source_path,
-                    image_prefix,
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                check=False,
-            )
-            if render.returncode != 0:
-                detail = (render.stderr or render.stdout or "").strip()[:300]
-                raise RuntimeError(f"PDF page rendering failed{': ' + detail if detail else ''}")
-            image_path = f"{image_prefix}.png"
-            if not os.path.isfile(image_path):
-                raise RuntimeError("PDF renderer produced no page image")
+        from src.core.concurrency import governor_acquire
 
-            recognized = subprocess.run(
-                [
-                    self.ocr_command,
-                    image_path,
-                    "stdout",
-                    "--psm",
-                    "3",
-                    "-l",
-                    self.language,
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                check=False,
-            )
-            if recognized.returncode != 0:
-                detail = (recognized.stderr or recognized.stdout or "").strip()[:300]
-                raise RuntimeError(f"OCR process failed{': ' + detail if detail else ''}")
-            return (recognized.stdout or "").strip()
+        with governor_acquire("ocr", interactive=False):
+            with tempfile.TemporaryDirectory(prefix="hdb-attachment-ocr-") as temp_dir:
+                image_prefix = os.path.join(temp_dir, "page")
+                render = subprocess.run(
+                    [
+                        self.renderer_command,
+                        "-f",
+                        str(page_number),
+                        "-l",
+                        str(page_number),
+                        "-singlefile",
+                        "-r",
+                        str(self.dpi),
+                        "-png",
+                        source_path,
+                        image_prefix,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    check=False,
+                )
+                if render.returncode != 0:
+                    detail = (render.stderr or render.stdout or "").strip()[:300]
+                    raise RuntimeError(f"PDF page rendering failed{': ' + detail if detail else ''}")
+                image_path = f"{image_prefix}.png"
+                if not os.path.isfile(image_path):
+                    raise RuntimeError("PDF renderer produced no page image")
+
+                recognized = subprocess.run(
+                    [
+                        self.ocr_command,
+                        image_path,
+                        "stdout",
+                        "--psm",
+                        "3",
+                        "-l",
+                        self.language,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    check=False,
+                )
+                if recognized.returncode != 0:
+                    detail = (recognized.stderr or recognized.stdout or "").strip()[:300]
+                    raise RuntimeError(f"OCR process failed{': ' + detail if detail else ''}")
+                return (recognized.stdout or "").strip()
 
 
 def default_ocr_engine() -> OcrEngine:

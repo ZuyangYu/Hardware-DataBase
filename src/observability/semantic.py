@@ -47,4 +47,7 @@ METRIC_LABEL_KEYS = {
     "projection_kind",
     "scope",
     "semantic_index",
+    # P0b resource governance: bounded enumerations only.
+    "resource",
+    "reason",
 }

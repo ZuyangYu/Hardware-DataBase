@@ -664,16 +664,31 @@ class RAGFlowClient:
         }
         if metadata_condition:
             payload["metadata_condition"] = metadata_condition
-        if should_cancel is None:
-            data = self.request("POST", "/api/v1/retrieval", json=payload)
-        else:
-            data = self.request_cancellable(
-                "POST",
-                "/api/v1/retrieval",
-                json=payload,
-                should_cancel=should_cancel,
-            )
+        # P0b: each real retrieval call acquires the shared RAG budget, so
+        # fallback retries are re-admitted rather than inheriting a slot.
+        from src.core.concurrency import governor_acquire
+        from src.observability.metrics import incr_active, record_rag_zero_hit
+
+        with governor_acquire("rag", interactive=True):
+            incr_active("hdb.rag.active_requests", "Concurrent RAG retrieval calls", 1)
+            try:
+                if should_cancel is None:
+                    data = self.request("POST", "/api/v1/retrieval", json=payload)
+                else:
+                    data = self.request_cancellable(
+                        "POST",
+                        "/api/v1/retrieval",
+                        json=payload,
+                        should_cancel=should_cancel,
+                    )
+            finally:
+                incr_active("hdb.rag.active_requests", "Concurrent RAG retrieval calls", -1)
         chunks = data.get("data", {}).get("chunks", [])
+        if not chunks:
+            try:
+                record_rag_zero_hit()
+            except Exception:
+                pass
         return chunks if isinstance(chunks, list) else []
 
     def health(self) -> dict:

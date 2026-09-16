@@ -652,6 +652,16 @@ class EvaluationService:
         return summary, ordered_results
 
     @staticmethod
+    def _judge_governance_metadata() -> dict[str, object]:
+        """Explicit judge-LLM governance state for the run summary (P0-006)."""
+        try:
+            from src.core.model_gateway import governance_status
+
+            return dict(governance_status())
+        except Exception:
+            return {"assembled": False, "bypassed": False, "reason": "unavailable"}
+
+    @staticmethod
     def _build_summary(
         samples: list[EvaluationSample],
         ordered_results: list[SampleResult],
@@ -701,6 +711,9 @@ class EvaluationService:
                 "scoring_diagnostics": EvaluationService._build_scoring_diagnostics(
                     ordered_results
                 ),
+                # Judge-LLM governance assembly state; ``bypassed`` results are
+                # not valid for production capacity/quality acceptance.
+                "judge_governance": EvaluationService._judge_governance_metadata(),
             },
         )
         return summary

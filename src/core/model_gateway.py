@@ -474,35 +474,96 @@ def _record_ragas_usage(result: Any) -> None:
     )
 
 
+_GOVERNANCE_LOCK = threading.Lock()
+_GOVERNANCE_STATUS: dict[str, Any] = {
+    "assembled": False,
+    "bypassed": False,
+    "reason": "",
+    "wrapped_methods": [],
+}
+
+
+def governance_status() -> dict[str, Any]:
+    """Last judge-LLM governance assembly status (P0-006 acceptance surface).
+
+    ``bypassed`` means the wrapper could not be installed; evaluation results
+    produced in that state must be marked ``governance_bypassed`` and are not
+    valid for production capacity/quality acceptance.
+    """
+    with _GOVERNANCE_LOCK:
+        return dict(_GOVERNANCE_STATUS)
+
+
+def reset_governance_status() -> None:
+    with _GOVERNANCE_LOCK:
+        _GOVERNANCE_STATUS.update(
+            {"assembled": False, "bypassed": False, "reason": "", "wrapped_methods": []}
+        )
+
+
+def _mark_governance(assembled: bool, reason: str, wrapped: list[str]) -> None:
+    with _GOVERNANCE_LOCK:
+        _GOVERNANCE_STATUS.update(
+            {"assembled": assembled, "bypassed": not assembled, "reason": reason, "wrapped_methods": wrapped}
+        )
+    if not assembled:
+        try:
+            from src.observability.metrics import counter
+
+            counter(
+                "hdb.eval.governance_bypassed",
+                attributes={"reason": str(reason or "unknown")[:80]},
+                description="Judge-LLM governance could not be assembled (results marked bypassed)",
+            )
+        except Exception:
+            pass
+
+
 def govern_ragas_llm(llm: Any) -> Any:
     """把 RAGAS judge 纳入闸门。
 
     不能在 client 层包代理: ragas 的 instructor 适配器要求真 ``AsyncOpenAI``
     实例(isinstance 校验)。因此在 LLM 对象的 generate/agenerate 层包裹,
     让评测(批量)与在线问答共享准入控制。
+
+    装配成功/失败都会记录显式治理状态（``governance_status()``）；失败时
+    fail-open 返回原对象，但评测结果必须标记 ``governance_bypassed``。
     """
+    wrapped: list[str] = []
     try:
         for name in ("agenerate", "generate"):
             original = getattr(llm, name, None)
             if original is None or getattr(original, "_hdb_governed", False):
+                if original is not None:
+                    wrapped.append(name)
                 continue
             if asyncio.iscoroutinefunction(original):
-                async def wrapped(*args: Any, _orig=original, **kwargs: Any) -> Any:
+                async def wrapped_async(*args: Any, _orig=original, **kwargs: Any) -> Any:
                     with get_llm_governor().slot(PRIORITY_BATCH):
                         result = await _orig(*args, **kwargs)
                     _record_ragas_usage(result)
                     return result
+
+                target = wrapped_async
             else:
-                def wrapped(*args: Any, _orig=original, **kwargs: Any) -> Any:
+                def wrapped_sync(*args: Any, _orig=original, **kwargs: Any) -> Any:
                     with get_llm_governor().slot(PRIORITY_BATCH):
                         result = _orig(*args, **kwargs)
                     _record_ragas_usage(result)
                     return result
-            wrapped._hdb_governed = True  # type: ignore[attr-defined]
-            setattr(llm, name, wrapped)
-    except Exception:  # noqa: BLE001 - 治理层绝不阻塞评测
+
+                target = wrapped_sync
+            target._hdb_governed = True  # type: ignore[attr-defined]
+            setattr(llm, name, target)
+            wrapped.append(name)
+        if not wrapped:
+            _mark_governance(False, "no_generate_method", wrapped)
+        else:
+            _mark_governance(True, "", wrapped)
         return llm
-    return llm
+    except Exception as exc:  # noqa: BLE001 - 治理层绝不阻塞评测
+        _mark_governance(False, f"{type(exc).__name__}: {exc}", wrapped)
+        return llm
 
 
 __all__ = [
@@ -514,5 +575,7 @@ __all__ = [
     "get_persisted_usage",
     "get_usage_ledger",
     "govern_ragas_llm",
+    "governance_status",
+    "reset_governance_status",
     "reset_usage_ledger",
 ]

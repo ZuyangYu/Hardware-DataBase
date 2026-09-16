@@ -510,6 +510,14 @@ def confirm_document_plan(
 ):
     """Gate 1 confirmation: hash-bound, explicit, idempotent per client request."""
 
+    from src.api.admission import admission_model_name, enforce_admission
+
+    enforce_admission(
+        user,
+        getattr(user, "department_id", None),
+        resource="document",
+        model=admission_model_name(),
+    )
     ctx = _write_ctx(user, auth, kb)
     try:
         submission = pipeline.confirm_document_plan(

@@ -979,7 +979,19 @@ class MemoryWorker:
                 # Reconciliation is a rebuild aid; it must not prevent a
                 # durable job from being claimed or make Chat unavailable.
                 counter("hdb.memory.reconcile_error", attributes={"error": str(exc)[:100]})
-        return self._process_job()
+        # P0b: reflection/extraction model work holds one MEMORY slot.
+        if not bool(getattr(self.settings, "RESOURCE_GOVERNOR_ENABLED", True)):
+            return self._process_job()
+        try:
+            from src.core.concurrency import GovernorRejected, get_governor
+
+            permit = get_governor().acquire("memory", interactive=False, timeout=1.0)
+        except GovernorRejected:
+            return False
+        try:
+            return self._process_job()
+        finally:
+            permit.release()
 
     def run_forever(self) -> None:
         while self.running:

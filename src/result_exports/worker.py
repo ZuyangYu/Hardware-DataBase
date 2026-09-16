@@ -145,12 +145,23 @@ class ResultExportWorker:
         self._record_queue_state()
         did_work = False
         for candidate in self.store.list_pending(limit=limit):
-            job = self.store.claim(
-                candidate.export_job_id,
-                self.worker_id,
-                lease_seconds=max(15, int(getattr(src.settings, "RESULT_EXPORT_JOB_LEASE_SECONDS", 300))),
-            )
+            export_permit = self._acquire_export_permit()
+            if export_permit is False:
+                # Saturated: leave remaining jobs pending for the next loop.
+                break
+            try:
+                job = self.store.claim(
+                    candidate.export_job_id,
+                    self.worker_id,
+                    lease_seconds=max(15, int(getattr(src.settings, "RESULT_EXPORT_JOB_LEASE_SECONDS", 300))),
+                )
+            except Exception:
+                if export_permit is not None:
+                    export_permit.release()
+                raise
             if job is None:
+                if export_permit is not None:
+                    export_permit.release()
                 continue
             did_work = True
             started_at = time.monotonic()
@@ -220,6 +231,8 @@ class ResultExportWorker:
                         retryable=not isinstance(exc, (ValueError, KeyError, PermissionError)),
                     )
                     failed_status = failed_job.status
+                    if failed_status == "dead_letter":
+                        _safe_metric(observability_metrics.record_job_dead_letter, kind="export")
                 except Exception:
                     pass
                 _safe_metric(
@@ -235,8 +248,28 @@ class ResultExportWorker:
                     heartbeat_stop.set()
                 if heartbeat_thread is not None:
                     heartbeat_thread.join(timeout=1)
+                if export_permit is not None:
+                    export_permit.release()
+                _safe_metric(
+                    observability_metrics.record_job_phase,
+                    kind="export",
+                    phase="execution",
+                    seconds=time.monotonic() - started_at,
+                )
         self._record_queue_state()
         return did_work
+
+    @staticmethod
+    def _acquire_export_permit():
+        """Acquire one EXPORT slot; ``False`` means saturated, ``None`` disabled."""
+        if not bool(getattr(src.settings, "RESOURCE_GOVERNOR_ENABLED", True)):
+            return None
+        try:
+            from src.core.concurrency import GovernorRejected, get_governor
+
+            return get_governor().acquire("export", interactive=False, timeout=1.0)
+        except GovernorRejected:
+            return False
 
     def run_forever(self) -> None:
         while self.running:

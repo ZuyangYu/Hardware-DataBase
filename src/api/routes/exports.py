@@ -398,6 +398,14 @@ def create_exports(
     conv: ConversationService = Depends(get_conversation_service),
     store: ResultExportStore = Depends(get_export_store),
 ):
+    from src.api.admission import admission_model_name, enforce_admission
+
+    enforce_admission(
+        user,
+        getattr(user, "department_id", None),
+        resource="export",
+        model=admission_model_name(),
+    )
     formats = list(dict.fromkeys(body.formats))
     if len(formats) != len(body.formats):
         raise HTTPException(status_code=400, detail="formats must be unique")
