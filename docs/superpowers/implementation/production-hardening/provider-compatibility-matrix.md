@@ -8,7 +8,7 @@
 | 后端 | 配置 | 实现 | 验证 |
 |---|---|---|---|
 | sqlite（默认） | `AGENT_CHECKPOINT_BACKEND=sqlite`、`AGENT_CHECKPOINT_DB_PATH` | `SqliteCheckpointerProvider`（共享连接，saver 内部串行） | `tests/test_checkpoint_provider.py`、`test_checkpoint_fork_restore.py` |
-| postgres | `AGENT_CHECKPOINT_BACKEND=postgres` + `AGENT_CHECKPOINT_DATABASE_URL` | `PostgresCheckpointerProvider`：`psycopg_pool.ConnectionPool`（`AGENT_CHECKPOINT_POOL_SIZE`，默认 4；`min_size=1`、autocommit），单连接回退保留 | PG 集成测试 10 passed；16 线程并发 put/get；`verify_checkpoint_postgres.py` 全项通过 |
+| postgres | `AGENT_CHECKPOINT_BACKEND=postgres` + `AGENT_CHECKPOINT_DATABASE_URL` | `PostgresCheckpointerProvider`：`psycopg_pool.ConnectionPool`（`AGENT_CHECKPOINT_POOL_SIZE`，默认 4；`min_size=1`、autocommit），单连接回退保留 | PG 集成测试 10 passed；16 线程并发 put/get；`verify_checkpoint_postgres.py` 全项通过；双副本 HTTP 演练跨副本续跑同一会话（`multi-instance-pg-provider-drill-20260916.json`，checkpoints/checkpoint_writes/store 表实测写入） |
 | 其他值 | — | 配置保存/启动阶段拒绝（`validate_provider_configuration`） | `tests/test_provider_config_guard.py` |
 
 版本：`langgraph==1.2.11`、`langgraph-checkpoint-postgres==3.1.2`、`langgraph-checkpoint-sqlite==3.1.1`、`psycopg[binary]==3.3.5`（已锁定并写入 `uv.lock`）。

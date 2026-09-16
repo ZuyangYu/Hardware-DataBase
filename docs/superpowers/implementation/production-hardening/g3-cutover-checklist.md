@@ -16,9 +16,11 @@
 
 1. `state_fingerprint.py --label g3-pre` 记录源库行数/hash 与文件目录指纹；
 2. `migration_rollback_drill.py --all-groups --dsn <pg>`：快照副本 + 双跑幂等 + 源库不变；
-3. `migrate_sqlite_to_postgres.py --group <g> --dsn <pg>`：逐组迁移；
+3. `migration_rollback_drill.py --all-groups --kill-after 1 --dsn <pg>`：第一遍 SIGKILL 中途打断，验证从半迁移状态恢复收敛（失败恢复）；
+4. `migrate_sqlite_to_postgres.py --group <g> --dsn <pg>`：逐组迁移；
 4. 判定门槛：**任意 `hash_mismatches` 或 `count_mismatches` 非空即阻止切换**（不能只看 `ok=true`）；
-5. 外键/权限/租约/恢复指针抽查；附件/Artifact 文件 hash 与元数据一致。
+5. 外键/权限/租约/恢复指针抽查；附件/Artifact 文件 hash 与元数据一致；
+6. 双 API 副本 PostgreSQL provider 演练：`multi_instance_drill.py --checkpoint-backend postgres --postgres-dsn <pg>`（见 §6）。
 
 ## 3. 切换步骤（生产，需发布窗口）
 
@@ -47,6 +49,16 @@ uv run python scripts/production_hardening/migration_rollback_drill.py --all-gro
   --dsn postgresql://postgres:postgres@127.0.0.1:55432/hdb \
   --output docs/superpowers/implementation/production-hardening/g3-all-groups-rollback-drill.json
 
+# 迁移失败恢复（第一遍被 SIGKILL，后续全量补齐必须收敛）
+uv run python scripts/production_hardening/migration_rollback_drill.py --all-groups --kill-after 1 \
+  --dsn postgresql://postgres:postgres@127.0.0.1:55432/hdb \
+  --output docs/superpowers/implementation/production-hardening/g3-migration-failure-recovery-drill.json
+
+# 双副本使用 PostgreSQL checkpoint/memory provider，跨副本续跑同一会话
+uv run python scripts/production_hardening/multi_instance_drill.py --checkpoint-backend postgres \
+  --postgres-dsn postgresql://postgres:postgres@127.0.0.1:55432/hdb \
+  --output docs/superpowers/implementation/production-hardening/multi-instance-pg-provider-drill-20260916.json
+
 # 单组迁移（含 hash/count 判定）
 uv run python scripts/production_hardening/migrate_sqlite_to_postgres.py --group authority \
   --dsn postgresql://postgres:postgres@127.0.0.1:55432/hdb --report <report.json>
@@ -59,4 +71,5 @@ uv run python scripts/production_hardening/state_fingerprint.py --label g3-post 
 
 - 每单元：源/目标映射、行数与 hash、外键与权限、切换步骤、回滚说明、演练报告；
 - 责任人：存储负责人（切换执行）、后端负责人（应用兼容）、测试负责人（校验）、运维负责人（窗口与回滚）；
-- 当前就绪度：provider/迁移/回滚脚本与演练通过（见 `postgres-migration-drill-20260915.json`、`migration-rollback-drill-20260915.json`、`g3-all-groups-rollback-drill.json`）；共享文件与多主机待环境。
+- 当前就绪度：provider/迁移/回滚脚本与演练通过（见 `postgres-migration-drill-20260915.json`、`migration-rollback-drill-20260915.json`、`g3-all-groups-rollback-drill.json`、`g3-migration-failure-recovery-drill.json`、`multi-instance-pg-provider-drill-20260916.json`）；共享文件与多主机待环境。
+- 已覆盖的 §8.3 验收项：任意 API 副本恢复同一会话（SQLite 与 PostgreSQL provider 双副本跨副本续跑）、同角色 Worker 接管过期任务（G2 套件 + 故障隔离演练）、迁移失败恢复到明确时间点（chaos 打断后收敛）。剩余：跨节点 Artifact/附件访问（共享文件服务）、跨主机配额。

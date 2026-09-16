@@ -78,7 +78,10 @@ uv run hardware-database-eval run --dataset evaluation/datasets/hardware_qa_v1.j
 uv run hardware-database-eval score --dataset <ds> --snapshot <snap> --output storage/evaluations ...
 ```
 
-已归档的质量证据（历史）：附件编辑 e2e 50/50（`attachment-e2e-baseline-20260916.json`）、ADAS_new 小样本 RAGAS（`ragas-small-sample-adas-new-20260916.json`）、Reviewer 确定性 1.0（`reviewer-eval-20260915.json`）。
+已归档的质量证据（历史）：
+- 附件编辑 e2e 50/50（`attachment-e2e-baseline-20260916.json`）、ADAS_new 小样本 RAGAS（`ragas-small-sample-adas-new-20260916.json`）、Reviewer 确定性 1.0（`reviewer-eval-20260915.json`）；
+- **确定性规则层（无裁判模型、可复现）**：对 `hardware_qa_v1` 25 条历史快照（`storage/evaluations/20260916T025402Z-8f3cbdec/snapshot.jsonl`）执行 `hardware-database-eval score --metric none`，`evidence_consistency=1.0`（21 条有证据类型断言，对应 Agent routing 审计）、`forbidden_claims=1.0`（6 条有禁词断言，对应 Unsupported Claim）、gate passed；产物 `g4-deterministic-rules-20260916.json` / `-results.jsonl`；
+- Citation coverage 与 Document Eval 的完整报告仍需裁判/文档夹具（预算窗口内执行）。
 
 ## 5. 资源预算与责任（执行前提，方案 §9.0）
 
