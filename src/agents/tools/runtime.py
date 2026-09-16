@@ -182,9 +182,30 @@ class ToolRuntime:
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     queries: list[dict[str, Any]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    # P0-007: per-call epochs make late evidence registration impossible once
+    # a call (or the whole cancellation path) has ended; checks and appends
+    # share ``_lock`` so there is no check-then-register window.
+    _call_epoch: int = 0
+    _active_call_epochs: set[int] = field(default_factory=set)
+
+    def begin_tool_call(self) -> int:
+        with self._lock:
+            self._call_epoch += 1
+            self._active_call_epochs.add(self._call_epoch)
+            return self._call_epoch
+
+    def end_tool_call(self, epoch: int) -> None:
+        with self._lock:
+            self._active_call_epochs.discard(int(epoch))
+
+    def mark_ended(self) -> None:
+        """Revoke every outstanding call epoch (cancellation/run teardown)."""
+        with self._lock:
+            self._active_call_epochs.clear()
 
     def check_cancel(self) -> None:
         if self.should_cancel is not None and self.should_cancel():
+            self.mark_ended()
             raise QueryCancelled("用户取消查询")
 
     def emit(self, evt_type: str, payload: dict[str, Any]) -> None:
@@ -216,16 +237,23 @@ class ToolRuntime:
                 for item in self.queries
             )
 
-    def add_evidence(self, items: list[Evidence]) -> list[int | None]:
+    def add_evidence(self, items: list[Evidence], *, epoch: int | None = None) -> list[int | None]:
         """Register evidence rows and return their 1-based citation numbers.
 
         ``None`` marks items rejected by the evidence budget: they were never
         registered, so callers must not render or cite them. 超出预算时按
         与问题的词法相关性准入;已编号的证据永不淘汰,保证历史消息里
         的 [n] 引用不悬空。
+
+        When ``epoch`` is given (the tool-call epoch from ``begin_tool_call``),
+        registration is refused for calls that already ended or were revoked by
+        cancellation, so a late result cannot mutate the evidence set.
         """
         numbers: list[int | None] = []
         with self._lock:
+            if epoch is not None and int(epoch) not in self._active_call_epochs:
+                self._record_late_evidence_rejected()
+                return [None for _ in items]
             fresh: list[int] = []
             for position, item in enumerate(items):
                 if item.id and item.id in self.evidence_index:
@@ -261,6 +289,18 @@ class ToolRuntime:
                 self.evidence_index[key] = len(self.evidence)
                 numbers[position] = len(self.evidence)
         return numbers
+
+    @staticmethod
+    def _record_late_evidence_rejected() -> None:
+        try:
+            from src.observability.metrics import counter
+
+            counter(
+                "hdb.retrieval.late_evidence_rejected",
+                description="Evidence registration refused after its tool call ended",
+            )
+        except Exception:
+            pass
 
     def finalize_evidence(self) -> None:
         """按问题相关性重排证据堆;citation_number 在 metadata 里,编号不变。"""
@@ -332,13 +372,26 @@ def timed_tool_call(
         pre_registered = set(rt.evidence_index)
     rt.emit("tool_started", {"tool_name": tool_name, "query": query})
     started = time.monotonic()
+    call_epoch = rt.begin_tool_call()
     try:
-        items = fn()
+        from src.core.concurrency import governor_acquire
+
+        with governor_acquire("tool", interactive=True):
+            items = fn()
+        # Late results from a cancelled run must never be registered as
+        # evidence (P0-007); re-check cancellation after the call returns.
+        rt.check_cancel()
     except QueryCancelled:
         raise
     except Exception as exc:
         from src.core.error_friendly import friendly_error_message
 
+        try:
+            from src.observability.metrics import record_agent_tool_call
+
+            record_agent_tool_call(tool=tool_name, status="failed")
+        except Exception:
+            pass
         rt.record_diagnostic(
             ToolDiagnostics(
                 tool_name=tool_name,
@@ -364,10 +417,18 @@ def timed_tool_call(
                 "reason": friendly_error_message(exc),
             },
         )
+        rt.end_tool_call(call_epoch)
         return AdmittedEvidence(), False
     latency_ms = int((time.monotonic() - started) * 1000)
+    try:
+        from src.observability.metrics import record_agent_tool_call
+
+        record_agent_tool_call(tool=tool_name, status="ok")
+    except Exception:
+        pass
     rt.log_query(tool_name, query)
-    numbers = rt.add_evidence(items)
+    numbers = rt.add_evidence(items, epoch=call_epoch)
+    rt.end_tool_call(call_epoch)
     admitted_items: AdmittedEvidence = AdmittedEvidence()
     for item, number in zip(items, numbers):
         if number is None:

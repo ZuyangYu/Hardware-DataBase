@@ -117,19 +117,49 @@ def make_document_search_batch(
 
     def document_search_batch(queries: list[str], top_k: int = rt.top_k) -> str:
         """并发检索多个相互独立的文档查询。适合中文/英文、型号/标题等查询变体；不要把有前后依赖的查询放在同一批。"""
+        import src.settings as settings
+
         normalized = []
         for query in queries or []:
             value = str(query or "").strip()
             if value and value not in normalized:
                 normalized.append(value)
-        normalized = normalized[:4]
+        try:
+            fanout_cap = max(1, int(getattr(settings, "RETRIEVAL_PER_REQUEST_FANOUT", 4)))
+        except (TypeError, ValueError):
+            fanout_cap = 4
+        normalized = normalized[:fanout_cap]
         if not normalized:
             return "（未提供有效的文档查询）"
         safe_top_k = max(1, min(int(top_k), 20))
-        with ThreadPoolExecutor(
-            max_workers=len(normalized), thread_name_prefix="hdb-document-search"
-        ) as executor:
-            results = list(executor.map(lambda query: search(query, safe_top_k), normalized))
-        return "\n\n".join(result for result in results if result)
+        if not bool(getattr(settings, "SHARED_RETRIEVAL_EXECUTOR_ENABLED", True)):
+            with ThreadPoolExecutor(
+                max_workers=len(normalized), thread_name_prefix="hdb-document-search"
+            ) as executor:
+                results = list(executor.map(lambda query: search(query, safe_top_k), normalized))
+            return "\n\n".join(result for result in results if result)
+
+        from src.agents.tools.retrieval_executor import get_retrieval_executor
+
+        try:
+            from src.observability.metrics import record_rag_batch
+
+            record_rag_batch(fanout=len(normalized))
+        except Exception:
+            pass
+        cancel_check = None
+        if getattr(rt, "should_cancel", None) is not None:
+            cancel_check = lambda: bool(rt.should_cancel())  # noqa: E731
+        call_results = get_retrieval_executor().map_bounded(
+            lambda query: search(query, safe_top_k),
+            normalized,
+            fanout=fanout_cap,
+            deadline=float(getattr(settings, "RETRIEVAL_QUEUE_MAX_WAIT_SECONDS", 30.0)),
+            cancel_check=cancel_check,
+        )
+        texts = [str(item.value) for item in call_results if item.status == "ok" and item.value]
+        if not texts and any(item.status == "saturated" for item in call_results):
+            return "（检索服务繁忙，请稍后重试或减少并发查询）"
+        return "\n\n".join(texts)
 
     return document_search_batch
