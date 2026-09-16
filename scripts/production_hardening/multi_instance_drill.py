@@ -6,7 +6,15 @@ Starts two API processes against the same storage (SQLite default), then:
    concurrently — exactly one owner may execute;
 2. asserts the turn reaches a terminal state exactly once (one ``turn_end``
    event, non-empty answer), proving claim/fencing holds across processes;
-3. asserts a session created on A is visible on B (shared state).
+3. asserts a session created on A is visible on B (shared state);
+4. starts a follow-up turn on replica B in the same session, proving the
+   conversation (and, with ``--checkpoint-backend postgres``, the agent
+   checkpoint) resumes on another replica.
+
+With ``--checkpoint-backend postgres --postgres-dsn <dsn>`` both replicas use
+the PostgreSQL agent/authoring checkpoint providers and the PostgreSQL memory
+projection, so the drill exercises the production service-backed state path
+instead of the SQLite default.
 
 The report is written as JSON; the drill is repeatable in a dev workspace and
 does not require a model to be reachable beyond what the deployment provides.
@@ -133,19 +141,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--username", default="midrill")
     parser.add_argument("--password", default="StrongPass123!")
     parser.add_argument("--auth-db", default=str(REPO_ROOT / "storage" / "auth.db"))
+    parser.add_argument(
+        "--checkpoint-backend",
+        choices=["sqlite", "postgres"],
+        default="sqlite",
+        help="state provider under test for both replicas",
+    )
+    parser.add_argument(
+        "--postgres-dsn",
+        default="",
+        help="PostgreSQL DSN required when --checkpoint-backend postgres",
+    )
     parser.add_argument("--turn-timeout", type=float, default=300.0)
     parser.add_argument("--output", default="")
     args = parser.parse_args(argv)
 
+    if args.checkpoint_backend == "postgres" and not args.postgres_dsn:
+        parser.error("--postgres-dsn is required with --checkpoint-backend postgres")
+
     _seed_actor(args.username, args.password, args.auth_db)
 
+    provider_env: dict[str, str] = {"AUTH_DB_PATH": args.auth_db}
+    if args.checkpoint_backend == "postgres":
+        provider_env.update(
+            {
+                "AGENT_CHECKPOINT_BACKEND": "postgres",
+                "AGENT_CHECKPOINT_DATABASE_URL": args.postgres_dsn,
+                "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND": "postgres",
+                "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL": args.postgres_dsn,
+                "MEMORY_STORE_BACKEND": "postgres",
+                "MEMORY_DATABASE_URL": args.postgres_dsn,
+            }
+        )
     replicas = [
-        _Replica(args.port_a, {"AUTH_DB_PATH": args.auth_db}),
-        _Replica(args.port_b, {"AUTH_DB_PATH": args.auth_db}),
+        _Replica(args.port_a, provider_env),
+        _Replica(args.port_b, provider_env),
     ]
     report: dict[str, object] = {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "auth_db": args.auth_db,
+        "checkpoint_backend": args.checkpoint_backend,
         "replicas": [args.port_a, args.port_b],
         "checks": {},
     }
@@ -216,11 +251,46 @@ def main(argv: list[str] | None = None) -> int:
         report["checks"]["single_turn_end_event"] = turn_end_events == 1
         report["turn_end_events"] = turn_end_events
 
+        # Follow-up turn on replica B: same session, another process. With the
+        # postgres provider this resumes agent checkpoints created on A.
+        follow_up = httpx.post(
+            f"{replicas[1].base_url}/api/v1/conversations/{session_id}/turns",
+            json={
+                "query": "跨副本续跑：请用一句话确认这是第二条消息。",
+                "client_request_id": f"mi-drill-b-{int(time.time())}",
+                "source_scope": "knowledge_base_only",
+            },
+            headers=headers,
+            timeout=20,
+        )
+        follow_up.raise_for_status()
+        follow_up_id = str(follow_up.json()["turn"]["id"])
+        follow_start = httpx.post(
+            f"{replicas[1].base_url}/api/v1/turns/{follow_up_id}/start",
+            headers=headers,
+            timeout=20,
+        )
+        report["follow_up_start_status"] = follow_start.status_code
+        follow_terminal = _wait_terminal(
+            replicas[1].base_url, token, follow_up_id, timeout=args.turn_timeout
+        )
+        report["checks"]["cross_replica_resume_completed"] = follow_terminal == "completed"
+        detail_b = httpx.get(
+            f"{replicas[1].base_url}/api/v1/conversations/{session_id}/messages",
+            headers=headers,
+            timeout=15,
+        ).json()
+        messages = detail_b if isinstance(detail_b, list) else detail_b.get("messages")
+        report["message_count_on_b"] = len(messages or [])
+        report["checks"]["resumed_messages_on_b"] = len(messages or []) >= 4
+
         ok = (
             report["checks"]["session_visible_on_both"]
             and terminal == "completed"
             and report["checks"]["answer_present"]
             and report["checks"]["single_turn_end_event"]
+            and report["checks"]["cross_replica_resume_completed"]
+            and report["checks"]["resumed_messages_on_b"]
         )
         report["ok"] = ok
     finally:
