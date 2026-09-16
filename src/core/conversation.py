@@ -2,6 +2,8 @@ import os
 import json
 import hashlib
 import sqlite3
+import threading
+import time
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -79,10 +81,40 @@ class ChatTurn:
     source_scope: str = "auto"
     required_attachment_ids: list[str] = field(default_factory=list)
     attachments: list[dict] = field(default_factory=list)
+    # Server-assigned, per-session monotonic turn order.  0 only appears for
+    # rows written before the expand migration; runtime always allocates.
+    turn_sequence: int = 0
+    # Execution ownership captured at claim time.  0 means the legacy
+    # (non-serialized) path and disables stale-owner rejection for that turn.
+    fencing_token: int = 0
+    session_generation: int = 0
+    # Server-generated identity of the execution attempt that owns this turn.
+    attempt_id: str = ""
 
 
 # A turn waits here while its required chat attachments are still parsing.
 TURN_STATUS_WAITING_FOR_ATTACHMENTS = "waiting_for_attachments"
+
+# Non-terminal statuses that keep later turns of the same session queued.
+TURN_STATUSES_NON_TERMINAL = ("pending", "streaming", "cancelling", "waiting_for_attachments")
+
+
+class StaleTurnOwner(RuntimeError):
+    """Raised when a superseded attempt tries to write authoritative state."""
+
+
+@dataclass
+class TurnClaimResult:
+    """Structured ``claim_turn`` outcome (plan §5.2).
+
+    ``status`` is one of ``claimed``/``blocked``/``stale``/``cancelled``/
+    ``retry_exhausted``/``noop``.  ``turn`` is only set for ``claimed``; the
+    legacy ``ChatTurn | None`` adapter keeps existing callers working.
+    """
+
+    status: str
+    turn: ChatTurn | None = None
+    blocker_turn_id: str = ""
 
 
 @dataclass
@@ -94,11 +126,36 @@ class ChatTurnEvent:
     created_at: str
 
 
+# Paths whose schema has already been initialized by this process; repeated
+# constructions must not re-run DDL/backfills on the shared authority DB.
+_INITIALIZED_DB_PATHS: set[str] = set()
+_INIT_LOCK = threading.Lock()
+
+
 class ConversationService:
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or src.settings.AUTH_DB_PATH
+        self.db_path = os.path.abspath(db_path or src.settings.AUTH_DB_PATH)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._init_db()
+        with _INIT_LOCK:
+            needs_init = self.db_path not in _INITIALIZED_DB_PATHS
+        if needs_init:
+            self._init_db_with_retry()
+            with _INIT_LOCK:
+                _INITIALIZED_DB_PATHS.add(self.db_path)
+
+    def _init_db_with_retry(self) -> None:
+        """Bounded busy retry for concurrent first-use schema initialization."""
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                self._init_db()
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
@@ -119,6 +176,9 @@ class ConversationService:
                     kb_id INTEGER,
                     title TEXT NOT NULL,
                     document_context_json TEXT NOT NULL DEFAULT '{}',
+                    -- Next sequence value to hand to a new turn of this session.
+                    -- Legacy rows are reconciled to MAX(turn_sequence)+1 on init.
+                    next_turn_sequence INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -155,6 +215,7 @@ class ConversationService:
                     query_mode TEXT NOT NULL DEFAULT 'fast',
                     status TEXT NOT NULL,
                     client_request_id TEXT,
+                    turn_sequence INTEGER NOT NULL,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     last_event_seq INTEGER NOT NULL DEFAULT 0,
                     answer TEXT NOT NULL DEFAULT '',
@@ -256,28 +317,70 @@ class ConversationService:
             self._ensure_column(conn, "chat_sessions", "auto_memory", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(conn, "chat_turns", "source_scope", "TEXT NOT NULL DEFAULT 'auto'")
             self._ensure_column(conn, "chat_turns", "required_attachment_ids", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(conn, "chat_sessions", "next_turn_sequence", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(conn, "chat_turns", "turn_sequence", "INTEGER")
+            self._backfill_turn_sequences(conn)
+            # Per-session execution authority (plan §5.2.1): the single source of
+            # truth for lease, fencing token, generation and checkpoint pointers.
+            # Turn/event/answer writes share this database transaction boundary.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_execution_state (
+                    session_id INTEGER PRIMARY KEY,
+                    active_turn_id TEXT NOT NULL DEFAULT '',
+                    active_attempt_id TEXT NOT NULL DEFAULT '',
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_expires_at TEXT,
+                    fencing_token INTEGER NOT NULL DEFAULT 0,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    recoverable_checkpoint_ref TEXT NOT NULL DEFAULT '',
+                    committed_checkpoint_ref TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_chat_turns_session_sequence"
+                " ON chat_turns(session_id, turn_sequence)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_chat_turns_session_status_sequence"
+                " ON chat_turns(session_id, status, turn_sequence)"
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_turns_status_created ON chat_turns(status, created_at)")
             has_users = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
             ).fetchone()
             if has_users:
                 # Backfill historical chats from their owning user. Once populated,
-                # every read also enforces this department scope.
-                conn.execute(
-                    """
-                    UPDATE chat_sessions
-                    SET department_id = (SELECT department_id FROM users WHERE users.id = chat_sessions.user_id)
-                    WHERE department_id IS NULL
-                    """
-                )
-                conn.execute(
-                    """
-                    UPDATE chat_turns
-                    SET department_id = (SELECT department_id FROM chat_sessions WHERE chat_sessions.id = chat_turns.session_id),
-                        kb_id = (SELECT kb_id FROM chat_sessions WHERE chat_sessions.id = chat_turns.session_id)
-                    WHERE department_id IS NULL
-                    """
-                )
+                # every read also enforces this department scope.  Only write when
+                # rows actually need it: a no-op UPDATE would still contend for the
+                # write lock during multi-process startup.
+                pending_sessions = conn.execute(
+                    "SELECT 1 FROM chat_sessions WHERE department_id IS NULL LIMIT 1"
+                ).fetchone()
+                if pending_sessions is not None:
+                    conn.execute(
+                        """
+                        UPDATE chat_sessions
+                        SET department_id = (SELECT department_id FROM users WHERE users.id = chat_sessions.user_id)
+                        WHERE department_id IS NULL
+                        """
+                    )
+                pending_turns = conn.execute(
+                    "SELECT 1 FROM chat_turns WHERE department_id IS NULL LIMIT 1"
+                ).fetchone()
+                if pending_turns is not None:
+                    conn.execute(
+                        """
+                        UPDATE chat_turns
+                        SET department_id = (SELECT department_id FROM chat_sessions WHERE chat_sessions.id = chat_turns.session_id),
+                            kb_id = (SELECT kb_id FROM chat_sessions WHERE chat_sessions.id = chat_turns.session_id)
+                        WHERE department_id IS NULL
+                        """
+                    )
             # Long-term memory control-plane tables share this SQLite
             # connection boundary with Conversation.  The import is deferred
             # to keep the auth/conversation modules independently importable.
@@ -290,6 +393,122 @@ class ConversationService:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    @staticmethod
+    def _backfill_turn_sequences(conn) -> None:
+        """Expand/backfill legacy rows in (session_id, user_message_id) order.
+
+        Existing non-null sequences are respected; new values continue from the
+        per-session maximum.  The per-session counter stores the next available
+        value, so it is reconciled to ``MAX(turn_sequence) + 1`` (1 for sessions
+        without turns).  This never reuses a sequence that history already used.
+        """
+        rows = conn.execute(
+            """
+            SELECT id, session_id FROM chat_turns
+            WHERE turn_sequence IS NULL
+            ORDER BY session_id, user_message_id, rowid
+            """
+        ).fetchall()
+        if rows:
+            counters = {
+                int(row["session_id"]): int(row["max_seq"] or 0)
+                for row in conn.execute(
+                    "SELECT session_id, MAX(turn_sequence) AS max_seq FROM chat_turns GROUP BY session_id"
+                ).fetchall()
+            }
+            for row in rows:
+                session_id = int(row["session_id"])
+                counters[session_id] = counters.get(session_id, 0) + 1
+                conn.execute(
+                    "UPDATE chat_turns SET turn_sequence = ? WHERE id = ?",
+                    (counters[session_id], str(row["id"])),
+                )
+        mismatch = conn.execute(
+            """
+            SELECT 1 FROM chat_sessions
+            WHERE next_turn_sequence <> COALESCE((
+                SELECT MAX(turns.turn_sequence)
+                FROM chat_turns turns WHERE turns.session_id = chat_sessions.id
+            ), 0) + 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if mismatch is not None:
+            conn.execute(
+                """
+                UPDATE chat_sessions
+                SET next_turn_sequence = COALESCE((
+                    SELECT MAX(turns.turn_sequence)
+                    FROM chat_turns turns WHERE turns.session_id = chat_sessions.id
+                ), 0) + 1
+                WHERE next_turn_sequence <> COALESCE((
+                    SELECT MAX(turns.turn_sequence)
+                    FROM chat_turns turns WHERE turns.session_id = chat_sessions.id
+                ), 0) + 1
+                """
+            )
+
+    @staticmethod
+    def _ensure_execution_state(conn, session_id: int):
+        """Fetch (creating if needed) the per-session execution state row.
+
+        Returns ``None`` when the session no longer exists: a deleted session
+        must never be resurrected by a late worker re-creating state.
+        """
+        sid = int(session_id)
+        row = conn.execute(
+            "SELECT * FROM conversation_execution_state WHERE session_id = ?", (sid,)
+        ).fetchone()
+        if row is not None:
+            return row
+        exists = conn.execute("SELECT 1 FROM chat_sessions WHERE id = ?", (sid,)).fetchone()
+        if exists is None:
+            return None
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO conversation_execution_state (session_id, updated_at)
+            VALUES (?, ?)
+            """,
+            (sid, utc_now()),
+        )
+        return conn.execute(
+            "SELECT * FROM conversation_execution_state WHERE session_id = ?", (sid,)
+        ).fetchone()
+
+    @classmethod
+    def _bump_session_generation(cls, conn, session_id: int) -> None:
+        """Revoke in-flight commits for a session without touching pointers."""
+        state = cls._ensure_execution_state(conn, session_id)
+        if state is None:
+            return
+        conn.execute(
+            """
+            UPDATE conversation_execution_state
+            SET generation = generation + 1, revision = revision + 1, updated_at = ?
+            WHERE session_id = ?
+            """,
+            (utc_now(), int(session_id)),
+        )
+
+    @classmethod
+    def _reset_execution_state(cls, conn, session_id: int) -> None:
+        """Clear history: advance generation and drop ownership/checkpoint refs."""
+        state = cls._ensure_execution_state(conn, session_id)
+        if state is None:
+            return
+        conn.execute(
+            """
+            UPDATE conversation_execution_state
+            SET generation = generation + 1,
+                active_turn_id = '', active_attempt_id = '',
+                lease_owner = '', lease_expires_at = NULL,
+                recoverable_checkpoint_ref = '', committed_checkpoint_ref = '',
+                revision = revision + 1, updated_at = ?
+            WHERE session_id = ?
+            """,
+            (utc_now(), int(session_id)),
+        )
 
     def list_sessions(self, user_id: int, kb_name: str | None = None) -> list[ChatSession]:
         with closing(self._connect()) as conn:
@@ -466,9 +685,16 @@ class ConversationService:
                 invalidate_session_memory_in_connection(conn, session_id, reason="session_cleared")
                 conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
                 conn.execute(
-                    "UPDATE chat_sessions SET title = '新对话', updated_at = ? WHERE id = ? AND user_id = ?",
+                    """
+                    UPDATE chat_sessions
+                    SET title = '新对话', updated_at = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
                     (now, session_id, user_id),
                 )
+                # Sequence values already handed out are never reused; the
+                # generation advance invalidates in-flight commits and pointers.
+                self._reset_execution_state(conn, session_id)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -826,6 +1052,22 @@ class ConversationService:
                     if existing is not None:
                         conn.execute("COMMIT")
                         return row_to_turn(existing)
+                keys = session_row.keys()
+                if "next_turn_sequence" in keys:
+                    turn_sequence = int(session_row["next_turn_sequence"] or 0)
+                else:
+                    # Legacy schema before the expand migration ran; the
+                    # surrounding BEGIN IMMEDIATE makes the max+1 read safe.
+                    turn_sequence = 0
+                if turn_sequence <= 0:
+                    turn_sequence = 1
+                # Defensive reconciliation: never hand out a sequence history
+                # already used (covers concurrent writers on a legacy schema).
+                max_row = conn.execute(
+                    "SELECT COALESCE(MAX(turn_sequence), 0) AS seq FROM chat_turns WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                turn_sequence = max(turn_sequence, int(max_row["seq"] or 0) + 1)
                 user_cursor = conn.execute(
                     "INSERT INTO chat_messages (session_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
                     (session_id, query, now),
@@ -837,11 +1079,12 @@ class ConversationService:
                 conn.execute(
                     """UPDATE chat_sessions
                        SET updated_at = ?,
+                           next_turn_sequence = ?,
                            title = CASE WHEN title = '新对话' THEN ? ELSE title END,
                            document_context_json = CASE WHEN ? = '{}' THEN document_context_json ELSE ? END
                        WHERE id = ?""",
                     (
-                        now, query.replace("\n", " ")[:32] or "新对话",
+                        now, turn_sequence + 1, query.replace("\n", " ")[:32] or "新对话",
                         document_context_json, document_context_json, session_id,
                     ),
                 )
@@ -859,10 +1102,11 @@ class ConversationService:
                     """
                     INSERT INTO chat_turns (
                         id, session_id, user_message_id, assistant_message_id, kb_name, query, query_mode,
-                        department_id, kb_id, status, client_request_id, trace_context_json, created_at,
+                        department_id, kb_id, status, client_request_id, turn_sequence,
+                        trace_context_json, created_at,
                         document_context_json, export_plan_json, source_scope, required_attachment_ids,
                         wiki_assist
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -876,6 +1120,7 @@ class ConversationService:
                         session_row["kb_id"],
                         initial_status,
                         request_id,
+                        turn_sequence,
                         json.dumps(trace_context or {}, ensure_ascii=False),
                         now,
                         document_context_json,
@@ -929,6 +1174,47 @@ class ConversationService:
                 (turn_id, user_id),
             ).fetchone()
         return row_to_turn(row) if row else None
+
+    def find_turn_by_client_request(self, session_id: int, client_request_id: str) -> ChatTurn | None:
+        """Idempotency lookup used before admission checks (P0-006)."""
+        request_id = str(client_request_id or "").strip()[:128]
+        if not request_id:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_turns WHERE session_id = ? AND client_request_id = ?",
+                (int(session_id), request_id),
+            ).fetchone()
+        return row_to_turn(row) if row else None
+
+    def count_unterminal_turns(self, user_id: int, *, session_id: int | None = None) -> int:
+        """Non-terminal turns owned by a user (optionally scoped to a session).
+
+        Includes attachment waits so per-session/user admission bounds apply to
+        work that has not reached a terminal state yet (plan §6.4).
+        """
+        with closing(self._connect()) as conn:
+            if session_id is not None:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS total FROM chat_turns t
+                    JOIN chat_sessions s ON s.id = t.session_id
+                    WHERE s.user_id = ? AND t.session_id = ?
+                      AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                    """,
+                    (int(user_id), int(session_id)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS total FROM chat_turns t
+                    JOIN chat_sessions s ON s.id = t.session_id
+                    WHERE s.user_id = ?
+                      AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                    """,
+                    (int(user_id),),
+                ).fetchone()
+        return int(row["total"] or 0) if row else 0
 
     def get_turn_by_message(self, user_id: int, message_id: int) -> ChatTurn | None:
         """Resolve a persisted user/assistant message to its owning turn."""
@@ -1020,6 +1306,7 @@ class ConversationService:
         *,
         to_status: str,
         error_message: str = "",
+        reason_code: str = "",
     ) -> bool:
         """Atomically move a waiting turn out of the attachment wait state.
 
@@ -1057,10 +1344,200 @@ class ConversationService:
                         (f"附件解析失败：{error_message[:400]}", turn_id),
                     )
                 conn.execute("COMMIT")
-                return int(cursor.rowcount or 0) > 0
+                updated = int(cursor.rowcount or 0) > 0
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+        if updated:
+            if reason_code == "attachment_wait_timeout":
+                wait_status = "timed_out"
+            elif to_status == "pending":
+                wait_status = "completed"
+            else:
+                wait_status = "failed"
+            self._record_attachment_wait(turn_id, wait_status)
+        return updated
+
+    def _record_attachment_wait(self, turn_id: str, wait_status: str) -> None:
+        try:
+            from src.observability.metrics import histogram
+
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    "SELECT created_at FROM chat_turns WHERE id = ?", (turn_id,)
+                ).fetchone()
+            if row is None:
+                return
+            created = datetime.fromisoformat(str(row["created_at"]))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            duration = max(0.0, (datetime.now(timezone.utc) - created).total_seconds())
+            histogram(
+                "hdb.conversation.attachment_wait",
+                duration,
+                attributes={"status": wait_status},
+                description="Time spent in waiting_for_attachments by terminal outcome",
+            )
+        except Exception:
+            pass
+
+    def expire_waiting_turns(self, max_wait_seconds: int | None = None, limit: int = 50) -> int:
+        """Fail attachment waits that exceeded the cap so later turns proceed.
+
+        Uses the same conditional transition as the settlement path, so a parse
+        completion racing the sweep can win only once.
+        """
+        configured = getattr(src.settings, "WAITING_TURN_MAX_SECONDS", 600)
+        max_wait_seconds = max(1, int(max_wait_seconds if max_wait_seconds is not None else configured))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM chat_turns
+                WHERE status = 'waiting_for_attachments'
+                  AND datetime(created_at) < datetime('now', ?)
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
+                (f"-{int(max_wait_seconds)} seconds", max(1, min(int(limit), 500))),
+            ).fetchall()
+        expired = 0
+        for row in rows:
+            turn_id = str(row["id"])
+            updated = self.transition_waiting_turn(
+                turn_id,
+                to_status="failed",
+                error_message="附件解析等待超时，本轮请求已取消；可稍后重新发送。",
+                reason_code="attachment_wait_timeout",
+            )
+            if updated:
+                expired += 1
+                try:
+                    self.append_turn_event(
+                        turn_id,
+                        "attachment_wait_timeout",
+                        {
+                            "error_code": "attachment_wait_timeout",
+                            "wait_seconds": int(max_wait_seconds),
+                        },
+                    )
+                except Exception:
+                    pass
+        return expired
+
+    def expire_queued_turns(self, max_queue_seconds: int | None = None, limit: int = 100) -> int:
+        """Fail never-started turns that waited past the chat queue deadline.
+
+        The deadline counts from turn acceptance and includes attachment waits
+        and same-session blocking (plan §6.4).  Running turns keep their
+        execution deadline and are never touched by this sweep.
+        """
+        configured = getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)
+        max_queue_seconds = max(
+            1, int(max_queue_seconds if max_queue_seconds is not None else configured)
+        )
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM chat_turns
+                WHERE status = 'pending' AND cancel_requested = 0
+                  AND datetime(created_at) < datetime('now', ?)
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
+                (f"-{int(max_queue_seconds)} seconds", max(1, min(int(limit), 500))),
+            ).fetchall()
+        expired = 0
+        for row in rows:
+            turn_id = str(row["id"])
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = conn.execute(
+                        """
+                        UPDATE chat_turns
+                        SET status = 'failed',
+                            error_message = '排队等待超时，本轮请求未执行；请稍后重试。',
+                            finished_at = ?
+                        WHERE id = ? AND status = 'pending'
+                        """,
+                        (now, turn_id),
+                    )
+                    updated = int(cursor.rowcount or 0) > 0
+                    if updated:
+                        conn.execute(
+                            "UPDATE chat_messages SET content = ? WHERE id = ("
+                            " SELECT assistant_message_id FROM chat_turns WHERE id = ?"
+                            ") AND content = ''",
+                            ("生成失败：排队等待超时", turn_id),
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+            if not updated:
+                continue
+            expired += 1
+            try:
+                self.append_turn_event(
+                    turn_id,
+                    "chat_queue_timeout",
+                    {
+                        "error_code": "chat_queue_timeout",
+                        "wait_seconds": int(max_queue_seconds),
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                from src.observability.metrics import counter
+
+                counter(
+                    "hdb.chat.queue_timeout",
+                    description="Turns failed after exceeding the chat queue deadline",
+                )
+            except Exception:
+                pass
+        return expired
+
+    def turn_queue_context(self, turn_id: str) -> dict[str, Any]:
+        """Queue visibility for the turn API: blocker, reason and deadline."""
+        context: dict[str, Any] = {
+            "blocked_by_turn_id": None,
+            "queue_reason": "",
+            "wait_deadline": None,
+        }
+        with closing(self._connect()) as conn:
+            turn = conn.execute(
+                "SELECT session_id, turn_sequence, status, created_at FROM chat_turns WHERE id = ?",
+                (turn_id,),
+            ).fetchone()
+            if turn is None:
+                return context
+            blocker = conn.execute(
+                """
+                SELECT prior.id, prior.status FROM chat_turns prior
+                WHERE prior.session_id = ? AND prior.turn_sequence < ?
+                  AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                ORDER BY prior.turn_sequence DESC
+                LIMIT 1
+                """,
+                (int(turn["session_id"]), int(turn["turn_sequence"] or 0)),
+            ).fetchone()
+        if str(turn["status"]) == TURN_STATUS_WAITING_FOR_ATTACHMENTS:
+            context["queue_reason"] = "waiting_for_attachments"
+            context["wait_deadline"] = _iso_after(
+                str(turn["created_at"]),
+                int(getattr(src.settings, "WAITING_TURN_MAX_SECONDS", 600)),
+            )
+        elif blocker is not None:
+            context["blocked_by_turn_id"] = str(blocker["id"])
+            context["queue_reason"] = (
+                "waiting_for_attachments"
+                if str(blocker["status"]) == TURN_STATUS_WAITING_FOR_ATTACHMENTS
+                else "queued_behind_previous_turn"
+            )
+        return context
 
     def list_turn_attachments(self, turn_id: str) -> list[dict]:
         """Frozen attachment snapshots for one turn (history rendering)."""
@@ -1156,30 +1633,66 @@ class ConversationService:
         """Make abandoned worker claims available to an independent worker again."""
         stale_after_seconds = max(30, int(stale_after_seconds or src.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
         with closing(self._connect()) as conn:
-            cursor = conn.execute(
-                """
-                UPDATE chat_turns
-                SET status = 'pending', worker_id = '', worker_heartbeat_at = NULL
-                WHERE status IN ('streaming', 'cancelling')
-                  AND worker_heartbeat_at IS NOT NULL
-                  AND datetime(worker_heartbeat_at) < datetime('now', ?)
-                  AND retry_count < 3
-                """,
-                (f"-{stale_after_seconds} seconds",),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE chat_turns
+                    SET status = 'pending', worker_id = '', worker_heartbeat_at = NULL
+                    WHERE status IN ('streaming', 'cancelling')
+                      AND worker_heartbeat_at IS NOT NULL
+                      AND datetime(worker_heartbeat_at) < datetime('now', ?)
+                      AND retry_count < 3
+                    """,
+                    (f"-{stale_after_seconds} seconds",),
+                )
+                # A requeued turn is no longer running: drop the session lease
+                # so the next claim (possibly another worker) can take over.
+                conn.execute(
+                    """
+                    UPDATE conversation_execution_state
+                    SET active_turn_id = '', active_attempt_id = '',
+                        lease_owner = '', lease_expires_at = NULL,
+                        revision = revision + 1, updated_at = ?
+                    WHERE active_turn_id <> '' AND NOT EXISTS (
+                        SELECT 1 FROM chat_turns t
+                        WHERE t.id = conversation_execution_state.active_turn_id
+                          AND t.status IN ('streaming', 'cancelling')
+                    )
+                    """,
+                    (utc_now(),),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         return int(cursor.rowcount or 0)
 
     def list_pending_turn_work(self, limit: int = 8) -> list[tuple[ChatTurn, int]]:
         """Return queued work without claiming it; ``claim_turn`` remains atomic."""
+        serialize = bool(getattr(src.settings, "CONVERSATION_SERIALIZE_SAME_THREAD", True))
+        head_filter = (
+            """
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chat_turns prior
+                      WHERE prior.session_id = t.session_id
+                        AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                        AND prior.turn_sequence < t.turn_sequence
+                  )
+            """
+            if serialize
+            else ""
+        )
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT t.*, s.user_id
                 FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 JOIN users u ON u.id = s.user_id
                 WHERE t.status = 'pending' AND t.cancel_requested = 0
                   AND u.is_active = 1
+                  {head_filter}
                 ORDER BY t.created_at, t.id
                 LIMIT ?
                 """,
@@ -1217,9 +1730,44 @@ class ConversationService:
         worker_id: str = "",
         stale_after_seconds: int | None = None,
     ) -> ChatTurn | None:
-        """Claim a pending turn once; concurrent start requests are harmless."""
+        """Legacy adapter: structured claim result projected to ``ChatTurn | None``."""
+        return self.claim_turn_result(
+            user_id, turn_id, worker_id, stale_after_seconds=stale_after_seconds
+        ).turn
+
+    def claim_turn_result(
+        self,
+        user_id: int,
+        turn_id: str,
+        worker_id: str = "",
+        stale_after_seconds: int | None = None,
+    ) -> TurnClaimResult:
+        """Claim a pending turn once; concurrent start requests are harmless.
+
+        With ``CONVERSATION_SERIALIZE_SAME_THREAD`` enabled, only the earliest
+        non-terminal turn of a session is claimable, and the claim carries a
+        per-session lease plus an increasing fencing token.  Superseded
+        attempts are rejected by the guarded write methods.
+        """
         now = utc_now()
         stale_after_seconds = max(30, int(stale_after_seconds or src.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
+        serialize = bool(getattr(src.settings, "CONVERSATION_SERIALIZE_SAME_THREAD", True))
+        lease_seconds = max(30, int(getattr(src.settings, "CHAT_TURN_LEASE_SECONDS", 120)))
+        claim_started = time.monotonic()
+
+        def _done(status: str, conflict: bool = False) -> None:
+            try:
+                from src.observability.metrics import (
+                    record_conversation_claim,
+                    record_same_thread_conflict,
+                )
+
+                record_conversation_claim(status=status, wait_s=time.monotonic() - claim_started)
+                if conflict:
+                    record_same_thread_conflict()
+            except Exception:
+                pass
+
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1230,6 +1778,10 @@ class ConversationService:
                     """,
                     (turn_id, user_id),
                 ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    _done("noop")
+                    return TurnClaimResult(status="noop")
                 # A process may have died after claiming the turn. Requeue only
                 # after a conservative heartbeat timeout; a live worker keeps
                 # touching the row as it emits stages and deltas.
@@ -1250,8 +1802,67 @@ class ConversationService:
                     (turn_id, user_id),
                 ).fetchone()
                 if row is None or row["status"] != "pending":
+                    if row is not None and int(row["cancel_requested"] or 0) == 1 and row["status"] == "cancelled":
+                        conn.execute("COMMIT")
+                        _done("cancelled")
+                        return TurnClaimResult(status="cancelled")
                     conn.execute("COMMIT")
-                    return None
+                    _done("noop")
+                    return TurnClaimResult(status="noop")
+                if int(row["cancel_requested"] or 0) == 1:
+                    conn.execute("COMMIT")
+                    _done("cancelled")
+                    return TurnClaimResult(status="cancelled")
+                session_id = int(row["session_id"])
+                fencing_token = 0
+                generation = 0
+                attempt_id = ""
+                if serialize:
+                    session_row = self._ensure_execution_state(conn, session_id)
+                    if session_row is None:
+                        conn.execute("COMMIT")
+                        _done("stale")
+                        return TurnClaimResult(status="stale")
+                    # Strict per-session ordering: an earlier non-terminal turn
+                    # keeps this one queued.
+                    earlier = conn.execute(
+                        """
+                        SELECT id FROM chat_turns
+                        WHERE session_id = ? AND id <> ?
+                          AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                          AND turn_sequence < ?
+                        ORDER BY turn_sequence
+                        LIMIT 1
+                        """,
+                        (session_id, turn_id, int(row["turn_sequence"] or 0)),
+                    ).fetchone()
+                    if earlier is not None:
+                        conn.execute("COMMIT")
+                        _done("blocked", conflict=True)
+                        return TurnClaimResult(status="blocked", blocker_turn_id=str(earlier["id"]))
+                    active_turn = str(session_row["active_turn_id"] or "")
+                    if active_turn and active_turn != turn_id and _lease_active(
+                        session_row["lease_expires_at"], now
+                    ):
+                        active_status = conn.execute(
+                            "SELECT status FROM chat_turns WHERE id = ?", (active_turn,)
+                        ).fetchone()
+                        if active_status is not None and str(active_status["status"]) in TURN_STATUSES_NON_TERMINAL:
+                            conn.execute("COMMIT")
+                            _done("blocked", conflict=True)
+                            return TurnClaimResult(status="blocked", blocker_turn_id=active_turn)
+                        # Terminal turn with a leftover lease (crash between
+                        # completion and release): reclaim it and continue.
+                        conn.execute(
+                            """
+                            UPDATE conversation_execution_state
+                            SET active_turn_id = '', active_attempt_id = '',
+                                lease_owner = '', lease_expires_at = NULL,
+                                revision = revision + 1, updated_at = ?
+                            WHERE session_id = ? AND active_turn_id = ?
+                            """,
+                            (now, session_id, active_turn),
+                        )
                 conn.execute(
                     """
                     UPDATE chat_turns
@@ -1263,34 +1874,271 @@ class ConversationService:
                 )
                 claimed = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
                 if claimed is None or claimed["worker_id"] != worker_id:
-                    if claimed is not None and int(claimed["retry_count"] or 0) >= 3:
+                    exhausted = claimed is not None and int(claimed["retry_count"] or 0) >= 3
+                    if exhausted:
                         conn.execute(
                             "UPDATE chat_turns SET status = 'failed', error_message = 'Exceeded maximum chat retries', finished_at = ? WHERE id = ?",
                             (now, turn_id),
                         )
                     conn.execute("COMMIT")
-                    return None
+                    _done("exhausted" if exhausted else "noop")
+                    return TurnClaimResult(status="retry_exhausted" if exhausted else "noop")
+                if serialize:
+                    attempt_id = f"attempt-{uuid.uuid4().hex}"
+                    conn.execute(
+                        """
+                        UPDATE conversation_execution_state
+                        SET active_turn_id = ?, active_attempt_id = ?,
+                            lease_owner = ?, lease_expires_at = ?,
+                            fencing_token = fencing_token + 1,
+                            revision = revision + 1, updated_at = ?
+                        WHERE session_id = ?
+                        """,
+                        (
+                            turn_id,
+                            attempt_id,
+                            worker_id,
+                            _iso_after(now, lease_seconds),
+                            now,
+                            session_id,
+                        ),
+                    )
+                    session_state = self._ensure_execution_state(conn, session_id)
+                    if session_state is None:
+                        conn.execute("ROLLBACK")
+                        _done("stale")
+                        return TurnClaimResult(status="stale")
+                    fencing_token = int(session_state["fencing_token"] or 0)
+                    generation = int(session_state["generation"] or 0)
                 conn.execute("COMMIT")
-                return row_to_turn(claimed)
+                _done("claimed")
+                turn = row_to_turn(claimed)
+                turn.fencing_token = fencing_token
+                turn.session_generation = generation
+                turn.attempt_id = attempt_id
+                return TurnClaimResult(status="claimed", turn=turn)
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
 
-    def touch_turn_worker(self, turn_id: str, worker_id: str) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(
-                """
-                UPDATE chat_turns SET worker_heartbeat_at = ?
-                WHERE id = ? AND worker_id = ? AND status IN ('streaming', 'cancelling')
-                """,
-                (utc_now(), turn_id, worker_id),
-            )
+    @staticmethod
+    def _verify_turn_owner(
+        conn,
+        turn_id: str,
+        worker_id: str,
+        fencing_token: int,
+    ) -> bool:
+        """True when this attempt still owns the turn's session execution."""
+        row = conn.execute(
+            """
+            SELECT e.active_turn_id, e.lease_owner, e.fencing_token
+            FROM chat_turns t
+            JOIN conversation_execution_state e ON e.session_id = t.session_id
+            WHERE t.id = ?
+            """,
+            (turn_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return (
+            str(row["active_turn_id"] or "") == turn_id
+            and str(row["lease_owner"] or "") == worker_id
+            and int(row["fencing_token"] or 0) == int(fencing_token)
+        )
 
-    def append_turn_event(self, turn_id: str, event_type: str, payload: dict) -> ChatTurnEvent:
+    def release_turn_ownership(
+        self,
+        turn_id: str,
+        worker_id: str = "",
+        *,
+        fencing_token: int | None = None,
+    ) -> bool:
+        """Release the session lease after the owning worker finished a turn.
+
+        Called after the final SSE events are appended.  A crash between
+        completion and release leaves a terminal turn whose lease is reclaimed
+        by the next claim, so the next turn is never blocked permanently.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT session_id FROM chat_turns WHERE id = ?", (turn_id,)
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return False
+                if fencing_token is not None and not self._verify_turn_owner(
+                    conn, turn_id, worker_id, fencing_token
+                ):
+                    conn.execute("COMMIT")
+                    return False
+                cursor = conn.execute(
+                    """
+                    UPDATE conversation_execution_state
+                    SET active_turn_id = '', active_attempt_id = '',
+                        lease_owner = '', lease_expires_at = NULL,
+                        revision = revision + 1, updated_at = ?
+                    WHERE session_id = ? AND active_turn_id = ?
+                    """,
+                    (utc_now(), int(row["session_id"]), turn_id),
+                )
+                conn.execute("COMMIT")
+                return int(cursor.rowcount or 0) > 0
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def touch_turn_worker(self, turn_id: str, worker_id: str, *, fencing_token: int | None = None) -> bool:
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            if fencing_token is None:
+                conn.execute(
+                    """
+                    UPDATE chat_turns SET worker_heartbeat_at = ?
+                    WHERE id = ? AND worker_id = ? AND status IN ('streaming', 'cancelling')
+                    """,
+                    (now, turn_id, worker_id),
+                )
+                return True
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not self._verify_turn_owner(conn, turn_id, worker_id, fencing_token):
+                    conn.execute("COMMIT")
+                    try:
+                        from src.observability.metrics import record_governor_lease_lost
+
+                        record_governor_lease_lost(resource="chat", reason="stale_owner")
+                    except Exception:
+                        pass
+                    return False
+                renew_seconds = max(5, int(getattr(src.settings, "CHAT_TURN_LEASE_RENEW_SECONDS", 15)))
+                conn.execute(
+                    """
+                    UPDATE chat_turns SET worker_heartbeat_at = ?
+                    WHERE id = ? AND worker_id = ? AND status IN ('streaming', 'cancelling')
+                    """,
+                    (now, turn_id, worker_id),
+                )
+                row = conn.execute("SELECT session_id FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
+                if row is not None:
+                    conn.execute(
+                        """
+                        UPDATE conversation_execution_state
+                        SET lease_expires_at = ?, revision = revision + 1, updated_at = ?
+                        WHERE session_id = ? AND active_turn_id = ? AND lease_owner = ?
+                        """,
+                        (_iso_after(now, renew_seconds), now, int(row["session_id"]), turn_id, worker_id),
+                    )
+                conn.execute("COMMIT")
+                return True
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def get_checkpoint_refs(self, session_id: int) -> dict[str, Any]:
+        """Recoverable/committed checkpoint pointers plus execution identity."""
+        empty: dict[str, Any] = {
+            "recoverable": None,
+            "committed": None,
+            "generation": 0,
+            "fencing_token": 0,
+        }
+        with closing(self._connect()) as conn:
+            state = conn.execute(
+                """
+                SELECT recoverable_checkpoint_ref, committed_checkpoint_ref, generation, fencing_token
+                FROM conversation_execution_state WHERE session_id = ?
+                """,
+                (int(session_id),),
+            ).fetchone()
+        if state is None:
+            return empty
+
+        def _load(raw: Any) -> dict | None:
+            try:
+                value = json.loads(str(raw or ""))
+            except (TypeError, ValueError):
+                return None
+            return value if isinstance(value, dict) else None
+
+        return {
+            "recoverable": _load(state["recoverable_checkpoint_ref"]),
+            "committed": _load(state["committed_checkpoint_ref"]),
+            "generation": int(state["generation"] or 0),
+            "fencing_token": int(state["fencing_token"] or 0),
+        }
+
+    def update_recoverable_checkpoint_ref(
+        self,
+        turn_id: str,
+        worker_id: str,
+        fencing_token: int,
+        ref: dict,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """CAS-register the latest durable checkpoint for the owning attempt.
+
+        Runs in the authority transaction: the pointer can only move forward
+        while the attempt still owns the session and the generation matches.
+        """
         now = utc_now()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                row = conn.execute(
+                    "SELECT session_id FROM chat_turns WHERE id = ?", (turn_id,)
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return False
+                if not self._verify_turn_owner(conn, turn_id, worker_id, fencing_token):
+                    raise StaleTurnOwner(f"turn {turn_id} is owned by a newer attempt")
+                session_id = int(row["session_id"])
+                if expected_generation is not None:
+                    state = self._ensure_execution_state(conn, session_id)
+                    if state is None or int(state["generation"] or 0) != int(expected_generation):
+                        raise StaleTurnOwner("checkpoint pointer was revoked by cancel or takeover")
+                conn.execute(
+                    """
+                    UPDATE conversation_execution_state
+                    SET recoverable_checkpoint_ref = ?, revision = revision + 1, updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (
+                        json.dumps(ref, ensure_ascii=False, sort_keys=True),
+                        now,
+                        session_id,
+                    ),
+                )
+                conn.execute("COMMIT")
+                return True
+            except StaleTurnOwner:
+                conn.execute("ROLLBACK")
+                self._record_stale_write("checkpoint_pointer")
+                raise
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def append_turn_event(
+        self,
+        turn_id: str,
+        event_type: str,
+        payload: dict,
+        *,
+        worker_id: str = "",
+        fencing_token: int | None = None,
+    ) -> ChatTurnEvent:
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if fencing_token is not None and not self._verify_turn_owner(
+                    conn, turn_id, worker_id, fencing_token
+                ):
+                    raise StaleTurnOwner(f"turn {turn_id} is owned by a newer attempt")
                 row = conn.execute("SELECT last_event_seq FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
                 if row is None:
                     raise KeyError("turn not found")
@@ -1301,10 +2149,27 @@ class ConversationService:
                 )
                 conn.execute("UPDATE chat_turns SET last_event_seq = ? WHERE id = ?", (seq, turn_id))
                 conn.execute("COMMIT")
+            except StaleTurnOwner:
+                conn.execute("ROLLBACK")
+                self._record_stale_write("append_event")
+                raise
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
         return ChatTurnEvent(turn_id=turn_id, seq=seq, event_type=event_type, payload=payload, created_at=now)
+
+    @staticmethod
+    def _record_stale_write(operation: str) -> None:
+        try:
+            from src.observability.metrics import counter
+
+            counter(
+                "hdb.conversation.stale_write_rejected",
+                attributes={"operation": operation},
+                description="Authoritative conversation writes rejected from superseded attempts",
+            )
+        except Exception:
+            pass
 
     def list_turn_events(self, user_id: int, turn_id: str, after_seq: int = 0) -> list[ChatTurnEvent]:
         with closing(self._connect()) as conn:
@@ -1337,6 +2202,11 @@ class ConversationService:
         summary: dict,
         footer: str = "",
         metrics: dict | None = None,
+        *,
+        worker_id: str = "",
+        fencing_token: int | None = None,
+        expected_generation: int | None = None,
+        committed_checkpoint_ref: dict | None = None,
     ) -> ChatTurn:
         # Initialize the export schema before opening the completion
         # transaction. The actual snapshot/jobs are inserted through the
@@ -1371,6 +2241,28 @@ class ConversationService:
                 ).fetchone()
                 if row is None:
                     raise KeyError("turn not found")
+                if fencing_token is not None:
+                    if not self._verify_turn_owner(conn, turn_id, worker_id, fencing_token):
+                        raise StaleTurnOwner(f"turn {turn_id} is owned by a newer attempt")
+                    if expected_generation is not None:
+                        current = self._ensure_execution_state(conn, int(row["session_id"]))
+                        if current is None or int(current["generation"] or 0) != int(expected_generation):
+                            raise StaleTurnOwner("turn completion was revoked by cancel or takeover")
+                    if committed_checkpoint_ref is not None:
+                        # The canonical committed pointer moves in the same
+                        # authoritative transaction that publishes the answer.
+                        conn.execute(
+                            """
+                            UPDATE conversation_execution_state
+                            SET committed_checkpoint_ref = ?, revision = revision + 1, updated_at = ?
+                            WHERE session_id = ?
+                            """,
+                            (
+                                json.dumps(committed_checkpoint_ref, ensure_ascii=False, sort_keys=True),
+                                now,
+                                int(row["session_id"]),
+                            ),
+                        )
                 conn.execute("UPDATE chat_messages SET content = ? WHERE id = ?", (answer, row["assistant_message_id"]))
                 conn.execute(
                     """
@@ -1440,11 +2332,24 @@ class ConversationService:
                     )
                 conn.execute("COMMIT")
                 return row_to_turn(completed)
+            except StaleTurnOwner:
+                conn.execute("ROLLBACK")
+                self._record_stale_write("complete_turn")
+                raise
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
 
-    def fail_turn(self, user_id: int, turn_id: str, message: str, cancelled: bool = False) -> ChatTurn | None:
+    def fail_turn(
+        self,
+        user_id: int,
+        turn_id: str,
+        message: str,
+        cancelled: bool = False,
+        *,
+        worker_id: str = "",
+        fencing_token: int | None = None,
+    ) -> ChatTurn | None:
         now = utc_now()
         status = "cancelled" if cancelled else "failed"
         with closing(self._connect()) as conn:
@@ -1452,7 +2357,7 @@ class ConversationService:
             try:
                 row = conn.execute(
                     """
-                    SELECT t.assistant_message_id FROM chat_turns t
+                    SELECT t.assistant_message_id, t.session_id FROM chat_turns t
                     JOIN chat_sessions s ON s.id = t.session_id
                     WHERE t.id = ? AND s.user_id = ?
                     """,
@@ -1461,6 +2366,10 @@ class ConversationService:
                 if row is None:
                     conn.execute("COMMIT")
                     return None
+                if fencing_token is not None and not self._verify_turn_owner(
+                    conn, turn_id, worker_id, fencing_token
+                ):
+                    raise StaleTurnOwner(f"turn {turn_id} is owned by a newer attempt")
                 cursor = conn.execute(
                 """
                 UPDATE chat_turns SET status = ?, error_message = ?, finished_at = ?,
@@ -1483,6 +2392,10 @@ class ConversationService:
                 completed = conn.execute("SELECT * FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
                 conn.execute("COMMIT")
                 return row_to_turn(completed)
+            except StaleTurnOwner:
+                conn.execute("ROLLBACK")
+                self._record_stale_write("fail_turn")
+                raise
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
@@ -1510,6 +2423,18 @@ class ConversationService:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                target = conn.execute(
+                    """
+                    SELECT t.status, t.session_id FROM chat_turns t
+                    JOIN chat_sessions s ON s.id = t.session_id
+                    WHERE t.id = ? AND s.user_id = ?
+                    """,
+                    (turn_id, user_id),
+                ).fetchone()
+                if target is not None and str(target["status"]) in {"streaming", "cancelling"}:
+                    # Revoke the business commit before signalling the worker:
+                    # an in-flight answer must not be accepted after a cancel.
+                    self._bump_session_generation(conn, int(target["session_id"]))
                 conn.execute(
                 """
                 UPDATE chat_turns SET cancel_requested = 1,
@@ -1541,6 +2466,20 @@ class ConversationService:
                     """,
                     (turn_id,),
                 )
+                if target is not None and str(target["status"]) in {"pending", "waiting_for_attachments"}:
+                    # An unstarted turn releases any stale lease so the next turn
+                    # of the session can be claimed.  A running turn keeps its
+                    # lease until the owning worker finalises it.
+                    conn.execute(
+                        """
+                        UPDATE conversation_execution_state
+                        SET active_turn_id = '', active_attempt_id = '',
+                            lease_owner = '', lease_expires_at = NULL,
+                            revision = revision + 1, updated_at = ?
+                        WHERE session_id = ? AND active_turn_id = ?
+                        """,
+                        (now, int(target["session_id"]), turn_id),
+                    )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -1595,6 +2534,33 @@ class ConversationService:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _iso_after(timestamp: str, seconds: int) -> str:
+    """Return ``timestamp`` plus ``seconds`` as an ISO string (UTC-safe)."""
+    try:
+        base = datetime.fromisoformat(str(timestamp))
+    except (TypeError, ValueError):
+        base = datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    return (base + timedelta(seconds=max(0, int(seconds)))).isoformat()
+
+
+def _lease_active(expires_at: Any, now: str) -> bool:
+    """True when a stored lease expiry is still in the future."""
+    if not expires_at:
+        return False
+    try:
+        expires = datetime.fromisoformat(str(expires_at))
+        current = datetime.fromisoformat(str(now))
+    except (TypeError, ValueError):
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return expires > current
 
 
 def row_to_session(row) -> ChatSession:
@@ -1746,4 +2712,9 @@ def row_to_turn(row) -> ChatTurn:
         export_plan=export_plan,
         source_scope=row["source_scope"] if "source_scope" in row.keys() else "auto",
         required_attachment_ids=required_ids,
+        turn_sequence=(
+            int(row["turn_sequence"])
+            if "turn_sequence" in row.keys() and row["turn_sequence"] is not None
+            else 0
+        ),
     )

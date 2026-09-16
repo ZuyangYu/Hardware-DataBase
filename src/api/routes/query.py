@@ -24,6 +24,7 @@ from src.core.conversation import (
     ChatMessage,
     ChatTurn,
     ConversationService,
+    StaleTurnOwner,
 )
 from src.document_authoring.chat_context import (
     DocumentAuthoringContext,
@@ -269,7 +270,18 @@ def _turn_attachments_for(turn: ChatTurn) -> list[AttachmentSnapshotView]:
     return [_attachment_snapshot_view(snapshot) for snapshot in snapshots]
 
 
+def _turn_queue_context(turn: ChatTurn) -> dict:
+    """Queue visibility fields; terminal turns never need an extra query."""
+    if turn.status in {"completed", "failed", "cancelled"}:
+        return {}
+    try:
+        return _conv_service().turn_queue_context(turn.id)
+    except Exception:
+        return {}
+
+
 def _turn_view(turn: ChatTurn) -> TurnView:
+    queue_context = _turn_queue_context(turn)
     document_context = None
     if turn.document_context:
         try:
@@ -300,6 +312,9 @@ def _turn_view(turn: ChatTurn) -> TurnView:
         document_context=document_context,
         source_scope=str(getattr(turn, "source_scope", "") or "auto"),
         attachments=_turn_attachments_for(turn),
+        blocked_by_turn_id=queue_context.get("blocked_by_turn_id"),
+        queue_reason=str(queue_context.get("queue_reason") or ""),
+        wait_deadline=queue_context.get("wait_deadline"),
     )
 
 
@@ -380,7 +395,105 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     turn = conv.claim_turn(user.id, turn_id, worker_id)
     if turn is None:
         return
+    # Execution ownership: a positive token means serialized mode and enables
+    # stale-owner rejection for every later authoritative write of this turn.
+    fencing_token = int(getattr(turn, "fencing_token", 0) or 0)
+    session_generation = int(getattr(turn, "session_generation", 0) or 0)
+    ownership_token: int | None = fencing_token if fencing_token > 0 else None
+    # P0b: a chat turn holds one CHAT slot for its whole execution.  Queued
+    # turns wait up to the chat deadline before failing with backpressure.
+    chat_permit = None
+    if bool(getattr(src.settings, "RESOURCE_GOVERNOR_ENABLED", True)):
+        try:
+            from src.core.concurrency import get_governor
+
+            chat_permit = get_governor().acquire(
+                "chat",
+                interactive=True,
+                timeout=float(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)),
+            )
+        except Exception:
+            try:
+                conv.fail_turn(
+                    user.id,
+                    turn_id,
+                    "系统繁忙，请稍后重试",
+                    worker_id=worker_id,
+                    fencing_token=ownership_token,
+                )
+            except StaleTurnOwner:
+                pass
+            return
     _bind_document_task_trace(ctx, turn)
+    # P0a attempt isolation: the runner writes to an attempt-scoped checkpoint
+    # thread; the visible thread only moves through the guarded commit below.
+    visible_thread = str(turn.session_id)
+    runner_thread = visible_thread
+    checkpoint_observer = None
+
+    def _register_checkpoint_ref(saved: dict) -> None:
+        """Report one durable graph-state write to the authority transaction."""
+        try:
+            ref = {
+                "backend": str(getattr(src.settings, "AGENT_CHECKPOINT_BACKEND", "sqlite")),
+                "thread_id": str(saved.get("thread_id") or ""),
+                "checkpoint_ns": str(saved.get("checkpoint_ns") or ""),
+                "checkpoint_id": str(saved.get("checkpoint_id") or ""),
+                "attempt_id": str(getattr(turn, "attempt_id", "") or ""),
+                "fencing_token": int(fencing_token),
+                "generation": int(session_generation),
+            }
+            conv.update_recoverable_checkpoint_ref(
+                turn_id,
+                worker_id,
+                fencing_token,
+                ref,
+                expected_generation=session_generation if ownership_token else None,
+            )
+        except StaleTurnOwner:
+            pass
+        except Exception:
+            pass
+
+    if ownership_token:
+        try:
+            from src.agents.checkpoints import get_checkpointer, prepare_attempt
+
+            resume_ref = None
+            try:
+                refs = conv.get_checkpoint_refs(int(turn.session_id))
+                candidate = refs.get("recoverable")
+                # Only a pointer from the same generation and an older attempt
+                # may be resumed; cancellation advances the generation.
+                if (
+                    isinstance(candidate, dict)
+                    and int(candidate.get("generation") or 0) == session_generation
+                    and int(candidate.get("fencing_token") or 0) < fencing_token
+                ):
+                    resume_ref = candidate
+            except Exception:
+                resume_ref = None
+            runner_thread = prepare_attempt(
+                get_checkpointer(),
+                visible_thread,
+                fencing_token,
+                attempt_id=str(getattr(turn, "attempt_id", "") or ""),
+                resume_ref=resume_ref,
+            )
+        except Exception:
+            # Fail open to the visible thread rather than losing the turn.
+            runner_thread = visible_thread
+        if ownership_token and runner_thread != visible_thread:
+            try:
+                from src.agents.checkpoints.observer import install_checkpoint_observer
+
+                checkpoint_observer = install_checkpoint_observer(
+                    get_checkpointer(),
+                    _register_checkpoint_ref,
+                    thread_filter=runner_thread,
+                )
+            except Exception:
+                checkpoint_observer = None
     document_context = None
     if turn.document_context:
         try:
@@ -438,10 +551,45 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     cancel = _turn_cancel_signal(turn_id)
     heartbeat_stop = threading.Event()
     heartbeat_interval = max(2, min(30, src.settings.CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS))
+    lease_lost = threading.Event()
 
     def heartbeat_loop() -> None:
         while not heartbeat_stop.wait(heartbeat_interval):
-            conv.touch_turn_worker(turn_id, worker_id)
+            renewed = conv.touch_turn_worker(turn_id, worker_id, fencing_token=ownership_token)
+            if not renewed:
+                # Lease renewal failed: stop scheduling new work immediately.
+                # In-flight downstream calls finish on their own deadline and
+                # only a newer attempt may publish authoritative results.
+                lease_lost.set()
+                cancel.set()
+                return
+
+    def _append_owned_event(event_type: str, payload: dict):
+        """Append with ownership guard; drop late events from superseded attempts."""
+        try:
+            return conv.append_turn_event(
+                turn_id,
+                event_type,
+                payload,
+                worker_id=worker_id,
+                fencing_token=ownership_token,
+            )
+        except StaleTurnOwner:
+            return None
+
+    def _fail_owned(message: str, *, cancelled_turn: bool = False) -> None:
+        try:
+            conv.fail_turn(
+                user.id,
+                turn_id,
+                message,
+                cancelled=cancelled_turn,
+                worker_id=worker_id,
+                fencing_token=ownership_token,
+            )
+        except StaleTurnOwner:
+            # A newer attempt owns the turn; it will finalise it.
+            pass
 
     heartbeat_thread = start_thread_with_current_context(
         heartbeat_loop,
@@ -483,11 +631,12 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             text = "".join(_delta_text_parts)
             _delta_text_parts.clear()
             _delta_first_at.clear()
-        event = conv.append_turn_event(turn_id, "delta", {"text": text})
-        _publish_turn_event(turn_id, event.seq, "delta", {"text": text})
+        event = _append_owned_event("delta", {"text": text})
+        if event is not None:
+            _publish_turn_event(turn_id, event.seq, "delta", {"text": text})
 
     def emit(event_type: str, payload: dict) -> None:
-        conv.touch_turn_worker(turn_id, worker_id)
+        conv.touch_turn_worker(turn_id, worker_id, fencing_token=ownership_token)
         if event_type == "delta":
             now = time.monotonic()
             flush = False
@@ -506,7 +655,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         _flush_deltas()
         if event_type == "narration":
             narrated.append(str(payload.get("text") or ""))
-        event = conv.append_turn_event(turn_id, event_type, payload)
+        event = _append_owned_event(event_type, payload)
+        if event is None:
+            return
         _publish_turn_event(turn_id, event.seq, event_type, payload)
 
     def emit_stage(key: str, label: str, status: str = "running", detail: str = "", **extra: Any) -> None:
@@ -566,13 +717,20 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         # deepagents agent 循环，不存在单独的直连模型旁路。
         if pipeline is None:
             raise RuntimeError("query pipeline is unavailable")
+        # P2-001: stable action-receipt identity for crash-recovered turns.
+        action_scope = {
+            "tenant_id": "default",
+            "session_generation": session_generation,
+            "turn_id": turn_id,
+            "plan_version": "v1",
+        }
         gen = _query_generator(
             pipeline,
             turn.query,
             turn.kb_name,
             history,
             ctx,
-            str(turn.session_id),
+            runner_thread,
             _make_event_callback(emit_stage, emit),
             turn.query_mode,
             cancelled,
@@ -584,6 +742,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             source_scope=str(getattr(turn, "source_scope", "") or "auto"),
             propagate_errors=True,
             attachment_user_id=int(user.id),
+            action_scope=action_scope,
         )
         try:
             for chunk in gen:
@@ -609,7 +768,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         _flush_deltas()
         if cancelled():
             emit("error", {"message": "已停止生成", "cancelled": True})
-            conv.fail_turn(user.id, turn_id, "已停止生成", cancelled=True)
+            _fail_owned("已停止生成", cancelled_turn=True)
             emit("turn_end", {"status": "cancelled"})
             outcome_status = "cancelled"
             return
@@ -622,7 +781,68 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "query_mode": turn.query_mode,
             "short_term_memory": short_term_memory,
         }
-        completed = conv.complete_turn(user.id, turn_id, answer, summary, footer, metrics=metrics(summary=summary))
+        # Canonical committed pointer (P0-003): the authoritative transaction
+        # stores it together with the answer; the physical copy happens only
+        # after the business commit succeeded.
+        committed_ref = None
+        if ownership_token and runner_thread != visible_thread:
+            try:
+                from src.agents.checkpoints import attempt_checkpoint_ref as _attempt_ref
+                from src.agents.checkpoints import get_checkpointer as _agent_checkpointer
+
+                committed_ref = _attempt_ref(
+                    _agent_checkpointer(),
+                    runner_thread,
+                    fencing_token=fencing_token,
+                    generation=session_generation,
+                    attempt_id=str(getattr(turn, "attempt_id", "") or ""),
+                )
+            except Exception:
+                committed_ref = None
+        try:
+            completed = conv.complete_turn(
+                user.id,
+                turn_id,
+                answer,
+                summary,
+                footer,
+                metrics=metrics(summary=summary),
+                worker_id=worker_id,
+                fencing_token=ownership_token,
+                expected_generation=session_generation if ownership_token else None,
+                committed_checkpoint_ref=committed_ref,
+            )
+        except StaleTurnOwner:
+            # Cancel revoked the business commit, or a newer attempt took over.
+            if cancelled():
+                _fail_owned("已停止生成", cancelled_turn=True)
+                outcome_status = "cancelled"
+            else:
+                outcome_status = "stale"
+            return
+        # The business commit passed ownership/generation checks; only now may
+        # this attempt move the canonical checkpoint pointer (P0a).
+        if ownership_token and runner_thread != visible_thread:
+            try:
+                from src.agents.checkpoints import commit_attempt as _commit_attempt
+                from src.agents.checkpoints import get_checkpointer as _agent_checkpointer
+
+                _commit_attempt(
+                    _agent_checkpointer(),
+                    visible_thread,
+                    runner_thread,
+                    fencing_token,
+                )
+            except Exception:
+                try:
+                    from src.observability.metrics import counter
+
+                    counter(
+                        "hdb.checkpoint.commit_failed",
+                        description="Canonical checkpoint commits rejected or failed",
+                    )
+                except Exception:
+                    pass
         # ``complete_turn`` is the canonical normalization boundary for stale
         # export fallbacks. Use its persisted answer in the final event so the
         # browser does not replace the cleaned message with the raw model text.
@@ -654,13 +874,13 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         turn_observation.error(exc)
         if cancelled():
             emit("error", {"message": "已停止生成", "cancelled": True})
-            conv.fail_turn(user.id, turn_id, "已停止生成", cancelled=True)
+            _fail_owned("已停止生成", cancelled_turn=True)
             outcome_status = "cancelled"
         else:
             from src.core.error_friendly import friendly_error_message
 
             friendly_error = friendly_error_message(exc)
-            conv.fail_turn(user.id, turn_id, friendly_error)
+            _fail_owned(friendly_error)
             emit("error", {"message": friendly_error})
             summary = {
                 **summary,
@@ -716,6 +936,20 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         turn_observation.outcome(outcome_status)
         turn_observation.set("hdb.agent.retrieval_round", int((summary or {}).get("retrieval_rounds") or 0))
         turn_observation.end()
+        if checkpoint_observer is not None:
+            try:
+                checkpoint_observer.uninstall()
+            except Exception:
+                pass
+        try:
+            conv.release_turn_ownership(turn_id, worker_id, fencing_token=ownership_token)
+        except Exception:
+            pass
+        if chat_permit is not None:
+            try:
+                chat_permit.release()
+            except Exception:
+                pass
         _clear_turn_cancel_signal(turn_id)
 
 
@@ -734,7 +968,49 @@ def create_turn(
     reject_system_admin_kb_access(ctx)
     if session.kb_name != GENERAL_CHAT_KB_NAME and not ctx.has_kb_permission(session.kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
+    # P0-006: an idempotent replay returns the original turn and never counts
+    # against admission or creates a second unit of work.
+    replay = conv.find_turn_by_client_request(session_id, body.client_request_id or "")
+    if replay is not None:
+        messages = conv.list_messages(user.id, session_id)
+        user_message = next(
+            (message for message in messages if message.id == replay.user_message_id), None
+        )
+        if user_message is None:
+            raise HTTPException(status_code=500, detail="turn message was not persisted")
+        return TurnStartResponse(
+            turn=_turn_view(replay),
+            user_message=_message_view(
+                user_message, attachments=_turn_attachments_for(replay)
+            ),
+        )
+    from src.api.admission import admission_model_name, enforce_admission
+
+    # Resource type follows the execution mode: deep knowledge-base turns get
+    # the stricter deep bucket, general chat keeps the chat bucket.
     query_mode = "fast" if session.kb_name == GENERAL_CHAT_KB_NAME else "deep"
+    enforce_admission(
+        user,
+        session.department_id,
+        resource="deep" if query_mode == "deep" else "chat",
+        model=admission_model_name(),
+    )
+    if conv.count_unterminal_turns(user.id, session_id=session_id) >= int(
+        src.settings.ADMISSION_MAX_UNTERMINAL_TURNS_PER_SESSION
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail={"message": "本会话排队任务过多，请等待或取消后再试", "reason": "session_backlog"},
+            headers={"Retry-After": "5"},
+        )
+    if conv.count_unterminal_turns(user.id) >= int(
+        src.settings.ADMISSION_MAX_UNTERMINAL_TURNS_PER_USER
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail={"message": "未完成的任务过多，请稍后再试", "reason": "user_backlog"},
+            headers={"Retry-After": "5"},
+        )
     # Chat attachments (design §5/§14.2): resolve the explicit source scope
     # before touching attachment rows.  ``knowledge_base_only`` must not be
     # widened merely because a stale client also sent attachment ids.
@@ -1081,6 +1357,17 @@ async def query(
     reject_system_admin_kb_access(ctx)
     if body.kb_name not in ("", GENERAL_CHAT_KB_NAME) and not ctx.has_kb_permission(body.kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
+    from src.api.admission import admission_model_name, enforce_admission
+
+    legacy_resource = (
+        "chat" if body.kb_name in ("", GENERAL_CHAT_KB_NAME) else "deep"
+    )
+    enforce_admission(
+        user,
+        getattr(user, "department_id", None),
+        resource=legacy_resource,
+        model=admission_model_name(),
+    )
 
     document_context = None
     raw_document_context: Any = body.document_context
@@ -1168,7 +1455,22 @@ async def query(
         observation.set_input(body.query, content_kind="query")
         _set_short_term_memory_observation(observation, short_term_memory)
         outcome_status = "failed"
+        legacy_permit = None
         try:
+            if bool(getattr(src.settings, "RESOURCE_GOVERNOR_ENABLED", True)):
+                try:
+                    from src.core.concurrency import get_governor
+
+                    legacy_permit = get_governor().acquire(
+                        "chat",
+                        interactive=True,
+                        timeout=float(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)),
+                    )
+                except Exception:
+                    if not cancel.is_set():
+                        _put(("error", {"message": "系统繁忙，请稍后重试"}))
+                    outcome_status = "rejected"
+                    return
             answer_parts: list[str] = []
             narrated: list[str] = []
 
@@ -1261,6 +1563,11 @@ async def query(
                         close()
                     except Exception:
                         pass
+            if legacy_permit is not None:
+                try:
+                    legacy_permit.release()
+                except Exception:
+                    pass
             duration_ms = int((time.monotonic() - start) * 1000)
             record_chat_turn(
                 status=outcome_status,
@@ -1339,6 +1646,7 @@ def _query_generator(
     source_scope="auto",
     propagate_errors=False,
     attachment_user_id=None,
+    action_scope=None,
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -1366,6 +1674,8 @@ def _query_generator(
             kwargs["propagate_errors"] = propagate_errors
         if "attachment_user_id" in params:
             kwargs["attachment_user_id"] = attachment_user_id
+        if action_scope is not None and "action_scope" in params:
+            kwargs["action_scope"] = action_scope
         return pipeline.query(
             query,
             kb_name,
@@ -1394,6 +1704,8 @@ def _query_generator(
         kwargs["propagate_errors"] = propagate_errors
     if "attachment_user_id" in params:
         kwargs["attachment_user_id"] = attachment_user_id
+    if action_scope is not None and "action_scope" in params:
+        kwargs["action_scope"] = action_scope
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 
