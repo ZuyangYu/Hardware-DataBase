@@ -72,6 +72,8 @@
 43. **多用户多并发 A/B 实测**：新增 `scripts/production_hardening/concurrency_compare_drill.py`（隔离临时库，不影响在线服务）——`off`（legacy）vs `on`（serialize+deployment governor+共享执行器+低 RPM）：
 44. **多实例维护选主（§6.3.1）**：`SqliteQuotaStore` 新增 `resource_maintenance_lease`（owner/token/expiry + CAS 接管递增 token），`start_governor_maintenance` 仅由 lease 持有者执行 `maintain`，退出时释放；补 3 个测试（选主/接管/释放、启动不挂死、幂等），避免多进程重复扫描与重复升级。
 45. **测试稳健性**：`test_chat_attachment_scopes` 客户端超时 30s→60s，消除满载时的一次性偶发失败（后续全量多次通过）。
+46. **G0 交付固化**：在 `feature/production-hardening-p0` 分支按主题提交 10 个 commit（配置/工具、P0a×2、P0b×2、P1、P2、P3、评测修复、文档纳管）；`/docs/` 工件用 `git add -f` 显式纳管；生成 `workspace-manifest.json`（base commit、untracked、lock/manifest hash、数据集 hash、复现命令）；修正样本数口径为 **143**（25+47+50+21）。
+47. **G1 初始化竞争修复（后续方案 §6.1）**：复现 `test_multiprocess_sqlite_contention` 20 次 5 失败（失败轮 31.3s，ready 超时），根因是配额/租约库构造期 `BEGIN IMMEDIATE` 无有界重试且 busy timeout 1s，4 进程同时启动时子进程在建 ready 前退出导致父进程等 30s。修复：`SqliteQuotaStore`/`CoordinatorLeaseStore` 初始化包在有界忙重试；`ConversationService` 增加进程内初始化缓存、`_init_db` 有界重试，并把部门/`turn_sequence` 回填改为“先探测再写”。验证：多进程专项 **20/20 通过、耗时 3.3s 稳定**；G1 验收套件 34 passed；全量 2657 passed / 0 failed。
    - 跨用户 3/3 完成；e2e P50 47.4s→50.1s、P95 80.4s→73.3s（同量级，串行不拖慢跨会话）；
    - 同会话突发：`off` 出现 1 次执行重叠；`on` 0 重叠、后序 queue wait 39.3s/66.8s，严格按 `turn_sequence` 串行；
    - 跨用户隔离两模式均 404；准入过载 `off` 0/4、`on` 1/4 且带 `Retry-After`。
