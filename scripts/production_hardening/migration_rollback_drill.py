@@ -78,9 +78,73 @@ def _run_migration(group: str, dsn: str, report: Path) -> dict:
     return json.loads(report.read_text(encoding="utf-8"))
 
 
+def _drill_group(
+    group: str,
+    *,
+    source_override: str,
+    dsn: str,
+    direct: bool,
+) -> dict:
+    live_source = Path(source_override) if source_override else STORAGE / GROUP_DATABASES[group]
+    if not live_source.is_file():
+        return {"group": group, "ok": False, "error": f"source database not found: {live_source}"}
+
+    temp_dir = tempfile.TemporaryDirectory()
+    try:
+        if direct:
+            source = live_source
+        else:
+            # Runbook §7.5: rehearse on a consistent backup copy; live services
+            # keep writing their own database and must not be touched.
+            source = Path(temp_dir.name) / live_source.name
+            _snapshot_sqlite(live_source, source)
+
+        report: dict[str, object] = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "group": group,
+            "live_source": str(live_source),
+            "drilled_source": str(source),
+            "mode": "direct" if direct else "snapshot-copy",
+            "checks": {},
+        }
+        started = time.monotonic()
+        before_hash = _sha256(source)
+        first_path = Path(temp_dir.name) / "first.json"
+        second_path = Path(temp_dir.name) / "second.json"
+        first = _run_migration(group, dsn, first_path)
+        second = _run_migration(group, dsn, second_path)
+        after_hash = _sha256(source)
+        report["checks"]["source_unchanged"] = before_hash == after_hash
+        report["checks"]["first_ok"] = bool(first.get("ok"))
+        report["checks"]["second_ok"] = bool(second.get("ok"))
+        report["checks"]["second_copy_is_idempotent"] = all(
+            int(item.get("copied") or 0) == 0
+            for item in second.get("tables", [])
+            if item.get("status") == "ok"
+        )
+        report["checks"]["hashes_still_match"] = not second.get("hash_mismatches")
+        report["checks"]["derived_skipped"] = all(
+            item.get("status") == "derived_skipped"
+            for item in second.get("tables", [])
+            if "_fts" in str(item.get("table")) or "_trigram" in str(item.get("table"))
+        )
+        report["source_sha256"] = before_hash
+        report["tables"] = len(first.get("tables", []))
+        report["duration_seconds"] = round(time.monotonic() - started, 2)
+        report["ok"] = all(bool(value) for value in report["checks"].values())
+        return report
+    finally:
+        temp_dir.cleanup()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--group", choices=sorted(GROUP_DATABASES), default="authority")
+    parser.add_argument(
+        "--all-groups",
+        action="store_true",
+        help="drill every source database that exists (skips missing ones)",
+    )
     parser.add_argument("--source", default="")
     parser.add_argument(
         "--direct",
@@ -91,54 +155,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", default="")
     args = parser.parse_args(argv)
 
-    live_source = Path(args.source) if args.source else STORAGE / GROUP_DATABASES[args.group]
-    if not live_source.is_file():
-        print(f"source database not found: {live_source}", file=sys.stderr)
-        return 2
+    if args.all_groups:
+        reports = [
+            _drill_group(
+                group,
+                source_override=args.source if args.source and len(GROUP_DATABASES) == 1 else "",
+                dsn=args.dsn,
+                direct=args.direct,
+            )
+            for group in sorted(GROUP_DATABASES)
+        ]
+        combined = {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "direct" if args.direct else "snapshot-copy",
+            "dsn": args.dsn,
+            "groups": {item["group"]: item for item in reports},
+            "ok": all(bool(item.get("ok")) or "source database not found" in str(item.get("error", "")) for item in reports),
+            "missing": [item["group"] for item in reports if "source database not found" in str(item.get("error", ""))],
+        }
+        text = json.dumps(combined, ensure_ascii=False, indent=2)
+        if args.output:
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(text, encoding="utf-8")
+            print(f"report={output}")
+        else:
+            print(text)
+        print(f"ok={combined['ok']}")
+        return 0 if combined["ok"] else 1
 
-    temp_dir = tempfile.TemporaryDirectory()
-    if args.direct:
-        source = live_source
-    else:
-        # Runbook §7.5: rehearse on a consistent backup copy; live services keep
-        # writing their own database and must not be touched by the drill.
-        source = Path(temp_dir.name) / live_source.name
-        _snapshot_sqlite(live_source, source)
-
-    report: dict[str, object] = {
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
-        "group": args.group,
-        "live_source": str(live_source),
-        "drilled_source": str(source),
-        "mode": "direct" if args.direct else "snapshot-copy",
-        "dsn": args.dsn,
-        "checks": {},
-    }
-    started = time.monotonic()
-    before_hash = _sha256(source)
-    first = _run_migration(args.group, args.dsn, Path("/tmp/hdb-migration-first.json"))
-    second = _run_migration(args.group, args.dsn, Path("/tmp/hdb-migration-second.json"))
-    after_hash = _sha256(source)
-    report["checks"]["source_unchanged"] = before_hash == after_hash
-    report["checks"]["first_ok"] = bool(first.get("ok"))
-    report["checks"]["second_ok"] = bool(second.get("ok"))
-    report["checks"]["second_copy_is_idempotent"] = all(
-        int(item.get("copied") or 0) == 0
-        for item in second.get("tables", [])
-        if item.get("status") == "ok"
+    report = _drill_group(
+        args.group,
+        source_override=args.source,
+        dsn=args.dsn,
+        direct=args.direct,
     )
-    report["checks"]["hashes_still_match"] = not second.get("hash_mismatches")
-    report["checks"]["derived_skipped"] = all(
-        item.get("status") == "derived_skipped"
-        for item in second.get("tables", [])
-        if "_fts" in str(item.get("table")) or "_trigram" in str(item.get("table"))
-    )
-    report["source_sha256"] = before_hash
-    report["tables"] = len(first.get("tables", []))
-    report["duration_seconds"] = round(time.monotonic() - started, 2)
-    report["ok"] = all(bool(value) for value in report["checks"].values())
-    temp_dir.cleanup()
-
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         output = Path(args.output)
