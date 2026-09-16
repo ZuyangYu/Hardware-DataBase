@@ -228,7 +228,12 @@ class GovernedToolActionAdapters:
             "no authorized document-generation tool is available",
         )
 
-    def revise_document(self, action: ActionSpec, _prior: Mapping[str, ActionReceipt]) -> dict[str, Any]:
+    def revise_document(
+        self,
+        action: ActionSpec,
+        _prior: Mapping[str, ActionReceipt],
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
         """Create an immutable child-revision request; never edit a source file."""
 
         if "create_document_revision" not in self._tools_by_name:
@@ -292,10 +297,15 @@ class GovernedToolActionAdapters:
             "request": str(parameters.get("request") or self.query or "").strip(),
             "changed_fields": fields,
             "changed_sections": sections,
-            "client_request_id": str(parameters.get("client_request_id") or f"conversation-action:{action.action_id}"),
+            "client_request_id": str(parameters.get("client_request_id") or idempotency_key or f"conversation-action:{action.action_id}"),
         }))
 
-    def revise_attachment(self, action: ActionSpec, _prior: Mapping[str, ActionReceipt]) -> dict[str, Any]:
+    def revise_attachment(
+        self,
+        action: ActionSpec,
+        _prior: Mapping[str, ActionReceipt],
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
         """Propose a section rewrite or execute one exact-text replacement."""
 
         parameters = dict(action.parameters or {})
@@ -331,6 +341,7 @@ class GovernedToolActionAdapters:
             "attachment_id": attachment_id,
             "client_request_id": str(
                 parameters.get("client_request_id")
+                or idempotency_key
                 or f"conversation-action:{action.action_id}"
             ),
         }))
