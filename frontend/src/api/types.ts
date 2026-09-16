@@ -411,6 +411,10 @@ export interface TurnView {
   document_context?: DocumentContext | null;
   source_scope?: string;
   attachments?: AttachmentSnapshot[];
+  /** P0-004 queue visibility: blocking turn, reason and wait deadline. */
+  blocked_by_turn_id?: string | null;
+  queue_reason?: 'waiting_for_attachments' | 'queued_behind_previous_turn' | '';
+  wait_deadline?: string | null;
 }
 
 /** Chat attachment lifecycle DTO (aligned with src/api/routes/attachments.py). */

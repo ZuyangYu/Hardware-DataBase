@@ -490,6 +490,11 @@ class TurnView(BaseModel):
     document_context: DocumentContextView | None = None
     source_scope: str = "auto"
     attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
+    # Queue visibility: which earlier turn blocks this one, why, and when a
+    # waiting-for-attachments turn will time out.
+    blocked_by_turn_id: str | None = None
+    queue_reason: str = ""
+    wait_deadline: str | None = None
 
 
 class TurnStartResponse(BaseModel):

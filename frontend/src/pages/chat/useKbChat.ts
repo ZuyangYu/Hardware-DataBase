@@ -68,6 +68,27 @@ export {
 const GENERAL_CHAT_KB_NAME = '__general__';
 const QUERY_TRACE_HIDE_DELAY_MS = 5000;
 const STREAMING_RENDER_INTERVAL_MS = 64;
+
+/** P0-004 queue visibility derived from a pending/waiting turn. */
+export interface TurnQueueNotice {
+  reason: 'waiting_for_attachments' | 'queued_behind_previous_turn' | string;
+  blockedByTurnId: string | null;
+  waitDeadline: string | null;
+}
+
+/** Pure mapping used by the hook and covered by unit tests. */
+export function turnQueueNoticeFromTurn(turn: TurnView): TurnQueueNotice | null {
+  if (turn.status !== 'pending' && turn.status !== 'waiting_for_attachments') {
+    return null;
+  }
+  return {
+    reason:
+      turn.queue_reason
+      || (turn.status === 'waiting_for_attachments' ? 'waiting_for_attachments' : 'queued_behind_previous_turn'),
+    blockedByTurnId: turn.blocked_by_turn_id ?? null,
+    waitDeadline: turn.wait_deadline ?? null,
+  };
+}
 const DOCUMENT_TASK_POLL_INTERVAL_MS = 3000;
 const DOCUMENT_TASK_FALLBACK_POLL_INTERVAL_MS = 10000;
 
@@ -344,6 +365,12 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const [documentContext, setDocumentContextState] = useState<DocumentContext | null>(null);
   const setDocumentContext = useCallback((context: DocumentContext | null) => {
     setDocumentContextState(context);
+  }, []);
+  // P0-004: queue visibility for a turn that is pending behind an earlier turn
+  // or waiting for attachment parsing (blocker, reason, wait deadline).
+  const [turnQueueNotice, setTurnQueueNotice] = useState<TurnQueueNotice | null>(null);
+  const applyTurnQueueNotice = useCallback((turn: TurnView) => {
+    setTurnQueueNotice(turnQueueNoticeFromTurn(turn));
   }, []);
   const abortRef = useRef<AbortController | null>(null);
   const currentTurnRef = useRef<string | null>(null);
@@ -826,6 +853,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       }
       // set-or-clear:目标会话最新 turn 有持久化上下文则恢复,没有则清空,避免跨会话残留。
       setDocumentContextState(documentContextEnabled && turn.document_context ? turn.document_context : null);
+      applyTurnQueueNotice(turn);
       if (turn.status === 'completed' || turn.status === 'failed' || turn.status === 'cancelled') {
         // 已结束的 turn 不再接流:历史卡片与证据由消息投影恢复,避免重复重放。
         return;
@@ -912,6 +940,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           abortRef.current = null;
           setStreaming(false);
           resetStreamingText();
+          setTurnQueueNotice(null);
         }
       }
     }).catch(() => undefined);
@@ -919,7 +948,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       disposed = true;
       controller?.abort();
     };
-  }, [activeSessionId, documentContextEnabled, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep, refreshMemorySummary, scopeKbName]);
+  }, [activeSessionId, documentContextEnabled, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep, refreshMemorySummary, scopeKbName, applyTurnQueueNotice]);
 
   const createSession = useCallback(
     async (title: string, expectedStreamToken?: number): Promise<SessionView> => {
@@ -1240,6 +1269,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       if (ownsGeneration()) {
         setMessages((prev) => prev.map((m) => (m.id === optimisticId ? created.user_message : m)));
       }
+      applyTurnQueueNotice(created.turn);
 
       // 3. 后端任务独立执行; SSE 只订阅持久化事件，刷新可从事件序号重放。
       const controller = new AbortController();
@@ -1387,9 +1417,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         currentTurnRef.current = null;
         setStreaming(false);
         resetStreamingText();
+        setTurnQueueNotice(null);
       }
     }
-  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary]);
+  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice]);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
@@ -1431,6 +1462,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     traceByMessageId,
     degradedNotes,
     documentCards,
+    turnQueueNotice,
     documentCardRefreshingId,
     documentCardAnsweringId,
     documentCardReleaseRequestingId,
