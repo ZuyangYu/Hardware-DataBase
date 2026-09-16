@@ -76,6 +76,7 @@
 47. **G1 初始化竞争修复（后续方案 §6.1）**：复现 `test_multiprocess_sqlite_contention` 20 次 5 失败（失败轮 31.3s，ready 超时），根因是配额/租约库构造期 `BEGIN IMMEDIATE` 无有界重试且 busy timeout 1s，4 进程同时启动时子进程在建 ready 前退出导致父进程等 30s。修复：`SqliteQuotaStore`/`CoordinatorLeaseStore` 初始化包在有界忙重试；`ConversationService` 增加进程内初始化缓存、`_init_db` 有界重试，并把部门/`turn_sequence` 回填改为“先探测再写”。验证：多进程专项 **20/20 通过、耗时 3.3s 稳定**；G1 验收套件 34 passed；全量 2657 passed / 0 failed。
 48. **G1 验收**：G1 套件 34 passed；多进程专项 20/20（耗时稳定 3.3s）；stale-owner/重复终态/重复 Artifact 由测试覆盖为 0；同会话顺序与附件超时由测试与 A/B 演练验证；干净提交基线 `20260916T114508Z-d7898b8-g1-clean-baseline`（commit d7898b8）。测试环境 P0a 开关由 `concurrency_compare_drill` 以 ON 配置实测通过。
 49. **G2 验收（同机部分）**：新增多进程“LLM 部署总量不放大”用例（容量 2、4 进程、并发水位 ≤2），10/10 稳定；G2 套件 53 passed；uncertain 维护选主、证据恢复、停机未确认回收、入口 429 背压均已覆盖。跨主机 PostgreSQL 配额按修订方案归入 G3；EVAL_EMBEDDING 与供应商 RPM/TPM 保持范围外标注。
+50. **G3/G4 执行准备（本机可交付部分）**：迁移回滚演练新增 `--all-groups`（快照副本逐组双跑，authority 45/attachments 22/pipeline 4/projection 4 全部计数+哈希一致、源库不变，产物 `g3-all-groups-rollback-drill.json`）；新增 `g3-cutover-checklist.md`（切换单元 A/B/C/D、同事务规则、停写/校验/回滚与演练命令）与 `provider-compatibility-matrix.md`（三类 provider 配置/实现/验证/版本与配额存储作用域）；新增 `g4-execution-pack.md`（容量配方 5/30/3 + 2× 过载、发布门槛、200 条样本模板、预算与责任）。生产切换与压测仍待环境/预算。
    - 跨用户 3/3 完成；e2e P50 47.4s→50.1s、P95 80.4s→73.3s（同量级，串行不拖慢跨会话）；
    - 同会话突发：`off` 出现 1 次执行重叠；`on` 0 重叠、后序 queue wait 39.3s/66.8s，严格按 `turn_sequence` 串行；
    - 跨用户隔离两模式均 404；准入过载 `off` 0/4、`on` 1/4 且带 `Retry-After`。
