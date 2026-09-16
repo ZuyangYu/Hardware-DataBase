@@ -18,6 +18,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from src.agents import runner as runner_mod
+from src.agents.checkpoints import reset_checkpointer
 import src.settings as app_settings
 
 
@@ -49,13 +50,16 @@ class AgentThreadStateTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="hdb-thread-")
         self._original_path = app_settings.AGENT_CHECKPOINT_DB_PATH
-        self._original_saver = runner_mod._CHECKPOINT_SAVER
+        self._original_backend = app_settings.AGENT_CHECKPOINT_BACKEND
+        app_settings.AGENT_CHECKPOINT_BACKEND = "sqlite"
         app_settings.AGENT_CHECKPOINT_DB_PATH = os.path.join(self._tmp, "ckpt.db")
-        runner_mod._CHECKPOINT_SAVER = None
+        # Provider factory owns the process singleton now (P1-001).
+        reset_checkpointer()
 
     def tearDown(self):
+        reset_checkpointer()
         app_settings.AGENT_CHECKPOINT_DB_PATH = self._original_path
-        runner_mod._CHECKPOINT_SAVER = self._original_saver
+        app_settings.AGENT_CHECKPOINT_BACKEND = self._original_backend
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _runner(self):

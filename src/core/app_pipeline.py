@@ -519,6 +519,7 @@ class AppPipeline:
         source_scope: str = "auto",
         propagate_errors: bool = False,
         attachment_user_id: int | None = None,
+        action_scope: Any | None = None,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -543,6 +544,7 @@ class AppPipeline:
                 attachments=attachments,
                 source_scope=source_scope,
                 attachment_user_id=attachment_user_id,
+                action_scope=action_scope,
             )
         except QueryCancelled:
             return
@@ -701,6 +703,7 @@ class AppPipeline:
         # PUT /config requests serialise here instead of losing updates.
         with src.settings._ENV_WRITE_LOCK:
             src.settings.validate_settings_values(new_settings)
+            src.settings.validate_provider_configuration(new_settings)
             src.settings.save_settings_to_env(new_settings)
             src.settings.reload_settings()
             # create_chat_model 是 lru_cache 的:不清缓存的话,管理页改完
