@@ -8,6 +8,10 @@ Validates the rollback story that the runbook promises without cutting over:
    hashes still match;
 3. derived tables stay skipped on every pass.
 
+With ``--kill-after <seconds>`` the first attempt is SIGKILLed mid-flight to
+leave a partially migrated target; the following full pass must converge with
+matching counts and hashes (failure recovery to a clear point).
+
 Requires a reachable PostgreSQL (``--dsn``) and a source group database.
 """
 
@@ -16,6 +20,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -78,12 +84,60 @@ def _run_migration(group: str, dsn: str, report: Path) -> dict:
     return json.loads(report.read_text(encoding="utf-8"))
 
 
+def _run_migration_chaos(
+    group: str,
+    dsn: str,
+    report: Path,
+    kill_after: float,
+) -> tuple[bool, int | None]:
+    """Start a migration and SIGKILL it mid-flight (partial target state).
+
+    Small groups can finish inside the initial window, so the window shrinks
+    until a run is actually interrupted. Returns
+    ``(killed, returncode, window_seconds)``; the target database is left
+    partially migrated so the follow-up full pass proves convergence.
+    """
+
+    window = kill_after
+    last_returncode: int | None = None
+    while window > 0.01:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(MIGRATE),
+                "--group",
+                group,
+                "--dsn",
+                dsn,
+                "--report",
+                str(report),
+            ],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            process.communicate(timeout=window)
+            last_returncode = process.returncode
+            if process.returncode != 0:
+                raise RuntimeError(f"chaos migration failed rc={process.returncode}")
+            window = round(window / 3, 4)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process.communicate()
+            return True, process.returncode, window
+    return False, last_returncode, None
+
+
 def _drill_group(
     group: str,
     *,
     source_override: str,
     dsn: str,
     direct: bool,
+    kill_after: float = 0.0,
 ) -> dict:
     live_source = Path(source_override) if source_override else STORAGE / GROUP_DATABASES[group]
     if not live_source.is_file():
@@ -111,6 +165,16 @@ def _drill_group(
         before_hash = _sha256(source)
         first_path = Path(temp_dir.name) / "first.json"
         second_path = Path(temp_dir.name) / "second.json"
+        if kill_after > 0:
+            chaos_path = Path(temp_dir.name) / "chaos.json"
+            killed, returncode, window = _run_migration_chaos(group, dsn, chaos_path, kill_after)
+            report["chaos"] = {
+                "initial_window_seconds": kill_after,
+                "killed_window_seconds": window,
+                "killed": killed,
+                "returncode": returncode,
+            }
+            report["checks"]["chaos_failure_injected"] = killed
         first = _run_migration(group, dsn, first_path)
         second = _run_migration(group, dsn, second_path)
         after_hash = _sha256(source)
@@ -147,6 +211,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--source", default="")
     parser.add_argument(
+        "--kill-after",
+        type=float,
+        default=0.0,
+        help="SIGKILL the first migration attempt after N seconds (0 disables)",
+    )
+    parser.add_argument(
         "--direct",
         action="store_true",
         help="drill the source in place (requires all writers stopped)",
@@ -162,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_override=args.source if args.source and len(GROUP_DATABASES) == 1 else "",
                 dsn=args.dsn,
                 direct=args.direct,
+                kill_after=args.kill_after,
             )
             for group in sorted(GROUP_DATABASES)
         ]
@@ -189,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
         source_override=args.source,
         dsn=args.dsn,
         direct=args.direct,
+        kill_after=args.kill_after,
     )
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
