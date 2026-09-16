@@ -7,7 +7,7 @@
 
 | 字段 | 值 |
 |---|---|
-| baseline_id | `20260916T090815Z-01c807e-p0a-complete-9`（最终；此前 `20260915T112403Z-01c807e-p0a-p2-final`，实施后复核 `20260915T102004Z-01c807e-p0a-01c807e-verified`；初始基线 `20260915T084230Z-01c807e-p0-baseline-01c807e`） |
+| baseline_id | `20260916T114508Z-d7898b8-g1-clean-baseline`（干净提交基线，G1；此前 `20260915T112403Z-01c807e-p0a-p2-final`，实施后复核 `20260915T102004Z-01c807e-p0a-01c807e-verified`；初始基线 `20260915T084230Z-01c807e-p0-baseline-01c807e`） |
 | git_commit | `01c807e`（PR #49 合并后的 `feature/fix-module-matching`） |
 | 采集时间（UTC） | 2026-09-15T10:20:04Z（本机确定性回归） |
 | 模型配置摘要（provider/model/agent 参数） | 未调用模型；确定性 pytest 集 |
@@ -20,7 +20,7 @@
 | 套件 | 结果 | 耗时 |
 |---|---|---|
 | 固定 pytest 集（见 `regression-set.md` §1） | 全绿（回归子集 100 passed；全量 2657 passed / 0 failed（含 PostgreSQL 集成；既有失败已修复/清理，见 §6）） | 31.3s（子集） |
-| 数据集 hash（sha256，记录于基线 JSON） | 见 baselines/20260916T090815Z-01c807e-p0a-complete-9.json |  |
+| 数据集 hash（sha256，记录于基线 JSON） | 见 baselines/20260916T114508Z-d7898b8-g1-clean-baseline.json |  |
 | 三次连续运行波动（P0-001） | run1 35.53s / run2 35.31s / run3 36.47s，极差 1.16s（约 3.3%），结果全绿 | `baselines/*-p0a-fluctuation-run{1,2,3}.json` |
 
 ## 3. 质量基线（Phase 0）
