@@ -49,6 +49,7 @@ import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
+import { kbDeletionWarning, kbVisibilityLabel } from '@/lib/kbSharing';
 
 // Mirrors backend canonical labels (src/pipelines/document_rag/schemas.py
 // TASK_STATUS_LABELS); cross-language, so keep both in sync manually.
@@ -152,9 +153,12 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   const [deleteChatTarget, setDeleteChatTarget] = useState<ExternalConversationListItem | null>(null);
   const [deletingChat, setDeletingChat] = useState(false);
   const [summaryGenerating, setSummaryGenerating] = useState(false);
+  const [deleteTaskTarget, setDeleteTaskTarget] = useState<ParseTaskView | 'finished' | null>(null);
+  const [deletingTask, setDeletingTask] = useState(false);
 
-  const canWrite = kbMeta?.permission === 'write' || kbMeta?.permission === 'admin';
-  const canAdmin = kbMeta?.permission === 'admin';
+  const canWrite = auth.user.role !== 'system_admin' && (kbMeta?.permission === 'write' || kbMeta?.permission === 'admin');
+  const canAdmin = auth.user.role !== 'system_admin' && kbMeta?.permission === 'admin';
+  const deletionWarning = kbDeletionWarning(kbMeta);
   const hasActiveTasks = useMemo(
     () =>
       tasks.some((task) =>
@@ -549,7 +553,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   }
 
   async function handleDeleteFile() {
-    if (!deleteTarget) return;
+    if (!deleteTarget || !canAdmin || deleting) return;
     setDeleting(true);
     try {
       await api.delete<OkResponse>(
@@ -566,7 +570,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   }
 
   async function handleDeleteDesign() {
-    if (!deleteDesignTarget) return;
+    if (!deleteDesignTarget || !canAdmin || deletingDesign) return;
     setDeletingDesign(true);
     try {
       await api.delete<OkResponse>(
@@ -602,7 +606,8 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     }
   }
 
-  async function handleDeleteChat() {    if (!deleteChatTarget) return;
+  async function handleDeleteChat() {
+    if (!deleteChatTarget || !canWrite || deletingChat) return;
     setDeletingChat(true);
     try {
       await api.delete<OkResponse>(
@@ -620,39 +625,21 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     }
   }
 
-  async function deleteTask(task: ParseTaskView) {
+  async function handleDeleteTask() {
+    if (!deleteTaskTarget || !canWrite || deletingTask) return;
+    setDeletingTask(true);
     try {
-      await api.delete<OkResponse>(
-        `/api/v1/kbs/${encodeURIComponent(kbName)}/parse-tasks/${encodeURIComponent(task.id)}`,
-      );
-      notify.success('解析任务已删除');
+      const target = deleteTaskTarget === 'finished' ? 'finished' : encodeURIComponent(deleteTaskTarget.id);
+      await api.delete<OkResponse>(`/api/v1/kbs/${encodeURIComponent(kbName)}/parse-tasks/${target}`);
+      notify.success(deleteTaskTarget === 'finished' ? '已清理完成/失败任务' : '解析任务已删除');
+      setDeleteTaskTarget(null);
       loadTasks();
       loadFiles();
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '任务操作失败');
+    } finally {
+      setDeletingTask(false);
     }
-  }
-
-  async function clearFinishedTasks() {
-    try {
-      await api.delete<OkResponse>(`/api/v1/kbs/${encodeURIComponent(kbName)}/parse-tasks/finished`);
-      notify.success('已清理完成/失败任务');
-      loadTasks();
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '清理失败');
-    }
-  }
-
-  if (forbidden) {
-    return (
-      <div className="flex min-h-full items-center justify-center px-[48px] py-[32px]">
-        <div className="flex max-w-[420px] flex-col items-center gap-[12px] rounded-[16px] border border-[#e3e7f1] bg-white p-[36px] text-center shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
-          <AppIcon name="warning" size={36} className="text-[#b45309]" />
-          <div className="text-[15px] font-semibold text-[#18181a]">无法访问该知识库</div>
-          <div className="text-[13px] leading-[20px] text-[#757f9c]">{forbidden}</div>
-        </div>
-      </div>
-    );
   }
 
   const columns: DataTableColumn<FileView>[] = useMemo(() => {
@@ -715,11 +702,23 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     ];
   }, [canAdmin]);
 
+  if (forbidden) {
+    return (
+      <div className="flex min-h-full items-center justify-center px-[48px] py-[32px]">
+        <div className="flex max-w-[420px] flex-col items-center gap-[12px] rounded-[16px] border border-[#e3e7f1] bg-white p-[36px] text-center shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
+          <AppIcon name="warning" size={36} className="text-[#b45309]" />
+          <div className="text-[15px] font-semibold text-[#18181a]">无法访问该知识库</div>
+          <div className="text-[13px] leading-[20px] text-[#757f9c]">{forbidden}</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
       <AppHeader
         title={`知识库工作台 · ${kbName}`}
-        description={`共 ${files.length} 个文件;上传、解析任务和结构化结果在当前知识库内处理。`}
+        description={`${kbMeta ? `${kbVisibilityLabel(kbMeta)}${kbMeta.is_owner ? ' · 我是所有者' : ''}；` : ''}共 ${files.length} 个文件；上传、解析任务和结构化结果在当前知识库内处理。${deletionWarning}`}
         userName={auth.user.username}
         onLogout={onLogout}
       />
@@ -792,7 +791,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
                 <AppIcon name="refresh" size={13} />
                 刷新
               </Button>
-              <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[30px] px-[10px]')} onClick={clearFinishedTasks}>
+              <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[30px] px-[10px]')} onClick={() => setDeleteTaskTarget('finished')}>
                 清理完成
               </Button>
             </div>
@@ -806,7 +805,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
           ) : (
             <div className="grid gap-[8px]">
               {tasks.map((task) => (
-                <ParseTaskRow key={task.id} task={task} onDelete={deleteTask} />
+                <ParseTaskRow key={task.id} task={task} onDelete={setDeleteTaskTarget} />
               ))}
             </div>
           )}
@@ -959,12 +958,24 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       </Dialog>
 
       <ConfirmDialog
+        open={deleteTaskTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTaskTarget(null);
+        }}
+        title={deleteTaskTarget === 'finished' ? '清理完成/失败任务' : `删除解析任务「${deleteTaskTarget?.original_name ?? ''}」`}
+        description={`${deletionWarning}删除的解析任务记录将不可恢复，请确认后继续。`}
+        confirmText="确认删除"
+        loading={deletingTask}
+        destructive
+        onConfirm={handleDeleteTask}
+      />
+      <ConfirmDialog
         open={deleteTarget !== null}
         onOpenChange={(open: boolean) => {
           if (!open) setDeleteTarget(null);
         }}
         title={<>删除文件「{deleteTarget?.name}」</>}
-        description="删除后该文件的远端文档、归档和解析结果将不可恢复。"
+        description={`${deletionWarning}删除后该文件的远端文档、归档和解析结果将不可恢复。`}
         confirmText="删除"
         loading={deleting}
         destructive
@@ -976,7 +987,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
           if (!open) setDeleteDesignTarget(null);
         }}
         title={<>删除电路设计「{deleteDesignTarget?.design_id}」</>}
-        description="删除后该设计的结构化状态、索引、解析日志和归档文件会被清理。"
+        description={`${deletionWarning}删除后该设计的结构化状态、索引、解析日志和归档文件会被清理，不可恢复。`}
         confirmText="删除"
         loading={deletingDesign}
         destructive
@@ -988,7 +999,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
           if (!open) setDeleteChatTarget(null);
         }}
         title={<>删除外部对话「{deleteChatTarget?.title}」</>}
-        description="删除后该对话的解析结果、索引和归档文件会被清理。"
+        description={`${deletionWarning}删除后该对话的解析结果、索引和归档文件会被清理，不可恢复。`}
         confirmText="删除"
         loading={deletingChat}
         destructive

@@ -209,8 +209,8 @@ class StubPipeline:
 def make_auth(db_path: str):
     """Build a temp auth.db: one dept, employees 'admin1'/'user1', KB 'shared'.
 
-    Two-role model: ``admin1`` (owner) and ``user1`` are both department
-    employees with implicit admin access to the department KB. Assumes
+    Two-role model: ``admin1`` owns the department KB and has shared it to the
+    department, so ``user1`` also gets admin access. Assumes
     AUTH_DEFAULT_ADMIN_PASSWORD has already been raised to a non-default value
     by the caller's setUp.
     """
@@ -219,7 +219,7 @@ def make_auth(db_path: str):
     dept = auth.create_department("hw")
     admin = auth.create_user_as(sysadmin, "admin1", "pw123456", ROLE_EMPLOYEE, dept.id)
     user = auth.create_user_as(sysadmin, "user1", "pw123456", ROLE_EMPLOYEE, dept.id)
-    auth.register_knowledge_base("shared", owner=admin)
+    auth.register_knowledge_base("shared", owner=admin, is_shared=True)
     return auth, dept, admin, user
 
 

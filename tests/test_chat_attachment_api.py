@@ -164,8 +164,9 @@ class AttachmentApiTests(unittest.TestCase):
 
         # user2 uploads to their own session, then tries to read user1's row
         # through their own session id: must 404 without leaking existence.
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         self.auth.create_user_as(
-            self.admin, "user2", "pw123456", role="user", department_id=self.user.department_id
+            sysadmin, "user2", "pw123456", department_id=self.user.department_id
         )
         other_token = self._token("user2")
         other_session = ConversationService(self.db_path).create_session(

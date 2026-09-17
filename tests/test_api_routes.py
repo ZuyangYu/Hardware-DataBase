@@ -100,6 +100,59 @@ class ApiRoutesTests(unittest.TestCase):
         kbs = r.json()
         self.assertEqual([k["name"] for k in kbs], ["shared"])
         self.assertEqual(kbs[0]["permission"], "admin")
+        self.assertTrue(kbs[0]["is_shared"])
+        self.assertFalse(kbs[0]["is_owner"])
+
+    def test_private_kb_share_toggle_and_access(self):
+        self.auth.register_knowledge_base("private-kb", owner=self.admin)
+        user_token = self._token("user1")
+        admin_token = self._token("admin1")
+
+        # 私有库对其他员工完全不可见, 也不可操作
+        r = self.client.get("/api/v1/kbs", headers=self._auth(user_token))
+        self.assertNotIn("private-kb", [k["name"] for k in r.json()])
+        r = self.client.delete(
+            "/api/v1/kbs/private-kb/files/a.pdf", headers=self._auth(user_token)
+        )
+        self.assertEqual(r.status_code, 403)
+
+        # 非所有者不能切换共享状态
+        r = self.client.patch(
+            "/api/v1/kbs/private-kb/sharing",
+            json={"is_shared": True},
+            headers=self._auth(user_token),
+        )
+        self.assertEqual(r.status_code, 403)
+
+        # 所有者共享后, 部门其他员工获得 admin
+        r = self.client.patch(
+            "/api/v1/kbs/private-kb/sharing",
+            json={"is_shared": True},
+            headers=self._auth(admin_token),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get("/api/v1/kbs", headers=self._auth(user_token))
+        view = next(k for k in r.json() if k["name"] == "private-kb")
+        self.assertEqual(view["permission"], "admin")
+        self.assertTrue(view["is_shared"])
+        self.assertFalse(view["is_owner"])
+        r = self.client.get("/api/v1/kbs", headers=self._auth(admin_token))
+        own_view = next(k for k in r.json() if k["name"] == "private-kb")
+        self.assertTrue(own_view["is_owner"])
+
+        # 改回私有后立即收回
+        r = self.client.patch(
+            "/api/v1/kbs/private-kb/sharing",
+            json={"is_shared": False},
+            headers=self._auth(admin_token),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get("/api/v1/kbs", headers=self._auth(user_token))
+        self.assertNotIn("private-kb", [k["name"] for k in r.json()])
+        r = self.client.delete(
+            "/api/v1/kbs/private-kb/files/a.pdf", headers=self._auth(user_token)
+        )
+        self.assertEqual(r.status_code, 403)
 
     def test_evaluation_knowledge_base_list_is_system_admin_only(self):
         user_token = self._token("user1")

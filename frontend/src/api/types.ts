@@ -26,6 +26,9 @@ export interface KbView {
   department_name: string | null;
   permission: string | null;
   registered: boolean;
+  owner_user_id: number | null;
+  is_shared: boolean;
+  is_owner: boolean;
 }
 
 export interface FileView {

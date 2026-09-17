@@ -34,7 +34,7 @@ def memory_context(tmp_path, monkeypatch):
     department = auth.create_department("hardware")
     employee = auth.create_user_as(system_admin, "dept-admin", "password-123", ROLE_EMPLOYEE, department.id)
     user = auth.create_user_as(system_admin, "engineer", "password-123", ROLE_EMPLOYEE, department.id)
-    auth.register_knowledge_base("design", owner=employee)
+    auth.register_knowledge_base("design", owner=employee, is_shared=True)
     kb_id = auth.get_knowledge_base_id("design", department_id=department.id)
     assert kb_id is not None
 

@@ -236,6 +236,9 @@ export default function ChatPage({
         department_name: null,
         permission: 'read',
         registered: true,
+        owner_user_id: null,
+        is_shared: false,
+        is_owner: false,
       },
       ...rows,
     ];

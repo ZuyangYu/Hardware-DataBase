@@ -57,6 +57,10 @@ class CreateKbRequest(BaseModel):
     name: str
 
 
+class UpdateKbSharingRequest(BaseModel):
+    is_shared: bool
+
+
 class KbView(BaseModel):
     name: str
     kb_id: int | None = None
@@ -64,6 +68,9 @@ class KbView(BaseModel):
     department_name: str | None = None
     permission: str | None = None
     registered: bool = True
+    owner_user_id: int | None = None
+    is_shared: bool = False
+    is_owner: bool = False
 
 
 class FileView(BaseModel):

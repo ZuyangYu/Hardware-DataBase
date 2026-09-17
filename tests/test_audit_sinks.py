@@ -157,6 +157,37 @@ class AuditSinkTests(unittest.TestCase):
         new_events = self._new_actions(before)
         self.assertIn("create_user", new_events)
 
+    def test_update_kb_sharing_records_audit(self):
+        # 共享开关是治理敏感动作: 谁在什么时候把库共享/收回必须留痕。
+        token = self._token("admin1")
+        before = len(self._audit_actions())
+        r = self.client.patch(
+            "/api/v1/kbs/shared/sharing",
+            json={"is_shared": False},
+            headers=self._auth(token),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("update_kb_sharing", self._new_actions(before))
+        metadata = self._latest_metadata("update_kb_sharing")
+        self.assertEqual(metadata.get("is_shared"), False)
+        self.assertEqual(metadata.get("owner_user_id"), self.admin.id)
+
+    def test_delete_audit_metadata_marks_shared_and_actor(self):
+        # 共享库删除审计必须能区分所有者自删与部门成员删除他人共享库。
+        from src.core.app_pipeline import AppPipeline
+        from src.pipelines.document_rag.schemas import RequestContext
+
+        ctx = RequestContext(
+            user_id="user1",
+            roles=["employee"],
+            allowed_kbs=["shared"],
+            metadata={"department_id": self.dept.id, "resource_department_id": self.dept.id},
+        )
+        metadata = AppPipeline._kb_sharing_audit_metadata("shared", ctx)
+        self.assertTrue(metadata.get("is_shared"))
+        self.assertFalse(metadata.get("actor_is_owner"))
+        self.assertEqual(metadata.get("owner_user_id"), self.admin.id)
+
 
 class DepartmentPermissionTests(unittest.TestCase):
     """GET /departments must be admin-only (was: any authenticated user)."""

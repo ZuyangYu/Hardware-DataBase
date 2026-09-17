@@ -218,15 +218,15 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 `src/api/routes/evaluation.py`.
 
 ### API 层 (`src/api/`)
-前后端分离的后端。`src/api/` 是 FastAPI 服务(**就是后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务。所有业务路由挂在 `/api/v1` 前缀下(`/health` 保留根路径探针)。CORS 由 `HDB_API_CORS_ORIGINS`(逗号分隔)配置,默认放行本地开发 origin(5173/5174/3000),**生产部署必须显式设为前端实际域名**。RAGFlow key / `.env` / `auth.db` 只在服务侧。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:员工对本部门 KB 隐式 admin,系统管理员不参与内容访问。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。查询走 **turns 执行模型**:`POST /conversations/{id}/turns` 创建轮次(服务端自动落库 user 消息)-> `POST /turns/{turn_id}/start` 由 worker 轮询执行 -> `GET /turns/{turn_id}/events` SSE 流式返回。上传 `POST /kbs/{kb}/files`(multipart,分片写盘 + 大小上限 `HDB_API_MAX_UPLOAD_BYTES`)。
+前后端分离的后端。`src/api/` 是 FastAPI 服务(**就是后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务。所有业务路由挂在 `/api/v1` 前缀下(`/health` 保留根路径探针)。CORS 由 `HDB_API_CORS_ORIGINS`(逗号分隔)配置,默认放行本地开发 origin(5173/5174/3000),**生产部署必须显式设为前端实际域名**。RAGFlow key / `.env` / `auth.db` 只在服务侧。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:知识库默认私有(仅所有者可见可管理),所有者可通过 `PATCH /kbs/{kb}/sharing` 开启部门共享,共享后本部门其他员工获得 admin;系统管理员不参与内容访问。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。查询走 **turns 执行模型**:`POST /conversations/{id}/turns` 创建轮次(服务端自动落库 user 消息)-> `POST /turns/{turn_id}/start` 由 worker 轮询执行 -> `GET /turns/{turn_id}/events` SSE 流式返回。上传 `POST /kbs/{kb}/files`(multipart,分片写盘 + 大小上限 `HDB_API_MAX_UPLOAD_BYTES`)。
 
 **审计下沉**:管理写操作的 `record_audit` 住在 `AuthService._audit` / `AppPipeline._audit` 内部(fail-soft),所有入口自动覆盖、无双写。唯一例外是 `change_settings`(`apply_settings` 是 staticmethod 无 actor),由 `PUT /config` 路由层记一次。
 
 **角色权力分离**(两级角色,与前端 admin 页面严格对齐):
 - `system_admin` = **治理角色**,只碰元数据。可用:部门管理、注册员工(仅创建 `employee` 账号并绑定部门; 系统管理员账号由部署环境 `AUTH_DEFAULT_ADMIN_*` 管理, API 不可创建)、KB 挂载(`assign_kb`)、系统配置、日志中心、RAGAS 评估、治理面板。**不能**访问任何 KB 内容(检索、上传、看文件、删文件、看解析任务)。`RequestContext.has_kb_permission` 对 sysadmin 恒返回 False;API 路由用 `deps.reject_system_admin_kb_access(ctx)` 提前拒并给明确错误信息("system_admin 是治理角色,不能访问知识库内容")。这条铁律的目的是防"平台管理员静默窥视各部门私有数据"。
-- `employee` = **部门员工**(部门内唯一角色)。可用:本部门 KB 全部隐式可见(admin,不落授权表)、建/删 KB、上传/删除/查看文件、检索、文档资产/Wiki/图谱、本部门治理面板/日志/系统状态。**不能**创建或管理账号(注册员工是系统管理员的治理动作)。逐库授权(`kb_permissions`)已废弃:员工之间没有可授对象,表保留但不再读写。
+- `employee` = **部门员工**(部门内唯一角色)。可用:建 KB(新库默认私有)、管理**自己创建或部门共享**的知识库(上传/删除/查看文件、检索)、文档资产/Wiki/图谱、本部门治理面板/日志/系统状态。**不能**创建或管理账号(注册员工是系统管理员的治理动作)。逐用户授权(`kb_permissions`)已删除,改为所有者维度的共享开关:`knowledge_bases.is_shared`(默认 0=私有,仅 owner 可见;启动迁移时存量库也置为私有);`AuthService.get_kb_permissions_for_user` / `list_accessible_kbs` 只返回 owner 自己的库 + 已共享的部门库(无主历史库保持部门可见兜底);切换共享仅 owner 可操作(`PATCH /kbs/{kb}/sharing`,落 `update_kb_sharing` 审计)。删库仍仅 owner 可删;共享库内非 owner 的删文件等危险操作前端二次确认,并在 `delete_document` 审计 metadata 记录 `is_shared/actor_is_owner`。
 
-**两级角色迁移**:`AuthService._init_db` 启动时幂等执行 `UPDATE users SET role='employee' WHERE role IN ('dept_admin','user')`;旧普通用户与旧部门管理员统一并入员工。`tests/test_auth_kb_scope.py::test_legacy_role_and_permission_rows_migrate` 覆盖。
+**两级角色迁移**:`AuthService._init_db` 启动时幂等执行 `UPDATE users SET role='employee' WHERE role IN ('dept_admin','user')`;旧普通用户与旧部门管理员统一并入员工。`tests/test_auth_kb_scope.py::test_legacy_role_rows_migrate_and_permission_table_dropped` 覆盖。
 
 **会话持久化**:查询走 turns 执行模型时,服务端自动把 user/assistant 消息写入 `conversations`(见 `src/api/routes/query.py`),并在生成结束后按回答文本 + 检索 summary 推导状态写 query trace + 证据到日志中心。
 
