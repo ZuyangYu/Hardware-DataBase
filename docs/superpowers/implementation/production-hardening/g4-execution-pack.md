@@ -39,6 +39,17 @@ uv run python scripts/production_hardening/load_probe.py --mode health --rate 5 
 | 资源 | `hdb.resource.active/queue.waiting/uncertain`、LLM/RAG 在途、`hdb.retrieval.executor.*` |
 | 正确性 | `hdb.conversation.stale_write_rejected`、重复终态事件/Artifact、越权计数 |
 
+### 1.1 本机 50 用户实测（2026-09-16，开发机口径，非目标环境 SLO）
+
+`concurrency_compare_drill.py --users 50 --turns-per-user 1 --wave-size 10 --user-rpm 3 --tenant-rpm 120`（隔离临时库，通用聊天，同一模型；峰值在途 10）：
+
+| 模式 | 完成/总 | 有完成 turn 用户 | e2e P50 (s) | e2e P95 (s) | 队列 P95 (s) | 同会话突发 | 越权拦截 | 快速提交 429 |
+|---|---|---|---|---|---|---|---|---|
+| off（legacy 并发） | 50/50 | 50/50 | 70.2 | 119.5 | 95.7 | 2 次重叠 | 404 | 0/5 |
+| on（序列化+部署 governor+共享执行器+低 RPM） | 50/50 | 50/50 | 69.7 | 115.4 | 92.8 | 0 重叠（等待 17.0/38.9s） | 404 | 2/5（含 Retry-After） |
+
+结论：跨用户并行吞吐不被同会话串行拖慢（两模式同量级）；同会话严格按 `turn_sequence` 串行；过载显式拒绝而非静默挂起。绝对值不可用作 SLO（需 §2 目标环境）。
+
 ## 2. 发布门槛（相对 + 绝对同时通过）
 
 | 维度 | 门槛 |

@@ -54,6 +54,13 @@ uv run python scripts/production_hardening/migration_rollback_drill.py --all-gro
   --dsn postgresql://postgres:postgres@127.0.0.1:55432/hdb \
   --output docs/superpowers/implementation/production-hardening/g3-migration-failure-recovery-drill.json
 
+# 全栈预演：迁移 + PostgreSQL checkpoint/memory provider + PostgreSQL 配额 governor
+# （附件跨副本上传/下载 hash 校验、副本 B 同会话续跑、共享配额表实测写入）
+uv run python scripts/production_hardening/multi_instance_drill.py --checkpoint-backend postgres \
+  --governor-backend postgres \
+  --postgres-dsn postgresql://postgres:postgres@127.0.0.1:55432/hdb \
+  --output docs/superpowers/implementation/production-hardening/g3-fullstack-pg-drill-20260916.json
+
 # 双副本使用 PostgreSQL checkpoint/memory provider，跨副本续跑同一会话
 uv run python scripts/production_hardening/multi_instance_drill.py --checkpoint-backend postgres \
   --postgres-dsn postgresql://postgres:postgres@127.0.0.1:55432/hdb \
@@ -71,5 +78,5 @@ uv run python scripts/production_hardening/state_fingerprint.py --label g3-post 
 
 - 每单元：源/目标映射、行数与 hash、外键与权限、切换步骤、回滚说明、演练报告；
 - 责任人：存储负责人（切换执行）、后端负责人（应用兼容）、测试负责人（校验）、运维负责人（窗口与回滚）；
-- 当前就绪度：provider/迁移/回滚脚本与演练通过（见 `postgres-migration-drill-20260915.json`、`migration-rollback-drill-20260915.json`、`g3-all-groups-rollback-drill.json`、`g3-migration-failure-recovery-drill.json`、`multi-instance-pg-provider-drill-20260916.json`）；共享文件与多主机待环境。
+- 当前就绪度：provider/迁移/回滚脚本与演练通过（见 `postgres-migration-drill-20260915.json`、`migration-rollback-drill-20260915.json`、`g3-all-groups-rollback-drill.json`、`g3-migration-failure-recovery-drill.json`、`multi-instance-pg-provider-drill-20260916.json`、`g3-fullstack-pg-drill-20260916.json`）；跨主机配额存储已实现并验证（`tests/test_resource_governor_postgres.py`，4 子进程高水位 ≤2），共享文件与多主机实机待环境。
 - 已覆盖的 §8.3 验收项：任意 API 副本恢复同一会话（SQLite 与 PostgreSQL provider 双副本跨副本续跑）、同角色 Worker 接管过期任务（G2 套件 + 故障隔离演练）、迁移失败恢复到明确时间点（chaos 打断后收敛）。剩余：跨节点 Artifact/附件访问（共享文件服务）、跨主机配额。

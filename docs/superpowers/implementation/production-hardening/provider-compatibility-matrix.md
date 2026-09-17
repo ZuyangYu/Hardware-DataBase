@@ -38,7 +38,7 @@
 |---|---|---|
 | process | 进程内 semaphore | 开发/单实例 |
 | deployment（同机） | `RESOURCE_GOVERNOR_DB_PATH` SQLite 配额库 | 身份行（deployment_id/schema_version/config_revision）、WAL、短事务忙重试、uncertain 隔离与维护选主 |
-| deployment（跨主机） | PostgreSQL 配额存储（G3 范围） | 未实施；接口与 lease 契约保持一致，P1 切换只替换存储后端 |
+| deployment（跨主机） | `RESOURCE_GOVERNOR_BACKEND=postgres` + `RESOURCE_GOVERNOR_DATABASE_URL` + `RESOURCE_GOVERNOR_SCOPE=deployment` | `PostgresQuotaStore`：短事务 + 每资源 advisory xact lock，租约/uncertain/审计/维护选主与 SQLite 契约一致；未配置 URL 或 SCOPE 非 deployment 时保存/启动拒绝 | `tests/test_resource_governor_postgres.py`（11 例：容量/保留位、租约过期转 uncertain、finish 证据、reconcile、维护选主接管、双副本共享预算、部署预算不被进程数放大、4 子进程容量 2 高水位 ≤2）；全栈双副本演练 `g3-fullstack-pg-drill-20260916.json` |
 
 ## 5. 已知限制
 

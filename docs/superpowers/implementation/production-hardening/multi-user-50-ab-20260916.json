@@ -1,0 +1,938 @@
+{
+  "off": {
+    "mode": "off",
+    "config": {
+      "AUTH_DB_PATH": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/off/auth.db",
+      "AGENT_CHECKPOINT_DB_PATH": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/off/agent_checkpoints.db",
+      "CHAT_ATTACHMENT_INDEX_DB_PATH": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/off/attachments.db",
+      "CHAT_ATTACHMENT_STORAGE_DIR": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/off/attachment_files",
+      "RESOURCE_GOVERNOR_DB_PATH": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/off/resource_quotas.db",
+      "HDB_API_SPAWN_WORKER": "0",
+      "HDB_API_SPAWN_EXPORT_WORKER": "0",
+      "HDB_API_SPAWN_MEMORY_WORKER": "0",
+      "CONVERSATION_SERIALIZE_SAME_THREAD": "false"
+    },
+    "turns": [
+      {
+        "turn_id": "f4c5d3d7-a3c1-4beb-a059-2703d6a21314",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.481523,
+        "e2e_s": 26.691209,
+        "answer_len": 375
+      },
+      {
+        "turn_id": "1f449446-d058-4d03-a389-087af66c5f6c",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.422923,
+        "e2e_s": 28.4816,
+        "answer_len": 438
+      },
+      {
+        "turn_id": "e82228ec-c7fa-4fce-9631-f22401712319",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 26.65077,
+        "e2e_s": 46.205123,
+        "answer_len": 481
+      },
+      {
+        "turn_id": "46358997-21c5-4377-9e8b-15820b58893d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 28.468752,
+        "e2e_s": 48.718464,
+        "answer_len": 328
+      },
+      {
+        "turn_id": "814b9d8e-ebce-4014-b2f6-92aee1e06b12",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 46.211541,
+        "e2e_s": 67.110543,
+        "answer_len": 322
+      },
+      {
+        "turn_id": "7b51a551-a513-4fe7-84c9-aeb302cc2e46",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 48.502245,
+        "e2e_s": 70.206247,
+        "answer_len": 365
+      },
+      {
+        "turn_id": "9bbbf954-86c8-412d-8a85-f8a889997eec",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 66.85043,
+        "e2e_s": 88.569645,
+        "answer_len": 427
+      },
+      {
+        "turn_id": "7a7414ed-123f-4f4d-a8eb-2d96df9f0f0d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 70.252128,
+        "e2e_s": 88.804266,
+        "answer_len": 363
+      },
+      {
+        "turn_id": "35df4c8e-1d2d-4077-a71b-a748476ecdee",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 88.634859,
+        "e2e_s": 110.164026,
+        "answer_len": 291
+      },
+      {
+        "turn_id": "fe7c293a-bbab-4559-a0ab-aab845bb124b",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 88.830334,
+        "e2e_s": 109.811702,
+        "answer_len": 383
+      },
+      {
+        "turn_id": "078ad712-3ea7-4358-abb6-43f80a38cdef",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.061712,
+        "e2e_s": 26.196017,
+        "answer_len": 429
+      },
+      {
+        "turn_id": "9ec88a70-3fb4-4758-b7c6-12e9aa7bd4f2",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.319646,
+        "e2e_s": 20.559409,
+        "answer_len": 422
+      },
+      {
+        "turn_id": "45f77aab-73cd-45ed-97a0-ef7d87916b3d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 26.105145,
+        "e2e_s": 46.011524,
+        "answer_len": 391
+      },
+      {
+        "turn_id": "7a0e9a10-c02f-422c-a47e-16a2801c9642",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 20.56175,
+        "e2e_s": 42.097081,
+        "answer_len": 326
+      },
+      {
+        "turn_id": "c595776e-e35c-4db5-98d1-9c12950b44e0",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 42.148719,
+        "e2e_s": 89.497712,
+        "answer_len": 399
+      },
+      {
+        "turn_id": "761dbed3-694a-4c92-af65-c3f5fbe5f6c2",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 46.005259,
+        "e2e_s": 74.900845,
+        "answer_len": 403
+      },
+      {
+        "turn_id": "2226d5fd-b3da-4a61-84c3-4985e0da0e24",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 89.510598,
+        "e2e_s": 109.680643,
+        "answer_len": 396
+      },
+      {
+        "turn_id": "02594a37-904a-42d8-847d-cbbaf6ca27ed",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 74.930558,
+        "e2e_s": 95.1965,
+        "answer_len": 387
+      },
+      {
+        "turn_id": "85c6d8de-1bc3-4369-8231-77a839382f83",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 95.252486,
+        "e2e_s": 115.563043,
+        "answer_len": 323
+      },
+      {
+        "turn_id": "f57d8bf0-a805-4e26-87a6-a5a17454ff42",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 109.754063,
+        "e2e_s": 129.315407,
+        "answer_len": 277
+      },
+      {
+        "turn_id": "cd345912-0716-4add-b726-a1ac0d7d1bcb",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.090044,
+        "e2e_s": 25.378056,
+        "answer_len": 368
+      },
+      {
+        "turn_id": "7320b38b-348e-419e-b830-2c20340218f0",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.200936,
+        "e2e_s": 26.054218,
+        "answer_len": 401
+      },
+      {
+        "turn_id": "6b0eea3d-730e-45a9-979b-2c2695a8d385",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 25.335831,
+        "e2e_s": 43.947381,
+        "answer_len": 384
+      },
+      {
+        "turn_id": "9c8aad76-e962-44fc-8428-e7d49095d275",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 26.089158,
+        "e2e_s": 48.483914,
+        "answer_len": 417
+      },
+      {
+        "turn_id": "1389cd82-c1e9-4404-8e65-3061ebb9a7b4",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 43.980566,
+        "e2e_s": 69.376817,
+        "answer_len": 386
+      },
+      {
+        "turn_id": "32fb6446-5f87-48bb-a7f0-2b3fa3e460bb",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 48.513899,
+        "e2e_s": 66.878159,
+        "answer_len": 342
+      },
+      {
+        "turn_id": "29aa13a5-a472-4130-9848-551ce02afbf2",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 66.894748,
+        "e2e_s": 81.63727,
+        "answer_len": 326
+      },
+      {
+        "turn_id": "140c5e8a-badb-4a90-a5b5-5fecfddd0b97",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 69.388668,
+        "e2e_s": 91.516732,
+        "answer_len": 380
+      },
+      {
+        "turn_id": "ea1fd241-959a-4f6e-92c0-ff1b35c1b3a1",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 81.661845,
+        "e2e_s": 105.219254,
+        "answer_len": 425
+      },
+      {
+        "turn_id": "c73f7533-7341-494e-a0cb-34d67f052227",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 91.578841,
+        "e2e_s": 112.812719,
+        "answer_len": 370
+      },
+      {
+        "turn_id": "61ece298-ccbe-40a9-a41b-4e736f0b40a6",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.12913,
+        "e2e_s": 15.158364,
+        "answer_len": 312
+      },
+      {
+        "turn_id": "4e5a62eb-3be1-47c5-9da8-ace7eb6b5465",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.19491,
+        "e2e_s": 14.921323,
+        "answer_len": 365
+      },
+      {
+        "turn_id": "c961c0cf-2b4a-42db-b19b-8a46a681fa47",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 14.837905,
+        "e2e_s": 42.555744,
+        "answer_len": 551
+      },
+      {
+        "turn_id": "2a266800-7860-49b0-91c1-582afd80dc86",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 14.892614,
+        "e2e_s": 35.707935,
+        "answer_len": 338
+      },
+      {
+        "turn_id": "e90be429-74da-4fde-af04-d12f6395d877",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 35.703248,
+        "e2e_s": 50.90161,
+        "answer_len": 303
+      },
+      {
+        "turn_id": "a8aeb8c2-ee6f-484d-a68d-fb8be3fd35cf",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 42.430375,
+        "e2e_s": 77.576274,
+        "answer_len": 347
+      },
+      {
+        "turn_id": "d5ddf07b-906e-4e1b-ae91-5d01d948221b",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 50.899812,
+        "e2e_s": 74.503562,
+        "answer_len": 327
+      },
+      {
+        "turn_id": "350c188c-f9ac-42de-ad68-b052cd12a1bf",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 77.614428,
+        "e2e_s": 103.559889,
+        "answer_len": 451
+      },
+      {
+        "turn_id": "136cc547-2295-4902-ba5c-70f570c10ee7",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 74.556758,
+        "e2e_s": 95.077322,
+        "answer_len": 383
+      },
+      {
+        "turn_id": "aa922c41-f995-4337-8437-0f6cf7eff7df",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 95.1339,
+        "e2e_s": 115.371636,
+        "answer_len": 353
+      },
+      {
+        "turn_id": "130e375e-73b0-4296-8a10-a5764f41f61d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.075627,
+        "e2e_s": 19.49775,
+        "answer_len": 412
+      },
+      {
+        "turn_id": "109a2eb6-873e-4708-a239-64b498b01a5d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.387058,
+        "e2e_s": 23.392678,
+        "answer_len": 410
+      },
+      {
+        "turn_id": "83477d82-8807-462f-ba62-4b0619eb187d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 19.393309,
+        "e2e_s": 40.727386,
+        "answer_len": 322
+      },
+      {
+        "turn_id": "7e8d372a-05a4-42eb-a20a-fede0f8a7c32",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 23.424441,
+        "e2e_s": 40.511123,
+        "answer_len": 304
+      },
+      {
+        "turn_id": "4f32779e-be15-4277-9926-23eec0a17d48",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 40.494882,
+        "e2e_s": 83.943603,
+        "answer_len": 430
+      },
+      {
+        "turn_id": "9f9e548e-b919-4ca5-9620-ef5fa58403d7",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 40.617833,
+        "e2e_s": 74.910621,
+        "answer_len": 452
+      },
+      {
+        "turn_id": "bb7bfed6-664d-4558-9eff-664c7fa5b954",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 74.952041,
+        "e2e_s": 95.64005,
+        "answer_len": 411
+      },
+      {
+        "turn_id": "f402fd68-448f-42f8-acab-de922204d110",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 95.736686,
+        "e2e_s": 119.546309,
+        "answer_len": 335
+      },
+      {
+        "turn_id": "62545fd5-feab-455b-a651-93b141d11204",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 83.926609,
+        "e2e_s": 109.373263,
+        "answer_len": 447
+      },
+      {
+        "turn_id": "d4d95b69-57f0-4627-93b0-c3bb3ea5497e",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 109.450746,
+        "e2e_s": 130.509862,
+        "answer_len": 337
+      }
+    ],
+    "scenarios": {
+      "cross_user_errors": [],
+      "isolation": {
+        "cross_user_session_status": 404,
+        "cross_user_turn_status": 404,
+        "victim_turn_id": "f4c5d3d7-a3c1-4beb-a059-2703d6a21314",
+        "blocked": true
+      },
+      "burst": {
+        "turns": 3,
+        "terminals": [
+          "completed",
+          "completed",
+          "completed"
+        ],
+        "overlaps": 2,
+        "queue_waits_s": [
+          0.22,
+          0.201,
+          18.193
+        ],
+        "serialized": false
+      },
+      "overload": {
+        "requests": 5,
+        "statuses": [
+          201,
+          201,
+          201,
+          201,
+          201
+        ],
+        "rejected_429": 0,
+        "retry_after_present": false
+      }
+    },
+    "summary": {
+      "completed": 50,
+      "failed_or_other": 0,
+      "p50_e2e_s": 70.206,
+      "p95_e2e_s": 119.546,
+      "mean_e2e_s": 69.369,
+      "p95_queue_wait_s": 95.737,
+      "cross_user_parallel_rounds": 1,
+      "users": 50,
+      "wave_size": 10,
+      "peak_inflight": 10,
+      "users_with_completed_turn": 50
+    }
+  },
+  "on": {
+    "mode": "on",
+    "config": {
+      "AUTH_DB_PATH": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/on/auth.db",
+      "AGENT_CHECKPOINT_DB_PATH": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/on/agent_checkpoints.db",
+      "CHAT_ATTACHMENT_INDEX_DB_PATH": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/on/attachments.db",
+      "CHAT_ATTACHMENT_STORAGE_DIR": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/on/attachment_files",
+      "RESOURCE_GOVERNOR_DB_PATH": "/home/renfeng_zhang/workspace/Hardware-DataBase-observability/.tmp_dbg/cc-drill-fwst2e5m/on/resource_quotas.db",
+      "HDB_API_SPAWN_WORKER": "0",
+      "HDB_API_SPAWN_EXPORT_WORKER": "0",
+      "HDB_API_SPAWN_MEMORY_WORKER": "0",
+      "CONVERSATION_SERIALIZE_SAME_THREAD": "true",
+      "RESOURCE_GOVERNOR_ENABLED": "true",
+      "RESOURCE_GOVERNOR_SCOPE": "deployment",
+      "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "true",
+      "ADMISSION_CHAT_RPM_PER_USER": "3",
+      "ADMISSION_CHAT_RPM_PER_TENANT": "120"
+    },
+    "turns": [
+      {
+        "turn_id": "9201ed9e-675c-4f2c-9abd-1fcf14377d4d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.387048,
+        "e2e_s": 23.849098,
+        "answer_len": 415
+      },
+      {
+        "turn_id": "4c018a3c-6f8c-4ca0-97a7-464fd79398f9",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.281746,
+        "e2e_s": 21.275476,
+        "answer_len": 361
+      },
+      {
+        "turn_id": "64b0ee0c-bbd3-40ec-bc32-f8679cc0da0a",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 21.363574,
+        "e2e_s": 37.259028,
+        "answer_len": 314
+      },
+      {
+        "turn_id": "0a98a2ae-87c2-4fc8-887a-c6d3b344be17",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 37.298344,
+        "e2e_s": 58.381001,
+        "answer_len": 314
+      },
+      {
+        "turn_id": "76e112c4-cb97-464a-9024-1e522835c44f",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 23.759279,
+        "e2e_s": 46.783116,
+        "answer_len": 302
+      },
+      {
+        "turn_id": "0119b7c3-c8fa-43e6-a048-1448aae14793",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 46.815872,
+        "e2e_s": 74.253241,
+        "answer_len": 402
+      },
+      {
+        "turn_id": "d24f35f6-1a40-4500-b04b-3b4091ec5e25",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 58.353501,
+        "e2e_s": 73.888765,
+        "answer_len": 423
+      },
+      {
+        "turn_id": "d74f43c4-6091-432f-976a-2e37318a0143",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 74.170318,
+        "e2e_s": 89.539336,
+        "answer_len": 394
+      },
+      {
+        "turn_id": "c005fe8d-b33d-495d-bdbb-296bf9f07514",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 89.618735,
+        "e2e_s": 115.430083,
+        "answer_len": 417
+      },
+      {
+        "turn_id": "4c9f59b6-4589-4743-996b-e60d815fb4b2",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 73.953214,
+        "e2e_s": 103.07519,
+        "answer_len": 360
+      },
+      {
+        "turn_id": "e8c4108a-9d10-4085-b09d-1c666ab28dd1",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.230842,
+        "e2e_s": 30.628317,
+        "answer_len": 320
+      },
+      {
+        "turn_id": "2f4815b5-4d3c-4659-ab1c-f508039f68f6",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.403334,
+        "e2e_s": 16.427576,
+        "answer_len": 280
+      },
+      {
+        "turn_id": "dcbc7a71-4598-44f1-8e67-3bbff796b694",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 16.467938,
+        "e2e_s": 40.885915,
+        "answer_len": 291
+      },
+      {
+        "turn_id": "18201dd5-01d6-4680-b1ce-87bf8204e6e8",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 30.217078,
+        "e2e_s": 70.249934,
+        "answer_len": 344
+      },
+      {
+        "turn_id": "c414ad0b-e8fe-4a22-8ac9-527a75ab2931",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 40.905415,
+        "e2e_s": 72.758043,
+        "answer_len": 363
+      },
+      {
+        "turn_id": "38934e1f-c48b-4de0-be7e-429c14c2ae1d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 70.256136,
+        "e2e_s": 93.904598,
+        "answer_len": 366
+      },
+      {
+        "turn_id": "00d69a9b-f6a6-4eb2-900e-c4b0c40ed9f3",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 94.018876,
+        "e2e_s": 120.348904,
+        "answer_len": 523
+      },
+      {
+        "turn_id": "29bbfe4e-6f9a-42d4-8470-322823586616",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 112.693244,
+        "e2e_s": 139.293172,
+        "answer_len": 365
+      },
+      {
+        "turn_id": "50d30042-016d-4e08-ab1d-8d10b3a3fb4e",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 92.738381,
+        "e2e_s": 112.577015,
+        "answer_len": 305
+      },
+      {
+        "turn_id": "cbb2e15c-f1e2-40c2-abad-94ee60773e87",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 72.797444,
+        "e2e_s": 92.647502,
+        "answer_len": 323
+      },
+      {
+        "turn_id": "9a41843a-0299-4cf3-ba25-98dd3b3c8989",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.126407,
+        "e2e_s": 18.799129,
+        "answer_len": 400
+      },
+      {
+        "turn_id": "fe834133-83f9-412b-b5f3-e6983e03a7e6",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.176039,
+        "e2e_s": 18.68159,
+        "answer_len": 315
+      },
+      {
+        "turn_id": "8b33261f-c241-4f7b-818d-947928df7b06",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 18.652865,
+        "e2e_s": 44.779588,
+        "answer_len": 409
+      },
+      {
+        "turn_id": "9d9e4720-5744-443d-8b1a-f9085ce6c66a",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 18.629097,
+        "e2e_s": 38.308206,
+        "answer_len": 339
+      },
+      {
+        "turn_id": "d7bba2ab-cc6e-428b-a5de-7844fe761b79",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 38.390678,
+        "e2e_s": 65.884551,
+        "answer_len": 429
+      },
+      {
+        "turn_id": "ef8cb989-a605-464e-b36d-7114a34a782b",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 44.746317,
+        "e2e_s": 64.989116,
+        "answer_len": 322
+      },
+      {
+        "turn_id": "81933811-0f19-4b4f-96ae-2e9691efa88a",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 65.94241,
+        "e2e_s": 88.75295,
+        "answer_len": 442
+      },
+      {
+        "turn_id": "93ddf19c-a85e-47fb-b52f-ab20c2d64df6",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 65.078367,
+        "e2e_s": 90.994238,
+        "answer_len": 459
+      },
+      {
+        "turn_id": "b26d4257-00ab-4a64-8b11-59b649e15be3",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 91.120914,
+        "e2e_s": 110.558989,
+        "answer_len": 367
+      },
+      {
+        "turn_id": "ce666d14-f1f4-4a2e-a95f-f92539c8782a",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 88.827487,
+        "e2e_s": 111.49922,
+        "answer_len": 222
+      },
+      {
+        "turn_id": "b7706051-e16e-4cc3-be6e-64753a36810c",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.09068,
+        "e2e_s": 26.168347,
+        "answer_len": 305
+      },
+      {
+        "turn_id": "d8ffbda2-2d4d-4b9b-80cf-a6dea57116c6",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.481848,
+        "e2e_s": 19.734642,
+        "answer_len": 423
+      },
+      {
+        "turn_id": "cb2fb5f0-06af-4cf5-9c52-0b2c9db46d89",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 19.73082,
+        "e2e_s": 38.133849,
+        "answer_len": 389
+      },
+      {
+        "turn_id": "d18ff821-a323-4c12-8d88-0fe9433e4b98",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 26.083082,
+        "e2e_s": 58.085776,
+        "answer_len": 475
+      },
+      {
+        "turn_id": "4d13a63a-edf2-4893-8155-85d3d94d5c06",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 38.144671,
+        "e2e_s": 59.078012,
+        "answer_len": 301
+      },
+      {
+        "turn_id": "e699cb69-e0c7-4915-8592-ad831d6092ae",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 58.097666,
+        "e2e_s": 75.903556,
+        "answer_len": 464
+      },
+      {
+        "turn_id": "2daf2bbe-5eca-4024-b5b8-66fb19e9f81d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 74.513775,
+        "e2e_s": 92.702805,
+        "answer_len": 476
+      },
+      {
+        "turn_id": "d1422eb3-886e-4e07-99c3-6cf17d651aa3",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 59.104398,
+        "e2e_s": 74.413868,
+        "answer_len": 376
+      },
+      {
+        "turn_id": "3578270c-2f22-4a5a-99f2-bf8ab3905601",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 76.0247,
+        "e2e_s": 99.153996,
+        "answer_len": 351
+      },
+      {
+        "turn_id": "863dd3f5-46b0-4919-a061-2d86652eb150",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 92.830035,
+        "e2e_s": 114.498228,
+        "answer_len": 279
+      },
+      {
+        "turn_id": "106fcd44-d7ab-4d3d-8197-4d070e062cbd",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.149334,
+        "e2e_s": 18.246091,
+        "answer_len": 373
+      },
+      {
+        "turn_id": "07d84e11-c179-4ef1-aa8b-89e16d2f9d23",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 0.205512,
+        "e2e_s": 17.358874,
+        "answer_len": 468
+      },
+      {
+        "turn_id": "e27b2e10-1fe5-4543-9e74-1a9f0cefae75",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 17.361135,
+        "e2e_s": 37.413324,
+        "answer_len": 425
+      },
+      {
+        "turn_id": "79fb5893-c109-4781-a7df-92eb65a24e7d",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 18.243534,
+        "e2e_s": 53.441665,
+        "answer_len": 431
+      },
+      {
+        "turn_id": "bd1899fa-8fa3-4dd7-b70f-3748e24a1a04",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 37.43704,
+        "e2e_s": 56.381823,
+        "answer_len": 392
+      },
+      {
+        "turn_id": "42a5ea6f-234a-428c-be8a-40e2f085fb70",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 56.390918,
+        "e2e_s": 75.729874,
+        "answer_len": 351
+      },
+      {
+        "turn_id": "22bce1ea-083c-46ab-b221-99675329b225",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 53.446012,
+        "e2e_s": 69.672066,
+        "answer_len": 336
+      },
+      {
+        "turn_id": "2106c535-7025-4fd3-ab68-fc9ab79e869f",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 69.784676,
+        "e2e_s": 86.917684,
+        "answer_len": 416
+      },
+      {
+        "turn_id": "50c957aa-cfbe-4358-b572-54341f517a6c",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 75.811758,
+        "e2e_s": 95.162898,
+        "answer_len": 456
+      },
+      {
+        "turn_id": "37d26e25-1806-4a9c-9445-48691bb400e2",
+        "turn_sequence": 1,
+        "status": "completed",
+        "queue_wait_s": 86.995456,
+        "e2e_s": 102.657826,
+        "answer_len": 383
+      }
+    ],
+    "scenarios": {
+      "cross_user_errors": [],
+      "isolation": {
+        "cross_user_session_status": 404,
+        "cross_user_turn_status": 404,
+        "victim_turn_id": "4c9f59b6-4589-4743-996b-e60d815fb4b2",
+        "blocked": true
+      },
+      "burst": {
+        "turns": 3,
+        "terminals": [
+          "completed",
+          "completed",
+          "completed"
+        ],
+        "overlaps": 0,
+        "queue_waits_s": [
+          0.191,
+          16.958,
+          38.949
+        ],
+        "serialized": true
+      },
+      "overload": {
+        "requests": 5,
+        "statuses": [
+          201,
+          201,
+          201,
+          429,
+          429
+        ],
+        "rejected_429": 2,
+        "retry_after_present": true
+      }
+    },
+    "summary": {
+      "completed": 50,
+      "failed_or_other": 0,
+      "p50_e2e_s": 69.672,
+      "p95_e2e_s": 115.43,
+      "mean_e2e_s": 67.151,
+      "p95_queue_wait_s": 92.83,
+      "cross_user_parallel_rounds": 1,
+      "users": 50,
+      "wave_size": 10,
+      "peak_inflight": 10,
+      "users_with_completed_turn": 50
+    }
+  },
+  "markdown": "# 多用户多并发 A/B 实测报告\n\n> 口径：隔离临时库（不影响在线服务）；通用聊天；同一模型；**50 个用户**、每组 1 轮跨用户并行（每波 10 人，峰值在途 10）+ 3 条同会话突发 + 5 次快速提交。\n> `off` = 默认开关（legacy 并发）；`on` = `CONVERSATION_SERIALIZE_SAME_THREAD` + 部署级 governor + 共享检索执行器 + 低 RPM 准入。\n\n## 结果总表\n\n| 模式 | 完成/总 | 有完成 turn 用户数 | 跨用户 e2e P50 (s) | 跨用户 e2e P95 (s) | 队列等待 P95 (s) | 同会话严格串行 | 跨用户隔离拦截 | 准入拒绝 |\n|---|---|---|---|---|---|---|---|---|\n| off | 50/50 | 50/50 | 70.206 | 119.546 | 95.737 | 否 | 是 | 0/5 |\n| on | 50/50 | 50/50 | 69.672 | 115.43 | 92.83 | 是 | 是 | 2/5 |\n\n## 同会话突发（顺序语义）\n\n| 模式 | 突发重叠次数 | 各 turn queue wait (s) | 串行结论 |\n|---|---|---|---|\n| off | 2 | [0.22, 0.201, 18.193] | 发生并行/重叠（legacy 行为） |\n| on | 0 | [0.191, 16.958, 38.949] | 严格按 turn_sequence 串行，后序等待前序完成 |\n\n## 隔离与过载\n\n| 检查 | off | on |\n|---|---|---|\n| 他用户会话访问状态码 | 404 | 404 |\n| 他用户 turn 访问状态码 | 404 | 404 |\n| 429 次数 / 请求数 | 0/5 | 2/5 |\n| Retry-After 头 | 无 | 有 |\n\n## 效果说明\n\n- **多用户隔离**：两个模式下他用户访问会被拒绝（403/404），说明用户维度权限与会话归属默认生效，与开关无关。\n- **同会话顺序**：`on` 模式下后序 turn 的 `queue_wait` > 0 且无时间重叠，证明服务端顺序执行；`off` 模式为 legacy 并发（可能出现重叠），因此生产多 Worker 放量前必须开启该开关。\n- **跨用户并行**：两种模式的跨用户 e2e 分布相近，说明串行化只作用于同一会话，不会拖慢跨会话并行。\n- **过载背压**：`on` 模式下低 RPM 用户快速提交出现 429 且带 `Retry-After`，任务未被接受前即拒绝；`off` 模式默认仅依赖系统承载，缺少该显式背压。\n- **注意**：本报告为开发机短时实测（非 30 分钟×3 生产压测），绝对值不可直接用作 SLO；相对差异与行为断言可用于回归对比。\n"
+}
