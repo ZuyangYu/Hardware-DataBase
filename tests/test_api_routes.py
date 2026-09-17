@@ -2,6 +2,7 @@ import gc
 import os
 from contextlib import closing
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -233,11 +234,11 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(r2.status_code, 200)
         self.assertGreaterEqual(r2.json()["tasks"]["total"], 2)
 
-    def test_query_no_permission(self):
+    def test_conversation_no_permission(self):
         t = self._token("user1")
         r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "other_kb", "query": "问"},
+            "/api/v1/conversations",
+            json={"kb_name": "other_kb", "title": "越权"},
             headers=self._auth(t),
         )
         self.assertEqual(r.status_code, 403)
@@ -276,41 +277,35 @@ class ApiRoutesTests(unittest.TestCase):
             headers=self._auth(t),
         )
         self.assertEqual(r.status_code, 403)
-        r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "__general__", "query": "你好"},
-            headers=self._auth(t),
-        )
-        self.assertEqual(r.status_code, 403)
-        r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "", "query": "你好"},
-            headers=self._auth(t),
-        )
-        self.assertEqual(r.status_code, 403)
 
-    def test_query_sse(self):
-        t = self._token("user1")
-        with self.client.stream(
-            "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
-        ) as r:
-            self.assertEqual(r.status_code, 200)
-            body = b"".join(r.iter_bytes()).decode("utf-8")
-        self.assertIn("event: delta", body)
-        self.assertIn("第一段", body)
-        self.assertIn("event: done", body)
-        self.assertIn('"answer": "第一段第二段"', body)
-        self.assertIn('"status": "success"', body)
+    def _run_stub_turn(self, token: str, kb_name: str = "shared") -> tuple[str, str]:
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": kb_name, "title": "新对话"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(session.status_code, 200, session.text)
+        created = self.client.post(
+            f"/api/v1/conversations/{session.json()['id']}/turns",
+            json={"query": "问"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        turn_id = created.json()["turn"]["id"]
+        started = self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(token))
+        self.assertEqual(started.status_code, 202, started.text)
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(token)) as response:
+            self.assertEqual(response.status_code, 200)
+            body = b"".join(response.iter_bytes()).decode("utf-8")
+        return turn_id, body
 
-    def test_legacy_query_records_chat_metrics(self):
+    def test_turn_records_chat_metrics(self):
         t = self._token("user1")
         with patch("src.api.routes.query.record_chat_turn") as record:
-            with self.client.stream(
-                "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
-            ) as r:
-                self.assertEqual(r.status_code, 200)
-                b"".join(r.iter_bytes())
-
+            self._run_stub_turn(t)
+            deadline = time.time() + 5
+            while time.time() < deadline and not record.called:
+                time.sleep(0.05)
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["status"], "completed")
         self.assertEqual(record.call_args.kwargs["mode"], "deep")
@@ -321,17 +316,16 @@ class ApiRoutesTests(unittest.TestCase):
         # 的 pipeline（deepagents agent 链路）。
         t = self._token("user1")
         with patch("src.api.routes.query.record_chat_turn") as record:
-            with self.client.stream(
-                "POST", "/api/v1/query", json={"kb_name": "", "query": "问"}, headers=self._auth(t)
-            ) as r:
-                self.assertEqual(r.status_code, 200)
-                body = b"".join(r.iter_bytes()).decode("utf-8")
+            _, body = self._run_stub_turn(t, kb_name="__general__")
+            deadline = time.time() + 5
+            while time.time() < deadline and not record.called:
+                time.sleep(0.05)
         self.assertIn("event: delta", body)
         self.assertIn("第一段", body)
 
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["status"], "completed")
-        self.assertEqual(record.call_args.kwargs["mode"], "deep")
+        self.assertEqual(record.call_args.kwargs["mode"], "fast")
         self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
 
     def test_turn_persists_messages_and_replays_sse_events(self):
@@ -491,15 +485,6 @@ class ApiRoutesTests(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 201, created.text)
         self.assertEqual(created.json()["turn"]["document_context"]["analysis_id"], "analysis-1")
-
-    def test_query_document_flow_true_requires_document_context(self):
-        t = self._token("user1")
-        r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "shared", "query": "问", "document_flow": True},
-            headers=self._auth(t),
-        )
-        self.assertEqual(r.status_code, 422, r.text)
 
     def test_pending_turn_can_be_cancelled_without_starting(self):
         t = self._token("user1")

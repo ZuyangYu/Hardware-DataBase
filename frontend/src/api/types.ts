@@ -691,7 +691,7 @@ export interface SchematicPageResponse {
   pdf_cache: string[];
 }
 
-/** POST /query 的 SSE done 事件里的 retrieval summary(evidence 结构宽松,逐字段防御式读取) */
+/** turns SSE done 事件里的 retrieval summary(evidence 结构宽松,逐字段防御式读取) */
 export interface EvidenceItem {
   file_name?: string;
   source_name?: string;

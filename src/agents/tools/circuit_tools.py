@@ -80,7 +80,15 @@ def make_circuit_search(rt, circuit_service: CircuitIndexService):
             )
 
         items, adds_nothing = timed_tool_call(rt, "circuit_search", query, None, lambda: run(query, max(1, min(int(top_k), 20))))
-        return format_tool_result(rt, adds_nothing, items)
+        text = format_tool_result(rt, adds_nothing, items)
+        if not items and not getattr(items, "budget_blocked", False):
+            text += (
+                "\n本次未命中任何电路事实（知识库也可能没有电路资料）。"
+                "若问题同时涉及表格页面（如 Page2）、表内数值/位号/容值，"
+                "请改用 spreadsheet_row_search / spreadsheet_sql_query 在表格中查证，"
+                "不要据此判定问题不可答。"
+            )
+        return text
 
     return circuit_search
 

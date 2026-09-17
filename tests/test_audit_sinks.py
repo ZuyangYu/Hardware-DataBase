@@ -8,6 +8,7 @@ sank into the backend).
 import gc
 import os
 import tempfile
+import time
 import unittest
 
 import src.settings
@@ -350,17 +351,6 @@ class DepartmentPermissionTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 422)
 
-    def test_query_history_length_capped(self):
-        # QueryRequest.history has max_length=100; longer history -> 422.
-        t = self._token("user1")
-        big_history = [["u", "a"]] * 200
-        r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "shared", "query": "问", "history": big_history},
-            headers=self._auth(t),
-        )
-        self.assertEqual(r.status_code, 422)
-
     def test_evaluation_controller_singleton(self):
         # Two requests must hit the same controller so its in-memory _threads
         # registry can prevent concurrent workers on the same run. The unit
@@ -465,7 +455,7 @@ class SchemaValidationTests(unittest.TestCase):
         self.assertEqual(r.status_code, 422)
 
 class QueryTraceTests(unittest.TestCase):
-    """POST /query writes a query trace + evidence (fail-soft)."""
+    """turns writing a query trace + evidence (fail-soft)."""
 
     @classmethod
     def setUpClass(cls):
@@ -506,20 +496,45 @@ class QueryTraceTests(unittest.TestCase):
     def _auth(self, token: str) -> dict:
         return {"Authorization": f"Bearer {token}"}
 
-    def test_query_writes_trace(self):
+    def _run_stub_turn(self, token: str) -> str:
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "新对话"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(session.status_code, 200, session.text)
+        created = self.client.post(
+            f"/api/v1/conversations/{session.json()['id']}/turns",
+            json={"query": "问"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        turn_id = created.json()["turn"]["id"]
+        started = self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(token))
+        self.assertEqual(started.status_code, 202, started.text)
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(token)) as response:
+            self.assertEqual(response.status_code, 200)
+            b"".join(response.iter_bytes())
+        return turn_id
+
+    def _wait_for_trace(self, before: int, timeout: float = 5.0):
+        deadline = time.time() + timeout
+        traces = self.logs.list_query_traces(self.user)
+        while time.time() < deadline and len(traces) <= before:
+            time.sleep(0.05)
+            traces = self.logs.list_query_traces(self.user)
+        self.assertGreater(len(traces), before, "query trace was not written")
+        return traces
+
+    def test_turn_writes_trace(self):
         t = self._token("user1")
         before = len(self.logs.list_query_traces(self.user))
-        with self.client.stream(
-            "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
-        ) as r:
-            self.assertEqual(r.status_code, 200)
-            b"".join(r.iter_bytes())
-        traces = self.logs.list_query_traces(self.user)
-        self.assertGreater(len(traces), before)
-        # The newest trace reflects this API query.
+        self._run_stub_turn(t)
+        traces = self._wait_for_trace(before)
+        # The newest trace reflects this turn.
         self.assertEqual(traces[0].kb_name, "shared")
 
-    def test_query_trace_status_derived_from_summary(self):
+    def test_turn_trace_status_derived_from_summary(self):
         # If the retrieval summary reports failed, the trace status must be
         # "failed" -- proves query_trace_status is consulted rather than the
         # route hardcoding "success" like before P1-9.
@@ -527,12 +542,9 @@ class QueryTraceTests(unittest.TestCase):
         self.stub.get_last_retrieval_summary = lambda: {"status": "failed", "evidence": [], "error_message": "boom"}
         try:
             t = self._token("user1")
-            with self.client.stream(
-                "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
-            ) as r:
-                self.assertEqual(r.status_code, 200)
-                b"".join(r.iter_bytes())
-            traces = self.logs.list_query_traces(self.user)
+            before = len(self.logs.list_query_traces(self.user))
+            self._run_stub_turn(t)
+            traces = self._wait_for_trace(before)
             self.assertEqual(traces[0].status, "failed")
         finally:
             self.stub.get_last_retrieval_summary = original

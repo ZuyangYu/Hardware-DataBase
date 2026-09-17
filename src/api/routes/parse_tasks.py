@@ -117,35 +117,3 @@ def delete_parse_task(
     return OkResponse(ok=True, message=msg or "task deleted")
 
 
-@router.post("/kbs/{kb_name}/parse-tasks/{task_id}/pause", response_model=OkResponse)
-def pause_parse_task(
-    kb_name: str,
-    task_id: str,
-    user: AuthUser = Depends(current_user),
-    pipeline: AppPipeline = Depends(get_pipeline),
-    auth: AuthService = Depends(get_auth_service),
-):
-    """Pause a parse task. RAGFlow returns "not supported"."""
-    ctx = build_context_for_user(user, kb_name, auth=auth)
-    reject_system_admin_kb_access(ctx)
-    if not ctx.has_kb_permission(kb_name, "write"):
-        raise HTTPException(status_code=403, detail="write permission required")
-    msg = pipeline.pause_parse_task(task_id, ctx=ctx)
-    return OkResponse(ok=True, message=msg or "paused")
-
-
-@router.post("/kbs/{kb_name}/parse-tasks/{task_id}/resume", response_model=OkResponse)
-def resume_parse_task(
-    kb_name: str,
-    task_id: str,
-    user: AuthUser = Depends(current_user),
-    pipeline: AppPipeline = Depends(get_pipeline),
-    auth: AuthService = Depends(get_auth_service),
-):
-    """Resume a paused parse task. RAGFlow returns "not supported"."""
-    ctx = build_context_for_user(user, kb_name, auth=auth)
-    reject_system_admin_kb_access(ctx)
-    if not ctx.has_kb_permission(kb_name, "write"):
-        raise HTTPException(status_code=403, detail="write permission required")
-    msg = pipeline.resume_parse_task(task_id, ctx=ctx)
-    return OkResponse(ok=True, message=msg or "resumed")

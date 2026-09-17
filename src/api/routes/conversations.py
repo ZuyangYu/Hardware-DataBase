@@ -157,23 +157,6 @@ def delete_session(
     return OkResponse(ok=True, message="session deleted")
 
 
-@router.post("/conversations/{session_id}/clear", response_model=OkResponse)
-def clear_session(
-    session_id: int,
-    user: AuthUser = Depends(current_user),
-    auth: AuthService = Depends(get_auth_service),
-    conv: ConversationService = Depends(_conv_service),
-    pipeline=Depends(get_pipeline),
-):
-    s = conv.get_session(user.id, session_id)
-    if s is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    _ensure_history_access(user, auth)
-    conv.clear_session(user.id, session_id)
-    pipeline.forget_agent_thread(str(session_id))
-    return OkResponse(ok=True, message="session cleared")
-
-
 @router.get("/conversations/{session_id}/messages", response_model=list[MessageView])
 def list_messages(
     session_id: int,

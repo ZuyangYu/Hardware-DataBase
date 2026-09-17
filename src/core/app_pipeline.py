@@ -932,12 +932,6 @@ class AppPipeline:
             )
             raise
 
-    def pause_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
-        return self.documents.pause_parse_task(task_id, ctx=ctx)
-
-    def resume_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
-        return self.documents.resume_parse_task(task_id, ctx=ctx)
-
     def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
         # Stopping a parse task deletes the remote RAGFlow document + local
         # archive; audit it so the governance log can trace who cancelled what.

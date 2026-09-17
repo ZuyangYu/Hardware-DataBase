@@ -334,23 +334,6 @@ class WikiGraphView(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Query
-# ---------------------------------------------------------------------------
-
-class QueryRequest(BaseModel):
-    kb_name: str
-    query: str
-    wiki_assist: bool = False
-    # Route also slices [-5:] as defence in depth; the schema cap keeps a
-    # misconfigured client from wasting bandwidth on multi-MB history bodies
-    # (and blocks DoS-shaped requests before the body is even read).
-    history: list[tuple[str, str]] = Field(default_factory=list, max_length=100)
-    thread_id: str = ""
-    document_context: DocumentContextRequest | None = None
-    document_flow: bool | None = None
-
-
-# ---------------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------------
 
@@ -1366,11 +1349,3 @@ class CompleteDocumentRevisionRequest(BaseModel):
     child_artifact_id: str = Field(min_length=1, max_length=200)
     revalidation_status: Literal["passed", "failed", "requires_human"]
     revalidation_result: dict[str, Any] = Field(default_factory=dict)
-
-
-class AgentHumanDecisionRequest(BaseModel):
-    """One-time approve/reject decision for a pending agent proposal."""
-
-    pending_event_id: str = Field(min_length=1, max_length=200)
-    proposal_hash: str = Field(min_length=1, max_length=200)
-    decision: Literal["approve", "reject"]

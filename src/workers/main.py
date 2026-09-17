@@ -458,6 +458,15 @@ class HardwareWorker:
                     error(f"Parse worker failed: {exc}")
                 finally:
                     heartbeat(self.worker_id)
+        # RAGFlow 解析是远端异步: 周期性把仍在 parsing 的本地台账与远端对齐,
+        # 否则完成/失败状态永远不落库(上传时读不到实时进度的部署)。
+        refresh = getattr(getattr(self.pipeline, "backend", None), "refresh_parse_statuses", None)
+        if callable(refresh):
+            try:
+                if refresh(limit=max(2, int(getattr(src.settings, "WORKER_PARSE_BATCH_SIZE", 4)) * 2)):
+                    did_work = True
+            except Exception as exc:  # noqa: BLE001 - 状态同步失败不影响主循环
+                error(f"Parse status refresh failed: {exc}")
         return did_work
 
     def run_forever(self) -> None:

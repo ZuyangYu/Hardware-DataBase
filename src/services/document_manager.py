@@ -105,12 +105,6 @@ class DocumentManager:
     def requeue_dead_letter_parse_tasks(self, kb_name: str, ctx: RequestContext | None = None) -> list[str]:
         return self.processing_backend.requeue_dead_letter_parse_tasks(kb_name, ctx=ctx)
 
-    def pause_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
-        return self.processing_backend.pause_parse_task(task_id, ctx=ctx).message
-
-    def resume_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
-        return self.processing_backend.resume_parse_task(task_id, ctx=ctx).message
-
     def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
         return self.processing_backend.delete_parse_task(task_id, ctx=ctx).message
 

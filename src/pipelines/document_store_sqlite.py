@@ -84,6 +84,11 @@ class PipelineDocumentRecord:
     effective_from: str = ""
     effective_to: str = ""
     usage_type: str = ""
+    # P1-1: embedded child documents carry the depth of the extraction and the
+    # JSON list of parents that reference them, so shared children are deleted
+    # only after the last parent reference goes away.
+    embed_depth: int = 0
+    parent_document: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -217,6 +222,8 @@ class PipelineDocumentStore:
             "effective_from": f"{add_column} effective_from TEXT NOT NULL DEFAULT ''",
             "effective_to": f"{add_column} effective_to TEXT NOT NULL DEFAULT ''",
             "usage_type": f"{add_column} usage_type TEXT NOT NULL DEFAULT ''",
+            "embed_depth": f"{add_column} embed_depth INTEGER NOT NULL DEFAULT 0",
+            "parent_document": f"{add_column} parent_document TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -665,6 +672,89 @@ class PipelineDocumentStore:
             ).fetchone()
         return self._to_record(row) if row else None
 
+    @staticmethod
+    def _parse_parent_documents(raw: str) -> list[str]:
+        try:
+            value = json.loads(raw or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def update_embedding_meta(self, record_id: int, parent_document: str, embed_depth: int) -> None:
+        """Attach P1-1 embedded-child metadata to a just-created record."""
+        parents = [str(parent_document).strip()] if str(parent_document or "").strip() else []
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE pipeline_documents SET embed_depth = ?, parent_document = ? WHERE id = ?",
+                (max(0, int(embed_depth)), json.dumps(parents, ensure_ascii=False), int(record_id)),
+            )
+
+    def add_parent_reference(self, record_id: int, parent_document: str) -> None:
+        """Register an additional parent for a shared embedded child."""
+        parent_document = str(parent_document or "").strip()
+        if not parent_document:
+            return
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT parent_document FROM pipeline_documents WHERE id = ?",
+                (int(record_id),),
+            ).fetchone()
+            parents = self._parse_parent_documents(row["parent_document"] if row else "")
+            if parent_document in parents:
+                return
+            parents.append(parent_document)
+            conn.execute(
+                "UPDATE pipeline_documents SET parent_document = ? WHERE id = ?",
+                (json.dumps(parents, ensure_ascii=False), int(record_id)),
+            )
+
+    def list_embedded_children(
+        self,
+        kb_name: str,
+        department_id: str | int | None,
+        parent_document: str,
+    ) -> list[PipelineDocumentRecord]:
+        department_id = _require_department_id(department_id, "embedded child lookup")
+        parent_document = str(parent_document or "").strip()
+        if not parent_document:
+            return []
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM pipeline_documents
+                WHERE kb_name = ? AND department_id = ? AND embed_depth > 0
+                """,
+                (kb_name, department_id),
+            ).fetchall()
+        return [
+            record
+            for record in (self._to_record(row) for row in rows)
+            if parent_document in self._parse_parent_documents(record.parent_document)
+        ]
+
+    def remove_parent_reference(self, record_id: int, parent_document: str) -> bool:
+        """Drop one parent reference; return True when the child is orphaned."""
+        parent_document = str(parent_document or "").strip()
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT parent_document FROM pipeline_documents WHERE id = ?",
+                (int(record_id),),
+            ).fetchone()
+            if row is None:
+                return True
+            parents = [
+                item
+                for item in self._parse_parent_documents(row["parent_document"])
+                if item != parent_document
+            ]
+            conn.execute(
+                "UPDATE pipeline_documents SET parent_document = ? WHERE id = ?",
+                (json.dumps(parents, ensure_ascii=False), int(record_id)),
+            )
+        return not parents
+
     def delete_document(
         self,
         kb_name: str,
@@ -937,6 +1027,51 @@ class PipelineDocumentStore:
                 WHERE id = ?
                 """,
                 (record_id,),
+            )
+
+    def list_status_refresh_candidates(
+        self,
+        processor_kinds: list[str],
+        statuses: list[str],
+        *,
+        limit: int = 8,
+        min_interval_seconds: int = 60,
+    ) -> list[PipelineDocumentRecord]:
+        """Records still waiting on a remote parse status, throttled by last check."""
+        processor_kinds = tuple(processor_kinds)
+        statuses = tuple(statuses)
+        if not processor_kinds or not statuses:
+            return []
+        processor_placeholders = ", ".join("?" for _ in processor_kinds)
+        status_placeholders = ", ".join("?" for _ in statuses)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM pipeline_documents
+                WHERE processor_kind IN ({processor_placeholders})
+                  AND status IN ({status_placeholders})
+                  AND document_id != ''
+                  AND (
+                    last_status_checked_at = ''
+                    OR datetime(last_status_checked_at) < datetime('now', ?)
+                  )
+                ORDER BY updated_at ASC
+                LIMIT ?
+                """,
+                (
+                    *processor_kinds,
+                    *statuses,
+                    f"-{max(0, int(min_interval_seconds))} seconds",
+                    max(1, int(limit)),
+                ),
+            ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def mark_status_checked(self, record_id: int) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE pipeline_documents SET last_status_checked_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (int(record_id),),
             )
 
     def requeue_dead_letter_records(

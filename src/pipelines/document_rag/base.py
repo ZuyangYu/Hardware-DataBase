@@ -64,14 +64,6 @@ class RAGBackend(ABC):
         """Return backend parse tasks when supported."""
         return []
 
-    def pause_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> BackendResult:
-        """Pause a parse task when supported."""
-        return BackendResult(ok=False, message="当前后端不支持暂停解析任务", backend=self.name)
-
-    def resume_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> BackendResult:
-        """Resume a parse task when supported."""
-        return BackendResult(ok=False, message="当前后端不支持启动解析任务", backend=self.name)
-
     def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> BackendResult:
         """Delete or cancel a parse task when supported."""
         return BackendResult(ok=False, message="当前后端不支持删除解析任务", backend=self.name)

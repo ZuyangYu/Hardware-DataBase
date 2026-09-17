@@ -41,8 +41,6 @@ class StubPipeline:
         self.deleted: list = []
         self.deleted_kbs: list = []
         self.deleted_tasks: list = []
-        self.paused_tasks: list = []
-        self.resumed_tasks: list = []
         self.cleared_kbs: list = []
         self.forgotten_threads: list = []
         self.applied_settings: list = []
@@ -92,14 +90,6 @@ class StubPipeline:
     def delete_parse_task(self, task_id, ctx=None):
         self.deleted_tasks.append(task_id)
         return "任务已删除"
-
-    def pause_parse_task(self, task_id, ctx=None):
-        self.paused_tasks.append(task_id)
-        return "当前后端不支持暂停解析任务"
-
-    def resume_parse_task(self, task_id, ctx=None):
-        self.resumed_tasks.append(task_id)
-        return "当前后端不支持启动解析任务"
 
     def clear_finished_parse_tasks(self, kb_name=None, ctx=None):
         self.cleared_kbs.append(kb_name)

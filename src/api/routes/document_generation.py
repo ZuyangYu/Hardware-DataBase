@@ -18,7 +18,6 @@ import src.settings
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import (
-    AgentHumanDecisionRequest,
     AnalyzeTemplateFromAttachmentRequest,
     AnswerGenerationSessionRequest,
     ConfirmPlanRequest,
@@ -1506,33 +1505,6 @@ def cancel_harness(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/document-generation/harness-runs/{run_id}/agent-decision")
-def agent_human_decision(
-    run_id: str,
-    kb: str,
-    payload: AgentHumanDecisionRequest,
-    user: AuthUser = Depends(current_user),
-    pipeline: AppPipeline = Depends(get_pipeline),
-    auth: AuthService = Depends(get_auth_service),
-):
-    """Approve/reject a pending low-confidence field proposal."""
-    ctx = _write_ctx(user, auth, kb)
-    try:
-        return pipeline.resolve_knowledge_base_harness_human_decision(
-            ctx,
-            run_id,
-            pending_event_id=payload.pending_event_id,
-            proposal_hash=payload.proposal_hash,
-            decision=payload.decision,
-        )
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/document-generation/artifacts/{artifact_id}/preview")

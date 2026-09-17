@@ -941,25 +941,6 @@ def resume_run(
     return _state_dict(state)
 
 
-@router.get("/evaluation/runs/{run_id}/collection-qc")
-def get_collection_qc(
-    run_id: str,
-    output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
-    _actor: AuthUser = Depends(require_system_admin),
-) -> dict[str, Any]:
-    """Return the post-collection quality gate report (recomputing if absent)."""
-    output_root = _check_output_root(output_root)
-    _run_dir(output_root, run_id)
-    controller = _controller(output_root)
-    try:
-        qc = controller.load_collection_qc(run_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    if qc is None:
-        raise HTTPException(status_code=404, detail="该运行没有可用的采集质检报告")
-    return qc
-
-
 @router.post("/evaluation/runs/{run_id}/score")
 def start_scoring(
     run_id: str,
