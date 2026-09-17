@@ -34,6 +34,28 @@ class ProviderConfigGuardTests(unittest.TestCase):
             )
         self.assertIn("DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL", str(ctx.exception))
 
+    def test_postgres_governor_requires_database_url(self):
+        with self.assertRaises(ValueError) as ctx:
+            src.settings.validate_provider_configuration(
+                {
+                    "RESOURCE_GOVERNOR_BACKEND": "postgres",
+                    "RESOURCE_GOVERNOR_SCOPE": "deployment",
+                    "RESOURCE_GOVERNOR_DATABASE_URL": "",
+                }
+            )
+        self.assertIn("RESOURCE_GOVERNOR_DATABASE_URL", str(ctx.exception))
+
+    def test_postgres_governor_requires_deployment_scope(self):
+        with self.assertRaises(ValueError) as ctx:
+            src.settings.validate_provider_configuration(
+                {
+                    "RESOURCE_GOVERNOR_BACKEND": "postgres",
+                    "RESOURCE_GOVERNOR_SCOPE": "process",
+                    "RESOURCE_GOVERNOR_DATABASE_URL": "postgresql://user:pw@db:5432/hdb",
+                }
+            )
+        self.assertIn("RESOURCE_GOVERNOR_SCOPE", str(ctx.exception))
+
     def test_postgres_memory_store_requires_database_url(self):
         with self.assertRaises(ValueError) as ctx:
             src.settings.validate_provider_configuration(
@@ -46,6 +68,7 @@ class ProviderConfigGuardTests(unittest.TestCase):
             ("AGENT_CHECKPOINT_BACKEND", "redis"),
             ("DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "redis"),
             ("MEMORY_STORE_BACKEND", "redis"),
+            ("RESOURCE_GOVERNOR_BACKEND", "redis"),
         ):
             with self.assertRaises(ValueError):
                 src.settings.validate_provider_configuration({key: value})

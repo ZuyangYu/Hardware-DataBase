@@ -4,9 +4,10 @@ Two scopes:
 
 - ``process``: per-process semaphores; interactive callers keep a reserved
   slice that background callers can never occupy.
-- ``deployment``: a shared SQLite quota table (short ``BEGIN IMMEDIATE``
-  transactions) with lease rows so every API/Worker process on the same host
-  shares one budget.  PostgreSQL is the cross-host target (P1).
+- ``deployment``: a shared quota table with lease rows so every API/Worker
+  process shares one budget — SQLite (short ``BEGIN IMMEDIATE`` transactions)
+  on one host, or PostgreSQL (advisory-lock serialized short transactions)
+  across hosts.
 
 Every permit carries a lease in deployment scope; a crashed process leaves
 ``uncertain`` rows instead of silently freeing phantom capacity.
@@ -22,6 +23,13 @@ import uuid
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+try:  # PostgreSQL is optional for sqlite-only developer installs.
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:  # pragma: no cover - exercised only without psycopg installed
+    psycopg = None  # type: ignore[assignment]
+    dict_row = None  # type: ignore[assignment]
 
 DEFAULT_LIMITS: dict[str, tuple[int, int]] = {
     # resource: (capacity, reserved_interactive)
@@ -883,13 +891,725 @@ class SqliteQuotaStore:
         return {str(row["resource"]): int(row["active"] or 0) for row in rows}
 
 
+class PostgresQuotaStore:
+    """Cross-host deployment quota store (PostgreSQL, G3).
+
+    Same contract as :class:`SqliteQuotaStore` (leases, uncertain isolation,
+    audited reconciliation, maintenance election), but shared by API/Worker
+    replicas on different hosts.  Short transactions and one advisory
+    transaction lock per resource keep admissions race-free without long
+    table locks; a crashed process leaves ``uncertain`` rows instead of
+    silently freeing capacity.
+    """
+
+    SCHEMA_VERSION = 1
+    VALID_RELEASE_EVIDENCE = SqliteQuotaStore.VALID_RELEASE_EVIDENCE
+    MAINTENANCE_SCOPE = SqliteQuotaStore.MAINTENANCE_SCOPE
+    _CONNECT_OPTIONS = "-c lock_timeout=2000 -c statement_timeout=30000"
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        lease_seconds: int = 300,
+        deployment_id: str | None = None,
+        config_revision: str = "",
+        require_preconfigured: bool = False,
+    ) -> None:
+        if psycopg is None:  # pragma: no cover
+            raise RuntimeError("PostgreSQL quota store requires psycopg[binary]")
+        self.dsn = str(dsn)
+        self.lease_seconds = max(30, int(lease_seconds))
+        self.deployment_id = str(deployment_id or "").strip() or "local"
+        self.config_revision = str(config_revision or "")
+        self._require_preconfigured = bool(require_preconfigured)
+        # Multiple replicas run this schema/identity init concurrently.
+        self._run_with_retry(self._init_once, deadline_seconds=10.0)
+
+    # -- connection helpers -------------------------------------------------
+
+    def _connect(self):
+        return psycopg.connect(
+            self.dsn, options=self._CONNECT_OPTIONS, row_factory=dict_row
+        )
+
+    @contextmanager
+    def _transaction(self):
+        conn = self._connect()
+        try:
+            with conn.transaction():
+                yield conn
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _is_retryable(exc: BaseException) -> bool:
+        if psycopg is None:  # pragma: no cover
+            return False
+        return isinstance(
+            exc,
+            (
+                psycopg.errors.SerializationFailure,
+                psycopg.errors.DeadlockDetected,
+                psycopg.errors.LockNotAvailable,
+            ),
+        )
+
+    def _run_with_retry(self, operation, *, deadline_seconds: float = 2.0):
+        """Bounded retry for transient PostgreSQL contention errors."""
+        deadline = time.monotonic() + max(0.0, float(deadline_seconds))
+        while True:
+            try:
+                return operation()
+            except Exception as exc:
+                if not self._is_retryable(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+
+    @staticmethod
+    def _advisory_lock(conn, scope: str) -> None:
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (str(scope),)
+        )
+
+    # -- schema / identity --------------------------------------------------
+
+    def _init_once(self) -> None:
+        with self._transaction() as conn:
+            self._advisory_lock(conn, "resource-governor:init")
+            self._init_schema(conn)
+            self._check_identity(conn, require_preconfigured=self._require_preconfigured)
+
+    def _init_schema(self, conn) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resource_permits (
+                permit_id TEXT PRIMARY KEY,
+                resource TEXT NOT NULL,
+                interactive BOOLEAN NOT NULL DEFAULT false,
+                owner_id TEXT NOT NULL DEFAULT '',
+                attempt_id TEXT NOT NULL DEFAULT '',
+                weight INTEGER NOT NULL DEFAULT 1,
+                state TEXT NOT NULL DEFAULT 'active',
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                started_at TIMESTAMPTZ,
+                hard_deadline_at TIMESTAMPTZ,
+                provider_request_id TEXT NOT NULL DEFAULT '',
+                uncertain_since TIMESTAMPTZ,
+                escalated_at TIMESTAMPTZ,
+                recovery_reason TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_resource_permits_state"
+            " ON resource_permits(resource, state)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resource_permit_audit (
+                audit_id BIGSERIAL PRIMARY KEY,
+                permit_id TEXT NOT NULL,
+                resource TEXT NOT NULL,
+                action TEXT NOT NULL,
+                evidence TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                operator TEXT NOT NULL DEFAULT '',
+                previous_state TEXT NOT NULL DEFAULT '',
+                recorded_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resource_governor_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resource_maintenance_lease (
+                scope TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL DEFAULT '',
+                fencing_token BIGINT NOT NULL DEFAULT 0,
+                lease_expires_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resource_quotas (
+                resource TEXT PRIMARY KEY,
+                capacity INTEGER NOT NULL,
+                reserved_interactive INTEGER NOT NULL DEFAULT 0,
+                config_revision TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+
+    def _check_identity(self, conn, *, require_preconfigured: bool) -> None:
+        rows = {
+            str(row["key"]): str(row["value"])
+            for row in conn.execute(
+                "SELECT key, value FROM resource_governor_meta"
+            ).fetchall()
+        }
+        if not rows:
+            if require_preconfigured:
+                raise RuntimeError(
+                    "quota database has no identity rows; provision it first"
+                )
+            for key, value in (
+                ("deployment_id", self.deployment_id),
+                ("schema_version", str(self.SCHEMA_VERSION)),
+                ("config_revision", self.config_revision),
+            ):
+                conn.execute(
+                    "INSERT INTO resource_governor_meta (key, value) VALUES (%s, %s)",
+                    (key, value),
+                )
+            return
+        stored_deployment = rows.get("deployment_id", "")
+        if stored_deployment != self.deployment_id:
+            raise RuntimeError(
+                f"quota database deployment_id mismatch: stored={stored_deployment!r} "
+                f"process={self.deployment_id!r}"
+            )
+        stored_version = rows.get("schema_version", "")
+        if stored_version != str(self.SCHEMA_VERSION):
+            raise RuntimeError(
+                f"quota database schema_version mismatch: stored={stored_version!r} "
+                f"code={self.SCHEMA_VERSION!r}"
+            )
+
+    # -- quotas -------------------------------------------------------------
+
+    def ensure_quotas(self, defaults: dict[str, tuple[int, int]]) -> dict[str, tuple[int, int]]:
+        now = datetime.now(timezone.utc)
+        with self._transaction() as conn:
+            for resource, (capacity, reserved) in defaults.items():
+                conn.execute(
+                    """
+                    INSERT INTO resource_quotas
+                        (resource, capacity, reserved_interactive, config_revision, updated_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (resource) DO NOTHING
+                    """,
+                    (
+                        str(resource),
+                        max(1, int(capacity)),
+                        max(0, int(reserved)),
+                        self.config_revision,
+                        now,
+                    ),
+                )
+            rows = conn.execute(
+                "SELECT resource, capacity, reserved_interactive FROM resource_quotas"
+            ).fetchall()
+        return {
+            str(row["resource"]): (
+                int(row["capacity"]),
+                int(row["reserved_interactive"]),
+            )
+            for row in rows
+        }
+
+    def update_quota(
+        self, resource: str, *, capacity: int, reserved_interactive: int, operator: str = ""
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO resource_quotas
+                    (resource, capacity, reserved_interactive, config_revision, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (resource) DO UPDATE SET
+                    capacity = EXCLUDED.capacity,
+                    reserved_interactive = EXCLUDED.reserved_interactive,
+                    config_revision = EXCLUDED.config_revision,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    str(resource),
+                    max(1, int(capacity)),
+                    max(0, int(reserved_interactive)),
+                    self.config_revision,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO resource_permit_audit
+                    (permit_id, resource, action, evidence, reason, operator, previous_state, recorded_at)
+                VALUES ('', %s, 'quota_update', 'config_revision', %s, %s, '', %s)
+                """,
+                (
+                    str(resource),
+                    f"capacity={capacity} reserved={reserved_interactive}",
+                    str(operator),
+                    now,
+                ),
+            )
+
+    # -- permits ------------------------------------------------------------
+
+    def reap_expired(self, conn) -> int:
+        cursor = conn.execute(
+            """
+            UPDATE resource_permits
+            SET state = 'uncertain',
+                uncertain_since = COALESCE(uncertain_since, now())
+            WHERE state = 'active' AND expires_at < now()
+            """
+        )
+        return int(cursor.rowcount or 0)
+
+    def maintain(self, escalate_seconds: int) -> dict[str, int]:
+        threshold = max(60, int(escalate_seconds))
+        with self._transaction() as conn:
+            self._advisory_lock(conn, "resource-governor:maintain")
+            reaped = self.reap_expired(conn)
+            cursor = conn.execute(
+                """
+                UPDATE resource_permits
+                SET escalated_at = now()
+                WHERE state = 'uncertain' AND escalated_at IS NULL
+                  AND uncertain_since IS NOT NULL
+                  AND uncertain_since < now() - make_interval(secs => %s)
+                """,
+                (threshold,),
+            )
+            escalated = int(cursor.rowcount or 0)
+        if escalated:
+            SqliteQuotaStore._record_escalation(escalated)
+        if reaped or escalated:
+            SqliteQuotaStore._publish_uncertain_gauge(self)
+        return {"reaped": reaped, "escalated": escalated}
+
+    def escalated_resources(self) -> set[str]:
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT resource FROM resource_permits"
+                " WHERE state = 'uncertain' AND escalated_at IS NOT NULL"
+            ).fetchall()
+        return {str(row["resource"]) for row in rows}
+
+    def uncertain_permits(self, resource: str | None = None) -> list[dict]:
+        query = "SELECT * FROM resource_permits WHERE state = 'uncertain'"
+        params: list[object] = []
+        if resource:
+            query += " AND resource = %s"
+            params.append(str(resource))
+        query += " ORDER BY uncertain_since NULLS LAST, permit_id"
+        with self._transaction() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def release_uncertain(
+        self,
+        permit_id: str,
+        *,
+        evidence: str,
+        reason: str = "",
+        operator: str = "",
+    ) -> bool:
+        evidence = str(evidence or "").strip()
+        if evidence not in self.VALID_RELEASE_EVIDENCE:
+            raise ValueError(
+                "release requires a recognized downstream end evidence; "
+                f"got {evidence or '<empty>'!r}"
+            )
+        now = datetime.now(timezone.utc)
+
+        def _op() -> bool:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM resource_permits WHERE permit_id = %s FOR UPDATE",
+                    (str(permit_id),),
+                ).fetchone()
+                if row is None or str(row["state"]) != "uncertain":
+                    return False
+                cursor = conn.execute(
+                    """
+                    UPDATE resource_permits
+                    SET state = 'released', recovery_reason = %s
+                    WHERE permit_id = %s AND state = 'uncertain'
+                    """,
+                    (str(reason)[:500], str(permit_id)),
+                )
+                if int(cursor.rowcount or 0) == 0:
+                    return False
+                conn.execute(
+                    """
+                    INSERT INTO resource_permit_audit
+                        (permit_id, resource, action, evidence, reason, operator, previous_state, recorded_at)
+                    VALUES (%s, %s, 'release_uncertain', %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        str(permit_id),
+                        str(row["resource"]),
+                        evidence,
+                        str(reason)[:500],
+                        str(operator),
+                        "uncertain",
+                        now,
+                    ),
+                )
+                return True
+
+        return bool(self._run_with_retry(_op))
+
+    def audit_entries(self, permit_id: str | None = None) -> list[dict]:
+        query = "SELECT * FROM resource_permit_audit"
+        params: list[object] = []
+        if permit_id:
+            query += " WHERE permit_id = %s"
+            params.append(str(permit_id))
+        query += " ORDER BY audit_id"
+        with self._transaction() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- maintenance election ----------------------------------------------
+
+    def try_acquire_maintenance(self, owner_id: str, *, lease_seconds: int = 15) -> int | None:
+        owner = str(owner_id or "")
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=max(1, int(lease_seconds)))
+
+        def _op() -> int | None:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM resource_maintenance_lease WHERE scope = %s FOR UPDATE",
+                    (self.MAINTENANCE_SCOPE,),
+                ).fetchone()
+                if row is not None and str(row["owner_id"] or "") == owner:
+                    conn.execute(
+                        """
+                        UPDATE resource_maintenance_lease
+                        SET lease_expires_at = %s, updated_at = %s
+                        WHERE scope = %s
+                        """,
+                        (expires, now, self.MAINTENANCE_SCOPE),
+                    )
+                    return int(row["fencing_token"] or 0)
+                if row is not None and _lease_active(row["lease_expires_at"], now):
+                    return None
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO resource_maintenance_lease
+                            (scope, owner_id, fencing_token, lease_expires_at, updated_at)
+                        VALUES (%s, %s, 1, %s, %s)
+                        """,
+                        (self.MAINTENANCE_SCOPE, owner, expires, now),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE resource_maintenance_lease
+                        SET owner_id = %s,
+                            fencing_token = fencing_token + 1,
+                            lease_expires_at = %s,
+                            updated_at = %s
+                        WHERE scope = %s
+                        """,
+                        (owner, expires, now, self.MAINTENANCE_SCOPE),
+                    )
+                current = conn.execute(
+                    "SELECT fencing_token FROM resource_maintenance_lease WHERE scope = %s",
+                    (self.MAINTENANCE_SCOPE,),
+                ).fetchone()
+                return int(current["fencing_token"] or 0) if current else None
+
+        return self._run_with_retry(_op)
+
+    def renew_maintenance(self, owner_id: str, token: int, *, lease_seconds: int = 15) -> bool:
+        expires = datetime.now(timezone.utc) + timedelta(seconds=max(1, int(lease_seconds)))
+
+        def _op() -> bool:
+            with self._transaction() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE resource_maintenance_lease
+                    SET lease_expires_at = %s, updated_at = %s
+                    WHERE scope = %s AND owner_id = %s AND fencing_token = %s
+                    """,
+                    (
+                        expires,
+                        datetime.now(timezone.utc),
+                        self.MAINTENANCE_SCOPE,
+                        str(owner_id),
+                        int(token),
+                    ),
+                )
+                return int(cursor.rowcount or 0) > 0
+
+        return bool(self._run_with_retry(_op))
+
+    def release_maintenance(self, owner_id: str, token: int) -> bool:
+        def _op() -> bool:
+            with self._transaction() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE resource_maintenance_lease
+                    SET owner_id = '', lease_expires_at = NULL, updated_at = %s
+                    WHERE scope = %s AND owner_id = %s AND fencing_token = %s
+                    """,
+                    (
+                        datetime.now(timezone.utc),
+                        self.MAINTENANCE_SCOPE,
+                        str(owner_id),
+                        int(token),
+                    ),
+                )
+                return int(cursor.rowcount or 0) > 0
+
+        return bool(self._run_with_retry(_op))
+
+    def maintenance_snapshot(self) -> dict:
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM resource_maintenance_lease WHERE scope = %s",
+                (self.MAINTENANCE_SCOPE,),
+            ).fetchone()
+        if row is None:
+            return {"owner_id": "", "fencing_token": 0, "lease_expires_at": None}
+        return {
+            "owner_id": str(row["owner_id"] or ""),
+            "fencing_token": int(row["fencing_token"] or 0),
+            "lease_expires_at": row["lease_expires_at"],
+        }
+
+    # -- admission ----------------------------------------------------------
+
+    def try_acquire(
+        self,
+        resource: str,
+        *,
+        capacity: int,
+        reserved_interactive: int,
+        interactive: bool,
+        owner_id: str,
+        attempt_id: str,
+    ) -> str | None:
+        now = datetime.now(timezone.utc)
+        permit_id = str(uuid.uuid4())
+        expires_at = now + timedelta(seconds=self.lease_seconds)
+
+        def _op() -> str | None:
+            conn = self._connect()
+            try:
+                with conn.transaction():
+                    # Waiting inside the resource lock is fine for correctness
+                    # but the caller's deadline is handled by the governor
+                    # loop; a short lock timeout reports "not admitted now".
+                    conn.execute("SET LOCAL lock_timeout = '1000ms'")
+                    try:
+                        self._advisory_lock(conn, f"resource:{resource}")
+                    except psycopg.errors.LockNotAvailable:
+                        return None
+                    self.reap_expired(conn)
+                    escalated = conn.execute(
+                        """
+                        SELECT 1 FROM resource_permits
+                        WHERE resource = %s AND state = 'uncertain' AND escalated_at IS NOT NULL
+                        LIMIT 1
+                        """,
+                        (resource,),
+                    ).fetchone()
+                    if escalated is not None:
+                        return None
+                    counts = conn.execute(
+                        """
+                        SELECT
+                            COALESCE(SUM(weight), 0) AS active,
+                            COALESCE(SUM(CASE WHEN interactive = false THEN weight ELSE 0 END), 0) AS background
+                        FROM resource_permits
+                        WHERE resource = %s AND state = 'active'
+                        """,
+                        (resource,),
+                    ).fetchone()
+                    active = int(counts["active"] or 0)
+                    background = int(counts["background"] or 0)
+                    background_capacity = max(0, int(capacity) - int(reserved_interactive))
+                    if active >= int(capacity) or (
+                        not interactive and background >= background_capacity
+                    ):
+                        return None
+                    conn.execute(
+                        """
+                        INSERT INTO resource_permits (
+                            permit_id, resource, interactive, owner_id, attempt_id, weight,
+                            state, expires_at, created_at, started_at
+                        ) VALUES (%s, %s, %s, %s, %s, 1, 'active', %s, %s, %s)
+                        """,
+                        (
+                            permit_id,
+                            resource,
+                            bool(interactive),
+                            str(owner_id),
+                            str(attempt_id),
+                            expires_at,
+                            now,
+                            now,
+                        ),
+                    )
+                    return permit_id
+            finally:
+                conn.close()
+
+        return self._run_with_retry(_op)
+
+    def release(self, permit_id: str) -> None:
+        def _op() -> None:
+            with self._transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE resource_permits
+                    SET state = 'released'
+                    WHERE permit_id = %s AND state IN ('active', 'uncertain')
+                    """,
+                    (permit_id,),
+                )
+
+        self._run_with_retry(_op)
+
+    def renew(self, permit_id: str) -> bool:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=self.lease_seconds)
+
+        def _op() -> bool:
+            with self._transaction() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE resource_permits SET expires_at = %s
+                    WHERE permit_id = %s AND state = 'active'
+                    """,
+                    (expires_at, permit_id),
+                )
+                return int(cursor.rowcount or 0) > 0
+
+        return bool(self._run_with_retry(_op))
+
+    def finish(
+        self,
+        permit_id: str,
+        *,
+        outcome: str = "completed",
+        evidence: str = "",
+        reason: str = "",
+    ) -> bool:
+        outcome = str(outcome or "").strip().lower()
+        if outcome not in {"completed", "cancelled", "uncertain"}:
+            raise ValueError(f"unsupported finish outcome: {outcome!r}")
+        if outcome != "uncertain":
+            evidence = str(evidence or "").strip()
+            if evidence not in self.VALID_RELEASE_EVIDENCE:
+                raise ValueError(
+                    "finish requires a recognized downstream end evidence; "
+                    f"got {evidence or '<empty>'!r}"
+                )
+        now = datetime.now(timezone.utc)
+
+        def _op() -> bool:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    "SELECT * FROM resource_permits WHERE permit_id = %s FOR UPDATE",
+                    (str(permit_id),),
+                ).fetchone()
+                if row is None:
+                    return False
+                state = str(row["state"])
+                if state == "released":
+                    return True
+                if outcome == "uncertain":
+                    conn.execute(
+                        """
+                        UPDATE resource_permits
+                        SET state = 'uncertain',
+                            uncertain_since = COALESCE(uncertain_since, %s),
+                            recovery_reason = %s
+                        WHERE permit_id = %s AND state IN ('active', 'uncertain')
+                        """,
+                        (now, str(reason)[:500], str(permit_id)),
+                    )
+                    action = "finish_uncertain"
+                else:
+                    conn.execute(
+                        """
+                        UPDATE resource_permits
+                        SET state = 'released', recovery_reason = %s
+                        WHERE permit_id = %s AND state IN ('active', 'uncertain')
+                        """,
+                        (str(reason)[:500], str(permit_id)),
+                    )
+                    action = "finish"
+                conn.execute(
+                    """
+                    INSERT INTO resource_permit_audit
+                        (permit_id, resource, action, evidence, reason, operator, previous_state, recorded_at)
+                    VALUES (%s, %s, %s, %s, %s, '', %s, %s)
+                    """,
+                    (
+                        str(permit_id),
+                        str(row["resource"]),
+                        action,
+                        evidence,
+                        str(reason)[:500],
+                        state,
+                        now,
+                    ),
+                )
+                return True
+
+        return bool(self._run_with_retry(_op))
+
+    # -- observability ------------------------------------------------------
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        with self._transaction() as conn:
+            self.reap_expired(conn)
+            rows = conn.execute(
+                """
+                SELECT resource,
+                       COALESCE(SUM(CASE WHEN state = 'active' THEN weight ELSE 0 END), 0) AS active,
+                       COALESCE(SUM(CASE WHEN state = 'uncertain' THEN weight ELSE 0 END), 0) AS uncertain
+                FROM resource_permits GROUP BY resource
+                """
+            ).fetchall()
+        return {
+            str(row["resource"]): {
+                "active": int(row["active"] or 0),
+                "uncertain": int(row["uncertain"] or 0),
+            }
+            for row in rows
+        }
+
+    def active_counts(self) -> dict[str, int]:
+        with self._transaction() as conn:
+            self.reap_expired(conn)
+            rows = conn.execute(
+                """
+                SELECT resource, COALESCE(SUM(weight), 0) AS active
+                FROM resource_permits WHERE state = 'active' GROUP BY resource
+                """
+            ).fetchall()
+        return {str(row["resource"]): int(row["active"] or 0) for row in rows}
+
+
 class ResourceGovernor:
     def __init__(
         self,
         *,
         scope: str = "process",
         limits: dict[str, tuple[int, int]] | None = None,
-        store: SqliteQuotaStore | None = None,
+        store: SqliteQuotaStore | PostgresQuotaStore | None = None,
         queue_max_wait_seconds: float = 30.0,
         queue_max_depth: int = 256,
     ) -> None:
@@ -1256,17 +1976,40 @@ def get_governor() -> ResourceGovernor:
 
             limits = _limits_from_settings()
             scope = str(getattr(settings, "RESOURCE_GOVERNOR_SCOPE", "process") or "process").lower()
-            store = None
+            store: SqliteQuotaStore | PostgresQuotaStore | None = None
             if scope == "deployment":
-                store = SqliteQuotaStore(
-                    str(getattr(settings, "RESOURCE_GOVERNOR_DB_PATH", "storage/resource_quotas.db")),
-                    lease_seconds=int(getattr(settings, "RESOURCE_PERMIT_LEASE_SECONDS", 300)),
-                    deployment_id=str(getattr(settings, "RESOURCE_GOVERNOR_DEPLOYMENT_ID", "local")),
-                    config_revision=_config_revision(limits),
-                    require_preconfigured=bool(
-                        getattr(settings, "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False)
-                    ),
+                lease_seconds = int(getattr(settings, "RESOURCE_PERMIT_LEASE_SECONDS", 300))
+                deployment_id = str(getattr(settings, "RESOURCE_GOVERNOR_DEPLOYMENT_ID", "local"))
+                require_preconfigured = bool(
+                    getattr(settings, "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False)
                 )
+                backend = str(
+                    getattr(settings, "RESOURCE_GOVERNOR_BACKEND", "sqlite") or "sqlite"
+                ).lower()
+                if backend == "postgres":
+                    database_url = str(
+                        getattr(settings, "RESOURCE_GOVERNOR_DATABASE_URL", "") or ""
+                    ).strip()
+                    if not database_url:
+                        raise RuntimeError(
+                            "RESOURCE_GOVERNOR_BACKEND=postgres requires "
+                            "RESOURCE_GOVERNOR_DATABASE_URL"
+                        )
+                    store = PostgresQuotaStore(
+                        database_url,
+                        lease_seconds=lease_seconds,
+                        deployment_id=deployment_id,
+                        config_revision=_config_revision(limits),
+                        require_preconfigured=require_preconfigured,
+                    )
+                else:
+                    store = SqliteQuotaStore(
+                        str(getattr(settings, "RESOURCE_GOVERNOR_DB_PATH", "storage/resource_quotas.db")),
+                        lease_seconds=lease_seconds,
+                        deployment_id=deployment_id,
+                        config_revision=_config_revision(limits),
+                        require_preconfigured=require_preconfigured,
+                    )
             _GOVERNOR = ResourceGovernor(
                 scope=scope,
                 limits=limits,

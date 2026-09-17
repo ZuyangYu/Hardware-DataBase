@@ -296,6 +296,12 @@ if RESOURCE_GOVERNOR_SCOPE not in {"process", "deployment"}:
 RESOURCE_GOVERNOR_DB_PATH = _resolve_storage_path(
     os.getenv("RESOURCE_GOVERNOR_DB_PATH"), "resource_quotas.db"
 )
+# P1/G3: deployment quota storage.  sqlite = same-host shared file (default);
+# postgres = cross-host shared quota database (requires SCOPE=deployment).
+RESOURCE_GOVERNOR_BACKEND = os.getenv("RESOURCE_GOVERNOR_BACKEND", "sqlite").strip().lower()
+if RESOURCE_GOVERNOR_BACKEND not in {"sqlite", "postgres"}:
+    RESOURCE_GOVERNOR_BACKEND = "sqlite"
+RESOURCE_GOVERNOR_DATABASE_URL = os.getenv("RESOURCE_GOVERNOR_DATABASE_URL", "")
 RESOURCE_QUEUE_MAX_WAIT_SECONDS = float(os.getenv("RESOURCE_QUEUE_MAX_WAIT_SECONDS", "30"))
 RESOURCE_QUEUE_MAX_DEPTH = int(os.getenv("RESOURCE_QUEUE_MAX_DEPTH", "256"))
 RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "300"))
@@ -647,6 +653,8 @@ DEFAULT_VALUES = {
     "RESOURCE_GOVERNOR_ENABLED": "false",
     "RESOURCE_GOVERNOR_SCOPE": "process",
     "RESOURCE_GOVERNOR_DB_PATH": os.path.join(STORAGE_DIR, "resource_quotas.db"),
+    "RESOURCE_GOVERNOR_BACKEND": "sqlite",
+    "RESOURCE_GOVERNOR_DATABASE_URL": "",
     "RESOURCE_QUEUE_MAX_WAIT_SECONDS": "30",
     "RESOURCE_QUEUE_MAX_DEPTH": "256",
     "RESOURCE_PERMIT_LEASE_SECONDS": "300",
@@ -832,6 +840,7 @@ def reload_settings():
     global FINAL_TOP_K, AGENT_MAX_RETRIEVAL_ROUNDS
     global WORKER_POLL_INTERVAL_SECONDS, WORKER_PARSE_BATCH_SIZE, WORKER_ROLE
     global RESOURCE_GOVERNOR_ENABLED, RESOURCE_GOVERNOR_SCOPE, RESOURCE_GOVERNOR_DB_PATH
+    global RESOURCE_GOVERNOR_BACKEND, RESOURCE_GOVERNOR_DATABASE_URL
     global RESOURCE_QUEUE_MAX_WAIT_SECONDS, RESOURCE_QUEUE_MAX_DEPTH, RESOURCE_PERMIT_LEASE_SECONDS
     global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
     global RESOURCE_GOVERNOR_DEPLOYMENT_ID, RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED
@@ -1022,6 +1031,10 @@ def reload_settings():
     RESOURCE_GOVERNOR_DB_PATH = _resolve_storage_path(
         os.getenv("RESOURCE_GOVERNOR_DB_PATH"), "resource_quotas.db"
     )
+    RESOURCE_GOVERNOR_BACKEND = os.getenv("RESOURCE_GOVERNOR_BACKEND", "sqlite").strip().lower()
+    if RESOURCE_GOVERNOR_BACKEND not in {"sqlite", "postgres"}:
+        RESOURCE_GOVERNOR_BACKEND = "sqlite"
+    RESOURCE_GOVERNOR_DATABASE_URL = os.getenv("RESOURCE_GOVERNOR_DATABASE_URL", "")
     RESOURCE_QUEUE_MAX_WAIT_SECONDS = float(os.getenv("RESOURCE_QUEUE_MAX_WAIT_SECONDS", "30"))
     RESOURCE_QUEUE_MAX_DEPTH = int(os.getenv("RESOURCE_QUEUE_MAX_DEPTH", "256"))
     RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "300"))
@@ -1563,3 +1576,19 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
             "MEMORY_STORE_BACKEND=postgres 需要显式配置 MEMORY_DATABASE_URL，"
             "否则会静默创建本地空库"
         )
+
+    governor_backend = _value("RESOURCE_GOVERNOR_BACKEND").lower() or "sqlite"
+    if governor_backend not in {"sqlite", "postgres"}:
+        raise ValueError(
+            f"RESOURCE_GOVERNOR_BACKEND 必须是 sqlite 或 postgres，当前值: {governor_backend!r}"
+        )
+    if governor_backend == "postgres":
+        if not _value("RESOURCE_GOVERNOR_DATABASE_URL"):
+            raise ValueError(
+                "RESOURCE_GOVERNOR_BACKEND=postgres 需要显式配置 "
+                "RESOURCE_GOVERNOR_DATABASE_URL，否则会静默落到本地配额库"
+            )
+        if (_value("RESOURCE_GOVERNOR_SCOPE").lower() or "process") != "deployment":
+            raise ValueError(
+                "RESOURCE_GOVERNOR_BACKEND=postgres 需要 RESOURCE_GOVERNOR_SCOPE=deployment"
+            )
