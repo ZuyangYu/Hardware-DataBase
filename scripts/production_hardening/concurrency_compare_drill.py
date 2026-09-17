@@ -288,12 +288,14 @@ def _run_mode(mode: str, args: argparse.Namespace, workdir: Path) -> dict:
                 "RESOURCE_GOVERNOR_ENABLED": "true",
                 "RESOURCE_GOVERNOR_SCOPE": "deployment",
                 "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "true",
-                "ADMISSION_CHAT_RPM_PER_USER": "3",
-                "ADMISSION_CHAT_RPM_PER_TENANT": "30",
+                "ADMISSION_CHAT_RPM_PER_USER": str(args.user_rpm),
+                "ADMISSION_CHAT_RPM_PER_TENANT": str(args.tenant_rpm),
             }
         )
     else:
         env.update({"CONVERSATION_SERIALIZE_SAME_THREAD": "false"})
+    if args.queue_deadline > 0:
+        env["CHAT_QUEUE_DEADLINE_SECONDS"] = str(int(args.queue_deadline))
 
     usernames = [f"ccu{i}" for i in range(args.users)] + ["cco"]
     _seed_users(db_path, usernames, args.password)
@@ -314,37 +316,50 @@ def _run_mode(mode: str, args: argparse.Namespace, workdir: Path) -> dict:
             for name in usernames[: args.users]
         }
         play_turns: list[str] = []
+        user_turn_ids: dict[str, str] = {}
         errors: list[str] = []
+        per_user_completed: dict[str, int] = {}
+        peak_inflight = 0
+        active_users = usernames[: args.users]
+        wave_size = args.wave_size if args.wave_size > 0 else len(active_users)
         for _round in range(args.turns_per_user):
-            threads = []
-            results: dict[str, tuple[str, str]] = {}
+            for offset in range(0, len(active_users), wave_size):
+                wave = active_users[offset : offset + wave_size]
+                peak_inflight = max(peak_inflight, len(wave))
+                threads = []
+                results: dict[str, tuple[str, str]] = {}
 
-            def fire(name: str) -> None:
-                try:
-                    status, turn_id = _create_turn(
-                        api.base_url, tokens[name], sessions[name], f"{mode} 并发探测 {time.time_ns()}"
+                def fire(name: str) -> None:
+                    try:
+                        status, turn_id = _create_turn(
+                            api.base_url, tokens[name], sessions[name], f"{mode} 并发探测 {time.time_ns()}"
+                        )
+                        results[name] = (status, turn_id)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{name}: {exc}")
+
+                for name in wave:
+                    thread = threading.Thread(target=fire, args=(name,))
+                    thread.start()
+                    threads.append(thread)
+                for thread in threads:
+                    thread.join(timeout=60)
+                for name, (status, turn_id) in results.items():
+                    if status != "201":
+                        errors.append(f"{name}: create status {status}")
+                        continue
+                    play_turns.append(turn_id)
+                    user_turn_ids.setdefault(name, turn_id)
+                for name, (status, turn_id) in results.items():
+                    if status != "201":
+                        continue
+                    terminal = _start_and_wait(
+                        api.base_url, tokens[name], turn_id, timeout=args.wait_timeout
                     )
-                    results[name] = (status, turn_id)
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{name}: {exc}")
-
-            for name in usernames[: args.users]:
-                thread = threading.Thread(target=fire, args=(name,))
-                thread.start()
-                threads.append(thread)
-            for thread in threads:
-                thread.join(timeout=60)
-            for name, (status, turn_id) in results.items():
-                if status != "201":
-                    errors.append(f"{name}: create status {status}")
-                    continue
-                play_turns.append(turn_id)
-            for name, (status, turn_id) in results.items():
-                if status != "201":
-                    continue
-                terminal = _start_and_wait(api.base_url, tokens[name], turn_id)
-                if terminal != "completed":
-                    errors.append(f"{name}: terminal {terminal}")
+                    if terminal != "completed":
+                        errors.append(f"{name}: terminal {terminal}")
+                    else:
+                        per_user_completed[name] = per_user_completed.get(name, 0) + 1
 
         rows = _turn_rows(db_path, play_turns)
         for turn_id in play_turns:
@@ -374,9 +389,10 @@ def _run_mode(mode: str, args: argparse.Namespace, workdir: Path) -> dict:
             headers={"Authorization": f"Bearer {tokens[intruder]}"},
             timeout=15,
         )
-        if play_turns:
+        victim_turn = user_turn_ids.get(usernames[0], "")
+        if victim_turn:
             cross_turn = httpx.get(
-                f"{api.base_url}/api/v1/turns/{play_turns[0]}",
+                f"{api.base_url}/api/v1/turns/{victim_turn}",
                 headers={"Authorization": f"Bearer {tokens[intruder]}"},
                 timeout=15,
             )
@@ -386,6 +402,7 @@ def _run_mode(mode: str, args: argparse.Namespace, workdir: Path) -> dict:
         report["scenarios"]["isolation"] = {
             "cross_user_session_status": cross_session.status_code,
             "cross_user_turn_status": cross_turn_code,
+            "victim_turn_id": victim_turn,
             "blocked": cross_session.status_code in {403, 404}
             and cross_turn_code in {403, 404, None},
         }
@@ -454,13 +471,23 @@ def _run_mode(mode: str, args: argparse.Namespace, workdir: Path) -> dict:
         }
 
         e2e = [float(t["e2e_s"]) for t in report["turns"] if t.get("e2e_s") is not None]
+        waits = [
+            float(t["queue_wait_s"])
+            for t in report["turns"]
+            if t.get("queue_wait_s") is not None
+        ]
         report["summary"] = {
             "completed": sum(1 for t in report["turns"] if t["status"] == "completed"),
             "failed_or_other": sum(1 for t in report["turns"] if t["status"] != "completed"),
             "p50_e2e_s": _percentile(e2e, 0.50),
             "p95_e2e_s": _percentile(e2e, 0.95),
             "mean_e2e_s": round(statistics.fmean(e2e), 3) if e2e else None,
+            "p95_queue_wait_s": _percentile(waits, 0.95),
             "cross_user_parallel_rounds": args.turns_per_user,
+            "users": args.users,
+            "wave_size": wave_size,
+            "peak_inflight": peak_inflight,
+            "users_with_completed_turn": len(per_user_completed),
         }
     finally:
         for worker in workers:
@@ -475,7 +502,8 @@ def _markdown(off: dict, on: dict) -> str:
         scenario = report["scenarios"]
         return (
             f"| {report['mode']} | {summary['completed']}/{len(report['turns'])} | "
-            f"{summary['p50_e2e_s']} | {summary['p95_e2e_s']} | "
+            f"{summary['users_with_completed_turn']}/{summary['users']} | "
+            f"{summary['p50_e2e_s']} | {summary['p95_e2e_s']} | {summary['p95_queue_wait_s']} | "
             f"{'是' if scenario['burst']['serialized'] else '否'} | "
             f"{'是' if scenario['isolation']['blocked'] else '否'} | "
             f"{scenario['overload']['rejected_429']}/{scenario['overload']['requests']} |"
@@ -486,13 +514,13 @@ def _markdown(off: dict, on: dict) -> str:
     burst_off = off["scenarios"]["burst"]
     return f"""# 多用户多并发 A/B 实测报告
 
-> 口径：隔离临时库（不影响在线服务）；通用聊天；同一模型；每组 {off['summary']['cross_user_parallel_rounds']} 轮跨用户并行 + {burst_on['turns']} 条同会话突发 + {on['scenarios']['overload']['requests']} 次快速提交。
+> 口径：隔离临时库（不影响在线服务）；通用聊天；同一模型；**{off['summary']['users']} 个用户**、每组 {off['summary']['cross_user_parallel_rounds']} 轮跨用户并行（每波 {off['summary']['wave_size']} 人，峰值在途 {off['summary']['peak_inflight']}）+ {burst_on['turns']} 条同会话突发 + {on['scenarios']['overload']['requests']} 次快速提交。
 > `off` = 默认开关（legacy 并发）；`on` = `CONVERSATION_SERIALIZE_SAME_THREAD` + 部署级 governor + 共享检索执行器 + 低 RPM 准入。
 
 ## 结果总表
 
-| 模式 | 完成/总 | 跨用户 e2e P50 (s) | 跨用户 e2e P95 (s) | 同会话严格串行 | 跨用户隔离拦截 | 准入拒绝 |
-|---|---|---|---|---|---|---|
+| 模式 | 完成/总 | 有完成 turn 用户数 | 跨用户 e2e P50 (s) | 跨用户 e2e P95 (s) | 队列等待 P95 (s) | 同会话严格串行 | 跨用户隔离拦截 | 准入拒绝 |
+|---|---|---|---|---|---|---|---|---|
 {rows}
 
 ## 同会话突发（顺序语义）
@@ -528,6 +556,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--turns-per-user", type=int, default=2)
     parser.add_argument("--burst", type=int, default=3)
     parser.add_argument("--overload", type=int, default=5)
+    parser.add_argument(
+        "--wave-size",
+        type=int,
+        default=0,
+        help="users fired per wave; 0 = all users at once",
+    )
+    parser.add_argument("--wait-timeout", type=float, default=300.0, help="per-turn completion timeout")
+    parser.add_argument(
+        "--queue-deadline",
+        type=float,
+        default=0.0,
+        help="override CHAT_QUEUE_DEADLINE_SECONDS when > 0",
+    )
+    parser.add_argument("--user-rpm", type=int, default=3, help="on-mode per-user chat RPM")
+    parser.add_argument("--tenant-rpm", type=int, default=30, help="on-mode per-tenant chat RPM")
     parser.add_argument("--password", default="StrongPass123!")
     parser.add_argument("--output", default="")
     args = parser.parse_args(argv)

@@ -14,7 +14,12 @@ Starts two API processes against the same storage (SQLite default), then:
 With ``--checkpoint-backend postgres --postgres-dsn <dsn>`` both replicas use
 the PostgreSQL agent/authoring checkpoint providers and the PostgreSQL memory
 projection, so the drill exercises the production service-backed state path
-instead of the SQLite default.
+instead of the SQLite default.  It also uploads a chat attachment on replica A
+and verifies metadata plus bytes on replica B (shared file storage contract).
+
+With ``--governor-backend postgres`` both replicas share the PostgreSQL
+deployment quota store (``RESOURCE_GOVERNOR_BACKEND=postgres``); the drill
+records the permit rows proving the shared governor state was exercised.
 
 The report is written as JSON; the drill is repeatable in a dev workspace and
 does not require a model to be reachable beyond what the deployment provides.
@@ -23,6 +28,7 @@ does not require a model to be reachable beyond what the deployment provides.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -152,16 +158,34 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="PostgreSQL DSN required when --checkpoint-backend postgres",
     )
+    parser.add_argument(
+        "--governor-backend",
+        choices=["off", "postgres"],
+        default="off",
+        help="enable the deployment resource governor on PostgreSQL (needs --postgres-dsn)",
+    )
     parser.add_argument("--turn-timeout", type=float, default=300.0)
     parser.add_argument("--output", default="")
     args = parser.parse_args(argv)
 
     if args.checkpoint_backend == "postgres" and not args.postgres_dsn:
         parser.error("--postgres-dsn is required with --checkpoint-backend postgres")
+    if args.governor_backend == "postgres" and not args.postgres_dsn:
+        parser.error("--postgres-dsn is required with --governor-backend postgres")
 
     _seed_actor(args.username, args.password, args.auth_db)
 
     provider_env: dict[str, str] = {"AUTH_DB_PATH": args.auth_db}
+    if args.governor_backend == "postgres":
+        provider_env.update(
+            {
+                "RESOURCE_GOVERNOR_ENABLED": "true",
+                "RESOURCE_GOVERNOR_SCOPE": "deployment",
+                "RESOURCE_GOVERNOR_BACKEND": "postgres",
+                "RESOURCE_GOVERNOR_DATABASE_URL": args.postgres_dsn,
+                "RESOURCE_GOVERNOR_DEPLOYMENT_ID": "mi-drill",
+            }
+        )
     if args.checkpoint_backend == "postgres":
         provider_env.update(
             {
@@ -181,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "auth_db": args.auth_db,
         "checkpoint_backend": args.checkpoint_backend,
+        "governor_backend": args.governor_backend,
         "replicas": [args.port_a, args.port_b],
         "checks": {},
     }
@@ -207,6 +232,42 @@ def main(argv: list[str] | None = None) -> int:
         report["checks"]["session_visible_on_both"] = bool(
             visible_on_b.status_code == 200 and visible_on_b.json().get("id") == session_id
         )
+
+        # Shared file storage: upload on replica A, read bytes/metadata on B.
+        payload = f"cross-replica attachment {time.time_ns()}".encode()
+        upload = httpx.post(
+            f"{replicas[0].base_url}/api/v1/conversations/{session_id}/attachments",
+            files={"file": ("cross-replica.txt", payload, "text/plain")},
+            params={"usage_hint": "reference"},
+            headers=headers,
+            timeout=30,
+        )
+        report["checks"]["attachment_uploaded_on_a"] = upload.status_code == 201
+        if upload.status_code == 201:
+            attachment_id = str(upload.json()["attachment_id"])
+            uploaded_sha = str(upload.json().get("sha256") or "")
+            view_b = httpx.get(
+                f"{replicas[1].base_url}/api/v1/conversations/{session_id}/attachments/{attachment_id}",
+                headers=headers,
+                timeout=15,
+            )
+            download_b = httpx.get(
+                f"{replicas[1].base_url}/api/v1/conversations/{session_id}/attachments/{attachment_id}/download",
+                headers=headers,
+                timeout=30,
+            )
+            report["attachment_id"] = attachment_id
+            report["checks"]["attachment_metadata_matches_on_b"] = bool(
+                view_b.status_code == 200
+                and str(view_b.json().get("sha256") or "") == uploaded_sha
+                and int(view_b.json().get("size_bytes") or 0) == len(payload)
+            )
+            report["checks"]["attachment_bytes_match_on_b"] = bool(
+                download_b.status_code == 200
+                and hashlib.sha256(download_b.content).hexdigest()
+                == hashlib.sha256(payload).hexdigest()
+                == uploaded_sha
+            )
 
         turn = httpx.post(
             f"{replicas[0].base_url}/api/v1/conversations/{session_id}/turns",
@@ -251,6 +312,20 @@ def main(argv: list[str] | None = None) -> int:
         report["checks"]["single_turn_end_event"] = turn_end_events == 1
         report["turn_end_events"] = turn_end_events
 
+        if args.governor_backend == "postgres":
+            import psycopg
+
+            with psycopg.connect(args.postgres_dsn, autocommit=True) as conn:
+                rows = conn.execute(
+                    "SELECT resource, state, COUNT(*) FROM resource_permits"
+                    " GROUP BY resource, state ORDER BY resource, state"
+                ).fetchall()
+            report["governor_permits"] = [
+                {"resource": str(r[0]), "state": str(r[1]), "count": int(r[2])}
+                for r in rows
+            ]
+            report["checks"]["governor_postgres_tables_used"] = True
+
         # Follow-up turn on replica B: same session, another process. With the
         # postgres provider this resumes agent checkpoints created on A.
         follow_up = httpx.post(
@@ -286,11 +361,15 @@ def main(argv: list[str] | None = None) -> int:
 
         ok = (
             report["checks"]["session_visible_on_both"]
+            and report["checks"]["attachment_uploaded_on_a"]
+            and report["checks"].get("attachment_metadata_matches_on_b", False)
+            and report["checks"].get("attachment_bytes_match_on_b", False)
             and terminal == "completed"
             and report["checks"]["answer_present"]
             and report["checks"]["single_turn_end_event"]
             and report["checks"]["cross_replica_resume_completed"]
             and report["checks"]["resumed_messages_on_b"]
+            and report["checks"].get("governor_postgres_tables_used", True)
         )
         report["ok"] = ok
     finally:
