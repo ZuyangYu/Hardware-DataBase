@@ -482,6 +482,64 @@ class ApiRoutesTests(unittest.TestCase):
         user_message = [message for message in messages if message["role"] == "user"][-1]
         self.assertEqual(user_message["cards"], [])
 
+    def test_messages_project_persisted_trace_steps(self):
+        from src.core.conversation import ConversationService
+
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "轨迹回填"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "轨迹恢复", "client_request_id": "trace-recovery-key"},
+            headers=self._auth(t),
+        ).json()
+        turn_id = created["turn"]["id"]
+        self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(t))
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(t)) as response:
+            b"".join(response.iter_bytes())
+
+        # Persisted stage/tool events fold into the same step shape the live
+        # SSE trace uses, so a page refresh keeps the execution trace.
+        conv = ConversationService(self.db_path)
+        conv.append_turn_event(turn_id, "stage", {"key": "route", "label": "来源路由", "status": "running"})
+        conv.append_turn_event(
+            turn_id,
+            "stage",
+            {"key": "route", "label": "来源路由", "status": "done", "detail": "命中 2 个来源组"},
+        )
+        conv.append_turn_event(
+            turn_id,
+            "tool_started",
+            {"tool_name": "document_search", "query": "电源结构"},
+        )
+        conv.append_turn_event(
+            turn_id,
+            "tool_result",
+            {"tool_name": "document_search", "hit_count": 3, "status": "done", "latency_ms": 9},
+        )
+        conv.append_turn_event(
+            turn_id,
+            "stage",
+            {"key": "generate", "label": "生成回答", "status": "done"},
+        )
+
+        messages = self.client.get(
+            f"/api/v1/conversations/{session['id']}/messages", headers=self._auth(t)
+        ).json()
+        assistant = [message for message in messages if message["role"] == "assistant"][-1]
+        steps = assistant["trace_steps"]
+        self.assertEqual([step["key"] for step in steps], ["route", "document_search#2"])
+        self.assertEqual(steps[0]["status"], "done")
+        self.assertEqual(steps[0]["detail"], "命中 2 个来源组")
+        self.assertEqual(steps[1]["label"], "文档检索")
+        self.assertEqual(steps[1]["detail"], "3 条命中 · 9ms")
+        self.assertTrue(all(step["key"] != "generate" for step in steps))
+        user_message = [message for message in messages if message["role"] == "user"][-1]
+        self.assertEqual(user_message["trace_steps"], [])
+
     def test_knowledge_base_turn_forces_deep_retrieval(self):
         t = self._token("user1")
         session = self.client.post(

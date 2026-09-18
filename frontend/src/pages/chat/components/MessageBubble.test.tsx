@@ -43,6 +43,40 @@ describe('assistant result exports', () => {
     expect(html).toContain('导出对话');
   });
 
+  it('renders 记入项目记忆 when a project handler is provided', () => {
+    const message: MessageView = {
+      id: 42,
+      session_id: 7,
+      turn_id: 'turn-42',
+      role: 'assistant',
+      content: '检索结果',
+      created_at: '2026-09-02T00:00:00Z',
+    };
+    const html = renderToStaticMarkup(
+      <MessageBubble
+        msg={message}
+        onCreateProjectMemory={() => undefined}
+        memorySourceMessageIds={[41, 42]}
+      />,
+    );
+    expect(html).toContain('记入项目记忆');
+  });
+
+  it('hides 记入项目记忆 when no project handler is provided', () => {
+    const message: MessageView = {
+      id: 42,
+      session_id: 7,
+      turn_id: 'turn-42',
+      role: 'assistant',
+      content: '检索结果',
+      created_at: '2026-09-02T00:00:00Z',
+    };
+    const html = renderToStaticMarkup(
+      <MessageBubble msg={message} memorySourceMessageIds={[41, 42]} />,
+    );
+    expect(html).not.toContain('记入项目记忆');
+  });
+
   it('places the export entry below the answer and above the retrieval overview', () => {
     const message: MessageView = {
       id: 42,

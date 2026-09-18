@@ -21,6 +21,7 @@ from typing import Any, Iterable
 
 import src.settings as settings
 
+from src.core.logger import error as log_error, warn as log_warn
 from src.memory.catalog import (
     MemoryCatalogRepository,
     ensure_memory_schema,
@@ -728,6 +729,32 @@ class MemoryWorker:
                         continue
                     memory_id = previous["memory_id"] if previous is not None else None
                     projection_key = item.get("output_key")
+                    if not memory_id:
+                        # 同一 scope 内内容完全相同的 candidate 直接复用既有记录：
+                        # 自动提炼与主动触发（或不同窗口的重复运行）可能产出同一
+                        # 事实，这里作为 Catalog 层的兜底，避免出现重复条目。
+                        if user:
+                            duplicate = conn.execute(
+                                """SELECT memory_id FROM memory_records
+                                   WHERE scope = 'user' AND user_id = ? AND status = 'candidate'
+                                     AND deleted_at IS NULL AND content_hash = ?
+                                   LIMIT 1""",
+                                (str(session["user_id"]), item_hash),
+                            ).fetchone()
+                        else:
+                            duplicate = conn.execute(
+                                """SELECT memory_id FROM memory_records
+                                   WHERE scope = 'project' AND department_id = ? AND kb_id = ?
+                                     AND status = 'candidate' AND deleted_at IS NULL AND content_hash = ?
+                                   LIMIT 1""",
+                                (str(session["department_id"]), str(session["kb_id"]), item_hash),
+                            ).fetchone()
+                        if duplicate is not None:
+                            memory_id = str(duplicate["memory_id"])
+                            counter(
+                                "hdb.memory.candidate_duplicate_reused",
+                                attributes={"scope": "user" if user else "project"},
+                            )
                     if not memory_id and projection_key:
                         projection = self.catalog.get_projection_by_key("sqlite", scope, str(projection_key), conn=conn)
                         if projection is not None:
@@ -902,6 +929,12 @@ class MemoryWorker:
             return True
         except InvalidMemorySource as exc:
             outcome = "failed"
+            log_warn(
+                "memory_job_source_invalid job_id=%s kind=%s error=%s",
+                job.job_id,
+                job.job_kind,
+                str(exc)[:300],
+            )
             self._cancel_job(job, str(exc))
             counter("hdb.memory.user_job_consent_denied")
             record_worker(status="failed", duration_s=time.monotonic() - started)
@@ -911,6 +944,12 @@ class MemoryWorker:
             # Job; retrying it would only create noise and could re-read a
             # source that is no longer authorized.
             outcome = "failed"
+            log_warn(
+                "memory_job_consent_denied job_id=%s kind=%s error=%s",
+                job.job_id,
+                job.job_kind,
+                str(exc)[:300],
+            )
             self._cancel_job(job, str(exc))
             counter("hdb.memory.user_job_consent_denied")
             record_worker(status="failed", duration_s=time.monotonic() - started)
@@ -923,6 +962,15 @@ class MemoryWorker:
             return True
         except Exception as exc:
             outcome = "failed"
+            log_error(
+                "memory_job_failed job_id=%s kind=%s attempt=%s error=%s: %s",
+                job.job_id,
+                job.job_kind,
+                int(job.retry_count or 0),
+                type(exc).__name__,
+                str(exc)[:500],
+                exc_info=True,
+            )
             self._reflection_failures += 1
             circuit_failures = max(1, int(getattr(self.settings, "MEMORY_REFLECTION_CIRCUIT_FAILURES", 5)))
             if self._reflection_failures >= circuit_failures:

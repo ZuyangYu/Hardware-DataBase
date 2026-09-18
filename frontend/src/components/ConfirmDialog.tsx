@@ -83,7 +83,7 @@ export function ConfirmDialog({
             <Button
               variant="outline"
               disabled={loading}
-              className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] py-[8px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+              className="h-[32px] min-w-[80px] rounded-[10px] border-[#e3e7f1] bg-white px-[12px] py-[8px] text-[14px] font-normal text-[#464c5e] hover:border-[#e3e7f1] hover:bg-[#f6f6f6] hover:text-[#18181a]"
             >
               {cancelText}
             </Button>
@@ -92,7 +92,7 @@ export function ConfirmDialog({
             <Button
               disabled={loading}
               className={cn(
-                'h-[32px] w-[80px] rounded-[10px] px-[12px] py-[8px] text-[14px] font-normal',
+                'h-[32px] min-w-[80px] rounded-[10px] px-[12px] py-[8px] text-[14px] font-normal',
                 destructive
                   ? 'bg-[#d20b0b] text-white hover:bg-[#b80909]'
                   : 'bg-[#18181a] text-white hover:bg-[#303030]',

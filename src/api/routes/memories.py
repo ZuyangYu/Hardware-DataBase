@@ -276,6 +276,7 @@ def extract_memory(
         session_id=session_id,
         reason=body.reason,
         request_id=body.request_id,
+        message_ids=list(body.message_ids),
     )
     return _operation_response(result)
 

@@ -406,6 +406,8 @@ class MessageView(BaseModel):
     # 该 turn 持久化的 document_card 事件（历史回填用；刷新/重开会话后
     # 候选卡片与文档状态卡不丢失，前端按引用去重合并）。
     cards: list[dict] = Field(default_factory=list)
+    # 该 turn 持久化的执行轨迹（stage/tool 事件折叠；刷新后轨迹面板不消失）。
+    trace_steps: list[dict] = Field(default_factory=list)
 
 
 class AddMessageRequest(BaseModel):
@@ -686,6 +688,9 @@ class MemoryDraftRequest(BaseModel):
 class MemoryExtractionRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2_000)
     request_id: str = Field(min_length=1, max_length=128)
+    # 主动触发项目记忆：精确指定某个已完成轮次的 user/assistant 消息；
+    # 为空时保持原有"重新提炼最新完成轮"的行为。
+    message_ids: list[int] = Field(default_factory=list, max_length=20)
 
 
 class VerifyMemoryRequest(MemoryActionRequest):

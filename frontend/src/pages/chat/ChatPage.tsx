@@ -771,6 +771,10 @@ export default function ChatPage({
   const [extractConfirmOpen, setExtractConfirmOpen] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [userMemoryTarget, setUserMemoryTarget] = useState<number[] | null>(null);
+  // 个人记忆默认关闭：打开弹窗时读取 opt_in，未开启时在同一弹窗内先征得开启确认。
+  const [userMemoryOptIn, setUserMemoryOptIn] = useState<boolean | null>(null);
+  const [userMemorySubmitting, setUserMemorySubmitting] = useState(false);
+  const [projectMemorySubmitting, setProjectMemorySubmitting] = useState(false);
 
   async function runProjectExtraction() {
     if (activeSessionId == null || !mountedKbName) return;
@@ -790,9 +794,31 @@ export default function ChatPage({
     }
   }
 
+  async function openUserMemoryDialog(messageIds: number[]) {
+    setUserMemoryTarget(messageIds);
+    setUserMemoryOptIn(null);
+    try {
+      const settings = await api.get<{ opt_in: boolean }>('/api/v1/memory-settings');
+      setUserMemoryOptIn(Boolean(settings.opt_in));
+    } catch {
+      // 读取失败不阻塞流程：创建授权时后端仍会校验 opt-in。
+    }
+  }
+
   async function runUserMemoryConsent(messageIds: number[]) {
     if (activeSessionId == null) return;
+    setUserMemorySubmitting(true);
     try {
+      if (userMemoryOptIn === false) {
+        await api.put('/api/v1/memory-settings', {
+          opt_in: true,
+          reason: '用户在对话页面创建个人记忆时明确开启',
+          request_id: `chat-memory-optin-${Date.now()}`,
+        });
+        setUserMemoryOptIn(true);
+        notify.success('已开启个人记忆提炼');
+        void refreshMemorySummary();
+      }
       await api.post(`/api/v1/conversations/${activeSessionId}/memory-consents`, {
         message_ids: messageIds,
         reason: '对话页面明确创建个人记忆',
@@ -801,7 +827,40 @@ export default function ChatPage({
       notify.success('个人记忆授权已创建，提炼将在后台执行');
       void refreshSessionConsents();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '创建个人记忆授权失败');
+      const message = error instanceof Error ? error.message : '创建个人记忆授权失败';
+      notify.error(
+        message.includes('opt-in')
+          ? '个人记忆尚未开启：请先在「长期记忆」页开启“允许个人记忆提炼”，再回到这里创建。'
+          : message,
+      );
+    } finally {
+      setUserMemorySubmitting(false);
+      setUserMemoryTarget(null);
+    }
+  }
+
+  async function runProjectMemoryRequest(messageIds: number[]) {
+    if (activeSessionId == null || !mountedKbName || projectMemorySubmitting) return;
+    setProjectMemorySubmitting(true);
+    try {
+      const result = await api.post<{ status: string }>(
+        `/api/v1/conversations/${activeSessionId}/extract-memory`,
+        {
+          message_ids: messageIds,
+          reason: '对话页面主动记入项目记忆',
+          request_id: `chat-project-memory-${Date.now()}`,
+        },
+      );
+      if (result?.status === 'already_covered') {
+        notify.info('该轮已包含在最近一次项目提炼中，无需重复创建');
+      } else {
+        notify.success('已提交项目记忆提炼，结果进入 Candidate 待审核');
+      }
+      void refreshMemorySummary();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '提交项目记忆提炼失败');
+    } finally {
+      setProjectMemorySubmitting(false);
     }
   }
 
@@ -872,7 +931,10 @@ export default function ChatPage({
           traceSteps={traceSteps}
           traceByMessageId={traceByMessageId}
           degradedNotes={degradedNotes}
-          onCreateMemory={(messageIds) => setUserMemoryTarget(messageIds)}
+          onCreateMemory={(messageIds) => void openUserMemoryDialog(messageIds)}
+          onCreateProjectMemory={
+            mountedKbName ? (messageIds) => void runProjectMemoryRequest(messageIds) : undefined
+          }
           onEditMessage={openEditMessage}
           onExport={handleExportMessage}
           onDownloadExport={(job) => void handleDownloadExport(job)}
@@ -954,15 +1016,18 @@ export default function ChatPage({
         onOpenChange={(next) => {
           if (!next) setUserMemoryTarget(null);
         }}
-        title="创建个人记忆"
-        description="记录本轮问答（提问与输出）为授权来源，提交后会生成可撤销的授权事件。"
-        confirmText="创建个人记忆"
+        title={userMemoryOptIn === false ? '开启个人记忆提炼并创建？' : '创建个人记忆'}
+        description={
+          userMemoryOptIn === false
+            ? '个人记忆默认关闭。确认后将先开启个人记忆提炼，并把本轮问答（提问与输出）记录为可撤销的授权来源；可随时在「长期记忆」页关闭。'
+            : '记录本轮问答（提问与输出）为授权来源，提交后会生成可撤销的授权事件。'
+        }
+        confirmText={userMemoryOptIn === false ? '开启并创建' : '创建个人记忆'}
         destructive={false}
+        loading={userMemorySubmitting}
         onConfirm={() => {
           if (userMemoryTarget == null) return;
-          const target = userMemoryTarget;
-          setUserMemoryTarget(null);
-          void runUserMemoryConsent(target);
+          void runUserMemoryConsent(userMemoryTarget);
         }}
       />
       <EditMessageDialog

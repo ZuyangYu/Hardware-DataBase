@@ -52,7 +52,11 @@ def _attachment_snapshot_view(snapshot: dict):
     )
 
 
-def _message_view(m, cards: list[dict] | None = None) -> MessageView:
+def _message_view(
+    m,
+    cards: list[dict] | None = None,
+    trace_steps: list[dict] | None = None,
+) -> MessageView:
     attachments = []
     if m.turn_id and m.role == "user":
         try:
@@ -75,7 +79,79 @@ def _message_view(m, cards: list[dict] | None = None) -> MessageView:
         attachments=attachments,
         citations=getattr(m, "citations", []) or [],
         cards=list(cards or []),
+        trace_steps=list(trace_steps or []),
     )
+
+
+_TRACE_STEP_IGNORED_KEYS = frozenset({"permission", "generate"})
+
+
+def _trace_steps_from_events(events) -> list[dict]:
+    """把持久化的 turn 事件折叠成与前端实时轨迹同形的步骤列表。
+
+    stage / tool_started / tool_result 三类事件驱动实时执行轨迹；刷新页面后
+    用同一规则从 chat_turn_events 重建，避免轨迹只在当次流式会话里可见。
+    """
+    from src.agents.tools.runtime import tool_label
+
+    steps: list[dict] = []
+    active: dict[str, int] = {}
+    for event in events:
+        event_type = str(getattr(event, "event_type", "") or "")
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        if event_type == "tool_started":
+            name = str(payload.get("tool_name") or "").strip()
+            if not name:
+                continue
+            active[name] = len(steps)
+            steps.append(
+                {
+                    "key": f"{name}#{len(steps) + 1}",
+                    "label": tool_label(name),
+                    "status": "running",
+                    "detail": str(payload.get("query") or ""),
+                }
+            )
+        elif event_type == "tool_result":
+            name = str(payload.get("tool_name") or "").strip()
+            if not name:
+                continue
+            hits = int(payload.get("hit_count") or 0)
+            latency = payload.get("latency_ms")
+            detail = f"{hits} 条命中"
+            if isinstance(latency, (int, float)):
+                detail += f" · {int(latency)}ms"
+            step = {
+                "key": f"{name}#{len(steps) + 1}",
+                "label": tool_label(name),
+                "status": "error" if payload.get("status") == "failed" else "done",
+                "detail": detail,
+            }
+            index = active.get(name)
+            if index is not None and 0 <= index < len(steps) and steps[index]["key"].startswith(f"{name}#"):
+                steps[index] = {**steps[index], **step, "key": steps[index]["key"]}
+            else:
+                steps.append(step)
+        elif event_type == "stage":
+            key = str(payload.get("key") or "").strip()
+            if not key or key in _TRACE_STEP_IGNORED_KEYS:
+                continue
+            step = {
+                "key": key,
+                "label": str(payload.get("label") or key),
+                "status": str(payload.get("status") or "done"),
+                "detail": str(payload.get("detail") or ""),
+            }
+            for existing in steps:
+                if existing["key"] == key:
+                    existing.update(step)
+                    break
+            else:
+                steps.append(step)
+    return steps
+
 
 
 def _ensure_kb_read(user: AuthUser, kb_name: str, auth: AuthService) -> None:
@@ -179,13 +255,24 @@ def list_messages(
     assistant_turns = {
         str(m.turn_id) for m in messages if m.role == "assistant" and m.turn_id
     }
+    trace_by_turn: dict[str, list[dict]] = {}
+    for turn_id in assistant_turns:
+        try:
+            trace_by_turn[turn_id] = _trace_steps_from_events(
+                conv.list_turn_events(user.id, turn_id)
+            )
+        except Exception:
+            # Trace rehydration is best-effort: a projection failure must
+            # never break the message list itself.
+            trace_by_turn[turn_id] = []
     views: list[MessageView] = []
     for m in messages:
         turn_id = str(getattr(m, "turn_id", "") or "")
         cards: list[dict] = []
         if turn_id and (m.role == "assistant" or turn_id not in assistant_turns):
             cards = cards_by_turn.get(turn_id, [])
-        views.append(_message_view(m, cards=cards))
+        trace_steps = trace_by_turn.get(turn_id, []) if m.role == "assistant" else []
+        views.append(_message_view(m, cards=cards, trace_steps=trace_steps))
     return views
 
 

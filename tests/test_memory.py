@@ -840,3 +840,111 @@ def test_consent_revocation_races_worker_output_persistence(memory_context, tmp_
     assert user_memory == []
     worker.close()
     base_service.close()
+
+
+class RepeatingAdapter:
+    """每次调用都产出相同语义、不同 output_key 的抽取器（模拟重复提炼）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def extract(self, messages, *, scope, user=False):
+        self.calls += 1
+        semantic = {
+            "memory_type": "decision",
+            "title": "电源器件决策",
+            "content": "本项目建议采用 LM76003。",
+            "subject": "power",
+            "confidence": 0.9,
+            "tags": ["power"],
+        }
+        return MemoryExtractionOutput(
+            (ExtractedMemory(semantic, f"repeat-key-{self.calls}", ""),)
+        )
+
+
+def test_extract_memory_for_selected_turn_skips_when_covered(memory_context, tmp_path):
+    ctx = memory_context
+    _worker, runtime, _fake = run_project_worker(ctx, tmp_path)
+    service = MemoryService(db_path=ctx.db_path, auth=ctx.auth, store_runtime=runtime)
+    with MemoryJobRepository(ctx.db_path)._connect() as conn:
+        turn = conn.execute(
+            "SELECT user_message_id, assistant_message_id FROM chat_turns WHERE id = ?",
+            (ctx.turn.id,),
+        ).fetchone()
+    result = service.extract_memory(
+        actor=ctx.user,
+        session_id=ctx.session.id,
+        reason="主动记入项目记忆",
+        request_id="project-selected-1",
+        message_ids=[turn["user_message_id"], turn["assistant_message_id"]],
+    )
+    assert result["status"] == "already_covered"
+    with MemoryJobRepository(ctx.db_path)._connect() as conn:
+        jobs = conn.execute(
+            "SELECT * FROM memory_jobs WHERE session_id = ? AND job_kind = 'project_reflection'",
+            (ctx.session.id,),
+        ).fetchall()
+    assert len(jobs) == 1
+    service.close()
+
+
+def test_extract_memory_rejects_mixed_turn_selection(memory_context, tmp_path):
+    ctx = memory_context
+    service = MemoryService(db_path=ctx.db_path, auth=ctx.auth)
+    other_session = ctx.conversation.create_session(
+        ctx.user.id,
+        "design",
+        department_id=ctx.department.id,
+        kb_id=ctx.kb_id,
+    )
+    other_turn = ctx.conversation.create_turn(ctx.user.id, other_session.id, "另一个问题")
+    ctx.conversation.complete_turn(ctx.user.id, other_turn.id, "另一个回答", {"status": "ok"})
+    with MemoryJobRepository(ctx.db_path)._connect() as conn:
+        first = conn.execute(
+            "SELECT assistant_message_id FROM chat_turns WHERE id = ?", (ctx.turn.id,)
+        ).fetchone()["assistant_message_id"]
+        second = conn.execute(
+            "SELECT assistant_message_id FROM chat_turns WHERE id = ?", (other_turn.id,)
+        ).fetchone()["assistant_message_id"]
+    with pytest.raises(ValueError):
+        service.extract_memory(
+            actor=ctx.user,
+            session_id=ctx.session.id,
+            reason="跨轮选择",
+            request_id="project-mixed-1",
+            message_ids=[first, second],
+        )
+    service.close()
+
+
+def test_duplicate_candidate_content_is_reused_not_duplicated(memory_context, tmp_path):
+    ctx = memory_context
+    runtime = MemoryStoreRuntime(path=str(tmp_path / "memory.db"))
+    adapter = RepeatingAdapter()
+    worker = MemoryWorker(
+        db_path=ctx.db_path,
+        worker_id="duplicate-worker",
+        runtime=runtime,
+        adapter=adapter,
+        settings_module=worker_settings(ctx.db_path, str(tmp_path / "memory.db")),
+    )
+    while worker.run_once():
+        pass
+    second_turn = ctx.conversation.create_turn(ctx.user.id, ctx.session.id, "再确认一次器件结论")
+    ctx.conversation.complete_turn(ctx.user.id, second_turn.id, "仍然建议采用 LM76003。", {"status": "ok"})
+    while worker.run_once():
+        pass
+    catalog = MemoryCatalogRepository(ctx.db_path)
+    records = [
+        record
+        for record in catalog.list_records(
+            scope="project", department_id=ctx.department.id, kb_id=ctx.kb_id
+        )
+        if record.status == "candidate"
+    ]
+    assert adapter.calls == 2
+    assert len(records) == 1
+    assert records[0].current_revision >= 2
+    worker.close()
+    runtime.close()

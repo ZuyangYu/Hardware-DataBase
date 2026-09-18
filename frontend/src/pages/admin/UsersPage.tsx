@@ -350,14 +350,14 @@ function ResetPasswordDialog({
             variant="outline"
             onClick={() => onOpenChange(false)}
             disabled={loading}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
+            className="h-[32px] min-w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
           >
             取消
           </Button>
           <Button
             onClick={onConfirm}
             disabled={loading}
-            className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303030]"
+            className="h-[32px] min-w-[80px] rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303030]"
           >
             {loading ? '重置中' : '重置'}
           </Button>
@@ -464,14 +464,14 @@ function CreateUserDialog({
           <Button
             variant="outline"
             onClick={() => onOpenChange(false)}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
+            className="h-[32px] min-w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
           >
             取消
           </Button>
           <Button
             onClick={submit}
             disabled={submitting}
-            className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303030]"
+            className="h-[32px] min-w-[80px] rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303030]"
           >
             {submitting ? '创建中' : '创建'}
           </Button>

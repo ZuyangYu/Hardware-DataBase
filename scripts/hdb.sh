@@ -152,7 +152,7 @@ wait_for() {
   return 1
 }
 
-NODEENV="${NODEENV:-/tmp/opencode/nodeenv}"
+NODEENV="${NODEENV:-$APP_ROOT/storage/nodeenv}"
 
 ensure_node() {
   if [ -x "${NODEENV}/lib/python3.12/site-packages/nodejs_wheel/bin/node" ]; then return 0; fi

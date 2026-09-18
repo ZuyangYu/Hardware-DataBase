@@ -493,6 +493,18 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       .then((rows) => {
         if (cancelled) return;
         setMessages(rows);
+        // 执行轨迹回填：服务端把每个 turn 的 stage/tool 事件折叠成步骤投影到消息上，
+        // 刷新/重开会话后轨迹面板不消失（与实时 SSE 使用同一形状）。
+        // 合并而非覆盖：并发的活跃 turn 实时轨迹不会被历史投影清掉。
+        const restoredTraces: Record<number, QueryTraceStep[]> = {};
+        for (const row of rows) {
+          if (row.role === 'assistant' && row.trace_steps?.length) {
+            restoredTraces[row.id] = row.trace_steps;
+          }
+        }
+        if (Object.keys(restoredTraces).length > 0) {
+          setTraceByMessageId((previous) => ({ ...restoredTraces, ...previous }));
+        }
         // 历史卡片回填：服务端把每个 turn 的 document_card 事件投影到消息上，
         // 刷新/重开会话后候选与文档状态卡不再消失（与实时事件同一合并规则）。
         // 合并而非覆盖：并发的活跃 turn 实时事件不会被历史投影清掉。
