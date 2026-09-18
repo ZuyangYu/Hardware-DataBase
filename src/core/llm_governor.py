@@ -48,6 +48,14 @@ def current_priority() -> str:
     return str(CURRENT_LLM_PRIORITY.get() or PRIORITY_INTERACTIVE)
 
 
+class ProviderQuotaExceeded(TimeoutError):
+    """Provider-level quota rejection (RPM) counted at the model boundary.
+
+    SDK/LangChain retries re-enter the governor and re-consume; running out of
+    provider quota fails closed instead of oversubscribing the vendor.
+    """
+
+
 class LLMQueueTimeoutError(TimeoutError):
     """Raised when a model call cannot be admitted within the queue budget."""
 
@@ -96,8 +104,43 @@ class LLMGovernor:
 
     # -- admission ----------------------------------------------------------
 
+    @staticmethod
+    def _check_provider_quota(provider: str, model: str, estimated_tokens: int = 0) -> None:
+        from src.core.concurrency.provider_limiter import allow_provider_call
+
+        decision = allow_provider_call(provider, model)
+        if decision is None:
+            raise ProviderQuotaExceeded(
+                "provider quota limiter unavailable; request rejected fail-closed"
+            )
+        if not decision:
+            raise ProviderQuotaExceeded(
+                f"provider RPM limit reached for {provider or 'default'}/"
+                f"{model or 'default'}"
+            )
+        if int(estimated_tokens or 0) > 0:
+            from src.core.concurrency.provider_limiter import allow_provider_tokens
+
+            token_decision = allow_provider_tokens(provider, model, int(estimated_tokens))
+            if token_decision is None:
+                raise ProviderQuotaExceeded(
+                    "provider token quota limiter unavailable; request rejected fail-closed"
+                )
+            if not token_decision:
+                raise ProviderQuotaExceeded(
+                    f"provider TPM limit reached for {provider or 'default'}/"
+                    f"{model or 'default'}"
+                )
+
     @contextmanager
-    def slot(self, priority: str = PRIORITY_INTERACTIVE):
+    def slot(
+        self,
+        priority: str = PRIORITY_INTERACTIVE,
+        *,
+        provider: str = "",
+        model: str = "",
+        estimated_tokens: int = 0,
+    ):
         """Hold one governor slot for the duration of the ``with`` body.
 
         For streaming calls the body must span the whole stream iteration so
@@ -180,6 +223,15 @@ class LLMGovernor:
         except Exception:
             # Rejection/assembly failure must release the process slot and
             # propagate: no silent bypass of governance (plan §6.2).
+            _release_process_slot()
+            raise
+        try:
+            self._check_provider_quota(provider, model, estimated_tokens)
+        except Exception:
+            try:
+                deployment_cm.__exit__(None, None, None)
+            except Exception:
+                pass
             _release_process_slot()
             raise
         try:

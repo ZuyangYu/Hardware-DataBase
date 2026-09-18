@@ -804,24 +804,29 @@ class MemoryService:
                 )
                 if expected_scope != job.scope_fingerprint:
                     raise MemoryAuthorizationError("project memory scope changed")
-                rows = conn.execute(
-                    """SELECT DISTINCT m.id, m.session_id, m.role, m.content, m.created_at,
+                # Branch on the optional lower bound instead of ``? IS NULL``:
+                # PostgreSQL cannot infer the type of a NULL parameter there.
+                message_sql = """SELECT DISTINCT m.id, m.session_id, m.role, m.content, m.created_at,
                         t.id AS turn_id
                        FROM chat_messages m
                        JOIN chat_turns t ON t.session_id = m.session_id
                          AND (t.user_message_id = m.id OR t.assistant_message_id = m.id)
                          AND t.status = 'completed'
-                       WHERE m.session_id = ?
-                         AND m.id <= ?
-                         AND (? IS NULL OR m.id >= ?)
-                       ORDER BY m.id""",
-                    (
-                        int(job.session_id),
-                        int(job.target_message_id),
-                        job.source_start_message_id,
-                        job.source_start_message_id,
-                    ),
-                ).fetchall()
+                       WHERE m.session_id = ? AND m.id <= ?"""
+                if job.source_start_message_id is None:
+                    rows = conn.execute(
+                        message_sql + " ORDER BY m.id",
+                        (int(job.session_id), int(job.target_message_id)),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        message_sql + " AND m.id >= ? ORDER BY m.id",
+                        (
+                            int(job.session_id),
+                            int(job.target_message_id),
+                            int(job.source_start_message_id),
+                        ),
+                    ).fetchall()
             messages = self._rows_to_messages(rows)
             if not messages or int(messages[-1]["id"]) != int(job.target_message_id):
                 raise MemoryAuthorizationError("project reflection target is not a completed message")
@@ -991,7 +996,7 @@ class MemoryService:
                 raise MemoryServiceError("candidate projection is fenced")
             next_fence = int(projection["fence_version"]) + 1
             fenced = conn.execute(
-                "UPDATE memory_projections SET fence_version = ? WHERE projection_id = ? AND retired_at IS NULL AND manager_writable = 1 AND fence_version = ?",
+                "UPDATE memory_projections SET fence_version = ? WHERE projection_id = ? AND retired_at IS NULL AND manager_writable = TRUE AND fence_version = ?",
                 (next_fence, projection["projection_id"], int(projection["fence_version"])),
             )
             if fenced.rowcount != 1:
@@ -1065,7 +1070,7 @@ class MemoryService:
             """INSERT INTO memory_projections
             (projection_id, memory_id, projection_kind, store_backend, namespace_json, store_key,
              current_revision, current_content_hash, active, manager_writable, fence_version, created_at)
-            VALUES (?, ?, 'verified', 'sqlite', ?, ?, ?, ?, 0, 0, 1, ?)""",
+            VALUES (?, ?, 'verified', 'sqlite', ?, ?, ?, ?, FALSE, FALSE, 1, ?)""",
             (projection_id, record["memory_id"], json_dumps(list(namespace)), store_key, int(revision), record["content_hash"], now),
         )
         operation_id = str(uuid.uuid4())
@@ -1232,7 +1237,7 @@ class MemoryService:
                     (next_status, revision, replacement_hash, utc_now(), utc_now(), memory_id, int(expected_revision)),
                 )
                 conn.execute(
-                    "UPDATE memory_sources SET source_valid = 0, invalidated_at = COALESCE(invalidated_at, ?) WHERE memory_id = ?",
+                    "UPDATE memory_sources SET source_valid = FALSE, invalidated_at = COALESCE(invalidated_at, ?) WHERE memory_id = ?",
                     (utc_now(), memory_id),
                 )
                 conn.execute("UPDATE memory_revisions SET before_content_json = NULL, after_content_json = NULL WHERE memory_id = ?", (memory_id,))
@@ -1415,19 +1420,31 @@ class MemoryService:
         if not user_id:
             raise MemoryAuthorizationError("user identity is required")
         with closing(self.jobs._connect()) as conn:
-            rows = conn.execute(
-                """SELECT c.consent_event_id, c.session_id, c.policy_version,
+            consent_sql = """SELECT c.consent_event_id, c.session_id, c.policy_version,
                           c.consent_revoke_generation, c.granted_at, c.revoked_at,
                           c.authorized_source_hash,
                           COUNT(i.message_id) AS source_count
                    FROM memory_consent_events c
                    LEFT JOIN memory_consent_source_items i
                      ON i.consent_event_id = c.consent_event_id
-                   WHERE c.user_id = ? AND (? IS NULL OR c.session_id = ?)
-                   GROUP BY c.consent_event_id
-                   ORDER BY c.granted_at DESC, c.consent_event_id DESC""",
-                (user_id, session_id, session_id),
-            ).fetchall()
+                   WHERE c.user_id = ?"""
+            # Branch instead of ``? IS NULL``: PostgreSQL cannot infer a NULL
+            # parameter type in that position.
+            if session_id is None:
+                rows = conn.execute(
+                    consent_sql
+                    + " GROUP BY c.consent_event_id"
+                    " ORDER BY c.granted_at DESC, c.consent_event_id DESC",
+                    (user_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    consent_sql
+                    + " AND c.session_id = ?"
+                    " GROUP BY c.consent_event_id"
+                    " ORDER BY c.granted_at DESC, c.consent_event_id DESC",
+                    (user_id, session_id),
+                ).fetchall()
         return [
             {
                 "consent_event_id": row["consent_event_id"],

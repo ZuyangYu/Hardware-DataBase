@@ -27,6 +27,8 @@ class PostgresCheckpointerProvider:
         self.setup = bool(setup)
         self._connection: Any | None = None
         self._pool: Any | None = None
+        # Per-graph savers share this provider; schema setup runs once.
+        self._setup_done = False
 
     def _pool_size(self) -> int:
         try:
@@ -66,8 +68,12 @@ class PostgresCheckpointerProvider:
             if self._connection is None:
                 self._connection = psycopg.connect(self.database_url, autocommit=True)
             saver = PostgresSaver(self._connection)
+        # ``setup`` is idempotent.  Re-run it for each saver so a maintenance
+        # rehearsal or test that recreates the target schema cannot leave a
+        # process-level provider pointing at missing checkpoint tables.
         if self.setup:
             saver.setup()
+            self._setup_done = True
         return saver
 
     def close(self) -> None:

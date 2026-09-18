@@ -13,6 +13,7 @@ from .attempts import (
 from .base import CheckpointerProvider, normalize_backend
 from .factory import (
     build_checkpointer_provider,
+    create_checkpointer,
     get_checkpointer,
     get_checkpointer_provider,
     reset_checkpointer,
@@ -35,6 +36,7 @@ __all__ = [
     "attempt_thread_id",
     "build_checkpointer_provider",
     "commit_attempt",
+    "create_checkpointer",
     "copy_checkpoint_namespace",
     "copy_latest_checkpoint",
     "forget_thread_state",

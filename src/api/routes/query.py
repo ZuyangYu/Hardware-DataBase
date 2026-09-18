@@ -121,6 +121,14 @@ def _publish_turn_event(turn_id: str, seq: int | None, event_type: str, payload:
             q.put_nowait((seq, event_type, payload))
         except queue.Full:
             pass
+    if seq is not None:
+        # Cross-process SSE wake-up (v3 §10); PG remains the replay truth.
+        try:
+            from src.core.redis_events import publish_turn_event
+
+            publish_turn_event(turn_id, seq, event_type, payload)
+        except Exception:
+            pass
 
 
 def _subscribe_turn_events(turn_id: str) -> tuple["queue.Queue", Callable[[], None]]:
@@ -280,7 +288,11 @@ def _turn_queue_context(turn: ChatTurn) -> dict:
         return {}
 
 
-def _turn_view(turn: ChatTurn) -> TurnView:
+def _turn_view(
+    turn: ChatTurn,
+    *,
+    attachments: list[AttachmentSnapshotView] | None = None,
+) -> TurnView:
     queue_context = _turn_queue_context(turn)
     document_context = None
     if turn.document_context:
@@ -311,7 +323,7 @@ def _turn_view(turn: ChatTurn) -> TurnView:
         finished_at=turn.finished_at,
         document_context=document_context,
         source_scope=str(getattr(turn, "source_scope", "") or "auto"),
-        attachments=_turn_attachments_for(turn),
+        attachments=attachments if attachments is not None else _turn_attachments_for(turn),
         blocked_by_turn_id=queue_context.get("blocked_by_turn_id"),
         queue_reason=str(queue_context.get("queue_reason") or ""),
         wait_deadline=queue_context.get("wait_deadline"),
@@ -457,7 +469,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
 
     if ownership_token:
         try:
-            from src.agents.checkpoints import get_checkpointer, prepare_attempt
+            from src.agents.checkpoints import create_checkpointer, prepare_attempt
 
             resume_ref = None
             try:
@@ -474,7 +486,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             except Exception:
                 resume_ref = None
             runner_thread = prepare_attempt(
-                get_checkpointer(),
+                create_checkpointer(),
                 visible_thread,
                 fencing_token,
                 attempt_id=str(getattr(turn, "attempt_id", "") or ""),
@@ -488,7 +500,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 from src.agents.checkpoints.observer import install_checkpoint_observer
 
                 checkpoint_observer = install_checkpoint_observer(
-                    get_checkpointer(),
+                    create_checkpointer(),
                     _register_checkpoint_ref,
                     thread_filter=runner_thread,
                 )
@@ -578,18 +590,32 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             return None
 
     def _fail_owned(message: str, *, cancelled_turn: bool = False) -> None:
+        def _final_events(_final: ChatTurn) -> list[tuple[str, dict]]:
+            if cancelled_turn:
+                return [
+                    ("error", {"message": message, "cancelled": True}),
+                    ("turn_end", {"status": "cancelled"}),
+                ]
+            return [
+                ("error", {"message": message}),
+                ("turn_end", {"status": "failed"}),
+            ]
+
         try:
-            conv.fail_turn(
+            finalization = conv.fail_turn_result(
                 user.id,
                 turn_id,
                 message,
                 cancelled=cancelled_turn,
                 worker_id=worker_id,
                 fencing_token=ownership_token,
+                terminal_events_builder=_final_events,
             )
         except StaleTurnOwner:
             # A newer attempt owns the turn; it will finalise it.
-            pass
+            return
+        for event in finalization.terminal_events:
+            _publish_turn_event(turn_id, event.seq, event.event_type, event.payload)
 
     heartbeat_thread = start_thread_with_current_context(
         heartbeat_loop,
@@ -614,8 +640,32 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         status="not_checked",
     )
 
+    # Cancel detection: in-process event first, then the Redis fast path every
+    # ~250 ms, then the durable flag at most once per second (v3 §8/§12).
+    _cancel_poll = {"redis": 0.0, "db": 0.0, "hit": False}
+
     def cancelled() -> bool:
-        return cancel.is_set() or conv.is_turn_cancel_requested(turn_id)
+        if cancel.is_set():
+            return True
+        if _cancel_poll["hit"]:
+            return True
+        now = time.monotonic()
+        from src.core.redis_cancel import fast_path_enabled, is_cancel_requested
+
+        if fast_path_enabled() and now - _cancel_poll["redis"] >= 0.25:
+            _cancel_poll["redis"] = now
+            if is_cancel_requested(turn_id):
+                _cancel_poll["hit"] = True
+                return True
+        if now - _cancel_poll["db"] >= 1.0:
+            _cancel_poll["db"] = now
+            try:
+                if conv.is_turn_cancel_requested(turn_id):
+                    _cancel_poll["hit"] = True
+                    return True
+            except Exception:
+                pass
+        return False
 
     # Delta batching: consecutive answer tokens are merged into one durable
     # turn_event (and one push) so per-token DB writes don't throttle the
@@ -767,9 +817,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
 
         _flush_deltas()
         if cancelled():
-            emit("error", {"message": "已停止生成", "cancelled": True})
             _fail_owned("已停止生成", cancelled_turn=True)
-            emit("turn_end", {"status": "cancelled"})
             outcome_status = "cancelled"
             return
 
@@ -788,7 +836,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         if ownership_token and runner_thread != visible_thread:
             try:
                 from src.agents.checkpoints import attempt_checkpoint_ref as _attempt_ref
-                from src.agents.checkpoints import get_checkpointer as _agent_checkpointer
+                from src.agents.checkpoints import create_checkpointer as _agent_checkpointer
 
                 committed_ref = _attempt_ref(
                     _agent_checkpointer(),
@@ -799,8 +847,31 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 )
             except Exception:
                 committed_ref = None
+        terminal_attachments = _turn_attachments_for(turn)
+
+        def _terminal_events(completed_turn: ChatTurn) -> list[tuple[str, dict]]:
+            """Terminal events persisted atomically with the answer (v3 §4.7)."""
+            return [
+                (
+                    "stage",
+                    {"key": "generate", "label": "生成回答", "status": "done", "detail": "最终回答已生成"},
+                ),
+                (
+                    "done",
+                    {
+                        "turn": _turn_view(
+                            completed_turn, attachments=terminal_attachments
+                        ).model_dump(),
+                        "answer": completed_turn.answer,
+                        "summary": summary,
+                        "footer": footer,
+                    },
+                ),
+                ("turn_end", {"status": "completed"}),
+            ]
+
         try:
-            completed = conv.complete_turn(
+            completion = conv.complete_turn_result(
                 user.id,
                 turn_id,
                 answer,
@@ -811,7 +882,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 fencing_token=ownership_token,
                 expected_generation=session_generation if ownership_token else None,
                 committed_checkpoint_ref=committed_ref,
+                terminal_events_builder=_terminal_events,
             )
+            completed = completion.turn
         except StaleTurnOwner:
             # Cancel revoked the business commit, or a newer attempt took over.
             if cancelled():
@@ -825,7 +898,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         if ownership_token and runner_thread != visible_thread:
             try:
                 from src.agents.checkpoints import commit_attempt as _commit_attempt
-                from src.agents.checkpoints import get_checkpointer as _agent_checkpointer
+                from src.agents.checkpoints import create_checkpointer as _agent_checkpointer
 
                 _commit_attempt(
                     _agent_checkpointer(),
@@ -843,22 +916,13 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                     )
                 except Exception:
                     pass
-        # ``complete_turn`` is the canonical normalization boundary for stale
-        # export fallbacks. Use its persisted answer in the final event so the
-        # browser does not replace the cleaned message with the raw model text.
+        # ``complete_turn_result`` is the canonical normalization boundary for
+        # stale export fallbacks and persists the terminal events atomically.
+        # Live subscribers receive those persisted events through the queue.
         answer = completed.answer
         turn_observation.set_output(answer, content_kind="llm")
-        emit_stage("generate", "生成回答", "done", "最终回答已生成")
-        emit(
-            "done",
-            {
-                "turn": _turn_view(completed).model_dump(),
-                "answer": answer,
-                "summary": summary,
-                "footer": footer,
-            },
-        )
-        emit("turn_end", {"status": "completed"})
+        for event in completion.terminal_events:
+            _publish_turn_event(turn_id, event.seq, event.event_type, event.payload)
         outcome_status = "completed"
         _record_query_trace(
             user=user,
@@ -873,7 +937,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     except Exception as exc:
         turn_observation.error(exc)
         if cancelled():
-            emit("error", {"message": "已停止生成", "cancelled": True})
             _fail_owned("已停止生成", cancelled_turn=True)
             outcome_status = "cancelled"
         else:
@@ -881,7 +944,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
 
             friendly_error = friendly_error_message(exc)
             _fail_owned(friendly_error)
-            emit("error", {"message": friendly_error})
             summary = {
                 **summary,
                 "short_term_memory": short_term_memory,
@@ -897,7 +959,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 error_message=friendly_error,
                 turn_id=turn_id,
             )
-        emit("turn_end", {"status": "failed"})
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1)
@@ -951,6 +1012,12 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             except Exception:
                 pass
         _clear_turn_cancel_signal(turn_id)
+        try:
+            from src.core.redis_cancel import clear_cancel
+
+            clear_cancel(turn_id)
+        except Exception:
+            pass
 
 
 @router.post("/conversations/{session_id}/turns", response_model=TurnStartResponse, status_code=201)
@@ -1220,6 +1287,11 @@ def cancel_turn(
     turn = conv.request_turn_cancel(user.id, turn_id)
     if turn is None:
         raise HTTPException(status_code=404, detail="turn not found")
+    # The durable flag above is authoritative; the Redis key only shortens the
+    # time until the owning worker notices (v3 §12, fail-soft).
+    from src.core.redis_cancel import publish_cancel
+
+    publish_cancel(turn_id)
     # Do not create a process-local signal in an API process that does not own
     # the worker. The DB flag above is the cross-process cancellation signal.
     local_signal = _existing_turn_cancel_signal(turn_id)
@@ -1249,6 +1321,7 @@ async def stream_turn_events(
         q, unsubscribe = _subscribe_turn_events(turn_id)
         db_synced = False  # initial pass: replay anything persisted before we subscribed
         terminal_idle_polls = 0
+        redis_cursor = "0-0"
 
         def _drain_db_events() -> list:
             return conv.list_turn_events(user.id, turn_id, last_seq)
@@ -1278,15 +1351,10 @@ async def stream_turn_events(
                     continue
 
                 current = conv.get_turn(user.id, turn_id)
-                if current is not None and conv.is_turn_worker_stale(user.id, turn_id):
-                    # A live standalone worker requeues stale claims on its next
-                    # poll. If no worker exists, close this subscription with a
-                    # durable terminal error instead of infinite keepalives.
-                    conv.append_turn_event(
-                        turn_id, "error", {"message": "任务执行器失去心跳，请重新提交问题", "worker_lost": True}
-                    )
-                    conv.fail_turn(user.id, turn_id, "任务执行器失去心跳")
-                    continue
+                # Read-only boundary (v3 §7.3): subscribers never write terminal
+                # state. A stale claim is converged by the worker reaper
+                # (``requeue_stale_turns``); this stream keeps waiting and
+                # replays the terminal events once they are persisted.
                 if current is None or current.status in _TERMINAL_TURN_STATUSES:
                     # Deliver everything persisted so far before deciding to
                     # close, including events written by the stale-worker
@@ -1306,6 +1374,20 @@ async def stream_turn_events(
                 if await request.is_disconnected():
                     break
                 if not pushed:
+                    # Cross-process wake-up: a committed event in another
+                    # process lands here in milliseconds; the DB drain below
+                    # stays the replay truth (gap and lost-tail recovery).
+                    try:
+                        from src.core.redis_events import read_turn_events
+
+                        redis_events, redis_cursor = read_turn_events(
+                            turn_id, after_id=redis_cursor
+                        )
+                    except Exception:
+                        redis_events = []
+                    if redis_events:
+                        db_synced = False
+                        continue
                     # No pushes available (cross-process worker or idle turn):
                     # fall back to a short-interval DB poll, then keepalive.
                     events = _drain_db_events()
@@ -1326,13 +1408,20 @@ async def stream_turn_events(
     )
 
 
-@router.post("/query")
+@router.post("/query", deprecated=True)
 async def query(
     body: QueryRequest,
     request: Request,
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
 ):
+    if not bool(getattr(src.settings, "LEGACY_QUERY_ENABLED", True)):
+        # v3 §12.4: production chat must use durable turns; the turn-less
+        # adapter can be switched off explicitly without touching the rest.
+        raise HTTPException(
+            status_code=410,
+            detail="POST /query 已停用：请使用持久化 Turn 接口 POST /conversations/{id}/turns",
+        )
     if (
         body.document_flow is True
         and body.document_context is None
@@ -1618,7 +1707,14 @@ async def query(
             cancel.set()
             thread.join(timeout=2.0)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    # Legacy turn-less endpoint (v3 §12.4): the durable path is
+    # POST /conversations/{id}/turns.  The response is marked so clients,
+    # proxies and audits can distinguish it from the persisted turn protocol.
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"X-HDB-Legacy-Endpoint": "turn-less"},
+    )
 
 
 def _resolve_pipeline(request: Request) -> AppPipeline:

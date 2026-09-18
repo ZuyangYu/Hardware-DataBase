@@ -11,7 +11,7 @@ from .sqlite_provider import SqliteCheckpointerProvider
 
 _PROVIDER: CheckpointerProvider | None = None
 _CHECKPOINTER: Any | None = None
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 
 
 def build_checkpointer_provider(
@@ -38,14 +38,35 @@ def build_checkpointer_provider(
     )
 
 
+def _provider_singleton() -> CheckpointerProvider:
+    global _PROVIDER
+    with _LOCK:
+        if _PROVIDER is None:
+            _PROVIDER = build_checkpointer_provider()
+        return _PROVIDER
+
+
 def get_checkpointer() -> Any:
     """Return the process-level saver singleton for the configured backend."""
-    global _PROVIDER, _CHECKPOINTER
+    global _CHECKPOINTER
     with _LOCK:
         if _CHECKPOINTER is None:
-            _PROVIDER = build_checkpointer_provider()
-            _CHECKPOINTER = _PROVIDER.create()
+            _CHECKPOINTER = _provider_singleton().create()
         return _CHECKPOINTER
+
+
+def create_checkpointer() -> Any:
+    """Return a saver for one graph build (v3 §10).
+
+    PostgreSQL: a fresh saver over the provider's shared connection pool, so
+    concurrent runs never serialize on a saver instance lock.  SQLite keeps
+    the process-level singleton because one connection must stay behind one
+    saver lock.
+    """
+    provider = _provider_singleton()
+    if str(getattr(provider, "backend", "")) == "postgres":
+        return provider.create()
+    return get_checkpointer()
 
 
 def get_checkpointer_provider() -> CheckpointerProvider | None:

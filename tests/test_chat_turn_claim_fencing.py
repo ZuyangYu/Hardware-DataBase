@@ -314,5 +314,144 @@ class ChatTurnFencingTests(_Base):
         )
 
 
+class ChatTurnTerminalEventTests(_Base):
+    """v3 §4.7: terminal events commit atomically with the terminal status."""
+
+    def test_complete_turn_persists_terminal_events_in_the_same_transaction(self):
+        turn = self._turn("q1")
+        claimed = self.conv.claim_turn(1, turn.id, "worker-a")
+
+        def builder(completed):
+            return [
+                ("done", {"answer": completed.answer, "status": completed.status}),
+                ("turn_end", {"status": "completed"}),
+            ]
+
+        completion = self.conv.complete_turn_result(
+            1,
+            turn.id,
+            "answer",
+            {},
+            worker_id="worker-a",
+            fencing_token=claimed.fencing_token,
+            expected_generation=claimed.session_generation,
+            terminal_events_builder=builder,
+        )
+        self.assertEqual(completion.turn.status, "completed")
+        self.assertEqual([event.seq for event in completion.terminal_events], [1, 2])
+        persisted = self.conv.list_turn_events(1, turn.id)
+        self.assertEqual([event.event_type for event in persisted], ["done", "turn_end"])
+        self.assertEqual(persisted[0].payload["answer"], "answer")
+        self.assertEqual(self.conv.get_turn(1, turn.id).last_event_seq, 2)
+
+    def test_complete_turn_rolls_back_answer_when_terminal_event_builder_fails(self):
+        turn = self._turn("q1")
+        claimed = self.conv.claim_turn(1, turn.id, "worker-a")
+
+        def broken(_completed):
+            raise RuntimeError("terminal event build failed")
+
+        with self.assertRaises(RuntimeError):
+            self.conv.complete_turn_result(
+                1,
+                turn.id,
+                "answer",
+                {},
+                worker_id="worker-a",
+                fencing_token=claimed.fencing_token,
+                expected_generation=claimed.session_generation,
+                terminal_events_builder=broken,
+            )
+        current = self.conv.get_turn(1, turn.id)
+        self.assertEqual(current.status, "streaming")
+        self.assertEqual(current.answer, "")
+        self.assertEqual(current.last_event_seq, 0)
+        self.assertEqual(self.conv.list_turn_events(1, turn.id), [])
+        messages = self.conv.list_messages(1, self.session.id)
+        self.assertEqual(messages[-1].content, "")
+
+    def test_fail_turn_persists_error_events_in_the_same_transaction(self):
+        turn = self._turn("q1")
+        claimed = self.conv.claim_turn(1, turn.id, "worker-a")
+
+        def builder(_final):
+            return [
+                ("error", {"message": "boom"}),
+                ("turn_end", {"status": "failed"}),
+            ]
+
+        finalization = self.conv.fail_turn_result(
+            1,
+            turn.id,
+            "boom",
+            worker_id="worker-a",
+            fencing_token=claimed.fencing_token,
+            terminal_events_builder=builder,
+        )
+        self.assertEqual(finalization.turn.status, "failed")
+        self.assertEqual(
+            [event.event_type for event in self.conv.list_turn_events(1, turn.id)],
+            ["error", "turn_end"],
+        )
+        self.assertEqual(self.conv.get_turn(1, turn.id).status, "failed")
+
+    def test_requeue_stale_turn_converges_cancelled_request(self):
+        turn = self._turn("q1")
+        self.conv.claim_turn(1, turn.id, "worker-a")
+        cancelled = self.conv.request_turn_cancel(1, turn.id)
+        self.assertEqual(cancelled.status, "cancelling")
+        self._expire_session_lease(turn.id)
+        requeued = self.conv.requeue_stale_turns(stale_after_seconds=30)
+        self.assertEqual(requeued, 0)
+        current = self.conv.get_turn(1, turn.id)
+        self.assertEqual(current.status, "cancelled")
+        self.assertEqual(
+            [event.event_type for event in self.conv.list_turn_events(1, turn.id)],
+            ["error", "turn_end"],
+        )
+        row = self._execution_row()
+        self.assertEqual(row["active_turn_id"], "")
+
+    def test_requeue_stale_turn_fails_exhausted_retry(self):
+        turn = self._turn("q1")
+        self.conv.claim_turn(1, turn.id, "worker-a")
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE chat_turns SET retry_count = 3 WHERE id = ?", (turn.id,))
+            conn.commit()
+        self._expire_session_lease(turn.id)
+        requeued = self.conv.requeue_stale_turns(stale_after_seconds=30)
+        self.assertEqual(requeued, 0)
+        current = self.conv.get_turn(1, turn.id)
+        self.assertEqual(current.status, "failed")
+        self.assertIn("重试", current.error_message)
+        self.assertEqual(
+            [event.event_type for event in self.conv.list_turn_events(1, turn.id)],
+            ["error", "turn_end"],
+        )
+
+    def test_requeue_stale_turn_requeues_live_claim(self):
+        turn = self._turn("q1")
+        self.conv.claim_turn(1, turn.id, "worker-a")
+        self._expire_session_lease(turn.id)
+        requeued = self.conv.requeue_stale_turns(stale_after_seconds=30)
+        self.assertEqual(requeued, 1)
+        self.assertEqual(self.conv.get_turn(1, turn.id).status, "pending")
+        self.assertEqual(self.conv.list_turn_events(1, turn.id), [])
+
+    def test_claim_converges_stale_cancelled_turn(self):
+        turn = self._turn("q1")
+        self.conv.claim_turn(1, turn.id, "worker-a")
+        self.conv.request_turn_cancel(1, turn.id)
+        self._expire_session_lease(turn.id)
+        result = self.conv.claim_turn_result(1, turn.id, "worker-b", stale_after_seconds=30)
+        self.assertEqual(result.status, "cancelled")
+        current = self.conv.get_turn(1, turn.id)
+        self.assertEqual(current.status, "cancelled")
+        self.assertEqual(
+            [event.event_type for event in self.conv.list_turn_events(1, turn.id)],
+            ["error", "turn_end"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

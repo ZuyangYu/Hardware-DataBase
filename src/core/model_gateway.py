@@ -315,20 +315,54 @@ def _model_name(model: Any) -> str:
     return str(getattr(model, "model_name", "") or getattr(model, "model", "") or "unknown")
 
 
+def _estimated_call_tokens(model: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> int:
+    """Bound one provider request for TPM admission before it is sent.
+
+    Provider SDKs expose usage only after completion.  The preflight estimate
+    therefore uses the serialized prompt size plus the configured output cap;
+    it is deliberately conservative and only affects deployments that enable
+    ``PROVIDER_TPM_LIMIT``.
+    """
+    try:
+        messages = args[0] if args else kwargs.get("messages", "")
+        prompt_chars = len(repr(messages))
+        output_cap = int(getattr(model, "max_tokens", 0) or 0)
+        return max(1, (prompt_chars + 3) // 4 + max(0, output_cap))
+    except Exception:  # noqa: BLE001 - quota estimation must not break setup
+        return 0
+
+
 class _GovernedChatOpenAI(ChatOpenAI):
     hdb_priority: str = PRIORITY_INTERACTIVE
+    hdb_provider: str = "openai-compatible"
+    hdb_model: str = ""
 
     def _generate(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        with get_llm_governor().slot(self.hdb_priority):
+        with get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        ):
             return super()._generate(*args, **kwargs)
 
     def _stream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        with get_llm_governor().slot(self.hdb_priority):
+        with get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        ):
             timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
             yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
 
     async def _agenerate(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        cm = get_llm_governor().slot(self.hdb_priority)
+        cm = get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        )
         await asyncio.to_thread(cm.__enter__)
         try:
             return await super()._agenerate(*args, **kwargs)
@@ -336,7 +370,12 @@ class _GovernedChatOpenAI(ChatOpenAI):
             await asyncio.to_thread(cm.__exit__, None, None, None)
 
     async def _astream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        cm = get_llm_governor().slot(self.hdb_priority)
+        cm = get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        )
         await asyncio.to_thread(cm.__enter__)
         try:
             async for chunk in super()._astream(*args, **kwargs):
@@ -347,13 +386,25 @@ class _GovernedChatOpenAI(ChatOpenAI):
 
 class _GovernedChatOllama(ChatOllama):
     hdb_priority: str = PRIORITY_INTERACTIVE
+    hdb_provider: str = "ollama"
+    hdb_model: str = ""
 
     def _generate(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        with get_llm_governor().slot(self.hdb_priority):
+        with get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        ):
             return super()._generate(*args, **kwargs)
 
     def _stream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        with get_llm_governor().slot(self.hdb_priority):
+        with get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        ):
             timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
             yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
 
@@ -387,6 +438,8 @@ def build_governed_model(
             client_kwargs=kwargs,
             callbacks=callbacks,
             hdb_priority=priority,
+            hdb_provider="ollama",
+            hdb_model=model,
         )
     return _GovernedChatOpenAI(
         model=model,
@@ -399,6 +452,8 @@ def build_governed_model(
         default_headers=default_headers or None,
         callbacks=callbacks,
         hdb_priority=priority,
+        hdb_provider="openai-compatible",
+        hdb_model=model,
     )
 
 

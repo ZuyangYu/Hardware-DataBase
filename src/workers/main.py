@@ -5,7 +5,7 @@ import signal
 import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 import src.settings
 from src.api.context import build_context_for_user
@@ -139,7 +139,12 @@ class HardwareWorker:
 
             invalidate_chat_model_cache()
             self._env_mtime_ns = current_mtime_ns
-            log("Worker reloaded runtime settings")
+            # v3 §11.3: record the reloaded content revision so config drift
+            # across API/worker processes is traceable in logs.
+            log(
+                "Worker reloaded runtime settings "
+                f"(config_revision={getattr(src.settings, 'CONFIG_REVISION', '')})"
+            )
         except Exception as exc:
             error(f"Worker failed to reload runtime settings: {exc}")
 
@@ -505,6 +510,69 @@ class HardwareWorker:
                 loop.stop()
             except Exception:
                 pass
+        pool = getattr(self, "_chat_pool", None)
+        if pool is not None:
+            # Bounded drain (v3 §26): queued work is cancelled, running turns
+            # finish on their own lease; the reaper converges anything lost.
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _ensure_chat_pool(self, concurrency: int) -> ThreadPoolExecutor:
+        """Process-level chat executor, recreated only on a concurrency change."""
+        pool = getattr(self, "_chat_pool", None)
+        if pool is not None and getattr(self, "_chat_pool_workers", 0) == concurrency:
+            return pool
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="hdb-chat")
+        self._chat_pool = pool
+        self._chat_pool_workers = concurrency
+        return pool
+
+    def _process_chat_claims(self) -> bool:
+        """Execute chat turns with slot-based refill (v3 §6.1).
+
+        A finished turn frees its slot immediately instead of waiting for the
+        rest of a batch; the executor lives for the whole process.  `handled`
+        stops a requeued turn from being re-submitted within the same pass.
+        """
+        concurrency = max(1, int(getattr(src.settings, "WORKER_TURN_CONCURRENCY", 1) or 1))
+        batch_size = max(1, int(getattr(src.settings, "WORKER_CLAIM_BATCH_SIZE", 8)))
+        if concurrency <= 1:
+            did_work = False
+            for turn, user_id in self.conversations.list_pending_turn_work(limit=batch_size):
+                self._process_turn(turn, user_id)
+                did_work = True
+            return did_work
+        pool = self._ensure_chat_pool(concurrency)
+        in_flight: dict[Future, str] = {}
+        handled: set[str] = set()
+        did_work = False
+        while self.running:
+            free = concurrency - len(in_flight)
+            if free > 0:
+                candidates = list(
+                    self.conversations.list_pending_turn_work(limit=min(free, batch_size))
+                )
+                for turn, user_id in candidates:
+                    if len(in_flight) >= concurrency:
+                        break
+                    if turn.id in handled:
+                        continue
+                    handled.add(turn.id)
+                    in_flight[pool.submit(self._process_turn, turn, user_id)] = turn.id
+                    did_work = True
+            if not in_flight:
+                break
+            done, _pending = wait(
+                list(in_flight), timeout=1.0, return_when=FIRST_COMPLETED
+            )
+            for future in done:
+                in_flight.pop(future, None)
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 - 单轮失败不影响其他轮
+                    error(f"Chat worker turn future failed: {exc}")
+        return did_work
 
     def start_coordinator_control_loop(self) -> None:
         """Start the parse role's dedicated waiting-turn control loop (P0-004).
@@ -574,25 +642,8 @@ class HardwareWorker:
             self.conversations.expire_queued_turns()
             depth, oldest_age_s = self.conversations.pending_turn_queue_state()
             set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
-            claims = list(self.conversations.list_pending_turn_work(limit=8))
-            concurrency = max(1, int(getattr(src.settings, "WORKER_TURN_CONCURRENCY", 1) or 1))
-            if claims:
-                if concurrency <= 1:
-                    for turn, user_id in claims:
-                        self._process_turn(turn, user_id)
-                        did_work = True
-                else:
-                    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                        futures = [
-                            pool.submit(self._process_turn, turn, user_id)
-                            for turn, user_id in claims
-                        ]
-                        for future in as_completed(futures):
-                            try:
-                                future.result()
-                            except Exception as exc:  # noqa: BLE001 - 单轮失败不影响其他轮
-                                error(f"Chat worker turn future failed: {exc}")
-                            did_work = True
+            if self._process_chat_claims():
+                did_work = True
             depth, oldest_age_s = self.conversations.pending_turn_queue_state()
             set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
         if self._role_enabled("parse") and self.runtime is not None:

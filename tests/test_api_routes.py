@@ -316,6 +316,27 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(record.call_args.kwargs["mode"], "deep")
         self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
 
+    def test_legacy_query_is_marked_non_durable_and_can_fail_closed(self):
+        # v3 §12.4: the turn-less adapter is a compat/debug entry and must be
+        # distinguishable from the persisted turn protocol, including a
+        # fail-closed switch for production deployments.
+        t = self._token("user1")
+        old_flag = src.settings.LEGACY_QUERY_ENABLED
+        self.addCleanup(setattr, src.settings, "LEGACY_QUERY_ENABLED", old_flag)
+        with self.client.stream(
+            "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
+        ) as r:
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers.get("x-hdb-legacy-endpoint"), "turn-less")
+            b"".join(r.iter_bytes())
+
+        src.settings.LEGACY_QUERY_ENABLED = False
+        r = self.client.post(
+            "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
+        )
+        self.assertEqual(r.status_code, 410)
+        self.assertIn("持久化 Turn", r.json()["detail"])
+
     def test_general_query_unified_through_pipeline(self):
         # 未挂载知识库的通用对话不再有直连模型旁路，与 KB 问答一样走统一
         # 的 pipeline（deepagents agent 链路）。
@@ -522,7 +543,7 @@ class ApiRoutesTests(unittest.TestCase):
         ).json()
         self.assertEqual(messages[-1]["content"], "已停止生成")
 
-    def test_stale_turn_sse_closes_with_durable_worker_lost_error(self):
+    def test_stale_turn_sse_subscriber_stays_read_only(self):
         token = self._token("user1")
         session = self.client.post(
             "/api/v1/conversations",
@@ -539,14 +560,20 @@ class ApiRoutesTests(unittest.TestCase):
                 "UPDATE chat_turns SET status = 'streaming', worker_id = 'lost-worker', worker_heartbeat_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
                 (turn["id"],),
             )
+        chunks: list[bytes] = []
         with self.client.stream("GET", f"/api/v1/turns/{turn['id']}/events", headers=self._auth(token)) as response:
             self.assertEqual(response.status_code, 200)
-            body = b"".join(response.iter_bytes()).decode("utf-8")
-        self.assertIn("event: error", body)
-        self.assertIn("任务执行器失去心跳", body)
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+                if b"keepalive" in chunk:
+                    break
+        body = b"".join(chunks).decode("utf-8")
+        # v3 §7.3: the subscriber never writes terminal state. A stale claim is
+        # converged by the worker reaper, not by inventing an SSE error event.
+        self.assertNotIn("event: error", body)
         self.assertEqual(
             self.client.get(f"/api/v1/turns/{turn['id']}", headers=self._auth(token)).json()["status"],
-            "failed",
+            "streaming",
         )
 
     def test_turn_cancel_does_not_disclose_another_users_turn(self):

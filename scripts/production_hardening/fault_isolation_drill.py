@@ -6,7 +6,9 @@ never touched):
 1. baseline: a general-chat turn completes with a healthy chat worker;
 2. authoring worker killed → the next general-chat turn still completes;
 3. parse worker killed → the next general-chat turn still completes;
-4. a second API replica configured with an unreachable ``RAGFLOW_BASE_URL``
+4. the healthy chat worker killed → the surviving chat replica still
+   completes a general-chat turn;
+5. a second API replica configured with an unreachable ``RAGFLOW_BASE_URL``
    still serves ``/health`` and completes general-chat turns (retrieval fault
    ≠ API/main-link outage).
 
@@ -234,12 +236,20 @@ def main(argv: list[str] | None = None) -> int:
             bad_url, str(bad_login.json()["token"]), label="ragflow-down"
         )
 
+        # The healthy chat worker dies; the surviving chat replica (whose
+        # RAGFlow URL is unreachable) must still finish general-chat turns.
+        chat_worker.kill()
+        report["scenarios"]["chat_worker_killed"] = _run_chat_turn(
+            base_url, token, label="after-chat-kill"
+        )
+
         checks = report["scenarios"]
         completed = lambda name: checks.get(name, {}).get("status") == "completed"  # noqa: E731
         report["ok"] = (
             completed("baseline_chat")
             and completed("authoring_worker_killed")
             and completed("parse_worker_killed")
+            and completed("chat_worker_killed")
             and completed("ragflow_unreachable_chat")
             and report["health"].get("after_authoring_kill") == 200
             and report["health"].get("after_parse_kill") == 200

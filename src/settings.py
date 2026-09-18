@@ -1,6 +1,7 @@
 import os
 import stat
 import threading
+import hashlib
 from enum import Enum
 from dotenv import load_dotenv
 
@@ -8,6 +9,16 @@ from dotenv import load_dotenv
 ENV_FILE_ENCODING = "utf-8-sig"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
+CONFIG_REVISION = ""
+
+
+def _config_revision(path: str = ENV_FILE_PATH) -> str:
+    """Stable content revision shared by API and workers at task boundaries."""
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()[:16]
+    except OSError:
+        return "missing"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -31,6 +42,7 @@ def _env_csv(name: str) -> frozenset[str]:
 _ENV_WRITE_LOCK = threading.RLock()
 
 load_dotenv(dotenv_path=ENV_FILE_PATH, encoding=ENV_FILE_ENCODING)
+CONFIG_REVISION = _config_revision()
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
@@ -307,11 +319,34 @@ RESOURCE_QUEUE_MAX_DEPTH = int(os.getenv("RESOURCE_QUEUE_MAX_DEPTH", "256"))
 RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "300"))
 # P0-006: uncertain permits older than this pause new admissions for their
 # resource and raise an operations alert (never auto-release).
-RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "900"))
+RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "600"))
 RESOURCE_GOVERNOR_MAINTENANCE_SECONDS = float(
     os.getenv("RESOURCE_GOVERNOR_MAINTENANCE_SECONDS", "5")
 )
 RESOURCE_GOVERNOR_DEPLOYMENT_ID = os.getenv("RESOURCE_GOVERNOR_DEPLOYMENT_ID", "local").strip() or "local"
+# Control-plane storage: sqlite (default, auth.db) or postgres.  The
+# PostgreSQL backend stays disabled until the conversation/memory port and
+# the cutover rehearsal land; the provider guard rejects silent enablement.
+CONTROL_PLANE_BACKEND = os.getenv("CONTROL_PLANE_BACKEND", "sqlite").strip().lower()
+CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
+CONTROL_PLANE_POOL_SIZE = int(os.getenv("CONTROL_PLANE_POOL_SIZE", "8"))
+# Redis realtime plane (cancel fast path first; empty URL disables it).
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+CANCEL_FAST_PATH_ENABLED = _env_bool("CANCEL_FAST_PATH_ENABLED", True)
+CANCEL_KEY_TTL_SECONDS = int(os.getenv("CANCEL_KEY_TTL_SECONDS", "7200"))
+TURN_EVENT_STREAM_TTL_SECONDS = int(os.getenv("TURN_EVENT_STREAM_TTL_SECONDS", "7200"))
+TURN_EVENT_STREAM_MAXLEN = int(os.getenv("TURN_EVENT_STREAM_MAXLEN", "5000"))
+# L2 distributed admission (Redis Lua); requires REDIS_URL to take effect.
+DISTRIBUTED_ADMISSION_ENABLED = _env_bool("DISTRIBUTED_ADMISSION_ENABLED", False)
+DISTRIBUTED_ADMISSION_TTL_SECONDS = int(os.getenv("DISTRIBUTED_ADMISSION_TTL_SECONDS", "120"))
+# Provider RPM budget counted at the model boundary (0 disables).
+PROVIDER_RPM_LIMIT = int(os.getenv("PROVIDER_RPM_LIMIT", "0"))
+# Provider token budget per minute, counted from estimated input/output tokens.
+PROVIDER_TPM_LIMIT = int(os.getenv("PROVIDER_TPM_LIMIT", "0"))
+# Legacy turn-less POST /query adapter (v3 §12.4).  It keeps no durable Turn,
+# so it is debug/compat only and must not back production chat traffic; the
+# durable path is POST /conversations/{id}/turns.  Set false to fail it closed.
+LEGACY_QUERY_ENABLED = _env_bool("LEGACY_QUERY_ENABLED", True)
 # Production processes must point at a pre-provisioned quota database instead
 # of silently creating a same-named local file.
 RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool(
@@ -531,6 +566,33 @@ def ensure_runtime_dirs():
 ensure_runtime_dirs()
 
 
+# v3 §11.2: settings that only take effect after a process restart (storage
+# backends, DSNs, role/port and other construction-time wiring).  Everything
+# else is reloaded at task boundaries.  Readiness reports both the live config
+# revision and this list so operators can tell hot reload from restart.
+RESTART_REQUIRED_SETTINGS = frozenset(
+    {
+        "STORAGE_DIR",
+        "AUTH_DB_PATH",
+        "CONTROL_PLANE_BACKEND",
+        "CONTROL_PLANE_DATABASE_URL",
+        "CONTROL_PLANE_POOL_SIZE",
+        "REDIS_URL",
+        "RESOURCE_GOVERNOR_BACKEND",
+        "RESOURCE_GOVERNOR_DATABASE_URL",
+        "RESOURCE_GOVERNOR_SCOPE",
+        "AGENT_CHECKPOINT_BACKEND",
+        "AGENT_CHECKPOINT_DATABASE_URL",
+        "MEMORY_STORE_BACKEND",
+        "MEMORY_DATABASE_URL",
+        "MEMORY_SQLITE_PATH",
+        "WORKER_ROLE",
+        "HDB_API_HOST",
+        "HDB_API_PORT",
+    }
+)
+
+
 DEFAULT_VALUES = {
     "RAGFLOW_BASE_URL": "http://localhost:9380",
     "RAGFLOW_API_KEY": "",
@@ -658,10 +720,23 @@ DEFAULT_VALUES = {
     "RESOURCE_QUEUE_MAX_WAIT_SECONDS": "30",
     "RESOURCE_QUEUE_MAX_DEPTH": "256",
     "RESOURCE_PERMIT_LEASE_SECONDS": "300",
-    "RESOURCE_UNCERTAIN_ESCALATE_SECONDS": "900",
+    "RESOURCE_UNCERTAIN_ESCALATE_SECONDS": "600",
     "RESOURCE_GOVERNOR_MAINTENANCE_SECONDS": "5",
     "RESOURCE_GOVERNOR_DEPLOYMENT_ID": "local",
     "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED": "false",
+    "CONTROL_PLANE_BACKEND": "sqlite",
+    "CONTROL_PLANE_DATABASE_URL": "",
+    "CONTROL_PLANE_POOL_SIZE": "8",
+    "REDIS_URL": "",
+    "CANCEL_FAST_PATH_ENABLED": "true",
+    "CANCEL_KEY_TTL_SECONDS": "7200",
+    "TURN_EVENT_STREAM_TTL_SECONDS": "7200",
+    "TURN_EVENT_STREAM_MAXLEN": "5000",
+    "DISTRIBUTED_ADMISSION_ENABLED": "false",
+    "DISTRIBUTED_ADMISSION_TTL_SECONDS": "120",
+    "PROVIDER_RPM_LIMIT": "0",
+    "PROVIDER_TPM_LIMIT": "0",
+    "LEGACY_QUERY_ENABLED": "true",
     "CHAT_QUEUE_DEADLINE_SECONDS": "600",
     "RESOURCE_LLM_MAX_CONCURRENT": "4",
     "RESOURCE_LLM_RESERVED_INTERACTIVE": "2",
@@ -844,6 +919,13 @@ def reload_settings():
     global RESOURCE_QUEUE_MAX_WAIT_SECONDS, RESOURCE_QUEUE_MAX_DEPTH, RESOURCE_PERMIT_LEASE_SECONDS
     global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
     global RESOURCE_GOVERNOR_DEPLOYMENT_ID, RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED
+    global CONTROL_PLANE_BACKEND, CONTROL_PLANE_DATABASE_URL, CONTROL_PLANE_POOL_SIZE
+    global REDIS_URL, CANCEL_FAST_PATH_ENABLED, CANCEL_KEY_TTL_SECONDS
+    global TURN_EVENT_STREAM_TTL_SECONDS, TURN_EVENT_STREAM_MAXLEN
+    global DISTRIBUTED_ADMISSION_ENABLED, DISTRIBUTED_ADMISSION_TTL_SECONDS
+    global PROVIDER_RPM_LIMIT
+    global PROVIDER_TPM_LIMIT
+    global LEGACY_QUERY_ENABLED
     global CHAT_QUEUE_DEADLINE_SECONDS
     global RESOURCE_LLM_MAX_CONCURRENT, RESOURCE_LLM_RESERVED_INTERACTIVE
     global RESOURCE_RAG_MAX_CONCURRENT, RESOURCE_RAG_RESERVED_INTERACTIVE
@@ -1038,7 +1120,7 @@ def reload_settings():
     RESOURCE_QUEUE_MAX_WAIT_SECONDS = float(os.getenv("RESOURCE_QUEUE_MAX_WAIT_SECONDS", "30"))
     RESOURCE_QUEUE_MAX_DEPTH = int(os.getenv("RESOURCE_QUEUE_MAX_DEPTH", "256"))
     RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "300"))
-    RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "900"))
+    RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "600"))
     RESOURCE_GOVERNOR_MAINTENANCE_SECONDS = float(
         os.getenv("RESOURCE_GOVERNOR_MAINTENANCE_SECONDS", "5")
     )
@@ -1046,6 +1128,19 @@ def reload_settings():
     RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool(
         "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False
     )
+    CONTROL_PLANE_BACKEND = os.getenv("CONTROL_PLANE_BACKEND", "sqlite").strip().lower()
+    CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
+    CONTROL_PLANE_POOL_SIZE = int(os.getenv("CONTROL_PLANE_POOL_SIZE", "8"))
+    REDIS_URL = os.getenv("REDIS_URL", "").strip()
+    CANCEL_FAST_PATH_ENABLED = _env_bool("CANCEL_FAST_PATH_ENABLED", True)
+    CANCEL_KEY_TTL_SECONDS = int(os.getenv("CANCEL_KEY_TTL_SECONDS", "7200"))
+    TURN_EVENT_STREAM_TTL_SECONDS = int(os.getenv("TURN_EVENT_STREAM_TTL_SECONDS", "7200"))
+    TURN_EVENT_STREAM_MAXLEN = int(os.getenv("TURN_EVENT_STREAM_MAXLEN", "5000"))
+    DISTRIBUTED_ADMISSION_ENABLED = _env_bool("DISTRIBUTED_ADMISSION_ENABLED", False)
+    DISTRIBUTED_ADMISSION_TTL_SECONDS = int(os.getenv("DISTRIBUTED_ADMISSION_TTL_SECONDS", "120"))
+    PROVIDER_RPM_LIMIT = int(os.getenv("PROVIDER_RPM_LIMIT", "0"))
+    PROVIDER_TPM_LIMIT = int(os.getenv("PROVIDER_TPM_LIMIT", "0"))
+    LEGACY_QUERY_ENABLED = _env_bool("LEGACY_QUERY_ENABLED", True)
     CHAT_QUEUE_DEADLINE_SECONDS = int(os.getenv("CHAT_QUEUE_DEADLINE_SECONDS", "600"))
     RESOURCE_LLM_MAX_CONCURRENT = int(os.getenv("RESOURCE_LLM_MAX_CONCURRENT", "4"))
     RESOURCE_LLM_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_LLM_RESERVED_INTERACTIVE", "2"))
@@ -1296,6 +1391,7 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
     truncated .env (which holds the live API keys). Callers should hold this
     via the module-level lock; concurrent PUT /config requests serialise here.
     """
+    global CONFIG_REVISION
     if env_path is None:
         env_path = os.path.join(BASE_DIR, ".env")
 
@@ -1358,6 +1454,8 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
             if mode is not None:
                 os.chmod(tmp_path, mode)
             os.replace(tmp_path, env_path)
+            if os.path.abspath(env_path) == os.path.abspath(ENV_FILE_PATH):
+                CONFIG_REVISION = _config_revision(env_path)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -1401,6 +1499,13 @@ _INT_SETTING_KEYS = frozenset({
     "RESOURCE_QUEUE_MAX_DEPTH",
     "RESOURCE_PERMIT_LEASE_SECONDS",
     "CHAT_QUEUE_DEADLINE_SECONDS",
+    "CONTROL_PLANE_POOL_SIZE",
+    "CANCEL_KEY_TTL_SECONDS",
+    "TURN_EVENT_STREAM_TTL_SECONDS",
+    "TURN_EVENT_STREAM_MAXLEN",
+    "DISTRIBUTED_ADMISSION_TTL_SECONDS",
+    "PROVIDER_RPM_LIMIT",
+    "PROVIDER_TPM_LIMIT",
     "ADMISSION_MAX_UNTERMINAL_TURNS_PER_SESSION",
     "ADMISSION_MAX_UNTERMINAL_TURNS_PER_USER",
     "RESOURCE_LLM_MAX_CONCURRENT",
@@ -1592,3 +1697,23 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
             raise ValueError(
                 "RESOURCE_GOVERNOR_BACKEND=postgres 需要 RESOURCE_GOVERNOR_SCOPE=deployment"
             )
+
+    control_backend = _value("CONTROL_PLANE_BACKEND").lower() or "sqlite"
+    if control_backend not in {"sqlite", "postgres"}:
+        raise ValueError(
+            f"CONTROL_PLANE_BACKEND 必须是 sqlite 或 postgres，当前值: {control_backend!r}"
+        )
+    if control_backend == "postgres":
+        if not _value("CONTROL_PLANE_DATABASE_URL"):
+            raise ValueError(
+                "CONTROL_PLANE_BACKEND=postgres 需要显式配置 CONTROL_PLANE_DATABASE_URL，"
+                "否则会静默落到本地 auth.db"
+            )
+        # The PostgreSQL control plane now owns conversation execution, the
+        # memory ledger and the result-export ledger (v3 §5.1).  Auth, audit
+        # logs, document authoring and attachment bytes intentionally stay on
+        # the local SQLite stores: they are separate authorization/log domains
+        # and never join a control-plane transaction.  Readiness
+        # (``/health/ready`` -> ``control_plane``) fails closed when the
+        # versioned schema is missing or stale; see control-plane-port-inventory
+        # §3-§5 for the declared boundary and the cutover rehearsal.

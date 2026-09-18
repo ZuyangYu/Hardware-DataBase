@@ -3,6 +3,7 @@ import re
 from typing import Any
 
 import src.settings
+from src.circuit.index_lock import circuit_index_lock
 from src.core.query_tokens import tokenize_hardware_query
 from src.ingestion.kb_paths import safe_child_path, validate_kb_name
 from src.pipelines.spreadsheet.pipeline import SpreadsheetIndexRequest, SpreadsheetIndexResult, SpreadsheetPipeline
@@ -30,10 +31,15 @@ class SpreadsheetIndexService:
         request: SpreadsheetIndexRequest,
         progress_callback=None,
     ) -> SpreadsheetIndexResult:
-        return self._pipeline(request.department_id, request.kb_name).parse_and_index(
-            request,
-            progress_callback=progress_callback,
-        )
+        # v3 §12.2: the per-KB SQLite index has a single cross-process writer.
+        # API-side daemon parsers and dedicated workers may otherwise open the
+        # same index concurrently; the exclusive lock serialises every
+        # mutation while readers keep their WAL snapshot.
+        with circuit_index_lock(self.kb_index_path(request.department_id, request.kb_name), exclusive=True):
+            return self._pipeline(request.department_id, request.kb_name).parse_and_index(
+                request,
+                progress_callback=progress_callback,
+            )
 
     def get_document_profile(self, record: Any) -> dict | None:
         return self._pipeline(record.department_id, record.kb_name).get_document_profile(record.id)
@@ -53,7 +59,8 @@ class SpreadsheetIndexService:
         return TableIndexStore(db_path).rank_documents_by_terms(terms, limit=limit)
 
     def delete_record(self, record: Any):
-        self._pipeline(record.department_id, record.kb_name).delete(record.id)
+        with circuit_index_lock(self.kb_index_path(record.department_id, record.kb_name), exclusive=True):
+            self._pipeline(record.department_id, record.kb_name).delete(record.id)
 
     def db_path(self, department_id: str | int | None, kb_name: str, create: bool = True) -> str:
         return os.path.join(self.kb_index_path(department_id, kb_name, create=create), "table_indexes.db")

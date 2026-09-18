@@ -122,11 +122,18 @@ def _agent_active(delta: int) -> None:
 
 
 # LangGraph checkpointer：agent 会话状态（thread 级完整消息历史）持久化。
-# 进程级单例由 checkpoints.factory 按 AGENT_CHECKPOINT_BACKEND 装配（P1-001）。
+# PostgreSQL 后端为每次构图返回独立 saver（共享连接池），避免实例锁串行化
+# 并发会话；SQLite 后端保持进程级单例（v3 §10）。
 def _get_checkpointer() -> Any:
     from src.agents.checkpoints.factory import get_checkpointer
 
     return get_checkpointer()
+
+
+def _create_checkpointer() -> Any:
+    from src.agents.checkpoints.factory import create_checkpointer
+
+    return create_checkpointer()
 
 
 def forget_thread(thread_id: str) -> bool:
@@ -3354,7 +3361,11 @@ class MultiSourceAgentRunner:
         # 会话状态持久化：thread 模式挂 checkpointer，LangGraph 按
         # configurable.thread_id 自动恢复/续写该会话的完整消息历史；
         # stateless 路径（legacy /query、eval、测试）保持现状。
-        checkpointer = _get_checkpointer() if (persist_thread and str(thread_id or "").strip()) else None
+        checkpointer = (
+            _create_checkpointer()
+            if (persist_thread and str(thread_id or "").strip())
+            else None
+        )
         agent = create_deep_agent(
             model=model, tools=tools, system_prompt=system_prompt, checkpointer=checkpointer
         )

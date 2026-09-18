@@ -444,18 +444,29 @@ class MemoryWorker:
             expected_scope = scope_fingerprint(scope="project", department_id=session["department_id"], kb_id=session["kb_id"])
             if expected_scope != job.scope_fingerprint:
                 raise StaleMemoryJob("project scope changed")
-            rows = conn.execute(
-                """SELECT DISTINCT m.id, m.session_id, m.role, m.content, m.created_at,
+            # Branch on the optional lower bound instead of ``? IS NULL``:
+            # PostgreSQL cannot infer the type of a NULL parameter there.
+            message_sql = """SELECT DISTINCT m.id, m.session_id, m.role, m.content, m.created_at,
                     t.id AS turn_id
                     FROM chat_messages m
                     JOIN chat_turns t ON t.session_id = m.session_id
                       AND (t.user_message_id = m.id OR t.assistant_message_id = m.id)
                       AND t.status = 'completed'
-                    WHERE m.session_id = ? AND m.id <= ?
-                      AND (? IS NULL OR m.id >= ?)
-                    ORDER BY m.id""",
-                (job.session_id, job.target_message_id, job.source_start_message_id, job.source_start_message_id),
-            ).fetchall()
+                    WHERE m.session_id = ? AND m.id <= ?"""
+            if job.source_start_message_id is None:
+                rows = conn.execute(
+                    message_sql + " ORDER BY m.id",
+                    (job.session_id, job.target_message_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    message_sql + " AND m.id >= ? ORDER BY m.id",
+                    (
+                        job.session_id,
+                        job.target_message_id,
+                        job.source_start_message_id,
+                    ),
+                ).fetchall()
         messages = self._rows_to_messages(rows)
         if not messages or int(messages[-1]["id"]) != int(job.target_message_id):
             raise StaleMemoryJob("no stable completed messages at project target")

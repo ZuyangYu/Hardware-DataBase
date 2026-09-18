@@ -1280,35 +1280,39 @@ class PostgresQuotaStore:
 
     def try_acquire_maintenance(self, owner_id: str, *, lease_seconds: int = 15) -> int | None:
         owner = str(owner_id or "")
-        now = datetime.now(timezone.utc)
-        expires = now + timedelta(seconds=max(1, int(lease_seconds)))
+        lease = max(1, int(lease_seconds))
 
         def _op() -> int | None:
             with self._transaction() as conn:
                 row = conn.execute(
-                    "SELECT * FROM resource_maintenance_lease WHERE scope = %s FOR UPDATE",
+                    """
+                    SELECT *, (lease_expires_at IS NOT NULL AND lease_expires_at > now())
+                        AS lease_active
+                    FROM resource_maintenance_lease WHERE scope = %s FOR UPDATE
+                    """,
                     (self.MAINTENANCE_SCOPE,),
                 ).fetchone()
                 if row is not None and str(row["owner_id"] or "") == owner:
                     conn.execute(
                         """
                         UPDATE resource_maintenance_lease
-                        SET lease_expires_at = %s, updated_at = %s
+                        SET lease_expires_at = now() + make_interval(secs => %s),
+                            updated_at = now()
                         WHERE scope = %s
                         """,
-                        (expires, now, self.MAINTENANCE_SCOPE),
+                        (lease, self.MAINTENANCE_SCOPE),
                     )
                     return int(row["fencing_token"] or 0)
-                if row is not None and _lease_active(row["lease_expires_at"], now):
+                if row is not None and bool(row["lease_active"]):
                     return None
                 if row is None:
                     conn.execute(
                         """
                         INSERT INTO resource_maintenance_lease
                             (scope, owner_id, fencing_token, lease_expires_at, updated_at)
-                        VALUES (%s, %s, 1, %s, %s)
+                        VALUES (%s, %s, 1, now() + make_interval(secs => %s), now())
                         """,
-                        (self.MAINTENANCE_SCOPE, owner, expires, now),
+                        (self.MAINTENANCE_SCOPE, owner, lease),
                     )
                 else:
                     conn.execute(
@@ -1316,11 +1320,11 @@ class PostgresQuotaStore:
                         UPDATE resource_maintenance_lease
                         SET owner_id = %s,
                             fencing_token = fencing_token + 1,
-                            lease_expires_at = %s,
-                            updated_at = %s
+                            lease_expires_at = now() + make_interval(secs => %s),
+                            updated_at = now()
                         WHERE scope = %s
                         """,
-                        (owner, expires, now, self.MAINTENANCE_SCOPE),
+                        (owner, lease, self.MAINTENANCE_SCOPE),
                     )
                 current = conn.execute(
                     "SELECT fencing_token FROM resource_maintenance_lease WHERE scope = %s",
@@ -1331,19 +1335,19 @@ class PostgresQuotaStore:
         return self._run_with_retry(_op)
 
     def renew_maintenance(self, owner_id: str, token: int, *, lease_seconds: int = 15) -> bool:
-        expires = datetime.now(timezone.utc) + timedelta(seconds=max(1, int(lease_seconds)))
+        lease = max(1, int(lease_seconds))
 
         def _op() -> bool:
             with self._transaction() as conn:
                 cursor = conn.execute(
                     """
                     UPDATE resource_maintenance_lease
-                    SET lease_expires_at = %s, updated_at = %s
+                    SET lease_expires_at = now() + make_interval(secs => %s),
+                        updated_at = now()
                     WHERE scope = %s AND owner_id = %s AND fencing_token = %s
                     """,
                     (
-                        expires,
-                        datetime.now(timezone.utc),
+                        lease,
                         self.MAINTENANCE_SCOPE,
                         str(owner_id),
                         int(token),
@@ -1359,11 +1363,10 @@ class PostgresQuotaStore:
                 cursor = conn.execute(
                     """
                     UPDATE resource_maintenance_lease
-                    SET owner_id = '', lease_expires_at = NULL, updated_at = %s
+                    SET owner_id = '', lease_expires_at = NULL, updated_at = now()
                     WHERE scope = %s AND owner_id = %s AND fencing_token = %s
                     """,
                     (
-                        datetime.now(timezone.utc),
                         self.MAINTENANCE_SCOPE,
                         str(owner_id),
                         int(token),
@@ -1399,9 +1402,7 @@ class PostgresQuotaStore:
         owner_id: str,
         attempt_id: str,
     ) -> str | None:
-        now = datetime.now(timezone.utc)
         permit_id = str(uuid.uuid4())
-        expires_at = now + timedelta(seconds=self.lease_seconds)
 
         def _op() -> str | None:
             conn = self._connect()
@@ -1448,7 +1449,10 @@ class PostgresQuotaStore:
                         INSERT INTO resource_permits (
                             permit_id, resource, interactive, owner_id, attempt_id, weight,
                             state, expires_at, created_at, started_at
-                        ) VALUES (%s, %s, %s, %s, %s, 1, 'active', %s, %s, %s)
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, 1, 'active',
+                            now() + make_interval(secs => %s), now(), now()
+                        )
                         """,
                         (
                             permit_id,
@@ -1456,9 +1460,7 @@ class PostgresQuotaStore:
                             bool(interactive),
                             str(owner_id),
                             str(attempt_id),
-                            expires_at,
-                            now,
-                            now,
+                            self.lease_seconds,
                         ),
                     )
                     return permit_id
@@ -1482,16 +1484,15 @@ class PostgresQuotaStore:
         self._run_with_retry(_op)
 
     def renew(self, permit_id: str) -> bool:
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=self.lease_seconds)
-
         def _op() -> bool:
             with self._transaction() as conn:
                 cursor = conn.execute(
                     """
-                    UPDATE resource_permits SET expires_at = %s
+                    UPDATE resource_permits
+                    SET expires_at = now() + make_interval(secs => %s)
                     WHERE permit_id = %s AND state = 'active'
                     """,
-                    (expires_at, permit_id),
+                    (self.lease_seconds, permit_id),
                 )
                 return int(cursor.rowcount or 0) > 0
 

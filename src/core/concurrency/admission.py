@@ -37,11 +37,18 @@ class AdmissionController:
         kind_limits: dict[str, tuple[float, float]] | None = None,
         model_rpm_per_user: float = 0.0,
         model_rpm_per_tenant: float = 0.0,
+        distributed: bool = False,
+        distributed_ttl_seconds: int = 120,
     ) -> None:
         self.enabled = bool(enabled)
         self.queue_depth_limit = max(1, int(queue_depth_limit))
         self.queue_depth_provider = queue_depth_provider
         self.retry_after_seconds = max(0.1, float(retry_after_seconds))
+        # L2 authoritative limiter (Redis); when enabled, Redis being
+        # unavailable rejects new chat requests instead of multiplying the
+        # quota per API replica (v3 §14.4).
+        self.distributed = bool(distributed)
+        self.distributed_ttl_seconds = max(1, int(distributed_ttl_seconds))
         # Resource-type buckets (plan §4.5).  ``heavy`` stays a compatibility
         # alias for document/export/ocr-style work.
         self._limits: dict[str, tuple[float, float]] = {
@@ -97,13 +104,46 @@ class AdmissionController:
                     now,
                     reason="rate_limit_model",
                 )
+        if self.distributed:
+            tenant_key = tenant_id if tenant_id not in (None, "") else "default"
+            self._consume_distributed(
+                f"hdb:quota:user:{tenant_key}:{user_id}:{kind}",
+                user_rate,
+                reason="rate_limit_user",
+            )
+            if tenant_id not in (None, ""):
+                self._consume_distributed(
+                    f"hdb:quota:tenant:{tenant_key}:{kind}",
+                    tenant_rate,
+                    reason="rate_limit_tenant",
+                )
         if kind in {"chat", "deep"} and self.queue_depth_provider is not None:
             try:
                 depth = int(self.queue_depth_provider())
-            except Exception:
-                depth = 0
+            except Exception as exc:
+                # A failed queue-state read must not silently report an empty
+                # queue (v3 §9.2): fail closed with an explicit reason.
+                raise AdmissionRejected(
+                    "queue_state_unavailable", retry_after=self.retry_after_seconds
+                ) from exc
             if depth >= self.queue_depth_limit:
                 raise AdmissionRejected("queue_full", retry_after=self.retry_after_seconds)
+
+    def _consume_distributed(self, key: str, rate: float, *, reason: str) -> None:
+        from .distributed_limiter import allow
+
+        decision = allow(
+            key,
+            rate_per_minute=rate,
+            burst=max(1.0, min(float(rate), 10.0)),
+            ttl_seconds=self.distributed_ttl_seconds,
+        )
+        if decision is None:
+            raise AdmissionRejected(
+                "admission_unavailable", retry_after=self.retry_after_seconds
+            )
+        if not decision:
+            raise AdmissionRejected(reason, retry_after=self.retry_after_seconds)
 
     @staticmethod
     def _normalize_resource(resource: str) -> str:
@@ -202,6 +242,13 @@ def get_admission_controller() -> AdmissionController:
                 ),
                 model_rpm_per_tenant=_optional_rate(
                     getattr(settings, "ADMISSION_MODEL_RPM_PER_TENANT", ""), 0.0
+                ),
+                distributed=bool(
+                    getattr(settings, "DISTRIBUTED_ADMISSION_ENABLED", False)
+                )
+                and bool(str(getattr(settings, "REDIS_URL", "") or "").strip()),
+                distributed_ttl_seconds=int(
+                    getattr(settings, "DISTRIBUTED_ADMISSION_TTL_SECONDS", 120) or 120
                 ),
             )
         return _CONTROLLER

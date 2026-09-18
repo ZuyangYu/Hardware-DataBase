@@ -40,6 +40,32 @@ def expire_memory_records(
     days = _retention_days(retention_days)
     if days is None:
         return 0
+    import src.settings as settings
+
+    if (
+        str(getattr(settings, "CONTROL_PLANE_BACKEND", "sqlite") or "sqlite").lower()
+        == "postgres"
+    ):
+        dsn = str(getattr(settings, "CONTROL_PLANE_DATABASE_URL", "") or "").strip()
+        if not dsn:
+            raise RuntimeError(
+                "CONTROL_PLANE_BACKEND=postgres requires CONTROL_PLANE_DATABASE_URL"
+            )
+        from psycopg.rows import dict_row
+
+        import psycopg
+
+        from src.storage.control_plane.memory_invalidation import (
+            expire_memory_records_postgres,
+        )
+
+        with psycopg.connect(dsn, row_factory=dict_row) as conn:
+            expired = expire_memory_records_postgres(
+                conn, retention_days=days, now=now, limit=limit
+            )
+            conn.commit()
+        return expired
+
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=days)
     cutoff_text = cutoff.isoformat()
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -61,7 +87,7 @@ def expire_memory_records(
             ).fetchall()
             for row in rows:
                 conn.execute(
-                    "UPDATE memory_sources SET source_valid = 0, invalidated_at = COALESCE(invalidated_at, ?) WHERE memory_id = ?",
+                    "UPDATE memory_sources SET source_valid = FALSE, invalidated_at = COALESCE(invalidated_at, ?) WHERE memory_id = ?",
                     (utc_now(), row["memory_id"]),
                 )
                 _invalidate_memory_in_transaction(

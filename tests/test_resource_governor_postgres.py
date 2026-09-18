@@ -208,6 +208,19 @@ class PostgresQuotaStoreTests(unittest.TestCase):
         self.assertEqual(snapshot["llm"]["active"], 1)
         self.assertEqual(snapshot["llm"]["uncertain"], 1)
 
+    def test_expiry_uses_database_clock(self):
+        permit = self.store.try_acquire(
+            "llm", capacity=1, reserved_interactive=0, interactive=True, owner_id="w1", attempt_id="a1"
+        )
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            remaining = conn.execute(
+                "SELECT expires_at - now() FROM resource_permits WHERE permit_id = %s",
+                (permit,),
+            ).fetchone()[0].total_seconds()
+        # lease_seconds=30 in setUp; the remaining time must come from now().
+        self.assertGreater(remaining, 25)
+        self.assertLess(remaining, 35)
+
     def test_renew_extends_only_active_permits(self):
         permit = self.store.try_acquire(
             "tool", capacity=1, reserved_interactive=0, interactive=True, owner_id="w1", attempt_id="a1"
