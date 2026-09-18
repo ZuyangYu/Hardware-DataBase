@@ -22,6 +22,9 @@ const hardwareKb = {
   department_name: '研发部',
   permission: 'write' as const,
   registered: true,
+  owner_user_id: 1,
+  is_shared: false,
+  is_owner: true,
 };
 
 function cardEvent(card: Record<string, unknown>): string {

@@ -12,7 +12,6 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from starlette.concurrency import run_in_threadpool
 
 import src.settings
 from src.agents.runner import strip_narration_segments
@@ -45,7 +44,6 @@ from src.api.schemas import (
     AttachmentSnapshotView,
     CreateTurnRequest,
     MessageView,
-    QueryRequest,
     TurnStartResponse,
     TurnView,
 )
@@ -612,6 +610,19 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             conv.fail_turn(user.id, turn_id, "已停止生成", cancelled=True)
             emit("turn_end", {"status": "cancelled"})
             outcome_status = "cancelled"
+            # 与 legacy 路径对齐：取消也要落一条 trace，否则日志中心看不到
+            # 被停止的查询（legacy 记的是 failed + client disconnected）。
+            _record_query_trace(
+                user=user,
+                kb_name="" if turn.kb_name == GENERAL_CHAT_KB_NAME else turn.kb_name,
+                original_query=turn.query,
+                thread_id=str(turn.session_id),
+                summary=summary,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                status="failed",
+                error_message="已停止生成",
+                turn_id=turn_id,
+            )
             return
 
         answer = strip_narration_segments("".join(answer_parts), narrated)
@@ -640,6 +651,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         )
         emit("turn_end", {"status": "completed"})
         outcome_status = "completed"
+        # P1-9 行为保留：trace 状态由回答文本 + 检索 summary 推导，而不是
+        # 无论 no_evidence / partial_failure 都硬编码 success。
+        trace_status, trace_error = query_trace_status(answer, summary)
         _record_query_trace(
             user=user,
             kb_name="" if turn.kb_name == GENERAL_CHAT_KB_NAME else turn.kb_name,
@@ -647,7 +661,8 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             thread_id=str(turn.session_id),
             summary=summary,
             latency_ms=int((time.monotonic() - start) * 1000),
-            status="success",
+            status=trace_status,
+            error_message=trace_error,
             turn_id=turn_id,
         )
     except Exception as exc:
@@ -1048,270 +1063,6 @@ async def stream_turn_events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
-
-
-@router.post("/query")
-async def query(
-    body: QueryRequest,
-    request: Request,
-    user: AuthUser = Depends(current_user),
-    auth: AuthService = Depends(get_auth_service),
-):
-    if (
-        body.document_flow is True
-        and body.document_context is None
-        and (
-            not _authoring_context_candidate(
-                query=body.query,
-                document_flow=body.document_flow,
-                kb_name=body.kb_name,
-                has_attachments=False,
-            )
-            or body.kb_name in ("", GENERAL_CHAT_KB_NAME)
-        )
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail="document_flow=true requires an authorized knowledge-base, attachment, or task scope",
-        )
-    if body.kb_name in ("", GENERAL_CHAT_KB_NAME):
-        if body.document_context is not None:
-            raise HTTPException(status_code=400, detail="document context requires a knowledge-base query")
-    ctx = build_context_for_user(user, body.kb_name, auth=auth)
-    reject_system_admin_kb_access(ctx)
-    if body.kb_name not in ("", GENERAL_CHAT_KB_NAME) and not ctx.has_kb_permission(body.kb_name, "read"):
-        raise HTTPException(status_code=403, detail="read permission required")
-
-    document_context = None
-    raw_document_context: Any = body.document_context
-    if raw_document_context is None and _authoring_context_candidate(
-        query=body.query,
-        document_flow=body.document_flow,
-        kb_name=body.kb_name,
-        has_attachments=False,
-    ):
-        raw_document_context = {
-            "version": "v2",
-            "knowledge_base_name": (
-                None if body.kb_name in ("", GENERAL_CHAT_KB_NAME) else body.kb_name
-            ),
-            "source_scope": "knowledge_base_only",
-        }
-    if body.document_flow is True and raw_document_context is None:
-        raise HTTPException(
-            status_code=422,
-            detail="document_flow=true requires an authorized knowledge-base, attachment, or task scope",
-        )
-    if raw_document_context is not None:
-        payload_version = str(
-            getattr(raw_document_context, "version", None)
-            or (raw_document_context.get("version") if isinstance(raw_document_context, dict) else "")
-            or ""
-        ).strip().lower()
-        if body.kb_name in ("", GENERAL_CHAT_KB_NAME) and payload_version != "v2":
-            raise HTTPException(status_code=400, detail="document context requires an authorized source scope")
-        try:
-            document_context = build_document_context(
-                raw_document_context,
-                ctx=ctx,
-                expected_kb=(None if body.kb_name in ("", GENERAL_CHAT_KB_NAME) else body.kb_name),
-            )
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    pipeline = _resolve_pipeline(request)
-    # Keep only the most recent 5 history turns -- Streamlit slices [-5:] and
-    # the agent prompt isn't sized for unbounded history.
-    history = [tuple(h) for h in body.history[-_SHORT_TERM_HISTORY_LIMIT:]]
-
-    # pipeline.query is a *sync* generator whose _RUN_RECORD ContextVar is set
-    # inside the generator body. If we iterated it via run_in_threadpool the
-    # worker thread could change between next() calls and lose the record, so
-    # the footer/summary read afterwards would be empty. Instead a single
-    # dedicated producer thread owns the whole generator + the post-stream
-    # observability reads; the async side only pulls from the queue.
-    q: queue.Queue = queue.Queue(maxsize=64)
-    sentinel = object()
-    cancel = threading.Event()
-
-    def _put(item) -> None:
-        # Block on a full queue (backpressure) but wake periodically so the
-        # producer can notice the consumer has disconnected and stop early,
-        # instead of buffering an unbounded stream the client will never read.
-        while not cancel.is_set():
-            try:
-                q.put(item, timeout=0.5)
-                return
-            except queue.Full:
-                continue
-        # Consumer gone: drop the item.
-
-    def producer() -> None:
-        start = time.monotonic()
-        summary: dict = {}
-        short_term_memory = _short_term_memory_summary(
-            history,
-            source="client_history",
-        )
-        gen = None
-        observation = observe.chain(
-            "hdb.chat.turn",
-            **{
-                "hdb.session.id": body.thread_id,
-                "session.id": body.thread_id,
-                "hdb.query.mode": "deep",
-                "hdb.query.source": "legacy_api",
-            },
-        ).start()
-        observation.set_input(body.query, content_kind="query")
-        _set_short_term_memory_observation(observation, short_term_memory)
-        outcome_status = "failed"
-        try:
-            answer_parts: list[str] = []
-            narrated: list[str] = []
-
-            def _forward_event(e: dict) -> None:
-                if e.get("type") == "narration":
-                    narrated.append(str((e.get("payload") or {}).get("text") or ""))
-                _put((e["type"], e.get("payload") or {}))
-
-            gen = _query_generator(
-                pipeline,
-                body.query,
-                body.kb_name,
-                history,
-                ctx,
-                body.thread_id,
-                _forward_event,
-                "deep",
-                cancel.is_set,
-                wiki_assist=body.wiki_assist,
-                document_context=document_context,
-                document_flow=body.document_flow,
-            )
-            for chunk in gen:
-                if cancel.is_set():
-                    break
-                if chunk:
-                    answer_parts.append(chunk)
-                    _put(("delta", {"text": chunk}))
-            summary = {
-                **(pipeline.get_last_retrieval_summary() or {}),
-                "short_term_memory": short_term_memory,
-            }
-            answer = strip_narration_segments("".join(answer_parts), narrated)
-            observation.set_output(answer, content_kind="llm")
-            if not cancel.is_set():
-                q.put(
-                    (
-                        "done",
-                        {
-                            "answer": answer,
-                            "summary": summary,
-                            "footer": pipeline.get_last_agent_footer() or "",
-                            "token_usage": pipeline.get_last_token_usage_summary(),
-                        },
-                    )
-                )
-            # Derive trace status from the answer text + retrieval summary
-            # (same helper Streamlit uses) instead of hardcoding "success" --
-            # a failed/partial/no-evidence response is then logged accurately.
-            trace_status, trace_error = query_trace_status(answer, summary)
-            outcome_status = "cancelled" if cancel.is_set() else (
-                "completed" if trace_status == "success" else trace_status
-            )
-            _record_query_trace(
-                user=user,
-                kb_name=body.kb_name,
-                original_query=body.query,
-                thread_id=body.thread_id,
-                summary=summary,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                status="failed" if cancel.is_set() else trace_status,
-                error_message=("client disconnected" if cancel.is_set() else trace_error),
-            )
-        except Exception as exc:  # fail-open: surface the error as an SSE event
-            observation.error(exc)
-            if not cancel.is_set():
-                _put(_stage("generate", "生成回答", "error", "答案生成失败"))
-                q.put(("error", {"message": str(exc)}))
-            summary = {
-                **(pipeline.get_last_retrieval_summary() or {}),
-                "short_term_memory": short_term_memory,
-            }
-            _record_query_trace(
-                user=user,
-                kb_name=body.kb_name,
-                original_query=body.query,
-                thread_id=body.thread_id,
-                summary=summary,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                status="failed",
-                error_message=str(exc),
-            )
-        finally:
-            # Release the generator if we exited early (client disconnect) so
-            # the LLM producer can stop sooner.
-            if gen is not None:
-                close = getattr(gen, "close", None)
-                if close is not None:
-                    try:
-                        close()
-                    except Exception:
-                        pass
-            duration_ms = int((time.monotonic() - start) * 1000)
-            record_chat_turn(
-                status=outcome_status,
-                mode="deep",
-                duration_s=max(0.0, duration_ms / 1000.0),
-                queue_s=0.0,
-                ttft_s=None,
-            )
-            observation.set("hdb.chat.status", outcome_status)
-            observation.set("hdb.chat.latency_ms", duration_ms)
-            observation.set("hdb.chat.queue_ms", 0)
-            _set_short_term_memory_observation(observation, short_term_memory)
-            observation.set_token_usage(pipeline.get_last_token_usage_summary())
-            observation.set("hdb.retrieval.rounds", int(summary.get("retrieval_rounds") or 0))
-            diagnostics = summary.get("tool_diagnostics") or []
-            observation.set("hdb.retrieval.calls", len(diagnostics))
-            observation.set(
-                "hdb.retrieval.hits",
-                sum(int(item.get("hit_count") or 0) for item in diagnostics),
-            )
-            observation.set("hdb.retrieval.final_top_k", int(summary.get("final_top_k") or 0))
-            observation.set("hdb.retriever.type", summary.get("retriever_type") or "multi_source_agent")
-            observation.set("hdb.retrieval.status", summary.get("status") or "")
-            observation.set("hdb.evidence.count", len(summary.get("evidence") or []))
-            if summary.get("rewritten_queries"):
-                observation.set(
-                    "hdb.query.rewritten",
-                    json.dumps(summary.get("rewritten_queries"), ensure_ascii=False),
-                )
-            if answer_parts and outcome_status != "completed":
-                observation.set_output("".join(answer_parts), content_kind="llm")
-            observation.outcome(outcome_status)
-            observation.end()
-            q.put(sentinel)
-
-    async def event_stream():
-        thread = start_thread_with_current_context(producer, daemon=True, name="api-query-producer")
-        try:
-            while True:
-                item = await run_in_threadpool(q.get)
-                if item is sentinel:
-                    break
-                event, payload = item
-                yield _sse(event, payload)
-        finally:
-            # Client disconnected: signal the producer to stop and give it a
-            # moment to flush its trace + close the generator.
-            cancel.set()
-            thread.join(timeout=2.0)
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 def _resolve_pipeline(request: Request) -> AppPipeline:

@@ -32,7 +32,6 @@ from src.api.routes import (
     kbs,
     logs,
     memories,
-    metrics,
     notifications,
     parse_tasks,
     query,
@@ -247,7 +246,6 @@ def create_app() -> FastAPI:
     app.include_router(logs.router, prefix=api_v1)
     app.include_router(memories.router, prefix=api_v1)
     app.include_router(notifications.router, prefix=api_v1)
-    app.include_router(metrics.router, prefix=api_v1)
     app.include_router(status.router, prefix=api_v1)
     app.include_router(evaluation.router, prefix=api_v1)
     app.include_router(structured.router, prefix=api_v1)

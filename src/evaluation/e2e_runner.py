@@ -644,7 +644,7 @@ def run_case(
 
 
 def _create_identities(
-    client: "E2EClient", *, kb_name: str, department_id: int
+    client: "E2EClient", *, department_id: int
 ) -> tuple[str, str, str, int, int]:
     run = uuid.uuid4().hex[:6]
     admin_token = client.login(
@@ -654,13 +654,14 @@ def _create_identities(
     reviewer_name = f"e2e_admin_{run}"
     owner_name = f"e2e_owner_{run}"
     password = os.getenv("HDB_E2E_PASSWORD", "E2ePass!2026")
+    # 两级角色模型：系统管理员创建两个部门员工；员工对部门 KB 隐式 admin，
+    # 没有逐用户授权步骤（kb_permissions 已随旧模型删除）。
     created_reviewer = client.requests.post(
         f"{client.base_url}/api/v1/users",
         headers=client.headers(admin_token),
         json={
             "username": reviewer_name,
             "password": password,
-            "role": "dept_admin",
             "department_id": department_id,
         },
         timeout=client.timeout,
@@ -670,20 +671,17 @@ def _create_identities(
     reviewer_token = client.login(reviewer_name, password)
     created_owner = client.requests.post(
         f"{client.base_url}/api/v1/users",
-        headers=client.headers(reviewer_token),
-        json={"username": owner_name, "password": password, "role": "user"},
+        headers=client.headers(admin_token),
+        json={
+            "username": owner_name,
+            "password": password,
+            "department_id": department_id,
+        },
         timeout=client.timeout,
     )
     created_owner.raise_for_status()
     owner_id = int(created_owner.json()["id"])
     owner_token = client.login(owner_name, password)
-    granted = client.requests.post(
-        f"{client.base_url}/api/v1/kbs/{kb_name}/permissions",
-        headers=client.headers(reviewer_token),
-        json={"user_id": owner_id, "permission": "read"},
-        timeout=client.timeout,
-    )
-    granted.raise_for_status()
     return admin_token, reviewer_token, owner_token, owner_id, reviewer_id
 
 
@@ -766,7 +764,7 @@ def main(argv: list[str] | None = None) -> int:
     client = E2EClient(args.base_url)
     db_path = _resolve_auth_db()
     admin_token, reviewer_token, owner_token, owner_id, reviewer_id = _create_identities(
-        client, kb_name=args.kb, department_id=args.department_id
+        client, department_id=args.department_id
     )
 
     results: list[CaseResult] = []

@@ -874,6 +874,38 @@ class RAGFlowBackend(RAGBackend):
     def _delete_pipeline_record(self, record):
         return self.runtime.delete_record(record)
 
+    def _delete_embedded_children(self, parent) -> list[str]:
+        """父文档删除时级联处理嵌入子文档(fail-soft).
+
+        共享子文档（被多个父引用）只移除当前父引用；引用清空后才走完整删除
+        （远端 + 索引 + 归档 + 台账）。子文档清理失败只记录在审计里，不影响
+        父文档删除结果。
+        """
+        errors: list[str] = []
+        try:
+            children = self.store.list_embedded_children(
+                parent.kb_name, parent.department_id, parent.document_name
+            )
+        except Exception as exc:  # noqa: BLE001
+            return [f"embedded child lookup failed: {exc}"]
+        for child in children:
+            try:
+                if not self.store.remove_parent_reference(child.id, parent.document_name):
+                    continue
+                result = self._delete_pipeline_record(child)
+                if not result.ok:
+                    errors.append(f"{child.document_name}: {result.message}")
+                    continue
+                try:
+                    from src.core.doc_assets import sync_file_deleted
+
+                    sync_file_deleted(kb_id=child.kb_id, file_id=str(child.id))
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{child.document_name}: {exc}")
+        return errors
+
     def _get_record_for_document_id(self, kb_name: str, document_id: str, ctx: RequestContext | None = None):
         record_id = _record_id_from_document_id(document_id)
         if record_id is not None:
@@ -1019,6 +1051,68 @@ class RAGFlowBackend(RAGBackend):
             time.sleep(RAGFLOW_PARSE_PROGRESS_POLL_SECONDS)
 
         return last_status, last_message or f"{filename}: RAGFlow parsing progress timed out"
+
+    def refresh_parse_statuses(
+        self,
+        limit: int | None = None,
+        min_interval_seconds: int | None = None,
+    ) -> int:
+        """把仍在解析中的 RAGFlow 台账状态与远端真实状态对齐(节流, fail-soft).
+
+        上传时无法读取实时进度的部署会让本地记录停在 parsing；后台 worker
+        周期性调用本方法，按 last_status_checked_at 节流重查远端，完成/失败时
+        更新本地状态，使 UI 与检索记录过滤（只收 completed）看到真实状态。
+        """
+        interval = (
+            int(min_interval_seconds)
+            if min_interval_seconds is not None
+            else int(getattr(src.settings, "RAGFLOW_STATUS_REFRESH_MIN_SECONDS", 60) or 60)
+        )
+        try:
+            candidates = self.store.list_status_refresh_candidates(
+                [PROCESSOR_KIND_RAGFLOW],
+                [RAGFLOW_STATUS_PARSING, RAGFLOW_STATUS_UPLOADED],
+                limit=max(1, int(limit if limit is not None else 8)),
+                min_interval_seconds=interval,
+            )
+        except Exception as exc:  # noqa: BLE001 - 后台同步 fail-soft
+            error(f"Parse status refresh candidate lookup failed: {exc}")
+            return 0
+        updated = 0
+        for record in candidates:
+            try:
+                remote_docs = self._client().list_documents(record.dataset_id, record.document_id)
+            except Exception:  # noqa: BLE001
+                self.store.mark_status_checked(record.id)
+                continue
+            self.store.mark_status_checked(record.id)
+            if not remote_docs:
+                continue
+            remote = remote_docs[0]
+            status = _normalize_ragflow_status(remote.get("run"))
+            if status == RAGFLOW_STATUS_PARSING:
+                progress = _extract_ragflow_progress(remote)
+                if progress is not None:
+                    self.store.update_document_progress_by_id(
+                        record.id, int(progress), "RAGFlow 解析中"
+                    )
+                continue
+            if status == RAGFLOW_STATUS_PARSED:
+                self.store.update_document_progress_by_id(
+                    record.id, 100, "RAGFlow 解析完成", status=RAGFLOW_STATUS_PARSED
+                )
+                updated += 1
+            elif status == RAGFLOW_STATUS_FAILED:
+                message = _extract_ragflow_error(remote) or "RAGFlow 解析失败"
+                self.store.update_document_progress_by_id(
+                    record.id,
+                    int(record.parse_progress or 0),
+                    message,
+                    status=RAGFLOW_STATUS_FAILED,
+                    error_message=message,
+                )
+                updated += 1
+        return updated
 
     def retrieve(
         self,
@@ -1332,23 +1426,25 @@ class RAGFlowBackend(RAGBackend):
                     sync_file_deleted(kb_id=record.kb_id, file_id=str(record.id))
                 except Exception:  # noqa: BLE001
                     pass
-            self._audit(
-                delete_result.audit_action or f"{record.processor_kind}_delete_document",
-                ctx,
-                kb_name=kb_name,
-                target_type="document",
-                target_id=record.document_name,
-                metadata={
-                    "store_id": record.id,
-                    "ragflow_document_id": record.document_id,
-                    "dataset_id": record.dataset_id,
-                    "dataset_kind": record.dataset_kind,
-                    "content_kind": record.content_kind,
-                    "processor_kind": record.processor_kind,
-                    "local_path": record.local_path,
-                    "cleanup_errors": delete_result.errors,
-                },
-            )
+                embedded_errors = self._delete_embedded_children(record)
+                self._audit(
+                    delete_result.audit_action or f"{record.processor_kind}_delete_document",
+                    ctx,
+                    kb_name=kb_name,
+                    target_type="document",
+                    target_id=record.document_name,
+                    metadata={
+                        "store_id": record.id,
+                        "ragflow_document_id": record.document_id,
+                        "dataset_id": record.dataset_id,
+                        "dataset_kind": record.dataset_kind,
+                        "content_kind": record.content_kind,
+                        "processor_kind": record.processor_kind,
+                        "local_path": record.local_path,
+                        "cleanup_errors": delete_result.errors,
+                        "embedded_cleanup_errors": embedded_errors,
+                    },
+                )
             return BackendResult(ok=delete_result.ok, message=delete_result.message, backend=self.name)
         except Exception as exc:
             if _is_ragflow_not_owner_error(exc):

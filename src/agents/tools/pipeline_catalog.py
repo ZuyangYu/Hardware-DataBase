@@ -117,7 +117,8 @@ def make_catalog_tool(rt, *, document_store: PipelineDocumentStore, spreadsheet_
     def list_kb_sources(query: str = "") -> str:
         """按需列出当前知识库的资料源（文档/表格/电路）及其状态。
         仅在用户询问资料目录、或无法判断应使用哪类来源时调用；普通技术问题
-        直接调用最相关的检索工具，避免为目录扫描额外增加一轮 agent 往返。"""
+        直接调用最相关的检索工具，避免为目录扫描额外增加一轮 agent 往返。
+        注意：目录只反映已有来源类型与状态，某类来源为 0 时不要放弃，应在已有来源中继续检索。"""
         from src.agents.tools.runtime import timed_tool_call
 
         def run(_: str, __: int):
@@ -136,7 +137,9 @@ def make_catalog_tool(rt, *, document_store: PipelineDocumentStore, spreadsheet_
             summary = result.get("summary") or {}
             lines = [
                 f"共 {summary.get('total', 0)} 个资料源：文档 {summary.get('documents', 0)}、"
-                f"表格 {summary.get('spreadsheets', 0)}、电路 {summary.get('circuits', 0)}"
+                f"表格 {summary.get('spreadsheets', 0)}、电路 {summary.get('circuits', 0)}",
+                "（目录仅列出知识库已有来源；某类来源数量为 0 不代表问题不可答，"
+                "请在想关来源类型中用对应检索工具继续查证，不要据此判定无法回答。）",
             ]
             for source in (result.get("sources") or [])[:50]:
                 name = source.get("document_name") or ""

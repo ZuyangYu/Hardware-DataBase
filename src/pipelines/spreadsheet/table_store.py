@@ -644,6 +644,31 @@ def _is_title_like_row(row: list[str]) -> bool:
     return len(value) >= 8 or bool(re.search(r"[一-鿿].*[A-Za-z]|[A-Za-z].*[一-鿿]", value))
 
 
+_SECTION_HEADING_NUMBER_RE = re.compile(r"^\s*\d+(?:\.\d+)+")
+
+
+def _section_heading_text(row: list[str], raw_values: dict[str, str]) -> str:
+    """Return the section heading text when a row is a 章节名称/Heading row.
+
+    Hardware requirement/ICD sheets mark section headings via 目标类型=章节名称,
+    but the heading text (e.g. ``3.1.2 通讯接口/Communication Interface``) often
+    sits in an unheadered cell and never reaches the mapped values. Recovering it
+    from the raw row lets the caller stamp subsequent semantic rows with their
+    parent section, so section-number queries can reach the right rows.
+    """
+
+    if not any(
+        "章节名称" in str(value) or "heading" in str(value).casefold()
+        for value in raw_values.values()
+    ):
+        return ""
+    for cell in row:
+        text = str(cell).strip()
+        if text and _SECTION_HEADING_NUMBER_RE.match(text):
+            return text
+    return ""
+
+
 def _is_numeric_like(value: str) -> bool:
     text = str(value).strip()
     if not text:
@@ -756,6 +781,10 @@ def _sheet_semantic_rows(sheet, profile: dict | None = None) -> list[dict]:
     # (authoritative),不应越过其合并区域继续前向继承。
     context_structural: dict[str, bool] = {}
     section_title = ""
+    # section_path 记录最近的 章节名称/Heading 标题; 只进物化 section 列供 SQL
+    # 定位(如 WHERE section LIKE '%3.1.2%'), 不写进 semantic_text, 避免改变
+    # 词法检索排序。
+    section_path = ""
 
     for row_position, row in enumerate(sheet.rows, start=1):
         if row_position <= header_row_position:
@@ -842,6 +871,10 @@ def _sheet_semantic_rows(sheet, profile: dict | None = None) -> list[dict]:
         if not raw_values:
             continue
 
+        section_heading = _section_heading_text(row, raw_values)
+        if section_heading:
+            section_path = section_heading
+
         values = {}
         inherited = {}
         structural_fill: dict[str, int] = {}
@@ -886,6 +919,7 @@ def _sheet_semantic_rows(sheet, profile: dict | None = None) -> list[dict]:
             "confidence_reasons": reasons,
             "evidence_policy": "Use raw_text/raw_values as facts; verify inherited fields with source.inherited_from_rows. Structural (merged-cell) values are authoritative, not inferred.",
             "section_title": section_title,
+            "section_heading": section_path,
             "raw_text": raw_text,
             "semantic_text": semantic_text,
             "values": values,

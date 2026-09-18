@@ -35,7 +35,7 @@ class ContainerInspection:
             parts.append(f"{len(self.media_objects)} media object(s)")
         return (
             f"{self.file_name}: detected {', '.join(parts)}; "
-            "embedded content is not expanded into child pipelines yet."
+            "OOXML payloads are indexed as child documents, media objects are not expanded."
         )
 
     def to_metadata(self) -> dict:

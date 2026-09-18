@@ -57,6 +57,10 @@ class CreateKbRequest(BaseModel):
     name: str
 
 
+class UpdateKbSharingRequest(BaseModel):
+    is_shared: bool
+
+
 class KbView(BaseModel):
     name: str
     kb_id: int | None = None
@@ -64,6 +68,9 @@ class KbView(BaseModel):
     department_name: str | None = None
     permission: str | None = None
     registered: bool = True
+    owner_user_id: int | None = None
+    is_shared: bool = False
+    is_owner: bool = False
 
 
 class FileView(BaseModel):
@@ -334,23 +341,6 @@ class WikiGraphView(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Query
-# ---------------------------------------------------------------------------
-
-class QueryRequest(BaseModel):
-    kb_name: str
-    query: str
-    wiki_assist: bool = False
-    # Route also slices [-5:] as defence in depth; the schema cap keeps a
-    # misconfigured client from wasting bandwidth on multi-MB history bodies
-    # (and blocks DoS-shaped requests before the body is even read).
-    history: list[tuple[str, str]] = Field(default_factory=list, max_length=100)
-    thread_id: str = ""
-    document_context: DocumentContextRequest | None = None
-    document_flow: bool | None = None
-
-
-# ---------------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------------
 
@@ -416,6 +406,8 @@ class MessageView(BaseModel):
     # 该 turn 持久化的 document_card 事件（历史回填用；刷新/重开会话后
     # 候选卡片与文档状态卡不丢失，前端按引用去重合并）。
     cards: list[dict] = Field(default_factory=list)
+    # 该 turn 持久化的执行轨迹（stage/tool 事件折叠；刷新后轨迹面板不消失）。
+    trace_steps: list[dict] = Field(default_factory=list)
 
 
 class AddMessageRequest(BaseModel):
@@ -696,6 +688,9 @@ class MemoryDraftRequest(BaseModel):
 class MemoryExtractionRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2_000)
     request_id: str = Field(min_length=1, max_length=128)
+    # 主动触发项目记忆：精确指定某个已完成轮次的 user/assistant 消息；
+    # 为空时保持原有"重新提炼最新完成轮"的行为。
+    message_ids: list[int] = Field(default_factory=list, max_length=20)
 
 
 class VerifyMemoryRequest(MemoryActionRequest):
@@ -1366,11 +1361,3 @@ class CompleteDocumentRevisionRequest(BaseModel):
     child_artifact_id: str = Field(min_length=1, max_length=200)
     revalidation_status: Literal["passed", "failed", "requires_human"]
     revalidation_result: dict[str, Any] = Field(default_factory=dict)
-
-
-class AgentHumanDecisionRequest(BaseModel):
-    """One-time approve/reject decision for a pending agent proposal."""
-
-    pending_event_id: str = Field(min_length=1, max_length=200)
-    proposal_hash: str = Field(min_length=1, max_length=200)
-    decision: Literal["approve", "reject"]

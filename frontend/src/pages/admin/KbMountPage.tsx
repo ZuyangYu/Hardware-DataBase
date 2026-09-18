@@ -126,7 +126,7 @@ export default function KbMountPage({ auth, onLogout }: Props) {
     <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
       <AppHeader
         title="知识库挂载"
-        description="把知识库归属到部门并指定部门员工为负责人; 该部门员工自动获得这个知识库的完整访问权限。"
+        description="把知识库归属到部门并指定部门员工为所有者；知识库默认私有，由所有者决定是否部门共享，共享后部门其他成员拥有完整 admin 权限。"
         userName={auth.user.username}
         onLogout={onLogout}
       />

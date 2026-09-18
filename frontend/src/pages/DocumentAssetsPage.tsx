@@ -342,6 +342,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
 
   async function removeLink(linkId: number) {
     if (!kbName || !detail) return;
+    if (!window.confirm('移除这条关联吗？移除后可在需要时重新建立。')) return;
     try {
       await api.delete<OkShape>(`/api/v1/kbs/${encodeURIComponent(kbName)}/doc-assets/${detail.id}/links/${linkId}`);
       notify.success('关联已移除');

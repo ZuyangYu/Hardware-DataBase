@@ -881,8 +881,23 @@ class MemoryService:
             "consent": consent,
         }
 
-    def extract_memory(self, *, actor: AuthUser, session_id: int, reason: str = "", request_id: str = "") -> dict[str, Any]:
-        """Explicitly enqueue a project extraction for the current session."""
+    def extract_memory(
+        self,
+        *,
+        actor: AuthUser,
+        session_id: int,
+        reason: str = "",
+        request_id: str = "",
+        message_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly enqueue a project extraction for the current session.
+
+        ``message_ids`` selects one completed turn for an on-demand extraction
+        (主动触发).  When it is omitted the legacy behaviour is kept: the latest
+        completed turn is re-extracted.  A selection that is already inside the
+        latest completed reflection window is reported as ``already_covered``
+        instead of enqueueing a duplicate run.
+        """
 
         if not bool(getattr(self._settings, "MEMORY_ENABLED", True)) or not bool(
             getattr(self._settings, "MEMORY_EXTRACTION_ENABLED", True)
@@ -890,6 +905,18 @@ class MemoryService:
             raise MemoryServiceError("long-term memory extraction is disabled")
         if not isinstance(actor, AuthUser) or not actor.is_active:
             raise MemoryAuthorizationError("active authenticated user is required")
+        requested_ids: list[int] = []
+        for value in message_ids or []:
+            try:
+                message_id = int(value)
+            except (TypeError, ValueError):
+                raise ValueError("message ids must be integers") from None
+            if message_id <= 0:
+                raise ValueError("message ids must be positive")
+            if message_id not in requested_ids:
+                requested_ids.append(message_id)
+        if len(requested_ids) > 20:
+            raise ValueError("at most 20 message ids are allowed")
         with closing(self.jobs._connect()) as conn:
             session = conn.execute(
                 "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?",
@@ -910,16 +937,73 @@ class MemoryService:
                     "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?",
                     (int(session_id), int(actor.id)),
                 ).fetchone()
-                target = conn.execute(
-                    """SELECT t.id AS turn_id, t.assistant_message_id
-                       FROM chat_turns t
-                       WHERE t.session_id = ? AND t.status = 'completed'
-                       ORDER BY t.assistant_message_id DESC, t.id DESC
-                       LIMIT 1""",
-                    (int(session_id),),
-                ).fetchone()
+                if requested_ids:
+                    placeholders = ",".join("?" for _ in requested_ids)
+                    turn = conn.execute(
+                        f"""SELECT t.id AS turn_id, t.user_message_id, t.assistant_message_id
+                           FROM chat_turns t
+                           WHERE t.session_id = ? AND t.status = 'completed'
+                             AND (t.user_message_id IN ({placeholders})
+                                  OR t.assistant_message_id IN ({placeholders}))
+                           ORDER BY t.assistant_message_id DESC, t.id DESC
+                           LIMIT 1""",
+                        (int(session_id), *requested_ids, *requested_ids),
+                    ).fetchone()
+                    if turn is None or turn["assistant_message_id"] is None:
+                        raise ValueError("selected messages do not belong to a completed turn")
+                    turn_ids = {
+                        int(turn["user_message_id"] or 0),
+                        int(turn["assistant_message_id"] or 0),
+                    }
+                    if any(message_id not in turn_ids for message_id in requested_ids):
+                        raise ValueError("selected messages must belong to one completed turn")
+                    target = turn
+                else:
+                    target = conn.execute(
+                        """SELECT t.id AS turn_id, t.assistant_message_id
+                           FROM chat_turns t
+                           WHERE t.session_id = ? AND t.status = 'completed'
+                           ORDER BY t.assistant_message_id DESC, t.id DESC
+                           LIMIT 1""",
+                        (int(session_id),),
+                    ).fetchone()
                 if current_session is None or target is None or target["assistant_message_id"] is None:
                     raise ValueError("a completed turn is required before extracting memory")
+                if requested_ids:
+                    # 自动提炼是会话级高水位：已完成窗口覆盖了所选轮次时，
+                    # 主动触发不再重复入队（需要强制重跑可用会话级"重新提炼"）。
+                    covered = conn.execute(
+                        """SELECT * FROM memory_jobs
+                           WHERE session_id = ? AND job_kind = 'project_reflection'
+                           LIMIT 1""",
+                        (int(session_id),),
+                    ).fetchone()
+                    if (
+                        covered is not None
+                        and str(covered["status"]) == "completed"
+                        and covered["target_message_id"] is not None
+                        and int(covered["target_message_id"]) >= int(target["assistant_message_id"])
+                    ):
+                        self.catalog.audit(
+                            "project_reflection_already_covered",
+                            actor_id=str(actor.id),
+                            request_id=request_id,
+                            metadata={
+                                "session_id": int(session_id),
+                                "reason": reason,
+                                "job_id": str(covered["job_id"]),
+                                "message_ids": requested_ids,
+                            },
+                            conn=conn,
+                        )
+                        conn.commit()
+                        return {
+                            "operation_id": str(covered["job_id"]),
+                            "memory_id": "",
+                            "status": "already_covered",
+                            "revision": None,
+                            "message": "selected turn is already covered by the latest completed project reflection",
+                        }
                 job_id = self.jobs.enqueue_project_reflection(
                     session_id=int(session_id),
                     scope_fingerprint=scope_fingerprint(
@@ -938,7 +1022,12 @@ class MemoryService:
                     "project_reflection_requested",
                     actor_id=str(actor.id),
                     request_id=request_id,
-                    metadata={"session_id": int(session_id), "reason": reason, "job_id": job_id},
+                    metadata={
+                        "session_id": int(session_id),
+                        "reason": reason,
+                        "job_id": job_id,
+                        "message_ids": requested_ids,
+                    },
                     conn=conn,
                 )
                 conn.commit()

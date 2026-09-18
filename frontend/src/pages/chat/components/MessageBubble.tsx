@@ -42,6 +42,8 @@ type Props = {
   showDiagnostics?: boolean;
   /** 为当前用户把一条已完成消息提交到明确的个人记忆授权确认流。 */
   onCreateMemory?: (messageIds: number[]) => void;
+  /** 把本轮问答主动提交为项目记忆提炼（结果先进入 Candidate）。 */
+  onCreateProjectMemory?: (messageIds: number[]) => void;
   /** 本轮问答的消息 id(提问在前、输出在后);个人记忆授权来源必须包含输出。 */
   memorySourceMessageIds?: number[];
   /** 打开消息编辑对话框(仅本人 user 消息)。 */
@@ -380,6 +382,7 @@ function MessageBubble({
   degradedNotes = [],
   showDiagnostics = true,
   onCreateMemory,
+  onCreateProjectMemory,
   memorySourceMessageIds,
   onEditMessage,
   onExport,
@@ -425,7 +428,9 @@ function MessageBubble({
               {msg.memory_context && msg.memory_context.length > 0 && (
                 <MemoryContextBlock memories={msg.memory_context} />
               )}
-              {((onCreateMemory && memorySourceMessageIds?.length) || (onExport && msg.turn_id)) && (
+              {((onCreateMemory && memorySourceMessageIds?.length) ||
+                (onCreateProjectMemory && memorySourceMessageIds?.length) ||
+                (onExport && msg.turn_id)) && (
                 <div className="flex flex-wrap items-center gap-[14px]">
                   {onCreateMemory && memorySourceMessageIds?.length ? (
                     <button
@@ -436,6 +441,17 @@ function MessageBubble({
                     >
                       <AppIcon name="user" size={13} />
                       创建个人记忆
+                    </button>
+                  ) : null}
+                  {onCreateProjectMemory && memorySourceMessageIds?.length ? (
+                    <button
+                      type="button"
+                      onClick={() => onCreateProjectMemory(memorySourceMessageIds)}
+                      title="把本轮问答提炼为项目记忆（先进入 Candidate 待审核）"
+                      className="inline-flex items-center gap-[5px] border-0 bg-transparent p-0 text-[11px] text-[#858b9c] transition-colors hover:text-[#18181a] hover:underline"
+                    >
+                      <AppIcon name="database" size={13} />
+                      记入项目记忆
                     </button>
                   ) : null}
                   {onExport && msg.turn_id && (

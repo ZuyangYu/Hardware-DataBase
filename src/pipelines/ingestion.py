@@ -1,13 +1,20 @@
 import os
 import threading
+import tempfile
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterator
 from typing import Callable
 
 from src.core.logger import error, log
 from src.ingestion.container_inspector import ContainerInspection, inspect_container_file
+from src.ingestion.embedded_extractor import (
+    EmbeddedObject,
+    build_child_name,
+    extract_embedded_objects,
+    write_embedded_child,
+)
 from src.pipelines.document_store import PipelineDocumentRecord, PipelineDocumentStore
 from src.pipelines.document_rag.schemas import (
     IngestResult,
@@ -89,6 +96,11 @@ class IngestionScope:
     uploaded_by: str = ""
     source_group: str | None = None
     ctx: RequestContext | None = None
+    # P1-1: embedded child submissions carry their depth (0 = user upload) and
+    # the parent document name, which drives parent-reference bookkeeping and
+    # stops recursive extraction at depth 1.
+    embed_depth: int = 0
+    parent_document: str = ""
 
 
 @dataclass
@@ -278,9 +290,26 @@ class IngestionOrchestrator:
                                 "keeping the current mapping. Please retry later."
                             )
                         if reusable:
+                            if scope.embed_depth > 0 and scope.parent_document and existing.id:
+                                # Shared embedded payload: reuse the indexed
+                                # document and just add this parent reference.
+                                self.store.add_parent_reference(existing.id, scope.parent_document)
                             messages.append(handler.reuse_message(existing))
                             success_count += 1
                             table_task_touched = True
+                            if scope.embed_depth == 0 and not self.store.list_embedded_children(
+                                scope.kb_name, scope.department_id, existing.document_name
+                            ):
+                                # 存量父文档（P1-1 之前入库）在重新上传时补展开。
+                                messages.extend(
+                                    self._ingest_embedded_children(
+                                        file_path=file_path,
+                                        parent_name=existing.document_name,
+                                        scope=scope,
+                                        default_dataset_kind=default_dataset_kind,
+                                        default_dataset_id=default_dataset_id,
+                                    )
+                                )
                             continue
                         log(f"Mapping for {existing.document_name} is stale; re-processing.")
                         handler.on_stale_existing(existing)
@@ -307,9 +336,27 @@ class IngestionOrchestrator:
                         metadata=handler_result.audit_metadata,
                     )
                 if handler_result.success:
+                    if handler_result.record_id and scope.embed_depth > 0 and scope.parent_document:
+                        self.store.update_embedding_meta(
+                            handler_result.record_id,
+                            scope.parent_document,
+                            scope.embed_depth,
+                        )
                     messages.append(handler_result.message)
                     messages.extend(f"[warning] {warning}" for warning in handler_result.warnings)
                     success_count += 1
+                    if scope.embed_depth == 0:
+                        # P1-1: only user-uploaded containers are expanded; an
+                        # embedded child is indexed as-is (no nested extraction).
+                        messages.extend(
+                            self._ingest_embedded_children(
+                                file_path=file_path,
+                                parent_name=archived.filename if archived else filename,
+                                scope=scope,
+                                default_dataset_kind=default_dataset_kind,
+                                default_dataset_id=default_dataset_id,
+                            )
+                        )
                 else:
                     if not handler_result.preserve_failed_record:
                         self._cleanup_failed_submission(handler, handler_result, scope, archived)
@@ -423,6 +470,70 @@ class IngestionOrchestrator:
             content_hash=content_hash,
             inspection=inspection,
         )
+
+    def _ingest_embedded_children(
+        self,
+        *,
+        file_path: str,
+        parent_name: str,
+        scope: IngestionScope,
+        default_dataset_kind: str,
+        default_dataset_id: str,
+    ) -> list[str]:
+        """Extract OOXML payloads from a container and index them as children.
+
+        Children run through the normal pipelines (docx -> RAGFlow, xlsx ->
+        spreadsheet) with content-hash dedup and per-child failure isolation;
+        a child problem is reported as a message and never fails the parent.
+        """
+        try:
+            extraction = extract_embedded_objects(file_path)
+        except Exception as exc:
+            return [f"[warning] {parent_name}: 嵌入对象扫描失败: {exc}"]
+        if not extraction.objects:
+            return []
+
+        deduped: list[EmbeddedObject] = []
+        seen_hashes: set[str] = set()
+        for embedded in extraction.objects:
+            if embedded.content_hash in seen_hashes:
+                continue
+            seen_hashes.add(embedded.content_hash)
+            deduped.append(embedded)
+
+        messages: list[str] = []
+        used_names: set[str] = set()
+        try:
+            with tempfile.TemporaryDirectory(prefix="hdb-embedded-") as child_dir:
+                child_paths = [
+                    write_embedded_child(
+                        embedded,
+                        build_child_name(parent_name, embedded, used_names),
+                        child_dir,
+                    )
+                    for embedded in deduped
+                ]
+                child_scope = replace(
+                    scope,
+                    embed_depth=max(1, int(scope.embed_depth) + 1),
+                    parent_document=parent_name,
+                )
+                result = self.upload_files(
+                    child_paths,
+                    child_scope,
+                    default_dataset_kind,
+                    default_dataset_id,
+                )
+        except Exception as exc:
+            return [f"[warning] {parent_name}: 嵌入对象入库失败: {exc}"]
+
+        messages.append(f"[info] {parent_name}: 已展开 {len(child_paths)} 个嵌入对象")
+        messages.extend(f"[embedded] {message}" for message in result.messages)
+        if extraction.skipped:
+            messages.append(
+                f"[warning] {parent_name}: {len(extraction.skipped)} 个嵌入载荷不是可入库的 OOXML, 已跳过"
+            )
+        return messages
 
     def _existing_record_is_reusable(self, record: PipelineDocumentRecord, handler: PipelineHandler) -> bool | None:
         """Tri-state reuse decision: True (reuse), False (stale, safe to rebuild), None (undetermined)."""

@@ -187,7 +187,7 @@ export function uploadFilesWithProgress<T>(
   });
 }
 
-/** SSE 流式请求(POST /query):fetch + ReadableStream 自解析 event/data 帧 */
+/** SSE 流式请求(turns 事件流):fetch + ReadableStream 自解析 event/data 帧 */
 export type SseEvent = { event: string; data: string; id?: number };
 
 async function* parseSseResponse(response: Response): AsyncGenerator<SseEvent, void, unknown> {

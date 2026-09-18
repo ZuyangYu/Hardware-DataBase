@@ -610,6 +610,7 @@ def _load_sql_registry(db_path: str) -> list[dict]:
                 "sheet_name": row["sheet_name"],
                 "document_name": row["document_name"],
                 "columns": schema.get("columns", []),
+                "meta_columns": schema.get("meta_columns", []),
                 "row_count": schema.get("row_count", row["row_count"]),
                 "note": schema.get("note", ""),
             }
@@ -623,9 +624,14 @@ def _format_schema_entry(entry: dict) -> str:
         + (f" 样本:{col['samples'][:3]}" if col.get("samples") else "")
         for col in entry.get("columns", [])
     )
+    meta = "; ".join(
+        f"{col['column']}={col.get('header', '')}"
+        for col in entry.get("meta_columns", [])
+    )
     return (
         f"表 {entry['table_name']} | 文档 {entry['document_name']} | sheet「{entry['sheet_name']}」"
         f" | {entry.get('row_count', '?')} 行\n  列: {columns}"
+        + (f"\n  附加列: {meta}" if meta else "")
         + (f"\n  说明: {entry['note']}" if entry.get("note") else "")
     )
 
@@ -723,7 +729,8 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
     """返回 SQL 查询两件套: 先查 schema 再执行只读 SQL."""
 
     def spreadsheet_schema_lookup(query: str = "", top_k: int = 8) -> str:
-        """列出可执行 SQL 的物化表 schema(表名/中文表头/类型/样本值), 写 SQL 前必查。"""
+        """列出可执行 SQL 的物化表 schema(表名/中文表头/类型/样本值), 写 SQL 前必查。
+        附加列: section 为章节标题(章节/层级问题用它过滤), row_index 为原表行号。"""
         from src.agents.tools.runtime import timed_tool_call
 
         scope = _knowledge_base_scope(
@@ -806,6 +813,8 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
         """执行只读 SQL 查询物化表(仅 SELECT, 自动 LIMIT)。筛选/聚合/比较/统计类问题优先用本工具。
 
         出错时按错误信息修正 SQL 后重试, 最多 2 次; 表名与列结构先用 spreadsheet_schema_lookup 查询。
+        按章节/层级编号(如 3.1.2)定位行时用附加列 section(章节标题): WHERE section LIKE '%3.1.2%',
+        不要只查普通列(col_N)——章节号常常不在数据列里。
         """
         from src.agents.tools.runtime import format_tool_result, timed_tool_call
 

@@ -185,7 +185,7 @@ def materialize_sheet(
         row_params: list[Any] = [
             int(semantic_row.get("row_index") or 0),
             int(semantic_row.get("header_row_index") or 0),
-            str(semantic_row.get("section_title") or ""),
+            str(semantic_row.get("section_heading") or semantic_row.get("section_title") or ""),
         ]
         for header in headers:
             row_params.append(
@@ -198,6 +198,10 @@ def materialize_sheet(
         "table_name": physical_name,
         "sheet_name": sheet_name,
         "columns": column_schema,
+        "meta_columns": [
+            {"column": "row_index", "header": "原表行号", "dtype": "INTEGER"},
+            {"column": "section", "header": "章节标题", "dtype": "TEXT"},
+        ],
         "row_count": len(params),
         "note": "列值已按语义层做前向填充; row_index 为原表行号, 可用相邻行差值处理层级表",
     }

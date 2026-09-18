@@ -302,9 +302,16 @@ class MemoryJobRepository:
                 # lease-expired job at that boundary is dead-lettered without
                 # manufacturing an extra attempt number.
                 if current_attempts >= max_attempts:
+                    previous_error = str(current["last_error"] or "").strip()
+                    reason = "maximum memory job attempts exceeded"
+                    if previous_error and previous_error != reason:
+                        # Preserve the last real failure: a lease-expired final
+                        # attempt never reaches mark_retry, so without this the
+                        # dead-letter row would only show the generic message.
+                        reason = f"{reason}; last error: {previous_error}"
                     conn.execute(
                         "UPDATE memory_jobs SET status = 'dead_letter', retry_count = ?, last_error = ?, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE job_id = ?",
-                        (current_attempts, "maximum memory job attempts exceeded", row["job_id"]),
+                        (current_attempts, reason[:2000], row["job_id"]),
                     )
                     counter("hdb.memory.job_dead_letter", attributes={"job_kind": current["job_kind"]})
                     _dead_letter_alert(
@@ -314,6 +321,7 @@ class MemoryJobRepository:
                             "job_kind": str(current["job_kind"]),
                             "attempts": current_attempts,
                             "reason": "max_attempts_exceeded_on_claim",
+                            "last_error": previous_error[:200],
                         }
                     )
                     conn.commit()

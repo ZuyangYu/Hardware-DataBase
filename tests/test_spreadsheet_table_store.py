@@ -153,6 +153,29 @@ class SpreadsheetTableStoreTests(unittest.TestCase):
         self.assertEqual(semantic_rows[0]["row_index"], 3)
         self.assertEqual(semantic_rows[0]["inference_type"], "forward_fill_context")
 
+    def test_section_heading_rows_stamp_following_rows(self):
+        # MC04: 章节标题行(目标类型=章节名称)的标题文本位于无表头单元格, 必须挂到
+        # 后续语义行供 SQL 的 section 列定位(如 WHERE section LIKE '%3.1.2%');
+        # semantic_text 不写入 Section 前缀, 以免改变词法检索排序。
+        sheet = _FakeSheet(
+            name="Requirements",
+            rows=[
+                ["ID", "类型", "编号", "章节"],
+                ["ID_SYS_RE_1", "章节名称", "", "3.1.2 通讯接口/Communication Interface"],
+                ["ID_SYS_RE_2", "章节名称", "HW-REQ-2", "3.1.2.1 CAN0通信需求"],
+                ["", "需求", "", ""],
+            ],
+        )
+
+        semantic_rows = _sheet_semantic_rows(sheet)
+
+        self.assertEqual(len(semantic_rows), 3)
+        first_heading, second_heading, data_row = semantic_rows
+        self.assertIn("3.1.2 通讯接口", first_heading["section_heading"])
+        self.assertIn("3.1.2.1 CAN0通信需求", second_heading["section_heading"])
+        self.assertIn("3.1.2.1 CAN0通信需求", data_row["section_heading"])
+        self.assertNotIn("Section:", data_row["semantic_text"])
+
 
 class _FakeSheet:
     def __init__(self, name: str, rows: list[list[str]]):
