@@ -177,44 +177,6 @@ class AnalyzeFromAttachmentTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["token"]
 
-    def test_convert_attachment_to_template_without_reupload(self):
-        token = self._token()
-        # Same-department employees implicitly hold KB admin (PR #49 role
-        # model), so their own attachment converts without an explicit grant.
-        upload = self.client.post(
-            f"/api/v1/conversations/{self.session.id}/attachments",
-            headers={"Authorization": f"Bearer {token}"},
-            files={"file": ("t.docx", io.BytesIO(_valid_office_stub()), "application/octet-stream")},
-        )
-        self.assertEqual(upload.status_code, 201, upload.text)
-        attachment_id = upload.json()["attachment_id"]
-
-        allowed = self.client.post(
-            "/api/v1/document-generation/templates/analyze-from-attachment",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"kb": "shared", "session_id": self.session.id, "attachment_id": attachment_id,
-                    "template_name": "评审表"},
-        )
-        self.assertEqual(allowed.status_code, 200, allowed.text)
-
-        # A caller without KB access is rejected before attachment existence
-        # is revealed (permission-first), even with a real attachment id.
-        foreign_token = self._foreign_token()
-        denied = self.client.post(
-            "/api/v1/document-generation/templates/analyze-from-attachment",
-            headers={"Authorization": f"Bearer {foreign_token}"},
-            params={"kb": "shared", "session_id": self.session.id, "attachment_id": attachment_id,
-                    "template_name": "评审表"},
-        )
-        self.assertEqual(denied.status_code, 403, denied.text)
-        missing = self.client.post(
-            "/api/v1/document-generation/templates/analyze-from-attachment",
-            headers={"Authorization": f"Bearer {foreign_token}"},
-            params={"kb": "shared", "session_id": self.session.id,
-                    "attachment_id": "att-missing", "template_name": "评审表"},
-        )
-        self.assertEqual(missing.status_code, 403)
-
     def test_conversion_forwards_attachment_provenance_after_kb_write_grant(self):
         token = self._token()
         upload = self.client.post(

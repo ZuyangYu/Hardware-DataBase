@@ -8,6 +8,7 @@ sank into the backend).
 import gc
 import os
 import tempfile
+import time
 import unittest
 
 import src.settings
@@ -155,6 +156,37 @@ class AuditSinkTests(unittest.TestCase):
             self.auth.create_user_as(self.admin, "should_fail", "pw123456", ROLE_EMPLOYEE, self.dept.id)
         new_events = self._new_actions(before)
         self.assertIn("create_user", new_events)
+
+    def test_update_kb_sharing_records_audit(self):
+        # 共享开关是治理敏感动作: 谁在什么时候把库共享/收回必须留痕。
+        token = self._token("admin1")
+        before = len(self._audit_actions())
+        r = self.client.patch(
+            "/api/v1/kbs/shared/sharing",
+            json={"is_shared": False},
+            headers=self._auth(token),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("update_kb_sharing", self._new_actions(before))
+        metadata = self._latest_metadata("update_kb_sharing")
+        self.assertEqual(metadata.get("is_shared"), False)
+        self.assertEqual(metadata.get("owner_user_id"), self.admin.id)
+
+    def test_delete_audit_metadata_marks_shared_and_actor(self):
+        # 共享库删除审计必须能区分所有者自删与部门成员删除他人共享库。
+        from src.core.app_pipeline import AppPipeline
+        from src.pipelines.document_rag.schemas import RequestContext
+
+        ctx = RequestContext(
+            user_id="user1",
+            roles=["employee"],
+            allowed_kbs=["shared"],
+            metadata={"department_id": self.dept.id, "resource_department_id": self.dept.id},
+        )
+        metadata = AppPipeline._kb_sharing_audit_metadata("shared", ctx)
+        self.assertTrue(metadata.get("is_shared"))
+        self.assertFalse(metadata.get("actor_is_owner"))
+        self.assertEqual(metadata.get("owner_user_id"), self.admin.id)
 
 
 class DepartmentPermissionTests(unittest.TestCase):
@@ -350,17 +382,6 @@ class DepartmentPermissionTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 422)
 
-    def test_query_history_length_capped(self):
-        # QueryRequest.history has max_length=100; longer history -> 422.
-        t = self._token("user1")
-        big_history = [["u", "a"]] * 200
-        r = self.client.post(
-            "/api/v1/query",
-            json={"kb_name": "shared", "query": "问", "history": big_history},
-            headers=self._auth(t),
-        )
-        self.assertEqual(r.status_code, 422)
-
     def test_evaluation_controller_singleton(self):
         # Two requests must hit the same controller so its in-memory _threads
         # registry can prevent concurrent workers on the same run. The unit
@@ -465,7 +486,7 @@ class SchemaValidationTests(unittest.TestCase):
         self.assertEqual(r.status_code, 422)
 
 class QueryTraceTests(unittest.TestCase):
-    """POST /query writes a query trace + evidence (fail-soft)."""
+    """turns writing a query trace + evidence (fail-soft)."""
 
     @classmethod
     def setUpClass(cls):
@@ -506,20 +527,45 @@ class QueryTraceTests(unittest.TestCase):
     def _auth(self, token: str) -> dict:
         return {"Authorization": f"Bearer {token}"}
 
-    def test_query_writes_trace(self):
+    def _run_stub_turn(self, token: str) -> str:
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "新对话"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(session.status_code, 200, session.text)
+        created = self.client.post(
+            f"/api/v1/conversations/{session.json()['id']}/turns",
+            json={"query": "问"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        turn_id = created.json()["turn"]["id"]
+        started = self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(token))
+        self.assertEqual(started.status_code, 202, started.text)
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(token)) as response:
+            self.assertEqual(response.status_code, 200)
+            b"".join(response.iter_bytes())
+        return turn_id
+
+    def _wait_for_trace(self, before: int, timeout: float = 5.0):
+        deadline = time.time() + timeout
+        traces = self.logs.list_query_traces(self.user)
+        while time.time() < deadline and len(traces) <= before:
+            time.sleep(0.05)
+            traces = self.logs.list_query_traces(self.user)
+        self.assertGreater(len(traces), before, "query trace was not written")
+        return traces
+
+    def test_turn_writes_trace(self):
         t = self._token("user1")
         before = len(self.logs.list_query_traces(self.user))
-        with self.client.stream(
-            "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
-        ) as r:
-            self.assertEqual(r.status_code, 200)
-            b"".join(r.iter_bytes())
-        traces = self.logs.list_query_traces(self.user)
-        self.assertGreater(len(traces), before)
-        # The newest trace reflects this API query.
+        self._run_stub_turn(t)
+        traces = self._wait_for_trace(before)
+        # The newest trace reflects this turn.
         self.assertEqual(traces[0].kb_name, "shared")
 
-    def test_query_trace_status_derived_from_summary(self):
+    def test_turn_trace_status_derived_from_summary(self):
         # If the retrieval summary reports failed, the trace status must be
         # "failed" -- proves query_trace_status is consulted rather than the
         # route hardcoding "success" like before P1-9.
@@ -527,12 +573,9 @@ class QueryTraceTests(unittest.TestCase):
         self.stub.get_last_retrieval_summary = lambda: {"status": "failed", "evidence": [], "error_message": "boom"}
         try:
             t = self._token("user1")
-            with self.client.stream(
-                "POST", "/api/v1/query", json={"kb_name": "shared", "query": "问"}, headers=self._auth(t)
-            ) as r:
-                self.assertEqual(r.status_code, 200)
-                b"".join(r.iter_bytes())
-            traces = self.logs.list_query_traces(self.user)
+            before = len(self.logs.list_query_traces(self.user))
+            self._run_stub_turn(t)
+            traces = self._wait_for_trace(before)
             self.assertEqual(traces[0].status, "failed")
         finally:
             self.stub.get_last_retrieval_summary = original

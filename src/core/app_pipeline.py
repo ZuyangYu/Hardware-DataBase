@@ -426,6 +426,31 @@ class AppPipeline:
         user = auth_service.get_user_by_username(raw)
         return int(user.id) if user is not None else None
 
+    @staticmethod
+    def _kb_sharing_audit_metadata(kb_name: str, ctx: RequestContext | None) -> dict[str, Any]:
+        """危险操作审计补充: 库是否部门共享、操作者是否为所有者。
+
+        共享库的删除等操作会影响全部门, 审计记录必须能区分"所有者自删"与
+        "部门成员删除他人共享库"。
+        """
+        try:
+            auth_service = AuthService()
+            scope = kb_scope_from_context(kb_name, ctx)
+            sharing = auth_service.get_knowledge_base_sharing(
+                scope.kb_name, department_id=scope.department_id, kb_id=scope.kb_id
+            )
+            if sharing is None:
+                return {}
+            owner_id, is_shared = sharing
+            actor_id = AppPipeline._resolve_actor_user_id(ctx, auth_service)
+            return {
+                "is_shared": is_shared,
+                "owner_user_id": owner_id,
+                "actor_is_owner": owner_id is not None and owner_id == actor_id,
+            }
+        except Exception:  # noqa: BLE001 - 审计补充信息失败不影响主流程
+            return {}
+
     def _audit(
         self,
         action: str,
@@ -727,6 +752,7 @@ class AppPipeline:
                 kb_name=kb_name,
                 success=delete_ok,
                 error_message="" if delete_ok else message,
+                metadata=self._kb_sharing_audit_metadata(kb_name, ctx),
             )
             return message
         except Exception as exc:
@@ -934,12 +960,6 @@ class AppPipeline:
                 error_message=str(exc),
             )
             raise
-
-    def pause_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
-        return self.documents.pause_parse_task(task_id, ctx=ctx)
-
-    def resume_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
-        return self.documents.resume_parse_task(task_id, ctx=ctx)
 
     def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
         # Stopping a parse task deletes the remote RAGFlow document + local

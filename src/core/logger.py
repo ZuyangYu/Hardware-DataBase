@@ -33,11 +33,6 @@ class TraceIdFilter(logging.Filter):
         return True
 
 
-def set_trace_id(trace_id: str) -> None:
-    """Deprecated compatibility shim; OTel remains the source of truth."""
-    return None
-
-
 def get_trace_id() -> str:
     return current_trace_id()
 

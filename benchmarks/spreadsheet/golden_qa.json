@@ -1,9 +1,9 @@
 {
   "meta": {
     "name": "AAA_ADAS_excel_qa_baseline",
-    "version": "1.0",
+    "version": "1.1",
     "created": "2026-08-31",
-    "note": "ground truth 全部来自对 AAA 原始 xlsx 的逐格核对; anchors 中 regex 字段用于规避 HW-REQ-2 误匹配 HW-REQ-20 这类前缀问题",
+    "note": "ground truth 全部来自对 AAA 原始 xlsx 的逐格核对; anchors 中 regex 字段用于规避 HW-REQ-2 误匹配 HW-REQ-20 这类前缀问题; 2026-09-16 v1.1: AG01 题面消歧(见其 truth_note)",
     "file_keys": {
       "arch": "600606894_ADAS_产品硬件架构设计说明书",
       "fpt": "600608964_ADAS_FPT_0506_1954",
@@ -178,12 +178,12 @@
     },
     {
       "id": "AG01", "category": "aggregation",
-      "question": "Page2 里 GND 到 PGND 网络的并联电阻一共有几个？",
-      "query_keywords": "GND PGND 并联电阻 数量",
+      "question": "Page2 里 GND 到 PGND 的并联连接一共有多少行？",
+      "query_keywords": "GND PGND 并联连接 行数",
       "expected_answer": "23 行连接、9 个位号（R1921/R1917 各 8 次, R1912/R1914/R1920/R1919/R1918/R1907/R1906 各 1 次）",
       "source": {"file": "testcov", "sheet": "Page2"},
       "anchor_groups": [["R1921"], ["R1917"], ["R1912"], ["R1914"], ["R1920"], ["R1919"], ["R1918"], ["R1907"], ["R1906"]],
-      "truth_note": "2026-08-31 全量核对修正: 初版只数了首个并联组(9), 完整数据 23 行"
+      "truth_note": "2026-08-31 全量核对修正: 初版只数了首个并联组(9), 完整数据 23 行; 2026-09-16 题面消歧: 原「并联电阻一共有几个」存在 9(位号数)/23(连接行数) 双解, 改为「并联连接一共有多少行」, 判分锚点与 must_include=[\"23\"] 不变"
     },
     {
       "id": "AG02", "category": "aggregation",

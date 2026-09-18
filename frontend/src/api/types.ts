@@ -26,6 +26,9 @@ export interface KbView {
   department_name: string | null;
   permission: string | null;
   registered: boolean;
+  owner_user_id: number | null;
+  is_shared: boolean;
+  is_owner: boolean;
 }
 
 export interface FileView {
@@ -381,6 +384,8 @@ export interface MessageView {
   citations?: EvidenceItem[];
   /** 该 turn 持久化的 document_card 事件（刷新后卡片回填；原始线格式）。 */
   cards?: Record<string, unknown>[];
+  /** 该 turn 持久化的执行轨迹步骤（刷新后轨迹面板回填）。 */
+  trace_steps?: QueryTraceStep[];
 }
 
 export interface SessionMemorySummary {
@@ -695,7 +700,7 @@ export interface SchematicPageResponse {
   pdf_cache: string[];
 }
 
-/** POST /query 的 SSE done 事件里的 retrieval summary(evidence 结构宽松,逐字段防御式读取) */
+/** turns SSE done 事件里的 retrieval summary(evidence 结构宽松,逐字段防御式读取) */
 export interface EvidenceItem {
   file_name?: string;
   source_name?: string;

@@ -11,6 +11,7 @@ import type { AuthSession } from '../../auth';
 import { ROLE_LABELS } from '../../auth';
 import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
 import { StatCard } from '@/components/StatCard';
 import { Button } from '@/components/ui/button';
@@ -48,6 +49,8 @@ export default function UsersPage({ auth, onLogout }: Props) {
   const [resetTarget, setResetTarget] = useState<UserView | null>(null);
   const [resetPassword, setResetPassword] = useState('');
   const [resetting, setResetting] = useState(false);
+  const [deactivateTarget, setDeactivateTarget] = useState<UserView | null>(null);
+  const [togglingActive, setTogglingActive] = useState(false);
 
   const load = useCallback(() => {
     let cancelled = false;
@@ -87,6 +90,17 @@ export default function UsersPage({ auth, onLogout }: Props) {
       notify.success(next ? '已启用' : '已停用');
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '操作失败');
+    }
+  }
+
+  async function handleDeactivateConfirm() {
+    if (!deactivateTarget || togglingActive) return;
+    setTogglingActive(true);
+    try {
+      await handleToggleActive(deactivateTarget, false);
+      setDeactivateTarget(null);
+    } finally {
+      setTogglingActive(false);
     }
   }
 
@@ -159,7 +173,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
             <button
               type="button"
               disabled={isSelf}
-              onClick={() => handleToggleActive(u, !u.is_active)}
+              onClick={() => (u.is_active ? setDeactivateTarget(u) : handleToggleActive(u, true))}
               className={cn(
                 'inline-flex h-[24px] items-center gap-[6px] whitespace-nowrap rounded-full px-[10px] text-[11px] transition-colors',
                 u.is_active
@@ -275,6 +289,19 @@ export default function UsersPage({ auth, onLogout }: Props) {
         }}
         onConfirm={handleResetConfirm}
       />
+
+      <ConfirmDialog
+        open={deactivateTarget !== null}
+        onOpenChange={(o: boolean) => {
+          if (!o) setDeactivateTarget(null);
+        }}
+        title={<>停用账号「{deactivateTarget?.username ?? ''}」</>}
+        description="停用后该账号立即无法登录，已有会话失效；可随时重新启用。"
+        confirmText="停用"
+        loading={togglingActive}
+        destructive
+        onConfirm={handleDeactivateConfirm}
+      />
     </div>
   );
 }
@@ -323,14 +350,14 @@ function ResetPasswordDialog({
             variant="outline"
             onClick={() => onOpenChange(false)}
             disabled={loading}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
+            className="h-[32px] min-w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
           >
             取消
           </Button>
           <Button
             onClick={onConfirm}
             disabled={loading}
-            className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303030]"
+            className="h-[32px] min-w-[80px] rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303030]"
           >
             {loading ? '重置中' : '重置'}
           </Button>
@@ -437,14 +464,14 @@ function CreateUserDialog({
           <Button
             variant="outline"
             onClick={() => onOpenChange(false)}
-            className="h-[32px] w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
+            className="h-[32px] min-w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
           >
             取消
           </Button>
           <Button
             onClick={submit}
             disabled={submitting}
-            className="h-[32px] w-[80px] rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303030]"
+            className="h-[32px] min-w-[80px] rounded-[10px] bg-[#18181a] text-[14px] text-white hover:bg-[#303030]"
           >
             {submitting ? '创建中' : '创建'}
           </Button>

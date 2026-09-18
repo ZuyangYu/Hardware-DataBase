@@ -50,13 +50,6 @@ class Department:
 
 
 @dataclass
-class KnowledgeBaseAccess:
-    kb_name: str
-    permission: str
-    department_id: int | None = None
-
-
-@dataclass
 class KnowledgeBaseSummary:
     name: str
     kb_id: int | None = None
@@ -64,6 +57,7 @@ class KnowledgeBaseSummary:
     department_name: str | None = None
     owner_user_id: int | None = None
     owner_username: str | None = None
+    is_shared: bool = False
     employee_count: int = 0
     registered: bool = False
     physical_exists: bool = False
@@ -198,26 +192,15 @@ class AuthService:
                     name TEXT NOT NULL,
                     department_id INTEGER,
                     owner_user_id INTEGER,
+                    is_shared INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     UNIQUE(department_id, name),
                     FOREIGN KEY(department_id) REFERENCES departments(id),
                     FOREIGN KEY(owner_user_id) REFERENCES users(id)
                 )
             """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kb_permissions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kb_id INTEGER NOT NULL,
-                    kb_name TEXT NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    permission TEXT NOT NULL DEFAULT 'read',
-                    created_at TEXT NOT NULL,
-                    UNIQUE(kb_id, user_id),
-                    FOREIGN KEY(kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                )
-            """)
             self._ensure_default_department(conn)
+            self._ensure_column(conn, "knowledge_bases", "is_shared", "INTEGER NOT NULL DEFAULT 0")
             self._migrate_kb_scope_schema(conn)
 
     def _ensure_column(self, conn, table: str, column: str, ddl: str):
@@ -233,6 +216,10 @@ class AuthService:
         )
 
     def _migrate_kb_scope_schema(self, conn):
+        # 逐用户授权（kb_permissions）已废弃：绑定改为所有者维度的共享开关
+        # （knowledge_bases.is_shared），不再有逐用户授予对象。启动时清理历史表。
+        conn.execute("DROP TABLE IF EXISTS kb_permissions")
+
         kb_columns = {row["name"] for row in conn.execute("PRAGMA table_info(knowledge_bases)").fetchall()}
         kb_sql_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_bases'"
@@ -240,81 +227,39 @@ class AuthService:
         kb_sql = kb_sql_row["sql"] if kb_sql_row else ""
         needs_kb_rebuild = "UNIQUE(department_id, name)" not in kb_sql
 
-        permission_columns = {row["name"] for row in conn.execute("PRAGMA table_info(kb_permissions)").fetchall()}
-        permission_sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'kb_permissions'"
-        ).fetchone()
-        permission_sql = permission_sql_row["sql"] if permission_sql_row else ""
-        needs_permission_rebuild = (
-            "kb_id" not in permission_columns
-            or "UNIQUE(kb_id, user_id)" not in permission_sql
-            or "kb_id INTEGER NOT NULL" not in permission_sql
-        )
-
-        if not needs_kb_rebuild and not needs_permission_rebuild:
+        if not needs_kb_rebuild:
             return
 
         conn.execute("PRAGMA foreign_keys=OFF")
         try:
-            if needs_kb_rebuild:
-                conn.execute("ALTER TABLE knowledge_bases RENAME TO knowledge_bases_old")
-                conn.execute("""
-                    CREATE TABLE knowledge_bases (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        department_id INTEGER,
-                        owner_user_id INTEGER,
-                        created_at TEXT NOT NULL,
-                        UNIQUE(department_id, name),
-                        FOREIGN KEY(department_id) REFERENCES departments(id),
-                        FOREIGN KEY(owner_user_id) REFERENCES users(id)
-                    )
-                """)
-                select_columns = [
-                    "id",
-                    "name",
-                    "department_id" if "department_id" in kb_columns else "NULL AS department_id",
-                    "owner_user_id" if "owner_user_id" in kb_columns else "NULL AS owner_user_id",
-                    "created_at" if "created_at" in kb_columns else "'' AS created_at",
-                ]
-                conn.execute(f"""
-                    INSERT OR IGNORE INTO knowledge_bases (id, name, department_id, owner_user_id, created_at)
-                    SELECT {', '.join(select_columns)}
-                    FROM knowledge_bases_old
-                """)
-                conn.execute("DROP TABLE knowledge_bases_old")
-
-            if needs_permission_rebuild:
-                conn.execute("ALTER TABLE kb_permissions RENAME TO kb_permissions_old")
-                conn.execute("""
-                    CREATE TABLE kb_permissions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        kb_id INTEGER NOT NULL,
-                        kb_name TEXT NOT NULL,
-                        user_id INTEGER NOT NULL,
-                        permission TEXT NOT NULL DEFAULT 'read',
-                        created_at TEXT NOT NULL,
-                        UNIQUE(kb_id, user_id),
-                        FOREIGN KEY(kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-                        FOREIGN KEY(user_id) REFERENCES users(id)
-                    )
-                """)
-                created_expr = "p.created_at" if "created_at" in permission_columns else "''"
-                permission_expr = "p.permission" if "permission" in permission_columns else "'read'"
-                kb_id_expr = "p.kb_id" if "kb_id" in permission_columns else "NULL"
-                conn.execute(f"""
-                    INSERT OR IGNORE INTO kb_permissions (kb_id, kb_name, user_id, permission, created_at)
-                    SELECT kb.id, kb.name, p.user_id, {permission_expr}, {created_expr}
-                    FROM kb_permissions_old p
-                    JOIN users u ON u.id = p.user_id
-                    JOIN knowledge_bases kb
-                      ON kb.name = p.kb_name
-                     AND (
-                         ({kb_id_expr} IS NOT NULL AND kb.id = {kb_id_expr})
-                         OR ({kb_id_expr} IS NULL AND kb.department_id = u.department_id)
-                     )
-                """)
-                conn.execute("DROP TABLE kb_permissions_old")
+            conn.execute("ALTER TABLE knowledge_bases RENAME TO knowledge_bases_old")
+            conn.execute("""
+                CREATE TABLE knowledge_bases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    department_id INTEGER,
+                    owner_user_id INTEGER,
+                    is_shared INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(department_id, name),
+                    FOREIGN KEY(department_id) REFERENCES departments(id),
+                    FOREIGN KEY(owner_user_id) REFERENCES users(id)
+                )
+            """)
+            select_columns = [
+                "id",
+                "name",
+                "department_id" if "department_id" in kb_columns else "NULL AS department_id",
+                "owner_user_id" if "owner_user_id" in kb_columns else "NULL AS owner_user_id",
+                "is_shared" if "is_shared" in kb_columns else "0 AS is_shared",
+                "created_at" if "created_at" in kb_columns else "'' AS created_at",
+            ]
+            conn.execute(f"""
+                INSERT OR IGNORE INTO knowledge_bases (id, name, department_id, owner_user_id, is_shared, created_at)
+                SELECT {', '.join(select_columns)}
+                FROM knowledge_bases_old
+            """)
+            conn.execute("DROP TABLE knowledge_bases_old")
         finally:
             conn.execute("PRAGMA foreign_keys=ON")
 
@@ -850,17 +795,18 @@ class AuthService:
             raise ValueError(f"Ambiguous knowledge base name without department scope: {kb_name}")
         return rows[0] if rows else None
 
-    def register_knowledge_base(self, kb_name: str, owner: AuthUser | None = None):
+    def register_knowledge_base(self, kb_name: str, owner: AuthUser | None = None, is_shared: bool = False):
+        """登记知识库归属。新库默认私有（仅所有者可访问），由所有者决定是否部门共享。"""
         kb_name = kb_name.strip()
         department_id = owner.department_id if owner else None
         owner_id = owner.id if owner else None
         with closing(self._connect()) as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO knowledge_bases (name, department_id, owner_user_id, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT OR IGNORE INTO knowledge_bases (name, department_id, owner_user_id, is_shared, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (kb_name, department_id, owner_id, utc_now()),
+                (kb_name, department_id, owner_id, 1 if is_shared else 0, utc_now()),
             )
 
     def knowledge_base_exists(
@@ -895,6 +841,72 @@ class AuthService:
                 return None
             owner = kb["owner_user_id"]
             return int(owner) if owner is not None else None
+
+    def get_knowledge_base_sharing(
+        self,
+        kb_name: str,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ) -> tuple[int | None, bool] | None:
+        """返回 ``(owner_user_id, is_shared)``；知识库不存在时返回 None。"""
+        with closing(self._connect()) as conn:
+            kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
+            if kb is None:
+                return None
+            owner = kb["owner_user_id"]
+            return (int(owner) if owner is not None else None, bool(kb["is_shared"]))
+
+    def set_knowledge_base_sharing(
+        self,
+        kb_name: str,
+        actor: AuthUser,
+        is_shared: bool,
+        department_id: int | str | None = None,
+        kb_id: int | None = None,
+    ) -> bool:
+        """切换知识库的部门共享状态；仅所有者可操作。
+
+        这是治理敏感动作(共享后全部门获得 admin)，因此在这里统一审计。
+        """
+        target_id = kb_name
+        try:
+            if actor is None or actor.role != ROLE_EMPLOYEE:
+                raise PermissionError("只有部门员工可以调整知识库共享状态。")
+            with closing(self._connect()) as conn:
+                kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
+                if kb is None:
+                    raise ValueError("知识库不存在")
+                target_id = kb["name"]
+                owner_id = kb["owner_user_id"]
+                if owner_id is None:
+                    raise PermissionError("该知识库未指定所有者，无法切换共享状态。")
+                if int(owner_id) != int(actor.id):
+                    raise PermissionError("只有知识库所有者可以调整共享状态。")
+                conn.execute(
+                    "UPDATE knowledge_bases SET is_shared = ? WHERE id = ?",
+                    (1 if is_shared else 0, kb["id"]),
+                )
+        except Exception as exc:
+            self._audit(
+                "update_kb_sharing",
+                actor=actor,
+                target_type="knowledge_base",
+                target_id=target_id,
+                kb_name=target_id,
+                success=False,
+                error_message=str(exc),
+                metadata={"is_shared": bool(is_shared)},
+            )
+            raise
+        self._audit(
+            "update_kb_sharing",
+            actor=actor,
+            target_type="knowledge_base",
+            target_id=target_id,
+            kb_name=target_id,
+            metadata={"is_shared": bool(is_shared), "owner_user_id": int(actor.id)},
+        )
+        return bool(is_shared)
 
     def delete_knowledge_base_record(
         self,
@@ -938,6 +950,7 @@ class AuthService:
                     d.name AS department_name,
                     kb.owner_user_id,
                     owner.username AS owner_username,
+                    kb.is_shared,
                     kb.created_at
                 FROM knowledge_bases kb
                 LEFT JOIN departments d ON d.id = kb.department_id
@@ -956,6 +969,7 @@ class AuthService:
                 department_name=row["department_name"],
                 owner_user_id=row["owner_user_id"],
                 owner_username=row["owner_username"],
+                is_shared=bool(row["is_shared"]),
                 employee_count=employee_counts.get(department_id, 0),
                 registered=True,
                 physical_exists=row["name"] in existing,
@@ -1056,20 +1070,31 @@ class AuthService:
         )
 
     def list_accessible_kbs(self, user: AuthUser, existing_kbs: list[str]) -> list[str]:
-        """员工对本部门全部知识库可见; 系统管理员不参与内容访问。"""
+        """员工可见的知识库: 自己是所有者, 或所有者已开启部门共享。
+
+        无主知识库(历史登记或治理挂载未指定负责人)保持部门可见, 避免数据失联。
+        系统管理员不参与内容访问。
+        """
         if user.role == ROLE_SYSTEM_ADMIN:
             return []
 
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT name FROM knowledge_bases WHERE department_id = ?",
-                (user.department_id,),
+                """
+                SELECT name FROM knowledge_bases
+                WHERE department_id = ?
+                  AND (is_shared = 1 OR owner_user_id IS NULL OR owner_user_id = ?)
+                """,
+                (user.department_id, user.id),
             ).fetchall()
         allowed = {row[0] for row in rows}
         return [kb for kb in existing_kbs if kb in allowed]
 
     def get_kb_permissions_for_user(self, user: AuthUser, existing_kbs: list[str] | None = None) -> dict[str, str]:
-        """员工对本部门全部知识库拥有 admin 权限(隐式, 不落授权表)。"""
+        """员工对自己创建的知识库、以及所有者已共享的知识库拥有 admin 权限。
+
+        私有库对其他同部门员工完全不可见(不落授权表)。无主历史库保持部门可见。
+        """
         if existing_kbs is None:
             existing_filter = None
         else:
@@ -1081,8 +1106,12 @@ class AuthService:
         permissions: dict[str, str] = {}
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT name, department_id FROM knowledge_bases WHERE department_id = ?",
-                (user.department_id,),
+                """
+                SELECT name, department_id FROM knowledge_bases
+                WHERE department_id = ?
+                  AND (is_shared = 1 OR owner_user_id IS NULL OR owner_user_id = ?)
+                """,
+                (user.department_id, user.id),
             ).fetchall()
         for row in rows:
             if existing_filter is not None and row["name"] not in existing_filter:

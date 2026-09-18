@@ -55,7 +55,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             self.assertIn((dept_b.id, "shared"), scoped)
             self.assertNotEqual(scoped[(dept_a.id, "shared")].kb_id, scoped[(dept_b.id, "shared")].kb_id)
 
-            # 员工对本部门 KB 隐式 admin; 跨部门互不可见
+            # 私有库: 只有所有者可见可管理; 共享后本部门其他员工才获得 admin
             perms_a = auth.get_kb_permissions_for_user(emp_a)
             perms_b = auth.get_kb_permissions_for_user(emp_b)
             self.assertEqual(perms_a[f"{dept_a.id}:shared"], "admin")
@@ -68,6 +68,49 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             self.assertEqual(accessible_a, ["shared"])
             self.assertEqual(accessible_b, ["shared"])
             self.assertEqual(auth.get_kb_permissions_for_user(system_admin), {})
+
+            del auth
+            gc.collect()
+
+    def test_private_kb_visible_only_to_owner_until_shared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = self._service(tmp)
+            system_admin = auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+            dept = auth.create_department("dept_private")
+            emp_a = auth.create_user_as(system_admin, "emp_a", "password123", ROLE_EMPLOYEE, dept.id)
+            emp_b = auth.create_user_as(system_admin, "emp_b", "password123", ROLE_EMPLOYEE, dept.id)
+
+            auth.register_knowledge_base("mine", owner=emp_a)
+            auth.register_knowledge_base("theirs", owner=emp_b)
+
+            perms_a = auth.get_kb_permissions_for_user(emp_a)
+            perms_b = auth.get_kb_permissions_for_user(emp_b)
+            self.assertEqual(set(perms_a), {f"{dept.id}:mine"})
+            self.assertEqual(set(perms_b), {f"{dept.id}:theirs"})
+            self.assertEqual(auth.list_accessible_kbs(emp_a, ["mine", "theirs"]), ["mine"])
+            self.assertEqual(auth.list_accessible_kbs(emp_b, ["mine", "theirs"]), ["theirs"])
+
+            # 只有所有者能切换共享
+            with self.assertRaises(PermissionError):
+                auth.set_knowledge_base_sharing("mine", emp_b, True)
+
+            # 共享 -> 部门全员 admin; 收回 -> 立即失效
+            auth.set_knowledge_base_sharing("mine", emp_a, True)
+            self.assertIn(f"{dept.id}:mine", auth.get_kb_permissions_for_user(emp_b))
+            self.assertEqual(sorted(auth.list_accessible_kbs(emp_b, ["mine", "theirs"])), ["mine", "theirs"])
+
+            auth.set_knowledge_base_sharing("mine", emp_a, False)
+            self.assertNotIn(f"{dept.id}:mine", auth.get_kb_permissions_for_user(emp_b))
+
+            # 未知知识库 -> ValueError; 无主库(治理挂载未指定负责人)保持部门可见但不可切换
+            with self.assertRaises(ValueError):
+                auth.set_knowledge_base_sharing("missing", emp_a, True)
+            auth.assign_knowledge_base_as(system_admin, "mounted", dept.id)
+            self.assertEqual(
+                sorted(auth.list_accessible_kbs(emp_b, ["mounted"])), ["mounted"]
+            )
+            with self.assertRaises(PermissionError):
+                auth.set_knowledge_base_sharing("mounted", emp_a, True)
 
             del auth
             gc.collect()
@@ -168,7 +211,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             del auth
             gc.collect()
 
-    def test_legacy_role_and_permission_rows_migrate(self):
+    def test_legacy_role_rows_migrate_and_permission_table_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "auth.db")
             conn = sqlite3.connect(db_path)
@@ -206,8 +249,7 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
                         created_at TEXT NOT NULL,
                         UNIQUE(kb_name, user_id)
                     );
-                    """
-                )
+                    """                )
                 now = "2026-01-01T00:00:00+00:00"
                 conn.executemany("INSERT INTO departments (id, name, created_at) VALUES (?, ?, ?)", [(1, "system", now), (2, "dept_a", now), (3, "dept_b", now)])
                 conn.executemany(
@@ -236,20 +278,25 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             self.assertEqual(roles["legacy_admin"], ROLE_EMPLOYEE)
             self.assertEqual(roles["legacy_user"], ROLE_EMPLOYEE)
 
-            # 旧授权行仍按用户部门映射到 kb_id (schema 迁移未破坏)
+            # 逐用户授权表已废弃：启动时清理历史表（不再迁移历史授权行）。
             conn = sqlite3.connect(db_path)
             try:
-                rows = conn.execute(
-                    """
-                    SELECT kb.department_id, p.user_id, p.permission
-                    FROM kb_permissions p
-                    JOIN knowledge_bases kb ON kb.id = p.kb_id
-                    ORDER BY p.user_id
-                    """
-                ).fetchall()
+                dropped = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'kb_permissions'"
+                ).fetchone()
+                kb_sql = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_bases'"
+                ).fetchone()[0]
+                sharing_rows = conn.execute(
+                    "SELECT COUNT(*) FROM knowledge_bases WHERE is_shared = 0"
+                ).fetchone()[0]
             finally:
                 conn.close()
-            self.assertEqual(rows, [(2, 2, "read"), (3, 3, "write")])
+            self.assertIsNone(dropped)
+            self.assertIn("UNIQUE(department_id, name)", kb_sql)
+            # 存量库迁移后默认私有
+            self.assertIn("is_shared", kb_sql)
+            self.assertEqual(sharing_rows, 2)
 
             del auth
             gc.collect()

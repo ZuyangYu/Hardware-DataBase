@@ -16,6 +16,7 @@ import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
+import { kbDeletionWarning, kbSharingDescription, kbVisibilityLabel, updateKbSharing } from '@/lib/kbSharing';
 
 const PERMISSION_LABELS: Record<string, string> = {
   read: '可读',
@@ -43,13 +44,27 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
   const [creating, setCreating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<KbView | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [sharingTarget, setSharingTarget] = useState<KbView | null>(null);
+  const [sharing, setSharing] = useState(false);
   const canManageContent = useCallback(
-    (kb: KbView) =>
-      kb.permission === 'write' ||
-      kb.permission === 'admin' ||
-      (employee && kb.department_id != null && kb.department_id === auth.user.department_id),
-    [auth.user.department_id, employee],
+    (kb: KbView) => !sysAdmin && (kb.permission === 'write' || kb.permission === 'admin'),
+    [sysAdmin],
   );
+
+  async function handleSharing() {
+    if (!sharingTarget || !sharingTarget.is_owner || sysAdmin || sharing) return;
+    setSharing(true);
+    try {
+      await updateKbSharing(sharingTarget, !sharingTarget.is_shared);
+      notify.success(sharingTarget.is_shared ? '知识库已改为私有' : '知识库已设为部门共享');
+      setSharingTarget(null);
+      onRefresh();
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '更新共享状态失败');
+    } finally {
+      setSharing(false);
+    }
+  }
 
   function openKb(kb: KbView, target: 'chat' | 'content') {
     if (sysAdmin) {
@@ -76,7 +91,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
     setCreating(true);
     try {
       await api.post<OkResponse>('/api/v1/kbs', { name });
-      notify.success('知识库已创建');
+      notify.success('私有知识库已创建，可在列表中设置部门共享');
       setNewKbName('');
       setCreateOpen(false);
       setPage(1);
@@ -89,7 +104,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
   }
 
   async function handleDeleteKb() {
-    if (!deleteTarget) return;
+    if (!deleteTarget || deleteTarget.permission !== 'admin' || sysAdmin || deleting) return;
     setDeleting(true);
     try {
       await api.delete<OkResponse>(`/api/v1/kbs/${encodeURIComponent(deleteTarget.name)}`);
@@ -119,6 +134,16 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
         ),
       },
       {
+        key: 'visibility',
+        title: '可见性',
+        width: 170,
+        render: (kb) => (
+          <span className="inline-flex whitespace-nowrap rounded-full bg-[#f3f4f6] px-[8px] py-[2px] text-[11px] text-[#464c5e]">
+            {kbVisibilityLabel(kb)}{kb.is_owner ? ' · 我是所有者' : ''}
+          </span>
+        ),
+      },
+      {
         key: 'permission',
         title: '权限',
         width: 100,
@@ -145,11 +170,21 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
       {
         key: 'actions',
         title: '操作',
-        width: 240,
+        width: 340,
         align: 'right',
-        className: 'min-w-[230px]',
+        className: 'min-w-[330px]',
         render: (kb) => (
           <div className="flex flex-nowrap justify-end gap-[8px]">
+            {kb.is_owner && !sysAdmin && (
+              <Button
+                variant="outline"
+                disabled={sharing || deleting || !kbsLoaded}
+                onClick={() => setSharingTarget(kb)}
+                className="h-[28px] rounded-[8px] px-[12px] text-[12px]"
+              >
+                {kb.is_shared ? '改为私有' : '部门共享'}
+              </Button>
+            )}
             <button
               type="button"
               onClick={() => openKb(kb, 'chat')}
@@ -185,7 +220,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
         ),
       },
     ],
-    [canManageContent, employee, sysAdmin],
+    [canManageContent, employee, sysAdmin, sharing, deleting, kbsLoaded],
   );
 
   const pageCount = Math.max(1, Math.ceil(kbs.length / PAGE_SIZE));
@@ -202,7 +237,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
         description={
           sysAdmin
             ? '你是系统管理员(治理角色),可查看知识库登记信息,但不能访问库内容。'
-            : '管理知识库名称、授权状态和删除操作;内容处理从具体知识库进入,对话可在侧边栏独立打开并选择挂载。'
+            : '知识库默认私有，仅所有者可切换部门共享；共享后本部门其他成员拥有完整 admin 权限，可管理文件和删除知识库。'
         }
         userName={auth.user.username}
         onLogout={onLogout}
@@ -239,7 +274,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
           </div>
         ) : kbs.length === 0 ? (
           <div className="py-[48px] text-center text-[13px] text-[#858b9c]">
-            暂无可访问的知识库,请联系系统管理员挂载。
+            暂无可访问的知识库，可新建私有知识库或请同部门所有者开启共享。
           </div>
         ) : (
           <>
@@ -261,6 +296,7 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
             <DialogTitle className="text-[16px] font-semibold text-[#18181a]">新建知识库</DialogTitle>
           </DialogHeader>
           <div className="grid gap-[14px] px-[24px] pb-[20px]">
+            <p className="text-[12px] text-[#757f9c]">新知识库默认私有，仅你可访问。创建后可设置部门共享。</p>
             <div className="grid gap-[4px]">
               <Label className="text-[12px] text-[#464c5e]">知识库名称</Label>
               <Input value={newKbName} onChange={(e) => setNewKbName(e.target.value)} placeholder="例如 project_alpha" autoFocus />
@@ -282,12 +318,24 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
       </Dialog>
 
       <ConfirmDialog
+        open={sharingTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setSharingTarget(null);
+        }}
+        title={<>{sharingTarget?.is_shared ? '改为私有' : '部门共享'}「{sharingTarget?.name}」</>}
+        description={kbSharingDescription(Boolean(sharingTarget?.is_shared))}
+        confirmText={sharingTarget?.is_shared ? '改为私有' : '确认共享'}
+        loading={sharing}
+        destructive={Boolean(sharingTarget?.is_shared)}
+        onConfirm={handleSharing}
+      />
+      <ConfirmDialog
         open={deleteTarget !== null}
         onOpenChange={(open: boolean) => {
           if (!open) setDeleteTarget(null);
         }}
         title={<>删除知识库「{deleteTarget?.name}」</>}
-        description="删除后该知识库及其文档、归档和索引将不可恢复。"
+        description={`${kbDeletionWarning(deleteTarget)}删除后该知识库及其文档、归档和索引将不可恢复。`}
         confirmText="删除"
         loading={deleting}
         destructive

@@ -166,7 +166,7 @@ class AttachmentApiTests(unittest.TestCase):
         # through their own session id: must 404 without leaking existence.
         sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         self.auth.create_user_as(
-            sysadmin, "user2", "pw123456", role="employee", department_id=self.user.department_id
+            sysadmin, "user2", "pw123456", department_id=self.user.department_id
         )
         other_token = self._token("user2")
         other_session = ConversationService(self.db_path).create_session(

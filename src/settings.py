@@ -70,6 +70,9 @@ RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
 RAGFLOW_GOVERNANCE_DATASET_NAME = os.getenv("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")
 RAGFLOW_DESIGN_DATASET_NAME = os.getenv("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")
 RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
+# 解析状态同步最小间隔: 后台 worker 按该间隔把仍在解析中的文档状态与
+# RAGFlow 远端对齐, 避免本地台账永远停留在 parsing。
+RAGFLOW_STATUS_REFRESH_MIN_SECONDS = int(os.getenv("RAGFLOW_STATUS_REFRESH_MIN_SECONDS", "60"))
 RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
 RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
 
@@ -343,10 +346,6 @@ DISTRIBUTED_ADMISSION_TTL_SECONDS = int(os.getenv("DISTRIBUTED_ADMISSION_TTL_SEC
 PROVIDER_RPM_LIMIT = int(os.getenv("PROVIDER_RPM_LIMIT", "0"))
 # Provider token budget per minute, counted from estimated input/output tokens.
 PROVIDER_TPM_LIMIT = int(os.getenv("PROVIDER_TPM_LIMIT", "0"))
-# Legacy turn-less POST /query adapter (v3 §12.4).  It keeps no durable Turn,
-# so it is debug/compat only and must not back production chat traffic; the
-# durable path is POST /conversations/{id}/turns.  Set false to fail it closed.
-LEGACY_QUERY_ENABLED = _env_bool("LEGACY_QUERY_ENABLED", True)
 # Production processes must point at a pre-provisioned quota database instead
 # of silently creating a same-named local file.
 RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool(
@@ -599,6 +598,7 @@ DEFAULT_VALUES = {
     "RAGFLOW_GOVERNANCE_DATASET_NAME": "department_governance",
     "RAGFLOW_DESIGN_DATASET_NAME": "project_design_assets",
     "RAGFLOW_TIMEOUT_SECONDS": "120",
+    "RAGFLOW_STATUS_REFRESH_MIN_SECONDS": "60",
     "RAGFLOW_SIMILARITY_THRESHOLD": "0.25",
     "RAGFLOW_VECTOR_WEIGHT": "0.4",
     "PIPELINE_ARCHIVE_ROOT": os.path.join(STORAGE_DIR, "pipeline_archives"),
@@ -736,7 +736,6 @@ DEFAULT_VALUES = {
     "DISTRIBUTED_ADMISSION_TTL_SECONDS": "120",
     "PROVIDER_RPM_LIMIT": "0",
     "PROVIDER_TPM_LIMIT": "0",
-    "LEGACY_QUERY_ENABLED": "true",
     "CHAT_QUEUE_DEADLINE_SECONDS": "600",
     "RESOURCE_LLM_MAX_CONCURRENT": "4",
     "RESOURCE_LLM_RESERVED_INTERACTIVE": "2",
@@ -875,6 +874,7 @@ def reload_settings():
     global RAGFLOW_BASE_URL, RAGFLOW_API_KEY
     global RAGFLOW_GOVERNANCE_DATASET_NAME, RAGFLOW_DESIGN_DATASET_NAME
     global RAGFLOW_TIMEOUT_SECONDS, RAGFLOW_SIMILARITY_THRESHOLD, RAGFLOW_VECTOR_WEIGHT
+    global RAGFLOW_STATUS_REFRESH_MIN_SECONDS
     global AUTH_DB_PATH, AUTH_DEFAULT_ADMIN_USERNAME, AUTH_DEFAULT_ADMIN_PASSWORD, AUTH_SESSION_TTL_HOURS
     global AGENT_CHECKPOINT_DB_PATH, AGENT_CHECKPOINT_BACKEND, AGENT_CHECKPOINT_DATABASE_URL
     global AGENT_CHECKPOINT_POOL_SIZE
@@ -925,7 +925,6 @@ def reload_settings():
     global DISTRIBUTED_ADMISSION_ENABLED, DISTRIBUTED_ADMISSION_TTL_SECONDS
     global PROVIDER_RPM_LIMIT
     global PROVIDER_TPM_LIMIT
-    global LEGACY_QUERY_ENABLED
     global CHAT_QUEUE_DEADLINE_SECONDS
     global RESOURCE_LLM_MAX_CONCURRENT, RESOURCE_LLM_RESERVED_INTERACTIVE
     global RESOURCE_RAG_MAX_CONCURRENT, RESOURCE_RAG_RESERVED_INTERACTIVE
@@ -1010,6 +1009,7 @@ def reload_settings():
     RAGFLOW_GOVERNANCE_DATASET_NAME = os.getenv("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")
     RAGFLOW_DESIGN_DATASET_NAME = os.getenv("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")
     RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
+    RAGFLOW_STATUS_REFRESH_MIN_SECONDS = int(os.getenv("RAGFLOW_STATUS_REFRESH_MIN_SECONDS", "60"))
     RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
     RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
     PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
@@ -1140,7 +1140,6 @@ def reload_settings():
     DISTRIBUTED_ADMISSION_TTL_SECONDS = int(os.getenv("DISTRIBUTED_ADMISSION_TTL_SECONDS", "120"))
     PROVIDER_RPM_LIMIT = int(os.getenv("PROVIDER_RPM_LIMIT", "0"))
     PROVIDER_TPM_LIMIT = int(os.getenv("PROVIDER_TPM_LIMIT", "0"))
-    LEGACY_QUERY_ENABLED = _env_bool("LEGACY_QUERY_ENABLED", True)
     CHAT_QUEUE_DEADLINE_SECONDS = int(os.getenv("CHAT_QUEUE_DEADLINE_SECONDS", "600"))
     RESOURCE_LLM_MAX_CONCURRENT = int(os.getenv("RESOURCE_LLM_MAX_CONCURRENT", "4"))
     RESOURCE_LLM_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_LLM_RESERVED_INTERACTIVE", "2"))
@@ -1469,6 +1468,7 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
 # so callers must validate BEFORE persisting anything to .env.
 _INT_SETTING_KEYS = frozenset({
     "RAGFLOW_TIMEOUT_SECONDS",
+    "RAGFLOW_STATUS_REFRESH_MIN_SECONDS",
     "AUTH_SESSION_TTL_HOURS",
     "AGENT_CUSTOM_MAX_TOKENS",
     "AGENT_MODEL_MAX_INPUT_TOKENS",

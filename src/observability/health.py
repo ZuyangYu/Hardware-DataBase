@@ -109,15 +109,6 @@ def check_dependencies() -> dict[str, Any]:
         "worker": {"status": worker_status, "count": len(workers), "instances": workers},
         "ragflow": ragflow,
         "llm": llm,
-        # v3 §12.4: the turn-less adapter keeps no durable Turn; the durable
-        # path is POST /conversations/{id}/turns.
-        "legacy_query": {
-            "status": "enabled"
-            if bool(getattr(settings, "LEGACY_QUERY_ENABLED", True))
-            else "disabled",
-            "durable_turn": False,
-            "note": "调试/兼容入口；生产聊天使用持久化 Turn",
-        },
     }
     failed = [name for name, item in dependencies.items() if item.get("status") == "down"]
     degraded = [name for name, item in dependencies.items() if item.get("status") == "degraded"]

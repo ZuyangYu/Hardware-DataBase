@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 
 import CodeBlock from '@/components/CodeBlock';
 import type { EvidenceItem } from '@/api/types';
@@ -8,6 +8,66 @@ import {
   CHAT_MD_TABLE_CLASS,
   CHAT_MD_TABLE_SCROLL_CLASS,
 } from './chatPageStyles';
+
+/** SVG 图上限: 超过则回退按源码显示,避免超大图形拖垮页面。 */
+const SVG_FIGURE_MAX_CHARS = 200 * 1024;
+
+/**
+ * 把模型输出的 SVG 代码块渲染成图片。
+ * 走 ``<img src=blob:...>`` 而不是 innerHTML: 浏览器在 img 中加载 SVG 不会执行脚本。
+ */
+function SvgFigure({ code, tooLarge }: { code: string; tooLarge: boolean }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    // 在 effect 里创建 blob URL: StrictMode 的"挂载→卸载→再挂载"会重建,
+    // 避免 useMemo 一次性 URL 被清理 revoke 后无法恢复(img 裂图/打不开)。
+    if (tooLarge) {
+      setUrl(null);
+      return;
+    }
+    let created: string | null = null;
+    try {
+      created = URL.createObjectURL(new Blob([code], { type: 'image/svg+xml;charset=utf-8' }));
+    } catch {
+      created = null;
+    }
+    setUrl(created);
+    return () => {
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [code, tooLarge]);
+
+  if (tooLarge) {
+    return (
+      <figure data-svg-figure className="overflow-hidden rounded-[12px] border border-[#e3e7f1] bg-white">
+        <figcaption className="border-b border-[#eef1f7] px-[10px] py-[6px] text-[11px] text-[#b45309]">
+          SVG 过大（超过 200KB），已按源码显示
+        </figcaption>
+        <CodeBlock className="md-code-block" code={code} language="svg" />
+      </figure>
+    );
+  }
+
+  return (
+    <figure data-svg-figure className="overflow-hidden rounded-[12px] border border-[#e3e7f1] bg-white">
+      {url ? (
+        <img src={url} alt="SVG 图形" className="mx-auto max-h-[560px] w-auto max-w-full p-[10px]" />
+      ) : (
+        <div className="px-[10px] py-[18px] text-center text-[12px] text-[#858b9c]">正在绘图…</div>
+      )}
+      {url && (
+        <figcaption className="flex items-center gap-[12px] border-t border-[#eef1f7] px-[10px] py-[6px] text-[11px] text-[#858b9c]">
+          <a href={url} download="figure.svg" className="transition-colors hover:text-[#18181a] hover:underline">
+            下载 SVG
+          </a>
+          <a href={url} target="_blank" rel="noreferrer" className="transition-colors hover:text-[#18181a] hover:underline">
+            新窗口打开
+          </a>
+        </figcaption>
+      )}
+    </figure>
+  );
+}
 
 /**
  * 聊天 markdown 渲染(照搬自 chatHelpers 的 markdown 部分,手写、无 react-markdown 依赖)。
@@ -226,15 +286,33 @@ export function renderMarkdownBlocks(content: string, preserveLineBreaks = true)
     if (trimmed.startsWith('```')) {
       const language = trimmed.slice(3).trim();
       const codeLines: string[] = [];
+      let closed = false;
       index += 1;
-      while (index < lines.length && !lines[index].trim().startsWith('```')) {
+      while (index < lines.length) {
+        if (lines[index].trim().startsWith('```')) {
+          closed = true;
+          index += 1;
+          break;
+        }
         codeLines.push(lines[index]);
         index += 1;
       }
-      if (index < lines.length) index += 1;
-      blocks.push(
-        <CodeBlock key={key} className="md-code-block" code={codeLines.join('\n')} language={language || undefined} />,
-      );
+      const code = codeLines.join('\n');
+      const lang = language.toLowerCase();
+      const isSvg = /^(svg|xml|html)$/.test(lang) && /<svg[\s>]/i.test(code);
+      if (isSvg && !closed) {
+        blocks.push(
+          <div key={key} className="rounded-[12px] border border-[#e3e7f1] bg-white px-[10px] py-[18px] text-center text-[12px] text-[#858b9c]">
+            正在绘图…（等待 SVG 输出完成）
+          </div>,
+        );
+      } else if (isSvg) {
+        blocks.push(<SvgFigure key={key} code={code} tooLarge={code.length > SVG_FIGURE_MAX_CHARS} />);
+      } else {
+        blocks.push(
+          <CodeBlock key={key} className="md-code-block" code={code} language={language || undefined} />,
+        );
+      }
       blockIndex += 1;
       continue;
     }

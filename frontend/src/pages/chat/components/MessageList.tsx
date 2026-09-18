@@ -25,6 +25,7 @@ type Props = {
   traceByMessageId: Record<number, QueryTraceStep[]>;
   degradedNotes: Array<{ stage: string; reason: string }>;
   onCreateMemory?: (messageIds: number[]) => void;
+  onCreateProjectMemory?: (messageIds: number[]) => void;
   onEditMessage?: (messageId: number) => void;
   onExport?: (message: MessageView, format: ExportFormat) => void;
   onDownloadExport?: (job: ExportJobView) => void;
@@ -48,6 +49,7 @@ export default function MessageList({
   traceByMessageId,
   degradedNotes,
   onCreateMemory,
+  onCreateProjectMemory,
   onEditMessage,
   onExport,
   onDownloadExport,
@@ -121,6 +123,7 @@ export default function MessageList({
                 : undefined
             }
             onCreateMemory={onCreateMemory}
+            onCreateProjectMemory={onCreateProjectMemory}
             memorySourceMessageIds={memorySourceFor(msg)}
             onEditMessage={onEditMessage}
             onExport={onExport}

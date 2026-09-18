@@ -5,7 +5,9 @@
 
 输入: <repo>/AAA/*.xlsx (gitignore 的本地数据, 与 golden_qa.json 的 file_keys 对应)
 输出: <repo>/storage/eval/spreadsheet/aaa_eval/latest_report.json (gitignore)
-基线: benchmarks/spreadsheet/baseline_report.json (2026-08-31 存档, 优化对比的基准)
+基线: benchmarks/spreadsheet/baseline_report.json (2026-09-16 以 v1.1 数据集与当前解析器重生成;
+      历史存档 baseline_report_20260831.json; 重生成原因: 旧基线早于解析器修正,
+      各文件 semantic_row_count 已变化, PL01 解析命中 0/1 -> 1/1)
 
 层1(解析保真): 每个 anchor_group 是否能被 table_semantic_rows 表示(按 file+sheet 定位)
 层2(检索召回): 用问题原文/关键词两种 query, 走与 SpreadsheetSemanticTool/SpreadsheetCellTool

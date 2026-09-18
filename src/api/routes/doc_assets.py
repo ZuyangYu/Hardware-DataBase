@@ -18,7 +18,7 @@ from src.core.auth import AuthService, AuthUser
 from src.core.doc_assets import DocumentAssetError, DocumentAssetService
 from src.core.wiki import WikiService
 from src.core.app_pipeline import AppPipeline
-from src.pipelines.document_rag.schemas import TASK_STATUS_COMPLETED, normalize_parse_status
+from src.pipelines.document_rag.schemas import normalize_parse_status
 
 router = APIRouter(tags=["doc-assets"])
 
@@ -146,33 +146,6 @@ def add_doc_asset_version(
         kb_id=kb_id, department_id=department_id, file_id=info.id, exclude_asset_id=asset_id
     )
     return DocAssetView(**asset)
-
-
-@router.post("/kbs/{kb_name}/doc-assets/backfill", response_model=OkResponse)
-def backfill_doc_assets(
-    kb_name: str,
-    user: AuthUser = Depends(current_user),
-    pipeline: AppPipeline = Depends(get_pipeline),
-    auth: AuthService = Depends(get_auth_service),
-):
-    """One shadow asset per parsed file not yet registered (idempotent)."""
-    ctx, kb_id, department_id = _scope(user, kb_name, "write", auth)
-    files = []
-    for item in pipeline.list_file_infos(kb_name, ctx=ctx):
-        if normalize_parse_status(getattr(item, "status", ""), getattr(item, "processor_kind", "")) != TASK_STATUS_COMPLETED:
-            continue
-        files.append({
-            "file_id": str(item.id),
-            "file_name": str(item.name),
-            "processor_kind": str(getattr(item, "processor_kind", "") or ""),
-            "content_hash": str((getattr(item, "metadata", {}) or {}).get("content_hash") or ""),
-            "parse_status": normalize_parse_status(getattr(item, "status", ""), getattr(item, "processor_kind", "")),
-        })
-    result = DocumentAssetService().backfill_shadow_assets(
-        kb_id=kb_id, kb_name=kb_name, department_id=department_id,
-        actor_user_id=user.id, files=files,
-    )
-    return OkResponse(ok=True, message=f"补录 {result['created']} 个影子资产, 跳过 {result['skipped']} 个(已登记)")
 
 
 @router.post("/kbs/{kb_name}/doc-assets/{asset_id}/links", response_model=DocAssetLinkView)

@@ -644,7 +644,7 @@ def run_case(
 
 
 def _create_identities(
-    client: "E2EClient", *, kb_name: str, department_id: int
+    client: "E2EClient", *, department_id: int
 ) -> tuple[str, str, str, int, int]:
     import src.settings as settings
 
@@ -655,16 +655,14 @@ def _create_identities(
     reviewer_name = f"e2e_admin_{run}"
     owner_name = f"e2e_owner_{run}"
     password = os.getenv("HDB_E2E_PASSWORD", "E2ePass!2026")
-    # Two-role model (PR #49): only the system admin registers staff, accounts
-    # are always employees, and same-department employees hold implicit KB
-    # admin — no per-KB permission grant exists anymore.
+    # 两级角色模型：系统管理员创建两个部门员工；员工对部门 KB 隐式 admin，
+    # 没有逐用户授权步骤（kb_permissions 已随旧模型删除）。
     created_reviewer = client.requests.post(
         f"{client.base_url}/api/v1/users",
         headers=client.headers(admin_token),
         json={
             "username": reviewer_name,
             "password": password,
-            "role": "employee",
             "department_id": department_id,
         },
         timeout=client.timeout,
@@ -678,7 +676,6 @@ def _create_identities(
         json={
             "username": owner_name,
             "password": password,
-            "role": "employee",
             "department_id": department_id,
         },
         timeout=client.timeout,
@@ -768,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
     client = E2EClient(args.base_url)
     db_path = _resolve_auth_db()
     admin_token, reviewer_token, owner_token, owner_id, reviewer_id = _create_identities(
-        client, kb_name=args.kb, department_id=args.department_id
+        client, department_id=args.department_id
     )
 
     results: list[CaseResult] = []

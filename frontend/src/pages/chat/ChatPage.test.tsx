@@ -33,6 +33,9 @@ const writableKb: KbView = {
   department_name: '研发部',
   permission: 'write',
   registered: true,
+  owner_user_id: 1,
+  is_shared: true,
+  is_owner: false,
 };
 
 function renderChat(documentAuthoringEnabled?: boolean, availableKbs: KbView[] = [writableKb]) {

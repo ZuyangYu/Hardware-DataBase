@@ -19,7 +19,7 @@ def system_status(
 ):
     """Return operational dependencies and durable task counters for admins.
 
-    员工只看本部门的任务计数(与 /task-metrics 一致); 系统管理员看全局。
+    员工只看本部门的任务计数; 系统管理员看全局。
     """
     department_id = None if viewer.role == ROLE_SYSTEM_ADMIN else viewer.department_id
     return {

@@ -96,6 +96,7 @@ _FAILURE_CONSTANTS = frozenset({
     # friendly_error_message (src/core/error_friendly.py) 的五条稳定文案
     "model_rate_limited",
     "model_timeout",
+    "model_unavailable",
     "model_unreachable",
     "permission_denied",
     "system_error",
@@ -106,6 +107,7 @@ _FAILURE_CONSTANTS = frozenset({
 _FRIENDLY_ERROR_CATEGORY = {
     "模型服务调用过于频繁或额度受限，请稍后重试。": "model_rate_limited",
     "模型服务响应超时，请稍后重试。": "model_timeout",
+    "模型服务暂时不可用，请稍后重新发送本问题。": "model_unavailable",
     "无法连接模型服务，请检查网络或稍后重试。": "model_unreachable",
     "没有执行该操作的权限。": "permission_denied",
     "系统错误，请稍后重试；若持续出现请联系管理员。": "system_error",
