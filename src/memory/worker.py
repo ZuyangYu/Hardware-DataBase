@@ -1038,6 +1038,10 @@ class MemoryWorker:
                 # Reconciliation is a rebuild aid; it must not prevent a
                 # durable job from being claimed or make Chat unavailable.
                 counter("hdb.memory.reconcile_error", attributes={"error": str(exc)[:100]})
+        # Idle polls must not churn the shared deployment quota ledger: only
+        # acquire a MEMORY slot when a job is actually claimable.
+        if not self.jobs.has_claimable():
+            return False
         # P0b: reflection/extraction model work holds one MEMORY slot.
         if not bool(getattr(self.settings, "RESOURCE_GOVERNOR_ENABLED", True)):
             return self._process_job()

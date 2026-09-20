@@ -10,10 +10,12 @@ feature flag defaults on but remains opt-out configurable.
 from __future__ import annotations
 
 import src.settings
+from functools import partial
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from src.api.deps import (
     current_user,
@@ -135,18 +137,21 @@ async def run_upload(
     # Spool to an in-process temp buffer is avoided: Starlette's SpooledTemporaryFile
     # already streams to disk above a threshold, and our storage writer streams
     # chunks from it so peak memory stays bounded.
-    return service.upload(
-        session_id=session_id,
-        user_id=user_id,
-        filename=file.filename or "attachment",
-        stream=file.file,
-        client_request_id=client_request_id,
-        usage_hint=usage_hint,
-        declared_media_type=(
-            declared_media_type
-            if declared_media_type is not None
-            else getattr(file, "content_type", None)
-        ),
+    return await run_in_threadpool(
+        partial(
+            service.upload,
+            session_id=session_id,
+            user_id=user_id,
+            filename=file.filename or "attachment",
+            stream=file.file,
+            client_request_id=client_request_id,
+            usage_hint=usage_hint,
+            declared_media_type=(
+                declared_media_type
+                if declared_media_type is not None
+                else getattr(file, "content_type", None)
+            ),
+        )
     )
 
 

@@ -277,6 +277,24 @@ class MemoryJobRepository:
             if own:
                 conn.close()
 
+    def has_claimable(self, *, now: str | None = None) -> bool:
+        """Read-only check for runnable jobs; never mutates state.
+
+        Used by the worker to avoid churning the shared deployment quota
+        ledger while its queue is empty.
+        """
+        now = now or utc_now()
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT 1 FROM memory_jobs
+                WHERE (status IN ('pending', 'retrying') AND available_at <= ?
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?))
+                   OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                LIMIT 1""",
+                (now, now, now),
+            ).fetchone()
+        return row is not None
+
     def claim_next(
         self,
         worker_id: str,
