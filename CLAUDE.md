@@ -16,7 +16,9 @@ The UI is a React + TypeScript SPA in `frontend/` talking to the FastAPI
 backend in `src/api/`. The former Streamlit app (`streamlit_app.py`, `src/ui/`)
 has been removed; `frontend/` + `src/api/` are the only UI path now.
 
-`docs/` holds local design/eval notes and is not tracked in git. The former
+`docs/` holds local design/eval notes and is not tracked in git. `wiki/` (tracked
+in git, entry `wiki/README.md`) holds the system technical wiki — keep it in sync
+when changing a subsystem. The former
 `architecture_doc.md`, `pipeline_contract.md`, `langgraph_agentic_query_design.md`,
 `joint_retrieval_test_cases.md` and `hardware_database_develop_integration_plan.md`
 are no longer present - treat the code as the source of truth.
