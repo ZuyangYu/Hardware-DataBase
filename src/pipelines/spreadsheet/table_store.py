@@ -1101,8 +1101,11 @@ def _delete_legacy_index_files_for_document(department_id: str, kb_name: str, re
         doc for doc in kb_index.get("documents", [])
         if doc.get("record_id") != record_id
     ]
-    with open(kb_index_path, "w", encoding="utf-8") as file_obj:
-        json.dump(kb_index, file_obj, ensure_ascii=False, indent=2)
+    from src.core.atomic_files import atomic_write_text
+
+    atomic_write_text(
+        kb_index_path, json.dumps(kb_index, ensure_ascii=False, indent=2)
+    )
 
 
 def _json_loads(value: str, default):

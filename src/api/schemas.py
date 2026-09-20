@@ -482,6 +482,11 @@ class TurnView(BaseModel):
     document_context: DocumentContextView | None = None
     source_scope: str = "auto"
     attachments: list[AttachmentSnapshotView] = Field(default_factory=list)
+    # Queue visibility: which earlier turn blocks this one, why, and when a
+    # waiting-for-attachments turn will time out.
+    blocked_by_turn_id: str | None = None
+    queue_reason: str = ""
+    wait_deadline: str | None = None
 
 
 class TurnStartResponse(BaseModel):
@@ -517,7 +522,12 @@ class CreateExportRequest(BaseModel):
     content_shape: Literal["report", "data", "raw"] = "report"
     title: str | None = Field(default=None, max_length=160)
     client_request_id: str | None = Field(default=None, max_length=128)
-    include_citations: bool = True
+    # None = automatic: organized exports exclude the source list unless the
+    # caller explicitly asks for it; as-is exports keep the legacy default.
+    include_citations: bool | None = None
+    # Arrange-before-export: one model pass turns the chat answer into
+    # deliverable content following the original user request.
+    organize: bool = True
     options: dict[str, Any] = Field(default_factory=dict)
 
 

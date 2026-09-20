@@ -101,6 +101,15 @@ class MemoryJobRepository:
     """
 
     def __init__(self, db_path: str | None = None):
+        import src.settings as settings
+        if str(getattr(settings, "CONTROL_PLANE_BACKEND", "sqlite") or "sqlite").lower() == "postgres":
+            dsn = str(getattr(settings, "CONTROL_PLANE_DATABASE_URL", "") or "").strip()
+            if not dsn:
+                raise RuntimeError("CONTROL_PLANE_BACKEND=postgres requires CONTROL_PLANE_DATABASE_URL")
+            from src.storage.control_plane.memory_worker import PostgresMemoryJobRepository
+            self.__class__ = PostgresMemoryJobRepository
+            PostgresMemoryJobRepository.__init__(self, dsn)
+            return
         if not db_path:
             import src.settings as settings
 
@@ -755,11 +764,11 @@ class MemoryJobRepository:
             ids,
         )
         sources = conn.execute(
-            f"SELECT DISTINCT memory_id FROM memory_sources WHERE consent_event_id IN ({placeholders}) AND source_valid = 1",
+            f"SELECT DISTINCT memory_id FROM memory_sources WHERE consent_event_id IN ({placeholders}) AND source_valid = TRUE",
             ids,
         ).fetchall()
         conn.execute(
-            f"UPDATE memory_sources SET source_valid = 0, invalidated_at = ? WHERE consent_event_id IN ({placeholders}) AND source_valid = 1",
+            f"UPDATE memory_sources SET source_valid = FALSE, invalidated_at = ? WHERE consent_event_id IN ({placeholders}) AND source_valid = TRUE",
             (now, *ids),
         )
         for row in sources:
@@ -802,8 +811,8 @@ class MemoryJobRepository:
                     "UPDATE memory_reflection_runs SET output_payload_json = NULL, encrypted_source_snapshot_ref = NULL, status = 'failed' WHERE consent_event_id = ?",
                     (consent_event_id,),
                 )
-                sources = conn.execute("SELECT DISTINCT memory_id FROM memory_sources WHERE consent_event_id = ? AND source_valid = 1", (consent_event_id,)).fetchall()
-                conn.execute("UPDATE memory_sources SET source_valid = 0, invalidated_at = ? WHERE consent_event_id = ? AND source_valid = 1", (now, consent_event_id))
+                sources = conn.execute("SELECT DISTINCT memory_id FROM memory_sources WHERE consent_event_id = ? AND source_valid = TRUE", (consent_event_id,)).fetchall()
+                conn.execute("UPDATE memory_sources SET source_valid = FALSE, invalidated_at = ? WHERE consent_event_id = ? AND source_valid = TRUE", (now, consent_event_id))
                 for source in sources:
                     _invalidate_memory_in_transaction(conn, source["memory_id"], reason=reason)
                 self._audit_consent(
@@ -998,7 +1007,7 @@ def apply_source_invalidation(
     if record is None:
         return
     valid_count = conn.execute(
-        "SELECT COUNT(*) AS count FROM memory_sources WHERE memory_id = ? AND source_valid = 1",
+        "SELECT COUNT(*) AS count FROM memory_sources WHERE memory_id = ? AND source_valid = TRUE",
         (memory_id,),
     ).fetchone()["count"]
     if record["scope"] == "user":
@@ -1036,7 +1045,7 @@ def apply_source_invalidation(
     for projection in projections:
         next_fence = int(projection["fence_version"]) + 1
         conn.execute(
-            "UPDATE memory_projections SET active = 0, manager_writable = 0, fence_version = ?, retired_at = ?"
+            "UPDATE memory_projections SET active = FALSE, manager_writable = FALSE, fence_version = ?, retired_at = ?"
             " WHERE projection_id = ? AND retired_at IS NULL AND fence_version = ?",
             (next_fence, now, projection["projection_id"], int(projection["fence_version"])),
         )
@@ -1118,14 +1127,14 @@ def invalidate_message_memory_in_connection(
     )
     source_rows = conn.execute(
         """SELECT DISTINCT memory_id FROM memory_sources
-           WHERE session_id = ? AND message_id = ? AND source_valid = 1""",
+           WHERE session_id = ? AND message_id = ? AND source_valid = TRUE""",
         (int(session_id), int(message_id)),
     ).fetchall()
     if not source_rows:
         return 0
     conn.execute(
-        """UPDATE memory_sources SET source_valid = 0, invalidated_at = ?
-           WHERE session_id = ? AND message_id = ? AND source_valid = 1""",
+        """UPDATE memory_sources SET source_valid = FALSE, invalidated_at = ?
+           WHERE session_id = ? AND message_id = ? AND source_valid = TRUE""",
         (now, int(session_id), int(message_id)),
     )
     affected = 0
@@ -1205,13 +1214,13 @@ def invalidate_session_memory_in_connection(
         (reason, int(session_id)),
     )
     source_rows = conn.execute(
-        "SELECT DISTINCT memory_id FROM memory_sources WHERE session_id = ? AND source_valid = 1",
+        "SELECT DISTINCT memory_id FROM memory_sources WHERE session_id = ? AND source_valid = TRUE",
         (int(session_id),),
     ).fetchall()
     if not source_rows:
         return 0
     conn.execute(
-        "UPDATE memory_sources SET source_valid = 0, invalidated_at = ? WHERE session_id = ? AND source_valid = 1",
+        "UPDATE memory_sources SET source_valid = FALSE, invalidated_at = ? WHERE session_id = ? AND source_valid = TRUE",
         (now, int(session_id)),
     )
     affected = 0
@@ -1340,7 +1349,7 @@ def _invalidate_memory_in_transaction(conn: sqlite3.Connection, memory_id: str, 
     for projection in projections:
         next_fence = int(projection["fence_version"]) + 1
         conn.execute(
-            "UPDATE memory_projections SET active = 0, manager_writable = 0, fence_version = ?, retired_at = ? WHERE projection_id = ? AND retired_at IS NULL",
+            "UPDATE memory_projections SET active = FALSE, manager_writable = FALSE, fence_version = ?, retired_at = ? WHERE projection_id = ? AND retired_at IS NULL",
             (next_fence, now, projection["projection_id"]),
         )
         operation_id = str(uuid.uuid4())

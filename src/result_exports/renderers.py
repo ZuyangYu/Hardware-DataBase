@@ -144,6 +144,13 @@ def _inline_markup(
     return "".join(rendered)
 
 
+def _is_organized(envelope: ResultEnvelope) -> bool:
+    """Organized exports are deliverables: skip conversation section headings."""
+
+    metadata = envelope.metadata if isinstance(envelope.metadata, dict) else {}
+    return bool(metadata.get("organized"))
+
+
 def _answer_blocks(envelope: ResultEnvelope) -> list[dict[str, Any]]:
     """Return the persisted block model, or derive it for old snapshots."""
 
@@ -632,7 +639,8 @@ def _render_docx(envelope: ResultEnvelope, content_shape: str) -> RenderedResult
     rendered_table_fingerprints: set[tuple[Any, ...]] = set()
     section_count = 0
     if content_shape in {"report", "raw"} and blocks:
-        document.add_heading("回答", level=1)
+        if not _is_organized(envelope):
+            document.add_heading("回答", level=1)
         markdown_index = 0
         for block in blocks:
             if block.get("type") == "table":
@@ -935,7 +943,8 @@ def _render_pdf(envelope: ResultEnvelope, content_shape: str) -> RenderedResult:
         story.extend([_pdf_paragraph(f"查询：{envelope.query}", body_style), Spacer(1, 2 * mm)])
     rendered_table_fingerprints: set[tuple[Any, ...]] = set()
     if content_shape in {"report", "raw"} and blocks:
-        story.append(_pdf_paragraph("回答", heading_style))
+        if not _is_organized(envelope):
+            story.append(_pdf_paragraph("回答", heading_style))
         markdown_index = 0
         for block in blocks:
             if block.get("type") == "table":
@@ -1207,17 +1216,26 @@ def _ppt_answer_lines(block: dict[str, Any]) -> list[str]:
     return []
 
 
-def _ppt_answer_slides(presentation, blank, theme, blocks: list[dict[str, Any]], footer: str, *, content_shape: str) -> None:
+def _ppt_answer_slides(
+    presentation,
+    blank,
+    theme,
+    blocks: list[dict[str, Any]],
+    footer: str,
+    *,
+    content_shape: str,
+    section_fallback: str = "回答",
+) -> None:
     """Render non-table answer blocks as section-oriented slides."""
 
     if content_shape not in {"report", "raw"}:
         return
-    title = "回答"
+    title = section_fallback
     lines: list[str] = []
 
     def flush() -> None:
         nonlocal lines, title
-        if not lines and title == "回答":
+        if not lines and title == section_fallback:
             return
         slide = presentation.slides.add_slide(blank)
         _set_slide_theme(slide, theme)
@@ -1279,12 +1297,12 @@ def _ppt_answer_slides(presentation, blank, theme, blocks: list[dict[str, Any]],
         block_type = block.get("type")
         if block_type == "table":
             flush()
-            title = "回答"
+            title = section_fallback
             continue
         if block_type == "heading":
             if lines:
                 flush()
-            title = str(block.get("text") or "回答")
+            title = str(block.get("text") or section_fallback)
             continue
         lines.extend(_ppt_answer_lines(block))
     if footer:
@@ -1314,7 +1332,15 @@ def _render_pptx(envelope: ResultEnvelope, content_shape: str, render_options: d
         _add_ppt_text(title_slide, f"查询：{envelope.query}", left=0.75, top=3.5, width=11.8, height=0.8, font_size=16, color=theme["foreground"])
 
     blocks = _answer_blocks(envelope)
-    _ppt_answer_slides(presentation, blank, theme, blocks, envelope.footer, content_shape=content_shape)
+    _ppt_answer_slides(
+        presentation,
+        blank,
+        theme,
+        blocks,
+        envelope.footer,
+        content_shape=content_shape,
+        section_fallback=envelope.title if _is_organized(envelope) else "回答",
+    )
     chart_count = 0
     section_count = 0
     rendered_table_fingerprints: set[tuple[Any, ...]] = set()

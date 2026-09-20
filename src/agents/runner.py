@@ -24,9 +24,7 @@ from __future__ import annotations
 
 import contextvars
 import json
-import os
 import re
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -105,33 +103,51 @@ for _provider_key in ("openai", "ollama"):
         break
 
 
+_AGENT_ACTIVE = 0
+_AGENT_ACTIVE_LOCK = threading.Lock()
+
+
+def _agent_active(delta: int) -> None:
+    """Publish the concurrent agent-run gauge (P2-002)."""
+    global _AGENT_ACTIVE
+    with _AGENT_ACTIVE_LOCK:
+        _AGENT_ACTIVE = max(0, _AGENT_ACTIVE + int(delta))
+        current = _AGENT_ACTIVE
+    try:
+        from src.observability.metrics import set_active_state
+
+        set_active_state("hdb.agent.inflight_requests", "Concurrent agent runs", current)
+    except Exception:
+        pass
+
+
 # LangGraph checkpointer：agent 会话状态（thread 级完整消息历史）持久化。
-# 进程级单例、跨线程复用（SqliteSaver 内部带锁串行化读写）。
-_CHECKPOINT_SAVER: Any | None = None
-_CHECKPOINT_LOCK = threading.Lock()
-
-
+# PostgreSQL 后端为每次构图返回独立 saver（共享连接池），避免实例锁串行化
+# 并发会话；SQLite 后端保持进程级单例（v3 §10）。
 def _get_checkpointer() -> Any:
-    from langgraph.checkpoint.sqlite import SqliteSaver
+    from src.agents.checkpoints.factory import get_checkpointer
 
-    global _CHECKPOINT_SAVER
-    with _CHECKPOINT_LOCK:
-        if _CHECKPOINT_SAVER is None:
-            db_path = settings.AGENT_CHECKPOINT_DB_PATH
-            parent = os.path.dirname(db_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            _CHECKPOINT_SAVER = SqliteSaver(conn)
-        return _CHECKPOINT_SAVER
+    return get_checkpointer()
+
+
+def _create_checkpointer() -> Any:
+    from src.agents.checkpoints.factory import create_checkpointer
+
+    return create_checkpointer()
 
 
 def forget_thread(thread_id: str) -> bool:
-    """Drop the persisted agent state for a thread (session clear/delete)."""
+    """Drop the persisted agent state for a thread (session clear/delete).
+
+    Removes the canonical thread, every attempt namespace and the pointer
+    (P0a attempt isolation).
+    """
     if not str(thread_id or "").strip():
         return False
     try:
-        _get_checkpointer().delete_thread(str(thread_id))
+        from src.agents.checkpoints.attempts import forget_thread_state
+
+        forget_thread_state(_get_checkpointer(), str(thread_id))
         return True
     except Exception:
         # The API path remains fail-soft; the cleanup outbox can inspect the
@@ -1915,10 +1931,12 @@ class MultiSourceAgentRunner:
         attachments: list[Any] | None = None,
         source_scope: str = "auto",
         attachment_user_id: int | None = None,
+        action_scope: Any | None = None,
     ) -> Generator[str, None, None]:
         """Observability wrapper: one agent span + metrics per run."""
         started = time.monotonic()
         status = "success"
+        _agent_active(1)
         with observe.agent(
             "hdb.agent.run",
             **{
@@ -1945,16 +1963,33 @@ class MultiSourceAgentRunner:
                     attachments=attachments,
                     source_scope=source_scope,
                     attachment_user_id=attachment_user_id,
+                    action_scope=action_scope,
                 )
             except QueryCancelled:
                 status = "cancelled"
+                try:
+                    from src.observability.metrics import record_agent_cancel
+
+                    record_agent_cancel(reason="user_or_timeout")
+                except Exception:
+                    pass
                 raise
             except Exception as exc:
                 status = "failed"
                 observation.error(exc)
                 raise
             finally:
+                _agent_active(-1)
                 summary = self.get_last_retrieval_summary()
+                try:
+                    from src.observability.metrics import record_agent_step
+
+                    record_agent_step(
+                        step_count=len(summary.get("tool_diagnostics") or []) + 1,
+                        status=status,
+                    )
+                except Exception:
+                    pass
                 run_record = _current_run()
                 observation.set_token_usage(run_record.token_usage_summary if run_record is not None else None)
                 if run_record.answer:
@@ -2001,6 +2036,7 @@ class MultiSourceAgentRunner:
         attachments: list[Any] | None = None,
         source_scope: str = "auto",
         attachment_user_id: int | None = None,
+        action_scope: Any | None = None,
     ) -> Generator[str, None, None]:
         """Run the deep agent and stream answer deltas live.
 
@@ -2551,6 +2587,26 @@ class MultiSourceAgentRunner:
                     issues=action_plan_issues,
                 )
             else:
+                receipt_store = None
+                execution_scope = None
+                if action_scope is not None:
+                    try:
+                        from src.agents.orchestration.receipts import (
+                            ActionExecutionScope,
+                            ActionReceiptStore,
+                        )
+
+                        execution_scope = (
+                            action_scope
+                            if isinstance(action_scope, ActionExecutionScope)
+                            else ActionExecutionScope(**dict(action_scope))
+                        )
+                        receipt_store = ActionReceiptStore()
+                    except Exception:
+                        # Receipt persistence is a recovery aid; a failure here
+                        # must never block the user's action plan.
+                        receipt_store = None
+                        execution_scope = None
                 action_execution = ConversationActionExecutor(
                     handlers=GovernedToolActionAdapters(
                         tools=tools,
@@ -2572,6 +2628,8 @@ class MultiSourceAgentRunner:
                         ),
                     ).handlers(),
                     available_capabilities=effective_capabilities,
+                    receipt_store=receipt_store,
+                    execution_scope=execution_scope,
                 ).execute(action_plan)
                 receipts = [receipt.model_dump(mode="json") for receipt in action_execution.receipts]
                 successful = all(
@@ -3303,7 +3361,11 @@ class MultiSourceAgentRunner:
         # 会话状态持久化：thread 模式挂 checkpointer，LangGraph 按
         # configurable.thread_id 自动恢复/续写该会话的完整消息历史；
         # stateless 路径（legacy /query、eval、测试）保持现状。
-        checkpointer = _get_checkpointer() if (persist_thread and str(thread_id or "").strip()) else None
+        checkpointer = (
+            _create_checkpointer()
+            if (persist_thread and str(thread_id or "").strip())
+            else None
+        )
         agent = create_deep_agent(
             model=model, tools=tools, system_prompt=system_prompt, checkpointer=checkpointer
         )

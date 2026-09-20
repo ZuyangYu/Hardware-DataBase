@@ -127,3 +127,6 @@ run_state.json
 
 # Accidental test artifacts (Mock repr used as a filename)
 <Mock name=*
+
+# 本地演练/调试临时目录
+.tmp_dbg/

@@ -337,6 +337,7 @@ export default function ChatPage({
     traceByMessageId,
     degradedNotes,
     documentCards,
+    turnQueueNotice,
     documentCardRefreshingId,
     documentCardReleaseRequestingId,
     requestDocumentCardRelease,
@@ -943,6 +944,20 @@ export default function ChatPage({
           exportPreviewsByJobId={exportPreviewsByJobId}
           exportFormats={exportFormats}
         />
+        {turnQueueNotice && (
+          <div className="shrink-0 px-[24px] pb-[6px]" data-testid="turn-queue-notice">
+            <div className="mx-auto flex w-full max-w-[820px] items-center gap-[8px] rounded-[8px] border border-[#f0e0c0] bg-[#fffaf0] px-[12px] py-[8px] text-[13px] text-[#8a6d3b]">
+              <span>
+                {turnQueueNotice.reason === 'waiting_for_attachments'
+                  ? '等待附件解析中，完成后将自动开始回答'
+                  : '已排队，等待同会话前一轮回答完成后自动开始'}
+                {turnQueueNotice.waitDeadline
+                  ? `（截止 ${new Date(turnQueueNotice.waitDeadline).toLocaleTimeString()}）`
+                  : ''}
+              </span>
+            </div>
+          </div>
+        )}
         {documentCards.length > 0 && (
           <div className="shrink-0 px-[24px] pb-[6px]">
             <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[10px]">

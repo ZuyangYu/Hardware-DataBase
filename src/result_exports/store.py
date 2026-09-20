@@ -116,6 +116,30 @@ class ResultExportStore:
     """Durable repository with idempotent creation and lease-based claims."""
 
     def __init__(self, db_path: str | None = None, storage_dir: str | None = None):
+        import src.settings as _settings
+
+        if (
+            str(getattr(_settings, "CONTROL_PLANE_BACKEND", "sqlite") or "sqlite")
+            .strip()
+            .lower()
+            == "postgres"
+        ):
+            dsn = str(
+                getattr(_settings, "CONTROL_PLANE_DATABASE_URL", "") or ""
+            ).strip()
+            if not dsn:
+                raise RuntimeError(
+                    "CONTROL_PLANE_BACKEND=postgres requires CONTROL_PLANE_DATABASE_URL"
+                )
+            from src.storage.control_plane.result_exports import (
+                PostgresResultExportStore,
+            )
+
+            self.__class__ = PostgresResultExportStore
+            PostgresResultExportStore.__init__(
+                self, dsn, storage_dir=storage_dir
+            )
+            return
         self.db_path = db_path or src.settings.AUTH_DB_PATH
         self.storage_dir = Path(
             storage_dir
@@ -545,6 +569,9 @@ class ResultExportStore:
         )
         options = dict(export_plan.get("options") or {})
         options["include_citations"] = bool(export_plan.get("include_citations", True))
+        # Arrange-before-export is opt-in per job; plans persisted before the
+        # feature (and direct store callers) keep the legacy rendering.
+        options["organize"] = bool(export_plan.get("organize", False))
         title = export_plan.get("title")
         if title:
             options["render_title"] = str(title)[:160]
@@ -583,6 +610,7 @@ class ResultExportStore:
         client_request_id: str,
         title: str | None = None,
         include_citations: bool = True,
+        organize: bool = True,
         options: dict[str, Any] | None = None,
     ) -> tuple[ResultSnapshot, list[ExportJob]]:
         """Create a snapshot and all manual export jobs atomically."""
@@ -592,6 +620,7 @@ class ResultExportStore:
             "content_shape": content_shape,
             "title": title,
             "include_citations": include_citations,
+            "organize": bool(organize),
             "options": dict(options or {}),
             "client_request_id": client_request_id,
         }
@@ -652,14 +681,15 @@ class ResultExportStore:
         return [_row_to_job(row) for row in rows]
 
     def list_pending(self, limit: int = 16) -> list[ExportJob]:
+        now = _iso()
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT * FROM result_export_jobs
-                   WHERE (status = 'queued' AND datetime(available_at) <= datetime('now'))
+                   WHERE (status = 'queued' AND available_at <= ?)
                       OR (status = 'running' AND lease_expires_at IS NOT NULL
-                          AND datetime(lease_expires_at) <= datetime('now'))
+                          AND lease_expires_at <= ?)
                    ORDER BY created_at, export_job_id LIMIT ?""",
-                (max(1, min(int(limit), 100)),),
+                (now, now, max(1, min(int(limit), 100))),
             ).fetchall()
         return [_row_to_job(row) for row in rows]
 
@@ -706,7 +736,7 @@ class ResultExportStore:
                     active_running = conn.execute(
                         """SELECT COUNT(*) AS count FROM result_export_jobs
                            WHERE status = 'running' AND lease_expires_at IS NOT NULL
-                             AND datetime(lease_expires_at) > datetime(?)""",
+                             AND lease_expires_at > ?""",
                         (_iso(now),),
                     ).fetchone()["count"]
                     if int(active_running or 0) >= max_running:
@@ -955,8 +985,8 @@ class ResultExportStore:
                 """SELECT * FROM result_artifacts
                    WHERE artifact_id = ? AND owner_user_id = ?
                      AND storage_ref != ''
-                     AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))""",
-                (artifact_id, str(owner_user_id)),
+                     AND (expires_at IS NULL OR expires_at > ?)""",
+                (artifact_id, str(owner_user_id), _iso()),
             ).fetchone()
         return _row_to_artifact(row) if row else None
 
@@ -1035,7 +1065,7 @@ class ResultExportStore:
             try:
                 rows = conn.execute(
                     """SELECT * FROM result_artifacts
-                       WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime(?)
+                       WHERE expires_at IS NOT NULL AND expires_at <= ?
                          AND storage_ref != ''
                        ORDER BY expires_at, artifact_id LIMIT ?""",
                     (_iso(current), max(1, min(int(limit), 1000))),

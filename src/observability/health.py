@@ -13,6 +13,8 @@ import src.settings as settings
 
 from .worker_registry import list_workers
 
+from src.storage.control_plane.health import check_control_plane
+
 
 def _check_sqlite() -> dict[str, Any]:
     started = time.monotonic()
@@ -57,10 +59,27 @@ def check_live() -> dict[str, Any]:
 def check_ready() -> dict[str, Any]:
     dependencies = {
         "database": _check_sqlite(),
+        "control_plane": check_control_plane(),
         "storage": _check_storage(),
     }
     ready = all(item.get("status") == "up" for item in dependencies.values())
-    return {"status": "ready" if ready else "not_ready", "dependencies": dependencies}
+    return {
+        "status": "ready" if ready else "not_ready",
+        # v3 §11.5: the live content revision plus the settings that still need
+        # a restart, so a config change is traceable from the readiness probe.
+        "config_revision": _config_revision(),
+        "restart_required_settings": sorted(
+            getattr(settings, "RESTART_REQUIRED_SETTINGS", ())
+        ),
+        "dependencies": dependencies,
+    }
+
+
+def _config_revision() -> str:
+    try:
+        return str(settings.CONFIG_REVISION or "")
+    except Exception:  # noqa: BLE001 - readiness must not fail on metadata
+        return ""
 
 
 def check_dependencies() -> dict[str, Any]:
@@ -85,6 +104,7 @@ def check_dependencies() -> dict[str, Any]:
 
     dependencies = {
         "database": _check_sqlite(),
+        "control_plane": check_control_plane(),
         "storage": _check_storage(),
         "worker": {"status": worker_status, "count": len(workers), "instances": workers},
         "ragflow": ragflow,

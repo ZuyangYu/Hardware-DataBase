@@ -8,11 +8,28 @@ conversation requests.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.core.intent import classify_intent
 from src.result_exports.models import is_export_format_enabled, normalize_export_format
+
+# Explicit opt-outs keep the legacy "serialize the answer as-is" behavior.
+_NO_ORGANIZE_PATTERN = re.compile(
+    r"原样(?:导出|输出|生成)|不要整理|无需整理|不用整理|不必整理"
+    r"|保留原始(?:回答|内容|文本)|保持原样",
+    re.IGNORECASE,
+)
+_SOURCE_REQUEST_PATTERN = re.compile(
+    r"(?:带|附|含|包含|保留|标注|加上).{0,6}(?:来源|引用|出处)"
+    r"|参考来源|参考文献|引用出处|附引用",
+    re.IGNORECASE,
+)
+_NO_SOURCE_PATTERN = re.compile(
+    r"(?:不要|无需|不用|别|禁止|不含|去掉|不需要).{0,6}(?:来源|引用|出处)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -23,6 +40,10 @@ class ExportPlan:
     content_shape: str = "report"
     title: str | None = None
     include_citations: bool = True
+    # Arrange-before-export (default).  The export worker runs one model pass
+    # that turns the chat answer into deliverable content following the
+    # user's request; users can opt out with "原样导出".
+    organize: bool = True
     options: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -31,6 +52,7 @@ class ExportPlan:
             "content_shape": self.content_shape,
             "title": self.title,
             "include_citations": self.include_citations,
+            "organize": self.organize,
             "options": dict(self.options),
         }
 
@@ -69,4 +91,18 @@ def infer_export_intent(query: str) -> ExportPlan | None:
     # mixed requests keep report semantics so the answer and evidence remain
     # available in every requested format.
     content_shape = "data" if formats == ("xlsx",) else "report"
-    return ExportPlan(formats=formats, content_shape=content_shape)
+    organize = _NO_ORGANIZE_PATTERN.search(text) is None
+    if _NO_SOURCE_PATTERN.search(text):
+        include_citations = False
+    elif _SOURCE_REQUEST_PATTERN.search(text):
+        include_citations = True
+    else:
+        # Organized deliverables are clean by default; the legacy as-is
+        # export keeps the evidence list unless the user opts out.
+        include_citations = not organize
+    return ExportPlan(
+        formats=formats,
+        content_shape=content_shape,
+        include_citations=include_citations,
+        organize=organize,
+    )

@@ -32,6 +32,7 @@ from src.document_authoring.harness.langgraph_state import normalize_graph_state
 STALE_FENCING_ERROR = "stale_fencing_token"
 CHECKPOINTER_BACKEND_SQLITE = "sqlite"
 CHECKPOINTER_BACKEND_MEMORY = "memory"
+CHECKPOINTER_BACKEND_POSTGRES = "postgres"
 
 
 class StaleFencingToken(RuntimeError):
@@ -388,10 +389,42 @@ def create_memory_checkpointer(
     return FencedCheckpointer(InMemorySaver(), fencing_token_provider=fencing_token_provider)
 
 
+def create_postgres_checkpointer(
+    database_url: str | None = None,
+    *,
+    fencing_token_provider: FencingTokenProvider | None = None,
+    setup: bool = True,
+) -> FencedCheckpointer:
+    """Create the multi-instance saver over the official PostgreSQL provider.
+
+    The fencing wrapper is preserved; the underlying connection is kept alive
+    through the returned checkpointer and closed via ``close()``.
+    """
+    import src.settings as settings
+    from src.agents.checkpoints.postgres_provider import PostgresCheckpointerProvider
+
+    url = str(
+        database_url
+        if database_url is not None
+        else getattr(settings, "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL", "")
+        or ""
+    ).strip()
+    if not url:
+        raise ValueError(
+            "postgres authoring checkpointer requires DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL"
+        )
+    provider = PostgresCheckpointerProvider(url, setup=setup)
+    checkpointer = FencedCheckpointer(provider.create(), fencing_token_provider=fencing_token_provider)
+    checkpointer._provider = provider  # type: ignore[attr-defined]
+    checkpointer.close = provider.close  # type: ignore[attr-defined]
+    return checkpointer
+
+
 def build_checkpointer(
     backend: str = CHECKPOINTER_BACKEND_MEMORY,
     *,
     sqlite_path: str | Path | None = None,
+    database_url: str | None = None,
     connection: sqlite3.Connection | None = None,
     fencing_token_provider: FencingTokenProvider | None = None,
 ) -> FencedCheckpointer:
@@ -404,8 +437,14 @@ def build_checkpointer(
             connection=connection,
             fencing_token_provider=fencing_token_provider,
         )
+    if normalized == CHECKPOINTER_BACKEND_POSTGRES:
+        return create_postgres_checkpointer(
+            database_url=database_url,
+            fencing_token_provider=fencing_token_provider,
+        )
     raise ValueError(
-        "unsupported authoring checkpointer backend; use 'memory' for tests or 'sqlite' for single-process"
+        "unsupported authoring checkpointer backend; use 'memory' for tests, "
+        "'sqlite' for single-process or 'postgres' for multi-instance"
     )
 
 
@@ -413,5 +452,5 @@ __all__ = [
     "AuthoringCheckpointer", "CHECKPOINTER_BACKEND_MEMORY", "CHECKPOINTER_BACKEND_SQLITE",
     "FencedCheckpointer", "InMemorySaver", "SqliteSaver", "STALE_FENCING_ERROR",
     "StaleFencingToken", "build_checkpointer", "create_memory_checkpointer",
-    "create_sqlite_checkpointer",
+    "create_postgres_checkpointer", "create_sqlite_checkpointer",
 ]

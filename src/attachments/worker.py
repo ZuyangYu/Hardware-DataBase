@@ -14,6 +14,7 @@ from threading import Event, Thread
 
 import src.settings
 from src.attachments.coordinator import AttachmentTurnCoordinator
+from src.attachments.coordinator_lease import AttachmentCoordinatorLoop
 from src.attachments.jobs import AttachmentParseExecutor
 from src.attachments.store import AttachmentStore
 from src.core.logger import error, log
@@ -29,6 +30,7 @@ class AttachmentWorker:
         worker_id: str = "attachment-worker",
         parse_timeout_seconds: float | None = None,
         lease_seconds: int | None = None,
+        coordinator_loop: AttachmentCoordinatorLoop | None = None,
     ):
         self.running = True
         self.worker_id = worker_id
@@ -37,9 +39,16 @@ class AttachmentWorker:
         self.coordinator = coordinator or AttachmentTurnCoordinator(store=self.store)
         self.parse_timeout_seconds = parse_timeout_seconds
         self.lease_seconds = lease_seconds
+        # All reconciliation paths share the coordinator lease protocol so only
+        # one logical scanner owns the sweep at a time (plan §5.4).
+        self.coordinator_loop = coordinator_loop or AttachmentCoordinatorLoop(
+            coordinator=self.coordinator,
+            worker_id=f"{self.worker_id}-coordinator",
+        )
 
     def stop(self, *_args) -> None:
         self.running = False
+        self.coordinator_loop.stop()
 
     def run_once(self) -> bool:
         did_work = False
@@ -62,12 +71,14 @@ class AttachmentWorker:
                 did_work = True
         except Exception as exc:  # noqa: BLE001
             error(f"Attachment session cleanup failed: {exc}")
+        # Waiting-turn reconciliation/expiry only runs while this candidate
+        # holds the coordinator lease; the parse role's dedicated control loop
+        # keeps it timely even when a long parse blocks this function.
         try:
-            recovered = self.coordinator.reconcile_waiting_turns()
-            if recovered:
+            if self.coordinator_loop.run_once():
                 did_work = True
         except Exception as exc:  # noqa: BLE001 - recovery must not stop parsing
-            error(f"Attachment waiting-turn reconciliation failed: {exc}")
+            error(f"Attachment waiting-turn coordination failed: {exc}")
         pending = self.store.list_pending_jobs(limit=4)
         for job in pending:
             claim_kwargs = {}

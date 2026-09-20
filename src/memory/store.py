@@ -20,7 +20,7 @@ from langgraph.store.sqlite import SqliteStore
 
 from src.memory.catalog import MemoryCatalogRepository, MemoryProjection
 from src.memory.schemas import MEMORY_SCHEMA_VERSION, content_hash
-from src.observability.metrics import counter, set_memory_index_health
+from src.observability.metrics import counter, histogram, set_memory_index_health
 
 import logging
 import time
@@ -154,12 +154,32 @@ class MemoryStoreRuntime:
                 time.sleep(delay * attempt)
 
     def put(self, namespace: tuple[str, ...], key: str, value: dict[str, Any], *, index: Any = None) -> None:
-        with self.lock:
-            self._run_with_busy_retry("put", self.store.put, namespace, str(key), value, index=index)
+        started = time.monotonic()
+        try:
+            with self.lock:
+                self._run_with_busy_retry("put", self.store.put, namespace, str(key), value, index=index)
+        finally:
+            self._record_write_latency("put", time.monotonic() - started)
 
     def delete(self, namespace: tuple[str, ...], key: str) -> None:
-        with self.lock:
-            self._run_with_busy_retry("delete", self.store.delete, namespace, str(key))
+        started = time.monotonic()
+        try:
+            with self.lock:
+                self._run_with_busy_retry("delete", self.store.delete, namespace, str(key))
+        finally:
+            self._record_write_latency("delete", time.monotonic() - started)
+
+    @staticmethod
+    def _record_write_latency(operation: str, seconds: float) -> None:
+        try:
+            histogram(
+                "hdb.memory.write_latency",
+                max(0.0, float(seconds)),
+                attributes={"operation": operation},
+                description="Long-term memory projection write latency",
+            )
+        except Exception:
+            pass
 
     def search(self, namespace: tuple[str, ...], *, query: str | None = None, limit: int = 10, offset: int = 0, filter: dict[str, Any] | None = None) -> list[SearchItem]:
         with self.lock:
@@ -174,6 +194,135 @@ class MemoryStoreRuntime:
             )
 
     def list_namespaces(self, *, prefix: tuple[str, ...] | None = None, limit: int = 100, offset: int = 0) -> list[tuple[str, ...]]:
+        with self.lock:
+            return [
+                tuple(str(part) for part in namespace)
+                for namespace in self.store.list_namespaces(
+                    prefix=prefix,
+                    max_depth=10,
+                    limit=max(1, int(limit)),
+                    offset=max(0, int(offset)),
+                )
+            ]
+
+
+class PostgresMemoryStoreRuntime:
+    """Owns one official ``PostgresStore`` and its connection lifecycle (P1).
+
+    Mirrors :class:`MemoryStoreRuntime`'s public surface so the worker,
+    MemoryService and CatalogAwareStore stay backend-agnostic.  Semantic search
+    requires the pgvector extension; when the index cannot be created the store
+    degrades to keyword-only search exactly like the SQLite runtime.
+    """
+
+    def __init__(self, *, database_url: str, index: dict[str, Any] | None = None):
+        import psycopg
+        from langgraph.store.postgres import PostgresStore
+
+        self.database_url = str(database_url)
+        self.path = self.database_url  # log/health compatibility
+        self.conn = psycopg.connect(self.database_url, autocommit=True)
+        self.lock = threading.RLock()
+        self.semantic_index_ready = False
+        self.index_error = ""
+        try:
+            self.store = PostgresStore(self.conn, index=dict(index) if index else None)
+            self.store.setup()
+            self.semantic_index_ready = bool(index)
+            set_memory_index_health(
+                backend="postgres",
+                healthy=True,
+                semantic_index=self.semantic_index_ready,
+            )
+        except Exception as exc:
+            # pgvector may be unavailable; keep the control plane usable with
+            # keyword-only search rather than bricking Memory.
+            self.index_error = str(exc)[:500]
+            self.store = PostgresStore(self.conn)
+            self.store.setup()
+            set_memory_index_health(backend="postgres", healthy=True, semantic_index=False)
+
+    def close(self) -> None:
+        with self.lock:
+            try:
+                self.conn.close()
+            finally:
+                pass
+
+    def health(self) -> dict[str, Any]:
+        with self.lock:
+            try:
+                self.conn.execute("SELECT 1").fetchone()
+                set_memory_index_health(
+                    backend="postgres",
+                    healthy=True,
+                    semantic_index=self.semantic_index_ready,
+                )
+                return {"ok": True, "semantic_index": self.semantic_index_ready, "error": self.index_error}
+            except Exception as exc:
+                set_memory_index_health(backend="postgres", healthy=False, semantic_index=False)
+                return {"ok": False, "semantic_index": False, "error": str(exc)[:500]}
+
+    def _run_with_retry(self, operation: str, fn, /, *args, **kwargs):
+        """Retry transient PostgreSQL connection failures a bounded number of times."""
+        import psycopg
+
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                return fn(*args, **kwargs)
+            except (psycopg.OperationalError, psycopg.InterfaceError):
+                if attempt == attempts:
+                    raise
+                try:
+                    counter("hdb.memory.postgres_retries", attributes={"operation": operation})
+                except Exception:
+                    pass
+                time.sleep(0.05 * attempt)
+
+    def put(self, namespace: tuple[str, ...], key: str, value: dict[str, Any], *, index: Any = None) -> None:
+        started = time.monotonic()
+        try:
+            with self.lock:
+                self._run_with_retry("put", self.store.put, namespace, str(key), value, index=index)
+        finally:
+            MemoryStoreRuntime._record_write_latency("put", time.monotonic() - started)
+
+    def delete(self, namespace: tuple[str, ...], key: str) -> None:
+        started = time.monotonic()
+        try:
+            with self.lock:
+                self._run_with_retry("delete", self.store.delete, namespace, str(key))
+        finally:
+            MemoryStoreRuntime._record_write_latency("delete", time.monotonic() - started)
+
+    def search(
+        self,
+        namespace: tuple[str, ...],
+        *,
+        query: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+        filter: dict[str, Any] | None = None,
+    ) -> list[SearchItem]:
+        with self.lock:
+            return self._run_with_retry(
+                "search",
+                self.store.search,
+                namespace,
+                query=query,
+                limit=limit,
+                offset=offset,
+                filter=filter,
+            )
+
+    def list_namespaces(
+        self,
+        *,
+        prefix: tuple[str, ...] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
         with self.lock:
             return [
                 tuple(str(part) for part in namespace)
@@ -227,20 +376,17 @@ def _create_embedding(settings):
     raise ValueError(f"unsupported memory embedding provider: {provider}")
 
 
-def create_memory_store(settings=None) -> MemoryStoreRuntime:
+def create_memory_store(settings=None) -> MemoryStoreRuntime | PostgresMemoryStoreRuntime:
     """Create the configured projection backend.
 
-    Postgres is deliberately explicit: selecting it before the controlled
-    migration is an error, never an implicit empty database.
+    The projection is rebuildable; the authority ledger migration is a separate
+    step (see the PostgreSQL migration runbook).  Selecting ``postgres`` without
+    a ``MEMORY_DATABASE_URL`` is an error, never an implicit empty database.
     """
     settings = _resolve_settings(settings)
     backend = str(getattr(settings, "MEMORY_STORE_BACKEND", "sqlite") or "sqlite").strip().lower()
-    if backend == "postgres":
-        raise RuntimeError("Postgres memory projection requires the Phase 2 migration runbook")
-    if backend != "sqlite":
+    if backend not in {"sqlite", "postgres"}:
         raise ValueError(f"unsupported memory store backend: {backend}")
-    storage_dir = str(getattr(settings, "STORAGE_DIR", os.getcwd()))
-    path = _absolute_storage_path(getattr(settings, "MEMORY_SQLITE_PATH", "memory.db"), storage_dir)
     dims_raw = getattr(settings, "MEMORY_EMBEDDING_DIMS", "")
     try:
         dims = int(dims_raw) if str(dims_raw or "").strip() else 0
@@ -253,6 +399,16 @@ def create_memory_store(settings=None) -> MemoryStoreRuntime:
             raw_fields = str(getattr(settings, "MEMORY_INDEX_FIELDS", "content.content,content.title,content.subject") or "")
             fields = [field.strip() for field in raw_fields.split(",") if field.strip()]
             index = {"dims": dims, "embed": embedding, "fields": fields or ["content.content"]}
+    if backend == "postgres":
+        database_url = str(getattr(settings, "MEMORY_DATABASE_URL", "") or "").strip()
+        if not database_url:
+            raise RuntimeError(
+                "Postgres memory projection requires MEMORY_DATABASE_URL; migrate the authority "
+                "ledger first per the PostgreSQL migration runbook"
+            )
+        return PostgresMemoryStoreRuntime(database_url=database_url, index=index)
+    storage_dir = str(getattr(settings, "STORAGE_DIR", os.getcwd()))
+    path = _absolute_storage_path(getattr(settings, "MEMORY_SQLITE_PATH", "memory.db"), storage_dir)
     return MemoryStoreRuntime(
         path=path,
         index=index,

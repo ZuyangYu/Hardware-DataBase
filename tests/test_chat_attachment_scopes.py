@@ -155,9 +155,20 @@ class AnalyzeFromAttachmentTests(unittest.TestCase):
         self.pipeline_stub = StubPipeline()
         self.app.dependency_overrides[get_pipeline] = lambda: self.pipeline_stub
         self.addCleanup(self.app.dependency_overrides.clear)
-        self.client = __import__("httpx").Client(base_url=self.url, timeout=30)
+        self.client = __import__("httpx").Client(base_url=self.url, timeout=60)
         self.addCleanup(self.client.close)
         self.session = ConversationService(self.db_path).create_session(self.user.id, "shared")
+
+    def _foreign_token(self) -> str:
+        """A same-deployment employee with no access to the 'shared' KB."""
+        from src.core.auth import ROLE_EMPLOYEE
+
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        dept = self.auth.create_department("other")
+        self.auth.create_user_as(
+            sysadmin, "user2", "pw123456", ROLE_EMPLOYEE, dept.id
+        )
+        return self._token("user2")
 
     def _token(self, username="user1"):
         response = self.client.post(

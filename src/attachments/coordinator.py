@@ -60,6 +60,13 @@ class AttachmentTurnCoordinator:
                 resolved += 1
         return resolved
 
+    def expire_waiting_turns(self, max_wait_seconds: int | None = None) -> int:
+        """Fail turns that exceeded the attachment wait cap (P0-004)."""
+        try:
+            return self._conv().expire_waiting_turns(max_wait_seconds=max_wait_seconds)
+        except Exception:
+            return 0
+
     def reconcile_waiting_turns(self, limit: int = 100) -> int:
         """Resolve waiting turns whose settlement event was missed.
 

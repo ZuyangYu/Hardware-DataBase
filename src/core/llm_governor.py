@@ -22,6 +22,7 @@ governor bug must never take the model path down.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import threading
 import time
@@ -34,9 +35,43 @@ _log = logging.getLogger(__name__)
 PRIORITY_INTERACTIVE = "interactive"
 PRIORITY_BATCH = "batch"
 
+# Propagated to the invocation boundary so the deployment-level LLM permit
+# (P0b resource governor) can apply the same priority classification instead
+# of assuming every call is interactive.
+CURRENT_LLM_PRIORITY: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hdb_llm_priority", default=PRIORITY_INTERACTIVE
+)
+
+
+def current_priority() -> str:
+    """Priority of the LLM call active in this context (default interactive)."""
+    return str(CURRENT_LLM_PRIORITY.get() or PRIORITY_INTERACTIVE)
+
+
+class ProviderQuotaExceeded(TimeoutError):
+    """Provider-level quota rejection (RPM) counted at the model boundary.
+
+    SDK/LangChain retries re-enter the governor and re-consume; running out of
+    provider quota fails closed instead of oversubscribing the vendor.
+    """
+
 
 class LLMQueueTimeoutError(TimeoutError):
     """Raised when a model call cannot be admitted within the queue budget."""
+
+
+def _acquire_deployment_permit(is_batch: bool):
+    """Deployment-scope LLM permit acquired per real provider request (P0b).
+
+    Lives here so ``llm_governor`` stays the single LLM admission authority:
+    the process slot is acquired first, then the shared deployment permit.
+    Owning the acquisition at this module (called from the model adapter for
+    every underlying request) also means an SDK/LangChain retry re-enters this
+    boundary and re-acquires the permit instead of reusing a stale one.
+    """
+    from src.core.concurrency import governor_acquire
+
+    return governor_acquire("llm", interactive=not is_batch)
 
 
 class LLMGovernor:
@@ -69,8 +104,43 @@ class LLMGovernor:
 
     # -- admission ----------------------------------------------------------
 
+    @staticmethod
+    def _check_provider_quota(provider: str, model: str, estimated_tokens: int = 0) -> None:
+        from src.core.concurrency.provider_limiter import allow_provider_call
+
+        decision = allow_provider_call(provider, model)
+        if decision is None:
+            raise ProviderQuotaExceeded(
+                "provider quota limiter unavailable; request rejected fail-closed"
+            )
+        if not decision:
+            raise ProviderQuotaExceeded(
+                f"provider RPM limit reached for {provider or 'default'}/"
+                f"{model or 'default'}"
+            )
+        if int(estimated_tokens or 0) > 0:
+            from src.core.concurrency.provider_limiter import allow_provider_tokens
+
+            token_decision = allow_provider_tokens(provider, model, int(estimated_tokens))
+            if token_decision is None:
+                raise ProviderQuotaExceeded(
+                    "provider token quota limiter unavailable; request rejected fail-closed"
+                )
+            if not token_decision:
+                raise ProviderQuotaExceeded(
+                    f"provider TPM limit reached for {provider or 'default'}/"
+                    f"{model or 'default'}"
+                )
+
     @contextmanager
-    def slot(self, priority: str = PRIORITY_INTERACTIVE):
+    def slot(
+        self,
+        priority: str = PRIORITY_INTERACTIVE,
+        *,
+        provider: str = "",
+        model: str = "",
+        estimated_tokens: int = 0,
+    ):
         """Hold one governor slot for the duration of the ``with`` body.
 
         For streaming calls the body must span the whole stream iteration so
@@ -81,6 +151,9 @@ class LLMGovernor:
         timeout = float(getattr(settings, "LLM_QUEUE_TIMEOUT_SECONDS", 180) or 0)
         started = time.monotonic()
         deadline = started + timeout
+        priority_token = CURRENT_LLM_PRIORITY.set(
+            PRIORITY_BATCH if is_batch else PRIORITY_INTERACTIVE
+        )
 
         with self._cond:
             if is_batch:
@@ -102,6 +175,7 @@ class LLMGovernor:
                     else:
                         self._cond.wait(0.25)
                 if not admitted:
+                    CURRENT_LLM_PRIORITY.reset(priority_token)
                     raise LLMQueueTimeoutError(
                         f"LLM queue timeout after {timeout:.0f}s "
                         f"(priority={priority}, active={self._active_interactive + self._active_batch}/{total}, "
@@ -133,9 +207,7 @@ class LLMGovernor:
                     "LLM queue wait %.1fs (priority=%s, active=%d/%d, queued=%d)",
                     wait_ms / 1000, priority, active, total, queued,
                 )
-        try:
-            yield
-        finally:
+        def _release_process_slot() -> None:
             with self._cond:
                 if is_batch:
                     self._active_batch = max(0, self._active_batch - 1)
@@ -143,6 +215,33 @@ class LLMGovernor:
                     self._active_interactive = max(0, self._active_interactive - 1)
                 self._completed += 1
                 self._cond.notify_all()
+            CURRENT_LLM_PRIORITY.reset(priority_token)
+
+        try:
+            deployment_cm = _acquire_deployment_permit(is_batch)
+            deployment_cm.__enter__()
+        except Exception:
+            # Rejection/assembly failure must release the process slot and
+            # propagate: no silent bypass of governance (plan §6.2).
+            _release_process_slot()
+            raise
+        try:
+            self._check_provider_quota(provider, model, estimated_tokens)
+        except Exception:
+            try:
+                deployment_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            _release_process_slot()
+            raise
+        try:
+            yield
+        finally:
+            try:
+                deployment_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            _release_process_slot()
 
     # -- observability ------------------------------------------------------
 

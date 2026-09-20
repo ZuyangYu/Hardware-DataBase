@@ -106,6 +106,9 @@ def test_run_once_uses_shared_pipeline_for_general_chat_after_document_batch(mon
         def requeue_stale_turns(self):
             return None
 
+        def expire_queued_turns(self):
+            return 0
+
         def pending_turn_queue_state(self):
             return 0, 0.0
 

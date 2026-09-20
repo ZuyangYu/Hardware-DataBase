@@ -732,6 +732,14 @@ def preflight_run(
 ) -> EvaluationPreflightResponse:
     """Run the read-only checks used by the system-admin evaluation form."""
 
+    from src.api.admission import admission_model_name, enforce_admission
+
+    enforce_admission(
+        _actor,
+        getattr(_actor, "department_id", None),
+        resource="evaluation",
+        model=admission_model_name(),
+    )
     output_root = _check_output_root(output_root)
     prepared = _prepare_evaluation(
         body,

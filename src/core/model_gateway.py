@@ -315,20 +315,54 @@ def _model_name(model: Any) -> str:
     return str(getattr(model, "model_name", "") or getattr(model, "model", "") or "unknown")
 
 
+def _estimated_call_tokens(model: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> int:
+    """Bound one provider request for TPM admission before it is sent.
+
+    Provider SDKs expose usage only after completion.  The preflight estimate
+    therefore uses the serialized prompt size plus the configured output cap;
+    it is deliberately conservative and only affects deployments that enable
+    ``PROVIDER_TPM_LIMIT``.
+    """
+    try:
+        messages = args[0] if args else kwargs.get("messages", "")
+        prompt_chars = len(repr(messages))
+        output_cap = int(getattr(model, "max_tokens", 0) or 0)
+        return max(1, (prompt_chars + 3) // 4 + max(0, output_cap))
+    except Exception:  # noqa: BLE001 - quota estimation must not break setup
+        return 0
+
+
 class _GovernedChatOpenAI(ChatOpenAI):
     hdb_priority: str = PRIORITY_INTERACTIVE
+    hdb_provider: str = "openai-compatible"
+    hdb_model: str = ""
 
     def _generate(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        with get_llm_governor().slot(self.hdb_priority):
+        with get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        ):
             return super()._generate(*args, **kwargs)
 
     def _stream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        with get_llm_governor().slot(self.hdb_priority):
+        with get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        ):
             timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
             yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
 
     async def _agenerate(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        cm = get_llm_governor().slot(self.hdb_priority)
+        cm = get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        )
         await asyncio.to_thread(cm.__enter__)
         try:
             return await super()._agenerate(*args, **kwargs)
@@ -336,7 +370,12 @@ class _GovernedChatOpenAI(ChatOpenAI):
             await asyncio.to_thread(cm.__exit__, None, None, None)
 
     async def _astream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        cm = get_llm_governor().slot(self.hdb_priority)
+        cm = get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        )
         await asyncio.to_thread(cm.__enter__)
         try:
             async for chunk in super()._astream(*args, **kwargs):
@@ -347,13 +386,25 @@ class _GovernedChatOpenAI(ChatOpenAI):
 
 class _GovernedChatOllama(ChatOllama):
     hdb_priority: str = PRIORITY_INTERACTIVE
+    hdb_provider: str = "ollama"
+    hdb_model: str = ""
 
     def _generate(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        with get_llm_governor().slot(self.hdb_priority):
+        with get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        ):
             return super()._generate(*args, **kwargs)
 
     def _stream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
-        with get_llm_governor().slot(self.hdb_priority):
+        with get_llm_governor().slot(
+            self.hdb_priority,
+            provider=self.hdb_provider,
+            model=self.hdb_model,
+            estimated_tokens=_estimated_call_tokens(self, args, kwargs),
+        ):
             timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
             yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
 
@@ -387,6 +438,8 @@ def build_governed_model(
             client_kwargs=kwargs,
             callbacks=callbacks,
             hdb_priority=priority,
+            hdb_provider="ollama",
+            hdb_model=model,
         )
     return _GovernedChatOpenAI(
         model=model,
@@ -399,6 +452,8 @@ def build_governed_model(
         default_headers=default_headers or None,
         callbacks=callbacks,
         hdb_priority=priority,
+        hdb_provider="openai-compatible",
+        hdb_model=model,
     )
 
 
@@ -474,35 +529,96 @@ def _record_ragas_usage(result: Any) -> None:
     )
 
 
+_GOVERNANCE_LOCK = threading.Lock()
+_GOVERNANCE_STATUS: dict[str, Any] = {
+    "assembled": False,
+    "bypassed": False,
+    "reason": "",
+    "wrapped_methods": [],
+}
+
+
+def governance_status() -> dict[str, Any]:
+    """Last judge-LLM governance assembly status (P0-006 acceptance surface).
+
+    ``bypassed`` means the wrapper could not be installed; evaluation results
+    produced in that state must be marked ``governance_bypassed`` and are not
+    valid for production capacity/quality acceptance.
+    """
+    with _GOVERNANCE_LOCK:
+        return dict(_GOVERNANCE_STATUS)
+
+
+def reset_governance_status() -> None:
+    with _GOVERNANCE_LOCK:
+        _GOVERNANCE_STATUS.update(
+            {"assembled": False, "bypassed": False, "reason": "", "wrapped_methods": []}
+        )
+
+
+def _mark_governance(assembled: bool, reason: str, wrapped: list[str]) -> None:
+    with _GOVERNANCE_LOCK:
+        _GOVERNANCE_STATUS.update(
+            {"assembled": assembled, "bypassed": not assembled, "reason": reason, "wrapped_methods": wrapped}
+        )
+    if not assembled:
+        try:
+            from src.observability.metrics import counter
+
+            counter(
+                "hdb.eval.governance_bypassed",
+                attributes={"reason": str(reason or "unknown")[:80]},
+                description="Judge-LLM governance could not be assembled (results marked bypassed)",
+            )
+        except Exception:
+            pass
+
+
 def govern_ragas_llm(llm: Any) -> Any:
     """把 RAGAS judge 纳入闸门。
 
     不能在 client 层包代理: ragas 的 instructor 适配器要求真 ``AsyncOpenAI``
     实例(isinstance 校验)。因此在 LLM 对象的 generate/agenerate 层包裹,
     让评测(批量)与在线问答共享准入控制。
+
+    装配成功/失败都会记录显式治理状态（``governance_status()``）；失败时
+    fail-open 返回原对象，但评测结果必须标记 ``governance_bypassed``。
     """
+    wrapped: list[str] = []
     try:
         for name in ("agenerate", "generate"):
             original = getattr(llm, name, None)
             if original is None or getattr(original, "_hdb_governed", False):
+                if original is not None:
+                    wrapped.append(name)
                 continue
             if asyncio.iscoroutinefunction(original):
-                async def wrapped(*args: Any, _orig=original, **kwargs: Any) -> Any:
+                async def wrapped_async(*args: Any, _orig=original, **kwargs: Any) -> Any:
                     with get_llm_governor().slot(PRIORITY_BATCH):
                         result = await _orig(*args, **kwargs)
                     _record_ragas_usage(result)
                     return result
+
+                target = wrapped_async
             else:
-                def wrapped(*args: Any, _orig=original, **kwargs: Any) -> Any:
+                def wrapped_sync(*args: Any, _orig=original, **kwargs: Any) -> Any:
                     with get_llm_governor().slot(PRIORITY_BATCH):
                         result = _orig(*args, **kwargs)
                     _record_ragas_usage(result)
                     return result
-            wrapped._hdb_governed = True  # type: ignore[attr-defined]
-            setattr(llm, name, wrapped)
-    except Exception:  # noqa: BLE001 - 治理层绝不阻塞评测
+
+                target = wrapped_sync
+            target._hdb_governed = True  # type: ignore[attr-defined]
+            setattr(llm, name, target)
+            wrapped.append(name)
+        if not wrapped:
+            _mark_governance(False, "no_generate_method", wrapped)
+        else:
+            _mark_governance(True, "", wrapped)
         return llm
-    return llm
+    except Exception as exc:  # noqa: BLE001 - 治理层绝不阻塞评测
+        _mark_governance(False, f"{type(exc).__name__}: {exc}", wrapped)
+        return llm
 
 
 __all__ = [
@@ -514,5 +630,7 @@ __all__ = [
     "get_persisted_usage",
     "get_usage_ledger",
     "govern_ragas_llm",
+    "governance_status",
+    "reset_governance_status",
     "reset_usage_ledger",
 ]

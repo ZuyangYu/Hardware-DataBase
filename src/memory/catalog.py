@@ -46,6 +46,9 @@ def json_dumps(value: Any) -> str:
 
 
 def json_loads(value: str | None, default: Any = None) -> Any:
+    if isinstance(value, (dict, list)):
+        # PostgreSQL JSONB rows arrive already decoded; SQLite rows are TEXT.
+        return value
     if not value:
         return default
     try:
@@ -96,6 +99,15 @@ def scope_fingerprint(
     return hashlib.sha256(normalized_content(payload)).hexdigest()
 
 
+def _is_postgres_connection(conn) -> bool:
+    """True for psycopg connections and the translated PG adapters."""
+    module = type(conn).__module__ or ""
+    if module.startswith("psycopg"):
+        return True
+    wrapped = getattr(conn, "_conn", None)
+    return bool(wrapped is not None and (type(wrapped).__module__ or "").startswith("psycopg"))
+
+
 def ensure_memory_schema(conn: sqlite3.Connection) -> None:
     """Create or migrate the memory control plane on an existing connection.
 
@@ -104,6 +116,10 @@ def ensure_memory_schema(conn: sqlite3.Connection) -> None:
     rows: conversation deletion first invalidates and queues them, then removes
     the raw messages while preserving the provenance/tombstone evidence.
     """
+    if _is_postgres_connection(conn):
+        # v3 §5.2: the PostgreSQL memory schema comes from the versioned
+        # control-plane DDL; applications never run implicit DDL there.
+        return
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute(
         """
@@ -563,6 +579,15 @@ class MemoryCatalogRepository:
     """SQLite repository for Catalog and durable memory control-plane state."""
 
     def __init__(self, db_path: str | None = None, *, conn: sqlite3.Connection | None = None):
+        import src.settings as settings
+        if conn is None and str(getattr(settings, "CONTROL_PLANE_BACKEND", "sqlite") or "sqlite").lower() == "postgres":
+            dsn = str(getattr(settings, "CONTROL_PLANE_DATABASE_URL", "") or "").strip()
+            if not dsn:
+                raise RuntimeError("CONTROL_PLANE_BACKEND=postgres requires CONTROL_PLANE_DATABASE_URL")
+            from src.storage.control_plane.memory_worker import PostgresMemoryCatalogRepository
+            self.__class__ = PostgresMemoryCatalogRepository
+            PostgresMemoryCatalogRepository.__init__(self, dsn)
+            return
         self.db_path = db_path
         self._external_conn = conn
         if conn is None:
@@ -659,7 +684,7 @@ class MemoryCatalogRepository:
             conditions.extend(["r.department_id = ?", "r.kb_id = ?"])
             params.extend([str(department_id), str(kb_id)])
         if active_only:
-            conditions.extend(["p.active = 1", "p.retired_at IS NULL", "r.status IN ('candidate', 'verified')"])
+            conditions.extend(["p.active = TRUE", "p.retired_at IS NULL", "r.status IN ('candidate', 'verified')"])
         rows = c.execute(
             "SELECT p.* FROM memory_projections p JOIN memory_records r ON r.memory_id = p.memory_id WHERE "
             + " AND ".join(conditions),
@@ -687,7 +712,7 @@ class MemoryCatalogRepository:
         sql = "SELECT * FROM memory_sources WHERE memory_id = ?"
         params: list[Any] = [memory_id]
         if valid_only:
-            sql += " AND source_valid = 1"
+            sql += " AND source_valid = TRUE"
         sql += " ORDER BY created_at, source_id"
         return c.execute(sql, params).fetchall()
 
@@ -845,14 +870,14 @@ class MemoryCatalogRepository:
                 """INSERT INTO memory_projections
                 (projection_id, memory_id, projection_kind, store_backend, namespace_json, store_key,
                  current_revision, current_content_hash, active, manager_writable, fence_version, created_at)
-                VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, 0, 1, 1, ?)""",
+                VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, FALSE, TRUE, 1, ?)""",
                 (projection_id, memory_id, store_backend, namespace_json(namespace), str(key), revision_no, normalized_hash, now),
             )
             projection = self.get_projection(projection_id, conn=c)
         else:
             cur = c.execute(
                 """UPDATE memory_projections SET current_revision = ?, current_content_hash = ?,
-                    active = 0, manager_writable = 1 WHERE projection_id = ? AND retired_at IS NULL
+                    active = FALSE, manager_writable = TRUE WHERE projection_id = ? AND retired_at IS NULL
                       AND fence_version = ?""",
                 (revision_no, normalized_hash, projection.projection_id, projection.fence_version),
             )
@@ -909,7 +934,7 @@ class MemoryCatalogRepository:
         now = utc_now()
         next_fence = int(row["fence_version"]) + 1
         cur = c.execute(
-            "UPDATE memory_projections SET active = 0, manager_writable = 0, fence_version = ?, retired_at = ? WHERE projection_id = ? AND retired_at IS NULL AND fence_version = ?",
+            "UPDATE memory_projections SET active = FALSE, manager_writable = FALSE, fence_version = ?, retired_at = ? WHERE projection_id = ? AND retired_at IS NULL AND fence_version = ?",
             (next_fence, now, projection_id, int(row["fence_version"])),
         )
         if cur.rowcount != 1:
@@ -948,7 +973,7 @@ class MemoryCatalogRepository:
         next_fence = int(expected_fence) + 1
         cur = c.execute(
             """UPDATE memory_projections
-               SET active = 0, manager_writable = 0, fence_version = ?
+               SET active = FALSE, manager_writable = FALSE, fence_version = ?
                WHERE projection_id = ? AND retired_at IS NULL AND fence_version = ?""",
             (next_fence, projection_id, int(expected_fence)),
         )
@@ -983,7 +1008,7 @@ class MemoryCatalogRepository:
         if projection["retired_at"] is not None:
             return False
         now = utc_now()
-        c.execute("UPDATE memory_projections SET active = 1 WHERE projection_id = ? AND current_revision = ? AND fence_version = ? AND retired_at IS NULL", (projection_id, int(expected_revision), int(expected_fence)))
+        c.execute("UPDATE memory_projections SET active = TRUE WHERE projection_id = ? AND current_revision = ? AND fence_version = ? AND retired_at IS NULL", (projection_id, int(expected_revision), int(expected_fence)))
         if projection["projection_kind"] == "verified" and record["status"] == "verification_pending":
             c.execute(
                 "UPDATE memory_records SET status = 'verified', updated_at = ? WHERE memory_id = ? AND status = 'verification_pending' AND current_revision = ?",
@@ -1063,7 +1088,7 @@ def _insert_source(conn: sqlite3.Connection, memory_id: str, source: dict[str, A
         """INSERT OR IGNORE INTO memory_sources
         (source_id, memory_id, session_id, turn_id, message_id, consent_event_id, source_hash,
          source_role, contribution_kind, source_valid, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?)""",
         (
             str(uuid.uuid4()),
             memory_id,

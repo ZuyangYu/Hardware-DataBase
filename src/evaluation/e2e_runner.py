@@ -646,11 +646,12 @@ def run_case(
 def _create_identities(
     client: "E2EClient", *, department_id: int
 ) -> tuple[str, str, str, int, int]:
+    import src.settings as settings
+
     run = uuid.uuid4().hex[:6]
-    admin_token = client.login(
-        os.getenv("HDB_E2E_ADMIN_USERNAME", "admin"),
-        os.getenv("HDB_E2E_ADMIN_PASSWORD", "123456"),
-    )
+    admin_username = os.getenv("HDB_E2E_ADMIN_USERNAME") or settings.AUTH_DEFAULT_ADMIN_USERNAME
+    admin_password = os.getenv("HDB_E2E_ADMIN_PASSWORD") or settings.AUTH_DEFAULT_ADMIN_PASSWORD
+    admin_token = client.login(admin_username, admin_password)
     reviewer_name = f"e2e_admin_{run}"
     owner_name = f"e2e_owner_{run}"
     password = os.getenv("HDB_E2E_PASSWORD", "E2ePass!2026")
@@ -704,7 +705,7 @@ def _cleanup(
             )
         except Exception:  # noqa: BLE001
             pass
-    for user_id, token in ((owner_id, reviewer_token), (reviewer_id, admin_token)):
+    for user_id, token in ((owner_id, admin_token), (reviewer_id, admin_token)):
         try:
             client.requests.put(
                 f"{client.base_url}/api/v1/users/{user_id}/active",

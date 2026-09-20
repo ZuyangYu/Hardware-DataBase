@@ -66,16 +66,15 @@ class ExternalConversationStore:
         dept = _require_department_id(conversation.department_id, "saving")
         path = self.conversation_dir(dept, conversation.kb_name, conversation.conversation_id, create=True)
         target = os.path.join(path, "conversation.json")
-        with open(target, "w", encoding="utf-8") as f:
-            json.dump(conversation.to_dict(), f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
+        from src.core.atomic_files import atomic_write_bytes, atomic_write_text
+
+        atomic_write_text(
+            target,
+            json.dumps(conversation.to_dict(), ensure_ascii=False, indent=2),
+        )
         if raw_bytes is not None:
             ext = raw_ext if raw_ext.startswith(".") else f".{raw_ext}"
-            with open(os.path.join(path, f"original{ext}"), "wb") as f:
-                f.write(raw_bytes)
-                f.flush()
-                os.fsync(f.fileno())
+            atomic_write_bytes(os.path.join(path, f"original{ext}"), raw_bytes)
         return target
 
     def load(self, department_id: str | int | None, kb_name: str, conversation_id: str) -> ExternalConversation | None:

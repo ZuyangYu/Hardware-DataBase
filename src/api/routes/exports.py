@@ -398,6 +398,14 @@ def create_exports(
     conv: ConversationService = Depends(get_conversation_service),
     store: ResultExportStore = Depends(get_export_store),
 ):
+    from src.api.admission import admission_model_name, enforce_admission
+
+    enforce_admission(
+        user,
+        getattr(user, "department_id", None),
+        resource="export",
+        model=admission_model_name(),
+    )
     formats = list(dict.fromkeys(body.formats))
     if len(formats) != len(body.formats):
         raise HTTPException(status_code=400, detail="formats must be unique")
@@ -435,9 +443,15 @@ def create_exports(
     # Keep one canonical immutable snapshot per completed turn. Presentation
     # choices belong to each ExportJob so another format/title can reuse it.
     envelope = snapshot_source.envelope if snapshot_source is not None else envelope_from_turn(turn)
+    organize = bool(body.organize)
+    include_citations = body.include_citations
+    if include_citations is None:
+        # Organized deliverables are clean by default; the as-is path keeps
+        # the legacy evidence list unless the caller opts out.
+        include_citations = not organize
     render_options = dict(render_options)
     render_options["render_title"] = body.title
-    render_options["include_citations"] = body.include_citations
+    render_options["include_citations"] = include_citations
     try:
         if snapshot_source is not None:
             session_id = snapshot_source.session_id
@@ -468,7 +482,8 @@ def create_exports(
             content_shape=body.content_shape,
             client_request_id=request_id,
             title=body.title,
-            include_citations=body.include_citations,
+            include_citations=include_citations,
+            organize=organize,
             options=render_options,
         )
     except (ValueError, KeyError) as exc:

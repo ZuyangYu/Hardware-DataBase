@@ -7,7 +7,7 @@ boundary that decides whether a plan is eligible to reach a domain adapter.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -113,6 +113,84 @@ class ConversationActionPlan(BaseModel):
             if action.action_id in action.depends_on:
                 raise ValueError("an action cannot depend on itself")
         return self
+
+
+# Server-owned execution profile per action kind (P2-001).  Model input can
+# never set access mode, cost class or resource keys; unknown kinds default to
+# write/heavy so they stay serial.
+ACTION_EXECUTION_PROFILE: dict[str, tuple[str, str]] = {
+    "search": ("read_only", "normal"),
+    "inspect": ("read_only", "normal"),
+    "compare": ("read_only", "normal"),
+    "summarize": ("read_only", "normal"),
+    "get_status": ("read_only", "normal"),
+    "pause": ("write", "normal"),
+    "cancel": ("write", "normal"),
+    "resume": ("write", "normal"),
+    "retry": ("write", "normal"),
+    "rebase_sources": ("write", "normal"),
+    "resolve_decision": ("write", "normal"),
+    "create_document": ("write", "heavy"),
+    "revise_document": ("write", "heavy"),
+    "revise_attachment": ("write", "heavy"),
+    "export_result": ("write", "heavy"),
+    "request_release": ("write", "heavy"),
+}
+
+# Kinds whose receipts are ``accepted`` while the real work continues in the
+# background.  Documentation only: accepted is NOT the default dependency
+# requirement.  Every dependency edge requires ``completed`` unless the exact
+# (dependent_kind, dependency_kind) pair is whitelisted below by the server.
+ASYNC_ACTION_KINDS = frozenset(
+    {"create_document", "revise_document", "revise_attachment", "export_result", "request_release"}
+)
+
+# Server whitelist of edges that may rely on submission only.  Empty by
+# default: dependents wait for the actual result.
+ACCEPTED_DEPENDENCY_EDGES: frozenset[tuple[str, str]] = frozenset()
+
+
+class ResolvedAction(BaseModel):
+    """Server-resolved execution metadata for one validated action."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: ActionSpec
+    access_mode: Literal["read_only", "write"] = "write"
+    cost_class: Literal["normal", "heavy"] = "heavy"
+    resource_key: str = ""
+    # dependency action_id -> required dependency status for this edge.
+    dependency_requirements: dict[str, Literal["accepted", "completed"]] = Field(default_factory=dict)
+
+
+def resolve_action(
+    action: ActionSpec,
+    actions_by_id: Mapping[str, ActionSpec] | None = None,
+) -> ResolvedAction:
+    """Resolve server-side execution metadata; never trusts model-provided data."""
+    normalized_kind = str(action.kind)
+    access_mode, cost_class = ACTION_EXECUTION_PROFILE.get(normalized_kind, ("write", "heavy"))
+    resource_key = ""
+    if access_mode == "write":
+        target = str(action.target_ref or "").strip() or "global"
+        resource_key = f"{normalized_kind}:{target}"
+    requirements: dict[str, Literal["accepted", "completed"]] = {}
+    for dependency in action.depends_on:
+        dependency_kind = ""
+        if actions_by_id and dependency in actions_by_id:
+            dependency_kind = str(actions_by_id[dependency].kind)
+        requirements[dependency] = (
+            "accepted"
+            if (normalized_kind, dependency_kind) in ACCEPTED_DEPENDENCY_EDGES
+            else "completed"
+        )
+    return ResolvedAction(
+        action=action,
+        access_mode=access_mode,
+        cost_class=cost_class,
+        resource_key=resource_key,
+        dependency_requirements=requirements,
+    )
 
 
 class ActionReceipt(BaseModel):
@@ -757,6 +835,9 @@ def validate_action_plan(
 
 
 __all__ = [
+    "ACCEPTED_DEPENDENCY_EDGES",
+    "ACTION_EXECUTION_PROFILE",
+    "ASYNC_ACTION_KINDS",
     "ActionKind",
     "ActionPlanIssue",
     "ActionExecutionResult",
@@ -765,9 +846,11 @@ __all__ = [
     "ConstraintKind",
     "ConversationActionPlan",
     "MUTATING_ACTION_KINDS",
+    "ResolvedAction",
     "UserConstraint",
     "action_requires_resolved_reference",
     "compile_deterministic_action_plan",
     "extract_explicit_constraints",
+    "resolve_action",
     "validate_action_plan",
 ]

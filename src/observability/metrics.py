@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -114,6 +115,72 @@ def set_queue_state(queue: str, *, depth: int, oldest_age_s: float) -> None:
                 ]],
                 description="Age of the oldest durable queue item",
                 unit="s",
+            )
+    except Exception:
+        pass
+
+
+_RESOURCE_STATE: dict[str, dict[str, float]] = {}
+_RESOURCE_GAUGES: dict[str, Any] = {}
+
+
+def set_resource_state(
+    *,
+    active: Mapping[str, Any] | None = None,
+    waiting: Mapping[str, Any] | None = None,
+    capacities: Mapping[str, Any] | None = None,
+    reserved: Mapping[str, Any] | None = None,
+    uncertain: Mapping[str, Any] | None = None,
+) -> None:
+    """Publish resource governor state (P0b) as low-cardinality gauges."""
+    if not _enabled():
+        return
+    _RESOURCE_STATE.clear()
+    active = active or {}
+    waiting = waiting or {}
+    capacities = capacities or {}
+    reserved = reserved or {}
+    uncertain = uncertain or {}
+    for key in set(active) | set(waiting) | set(capacities) | set(reserved) | set(uncertain):
+        _RESOURCE_STATE[str(key)] = {
+            "active": float(active.get(key, 0) or 0),
+            "waiting": float(waiting.get(key, 0) or 0),
+            "capacity": float(capacities.get(key, 0) or 0),
+            "reserved": float(reserved.get(key, 0) or 0),
+            "uncertain": float(uncertain.get(key, 0) or 0),
+        }
+    specs = {
+        "active": ("hdb.resource.active", "Currently held resource permits", "{calls}"),
+        "waiting": ("hdb.resource.queue.waiting", "Callers queued for a resource permit", "{calls}"),
+        "capacity": ("hdb.resource.capacity", "Configured resource capacity", "{slots}"),
+        "reserved": ("hdb.resource.reserved", "Interactive-reserved resource slots", "{slots}"),
+        "uncertain": ("hdb.resource.uncertain", "Permits in the uncertain state", "{calls}"),
+    }
+    try:
+        for field, (name, description, unit) in specs.items():
+            if field in _RESOURCE_GAUGES:
+                continue
+            _RESOURCE_GAUGES[field] = _meter().create_observable_gauge(
+                name,
+                callbacks=[
+                    lambda _options, field=field: [
+                        GaugeObservation(value[field], {"resource": resource})
+                        for resource, value in _RESOURCE_STATE.items()
+                    ]
+                ],
+                description=description,
+                unit=unit,
+            )
+        if "chat_reserved" not in _RESOURCE_GAUGES:
+            _RESOURCE_GAUGES["chat_reserved"] = _meter().create_observable_gauge(
+                "hdb.chat.reserved_capacity",
+                callbacks=[
+                    lambda _options: [
+                        GaugeObservation(_RESOURCE_STATE.get("chat", {}).get("reserved", 0.0))
+                    ]
+                ],
+                description="Interactive slots reserved for chat",
+                unit="{slots}",
             )
     except Exception:
         pass
@@ -262,6 +329,190 @@ def record_attachment(
     counter("hdb.attachment.events", attributes=attrs, description="Chat attachment events")
     if duration_s is not None:
         histogram("hdb.attachment.duration", duration_s, attributes={"event": event, "status": status})
+
+
+_ACTIVE_STATE: dict[str, int] = {}
+_ACTIVE_GAUGES: dict[str, Any] = {}
+
+
+def set_active_state(name: str, description: str, count: int, *, unit: str = "{calls}") -> None:
+    """Publish one bounded concurrent-activity gauge (agent/llm/rag)."""
+    if not _enabled():
+        return
+    key = str(name)
+    _ACTIVE_STATE[key] = max(0, int(count))
+    try:
+        if key not in _ACTIVE_GAUGES:
+            _ACTIVE_GAUGES[key] = _meter().create_observable_gauge(
+                key,
+                callbacks=[lambda _options, key=key: [GaugeObservation(_ACTIVE_STATE.get(key, 0))]],
+                description=description,
+                unit=unit,
+            )
+    except Exception:
+        pass
+
+
+_ACTIVE_COUNTS: dict[str, int] = {}
+_ACTIVE_COUNTS_LOCK = threading.Lock()
+
+
+def incr_active(name: str, description: str, delta: int, *, unit: str = "{calls}") -> int:
+    """Adjust one internal active-count and publish its gauge."""
+    key = str(name)
+    with _ACTIVE_COUNTS_LOCK:
+        value = max(0, _ACTIVE_COUNTS.get(key, 0) + int(delta))
+        _ACTIVE_COUNTS[key] = value
+    set_active_state(key, description, value, unit=unit)
+    return value
+
+
+def record_conversation_claim(*, status: str, wait_s: float) -> None:
+    counter(
+        "hdb.conversation.claims",
+        attributes={"status": status},
+        description="Session turn claim outcomes",
+    )
+    histogram(
+        "hdb.conversation.lock.wait",
+        max(0.0, float(wait_s)),
+        attributes={"status": status},
+        description="Time spent acquiring the per-session claim lock",
+    )
+
+
+def record_same_thread_conflict() -> None:
+    counter(
+        "hdb.conversation.concurrent_claim_blocked",
+        description="Same-session claims blocked while another turn held the lease",
+    )
+
+
+def record_governor_lease_lost(*, resource: str, reason: str) -> None:
+    counter(
+        "hdb.governor.lease_lost",
+        attributes={"resource": resource, "reason": reason},
+        description="Execution leases lost or rejected by ownership checks",
+    )
+
+
+def record_agent_step(*, step_count: int, status: str) -> None:
+    histogram(
+        "hdb.agent.step_count",
+        max(0, int(step_count)),
+        attributes={"status": status},
+        unit="{steps}",
+        description="Agent steps per run",
+    )
+
+
+def record_agent_cancel(*, reason: str) -> None:
+    counter(
+        "hdb.agent.cancel_count",
+        attributes={"reason": reason},
+        description="Agent runs cancelled",
+    )
+
+
+def record_agent_tool_call(*, tool: str, status: str) -> None:
+    counter(
+        "hdb.agent.tool_call_count",
+        attributes={"tool": tool, "status": status},
+        description="Agent tool calls",
+    )
+
+
+def record_llm_timeout(*, provider: str) -> None:
+    counter(
+        "hdb.llm.timeout_total",
+        attributes={"provider": provider},
+        description="LLM calls that timed out",
+    )
+
+
+def record_llm_tokens(*, provider: str, input_tokens: int, output_tokens: int) -> None:
+    if input_tokens:
+        counter(
+            "hdb.llm.tokens",
+            attributes={"provider": provider, "kind": "input"},
+            value=max(0, int(input_tokens)),
+            description="LLM tokens consumed (enables per-minute rates)",
+        )
+    if output_tokens:
+        counter(
+            "hdb.llm.tokens",
+            attributes={"provider": provider, "kind": "output"},
+            value=max(0, int(output_tokens)),
+            description="LLM tokens consumed (enables per-minute rates)",
+        )
+
+
+def record_rag_batch(*, fanout: int) -> None:
+    histogram(
+        "hdb.rag.batch_fanout",
+        max(0, int(fanout)),
+        unit="{queries}",
+        description="Queries per document batch retrieval call",
+    )
+
+
+def record_rag_zero_hit() -> None:
+    counter("hdb.rag.zero_hit", description="RAG retrieval calls that returned no chunks")
+
+
+def record_job_phase(*, kind: str, phase: str, seconds: float) -> None:
+    name = "hdb.job.wait_time" if phase == "wait" else "hdb.job.execution_time"
+    histogram(
+        name,
+        max(0.0, float(seconds)),
+        attributes={"kind": kind},
+        description=f"{kind} job {phase} duration",
+    )
+
+
+def record_job_dead_letter(*, kind: str) -> None:
+    counter(
+        "hdb.job.dead_letter_count",
+        attributes={"kind": kind},
+        description="Jobs that exhausted retries",
+    )
+
+
+def record_action_parallel(*, layer_size: int, duration_s: float, status: str = "ok") -> None:
+    """Record one bounded-parallel action layer (P2-001)."""
+    counter(
+        "hdb.action.parallel.layers",
+        attributes={"status": status},
+        description="Action DAG parallel layers executed",
+    )
+    histogram(
+        "hdb.action.parallel.layer_size",
+        max(0, int(layer_size)),
+        unit="{actions}",
+        description="Actions merged into one parallel layer",
+    )
+    histogram(
+        "hdb.action.parallel.duration",
+        max(0.0, float(duration_s)),
+        attributes={"status": status},
+        description="Parallel layer execution duration",
+    )
+
+
+def record_retrieval_executor(*, status: str, wait_s: float | None = None) -> None:
+    """Record shared retrieval executor admission (P0-007/P2-002)."""
+    counter(
+        "hdb.retrieval.executor.attempts",
+        attributes={"status": status},
+        description="Shared retrieval executor admission outcomes",
+    )
+    if wait_s is not None:
+        histogram(
+            "hdb.retrieval.executor.queue_wait",
+            max(0.0, float(wait_s)),
+            attributes={"status": status},
+            description="Time waiting for a bounded retrieval queue slot",
+        )
 
 
 def record_evaluation(*, status: str, mode: str) -> None:

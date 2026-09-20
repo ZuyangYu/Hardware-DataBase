@@ -9,8 +9,10 @@ their workflow; this module never changes business state or fallback policy.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Generic, Protocol, TypeVar
 
@@ -21,7 +23,7 @@ from langchain_core.runnables import Runnable
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.observability import observe
-from src.observability.metrics import record_llm
+from src.observability.metrics import record_llm, record_llm_timeout, record_llm_tokens
 
 
 class ChatModelLike(Protocol):
@@ -226,6 +228,39 @@ def instrument_chat_model(
     return model
 
 
+_LLM_ACTIVE = 0
+_LLM_ACTIVE_LOCK = threading.Lock()
+
+
+def _llm_active(delta: int) -> None:
+    global _LLM_ACTIVE
+    with _LLM_ACTIVE_LOCK:
+        _LLM_ACTIVE = max(0, _LLM_ACTIVE + int(delta))
+        current = _LLM_ACTIVE
+    try:
+        from src.observability.metrics import set_active_state
+
+        set_active_state("hdb.llm.active_requests", "Concurrent LLM calls", current)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _llm_governor():
+    """Active-call gauge for one logical LLM call.
+
+    Process-level admission lives in ``llm_governor.slot`` and the
+    deployment-scope permit is acquired per real provider request inside the
+    governed adapter (``model_gateway``) so retries re-acquire it; this wrapper
+    only keeps the ``hdb.llm.active_requests`` gauge accurate.
+    """
+    _llm_active(1)
+    try:
+        yield
+    finally:
+        _llm_active(-1)
+
+
 def invoke_text(
     model: ChatModelLike,
     messages: Sequence[Mapping[str, Any]],
@@ -236,14 +271,15 @@ def invoke_text(
 ) -> TextCallResult:
     """Invoke a chat model and normalize its response to text."""
 
-    response, usage = _observed_invoke(
-        model,
-        messages,
-        operation=operation,
-        profile=profile,
-        streaming=False,
-        **kwargs,
-    )
+    with _llm_governor():
+        response, usage = _observed_invoke(
+            model,
+            messages,
+            operation=operation,
+            profile=profile,
+            streaming=False,
+            **kwargs,
+        )
     text = extract_text(response)
     if text is None or not text.strip():
         raise TextResponseError(
@@ -298,15 +334,16 @@ def invoke_structured(
         raise StructuredOutputCapabilityError(str(error)) from error
 
     try:
-        response, usage = _observed_invoke(
-            structured_model,
-            messages,
-            operation=operation,
-            profile=profile,
-            streaming=False,
-            identity_model=model,
-            **kwargs,
-        )
+        with _llm_governor():
+            response, usage = _observed_invoke(
+                structured_model,
+                messages,
+                operation=operation,
+                profile=profile,
+                streaming=False,
+                identity_model=model,
+                **kwargs,
+            )
     except ModelInvocationError as exc:
         if text_fallback is not None and _is_structured_capability_error(exc):
             return _invoke_text_fallback(
@@ -360,7 +397,9 @@ def stream_text(
         stage=operation, profile=profile, streaming=True,
     )
     try:
-        with observation:
+        # The permit is held until the stream is exhausted or closed, matching
+        # the real downstream lifetime rather than the caller's future.
+        with _llm_governor(), observation:
             try:
                 stream = model.stream(messages, **kwargs)
                 for chunk in stream:
@@ -375,10 +414,23 @@ def stream_text(
                         input_tokens=usage["input"], output_tokens=usage["output"],
                         total_tokens=usage["total"],
                     )
+                    try:
+                        record_llm_tokens(
+                            provider=provider,
+                            input_tokens=int(usage["input"] or 0),
+                            output_tokens=int(usage["output"] or 0),
+                        )
+                    except Exception:
+                        pass
                 observation.set("hdb.usage_returned", bool(usage["returned"]))
                 observation.outcome("success")
             except Exception as exc:
                 status = "error"
+                if isinstance(exc, (TimeoutError,)) or "timeout" in str(exc).lower():
+                    try:
+                        record_llm_timeout(provider=provider)
+                    except Exception:
+                        pass
                 wrapped = ModelInvocationError(
                     f"{operation} stream failed for {_model_identity(model)}: {exc}"
                 )
@@ -515,6 +567,14 @@ def _observed_invoke(
                         output_tokens=usage.output_tokens,
                         total_tokens=usage.total_tokens,
                     )
+                    try:
+                        record_llm_tokens(
+                            provider=provider,
+                            input_tokens=int(usage.input_tokens or 0),
+                            output_tokens=int(usage.output_tokens or 0),
+                        )
+                    except Exception:
+                        pass
                 text = extract_text(response)
                 if text is not None:
                     observation.set_output(text, content_kind="llm")
@@ -522,6 +582,11 @@ def _observed_invoke(
                 return response, usage
             except Exception as exc:
                 status = "error"
+                if isinstance(exc, (TimeoutError,)) or "timeout" in str(exc).lower():
+                    try:
+                        record_llm_timeout(provider=provider)
+                    except Exception:
+                        pass
                 wrapped = ModelInvocationError(
                     f"{operation} invocation failed for {_model_identity(identity)}: {exc}"
                 )
