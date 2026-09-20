@@ -22,6 +22,7 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化�
 ```text
 Hardware-DataBase/
 ├── assets/                     # 应用示例图片
+├── wiki/                       # 系统技术 Wiki（已纳入 git，入口 wiki/README.md）
 ├── docs/                       # 本地设计/评估笔记（未纳入 git 版本管理）
 │   ├── production_readiness_report.md  # 生产化审计报告
 │   └── optimization_roadmap.md         # 优化路线
