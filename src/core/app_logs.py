@@ -289,6 +289,9 @@ class AppLogService:
         department_id: int | None = None,
     ) -> int:
         with closing(self._connect()) as conn:
+            # The audit hash chain is read-then-insert; serialize the append so
+            # concurrent API/worker writers cannot fork the chain.
+            conn.execute("BEGIN IMMEDIATE")
             created_at = utc_now()
             actor_department_id = actor.department_id if actor else department_id
             metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
@@ -336,6 +339,7 @@ class AppLogService:
                     created_at,
                 ),
             )
+            conn.execute("COMMIT")
         return int(cursor.lastrowid)
 
     def _last_audit_hash(self, conn) -> str:

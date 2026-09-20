@@ -16,11 +16,10 @@ The UI is a React + TypeScript SPA in `frontend/` talking to the FastAPI
 backend in `src/api/`. The former Streamlit app (`streamlit_app.py`, `src/ui/`)
 has been removed; `frontend/` + `src/api/` are the only UI path now.
 
-`docs/architecture_doc.md` is the live whole-system architecture doc (v0.1.0,
-2026-07) - read it first for the big picture. Other design notes in `docs/`:
-`pipeline_contract.md` (pipeline isolation contract), `langgraph_agentic_query_design.md`
-(query graph design), `joint_retrieval_test_cases.md` (source of the eval
-dataset), `hardware_database_develop_integration_plan.md`.
+`docs/` holds local design/eval notes and is not tracked in git. The former
+`architecture_doc.md`, `pipeline_contract.md`, `langgraph_agentic_query_design.md`,
+`joint_retrieval_test_cases.md` and `hardware_database_develop_integration_plan.md`
+are no longer present - treat the code as the source of truth.
 
 > Note: an earlier version of this file described a removed local hybrid-retrieval
 > architecture (`src/query_router/`, `src/rag_backends/`, `src/core/rag_pipeline.py`,

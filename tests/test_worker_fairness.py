@@ -97,6 +97,9 @@ def test_run_once_uses_shared_pipeline_for_general_chat_after_document_batch(mon
     worker.worker_id = "worker-test"
     worker.pipeline = object()
     worker.runtime = None
+    # Required by the multi-slot path (_process_chat_claims with
+    # WORKER_TURN_CONCURRENCY > 1); the single-slot path ignores it.
+    worker.running = True
     worker.auth = SimpleNamespace(
         get_user_by_id=lambda _value: SimpleNamespace(id=1, is_active=True),
     )

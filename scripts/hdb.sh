@@ -11,7 +11,7 @@ cd "$APP_ROOT" || exit 1
 if [ -f "$APP_ROOT/.env" ]; then
   while IFS='=' read -r key value; do
     case "$key" in
-      HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT) export "$key=$value" ;;
+      HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT|HDB_WORKER_ROLES) export "$key=$value" ;;
     esac
   done < <(grep -E '^(HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT)=' "$APP_ROOT/.env" 2>/dev/null || true)
 fi
@@ -26,6 +26,9 @@ FRONT_PID_FILE="$PID_DIR/frontend.pid"
 WORKER_PID_FILE="$PID_DIR/worker.pid"
 MEMORY_WORKER_PID_FILE="$PID_DIR/memory-worker.pid"
 EXPORT_WORKER_PID_FILE="$PID_DIR/export-worker.pid"
+# Worker 角色进程: 默认 chat/authoring/parse 三个独立进程(互不阻塞)。
+# HDB_WORKER_ROLES=all 时回退为单进程 legacy 模式。
+WORKER_ROLES="${HDB_WORKER_ROLES:-chat authoring parse}"
 
 # 后台 worker 命令名:聊天/文档轮次在 worker 进程内执行(agent 工具、
 # 计划提交、记忆提炼),重复启动会留下携带旧代码的僵尸实例,因此
@@ -80,8 +83,21 @@ stop_process() {
 
 # ---- worker 生命周期(纳管 + 清理未纳管旧实例) ----
 
+worker_pid_file_for() {
+  # $1 = role ("all" -> legacy single worker pid file)
+  case "$1" in
+    all) printf '%s\n' "$WORKER_PID_FILE" ;;
+    *)   printf '%s\n' "$PID_DIR/worker-$1.pid" ;;
+  esac
+}
+
 worker_pid_files() {
   printf '%s\n' "$WORKER_PID_FILE" "$MEMORY_WORKER_PID_FILE" "$EXPORT_WORKER_PID_FILE"
+  local role
+  for role in $WORKER_ROLES; do
+    [ "$role" = "all" ] && continue
+    printf '%s\n' "$PID_DIR/worker-$role.pid"
+  done
 }
 
 is_managed_worker_pid() {
@@ -110,35 +126,55 @@ cleanup_stale_workers() {
   return 0
 }
 
+report_worker() {
+  local name="$1" pid_file="$2" pid
+  pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+  if [ -n "$pid" ] && pid_alive "$pid"; then
+    echo "[${name}] 已启动 (pid ${pid})"
+  else
+    echo "[${name}] 未能启动,查看 $LOG_DIR/${name}.log"
+  fi
+}
+
 start_worker_processes() {
   # 幂等:重复 start 先停掉已纳管实例,避免越积越多的 worker 抢同一队列。
   stop_worker_processes
   echo "[worker] 启动中..."
-  start_process worker "$APP_ROOT" "$WORKER_PID_FILE" \
-    uv run hardware-database-worker
+  local role
+  if [ "$WORKER_ROLES" = "all" ]; then
+    start_process worker "$APP_ROOT" "$WORKER_PID_FILE" \
+      uv run hardware-database-worker
+  else
+    for role in $WORKER_ROLES; do
+      start_process "worker-$role" "$APP_ROOT" "$(worker_pid_file_for "$role")" \
+        uv run hardware-database-worker --role "$role"
+    done
+  fi
   start_process memory-worker "$APP_ROOT" "$MEMORY_WORKER_PID_FILE" \
     uv run hardware-database-memory-worker
   start_process export-worker "$APP_ROOT" "$EXPORT_WORKER_PID_FILE" \
     uv run python -m src.result_exports.worker
   sleep 1
-  local pid_file name
-  for name in worker memory-worker export-worker; do
-    case "$name" in
-      worker) pid_file="$WORKER_PID_FILE" ;;
-      memory-worker) pid_file="$MEMORY_WORKER_PID_FILE" ;;
-      export-worker) pid_file="$EXPORT_WORKER_PID_FILE" ;;
-    esac
-    pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
-    if [ -n "$pid" ] && pid_alive "$pid"; then
-      echo "[${name}] 已启动 (pid ${pid})"
-    else
-      echo "[${name}] 未能启动,查看 $LOG_DIR/${name}.log"
-    fi
-  done
+  if [ "$WORKER_ROLES" = "all" ]; then
+    report_worker worker "$WORKER_PID_FILE"
+  else
+    for role in $WORKER_ROLES; do
+      report_worker "worker-$role" "$(worker_pid_file_for "$role")"
+    done
+  fi
+  report_worker memory-worker "$MEMORY_WORKER_PID_FILE"
+  report_worker export-worker "$EXPORT_WORKER_PID_FILE"
 }
 
 stop_worker_processes() {
+  local role
+  # legacy 单进程 pid 文件在任何模式下都清理，避免切换模式后残留双消费。
   stop_process worker "$APP_ROOT" "$WORKER_PID_FILE"
+  if [ "$WORKER_ROLES" != "all" ]; then
+    for role in $WORKER_ROLES; do
+      stop_process "worker-$role" "$APP_ROOT" "$(worker_pid_file_for "$role")"
+    done
+  fi
   stop_process memory-worker "$APP_ROOT" "$MEMORY_WORKER_PID_FILE"
   stop_process export-worker "$APP_ROOT" "$EXPORT_WORKER_PID_FILE"
 }
@@ -180,6 +216,9 @@ start_front() {
 
 do_start() {
   mkdir -p "$LOG_DIR" "$PID_DIR"
+  # hdb.sh 自己管理 worker 生命周期：阻止 API 进程再 spawn 一份 export/memory worker
+  export HDB_API_SPAWN_EXPORT_WORKER=0
+  export HDB_API_SPAWN_MEMORY_WORKER=0
   # 先清理历史残留的未纳管 worker,避免旧代码实例继续消费队列。
   cleanup_stale_workers
   if api_ok; then
@@ -275,13 +314,19 @@ do_status() {
     echo "❌ [front]  未启动      -> bash scripts/hdb.sh start"
     rc=1
   fi
-  local pid_file name pid
-  for name in worker memory-worker export-worker; do
-    case "$name" in
-      worker) pid_file="$WORKER_PID_FILE" ;;
-      memory-worker) pid_file="$MEMORY_WORKER_PID_FILE" ;;
-      export-worker) pid_file="$EXPORT_WORKER_PID_FILE" ;;
-    esac
+  local role pid_file name pid spec
+  local worker_specs=""
+  if [ "$WORKER_ROLES" = "all" ]; then
+    worker_specs="worker:$WORKER_PID_FILE"
+  else
+    for role in $WORKER_ROLES; do
+      worker_specs="$worker_specs worker-$role:$(worker_pid_file_for "$role")"
+    done
+  fi
+  worker_specs="$worker_specs memory-worker:$MEMORY_WORKER_PID_FILE export-worker:$EXPORT_WORKER_PID_FILE"
+  for spec in $worker_specs; do
+    name="${spec%%:*}"
+    pid_file="${spec#*:}"
     pid="$(managed_pid "$pid_file" "$APP_ROOT" 2>/dev/null || true)"
     if [ -n "$pid" ] && pid_alive "$pid"; then
       echo "✅ [${name}]  pid ${pid}"
@@ -294,7 +339,16 @@ do_status() {
 }
 
 do_logs() {
-  for log in "$LOG_DIR/api.log" "$LOG_DIR/frontend.log" "$LOG_DIR/worker.log" "$LOG_DIR/memory-worker.log"; do
+  local role logs log
+  logs="$LOG_DIR/api.log $LOG_DIR/frontend.log $LOG_DIR/memory-worker.log $LOG_DIR/export-worker.log"
+  if [ "$WORKER_ROLES" = "all" ]; then
+    logs="$logs $LOG_DIR/worker.log"
+  else
+    for role in $WORKER_ROLES; do
+      logs="$logs $LOG_DIR/worker-$role.log"
+    done
+  fi
+  for log in $logs; do
     [ -f "$log" ] && tail -n 30 "$log"
   done
 }

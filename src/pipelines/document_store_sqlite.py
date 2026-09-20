@@ -183,6 +183,17 @@ class PipelineDocumentStore:
             """)
             self._migrate_department_unique_constraint(conn)
             self._ensure_columns(conn)
+            # Claim/sweep paths filter on processor_kind/status/worker_id and
+            # order by updated_at; without these the worker full-scans every
+            # 0.5s poll.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_pipeline_documents_claim"
+                " ON pipeline_documents(processor_kind, status, worker_id, retry_count, updated_at, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_pipeline_documents_lease"
+                " ON pipeline_documents(processor_kind, worker_id, worker_heartbeat_at)"
+            )
 
     def _ensure_columns(self, conn):
         columns = {

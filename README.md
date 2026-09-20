@@ -22,12 +22,9 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化�
 ```text
 Hardware-DataBase/
 ├── assets/                     # 应用示例图片
-├── docs/                       # 架构与设计文档
-│   ├── architecture_doc.md     # 当前整体架构
-│   ├── pipeline_contract.md    # pipeline 隔离契约
-│   ├── langgraph_agentic_query_design.md
-│   ├── joint_retrieval_test_cases.md
-│   └── hardware_database_develop_integration_plan.md
+├── docs/                       # 本地设计/评估笔记（未纳入 git 版本管理）
+│   ├── production_readiness_report.md  # 生产化审计报告
+│   └── optimization_roadmap.md         # 优化路线
 ├── evaluation/                 # RAGAS 评估数据集与说明
 │   ├── datasets/hardware_qa_v1.jsonl
 │   └── README.md
