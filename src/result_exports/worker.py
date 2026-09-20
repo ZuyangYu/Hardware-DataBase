@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 import src.settings
 from src.observability import metrics as observability_metrics
+from src.result_exports.organizer import organize_envelope
 from src.result_exports.renderers import render_result
 from src.result_exports.store import ResultExportStore
 
@@ -32,6 +33,20 @@ def _render_envelope(snapshot, job):
     if job.options.get("include_citations") is False:
         envelope = replace(envelope, citations=[])
     return envelope
+
+
+def _should_organize(job) -> bool:
+    """Arrange-before-export is explicit per job and report-shaped only.
+
+    ``data``/``raw`` shapes and the spreadsheet renderer are intentionally
+    excluded: their content is structured data or an as-is body, so a model
+    rewrite would add nothing (and xlsx cannot represent Markdown tables).
+    """
+    if job.options.get("organize") is not True:
+        return False
+    if str(job.content_shape or "report") != "report":
+        return False
+    return str(job.format or "").strip().lower() != "xlsx"
 
 
 def _age_seconds(value: str | None) -> float:
@@ -177,6 +192,12 @@ class ResultExportWorker:
                 if snapshot is None:
                     raise KeyError("result snapshot not found")
                 render_envelope = _render_envelope(snapshot, job)
+                if _should_organize(job):
+                    render_envelope = organize_envelope(
+                        render_envelope,
+                        formats=[job.format],
+                        include_citations=job.options.get("include_citations") is not False,
+                    )
                 render_started_at = time.monotonic()
                 rendered = render_result(
                     render_envelope,

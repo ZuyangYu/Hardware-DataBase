@@ -569,6 +569,9 @@ class ResultExportStore:
         )
         options = dict(export_plan.get("options") or {})
         options["include_citations"] = bool(export_plan.get("include_citations", True))
+        # Arrange-before-export is opt-in per job; plans persisted before the
+        # feature (and direct store callers) keep the legacy rendering.
+        options["organize"] = bool(export_plan.get("organize", False))
         title = export_plan.get("title")
         if title:
             options["render_title"] = str(title)[:160]
@@ -607,6 +610,7 @@ class ResultExportStore:
         client_request_id: str,
         title: str | None = None,
         include_citations: bool = True,
+        organize: bool = True,
         options: dict[str, Any] | None = None,
     ) -> tuple[ResultSnapshot, list[ExportJob]]:
         """Create a snapshot and all manual export jobs atomically."""
@@ -616,6 +620,7 @@ class ResultExportStore:
             "content_shape": content_shape,
             "title": title,
             "include_citations": include_citations,
+            "organize": bool(organize),
             "options": dict(options or {}),
             "client_request_id": client_request_id,
         }
