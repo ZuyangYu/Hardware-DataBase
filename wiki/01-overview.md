@@ -201,7 +201,7 @@ markdown 渲染库、图表库、i18n 库——全部手写实现（见 [19-fron
 
 ## 7. 代码地图
 
-```
+```Python
 Hardware-DataBase/
 ├── src/
 │   ├── settings.py                 # 单一配置事实来源（1731 行，全部 .env 读写/校验/热重载）
@@ -249,7 +249,9 @@ Hardware-DataBase/
 │   └── test_data/                  # 结构化测试数据（骨架）
 ├── frontend/                       # React SPA
 ├── deploy/observability/           # OTel Collector/Prometheus/Tempo/Loki/Grafana/Phoenix
-├── scripts/                        # hdb.sh 进程管理 + production_hardening/ 迁移演练
+├── deploy/redis/                   # 自管 Redis（实时面：取消快路径 + 跨进程 SSE）
+├── deploy/postgres/                # 自管 PostgreSQL（pgvector：控制面/记忆/检查点/配额）
+├── scripts/                        # hdb.sh 进程管理 + redis.sh/postgres.sh 自管设施 + production_hardening/ 迁移演练
 ├── benchmarks/spreadsheet/         # 表格检索基准（与 RAGAS 评估独立）
 ├── evaluation/                     # RAGAS 数据集
 ├── tests/                          # ~307 个 Python 测试模块

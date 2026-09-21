@@ -170,6 +170,12 @@ W3C `propagate.inject/extract`；`TraceIdentity(trace_id, span_id)`；`use_trace
 
 ## 3. Redis（可选实时平面）
 
+**项目自管实例**：`bash scripts/redis.sh up` 起 `deploy/redis/docker-compose.yml`
+（`redis:8-alpine`，仅宿主 `127.0.0.1:6380`，必填随机密码，AOF everysec，
+内存 256mb + volatile-lru），健康后自动把 `REDIS_URL` 写入应用 `.env`；
+随后 `bash scripts/hdb.sh restart`（重启生效项）。自检 `bash scripts/redis.sh test`。
+详见 `deploy/redis/README.md`。
+
 | 用途 | Key / 机制 | 配置 |
 |---|---|---|
 | 取消快路径 | `hdb:turn:cancel:{turn_id}`，TTL 7200 | `CANCEL_FAST_PATH_ENABLED=true` + `REDIS_URL` |
@@ -178,7 +184,9 @@ W3C `propagate.inject/extract`；`TraceIdentity(trace_id, span_id)`；`use_trace
 | 提供商配额 | RPM/TPM 预算（0=关；开启后 Redis 不可用即拒绝） | `PROVIDER_RPM_LIMIT` / `PROVIDER_TPM_LIMIT` |
 
 **无 Redis 时的行为**：取消只能靠 DB 列 + worker 轮询；SSE 退化为进程内队列 + 0.4s DB 轮询
-（同进程 worker 场景完全可用；跨进程需要 Redis 才能实时）。
+（同进程 worker 场景完全可用；跨进程需要 Redis 才能实时）。实时面整体 fail-soft，
+`GET /health/dependencies` 的 `redis` 项区分 `up` / `degraded`（配置了连不上，不拖垮就绪）/
+`not_configured`（URL 为空），`/health/ready` 不依赖 Redis。
 
 ---
 
@@ -198,6 +206,16 @@ cd frontend && npm ci && npm run dev      # 5176，/api 代理到 8001
 按角色启动 `worker-chat` / `worker-authoring` / `worker-parse` / `memory-worker` / `export-worker`；
 pid 在 `storage/run/`，日志在 `storage/logs/`；前端用 `storage/nodeenv`（便携 Node）。
 
+可选实时面：`bash scripts/redis.sh up` 起项目自管 Redis（`127.0.0.1:6380`），
+健康后自动写 `REDIS_URL` 到 `.env`，再 `bash scripts/hdb.sh restart` 生效；见 §3。
+
+可选账本库：`bash scripts/postgres.sh up` 起项目自管 PostgreSQL
+（`deploy/postgres`，pgvector 镜像，`127.0.0.1:55433`），
+`bash scripts/postgres.sh write-env` 一次写入控制面/记忆/检查点/配额五组后端与 DSN，
+再 `bash scripts/hdb.sh restart`；首次切换先跑 `cutover_rehearsal.py` 预演
+（见 `deploy/postgres/README.md`）。切换后 `/health/ready` 的 `control_plane`
+应报 `backend=postgres` + `schema_version`。
+
 ### 4.2 多实例（检查清单）
 
 1. `HDB_API_SPAWN_*=0`（全部）；
@@ -205,7 +223,8 @@ pid 在 `storage/run/`，日志在 `storage/logs/`；前端用 `storage/nodeenv`
 3. `AGENT_CHECKPOINT_BACKEND=postgres`、`DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND=postgres`、
    `MEMORY_STORE_BACKEND=postgres`；
 4. `RESOURCE_GOVERNOR_SCOPE=deployment` + `RESOURCE_GOVERNOR_BACKEND=postgres`；
-5. `REDIS_URL` + `DISTRIBUTED_ADMISSION_ENABLED=true`；
+5. `REDIS_URL`（`bash scripts/redis.sh up`；跨机多实例需改指向所有副本可达的外部实例）
+   + `DISTRIBUTED_ADMISSION_ENABLED=true`；
 6. **只跑一个** memory worker（`MEMORY_SINGLE_WRITER=true`）；
 7. 所有实例共享同一 `storage/`（附件/归档/导出/索引均为文件 + SQLite）；
 8. 先跑 `connection_budget.py` 校验 PG 连接预算；
@@ -278,7 +297,8 @@ uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa
 | 依赖 | 门控 |
 |---|---|
 | Postgres | `HDB_TEST_POSTGRES_DSN` 存在才跑（约 14 个文件：控制面 schema/store/health/factory/read-parity、记忆 enqueue/worker/e2e/invalidation、governor、checkpointer） |
-| Redis | `HDB_TEST_REDIS_URL`（默认 `redis://127.0.0.1:6379/15`）可达才跑；否则 skip（分布式准入、redis events/cancel、provider quota） |
+| Redis | `HDB_TEST_REDIS_URL`（默认 `redis://127.0.0.1:6379/15`）可达才跑；否则 skip（分布式准入、redis events/cancel、provider quota）。自管实例用 `bash scripts/redis.sh test` 直接指定 |
+| PostgreSQL | `HDB_TEST_POSTGRES_DSN` 存在才跑；**必须指向一次性库**（如 `hdb_rehearsal`），测试会建库/删 schema。注意 `tests/conftest.py` 会把五个后端强制回落 sqlite（settings + `os.environ`，子进程同样继承），**防止 `.env` 指向生产 PG 时测试写入真实数据** |
 | LLM/RAGFlow | 一律 fake：monkeypatch `build_governed_model`、`_Model`/`RunnableLambda` 替身、`FakeLLM`；真实 smoke 需 `AGENT_REAL_SMOKE_OLLAMA=1` / `AGENT_REAL_SMOKE_OPENAI=1` |
 | RAGAS | 需安装 `ragas`/`openai`/`langchain_openai` 且配置 `EVAL_*`，否则 skip |
 

@@ -87,7 +87,20 @@ Two axes matter most:
   no `RAG_BACKEND` switch. Embedding/parse happen RAGFlow-side; the project no
   longer configures local embedding / reranker / BM25.
 
-`.env` is committed and contains **real API keys** (RAGFlow, OpenRouter,
+Data-plane instantiation (all are restart-required settings) - both instances are
+project-managed under `deploy/` and wrapped by scripts:
+
+- `bash scripts/redis.sh up` -> `deploy/redis/` (redis:8-alpine, `127.0.0.1:6380`,
+  random password, AOF) enables the realtime plane (`REDIS_URL`: cancel fast path +
+  cross-process SSE). Fail-soft; absent Redis degrades to DB polling.
+- `bash scripts/postgres.sh up` + `write-env` -> `deploy/postgres/`
+  (pgvector/pgvector:pg17, `127.0.0.1:55433`) writes the five PostgreSQL backends
+  (`CONTROL_PLANE_*`, `MEMORY_STORE_*`, `AGENT_CHECKPOINT_*`,
+  `DOCUMENT_AUTHORING_CHECKPOINTER_*`, `RESOURCE_GOVERNOR_*`). Control-plane schema
+  is hand-pinned DDL, fail-closed on readiness; migration/rehearsal commands live in
+  `deploy/postgres/README.md`.
+
+`.env` is gitignored (not committed) and contains **real API keys** (RAGFlow, OpenRouter,
 SiliconFlow) plus a stale block of dead old-architecture variables
 (`RAG_BACKEND`, `PROVIDER`, `CUSTOM_LLM_MODEL`, `BM25_TOP_K`, `RERANKER_TYPE`,
 `CHUNK_SIZE`, `RRF_K`, `VECTOR_TOP_K`, `USE_OLLAMA_EMBEDDING`, …) that
@@ -258,6 +271,18 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 `parse_tasks/`, `auth.db`, `evaluations/`, `logs/`, `query_sessions/`,
 `circuit_uploads/`. Directories prefixed `_test_*` / `_*_smoke` are test scratch
 space.
+
+When the PostgreSQL backends are on, these files are **retired** (present but no
+longer written): `agent_checkpoints.db`, `memory.db`, `resource_quotas.db`,
+`document_authoring_checkpoints.sqlite`. Still live: `auth.db` (auth/audit),
+`chat_attachments.db`, `pipeline_documents.db`, `projects.db`,
+`document_authoring.db` (work orders), and the derived index dirs.
+
+Tests must never touch the production backends: `tests/conftest.py` forces
+`CONTROL_PLANE_/MEMORY_/AGENT_CHECKPOINT_/DOCUMENT_AUTHORING_CHECKPOINTER_/
+RESOURCE_GOVERNOR_` to sqlite in both `settings` and `os.environ` (so spawned
+subprocesses inherit it). PG-gated suites opt in via `HDB_TEST_POSTGRES_DSN`
+pointing at a disposable database such as `hdb_rehearsal`.
 
 ## Conventions
 

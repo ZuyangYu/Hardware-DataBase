@@ -111,7 +111,7 @@
 
 ### 2.8 平台与安全
 
-40. 仓库根的 `.env` **已提交且含真实 API Key**，且有大量旧架构死变量
+40. 仓库根的 `.env` **含真实 API Key 但已被 `.gitignore` 忽略（不再入库）**，且留有大量旧架构死变量
     （`RAG_BACKEND`、`PROVIDER`、`CUSTOM_LLM_MODEL`、`BM25_TOP_K`、`RERANKER_TYPE`、`CHUNK_SIZE`…，
     `settings.py` 已忽略）。**不要**把它当模板，用 `.env.example`。
 41. `AUTH_DEFAULT_ADMIN_PASSWORD` 为空或 `admin123` 时**进程拒绝启动**。
@@ -123,8 +123,71 @@
 47. `docs/` 与 `CLAUDE.md` 是本地文件（gitignored）；本 Wiki 已迁至仓库根 `wiki/` 并纳入版本管理——
     新增/修改文档请写 `wiki/`，不要写回 `docs/wiki/`（该路径已不存在）。
 48. `requirements.txt` 是 uv 生成的，**改依赖请改 `pyproject.toml`** 后 `uv lock`。
-49. 仓库没有 Dockerfile/systemd/k8s/nginx 与 CI workflow；`deploy/` 只有可观测性栈。
+49. `deploy/` 目前有可观测性栈、`redis/`（项目自管实时面）与 `postgres/`（项目自管账本库）；
+    仍**没有** Dockerfile/systemd/k8s/nginx 与 CI workflow。
 50. `hardware-database-eval` CLI 不调用 `init_observability`（离线评估无外部遥测）。
+
+### 2.9 PostgreSQL 控制面（单机也走 PG 之后）
+
+51. 切到 PG 后，`storage/` 里这些库**退休**（文件可能还在，但已无人写入）：
+    `agent_checkpoints.db`、`memory.db`、`resource_quotas.db`、
+    `document_authoring_checkpoints.sqlite`。仍在用的是：`auth.db`（鉴权/审计）、
+    `chat_attachments.db`、`pipeline_documents.db`、`projects.db`、
+    `document_authoring.db`（work order），以及 `table_indexes/`、`circuits/` 等派生文件。
+52. 控制面 schema 是**手写固定 DDL**（`src/storage/control_plane/schema.py`），
+    SQLite 源库加列**不会**自动同步：装载会报 `UndefinedColumn`，readiness 报
+    schema 不匹配。新增列必须同步固定 DDL（已发生：`chat_sessions.rolling_summary`、
+    `summary_covered_message_id`）。预演脚本是兜底网，不是替代品。
+53. 源库是 SQLite，**外键默认不强制**，可能带孤儿行；`loader` 会跳过对应外键并在
+    报告里注明 `skipped (source rows violate the constraint)` —— 不删数据、不中止迁移。
+54. JSONB 列默认值必须是合法 JSON：loader 已把 `''`（SQLite 哨兵）与非法字面量
+    丢弃，不再生成 `''::jsonb` 这类建表即失败的 DDL。
+55. **测试隔离**：`tests/conftest.py` 强制 `CONTROL_PLANE_/MEMORY_/AGENT_CHECKPOINT_/
+    DOCUMENT_AUTHORING_CHECKPOINTER_/RESOURCE_GOVERNOR_` 回落 sqlite（settings +
+    `os.environ`，spawn 的子进程同样继承）。不要在测试里依赖 `.env` 的 PG 配置：
+    本机 `.env` 指向生产库时，一个 `ConversationService()` 就能写进真实数据。
+56. PG 门控测试一律用 `HDB_TEST_POSTGRES_DSN` 且指向 `hdb_rehearsal` 这类一次性库；
+    它们会 `DROP SCHEMA public` / 建临时库，**绝不能指向 `hdb`**。
+57. worker 重载运行时配置时可能打印 `RuntimeError: cannot join current thread`
+    （psycopg 连接池在 GC 期析构、未显式关闭），目前只是噪音，不影响任务。
+
+### 2.10 性能与延迟（2026-09 实测）
+
+58. **不要放大 `AGENT_CUSTOM_MAX_TOKENS`**。本机曾设 `60000`（默认 4096），实测
+    单次模型调用 25~34s；恢复 4096 后降到 5~7s，同一问题总耗时 178~206s → 16~71s。
+    该值只是上限，调大没有收益，但会让生成侧显著变慢。
+59. 同一问题 **agent 路径不确定**：实测工具调用 2~10 次、总耗时 16~206s。
+    对比配置时每个配置至少跑 2~3 次看趋势，别用单次结果下结论。
+    基线工具：`scripts/bench_answer_latency.py "<问题>"`（输出总耗时/首字/LLM 调用与
+    token/逐工具耗时）。
+60. **RAGFlow 检索偶发抖动**：实测单次 `document_search` 53s（同条件常态 1~3s）。
+    单次工具耗时记录在 `chat_turns.metrics_json.tool_calls`，排查先看这里。
+61. `AGENT_TEMPERATURE` 默认 0.2，本机 `.env` 设为 0.6；温度偏高可能放大工具漫游
+    （未验证，改动需过评测集）。
+
+### 2.11 记忆投影与检索（切 PostgreSQL 后新增）
+
+62. **切换记忆投影后端（sqlite↔postgres）后必须重放 outbox**：投影对象不会跟着控制面
+    迁移走（`memory.db` 是"可重建投影"）。症状：`memory_search` 永远 0 命中、`store`
+    行数远小于活跃 `memory_projections`。修法：把已完成的 `memory_projection_outbox`
+    行按安全条件（`active` + 未退休 + revision/fence/content_hash 与投影一致 + record
+    状态有效）置回 `pending`，等 memory worker 重放即可。
+63. **候选（candidate）记忆检索是 fail-closed 的**：`_search_projection_kind` 在没有语义
+    索引（`MEMORY_EMBEDDING_PROVIDER/MODEL/DIMS` 未配置 → `semantic_index_ready=False`）
+    时**完全跳过候选检索**；`verified` 记忆才有目录词法兜底。所以"记忆全零"的常见组合是：
+    该账号没有记忆，或记忆都是 candidate 且没配 embedding —— 这是设计，不是 bug。
+64. 记忆按用户（`scope=user`）与按项目/KB（`scope=project`）隔离；换账号排查时先看
+    `memory_records.user_id` 与 `memory_projections.active`，再怀疑检索本身。
+65. **pgvector 的 ANN 索引上限 2000 维**：hnsw/ivfflat 都建不了更高维的索引，`langgraph`
+    在建索引失败时会**静默降级**成无语义检索（`index_error` 只进指标、不进日志）。
+    doubao-embedding-vision 是 2048 维，所以 `create_memory_store` 现在对 >2000 维
+    自动改用 `ann_index_config={"kind": "flat"}`（精确检索，无误配风险）。
+    排查信号：`store_vectors_embedding_idx` 为 `INVALID`，或 `store_vectors` 有行但为空 embedding。
+66. **`PgSqlAdapterConnection` 必须与 sqlite3 连接同形**：被适配的仓储会直接调
+    `execute` / `executemany` / `cursor`，缺一个方法就是运行期 500（已发生：缺
+    `executemany` 让记忆 consent 接口直接报 AttributeError，SQLite 下完全正常）。
+    新增/移植仓储方法时先确认适配器支持，并在 `tests/test_control_plane_sql_adapter.py`
+    补一条方言改写断言。
 
 ---
 
@@ -204,12 +267,16 @@
 ### 3.7 把某个域迁到 PostgreSQL 控制面
 
 ```
-1. 在 storage/control_plane/schema.py 添加核心表 DDL 与索引（或确认 loader 反射可用）
-2. 提供一个 ExecutionStore 风格适配器或 PgSqlAdapterConnection 复用 store 逻辑
-3. 用 loader.load_sqlite_snapshot 演练（dry-run → 报告 → apply）
-4. 校验权威性断言与 schema_version
-5. 补 @skipUnless(HDB_TEST_POSTGRES_DSN) 的契约测试（参照 test_control_plane_store_contract.py）
-6. 更新 provider 校验（settings.validate_provider_configuration）与 /health/ready
+0. 起项目自管 PG：bash scripts/postgres.sh up（pgvector 镜像，127.0.0.1:55433）；
+   迁移/装载/演练命令见 deploy/postgres/README.md
+1. 先对一次性库跑 cutover_rehearsal.py：空库预演会暴露三类常见问题——
+   固定 DDL 漂移、JSONB 默认值非法、源库孤儿外键
+2. 在 storage/control_plane/schema.py 添加核心表 DDL 与索引（或确认 loader 反射可用）
+3. 提供一个 ExecutionStore 风格适配器或 PgSqlAdapterConnection 复用 store 逻辑
+4. 用 loader.load_sqlite_snapshot 演练（dry-run → 报告 → apply）
+5. 校验权威性断言与 schema_version
+6. 补 @skipUnless(HDB_TEST_POSTGRES_DSN) 的契约测试（参照 test_control_plane_store_contract.py）
+7. 更新 provider 校验（settings.validate_provider_configuration）与 /health/ready
 ```
 
 ### 3.8 新增前端页面
@@ -236,6 +303,7 @@
 | 中 | 附件存储加 PG/对象存储后端 | 附件仍是 SQLite-only，多实例靠共享文件系统 |
 | 中 | 前端权限判断收敛（`\|\| isEmployee` 过宽） | 会显示无效的写入口 |
 | 中 | `templateMappingCorrection` 接入 UI | 模板分析人工纠错能力未开放 |
+| 中 | worker 重载时显式 `pool.close()` psycopg 连接池 | 目前 GC 析构会打印 `cannot join current thread` 噪音 |
 | 中 | RAGFlow `source_group_router` 的 `weights` 要么使用要么删除 | 死配置容易误导 |
 | 中 | 审计日志清理策略（当前永久） | 长期增长；需合规确认后再动 |
 | 低 | 测试文件平铺 → 按子系统分组 | 307 个扁平文件检索成本高 |
@@ -259,6 +327,8 @@
    是否区分「热重载」与「重启生效」？
 9. **测试**：是否覆盖正常路径 + 越权路径 + 降级路径？是否需要 PG/Redis 门控版本？
 10. **文档**：本 Wiki 对应页面是否更新？（`docs/` 目前不在 git 里，需团队决定是否纳入）
+11. **固定 DDL**：改动了控制面所属 SQLite 表结构（加列/改默认值）时，是否同步了
+    `src/storage/control_plane/schema.py` 的固定 DDL？测试通过不代表预演能过。
 
 ---
 
