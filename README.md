@@ -42,6 +42,8 @@ Hardware-DataBase/
 ├── frontend/                     # React + TypeScript 前端（对接 src/api 的 FastAPI 服务）
 │   └── ...
 ├── storage/                    # (自动生成) 归档、索引、日志与鉴权库
+├── deploy/                     # 自管基础设施：observability/、redis/、postgres/
+├── scripts/                    # hdb.sh 进程管理 + redis.sh/postgres.sh + production_hardening/
 ├── tests/                      # 单元与集成测试（unittest.TestCase）
 ├── src/api/                    # FastAPI 后端（唯一后端入口，见 src/api/routes/）
 ├── pyproject.toml
@@ -53,6 +55,11 @@ Hardware-DataBase/
 
 - **Python**：>= 3.12
 - **RAGFlow**：需准备一个可访问的 RAGFlow 实例作为文档检索后端，并获取其 API Key。
+- **Redis（可选）**：`bash scripts/redis.sh up` 起项目自管实例（`127.0.0.1:6380`）。
+  启用后取消操作走快路径、跨进程 SSE 实时推送；不启用则自动退化轮询，不影响正确性。
+- **PostgreSQL（可选）**：`bash scripts/postgres.sh up && bash scripts/postgres.sh write-env`
+  把会话/记忆/检查点/配额五组后端切到项目自管 pgvector 实例（`127.0.0.1:55433`）。
+  首次切换先按 `deploy/postgres/README.md` 跑预演；不切换则仍用本地 SQLite。
 - **Ollama**：当 `AGENT_LLM_PROVIDER=ollama`（默认）时需要本地 [Ollama](https://ollama.com/) 服务并拉取对应模型；若改用 OpenAI-compatible API 则无需 Ollama。
 
 ## 安装

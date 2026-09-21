@@ -135,16 +135,16 @@
 
 ### 3.3 多实例部署要求
 
-| 维度                | 单机                                               | 多实例                                                                                           |
-| ------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 控制面              | `CONTROL_PLANE_BACKEND=sqlite`                   | `postgres` + `CONTROL_PLANE_DATABASE_URL`（池 `CONTROL_PLANE_POOL_SIZE=8`）                |
-| 会话 checkpoint     | `AGENT_CHECKPOINT_BACKEND=sqlite`                | `postgres`                                                                                     |
-| 文档生成 checkpoint | `DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND=sqlite` | `postgres`（注意：attempt/pointer 表目前仅 SQLite，见 [21](21-gotchas-and-extension-guide.md)） |
-| 记忆投影            | `MEMORY_STORE_BACKEND=sqlite`                    | `postgres`（pgvector）                                                                         |
-| 资源配额            | `RESOURCE_GOVERNOR_SCOPE=process`                | `deployment` + `RESOURCE_GOVERNOR_BACKEND=postgres`                                          |
-| 实时平面            | 无 Redis 可用                                      | `REDIS_URL`：取消快路径 / 跨进程 SSE / 分布式准入                                              |
-| 子进程              | `HDB_API_SPAWN_*` 默认                           | 全部设 0，独立起 worker（含**唯一的** memory worker）                                      |
-| 文件                | 本地`storage/`                                   | 所有实例共享同一`storage/`（附件、归档、导出、索引都是文件+SQLite）                            |
+| 维度                | 单机                                                                                               | 多实例                                                                                           |
+| ------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 控制面              | `CONTROL_PLANE_BACKEND=sqlite`（或 `bash scripts/postgres.sh up` + `write-env` 单机也走 PG） | `postgres` + `CONTROL_PLANE_DATABASE_URL`（池 `CONTROL_PLANE_POOL_SIZE=8`）                |
+| 会话 checkpoint     | `AGENT_CHECKPOINT_BACKEND=sqlite`                                                                | `postgres`                                                                                     |
+| 文档生成 checkpoint | `DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND=sqlite`                                                 | `postgres`（注意：attempt/pointer 表目前仅 SQLite，见 [21](21-gotchas-and-extension-guide.md)） |
+| 记忆投影            | `MEMORY_STORE_BACKEND=sqlite`                                                                    | `postgres`（pgvector）                                                                         |
+| 资源配额            | `RESOURCE_GOVERNOR_SCOPE=process`                                                                | `deployment` + `RESOURCE_GOVERNOR_BACKEND=postgres`                                          |
+| 实时平面            | 可选 Redis（`bash scripts/redis.sh up`，缺失按 fail-soft 退化）                                  | `REDIS_URL`：取消快路径 / 跨进程 SSE / 分布式准入                                              |
+| 子进程              | `HDB_API_SPAWN_*` 默认                                                                           | 全部设 0，独立起 worker（含**唯一的** memory worker）                                      |
+| 文件                | 本地`storage/`                                                                                   | 所有实例共享同一`storage/`（附件、归档、导出、索引都是文件+SQLite）                            |
 
 扩容前必跑 `scripts/production_hardening/connection_budget.py` 校验 PG 连接数预算。
 

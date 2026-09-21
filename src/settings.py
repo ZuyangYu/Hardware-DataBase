@@ -287,6 +287,9 @@ MEMORY_EMBEDDING_MODEL = os.getenv("MEMORY_EMBEDDING_MODEL", "")
 MEMORY_EMBEDDING_BASE_URL = os.getenv("MEMORY_EMBEDDING_BASE_URL", "")
 MEMORY_EMBEDDING_API_KEY = os.getenv("MEMORY_EMBEDDING_API_KEY", "")
 MEMORY_EMBEDDING_DIMS = os.getenv("MEMORY_EMBEDDING_DIMS", "")
+# ANN 索引类型：hnsw | ivfflat | flat；留空时按维度自动选择
+# （>2000 维必须用 flat——pgvector 的 hnsw/ivfflat 上限 2000 维）。
+MEMORY_EMBEDDING_INDEX_KIND = os.getenv("MEMORY_EMBEDDING_INDEX_KIND", "").strip().lower()
 MEMORY_INDEX_FIELDS = os.getenv("MEMORY_INDEX_FIELDS", "content.content,content.title,content.subject")
 MEMORY_ALLOW_GENERAL_CHAT_EXTRACTION = os.getenv("MEMORY_ALLOW_GENERAL_CHAT_EXTRACTION", "false").lower() in {"1", "true", "yes", "on"}
 MEMORY_USER_MEMORY_OPT_IN = os.getenv("MEMORY_USER_MEMORY_OPT_IN", "false").lower() in {"1", "true", "yes", "on"}
@@ -708,6 +711,7 @@ DEFAULT_VALUES = {
     "MEMORY_EMBEDDING_BASE_URL": "",
     "MEMORY_EMBEDDING_API_KEY": "",
     "MEMORY_EMBEDDING_DIMS": "",
+    "MEMORY_EMBEDDING_INDEX_KIND": "",
     "MEMORY_INDEX_FIELDS": "content.content,content.title,content.subject",
     "MEMORY_ALLOW_GENERAL_CHAT_EXTRACTION": "false",
     "MEMORY_USER_MEMORY_OPT_IN": "false",
@@ -1004,6 +1008,7 @@ def reload_settings():
     global MEMORY_MODEL_PROVIDER, MEMORY_MODEL, MEMORY_MODEL_BASE_URL, MEMORY_MODEL_API_KEY
     global MEMORY_MODEL_REQUIRE_STRUCTURED_TOOLS, MEMORY_EMBEDDING_PROVIDER, MEMORY_EMBEDDING_MODEL
     global MEMORY_EMBEDDING_BASE_URL, MEMORY_EMBEDDING_API_KEY, MEMORY_EMBEDDING_DIMS, MEMORY_INDEX_FIELDS
+    global MEMORY_EMBEDDING_INDEX_KIND
     global MEMORY_ALLOW_GENERAL_CHAT_EXTRACTION, MEMORY_USER_MEMORY_OPT_IN
     global MEMORY_USER_MEMORY_REQUIRE_PER_EVENT_CONSENT, MEMORY_RETENTION_DAYS
 
@@ -1326,6 +1331,7 @@ def reload_settings():
     MEMORY_EMBEDDING_BASE_URL = os.getenv("MEMORY_EMBEDDING_BASE_URL", "")
     MEMORY_EMBEDDING_API_KEY = os.getenv("MEMORY_EMBEDDING_API_KEY", "")
     MEMORY_EMBEDDING_DIMS = os.getenv("MEMORY_EMBEDDING_DIMS", "")
+    MEMORY_EMBEDDING_INDEX_KIND = os.getenv("MEMORY_EMBEDDING_INDEX_KIND", "").strip().lower()
     MEMORY_INDEX_FIELDS = os.getenv("MEMORY_INDEX_FIELDS", "content.content,content.title,content.subject")
     MEMORY_ALLOW_GENERAL_CHAT_EXTRACTION = os.getenv("MEMORY_ALLOW_GENERAL_CHAT_EXTRACTION", "false").lower() in {"1", "true", "yes", "on"}
     MEMORY_USER_MEMORY_OPT_IN = os.getenv("MEMORY_USER_MEMORY_OPT_IN", "false").lower() in {"1", "true", "yes", "on"}

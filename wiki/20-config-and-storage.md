@@ -36,10 +36,10 @@
 | `PIPELINE_ARCHIVE_ROOT` / `RAGFLOW_FILE_ROOT` | `storage/pipeline_archives` / 同左 |
 | `LOG_DIR`（派生） | `storage/logs` |
 | `AUTH_DB_PATH` | `storage/auth.db` |
-| `AGENT_CHECKPOINT_DB_PATH` | `storage/agent_checkpoints.db` |
-| `MEMORY_SQLITE_PATH` | `storage/memory.db` |
-| `RESOURCE_GOVERNOR_DB_PATH` | `storage/resource_quotas.db` |
-| `DOCUMENT_AUTHORING_CHECKPOINTER_PATH` | `storage/document_authoring_checkpoints.sqlite` |
+| `AGENT_CHECKPOINT_DB_PATH` | `storage/agent_checkpoints.db`（`AGENT_CHECKPOINT_BACKEND=postgres` 时退休） |
+| `MEMORY_SQLITE_PATH` | `storage/memory.db`（`MEMORY_STORE_BACKEND=postgres` 时退休） |
+| `RESOURCE_GOVERNOR_DB_PATH` | `storage/resource_quotas.db`（`RESOURCE_GOVERNOR_BACKEND=postgres` 时退休） |
+| `DOCUMENT_AUTHORING_CHECKPOINTER_PATH` | `storage/document_authoring_checkpoints.sqlite`（切 postgres 时退休） |
 | `DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH` | `storage/document_authoring_compatibility.sqlite` |
 | `CHAT_ATTACHMENT_STORAGE_DIR` / `_INDEX_DB_PATH` | `storage/chat_attachments` / `storage/chat_attachments.db` |
 | `RESULT_EXPORT_STORAGE_DIR` | `storage/exports` |
@@ -96,8 +96,8 @@
 | `CHAT_QUEUE_DEADLINE_SECONDS` | `600` |
 | `CANCEL_FAST_PATH_ENABLED` / `CANCEL_KEY_TTL_SECONDS` | `true` / `7200` |
 | `TURN_EVENT_STREAM_TTL_SECONDS` / `_MAXLEN` | `7200` / `5000` |
-| `REDIS_URL` | `""` |
-| `CONTROL_PLANE_BACKEND` / `_DATABASE_URL` / `_POOL_SIZE` | `sqlite` / `""` / `8` |
+| `REDIS_URL` | `""`（项目自管实例由 `bash scripts/redis.sh up` 写入） |
+| `CONTROL_PLANE_BACKEND` / `_DATABASE_URL` / `_POOL_SIZE` | `sqlite` / `""` / `8`（自管实例：`bash scripts/postgres.sh up` + `write-env`） |
 
 #### 准入与资源治理
 

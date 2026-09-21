@@ -36,6 +36,41 @@ def _check_storage() -> dict[str, Any]:
     return {"status": "up", "path": path}
 
 
+def _check_redis() -> dict[str, Any]:
+    """Probe the optional realtime plane.
+
+    Redis never gates readiness: the durable flags/DB replay are authoritative,
+    so an unreachable Redis is reported as ``degraded`` (fail-soft) rather than
+    taking the deployment down.  ``not_configured`` means ``REDIS_URL`` is empty.
+    """
+    url = str(getattr(settings, "REDIS_URL", "") or "").strip()
+    if not url:
+        return {"status": "not_configured"}
+    started = time.monotonic()
+    client = None
+    try:
+        import redis as redis_lib
+
+        client = redis_lib.Redis.from_url(
+            url,
+            decode_responses=True,
+            socket_timeout=settings.OBS_DEPENDENCY_TIMEOUT_SECONDS,
+            socket_connect_timeout=settings.OBS_DEPENDENCY_TIMEOUT_SECONDS,
+        )
+        client.ping()
+        return {"status": "up", "latency_ms": round((time.monotonic() - started) * 1000, 2)}
+    except ImportError:
+        return {"status": "degraded", "error": "redis package not installed"}
+    except Exception as exc:  # noqa: BLE001 - fail-soft dependency probe
+        return {"status": "degraded", "error": type(exc).__name__}
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - closing must not fail the probe
+                pass
+
+
 def _probe_http(name: str, url: str, *, headers: dict[str, str] | None = None) -> dict[str, Any]:
     if not url:
         return {"status": "not_configured"}
@@ -107,6 +142,7 @@ def check_dependencies() -> dict[str, Any]:
         "control_plane": check_control_plane(),
         "storage": _check_storage(),
         "worker": {"status": worker_status, "count": len(workers), "instances": workers},
+        "redis": _check_redis(),
         "ragflow": ragflow,
         "llm": llm,
     }

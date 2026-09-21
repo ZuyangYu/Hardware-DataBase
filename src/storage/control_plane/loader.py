@@ -40,11 +40,13 @@ from .schema import (
 )
 
 try:  # psycopg is an optional runtime dependency for the loader only
+    from psycopg.errors import ForeignKeyViolation
     from psycopg.rows import tuple_row
     from psycopg.types.json import Jsonb
 except ImportError:  # pragma: no cover - exercised by callers without psycopg
     tuple_row = None  # type: ignore[assignment]
     Jsonb = None  # type: ignore[assignment]
+    ForeignKeyViolation = None  # type: ignore[assignment]
 
 
 _DERIVED_TABLE_PATTERNS = ("_fts", "_trigram")
@@ -327,7 +329,20 @@ def _generated_foreign_key_ddl(
     return constraints, notes
 
 
-def _add_constraint_if_missing(conn, table: str, name: str, constraint_sql: str) -> bool:
+def _add_constraint_if_missing(
+    conn,
+    table: str,
+    name: str,
+    constraint_sql: str,
+    *,
+    notes: list[str] | None = None,
+) -> bool:
+    """Add a constraint unless it already exists.
+
+    SQLite does not enforce foreign keys by default, so the source can contain
+    orphan rows.  A failing FK is skipped and reported (the migration tool
+    never deletes or rewrites source data), instead of aborting the whole load.
+    """
     with conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = to_regclass(%s)",
@@ -335,10 +350,26 @@ def _add_constraint_if_missing(conn, table: str, name: str, constraint_sql: str)
         )
         if cursor.fetchone() is not None:
             return False
-        cursor.execute(
-            f"ALTER TABLE {pg_ident(table)} ADD CONSTRAINT {pg_ident(name)} {constraint_sql}"
-        )
+        try:
+            cursor.execute(
+                f"ALTER TABLE {pg_ident(table)} ADD CONSTRAINT {pg_ident(name)} {constraint_sql}"
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is dirty source data
+            if ForeignKeyViolation is None or not isinstance(exc, ForeignKeyViolation):
+                raise
+            if notes is not None:
+                notes.append(
+                    f"foreign key {name} skipped (source rows violate the constraint)"
+                )
+            return False
     return True
+
+
+def _table_notes(report: LoadReport, table: str) -> list[str]:
+    for entry in report.tables:
+        if entry.table == table:
+            return entry.notes
+    return []
 
 
 def _advance_identity(conn, table: str, column: str) -> int | None:
@@ -580,25 +611,22 @@ def load_sqlite_snapshot(
                     continue
                 reference = constraint_sql.split("REFERENCES")[1].split("(")[0].strip().strip('"')
                 if reference not in loaded:
-                    for entry in report.tables:
-                        if entry.table == table:
-                            entry.notes.append(
-                                f"foreign key {name} skipped ({reference} not loaded)"
-                            )
-                            break
+                    _table_notes(report, table).append(
+                        f"foreign key {name} skipped ({reference} not loaded)"
+                    )
                     continue
-                _add_constraint_if_missing(conn, table, name, constraint_sql)
+                _add_constraint_if_missing(
+                    conn, table, name, constraint_sql, notes=_table_notes(report, table)
+                )
             for table in selected:
                 if table not in loaded or is_core_table(table):
                     continue
                 constraints, notes = _generated_foreign_key_ddl(source, table, loaded)
                 for name, ddl in constraints:
-                    _add_constraint_if_missing(conn, table, name, ddl)
-                if notes:
-                    for entry in report.tables:
-                        if entry.table == table:
-                            entry.notes.extend(notes)
-                            break
+                    _add_constraint_if_missing(
+                        conn, table, name, ddl, notes=_table_notes(report, table)
+                    )
+                _table_notes(report, table).extend(notes)
 
         identity_columns = [
             (table, column)

@@ -47,6 +47,11 @@ class PgSqlAdapterCursor:
             for row in self._cursor.fetchall()
         ]
 
+    def executemany(self, sql, seq_of_params):
+        self._cursor.executemany(sql, seq_of_params)
+        self.rowcount = self._cursor.rowcount
+        return self
+
 
 class PgSqlAdapterConnection:
     def __init__(self, conn):
@@ -76,6 +81,12 @@ class PgSqlAdapterConnection:
 
     def execute(self, sql: str, params=()):
         return PgSqlAdapterCursor(self._conn.execute(self._sql(sql), params))
+
+    def executemany(self, sql: str, seq_of_params):
+        # psycopg3 的 Connection 没有 executemany（只有 Cursor 有）。
+        cursor = self._conn.cursor()
+        cursor.executemany(self._sql(sql), seq_of_params)
+        return PgSqlAdapterCursor(cursor)
 
     def commit(self):
         self._conn.commit()
