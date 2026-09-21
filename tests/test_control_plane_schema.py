@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.storage.control_plane import schema
+from src.storage.control_plane import loader, schema
 from src.storage.control_plane.loader import adapt_value, canonical_value
 from src.storage.control_plane.schema_version import assert_schema_compatible
 
@@ -54,6 +54,19 @@ class TypeMappingTests(unittest.TestCase):
         self.assertIn('"active" BIGINT NOT NULL DEFAULT 1', ddl)
         self.assertNotIn("datetime", ddl)
 
+    def test_generated_ddl_drops_non_json_defaults(self):
+        """SQLite 的 '' 哨兵/非法 JSON 不能变成 PG 的 DEFAULT（建表会直接报错）。"""
+        columns = [
+            {"name": "stats_json", "type": "TEXT", "notnull": 1, "pk": 0, "dflt_value": "''"},
+            {"name": "bad_json", "type": "TEXT", "notnull": 1, "pk": 0, "dflt_value": "'{oops'"},
+            {"name": "ok_json", "type": "TEXT", "notnull": 1, "pk": 0, "dflt_value": "'[]'"},
+        ]
+        ddl = schema.generated_table_ddl("wiki_jobs", columns)
+        self.assertIn('"stats_json" JSONB NOT NULL', ddl)
+        self.assertIn('"bad_json" JSONB NOT NULL', ddl)
+        self.assertIn("\"ok_json\" JSONB NOT NULL DEFAULT '[]'::jsonb", ddl)
+        self.assertNotIn("''::jsonb", ddl)
+
     def test_generated_ddl_pins_identity_and_constraints(self):
         columns = [
             {"name": "id", "type": "INTEGER", "notnull": 0, "pk": 1},
@@ -65,6 +78,61 @@ class TypeMappingTests(unittest.TestCase):
         self.assertIn('"payload_json" JSONB NOT NULL', ddl)
         self.assertIn('"seen_at" TIMESTAMPTZ', ddl)
         self.assertIn('PRIMARY KEY ("id")', ddl)
+
+
+class ConstraintLoadTests(unittest.TestCase):
+    """源库脏数据（SQLite 不强制外键）必须跳过约束并上报，而不是中止迁移。"""
+
+    class _Cursor:
+        def __init__(self, fail: bool):
+            self.fail = fail
+            self.executed: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            self.executed.append(str(sql))
+            if self.fail and str(sql).lstrip().upper().startswith("ALTER"):
+                raise loader.ForeignKeyViolation("violates foreign key constraint")
+
+        def fetchone(self):
+            return None
+
+    class _Conn:
+        def __init__(self, fail: bool):
+            self.fail = fail
+
+        def cursor(self, **kwargs):
+            return ConstraintLoadTests._Cursor(self.fail)
+
+    def test_foreign_key_violation_is_skipped_and_reported(self):
+        notes: list[str] = []
+        added = loader._add_constraint_if_missing(
+            self._Conn(fail=True),
+            "wiki_page_revisions",
+            "fk_wiki_page_revisions_page_id_0",
+            'FOREIGN KEY ("page_id") REFERENCES "wiki_pages" ("id")',
+            notes=notes,
+        )
+        self.assertFalse(added)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("skipped", notes[0])
+
+    def test_clean_constraint_is_added(self):
+        notes: list[str] = []
+        added = loader._add_constraint_if_missing(
+            self._Conn(fail=False),
+            "wiki_page_revisions",
+            "fk_wiki_page_revisions_page_id_0",
+            'FOREIGN KEY ("page_id") REFERENCES "wiki_pages" ("id")',
+            notes=notes,
+        )
+        self.assertTrue(added)
+        self.assertEqual(notes, [])
 
 
 class ValueAdaptationTests(unittest.TestCase):

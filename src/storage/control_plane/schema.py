@@ -22,6 +22,7 @@ Type rules (explicit, no declaration-string guessing):
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 SCHEMA_VERSION = "1"
@@ -62,6 +63,8 @@ CORE_TABLE_DDL: dict[str, str] = {
             created_at TIMESTAMPTZ NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL,
             auto_memory BOOLEAN NOT NULL DEFAULT TRUE,
+            rolling_summary TEXT NOT NULL DEFAULT '',
+            summary_covered_message_id BIGINT NOT NULL DEFAULT 0,
             document_context_json JSONB NOT NULL DEFAULT '{}'::jsonb,
             next_turn_sequence BIGINT NOT NULL DEFAULT 0,
             active_turn_id TEXT NOT NULL DEFAULT '',
@@ -380,6 +383,15 @@ def _render_default(raw: Any, type_sql: str) -> str | None:
             # not a valid timestamptz literal, so no default is carried over.
             return None
         if type_sql == "JSONB":
+            # SQLite 把 JSON 存成 TEXT：'' 是"未设置"哨兵而非合法 JSON，
+            # 非法 JSON 字面量同样不能带进 PG（否则建表即报错）。
+            inner = text[1:-1].replace("''", "'")
+            if not inner.strip():
+                return None
+            try:
+                json.loads(inner)
+            except ValueError:
+                return None
             return f"{text}::jsonb"
         if type_sql == "BOOLEAN":
             lowered = text.strip("'").lower()
