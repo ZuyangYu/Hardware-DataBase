@@ -376,6 +376,40 @@ def _create_embedding(settings):
     raise ValueError(f"unsupported memory embedding provider: {provider}")
 
 
+_PGVECTOR_INDEX_DIM_LIMIT = 2000
+_INDEX_KINDS = {"hnsw", "ivfflat", "flat"}
+
+
+def build_memory_index_config(
+    settings, *, dims: int, embedding: Any
+) -> dict[str, Any] | None:
+    """Build the LangGraph store index config for memory projections.
+
+    pgvector 的 ANN 索引（hnsw/ivfflat）**上限 2000 维**：更大的 embedding
+    （例如 doubao-embedding-vision 的 2048）会让 langgraph 的 ``setup()``
+    建索引失败并**静默降级**成无语义检索。这里对超限维度自动改用精确检索
+    （``flat``，不建 ANN 索引），可用性优先；记忆量级下暴力检索完全够用。
+    也可用 ``MEMORY_EMBEDDING_INDEX_KIND`` 显式指定 hnsw/ivfflat/flat。
+    """
+    if dims <= 0 or embedding is None:
+        return None
+    raw_fields = str(
+        getattr(settings, "MEMORY_INDEX_FIELDS", "content.content,content.title,content.subject") or ""
+    )
+    fields = [field.strip() for field in raw_fields.split(",") if field.strip()]
+    kind = str(getattr(settings, "MEMORY_EMBEDDING_INDEX_KIND", "") or "").strip().lower()
+    if kind not in _INDEX_KINDS:
+        kind = "flat" if dims > _PGVECTOR_INDEX_DIM_LIMIT else ""
+    index: dict[str, Any] = {
+        "dims": dims,
+        "embed": embedding,
+        "fields": fields or ["content.content"],
+    }
+    if kind:
+        index["ann_index_config"] = {"kind": kind}
+    return index
+
+
 def create_memory_store(settings=None) -> MemoryStoreRuntime | PostgresMemoryStoreRuntime:
     """Create the configured projection backend.
 
@@ -394,11 +428,9 @@ def create_memory_store(settings=None) -> MemoryStoreRuntime | PostgresMemorySto
         dims = 0
     index: dict[str, Any] | None = None
     if dims > 0:
-        embedding = _create_embedding(settings)
-        if embedding is not None:
-            raw_fields = str(getattr(settings, "MEMORY_INDEX_FIELDS", "content.content,content.title,content.subject") or "")
-            fields = [field.strip() for field in raw_fields.split(",") if field.strip()]
-            index = {"dims": dims, "embed": embedding, "fields": fields or ["content.content"]}
+        index = build_memory_index_config(
+            settings, dims=dims, embedding=_create_embedding(settings)
+        )
     if backend == "postgres":
         database_url = str(getattr(settings, "MEMORY_DATABASE_URL", "") or "").strip()
         if not database_url:

@@ -6,7 +6,11 @@ import os
 import unittest
 
 import src.settings
-from src.memory.store import PostgresMemoryStoreRuntime, create_memory_store
+from src.memory.store import (
+    PostgresMemoryStoreRuntime,
+    build_memory_index_config,
+    create_memory_store,
+)
 
 
 class MemoryPostgresRuntimeTests(unittest.TestCase):
@@ -34,6 +38,24 @@ class MemoryPostgresRuntimeTests(unittest.TestCase):
             self.assertTrue(runtime.health()["ok"])
         finally:
             runtime.close()
+
+    def test_large_embedding_falls_back_to_exact_search(self):
+        # pgvector 的 hnsw/ivfflat 上限 2000 维：2048 维必须走 flat，
+        # 否则 langgraph setup() 建索引失败并静默降级成无语义检索。
+        config = build_memory_index_config(src.settings, dims=2048, embedding=object())
+        self.assertEqual(config["ann_index_config"], {"kind": "flat"})
+        self.assertEqual(config["dims"], 2048)
+
+    def test_small_embedding_keeps_default_ann_index(self):
+        config = build_memory_index_config(src.settings, dims=1536, embedding=object())
+        self.assertNotIn("ann_index_config", config)
+
+    def test_explicit_index_kind_is_honored(self):
+        original = src.settings.MEMORY_EMBEDDING_INDEX_KIND
+        self.addCleanup(setattr, src.settings, "MEMORY_EMBEDDING_INDEX_KIND", original)
+        src.settings.MEMORY_EMBEDDING_INDEX_KIND = "hnsw"
+        config = build_memory_index_config(src.settings, dims=2048, embedding=object())
+        self.assertEqual(config["ann_index_config"], {"kind": "hnsw"})
 
     @unittest.skipUnless(
         os.environ.get("HDB_TEST_POSTGRES_DSN", ""), "HDB_TEST_POSTGRES_DSN is not configured"
