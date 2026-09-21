@@ -1,0 +1,47 @@
+name: hardware-database-postgres
+
+# 项目自管 PostgreSQL（控制面账本 + 记忆投影 + 检查点 + 配额）。
+#
+# 启动方式（推荐，会生成密码并写入 deploy/postgres/.env）：
+#   bash scripts/postgres.sh up
+# 手动方式：
+#   cp deploy/postgres/.env.example deploy/postgres/.env   # 改掉密码
+#   docker compose -f deploy/postgres/docker-compose.yml up -d
+#
+# 用 pgvector 镜像：记忆投影的语义索引需要 vector 扩展，alpine 官方镜像没有。
+# 仅发布到宿主机回环地址；密码必填（缺失时 compose 直接报错）。
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hdb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?deploy/postgres/.env 缺少 POSTGRES_PASSWORD（运行 bash scripts/postgres.sh init 生成）}
+      POSTGRES_DB: hdb
+    command:
+      - postgres
+      - -c
+      - max_connections=120
+      - -c
+      - shared_buffers=512MB
+      # 控制面按 UTC 写入 TIMESTAMPTZ；固定会话时区避免宿主机时区漂移。
+      - -c
+      - timezone=UTC
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      # 首次初始化（数据卷为空时执行一次）：装 vector 扩展 + 建预演库。
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${HDB_PG_PORT:-55433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hdb -d hdb"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s
+
+volumes:
+  pg-data:
+    name: hardware-database-postgres-data

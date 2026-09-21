@@ -1,0 +1,39 @@
+name: hardware-database-redis
+
+# 项目自管 Redis 实时平面。启动方式（推荐，会同时写入应用 .env 的 REDIS_URL）：
+#   bash scripts/redis.sh up
+# 手动方式：
+#   cp deploy/redis/.env.example deploy/redis/.env   # 改掉密码
+#   docker compose -f deploy/redis/docker-compose.yml up -d
+#
+# 仅发布到宿主机回环地址，密码必填（缺失时 compose 直接报错，不会起裸奔实例）。
+
+services:
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+      - --requirepass
+      - ${REDIS_PASSWORD:?deploy/redis/.env 缺少 REDIS_PASSWORD（运行 bash scripts/redis.sh init 生成）}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?deploy/redis/.env 缺少 REDIS_PASSWORD}
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${HDB_REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    stop_grace_period: 10s
+
+volumes:
+  redis-data:
+    name: hardware-database-redis-data
