@@ -47,6 +47,10 @@ describe('turn queue notice (P0-004)', () => {
     expect(notice?.waitDeadline).toBe('2026-09-15T00:10:00+00:00');
   });
 
+  it('shows nothing for an unblocked pending turn (worker not claimed yet)', () => {
+    expect(turnQueueNoticeFromTurn(turn({}))).toBeNull();
+  });
+
   it('clears for running and terminal turns', () => {
     expect(turnQueueNoticeFromTurn(turn({ status: 'streaming' }))).toBeNull();
     expect(turnQueueNoticeFromTurn(turn({ status: 'completed' }))).toBeNull();

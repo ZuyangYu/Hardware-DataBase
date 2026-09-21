@@ -76,16 +76,34 @@ export interface TurnQueueNotice {
   waitDeadline: string | null;
 }
 
-/** Pure mapping used by the hook and covered by unit tests. */
+/** 排队提示延迟显示：真实排队也可能很短（<1s），等一拍再提示避免闪烁。 */
+export const TURN_QUEUE_NOTICE_DELAY_MS = 600;
+
+/**
+ * Pure mapping used by the hook and covered by unit tests.
+ *
+ * 只在**真有阻塞**时提示：
+ * - `waiting_for_attachments`：本轮在等附件解析；
+ * - pending 且存在前序未完成轮次（`blocked_by_turn_id`）：同会话串行排队。
+ *
+ * 普通 pending（worker 还没认领，通常几十~几百毫秒）**不提示**，避免误报
+ * "等待前一轮"和每次发消息闪一下。
+ */
 export function turnQueueNoticeFromTurn(turn: TurnView): TurnQueueNotice | null {
-  if (turn.status !== 'pending' && turn.status !== 'waiting_for_attachments') {
+  const blockedByTurnId = turn.blocked_by_turn_id ?? null;
+  if (turn.status === 'waiting_for_attachments') {
+    return {
+      reason: turn.queue_reason || 'waiting_for_attachments',
+      blockedByTurnId,
+      waitDeadline: turn.wait_deadline ?? null,
+    };
+  }
+  if (turn.status !== 'pending' || !blockedByTurnId) {
     return null;
   }
   return {
-    reason:
-      turn.queue_reason
-      || (turn.status === 'waiting_for_attachments' ? 'waiting_for_attachments' : 'queued_behind_previous_turn'),
-    blockedByTurnId: turn.blocked_by_turn_id ?? null,
+    reason: turn.queue_reason || 'queued_behind_previous_turn',
+    blockedByTurnId,
     waitDeadline: turn.wait_deadline ?? null,
   };
 }
@@ -369,8 +387,24 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   // P0-004: queue visibility for a turn that is pending behind an earlier turn
   // or waiting for attachment parsing (blocker, reason, wait deadline).
   const [turnQueueNotice, setTurnQueueNotice] = useState<TurnQueueNotice | null>(null);
+  const queueNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const applyTurnQueueNotice = useCallback((turn: TurnView) => {
-    setTurnQueueNotice(turnQueueNoticeFromTurn(turn));
+    const notice = turnQueueNoticeFromTurn(turn);
+    if (queueNoticeTimerRef.current !== null) {
+      clearTimeout(queueNoticeTimerRef.current);
+      queueNoticeTimerRef.current = null;
+    }
+    if (notice === null) {
+      setTurnQueueNotice(null);
+      return;
+    }
+    queueNoticeTimerRef.current = setTimeout(() => {
+      queueNoticeTimerRef.current = null;
+      setTurnQueueNotice(notice);
+    }, TURN_QUEUE_NOTICE_DELAY_MS);
+  }, []);
+  useEffect(() => () => {
+    if (queueNoticeTimerRef.current !== null) clearTimeout(queueNoticeTimerRef.current);
   }, []);
   const abortRef = useRef<AbortController | null>(null);
   const currentTurnRef = useRef<string | null>(null);
