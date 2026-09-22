@@ -109,6 +109,15 @@ class McpSettingsTests(unittest.TestCase):
         settings.validate_settings_values({"MCP_CALL_TIMEOUT_SECONDS": "30"})
 
     def test_enabling_mcp_requires_unified_tools_and_governor(self):
+        # 守卫看的是"当前生效配置"，必须先把本机 .env 可能打开的前置开关关掉，
+        # 否则 override 会命中已满足的全局值而放行。
+        self._reload(
+            {
+                "MCP_ENABLED": "false",
+                "CONVERSATION_UNIFIED_TOOLS_ENABLED": "false",
+                "RESOURCE_GOVERNOR_ENABLED": "false",
+            }
+        )
         with self.assertRaises(ValueError) as ctx:
             settings.validate_provider_configuration({"MCP_ENABLED": "true"})
         self.assertIn("CONVERSATION_UNIFIED_TOOLS_ENABLED", str(ctx.exception))
