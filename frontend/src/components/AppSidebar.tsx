@@ -171,6 +171,14 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 onClick={() => navigate('/memory')}
                 tooltip="长期记忆"
               />
+              <PrimaryNavButton
+                label="扩展"
+                iconName="tool"
+                active={location.pathname === '/extensions'}
+                collapsed={collapsed}
+                onClick={() => navigate('/extensions')}
+                tooltip="外部扩展"
+              />
             </SidebarMenu>
           )}
 
@@ -244,6 +252,16 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   onClick={() => navigate('/admin/status')}
                   tooltip="系统状态"
                 />
+                {sysAdmin && (
+                  <PrimaryNavButton
+                    label="扩展插件"
+                    iconName="tool"
+                    active={location.pathname === '/admin/plugins'}
+                    collapsed={collapsed}
+                    onClick={() => navigate('/admin/plugins')}
+                    tooltip="外部 MCP 扩展"
+                  />
+                )}
                 {sysAdmin && (
                   <PrimaryNavButton
                     label="系统配置"

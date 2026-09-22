@@ -736,3 +736,145 @@ def set_export_queue_state(*, queue: str, depth: int, oldest_age_s: float) -> No
         depth=depth,
         oldest_age_s=oldest_age_s,
     )
+
+
+# ---------------------------------------------------------------------------
+# External MCP plugins (governed external tool federation)
+
+_MCP_TRANSPORTS = frozenset({"streamable_http", "sse"})
+_MCP_CALL_STATUSES = frozenset({"ok", "rejected", "failed", "timeout"})
+_MCP_DISCOVERY_STATUSES = frozenset(
+    {
+        "ok",
+        "policy",
+        "credentials",
+        "connect",
+        "timeout",
+        "protocol",
+        "tool_limit",
+        "runtime",
+        "discovery",
+    }
+)
+_MCP_SKIP_REASONS = frozenset(
+    {
+        "not_read_only",
+        "disabled",
+        "name_conflict",
+        "policy",
+        "quota",
+        "invalid_argument",
+        "credentials",
+        "department",
+        "subscription",
+        "server_limit",
+        "write_disabled",
+        "not_allowed_write",
+        "store_error",
+    }
+)
+_MCP_WRITE_STATUSES = frozenset(
+    {"proposed", "confirmed", "rejected", "expired", "running", "completed", "failed"}
+)
+_MCP_ARTIFACT_REASONS = frozenset(
+    {"extension", "size", "hash", "encoding", "empty", "path", "store"}
+)
+
+
+def _mcp_transport(transport: Any) -> str:
+    value = str(transport or "").strip().lower()
+    return value if value in _MCP_TRANSPORTS else "other"
+
+
+def _mcp_call_status(status: Any) -> str:
+    value = str(status or "").strip().lower()
+    return value if value in _MCP_CALL_STATUSES else "failed"
+
+
+def _mcp_discovery_status(status: Any) -> str:
+    value = str(status or "").strip().lower()
+    return value if value in _MCP_DISCOVERY_STATUSES else "discovery"
+
+
+def _mcp_skip_reason(reason: Any) -> str:
+    value = str(reason or "").strip().lower()
+    return value if value in _MCP_SKIP_REASONS else "policy"
+
+
+def record_mcp_call(*, transport: str, status: str, duration_s: float) -> None:
+    """Record one external tool call with bounded transport/status labels."""
+
+    attributes = {"transport": _mcp_transport(transport), "status": _mcp_call_status(status)}
+    counter("hdb.mcp.call_count", attributes=attributes, description="External MCP tool calls")
+    histogram(
+        "hdb.mcp.call_duration_seconds",
+        max(0.0, float(duration_s)),
+        attributes=attributes,
+        description="External MCP tool call duration",
+    )
+
+
+def record_mcp_discovery(*, transport: str, status: str) -> None:
+    """Count discovery attempts by outcome; server slugs stay out of metrics."""
+
+    counter(
+        "hdb.mcp.discovery_count",
+        attributes={"transport": _mcp_transport(transport), "status": _mcp_discovery_status(status)},
+        description="External MCP discovery attempts",
+    )
+
+
+def record_mcp_tools(*, transport: str, read_only: bool, count: int) -> None:
+    histogram(
+        "hdb.mcp.tools.discovered",
+        max(0, int(count)),
+        attributes={
+            "transport": _mcp_transport(transport),
+            "kind": "read_only" if read_only else "writable",
+        },
+        unit="{tools}",
+        description="External MCP tools discovered per server",
+    )
+
+
+def record_mcp_truncated(*, transport: str) -> None:
+    counter(
+        "hdb.mcp.truncated_total",
+        attributes={"transport": _mcp_transport(transport)},
+        description="Truncated external MCP results",
+    )
+
+
+def record_mcp_skipped(*, reason: str) -> None:
+    """Count tools/servers/calls dropped by policy, by bounded reason only."""
+
+    counter(
+        "hdb.mcp.skipped_total",
+        attributes={"reason": _mcp_skip_reason(reason)},
+        description="External MCP tools or calls skipped by policy",
+    )
+
+
+def record_mcp_write(*, transport: str, status: str) -> None:
+    """Count write-proposal lifecycle transitions with bounded labels."""
+
+    value = str(status or "").strip().lower()
+    counter(
+        "hdb.mcp.write_count",
+        attributes={
+            "transport": _mcp_transport(transport),
+            "status": value if value in _MCP_WRITE_STATUSES else "failed",
+        },
+        description="External MCP write proposals by lifecycle status",
+    )
+
+
+def record_mcp_artifact_rejected(*, reason: str) -> None:
+    """Count candidate artifacts refused by validation, by bounded reason."""
+
+    value = str(reason or "").strip().lower()
+    counter(
+        "hdb.mcp.artifact_rejected_total",
+        attributes={"reason": value if value in _MCP_ARTIFACT_REASONS else "store"},
+        description="Candidate artifacts rejected by the write channel",
+    )

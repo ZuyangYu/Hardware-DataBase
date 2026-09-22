@@ -32,9 +32,9 @@ type Props = {
 
 // 分组(对齐 settings.DEFAULT_VALUES)。值是 [key, 标签]。
 type FieldDef = [string, string];
-type Group = { title: string; fields: FieldDef[]; textarea?: boolean };
+type Group = { title: string; fields: FieldDef[]; textarea?: boolean; hint?: string };
 
-const GROUPS: Group[] = [
+export const GROUPS: Group[] = [
   {
     title: 'RAGFlow 检索',
     fields: [
@@ -100,6 +100,34 @@ const GROUPS: Group[] = [
     ],
   },
   {
+    title: '外部 MCP 扩展（受管控）',
+    hint: '启用 MCP_ENABLED 需同时开启统一工具路径与资源 governor；凭据密钥 MCP_CREDENTIALS_KEY 只能写在 .env，配置接口不会返回或写入。保存后热加载生效。',
+    fields: [
+      ['CONVERSATION_UNIFIED_TOOLS_ENABLED', 'MCP 前置：统一工具路径'],
+      ['RESOURCE_GOVERNOR_ENABLED', 'MCP 前置：资源 governor'],
+      ['MCP_ENABLED', '启用外部 MCP 扩展'],
+      ['MCP_WRITE_ENABLED', '启用写入通道（候选产物）'],
+      ['MCP_ALLOW_INSECURE_HTTP', '允许 http://（非 https）'],
+      ['MCP_ALLOW_PRIVATE_HOSTS', '允许内网地址'],
+      ['MCP_CONNECT_TIMEOUT_SECONDS', '连接超时(秒)'],
+      ['MCP_CALL_TIMEOUT_SECONDS', '调用超时(秒)'],
+      ['MCP_SSE_READ_TIMEOUT_SECONDS', 'SSE 读取超时(秒)'],
+      ['MCP_MAX_RESULT_CHARS', '结果字符上限'],
+      ['MCP_MAX_RESULT_BYTES', '结果字节上限'],
+      ['MCP_MAX_ARGUMENT_CHARS', '参数上限(字符)'],
+      ['MCP_MAX_TOOLS_PER_SERVER', '单服务工具上限'],
+      ['MCP_MAX_SERVERS_PER_RUN', '单回合服务上限'],
+      ['MCP_CALLS_PER_TURN', '单回合调用上限'],
+      ['MCP_FAILURE_COOLDOWN_SECONDS', '失败冷却(秒)'],
+      ['MCP_WRITE_CONFIRM_TTL_SECONDS', '写入提案有效期(秒)'],
+      ['MCP_MAX_ARTIFACT_BYTES', '候选产物大小上限(字节)'],
+      ['MCP_ARTIFACT_ALLOWED_EXTENSIONS', '候选产物扩展名白名单'],
+      ['MCP_WRITE_MAX_ATTEMPTS', '写入最大尝试次数'],
+      ['RESOURCE_MCP_MAX_CONCURRENT', 'MCP 最大并发'],
+      ['RESOURCE_MCP_RESERVED_INTERACTIVE', 'MCP 交互保留并发'],
+    ],
+  },
+  {
     title: '可观测性',
     fields: [
       ['OBS_ENABLED', '启用观测'],
@@ -136,7 +164,24 @@ const GROUPS: Group[] = [
 ];
 
 const SECRET_KEYS = new Set(['RAGFLOW_API_KEY', 'AGENT_CUSTOM_API_KEY', 'AUTH_DEFAULT_ADMIN_PASSWORD']);
-const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: number; integer?: boolean }> = {
+
+/** 受控布尔开关:渲染 true/false 下拉,避免手输字符串。 */
+export const BOOLEAN_KEYS = new Set([
+  'CONVERSATION_UNIFIED_TOOLS_ENABLED',
+  'RESOURCE_GOVERNOR_ENABLED',
+  'MCP_ENABLED',
+  'MCP_WRITE_ENABLED',
+  'MCP_ALLOW_INSECURE_HTTP',
+  'MCP_ALLOW_PRIVATE_HOSTS',
+]);
+
+const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
+
+export function booleanDraftValue(raw: unknown): 'true' | 'false' {
+  return TRUTHY.has(String(raw ?? '').trim().toLowerCase()) ? 'true' : 'false';
+}
+
+export const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: number; integer?: boolean }> = {
   RAGFLOW_TIMEOUT_SECONDS: { min: 10, max: 600, integer: true },
   RAGFLOW_SIMILARITY_THRESHOLD: { min: 0, max: 1, step: 0.05 },
   RAGFLOW_VECTOR_WEIGHT: { min: 0, max: 1, step: 0.05 },
@@ -164,6 +209,21 @@ const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: number; 
   OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS: { min: 1, max: 300 },
   OBS_WORKER_STALE_SECONDS: { min: 5, max: 3600, integer: true },
   OBS_DEPENDENCY_TIMEOUT_SECONDS: { min: 0.1, max: 60 },
+  MCP_CONNECT_TIMEOUT_SECONDS: { min: 1, max: 300, integer: true },
+  MCP_CALL_TIMEOUT_SECONDS: { min: 1, max: 3600, integer: true },
+  MCP_SSE_READ_TIMEOUT_SECONDS: { min: 1, max: 3600, integer: true },
+  MCP_MAX_RESULT_CHARS: { min: 1000, max: 500000, integer: true },
+  MCP_MAX_RESULT_BYTES: { min: 1024, max: 10485760, integer: true },
+  MCP_MAX_ARGUMENT_CHARS: { min: 100, max: 1000000, integer: true },
+  MCP_MAX_TOOLS_PER_SERVER: { min: 1, max: 500, integer: true },
+  MCP_MAX_SERVERS_PER_RUN: { min: 1, max: 50, integer: true },
+  MCP_CALLS_PER_TURN: { min: 1, max: 100, integer: true },
+  MCP_FAILURE_COOLDOWN_SECONDS: { min: 0, max: 86400, integer: true },
+  MCP_WRITE_CONFIRM_TTL_SECONDS: { min: 60, max: 86400, integer: true },
+  MCP_MAX_ARTIFACT_BYTES: { min: 1024, max: 1073741824, integer: true },
+  MCP_WRITE_MAX_ATTEMPTS: { min: 1, max: 10, integer: true },
+  RESOURCE_MCP_MAX_CONCURRENT: { min: 1, max: 64, integer: true },
+  RESOURCE_MCP_RESERVED_INTERACTIVE: { min: 0, max: 64, integer: true },
 };
 
 export default function ConfigPage({ auth, onLogout }: Props) {
@@ -252,6 +312,15 @@ export default function ConfigPage({ auth, onLogout }: Props) {
       if (rule.integer && !Number.isInteger(value)) errors.push(`${key} 必须为整数`);
       if (value < rule.min) errors.push(`${key} 不能小于 ${rule.min}`);
       if (rule.max != null && value > rule.max) errors.push(`${key} 不能大于 ${rule.max}`);
+    }
+    // 与后端 validate_provider_configuration 一致:MCP 依赖统一工具路径与 governor。
+    if (booleanDraftValue(view.MCP_ENABLED) === 'true') {
+      if (booleanDraftValue(view.CONVERSATION_UNIFIED_TOOLS_ENABLED) !== 'true') {
+        errors.push('MCP_ENABLED=true 需要 CONVERSATION_UNIFIED_TOOLS_ENABLED=true');
+      }
+      if (booleanDraftValue(view.RESOURCE_GOVERNOR_ENABLED) !== 'true') {
+        errors.push('MCP_ENABLED=true 需要 RESOURCE_GOVERNOR_ENABLED=true');
+      }
     }
     return errors;
   }
@@ -399,13 +468,27 @@ export default function ConfigPage({ auth, onLogout }: Props) {
           {visibleGroups().map((group) => (
             <div key={group.title} className="flex flex-col gap-[12px]">
               <h3 className="text-[14px] font-semibold text-[#18181a]">{group.title}</h3>
+              {group.hint && <p className="-mt-[6px] text-[12px] text-[#858b9c]">{group.hint}</p>}
               <div className={cn('grid gap-[12px]', group.textarea ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-2')}>
                 {group.fields.map(([key, label]) => (
                   <div key={key} className="grid gap-[4px]">
                     <Label className="text-[11px] text-[#858b9c]">
                       {label} <span className="text-[#b3b8c4]">({key})</span>
                     </Label>
-                    {key === 'AGENT_LLM_PROVIDER' ? (
+                    {BOOLEAN_KEYS.has(key) ? (
+                      <Select
+                        value={booleanDraftValue(draft[key])}
+                        onValueChange={(value) => setField(key, value)}
+                      >
+                        <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="true">true（启用）</SelectItem>
+                          <SelectItem value="false">false（关闭）</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    ) : key === 'AGENT_LLM_PROVIDER' ? (
                       <Select value={String(draft[key] ?? 'ollama')} onValueChange={(value) => setField(key, value)}>
                         <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
                           <SelectValue />

@@ -52,6 +52,13 @@ from src.agents.orchestration.tool_assembly import (
     filter_tools_by_capability,
     filter_tools_for_action_plan_narration,
 )
+from src.agents.mcp.executor import MCPToolExecutor
+from src.agents.mcp.policy import (
+    McpServerSnapshot,
+    append_mcp_prompt,
+    load_tools,
+    resolve_visible_servers,
+)
 from src.agents.tools.circuit_tools import make_circuit_search
 from src.agents.tools.document_rag_tool import make_document_search, make_document_search_batch
 from src.agents.tools.document_authoring_tools import make_document_authoring_tools
@@ -1444,6 +1451,8 @@ class MultiSourceAgentRunner:
         document_context: Any | None,
         allow_document_write: bool,
         document_projection: dict[str, Any] | None = None,
+        has_mcp_access: bool = False,
+        has_mcp_write_access: bool = False,
     ) -> tuple[CapabilityResolver, set[str], dict[str, object]]:
         """Resolve the server-owned capability boundary for this turn."""
 
@@ -1475,6 +1484,8 @@ class MultiSourceAgentRunner:
             has_task=bool(task_ref),
             has_candidate_artifact=bool(artifact_ref),
             allow_document_write=allow_document_write,
+            has_mcp_access=has_mcp_access,
+            has_mcp_write_access=has_mcp_write_access,
         )
         state: dict[str, object] = {
             "task_ref": task_ref,
@@ -2211,14 +2222,23 @@ class MultiSourceAgentRunner:
         def emit_event(evt: dict) -> None:
             # 通用对话可以在内部读取长期记忆，但这是上下文 plumbing，不应在
             # 用户可见的检索执行轨迹中显示。故只过滤展示事件，内部诊断仍保留。
+            # MCP 外部调用是用户显式订阅的服务，必须保留时间线可见性。
             if is_general and evt.get("type") in {"stage", "tool_started", "tool_result", "narration"}:
-                return
+                payload = evt.get("payload") or {}
+                if payload.get("tool_kind") != "mcp":
+                    return
             if event_callback is not None:
                 try:
                     event_callback(evt)
                 except Exception:
                     pass
 
+        # RequestContext.user_id is the username by design; the durable turn
+        # worker passes AuthUser.id explicitly.  Attachment ACLs and MCP
+        # subscriptions share this one numeric identity.
+        numeric_user_id = self._numeric_identity(attachment_user_id) or self._numeric_identity(
+            getattr(ctx, "user_id", None)
+        )
         rt = ToolRuntime(
             kb_name=scope_kb,
             ctx=ctx,
@@ -2234,8 +2254,7 @@ class MultiSourceAgentRunner:
             source_scope=effective_scope,
             # RequestContext.user_id is the username by design; the durable
             # turn worker passes AuthUser.id explicitly for attachment ACLs.
-            attachment_user_id=self._numeric_identity(attachment_user_id)
-            or self._numeric_identity(getattr(ctx, "user_id", None)),
+            attachment_user_id=numeric_user_id,
             attachment_session_id=self._numeric_identity(
                 thread_id or getattr(ctx, "session_id", None)
             ),
@@ -2347,6 +2366,18 @@ class MultiSourceAgentRunner:
             ctx=ctx,
             document_context=document_context,
         )
+        # Resolve the MCP server snapshot BEFORE capabilities: visibility comes
+        # from the authenticated turn (role/department/subscription), and its
+        # result feeds has_mcp_access.  A capability never decides visibility.
+        mcp_snapshot = (
+            resolve_visible_servers(ctx, user_id=numeric_user_id)
+            if unified_tools_enabled
+            else McpServerSnapshot()
+        )
+        mcp_department_id: Any = None
+        if ctx is not None:
+            metadata = dict(getattr(ctx, "metadata", {}) or {})
+            mcp_department_id = metadata.get("resource_department_id") or metadata.get("department_id")
         capability_resolver, authorized_capabilities, object_state = self._conversation_capabilities(
             ctx=ctx,
             kb_name=scope_kb,
@@ -2354,6 +2385,9 @@ class MultiSourceAgentRunner:
             document_context=document_context,
             allow_document_write=allow_document_write,
             document_projection=document_projection,
+            has_mcp_access=bool(mcp_snapshot.servers),
+            has_mcp_write_access=bool(mcp_snapshot.allow_write_slugs)
+            and bool(getattr(settings, "MCP_WRITE_ENABLED", False)),
         )
         initial_capabilities = capability_resolver.effective(
             authorized=authorized_capabilities,
@@ -2665,6 +2699,42 @@ class MultiSourceAgentRunner:
                         + "\n".join(receipt_lines)
                         + "\n不要重复提交已完成的写操作；如需下一步，请先解释依据和结果。"
                     )
+
+        if unified_tools_enabled and not action_plan_enabled:
+            # External MCP tools load after the governed action executor, so
+            # they can never be dispatched as action receipts.  Action-plan
+            # narration mode intentionally keeps them invisible.
+            mcp_executor = MCPToolExecutor(
+                rt,
+                user_id=numeric_user_id,
+                department_id=mcp_department_id,
+                username=str(getattr(ctx, "user_id", "") or ""),
+            )
+            mcp_plan = load_tools(
+                mcp_snapshot,
+                effective_capabilities=effective_capabilities,
+                local_tool_names={
+                    str(getattr(tool, "name", "") or "") for tool in tools
+                },
+                wrap=mcp_executor.wrap,
+            )
+            if mcp_plan.tools:
+                tools.extend(mcp_plan.tools)
+                system_prompt = append_mcp_prompt(system_prompt, mcp_plan)
+            for error in mcp_plan.errors:
+                # Timeline visibility for ops: the turn still completes.
+                emit_event(
+                    {
+                        "type": "degraded",
+                        "payload": {
+                            "stage": "mcp_load",
+                            "component": "mcp",
+                            "failure_type": str(error.get("kind") or "discovery"),
+                            "capability": "unavailable",
+                            "server": str(error.get("slug") or ""),
+                        },
+                    }
+                )
 
         if action_plan_enabled:
             # The action executor above receives the full capability-filtered

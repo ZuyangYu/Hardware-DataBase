@@ -121,6 +121,22 @@ talks to. It owns a `RAGFlowBackend` (the retrieval/ingest backend), a
 agent). `query` streams answer deltas; `upload_files` routes by `source_group`
 (see Ingestion) into the circuit pipeline or the RAGFlow backend.
 
+### External MCP plugins (`src/agents/mcp/`)
+Governed external tool federation, default off. Remote-only (stdio rejected),
+read-only tools only in phase 1. Flow: system admin registers a server
+(`/api/v1/plugins/mcp/*`) → test connection (bound to the config fingerprint) →
+enable → employees subscribe on the 扩展 page. Visibility = enabled ∧
+department scope ∧ subscription, resolved **before** capability resolution;
+`external_tool.invoke` is authorized only from that authenticated turn fact.
+The guarded executor re-checks at call time, consumes `MCP_CALLS_PER_TURN`,
+passes through the dedicated `mcp` governor resource and records
+events/audit/metrics with bounded labels. External results never enter
+`rt.evidence` and never get citation numbers. `MCP_CREDENTIALS_KEY` is
+environment-only; stored credentials are encrypted at rest and never echoed.
+Phase 2 (write channel: `write_tools` whitelist ∧ `MCP_WRITE_ENABLED` ∧ user
+consent ∧ `external_tool.write`) is not implemented yet. See
+`docs/mcp-plugins.md`.
+
 ### Agent loop (`src/agents/`)
 `MultiSourceAgentRunner` (`runner.py`) wraps `deepagents.create_deep_agent`
 (a compiled LangGraph graph under the hood, but with a fixed general agent loop —

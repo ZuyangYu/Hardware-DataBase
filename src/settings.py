@@ -375,6 +375,43 @@ RESOURCE_EXPORT_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_EXPORT_RESERVED_I
 RESOURCE_MEMORY_MAX_CONCURRENT = int(os.getenv("RESOURCE_MEMORY_MAX_CONCURRENT", "1"))
 RESOURCE_MEMORY_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MEMORY_RESERVED_INTERACTIVE", "0"))
 
+# MCP external plugins (外部插件): remote-only tool federation, default off.
+# Every key here is hot-reloadable at worker turn boundaries except the
+# credentials key, which is environment-only and never enters the config
+# write whitelist.
+MCP_ENABLED = _env_bool("MCP_ENABLED", False)
+MCP_ALLOW_INSECURE_HTTP = _env_bool("MCP_ALLOW_INSECURE_HTTP", False)
+MCP_ALLOW_PRIVATE_HOSTS = _env_bool("MCP_ALLOW_PRIVATE_HOSTS", False)
+MCP_CONNECT_TIMEOUT_SECONDS = int(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
+MCP_CALL_TIMEOUT_SECONDS = int(os.getenv("MCP_CALL_TIMEOUT_SECONDS", "60"))
+MCP_SSE_READ_TIMEOUT_SECONDS = int(os.getenv("MCP_SSE_READ_TIMEOUT_SECONDS", "300"))
+MCP_MAX_RESULT_CHARS = int(os.getenv("MCP_MAX_RESULT_CHARS", "20000"))
+MCP_MAX_RESULT_BYTES = int(os.getenv("MCP_MAX_RESULT_BYTES", "65536"))
+MCP_MAX_ARGUMENT_CHARS = int(os.getenv("MCP_MAX_ARGUMENT_CHARS", "12000"))
+MCP_MAX_TOOLS_PER_SERVER = int(os.getenv("MCP_MAX_TOOLS_PER_SERVER", "50"))
+MCP_MAX_SERVERS_PER_RUN = int(os.getenv("MCP_MAX_SERVERS_PER_RUN", "5"))
+MCP_CALLS_PER_TURN = int(os.getenv("MCP_CALLS_PER_TURN", "8"))
+MCP_FAILURE_COOLDOWN_SECONDS = int(os.getenv("MCP_FAILURE_COOLDOWN_SECONDS", "60"))
+# Phase 2 write channel: candidate artifacts only, user-confirmed; off by default.
+MCP_WRITE_ENABLED = _env_bool("MCP_WRITE_ENABLED", False)
+MCP_WRITE_CONFIRM_TTL_SECONDS = int(os.getenv("MCP_WRITE_CONFIRM_TTL_SECONDS", "1800"))
+MCP_MAX_ARTIFACT_BYTES = int(os.getenv("MCP_MAX_ARTIFACT_BYTES", str(50 * 1024 * 1024)))
+MCP_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
+    "MCP_ARTIFACT_ALLOWED_EXTENSIONS", "kicad_sch,kicad_pcb,kicad_pro,zip,json,csv"
+)
+# Phase 2 candidate artifacts: validated (extension/size/hash) and stored here
+# before any download link exists; originals are never touched.
+MCP_ARTIFACT_STORAGE_DIR = _resolve_storage_path(
+    os.getenv("MCP_ARTIFACT_STORAGE_DIR"), "mcp_artifacts"
+)
+MCP_WRITE_MAX_ATTEMPTS = int(os.getenv("MCP_WRITE_MAX_ATTEMPTS", "3"))
+# Fernet/HMAC key for stored MCP credentials.  Deliberately absent from
+# DEFAULT_VALUES so it is neither returned by GET /config nor writable through
+# PUT /config; rotation is an operator action with a restart.
+MCP_CREDENTIALS_KEY = os.getenv("MCP_CREDENTIALS_KEY", "").strip()
+RESOURCE_MCP_MAX_CONCURRENT = int(os.getenv("RESOURCE_MCP_MAX_CONCURRENT", "4"))
+RESOURCE_MCP_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MCP_RESERVED_INTERACTIVE", "1"))
+
 # P0b shared retrieval executor: one bounded pool per process for document
 # batch retrieval; per-request fan-out and the RAG governor are separate.
 # Rollout flag: off until stage acceptance opens it (plan §10.1).
@@ -530,6 +567,9 @@ OBS_CAPTURE_CONTENT = os.getenv("OBS_CAPTURE_CONTENT", "false").lower() == "true
 OBS_CAPTURE_QUERY = os.getenv("OBS_CAPTURE_QUERY", "false").lower() == "true"
 OBS_CAPTURE_EVIDENCE = os.getenv("OBS_CAPTURE_EVIDENCE", "false").lower() == "true"
 OBS_CAPTURE_LLM_CONTENT = os.getenv("OBS_CAPTURE_LLM_CONTENT", "false").lower() == "true"
+# MCP request/response bodies are opt-in on top of the per-kind gates; the
+# executor still redacts credentials and truncates to OBS_CONTENT_MAX_CHARS.
+OBS_CAPTURE_MCP_CONTENT = os.getenv("OBS_CAPTURE_MCP_CONTENT", "false").lower() == "true"
 OBS_CONTENT_MAX_CHARS = max(1000, int(os.getenv("OBS_CONTENT_MAX_CHARS", "50000")))
 OBS_LOG_FORMAT = os.getenv("OBS_LOG_FORMAT", "json")
 OBS_METRICS_ENABLED = os.getenv("OBS_METRICS_ENABLED", "true").lower() == "true"
@@ -596,6 +636,9 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "WORKER_ROLE",
         "HDB_API_HOST",
         "HDB_API_PORT",
+        # Environment-only MCP credential key: rotation requires a restart and
+        # must never be writable through the config API.
+        "MCP_CREDENTIALS_KEY",
     }
 )
 
@@ -762,6 +805,27 @@ DEFAULT_VALUES = {
     "RESOURCE_EXPORT_RESERVED_INTERACTIVE": "0",
     "RESOURCE_MEMORY_MAX_CONCURRENT": "1",
     "RESOURCE_MEMORY_RESERVED_INTERACTIVE": "0",
+    "MCP_ENABLED": "false",
+    "MCP_ALLOW_INSECURE_HTTP": "false",
+    "MCP_ALLOW_PRIVATE_HOSTS": "false",
+    "MCP_CONNECT_TIMEOUT_SECONDS": "15",
+    "MCP_CALL_TIMEOUT_SECONDS": "60",
+    "MCP_SSE_READ_TIMEOUT_SECONDS": "300",
+    "MCP_MAX_RESULT_CHARS": "20000",
+    "MCP_MAX_RESULT_BYTES": "65536",
+    "MCP_MAX_ARGUMENT_CHARS": "12000",
+    "MCP_MAX_TOOLS_PER_SERVER": "50",
+    "MCP_MAX_SERVERS_PER_RUN": "5",
+    "MCP_CALLS_PER_TURN": "8",
+    "MCP_FAILURE_COOLDOWN_SECONDS": "60",
+    "MCP_WRITE_ENABLED": "false",
+    "MCP_WRITE_CONFIRM_TTL_SECONDS": "1800",
+    "MCP_MAX_ARTIFACT_BYTES": str(50 * 1024 * 1024),
+    "MCP_ARTIFACT_ALLOWED_EXTENSIONS": "kicad_sch,kicad_pcb,kicad_pro,zip,json,csv",
+    "MCP_ARTIFACT_STORAGE_DIR": os.path.join(STORAGE_DIR, "mcp_artifacts"),
+    "MCP_WRITE_MAX_ATTEMPTS": "3",
+    "RESOURCE_MCP_MAX_CONCURRENT": "4",
+    "RESOURCE_MCP_RESERVED_INTERACTIVE": "1",
     "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "false",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS": "8",
     "RETRIEVAL_QUEUE_MAX_DEPTH": "256",
@@ -861,6 +925,7 @@ DEFAULT_VALUES = {
     "OBS_CAPTURE_QUERY": "false",
     "OBS_CAPTURE_EVIDENCE": "false",
     "OBS_CAPTURE_LLM_CONTENT": "false",
+    "OBS_CAPTURE_MCP_CONTENT": "false",
     "OBS_CONTENT_MAX_CHARS": "50000",
     "OBS_LOG_FORMAT": "json",
     "OBS_METRICS_ENABLED": "true",
@@ -946,6 +1011,14 @@ def reload_settings():
     global RESOURCE_OCR_MAX_CONCURRENT, RESOURCE_OCR_RESERVED_INTERACTIVE
     global RESOURCE_EXPORT_MAX_CONCURRENT, RESOURCE_EXPORT_RESERVED_INTERACTIVE
     global RESOURCE_MEMORY_MAX_CONCURRENT, RESOURCE_MEMORY_RESERVED_INTERACTIVE
+    global MCP_ENABLED, MCP_ALLOW_INSECURE_HTTP, MCP_ALLOW_PRIVATE_HOSTS
+    global MCP_CONNECT_TIMEOUT_SECONDS, MCP_CALL_TIMEOUT_SECONDS, MCP_SSE_READ_TIMEOUT_SECONDS
+    global MCP_MAX_RESULT_CHARS, MCP_MAX_RESULT_BYTES, MCP_MAX_ARGUMENT_CHARS
+    global MCP_MAX_TOOLS_PER_SERVER, MCP_MAX_SERVERS_PER_RUN, MCP_CALLS_PER_TURN
+    global MCP_FAILURE_COOLDOWN_SECONDS, MCP_WRITE_ENABLED, MCP_WRITE_CONFIRM_TTL_SECONDS
+    global MCP_MAX_ARTIFACT_BYTES, MCP_ARTIFACT_ALLOWED_EXTENSIONS, MCP_CREDENTIALS_KEY
+    global MCP_ARTIFACT_STORAGE_DIR, MCP_WRITE_MAX_ATTEMPTS
+    global RESOURCE_MCP_MAX_CONCURRENT, RESOURCE_MCP_RESERVED_INTERACTIVE
     global SHARED_RETRIEVAL_EXECUTOR_ENABLED, RETRIEVAL_EXECUTOR_MAX_WORKERS
     global RETRIEVAL_QUEUE_MAX_DEPTH, RETRIEVAL_PER_REQUEST_FANOUT, RETRIEVAL_QUEUE_MAX_WAIT_SECONDS
     global RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS
@@ -991,6 +1064,7 @@ def reload_settings():
     global DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES, DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS, DOCUMENT_AUTO_PUBLISH_VERIFIED
     global OBS_ENABLED, OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT, OBS_ENVIRONMENT, OBS_SERVICE_VERSION
     global OBS_TRACE_SAMPLE_RATIO, OBS_CAPTURE_CONTENT, OBS_CAPTURE_QUERY, OBS_CAPTURE_EVIDENCE, OBS_CAPTURE_LLM_CONTENT
+    global OBS_CAPTURE_MCP_CONTENT
     global OBS_CONTENT_MAX_CHARS
     global OBS_LOG_FORMAT, OBS_METRICS_ENABLED, OBS_TRACES_ENABLED, OBS_LOGS_ENABLED, OBS_PHOENIX_PROJECT
     global OBS_GRAFANA_BASE_URL, OBS_PHOENIX_BASE_URL, OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS
@@ -1171,6 +1245,32 @@ def reload_settings():
     RESOURCE_EXPORT_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_EXPORT_RESERVED_INTERACTIVE", "0"))
     RESOURCE_MEMORY_MAX_CONCURRENT = int(os.getenv("RESOURCE_MEMORY_MAX_CONCURRENT", "1"))
     RESOURCE_MEMORY_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MEMORY_RESERVED_INTERACTIVE", "0"))
+    MCP_ENABLED = _env_bool("MCP_ENABLED", False)
+    MCP_ALLOW_INSECURE_HTTP = _env_bool("MCP_ALLOW_INSECURE_HTTP", False)
+    MCP_ALLOW_PRIVATE_HOSTS = _env_bool("MCP_ALLOW_PRIVATE_HOSTS", False)
+    MCP_CONNECT_TIMEOUT_SECONDS = int(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
+    MCP_CALL_TIMEOUT_SECONDS = int(os.getenv("MCP_CALL_TIMEOUT_SECONDS", "60"))
+    MCP_SSE_READ_TIMEOUT_SECONDS = int(os.getenv("MCP_SSE_READ_TIMEOUT_SECONDS", "300"))
+    MCP_MAX_RESULT_CHARS = int(os.getenv("MCP_MAX_RESULT_CHARS", "20000"))
+    MCP_MAX_RESULT_BYTES = int(os.getenv("MCP_MAX_RESULT_BYTES", "65536"))
+    MCP_MAX_ARGUMENT_CHARS = int(os.getenv("MCP_MAX_ARGUMENT_CHARS", "12000"))
+    MCP_MAX_TOOLS_PER_SERVER = int(os.getenv("MCP_MAX_TOOLS_PER_SERVER", "50"))
+    MCP_MAX_SERVERS_PER_RUN = int(os.getenv("MCP_MAX_SERVERS_PER_RUN", "5"))
+    MCP_CALLS_PER_TURN = int(os.getenv("MCP_CALLS_PER_TURN", "8"))
+    MCP_FAILURE_COOLDOWN_SECONDS = int(os.getenv("MCP_FAILURE_COOLDOWN_SECONDS", "60"))
+    MCP_WRITE_ENABLED = _env_bool("MCP_WRITE_ENABLED", False)
+    MCP_WRITE_CONFIRM_TTL_SECONDS = int(os.getenv("MCP_WRITE_CONFIRM_TTL_SECONDS", "1800"))
+    MCP_MAX_ARTIFACT_BYTES = int(os.getenv("MCP_MAX_ARTIFACT_BYTES", str(50 * 1024 * 1024)))
+    MCP_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
+        "MCP_ARTIFACT_ALLOWED_EXTENSIONS", "kicad_sch,kicad_pcb,kicad_pro,zip,json,csv"
+    )
+    MCP_ARTIFACT_STORAGE_DIR = _resolve_storage_path(
+        os.getenv("MCP_ARTIFACT_STORAGE_DIR"), "mcp_artifacts"
+    )
+    MCP_WRITE_MAX_ATTEMPTS = int(os.getenv("MCP_WRITE_MAX_ATTEMPTS", "3"))
+    MCP_CREDENTIALS_KEY = os.getenv("MCP_CREDENTIALS_KEY", "").strip()
+    RESOURCE_MCP_MAX_CONCURRENT = int(os.getenv("RESOURCE_MCP_MAX_CONCURRENT", "4"))
+    RESOURCE_MCP_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MCP_RESERVED_INTERACTIVE", "1"))
     SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
     RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
     RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
@@ -1347,6 +1447,7 @@ def reload_settings():
     OBS_CAPTURE_QUERY = os.getenv("OBS_CAPTURE_QUERY", "false").lower() == "true"
     OBS_CAPTURE_EVIDENCE = os.getenv("OBS_CAPTURE_EVIDENCE", "false").lower() == "true"
     OBS_CAPTURE_LLM_CONTENT = os.getenv("OBS_CAPTURE_LLM_CONTENT", "false").lower() == "true"
+    OBS_CAPTURE_MCP_CONTENT = os.getenv("OBS_CAPTURE_MCP_CONTENT", "false").lower() == "true"
     OBS_CONTENT_MAX_CHARS = max(1000, int(os.getenv("OBS_CONTENT_MAX_CHARS", "50000")))
     OBS_LOG_FORMAT = os.getenv("OBS_LOG_FORMAT", "json")
     OBS_METRICS_ENABLED = os.getenv("OBS_METRICS_ENABLED", "true").lower() == "true"
@@ -1543,6 +1644,20 @@ _INT_SETTING_KEYS = frozenset({
     "RESOURCE_EXPORT_RESERVED_INTERACTIVE",
     "RESOURCE_MEMORY_MAX_CONCURRENT",
     "RESOURCE_MEMORY_RESERVED_INTERACTIVE",
+    "MCP_CONNECT_TIMEOUT_SECONDS",
+    "MCP_CALL_TIMEOUT_SECONDS",
+    "MCP_SSE_READ_TIMEOUT_SECONDS",
+    "MCP_MAX_RESULT_CHARS",
+    "MCP_MAX_RESULT_BYTES",
+    "MCP_MAX_ARGUMENT_CHARS",
+    "MCP_MAX_TOOLS_PER_SERVER",
+    "MCP_MAX_SERVERS_PER_RUN",
+    "MCP_CALLS_PER_TURN",
+    "MCP_FAILURE_COOLDOWN_SECONDS",
+    "MCP_WRITE_CONFIRM_TTL_SECONDS",
+    "MCP_MAX_ARTIFACT_BYTES",
+    "RESOURCE_MCP_MAX_CONCURRENT",
+    "RESOURCE_MCP_RESERVED_INTERACTIVE",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS",
     "RETRIEVAL_QUEUE_MAX_DEPTH",
     "RETRIEVAL_PER_REQUEST_FANOUT",
@@ -1735,3 +1850,29 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
         # (``/health/ready`` -> ``control_plane``) fails closed when the
         # versioned schema is missing or stale; see control-plane-port-inventory
         # §3-§5 for the declared boundary and the cutover rehearsal.
+
+    if _value("MCP_ENABLED").lower() in {"1", "true", "yes", "on"}:
+        # The MCP channel only exists on the unified tool path and relies on
+        # the resource governor for its independent mcp quota.  Refuse a
+        # configuration that would enable MCP but leave it unreachable or
+        # ungoverned, instead of failing silently at runtime.
+        if _value("CONVERSATION_UNIFIED_TOOLS_ENABLED").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            raise ValueError(
+                "MCP_ENABLED=true 需要 CONVERSATION_UNIFIED_TOOLS_ENABLED=true，"
+                "否则外部插件不会出现在任何对话路径"
+            )
+        if _value("RESOURCE_GOVERNOR_ENABLED").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            raise ValueError(
+                "MCP_ENABLED=true 需要 RESOURCE_GOVERNOR_ENABLED=true，"
+                "否则 MCP 调用没有独立配额"
+            )

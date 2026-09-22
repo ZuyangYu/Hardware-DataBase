@@ -16,7 +16,7 @@ import {
   retryAttachment,
   uploadAttachment,
 } from '@/api/chatAttachments';
-import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, MessageView } from '@/api/types';
+import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, McpWriteProposal, MessageView } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -27,6 +27,7 @@ import {
   useKbChat,
 } from './useKbChat';
 import DocumentStatusCard, { documentCardIdentity } from './components/DocumentStatusCard';
+import McpWriteProposalCard from './components/McpWriteProposalCard';
 import { planConfirmationStaleKey } from './useKbChat';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
 import ChatHeader from './components/ChatHeader';
@@ -347,8 +348,57 @@ export default function ChatPage({
     abortStream,
     forbidden,
     documentContext,
-    setDocumentContext,
+  setDocumentContext,
+    mcpWriteCards,
+    updateMcpWriteCard,
+    refreshMcpWriteCards,
   } = chat;
+
+  useEffect(() => {
+    if (!mcpWriteCards.some((card) => card.status === 'confirmed' || card.status === 'running')) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void refreshMcpWriteCards().catch(() => undefined);
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [mcpWriteCards, refreshMcpWriteCards]);
+
+  async function confirmMcpWriteCard(card: typeof mcpWriteCards[number]) {
+    try {
+      const response = await api.post<{ proposal: McpWriteProposal }>(
+        `/api/v1/plugins/mcp/write-proposals/${encodeURIComponent(card.proposal_id)}/confirm`,
+      );
+      updateMcpWriteCard(response.proposal);
+      notify.success('已确认，候选产物将由 worker 生成');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '确认写入提案失败');
+    }
+  }
+
+  async function rejectMcpWriteCard(card: typeof mcpWriteCards[number]) {
+    try {
+      const response = await api.post<{ proposal: McpWriteProposal }>(
+        `/api/v1/plugins/mcp/write-proposals/${encodeURIComponent(card.proposal_id)}/reject`,
+      );
+      updateMcpWriteCard(response.proposal);
+      notify.success('已拒绝写入提案');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '拒绝写入提案失败');
+    }
+  }
+
+  async function downloadMcpWriteCard(card: typeof mcpWriteCards[number]) {
+    try {
+      await downloadBlob(
+        `/api/v1/plugins/mcp/write-proposals/${encodeURIComponent(card.proposal_id)}/artifact`,
+        card.artifact_filename || `${card.proposal_id}.artifact`,
+      );
+      notify.success('下载已开始');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '下载候选产物失败');
+    }
+  }
 
   const documentQuickReplies = useMemo(() => {
     const card = documentCards[0];
@@ -971,6 +1021,24 @@ export default function ChatPage({
                       stale={documentCardStaleKeys.has(planConfirmationStaleKey(card))}
                       onRefreshStatus={(target) => void refreshDocumentCardStatus(target)}
                       onRequestRelease={(target, artifactId) => void requestDocumentCardRelease(target, artifactId)}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {mcpWriteCards.length > 0 && (
+          <div className="shrink-0 px-[24px] pb-[6px]">
+            <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[10px]">
+              {mcpWriteCards.map((card) => (
+                <div key={card.proposal_id} className={chatRowClass('assistant')}>
+                  <div className={chatBubbleClass('assistant')}>
+                    <McpWriteProposalCard
+                      card={card}
+                      onConfirm={(target) => void confirmMcpWriteCard(target)}
+                      onReject={(target) => void rejectMcpWriteCard(target)}
+                      onDownload={(target) => void downloadMcpWriteCard(target)}
                     />
                   </div>
                 </div>

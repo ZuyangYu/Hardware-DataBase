@@ -117,6 +117,50 @@ def _config_revision() -> str:
         return ""
 
 
+def _check_mcp() -> dict[str, Any]:
+    """Three-state MCP component for the System Status page.
+
+    ``not_configured`` when the global switch is off; ``degraded`` when the
+    feature is on but unusable (prerequisites missing, store error, broken
+    credentials on an enabled server, or no enabled server); ``up`` otherwise.
+    """
+
+    if not bool(getattr(settings, "MCP_ENABLED", False)):
+        return {"status": "not_configured"}
+    try:
+        from src.agents.mcp.policy import mcp_prerequisites_met
+        from src.agents.mcp.store import build_mcp_store
+
+        met, reason = mcp_prerequisites_met()
+        if not met:
+            return {"status": "degraded", "error": reason}
+        store = build_mcp_store()
+        servers = store.list_all()
+        enabled = [record for record in servers if record.enabled]
+        credentials_broken = [record.slug for record in enabled if not record.credentials_ok]
+        if credentials_broken:
+            return {
+                "status": "degraded",
+                "error": "credentials_unavailable",
+                "enabled": len(enabled),
+                "servers": len(servers),
+            }
+        payload: dict[str, Any] = {
+            "enabled": len(enabled),
+            "servers": len(servers),
+            "subscriptions": store.count_subscriptions(),
+            "write_enabled": bool(getattr(settings, "MCP_WRITE_ENABLED", False)),
+        }
+        if not enabled:
+            payload["status"] = "degraded"
+            payload["error"] = "no_enabled_server"
+            return payload
+        payload["status"] = "up"
+        return payload
+    except Exception as exc:  # noqa: BLE001 - status page must never raise
+        return {"status": "degraded", "error": type(exc).__name__}
+
+
 def check_dependencies() -> dict[str, Any]:
     workers = list_workers()
     worker_status = "up" if workers else "degraded"
@@ -145,6 +189,7 @@ def check_dependencies() -> dict[str, Any]:
         "redis": _check_redis(),
         "ragflow": ragflow,
         "llm": llm,
+        "mcp": _check_mcp(),
     }
     failed = [name for name, item in dependencies.items() if item.get("status") == "down"]
     degraded = [name for name, item in dependencies.items() if item.get("status") == "degraded"]

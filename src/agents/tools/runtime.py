@@ -86,7 +86,14 @@ def memory_context_item(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_label(tool_name: str) -> str:
-    return TOOL_LABELS.get(tool_name, tool_name)
+    """Human label for a tool; external MCP tools get a server-qualified name."""
+
+    name = str(tool_name or "")
+    if name.startswith("mcp__") and "__" in name[5:]:
+        slug, tool = name[5:].split("__", 1)
+        if slug and tool:
+            return f"外部插件 · {slug} · {tool}"
+    return TOOL_LABELS.get(name, name)
 
 
 _LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
@@ -181,6 +188,11 @@ class ToolRuntime:
     memory_context_index: set[str] = field(default_factory=set)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     queries: list[dict[str, Any]] = field(default_factory=list)
+    # External MCP plugins keep their own diagnostics and per-turn call budget:
+    # external calls must not change retrieval rounds, the evidence set or the
+    # grounding footer.
+    mcp_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    mcp_call_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
     # P0-007: per-call epochs make late evidence registration impossible once
     # a call (or the whole cancellation path) has ended; checks and appends
@@ -331,6 +343,19 @@ class ToolRuntime:
                     continue
                 self.memory_context_index.add(key)
                 self.memory_context.append(dict(item))
+
+    def reserve_mcp_call(self, limit: int) -> bool:
+        """Atomically consume one external-call slot for this turn."""
+
+        with self._lock:
+            if limit > 0 and self.mcp_call_count >= limit:
+                return False
+            self.mcp_call_count += 1
+            return True
+
+    def record_mcp_diagnostic(self, diagnostic: dict[str, Any]) -> None:
+        with self._lock:
+            self.mcp_diagnostics.append(dict(diagnostic))
 
     def record_diagnostic(self, diag: ToolDiagnostics) -> None:
         with self._lock:

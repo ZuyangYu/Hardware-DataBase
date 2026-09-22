@@ -34,6 +34,7 @@ from src.api.routes import (
     memories,
     notifications,
     parse_tasks,
+    plugins,
     query,
     exports,
     status,
@@ -210,6 +211,12 @@ async def lifespan(app: FastAPI):
             )
         except Exception:  # pragma: no cover - teardown is best-effort
             pass
+        try:
+            from src.agents.mcp.client import reset_mcp_runtime
+
+            reset_mcp_runtime()
+        except Exception:  # pragma: no cover - teardown is best-effort
+            pass
         shutdown_observability()
 
 
@@ -274,6 +281,7 @@ def create_app() -> FastAPI:
     app.include_router(logs.router, prefix=api_v1)
     app.include_router(memories.router, prefix=api_v1)
     app.include_router(notifications.router, prefix=api_v1)
+    app.include_router(plugins.router, prefix=api_v1)
     app.include_router(status.router, prefix=api_v1)
     app.include_router(evaluation.router, prefix=api_v1)
     app.include_router(structured.router, prefix=api_v1)

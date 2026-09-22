@@ -1371,3 +1371,98 @@ class CompleteDocumentRevisionRequest(BaseModel):
     child_artifact_id: str = Field(min_length=1, max_length=200)
     revalidation_status: Literal["passed", "failed", "requires_human"]
     revalidation_result: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# External MCP plugins (governed external tool federation)
+
+
+class McpServerCreateRequest(BaseModel):
+    slug: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    transport: str = "streamable_http"
+    url: str = Field(min_length=1, max_length=2048)
+    description: str = Field(default="", max_length=1000)
+    headers: dict[str, str] | None = None
+    timeout_s: int | None = None
+    sse_read_timeout_s: int | None = None
+    department_scope: str = "none"
+    department_ids: list[int] = Field(default_factory=list)
+    disabled_tools: list[str] = Field(default_factory=list)
+    write_tools: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    icon: str = Field(default="", max_length=16)
+
+
+class McpServerUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    transport: str | None = None
+    url: str | None = Field(default=None, max_length=2048)
+    headers: dict[str, str] | None = None
+    clear_headers: bool = False
+    timeout_s: int | None = None
+    sse_read_timeout_s: int | None = None
+    department_scope: str | None = None
+    department_ids: list[int] | None = None
+    disabled_tools: list[str] | None = None
+    write_tools: list[str] | None = None
+    tags: list[str] | None = None
+    icon: str | None = Field(default=None, max_length=16)
+
+
+class McpServerStatusRequest(BaseModel):
+    enabled: bool
+
+
+class McpSubscribeRequest(BaseModel):
+    allow_write: bool = False
+
+
+class McpWriteConsentRequest(BaseModel):
+    allow_write: bool
+
+
+class McpWriteToolsRequest(BaseModel):
+    write_tools: list[str] = Field(default_factory=list)
+
+
+class McpListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    enabled: bool = False
+    write_enabled: bool = False
+    prerequisites_met: bool = False
+    prerequisites_reason: str = ""
+
+
+class McpServerResponse(BaseModel):
+    server: dict[str, Any]
+
+
+class McpTestResponse(BaseModel):
+    ok: bool
+    tool_count: int = 0
+    read_only_tool_count: int = 0
+    blocked_count: int = 0
+    latency_ms: int = 0
+    message: str = ""
+
+
+class McpToolsResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class McpSubscriptionResponse(BaseModel):
+    subscription: dict[str, Any]
+
+
+class McpSubscriptionListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class McpWriteProposalListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class McpWriteProposalResponse(BaseModel):
+    proposal: dict[str, Any]

@@ -609,6 +609,42 @@ class HardwareWorker:
         finally:
             heartbeat(self.worker_id)
 
+    def _process_mcp_write_proposals(self, limit: int = 1) -> bool:
+        """Execute user-confirmed MCP write proposals (candidate-artifact mode)."""
+
+        if not bool(getattr(src.settings, "MCP_WRITE_ENABLED", False)):
+            return False
+        try:
+            from src.agents.mcp.executor import MCPToolExecutor
+            from src.agents.mcp.write_store import build_write_proposal_store
+
+            store = getattr(self, "_mcp_write_store", None)
+            if store is None:
+                store = build_write_proposal_store()
+                self._mcp_write_store = store
+            store.expire_overdue()
+            claimed = store.claim(self.worker_id, limit=max(1, int(limit)))
+            if not claimed:
+                return False
+            executor = MCPToolExecutor(write_store=store)
+            for proposal in claimed:
+                try:
+                    outcome = executor.execute_proposal(proposal, worker_id=self.worker_id)
+                except Exception as exc:  # noqa: BLE001 - one bad row must not stop the loop
+                    error(f"MCP write proposal {proposal.proposal_id} crashed: {exc}")
+                    outcome = executor.finish_proposal(
+                        proposal, error_code="worker_error", retryable=True
+                    )
+                log(
+                    "MCP write proposal "
+                    f"{proposal.proposal_id} -> {outcome.get('status')} "
+                    f"({outcome.get('error_code') or 'ok'})"
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001 - fail-soft like the other workers
+            error(f"MCP write worker failed: {exc}")
+            return False
+
     def run_once(self) -> bool:
         self._reload_runtime_settings_if_changed()
         did_work = False
@@ -643,6 +679,10 @@ class HardwareWorker:
             depth, oldest_age_s = self.conversations.pending_turn_queue_state()
             set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
             if self._process_chat_claims():
+                did_work = True
+            if self._process_mcp_write_proposals(
+                limit=max(1, int(getattr(src.settings, "MCP_WRITE_MAX_ATTEMPTS", 3))),
+            ):
                 did_work = True
             depth, oldest_age_s = self.conversations.pending_turn_queue_state()
             set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
@@ -718,6 +758,12 @@ def main() -> None:
                     getattr(src.settings, "RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS", 10)
                 )
             )
+        except Exception:
+            pass
+        try:
+            from src.agents.mcp.client import reset_mcp_runtime
+
+            reset_mcp_runtime()
         except Exception:
             pass
         unregister(worker.worker_id)

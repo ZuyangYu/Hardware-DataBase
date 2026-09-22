@@ -39,6 +39,8 @@ import LogsPage from './pages/admin/LogsPage';
 import ConfigPage from './pages/admin/ConfigPage';
 import EvaluationPage from './pages/admin/EvaluationPage';
 import SystemStatusPage from './pages/admin/SystemStatusPage';
+import PluginsPage from './pages/admin/PluginsPage';
+import ExtensionsPage from './pages/ExtensionsPage';
 import MemoryPage from './pages/MemoryPage';
 
 const SIDEBAR_STORAGE_KEY = 'hdb_sidebar_expanded';
@@ -204,6 +206,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               element={<MemoryPage auth={auth} onLogout={onLogout} kbs={kbs} />}
             />
             <Route
+              path="/extensions"
+              element={
+                <KbContentRoute auth={auth}>
+                  <ExtensionsPage auth={auth} onLogout={onLogout} />
+                </KbContentRoute>
+              }
+            />
+            <Route
               path="/kbs/:kbName/chat/*"
               element={
                 <KbContentRoute auth={auth}>
@@ -280,6 +290,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               element={
                 <AdminRoute auth={auth}>
                   <SystemStatusPage auth={auth} onLogout={onLogout} />
+                </AdminRoute>
+              }
+            />
+            <Route
+              path="/admin/plugins"
+              element={
+                <AdminRoute auth={auth} requireSysAdmin>
+                  <PluginsPage auth={auth} onLogout={onLogout} />
                 </AdminRoute>
               }
             />

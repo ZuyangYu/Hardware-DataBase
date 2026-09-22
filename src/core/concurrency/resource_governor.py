@@ -41,6 +41,9 @@ DEFAULT_LIMITS: dict[str, tuple[int, int]] = {
     "ocr": (1, 0),
     "export": (4, 0),
     "memory": (1, 0),
+    # External MCP plugins: slow third-party calls must not occupy the shared
+    # local-tool budget; interactive callers keep one reserved slot.
+    "mcp": (4, 1),
 }
 
 
@@ -1955,6 +1958,7 @@ def _limits_from_settings() -> dict[str, tuple[int, int]]:
         "ocr": _pair("RESOURCE_OCR_MAX_CONCURRENT", "RESOURCE_OCR_RESERVED_INTERACTIVE", DEFAULT_LIMITS["ocr"]),
         "export": _pair("RESOURCE_EXPORT_MAX_CONCURRENT", "RESOURCE_EXPORT_RESERVED_INTERACTIVE", DEFAULT_LIMITS["export"]),
         "memory": _pair("RESOURCE_MEMORY_MAX_CONCURRENT", "RESOURCE_MEMORY_RESERVED_INTERACTIVE", DEFAULT_LIMITS["memory"]),
+        "mcp": _pair("RESOURCE_MCP_MAX_CONCURRENT", "RESOURCE_MCP_RESERVED_INTERACTIVE", DEFAULT_LIMITS["mcp"]),
     }
 
 
