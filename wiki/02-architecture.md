@@ -276,8 +276,8 @@ cd frontend && npm ci && npm run dev       # 5176，代理 /api → 8001
 # 可选：bash scripts/hdb.sh start|stop|restart|status|logs
 ```
 
-生产化进程管理（推荐）：`scripts/hdb.sh` 白名单读取 `.env` 中 `HDB_API_HOST/PORT`、`HDB_FRONT_PORT`，
-强制 `HDB_API_SPAWN_EXPORT_WORKER=0`/`HDB_API_SPAWN_MEMORY_WORKER=0`，
+生产化进程管理（推荐）：`scripts/hdb.sh` 白名单读取 `.env` 中 `HDB_API_HOST/PORT`、`HDB_FRONT_PORT`、`HDB_WORKER_ROLES`，
+强制 `HDB_API_SPAWN_WORKER=0`/`HDB_API_SPAWN_EXPORT_WORKER=0`/`HDB_API_SPAWN_MEMORY_WORKER=0`，
 分别启动 `worker-chat`、`worker-authoring`、`worker-parse`、`memory-worker`、`export-worker`，
 pid 写 `storage/run/`、日志写 `storage/logs/`。
 

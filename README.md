@@ -92,6 +92,24 @@ npm ci
 npm run dev                       # Vite dev server，默认 0.0.0.0:5176，经 proxy 转发 /api 到后端
 ```
 
+启用可执行 Skill 时，还需按 `deploy/sandbox-runner/README.md` 一次性准备受核验的基础镜像和服务令牌，
+然后在启动 API **之前**单独启动独立 Runner：
+
+```bash
+uv run python deploy/sandbox-runner/runner.py  # 默认 127.0.0.1:8780；需要 Docker daemon
+```
+
+若开启本机沙箱 MCP Gateway（`SANDBOX_GATEWAY_ENABLED=true`），参照
+`deploy/mcp-gateway/README.md` 配置独立令牌，并另开终端运行
+`uv run python deploy/mcp-gateway/gateway.py`（默认 `127.0.0.1:8781`）。
+
+单机直接运行 `hardware-database-server` 时，API 默认自动拉起对话/解析 Worker 和导出 Worker；
+沙箱任务的调度/对账循环也在 API 进程内自动启动，**无需另起沙箱 Worker**。记忆 Worker 默认不自动启动，
+如需记忆提炼，可另行运行 `uv run hardware-database-memory-worker`。若采用
+`bash scripts/hdb.sh start` 管理 API、前端和所有 Worker，它会关闭 API 的 Worker 自动拉起并
+各自启动一次；不要和上述手动启动方式同时使用。Runner（以及按需使用的 MCP Gateway）
+始终是单独的服务，不在 `hdb.sh` 中启动。
+
 生产部署用 `npm run build` 产出 `frontend/dist/` 静态文件。
 
 ### 方式二：使用 pip
