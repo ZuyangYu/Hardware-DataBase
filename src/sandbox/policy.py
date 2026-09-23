@@ -151,6 +151,10 @@ def validate_task_spec(spec: SandboxTaskSpec) -> SandboxTaskSpec:
     if str(spec.kind or "task") not in {"task", "session"}:
         raise SandboxPolicyError("kind must be task or session")
     idempotency_key = _check_ref(spec.idempotency_key, "idempotency_key")
+    skill_ref = _check_ref(spec.skill_ref, "skill_ref") if spec.skill_ref else ""
+    skill_digest = str(spec.skill_content_digest or "").lower().removeprefix("sha256:")
+    if bool(skill_ref) != bool(skill_digest) or (skill_digest and not re.fullmatch(r"[0-9a-f]{64}", skill_digest)):
+        raise SandboxPolicyError("Skill task must bind a reviewed Skill reference and digest")
     owner_id = _check_ref(spec.owner_id, "owner_id")
     department_id = _check_ref(spec.department_id, "department_id")
     bundle_ref = _check_ref(spec.bundle_ref, "bundle_ref")
@@ -199,6 +203,8 @@ def validate_task_spec(spec: SandboxTaskSpec) -> SandboxTaskSpec:
 
     return SandboxTaskSpec(
         idempotency_key=idempotency_key,
+        skill_ref=skill_ref,
+        skill_content_digest=skill_digest,
         owner_id=owner_id,
         department_id=department_id,
         bundle_ref=bundle_ref,

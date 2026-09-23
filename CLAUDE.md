@@ -157,6 +157,13 @@ or execute hooks/bin/commands. The agent loads them only from the server-owned
 `RequestContext.metadata["skill_refs"]` list, and only when `SKILLS_ENABLED` is
 true; unauthorized or disabled refs are omitted.
 
+The separate execution-Skill path binds a draft text Skill to a predeployed,
+reviewed fixed-digest bundle, then requires Skill review/test/enable. Employee
+invocations use the existing sandbox task/Artifact Broker flow; the task stores
+the Skill identity so dispatch rechecks approval, department and capabilities.
+Skill text and embedded script snippets are never interpreted as executable
+code. On dev-l1 this path is limited to HDB-owned, Runner-pinned bundles.
+
 ### Agent loop (`src/agents/`)
 `MultiSourceAgentRunner` (`runner.py`) wraps `deepagents.create_deep_agent`
 (a compiled LangGraph graph under the hood, but with a fixed general agent loop —

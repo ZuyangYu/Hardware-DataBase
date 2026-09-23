@@ -29,6 +29,7 @@ import {
 } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
+import SkillsPanel from './SkillsPanel';
 
 type Props = { auth: AuthSession; onLogout: () => void };
 
@@ -749,6 +750,8 @@ export default function PluginsPage({ auth, onLogout }: Props) {
           );
         }}
       />
+
+      <SkillsPanel />
 
       <Dialog
         open={formOpen}

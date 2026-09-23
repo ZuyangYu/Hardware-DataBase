@@ -17,6 +17,15 @@ import { notify } from '@/components/ui/app-toast';
 
 type Props = { auth: AuthSession; onLogout: () => void };
 
+type ExecutableSkill = {
+  skill_ref: string;
+  version: string;
+  bundle_ref: string;
+  input_schema: Record<string, unknown>;
+};
+type SkillTask = { task_id: string; status: string; error_code?: string };
+type SkillArtifact = { artifact_id: string; filename: string; state: string };
+
 const EMPTY_FLAGS: McpListFlags = {
   enabled: false,
   write_enabled: false,
@@ -40,6 +49,15 @@ export type ExtensionsViewProps = {
   onConfirmProposal?: (proposal: McpWriteProposal) => void;
   onRejectProposal?: (proposal: McpWriteProposal) => void;
   onDownloadProposal?: (proposal: McpWriteProposal) => void;
+  skills?: ExecutableSkill[];
+  skillParameters?: Record<string, string>;
+  skillBusy?: string | null;
+  skillTask?: SkillTask | null;
+  skillArtifacts?: SkillArtifact[];
+  onSkillParametersChange?: (ref: string, value: string) => void;
+  onRunSkill?: (item: ExecutableSkill) => void;
+  onRefreshSkillTask?: () => void;
+  onDownloadSkillArtifact?: (artifact: SkillArtifact) => void;
 };
 
 /** Pure view: employee catalog with subscription and write-consent controls. */
@@ -59,6 +77,15 @@ export function ExtensionsView({
   onConfirmProposal,
   onRejectProposal,
   onDownloadProposal,
+  skills = [],
+  skillParameters = {},
+  skillBusy = null,
+  skillTask = null,
+  skillArtifacts = [],
+  onSkillParametersChange,
+  onRunSkill,
+  onRefreshSkillTask,
+  onDownloadSkillArtifact,
 }: ExtensionsViewProps) {
   return (
     <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
@@ -252,6 +279,52 @@ export function ExtensionsView({
           </div>
         )}
       </section>
+
+      <section data-sandbox-skills className="mt-[20px] rounded-[16px] bg-white p-[18px] shadow-[0_2px_10px_rgba(0,0,0,0.05)]">
+        <h2 className="text-[15px] font-semibold text-[#18181a]">已审核的执行 Skill</h2>
+        <p className="mt-[4px] text-[12px] text-[#858b9c]">
+          仅调用管理员绑定的固定沙箱任务；Skill 文本中的脚本、命令不会被执行。
+        </p>
+        {skills.length === 0 ? (
+          <p className="mt-[12px] text-[13px] text-[#858b9c]">暂无可用的执行 Skill。</p>
+        ) : (
+          <div className="mt-[12px] grid gap-[12px]">
+            {skills.map((skill) => (
+              <div key={skill.skill_ref} className="rounded-[12px] border border-[#eceef3] p-[12px]">
+                <div className="text-[13px] font-medium">{skill.skill_ref} · {skill.version}</div>
+                <div className="mt-[3px] text-[12px] text-[#858b9c]">固定任务：{skill.bundle_ref}</div>
+                <details className="mt-[8px] text-[12px] text-[#464c5e]">
+                  <summary>查看参数格式</summary>
+                  <pre className="mt-[6px] max-h-[180px] overflow-auto whitespace-pre-wrap break-all">{JSON.stringify(skill.input_schema, null, 2)}</pre>
+                </details>
+                <label className="mt-[8px] block text-[12px] text-[#464c5e]">
+                  JSON 参数
+                  <textarea
+                    data-skill-parameters={skill.skill_ref}
+                    className="mt-[4px] block min-h-[64px] w-full rounded-[8px] border border-[#eceef3] p-[8px] font-mono"
+                    value={skillParameters[skill.skill_ref] ?? '{}'}
+                    onChange={(event) => onSkillParametersChange?.(skill.skill_ref, event.target.value)}
+                  />
+                </label>
+                <Button className="mt-[8px]" disabled={skillBusy !== null || !onRunSkill} onClick={() => onRunSkill?.(skill)}>
+                  在沙箱中运行固定任务
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+        {skillTask && (
+          <div className="mt-[12px] rounded-[12px] border border-[#eceef3] p-[12px] text-[12px]">
+            <div>任务 {skillTask.task_id} · {skillTask.status}{skillTask.error_code ? ` · ${skillTask.error_code}` : ''}</div>
+            <Button variant="outline" className="mt-[8px]" onClick={onRefreshSkillTask}>刷新状态</Button>
+            {skillArtifacts.filter((item) => item.state === 'committed').map((item) => (
+              <Button key={item.artifact_id} variant="outline" className="ml-[8px] mt-[8px]" onClick={() => onDownloadSkillArtifact?.(item)}>
+                下载 {item.filename}
+              </Button>
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   );
 }
@@ -263,6 +336,11 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
   const [busySlug, setBusySlug] = useState<string | null>(null);
   const [proposals, setProposals] = useState<McpWriteProposal[]>([]);
   const [proposalBusyId, setProposalBusyId] = useState<string | null>(null);
+  const [skills, setSkills] = useState<ExecutableSkill[]>([]);
+  const [skillParameters, setSkillParameters] = useState<Record<string, string>>({});
+  const [skillBusy, setSkillBusy] = useState<string | null>(null);
+  const [skillTask, setSkillTask] = useState<SkillTask | null>(null);
+  const [skillArtifacts, setSkillArtifacts] = useState<SkillArtifact[]>([]);
 
   const load = useCallback(() => {
     let cancelled = false;
@@ -293,6 +371,9 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
       .catch(() => {
         if (!cancelled) setProposals([]);
       });
+    api.get<{ items: ExecutableSkill[] }>('/api/v1/sandbox/skills/available')
+      .then((payload) => { if (!cancelled) setSkills(payload.items); })
+      .catch(() => { if (!cancelled) setSkills([]); });
     return () => {
       cancelled = true;
     };
@@ -304,6 +385,23 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
   }, [load]);
 
   const path = (slug: string) => `/api/v1/plugins/mcp/${encodeURIComponent(slug)}`;
+
+  const refreshSkillTask = useCallback(async (taskId: string) => {
+    const response = await api.get<{ task: SkillTask }>(`/api/v1/sandbox/tasks/${encodeURIComponent(taskId)}`);
+    setSkillTask(response.task);
+    if (response.task.status === 'succeeded') {
+      const artifacts = await api.get<{ items: SkillArtifact[] }>(`/api/v1/sandbox/tasks/${encodeURIComponent(taskId)}/artifacts`);
+      setSkillArtifacts(artifacts.items);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!skillTask || ['succeeded', 'failed', 'cancelled', 'rejected', 'expired', 'reconcile_required'].includes(skillTask.status)) return;
+    const timer = window.setInterval(() => {
+      void refreshSkillTask(skillTask.task_id).catch(() => {});
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [skillTask?.task_id, skillTask?.status, refreshSkillTask]);
 
   function run(slug: string, action: () => Promise<unknown>, message: string) {
     setBusySlug(slug);
@@ -371,6 +469,42 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
           '下载已开始',
         )
       }
+      skills={skills}
+      skillParameters={skillParameters}
+      skillBusy={skillBusy}
+      skillTask={skillTask}
+      skillArtifacts={skillArtifacts}
+      onSkillParametersChange={(ref, value) => setSkillParameters((previous) => ({ ...previous, [ref]: value }))}
+      onRunSkill={(skill) => {
+        let parameters: Record<string, unknown>;
+        try {
+          const parsed: unknown = JSON.parse(skillParameters[skill.skill_ref] ?? '{}');
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('参数必须是 JSON 对象');
+          parameters = parsed as Record<string, unknown>;
+        } catch (error) {
+          notify.error(error instanceof Error ? error.message : '参数不是有效 JSON');
+          return;
+        }
+        setSkillBusy(skill.skill_ref);
+        api.post<{ task: SkillTask }>(`/api/v1/sandbox/skills/${encodeURIComponent(skill.skill_ref)}/run`, {
+          idempotency_key: globalThis.crypto?.randomUUID?.() ?? `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          parameters,
+        })
+          .then((response) => {
+            setSkillTask(response.task);
+            setSkillArtifacts([]);
+            notify.success('任务已提交到沙箱');
+          })
+          .catch((error) => notify.error(error instanceof Error ? error.message : 'Skill 任务提交失败'))
+          .finally(() => setSkillBusy(null));
+      }}
+      onRefreshSkillTask={() => {
+        if (skillTask) void refreshSkillTask(skillTask.task_id).catch((error) => notify.error(error instanceof Error ? error.message : '状态读取失败'));
+      }}
+      onDownloadSkillArtifact={(artifact) => {
+        void apiDownload.blob(`/api/v1/sandbox/artifacts/${encodeURIComponent(artifact.artifact_id)}`, artifact.filename)
+          .catch((error) => notify.error(error instanceof Error ? error.message : '下载失败'));
+      }}
     />
   );
 }

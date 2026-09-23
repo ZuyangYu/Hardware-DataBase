@@ -37,6 +37,8 @@ from src.api.schemas import (
     SandboxGatewayResponse,
     SandboxSkillListResponse,
     SandboxSkillRegisterRequest,
+    SandboxSkillExecutionBindingRequest,
+    SandboxSkillRunRequest,
     SandboxSkillResponse,
     SandboxTaskEventsResponse,
     SandboxTaskListResponse,
@@ -267,6 +269,7 @@ def register_skill(
             content=body.content,
             source_ref=body.source_ref,
             catalog_source=body.catalog_source,
+            department_id=body.department_id,
             actor=actor.username,
             metadata=body.metadata,
         )
@@ -290,6 +293,39 @@ def list_skills(
     catalog: SkillCatalog = Depends(get_skill_catalog),
 ):
     return SandboxSkillListResponse(items=[item.to_dict() for item in catalog.list(include_revoked=True)])
+
+
+@router.get("/skills/available")
+def available_skills(
+    user: AuthUser = Depends(require_employee),
+    auth: AuthService = Depends(get_auth_service),
+    skills: SkillCatalog = Depends(get_skill_catalog),
+    authorization: SandboxAuthorizationStore = Depends(get_sandbox_authorization_store),
+):
+    if not bool(getattr(settings, "SKILLS_ENABLED", False)):
+        return {"items": []}
+    try:
+        require_execution_enabled(operation="Skill bundle listing")
+    except SandboxPolicyError:
+        return {"items": []}
+    effective = _context_capabilities(user, auth, authorization)
+    items: list[dict[str, Any]] = []
+    for skill in skills.list(enabled_only=True):
+        try:
+            bundle = skills.execution_bundle(
+                skill.skill_ref, principal_id=user.id, department_id=user.department_id or "",
+            )
+        except SkillCatalogError:
+            continue
+        if not set(bundle.required_capabilities).issubset(effective):
+            continue
+        items.append({
+            "skill_ref": skill.skill_ref,
+            "version": skill.version,
+            "bundle_ref": bundle.bundle_ref,
+            "input_schema": dict(bundle.input_schema),
+        })
+    return {"items": items}
 
 
 def _skill_state_action(
@@ -347,6 +383,88 @@ def revoke_skill(
     catalog: SkillCatalog = Depends(get_skill_catalog),
 ):
     return _skill_state_action(skill_ref, "revoked", actor, catalog)
+
+
+@router.post("/skills/{skill_ref:path}/bind-execution", response_model=SandboxSkillResponse)
+def bind_skill_execution(
+    skill_ref: str,
+    body: SandboxSkillExecutionBindingRequest,
+    actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    try:
+        skill = catalog.bind_execution(
+            skill_ref, bundle_ref=body.bundle_ref, bundle_digest=body.bundle_digest,
+            profile_ref=body.profile_ref, actor=actor.username,
+        )
+    except (SkillCatalogError, BundleCatalogError) as exc:
+        _audit(actor, action="sandbox.skill_bind", task_id=skill_ref,
+               target_type="sandbox_skill", success=False, error=str(exc))
+        raise HTTPException(status_code=409, detail="Skill or reviewed bundle is not eligible") from exc
+    _audit(actor, action="sandbox.skill_bind", task_id=skill_ref, target_type="sandbox_skill",
+           metadata={"bundle_ref": skill.execution_bundle_ref, "bundle_digest": skill.execution_bundle_digest})
+    return SandboxSkillResponse(skill=skill.to_dict())
+
+
+@router.post("/skills/{skill_ref:path}/run", response_model=SandboxTaskResponse,
+             status_code=status.HTTP_202_ACCEPTED)
+def run_skill(
+    skill_ref: str,
+    body: SandboxSkillRunRequest,
+    user: AuthUser = Depends(require_employee),
+    auth: AuthService = Depends(get_auth_service),
+    skills: SkillCatalog = Depends(get_skill_catalog),
+    store: SandboxTaskStore = Depends(get_sandbox_task_store),
+    catalog: SandboxCatalog = Depends(get_sandbox_catalog),
+    broker: ArtifactBroker = Depends(get_sandbox_artifact_broker),
+    authorization: SandboxAuthorizationStore = Depends(get_sandbox_authorization_store),
+):
+    try:
+        require_execution_enabled(operation="Skill bundle admission")
+        bundle = skills.execution_bundle(
+            skill_ref, principal_id=user.id, department_id=user.department_id or "",
+        )
+    except (SkillCatalogError, SandboxPolicyError) as exc:
+        _audit(user, action="sandbox.skill_run", task_id=skill_ref,
+               target_type="sandbox_skill", success=False, error=str(exc))
+        raise HTTPException(status_code=403, detail="Skill execution is not authorized") from exc
+    # Bind retries to the reviewed Skill identity, not just the shared bundle.
+    skill = skills.require(skill_ref)
+    identity = hashlib.sha256(
+        f"{skill.skill_ref}:{skill.version}:{skill.content_digest}".encode("utf-8")
+    ).hexdigest()[:20]
+    required = set(bundle.required_capabilities)
+    if not required.issubset(_context_capabilities(user, auth, authorization)) or user.department_id in (None, ""):
+        raise HTTPException(status_code=403, detail="Skill bundle capabilities are not authorized")
+    try:
+        bundle = catalog.authorize(
+            bundle_ref=bundle.bundle_ref, bundle_digest=bundle.bundle_digest,
+            profile_ref=bundle.profile_ref, required_capabilities=required,
+            network_policy_ref="", parameters=body.parameters,
+        )
+        spec = SandboxTaskSpec(
+            idempotency_key=f"skill-{identity}-{body.idempotency_key}",
+            owner_id=str(user.id), department_id=str(user.department_id),
+            bundle_ref=bundle.bundle_ref, bundle_digest=bundle.bundle_digest,
+            profile_ref=bundle.profile_ref, policy_snapshot_hash=bundle.policy_snapshot_hash,
+            capability_snapshot_hash=capability_snapshot_hash(
+                user_id=user.id, department_id=user.department_id,
+                capabilities=required, policy_snapshot_hash=bundle.policy_snapshot_hash,
+            ),
+            required_capabilities=tuple(required), parameters=body.parameters,
+            skill_ref=skill.skill_ref, skill_content_digest=skill.content_digest,
+        )
+        task = SandboxExecutionAdapter(store=store, catalog=catalog, broker=broker).admit(
+            spec, actor_id=str(user.id),
+        )
+    except (BundleCatalogError, SandboxPolicyError, SandboxExecutionError, TaskConflict) as exc:
+        _audit(user, action="sandbox.skill_run", task_id=skill_ref,
+               target_type="sandbox_skill", success=False, error=str(exc))
+        raise HTTPException(status_code=409, detail="Skill task admission failed") from exc
+    _audit(user, action="sandbox.skill_run", task_id=task.task_id,
+           target_type="sandbox_skill", metadata={"skill_ref": skill.skill_ref,
+                                                   "bundle_ref": bundle.bundle_ref})
+    return SandboxTaskResponse(task=task.to_dict())
 
 
 @router.get("/bundles", response_model=SandboxBundleListResponse)

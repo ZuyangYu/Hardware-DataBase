@@ -75,6 +75,8 @@ class SandboxTaskSpec:
     input_artifact_ids: tuple[str, ...] = ()
     parameters: Mapping[str, Any] = field(default_factory=dict)
     deadline_at: str = ""
+    skill_ref: str = ""
+    skill_content_digest: str = ""
 
     def fingerprint(self) -> str:
         """Return a stable request identity without exposing parameter values."""
@@ -93,6 +95,8 @@ class SandboxTaskSpec:
             "input_artifact_ids": list(self.input_artifact_ids),
             "parameters": self.parameters,
             "deadline_at": self.deadline_at,
+            "skill_ref": self.skill_ref,
+            "skill_content_digest": self.skill_content_digest,
         }
         return sha256_text(canonical_json(payload))
 
@@ -133,6 +137,8 @@ class SandboxTask:
     updated_at: str = ""
     started_at: str = ""
     finished_at: str = ""
+    skill_ref: str = ""
+    skill_content_digest: str = ""
 
     @property
     def is_terminal(self) -> bool:
@@ -171,6 +177,7 @@ class SandboxTask:
             "input_artifact_ids": list(self.input_artifact_ids),
             "output_manifest": dict(self.output_manifest),
             "parameters_digest": self.parameters_digest,
+            "skill_ref": self.skill_ref,
             "status": self.status,
             "desired_state": self.desired_state,
             "observed_state": self.observed_state,

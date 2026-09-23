@@ -81,4 +81,25 @@ describe('ExtensionsView', () => {
     expect(disabled).toContain('data-mcp-empty');
     expect(disabled).toContain('扩展能力未启用');
   });
+
+  it('shows only the reviewed bundle invocation and committed output downloads', () => {
+    const markup = view({
+      skills: [{ skill_ref: 'skill/report', version: 'v1', bundle_ref: 'bundle/report',
+        input_schema: { type: 'object', required: ['title'] } }],
+      skillParameters: { 'skill/report': '{"title":"review"}' },
+      skillTask: { task_id: 'task-reviewed', status: 'succeeded' },
+      skillArtifacts: [
+        { artifact_id: 'art-reviewed', filename: 'report.txt', state: 'committed' },
+        { artifact_id: 'art-pending', filename: 'pending.txt', state: 'staged' },
+      ],
+      onRunSkill: () => undefined,
+      onDownloadSkillArtifact: () => undefined,
+    });
+    expect(markup).toContain('data-sandbox-skills');
+    expect(markup).toContain('skill/report');
+    expect(markup).toContain('bundle/report');
+    expect(markup).toContain('运行固定任务');
+    expect(markup).toContain('下载 report.txt');
+    expect(markup).not.toContain('下载 pending.txt');
+  });
 });

@@ -1057,3 +1057,18 @@ Gateway/Runner 服务身份使用外部 secret/workload identity reference，不
 - 后端全量回归 2914 passed / 75 skipped / 0 failed（43 subtests，exit 0）；
   随后新增的 attach/disable 竞态防护由定向测试验证。前端 184 passed，构建通过；
   Ruff 与 `git diff --check` 通过。全量功能回归不替代 §11 的生产安全验收。
+- 可执行 Skill 的 dev-l1 参考链路：管理员仅将 draft 文本 Skill 绑定到 Runner 已固定的
+  自有 bundle digest/profile，再依次 review/test/enable；员工按部门和能力位列出与提交
+  结构化参数，任务账本持久化 Skill ref/content digest，真正提交 Runner 前再次核验
+  Skill 和 bundle 状态。文本中的脚本、命令和依赖声明不会执行。真实 HTTP API 运行
+  `skill/report-executable` → 固定 `bundle/report`，任务成功且两个 committed 产物
+  SHA-256 逐项核对；重复请求返回同一任务，命令参数被拒绝。管理员插件页现提供 Skill
+  登记、固定 bundle 绑定与审核，员工扩展页提供运行及产物下载。撤销 Skill 或用户能力后，
+  尚未提交 Runner 的任务在调度前再次核验并标为 rejected；执行 Skill 必须声明部门范围，
+  全局文本 Skill 不能升级为执行入口。专项 pytest 57 passed，
+  前端 186 passed/build 通过。更新 Worker 后再跑真实 Skill 链路，任务 succeeded、两份
+  committed 输出的 SHA-256 均匹配。此项仅证明自有固定任务的 Skill 入口，**不解除第三方脚本
+  Skill、敏感多租户任务及 §11 生产验收的 NO-GO**。
+- 后端全量回归 `uv run python -m pytest -q` 2918 passed / 75 skipped / 0 failed，
+  43 subtests passed（exit 0）；其后增补的执行 Skill 部门/能力撤销检查由专项 57 passed
+  验证。前端 186 passed/build、Ruff 与 diff 检查通过。该回归不构成 L2/L3 验收。

@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 import src.settings as settings
+from .catalog import BundleCatalogError, ExecutionBundle, SandboxCatalog
 
 
 class SkillCatalogError(ValueError):
@@ -80,7 +81,10 @@ CREATE TABLE IF NOT EXISTS sandbox_skills (
     updated_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    execution_bundle_ref TEXT NOT NULL DEFAULT '',
+    execution_bundle_digest TEXT NOT NULL DEFAULT '',
+    execution_profile_ref TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_sandbox_skills_state
     ON sandbox_skills(approval_state, updated_at);
@@ -194,6 +198,9 @@ class SkillRecord:
     created_at: str = ""
     updated_at: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    execution_bundle_ref: str = ""
+    execution_bundle_digest: str = ""
+    execution_profile_ref: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -225,6 +232,10 @@ class SkillRecord:
             "execution_capabilities": [],
             "execution_allowed": False,
             "prompt_data_only": True,
+            "bundle_invocation_available": self.enabled and bool(self.execution_bundle_ref),
+            "execution_bundle_ref": self.execution_bundle_ref,
+            "execution_bundle_digest": self.execution_bundle_digest,
+            "execution_profile_ref": self.execution_profile_ref,
         }
 
 
@@ -239,6 +250,10 @@ class SkillCatalog:
         self._init_lock = threading.Lock()
         with self._init_lock, closing(self._connect()) as conn:
             conn.executescript(_DDL)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(sandbox_skills)")}
+            for column in ("execution_bundle_ref", "execution_bundle_digest", "execution_profile_ref"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE sandbox_skills ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None, check_same_thread=False)
@@ -274,6 +289,9 @@ class SkillCatalog:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             metadata=metadata,
+            execution_bundle_ref=str(row["execution_bundle_ref"] or ""),
+            execution_bundle_digest=str(row["execution_bundle_digest"] or ""),
+            execution_profile_ref=str(row["execution_profile_ref"] or ""),
         )
 
     def _row(self, skill_ref: str) -> sqlite3.Row | None:
@@ -348,6 +366,9 @@ class SkillCatalog:
                         old_item.version != version_value
                         or old_item.content_digest != digest
                         or old_item.source_ref != declared_source
+                        or old_item.catalog_source != str(catalog_source or "curated")[:50]
+                        or old_item.owner_id != str(owner_id or "")[:128]
+                        or old_item.department_id != str(department_id or "")[:128]
                         or _json(dict(old_item.metadata)) != _json(safe_metadata)
                     )
                 )
@@ -360,8 +381,9 @@ class SkillCatalog:
                         skill_ref, version, content_digest, source_ref, catalog_source,
                         approval_state, content, content_bytes, review_flags_json,
                         owner_id, department_id, created_by, updated_by, created_at,
-                        updated_at, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        updated_at, metadata_json, execution_bundle_ref,
+                        execution_bundle_digest, execution_profile_ref
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(skill_ref) DO UPDATE SET
                         version = excluded.version,
                         content_digest = excluded.content_digest,
@@ -375,7 +397,10 @@ class SkillCatalog:
                         department_id = excluded.department_id,
                         updated_by = excluded.updated_by,
                         updated_at = excluded.updated_at,
-                        metadata_json = excluded.metadata_json
+                        metadata_json = excluded.metadata_json,
+                        execution_bundle_ref = excluded.execution_bundle_ref,
+                        execution_bundle_digest = excluded.execution_bundle_digest,
+                        execution_profile_ref = excluded.execution_profile_ref
                     """,
                     (
                         ref,
@@ -394,6 +419,9 @@ class SkillCatalog:
                         now,
                         now,
                         _json(safe_metadata),
+                        old_item.execution_bundle_ref if old_item and not changed else "",
+                        old_item.execution_bundle_digest if old_item and not changed else "",
+                        old_item.execution_profile_ref if old_item and not changed else "",
                     ),
                 )
                 row = conn.execute("SELECT * FROM sandbox_skills WHERE skill_ref = ?", (ref,)).fetchone()
@@ -402,6 +430,78 @@ class SkillCatalog:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+
+    def bind_execution(
+        self, skill_ref: str, *, bundle_ref: str, bundle_digest: str,
+        profile_ref: str, actor: str = "",
+    ) -> SkillRecord:
+        """Bind a draft text Skill to an independently reviewed, fixed bundle.
+
+        No script, container arguments or executable bytes are accepted here.
+        A different binding requires a fresh review of the Skill declaration.
+        """
+        ref = _ref(skill_ref, "skill_ref")
+        bundle_name = _ref(bundle_ref, "bundle_ref")
+        profile = _ref(profile_ref, "profile_ref")
+        digest = _canonical_digest(bundle_digest)
+        if not _DIGEST_RE.fullmatch(digest):
+            raise SkillCatalogError("bundle_digest is not a SHA-256 digest")
+        bundle = SandboxCatalog(self.db_path).require(bundle_name)
+        if (
+            not bundle.enabled or bundle.bundle_digest.lower().removeprefix("sha256:") != digest
+            or bundle.profile_ref != profile or bundle.network_policy_ref
+            or bundle.catalog_source != "curated"
+            or not set(bundle.required_capabilities).issubset({"sandbox.execute", "sandbox.write_artifact"})
+            or "sandbox.execute" not in bundle.required_capabilities
+        ):
+            raise SkillStateConflict("Skill execution requires an enabled fixed no-network bundle")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT * FROM sandbox_skills WHERE skill_ref = ?", (ref,)).fetchone()
+                if row is None:
+                    raise SkillNotFound(ref)
+                item = self._row_to_record(row)
+                if item.approval_state != "draft":
+                    raise SkillStateConflict("Skill must be a draft to bind an execution bundle")
+                if not item.department_id:
+                    raise SkillStateConflict("executable Skill requires an explicit department scope")
+                conn.execute(
+                    "UPDATE sandbox_skills SET execution_bundle_ref = ?, execution_bundle_digest = ?, "
+                    "execution_profile_ref = ?, updated_by = ?, updated_at = ? WHERE skill_ref = ?",
+                    (bundle_name, digest, profile, str(actor or "")[:128], _now(), ref),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return self.require(ref)
+
+    def execution_bundle(
+        self, skill_ref: str, *, principal_id: str | int = "",
+        department_id: str | int = "", is_admin: bool = False,
+    ) -> ExecutionBundle:
+        """Re-check the Skill and bundle at every new invocation."""
+        item = self.require(skill_ref)
+        self.prompt_block(item.skill_ref, principal_id=principal_id,
+                          department_id=department_id, is_admin=is_admin)
+        return self._checked_execution_bundle(item)
+
+    def _checked_execution_bundle(self, item: SkillRecord) -> ExecutionBundle:
+        if not item.execution_bundle_ref:
+            raise SkillStateConflict("Skill has no reviewed execution bundle")
+        try:
+            bundle = SandboxCatalog(self.db_path).require(item.execution_bundle_ref)
+        except BundleCatalogError as exc:
+            raise SkillStateConflict("Skill execution bundle is not available") from exc
+        if (
+            not bundle.enabled or bundle.bundle_digest.lower().removeprefix("sha256:") != item.execution_bundle_digest
+            or bundle.profile_ref != item.execution_profile_ref or bundle.network_policy_ref
+            or bundle.catalog_source != "curated"
+            or not set(bundle.required_capabilities).issubset({"sandbox.execute", "sandbox.write_artifact"})
+        ):
+            raise SkillStateConflict("Skill execution bundle has changed or been revoked")
+        return bundle
 
     def _set_state(self, skill_ref: str, state: str, *, actor: str = "") -> SkillRecord:
         if state not in SKILL_STATES:
@@ -413,6 +513,8 @@ class SkillCatalog:
             raise SkillStateConflict(f"cannot transition Skill {item.approval_state} -> {state}")
         if state == "enabled" and not bool(getattr(settings, "SKILLS_ENABLED", False)):
             raise SkillStateConflict("SKILLS_ENABLED is false")
+        if state == "enabled" and item.execution_bundle_ref:
+            self._checked_execution_bundle(item)
         with closing(self._connect()) as conn:
             conn.execute(
                 "UPDATE sandbox_skills SET approval_state = ?, updated_by = ?, updated_at = ? WHERE skill_ref = ?",

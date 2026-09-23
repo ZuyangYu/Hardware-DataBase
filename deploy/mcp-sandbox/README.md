@@ -36,7 +36,9 @@ The HDB control plane includes:
   subscriptions and per-invocation authorization
   (`src/agents/mcp/gateway.py`);
 - text-only Skill catalog whose content is loaded only as bounded untrusted
-  prompt data and never changes tools/capabilities (`src/sandbox/skills.py`).
+  prompt data and never changes tools/capabilities (`src/sandbox/skills.py`);
+  a separate reviewed binding may invoke a fixed bundle, but never executes
+  code copied from the Skill text.
 
 An independent Runner and Gateway and the dev-l1 profile now have real runtime
 tests. Production is still blocked on L2/L3 runtime verification, SBOM/signature,
@@ -125,6 +127,43 @@ host for the **HDB-owned fixed-digest** first phase only:
 - scanner `scanner://builtin/basic-v1` (bounded structural checks only);
 - text-only Skill catalog enabled (`SKILLS_ENABLED=true`): reviewed skills load
   as bounded untrusted prompt data and never change tools/capabilities.
+
+### Fixed-bundle Skill invocation (dev-l1 reference)
+
+An administrator may bind a **draft** text Skill to an independently deployed,
+enabled, curated bundle with a fixed `bundle_ref`, SHA-256 digest and profile.
+Executable Skills must have an explicit department scope; globally visible
+text-only Skills cannot be bound to a task.
+The bundle must declare `sandbox.execute` and may additionally declare
+`sandbox.write_artifact`; this path refuses network and input artifacts. The
+Skill must then pass the existing review → tested → enable lifecycle. Changing
+its text, scope, version or binding requires review again. Admin UI:
+**Admin → Plugins → 文本 Skill 与固定任务绑定**. Equivalent API:
+
+```text
+POST /api/v1/sandbox/skills                         # register text and optional department_id
+POST /api/v1/sandbox/skills/{skill_ref}/bind-execution
+     {"bundle_ref":"bundle/report","bundle_digest":"<reviewed sha256>","profile_ref":"profile/dev-l1"}
+POST /api/v1/sandbox/skills/{skill_ref}/review
+POST /api/v1/sandbox/skills/{skill_ref}/tested
+POST /api/v1/sandbox/skills/{skill_ref}/enable
+```
+
+Employees with the bundle's deployment-authorized capabilities can see it on
+the Extensions page or call `GET /api/v1/sandbox/skills/available`, then submit
+`POST /api/v1/sandbox/skills/{skill_ref}/run` with an idempotency key and
+structured `parameters` matching the reviewed bundle schema. The normal task
+ledger, dispatcher, Runner and Artifact Broker handle observation and output
+downloads. The task records the Skill digest and the dispatcher checks its
+current enablement, owner/department scope and bundle binding before starting;
+revocation denies **new** runs; a dispatcher that observes a revoked Skill
+before submission marks the queued task rejected. Running
+tasks still follow the task cancellation endpoint.
+
+No uploaded script, hook, command, dynamic dependency or arbitrary image is
+accepted through these APIs. The development Runner still launches only its
+locally pinned, HDB-owned bundles. Third-party script Skills remain NO-GO until
+the L2/L3 runtime and production acceptance requirements above are satisfied.
 
 Evidence: `deploy/sandbox-runner/smoke.py` 17/17, `deploy/mcp-gateway/smoke.py`
 10/10, `deploy/sandbox-runner/hdb_e2e.py` 10/10 (HDB control plane against the

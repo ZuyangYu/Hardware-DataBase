@@ -39,6 +39,10 @@ class SandboxExecutionError(RuntimeError):
     """Bounded adapter error; callers must not expose Runner internals."""
 
 
+class SkillAuthorizationError(SandboxExecutionError):
+    """A queued Skill task is no longer authorized to start."""
+
+
 def _record_task_metric(*, operation: str, status: str, duration_s: float = 0.0) -> None:
     """Best-effort low-cardinality metrics; never affect the control plane."""
 
@@ -164,6 +168,30 @@ class SandboxExecutionAdapter:
             raise SandboxExecutionError("remote request idempotency key does not match the task")
 
     def _authorize_task(self, task: SandboxTask) -> None:
+        if task.skill_ref:
+            from .authorization import SandboxAuthorizationStore
+            from .skills import SkillCatalog, SkillCatalogError
+
+            try:
+                effective = SandboxAuthorizationStore(self.store.db_path).effective_capabilities(
+                    user_id=task.owner_id, department_id=task.department_id,
+                )
+                if not set(task.required_capabilities).issubset(effective):
+                    raise SkillAuthorizationError("Skill execution capabilities were revoked")
+                skill_catalog = SkillCatalog(self.store.db_path)
+                skill = skill_catalog.require(task.skill_ref)
+                reviewed = skill_catalog.execution_bundle(
+                    task.skill_ref, principal_id=task.owner_id, department_id=task.department_id,
+                )
+                if (
+                    skill.content_digest != task.skill_content_digest
+                    or reviewed.bundle_ref != task.bundle_ref
+                    or reviewed.bundle_digest != task.bundle_digest
+                    or reviewed.profile_ref != task.profile_ref
+                ):
+                    raise SkillAuthorizationError("Skill execution binding changed")
+            except SkillCatalogError as exc:
+                raise SkillAuthorizationError("Skill execution is no longer approved") from exc
         if self.authorization_checker is not None:
             try:
                 allowed = self.authorization_checker(task)
@@ -264,6 +292,8 @@ class SandboxExecutionAdapter:
             input_artifact_ids=claimed.input_artifact_ids,
             parameters=claimed.parameters,
             deadline_at=claimed.deadline_at,
+            skill_ref=claimed.skill_ref,
+            skill_content_digest=claimed.skill_content_digest,
         )
         started = time.monotonic()
         try:
@@ -808,6 +838,22 @@ class SandboxExecutionAdapter:
                     report.uncertain += 1
                 else:
                     report.submitted += 1
+            except SkillAuthorizationError:
+                # Authorization is checked before a lease or remote call. Only
+                # the unchanged queued/admitted revision may be rejected; a
+                # concurrent dispatcher or cancellation wins the CAS instead.
+                try:
+                    current = self.store.require(task.task_id)
+                    if current.status in {"admitted", "queued"}:
+                        self.store.transition(
+                            current.task_id, "rejected", expected_revision=current.revision,
+                            actor_id=self.worker_id, action="sandbox.skill_revoked",
+                            observed_state="rejected", cleanup_state="complete",
+                            error_code="skill_not_authorized",
+                        )
+                        report.failed += 1
+                except (TaskConflict, TaskNotFound):
+                    report.errors.append("skill_rejection_raced")
             except Exception:
                 report.errors.append("submit_failed")
         for task in self.store.list(statuses=("running", "collecting", "cancel_requested"), limit=max(1, min(limit, 100))):

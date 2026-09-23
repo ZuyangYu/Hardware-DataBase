@@ -1634,7 +1634,25 @@ class SandboxSkillRegisterRequest(BaseModel):
     content: str = Field(min_length=1, max_length=131_072)
     source_ref: str = Field(default="", max_length=512)
     catalog_source: str = Field(default="curated", max_length=50)
+    department_id: str = Field(default="", max_length=128)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxSkillExecutionBindingRequest(BaseModel):
+    """References to an operator-deployed bundle, never a script upload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bundle_ref: str = Field(min_length=1, max_length=256)
+    bundle_digest: str = Field(min_length=64, max_length=71)
+    profile_ref: str = Field(min_length=1, max_length=256)
+
+
+class SandboxSkillRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=100)
+    parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 class SandboxSkillResponse(BaseModel):

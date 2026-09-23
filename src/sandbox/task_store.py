@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS sandbox_tasks (
     bundle_digest TEXT NOT NULL,
     profile_ref TEXT NOT NULL,
     policy_snapshot_hash TEXT NOT NULL,
+    skill_ref TEXT NOT NULL DEFAULT '',
+    skill_content_digest TEXT NOT NULL DEFAULT '',
     capability_snapshot_hash TEXT NOT NULL DEFAULT '',
     network_policy_ref TEXT NOT NULL DEFAULT '',
     required_capabilities_json TEXT NOT NULL DEFAULT '[]',
@@ -298,6 +300,8 @@ class SandboxTaskStore:
                 "cleanup_state": "TEXT NOT NULL DEFAULT 'pending'",
                 "output_manifest_json": "TEXT NOT NULL DEFAULT '{}'",
                 "capability_snapshot_hash": "TEXT NOT NULL DEFAULT ''",
+                "skill_ref": "TEXT NOT NULL DEFAULT ''",
+                "skill_content_digest": "TEXT NOT NULL DEFAULT ''",
             }
             for column, ddl in migrations.items():
                 if column not in columns:
@@ -321,6 +325,8 @@ class SandboxTaskStore:
             bundle_digest=str(get("bundle_digest")),
             profile_ref=str(get("profile_ref")),
             policy_snapshot_hash=str(get("policy_snapshot_hash")),
+            skill_ref=str(get("skill_ref")),
+            skill_content_digest=str(get("skill_content_digest")),
             capability_snapshot_hash=str(get("capability_snapshot_hash")),
             network_policy_ref=str(get("network_policy_ref")),
             required_capabilities=tuple(_load_json(get("required_capabilities_json", "[]"), [])),
@@ -420,13 +426,13 @@ class SandboxTaskStore:
                     INSERT INTO sandbox_tasks(
                         task_id, idempotency_key, request_fingerprint, owner_id, department_id,
                         kind, bundle_ref, bundle_digest, profile_ref, policy_snapshot_hash,
-                        capability_snapshot_hash,
+                        capability_snapshot_hash, skill_ref, skill_content_digest,
                         network_policy_ref, required_capabilities_json, input_artifact_ids_json,
                         parameters_json, output_manifest_json, status, desired_state,
                         observed_state, cleanup_state, execution_id, backend_ref, lease_owner,
                         lease_expires_at, fencing_token, attempt, deadline_at, error_code,
                         error_message, revision, created_at, updated_at, started_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', 'admitted',
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', 'admitted',
                               'running', '', 'pending', '', '', '', '', 0, 0, ?, '', '', 0, ?, ?, '', '')
                     """,
                     (
@@ -441,6 +447,8 @@ class SandboxTaskStore:
                         normalized.profile_ref,
                         normalized.policy_snapshot_hash,
                         normalized.capability_snapshot_hash,
+                        normalized.skill_ref,
+                        normalized.skill_content_digest,
                         normalized.network_policy_ref,
                         _json(list(normalized.required_capabilities), []),
                         _json(list(normalized.input_artifact_ids), []),
