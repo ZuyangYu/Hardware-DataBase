@@ -1,0 +1,17 @@
+{
+  "deploy/sandbox-info": {
+    "profile_ref": "profile/dev-l1",
+    "profile_digest": "371196dd810ee0a602bc6617357b7008e8318c5c883d98acad9b8df8a5de4fb4",
+    "image_digest": "sha256:dc27462b1eae5caebe535ca33e0d4bd5121cbb9c735bd05bbec7f08b36e4abd2",
+    "entrypoint": ["/usr/local/bin/python3", "/opt/mcp/stdio_bridge.py"],
+    "environment": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "MCP_BRIDGE_PORT=8080",
+      "MCP_STDIO_SERVER=/opt/mcp/stdio_server.py"
+    ],
+    "source_labels": {
+      "org.hdb.stdio.server.sha256": "4c839643fb0ac5ead96754d3b08f8b4466ed91bc4d7ac4b566903ee26e1e2843",
+      "org.hdb.stdio.bridge.sha256": "969217af096f4d51dff6a75508eee4d0671e5e01519d8a30f0a721390d90469b"
+    }
+  }
+}

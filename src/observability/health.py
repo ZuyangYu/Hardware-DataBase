@@ -96,8 +96,12 @@ def check_ready() -> dict[str, Any]:
         "database": _check_sqlite(),
         "control_plane": check_control_plane(),
         "storage": _check_storage(),
+        "sandbox": _check_sandbox(),
     }
-    ready = all(item.get("status") == "up" for item in dependencies.values())
+    # A deliberately disabled optional extension is healthy by absence.  An
+    # enabled-but-unconfigured Sandbox is not ready and must not silently look
+    # like a working execution backend.
+    ready = all(item.get("status") in {"up", "not_configured"} for item in dependencies.values())
     return {
         "status": "ready" if ready else "not_ready",
         # v3 §11.5: the live content revision plus the settings that still need
@@ -161,6 +165,49 @@ def _check_mcp() -> dict[str, Any]:
         return {"status": "degraded", "error": type(exc).__name__}
 
 
+def _check_sandbox() -> dict[str, Any]:
+    """Report the HDB control-plane boundary without claiming runtime safety.
+
+    This probe never executes a task and does not make a remote health call.
+    ``up`` means only that the deployment supplied an authenticated client and
+    the local fail-closed gates are coherent; independent Runner/runtime
+    acceptance evidence remains an operator/deployment responsibility.
+    """
+
+    enabled = bool(getattr(settings, "SANDBOX_ENABLED", False))
+    gateway_enabled = bool(getattr(settings, "SANDBOX_GATEWAY_ENABLED", False))
+    if not enabled and not gateway_enabled:
+        return {
+            "status": "not_configured",
+            "backend": str(getattr(settings, "SANDBOX_BACKEND", "disabled") or "disabled"),
+        }
+    try:
+        from src.sandbox.policy import require_execution_enabled
+        from src.sandbox.dependencies import get_service_client
+
+        if enabled:
+            require_execution_enabled(operation="sandbox readiness")
+        elif str(getattr(settings, "SANDBOX_BACKEND", "disabled")).lower() == "disabled":
+            return {"status": "degraded", "error": "gateway_backend_not_configured"}
+        client = get_service_client()
+        if client is None:
+            return {"status": "degraded", "error": "authenticated_service_client_unavailable"}
+        if enabled and not client.runner_url:
+            return {"status": "degraded", "error": "runner_endpoint_unavailable"}
+        if gateway_enabled and not client.gateway_url:
+            return {"status": "degraded", "error": "gateway_endpoint_unavailable"}
+        return {
+            "status": "up",
+            "backend": str(getattr(settings, "SANDBOX_BACKEND", "disabled") or "disabled"),
+            "gateway_enabled": gateway_enabled,
+            "runtime_attestation_ref_present": bool(
+                str(getattr(settings, "SANDBOX_RUNTIME_ATTESTATION_REF", "") or "").strip()
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 - health must remain bounded
+        return {"status": "degraded", "error": type(exc).__name__}
+
+
 def check_dependencies() -> dict[str, Any]:
     workers = list_workers()
     worker_status = "up" if workers else "degraded"
@@ -190,6 +237,7 @@ def check_dependencies() -> dict[str, Any]:
         "ragflow": ragflow,
         "llm": llm,
         "mcp": _check_mcp(),
+        "sandbox": _check_sandbox(),
     }
     failed = [name for name, item in dependencies.items() if item.get("status") == "down"]
     degraded = [name for name, item in dependencies.items() if item.get("status") == "degraded"]

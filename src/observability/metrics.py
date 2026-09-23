@@ -878,3 +878,66 @@ def record_mcp_artifact_rejected(*, reason: str) -> None:
         attributes={"reason": value if value in _MCP_ARTIFACT_REASONS else "store"},
         description="Candidate artifacts rejected by the write channel",
     )
+
+
+_SANDBOX_TASK_STATUSES = frozenset(
+    {
+        "admitted",
+        "queued",
+        "running",
+        "collecting",
+        "succeeded",
+        "rejected",
+        "timed_out",
+        "cancel_requested",
+        "cancelled",
+        "failed",
+        "expired",
+        "unknown",
+        "cleanup_pending",
+        "reconcile_required",
+    }
+)
+_SANDBOX_OPERATIONS = frozenset({"submit", "observe", "cancel", "collect", "reconcile", "dispatch"})
+_SANDBOX_OUTCOMES = frozenset({"ok", "failed", "unknown", "disabled", "denied"})
+_SANDBOX_ARTIFACT_STATES = frozenset({"staged", "scanning", "committed", "rejected", "deleted"})
+
+
+def record_sandbox_task(*, operation: str, status: str, duration_s: float = 0.0) -> None:
+    """Record Sandbox lifecycle activity without task/user/tenant labels."""
+
+    op = str(operation or "").strip().lower()
+    outcome = str(status or "").strip().lower()
+    counter(
+        "hdb.sandbox.task_count",
+        attributes={
+            "operation": op if op in _SANDBOX_OPERATIONS else "other",
+            "outcome": outcome if outcome in _SANDBOX_OUTCOMES else "failed",
+        },
+        description="Sandbox control-plane task operations",
+    )
+    if duration_s:
+        histogram(
+            "hdb.sandbox.task_duration_seconds",
+            max(0.0, float(duration_s)),
+            attributes={"operation": op if op in _SANDBOX_OPERATIONS else "other"},
+            description="Sandbox control-plane operation duration",
+        )
+
+
+def record_sandbox_state(*, status: str) -> None:
+    value = str(status or "").strip().lower()
+    counter(
+        "hdb.sandbox.state_count",
+        attributes={"status": value if value in _SANDBOX_TASK_STATUSES else "other"},
+        description="Sandbox task state transitions",
+    )
+
+
+def record_sandbox_artifact(*, state: str) -> None:
+    value = str(state or "").strip().lower()
+    counter(
+        "hdb.sandbox.artifact_count",
+        attributes={"state": value if value in _SANDBOX_ARTIFACT_STATES else "other"},
+        description="Sandbox artifact lifecycle transitions",
+    )

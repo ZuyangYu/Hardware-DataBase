@@ -228,9 +228,9 @@ export function PluginsView({
 
       {!flags.enabled && (
         <div data-mcp-switch-off className="mt-[20px] text-[13px] text-[#7a5a12]">
-          MCP 总开关未启用（MCP_ENABLED=false）：仍可登记、编辑、删除服务，也可手动测试连接
-          （会立即发起一次真实外部连接），但不能启用服务。启用前请在「系统配置 → 外部 MCP 扩展」
-          把 MCP_ENABLED 设为 true（需同时开启统一工具路径与资源 governor），或修改 .env 后重启/热加载。
+          MCP 总开关未启用（MCP_ENABLED=false）：仍可登记、编辑、删除服务；测试连接与工具刷新
+          不会发起外部连接，也不能启用服务。启用前请在「系统配置 → 外部 MCP 扩展」把 MCP_ENABLED
+          设为 true（需同时开启统一工具路径与资源 governor），或修改 .env 后重启/热加载。
         </div>
       )}
       {flags.enabled && !flags.prerequisites_met && (

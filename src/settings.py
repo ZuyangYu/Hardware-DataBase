@@ -412,6 +412,54 @@ MCP_CREDENTIALS_KEY = os.getenv("MCP_CREDENTIALS_KEY", "").strip()
 RESOURCE_MCP_MAX_CONCURRENT = int(os.getenv("RESOURCE_MCP_MAX_CONCURRENT", "4"))
 RESOURCE_MCP_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MCP_RESERVED_INTERACTIVE", "1"))
 
+# External extension sandbox control plane.  The application never starts a
+# third-party process; ``runner_api`` means an independently deployed Runner
+# API must be available and authenticated.  ``disabled`` is the only safe
+# default until a concrete runtime/backend has passed the P0 probe.
+SANDBOX_ENABLED = _env_bool("SANDBOX_ENABLED", False)
+SANDBOX_BACKEND = os.getenv("SANDBOX_BACKEND", "disabled").strip().lower() or "disabled"
+SANDBOX_GATEWAY_ENABLED = _env_bool("SANDBOX_GATEWAY_ENABLED", False)
+SANDBOX_GATEWAY_URL = os.getenv("SANDBOX_GATEWAY_URL", "").strip()
+SANDBOX_RUNNER_URL = os.getenv("SANDBOX_RUNNER_URL", "").strip()
+SANDBOX_SERVICE_AUTH_REF = os.getenv("SANDBOX_SERVICE_AUTH_REF", "").strip()
+# The reference names an external identity provider/secret mount; it is never
+# interpreted as a bearer token by HDB.  A deployment may inject a short-lived
+# token through this owner-only file or configure a process-level provider.
+SANDBOX_SERVICE_TOKEN_FILE = os.getenv("SANDBOX_SERVICE_TOKEN_FILE", "").strip()
+SANDBOX_DIAGNOSTIC_TEST_ENABLED = _env_bool("SANDBOX_DIAGNOSTIC_TEST_ENABLED", False)
+SANDBOX_DEFAULT_NETWORK = os.getenv("SANDBOX_DEFAULT_NETWORK", "none").strip().lower() or "none"
+SANDBOX_MAX_CONCURRENT = int(os.getenv("SANDBOX_MAX_CONCURRENT", "2"))
+SANDBOX_TASK_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TASK_TIMEOUT_SECONDS", "300"))
+SANDBOX_TASK_LEASE_SECONDS = int(os.getenv("SANDBOX_TASK_LEASE_SECONDS", "60"))
+SANDBOX_MAX_OUTPUT_BYTES = int(os.getenv("SANDBOX_MAX_OUTPUT_BYTES", str(50 * 1024 * 1024)))
+SANDBOX_MAX_INPUT_BYTES = int(os.getenv("SANDBOX_MAX_INPUT_BYTES", str(50 * 1024 * 1024)))
+SANDBOX_ALLOW_DYNAMIC_INSTALL = _env_bool("SANDBOX_ALLOW_DYNAMIC_INSTALL", False)
+SANDBOX_AUTHORIZED_CAPABILITIES = _env_csv("SANDBOX_AUTHORIZED_CAPABILITIES")
+# Enabling execution without an operator-recorded runtime attestation is never
+# allowed.  The attestation and profile digest are deployment evidence, not
+# user-editable API settings.
+SANDBOX_REQUIRE_RUNTIME_ATTESTATION = _env_bool("SANDBOX_REQUIRE_RUNTIME_ATTESTATION", True)
+SANDBOX_RUNTIME_ATTESTATION_REF = os.getenv("SANDBOX_RUNTIME_ATTESTATION_REF", "").strip()
+SANDBOX_RUNTIME_PROFILE_DIGEST = os.getenv("SANDBOX_RUNTIME_PROFILE_DIGEST", "").strip()
+SANDBOX_ARTIFACT_SCANNER_REF = os.getenv("SANDBOX_ARTIFACT_SCANNER_REF", "").strip()
+SANDBOX_DISPATCH_INTERVAL_SECONDS = float(os.getenv("SANDBOX_DISPATCH_INTERVAL_SECONDS", "2"))
+SANDBOX_RECONCILE_INTERVAL_SECONDS = float(os.getenv("SANDBOX_RECONCILE_INTERVAL_SECONDS", "30"))
+SANDBOX_MAX_CONCURRENT_PER_USER = int(os.getenv("SANDBOX_MAX_CONCURRENT_PER_USER", "1"))
+SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT = int(os.getenv("SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT", "2"))
+SANDBOX_TASK_DB_PATH = _resolve_storage_path(
+    os.getenv("SANDBOX_TASK_DB_PATH"), "sandbox_tasks.db"
+)
+SANDBOX_ARTIFACT_STORAGE_DIR = _resolve_storage_path(
+    os.getenv("SANDBOX_ARTIFACT_STORAGE_DIR"), "sandbox_artifacts"
+)
+SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
+    "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS", "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro"
+)
+# Text Skills are a separate, prompt-data-only catalog.  They have no runtime
+# capability and stay disabled until an operator explicitly enables reviewed
+# content; this switch does not enable sandbox execution.
+SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", False)
+
 # P0b shared retrieval executor: one bounded pool per process for document
 # batch retrieval; per-request fan-out and the RAG governor are separate.
 # Rollout flag: off until stage acceptance opens it (plan §10.1).
@@ -826,6 +874,19 @@ DEFAULT_VALUES = {
     "MCP_WRITE_MAX_ATTEMPTS": "3",
     "RESOURCE_MCP_MAX_CONCURRENT": "4",
     "RESOURCE_MCP_RESERVED_INTERACTIVE": "1",
+    "SANDBOX_ENABLED": "false",
+    "SANDBOX_GATEWAY_ENABLED": "false",
+    "SANDBOX_DEFAULT_NETWORK": "none",
+    "SANDBOX_MAX_CONCURRENT": "2",
+    "SANDBOX_MAX_CONCURRENT_PER_USER": "1",
+    "SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT": "2",
+    "SANDBOX_TASK_TIMEOUT_SECONDS": "300",
+    "SANDBOX_TASK_LEASE_SECONDS": "60",
+    "SANDBOX_MAX_OUTPUT_BYTES": str(50 * 1024 * 1024),
+    "SANDBOX_MAX_INPUT_BYTES": str(50 * 1024 * 1024),
+    "SKILLS_ENABLED": "false",
+    # Deployment-only sandbox identity/endpoints are intentionally excluded
+    # from the ordinary config API; these defaults document the closed state.
     "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "false",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS": "8",
     "RETRIEVAL_QUEUE_MAX_DEPTH": "256",
@@ -1019,6 +1080,20 @@ def reload_settings():
     global MCP_MAX_ARTIFACT_BYTES, MCP_ARTIFACT_ALLOWED_EXTENSIONS, MCP_CREDENTIALS_KEY
     global MCP_ARTIFACT_STORAGE_DIR, MCP_WRITE_MAX_ATTEMPTS
     global RESOURCE_MCP_MAX_CONCURRENT, RESOURCE_MCP_RESERVED_INTERACTIVE
+    global SANDBOX_ENABLED, SANDBOX_BACKEND, SANDBOX_GATEWAY_ENABLED
+    global SANDBOX_GATEWAY_URL, SANDBOX_RUNNER_URL, SANDBOX_SERVICE_AUTH_REF
+    global SANDBOX_SERVICE_TOKEN_FILE
+    global SANDBOX_DIAGNOSTIC_TEST_ENABLED, SANDBOX_DEFAULT_NETWORK
+    global SANDBOX_MAX_CONCURRENT, SANDBOX_TASK_TIMEOUT_SECONDS, SANDBOX_TASK_LEASE_SECONDS
+    global SANDBOX_MAX_CONCURRENT_PER_USER, SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT
+    global SANDBOX_MAX_OUTPUT_BYTES, SANDBOX_MAX_INPUT_BYTES, SANDBOX_ALLOW_DYNAMIC_INSTALL
+    global SANDBOX_AUTHORIZED_CAPABILITIES
+    global SANDBOX_REQUIRE_RUNTIME_ATTESTATION, SANDBOX_RUNTIME_ATTESTATION_REF
+    global SANDBOX_RUNTIME_PROFILE_DIGEST, SANDBOX_ARTIFACT_SCANNER_REF
+    global SANDBOX_DISPATCH_INTERVAL_SECONDS, SANDBOX_RECONCILE_INTERVAL_SECONDS
+    global SANDBOX_TASK_DB_PATH, SANDBOX_ARTIFACT_STORAGE_DIR
+    global SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS
+    global SKILLS_ENABLED
     global SHARED_RETRIEVAL_EXECUTOR_ENABLED, RETRIEVAL_EXECUTOR_MAX_WORKERS
     global RETRIEVAL_QUEUE_MAX_DEPTH, RETRIEVAL_PER_REQUEST_FANOUT, RETRIEVAL_QUEUE_MAX_WAIT_SECONDS
     global RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS
@@ -1271,6 +1346,43 @@ def reload_settings():
     MCP_CREDENTIALS_KEY = os.getenv("MCP_CREDENTIALS_KEY", "").strip()
     RESOURCE_MCP_MAX_CONCURRENT = int(os.getenv("RESOURCE_MCP_MAX_CONCURRENT", "4"))
     RESOURCE_MCP_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MCP_RESERVED_INTERACTIVE", "1"))
+    SANDBOX_ENABLED = _env_bool("SANDBOX_ENABLED", False)
+    SANDBOX_BACKEND = os.getenv("SANDBOX_BACKEND", "disabled").strip().lower() or "disabled"
+    SANDBOX_GATEWAY_ENABLED = _env_bool("SANDBOX_GATEWAY_ENABLED", False)
+    SANDBOX_GATEWAY_URL = os.getenv("SANDBOX_GATEWAY_URL", "").strip()
+    SANDBOX_RUNNER_URL = os.getenv("SANDBOX_RUNNER_URL", "").strip()
+    SANDBOX_SERVICE_AUTH_REF = os.getenv("SANDBOX_SERVICE_AUTH_REF", "").strip()
+    SANDBOX_SERVICE_TOKEN_FILE = os.getenv("SANDBOX_SERVICE_TOKEN_FILE", "").strip()
+    SANDBOX_DIAGNOSTIC_TEST_ENABLED = _env_bool("SANDBOX_DIAGNOSTIC_TEST_ENABLED", False)
+    SANDBOX_DEFAULT_NETWORK = os.getenv("SANDBOX_DEFAULT_NETWORK", "none").strip().lower() or "none"
+    SANDBOX_MAX_CONCURRENT = int(os.getenv("SANDBOX_MAX_CONCURRENT", "2"))
+    SANDBOX_MAX_CONCURRENT_PER_USER = int(os.getenv("SANDBOX_MAX_CONCURRENT_PER_USER", "1"))
+    SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT = int(
+        os.getenv("SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT", "2")
+    )
+    SANDBOX_TASK_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TASK_TIMEOUT_SECONDS", "300"))
+    SANDBOX_TASK_LEASE_SECONDS = int(os.getenv("SANDBOX_TASK_LEASE_SECONDS", "60"))
+    SANDBOX_MAX_OUTPUT_BYTES = int(os.getenv("SANDBOX_MAX_OUTPUT_BYTES", str(50 * 1024 * 1024)))
+    SANDBOX_MAX_INPUT_BYTES = int(os.getenv("SANDBOX_MAX_INPUT_BYTES", str(50 * 1024 * 1024)))
+    SANDBOX_ALLOW_DYNAMIC_INSTALL = _env_bool("SANDBOX_ALLOW_DYNAMIC_INSTALL", False)
+    SANDBOX_AUTHORIZED_CAPABILITIES = _env_csv("SANDBOX_AUTHORIZED_CAPABILITIES")
+    SANDBOX_REQUIRE_RUNTIME_ATTESTATION = _env_bool("SANDBOX_REQUIRE_RUNTIME_ATTESTATION", True)
+    SANDBOX_RUNTIME_ATTESTATION_REF = os.getenv("SANDBOX_RUNTIME_ATTESTATION_REF", "").strip()
+    SANDBOX_RUNTIME_PROFILE_DIGEST = os.getenv("SANDBOX_RUNTIME_PROFILE_DIGEST", "").strip()
+    SANDBOX_ARTIFACT_SCANNER_REF = os.getenv("SANDBOX_ARTIFACT_SCANNER_REF", "").strip()
+    SANDBOX_DISPATCH_INTERVAL_SECONDS = float(os.getenv("SANDBOX_DISPATCH_INTERVAL_SECONDS", "2"))
+    SANDBOX_RECONCILE_INTERVAL_SECONDS = float(os.getenv("SANDBOX_RECONCILE_INTERVAL_SECONDS", "30"))
+    SANDBOX_TASK_DB_PATH = _resolve_storage_path(
+        os.getenv("SANDBOX_TASK_DB_PATH"), "sandbox_tasks.db"
+    )
+    SANDBOX_ARTIFACT_STORAGE_DIR = _resolve_storage_path(
+        os.getenv("SANDBOX_ARTIFACT_STORAGE_DIR"), "sandbox_artifacts"
+    )
+    SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
+        "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS",
+        "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro",
+    )
+    SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", False)
     SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
     RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
     RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
@@ -1658,6 +1770,13 @@ _INT_SETTING_KEYS = frozenset({
     "MCP_MAX_ARTIFACT_BYTES",
     "RESOURCE_MCP_MAX_CONCURRENT",
     "RESOURCE_MCP_RESERVED_INTERACTIVE",
+    "SANDBOX_MAX_CONCURRENT",
+    "SANDBOX_MAX_CONCURRENT_PER_USER",
+    "SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT",
+    "SANDBOX_TASK_TIMEOUT_SECONDS",
+    "SANDBOX_TASK_LEASE_SECONDS",
+    "SANDBOX_MAX_OUTPUT_BYTES",
+    "SANDBOX_MAX_INPUT_BYTES",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS",
     "RETRIEVAL_QUEUE_MAX_DEPTH",
     "RETRIEVAL_PER_REQUEST_FANOUT",
@@ -1718,6 +1837,8 @@ _FLOAT_SETTING_KEYS = frozenset({
     "RETRIEVAL_QUEUE_MAX_WAIT_SECONDS",
     "RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS",
     "ADMISSION_RETRY_AFTER_SECONDS",
+    "SANDBOX_DISPATCH_INTERVAL_SECONDS",
+    "SANDBOX_RECONCILE_INTERVAL_SECONDS",
 })
 
 
@@ -1731,9 +1852,19 @@ def validate_settings_values(settings_dict: dict) -> None:
         text = "" if value is None else str(value)
         if key in _INT_SETTING_KEYS:
             try:
-                int(text)
+                parsed_int = int(text)
             except ValueError as exc:
                 raise ValueError(f"{key} 必须是整数，当前值: {text!r}") from exc
+            if key in {
+                "SANDBOX_MAX_CONCURRENT",
+                "SANDBOX_MAX_CONCURRENT_PER_USER",
+                "SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT",
+                "SANDBOX_TASK_TIMEOUT_SECONDS",
+                "SANDBOX_TASK_LEASE_SECONDS",
+                "SANDBOX_MAX_OUTPUT_BYTES",
+                "SANDBOX_MAX_INPUT_BYTES",
+            } and parsed_int <= 0:
+                raise ValueError(f"{key} 必须大于 0，当前值: {text!r}")
         elif key in _FLOAT_SETTING_KEYS:
             try:
                 float(text)
@@ -1749,6 +1880,19 @@ def validate_settings_values(settings_dict: dict) -> None:
             lowered = text.strip().lower()
             if lowered not in {p.value for p in Provider}:
                 raise ValueError(f"AGENT_LLM_PROVIDER 必须是以下之一: {valid}，当前值: {text!r}")
+        elif key == "SANDBOX_BACKEND" and text.strip().lower() not in {"disabled", "runner_api"}:
+            raise ValueError(
+                "SANDBOX_BACKEND 必须是 disabled 或 runner_api，"
+                f"当前值: {text!r}"
+            )
+        elif key == "SANDBOX_DEFAULT_NETWORK" and text.strip().lower() not in {
+            "none",
+            "egress_proxy",
+        }:
+            raise ValueError(
+                "SANDBOX_DEFAULT_NETWORK 必须是 none 或 egress_proxy，"
+                f"当前值: {text!r}"
+            )
         elif key == "MEMORY_STORE_BACKEND" and text.strip().lower() not in {"sqlite", "postgres"}:
             raise ValueError(f"MEMORY_STORE_BACKEND 必须是 sqlite 或 postgres，当前值: {text!r}")
         elif key == "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND" and text.strip().lower() not in {
@@ -1850,6 +1994,60 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
         # (``/health/ready`` -> ``control_plane``) fails closed when the
         # versioned schema is missing or stale; see control-plane-port-inventory
         # §3-§5 for the declared boundary and the cutover rehearsal.
+
+    sandbox_backend = _value("SANDBOX_BACKEND").lower() or "disabled"
+    if sandbox_backend not in {"disabled", "runner_api"}:
+        raise ValueError(
+            "SANDBOX_BACKEND 必须是 disabled 或 runner_api，"
+            f"当前值: {sandbox_backend!r}"
+        )
+    sandbox_network = _value("SANDBOX_DEFAULT_NETWORK").lower() or "none"
+    if sandbox_network not in {"none", "egress_proxy"}:
+        raise ValueError(
+            "SANDBOX_DEFAULT_NETWORK 必须是 none 或 egress_proxy，"
+            f"当前值: {sandbox_network!r}"
+        )
+    sandbox_enabled = _value("SANDBOX_ENABLED").lower() in {"1", "true", "yes", "on"}
+    gateway_enabled = _value("SANDBOX_GATEWAY_ENABLED").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if sandbox_enabled or gateway_enabled:
+        if sandbox_backend == "disabled":
+            raise ValueError(
+                "SANDBOX_ENABLED/SANDBOX_GATEWAY_ENABLED=true 需要已验证的 SANDBOX_BACKEND，"
+                "不能使用 disabled"
+            )
+        if not _value("SANDBOX_RUNNER_URL"):
+            raise ValueError(
+                "启用 Sandbox 需要受运维控制的 SANDBOX_RUNNER_URL"
+            )
+        if not _value("SANDBOX_SERVICE_AUTH_REF"):
+            raise ValueError(
+                "启用 Sandbox 需要外部 secret/workload identity 的 SANDBOX_SERVICE_AUTH_REF"
+            )
+        if _value("SANDBOX_REQUIRE_RUNTIME_ATTESTATION").lower() in {"1", "true", "yes", "on", ""}:
+            if not _value("SANDBOX_RUNTIME_ATTESTATION_REF"):
+                raise ValueError(
+                    "启用 Sandbox 需要已审核的 SANDBOX_RUNTIME_ATTESTATION_REF"
+                )
+            profile_digest = _value("SANDBOX_RUNTIME_PROFILE_DIGEST").lower().removeprefix("sha256:")
+            if len(profile_digest) != 64 or any(char not in "0123456789abcdef" for char in profile_digest):
+                raise ValueError(
+                    "启用 Sandbox 需要有效的 SANDBOX_RUNTIME_PROFILE_DIGEST"
+                )
+        if not _value("SANDBOX_ARTIFACT_SCANNER_REF"):
+            raise ValueError(
+                "启用 Sandbox 需要已部署并登记的 SANDBOX_ARTIFACT_SCANNER_REF"
+            )
+    if gateway_enabled and not _value("SANDBOX_GATEWAY_URL"):
+        raise ValueError(
+            "SANDBOX_GATEWAY_ENABLED=true 需要受运维控制的 SANDBOX_GATEWAY_URL"
+        )
+    if _value("SANDBOX_ALLOW_DYNAMIC_INSTALL").lower() in {"1", "true", "yes", "on"}:
+        raise ValueError("SANDBOX_ALLOW_DYNAMIC_INSTALL 当前阶段必须保持 false")
 
     if _value("MCP_ENABLED").lower() in {"1", "true", "yes", "on"}:
         # The MCP channel only exists on the unified tool path and relies on

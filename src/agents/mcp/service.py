@@ -231,9 +231,21 @@ class McpPluginService:
         return self.store.set_enabled(slug, bool(enabled), str(actor or ""))
 
     def test_server(self, slug: str) -> dict[str, Any]:
-        """Real connect + discovery against the *current* config, even if disabled."""
+        """Test the current config without bypassing the global MCP kill switch.
+
+        Registration and governance reads remain available while MCP is off, but
+        this endpoint must not create an external connection unless the operator
+        explicitly enables the separate break-glass diagnostic flag.
+        """
 
         record = self.get_server(slug)
+        if not bool(getattr(settings, "MCP_ENABLED", False)) and not bool(
+            getattr(settings, "SANDBOX_DIAGNOSTIC_TEST_ENABLED", False)
+        ):
+            raise McpServiceError(
+                "MCP 总开关未启用，连接测试不会发起外部连接；如需 break-glass 诊断，请显式启用诊断开关",
+                status_code=409,
+            )
         started = time.monotonic()
         try:
             discovered = load_server_tools(record, force_refresh=True)
@@ -262,6 +274,10 @@ class McpPluginService:
         }
 
     def list_tools(self, slug: str) -> list[McpToolInfo]:
+        if not bool(getattr(settings, "MCP_ENABLED", False)):
+            raise McpServiceError(
+                "MCP 总开关未启用，工具发现不会发起外部连接", status_code=409
+            )
         record = self.get_server(slug)
         try:
             discovered = load_server_tools(record, force_refresh=True)
@@ -303,6 +319,10 @@ class McpPluginService:
     def refresh_tools(self, slug: str) -> list[McpToolInfo]:
         """Force re-discovery and drop this process's cached entry first."""
 
+        if not bool(getattr(settings, "MCP_ENABLED", False)):
+            raise McpServiceError(
+                "MCP 总开关未启用，工具刷新不会发起外部连接", status_code=409
+            )
         record = self.get_server(slug)
         get_tool_cache().clear(record.slug)
         return self.list_tools(slug)

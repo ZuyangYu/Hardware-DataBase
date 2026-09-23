@@ -36,6 +36,9 @@ class _McpTestBase(unittest.TestCase):
             patch.object(settings, "AUTH_DB_PATH", self.auth_db),
             patch.object(settings, "MCP_CREDENTIALS_KEY", self.key),
             patch.object(settings, "MCP_ENABLED", True),
+            # Deployment .env may enable the write channel; health assertions in
+            # this file pin the read-only component shape and must stay hermetic.
+            patch.object(settings, "MCP_WRITE_ENABLED", False),
             patch.object(settings, "CONVERSATION_UNIFIED_TOOLS_ENABLED", True),
             patch.object(settings, "RESOURCE_GOVERNOR_ENABLED", True),
             patch.object(settings, "MCP_ALLOW_INSECURE_HTTP", True),
