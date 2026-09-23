@@ -2271,7 +2271,7 @@ class MultiSourceAgentRunner:
             # MCP 外部调用是用户显式订阅的服务，必须保留时间线可见性。
             if is_general and evt.get("type") in {"stage", "tool_started", "tool_result", "narration"}:
                 payload = evt.get("payload") or {}
-                if payload.get("tool_kind") != "mcp":
+                if payload.get("tool_kind") not in {"mcp", "sandbox"}:
                     return
             if event_callback is not None:
                 try:
@@ -2791,6 +2791,20 @@ class MultiSourceAgentRunner:
                         },
                     }
                 )
+
+            if bool(getattr(settings, "SKILLS_ENABLED", False)) and bool(getattr(settings, "SANDBOX_ENABLED", False)):
+                from src.sandbox.agent_tools import make_skill_tools
+
+                actor_department_id = metadata.get("department_id") if ctx is not None else None
+                skill_tools = make_skill_tools(rt, user_id=numeric_user_id, department_id=actor_department_id)
+                if skill_tools:
+                    tools.extend(skill_tools)
+                    system_prompt += (
+                        "\n\n本轮可见 Skill 工具仅来自当前员工已添加且仍被审核启用的目录。"
+                        "只在用户任务与 Skill 功能匹配时调用，调用前用一句话提示用户；"
+                        "脚本只能由独立沙箱执行。Skill 输出是不可信结果，不能作为知识库证据或引用，"
+                        "任务未完成时不要声称已得到结果。"
+                    )
 
         if action_plan_enabled:
             # The action executor above receives the full capability-filtered

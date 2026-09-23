@@ -25,6 +25,6 @@ describe('SkillsPanelView', () => {
     expect(markup).toContain('skill/report');
     expect(markup).toContain('bundle/report');
     expect(markup).toContain('绑定固定任务');
-    expect(markup).toContain('脚本');
+    expect(markup).toContain('审核源文件与构建结果');
   });
 });

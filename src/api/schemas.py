@@ -1638,6 +1638,40 @@ class SandboxSkillRegisterRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class SandboxSkillPackageUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_ref: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=64)
+    department_id: str = Field(min_length=1, max_length=128)
+    source_ref: str = Field(default="", max_length=512)
+    catalog_source: str = Field(default="curated", max_length=50)
+    package_base64: str = Field(min_length=1, max_length=12_000_000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxSkillBuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_bundle_ref: str = Field(default="bundle/report", min_length=1, max_length=256)
+    profile_ref: str = Field(min_length=1, max_length=256)
+    runtime_policy_ref: str = Field(default="", max_length=256)
+    runtime_policy_digest: str = Field(default="", max_length=71)
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    required_capabilities: list[str] = Field(
+        default_factory=lambda: ["sandbox.execute", "sandbox.write_artifact"], max_length=8
+    )
+
+
+class SandboxSkillPipSourceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index_url: str = Field(default="", max_length=512)
+
+
 class SandboxSkillExecutionBindingRequest(BaseModel):
     """References to an operator-deployed bundle, never a script upload."""
 

@@ -11,7 +11,7 @@
 | 隔离 | 只读 rootfs、`--cap-drop ALL`、`no-new-privileges`、非 root 用户、`--pids-limit 128`、`--memory 256m`、`--cpus 1`、`tmpfs /tmp` |
 | 网络 | task：`none`；service：`--internal` 网桥（无出网，仅宿主可达） |
 | 挂载 | 仅任务自己的输入（只读）与输出（读写）目录；无宿主路径/socket |
-| 适用 | HDB 自有的固定 digest bundle 与固定只读 stdio MCP，单租户 |
+| 适用 | HDB 自有/受信任管理员审核的固定 digest bundle 与固定只读 stdio MCP，单租户 |
 | 不适用 | 第三方/模型生成代码、多租户高敏感数据（需 L2 rootless OCI 或 L3 gVisor/microVM） |
 
 本机没有可验证的 rootless OCI / gVisor / Kata 档位，非特权 user namespace 创建失败，
@@ -35,6 +35,7 @@ deploy/sandbox-runner/
 ├─ runtime_service_tamper.py     # 拒绝同名错镜像/改入口点/额外出网网络
 ├─ hdb_e2e.py                    # HDB 控制面 <-> Runner/Gateway 端到端（10 项）
 ├─ api_smoke.py                  # HDB HTTP API 端到端（22/24 项，含跨部门拒绝）
+├─ skill_api_smoke.py            # 管理员包/锁定依赖/审核 → 员工订阅 → HTTP/Agent 工具执行 → 隔离与回收
 └─ secrets/token                 # 0600 服务令牌（不要提交）
 ```
 
@@ -64,6 +65,7 @@ uv run python deploy/sandbox-runner/runtime_restart.py    # 隔离端口、账�
 uv run python deploy/sandbox-runner/runtime_service_tamper.py # 先禁用参考 Gateway 服务
 uv run python deploy/sandbox-runner/hdb_e2e.py   # 需要 HDB 沙箱环境变量
 uv run python deploy/sandbox-runner/api_smoke.py # 需要 HDB API 已启用沙箱
+uv run python deploy/sandbox-runner/skill_api_smoke.py # 需要管理员账号、HDB/Runner 和可达的 PyPI
 ```
 
 ## 接口（`/v1`，Bearer + 对应 `X-Audience`）
@@ -72,6 +74,7 @@ uv run python deploy/sandbox-runner/api_smoke.py # 需要 HDB API 已启用沙�
 |---|---|---|
 | GET | `/health` | 健康检查 |
 | POST | `/tasks` | 提交固定 bundle（校验 bundle digest/profile/参数 schema） |
+| POST | `/skill-build` | HDB 管理员上传源包后调用；使用固定模板构建（锁定依赖时可按批准的 HTTPS 源联网），返回镜像 ID、源码 digest 和 bundle 引用 |
 | GET | `/tasks/{id}` | 观察状态/执行身份/产物清单 |
 | POST | `/tasks/{id}/cancel` | 请求取消；容器与工作区清理确认后终结为 cancelled |
 | POST | `/tasks/{id}/collect` | 返回内联产物清单（base64 + sha256 + execution_id） |
@@ -93,5 +96,19 @@ uv run python deploy/sandbox-runner/api_smoke.py # 需要 HDB API 已启用沙�
 - 新增 bundle：把固定代码放到 `bundles/<name>/`（`entrypoint.py` + `bundle.json`，
   含 `entrypoint_path`、输入 schema 与 digest 算法），重建镜像，并在 HDB 侧以
   `sha256(entrypoint.py)` 注册新 digest。
+- 管理员可在 HDB 的 Skill 页面上传 ZIP（根目录 `SKILL.md` 与 `entrypoint.py`；可附带 UTF-8 文本 Python 辅助文件）。
+  HDB 私有目录持久保存原始 ZIP 并记录 SHA-256。Runner 从已核验的 `bundle/report` 基础镜像
+  用固定模板构建；不接受 Dockerfile、运行时动态安装或由调用方指定镜像。无依赖时构建也无网络；
+  可选 `requirements.lock`（每行 `name==version --hash=sha256:<64位十六进制>`，含所有传递依赖，
+  最多 64 行）：Runner 独立核对管理员配置的 HTTPS 镜像源是否在
+  `SANDBOX_RUNNER_PIP_ALLOWED_HOSTS` 内，在构建阶段以非 root 身份、仅安装哈希锁定的 wheel
+  到固定镜像；任务执行容器仍始终 `--network none`，从不安装依赖。依赖源变更产生不同 bundle 引用。
+  构建后生成固定 image ID 与源码校验标签；管理员下载源包并审核 bundle/Skill、标记测试和启用。
+  自动生成的 bundle 清单保存在 Runner 的 `state/skill-bundles/`（可配置
+  `SANDBOX_RUNNER_SKILL_BUNDLE_ROOT`，应作为持久卷备份），不写回版本库的固定 bundle 目录。
+  执行时脚本读取 `/work/in/parameters.json`，写入 `/work/out`；容器与任务 workspace 回收，源包与镜像保留。
+  构建失败保留 HDB 草稿和源包，管理员可重试；启用后版本变更须重新上传和审核。
+  Agent 对话仅加载员工已添加且仍被授权的 Skill 工具；调用时显示任务事件，Broker 校验后的
+  小型文本产物预览返回 Agent，长任务返回任务 ID 并可使用状态工具查询。插件仍沿用 MCP 订阅与写同意。
 - **生产替换项**：升级到 L2/L3 运行时、外部产物扫描器（替换
   `scanner://builtin/basic-v1`）、工作负载身份（mTLS/短时令牌）与真实混沌/重启测试。

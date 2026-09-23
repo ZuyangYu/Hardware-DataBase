@@ -22,6 +22,8 @@ type ExecutableSkill = {
   version: string;
   bundle_ref: string;
   input_schema: Record<string, unknown>;
+  subscribed?: boolean;
+  description?: string;
 };
 type SkillTask = { task_id: string; status: string; error_code?: string };
 type SkillArtifact = { artifact_id: string; filename: string; state: string };
@@ -56,6 +58,7 @@ export type ExtensionsViewProps = {
   skillArtifacts?: SkillArtifact[];
   onSkillParametersChange?: (ref: string, value: string) => void;
   onRunSkill?: (item: ExecutableSkill) => void;
+  onToggleSkill?: (item: ExecutableSkill) => void;
   onRefreshSkillTask?: () => void;
   onDownloadSkillArtifact?: (artifact: SkillArtifact) => void;
 };
@@ -84,6 +87,7 @@ export function ExtensionsView({
   skillArtifacts = [],
   onSkillParametersChange,
   onRunSkill,
+  onToggleSkill,
   onRefreshSkillTask,
   onDownloadSkillArtifact,
 }: ExtensionsViewProps) {
@@ -283,7 +287,7 @@ export function ExtensionsView({
       <section data-sandbox-skills className="mt-[20px] rounded-[16px] bg-white p-[18px] shadow-[0_2px_10px_rgba(0,0,0,0.05)]">
         <h2 className="text-[15px] font-semibold text-[#18181a]">已审核的执行 Skill</h2>
         <p className="mt-[4px] text-[12px] text-[#858b9c]">
-          仅调用管理员绑定的固定沙箱任务；Skill 文本中的脚本、命令不会被执行。
+          添加审核通过的 Skill 后，可在临时沙箱中运行其构建镜像。
         </p>
         {skills.length === 0 ? (
           <p className="mt-[12px] text-[13px] text-[#858b9c]">暂无可用的执行 Skill。</p>
@@ -292,7 +296,12 @@ export function ExtensionsView({
             {skills.map((skill) => (
               <div key={skill.skill_ref} className="rounded-[12px] border border-[#eceef3] p-[12px]">
                 <div className="text-[13px] font-medium">{skill.skill_ref} · {skill.version}</div>
+                {skill.description && <p className="mt-[6px] whitespace-pre-wrap break-words text-[12px] text-[#464c5e]">{skill.description}</p>}
                 <div className="mt-[3px] text-[12px] text-[#858b9c]">固定任务：{skill.bundle_ref}</div>
+                <Button variant="outline" className="mt-[8px]" onClick={() => onToggleSkill?.(skill)}>
+                  {skill.subscribed ? '移除 Skill' : '添加 Skill'}
+                </Button>
+                {skill.subscribed && <Badge className="ml-[8px]">已添加</Badge>}
                 <details className="mt-[8px] text-[12px] text-[#464c5e]">
                   <summary>查看参数格式</summary>
                   <pre className="mt-[6px] max-h-[180px] overflow-auto whitespace-pre-wrap break-all">{JSON.stringify(skill.input_schema, null, 2)}</pre>
@@ -306,8 +315,8 @@ export function ExtensionsView({
                     onChange={(event) => onSkillParametersChange?.(skill.skill_ref, event.target.value)}
                   />
                 </label>
-                <Button className="mt-[8px]" disabled={skillBusy !== null || !onRunSkill} onClick={() => onRunSkill?.(skill)}>
-                  在沙箱中运行固定任务
+                <Button className="mt-[8px]" disabled={skillBusy !== null || !skill.subscribed || !onRunSkill} onClick={() => onRunSkill?.(skill)}>
+                  在沙箱中运行
                 </Button>
               </div>
             ))}
@@ -475,6 +484,14 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
       skillTask={skillTask}
       skillArtifacts={skillArtifacts}
       onSkillParametersChange={(ref, value) => setSkillParameters((previous) => ({ ...previous, [ref]: value }))}
+      onToggleSkill={(skill) => {
+        setSkillBusy(skill.skill_ref);
+        const path = `/api/v1/sandbox/skills/${encodeURIComponent(skill.skill_ref)}/subscribe`;
+        const action = skill.subscribed ? api.delete(path) : api.post(path, {});
+        void action.then(() => { notify.success(skill.subscribed ? '已移除 Skill' : '已添加 Skill'); void load(); })
+          .catch((error) => notify.error(error instanceof Error ? error.message : 'Skill 操作失败'))
+          .finally(() => setSkillBusy(null));
+      }}
       onRunSkill={(skill) => {
         let parameters: Record<string, unknown>;
         try {

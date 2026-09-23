@@ -7,6 +7,7 @@ when the remote service is unavailable.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -153,6 +154,7 @@ class SandboxServiceClient:
         *,
         envelope: RequestEnvelope | None = None,
         payload: Mapping[str, Any] | None = None,
+        timeout: float | httpx.Timeout | None = None,
     ) -> dict[str, Any]:
         base = self._base(service)
         prefix = self.runner_prefix if service == "runner" else self.gateway_prefix
@@ -164,6 +166,7 @@ class SandboxServiceClient:
                 url,
                 headers=self._headers(envelope, service=service),
                 json=dict(payload or {}),
+                timeout=timeout or self.timeout,
             )
         except httpx.TimeoutException as exc:
             request_id = envelope.request_id if envelope else ""
@@ -283,6 +286,42 @@ class SandboxServiceClient:
 
     def collect(self, task_id: str, *, envelope: RequestEnvelope | None = None) -> dict[str, Any]:
         return self._request("runner", "POST", f"/tasks/{_path_part(task_id)}/collect", envelope=envelope)
+
+    def skill_build(
+        self,
+        *,
+        skill_ref: str,
+        package_digest: str,
+        package_bytes: bytes,
+        base_bundle_ref: str,
+        profile_ref: str,
+        runtime_policy_ref: str = "",
+        runtime_policy_digest: str = "",
+        input_schema: Mapping[str, Any] | None = None,
+        output_schema: Mapping[str, Any] | None = None,
+        required_capabilities: Any = ("sandbox.execute", "sandbox.write_artifact"),
+        dependency_index_url: str = "",
+        envelope: RequestEnvelope,
+    ) -> dict[str, Any]:
+        """Build an uploaded Skill through the Runner's fixed build template."""
+        if len(package_bytes) > 8 * 1024 * 1024:
+            raise SandboxPolicyError("Skill package is too large")
+        return self._request(
+            "runner", "POST", "/skill-build", envelope=envelope, timeout=httpx.Timeout(660.0),
+            payload={
+                "skill_ref": _path_part(skill_ref),
+                "package_digest": str(package_digest).lower().removeprefix("sha256:"),
+                "package_base64": base64.b64encode(package_bytes).decode("ascii"),
+                "base_bundle_ref": _path_part(base_bundle_ref),
+                "profile_ref": _path_part(profile_ref),
+                "runtime_policy_ref": str(runtime_policy_ref or ""),
+                "runtime_policy_digest": str(runtime_policy_digest or ""),
+                "input_schema": dict(input_schema or {}),
+                "output_schema": dict(output_schema or {}),
+                "required_capabilities": list(required_capabilities or ()),
+                "dependency_index_url": str(dependency_index_url or ""),
+            },
+        )
 
     def reconcile(self, task_id: str = "", *, envelope: RequestEnvelope | None = None) -> dict[str, Any]:
         suffix = f"/{_path_part(task_id)}" if task_id else ""

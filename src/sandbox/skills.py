@@ -84,10 +84,22 @@ CREATE TABLE IF NOT EXISTS sandbox_skills (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     execution_bundle_ref TEXT NOT NULL DEFAULT '',
     execution_bundle_digest TEXT NOT NULL DEFAULT '',
-    execution_profile_ref TEXT NOT NULL DEFAULT ''
+    execution_profile_ref TEXT NOT NULL DEFAULT '',
+    package_storage_ref TEXT NOT NULL DEFAULT '',
+    package_archive_digest TEXT NOT NULL DEFAULT '',
+    package_files_json TEXT NOT NULL DEFAULT '[]',
+    package_review_flags_json TEXT NOT NULL DEFAULT '[]',
+    package_build_state TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_sandbox_skills_state
     ON sandbox_skills(approval_state, updated_at);
+CREATE TABLE IF NOT EXISTS sandbox_skill_subscriptions (
+    skill_ref TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    skill_identity TEXT NOT NULL DEFAULT '',
+    subscribed_at TEXT NOT NULL,
+    PRIMARY KEY(skill_ref, principal_id)
+);
 """
 
 
@@ -201,6 +213,11 @@ class SkillRecord:
     execution_bundle_ref: str = ""
     execution_bundle_digest: str = ""
     execution_profile_ref: str = ""
+    package_storage_ref: str = ""
+    package_archive_digest: str = ""
+    package_files: tuple[str, ...] = ()
+    package_review_flags: tuple[str, ...] = ()
+    package_build_state: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -230,12 +247,17 @@ class SkillRecord:
             "updated_at": self.updated_at,
             "metadata": dict(self.metadata),
             "execution_capabilities": [],
-            "execution_allowed": False,
-            "prompt_data_only": True,
+            "execution_allowed": self.enabled and bool(self.execution_bundle_ref),
+            "prompt_data_only": not bool(self.package_archive_digest),
             "bundle_invocation_available": self.enabled and bool(self.execution_bundle_ref),
             "execution_bundle_ref": self.execution_bundle_ref,
             "execution_bundle_digest": self.execution_bundle_digest,
             "execution_profile_ref": self.execution_profile_ref,
+            "package_storage_ref": self.package_storage_ref,
+            "package_archive_digest": self.package_archive_digest,
+            "package_files": list(self.package_files),
+            "package_review_flags": list(self.package_review_flags),
+            "package_build_state": self.package_build_state,
         }
 
 
@@ -251,9 +273,21 @@ class SkillCatalog:
         with self._init_lock, closing(self._connect()) as conn:
             conn.executescript(_DDL)
             columns = {row[1] for row in conn.execute("PRAGMA table_info(sandbox_skills)")}
-            for column in ("execution_bundle_ref", "execution_bundle_digest", "execution_profile_ref"):
+            for column, ddl in (
+                ("execution_bundle_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("execution_bundle_digest", "TEXT NOT NULL DEFAULT ''"),
+                ("execution_profile_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("package_storage_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("package_archive_digest", "TEXT NOT NULL DEFAULT ''"),
+                ("package_files_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("package_review_flags_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("package_build_state", "TEXT NOT NULL DEFAULT ''"),
+            ):
                 if column not in columns:
-                    conn.execute(f"ALTER TABLE sandbox_skills ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+                    conn.execute(f"ALTER TABLE sandbox_skills ADD COLUMN {column} {ddl}")
+            subscription_columns = {row[1] for row in conn.execute("PRAGMA table_info(sandbox_skill_subscriptions)")}
+            if "skill_identity" not in subscription_columns:
+                conn.execute("ALTER TABLE sandbox_skill_subscriptions ADD COLUMN skill_identity TEXT NOT NULL DEFAULT ''")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None, check_same_thread=False)
@@ -273,6 +307,12 @@ class SkillCatalog:
             metadata = dict(json.loads(str(row["metadata_json"] or "{}")) or {})
         except (TypeError, ValueError, json.JSONDecodeError):
             metadata = {}
+        def _tuple_json(column: str) -> tuple[str, ...]:
+            try:
+                value = json.loads(str(row[column] or "[]"))
+                return tuple(str(item) for item in value) if isinstance(value, list) else ()
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return ()
         return SkillRecord(
             skill_ref=str(row["skill_ref"]),
             version=str(row["version"]),
@@ -292,6 +332,11 @@ class SkillCatalog:
             execution_bundle_ref=str(row["execution_bundle_ref"] or ""),
             execution_bundle_digest=str(row["execution_bundle_digest"] or ""),
             execution_profile_ref=str(row["execution_profile_ref"] or ""),
+            package_storage_ref=str(row["package_storage_ref"] or ""),
+            package_archive_digest=str(row["package_archive_digest"] or ""),
+            package_files=_tuple_json("package_files_json"),
+            package_review_flags=_tuple_json("package_review_flags_json"),
+            package_build_state=str(row["package_build_state"] or ""),
         )
 
     def _row(self, skill_ref: str) -> sqlite3.Row | None:
@@ -319,6 +364,42 @@ class SkillCatalog:
             rows = conn.execute(f"SELECT * FROM sandbox_skills{where} ORDER BY updated_at DESC").fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def is_subscribed(self, skill_ref: str, principal_id: str | int) -> bool:
+        item = self.get(skill_ref)
+        if item is None:
+            return False
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM sandbox_skill_subscriptions WHERE skill_ref = ? AND principal_id = ? "
+                "AND skill_identity = ?",
+                (item.skill_ref, str(principal_id), self._subscription_identity(item)),
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _subscription_identity(item: SkillRecord) -> str:
+        fields = (item.version, item.content_digest, item.package_archive_digest,
+                  item.execution_bundle_ref, item.execution_bundle_digest)
+        return hashlib.sha256(_json(fields).encode("utf-8")).hexdigest()
+
+    def subscribe(self, skill_ref: str, *, principal_id: str | int, department_id: str | int) -> None:
+        self.execution_bundle(skill_ref, principal_id=principal_id, department_id=department_id)
+        item = self.require(skill_ref)
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "INSERT INTO sandbox_skill_subscriptions(skill_ref, principal_id, skill_identity, subscribed_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(skill_ref, principal_id) DO UPDATE SET "
+                "skill_identity = excluded.skill_identity, subscribed_at = excluded.subscribed_at",
+                (item.skill_ref, str(principal_id), self._subscription_identity(item), _now()),
+            )
+
+    def unsubscribe(self, skill_ref: str, *, principal_id: str | int) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "DELETE FROM sandbox_skill_subscriptions WHERE skill_ref = ? AND principal_id = ?",
+                (str(skill_ref), str(principal_id)),
+            )
+
     def content(self, skill_ref: str, *, require_enabled: bool = True) -> str:
         item = self.require(skill_ref)
         if require_enabled and (not item.enabled or not bool(getattr(settings, "SKILLS_ENABLED", False))):
@@ -344,6 +425,11 @@ class SkillCatalog:
         department_id: str | int = "",
         actor: str = "",
         metadata: Mapping[str, Any] | None = None,
+        package_storage_ref: str = "",
+        package_archive_digest: str = "",
+        package_files: tuple[str, ...] = (),
+        package_review_flags: tuple[str, ...] = (),
+        package_build_state: str = "",
     ) -> SkillRecord:
         ref = _ref(skill_ref, "skill_ref")
         version_value = _ref(version, "version", version=True)
@@ -369,6 +455,7 @@ class SkillCatalog:
                         or old_item.catalog_source != str(catalog_source or "curated")[:50]
                         or old_item.owner_id != str(owner_id or "")[:128]
                         or old_item.department_id != str(department_id or "")[:128]
+                        or old_item.package_archive_digest != str(package_archive_digest or "")[:128]
                         or _json(dict(old_item.metadata)) != _json(safe_metadata)
                     )
                 )
@@ -382,8 +469,10 @@ class SkillCatalog:
                         approval_state, content, content_bytes, review_flags_json,
                         owner_id, department_id, created_by, updated_by, created_at,
                         updated_at, metadata_json, execution_bundle_ref,
-                        execution_bundle_digest, execution_profile_ref
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        execution_bundle_digest, execution_profile_ref,
+                        package_storage_ref, package_archive_digest, package_files_json,
+                        package_review_flags_json, package_build_state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(skill_ref) DO UPDATE SET
                         version = excluded.version,
                         content_digest = excluded.content_digest,
@@ -401,6 +490,11 @@ class SkillCatalog:
                         execution_bundle_ref = excluded.execution_bundle_ref,
                         execution_bundle_digest = excluded.execution_bundle_digest,
                         execution_profile_ref = excluded.execution_profile_ref
+                        , package_storage_ref = excluded.package_storage_ref
+                        , package_archive_digest = excluded.package_archive_digest
+                        , package_files_json = excluded.package_files_json
+                        , package_review_flags_json = excluded.package_review_flags_json
+                        , package_build_state = excluded.package_build_state
                     """,
                     (
                         ref,
@@ -422,6 +516,11 @@ class SkillCatalog:
                         old_item.execution_bundle_ref if old_item and not changed else "",
                         old_item.execution_bundle_digest if old_item and not changed else "",
                         old_item.execution_profile_ref if old_item and not changed else "",
+                        package_storage_ref[:512] if not (old_item and not changed) else old_item.package_storage_ref,
+                        package_archive_digest[:128] if not (old_item and not changed) else old_item.package_archive_digest,
+                        _json(list(package_files)) if not (old_item and not changed) else _json(list(old_item.package_files)),
+                        _json(list(package_review_flags)) if not (old_item and not changed) else _json(list(old_item.package_review_flags)),
+                        str(package_build_state or "")[:40] if not (old_item and not changed) else old_item.package_build_state,
                     ),
                 )
                 row = conn.execute("SELECT * FROM sandbox_skills WHERE skill_ref = ?", (ref,)).fetchone()
@@ -433,7 +532,7 @@ class SkillCatalog:
 
     def bind_execution(
         self, skill_ref: str, *, bundle_ref: str, bundle_digest: str,
-        profile_ref: str, actor: str = "",
+        profile_ref: str, actor: str = "", require_enabled: bool = True,
     ) -> SkillRecord:
         """Bind a draft text Skill to an independently reviewed, fixed bundle.
 
@@ -448,7 +547,8 @@ class SkillCatalog:
             raise SkillCatalogError("bundle_digest is not a SHA-256 digest")
         bundle = SandboxCatalog(self.db_path).require(bundle_name)
         if (
-            not bundle.enabled or bundle.bundle_digest.lower().removeprefix("sha256:") != digest
+            (require_enabled and not bundle.enabled)
+            or bundle.bundle_digest.lower().removeprefix("sha256:") != digest
             or bundle.profile_ref != profile or bundle.network_policy_ref
             or bundle.catalog_source != "curated"
             or not set(bundle.required_capabilities).issubset({"sandbox.execute", "sandbox.write_artifact"})
@@ -476,6 +576,21 @@ class SkillCatalog:
                 conn.execute("ROLLBACK")
                 raise
         return self.require(ref)
+
+    def mark_package_built(self, skill_ref: str, *, archive_digest: str, actor: str = "") -> SkillRecord:
+        item = self.require(skill_ref)
+        if (item.approval_state != "draft" or item.package_archive_digest != archive_digest
+                or not item.package_storage_ref):
+            raise SkillStateConflict("Skill source changed before build completed")
+        with closing(self._connect()) as conn:
+            result = conn.execute(
+                "UPDATE sandbox_skills SET package_build_state = 'built', updated_by = ?, updated_at = ? "
+                "WHERE skill_ref = ? AND package_archive_digest = ? AND approval_state = 'draft'",
+                (str(actor or "")[:128], _now(), item.skill_ref, archive_digest),
+            )
+            if result.rowcount != 1:
+                raise SkillStateConflict("Skill source changed before build completed")
+        return self.require(item.skill_ref)
 
     def execution_bundle(
         self, skill_ref: str, *, principal_id: str | int = "",
@@ -511,6 +626,10 @@ class SkillCatalog:
             return item
         if state not in _STATE_TRANSITIONS.get(item.approval_state, frozenset()):
             raise SkillStateConflict(f"cannot transition Skill {item.approval_state} -> {state}")
+        if state == "reviewed" and item.package_archive_digest and (
+            item.package_build_state != "built" or not item.execution_bundle_ref
+        ):
+            raise SkillStateConflict("uploaded Skill must have a built bundle before review")
         if state == "enabled" and not bool(getattr(settings, "SKILLS_ENABLED", False)):
             raise SkillStateConflict("SKILLS_ENABLED is false")
         if state == "enabled" and item.execution_bundle_ref:

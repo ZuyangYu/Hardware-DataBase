@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -37,9 +39,11 @@ import subprocess
 import threading
 import time
 import uuid
+import zipfile
 from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 
@@ -60,6 +64,9 @@ BUNDLE_ROOT = os.getenv(
 STATE_DIR = os.getenv(
     "SANDBOX_RUNNER_STATE_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "state"),
+)
+GENERATED_BUNDLE_ROOT = os.getenv(
+    "SANDBOX_RUNNER_SKILL_BUNDLE_ROOT", os.path.join(STATE_DIR, "skill-bundles")
 )
 WORKSPACE_ROOT = os.getenv(
     "SANDBOX_RUNNER_WORKSPACE_ROOT", "/tmp/hdb-sandbox-runner"
@@ -83,6 +90,10 @@ _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _TASK_ID_RE = re.compile(r"^task-[A-Za-z0-9_-]{16,64}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_LOCK_LINE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}==[A-Za-z0-9][A-Za-z0-9_.!+-]{0,99}"
+    r"(?:[ \t]+--hash=sha256:[0-9a-fA-F]{64}){1,4}$"
+)
 _ARTIFACT_ID_RE = re.compile(r"^art-[A-Za-z0-9_-]{16,64}$")
 _MEDIA_TYPES = {
     "txt": "text/plain",
@@ -94,6 +105,7 @@ _MEDIA_TYPES = {
 }
 
 _lock = threading.Lock()
+_build_lock = threading.Lock()
 _processes: dict[str, subprocess.Popen[bytes]] = {}
 _active_executions: set[str] = set()
 
@@ -227,7 +239,7 @@ def _authenticate(authorization: str, audience: str, *, expected: str = "sandbox
 
 
 def _load_bundle(bundle_ref: str) -> dict[str, Any]:
-    root = os.path.abspath(BUNDLE_ROOT)
+    root = os.path.abspath(GENERATED_BUNDLE_ROOT if bundle_ref.startswith("bundle/skill-") else BUNDLE_ROOT)
     # Directory convention: the last path segment of the reference names the
     # reviewed bundle directory (e.g. ``bundle/report`` -> ``bundles/report``).
     directory = _SAFE_NAME_RE.sub("_", bundle_ref.rsplit("/", 1)[-1])[:64]
@@ -263,6 +275,254 @@ def _load_bundle(bundle_ref: str) -> dict[str, Any]:
         "entrypoint_path": entrypoint_path,
         "image_digest": image_digest,
     }
+
+
+def _validate_skill_archive(raw: bytes, expected_digest: str) -> tuple[dict[str, bytes], str]:
+    """Validate an admin package without executing or importing its contents."""
+    if len(raw) > 8 * 1024 * 1024:
+        raise _safe_error("package_too_large", "Skill package exceeds the archive size limit")
+    digest = _sha256(raw)
+    if digest != str(expected_digest or "").lower().removeprefix("sha256:"):
+        raise _safe_error("package_digest_mismatch", "Skill package digest does not match the reviewed source")
+    files: dict[str, bytes] = {}
+    total = 0
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise _safe_error("package_invalid", "Skill package is not a valid ZIP archive") from exc
+    try:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            name = str(info.filename).replace("\\", "/")
+            parts = name.split("/")
+            if (
+                not name or name.startswith("/") or any(part in {"", ".", ".."} for part in parts)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,200}", name)
+                or name.lower().split("/")[-1] in {"dockerfile", ".env", "setup.py", "pyproject.toml", "package.json"}
+            ):
+                raise _safe_error("package_path_invalid", "Skill package contains a forbidden path")
+            if len(files) >= 128 or info.file_size > 4 * 1024 * 1024:
+                raise _safe_error("package_limits", "Skill package file limits were exceeded")
+            if name in files or ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                raise _safe_error("package_path_invalid", "Skill package contains a duplicate or symlink")
+            suffix = os.path.splitext(name)[1].lower()
+            if suffix not in {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".lock"}:
+                raise _safe_error("package_file_type", "Skill package file type is not allowed")
+            content = archive.read(info)
+            total += len(content)
+            if total > 16 * 1024 * 1024:
+                raise _safe_error("package_limits", "Skill package unpacked size is too large")
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise _safe_error("package_encoding", "Skill package files must be UTF-8 text") from exc
+            files[name] = content
+    finally:
+        archive.close()
+    if "SKILL.md" not in files or "entrypoint.py" not in files:
+        raise _safe_error("package_contract", "Skill package must contain SKILL.md and entrypoint.py")
+    return files, digest
+
+
+def _skill_bundle_ref(skill_ref: str, package_digest: str, source_digest: str = "") -> str:
+    safe = _SAFE_NAME_RE.sub("-", skill_ref).strip("-")[:16 if source_digest else 25] or "skill"
+    identity = _sha256(skill_ref.encode("utf-8"))[:12]
+    suffix = f"-{source_digest[:8]}" if source_digest else ""
+    return f"bundle/skill-{safe}-{identity}-{package_digest[:12]}{suffix}"
+
+
+def _skill_dependency_index(value: Any, lock: bytes) -> str:
+    lines = [line.strip() for line in lock.decode("utf-8").splitlines() if line.strip()]
+    if len(lock) > 128 * 1024 or len(lines) > 64 or any(not _LOCK_LINE_RE.fullmatch(line) for line in lines):
+        raise _safe_error("dependency_lock_invalid", "dependencies require pinned wheel versions and SHA-256 hashes")
+    raw = str(value or "").strip()
+    if not lines:
+        if raw:
+            raise _safe_error("dependency_index_unexpected", "a dependency index requires a locked dependency list")
+        return ""
+    if not raw or len(raw) > 512 or any(ord(ch) < 33 or ord(ch) > 126 for ch in raw):
+        raise _safe_error("dependency_index_invalid", "approved dependency index is required")
+    parsed = urlsplit(raw)
+    allowed = {host.strip().lower() for host in os.getenv("SANDBOX_RUNNER_PIP_ALLOWED_HOSTS", "pypi.org").split(",")}
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.hostname.lower() not in allowed
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or not re.fullmatch(r"/[A-Za-z0-9._~/-]*", parsed.path)
+            or ".." in parsed.path or "//" in parsed.path):
+        raise _safe_error("dependency_index_invalid", "dependency index host is not approved by the Runner")
+    try:
+        if parsed.port not in (None, 443):
+            raise ValueError("non-default port")
+    except ValueError as exc:
+        raise _safe_error("dependency_index_invalid", "dependency index port is invalid") from exc
+    return raw.rstrip("/") + "/"
+
+
+def _skill_build_base_allowed(image_digest: str) -> None:
+    """Only use a locally reviewed base image; never pull arbitrary images."""
+    allowed: set[str] = set()
+    try:
+        for name in ("report", "slow"):
+            with open(os.path.join(BUNDLE_ROOT, name, "bundle.json"), encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            value = str(manifest.get("image_digest") or "")
+            if _IMAGE_DIGEST_RE.fullmatch(value):
+                allowed.add(value)
+    except (OSError, ValueError, TypeError):
+        pass
+    if image_digest not in allowed:
+        raise _safe_error("build_base_unapproved", "Skill build base image is not locally reviewed", status=409)
+
+
+def _build_skill_bundle(body: Mapping[str, Any]) -> dict[str, Any]:
+    skill_ref = _require_ref(body.get("skill_ref"), "skill_ref")
+    package_digest = str(body.get("package_digest") or "").lower().removeprefix("sha256:")
+    if not _DIGEST_RE.fullmatch(package_digest):
+        raise _safe_error("invalid_digest", "package_digest must be a SHA-256 digest")
+    base_bundle_ref = _require_ref(body.get("base_bundle_ref"), "base_bundle_ref")
+    base_bundle = _load_bundle(base_bundle_ref)
+    image_digest = _reviewed_digest(base_bundle.get("image_digest"), "base image_digest")
+    profile_ref = _require_ref(body.get("profile_ref"), "profile_ref")
+    if profile_ref != "profile/dev-l1":
+        raise _safe_error("profile_invalid", "Skill build is limited to the reviewed dev-l1 profile", status=409)
+    if base_bundle_ref != "bundle/report" or base_bundle["profile_ref"] != profile_ref:
+        raise _safe_error("build_base_unapproved", "Skill build base must be the reviewed Python bundle", status=409)
+    _skill_build_base_allowed(image_digest)
+    base_tag = "hdb-sandbox-bundle:1.0"
+    tagged = subprocess.run(
+        ["docker", "image", "inspect", base_tag, "--format", "{{.Id}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if tagged.returncode or tagged.stdout.strip() != image_digest:
+        raise _safe_error("build_base_unapproved", "Skill build base tag does not match the reviewed image", status=409)
+    raw = base64.b64decode(str(body.get("package_base64") or ""), validate=True)
+    files, _ = _validate_skill_archive(raw, package_digest)
+    dependency_index = _skill_dependency_index(body.get("dependency_index_url"), files.get("requirements.lock", b""))
+    source_digest = _sha256(dependency_index.encode("utf-8")) if dependency_index else ""
+    bundle_ref = _skill_bundle_ref(skill_ref, package_digest, source_digest)
+    directory = _SAFE_NAME_RE.sub("_", bundle_ref.rsplit("/", 1)[-1])[:64]
+    root = os.path.abspath(GENERATED_BUNDLE_ROOT)
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    bundle_dir = os.path.abspath(os.path.join(root, directory))
+    if not bundle_dir.startswith(root + os.sep):
+        raise _safe_error("invalid_reference", "Skill bundle path is invalid")
+    if os.path.exists(bundle_dir):
+        bundle = _load_bundle(bundle_ref)
+        if bundle["digest"] != _sha256(files["entrypoint.py"]):
+            raise _safe_error("bundle_conflict", "Existing Skill bundle has different source", status=409)
+        with open(os.path.join(bundle_dir, "bundle.json"), encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if (existing.get("package_digest") != package_digest
+                or existing.get("dependency_index_digest", "") != source_digest
+                or existing.get("input_schema") != dict(body.get("input_schema") or {})
+                or existing.get("capabilities") != list(body.get("required_capabilities") or ["sandbox.execute"])):
+            raise _safe_error("bundle_conflict", "Existing Skill bundle has different package identity", status=409)
+        return {"bundle_ref": bundle_ref, "bundle_digest": bundle["digest"],
+                "image_digest": bundle["image_digest"], "profile_ref": profile_ref,
+                "package_digest": package_digest}
+    build_dir = os.path.join(WORKSPACE_ROOT, f"build-{directory}-{uuid.uuid4().hex[:8]}")
+    os.makedirs(build_dir, mode=0o700, exist_ok=True)
+    try:
+        for name, content in files.items():
+            target = os.path.abspath(os.path.join(build_dir, name))
+            if not target.startswith(os.path.abspath(build_dir) + os.sep):
+                raise _safe_error("package_path_invalid", "Skill package path escaped build context")
+            os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(content)
+            os.chmod(target, 0o600)
+        entrypoint_digest = _sha256(files["entrypoint.py"])
+        image_root = f"/opt/bundle/{directory}"
+        copy_lines = []
+        for name in sorted(files):
+            # BuildKit applies --chmod to newly created parent directories as
+            # well, so they must remain traversable by the non-root task UID.
+            copy_lines.append(f"COPY --chmod=0555 {name} {image_root}/{name}")
+        install_stage = ""
+        dependency_copy = ""
+        if dependency_index:
+            pip_args = [
+                "/usr/local/bin/python3", "-m", "pip", "--isolated", "install", "--no-cache-dir",
+                "--only-binary=:all:", "--require-hashes", "--no-deps",
+                "--target", "/opt/skill-build/packages", "--index-url", dependency_index,
+                "-r", "/opt/skill-build/requirements.lock",
+            ]
+            install_stage = (
+                f"FROM {base_tag} AS skill_deps\n"
+                "COPY --chmod=0777 requirements.lock /opt/skill-build/requirements.lock\n"
+                "ENV PIP_DISABLE_PIP_VERSION_CHECK=1 TMPDIR=/opt/skill-build\n"
+                f"RUN {json.dumps(pip_args, separators=(',', ':'))}\n"
+            )
+            dependency_copy = (
+                "COPY --from=skill_deps --chmod=0555 /opt/skill-build/packages/ /opt/skill-deps/\n"
+                "ENV PYTHONPATH=/opt/skill-deps\n"
+            )
+        dockerfile = (
+            install_stage + f"FROM {base_tag}\n"
+            f"LABEL org.hdb.bundle.{directory}.sha256=\"{entrypoint_digest}\"\n"
+            + dependency_copy
+            + "\n".join(copy_lines)
+            + "\nUSER 65534:65534\nWORKDIR /work\nENTRYPOINT [\"/usr/local/bin/python3\"]\n"
+        )
+        with open(os.path.join(build_dir, "Dockerfile"), "w", encoding="utf-8") as handle:
+            handle.write(dockerfile)
+        tag = f"hdb-skill-build:{directory}-{package_digest[:12]}"
+        built = subprocess.run(
+            ["docker", "build", "--pull=false", "--network", "default" if dependency_index else "none",
+             "--tag", tag, build_dir],
+            capture_output=True, text=True, timeout=600 if dependency_index else 300,
+        )
+        if built.returncode:
+            raise _safe_error("skill_build_failed", "fixed Skill image build failed", status=502)
+        tagged = subprocess.run(
+            ["docker", "image", "inspect", base_tag, "--format", "{{.Id}}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if tagged.returncode or tagged.stdout.strip() != image_digest:
+            raise _safe_error("build_base_unapproved", "Skill build base changed during build", status=409)
+        inspected = subprocess.run(
+            ["docker", "image", "inspect", tag, "--format", "{{.Id}}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        built_image = inspected.stdout.strip()
+        if inspected.returncode or not _IMAGE_DIGEST_RE.fullmatch(built_image):
+            raise _safe_error("skill_build_unverified", "built Skill image identity could not be verified", status=503)
+        manifest = {
+            "bundle_ref": bundle_ref,
+            "profile_ref": profile_ref,
+            "profile_digest": _profile_digest(),
+            "image_digest": built_image,
+            "entrypoint_digest": entrypoint_digest,
+            "package_digest": package_digest,
+            "dependency_index_digest": source_digest,
+            "description": f"Administrator-built Skill bundle: {skill_ref}",
+            "digest_algorithm": "sha256(entrypoint.py)",
+            "input_schema": dict(body.get("input_schema") or {}),
+            "outputs": ["output artifacts"],
+            "capabilities": list(body.get("required_capabilities") or ["sandbox.execute"]),
+            "entrypoint_path": f"{image_root}/entrypoint.py",
+        }
+        # Publish atomically: task admission never sees a partial manifest.
+        staged = os.path.join(root, f".{directory}.staging-{uuid.uuid4().hex}")
+        os.makedirs(staged, mode=0o700)
+        try:
+            with open(os.path.join(staged, "entrypoint.py"), "xb") as handle:
+                handle.write(files["entrypoint.py"])
+            with open(os.path.join(staged, "bundle.json"), "x", encoding="utf-8") as handle:
+                json.dump(manifest, handle, ensure_ascii=False, sort_keys=True, indent=2)
+            os.rename(staged, bundle_dir)
+        finally:
+            shutil.rmtree(staged, ignore_errors=True)
+        return {"bundle_ref": bundle_ref, "bundle_digest": entrypoint_digest,
+                "image_digest": built_image, "profile_ref": profile_ref,
+                "package_digest": package_digest}
+    finally:
+        shutil.rmtree(build_dir, ignore_errors=True)
+
+
+def _serialized_skill_build(body: Mapping[str, Any]) -> dict[str, Any]:
+    with _build_lock:
+        return _build_skill_bundle(body)
 
 
 def _validate_parameters(parameters: Mapping[str, Any], schema: Mapping[str, Any]) -> None:
@@ -1064,6 +1324,33 @@ async def submit_task(
     finished = _get_task(requested_id)
     assert finished is not None
     return {"task_id": finished["task_id"], **_observation(finished)}
+
+
+@app.post("/v1/skill-build")
+async def build_skill(
+    request: Request,
+    authorization: str = Header(default=""),
+    x_audience: str = Header(default=""),
+) -> dict[str, Any]:
+    """Build an admin-uploaded Skill using only the Runner's fixed template."""
+    _authenticate(authorization, x_audience)
+    chunks: list[bytes] = []
+    length = 0
+    async for chunk in request.stream():
+        length += len(chunk)
+        if length > 12 * 1024 * 1024:
+            raise _safe_error("package_too_large", "Skill build request exceeds the size limit", status=413)
+        chunks.append(chunk)
+    try:
+        body = json.loads(b"".join(chunks))
+    except (ValueError, UnicodeError) as exc:
+        raise _safe_error("invalid_request", "request body must be JSON") from exc
+    if not isinstance(body, Mapping):
+        raise _safe_error("invalid_request", "request body must be an object")
+    try:
+        return await asyncio.to_thread(_serialized_skill_build, body)
+    except (binascii.Error, ValueError) as exc:
+        raise _safe_error("package_invalid", "Skill build request is invalid") from exc
 
 
 @app.get("/v1/tasks/{task_id}")

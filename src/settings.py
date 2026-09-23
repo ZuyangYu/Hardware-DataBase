@@ -452,6 +452,10 @@ SANDBOX_TASK_DB_PATH = _resolve_storage_path(
 SANDBOX_ARTIFACT_STORAGE_DIR = _resolve_storage_path(
     os.getenv("SANDBOX_ARTIFACT_STORAGE_DIR"), "sandbox_artifacts"
 )
+SANDBOX_SKILL_STORAGE_DIR = _resolve_storage_path(
+    os.getenv("SANDBOX_SKILL_STORAGE_DIR"), "sandbox_skills"
+)
+SANDBOX_SKILL_PIP_ALLOWED_HOSTS = os.getenv("SANDBOX_SKILL_PIP_ALLOWED_HOSTS", "pypi.org")
 SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
     "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS", "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro"
 )
@@ -1092,6 +1096,8 @@ def reload_settings():
     global SANDBOX_RUNTIME_PROFILE_DIGEST, SANDBOX_ARTIFACT_SCANNER_REF
     global SANDBOX_DISPATCH_INTERVAL_SECONDS, SANDBOX_RECONCILE_INTERVAL_SECONDS
     global SANDBOX_TASK_DB_PATH, SANDBOX_ARTIFACT_STORAGE_DIR
+    global SANDBOX_SKILL_STORAGE_DIR
+    global SANDBOX_SKILL_PIP_ALLOWED_HOSTS
     global SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS
     global SKILLS_ENABLED
     global SHARED_RETRIEVAL_EXECUTOR_ENABLED, RETRIEVAL_EXECUTOR_MAX_WORKERS
@@ -1378,6 +1384,10 @@ def reload_settings():
     SANDBOX_ARTIFACT_STORAGE_DIR = _resolve_storage_path(
         os.getenv("SANDBOX_ARTIFACT_STORAGE_DIR"), "sandbox_artifacts"
     )
+    SANDBOX_SKILL_STORAGE_DIR = _resolve_storage_path(
+        os.getenv("SANDBOX_SKILL_STORAGE_DIR"), "sandbox_skills"
+    )
+    SANDBOX_SKILL_PIP_ALLOWED_HOSTS = os.getenv("SANDBOX_SKILL_PIP_ALLOWED_HOSTS", "pypi.org")
     SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
         "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS",
         "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro",

@@ -37,6 +37,9 @@ from src.api.schemas import (
     SandboxGatewayResponse,
     SandboxSkillListResponse,
     SandboxSkillRegisterRequest,
+    SandboxSkillPackageUploadRequest,
+    SandboxSkillBuildRequest,
+    SandboxSkillPipSourceRequest,
     SandboxSkillExecutionBindingRequest,
     SandboxSkillRunRequest,
     SandboxSkillResponse,
@@ -77,16 +80,19 @@ from src.agents.mcp.gateway import (
     GatewayRegistry,
     GatewayStateError,
 )
-from src.sandbox.protocol import RequestEnvelope
+from src.sandbox.protocol import RequestEnvelope, SandboxProtocolError
 from src.sandbox.policy import SandboxPolicyError, require_execution_enabled
 from src.sandbox.service import SandboxExecutionAdapter, SandboxExecutionError
 from src.sandbox.reconciler import SandboxReconciler
 from src.sandbox.skills import (
     SkillCatalog,
     SkillCatalogError,
+    SkillNotAuthorized,
     SkillNotFound,
     SkillStateConflict,
 )
+from src.sandbox.skill_packages import SkillPackageError, SkillPackageStore, validate_skill_package
+from src.sandbox.pip_sources import SkillPipSourceStore, SkillPipSourceError
 from src.sandbox.task_store import (
     IdempotencyConflict,
     InvalidTransition,
@@ -132,6 +138,14 @@ def get_sandbox_artifact_broker() -> ArtifactBroker:
 
 def get_skill_catalog() -> SkillCatalog:
     return SkillCatalog()
+
+
+def get_skill_package_store() -> SkillPackageStore:
+    return SkillPackageStore()
+
+
+def get_skill_pip_source_store() -> SkillPipSourceStore:
+    return SkillPipSourceStore()
 
 
 def get_sandbox_service_client() -> SandboxServiceClient | None:
@@ -287,12 +301,166 @@ def register_skill(
     return SandboxSkillResponse(skill=skill.to_dict())
 
 
+@router.post("/skills/packages", response_model=SandboxSkillResponse)
+def upload_skill_package(
+    body: SandboxSkillPackageUploadRequest,
+    actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+    packages: SkillPackageStore = Depends(get_skill_package_store),
+    pip_sources: SkillPipSourceStore = Depends(get_skill_pip_source_store),
+    bundles: SandboxCatalog = Depends(get_sandbox_catalog),
+    client: SandboxServiceClient | None = Depends(get_sandbox_service_client),
+):
+    try:
+        raw = base64.b64decode(body.package_base64, validate=True)
+        package = validate_skill_package(raw)
+        storage_ref = packages.save(body.skill_ref, package, raw)
+        skill = catalog.register(
+            skill_ref=body.skill_ref, version=body.version,
+            content=package.skill_markdown, source_ref=body.source_ref,
+            catalog_source=body.catalog_source, department_id=body.department_id,
+            actor=actor.username, metadata=body.metadata,
+            package_storage_ref=storage_ref, package_archive_digest=package.archive_digest,
+            package_files=package.files, package_review_flags=package.review_flags,
+            package_build_state="uploaded",
+        )
+    except (ValueError, binascii.Error, SkillPackageError, SkillCatalogError) as exc:
+        _audit(actor, action="sandbox.skill_package_upload", task_id=body.skill_ref,
+               target_type="sandbox_skill", success=False, error=str(exc))
+        raise HTTPException(status_code=400, detail="Skill package is invalid") from exc
+    _audit(actor, action="sandbox.skill_package_upload", task_id=skill.skill_ref,
+           target_type="sandbox_skill", metadata={"archive_digest": package.archive_digest})
+    # Build is system-managed: upload leaves a durable draft even if the
+    # Runner is unavailable; the administrator may retry the same build.
+    return build_skill_package(
+        skill.skill_ref,
+        SandboxSkillBuildRequest(
+            profile_ref="profile/dev-l1",
+            runtime_policy_ref="profile/dev-l1",
+            runtime_policy_digest=str(getattr(settings, "SANDBOX_RUNTIME_PROFILE_DIGEST", "")),
+            input_schema=body.input_schema,
+            output_schema=body.output_schema,
+        ),
+        actor=actor, skills=catalog, packages=packages, catalog=bundles, client=client,
+        pip_sources=pip_sources,
+    )
+
+
+@router.post("/skills/{skill_ref:path}/build", response_model=SandboxSkillResponse)
+def build_skill_package(
+    skill_ref: str,
+    body: SandboxSkillBuildRequest,
+    actor: AuthUser = Depends(require_system_admin),
+    skills: SkillCatalog = Depends(get_skill_catalog),
+    packages: SkillPackageStore = Depends(get_skill_package_store),
+    catalog: SandboxCatalog = Depends(get_sandbox_catalog),
+    client: SandboxServiceClient | None = Depends(get_sandbox_service_client),
+    pip_sources: SkillPipSourceStore = Depends(get_skill_pip_source_store),
+):
+    """Ask the independent Runner to build a fixed image from an uploaded package."""
+    try:
+        skill = skills.require(skill_ref)
+        if skill.approval_state != "draft" or not skill.package_storage_ref:
+            raise SkillStateConflict("Skill package must be an uploaded draft")
+        package = validate_skill_package(packages.read(skill.package_storage_ref))
+        if package.archive_digest != skill.package_archive_digest:
+            raise SkillStateConflict("Skill package digest changed")
+        if not client:
+            raise SandboxClientConfigurationError("Runner client is not configured")
+        dependency_index_url = pip_sources.get() if package.requirements_declared else ""
+        if package.requirements_declared and not dependency_index_url:
+            raise SkillPipSourceError("administrator must configure a reviewed pip index first")
+        result = client.skill_build(
+            skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            package_bytes=packages.read(skill.package_storage_ref),
+            base_bundle_ref=body.base_bundle_ref, profile_ref=body.profile_ref,
+            runtime_policy_ref=body.runtime_policy_ref,
+            runtime_policy_digest=body.runtime_policy_digest,
+            input_schema=body.input_schema, output_schema=body.output_schema,
+            required_capabilities=body.required_capabilities,
+            dependency_index_url=dependency_index_url,
+            envelope=_runner_envelope(actor, capabilities=tuple(body.required_capabilities)),
+        )
+        if str(result.get("package_digest") or "") != package.archive_digest:
+            raise SkillStateConflict("Runner returned a different Skill package digest")
+        if str(result.get("profile_ref") or "") != body.profile_ref:
+            raise SkillStateConflict("Runner returned a different runtime profile")
+        image_digest = str(result.get("image_digest") or "")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
+            raise SkillStateConflict("Runner did not return a fixed image identity")
+        bundle = catalog.register(
+            bundle_ref=str(result.get("bundle_ref") or ""),
+            bundle_digest=str(result.get("bundle_digest") or ""),
+            profile_ref=body.profile_ref, required_capabilities=body.required_capabilities,
+            input_schema=body.input_schema, output_schema=body.output_schema,
+            runtime_policy_ref=body.runtime_policy_ref,
+            runtime_policy_digest=body.runtime_policy_digest,
+            actor=actor.username, metadata={"skill_ref": skill.skill_ref, "package_digest": package.archive_digest,
+                                            "image_digest": image_digest},
+        )
+        skill = skills.mark_package_built(skill.skill_ref, archive_digest=package.archive_digest, actor=actor.username)
+        skill = skills.bind_execution(skill.skill_ref, bundle_ref=bundle.bundle_ref,
+                                      bundle_digest=bundle.bundle_digest, profile_ref=bundle.profile_ref,
+                                      actor=actor.username, require_enabled=False)
+    except (SkillCatalogError, SkillPackageError, SkillPipSourceError, BundleCatalogError, SandboxProtocolError) as exc:
+        _audit(actor, action="sandbox.skill_package_build", task_id=skill_ref,
+               target_type="sandbox_skill", success=False, error=str(exc))
+        raise HTTPException(status_code=409, detail="Skill package build failed; uploaded source is retained for retry") from exc
+    _audit(actor, action="sandbox.skill_package_build", task_id=skill_ref,
+           target_type="sandbox_skill", metadata={"bundle_ref": skill.execution_bundle_ref})
+    return SandboxSkillResponse(skill=skill.to_dict())
+
+
+@router.get("/skill-dependencies")
+def get_skill_dependency_source(
+    actor: AuthUser = Depends(require_system_admin),
+    sources: SkillPipSourceStore = Depends(get_skill_pip_source_store),
+):
+    _ = actor
+    return {"index_url": sources.get(),
+            "allowed_hosts": str(getattr(settings, "SANDBOX_SKILL_PIP_ALLOWED_HOSTS", "pypi.org"))}
+
+
+@router.put("/skill-dependencies")
+def set_skill_dependency_source(
+    body: SandboxSkillPipSourceRequest,
+    actor: AuthUser = Depends(require_system_admin),
+    sources: SkillPipSourceStore = Depends(get_skill_pip_source_store),
+):
+    try:
+        index_url = sources.set(body.index_url)
+    except SkillPipSourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit(actor, action="sandbox.skill_dependency_source", target_type="sandbox_skill",
+           metadata={"index_host": index_url.split("/")[2] if index_url else ""})
+    return {"index_url": index_url}
+
+
 @router.get("/skills", response_model=SandboxSkillListResponse)
 def list_skills(
     _actor: AuthUser = Depends(require_system_admin),
     catalog: SkillCatalog = Depends(get_skill_catalog),
 ):
     return SandboxSkillListResponse(items=[item.to_dict() for item in catalog.list(include_revoked=True)])
+
+
+@router.get("/skills/{skill_ref:path}/source")
+def download_skill_source(
+    skill_ref: str,
+    actor: AuthUser = Depends(require_system_admin),
+    skills: SkillCatalog = Depends(get_skill_catalog),
+    packages: SkillPackageStore = Depends(get_skill_package_store),
+):
+    try:
+        skill = skills.require(skill_ref)
+        raw = packages.read(skill.package_storage_ref)
+        if hashlib.sha256(raw).hexdigest() != skill.package_archive_digest:
+            raise SkillPackageError("Skill source changed")
+    except (SkillCatalogError, SkillPackageError) as exc:
+        raise HTTPException(status_code=404, detail="Skill source is unavailable") from exc
+    _audit(actor, action="sandbox.skill_source_read", task_id=skill_ref, target_type="sandbox_skill")
+    return Response(content=raw, media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="skill-source.zip"'})
 
 
 @router.get("/skills/available")
@@ -324,8 +492,35 @@ def available_skills(
             "version": skill.version,
             "bundle_ref": bundle.bundle_ref,
             "input_schema": dict(bundle.input_schema),
+            "subscribed": skills.is_subscribed(skill.skill_ref, user.id),
+            "description": skills.content(skill.skill_ref)[:2000],
         })
     return {"items": items}
+
+
+@router.post("/skills/{skill_ref:path}/subscribe")
+def subscribe_skill(
+    skill_ref: str,
+    user: AuthUser = Depends(require_employee),
+    skills: SkillCatalog = Depends(get_skill_catalog),
+):
+    try:
+        skills.subscribe(skill_ref, principal_id=user.id, department_id=user.department_id or "")
+    except SkillCatalogError as exc:
+        raise HTTPException(status_code=403, detail="Skill is not available") from exc
+    _audit(user, action="sandbox.skill_subscribe", task_id=skill_ref, target_type="sandbox_skill")
+    return {"subscribed": True}
+
+
+@router.delete("/skills/{skill_ref:path}/subscribe")
+def unsubscribe_skill(
+    skill_ref: str,
+    user: AuthUser = Depends(require_employee),
+    skills: SkillCatalog = Depends(get_skill_catalog),
+):
+    skills.unsubscribe(skill_ref, principal_id=user.id)
+    _audit(user, action="sandbox.skill_unsubscribe", task_id=skill_ref, target_type="sandbox_skill")
+    return {"subscribed": False}
 
 
 def _skill_state_action(
@@ -421,6 +616,8 @@ def run_skill(
 ):
     try:
         require_execution_enabled(operation="Skill bundle admission")
+        if not skills.is_subscribed(skill_ref, user.id):
+            raise SkillNotAuthorized("Skill must be added before use")
         bundle = skills.execution_bundle(
             skill_ref, principal_id=user.id, department_id=user.department_id or "",
         )
@@ -634,6 +831,25 @@ def _gateway_envelope(
         capability_snapshot=capabilities,
         capability_snapshot_hash=snapshot_hash,
         audience="sandbox-gateway",
+    )
+
+
+def _runner_envelope(actor: AuthUser, *, capabilities: tuple[str, ...] = ("sandbox.execute",)) -> RequestEnvelope:
+    policy_hash = hashlib.sha256(
+        f"skill-build:{settings.SANDBOX_RUNTIME_PROFILE_DIGEST}".encode("utf-8")
+    ).hexdigest()
+    return RequestEnvelope.create(
+        actor_id=str(actor.id),
+        department_id=str(actor.department_id or "system"),
+        policy_snapshot_hash=policy_hash,
+        capability_snapshot=capabilities,
+        capability_snapshot_hash=capability_snapshot_hash(
+            user_id=actor.id,
+            department_id=actor.department_id or "system",
+            capabilities=capabilities,
+            policy_snapshot_hash=policy_hash,
+        ),
+        audience="sandbox-runner",
     )
 
 

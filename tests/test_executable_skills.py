@@ -6,12 +6,18 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import ValidationError
+from deepagents import create_deep_agent
 
 import src.settings as settings
 from src.api.routes import sandbox as routes
 from src.api.schemas import SandboxSkillExecutionBindingRequest, SandboxSkillRunRequest
 from src.sandbox.artifact_broker import ArtifactBroker
+from src.sandbox.agent_tools import make_skill_tools
+from src.sandbox import agent_tools
 from src.sandbox.authorization import SandboxAuthorizationStore
 from src.sandbox.catalog import SandboxCatalog
 from src.sandbox.skills import SkillCatalog, SkillStateConflict
@@ -105,6 +111,7 @@ def test_skill_run_fences_scope_capabilities_revocation_and_idempotency(setup, m
     authorized = {"sandbox.execute", "sandbox.write_artifact"}
     monkeypatch.setattr(routes, "_context_capabilities", lambda *args: authorized)
     user = SimpleNamespace(id="user-1", department_id="dept-1", username="reviewer", role="employee")
+    skills.subscribe("skill/report", principal_id=user.id, department_id=user.department_id)
 
     def run(parameters=None, key="retry-1", actor=user):
         return routes.run_skill(
@@ -154,6 +161,7 @@ def test_available_skills_is_narrowed_by_scope_and_capabilities(setup, monkeypat
         return routes.available_skills(user=user, auth=None, skills=skills, authorization=None)["items"]
 
     assert [item["skill_ref"] for item in available("user-1")] == ["skill/report"]
+    assert "reviewed report" in available("user-1")[0]["description"]
     assert available("user-2") == []
     assert available("user-1", "dept-2") == []
     authorized.remove("sandbox.write_artifact")
@@ -177,6 +185,118 @@ def test_skill_cannot_be_enabled_after_bound_bundle_is_revoked(setup):
     assert skills.require("skill/report").approval_state == "tested"
 
 
+def test_skill_subscription_requires_new_consent_after_version_change(setup):
+    _, _, skills, _, bundle = setup
+    _reviewed_skill(skills, bundle)
+    skills.subscribe("skill/report", principal_id="user-1", department_id="dept-1")
+    assert skills.is_subscribed("skill/report", "user-1")
+    skills.revoke("skill/report")
+    skills.register(skill_ref="skill/report", version="v2", content="Updated reviewed report",
+                    owner_id="user-1", department_id="dept-1")
+    skills.bind_execution("skill/report", bundle_ref=bundle.bundle_ref,
+                          bundle_digest=bundle.bundle_digest, profile_ref=bundle.profile_ref)
+    skills.review("skill/report")
+    skills.mark_tested("skill/report")
+    skills.enable("skill/report")
+    assert not skills.is_subscribed("skill/report", "user-1")
+
+
+def test_agent_sees_only_subscribed_reviewed_skills_and_rechecks_at_call(setup, monkeypatch):
+    store, _, skills, _, bundle = setup
+    monkeypatch.setattr(settings, "SANDBOX_TASK_DB_PATH", store.db_path)
+    skills.register(skill_ref="skill/agent-report", version="v1", content="Report task for sandbox",
+                    department_id="dept-1")
+    skills.bind_execution("skill/agent-report", bundle_ref=bundle.bundle_ref,
+                          bundle_digest=bundle.bundle_digest, profile_ref=bundle.profile_ref)
+    skills.review("skill/agent-report")
+    skills.mark_tested("skill/agent-report")
+    skills.enable("skill/agent-report")
+    events = []
+    rt = SimpleNamespace(check_cancel=lambda: None, emit=lambda kind, data: events.append((kind, data)))
+    assert make_skill_tools(rt, user_id=42, department_id="dept-1") == []
+    skills.subscribe("skill/agent-report", principal_id=42, department_id="dept-1")
+    tools = make_skill_tools(rt, user_id=42, department_id="dept-1")
+    invocation = next(tool for tool in tools if tool.name.startswith("skill__"))
+    assert "skill/agent-report" in invocation.description
+    assert '"title"' in invocation.description
+    assert "skill_request_rejected" in invocation.invoke({"parameters_json": "not JSON"})
+    skills.unsubscribe("skill/agent-report", principal_id=42)
+    assert "skill_not_subscribed" in invocation.invoke({"parameters_json": '{"title":"report"}'})
+    assert make_skill_tools(rt, user_id=42, department_id="dept-1") == []
+    assert events == []
+
+
+def test_agent_skill_tool_returns_broker_verified_preview_for_followup(setup, monkeypatch):
+    store, _, skills, _, bundle = setup
+    monkeypatch.setattr(settings, "SANDBOX_TASK_DB_PATH", store.db_path)
+    skills.register(skill_ref="skill/agent-report", version="v1", content="Report task",
+                    department_id="dept-1")
+    skills.bind_execution("skill/agent-report", bundle_ref=bundle.bundle_ref,
+                          bundle_digest=bundle.bundle_digest, profile_ref=bundle.profile_ref)
+    skills.review("skill/agent-report")
+    skills.mark_tested("skill/agent-report")
+    skills.enable("skill/agent-report")
+    skills.subscribe("skill/agent-report", principal_id=42, department_id="dept-1")
+
+    class FinishedStore:
+        db_path = store.db_path
+
+        def create(self, spec, *, actor_id=""):
+            return store.create(spec, actor_id=actor_id)
+
+        def require(self, task_id):
+            original = store.require(task_id)
+            return SimpleNamespace(task_id=task_id, status="succeeded", owner_id=original.owner_id,
+                                   department_id=original.department_id, skill_ref=original.skill_ref)
+
+    class VerifiedBroker:
+        def list_for_task(self, task_id, *, states=None):
+            return [SimpleNamespace(artifact_id="art-" + "0" * 32, filename="input.txt",
+                                    sha256="c" * 64, size=6, role="input"),
+                    SimpleNamespace(artifact_id="art-" + "a" * 32, filename="report.txt",
+                                    sha256="b" * 64, size=5, role="output")]
+
+        def read(self, artifact_id, **kwargs):
+            assert kwargs["principal_id"] == "42"
+            return b"hello"
+
+    monkeypatch.setattr(agent_tools, "SandboxTaskStore", lambda: FinishedStore())
+    monkeypatch.setattr(agent_tools, "ArtifactBroker", lambda **kwargs: VerifiedBroker())
+    events = []
+    rt = SimpleNamespace(check_cancel=lambda: None, emit=lambda kind, data: events.append((kind, data)))
+    tool = next(tool for tool in make_skill_tools(rt, user_id=42, department_id="dept-1")
+                if tool.name.startswith("skill__"))
+    response = tool.invoke({"parameters_json": '{"title":"report"}'})
+    assert '"status": "succeeded"' in response and '"untrusted_preview": "hello"' in response
+    assert "input.txt" not in response
+    assert [kind for kind, _ in events] == ["tool_started", "tool_result"]
+
+    class ToolCallingModel(BaseChatModel):
+        @property
+        def _llm_type(self):
+            return "skill-tool-test"
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            result = next((message for message in messages if isinstance(message, ToolMessage)), None)
+            if result is not None:
+                output = AIMessage(content="Report result: " + str(result.content))
+            else:
+                output = AIMessage(content="", tool_calls=[{
+                    "name": tool.name, "args": {"parameters_json": '{"title":"report"}'},
+                    "id": "call-skill", "type": "tool_call",
+                }])
+            return ChatResult(generations=[ChatGeneration(message=output)])
+
+    # Exercise Deep Agents' real tool loop: its next model turn receives the
+    # broker-filtered tool result and can use it in the final answer.
+    agent = create_deep_agent(model=ToolCallingModel(), tools=[tool], system_prompt="Use the subscribed Skill")
+    final = agent.invoke({"messages": [{"role": "user", "content": "Run the report Skill"}]})
+    assert '"untrusted_preview": "hello"' in str(final["messages"][-1].content)
+
+
 def test_global_text_skill_cannot_become_a_global_executable_skill(setup):
     _, _, skills, _, bundle = setup
     skills.register(skill_ref="skill/global-text", version="v1", content="reference data")
@@ -191,6 +311,7 @@ def test_skill_queued_task_fails_closed_when_user_capability_is_revoked(setup, m
     monkeypatch.setattr(routes, "_audit", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "_context_capabilities", lambda *args: {"sandbox.execute", "sandbox.write_artifact"})
     user = SimpleNamespace(id="user-1", department_id="dept-1", username="reviewer", role="employee")
+    skills.subscribe("skill/report", principal_id=user.id, department_id=user.department_id)
     grants = SandboxAuthorizationStore(store.db_path)
     grants.grant("user", user.id, ["sandbox.execute", "sandbox.write_artifact"])
     task = routes.run_skill(
@@ -202,3 +323,23 @@ def test_skill_queued_task_fails_closed_when_user_capability_is_revoked(setup, m
     report = SandboxExecutionAdapter(store=store, catalog=bundles, broker=broker, client=object()).dispatch_once()
     assert report.failed == 1
     assert store.require(task["task_id"]).status == "rejected"
+
+
+def test_queued_skill_task_is_rejected_after_unsubscribe(setup, monkeypatch):
+    store, bundles, skills, broker, bundle = setup
+    _reviewed_skill(skills, bundle)
+    monkeypatch.setattr(routes, "_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, "_context_capabilities", lambda *args: {"sandbox.execute", "sandbox.write_artifact"})
+    user = SimpleNamespace(id="user-1", department_id="dept-1", username="reviewer", role="employee")
+    skills.subscribe("skill/report", principal_id=user.id, department_id=user.department_id)
+    task = routes.run_skill(
+        "skill/report", SandboxSkillRunRequest(idempotency_key="unsubscribe-before-dispatch",
+                                               parameters={"title": "report"}),
+        user=user, auth=None, skills=skills, store=store, catalog=bundles,
+        broker=broker, authorization=None,
+    ).task
+    skills.unsubscribe("skill/report", principal_id=user.id)
+    report = SandboxExecutionAdapter(store=store, catalog=bundles, broker=broker, client=object()).dispatch_once()
+    assert report.failed == 1
+    assert store.require(task["task_id"]).status == "rejected"
+    assert store.require(task["task_id"]).error_code == "skill_not_authorized"

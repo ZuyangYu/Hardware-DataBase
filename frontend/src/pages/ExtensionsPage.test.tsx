@@ -98,7 +98,8 @@ describe('ExtensionsView', () => {
     expect(markup).toContain('data-sandbox-skills');
     expect(markup).toContain('skill/report');
     expect(markup).toContain('bundle/report');
-    expect(markup).toContain('运行固定任务');
+    expect(markup).toContain('添加 Skill');
+    expect(markup).toContain('在沙箱中运行');
     expect(markup).toContain('下载 report.txt');
     expect(markup).not.toContain('下载 pending.txt');
   });

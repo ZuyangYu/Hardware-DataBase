@@ -311,6 +311,7 @@ const TOOL_LABELS: Record<string, string> = {
 };
 
 function toolLabel(name: string): string {
+  if (name.startsWith('skill__') || name === 'skill_task_status') return '沙箱 Skill';
   return TOOL_LABELS[name] || name;
 }
 
@@ -341,10 +342,20 @@ function traceStepFromToolEvent(etype: string, raw: string): QueryTraceStep | nu
   }
   if (etype === 'tool_started') {
     const name = String(parsed.tool_name ?? '');
+    if (parsed.tool_kind === 'sandbox') return {
+      key: name, label: `运行 Skill · ${String(parsed.skill_ref ?? '')}`,
+      status: 'running', detail: `任务 ${String(parsed.task_id ?? '')}`,
+    };
     return { key: name, label: toolLabel(name), status: 'running', detail: String(parsed.query ?? '') };
   }
   if (etype === 'tool_result') {
     const name = String(parsed.tool_name ?? '');
+    if (parsed.tool_kind === 'sandbox') return {
+      key: name, label: `Skill · ${String(parsed.skill_ref ?? '')}`,
+      status: parsed.status === 'succeeded' ? 'done'
+        : ['failed', 'rejected', 'cancelled', 'expired', 'timed_out'].includes(String(parsed.status)) ? 'error' : 'running',
+      detail: `任务 ${String(parsed.task_id ?? '')} · ${String(parsed.status ?? '')}`,
+    };
     const status: QueryTraceStatus = parsed.status === 'failed' ? 'error' : 'done';
     const hits = Number(parsed.hit_count ?? 0);
     const latency = Number(parsed.latency_ms ?? NaN);

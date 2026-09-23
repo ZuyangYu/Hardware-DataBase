@@ -93,6 +93,8 @@ def tool_label(tool_name: str) -> str:
         slug, tool = name[5:].split("__", 1)
         if slug and tool:
             return f"外部插件 · {slug} · {tool}"
+    if name.startswith("skill__") or name == "skill_task_status":
+        return "沙箱 Skill"
     return TOOL_LABELS.get(name, name)
 
 

@@ -180,6 +180,8 @@ class SandboxExecutionAdapter:
                     raise SkillAuthorizationError("Skill execution capabilities were revoked")
                 skill_catalog = SkillCatalog(self.store.db_path)
                 skill = skill_catalog.require(task.skill_ref)
+                if not skill_catalog.is_subscribed(task.skill_ref, task.owner_id):
+                    raise SkillAuthorizationError("Skill subscription was removed")
                 reviewed = skill_catalog.execution_bundle(
                     task.skill_ref, principal_id=task.owner_id, department_id=task.department_id,
                 )
