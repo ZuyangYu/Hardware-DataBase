@@ -73,7 +73,7 @@ export function SkillsPanelView({ skills, bundles, busy, skillRef, version, cont
         <Button variant="outline" onClick={onRefresh}>刷新</Button>
       </div>
       <p className="mt-[6px] text-[12px] text-[#858b9c]">
-        管理员上传 ZIP 后，由独立 Runner 使用固定离线模板构建镜像；先审核源文件与构建结果，再启用。
+        管理员上传 ZIP 后，由独立 Runner 使用固定模板构建镜像；无依赖时离线构建，锁定依赖从已批准的 HTTPS 源安装。先审核源文件与构建结果，再启用。
       </p>
       <div className="mt-[14px] grid gap-[10px] md:grid-cols-2">
         <div><Label htmlFor="skill-ref">Skill 引用</Label><Input id="skill-ref" value={skillRef} onChange={(e) => onSkillRef(e.target.value)} placeholder="skill/report" /></div>
