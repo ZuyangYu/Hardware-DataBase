@@ -113,6 +113,11 @@ async def lifespan(app: FastAPI):
     # P0-008: fail fast on provider selections that cannot run; never fall back
     # to a silently created local database.
     src.settings.validate_provider_configuration()
+    # Redis 是硬依赖（REDIS_REQUIRED=true，默认）：未配置或不可达时拒绝启动，
+    # 不提供"降级成 DB 轮询"的运行形态。
+    from src.core.redis_client import assert_redis_ready
+
+    assert_redis_ready(purpose="API 启动")
     # P0-006: deployment-scope quota maintenance (reap/escalate uncertain).
     try:
         from src.core.concurrency import start_governor_maintenance

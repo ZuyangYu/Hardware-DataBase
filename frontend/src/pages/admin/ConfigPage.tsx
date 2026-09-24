@@ -328,8 +328,6 @@ export default function ConfigPage({ auth, onLogout }: Props) {
       <AppHeader
         title="系统配置"
         description="编辑运行时配置(写入 .env 并热加载)。仅白名单键可修改。"
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-between gap-[12px]">

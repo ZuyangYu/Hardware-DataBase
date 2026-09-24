@@ -294,11 +294,44 @@ BOOLEAN_EXTRA_COLUMNS: set[tuple[str, str]] = {
     ("chat_turns", "wiki_assist"),
     ("chat_messages", "redacted"),
     ("chat_sessions", "auto_memory"),
-    ("users", "is_active"),
     ("memory_sources", "source_valid"),
     ("memory_projections", "active"),
     ("memory_projections", "manager_writable"),
 }
+
+# 认证域的表跟随认证库（SQLite 方言）的类型：时间戳保持 TEXT（'' 哨兵、
+# 字典序比较、AuthService 全按文本读写），0/1 保持 BIGINT。与控制面核心表
+# 的语义映射（TIMESTAMPTZ/BOOLEAN）刻意不同 —— 这批表的写入方是
+# AuthService / AppLogService，不是控制面。
+AUTH_DOMAIN_TABLES: frozenset[str] = frozenset(
+    {
+        "users",
+        "departments",
+        "auth_sessions",
+        "login_attempts",
+        "knowledge_bases",
+        "audit_events",
+        "query_traces",
+        "retrieved_evidence",
+        # 治理杂项（wiki / 文档资产 / 硬件资产 / 通知）与文档生成兼容库：
+        # 写入方同样是 SQLite 方言的 store（WikiService / DocumentAssetService /
+        # AssetService / NotificationService / CompatibilityStore）。
+        "wiki_pages",
+        "wiki_page_revisions",
+        "wiki_jobs",
+        "doc_assets",
+        "doc_asset_versions",
+        "doc_asset_events",
+        "doc_asset_links",
+        "hardware_assets",
+        "asset_candidates",
+        "asset_evidence",
+        "notifications",
+        "document_authoring_compatibility_events",
+        "document_authoring_compatibility_releases",
+        "document_authoring_legacy_backfill_markers",
+    }
+)
 
 # Escape hatch for columns that must stay TEXT despite a suffix rule.
 TEXT_EXTRA_COLUMNS: set[tuple[str, str]] = set()
@@ -344,6 +377,16 @@ def create_core_indexes(conn) -> None:
 
 def pg_type_for(table: str, column: str, declared: str = "") -> str:
     """Explicit SQLite→PostgreSQL type mapping (no guessing)."""
+    if str(table).lower() in AUTH_DOMAIN_TABLES:
+        # 认证域：机械映射（TEXT 保真），见 AUTH_DOMAIN_TABLES 注释。
+        value = str(declared or "").upper()
+        if "BLOB" in value:
+            return "BYTEA"
+        if any(token in value for token in _INTEGER_TYPES):
+            return "BIGINT"
+        if any(token in value for token in _REAL_TYPES):
+            return "DOUBLE PRECISION"
+        return "TEXT"
     key = (str(table).lower(), str(column).lower())
     if key in TEXT_EXTRA_COLUMNS:
         return "TEXT"

@@ -17,7 +17,6 @@ import sqlite3
 from contextlib import closing
 from typing import Any
 
-import src.settings
 
 
 LIFECYCLE_STATES = ("draft", "effective")
@@ -117,13 +116,19 @@ class DocumentAssetService:
     """SQLite-backed document asset domain, colocated with auth/KB data."""
 
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or src.settings.AUTH_DB_PATH
-        directory = os.path.dirname(self.db_path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        self._init_db()
+        from src.storage import auth_domain
+
+        if auth_domain.configure_service(self, db_path):
+            directory = os.path.dirname(self.db_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            self._init_db()
 
     def _connect(self):
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.storage import auth_domain
+
+            return auth_domain.connect(self)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")

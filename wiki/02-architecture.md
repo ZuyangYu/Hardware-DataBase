@@ -201,6 +201,27 @@ storage/
 **刻意留在 SQLite 的域**：认证/审计/文档生成/附件字节。迁移文档明确：
 PostgreSQL 只拥有「会话执行 + 记忆账本 + 导出账本」，其它域不参与控制面事务。
 
+**本地台账域收敛（存储收敛项目，进行中）**：`projects.db`、`pipeline_documents.db`、
+`document_authoring.db`（46 表，7 个 store 成组建表）以及**认证域**（`auth.db` 的
+users/departments/auth_sessions/login_attempts/knowledge_bases/audit_events/
+query_traces/retrieved_evidence/wiki/文档资产/硬件资产/通知）以及文档生成兼容库
+（`document_authoring_compatibility.sqlite`）已经切到同一个 PG（`PROJECT_STORE_BACKEND` / `PIPELINE_DOCUMENT_STORE_BACKEND`，
+空值跟随控制面；PG 表结构由 `src/storage/domain_pg.py` 从 store 自己的 SQLite
+bootstrap 用机械映射生成，时间戳保持 TEXT）。切换前先跑
+`migrate_sqlite_to_postgres.py --group projects|pipeline`；未迁移时 store 启动
+fail-closed 并提示命令。认证域切换前需要 `rebuild_auth_domain.py` 重建表形状；
+切换后 `auth_mirror` 只在混合形态（认证 SQLite + 控制面 PG）下生效。
+下一阶段：附件 FTS（tsvector/pg_trgm，暂缓）。文件类数据（归档/导出/附件字节）
+与派生索引（表格/电路）留在 storage，属于设计选择。
+
+**auth 行镜像（混合形态的桥）**：控制面虽然不接管认证域，但它**读** PG 里的
+`users`（`list_pending_turn_work` 的 `JOIN users ... AND u.is_active`、
+`create_session` 的 department 回退）并对 `chat_sessions.user_id` 有外键。
+因此切换后**新建/停用的账号**必须同步进 PG，否则该用户无法创建会话（FK 直接拒绝）、
+轮次永远不被认领。`src/storage/auth_mirror.py` 在 `AuthService` 的每次
+用户/部门变更后把该行 upsert 进 PG（单向 SQLite→PG、fail-soft，权威仍在 SQLite；
+开关 `HDB_AUTH_MIRROR_ENABLED=0` 可关闭）。认证/治理整体收敛进 PG 后删除此模块。
+
 ---
 
 ## 5. 横切机制

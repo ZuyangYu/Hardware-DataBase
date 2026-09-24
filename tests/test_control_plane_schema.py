@@ -61,11 +61,31 @@ class TypeMappingTests(unittest.TestCase):
             {"name": "bad_json", "type": "TEXT", "notnull": 1, "pk": 0, "dflt_value": "'{oops'"},
             {"name": "ok_json", "type": "TEXT", "notnull": 1, "pk": 0, "dflt_value": "'[]'"},
         ]
-        ddl = schema.generated_table_ddl("wiki_jobs", columns)
+                # 用控制面表（语义映射）：认证域的表现在是机械映射（TEXT），见下一个用例
+        ddl = schema.generated_table_ddl("chat_turns", columns)
         self.assertIn('"stats_json" JSONB NOT NULL', ddl)
         self.assertIn('"bad_json" JSONB NOT NULL', ddl)
         self.assertIn("\"ok_json\" JSONB NOT NULL DEFAULT '[]'::jsonb", ddl)
         self.assertNotIn("''::jsonb", ddl)
+
+    def test_auth_domain_tables_use_mechanical_mapping(self):
+        """认证域的表跟随 SQLite 方言：时间戳 TEXT、0/1 保持 BIGINT（不转 JSONB/TIMESTAMPTZ/BOOLEAN）。
+
+        AuthService / AppLogService / WikiService 等按文本时间戳与 0/1 读写，
+        语义映射（TIMESTAMPTZ/BOOLEAN）会让它们直接报类型错误。
+        """
+        columns = [
+            {"name": "id", "type": "INTEGER", "notnull": 0, "pk": 1},
+            {"name": "is_active", "type": "INTEGER", "notnull": 1, "pk": 0, "dflt_value": "1"},
+            {"name": "created_at", "type": "TEXT", "notnull": 1, "pk": 0},
+            {"name": "payload_json", "type": "TEXT", "notnull": 1, "pk": 0, "dflt_value": "''"},
+        ]
+        ddl = schema.generated_table_ddl("users", columns)
+        self.assertIn('"is_active" BIGINT NOT NULL DEFAULT 1', ddl)
+        self.assertIn('"created_at" TEXT NOT NULL', ddl)
+        self.assertIn('"payload_json" TEXT NOT NULL', ddl)
+        self.assertNotIn("TIMESTAMPTZ", ddl)
+        self.assertNotIn("BOOLEAN", ddl)
 
     def test_generated_ddl_pins_identity_and_constraints(self):
         columns = [

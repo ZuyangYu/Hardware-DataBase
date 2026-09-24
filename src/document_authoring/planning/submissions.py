@@ -100,14 +100,20 @@ class DocumentPlanSubmission:
 class DocumentPlanSubmissionStore:
     """SQLite lease/claim repository for the plan-submission outbox."""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        parent = os.path.dirname(os.path.abspath(db_path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        self._init_db()
+    def __init__(self, db_path: str | None = None):
+        from src.document_authoring import pg_support
+
+        if pg_support.configure(self, db_path):
+            parent = os.path.dirname(os.path.abspath(self.db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.document_authoring import pg_support
+
+            return pg_support.connect(self)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -333,13 +339,24 @@ class DocumentPlanSubmissionStore:
         return _row_to_submission(row) if row is not None else None
 
     def list_pending(self, limit: int = 16) -> list[DocumentPlanSubmission]:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            # '' 哨兵要 NULLIF 成 NULL，否则 cast 报错；比较用显式 timestamptz。
+            available_clause = (
+                "(NULLIF(available_at, ''))::timestamptz <= clock_timestamp()"
+            )
+            lease_clause = (
+                "(NULLIF(lease_expires_at, ''))::timestamptz <= clock_timestamp()"
+            )
+        else:
+            available_clause = "datetime(available_at) <= datetime('now')"
+            lease_clause = "datetime(lease_expires_at) <= datetime('now')"
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                """SELECT * FROM document_plan_submissions
+                f"""SELECT * FROM document_plan_submissions
                    WHERE (status IN ('pending', 'retrying')
-                          AND datetime(available_at) <= datetime('now'))
+                          AND {available_clause})
                       OR (status = 'running' AND lease_expires_at IS NOT NULL
-                          AND datetime(lease_expires_at) <= datetime('now'))
+                          AND {lease_clause})
                    ORDER BY created_at, submission_id LIMIT ?""",
                 (max(1, min(int(limit), 100)),),
             ).fetchall()

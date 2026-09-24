@@ -315,9 +315,6 @@ input[type='password']::-ms-clear {
   z-index: 0;
   pointer-events: none;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 50% 44%, rgba(54, 60, 70, 0.06), transparent 36%),
-    radial-gradient(circle at 50% 50%, rgba(54, 60, 70, 0.035), transparent 48%);
   mask-image: linear-gradient(180deg, transparent 0%, #000 12%, #000 88%, transparent 100%);
 }
 
@@ -384,14 +381,11 @@ input[type='password']::-ms-clear {
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .login-graph-node,
-  .login-graph-line {
-    animation: none;
-    opacity: 0.55;
-    stroke-dashoffset: 0;
-  }
-}
+/*
+ * 登录页图谱动画不做 prefers-reduced-motion 降级:
+ * 内网机器常被组策略强制开启"减少动态效果", 会导致登录页看起来像静态图,
+ * 影响演示与观感。若将来需要无障碍降级, 改成"放慢/降低对比度"而不是完全静止。
+ */
 
 pre {
   max-width: 100%;

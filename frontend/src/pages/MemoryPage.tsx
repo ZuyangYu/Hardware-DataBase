@@ -191,8 +191,6 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
       <AppHeader
         title="长期记忆"
         description="记忆只作为不可信上下文线索；正式规格、Datasheet 与知识库证据始终优先。"
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[28px] flex flex-wrap items-center gap-[10px] rounded-[14px] border border-[#e3e7f1] bg-white px-[16px] py-[12px]">

@@ -72,8 +72,6 @@ export default function SystemStatusPage({ auth, onLogout }: Props) {
       <AppHeader
         title="系统状态"
         description="查看 API、worker、RAGFlow、LLM 与持久化任务状态。"
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
       <div className="mt-[20px] flex items-center gap-[10px]">
         <Button variant="outline" onClick={load} disabled={loading}>刷新</Button>

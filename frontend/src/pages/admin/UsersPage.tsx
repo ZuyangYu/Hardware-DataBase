@@ -10,6 +10,7 @@ import type {
 import type { AuthSession } from '../../auth';
 import { ROLE_LABELS } from '../../auth';
 import AppHeader from '@/components/AppHeader';
+import PasswordInput from '@/components/PasswordInput';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
@@ -227,8 +228,6 @@ export default function UsersPage({ auth, onLogout }: Props) {
       <AppHeader
         title="员工管理"
         description="注册员工到部门、创建系统管理员、停用/启用账号、重置密码。"
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-end gap-[12px]">
@@ -336,8 +335,9 @@ function ResetPasswordDialog({
           </p>
           <div className="grid gap-[6px]">
             <Label className="text-[12px] text-[#464c5e]">新密码</Label>
-            <Input
-              type="password"
+            <PasswordInput
+              autoComplete="new-password"
+              name="reset-password"
               value={password}
               onChange={(e) => onPasswordChange(e.target.value)}
               placeholder="输入新密码"
@@ -437,8 +437,9 @@ function CreateUserDialog({
           </div>
           <div className="grid gap-[6px]">
             <Label className="text-[12px] text-[#464c5e]">密码</Label>
-            <Input
-              type="password"
+            <PasswordInput
+              autoComplete="new-password"
+              name="employee-initial-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="初始密码"

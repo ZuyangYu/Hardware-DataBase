@@ -425,8 +425,6 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
       <AppHeader
         title="资产中心"
         description="文档资产:一文档一档,版本链与生命周期全程留痕;词条 Wiki 由文档蒸馏生成,出处可回溯。"
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[20px] flex flex-wrap items-center gap-[12px]">

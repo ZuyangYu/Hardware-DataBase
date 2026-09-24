@@ -130,6 +130,11 @@ class MemoryWorkerPostgresChainTests(unittest.TestCase):
             admin, "engineer", "password-123", ROLE_EMPLOYEE, self.department.id
         )
         self.auth.register_knowledge_base("design", owner=owner)
+        # 记忆治理以 engineer 身份访问该库：按产品模型需要 owner 把库共享给部门，
+        # 否则 KB 读权限检查（正确地）会拒绝。
+        self.auth.set_knowledge_base_sharing(
+            "design", actor=owner, is_shared=True, department_id=self.department.id
+        )
         self.kb_id = self.auth.get_knowledge_base_id(
             "design", department_id=self.department.id
         )

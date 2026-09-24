@@ -123,8 +123,9 @@
 47. `docs/` 与 `CLAUDE.md` 是本地文件（gitignored）；本 Wiki 已迁至仓库根 `wiki/` 并纳入版本管理——
     新增/修改文档请写 `wiki/`，不要写回 `docs/wiki/`（该路径已不存在）。
 48. `requirements.txt` 是 uv 生成的，**改依赖请改 `pyproject.toml`** 后 `uv lock`。
-49. `deploy/` 目前有可观测性栈、`redis/`（项目自管实时面）与 `postgres/`（项目自管账本库）；
-    仍**没有** Dockerfile/systemd/k8s/nginx 与 CI workflow。
+49. `deploy/` 目前有可观测性栈、`redis/`（项目自管实时面）、`postgres/`（项目自管账本库）
+    与 `docker/`（应用镜像 + compose + nginx，内网离线分发见 `deploy/docker/README.md`）；
+    仍**没有** systemd/k8s 与 CI workflow。
 50. `hardware-database-eval` CLI 不调用 `init_observability`（离线评估无外部遥测）。
 
 ### 2.9 PostgreSQL 控制面（单机也走 PG 之后）
@@ -329,6 +330,24 @@
 10. **文档**：本 Wiki 对应页面是否更新？（`docs/` 目前不在 git 里，需团队决定是否纳入）
 11. **固定 DDL**：改动了控制面所属 SQLite 表结构（加列/改默认值）时，是否同步了
     `src/storage/control_plane/schema.py` 的固定 DDL？测试通过不代表预演能过。
+12. **PG 模式下的 auth 行镜像**：控制面会读 PG 的 `users`（claim 的 `is_active`、
+    `create_session` 的 department 回退）并带 `fk_chat_sessions_user` 外键，而认证域
+    权威仍在 SQLite。`AuthService` 的用户/部门变更会经 `src/storage/auth_mirror.py`
+    单向镜像到 PG（fail-soft，`HDB_AUTH_MIRROR_ENABLED=0` 可关）。若看到
+    `chat_sessions` 的 FK violation 或某用户轮次永不认领，先查镜像日志
+    `[auth-mirror]`——通常是镜像失败（PG 不可达）或绕过 `AuthService` 直接改库。
+    认证域整体收敛进 PG 后删除该桥。**2026-09-22 起认证域已切 PG**：
+    `AUTH_STORE_BACKEND=postgres` 时镜像自动跳过（行就在 PG 里），
+    混合形态（`AUTH_STORE_BACKEND=sqlite` + 控制面 PG）才走镜像。
+13. **域表的类型映射是"机械"的，不是语义的**：`projects.db`/`pipeline_documents.db`
+    等本地台账域收敛到 PG 时，表结构由 `src/storage/domain_pg.py` 从 store 自己的
+    SQLite bootstrap 生成，`*_at` 列保持 **TEXT**（保真 '' 哨兵、字典序 MAX、
+    strftime 解析），与控制面 `schema.py` 的 TIMESTAMPTZ 策略**刻意不同**。给域表
+    加列时改 store 的 `_init_db` 即可，PG 侧建表会自动跟随；但 SQLite 专用语法
+    （`datetime('now', ?)` 修饰符等）需要像 `claim_next_parse_record` 那样按后端
+    分支处理，别指望 adapter 能翻译一切。适配器已覆盖的方言：`?` 占位符、
+    `BEGIN IMMEDIATE`、`INSERT OR IGNORE`、`strftime('%s', x)`、`CURRENT_TIMESTAMP`、
+    `json_extract(col, '$.a.b')`；未覆盖的写法要显式分支并配 PG 测试。
 
 ---
 

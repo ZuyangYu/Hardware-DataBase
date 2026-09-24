@@ -110,14 +110,20 @@ class DocumentTask(BaseModel):
 class DocumentTaskStore:
     """SQLite repository for task identity, associations and task events."""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        parent = os.path.dirname(os.path.abspath(db_path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        self._init_db()
+    def __init__(self, db_path: str | None = None):
+        from src.document_authoring import pg_support
+
+        if pg_support.configure(self, db_path):
+            parent = os.path.dirname(os.path.abspath(self.db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.document_authoring import pg_support
+
+            return pg_support.connect(self)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")

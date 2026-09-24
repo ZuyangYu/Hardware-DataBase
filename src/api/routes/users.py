@@ -1,8 +1,8 @@
-"""Employee account management endpoints (system_admin only).
+"""Account management endpoints.
 
-Account registration is governance: only the system administrator creates
-accounts. Department staff (``employee``) manage knowledge-base content, not
-accounts.
+Registration, activation and password resets are governance: only the system
+administrator manages other accounts. Every signed-in user may change their own
+password via ``PUT /users/me/password`` (current password required).
 """
 from __future__ import annotations
 
@@ -10,9 +10,10 @@ from fastapi import APIRouter, Depends, Query
 
 from src.core.auth import AuthService, AuthUser
 
-from src.api.deps import get_auth_service, require_system_admin
+from src.api.deps import current_user, get_auth_service, require_system_admin
 from src.api.schemas import (
     AuthUserView,
+    ChangeOwnPasswordRequest,
     CreateUserRequest,
     OkResponse,
     ResetPasswordRequest,
@@ -73,6 +74,20 @@ def set_user_active(
     """Enable or disable an account. Cannot target self."""
     auth.set_user_active_as(actor, user_id, body.is_active)
     return OkResponse(ok=True, message="user active state updated")
+
+
+@router.put("/users/me/password", response_model=OkResponse)
+def change_own_password(
+    body: ChangeOwnPasswordRequest,
+    user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Change the signed-in account's own password (requires the current password).
+
+    All sessions of the account are revoked, so the client must sign in again.
+    """
+    auth.change_own_password(user, body.current_password, body.new_password)
+    return OkResponse(ok=True, message="password changed")
 
 
 @router.put("/users/{user_id}/password", response_model=OkResponse)
