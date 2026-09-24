@@ -1,0 +1,47 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:9464
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+  otlphttp/phoenix:
+    endpoint: http://phoenix:6006
+    headers:
+      # Phoenix uses this HTTP header to route Collector-exported traces to a
+      # named project.  The application also sets the OpenInference resource
+      # attribute, so either path remains correct if one side is upgraded.
+      x-project-name: ${env:OBS_PHOENIX_PROJECT}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo, otlphttp/phoenix]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/loki]

@@ -1,0 +1,48 @@
+# Docker 构建上下文过滤器（放在仓库根，对 deploy/docker/ 下的 Dockerfile 生效）。
+# 目标：不发敏感文件、不带本地虚拟环境与前端依赖，控制上下文体积。
+#
+# 注意：不带前导 / 的目录名会匹配任意层级。本仓库有 src/storage/，所以根级
+# storage/logs/docs/tests/benchmarks 一律写成 /xxx，避免误伤源码目录。
+
+# --- 密钥：真实 .env 绝不进镜像（容器运行时挂载 config/.env）---
+.env
+.env.bak*
+deploy/*/.env
+deploy/docker/config
+deploy/docker/bundle
+deploy/docker/*.tar.gz
+
+# --- 版本库与本地缓存 ---
+.git
+.github
+.gitattributes
+.claude
+/.venv
+/venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.tmp_dbg
+/hardware_database.egg-info
+
+# --- 运行期数据（由卷挂载提供）---
+/storage
+/logs
+
+# --- 前端：web 镜像在构建阶段自行 npm ci + build ---
+frontend/node_modules
+frontend/dist
+frontend/.vite
+frontend/tsconfig.tsbuildinfo
+# Vite 本地覆盖配置可能含密钥/内网地址
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# --- 本地笔记/测试/基准（运行时不需要）---
+/docs
+/tests
+/benchmarks

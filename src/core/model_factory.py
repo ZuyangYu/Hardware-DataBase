@@ -1,302 +1,275 @@
-# src/core/model_factory.py
-import os
-import config.settings
-from llama_index.core import Settings
-from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.ollama import OllamaEmbedding
-from src.core.custom_embedding import OpenRouterEmbedding
-from llama_index.core.postprocessor import SentenceTransformerRerank
-from llama_index.core.node_parser import SentenceSplitter
-from src.core.logger import log, error, warn
-from src.core.custom_reranker import APIReranker, NoReranker
-from src.core.custom_llm import GenericOpenAILLM
+"""Central, profile-aware chat-model factory.
+
+Provider construction is intentionally kept here. Application modules may
+select a bounded profile, but cannot construct provider clients or override
+transport policy ad hoc.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any
+
+import src.settings as settings
+
+from src.core.llm_governor import PRIORITY_INTERACTIVE
+from src.core.llm_headers import opencode_extra_headers
+from src.core.model_gateway import build_governed_model
 
 
-def init_global_models():
-    """
-    初始化全局模型配置
-    这是整个 RAG 系统的模型的入口函数，负责初始化：
-    - LLM（大语言模型）
-    - Embedding（文本向量化模型）
-    - Reranker（重排序模型）
-    """
-    try:
-        log("=" * 60)
-        log(f"初始化模型 Provider: {config.settings.PROVIDER.name.upper()}")
-        log("=" * 60)
 
-        # 1. 初始化 LLM
-        _init_llm()
+_SETTINGS_GENERATION = 0
+_PROFILE_NAMES = frozenset({
+    "default",
+    "authoring_auxiliary",
+    "template_suggestion",
+    "external_conversation",
+    "memory",
+})
 
-        # 2. 初始化 Embedding
-        _init_embedding()
 
-        # 3. 初始化 Reranker
-        _init_reranker()
+@dataclass(frozen=True)
+class ChatModelConfig:
+    profile: str
+    provider: str
+    model: str
+    endpoint: str
+    api_key: str
+    max_tokens: int
+    timeout: int
+    temperature: float
+    max_retries: int
+    require_structured_tools: bool = False
+    max_input_tokens: int = 0
+    priority: str = PRIORITY_INTERACTIVE
 
-        # 4. 初始化 分词器
-        text_splitter = SentenceSplitter(
-            chunk_size=config.settings.CHUNK_SIZE,
-            chunk_overlap=config.settings.CHUNK_OVERLAP
+
+def settings_generation() -> int:
+    return _SETTINGS_GENERATION
+
+
+def notify_settings_reloaded() -> None:
+    global _SETTINGS_GENERATION
+    _SETTINGS_GENERATION += 1
+    create_chat_model.cache_clear()
+    _build_cached_chat_model.cache_clear()
+
+
+def invalidate_chat_model_cache() -> None:
+    create_chat_model.cache_clear()
+    _build_cached_chat_model.cache_clear()
+
+
+def normalize_provider(value: Any) -> str:
+    """Normalize settings.Enum and explicit string provider values."""
+
+    raw = getattr(value, "value", value)
+    provider = str(raw or "").strip().casefold()
+    if provider == "openai":
+        return "custom"
+    if provider not in {"ollama", "custom"}:
+        raise ValueError(f"Unsupported chat model provider: {provider or '<empty>'}")
+    return provider
+
+
+def resolve_chat_model_config(
+    *,
+    profile: str = "default",
+    provider: Any = "",
+    model: str = "",
+    settings_module: Any | None = None,
+    priority: str = PRIORITY_INTERACTIVE,
+) -> ChatModelConfig:
+    """Resolve one allowlisted profile from the application settings."""
+
+    settings_source = settings_module or settings
+
+    profile_name = str(profile or "default").strip().casefold()
+    if profile_name not in _PROFILE_NAMES:
+        raise ValueError(
+            f"Unknown chat model profile: {profile_name!r}; expected one of {sorted(_PROFILE_NAMES)}"
         )
 
-        Settings.text_splitter = text_splitter
-        Settings.node_parser = text_splitter
-        log(f"全局分词器已配置: Size={config.settings.CHUNK_SIZE}, Overlap={config.settings.CHUNK_OVERLAP}")
+    memory_provider = getattr(settings_source, "MEMORY_MODEL_PROVIDER", "") or ""
+    if profile_name == "memory" and not provider:
+        provider_value = memory_provider or getattr(settings_source, "AGENT_LLM_PROVIDER", "ollama")
+    else:
+        provider_value = provider or getattr(settings_source, "AGENT_LLM_PROVIDER", "ollama")
+    normalized_provider = normalize_provider(provider_value)
 
-        log("=" * 60)
-        log("✅ 全局模型初始化完成")
-        log("=" * 60)
+    if profile_name == "memory":
+        configured_model = str(getattr(settings_source, "MEMORY_MODEL", "") or "").strip()
+        configured_endpoint = str(getattr(settings_source, "MEMORY_MODEL_BASE_URL", "") or "").strip()
+        configured_api_key = str(getattr(settings_source, "MEMORY_MODEL_API_KEY", "") or "").strip()
+        timeout = int(getattr(settings_source, "MEMORY_REFLECTION_TIMEOUT_SECONDS", 120))
+        require_structured_tools = bool(
+            getattr(settings_source, "MEMORY_MODEL_REQUIRE_STRUCTURED_TOOLS", True)
+        )
+    else:
+        configured_model = ""
+        configured_endpoint = ""
+        configured_api_key = ""
+        timeout = int(getattr(settings_source, "AGENT_TIMEOUT_SECONDS", 120))
+        require_structured_tools = False
 
-    except Exception as e:
-        error(f"❌ 模型初始化失败: {e}")
-        raise
+    if normalized_provider == "ollama":
+        resolved_model = str(
+            model or configured_model or getattr(settings_source, "AGENT_OLLAMA_MODEL", "")
+        ).strip()
+        endpoint = str(
+            configured_endpoint or getattr(settings_source, "AGENT_OLLAMA_BASE_URL", "")
+        ).strip()
+        api_key = ""
+        default_retries = 0
+    else:
+        resolved_model = str(
+            model or configured_model or getattr(settings_source, "AGENT_CUSTOM_MODEL", "")
+        ).strip()
+        endpoint = str(
+            configured_endpoint or getattr(settings_source, "AGENT_CUSTOM_BASE_URL", "")
+        ).strip()
+        api_key = str(
+            configured_api_key or getattr(settings_source, "AGENT_CUSTOM_API_KEY", "")
+        ).strip()
+        default_retries = int(getattr(settings_source, "AGENT_RATE_LIMIT_MAX_RETRIES", 4))
+
+    if profile_name == "authoring_auxiliary":
+        timeout = 20
+        default_retries = 0
+    elif profile_name == "template_suggestion":
+        timeout = 60
+    elif profile_name == "external_conversation":
+        outer_timeout = int(
+            getattr(settings_source, "EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS", 60)
+        )
+        timeout = max(1, outer_timeout - 5)
+        default_retries = 0
+
+    if not resolved_model:
+        raise ValueError(f"Chat model is not configured for provider {normalized_provider}")
+
+    return ChatModelConfig(
+        profile=profile_name,
+        provider=normalized_provider,
+        model=resolved_model,
+        endpoint=endpoint,
+        api_key=api_key,
+        max_tokens=int(getattr(settings_source, "AGENT_CUSTOM_MAX_TOKENS", 4096)),
+        timeout=max(1, int(timeout)),
+        temperature=float(getattr(settings_source, "AGENT_TEMPERATURE", 0.2)),
+        max_retries=max(0, int(default_retries)),
+        require_structured_tools=require_structured_tools,
+        max_input_tokens=max(
+            0, int(getattr(settings_source, "AGENT_MODEL_MAX_INPUT_TOKENS", 0) or 0)
+        ),
+        priority=str(priority or PRIORITY_INTERACTIVE),
+    )
 
 
-def _init_llm():
+@lru_cache(maxsize=32)
+def create_chat_model(
+    provider: Any = "",
+    model: str = "",
+    profile: str = "default",
+    priority: str = PRIORITY_INTERACTIVE,
+) -> object:
+    """Build and cache a LangChain chat model for an allowlisted profile.
+
+    ``priority`` selects the governor admission class (interactive keeps
+    reserved capacity; batch is capped separately) and is part of the cache key.
     """
-    初始化 LLM 模型
-    根据 PROVIDER 配置选择：
-    - ollama: 本地 Ollama 服务
-    - custom: 第三方 API 服务
+
+    config = resolve_chat_model_config(
+        profile=profile,
+        provider=provider,
+        model=model,
+        priority=priority,
+    )
+    return _build_cached_chat_model(_SETTINGS_GENERATION, config)
+
+
+def create_chat_model_for_settings(
+    settings_module: Any,
+    provider: Any = "",
+    model: str = "",
+    profile: str = "default",
+    priority: str = PRIORITY_INTERACTIVE,
+) -> object:
+    """Build a model from an injected settings object.
+
+    Production code uses :func:`create_chat_model`; this narrow variant keeps
+    isolated worker/test settings injectable without moving provider
+    construction back into a domain module.
     """
+    config = resolve_chat_model_config(
+        profile=profile,
+        provider=provider,
+        model=model,
+        settings_module=settings_module,
+        priority=priority,
+    )
+    return _build_cached_chat_model(_SETTINGS_GENERATION, config)
+
+
+@lru_cache(maxsize=32)
+def _build_cached_chat_model(generation: int, config: ChatModelConfig) -> object:
+    del generation  # generation is intentionally part of the cache key.
+    if config.provider == "ollama":
+        # ChatOllama has no max_retries/timeout fields. The sync/async httpx
+        # clients enforce the bounded request timeout; transport retry is
+        # intentionally disabled for Ollama by the profile contract.
+        model = build_governed_model(
+            provider="ollama",
+            model=config.model,
+            base_url=config.endpoint,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            timeout=config.timeout,
+            priority=config.priority,
+        )
+        _apply_model_profile(model, config.max_input_tokens)
+        return model
+
+    model = build_governed_model(
+        provider="custom",
+        model=config.model,
+        base_url=config.endpoint,
+        api_key=config.api_key,
+        temperature=config.temperature,
+        max_tokens=config.max_tokens,
+        max_retries=config.max_retries,
+        timeout=config.timeout,
+        default_headers=opencode_extra_headers(config.endpoint) or None,
+        priority=config.priority,
+    )
+    _apply_model_profile(model, config.max_input_tokens)
+
+    return model
+
+
+def _apply_model_profile(model: "object", max_input_tokens: int | None = None) -> None:
+    """Declare the model context window for proactive summarization.
+
+    OpenAI-compatible relays do not expose a model profile, so the configured
+    ``AGENT_MODEL_MAX_INPUT_TOKENS`` value supplies it. An existing provider
+    declaration wins. Passing ``None`` reads the live application settings;
+    callers using an injected settings source pass the resolved value instead.
+    Assignment is fail-soft for older langchain-core versions.
+    """
+    if max_input_tokens is None:
+        max_input_tokens = getattr(settings, "AGENT_MODEL_MAX_INPUT_TOKENS", 0)
     try:
-        if config.settings.PROVIDER == config.settings.Provider.OLLAMA:
-            # ==================== Ollama 本地模型 ====================
-            Settings.llm = Ollama(
-                model=config.settings.OLLAMA_LLM_MODEL,
-                base_url=config.settings.OLLAMA_BASE_URL,
-                request_timeout=360
-            )
-            log(f"LLM: Ollama")
-            log(f"   ├─ 模型: {config.settings.OLLAMA_LLM_MODEL}")
-            log(f"   └─ 地址: {config.settings.OLLAMA_BASE_URL}")
-
-        elif config.settings.PROVIDER == config.settings.Provider.CUSTOM:
-            # ==================== 自定义 API =========================
-            # 验证必要参数
-            if not config.settings.CUSTOM_API_KEY or not config.settings.CUSTOM_BASE_URL or not config.settings.CUSTOM_LLM_MODEL:
-                error("❌ CUSTOM 模式需要设置以下参数:")
-                error("   - CUSTOM_API_KEY")
-                error("   - CUSTOM_BASE_URL")
-                error("   - CUSTOM_LLM_MODEL")
-                raise ValueError("CUSTOM 模式配置不完整")
-
-            # 使用自定义LLM封装
-            Settings.llm = GenericOpenAILLM(
-                model=config.settings.CUSTOM_LLM_MODEL,
-                api_key=config.settings.CUSTOM_API_KEY,
-                api_base=config.settings.CUSTOM_BASE_URL,
-                context_window=config.settings.CUSTOM_CONTEXT_WINDOW,
-                max_tokens=config.settings.CUSTOM_MAX_TOKENS
-            )
-
-            log(f"LLM: 自定义 API")
-            log(f"   ├─ 模型: {config.settings.CUSTOM_LLM_MODEL}")
-            log(f"   ├─ 地址: {config.settings.CUSTOM_BASE_URL}")
-            log(f"   ├─ 上下文: {config.settings.CUSTOM_CONTEXT_WINDOW}")
-            log(f"   └─ 最大Token: {config.settings.CUSTOM_MAX_TOKENS}")
-
-        else:
-            raise ValueError(f"❌ 未知的 Provider: {config.settings.PROVIDER}")
-
-    except Exception as e:
-        error(f"❌ LLM 初始化失败: {e}")
-        raise
-
-
-def _init_embedding():
-    """
-    初始化 Embedding 模型
-
-    根据配置选择：
-    - Ollama Embedding（本地，免费）
-    - 第三方 API Embedding（可能需要付费）
-    注意：很多第三方 API 不支持 Embedding，推荐使用本地 Ollama
-    """
+        max_input = int(max_input_tokens or 0)
+    except (TypeError, ValueError):
+        return
+    if max_input <= 0:
+        return
+    existing = getattr(model, "profile", None)
+    if isinstance(existing, dict) and existing.get("max_input_tokens"):
+        return
     try:
-        if config.settings.PROVIDER == config.settings.Provider.OLLAMA or config.settings.USE_OLLAMA_EMBEDDING:
-            # ==================== Ollama Embedding ====================
-            # 两种情况会使用 Ollama：
-            # 1. Provider 本身就是 ollama
-            # 2. 强制设置 USE_OLLAMA_EMBEDDING=true（混合模式）
-
-            Settings.embed_model = OllamaEmbedding(
-                model_name=config.settings.OLLAMA_EMBEDDING_MODEL,
-                base_url=config.settings.OLLAMA_BASE_URL
-            )
-
-            if config.settings.USE_OLLAMA_EMBEDDING and config.settings.PROVIDER == config.settings.Provider.CUSTOM: # 判断是不是混合模式
-                log(f"Embedding: Ollama（混合模式）")
-                log(f"LLM 用第三方 API，Embedding 用本地 Ollama")
-            else:
-                log(f"Embedding: Ollama")
-
-            log(f"   ├─ 模型: {config.settings.OLLAMA_EMBEDDING_MODEL}")
-            log(f"   └─ 地址: {config.settings.OLLAMA_BASE_URL}")
-
-        elif config.settings.PROVIDER == config.settings.Provider.CUSTOM:
-            # ==================== 第三方 API Embedding ====================
-            if not config.settings.CUSTOM_EMBEDDING_MODEL:
-                warn("未设置 CUSTOM_EMBEDDING_MODEL，请设置 USE_OLLAMA_EMBEDDING=true 使用本地 Ollama")
-                Settings.embed_model = None
-            else:
-                # 优先使用 Embedding 专用 API，未设置则回退到 LLM 的 API
-                emb_api_key = config.settings.CUSTOM_EMBEDDING_API_KEY or config.settings.CUSTOM_API_KEY
-                emb_api_base = config.settings.CUSTOM_EMBEDDING_BASE_URL or config.settings.CUSTOM_BASE_URL
-                Settings.embed_model = OpenRouterEmbedding(
-                    model=config.settings.CUSTOM_EMBEDDING_MODEL,
-                    api_key=emb_api_key,
-                    api_base=emb_api_base
-                )
-                log(f"Embedding: 自定义 API")
-                log(f"   ├─ 模型: {config.settings.CUSTOM_EMBEDDING_MODEL}")
-                log(f"   └─ 地址: {emb_api_base}")
-
-        else:
-            raise ValueError(f"❌ 未知的 Provider: {config.settings.PROVIDER}")
-
-    except Exception as e:
-        error(f"❌ Embedding 初始化失败: {e}")
-        raise
-
-
-def _init_reranker():
-    """
-    初始化 Reranker 模型
-
-    Reranker 用于对检索结果进行二次排序，提高精度
-
-    支持三种模式：
-    - none: 不使用 Reranker（最快，精度一般）
-    - local: 本地 Sentence Transformer 模型（精度高，需要下载模型）
-    - api: 使用 API 服务（需要付费）
-    """
-    try:
-        if config.settings.RERANKER_TYPE == config.settings.RerankerType.NONE:
-            # ==================== 不使用 Reranker ====================
-            Settings.node_postprocessors = [NoReranker(top_n=config.settings.FINAL_TOP_K)]
-            log(f"Reranker: 不使用（直接返回 Top {config.settings.FINAL_TOP_K}）")
-
-        elif config.settings.RERANKER_TYPE == config.settings.RerankerType.LOCAL:
-            # ==================== 本地 Reranker ====================
-            # 设置模型缓存目录, SentenceTransformer 会自动检查此目录
-            # 如果模型已存在,则直接加载,否则会自动下载
-            os.environ['SENTENCE_TRANSFORMERS_HOME'] = config.settings.RERANKER_CACHE
-
-            Settings.node_postprocessors = [
-                SentenceTransformerRerank(
-                    top_n=config.settings.FINAL_TOP_K,
-                    model=config.settings.RERANKER_MODEL
-                )
-            ]
-            log(f"Reranker: 本地模型")
-            log(f"   ├─ 模型: {config.settings.RERANKER_MODEL}")
-            log(f"   ├─ Top-N: {config.settings.FINAL_TOP_K}")
-            log(f"   └─ 缓存/本地路径: {config.settings.RERANKER_CACHE}")
-
-        elif config.settings.RERANKER_TYPE == config.settings.RerankerType.API:
-            # ==================== API Reranker ====================
-            api_key = config.settings.RERANKER_API_KEY or config.settings.CUSTOM_API_KEY
-
-            if not api_key:
-                warn("Reranker API Key 未设置")
-
-            Settings.node_postprocessors = [
-                APIReranker(
-                    model=config.settings.RERANKER_MODEL,
-                    api_key=api_key,
-                    api_base=config.settings.RERANKER_API_BASE,
-                    top_n=config.settings.FINAL_TOP_K
-                )
-            ]
-            log(f"Reranker: API")
-            log(f"   ├─ 模型: {config.settings.RERANKER_MODEL}")
-            log(f"   ├─ 地址: {config.settings.RERANKER_API_BASE}")
-            log(f"   └─ Top-N: {config.settings.FINAL_TOP_K}")
-
-        else:
-            warn(f"未知的 Reranker 类型: {config.settings.RERANKER_TYPE}")
-            Settings.node_postprocessors = [NoReranker(top_n=config.settings.FINAL_TOP_K)]
-
-    except Exception as e:
-        error(f"❌ Reranker 初始化失败: {e}")
-        warn("降级到不使用 Reranker")
-        Settings.node_postprocessors = [NoReranker(top_n=config.settings.FINAL_TOP_K)]
-
-
-def get_current_config() -> dict:
-    """
-    获取当前配置信息（用于调试和监控）
-
-    Returns:
-        dict: 当前配置的字典
-    """
-    config = {
-        "provider": config.settings.PROVIDER.name,
-        "llm_model": config.settings.OLLAMA_LLM_MODEL if config.settings.PROVIDER == config.settings.Provider.OLLAMA else config.settings.CUSTOM_LLM_MODEL,
-        "embedding_model": config.settings.OLLAMA_EMBEDDING_MODEL if (
-                config.settings.PROVIDER == config.settings.Provider.OLLAMA or config.settings.USE_OLLAMA_EMBEDDING) else config.settings.CUSTOM_EMBEDDING_MODEL,
-        "use_ollama_embedding": config.settings.USE_OLLAMA_EMBEDDING,
-        "reranker_type": config.settings.RERANKER_TYPE.name,
-        "reranker_model": config.settings.RERANKER_MODEL if config.settings.RERANKER_TYPE != config.settings.RerankerType.NONE else None,
-        "final_top_k": config.settings.FINAL_TOP_K,
-        "chunk_size": config.settings.CHUNK_SIZE,
-        "chunk_overlap": config.settings.CHUNK_OVERLAP,
-    }
-    return config
-
-
-def print_config():
-    """
-    打印当前配置（用于调试）
-    在启动时调用此函数可以查看完整的配置信息
-    """
-    config = get_current_config()
-    log("\n" + "=" * 60)
-    log("当前配置")
-    log("=" * 60)
-    for key, value in config.items():
-        log(f"   {key}: {value}")
-    log("=" * 60 + "\n")
-
-
-def validate_config() -> tuple[bool, list[str]]:
-    """
-    验证配置是否完整
-
-    Returns:
-        tuple: (是否有效, 错误信息列表)
-    """
-    errors = []
-
-    # 验证 Provider
-    if config.settings.PROVIDER == config.settings.Provider.CUSTOM:
-        if not config.settings.CUSTOM_API_KEY:
-            errors.append("缺少 CUSTOM_API_KEY")
-        if not config.settings.CUSTOM_BASE_URL:
-            errors.append("缺少 CUSTOM_BASE_URL")
-        if not config.settings.CUSTOM_LLM_MODEL:
-            errors.append("缺少 CUSTOM_LLM_MODEL")
-
-        # 如果不使用 Ollama Embedding，检查 Embedding 配置
-        if not config.settings.USE_OLLAMA_EMBEDDING and not config.settings.CUSTOM_EMBEDDING_MODEL:
-            errors.append("缺少 CUSTOM_EMBEDDING_MODEL（或设置 USE_OLLAMA_EMBEDDING=true）")
-
-    elif config.settings.PROVIDER == config.settings.Provider.OLLAMA:
-        if not config.settings.OLLAMA_BASE_URL:
-            errors.append("缺少 OLLAMA_BASE_URL")
-        if not config.settings.OLLAMA_LLM_MODEL:
-            errors.append("缺少 OLLAMA_LLM_MODEL")
-        if not config.settings.OLLAMA_EMBEDDING_MODEL:
-            errors.append("缺少 OLLAMA_EMBEDDING_MODEL")
-
-    return len(errors) == 0, errors
-
-
-if __name__ != "__main__":
-    is_valid, errors = validate_config()
-    if not is_valid:
-        warn("配置验证失败:")
-        for err in errors:
-            warn(f"- {err}")
+        model.profile = {"max_input_tokens": max_input}
+    except Exception:
+        # 老版本 langchain-core 不允许该字段赋值时，压缩退回被动兜底。
+        pass

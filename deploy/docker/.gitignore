@@ -1,0 +1,8 @@
+# 本地/容器运行期数据，不进版本库
+config/
+bundle/
+build/
+*.tar.gz
+*.tar
+# Docker 部署的 bind mount 数据目录（含账本归档）
+storage/

@@ -1,24 +1,85 @@
 [project]
-name = "hardware-rag"
+name = "hardware-database"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hardware DataBase: multi-source Q&A for hardware design assets (documents, spreadsheets, circuit designs) over RAGFlow + a deepagents-based agent."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "chromadb>=1.3.5,<2",
-    "jieba>=0.42.1",
-    "llama-index>=0.12.52,<0.13",
+    "deepagents>=0.7.8",
+    "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
+    "langchain-openai>=1.3,<2",
+    "langchain-ollama>=1.1.0",
+    # src/core/model_factory.py 与 src/agents/runner.py 直接 import langchain /
+    # langchain_core(init_chat_model / 消息类型),不能只靠 deepagents 传递提供。
+    "langchain>=1.3,<2",
+    "langgraph==1.2.11",
+    # LangMem is isolated behind src.memory.manager so the application keeps
+    # a stable adapter boundary while the model/store APIs evolve.
+    "langmem==0.0.30",
+    # The official SQLite projection store is a separate distribution; the
+    # langgraph meta-package does not install it.
+    "langgraph-checkpoint-sqlite==3.1.1",
     "llama-index-core>=0.12.52,<0.13",
-    "llama-index-embeddings-ollama>=0.6.0,<0.7",
-    "llama-index-llms-ollama>=0.6.2,<0.7",
-    "llama-index-vector-stores-chroma>=0.4.2,<0.5",
-    "llama-index-readers-docling>=0.3.0,<0.4",
-    "llama-index-node-parser-docling>=0.3.0,<0.4",
+    # Parse assistant Markdown into a portable block model before rendering
+    # Word/PDF/Excel/PowerPoint exports.
+    "markdown-it-py>=4,<5",
+    "networkx>=3.5",
+    "opentelemetry-api>=1.38,<2",
+    "opentelemetry-exporter-otlp>=1.38,<2",
+    "opentelemetry-instrumentation-fastapi>=0.59b0,<1",
+    "opentelemetry-instrumentation-httpx>=0.59b0,<1",
+    "opentelemetry-instrumentation-requests>=0.59b0,<1",
+    "opentelemetry-sdk>=1.38,<2",
+    "openinference-instrumentation>=0.1.31,<1",
+    "openinference-semantic-conventions>=0.1.27,<1",
     "pandas>=2.3.3,<3",
-    "rank-bm25>=0.2.2",
+    "pydantic>=2.11.10,<3",
+    # Result exports use the maintained OOXML/PDF renderers instead of
+    # assembling office packages by hand.
+    "python-docx>=1.1,<2",
+    "python-dotenv>=1.2.1,<2",
+    "python-multipart>=0.0.9,<1",
+    "python-pptx>=1.0,<2",
+    "reportlab>=4.2,<5",
+    # spreadsheet_sql_query: LLM 生成 SQL 的只读校验(单条 SELECT/表白名单)
+    "sqlglot>=27,<29",
+    # kept: vendored SpyDrNet imports requests at module top level
     "requests>=2.32.3,<3",
-    "sentence-transformers>=4.1.0,<5",
-    "streamlit>=1.52.1,<2",
+    "uvicorn[standard]>=0.30,<1",
+    "pypdf>=4,<6",
+    "langgraph-checkpoint-postgres==3.1.2",
+    "psycopg[binary]==3.3.5",
+    "redis",
+]
+
+[project.scripts]
+hardware-database-eval = "src.evaluation.cli:main"
+hardware-database-server = "src.api.app:main"
+hardware-database-worker = "src.workers.main:main"
+hardware-database-export-worker = "src.result_exports.worker:main"
+hardware-database-memory-worker = "src.memory.worker:main"
+hardware-database-maintenance = "src.maintenance.cli:main"
+hardware-database-e2e = "src.evaluation.e2e_runner:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+exclude = [
+    "src.circuit.vendor.spydrnet.docs*",
+    "src.circuit.vendor.spydrnet.examples*",
+    "src.circuit.vendor.spydrnet.example_netlists*",
+    "src.circuit.vendor.spydrnet.tests*",
+    "src.circuit.vendor.spydrnet.spydrnet_extension*.tests*",
+]
+
+[tool.setuptools.package-data]
+"src.circuit.vendor.spydrnet.spydrnet.support_files" = [
+    "*.tcl",
+    "architecture_libraries/*.zip",
 ]
 
 [tool.uv]
@@ -26,5 +87,23 @@ python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-st
 
 [dependency-groups]
 dev = [
+    "pytest>=8.0,<10",
     "ruff>=0.14.5",
 ]
+eval = [
+    "openai>=1.0,<3",
+    # Pin the collections API version used and tested by the adapter so
+    # metric prompts/semantics cannot drift across deployments.
+    "ragas==0.4.3",
+]
+
+[tool.pytest.ini_options]
+norecursedirs = ["build", "src/circuit/vendor/spydrnet"]
+
+[tool.ruff]
+# vendored SpyDrNet (含 sch_parse / spydrnet_extension 等 upstream 风格代码) 不属于本应用源码,不纳入 lint。
+extend-exclude = ["src/circuit/vendor", ".claude"]
+
+[tool.ruff.lint.per-file-ignores]
+# 基准脚本必须先设置环境变量/sys.path 再 import src.*, E402 是有意为之。
+"benchmarks/spreadsheet/*" = ["E402"]

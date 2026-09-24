@@ -1,0 +1,146 @@
+"""Minimum-question clarification policy for document generation briefs."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from src.document_authoring.generation_sessions import (
+    ClarificationAnswer,
+    ClarificationMessage,
+    GenerationBrief,
+)
+from src.document_authoring.harness.agent_contracts import normalize_clarification_policy
+
+
+class RequirementClarifier:
+    """Ask only decisions that materially change the generated document."""
+
+    def next_message(
+        self,
+        template_analysis: dict[str, Any],
+        brief: GenerationBrief,
+    ) -> ClarificationMessage:
+        if not str(brief.scope.get("revision", "")).strip():
+            return ClarificationMessage(
+                role="assistant",
+                question_id="scope.revision",
+                content="请确认本次文档应使用哪个项目或资料版本？",
+                options=["当前发布版本", "最新上传版本", "指定其他版本"],
+                reason="版本范围会决定检索使用的事实基线。",
+            )
+        if not brief.missing_data_policy:
+            return ClarificationMessage(
+                role="assistant",
+                question_id="missing_data_policy",
+                content="检索不到可靠资料的字段应如何处理？",
+                options=["标记未提供", "保留空白", "停止并提示"],
+                reason="缺失数据策略决定文档是否可以继续生成。",
+            )
+        if not brief.inference_policy:
+            return ClarificationMessage(
+                role="assistant",
+                question_id="inference_policy",
+                content="是否允许 AI 根据现有证据进行有限推断？",
+                options=["禁止推断", "允许但必须标注", "允许有限推断"],
+                reason="推断策略决定 Writer 可以生成的内容边界。",
+            )
+
+        for requirement in brief.unresolved_requirements:
+            if hasattr(requirement, "to_dict"):
+                requirement = requirement.to_dict()
+            if not isinstance(requirement, dict):
+                continue
+            field_id = str(
+                requirement.get("field")
+                or requirement.get("field_id")
+                or ""
+            ).strip()
+            if not field_id or not requirement.get("requires_clarification", True):
+                continue
+            if field_id in brief.resolved_fields:
+                continue
+            raw_candidates = requirement.get("candidate_values") or requirement.get("options") or []
+            options = [str(value) for value in raw_candidates if str(value).strip()]
+            label = str(requirement.get("field_label") or requirement.get("label") or field_id)
+            return ClarificationMessage(
+                role="assistant",
+                question_id=f"field:{field_id}",
+                content=f"请确认字段“{label}”应使用哪个值？",
+                options=options,
+                reason=str(requirement.get("reason") or "字段需求尚未明确。"),
+            )
+
+        template_format = str(
+            brief.output_policy.get("format") or template_analysis.get("format") or "文档",
+        )
+        return ClarificationMessage(
+            role="assistant",
+            content=f"需求已经明确，将按已确认范围生成 {template_format} 文档。",
+            reason="ready_to_generate",
+        )
+
+    def apply_answer(
+        self,
+        brief: GenerationBrief,
+        *,
+        question_id: str,
+        answer: str,
+    ) -> GenerationBrief:
+        normalized = answer.strip()
+        if not normalized:
+            raise ValueError("clarification answer is required")
+
+        updates: dict[str, Any]
+        previous_answers = [a for a in brief.clarification_answers if a.question_id != question_id]
+        if question_id == "scope.revision":
+            updates = {"scope": {**brief.scope, "revision": normalized}}
+            previous_answers.append(ClarificationAnswer(
+                question_id=question_id, raw_answer=normalized, normalized_answer=normalized,
+            ))
+        elif question_id == "missing_data_policy":
+            canonical = normalize_clarification_policy(question_id, normalized)
+            if canonical is None:
+                raise ValueError(f"invalid missing_data_policy answer: {normalized}")
+            updates = {"missing_data_policy": canonical}
+            previous_answers.append(ClarificationAnswer(
+                question_id=question_id, raw_answer=normalized, normalized_answer=canonical,
+            ))
+        elif question_id == "inference_policy":
+            canonical = normalize_clarification_policy(question_id, normalized)
+            if canonical is None:
+                raise ValueError(f"invalid inference_policy answer: {normalized}")
+            updates = {"inference_policy": canonical}
+            previous_answers.append(ClarificationAnswer(
+                question_id=question_id, raw_answer=normalized, normalized_answer=canonical,
+            ))
+        elif question_id.startswith("field:"):
+            field_id = question_id.removeprefix("field:").strip()
+            known_fields = {
+                str(item.get("field") or item.get("field_id") or "").strip()
+                for item in brief.unresolved_requirements
+                if isinstance(item, dict)
+            }
+            if not field_id or field_id not in known_fields:
+                raise ValueError("unknown clarification field")
+            updates = {
+                "resolved_fields": {
+                    **brief.resolved_fields,
+                    field_id: normalized,
+                },
+            }
+            previous_answers.append(ClarificationAnswer(
+                question_id=question_id,
+                raw_answer=normalized,
+                normalized_answer=normalized,
+            ))
+        else:
+            raise ValueError("unknown clarification question")
+
+        updates["clarification_answers"] = previous_answers
+        answered = sum([
+            bool(brief.scope.get("revision")),
+            bool(brief.missing_data_policy),
+            bool(brief.inference_policy),
+        ]) + 1
+        updates["confidence"] = min(1.0, answered / 3)
+        return brief.model_copy(update=updates)

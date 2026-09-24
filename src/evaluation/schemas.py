@@ -1,0 +1,325 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+MetricStatus = Literal["success", "failed", "not_applicable"]
+SnapshotStatus = Literal["success", "failed"]
+ExpectedAccess = Literal["allowed", "denied"]
+ObservedAccess = Literal["allowed", "denied", "unknown"]
+RunStatus = Literal[
+    "queued",
+    "running",
+    "pause_requested",
+    "paused",
+    "collected",
+    "cancel_requested",
+    "cancelled",
+    "completed",
+    "failed",
+]
+RunStage = Literal["idle", "collecting", "collected", "scoring", "reporting"]
+
+
+class SampleRubric(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    required_facts: list[str] = Field(default_factory=list)
+    forbidden_claims: list[str] = Field(default_factory=list)
+    must_disclose_missing: bool = False
+    must_disclose_conflicts: bool = False
+
+
+class EvaluationSample(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    question: str = Field(min_length=1)
+    reference_answer: str = Field(min_length=1)
+    reference_contexts: list[str] = Field(default_factory=list)
+    kb_name: str = Field(min_length=1)
+    tags: list[str] = Field(default_factory=list)
+    metrics: list[str] = Field(default_factory=list)
+    required_evidence_types: list[str] = Field(default_factory=list)
+    rubric: SampleRubric = Field(default_factory=SampleRubric)
+    request_context: dict[str, Any] = Field(default_factory=dict)
+    critical: bool = False
+    expected_access: ExpectedAccess = "allowed"
+
+    @field_validator("id", "question", "reference_answer", "kb_name")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("request_context")
+    @classmethod
+    def context_is_allowlisted(cls, value: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "user_id",
+            "session_id",
+            "department_id",
+            "roles",
+            "allowed_kbs",
+            "kb_permissions",
+        }
+        unsupported = sorted(set(value) - allowed)
+        if unsupported:
+            raise ValueError(f"request_context contains unsupported fields: {', '.join(unsupported)}")
+        return value
+
+class DocumentGenerationEvalRecord(BaseModel):
+    """One expected field result for a controlled document template."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    template_fixture: str = Field(min_length=1)
+    field_id: str = Field(min_length=1)
+    expected_value: str = Field(min_length=1)
+    allowed_sources: list[str] = Field(min_length=1)
+    required: bool = True
+    critical: bool = True
+    expected_value_type: str | None = None
+    expected_missing_policy: Literal["mark_tbd", "keep_blank", "block_section"] | None = None
+    evidence_rationale: str | None = None
+
+    @field_validator("id", "template_fixture", "field_id", "expected_value")
+    @classmethod
+    def strip_document_generation_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("allowed_sources")
+    @classmethod
+    def validate_allowed_sources(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value if item.strip()]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("allowed_sources must be unique")
+        if not normalized:
+            raise ValueError("allowed_sources must not be empty")
+        return normalized
+
+
+class AnswerSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sample_id: str
+    question: str
+    kb_name: str
+    response: str = ""
+    scored_response: str = ""
+    retrieved_contexts: list[str] = Field(default_factory=list)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_summary: dict[str, Any] = Field(default_factory=dict)
+    status: SnapshotStatus = "success"
+    error_stage: str = ""
+    error_message: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    duration_seconds: float = 0.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    access_check: dict[str, str] | None = None
+
+    def contexts_for_scoring(self) -> list[str]:
+        """裁判输入用的上下文列表。
+
+        retrieved_contexts 是 evidence.content 的纯派生数据，新快照不再
+        落盘副本；为空时从 evidence 现场提取。旧快照（字段非空）直接
+        沿用，保证历史数据兼容。
+        """
+
+        if self.retrieved_contexts:
+            return self.retrieved_contexts
+        return [
+            str(item.get("content") or "")
+            for item in self.evidence
+            if item.get("content")
+        ]
+
+
+class DocumentGenerationSnapshot(BaseModel):
+    """Observed output needed to score a document-generation eval record."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_id: str
+    template_fixture: str
+    mapped_field_id: str | None = None
+    filled_value: str | None = None
+    evidence_sources: list[str] = Field(default_factory=list)
+    retrieved_evidence_sources: list[str] = Field(default_factory=list)
+    attempted_fill_count: int = Field(default=0, ge=0)
+    fixed_content_overwrite_count: int = Field(default=0, ge=0)
+    source_scope_violation_count: int = Field(default=0, ge=0)
+    unsupported_required_field_fill_count: int = Field(default=0, ge=0)
+    auto_approved: bool = False
+    typed_value_ok: bool | None = None
+    writer_mode: str | None = None
+    writer_fallback: bool = False
+    requires_human: bool = False
+    llm_calls: int | None = None
+    duration_seconds: float | None = None
+    token_usage: dict[str, Any] = Field(default_factory=dict)
+
+
+class MetricResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sample_id: str
+    metric_name: str
+    score: float | None = None
+    status: MetricStatus = "success"
+    reason: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class SampleResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sample_id: str
+    question: str = ""
+    reference_answer: str = ""
+    response: str = ""
+    scored_response: str = ""
+    retrieved_contexts: list[str] = Field(default_factory=list)
+    critical: bool = False
+    snapshot_status: SnapshotStatus = "success"
+    metrics: list[MetricResult] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    access_check: dict[str, str] | None = None
+
+
+class GateResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    passed: bool
+    exit_code: int = 0
+    metric_scores: dict[str, float] = Field(default_factory=dict)
+    metric_counts: dict[str, int] = Field(default_factory=dict)
+    failures: list[str] = Field(default_factory=list)
+
+
+class EvaluationSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    sample_count: int = 0
+    successful_samples: int = 0
+    failed_samples: int = 0
+    metric_scores: dict[str, float] = Field(default_factory=dict)
+    metric_counts: dict[str, int] = Field(default_factory=dict)
+    metric_failures: dict[str, int] = Field(default_factory=dict)
+    scoring_completed_items: int = 0
+    scoring_total_items: int = 0
+    gate: GateResult | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    kb_id: int | None = None
+    kb_name: str = ""
+    department_id: int | None = None
+    created_by: str = ""
+    source_dataset_path: str = ""
+    dataset_sha256: str = ""
+    execution_dataset_sha256: str = ""
+    dataset_total_count: int = 0
+    dataset_sample_count: int = 0
+    matched_sample_count: int = 0
+    filtered_sample_count: int = 0
+    normal_sample_count: int = 0
+    expected_denied_sample_count: int = 0
+    cohort_fingerprint: str = ""
+    snapshot_sha256: str = ""
+    snapshot_ownership_verified: bool = False
+    validation_warnings: list[str] = Field(default_factory=list)
+    llm_model: str = ""
+    embedding_model: str = ""
+    evaluation_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationRunState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    dataset_path: str
+    snapshot_path: str
+    mode: Literal["online", "offline"]
+    kb_id: int | None = None
+    kb_name: str = ""
+    department_id: int | None = None
+    created_by: str = ""
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    source_dataset_path: str = ""
+    dataset_sha256: str = ""
+    execution_dataset_sha256: str = ""
+    dataset_total_count: int = 0
+    dataset_sample_count: int = 0
+    matched_sample_count: int = 0
+    filtered_sample_count: int = 0
+    normal_sample_count: int = 0
+    expected_denied_sample_count: int = 0
+    cohort_fingerprint: str = ""
+    snapshot_sha256: str = ""
+    snapshot_ownership_verified: bool = False
+    validation_warnings: list[str] = Field(default_factory=list)
+    llm_model: str = ""
+    embedding_model: str = ""
+    evaluation_config: dict[str, Any] = Field(default_factory=dict)
+    sample_ids: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    status: RunStatus = "queued"
+    stage: RunStage = "idle"
+    total_samples: int = 0
+    completed_samples: int = 0
+    successful_samples: int = 0
+    failed_samples: int = 0
+    scoring_completed_groups: int = 0
+    scoring_total_groups: int = 0
+    scoring_completed_items: int = 0
+    scoring_total_items: int = 0
+    current_sample_id: str = ""
+    current_question: str = ""
+    started_at: str = ""
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    finished_at: str = ""
+    error_message: str = ""
+    report_path: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_removed_score_enabled(cls, value: Any) -> Any:
+        """Read old run_state files without restoring the removed switch."""
+        if isinstance(value, dict) and "score_enabled" in value:
+            value = dict(value)
+            value.pop("score_enabled", None)
+        return value
+
+    @classmethod
+    def new_online(
+        cls,
+        *,
+        run_id: str,
+        dataset_path: str,
+        snapshot_path: str,
+        total_samples: int,
+        sample_ids: list[str] | None = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "EvaluationRunState":
+        return cls(
+            run_id=run_id,
+            dataset_path=dataset_path,
+            snapshot_path=snapshot_path,
+            mode="online",
+            total_samples=total_samples,
+            sample_ids=sample_ids or [],
+            tags=tags or [],
+            **(metadata or {}),
+        )

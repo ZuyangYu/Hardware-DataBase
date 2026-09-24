@@ -1,0 +1,95 @@
+name: hardware-database-observability
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      OBS_PHOENIX_PROJECT: ${OBS_PHOENIX_PROJECT:-hardware-database}
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "9464:9464"
+    depends_on:
+      - tempo
+      - loki
+      - phoenix
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    expose:
+      - "3200"
+      - "4317"
+
+  loki:
+    image: grafana/loki:3.5.1
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    expose:
+      - "3100"
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+  phoenix-db:
+    image: postgres:16.10-alpine
+    environment:
+      POSTGRES_USER: ${PHOENIX_DB_USER:-phoenix}
+      POSTGRES_PASSWORD: ${PHOENIX_DB_PASSWORD:-change-me}
+      POSTGRES_DB: ${PHOENIX_DB_NAME:-phoenix}
+    volumes:
+      - phoenix-db-data:/var/lib/postgresql/data
+
+  phoenix:
+    image: arizephoenix/phoenix:19.13.0
+    environment:
+      PHOENIX_SQL_DATABASE_URL: postgresql://${PHOENIX_DB_USER:-phoenix}:${PHOENIX_DB_PASSWORD:-change-me}@phoenix-db:5432/${PHOENIX_DB_NAME:-phoenix}
+      PHOENIX_PROJECT_NAME: ${OBS_PHOENIX_PROJECT:-hardware-database}
+    ports:
+      - "6006:6006"
+    depends_on:
+      - phoenix-db
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:
+  phoenix-db-data:

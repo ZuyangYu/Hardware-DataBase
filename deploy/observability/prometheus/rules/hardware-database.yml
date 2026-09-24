@@ -1,0 +1,124 @@
+groups:
+  - name: hardware-database-slo
+    rules:
+      - alert: HdbChatErrorRateHigh
+        expr: sum(rate(hdb_chat_turns_total{status!="completed"}[5m])) / clamp_min(sum(rate(hdb_chat_turns_total[5m])), 1) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hardware DataBase chat error rate is above 10%"
+
+      - alert: HdbChatLatencyP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(hdb_chat_turn_duration_seconds_bucket[5m]))) > 8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hardware DataBase chat p95 latency is above 8 seconds"
+
+      - alert: HdbQueueBacklogHigh
+        expr: max(hdb_queue_depth) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hardware DataBase durable queue backlog is above 100"
+
+      - alert: HdbWorkerFailures
+        expr: sum(rate(hdb_worker_task_failed_total[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hardware DataBase worker failures are occurring"
+
+      - alert: HdbRetrievalEmptyRateHigh
+        expr: sum(rate(hdb_retrieval_empty_total[10m])) / clamp_min(sum(rate(hdb_retrieval_calls_total[10m])), 1) > 0.30
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Retrieval empty-result rate is above 30%"
+
+      - alert: HdbLlmLatencyP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(hdb_llm_duration_seconds_bucket[5m]))) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM p95 latency is above 20 seconds"
+
+  - name: hardware-database-production-hardening
+    rules:
+      - alert: HdbStaleAuthorityWrites
+        expr: sum(rate(hdb_conversation_stale_write_rejected_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A superseded chat attempt is writing authoritative state"
+
+      - alert: HdbResourceRejections
+        expr: sum(rate(hdb_resource_rejected_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Resource governor is rejecting admissions above 1/s"
+
+      - alert: HdbResourceQueueDeep
+        expr: max(hdb_resource_queue_waiting) > 16
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 16 callers are queued for one resource"
+
+      - alert: HdbResourceUncertainPermits
+        expr: max(hdb_resource_uncertain) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Uncertain resource permits are not draining"
+
+      - alert: HdbResourceUncertainEscalated
+        expr: increase(hdb_resource_uncertain_escalated_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Uncertain permits exceeded the escalation window; new admissions for the resource are paused"
+
+      - alert: HdbAttachmentWaitTimeouts
+        expr: increase(hdb_conversation_attachment_wait_seconds_count{status="timed_out"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Attachment waits are timing out; queued turns were released"
+
+      - alert: HdbHeavyQueueStarvation
+        expr: max by (queue) (hdb_queue_oldest_age_seconds{queue=~"document_authoring|export"}) > 600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Heavy job queue oldest item exceeds 10 minutes"
+
+      - alert: HdbRetrievalExecutorShed
+        expr: sum(rate(hdb_retrieval_executor_attempts_total{status="saturated"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Shared retrieval executor is shedding queued calls"
+
+      - alert: HdbActionParallelFailures
+        expr: sum(rate(hdb_action_parallel_layers_total{status="failed"}[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Action DAG parallel layers are failing"

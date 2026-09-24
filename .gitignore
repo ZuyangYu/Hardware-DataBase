@@ -6,19 +6,134 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
-.venv
+# Virtual environments and local configuration
+.venv/
 .env
-# 忽略 storage/ 下所有内容，但保留 .gitkeep
+.env.*
+!.env.example
+
+# Local editor settings and temporary files
+.vscode/
+*.swp
+*.swo
+*~
+
+# Ignore all storage/ contents, but keep .gitkeep
 storage/**
 !storage/.gitkeep
 
-# 忽略 data/ 下所有内容，但保留 .gitkeep
-data/**
-!data/.gitkeep
-
 .idea/
+
+# Ruff cache
+.ruff_cache/
+
+# Pytest cache
+.pytest_cache/
 
 # Streamlit logs
 streamlit.log
 streamlit.err.log
+streamlit.out.log
+
+# Local verification scratch dirs
+.tmp_ragflow*/
+.tmp_pycache/
+ragflow_store_*/
+
+# Generated RAGAS evaluation snapshots and reports
+evaluation/reports/
+evaluation/results/
+evaluation/snapshots/
+evaluation/.cache/
+
+# Local test and coverage artifacts
+.coverage
+htmlcov/
+*.log
+*.pid
+*.db-wal
+*.db-shm
+*.db-journal
+*.bak
+*.bak-*
+
+# Local evaluation source documents are not the canonical test datasets.
+# Keep evaluation/datasets/*.jsonl under version control; ignore raw uploads
+# and editor-generated backup copies.
+/evaluation/datasets/*.docx
+/evaluation/datasets/*.jsonl.bak-*
+
+# Frontend generated artifacts
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/frontend/*.tsbuildinfo
+/frontend/coverage/
+/frontend/playwright-report/
+/frontend/test-results/
+
+# Rendered architecture preview; keep the Markdown/SVG sources versioned.
+/deploy/observability/current-architecture.png
+
+# Vendored SpyDrNet: exclude upstream documentation, examples, and tests.
+/src/circuit/vendor/spydrnet/docs/
+/src/circuit/vendor/spydrnet/examples/
+/src/circuit/vendor/spydrnet/example_netlists/
+/src/circuit/vendor/spydrnet/tests/
+/src/circuit/vendor/spydrnet/spydrnet_extension/ir/tests/
+/src/circuit/vendor/spydrnet/CONTRIBUTING.rst
+/src/circuit/vendor/spydrnet/CONTRIBUTORS.rst
+/src/circuit/vendor/spydrnet/INSTALL.rst
+/src/circuit/vendor/spydrnet/README.rst
+/src/circuit/vendor/spydrnet/RELEASE.rst
+/src/circuit/vendor/spydrnet/diff_analysis.md
+/src/circuit/vendor/spydrnet/pylint_output.txt
+
+# Generated parser tables in the vendored SpyDrNet source
+/src/circuit/vendor/spydrnet/**/parser.out
+/src/circuit/vendor/spydrnet/**/parsetab.py
+
+
+.agents/
+.worktrees/
+
+# Local-only documentation and planning materials (stay out of the repo)
+/.superpowers/
+/docs/
+
+# Local agent guidance
+/CLAUDE.md
+
+.tests/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Local diagnostic scripts and output (may contain secrets)
+/_diag_auth.py
+/_diag_out.txt
+/_verify.txt
+
+# macOS Finder metadata
+.DS_Store
+
+# Local business data / experiment scripts (not for repo)
+AAA/
+ingest_aaa_test.py
+verify_recall.py
+
+# 本地运行残留
+run_state.json
+
+# Accidental test artifacts (Mock repr used as a filename)
+<Mock name=*
+
+# 本地演练/调试临时目录
+.tmp_dbg/
+
+# 本地备份 / 分发产物（含真实数据，绝不进开源仓库）
+backups/
+storage.pre-restore-*/
+*.tar.gz
+*.dump
+.tmp_dbg/

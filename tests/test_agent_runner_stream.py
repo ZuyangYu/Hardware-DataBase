@@ -1,0 +1,412 @@
+"""MultiSourceAgentRunner.stream 观测包装冒烟测试。
+
+合并后 runner 换成 deepagents 门面，观测包装（observe.agent + 指标）是本分支
+回植的关键路径；此处用假模型/假 agent 验证流式输出、answer/summary 记录与
+指标调用不抛异常。
+"""
+
+from __future__ import annotations
+
+from unittest.mock import Mock
+
+from langchain_core.messages import AIMessage, AIMessageChunk
+
+from src.agents.runner import MultiSourceAgentRunner
+
+
+class _FakeRAGBackend:
+    name = "fake"
+
+    def retrieve(self, *args, **kwargs):
+        return []
+
+
+def test_stream_wrapper_emits_deltas_and_records_answer(monkeypatch):
+    from src.agents import runner as runner_mod
+
+    chunks = [AIMessage(content="你好"), AIMessage(content="，世界")]
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter((chunk, {"langgraph_node": "model"}) for chunk in chunks)
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    record_agent = Mock()
+    monkeypatch.setattr(runner_mod, "record_agent", record_agent)
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(query="问题", kb_name="kb_hw", history=[], thread_id="t1")
+    )
+
+    assert deltas == ["你好", "，世界"]
+    record = runner_mod._current_run()
+    assert record.answer == "你好，世界"
+    summary = runner.get_last_retrieval_summary()
+    assert summary["status"] == "no_evidence"
+    assert summary["retriever_type"] == "multi_source_agent"
+    assert runner.get_last_footer()
+    record_agent.assert_called_once()
+    assert record_agent.call_args.kwargs["mode"] == "deep"
+
+
+def test_stream_retracts_narration_without_tool_metadata(monkeypatch):
+    """真实观测形态：工具调用信息不在流式 chunk 上，后续消息开始才知道前一段是叙述。
+
+    叙述文本先被乐观下发为答案增量，再通过 narration 事件回收；
+    record.answer 只含最终回答。
+    """
+    from src.agents import runner as runner_mod
+
+    chunks = [
+        AIMessageChunk(content="让我先检索电源方案。", id="m1"),
+        AIMessageChunk(content="根据知识库证据，最终结论是 A。", id="m2"),
+    ]
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter((chunk, {"langgraph_node": "model"}) for chunk in chunks)
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(query="问题", kb_name="kb_hw", history=[], thread_id="t1", event_callback=events.append)
+    )
+
+    assert deltas == ["让我先检索电源方案。", "根据知识库证据，最终结论是 A。"]
+    assert [e for e in events if e["type"] == "narration"] == [
+        {"type": "narration", "payload": {"text": "让我先检索电源方案。"}}
+    ]
+    assert runner_mod._current_run().answer == "根据知识库证据，最终结论是 A。"
+
+
+def test_stream_classifies_whole_message_narration_without_retraction(monkeypatch):
+    """整条 AIMessage 的伪流式路径：叙述消息自带 tool_calls，文本从未下发，无需回收。"""
+    from src.agents import runner as runner_mod
+
+    chunks = [
+        AIMessage(
+            content="让我先检索电源方案。",
+            tool_calls=[{"name": "document_search", "args": {"query": "电源"}, "id": "t1", "type": "tool_call"}],
+        ),
+        AIMessage(content="根据知识库证据，最终结论是 A。"),
+    ]
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter((chunk, {"langgraph_node": "model"}) for chunk in chunks)
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(query="问题", kb_name="kb_hw", history=[], thread_id="t1", event_callback=events.append)
+    )
+
+    assert deltas == ["根据知识库证据，最终结论是 A。"]
+    assert [e for e in events if e["type"] == "narration"] == []
+    assert runner_mod._current_run().answer == "根据知识库证据，最终结论是 A。"
+
+
+def test_stream_wrapper_marks_failure_status(monkeypatch):
+    from src.agents import runner as runner_mod
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("模型炸了")
+
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = _boom
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    record_agent = Mock()
+    monkeypatch.setattr(runner_mod, "record_agent", record_agent)
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend())
+    try:
+        list(runner.stream(query="问题", kb_name="kb_hw", history=[]))
+        raised = False
+    except RuntimeError:
+        raised = True
+
+    assert raised
+    record_agent.assert_called_once()
+    assert record_agent.call_args.kwargs["status"] == "failed"
+
+
+def test_attachment_sessions_get_a_larger_evidence_budget():
+    from src.agents.runner import _agent_evidence_budget
+
+    base = _agent_evidence_budget([])
+    with_attachment = _agent_evidence_budget([object()])
+
+    assert with_attachment > base
+
+
+def test_graph_recursion_error_completes_with_actionable_notice(monkeypatch):
+    """步数上限是执行预算，不是系统故障：轮次必须完成并给出可操作提示。"""
+    from langgraph.errors import GraphRecursionError
+
+    from src.agents import runner as runner_mod
+
+    def _boom(*args, **kwargs):
+        raise GraphRecursionError(
+            "Recursion limit of 36 reached without hitting a stop condition."
+        )
+
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = _boom
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(query="完善附件第6章", kb_name="kb_hw", history=[], event_callback=events.append)
+    )
+
+    assert len(deltas) == 1
+    assert "单轮步数上限" in deltas[0]
+    assert "系统错误" not in deltas[0]
+    assert runner_mod._current_run().answer == deltas[0]
+    summary = runner.get_last_retrieval_summary()
+    assert summary["status"] == "no_evidence"
+    degraded = [event for event in events if event["type"] == "degraded"]
+    assert degraded and degraded[-1]["payload"]["stage"] == "agent_loop"
+
+
+def test_general_chat_runs_through_agent_without_retrieval_tools(monkeypatch):
+    """未挂载知识库的通用对话与 KB 问答共用同一条 deepagents 链路：
+    同一个模型接口与系统提示词来源，只是不注册知识库检索工具。"""
+    from src.agents import runner as runner_mod
+
+    captured: dict = {}
+
+    def _fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+
+        class _Agent:
+            def stream(self, *args, **kwargs):
+                return iter(())
+
+        return _Agent()
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", _fake_create_deep_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend())
+    def _tool_name(tool) -> str:
+        return str(getattr(tool, "name", None) or getattr(tool, "__name__", ""))
+
+    for kb_name in ("", "__general__"):
+        captured.clear()
+        list(runner.stream(query="你好", kb_name=kb_name, history=[], thread_id="t1"))
+
+        tool_names = [_tool_name(tool) for tool in captured["tools"]]
+        assert tool_names == ["memory_search"]
+        assert "当前未挂载知识库" in captured["system_prompt"]
+
+    # 挂载知识库时仍然注册全部检索工具。
+    captured.clear()
+    list(runner.stream(query="问题", kb_name="kb_hw", history=[], thread_id="t1"))
+    tool_names = [_tool_name(tool) for tool in captured["tools"]]
+    assert "document_search" in tool_names
+    assert "document_search_batch" in tool_names
+    assert "circuit_search" in tool_names
+    assert "当前未挂载知识库" not in captured["system_prompt"]
+
+
+def test_export_request_mounts_server_owned_export_protocol(monkeypatch):
+    """Export requests must teach the model that the server owns file creation."""
+    from src.agents import runner as runner_mod
+
+    captured: dict = {}
+
+    def _fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+
+        class _Agent:
+            def stream(self, *args, **kwargs):
+                return iter(((AIMessage(content="已整理结果"), {"langgraph_node": "model"}),))
+
+        return _Agent()
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", _fake_create_deep_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    list(
+        runner.stream(
+            query="请将这次 HSI 对比结果整理成 PDF 供下载",
+            kb_name="ADAS",
+            history=[],
+            thread_id="export-prompt",
+        )
+    )
+
+    prompt = captured["system_prompt"]
+    assert "导出任务由服务器异步生成" in prompt
+    assert "不要生成 HTML" in prompt
+    assert "不得声称当前环境无法输出 PDF" in prompt
+
+
+def test_attachment_turn_prefetches_evidence_before_agent_answer(monkeypatch):
+    """An attached-file question must not depend on the model choosing the tool."""
+    from src.agents import runner as runner_mod
+    from src.agents.tools import attachment_tools as attachment_tools_mod
+    from src.attachments.models import AttachmentRef
+
+    captured: dict = {}
+    search_queries: list[str] = []
+
+    def attachment_list() -> str:
+        return "本轮可用附件：1. 600605919_EPS_HSI.docx — 解析状态: ready"
+
+    def attachment_search(query: str, top_k: int = 6) -> str:
+        search_queries.append(query)
+        return (
+            '<evidence id="1" source="600605919_EPS_HSI.docx">\n'
+            "EPS 系统状态定义如下：\n"
+            "</evidence>"
+        )
+
+    attachment_tools = [attachment_list, attachment_search]
+
+    def _build_attachment_tools(rt):
+        captured["runtime_attachment_user_id"] = rt.attachment_user_id
+        return attachment_tools
+
+    monkeypatch.setattr(attachment_tools_mod, "build_attachment_tools", _build_attachment_tools)
+
+    def _fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+
+        class _Agent:
+            def stream(self, *args, **kwargs):
+                return iter(((AIMessage(content="已读取附件"), {"langgraph_node": "model"}),))
+
+        return _Agent()
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", _fake_create_deep_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    ref = AttachmentRef(
+        attachment_id="att-1",
+        asset_id="asset-1",
+        session_id=1,
+        filename="600605919_EPS_HSI.docx",
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        extension=".docx",
+        size_bytes=1,
+        sha256="hash",
+    )
+    assert list(
+        runner.stream(
+            query="对比知识库中的HSI文档和附件中的HSI文档区别",
+            kb_name="ADAS",
+            history=[],
+            thread_id="1",
+            attachments=[ref],
+            source_scope="attachment_and_knowledge_base",
+            attachment_user_id=7,
+        )
+    ) == ["已读取附件"]
+
+    assert captured["runtime_attachment_user_id"] == 7
+    assert search_queries
+    assert any("600605919" in query and "EPS" in query for query in search_queries)
+    assert "600605919_EPS_HSI.docx" in captured["system_prompt"]
+    assert "EPS 系统状态定义如下" in captured["system_prompt"]
+    assert "不得声称附件未挂载" in captured["system_prompt"]
+
+
+def test_general_chat_hides_memory_trace_and_retrieval_footer(monkeypatch):
+    from src.agents import runner as runner_mod
+    from src.pipelines.document_rag.schemas import RequestContext
+
+    class _MemoryService:
+        def search(self, query, **kwargs):
+            return [{"id": "m1", "scope": "user", "status": "verified", "content": "历史线索"}]
+
+        def format_context(self, rows):
+            return "<untrusted_memory>历史线索</untrusted_memory>"
+
+        def close(self):
+            pass
+
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter(
+        ((AIMessage(content="通用回答"), {"langgraph_node": "model"}),)
+    )
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(
+        rag_backend=_FakeRAGBackend(),
+        memory_service_factory=_MemoryService,
+    )
+    deltas = list(
+        runner.stream(
+            query="问题",
+            kb_name="",
+            history=[],
+            ctx=RequestContext(user_id="engineer"),
+            thread_id="general-1",
+            event_callback=events.append,
+        )
+    )
+
+    assert deltas == ["通用回答"]
+    assert not any(event["type"] in {"tool_started", "tool_result", "stage", "narration"} for event in events)
+    assert runner.get_last_footer() == ""
+    summary = runner.get_last_retrieval_summary()
+    assert summary["memory_context"][0]["id"] == "m1"
+    assert summary["tool_diagnostics"][0]["tool_name"] == "memory_search"
+
+
+def test_runner_prefetches_bounded_memory_context_before_agent_creation():
+    from src.agents.tools.runtime import ToolRuntime
+    from src.pipelines.document_rag.schemas import RequestContext
+
+    services = []
+
+    class _MemoryService:
+        def __init__(self):
+            self.closed = False
+            services.append(self)
+
+        def search(self, query, **kwargs):
+            assert query == "历史电源方案"
+            assert kwargs["scope"] == "all"
+            assert kwargs["status"] == "all"
+            return [{"id": "m1", "scope": "project", "status": "candidate", "content": {"content": "仅作历史线索"}}]
+
+        def format_context(self, rows):
+            assert len(rows) == 1
+            return "<untrusted_memory>\n[M1]仅作历史线索\n</untrusted_memory>"
+
+        def close(self):
+            self.closed = True
+
+    runner = MultiSourceAgentRunner(
+        rag_backend=_FakeRAGBackend(),
+        memory_service_factory=_MemoryService,
+    )
+    context = runner._prefetch_memory_context(
+        query="历史电源方案",
+        kb_name="design",
+        ctx=RequestContext(user_id="engineer"),
+        rt=ToolRuntime(kb_name="design", ctx=RequestContext(user_id="engineer")),
+    )
+
+    assert "仅作历史线索" in context
+    assert len(services) == 1
+    assert services[0].closed is True

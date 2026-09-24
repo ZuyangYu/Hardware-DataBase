@@ -1,0 +1,752 @@
+import gc
+import os
+from contextlib import closing
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+import src.settings
+import httpx
+
+from src.api.app import create_app
+from src.api.deps import get_auth_service, get_pipeline
+from src.core.auth import ROLE_EMPLOYEE, AuthService
+from src.core.conversation import ConversationService
+
+from tests._api_stub import Server, StubPipeline, make_auth
+
+
+class ApiRoutesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = create_app()
+        cls.server = Server(cls.app)
+        cls.server.start()
+        cls.url = cls.server.url
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+
+    def setUp(self):
+        self._old_pw = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
+        src.settings.AUTH_DEFAULT_ADMIN_PASSWORD = "StrongTestPassword123!"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, src.settings, "AUTH_DEFAULT_ADMIN_PASSWORD", self._old_pw)
+        self.db_path = os.path.join(self.tmp.name, "auth.db")
+        self._old_db = src.settings.AUTH_DB_PATH
+        src.settings.AUTH_DB_PATH = self.db_path
+        self.addCleanup(setattr, src.settings, "AUTH_DB_PATH", self._old_db)
+        self.auth, self.dept, self.admin, self.user = make_auth(self.db_path)
+        self.stub = StubPipeline()
+        self.app.dependency_overrides[get_pipeline] = lambda: self.stub
+        self.app.dependency_overrides[get_auth_service] = lambda: self.auth
+        self.addCleanup(self.app.dependency_overrides.clear)
+        self.addCleanup(gc.collect)
+        self.client = httpx.Client(base_url=self.url, timeout=30)
+        self.addCleanup(self.client.close)
+
+    def _token(self, username: str, password: str = "pw123456") -> str:
+        r = self.client.post("/api/v1/login", json={"username": username, "password": password})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["token"]
+
+    def _auth(self, token: str) -> dict:
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_login_wrong_password(self):
+        r = self.client.post("/api/v1/login", json={"username": "admin1", "password": "bad"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_login_failure_reason_is_specific(self):
+        # 密码错误 -> 中文原因(不暴露用户名是否存在)
+        r = self.client.post("/api/v1/login", json={"username": "user1", "password": "bad"})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["detail"], "用户名或密码错误")
+
+        # 账号被停用 -> 明确提示, 用户知道重试无意义
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        self.auth.set_user_active_as(sysadmin, self.user.id, False)
+        r2 = self.client.post("/api/v1/login", json={"username": "user1", "password": "pw123456"})
+        self.assertEqual(r2.status_code, 401)
+        self.assertIn("停用", r2.json()["detail"])
+
+    def test_login_lockout_reason_reports_wait(self):
+        from src.core.auth import LOGIN_MAX_FAILURES
+
+        for _ in range(LOGIN_MAX_FAILURES):
+            self.client.post("/api/v1/login", json={"username": "user1", "password": "bad"})
+        r = self.client.post("/api/v1/login", json={"username": "user1", "password": "pw123456"})
+        self.assertEqual(r.status_code, 401)
+        self.assertIn("锁定", r.json()["detail"])
+
+    def test_whoami_requires_token(self):
+        self.assertEqual(self.client.get("/api/v1/whoami").status_code, 401)
+
+    def test_whoami_ok(self):
+        t = self._token("admin1")
+        r = self.client.get("/api/v1/whoami", headers=self._auth(t))
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["username"], "admin1")
+        self.assertEqual(body["role"], "employee")
+
+    def test_list_kb_returns_accessible(self):
+        t = self._token("user1")
+        r = self.client.get("/api/v1/kbs", headers=self._auth(t))
+        self.assertEqual(r.status_code, 200)
+        kbs = r.json()
+        self.assertEqual([k["name"] for k in kbs], ["shared"])
+        self.assertEqual(kbs[0]["permission"], "admin")
+        self.assertTrue(kbs[0]["is_shared"])
+        self.assertFalse(kbs[0]["is_owner"])
+
+    def test_private_kb_share_toggle_and_access(self):
+        self.auth.register_knowledge_base("private-kb", owner=self.admin)
+        user_token = self._token("user1")
+        admin_token = self._token("admin1")
+
+        # 私有库对其他员工完全不可见, 也不可操作
+        r = self.client.get("/api/v1/kbs", headers=self._auth(user_token))
+        self.assertNotIn("private-kb", [k["name"] for k in r.json()])
+        r = self.client.delete(
+            "/api/v1/kbs/private-kb/files/a.pdf", headers=self._auth(user_token)
+        )
+        self.assertEqual(r.status_code, 403)
+
+        # 非所有者不能切换共享状态
+        r = self.client.patch(
+            "/api/v1/kbs/private-kb/sharing",
+            json={"is_shared": True},
+            headers=self._auth(user_token),
+        )
+        self.assertEqual(r.status_code, 403)
+
+        # 所有者共享后, 部门其他员工获得 admin
+        r = self.client.patch(
+            "/api/v1/kbs/private-kb/sharing",
+            json={"is_shared": True},
+            headers=self._auth(admin_token),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get("/api/v1/kbs", headers=self._auth(user_token))
+        view = next(k for k in r.json() if k["name"] == "private-kb")
+        self.assertEqual(view["permission"], "admin")
+        self.assertTrue(view["is_shared"])
+        self.assertFalse(view["is_owner"])
+        r = self.client.get("/api/v1/kbs", headers=self._auth(admin_token))
+        own_view = next(k for k in r.json() if k["name"] == "private-kb")
+        self.assertTrue(own_view["is_owner"])
+
+        # 改回私有后立即收回
+        r = self.client.patch(
+            "/api/v1/kbs/private-kb/sharing",
+            json={"is_shared": False},
+            headers=self._auth(admin_token),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get("/api/v1/kbs", headers=self._auth(user_token))
+        self.assertNotIn("private-kb", [k["name"] for k in r.json()])
+        r = self.client.delete(
+            "/api/v1/kbs/private-kb/files/a.pdf", headers=self._auth(user_token)
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_evaluation_knowledge_base_list_is_system_admin_only(self):
+        user_token = self._token("user1")
+        response = self.client.get(
+            "/api/v1/evaluation/knowledge-bases",
+            headers=self._auth(user_token),
+        )
+        self.assertEqual(response.status_code, 403)
+
+        admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        response = self.client.get(
+            "/api/v1/evaluation/knowledge-bases",
+            headers=self._auth(admin_token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[0]["kb_name"], "shared")
+        self.assertIsInstance(response.json()[0]["kb_id"], int)
+
+    def test_list_files_user_read_ok(self):
+        t = self._token("user1")
+        r = self.client.get("/api/v1/kbs/shared/files", headers=self._auth(t))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()[0]["name"], "a.pdf")
+
+    def test_assets_are_readable_but_system_admin_is_blocked(self):
+        user_token = self._token("user1")
+        r = self.client.get("/api/v1/kbs/shared/assets", headers=self._auth(user_token))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json(), [])
+
+        system_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.get("/api/v1/kbs/shared/assets", headers=self._auth(system_token))
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_asset_sources_normalize_indexed_files_to_completed(self):
+        self.stub.list_file_infos = lambda kb_name, ctx=None: [
+            type("IndexedFile", (), {
+                "id": "indexed-1", "name": "BOM.xlsx", "status": "indexed",
+                "processor_kind": "spreadsheet_table", "dataset_kind": "table",
+            })(),
+        ]
+        token = self._token("user1")
+        r = self.client.get("/api/v1/kbs/shared/asset-sources", headers=self._auth(token))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()[0]["file_status"], "completed")
+
+    def test_structured_spreadsheets_user_read_ok(self):
+        t = self._token("user1")
+        r = self.client.get("/api/v1/kbs/shared/structured/spreadsheets", headers=self._auth(t))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["totals"]["file_count"], 0)
+
+    def test_structured_content_rejects_system_admin(self):
+        t = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.get("/api/v1/kbs/shared/structured/spreadsheets", headers=self._auth(t))
+        self.assertEqual(r.status_code, 403)
+
+    def test_upload_employee_ok_system_admin_forbidden(self):
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/kbs/shared/files",
+            headers=self._auth(t),
+            files=[("files", ("a.txt", b"hello"))],
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        system_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r2 = self.client.post(
+            "/api/v1/kbs/shared/files",
+            headers=self._auth(system_token),
+            files=[("files", ("a.txt", b"hello"))],
+        )
+        self.assertEqual(r2.status_code, 403)
+
+    def test_upload_admin_ok(self):
+        t = self._token("admin1")
+        r = self.client.post(
+            "/api/v1/kbs/shared/files",
+            headers=self._auth(t),
+            files=[("files", ("a.txt", b"hello"))],
+            data={"source_group": "文档资料"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.stub.uploaded[0][0], "shared")
+        self.assertEqual(self.stub.uploaded[0][2], "文档资料")
+
+    def test_create_kb_system_admin_forbidden(self):
+        system_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.post("/api/v1/kbs", json={"name": "newkb"}, headers=self._auth(system_token))
+        self.assertEqual(r.status_code, 403)
+
+    def test_create_kb_admin_ok(self):
+        t = self._token("admin1")
+        r = self.client.post("/api/v1/kbs", json={"name": "newkb"}, headers=self._auth(t))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.stub.created, ["newkb"])
+
+    def test_delete_system_admin_forbidden(self):
+        system_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.delete("/api/v1/kbs/shared/files/a.pdf", headers=self._auth(system_token))
+        self.assertEqual(r.status_code, 403)
+
+    def test_delete_admin_ok(self):
+        t = self._token("admin1")
+        r = self.client.delete("/api/v1/kbs/shared/files/a.pdf", headers=self._auth(t))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.stub.deleted, [("shared", "a.pdf")])
+
+    def test_system_status_requires_system_admin(self):
+        # 运维明细(依赖/LLM/任务统计)只给系统管理员; 员工访问一律 403。
+        conv = ConversationService(db_path=self.db_path)
+        kb_id = self.auth.get_knowledge_base_id("shared", department_id=self.dept.id)
+        session = conv.create_session(self.user.id, "shared", department_id=self.dept.id, kb_id=kb_id)
+        turn = conv.create_turn(self.user.id, session.id, "本部门任务", client_request_id="status-dept")
+        conv.complete_turn(self.user.id, turn.id, "done", {"status": "ok"})
+
+        other_dept = self.auth.create_department("other")
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        other = self.auth.create_user_as(sysadmin, "other1", "pw123456", ROLE_EMPLOYEE, other_dept.id)
+        self.auth.register_knowledge_base("other-kb", owner=other)
+        other_kb_id = self.auth.get_knowledge_base_id("other-kb", department_id=other_dept.id)
+        other_session = conv.create_session(other.id, "other-kb", department_id=other_dept.id, kb_id=other_kb_id)
+        other_turn = conv.create_turn(other.id, other_session.id, "其它部门任务", client_request_id="status-other")
+        conv.complete_turn(other.id, other_turn.id, "done", {"status": "ok"})
+
+        emp_token = self._token("user1")
+        r = self.client.get("/api/v1/system/status", headers=self._auth(emp_token))
+        self.assertEqual(r.status_code, 403)
+
+        sys_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r2 = self.client.get("/api/v1/system/status", headers=self._auth(sys_token))
+        self.assertEqual(r2.status_code, 200)
+        self.assertGreaterEqual(r2.json()["tasks"]["total"], 2)
+
+    def test_conversation_no_permission(self):
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "other_kb", "title": "越权"},
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_general_chat_session_does_not_require_kb_permission(self):
+        t = self._token("user1")
+        r = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "__general__", "title": "通用对话"},
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        session_id = r.json()["id"]
+        r = self.client.post(
+            f"/api/v1/conversations/{session_id}/messages",
+            json={"role": "user", "content": "你好"},
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_general_chat_rejects_system_admin(self):
+        t = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
+        r = self.client.get(
+            "/api/v1/conversations",
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 403)
+        r = self.client.get(
+            "/api/v1/conversations?kb_name=__general__",
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 403)
+        r = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "__general__", "title": "通用对话"},
+            headers=self._auth(t),
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def _run_stub_turn(self, token: str, kb_name: str = "shared") -> tuple[str, str]:
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": kb_name, "title": "新对话"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(session.status_code, 200, session.text)
+        created = self.client.post(
+            f"/api/v1/conversations/{session.json()['id']}/turns",
+            json={"query": "问"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        turn_id = created.json()["turn"]["id"]
+        started = self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(token))
+        self.assertEqual(started.status_code, 202, started.text)
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(token)) as response:
+            self.assertEqual(response.status_code, 200)
+            body = b"".join(response.iter_bytes()).decode("utf-8")
+        return turn_id, body
+
+    def test_turn_records_chat_metrics(self):
+        t = self._token("user1")
+        with patch("src.api.routes.query.record_chat_turn") as record:
+            self._run_stub_turn(t)
+            deadline = time.time() + 5
+            while time.time() < deadline and not record.called:
+                time.sleep(0.05)
+        record.assert_called_once()
+        self.assertEqual(record.call_args.kwargs["status"], "completed")
+        self.assertEqual(record.call_args.kwargs["mode"], "deep")
+        self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
+
+    def test_general_query_unified_through_pipeline(self):
+        # 未挂载知识库的通用对话不再有直连模型旁路，与 KB 问答一样走统一
+        # 的 pipeline（deepagents agent 链路）。
+        t = self._token("user1")
+        with patch("src.api.routes.query.record_chat_turn") as record:
+            _, body = self._run_stub_turn(t, kb_name="__general__")
+            deadline = time.time() + 5
+            while time.time() < deadline and not record.called:
+                time.sleep(0.05)
+        self.assertIn("event: delta", body)
+        self.assertIn("第一段", body)
+
+        record.assert_called_once()
+        self.assertEqual(record.call_args.kwargs["status"], "completed")
+        self.assertEqual(record.call_args.kwargs["mode"], "fast")
+        self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
+
+    def test_turn_persists_messages_and_replays_sse_events(self):
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "新对话"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "问", "client_request_id": "retry-safe-key"},
+            headers=self._auth(t),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        payload = created.json()
+        turn_id = payload["turn"]["id"]
+        self.assertEqual(payload["user_message"]["content"], "问")
+
+        # Same idempotency key must not create another model turn/message pair.
+        retried = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "问", "client_request_id": "retry-safe-key"},
+            headers=self._auth(t),
+        )
+        self.assertEqual(retried.status_code, 201, retried.text)
+        self.assertEqual(retried.json()["turn"]["id"], turn_id)
+
+        started = self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(t))
+        self.assertEqual(started.status_code, 202, started.text)
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(t)) as response:
+            self.assertEqual(response.status_code, 200)
+            body = b"".join(response.iter_bytes()).decode("utf-8")
+        self.assertIn("id: 1", body)
+        self.assertIn("event: delta", body)
+        self.assertIn("第一段", body)
+        self.assertIn("event: done", body)
+
+        finished = self.client.get(f"/api/v1/turns/{turn_id}", headers=self._auth(t))
+        self.assertEqual(finished.status_code, 200, finished.text)
+        self.assertEqual(finished.json()["status"], "completed")
+        self.assertEqual(finished.json()["answer"], "第一段第二段")
+        messages = self.client.get(f"/api/v1/conversations/{session['id']}/messages", headers=self._auth(t)).json()
+        self.assertEqual([message["content"] for message in messages], ["问", "第一段第二段"])
+        self.assertEqual(messages[1]["footer"], "footer")
+
+    def test_turns_include_terminal_and_messages_project_document_cards(self):
+        from src.core.conversation import ConversationService
+
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "卡片回填"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "生成候选", "client_request_id": "card-recovery-key"},
+            headers=self._auth(t),
+        ).json()
+        turn_id = created["turn"]["id"]
+        self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(t))
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(t)) as response:
+            b"".join(response.iter_bytes())
+
+        # The active-only list hides the finished turn (no SSE reconnect), while
+        # the recovery query returns it so the client can restore the context.
+        active = self.client.get(
+            f"/api/v1/conversations/{session['id']}/turns", headers=self._auth(t)
+        ).json()
+        self.assertEqual(active, [])
+        recent = self.client.get(
+            f"/api/v1/conversations/{session['id']}/turns?include_terminal=true",
+            headers=self._auth(t),
+        ).json()
+        self.assertEqual([turn["id"] for turn in recent], [turn_id])
+        self.assertEqual(recent[0]["status"], "completed")
+
+        # Persisted document_card events are projected onto the assistant
+        # message so a page refresh re-renders the candidate card.
+        conv = ConversationService(self.db_path)
+        conv.append_turn_event(
+            turn_id,
+            "document_card",
+            {
+                "card": {
+                    "kind": "attachment_revision",
+                    "status": "review_candidate",
+                    "next_actions": [],
+                    "kb_name": "shared",
+                    "content": "已创建候选",
+                }
+            },
+        )
+        messages = self.client.get(
+            f"/api/v1/conversations/{session['id']}/messages", headers=self._auth(t)
+        ).json()
+        assistant = [message for message in messages if message["role"] == "assistant"][-1]
+        self.assertEqual(len(assistant["cards"]), 1)
+        self.assertEqual(assistant["cards"][0]["kind"], "attachment_revision")
+        user_message = [message for message in messages if message["role"] == "user"][-1]
+        self.assertEqual(user_message["cards"], [])
+
+    def test_messages_project_persisted_trace_steps(self):
+        from src.core.conversation import ConversationService
+
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "轨迹回填"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "轨迹恢复", "client_request_id": "trace-recovery-key"},
+            headers=self._auth(t),
+        ).json()
+        turn_id = created["turn"]["id"]
+        self.client.post(f"/api/v1/turns/{turn_id}/start", headers=self._auth(t))
+        with self.client.stream("GET", f"/api/v1/turns/{turn_id}/events", headers=self._auth(t)) as response:
+            b"".join(response.iter_bytes())
+
+        # Persisted stage/tool events fold into the same step shape the live
+        # SSE trace uses, so a page refresh keeps the execution trace.
+        conv = ConversationService(self.db_path)
+        conv.append_turn_event(turn_id, "stage", {"key": "route", "label": "来源路由", "status": "running"})
+        conv.append_turn_event(
+            turn_id,
+            "stage",
+            {"key": "route", "label": "来源路由", "status": "done", "detail": "命中 2 个来源组"},
+        )
+        conv.append_turn_event(
+            turn_id,
+            "tool_started",
+            {"tool_name": "document_search", "query": "电源结构"},
+        )
+        conv.append_turn_event(
+            turn_id,
+            "tool_result",
+            {"tool_name": "document_search", "hit_count": 3, "status": "done", "latency_ms": 9},
+        )
+        conv.append_turn_event(
+            turn_id,
+            "stage",
+            {"key": "generate", "label": "生成回答", "status": "done"},
+        )
+
+        messages = self.client.get(
+            f"/api/v1/conversations/{session['id']}/messages", headers=self._auth(t)
+        ).json()
+        assistant = [message for message in messages if message["role"] == "assistant"][-1]
+        steps = assistant["trace_steps"]
+        self.assertEqual([step["key"] for step in steps], ["route", "document_search#2"])
+        self.assertEqual(steps[0]["status"], "done")
+        self.assertEqual(steps[0]["detail"], "命中 2 个来源组")
+        self.assertEqual(steps[1]["label"], "文档检索")
+        self.assertEqual(steps[1]["detail"], "3 条命中 · 9ms")
+        self.assertTrue(all(step["key"] != "generate" for step in steps))
+        user_message = [message for message in messages if message["role"] == "user"][-1]
+        self.assertEqual(user_message["trace_steps"], [])
+
+    def test_knowledge_base_turn_forces_deep_retrieval(self):
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "新对话"},
+            headers=self._auth(t),
+        ).json()
+
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "即使客户端请求快速模式", "query_mode": "fast"},
+            headers=self._auth(t),
+        )
+
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(created.json()["turn"]["query_mode"], "deep")
+
+    def test_turn_document_flow_true_requires_document_context(self):
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "新对话"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "问", "document_flow": True},
+            headers=self._auth(t),
+        )
+        self.assertEqual(created.status_code, 422, created.text)
+
+    def test_turn_document_flow_follow_up_accepts_existing_document_context(self):
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "文档续答"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={
+                "query": "确认",
+                "document_flow": True,
+                "document_context": {
+                    "version": "v1",
+                    "knowledge_base_name": "shared",
+                    "analysis_id": "analysis-1",
+                    "template_version_id": "template-v1",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "client_request_id": "context-key-1",
+                },
+            },
+            headers=self._auth(t),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(created.json()["turn"]["document_context"]["analysis_id"], "analysis-1")
+
+    def test_pending_turn_can_be_cancelled_without_starting(self):
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "新对话"},
+            headers=self._auth(t),
+        ).json()
+        turn = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "不要启动"},
+            headers=self._auth(t),
+        ).json()["turn"]
+        cancelled = self.client.post(f"/api/v1/turns/{turn['id']}/cancel", headers=self._auth(t))
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["status"], "cancelled")
+        messages = self.client.get(
+            f"/api/v1/conversations/{session['id']}/messages",
+            headers=self._auth(t),
+        ).json()
+        self.assertEqual(messages[-1]["content"], "已停止生成")
+
+    def test_stale_turn_sse_subscriber_stays_read_only(self):
+        token = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "失联任务"},
+            headers=self._auth(token),
+        ).json()
+        turn = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "失联"},
+            headers=self._auth(token),
+        ).json()["turn"]
+        with closing(self.auth._connect()) as conn:
+            conn.execute(
+                "UPDATE chat_turns SET status = 'streaming', worker_id = 'lost-worker', worker_heartbeat_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (turn["id"],),
+            )
+        chunks: list[bytes] = []
+        with self.client.stream("GET", f"/api/v1/turns/{turn['id']}/events", headers=self._auth(token)) as response:
+            self.assertEqual(response.status_code, 200)
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+                if b"keepalive" in chunk:
+                    break
+        body = b"".join(chunks).decode("utf-8")
+        # v3 §7.3: the subscriber never writes terminal state. A stale claim is
+        # converged by the worker reaper, not by inventing an SSE error event.
+        self.assertNotIn("event: error", body)
+        self.assertEqual(
+            self.client.get(f"/api/v1/turns/{turn['id']}", headers=self._auth(token)).json()["status"],
+            "streaming",
+        )
+
+    def test_turn_cancel_does_not_disclose_another_users_turn(self):
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        self.auth.create_user_as(sysadmin, "user2", "pw123456", ROLE_EMPLOYEE, self.dept.id)
+        owner_token = self._token("user1")
+        other_token = self._token("user2")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "新对话"},
+            headers=self._auth(owner_token),
+        ).json()
+        turn = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "私有请求"},
+            headers=self._auth(owner_token),
+        ).json()["turn"]
+        response = self.client.post(f"/api/v1/turns/{turn['id']}/cancel", headers=self._auth(other_token))
+        self.assertEqual(response.status_code, 404, response.text)
+
+    def test_session_and_turn_history_survive_department_changes(self):
+        token = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "部门会话"},
+            headers=self._auth(token),
+        ).json()
+        turn = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "部门范围"},
+            headers=self._auth(token),
+        ).json()["turn"]
+        other_department = self.auth.create_department("other-department")
+        with closing(self.auth._connect()) as conn:
+            conn.execute("UPDATE users SET department_id = ? WHERE id = ?", (other_department.id, self.user.id))
+        moved_token = self._token("user1")
+        self.assertEqual(
+            self.client.get(f"/api/v1/conversations/{session['id']}", headers=self._auth(moved_token)).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get(f"/api/v1/turns/{turn['id']}", headers=self._auth(moved_token)).status_code,
+            200,
+        )
+
+    def test_stale_turn_is_reclaimed_when_the_client_reconnects(self):
+        token = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "恢复任务"},
+            headers=self._auth(token),
+        ).json()
+        turn = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "恢复生成"},
+            headers=self._auth(token),
+        ).json()["turn"]
+        with closing(self.auth._connect()) as conn:
+            conn.execute(
+                "UPDATE chat_turns SET status = 'streaming', worker_id = 'dead-worker', worker_heartbeat_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (turn["id"],),
+            )
+        self.assertEqual(self.client.post(f"/api/v1/turns/{turn['id']}/start", headers=self._auth(token)).status_code, 202)
+        with self.client.stream("GET", f"/api/v1/turns/{turn['id']}/events", headers=self._auth(token)) as response:
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("event: done", b"".join(response.iter_bytes()).decode("utf-8"))
+        self.assertEqual(
+            self.client.get(f"/api/v1/turns/{turn['id']}", headers=self._auth(token)).json()["status"],
+            "completed",
+        )
+
+
+class TurnWikiAssistFlagTests(unittest.TestCase):
+    """per-turn Wiki 辅助开关: 默认关闭, 可开启并持久化。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="_test_turn_wiki_")
+        self.db_path = os.path.join(self._tmp.name, "auth.db")
+        self.auth = AuthService(db_path=self.db_path)
+        self.conv = ConversationService(db_path=self.db_path)
+        admin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        self.dept = self.auth.create_department("hw")
+        self.user = self.auth.create_user_as(
+            admin, "wiki_flag_user", "password123", ROLE_EMPLOYEE, self.dept.id
+        )
+        self.auth.register_knowledge_base("KB-WF", owner=self.user)
+        self.session = self.conv.create_session(self.user.id, "KB-WF")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        gc.collect()
+
+    def test_wiki_assist_defaults_false_and_persists_on(self) -> None:
+        turn_default = self.conv.create_turn(self.user.id, self.session.id, "默认问题")
+        self.assertFalse(turn_default.wiki_assist)
+        turn_on = self.conv.create_turn(
+            self.user.id, self.session.id, "开启辅助", wiki_assist=True
+        )
+        self.assertTrue(turn_on.wiki_assist)
+        fetched = self.conv.get_turn(self.user.id, turn_on.id)
+        self.assertIsNotNone(fetched)
+        self.assertTrue(fetched.wiki_assist)
