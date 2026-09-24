@@ -8,7 +8,7 @@ import src.settings as settings
 
 
 class DocumentAuthoringSettingsTests(unittest.TestCase):
-    def test_document_authoring_flags_default_to_off_when_not_configured(self):
+    def test_document_authoring_flag_defaults_when_not_configured(self):
         env = os.environ.copy()
         env.pop("DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", None)
         env.pop("AGENT_DOCUMENT_TOOLS_ENABLED", None)
@@ -22,8 +22,9 @@ class DocumentAuthoringSettingsTests(unittest.TestCase):
                 "-c",
                 (
                     "import src.settings as s; "
+                    # Agent 文档模式仍是灰度开关(默认关); 文档工具已默认开启。
                     "assert s.DOCUMENT_AUTHORING_AGENT_MODE_ENABLED is False; "
-                    "assert s.AGENT_DOCUMENT_TOOLS_ENABLED is False"
+                    "assert s.AGENT_DOCUMENT_TOOLS_ENABLED is True"
                 ),
             ],
             cwd=os.path.dirname(os.path.dirname(__file__)),
