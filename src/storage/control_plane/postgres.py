@@ -662,7 +662,7 @@ class PostgresExecutionStore:
                 JOIN chat_sessions s ON s.id = t.session_id
                 JOIN users u ON u.id = s.user_id
                 WHERE t.status = 'pending' AND t.cancel_requested = FALSE
-                  AND u.is_active
+                  AND u.is_active = 1
                   {head_filter}
                 ORDER BY t.created_at, t.id
                 LIMIT %s

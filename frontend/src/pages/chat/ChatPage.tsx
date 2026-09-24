@@ -905,8 +905,6 @@ export default function ChatPage({
         <ChatHeader
           title={activeSession?.title || '新对话'}
           kbName={mountedKbName || '未挂载'}
-          userName={auth.user.username}
-          onLogout={onLogout}
           onExtractMemory={mountedKbName ? () => setExtractConfirmOpen(true) : undefined}
           extractDisabled={activeSessionId == null || streaming || extracting}
           memorySummary={memorySummary}

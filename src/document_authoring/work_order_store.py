@@ -64,15 +64,24 @@ def _payload(row) -> dict[str, Any]:
 
 class DocumentAuthoringStore:
     def __init__(self, db_path: str | None = None, artifact_root: str | None = None):
-        self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "document_authoring.db")
+        from src.document_authoring import pg_support
+
+        if pg_support.configure(self, db_path):
+            self.db_path = self.db_path or os.path.join(
+                src.settings.STORAGE_DIR, "document_authoring.db"
+            )
+            os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+            self._init_db()
         self.artifact_root = artifact_root or os.path.join(src.settings.STORAGE_DIR, "document_authoring")
-        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         os.makedirs(self.artifact_root, exist_ok=True)
-        self._init_db()
         self.planning = DocumentPlanningStore(self.db_path)
         self.generation_sessions = GenerationSessionStore(self.db_path)
 
     def _connect(self):
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.document_authoring import pg_support
+
+            return pg_support.connect(self)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")

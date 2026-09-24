@@ -547,8 +547,13 @@ def test_revision_child_artifacts_carry_parent_lineage(tmp_path):
     assert saved.revision_id == revision.revision_id
 
 
-def test_revision_orders_never_auto_publish():
+def test_revision_orders_never_auto_publish(monkeypatch):
+    import src.settings as app_settings
     from src.document_authoring.service import _automatic_release_allowed
+
+    # 自动放行默认关闭（DOCUMENT_AUTO_PUBLISH_VERIFIED=false）。本用例验证的是
+    # "修订单永不自动放行"这条策略，因此需要显式打开自动放行开关。
+    monkeypatch.setattr(app_settings, "DOCUMENT_AUTO_PUBLISH_VERIFIED", True)
 
     report = SimpleNamespace(status="passed")
     assert _automatic_release_allowed(

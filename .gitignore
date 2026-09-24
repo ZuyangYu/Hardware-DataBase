@@ -130,3 +130,10 @@ run_state.json
 
 # 本地演练/调试临时目录
 .tmp_dbg/
+
+# 本地备份 / 分发产物（含真实数据，绝不进开源仓库）
+backups/
+storage.pre-restore-*/
+*.tar.gz
+*.dump
+.tmp_dbg/

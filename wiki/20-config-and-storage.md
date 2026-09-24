@@ -9,7 +9,10 @@
 
 ### 1.1 机制
 
-- `src/settings.py` 在导入时读取仓库根 `.env`（`utf-8-sig`，容 BOM），并把值物化为模块级变量；
+- `src/settings.py` 在导入时读取 `.env`（`utf-8-sig`，容 BOM），并把值物化为模块级变量；
+  - 路径默认是仓库根 `.env`；容器部署用环境变量 `HDB_ENV_PATH` 指向挂载目录中的可写文件
+    （`save_settings_to_env` 用 `mkstemp + os.replace` 原子替换，镜像层与单文件 bind mount
+    不允许 rename（EBUSY），故 `.env` 必须落在挂载目录里；见 `deploy/docker/README.md`）；
 - 路径类配置若为相对路径，统一相对 `STORAGE_DIR = <repo>/storage` 解析（`_resolve_storage_path`）；
 - 布尔值接受 `1/true/yes/on`；CSV 用 `_env_csv`（casefold 集合）；
 - `DEFAULT_VALUES` 镜像全部键，供系统配置页与校验回退；
@@ -61,6 +64,27 @@
 | `RAGFLOW_DESIGN_DATASET_NAME` | `project_design_assets`（同上差异） |
 | `RAGFLOW_TIMEOUT_SECONDS` | `120` |
 | `RAGFLOW_STATUS_REFRESH_MIN_SECONDS` | `60` |
+
+#### 本地台账域后端（存储收敛）
+
+| 变量 | 默认 |
+|---|---|
+| `PROJECT_STORE_BACKEND` / `PROJECT_STORE_DATABASE_URL` | `""`（跟随 `CONTROL_PLANE_BACKEND`）/ 同左 |
+| `PIPELINE_DOCUMENT_STORE_BACKEND` / `PIPELINE_DOCUMENT_DATABASE_URL` | `""`（跟随 `CONTROL_PLANE_BACKEND`）/ 同左 |
+| `AUTHORING_STORE_BACKEND` / `AUTHORING_STORE_DATABASE_URL` | `""`（跟随 `CONTROL_PLANE_BACKEND`）/ 同左 |
+| `AUTH_STORE_BACKEND` / `AUTH_STORE_DATABASE_URL` | `"sqlite"`（**不跟随控制面**）/ 同左 |
+| `COMPATIBILITY_STORE_BACKEND` / `COMPATIBILITY_STORE_DATABASE_URL` | `"sqlite"`（同上）/ 同左 |
+
+- 域表在 PG 侧用**机械类型映射**（TEXT 时间戳保真 '' 哨兵），建表结构由 store 自己
+  的 SQLite bootstrap 生成（`src/storage/domain_pg.py::provision_domain_schema`）；
+- 空值跟随控制面，意味着 `CONTROL_PLANE_BACKEND=postgres` 时这些域自动切 PG ——
+  **切换前必须先迁移数据**（`migrate_sqlite_to_postgres.py --group projects|pipeline`），
+  store 启动时若发现"PG 空 + SQLite 有行"会 fail-closed 并给出迁移命令；
+- 显式 `_BACKEND=sqlite` 可以让单个域在迁移完成前留在本地文件；
+- 认证域特殊：PG 里 `users`/`departments`/`audit_events` 早期按控制面语义建过
+  （TIMESTAMPTZ/BOOLEAN），必须先跑 `scripts/production_hardening/rebuild_auth_domain.py`
+  重建为机械形状（TEXT 时间戳、BIGINT 标志）再切 `AUTH_STORE_BACKEND=postgres`；
+  形状不对时 `AuthService`/`AppLogService` 构造会 fail-closed 并提示该命令。
 | `RAGFLOW_SIMILARITY_THRESHOLD` / `RAGFLOW_VECTOR_WEIGHT` | `0.25` / `0.4` |
 | `FINAL_TOP_K` | `5` |
 | `AGENT_MAX_RETRIEVAL_ROUNDS` | `3` |
@@ -96,6 +120,7 @@
 | `CHAT_QUEUE_DEADLINE_SECONDS` | `600` |
 | `CANCEL_FAST_PATH_ENABLED` / `CANCEL_KEY_TTL_SECONDS` | `true` / `7200` |
 | `TURN_EVENT_STREAM_TTL_SECONDS` / `_MAXLEN` | `7200` / `5000` |
+| `REDIS_REQUIRED` | `true`（硬依赖：Redis 未配置/不可达则 API 与 worker 拒绝启动，`/health/ready` 判 not_ready；仅测试隔离置 false） |
 | `REDIS_URL` | `""`（项目自管实例由 `bash scripts/redis.sh up` 写入） |
 | `CONTROL_PLANE_BACKEND` / `_DATABASE_URL` / `_POOL_SIZE` | `sqlite` / `""` / `8`（自管实例：`bash scripts/postgres.sh up` + `write-env`） |
 

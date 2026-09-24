@@ -574,6 +574,12 @@ def test_confirmed_task_answer_keeps_missing_data_in_conversation():
 
 
 def test_non_routed_turn_keeps_general_toolset(monkeypatch):
+    from src.agents import runner as runner_mod
+
+    # 规划 v2 默认关闭（DOCUMENT_PLANNING_V2_ENABLED=false）：计划提案/确认/
+    # 放行/作用域例外这类工具只在 v2 打开时才安装。本用例要断言"非路由轮次
+    # 仍保留完整文档工具集（除工单创建外）"，因此显式开启 v2。
+    monkeypatch.setattr(runner_mod.settings, "DOCUMENT_PLANNING_V2_ENABLED", True)
     captured = _install_fake_agent(monkeypatch)
     runner = MultiSourceAgentRunner(
         rag_backend=_FakeRAGBackend(),

@@ -1,6 +1,8 @@
-"""Redis 实时面健康探针：未配置 / 可达 / 不可达（fail-soft），以及就绪隔离。
+"""Redis 硬依赖契约：探针状态 + 启动门禁 + 就绪门禁。
 
-Redis 是可选的加速层，不是持久真相源：不可达只能降级，不能把部署判成 down。
+``REDIS_REQUIRED=true``（默认）时 Redis 是硬依赖：未配置/不可达 → 拒绝启动、
+``/health/ready`` 判 not_ready，不提供"降级成 DB 轮询"的运行形态。
+``REDIS_REQUIRED=false``（仅测试隔离）时探针只作诊断，不参与就绪判定。
 """
 
 from __future__ import annotations
@@ -83,12 +85,57 @@ class DependencyAggregationTests(unittest.TestCase):
         self.assertEqual(result["dependencies"]["redis"]["status"], "degraded")
         self.assertEqual(result["status"], "degraded")
 
-    def test_readiness_never_depends_on_redis(self):
+    def test_readiness_requires_redis_when_required(self):
+        self._old_required = src.settings.REDIS_REQUIRED
+        self.addCleanup(setattr, src.settings, "REDIS_REQUIRED", self._old_required)
+
         src.settings.REDIS_URL = "redis://:secret@127.0.0.1:6380/0"
+        src.settings.REDIS_REQUIRED = True
+        with mock.patch("redis.Redis.from_url", side_effect=ConnectionError("refused")):
+            ready = health.check_ready()
+        self.assertEqual(ready["status"], "not_ready")
+        self.assertEqual(ready["dependencies"]["redis"]["status"], "degraded")
+
+        # 测试隔离形态：不参与就绪判定
+        src.settings.REDIS_REQUIRED = False
+        health.reset_readiness_cache()  # 就绪结果有 1 秒 TTL，换契约后要清
         with mock.patch("redis.Redis.from_url", side_effect=ConnectionError("refused")):
             ready = health.check_ready()
         self.assertEqual(ready["status"], "ready")
         self.assertNotIn("redis", ready["dependencies"])
+
+
+class RedisHardRequirementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._url = src.settings.REDIS_URL
+        self._required = src.settings.REDIS_REQUIRED
+        self.addCleanup(setattr, src.settings, "REDIS_URL", self._url)
+        self.addCleanup(setattr, src.settings, "REDIS_REQUIRED", self._required)
+
+    def test_missing_url_refuses_to_start(self):
+        from src.core.redis_client import RedisUnavailable, assert_redis_ready
+
+        src.settings.REDIS_REQUIRED = True
+        src.settings.REDIS_URL = ""
+        with self.assertRaises(RedisUnavailable) as ctx:
+            assert_redis_ready()
+        self.assertIn("REDIS_URL", str(ctx.exception))
+
+    def test_unreachable_redis_refuses_to_start(self):
+        from src.core.redis_client import RedisUnavailable, assert_redis_ready
+
+        src.settings.REDIS_REQUIRED = True
+        src.settings.REDIS_URL = "redis://:secret@127.0.0.1:6380/0"
+        with mock.patch("redis.Redis.from_url", side_effect=ConnectionError("refused")):
+            with self.assertRaises(RedisUnavailable):
+                assert_redis_ready()
+
+    def test_optional_mode_is_a_noop(self):
+        from src.core.redis_client import assert_redis_ready
+
+        src.settings.REDIS_REQUIRED = False
+        src.settings.REDIS_URL = ""
+        assert_redis_ready()  # 不抛异常
 
 
 if __name__ == "__main__":

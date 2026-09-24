@@ -73,7 +73,50 @@ class AuthSession:
 
 class AuthService:
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or src.settings.AUTH_DB_PATH
+        from src.storage import domain_pg
+
+        self._backend, self._dsn, resolved = domain_pg.resolve_store_backend(
+            explicit_db_path=db_path,
+            prefix="AUTH_STORE",
+            default_db_path=src.settings.AUTH_DB_PATH,
+        )
+        if self._backend == "postgres":
+            from src.storage.auth_domain import domain_classes as auth_domain_classes
+
+            domain_pg.ensure_domain_group_ready(
+                dsn=self._dsn,
+                store_classes=auth_domain_classes(),
+                sqlite_db_path=os.path.join(src.settings.STORAGE_DIR, "auth.db"),
+                primary_table="users",
+                migration_command=(
+                    "uv run python scripts/production_hardening/rebuild_auth_domain.py"
+                    " --dsn $CONTROL_PLANE_DATABASE_URL"
+                ),
+            )
+            domain_pg.assert_mechanical_shape(
+                self._dsn,
+                "users",
+                {"is_active": "bigint", "created_at": "text", "updated_at": "text"},
+                hint=(
+                    "认证域的表需要先重建为机械形状（早期按控制面语义建过）：\n"
+                    "  uv run python scripts/production_hardening/rebuild_auth_domain.py"
+                    " --dsn $CONTROL_PLANE_DATABASE_URL"
+                ),
+            )
+            self.db_path = None
+            # 后端无关的一次性引导：默认部门 + 默认管理员（空库/迁移后都幂等）。
+            init_key = f"postgres:{self._dsn}"
+            if init_key in _AUTH_INITIALIZED_DBS:
+                return
+            with _AUTH_INIT_LOCK:
+                if init_key in _AUTH_INITIALIZED_DBS:
+                    return
+                with closing(self._connect()) as conn:
+                    self._ensure_default_department(conn)
+                self._ensure_default_admin()
+                _AUTH_INITIALIZED_DBS.add(init_key)
+            return
+        self.db_path = resolved or src.settings.AUTH_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         init_key = os.path.abspath(self.db_path)
         if init_key in _AUTH_INITIALIZED_DBS:
@@ -89,12 +132,48 @@ class AuthService:
             _AUTH_INITIALIZED_DBS.add(init_key)
 
     def _connect(self):
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.storage.domain_pg import open_pg_connection
+
+            return open_pg_connection(self._dsn)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _mirror_control_plane_row(self, table: str, key_value, *, delete: bool = False) -> None:
+        """Best-effort: keep the control plane's copy of an auth row current.
+
+        With ``CONTROL_PLANE_BACKEND=postgres`` the control plane reads
+        ``users.is_active``/``users.department_id`` and enforces
+        ``fk_chat_sessions_user`` against its own ``users`` copy, while the
+        auth domain stays authoritative in SQLite.  Without this mirror a
+        post-cutover user cannot create sessions (FK violation) and their
+        turns are never claimed (``JOIN users ... AND u.is_active``).
+
+        Fail-soft: a mirror failure must never break the auth mutation; see
+        ``src/storage/auth_mirror.py`` for the failure semantics.
+
+        When the auth domain itself runs on PostgreSQL (``AUTH_STORE_BACKEND=
+        postgres``) the rows already live there and the mirror is a no-op —
+        the bridge is only for the hybrid (SQLite auth + PostgreSQL control
+        plane) shape.
+        """
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            return
+        try:
+            from src.storage.auth_mirror import mirror_auth_row
+
+            mirror_auth_row(self.db_path, table, key_value, delete=delete)
+        except Exception as exc:  # noqa: BLE001 - fail-soft by contract
+            try:
+                from src.core.logger import error
+
+                error(f"[auth-mirror] {table}#{key_value} 镜像异常: {type(exc).__name__}: {exc}")
+            except Exception:  # pragma: no cover - logging must not raise
+                pass
 
     def _audit(
         self,
@@ -286,6 +365,7 @@ class AuthService:
                         "UPDATE users SET password_hash = ?, managed_by_env = 1, updated_at = ? WHERE id = ?",
                         (hash_password(password), utc_now(), row["id"]),
                     )
+                self._mirror_control_plane_row("users", row["id"])
                 return
             now = utc_now()
             conn.execute(
@@ -295,6 +375,11 @@ class AuthService:
                 """,
                 (username, hash_password(password), ROLE_SYSTEM_ADMIN, department_id, now, now),
             )
+            admin_row = conn.execute(
+                "SELECT id FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        if admin_row is not None:
+            self._mirror_control_plane_row("users", int(admin_row["id"]))
 
     def create_user(self, username: str, password: str, role: str = ROLE_EMPLOYEE, department_id: int | None = None) -> AuthUser:
         raise PermissionError("Use create_user_as(actor, ...) so user creation is checked against the actor role.")
@@ -372,6 +457,7 @@ class AuthService:
                 (username, hash_password(password), role, department_id, now, now),
             )
             row = self._get_user_row(conn, username)
+        self._mirror_control_plane_row("users", row["id"])
         return row_to_user(row)
 
     @staticmethod
@@ -614,6 +700,7 @@ class AuthService:
                     "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
                     (utc_now(), user_id),
                 )
+        self._mirror_control_plane_row("users", user_id)
 
     def set_user_active_as(self, actor: AuthUser, user_id: int, is_active: bool):
         scope = "system" if actor.role == ROLE_SYSTEM_ADMIN else "department"
@@ -676,6 +763,7 @@ class AuthService:
                     "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
                     (utc_now(), user_id),
                 )
+                self._mirror_control_plane_row("users", user_id)
         except Exception as exc:
             self._audit(
                 "reset_user_password",
@@ -695,6 +783,66 @@ class AuthService:
             metadata={"scope": scope},
         )
 
+    def change_own_password(
+        self,
+        user: AuthUser,
+        current_password: str,
+        new_password: str,
+    ):
+        """Change the signed-in account's own password (current password required).
+
+        Revokes every session for the account, so the caller must sign in again
+        with the new password.
+        """
+        try:
+            if not current_password:
+                raise ValueError("请输入当前密码")
+            if not new_password:
+                raise ValueError("密码不能为空")
+            if len(new_password) < 8:
+                raise ValueError("密码长度不能少于 8 位")
+            if new_password == current_password:
+                raise ValueError("新密码不能与当前密码相同")
+
+            with closing(self._connect()) as conn:
+                row = conn.execute("SELECT * FROM users WHERE id = ?", (user.id,)).fetchone()
+                if row is None:
+                    raise ValueError("账号不存在")
+                if not row["is_active"]:
+                    raise PermissionError("账号已停用")
+                if not verify_password(current_password, row["password_hash"]):
+                    raise PermissionError("当前密码不正确")
+
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET password_hash = ?, managed_by_env = 0, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (hash_password(new_password), utc_now(), user.id),
+                )
+                conn.execute(
+                    "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+                    (utc_now(), user.id),
+                )
+                self._mirror_control_plane_row("users", user.id)
+        except Exception as exc:
+            self._audit(
+                "change_own_password",
+                actor=user,
+                target_type="user",
+                target_id=str(user.id),
+                success=False,
+                error_message=str(exc),
+            )
+            raise
+        self._audit(
+            "change_own_password",
+            actor=user,
+            target_type="user",
+            target_id=user.username,
+        )
+
     def create_department(self, name: str) -> Department:
         name = name.strip()
         if not name:
@@ -705,6 +853,7 @@ class AuthService:
                 (name, utc_now()),
             )
             row = conn.execute("SELECT * FROM departments WHERE name = ?", (name,)).fetchone()
+        self._mirror_control_plane_row("departments", int(row["id"]))
         return Department(id=int(row["id"]), name=row["name"])
 
     def create_department_as(self, actor: AuthUser, name: str) -> Department:
@@ -750,6 +899,7 @@ class AuthService:
             if kb_count:
                 raise ValueError("该部门下仍有关联知识库，不能删除")
             conn.execute("DELETE FROM departments WHERE id = ?", (department_id,))
+        self._mirror_control_plane_row("departments", department_id, delete=True)
 
     def delete_department_as(self, actor: AuthUser, department_id: int):
         try:
@@ -1087,7 +1237,7 @@ class AuthService:
                 """,
                 (user.department_id, user.id),
             ).fetchall()
-        allowed = {row[0] for row in rows}
+        allowed = {row["name"] for row in rows}
         return [kb for kb in existing_kbs if kb in allowed]
 
     def get_kb_permissions_for_user(self, user: AuthUser, existing_kbs: list[str] | None = None) -> dict[str, str]:

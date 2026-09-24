@@ -59,8 +59,6 @@ export default function LogsPage({ auth, onLogout }: Props) {
       <AppHeader
         title="日志中心"
         description={sysAdmin ? '全局审计日志与查询日志。' : '本部门审计日志与查询日志。'}
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[20px] mb-[16px] flex items-center gap-[6px]">

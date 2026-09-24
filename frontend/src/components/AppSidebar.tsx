@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 import {
@@ -17,6 +18,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
+import AccountSettingsDialog from '@/components/AccountSettingsDialog';
 import AppIcon from '@/components/AppIcon';
 import { hasDashboardAccess, isSystemAdmin, ROLE_LABELS, type AuthSession } from '../auth';
 import BrandLogo from './BrandLogo';
@@ -101,6 +103,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
   const navigate = useNavigate();
   const location = useLocation();
   const { toggleSidebar, state } = useSidebar();
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const sysAdmin = isSystemAdmin(auth.user);
   const anyAdmin = hasDashboardAccess(auth.user);
   const initial = auth.user.username.slice(0, 1).toUpperCase();
@@ -236,14 +239,16 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   onClick={() => navigate('/admin/logs')}
                   tooltip="日志中心"
                 />
-                <PrimaryNavButton
-                  label="系统状态"
-                  iconName="refresh"
-                  active={location.pathname === '/admin/status'}
-                  collapsed={collapsed}
-                  onClick={() => navigate('/admin/status')}
-                  tooltip="系统状态"
-                />
+                {sysAdmin && (
+                  <PrimaryNavButton
+                    label="系统状态"
+                    iconName="refresh"
+                    active={location.pathname === '/admin/status'}
+                    collapsed={collapsed}
+                    onClick={() => navigate('/admin/status')}
+                    tooltip="系统状态"
+                  />
+                )}
                 {sysAdmin && (
                   <PrimaryNavButton
                     label="系统配置"
@@ -274,9 +279,9 @@ export default function AppSidebar({ auth, onLogout }: Props) {
           {collapsed ? (
             <button
               type="button"
-              onClick={toggleSidebar}
-              title="展开边栏"
-              aria-label="展开边栏"
+              onClick={() => setSettingsOpen(true)}
+              title="个人设置"
+              aria-label="个人设置"
               className="flex w-full items-center justify-center rounded-[14px] px-0 py-[8px] text-left transition-colors hover:bg-sidebar-accent"
             >
               <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] text-[13px] font-bold text-[#7e96dc]">
@@ -306,6 +311,13 @@ export default function AppSidebar({ auth, onLogout }: Props) {
               </DropdownMenuTrigger>
               <DropdownMenuContent side="top" align="start" className="w-[200px] rounded-[14px] border-0 bg-white p-[6px] shadow-[0px_16px_15px_rgba(0,0,0,0.1)] ring-0 [--accent:#F6F6F6] [--accent-foreground:#18181A]">
                 <DropdownMenuItem
+                  onSelect={() => setSettingsOpen(true)}
+                  className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
+                >
+                  <AppIcon name="user" size={16} />
+                  个人设置
+                </DropdownMenuItem>
+                <DropdownMenuItem
                   onSelect={onLogout}
                   className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
                 >
@@ -317,6 +329,13 @@ export default function AppSidebar({ auth, onLogout }: Props) {
           )}
         </SidebarFooter>
       </div>
+
+      <AccountSettingsDialog
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        auth={auth}
+        onLogout={onLogout}
+      />
     </Sidebar>
   );
 }

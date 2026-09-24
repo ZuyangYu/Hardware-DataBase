@@ -1,0 +1,31 @@
+# 与 docker-compose.yml 叠加使用：给 api / web 补上 build 段。
+# 离线包（只有镜像 tar）不需要本文件。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+#
+# 镜像源/体积开关通过环境变量传入，例如：
+#   APT_MIRROR=mirrors.tuna.tsinghua.edu.cn \
+#   PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+#   NPM_REGISTRY=https://registry.npmmirror.com \
+#   docker compose ... build
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      # 镜像参数不在此传（空值会覆盖 Dockerfile 默认值）；需要换基础镜像时用
+      #   docker compose ... build --build-arg PYTHON_IMAGE=内网镜像/xxx
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        HDB_INSTALL_EVAL: ${HDB_INSTALL_EVAL:-0}
+
+  web:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.web
+      # 同上：NODE_IMAGE / NGINX_IMAGE 走 Dockerfile 默认值或 --build-arg
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-}

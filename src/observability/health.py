@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 from typing import Any
 
@@ -39,9 +40,9 @@ def _check_storage() -> dict[str, Any]:
 def _check_redis() -> dict[str, Any]:
     """Probe the optional realtime plane.
 
-    Redis never gates readiness: the durable flags/DB replay are authoritative,
-    so an unreachable Redis is reported as ``degraded`` (fail-soft) rather than
-    taking the deployment down.  ``not_configured`` means ``REDIS_URL`` is empty.
+    ``REDIS_REQUIRED=true``（默认）时 Redis 是硬依赖：不可用会让 ``check_ready``
+    判为 not_ready（编排/负载均衡据此摘流量）。置 false（仅测试隔离）时它只作
+    诊断信息，不参与就绪判定。``not_configured`` 表示 ``REDIS_URL`` 为空。
     """
     url = str(getattr(settings, "REDIS_URL", "") or "").strip()
     if not url:
@@ -91,12 +92,52 @@ def check_live() -> dict[str, Any]:
     return {"status": "live", "service": settings.OTEL_SERVICE_NAME}
 
 
+_READY_CACHE_LOCK = threading.Lock()
+# (monotonic 时间戳, 配置版本, 结果)
+_READY_CACHE: tuple[float, str, dict[str, Any]] | None = None
+
+
 def check_ready() -> dict[str, Any]:
+    """就绪探针（带短 TTL 缓存）。
+
+    K8s / 负载均衡每隔几秒探一次，无缓存时每次都会真查 SQLite + PG + storage，
+    探针风暴会放大依赖负载。TTL 把一轮密集探针收敛成一次真实检查，同时保证
+    真实故障在 ~1 秒内暴露。缓存以配置版本为键：改配置（如切后端）立即重探。
+    """
+    global _READY_CACHE
+    ttl = float(getattr(settings, "OBS_READINESS_CACHE_SECONDS", 1.0) or 0.0)
+    revision = _config_revision()
+    if ttl > 0:
+        with _READY_CACHE_LOCK:
+            cached = _READY_CACHE
+        if cached is not None:
+            cached_at, cached_revision, payload = cached
+            if cached_revision == revision and (time.monotonic() - cached_at) < ttl:
+                return payload
+
+    payload = _compute_ready()
+    if ttl > 0:
+        with _READY_CACHE_LOCK:
+            _READY_CACHE = (time.monotonic(), revision, payload)
+    return payload
+
+
+def reset_readiness_cache() -> None:
+    """清空就绪缓存（测试/配置变更后强制重探）。"""
+    global _READY_CACHE
+    with _READY_CACHE_LOCK:
+        _READY_CACHE = None
+
+
+def _compute_ready() -> dict[str, Any]:
     dependencies = {
         "database": _check_sqlite(),
         "control_plane": check_control_plane(),
         "storage": _check_storage(),
     }
+    if bool(getattr(settings, "REDIS_REQUIRED", True)):
+        # Redis 是硬依赖：不可用即 not_ready（由编排/负载均衡摘流量）。
+        dependencies["redis"] = _check_redis()
     ready = all(item.get("status") == "up" for item in dependencies.values())
     return {
         "status": "ready" if ready else "not_ready",

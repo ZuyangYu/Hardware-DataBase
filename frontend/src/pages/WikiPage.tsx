@@ -353,8 +353,6 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
         <AppHeader
           title="知识 Wiki"
           description="管线把知识库文档蒸馏成互链词条(summary/entity/concept),全部页面保留原文出处与修订历史。"
-          userName={auth.user.username}
-          onLogout={onLogout}
         />
       )}
 

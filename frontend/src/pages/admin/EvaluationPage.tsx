@@ -638,8 +638,6 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       <AppHeader
         title="RAGAS 评估"
         description="创建、控制和对比检索回答评估运行。仅系统管理员可访问。"
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <section className="mt-[20px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">

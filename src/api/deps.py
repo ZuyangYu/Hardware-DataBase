@@ -113,7 +113,10 @@ def require_system_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
 
 
 def require_dashboard_access(user: AuthUser = Depends(current_user)) -> AuthUser:
-    """治理面板/日志/系统状态依赖: 系统管理员看全局, 员工看本部门。"""
+    """治理面板/日志依赖: 系统管理员看全局, 员工看本部门。
+
+    系统状态(/system/status)属于运维明细, 只走 require_system_admin。
+    """
     if user.role not in (ROLE_SYSTEM_ADMIN, ROLE_EMPLOYEE):
         raise HTTPException(status_code=403, detail="dashboard access required")
     return user

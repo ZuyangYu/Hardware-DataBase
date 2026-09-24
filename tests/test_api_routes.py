@@ -260,8 +260,8 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.stub.deleted, [("shared", "a.pdf")])
 
-    def test_system_status_task_counts_are_department_scoped(self):
-        # 员工在系统状态页只看本部门任务计数; 系统管理员看全局。
+    def test_system_status_requires_system_admin(self):
+        # 运维明细(依赖/LLM/任务统计)只给系统管理员; 员工访问一律 403。
         conv = ConversationService(db_path=self.db_path)
         kb_id = self.auth.get_knowledge_base_id("shared", department_id=self.dept.id)
         session = conv.create_session(self.user.id, "shared", department_id=self.dept.id, kb_id=kb_id)
@@ -279,8 +279,7 @@ class ApiRoutesTests(unittest.TestCase):
 
         emp_token = self._token("user1")
         r = self.client.get("/api/v1/system/status", headers=self._auth(emp_token))
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(r.json()["tasks"]["total"], 1)
+        self.assertEqual(r.status_code, 403)
 
         sys_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r2 = self.client.get("/api/v1/system/status", headers=self._auth(sys_token))

@@ -50,13 +50,36 @@ class ProjectStore:
     """Durable project/source records with explicit immutable boundaries."""
 
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "projects.db")
-        parent = os.path.dirname(self.db_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        self._init_db()
+        from src.storage import domain_pg
+
+        self._backend, self._dsn = domain_pg.resolve_domain_backend("PROJECT_STORE")
+        if db_path:
+            # 显式 db_path（测试/工具）永远走 SQLite。
+            self._backend = "sqlite"
+        if self._backend == "sqlite":
+            self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "projects.db")
+            parent = os.path.dirname(self.db_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._init_db()
+            return
+        self.db_path = None
+        domain_pg.ensure_domain_ready(
+            dsn=self._dsn,
+            store_cls=type(self),
+            sqlite_db_path=os.path.join(src.settings.STORAGE_DIR, "projects.db"),
+            primary_table="projects",
+            migration_command=(
+                "uv run python scripts/production_hardening/migrate_sqlite_to_postgres.py "
+                "--group projects --dsn $CONTROL_PLANE_DATABASE_URL"
+            ),
+        )
 
     def _connect(self):
+        if self._backend == "postgres":
+            from src.storage.domain_pg import open_pg_connection
+
+            return open_pg_connection(self._dsn)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")

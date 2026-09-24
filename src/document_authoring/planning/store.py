@@ -69,18 +69,24 @@ def _decode_payload(row: sqlite3.Row) -> dict[str, Any]:
 class DocumentPlanningStore:
     """Repository with immutable version rows and compare-and-swap staleness."""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        parent = os.path.dirname(os.path.abspath(db_path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        self._init_db()
-        # Keep the outbox repository on the same SQLite file.  The planning
+    def __init__(self, db_path: str | None = None):
+        from src.document_authoring import pg_support
+
+        if pg_support.configure(self, db_path):
+            parent = os.path.dirname(os.path.abspath(self.db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._init_db()
+        # Keep the outbox repository on the same database.  The planning
         # store passes its open connection during confirmation so accepted
         # spec/plan/session/task rows and the outbox insert commit together.
-        self.submissions = DocumentPlanSubmissionStore(db_path)
+        self.submissions = DocumentPlanSubmissionStore(self.db_path)
 
     def _connect(self) -> sqlite3.Connection:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.document_authoring import pg_support
+
+            return pg_support.connect(self)
         connection = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")

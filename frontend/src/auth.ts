@@ -51,7 +51,7 @@ export function isEmployee(user: UserInfo): boolean {
   return user.role === 'employee';
 }
 
-/** 治理面板/日志/系统状态可见性: 系统管理员看全局, 员工看本部门。 */
+/** 治理面板/日志可见性: 系统管理员看全局, 员工看本部门。 */
 export function hasDashboardAccess(user: UserInfo): boolean {
   return user.role === 'system_admin' || user.role === 'employee';
 }
