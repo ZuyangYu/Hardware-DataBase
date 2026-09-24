@@ -37,7 +37,7 @@
 
 | 知识库问答 | 知识资产治理 |
 |---|---|
-| <img src="assets/chat_example.png" alt="知识库问答"> | <img src="assets/kap_example.png" alt="知识资产治理"> |
+| <img src="assets/front1.png" alt="知识库问答"> | <img src="assets/front2.png" alt="知识资产治理"> |
 
 ## 🚀 快速开始
 
