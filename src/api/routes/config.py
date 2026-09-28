@@ -82,8 +82,15 @@ def update_config(
             status_code=400,
             detail=f"unknown or read-only config keys: {', '.join(unknown)}",
         )
-    # apply_settings persists to .env then calls reload_settings.
-    pipeline.apply_settings({k: str(v) if v is not None else "" for k, v in body.settings.items()})
+    # apply_settings persists to .env then calls reload_settings.  Validation
+    # failures (e.g. MCP_ENABLED without the unified tool path) must surface as
+    # a 400 with the actionable message instead of a generic 500.
+    try:
+        pipeline.apply_settings(
+            {k: str(v) if v is not None else "" for k, v in body.settings.items()}
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Streamlit does init_pipeline.clear() so the next call rebuilds the pipeline
     # with the fresh settings; do the same on the API side.
     reset_pipeline()

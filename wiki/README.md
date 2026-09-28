@@ -49,6 +49,7 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 改导出 / 外部对话 / 评估 | [16-exports-and-external-conversations.md](16-exports-and-external-conversations.md) / [17-evaluation.md](17-evaluation.md) |
 | 改前端 | [19-frontend.md](19-frontend.md) |
 | 改模型/并发/限流 | [07-model-and-resources.md](07-model-and-resources.md) |
+| 接入/维护 MCP、Skill 或 Sandbox 扩展 | [22-external-extensions.md](22-external-extensions.md) + [操作指南](../docs/mcp-plugins.md) |
 | 上生产/扩容/排障 | [18-observability-and-ops.md](18-observability-and-ops.md) + [20-config-and-storage.md](20-config-and-storage.md) |
 | 踩坑预警 | [21-gotchas-and-extension-guide.md](21-gotchas-and-extension-guide.md) |
 
@@ -79,6 +80,7 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 19 | [frontend](19-frontend.md) | 技术栈、路由表、页面清单与端点、API 客户端与 SSE、状态模式、权限重复 |
 | 20 | [config-and-storage](20-config-and-storage.md) | 全量配置项分类表、SQLite/PG 表清单、磁盘布局、迁移、备份与恢复 |
 | 21 | [gotchas-and-extension-guide](21-gotchas-and-extension-guide.md) | 已知失效配置/死代码、易踩的坑、扩展新数据源/新工具/新渲染器的步骤 |
+| 22 | [external-extensions](22-external-extensions.md) | MCP、文本/执行型 Skill、Sandbox Gateway/Runner 的权限边界、生命周期、产物与可观测性 |
 
 ---
 

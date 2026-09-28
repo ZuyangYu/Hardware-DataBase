@@ -50,4 +50,7 @@ METRIC_LABEL_KEYS = {
     # P0b resource governance: bounded enumerations only.
     "resource",
     "reason",
+    # External MCP plugins: transport is a closed set and status a bounded
+    # outcome enum; server slugs/tool names never become metric dimensions.
+    "transport",
 }

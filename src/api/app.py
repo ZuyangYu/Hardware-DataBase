@@ -34,9 +34,11 @@ from src.api.routes import (
     memories,
     notifications,
     parse_tasks,
+    plugins,
     query,
     exports,
     status,
+    sandbox,
     structured,
     upload,
     users,
@@ -142,6 +144,60 @@ async def lifespan(app: FastAPI):
     worker_log_file = None
     export_log_file = None
     memory_log_file = None
+    sandbox_dispatcher = None
+    sandbox_reconciler = None
+    sandbox_client = None
+    if bool(getattr(src.settings, "SANDBOX_ENABLED", False)) or bool(
+        getattr(src.settings, "SANDBOX_GATEWAY_ENABLED", False)
+    ):
+        # Constructing this dependency never opens a remote connection.  It
+        # only succeeds when deployment injected an authenticated identity
+        # provider; otherwise the optional loops stay stopped and health can
+        # report the closed/degraded state without weakening the API boundary.
+        try:
+            from src.sandbox.dependencies import get_service_client
+
+            sandbox_client = get_service_client()
+            if sandbox_client is not None and bool(getattr(src.settings, "SANDBOX_ENABLED", False)):
+                from src.sandbox.artifact_broker import ArtifactBroker
+                from src.sandbox.artifacts import build_registered_scanner
+                from src.sandbox.catalog import SandboxCatalog
+                from src.sandbox.reconciler import SandboxReconciler, SandboxReconcilerLoop
+                from src.sandbox.service import SandboxDispatcherLoop, SandboxExecutionAdapter
+                from src.sandbox.task_store import SandboxTaskStore
+
+                sandbox_store = SandboxTaskStore()
+                sandbox_catalog = SandboxCatalog(sandbox_store.db_path)
+                sandbox_broker = ArtifactBroker(scanner=build_registered_scanner())
+                sandbox_adapter = SandboxExecutionAdapter(
+                    store=sandbox_store,
+                    catalog=sandbox_catalog,
+                    broker=sandbox_broker,
+                    client=sandbox_client,
+                )
+                sandbox_dispatcher = SandboxDispatcherLoop(
+                    sandbox_adapter,
+                    interval_seconds=float(
+                        getattr(src.settings, "SANDBOX_DISPATCH_INTERVAL_SECONDS", 2.0)
+                    ),
+                )
+                sandbox_reconciler = SandboxReconcilerLoop(
+                    SandboxReconciler(
+                        store=sandbox_store,
+                        client=sandbox_client,
+                        broker=sandbox_broker,
+                    ),
+                    interval_seconds=float(
+                        getattr(src.settings, "SANDBOX_RECONCILE_INTERVAL_SECONDS", 30.0)
+                    ),
+                )
+                sandbox_dispatcher.start()
+                sandbox_reconciler.start()
+                print("[hardware-database] sandbox dispatcher/reconciler started")
+            elif bool(getattr(src.settings, "SANDBOX_ENABLED", False)):
+                print("[hardware-database] sandbox loops not started: authenticated client is unavailable")
+        except Exception as exc:  # pragma: no cover - startup remains fail-closed
+            print(f"[hardware-database] sandbox loops not started: {exc}")
     if _should_spawn_worker():
         log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -181,6 +237,16 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if sandbox_dispatcher is not None:
+            sandbox_dispatcher.stop()
+        if sandbox_reconciler is not None:
+            sandbox_reconciler.stop()
+        try:
+            from src.sandbox.dependencies import close_service_client
+
+            close_service_client()
+        except Exception:  # pragma: no cover - teardown is best-effort
+            pass
         if worker_proc is not None and worker_proc.poll() is None:
             worker_proc.terminate()
             try:
@@ -213,6 +279,12 @@ async def lifespan(app: FastAPI):
                     getattr(src.settings, "RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS", 10)
                 )
             )
+        except Exception:  # pragma: no cover - teardown is best-effort
+            pass
+        try:
+            from src.agents.mcp.client import reset_mcp_runtime
+
+            reset_mcp_runtime()
         except Exception:  # pragma: no cover - teardown is best-effort
             pass
         shutdown_observability()
@@ -279,7 +351,9 @@ def create_app() -> FastAPI:
     app.include_router(logs.router, prefix=api_v1)
     app.include_router(memories.router, prefix=api_v1)
     app.include_router(notifications.router, prefix=api_v1)
+    app.include_router(plugins.router, prefix=api_v1)
     app.include_router(status.router, prefix=api_v1)
+    app.include_router(sandbox.router, prefix=api_v1)
     app.include_router(evaluation.router, prefix=api_v1)
     app.include_router(structured.router, prefix=api_v1)
 

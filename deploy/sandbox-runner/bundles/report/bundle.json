@@ -1,0 +1,36 @@
+{
+  "bundle_ref": "bundle/report",
+  "profile_ref": "profile/dev-l1",
+  "profile_digest": "371196dd810ee0a602bc6617357b7008e8318c5c883d98acad9b8df8a5de4fb4",
+  "image_digest": "sha256:e9153bb8ce65fd2d7e2250adb19d984b4a0283243e89df563765766f0856949b",
+  "entrypoint_digest": "ce2087faaf6debfd8d0ac6cfd834a83651bcfb0dd5d6dcba01ce3a4c9f854e51",
+  "description": "Fixed reviewed report bundle (stdlib only, no network)",
+  "digest_algorithm": "sha256(entrypoint.py)",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "maxLength": 80
+      },
+      "rows": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20
+      }
+    },
+    "required": [
+      "title"
+    ],
+    "additionalProperties": false
+  },
+  "outputs": [
+    "report.txt",
+    "report.json"
+  ],
+  "capabilities": [
+    "sandbox.execute",
+    "sandbox.write_artifact"
+  ],
+  "entrypoint_path": "/opt/bundle/report/entrypoint.py"
+}

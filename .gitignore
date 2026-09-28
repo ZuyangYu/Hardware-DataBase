@@ -21,6 +21,9 @@ wheels/
 # Ignore all storage/ contents, but keep .gitkeep
 storage/**
 !storage/.gitkeep
+/deploy/sandbox-runner/secrets/
+/deploy/sandbox-runner/state/
+/deploy/mcp-gateway/secrets/
 
 .idea/
 

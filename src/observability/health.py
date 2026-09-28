@@ -134,11 +134,22 @@ def _compute_ready() -> dict[str, Any]:
         "database": _check_sqlite(),
         "control_plane": check_control_plane(),
         "storage": _check_storage(),
+        "sandbox": _check_sandbox(),
     }
     if bool(getattr(settings, "REDIS_REQUIRED", True)):
         # Redis 是硬依赖：不可用即 not_ready（由编排/负载均衡摘流量）。
         dependencies["redis"] = _check_redis()
-    ready = all(item.get("status") == "up" for item in dependencies.values())
+    # A deliberately disabled optional extension is healthy by absence. An
+    # enabled-but-unconfigured Sandbox is not ready and must not silently look
+    # like a working execution backend. Other dependencies retain their
+    # deployment-required semantics (including Redis when REDIS_REQUIRED=true).
+    sandbox_ready = dependencies["sandbox"].get("status") in {"up", "not_configured"}
+    required_ready = all(
+        item.get("status") == "up"
+        for name, item in dependencies.items()
+        if name != "sandbox"
+    )
+    ready = sandbox_ready and required_ready
     return {
         "status": "ready" if ready else "not_ready",
         # v3 §11.5: the live content revision plus the settings that still need
@@ -156,6 +167,93 @@ def _config_revision() -> str:
         return str(settings.CONFIG_REVISION or "")
     except Exception:  # noqa: BLE001 - readiness must not fail on metadata
         return ""
+
+
+def _check_mcp() -> dict[str, Any]:
+    """Three-state MCP component for the System Status page.
+
+    ``not_configured`` when the global switch is off; ``degraded`` when the
+    feature is on but unusable (prerequisites missing, store error, broken
+    credentials on an enabled server, or no enabled server); ``up`` otherwise.
+    """
+
+    if not bool(getattr(settings, "MCP_ENABLED", False)):
+        return {"status": "not_configured"}
+    try:
+        from src.agents.mcp.policy import mcp_prerequisites_met
+        from src.agents.mcp.store import build_mcp_store
+
+        met, reason = mcp_prerequisites_met()
+        if not met:
+            return {"status": "degraded", "error": reason}
+        store = build_mcp_store()
+        servers = store.list_all()
+        enabled = [record for record in servers if record.enabled]
+        credentials_broken = [record.slug for record in enabled if not record.credentials_ok]
+        if credentials_broken:
+            return {
+                "status": "degraded",
+                "error": "credentials_unavailable",
+                "enabled": len(enabled),
+                "servers": len(servers),
+            }
+        payload: dict[str, Any] = {
+            "enabled": len(enabled),
+            "servers": len(servers),
+            "subscriptions": store.count_subscriptions(),
+            "write_enabled": bool(getattr(settings, "MCP_WRITE_ENABLED", False)),
+        }
+        if not enabled:
+            payload["status"] = "degraded"
+            payload["error"] = "no_enabled_server"
+            return payload
+        payload["status"] = "up"
+        return payload
+    except Exception as exc:  # noqa: BLE001 - status page must never raise
+        return {"status": "degraded", "error": type(exc).__name__}
+
+
+def _check_sandbox() -> dict[str, Any]:
+    """Report the HDB control-plane boundary without claiming runtime safety.
+
+    This probe never executes a task and does not make a remote health call.
+    ``up`` means only that the deployment supplied an authenticated client and
+    the local fail-closed gates are coherent; independent Runner/runtime
+    acceptance evidence remains an operator/deployment responsibility.
+    """
+
+    enabled = bool(getattr(settings, "SANDBOX_ENABLED", False))
+    gateway_enabled = bool(getattr(settings, "SANDBOX_GATEWAY_ENABLED", False))
+    if not enabled and not gateway_enabled:
+        return {
+            "status": "not_configured",
+            "backend": str(getattr(settings, "SANDBOX_BACKEND", "disabled") or "disabled"),
+        }
+    try:
+        from src.sandbox.policy import require_execution_enabled
+        from src.sandbox.dependencies import get_service_client
+
+        if enabled:
+            require_execution_enabled(operation="sandbox readiness")
+        elif str(getattr(settings, "SANDBOX_BACKEND", "disabled")).lower() == "disabled":
+            return {"status": "degraded", "error": "gateway_backend_not_configured"}
+        client = get_service_client()
+        if client is None:
+            return {"status": "degraded", "error": "authenticated_service_client_unavailable"}
+        if enabled and not client.runner_url:
+            return {"status": "degraded", "error": "runner_endpoint_unavailable"}
+        if gateway_enabled and not client.gateway_url:
+            return {"status": "degraded", "error": "gateway_endpoint_unavailable"}
+        return {
+            "status": "up",
+            "backend": str(getattr(settings, "SANDBOX_BACKEND", "disabled") or "disabled"),
+            "gateway_enabled": gateway_enabled,
+            "runtime_attestation_ref_present": bool(
+                str(getattr(settings, "SANDBOX_RUNTIME_ATTESTATION_REF", "") or "").strip()
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 - health must remain bounded
+        return {"status": "degraded", "error": type(exc).__name__}
 
 
 def check_dependencies() -> dict[str, Any]:
@@ -186,6 +284,8 @@ def check_dependencies() -> dict[str, Any]:
         "redis": _check_redis(),
         "ragflow": ragflow,
         "llm": llm,
+        "mcp": _check_mcp(),
+        "sandbox": _check_sandbox(),
     }
     failed = [name for name, item in dependencies.items() if item.get("status") == "down"]
     degraded = [name for name, item in dependencies.items() if item.get("status") == "degraded"]

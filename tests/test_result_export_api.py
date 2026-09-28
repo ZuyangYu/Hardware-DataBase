@@ -235,6 +235,9 @@ class ResultExportApiTests(unittest.TestCase):
                 "source_ref": {"kind": "turn", "id": self.turn.id},
                 "formats": ["md"],
                 "client_request_id": "download-1",
+                # This test owns the preview/download contract, not the model
+                # organizer pass: keep the artifact deterministic and offline.
+                "organize": False,
             },
         )
         self.assertEqual(created.status_code, 202, created.text)

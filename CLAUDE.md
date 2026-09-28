@@ -121,6 +121,49 @@ talks to. It owns a `RAGFlowBackend` (the retrieval/ingest backend), a
 agent). `query` streams answer deltas; `upload_files` routes by `source_group`
 (see Ingestion) into the circuit pipeline or the RAGFlow backend.
 
+### External MCP plugins (`src/agents/mcp/`)
+Governed external tool federation, default off. Remote-only (stdio rejected),
+read-only tools only in phase 1. Flow: system admin registers a server
+(`/api/v1/plugins/mcp/*`) → test connection (bound to the config fingerprint) →
+enable → employees subscribe on the 扩展 page. Visibility = enabled ∧
+department scope ∧ subscription, resolved **before** capability resolution;
+`external_tool.invoke` is authorized only from that authenticated turn fact.
+The guarded executor re-checks at call time, consumes `MCP_CALLS_PER_TURN`,
+passes through the dedicated `mcp` governor resource and records
+events/audit/metrics with bounded labels. External results never enter
+`rt.evidence` and never get citation numbers. `MCP_CREDENTIALS_KEY` is
+environment-only; stored credentials are encrypted at rest and never echoed.
+Phase 2's candidate-artifact write channel requires the `write_tools` whitelist,
+`MCP_WRITE_ENABLED`, user consent, and `external_tool.write`. It creates a
+validated candidate without overwriting the original; see `docs/mcp-plugins.md`.
+
+### Sandbox / Gateway / text Skill boundary
+
+The HDB API and workers are control-plane clients only. They never launch
+third-party processes and never open a Docker/OCI socket. `src/sandbox/` uses
+an authenticated API adapter to an independently deployed Sandbox Runner (and
+an MCP Gateway for sandboxed stdio); the Runner is the only component allowed
+to control a runtime. `SANDBOX_BACKEND=disabled` and all sandbox/Gateway
+switches are off by default, and an unavailable or unvalidated backend fails
+closed rather than falling back to a local process/container.
+
+Sandbox tasks require a reviewed fixed-digest bundle/profile, server-derived
+policy snapshot, capability checks, durable idempotency/CAS/lease/fencing
+state, and Artifact Broker `stage → scan → commit` manifests. Unknown or
+uncertain Runner outcomes stay uncertain until reconciliation. The independent
+`src/sandbox/skills.py` catalog treats Markdown/text Skills as untrusted prompt
+data only; Skills cannot grant tools, permissions, network, `sandbox.execute`,
+or execute hooks/bin/commands. The agent loads them only from the server-owned
+`RequestContext.metadata["skill_refs"]` list, and only when `SKILLS_ENABLED` is
+true; unauthorized or disabled refs are omitted.
+
+The separate execution-Skill path binds a draft text Skill to a predeployed,
+reviewed fixed-digest bundle, then requires Skill review/test/enable. Employee
+invocations use the existing sandbox task/Artifact Broker flow; the task stores
+the Skill identity so dispatch rechecks approval, department and capabilities.
+Skill text and embedded script snippets are never interpreted as executable
+code. On dev-l1 this path is limited to HDB-owned, Runner-pinned bundles.
+
 ### Agent loop (`src/agents/`)
 `MultiSourceAgentRunner` (`runner.py`) wraps `deepagents.create_deep_agent`
 (a compiled LangGraph graph under the hood, but with a fixed general agent loop —

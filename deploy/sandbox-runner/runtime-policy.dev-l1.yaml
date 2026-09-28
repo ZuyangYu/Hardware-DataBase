@@ -1,0 +1,34 @@
+# Runtime profile: dev-l1 (development / single-tenant fixed bundles only)
+#
+# Selected backend: rootful Docker 29.x on this host (no rootless OCI, gVisor,
+# Kata or microVM profile is installed, and the host grants no sudo).  The plan
+# permits L1 for HDB-authored, fixed-digest bundles without sensitive external
+# input; it is NOT the L2/L3 profile required for reviewed third-party or
+# generated code.  Do not reuse this profile for untrusted multi-tenant work.
+profile: dev-l1
+backend: docker
+runtime: runc
+rootful: true
+hardening:
+  network: internal-only bridge with no gateway (no outbound connectivity)
+  rootfs_read_only: true
+  user: service uid (non-root, never 0)
+  capabilities: drop ALL
+  no_new_privileges: true
+  pids_limit: 128
+  memory_limit: 256m
+  cpu_limit: "1"
+  tmpfs: "/tmp:rw,noexec,nosuid,size=16m"
+  mounts:
+    - "task input directory: read-only"
+    - "task output directory: read-write"
+    - "no host path, socket or environment injection"
+limits:
+  wall_clock_seconds: 120
+  max_output_bytes: 4194304
+  max_parameter_bytes: 65536
+network:
+  default: none
+  service_profiles: internal bridge only
+dynamic_install: false
+on_policy_failure: reject

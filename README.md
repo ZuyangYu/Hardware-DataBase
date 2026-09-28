@@ -27,6 +27,7 @@
 | 🗂 | **多源 Pipeline** | 普通文档进 RAGFlow 检索链路；Excel 进结构化表格索引；EDF 网表进电路结构化索引；外部对话记录单独索引——全部由 agent 统一调度 |
 | 🔌 | **RAGFlow 固定后端** | 文档上传、解析任务、检索、删除、知识库治理统一走 RAGFlow 适配层，项目内不维护本地向量索引 |
 | 🛡 | **权限与治理** | 部门、用户、知识库权限、审计日志、查询 trace、文件处理状态 |
+| 🧩 | **外部扩展** | 受治理的远程 MCP 工具、文本 Skill 与审核后沙箱 Skill；默认关闭并按部门和订阅授权，见[操作指南](docs/mcp-plugins.md)与[技术 Wiki](wiki/22-external-extensions.md) |
 | ⚙️ | **统一模型配置** | 答案生成、工具决策与后台模型任务统一走 `src.core.model_factory` profile，由 chat runtime 负责调用归一化与观测；支持 Ollama 与任意 OpenAI-compatible API |
 | 📤 | **结果导出** | 对话/检索结果先固化为不可变 ResultSnapshot，再由独立 export worker 生成 Markdown / Excel / Word / PDF / PowerPoint；后台任务带权限校验，切页面、刷新、断线都不丢 |
 | 🧠 | **长期记忆** | LangMem 驱动的 User / Project Memory：默认 opt-out、显式 consent、有界注入为不可信线索，正式证据始终优先 |
@@ -88,6 +89,24 @@ npm ci
 npm run dev                          # Vite dev server，默认 127.0.0.1:5176，/api 反代到后端
 ```
 
+启用可执行 Skill 时，还需按 `deploy/sandbox-runner/README.md` 一次性准备受核验的基础镜像和服务令牌，
+然后在启动 API **之前**单独启动独立 Runner：
+
+```bash
+uv run python deploy/sandbox-runner/runner.py  # 默认 127.0.0.1:8780；需要 Docker daemon
+```
+
+若开启本机沙箱 MCP Gateway（`SANDBOX_GATEWAY_ENABLED=true`），参照
+`deploy/mcp-gateway/README.md` 配置独立令牌，并另开终端运行
+`uv run python deploy/mcp-gateway/gateway.py`（默认 `127.0.0.1:8781`）。
+
+单机直接运行 `hardware-database-server` 时，API 默认自动拉起对话/解析 Worker 和导出 Worker；
+沙箱任务的调度/对账循环也在 API 进程内自动启动，**无需另起沙箱 Worker**。记忆 Worker 默认不自动启动，
+如需记忆提炼，可另行运行 `uv run hardware-database-memory-worker`。若采用
+`bash scripts/hdb.sh start` 管理 API、前端和所有 Worker，它会关闭 API 的 Worker 自动拉起并
+各自启动一次；不要和上述手动启动方式同时使用。Runner（以及按需使用的 MCP Gateway）
+始终是单独的服务，不在 `hdb.sh` 中启动。
+
 生产部署用 `npm run build` 产出 `frontend/dist/` 静态文件。
 
 自管数据库（可选但推荐）：
@@ -134,6 +153,9 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 |---|---|
 | [`wiki/README.md`](wiki/README.md) | 系统技术 Wiki：总览、架构、API 与鉴权、对话 turn、Agent 运行时、工具与证据、模型与资源、ingestion |
 | [`deploy/docker/README.md`](deploy/docker/README.md) | Docker 部署、镜像源加速、内网离线分发、外部 PostgreSQL、备份恢复 |
+| [`docs/mcp-plugins.md`](docs/mcp-plugins.md) | MCP 插件与文本/执行型 Skill 的管理员、员工操作和排障 |
+| [`deploy/mcp-sandbox/README.md`](deploy/mcp-sandbox/README.md) | Sandbox Gateway/Runner 部署边界、运行档位与安全门禁 |
+| [`wiki/22-external-extensions.md`](wiki/22-external-extensions.md) | MCP、Skill 与 Sandbox 的架构、授权和生命周期 |
 | [`deploy/postgres/README.md`](deploy/postgres/README.md) | 自管 pgvector 实例与账本库迁移预演 |
 | [`evaluation/README.md`](evaluation/README.md) | RAGAS 数据集格式与扩展方式 |
 | [`.env.example`](.env.example) | 全量配置项与默认值 |
