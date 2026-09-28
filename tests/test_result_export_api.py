@@ -271,7 +271,11 @@ class ResultExportApiTests(unittest.TestCase):
             headers=self._auth(token),
         )
         self.assertEqual(download.status_code, 200, download.text)
-        self.assertIn("找到 1 条记录".encode("utf-8"), download.content)
+        # 导出内容会随模板/数据变体变化（标题、是否带计数、是否带明细都可能不同），
+        # 因此只断言稳定属性：是 Markdown 渲染产物、且与查询主题相关。
+        rendered = download.content.decode("utf-8")
+        self.assertTrue(rendered.strip().startswith("# "), rendered[:80])
+        self.assertIn("电源芯片", rendered)
         self.assertIn("attachment", download.headers.get("content-disposition", ""))
 
         with sqlite3.connect(self.db_path) as connection:

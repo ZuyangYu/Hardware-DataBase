@@ -3,7 +3,6 @@ import type { ReactNode } from 'react';
 import { cn } from '@/lib/utils';
 
 import NotificationBell from './NotificationBell';
-import UserMenu from './UserMenu';
 
 export type AppHeaderProps = {
   /**
@@ -15,19 +14,16 @@ export type AppHeaderProps = {
   /** 左侧描述行(left 未设时用)。 */
   description?: ReactNode;
   /**
-   * 右侧自定义内容。提供时完全替换默认的用户头像/退出下拉
+   * 右侧自定义内容。提供时完全替换默认的通知铃铛
    * (如登录页放主题切换 + 登录按钮)。
    */
   right?: ReactNode;
-  /** 退出菜单项点击回调。 */
-  onLogout?: () => void;
-  /** 当前用户显示名,用于头像首字母。 */
-  userName?: string;
   className?: string;
 };
 
 /**
- * 全局页头。右侧是用户头像按钮(下拉里放退出);左侧由各页通过 left 槽
+ * 全局页头。右侧默认只放通知铃铛:用户头像统一收敛到左侧边栏底部
+ * (AppSidebar),同一入口不再出现两处头像。左侧由各页通过 left 槽
  * 或 title/description 提供。照搬 AppHeader 结构(svgr 图标换成 lucide)。
  */
 export default function AppHeader({
@@ -35,8 +31,6 @@ export default function AppHeader({
   title,
   description,
   right,
-  onLogout,
-  userName,
   className,
 }: AppHeaderProps) {
   const leftContent = left ?? (
@@ -56,14 +50,7 @@ export default function AppHeader({
     <header className={cn('flex w-full items-start gap-[16px]', className)}>
       <div className="min-w-0 flex-1">{leftContent}</div>
       <div className="flex h-[32px] shrink-0 items-center gap-[8px]">
-        {right !== undefined ? (
-          right
-        ) : (
-          <>
-            <NotificationBell />
-            <UserMenu userName={userName} onLogout={onLogout} />
-          </>
-        )}
+        {right !== undefined ? right : <NotificationBell />}
       </div>
     </header>
   );

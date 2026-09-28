@@ -276,13 +276,20 @@ Revision = ArtifactRevision
 class ArtifactRevisionStore:
     """SQLite repository with request-level idempotency."""
 
-    def __init__(self, db_path: str | os.PathLike[str]):
-        self.db_path = os.fspath(db_path)
-        if self.db_path != ":memory:":
-            os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        self._init_db()
+    def __init__(self, db_path: str | os.PathLike[str] | None = None):
+        from src.document_authoring import pg_support
+
+        explicit = os.fspath(db_path) if db_path is not None else None
+        if pg_support.configure(self, explicit):
+            if self.db_path != ":memory:":
+                os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.document_authoring import pg_support
+
+            return pg_support.connect(self)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")

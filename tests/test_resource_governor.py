@@ -429,6 +429,10 @@ class GovernorMaintenanceStartupTests(unittest.TestCase):
             stop_governor_maintenance,
         )
 
+        # start_governor_maintenance 是进程级单例：同进程里前面的用例
+        # 可能已经启动/停止过，直接 start 会是 no-op（不会重新选举）。
+        # 先 stop 复位，保证本次拿到干净的选举起点。
+        stop_governor_maintenance()
         start_governor_maintenance()
         store = get_governor().store
         self.assertIsNotNone(store)

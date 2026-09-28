@@ -28,6 +28,34 @@ def redis_url() -> str:
     return str(getattr(_settings(), "REDIS_URL", "") or "").strip()
 
 
+class RedisUnavailable(RuntimeError):
+    """Redis 是硬依赖：未配置或不可达时拒绝启动。"""
+
+
+def assert_redis_ready(*, purpose: str = "启动") -> None:
+    """硬依赖门禁：``REDIS_REQUIRED=true`` 时 Redis 必须已配置且可达。
+
+    与 PG 的 fail-closed 校验同款：没有 Redis 就不跑，而不是静默降级成
+    DB 轮询。``REDIS_REQUIRED=false``（仅测试隔离用）时本函数直接返回。
+    """
+    if not bool(getattr(_settings(), "REDIS_REQUIRED", True)):
+        return
+    url = redis_url()
+    if not url:
+        raise RedisUnavailable(
+            f"REDIS_REQUIRED=true 但 REDIS_URL 未配置，{purpose}被拒绝。"
+            "（部署说明见 deploy/docker/README.md 与 wiki/20）"
+        )
+    from src.observability.health import _check_redis
+
+    probe = _check_redis()
+    if probe.get("status") != "up":
+        raise RedisUnavailable(
+            f"REDIS_REQUIRED=true 但 Redis 不可用（{probe.get('status')}: "
+            f"{probe.get('error', '')}），{purpose}被拒绝。"
+        )
+
+
 def get_redis_client() -> Any | None:
     """Return a shared sync client, or None while Redis is disabled/unreachable."""
     global _CLIENT, _FAILED_AT

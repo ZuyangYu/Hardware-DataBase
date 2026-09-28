@@ -88,7 +88,7 @@ function KbContentRoute({
   return <>{children}</>;
 }
 
-/** 管理路由守卫:治理面板/日志/系统状态对员工开放(部门级);账号/配置等仅 sysadmin。 */
+/** 管理路由守卫:治理面板/日志对员工开放(部门级);系统状态/账号/配置等仅 sysadmin。 */
 function AdminRoute({
   auth,
   requireSysAdmin,
@@ -288,7 +288,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
             <Route
               path="/admin/status"
               element={
-                <AdminRoute auth={auth}>
+                <AdminRoute auth={auth} requireSysAdmin>
                   <SystemStatusPage auth={auth} onLogout={onLogout} />
                 </AdminRoute>
               }

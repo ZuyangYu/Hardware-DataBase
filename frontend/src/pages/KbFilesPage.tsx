@@ -719,8 +719,6 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       <AppHeader
         title={`知识库工作台 · ${kbName}`}
         description={`${kbMeta ? `${kbVisibilityLabel(kbMeta)}${kbMeta.is_owner ? ' · 我是所有者' : ''}；` : ''}共 ${files.length} 个文件；上传、解析任务和结构化结果在当前知识库内处理。${deletionWarning}`}
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[16px] flex flex-wrap justify-end gap-[8px]">

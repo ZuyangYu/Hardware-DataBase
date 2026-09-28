@@ -731,6 +731,9 @@ class HardwareWorker:
 
 
 def main() -> None:
+    from src.core.redis_client import assert_redis_ready
+
+    assert_redis_ready(purpose="worker 启动")
     parser = argparse.ArgumentParser(description="Hardware DataBase durable worker")
     parser.add_argument(
         "--role",

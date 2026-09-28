@@ -134,15 +134,22 @@ Review = DocumentReview
 class DocumentReviewStore:
     """SQLite repository for reviews and their idempotent decision commands."""
 
-    def __init__(self, db_path: str | os.PathLike[str]):
-        self.db_path = os.fspath(db_path)
-        if not self.db_path:
-            raise ValueError("review database path is required")
-        if self.db_path != ":memory:":
-            os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        self._init_db()
+    def __init__(self, db_path: str | os.PathLike[str] | None = None):
+        from src.document_authoring import pg_support
+
+        explicit = os.fspath(db_path) if db_path is not None else None
+        if pg_support.configure(self, explicit):
+            if not self.db_path:
+                raise ValueError("review database path is required")
+            if self.db_path != ":memory:":
+                os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.document_authoring import pg_support
+
+            return pg_support.connect(self)
         connection = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")

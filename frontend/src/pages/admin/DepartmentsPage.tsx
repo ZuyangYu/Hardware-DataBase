@@ -121,8 +121,6 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
       <AppHeader
         title="部门管理"
         description="创建、删除部门。部门下仍有用户或知识库时无法删除。"
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-end gap-[12px]">

@@ -181,8 +181,6 @@ export default function GovernancePage({ auth, onLogout }: Props) {
             ? '全局知识库治理视图:文件统计、解析异常、挂载与归属问题。'
             : '本部门知识库治理视图:文件统计与解析异常。'
         }
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-end gap-[12px]">

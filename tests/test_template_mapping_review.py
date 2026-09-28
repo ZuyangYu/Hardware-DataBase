@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import pytest
 
@@ -85,7 +86,28 @@ def _service_with_table(tmp_path):
         suggestion_provider=_TableSuggester(),
     )
     ctx = RequestContext(user_id="alice", tenant_id="tenant-a", roles=["user"])
-    fixture = Path("/home/renfeng_zhang/workspace/Hardware-DataBase/docs/ADAS/icd_example.xlsx")
+    # 夹具是可选的本地测试数据（不在版本库内）：默认找仓库内 docs/ADAS/，
+    # 也可用 HDB_TEST_ICD_FIXTURE 指向任意位置，找不到就跳过。
+    candidates = [
+        Path(__file__).resolve().parents[1] / "docs" / "ADAS" / "icd_example.xlsx",
+    ]
+    override = os.environ.get("HDB_TEST_ICD_FIXTURE", "").strip()
+    if override:
+        candidates.insert(0, Path(override))
+    fixture = None
+    for candidate in candidates:
+        try:
+            candidate.read_bytes()
+        except OSError:
+            continue
+        fixture = candidate
+        break
+    if fixture is None:
+        import pytest
+
+        pytest.skip(
+            "缺少可读的 icd_example.xlsx 夹具（该文件不在本仓库，属外部测试数据）"
+        )
     if not fixture.is_file():
         pytest.skip("real ICD fixture is not available")
     analysis = service.analyze_uploaded_template(

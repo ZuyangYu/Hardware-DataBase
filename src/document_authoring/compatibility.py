@@ -228,14 +228,22 @@ class SqliteBackupReport(CompatibilityModel):
 class DocumentAuthoringCompatibilityStore:
     """SQLite repository for compatibility events, markers and observations."""
 
-    def __init__(self, db_path: str | os.PathLike[str]):
-        self.db_path = str(db_path)
-        parent = os.path.dirname(os.path.abspath(self.db_path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        self._init_db()
+    def __init__(self, db_path: str | os.PathLike[str] | None = None):
+        from src.document_authoring import pg_support
+
+        explicit = os.fspath(db_path) if db_path is not None else None
+        if pg_support.configure_compat(self, explicit):
+            self.db_path = str(self.db_path)
+            parent = os.path.dirname(os.path.abspath(self.db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.document_authoring import pg_support
+
+            return pg_support.compat_connect(self)
         connection = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         return connection

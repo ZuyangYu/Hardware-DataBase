@@ -95,11 +95,34 @@ class PipelineDocumentRecord:
 
 class PipelineDocumentStore:
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "pipeline_documents.db")
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._init_db()
+        from src.storage import domain_pg
+
+        self._backend, self._dsn = domain_pg.resolve_domain_backend("PIPELINE_DOCUMENT")
+        if db_path:
+            # 显式 db_path（测试/工具）永远走 SQLite。
+            self._backend = "sqlite"
+        if self._backend == "sqlite":
+            self.db_path = db_path or os.path.join(src.settings.STORAGE_DIR, "pipeline_documents.db")
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            self._init_db()
+            return
+        self.db_path = None
+        domain_pg.ensure_domain_ready(
+            dsn=self._dsn,
+            store_cls=type(self),
+            sqlite_db_path=os.path.join(src.settings.STORAGE_DIR, "pipeline_documents.db"),
+            primary_table="pipeline_documents",
+            migration_command=(
+                "uv run python scripts/production_hardening/migrate_sqlite_to_postgres.py "
+                "--group pipeline --dsn $CONTROL_PLANE_DATABASE_URL"
+            ),
+        )
 
     def _connect(self):
+        if self._backend == "postgres":
+            from src.storage.domain_pg import open_pg_connection
+
+            return open_pg_connection(self._dsn)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -950,6 +973,17 @@ class PipelineDocumentStore:
         processor_placeholders = ", ".join("?" for _ in processor_kinds)
         stale_after_seconds = max(60, int(stale_after_seconds or WORKER_STALE_SECONDS))
         max_retries = max(1, int(max_retries or WORKER_MAX_RETRIES))
+        # 过期回收的心跳判断：SQLite 用 datetime('now', ?) 修饰符；PG 用
+        # NULLIF + 显式 timestamptz 转型（'' 哨兵必须转 NULL，否则 cast 报错）。
+        if self._backend == "postgres":
+            stale_filter = (
+                "  AND (NULLIF(worker_heartbeat_at, ''))::timestamptz"
+                " < clock_timestamp() - (%s * interval '1 second')"
+            )
+            stale_params: tuple = (stale_after_seconds,)
+        else:
+            stale_filter = "  AND datetime(worker_heartbeat_at) < datetime('now', ?)"
+            stale_params = (f"-{stale_after_seconds} seconds",)
         with closing(self._connect()) as conn:
             conn.execute(
                 f"""
@@ -964,9 +998,9 @@ class PipelineDocumentStore:
                 WHERE processor_kind IN ({processor_placeholders})
                   AND worker_id != ''
                   AND worker_heartbeat_at != ''
-                  AND datetime(worker_heartbeat_at) < datetime('now', ?)
+                  {stale_filter}
                 """,
-                (TASK_STATUS_QUEUED, TASK_STATUS_QUEUED, *processor_kinds, f"-{stale_after_seconds} seconds"),
+                (TASK_STATUS_QUEUED, TASK_STATUS_QUEUED, *processor_kinds, *stale_params),
             )
             conn.execute(
                 f"""
@@ -1055,6 +1089,15 @@ class PipelineDocumentStore:
             return []
         processor_placeholders = ", ".join("?" for _ in processor_kinds)
         status_placeholders = ", ".join("?" for _ in statuses)
+        if self._backend == "postgres":
+            refresh_filter = (
+                "OR (NULLIF(last_status_checked_at, ''))::timestamptz"
+                " < clock_timestamp() - (%s * interval '1 second')"
+            )
+            refresh_params = (max(0, int(min_interval_seconds)),)
+        else:
+            refresh_filter = "OR datetime(last_status_checked_at) < datetime('now', ?)"
+            refresh_params = (f"-{max(0, int(min_interval_seconds))} seconds",)
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""
@@ -1064,7 +1107,7 @@ class PipelineDocumentStore:
                   AND document_id != ''
                   AND (
                     last_status_checked_at = ''
-                    OR datetime(last_status_checked_at) < datetime('now', ?)
+                    {refresh_filter}
                   )
                 ORDER BY updated_at ASC
                 LIMIT ?
@@ -1072,7 +1115,7 @@ class PipelineDocumentStore:
                 (
                     *processor_kinds,
                     *statuses,
-                    f"-{max(0, int(min_interval_seconds))} seconds",
+                    *refresh_params,
                     max(1, int(limit)),
                 ),
             ).fetchall()

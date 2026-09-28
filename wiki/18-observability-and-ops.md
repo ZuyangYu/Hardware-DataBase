@@ -206,8 +206,10 @@ cd frontend && npm ci && npm run dev      # 5176，/api 代理到 8001
 按角色启动 `worker-chat` / `worker-authoring` / `worker-parse` / `memory-worker` / `export-worker`；
 pid 在 `storage/run/`，日志在 `storage/logs/`；前端用 `storage/nodeenv`（便携 Node）。
 
-可选实时面：`bash scripts/redis.sh up` 起项目自管 Redis（`127.0.0.1:6380`），
+实时面（必需）：`bash scripts/redis.sh up` 起项目自管 Redis（`127.0.0.1:6380`），
 健康后自动写 `REDIS_URL` 到 `.env`，再 `bash scripts/hdb.sh restart` 生效；见 §3。
+`REDIS_REQUIRED=true`（默认）时 Redis 未配置/不可达会拒绝启动（API 与 worker），
+`/health/ready` 也判 not_ready —— 不提供降级成 DB 轮询的运行形态。
 
 可选账本库：`bash scripts/postgres.sh up` 起项目自管 PostgreSQL
 （`deploy/postgres`，pgvector 镜像，`127.0.0.1:55433`），
@@ -252,6 +254,33 @@ uv run hardware-database-export-worker          # 多实例时单独运行
 uv run hardware-database-memory-worker
 uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
 ```
+
+### 4.3.1 探针缓存
+
+`/health/ready` 带短 TTL 缓存（`OBS_READINESS_CACHE_SECONDS`，默认 1 秒）：
+K8s/负载均衡每几秒探一次时，无缓存会每次都真查 SQLite + PG + storage；
+缓存以 `CONFIG_REVISION` 为键，改配置立即重探，真实故障仍在 ~1 秒内暴露。
+`/health/live` 与 `/health/dependencies`（管理员页）不缓存。
+
+### 4.4.1 备份/恢复（`scripts/backup.sh`）
+
+数据端是两个物理对象（PG 控制面 + `storage/`），备份合成一条命令：
+
+```bash
+bash scripts/backup.sh create                     # 全量：pg_dump(-Fc) + storage tar，默认留 7 份
+bash scripts/backup.sh create --lean              # 排除可重建数据（索引/checkpoint/投影）
+bash scripts/backup.sh create --skip-pg           # 纯 SQLite 部署
+bash scripts/backup.sh restore backups/storage-20260922-120000.tar.gz   # 破坏性，交互确认
+bash scripts/backup.sh list
+```
+
+- `create` 不需要停服：PG 用 `pg_dump -Fc` 一致性快照，storage tar 对"打包中文件变化"
+  按警告处理（退出码 1）；恢复才要求停应用（脚本会先 `hdb.sh stop`）。
+- `restore` 会把现有 `storage/` 挪到 `storage.pre-restore-<ts>`，并用
+  `pg_restore --clean --if-exists` 覆盖控制面库 —— 必须确认没有活跃连接。
+- 可重建数据（`table_indexes/`、`circuits/`、`agent_checkpoints.db` 等）`--lean`
+  时不备份，恢复后随首次解析重建；`auth.db`/`pipeline_documents.db`/
+  `chat_attachments.db`/`document_authoring.db`/`projects.db`/`exports` 永远是全量。
 
 ### 4.5 生产硬化脚本（`scripts/production_hardening/`）
 

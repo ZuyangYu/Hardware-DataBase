@@ -910,6 +910,11 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class ChangeOwnPasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
 # ---------------------------------------------------------------------------
 # Departments (system_admin)
 # ---------------------------------------------------------------------------

@@ -101,7 +101,7 @@ eval = [
 ]
 
 [tool.pytest.ini_options]
-norecursedirs = ["build", "src/circuit/vendor/spydrnet"]
+norecursedirs = ["build", "src/circuit/vendor/spydrnet", "deploy"]
 
 [tool.ruff]
 # vendored SpyDrNet (含 sch_parse / spydrnet_extension 等 upstream 风格代码) 不属于本应用源码,不纳入 lint。

@@ -239,8 +239,6 @@ export default function KbListPage({ auth, kbs, kbsLoaded, onLogout, onRefresh }
             ? '你是系统管理员(治理角色),可查看知识库登记信息,但不能访问库内容。'
             : '知识库默认私有，仅所有者可切换部门共享；共享后本部门其他成员拥有完整 admin 权限，可管理文件和删除知识库。'
         }
-        userName={auth.user.username}
-        onLogout={onLogout}
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-end gap-[12px]">

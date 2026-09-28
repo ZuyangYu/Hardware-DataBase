@@ -12,7 +12,6 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from typing import Any
 
-import src.settings
 
 
 def _utc_now() -> str:
@@ -123,14 +122,20 @@ class NotificationService:
     """Minimal store for in-app notifications."""
 
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or src.settings.AUTH_DB_PATH
-        parent = self.db_path.rsplit("/", 1)[0] if "/" in self.db_path else "."
-        import os
+        from src.storage import auth_domain
 
-        os.makedirs(parent, exist_ok=True)
-        self._init_db()
+        if auth_domain.configure_service(self, db_path):
+            parent = self.db_path.rsplit("/", 1)[0] if "/" in self.db_path else "."
+            import os
+
+            os.makedirs(parent, exist_ok=True)
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.storage import auth_domain
+
+            return auth_domain.connect(self)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")

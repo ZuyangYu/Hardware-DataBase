@@ -8,7 +8,11 @@ from dotenv import load_dotenv
 
 ENV_FILE_ENCODING = "utf-8-sig"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
+# 默认仍是仓库根 .env；容器部署可用 HDB_ENV_PATH 把可写配置指向挂载目录。
+# 原因：管理页保存走 save_settings_to_env 的 mkstemp + os.replace 原子替换，
+# 而镜像层内的 /app 与单文件 bind mount 都不允许 rename（EBUSY），
+# 因此 Docker 部署把 .env 放在挂载的目录里再指过来。
+ENV_FILE_PATH = os.getenv("HDB_ENV_PATH") or os.path.join(BASE_DIR, ".env")
 CONFIG_REVISION = ""
 
 
@@ -163,7 +167,7 @@ DOCUMENT_AUTHORING_AGENT_MODE_ENABLED = os.getenv(
     "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
 AGENT_DOCUMENT_TOOLS_ENABLED = os.getenv(
-    "AGENT_DOCUMENT_TOOLS_ENABLED", "false"
+    "AGENT_DOCUMENT_TOOLS_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND = os.getenv(
     "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"
@@ -310,7 +314,7 @@ if WORKER_ROLE not in {"all", "chat", "authoring", "parse"}:
 # P0b resource governance.  process = per-process semaphores (single host dev);
 # deployment = shared SQLite quota table across same-host API/Worker processes.
 # Rollout flag: off until the stage acceptance report opens it (plan §10.1).
-RESOURCE_GOVERNOR_ENABLED = _env_bool("RESOURCE_GOVERNOR_ENABLED", False)
+RESOURCE_GOVERNOR_ENABLED = _env_bool("RESOURCE_GOVERNOR_ENABLED", True)
 RESOURCE_GOVERNOR_SCOPE = os.getenv("RESOURCE_GOVERNOR_SCOPE", "process").strip().lower()
 if RESOURCE_GOVERNOR_SCOPE not in {"process", "deployment"}:
     RESOURCE_GOVERNOR_SCOPE = "process"
@@ -339,8 +343,33 @@ RESOURCE_GOVERNOR_DEPLOYMENT_ID = os.getenv("RESOURCE_GOVERNOR_DEPLOYMENT_ID", "
 CONTROL_PLANE_BACKEND = os.getenv("CONTROL_PLANE_BACKEND", "sqlite").strip().lower()
 CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
 CONTROL_PLANE_POOL_SIZE = int(os.getenv("CONTROL_PLANE_POOL_SIZE", "8"))
+# 本地台账域（projects / pipeline_documents）的存储后端。空值 = 跟随
+# CONTROL_PLANE_BACKEND（存储收敛的终态）；显式 sqlite 可以在迁移完成前
+# 让单个域先留在本地文件。DATABASE_URL 空 = CONTROL_PLANE_DATABASE_URL。
+PROJECT_STORE_BACKEND = os.getenv("PROJECT_STORE_BACKEND", "").strip().lower()
+PROJECT_STORE_DATABASE_URL = os.getenv("PROJECT_STORE_DATABASE_URL", "").strip()
+PIPELINE_DOCUMENT_STORE_BACKEND = os.getenv(
+    "PIPELINE_DOCUMENT_STORE_BACKEND", ""
+).strip().lower()
+PIPELINE_DOCUMENT_DATABASE_URL = os.getenv(
+    "PIPELINE_DOCUMENT_DATABASE_URL", ""
+).strip()
+# 文档生成域（document_authoring.db，46 张表）的后端。空值 = 跟随
+# CONTROL_PLANE_BACKEND；切换前先迁移（--group document_authoring）。
+AUTHORING_STORE_BACKEND = os.getenv("AUTHORING_STORE_BACKEND", "").strip().lower()
+AUTHORING_STORE_DATABASE_URL = os.getenv("AUTHORING_STORE_DATABASE_URL", "").strip()
+# 认证域（账号 + 审计）后端。**默认 sqlite**，不跟随控制面：PG 里这几张表
+# 早期按语义类型建过，必须先跑 rebuild_auth_domain.py 再显式切换。
+AUTH_STORE_BACKEND = os.getenv("AUTH_STORE_BACKEND", "sqlite").strip().lower()
+AUTH_STORE_DATABASE_URL = os.getenv("AUTH_STORE_DATABASE_URL", "").strip()
+# 文档生成兼容库（独立文件）。同样默认 sqlite，先重建再切换。
+COMPATIBILITY_STORE_BACKEND = os.getenv("COMPATIBILITY_STORE_BACKEND", "sqlite").strip().lower()
+COMPATIBILITY_STORE_DATABASE_URL = os.getenv("COMPATIBILITY_STORE_DATABASE_URL", "").strip()
 # Redis realtime plane (cancel fast path first; empty URL disables it).
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
+# 硬依赖开关：true（默认）时 Redis 必须已配置且可达，否则 API/worker 拒绝启动，
+# /health/ready 也会因 Redis 不可用判为 not_ready。仅测试隔离时置 false。
+REDIS_REQUIRED = _env_bool("REDIS_REQUIRED", True)
 CANCEL_FAST_PATH_ENABLED = _env_bool("CANCEL_FAST_PATH_ENABLED", True)
 CANCEL_KEY_TTL_SECONDS = int(os.getenv("CANCEL_KEY_TTL_SECONDS", "7200"))
 TURN_EVENT_STREAM_TTL_SECONDS = int(os.getenv("TURN_EVENT_STREAM_TTL_SECONDS", "7200"))
@@ -584,7 +613,7 @@ CHAT_ATTACHMENT_EMBEDDING_BASE_URL = os.getenv("CHAT_ATTACHMENT_EMBEDDING_BASE_U
 CHAT_ATTACHMENT_EMBEDDING_MODEL = os.getenv("CHAT_ATTACHMENT_EMBEDDING_MODEL", "").strip()
 CHAT_ATTACHMENT_EMBEDDING_API_KEY = os.getenv("CHAT_ATTACHMENT_EMBEDDING_API_KEY", "").strip()
 CHAT_ATTACHMENT_DENSE_MAX_PARTS = int(os.getenv("CHAT_ATTACHMENT_DENSE_MAX_PARTS", "4000"))
-CHAT_ATTACHMENT_OCR_ENABLED = os.getenv("CHAT_ATTACHMENT_OCR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+CHAT_ATTACHMENT_OCR_ENABLED = os.getenv("CHAT_ATTACHMENT_OCR_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 CHAT_ATTACHMENT_OCR_MAX_PAGES = int(os.getenv("CHAT_ATTACHMENT_OCR_MAX_PAGES", "10"))
 CHAT_ATTACHMENT_VISUAL_ENABLED = os.getenv("CHAT_ATTACHMENT_VISUAL_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED = os.getenv("CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED", "false").lower() in {"1", "true", "yes", "on"}
@@ -633,6 +662,10 @@ OBS_PHOENIX_BASE_URL = os.getenv("OBS_PHOENIX_BASE_URL", "")
 OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS", "10"))
 OBS_WORKER_STALE_SECONDS = int(os.getenv("OBS_WORKER_STALE_SECONDS", "30"))
 OBS_DEPENDENCY_TIMEOUT_SECONDS = float(os.getenv("OBS_DEPENDENCY_TIMEOUT_SECONDS", "5"))
+# /health/ready 的结果缓存秒数（0=关闭）。K8s/负载均衡每隔几秒探一次，
+# 无缓存时每次探针都会真查 SQLite + PG + storage，放大依赖负载；
+# 1 秒既能把探针风暴收敛成一次真实检查，又能在 ~1 秒内暴露真实故障。
+OBS_READINESS_CACHE_SECONDS = float(os.getenv("OBS_READINESS_CACHE_SECONDS", "1"))
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
     "你是一个专业的硬件技术助手。请严格基于检索到的【参考资料】回答用户问题。\n"
@@ -676,6 +709,16 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "CONTROL_PLANE_BACKEND",
         "CONTROL_PLANE_DATABASE_URL",
         "CONTROL_PLANE_POOL_SIZE",
+        "PROJECT_STORE_BACKEND",
+        "PROJECT_STORE_DATABASE_URL",
+        "PIPELINE_DOCUMENT_STORE_BACKEND",
+        "PIPELINE_DOCUMENT_DATABASE_URL",
+        "AUTHORING_STORE_BACKEND",
+        "AUTHORING_STORE_DATABASE_URL",
+        "AUTH_STORE_BACKEND",
+        "AUTH_STORE_DATABASE_URL",
+        "COMPATIBILITY_STORE_BACKEND",
+        "COMPATIBILITY_STORE_DATABASE_URL",
         "REDIS_URL",
         "RESOURCE_GOVERNOR_BACKEND",
         "RESOURCE_GOVERNOR_DATABASE_URL",
@@ -741,7 +784,7 @@ DEFAULT_VALUES = {
     "LLM_QUEUE_WARN_SECONDS": "10",
     "LLM_STREAM_IDLE_TIMEOUT_SECONDS": "0",
     "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED": "false",
-    "AGENT_DOCUMENT_TOOLS_ENABLED": "false",
+    "AGENT_DOCUMENT_TOOLS_ENABLED": "true",
     "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND": "sqlite",
     "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL": "",
     "DOCUMENT_AUTHORING_CHECKPOINTER_PATH": os.path.join(
@@ -816,7 +859,7 @@ DEFAULT_VALUES = {
     "AGENT_MAX_RETRIEVAL_ROUNDS": "3",
     "WORKER_POLL_INTERVAL_SECONDS": "0.5",
     "WORKER_ROLE": "all",
-    "RESOURCE_GOVERNOR_ENABLED": "false",
+    "RESOURCE_GOVERNOR_ENABLED": "true",
     "RESOURCE_GOVERNOR_SCOPE": "process",
     "RESOURCE_GOVERNOR_DB_PATH": os.path.join(STORAGE_DIR, "resource_quotas.db"),
     "RESOURCE_GOVERNOR_BACKEND": "sqlite",
@@ -830,6 +873,16 @@ DEFAULT_VALUES = {
     "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED": "false",
     "CONTROL_PLANE_BACKEND": "sqlite",
     "CONTROL_PLANE_DATABASE_URL": "",
+    "PROJECT_STORE_BACKEND": "",
+    "PROJECT_STORE_DATABASE_URL": "",
+    "PIPELINE_DOCUMENT_STORE_BACKEND": "",
+    "PIPELINE_DOCUMENT_DATABASE_URL": "",
+    "AUTHORING_STORE_BACKEND": "",
+    "AUTHORING_STORE_DATABASE_URL": "",
+    "AUTH_STORE_BACKEND": "sqlite",
+    "AUTH_STORE_DATABASE_URL": "",
+    "COMPATIBILITY_STORE_BACKEND": "sqlite",
+    "COMPATIBILITY_STORE_DATABASE_URL": "",
     "CONTROL_PLANE_POOL_SIZE": "8",
     "REDIS_URL": "",
     "CANCEL_FAST_PATH_ENABLED": "true",
@@ -967,7 +1020,7 @@ DEFAULT_VALUES = {
     "CHAT_ATTACHMENT_EMBEDDING_MODEL": "",
     "CHAT_ATTACHMENT_EMBEDDING_API_KEY": "",
     "CHAT_ATTACHMENT_DENSE_MAX_PARTS": "4000",
-    "CHAT_ATTACHMENT_OCR_ENABLED": "false",
+    "CHAT_ATTACHMENT_OCR_ENABLED": "true",
     "CHAT_ATTACHMENT_OCR_MAX_PAGES": "10",
     "CHAT_ATTACHMENT_VISUAL_ENABLED": "false",
     "CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED": "false",
@@ -1002,6 +1055,7 @@ DEFAULT_VALUES = {
     "OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS": "10",
     "OBS_WORKER_STALE_SECONDS": "30",
     "OBS_DEPENDENCY_TIMEOUT_SECONDS": "5",
+    "OBS_READINESS_CACHE_SECONDS": "1",
     "DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES": "false",
     "DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS": "false",
     "DOCUMENT_AUTO_PUBLISH_VERIFIED": "false",
@@ -1062,7 +1116,12 @@ def reload_settings():
     global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
     global RESOURCE_GOVERNOR_DEPLOYMENT_ID, RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED
     global CONTROL_PLANE_BACKEND, CONTROL_PLANE_DATABASE_URL, CONTROL_PLANE_POOL_SIZE
-    global REDIS_URL, CANCEL_FAST_PATH_ENABLED, CANCEL_KEY_TTL_SECONDS
+    global PROJECT_STORE_BACKEND, PROJECT_STORE_DATABASE_URL
+    global PIPELINE_DOCUMENT_STORE_BACKEND, PIPELINE_DOCUMENT_DATABASE_URL
+    global AUTHORING_STORE_BACKEND, AUTHORING_STORE_DATABASE_URL
+    global AUTH_STORE_BACKEND, AUTH_STORE_DATABASE_URL
+    global COMPATIBILITY_STORE_BACKEND, COMPATIBILITY_STORE_DATABASE_URL
+    global REDIS_URL, REDIS_REQUIRED, CANCEL_FAST_PATH_ENABLED, CANCEL_KEY_TTL_SECONDS
     global TURN_EVENT_STREAM_TTL_SECONDS, TURN_EVENT_STREAM_MAXLEN
     global DISTRIBUTED_ADMISSION_ENABLED, DISTRIBUTED_ADMISSION_TTL_SECONDS
     global PROVIDER_RPM_LIMIT
@@ -1150,6 +1209,7 @@ def reload_settings():
     global OBS_LOG_FORMAT, OBS_METRICS_ENABLED, OBS_TRACES_ENABLED, OBS_LOGS_ENABLED, OBS_PHOENIX_PROJECT
     global OBS_GRAFANA_BASE_URL, OBS_PHOENIX_BASE_URL, OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS
     global OBS_WORKER_STALE_SECONDS, OBS_DEPENDENCY_TIMEOUT_SECONDS
+    global OBS_READINESS_CACHE_SECONDS
     global SYSTEM_PROMPT, NO_CONTEXT_PROMPT
     global EXTERNAL_CONVERSATION_LLM_STRUCTURE, EXTERNAL_CONVERSATION_LLM_MAX_CHARS, EXTERNAL_CONVERSATION_LLM_SUMMARY
     global EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS
@@ -1214,7 +1274,7 @@ def reload_settings():
         "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "false"
     ).strip().lower() in {"1", "true", "yes", "on"}
     AGENT_DOCUMENT_TOOLS_ENABLED = os.getenv(
-        "AGENT_DOCUMENT_TOOLS_ENABLED", "false"
+        "AGENT_DOCUMENT_TOOLS_ENABLED", "true"
     ).strip().lower() in {"1", "true", "yes", "on"}
     DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND = os.getenv(
         "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"
@@ -1275,7 +1335,7 @@ def reload_settings():
     WORKER_ROLE = os.getenv("WORKER_ROLE", "all").strip().lower()
     if WORKER_ROLE not in {"all", "chat", "authoring", "parse"}:
         WORKER_ROLE = "all"
-    RESOURCE_GOVERNOR_ENABLED = _env_bool("RESOURCE_GOVERNOR_ENABLED", False)
+    RESOURCE_GOVERNOR_ENABLED = _env_bool("RESOURCE_GOVERNOR_ENABLED", True)
     RESOURCE_GOVERNOR_SCOPE = os.getenv("RESOURCE_GOVERNOR_SCOPE", "process").strip().lower()
     if RESOURCE_GOVERNOR_SCOPE not in {"process", "deployment"}:
         RESOURCE_GOVERNOR_SCOPE = "process"
@@ -1300,7 +1360,22 @@ def reload_settings():
     CONTROL_PLANE_BACKEND = os.getenv("CONTROL_PLANE_BACKEND", "sqlite").strip().lower()
     CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
     CONTROL_PLANE_POOL_SIZE = int(os.getenv("CONTROL_PLANE_POOL_SIZE", "8"))
+    PROJECT_STORE_BACKEND = os.getenv("PROJECT_STORE_BACKEND", "").strip().lower()
+    PROJECT_STORE_DATABASE_URL = os.getenv("PROJECT_STORE_DATABASE_URL", "").strip()
+    PIPELINE_DOCUMENT_STORE_BACKEND = os.getenv(
+        "PIPELINE_DOCUMENT_STORE_BACKEND", ""
+    ).strip().lower()
+    PIPELINE_DOCUMENT_DATABASE_URL = os.getenv(
+        "PIPELINE_DOCUMENT_DATABASE_URL", ""
+    ).strip()
+    AUTHORING_STORE_BACKEND = os.getenv("AUTHORING_STORE_BACKEND", "").strip().lower()
+    AUTHORING_STORE_DATABASE_URL = os.getenv("AUTHORING_STORE_DATABASE_URL", "").strip()
+    AUTH_STORE_BACKEND = os.getenv("AUTH_STORE_BACKEND", "sqlite").strip().lower()
+    AUTH_STORE_DATABASE_URL = os.getenv("AUTH_STORE_DATABASE_URL", "").strip()
+    COMPATIBILITY_STORE_BACKEND = os.getenv("COMPATIBILITY_STORE_BACKEND", "sqlite").strip().lower()
+    COMPATIBILITY_STORE_DATABASE_URL = os.getenv("COMPATIBILITY_STORE_DATABASE_URL", "").strip()
     REDIS_URL = os.getenv("REDIS_URL", "").strip()
+    REDIS_REQUIRED = _env_bool("REDIS_REQUIRED", True)
     CANCEL_FAST_PATH_ENABLED = _env_bool("CANCEL_FAST_PATH_ENABLED", True)
     CANCEL_KEY_TTL_SECONDS = int(os.getenv("CANCEL_KEY_TTL_SECONDS", "7200"))
     TURN_EVENT_STREAM_TTL_SECONDS = int(os.getenv("TURN_EVENT_STREAM_TTL_SECONDS", "7200"))
@@ -1491,7 +1566,7 @@ def reload_settings():
     CHAT_ATTACHMENT_EMBEDDING_MODEL = os.getenv("CHAT_ATTACHMENT_EMBEDDING_MODEL", "").strip()
     CHAT_ATTACHMENT_EMBEDDING_API_KEY = os.getenv("CHAT_ATTACHMENT_EMBEDDING_API_KEY", "").strip()
     CHAT_ATTACHMENT_DENSE_MAX_PARTS = int(os.getenv("CHAT_ATTACHMENT_DENSE_MAX_PARTS", "4000"))
-    CHAT_ATTACHMENT_OCR_ENABLED = os.getenv("CHAT_ATTACHMENT_OCR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    CHAT_ATTACHMENT_OCR_ENABLED = os.getenv("CHAT_ATTACHMENT_OCR_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     CHAT_ATTACHMENT_OCR_MAX_PAGES = int(os.getenv("CHAT_ATTACHMENT_OCR_MAX_PAGES", "10"))
     CHAT_ATTACHMENT_VISUAL_ENABLED = os.getenv("CHAT_ATTACHMENT_VISUAL_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED = os.getenv("CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED", "false").lower() in {"1", "true", "yes", "on"}
@@ -1581,6 +1656,7 @@ def reload_settings():
     OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS", "10"))
     OBS_WORKER_STALE_SECONDS = int(os.getenv("OBS_WORKER_STALE_SECONDS", "30"))
     OBS_DEPENDENCY_TIMEOUT_SECONDS = float(os.getenv("OBS_DEPENDENCY_TIMEOUT_SECONDS", "5"))
+    OBS_READINESS_CACHE_SECONDS = float(os.getenv("OBS_READINESS_CACHE_SECONDS", "1"))
     SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_VALUES["SYSTEM_PROMPT"])
     NO_CONTEXT_PROMPT = os.getenv("NO_CONTEXT_PROMPT", DEFAULT_VALUES["NO_CONTEXT_PROMPT"])
     ensure_runtime_dirs()
@@ -1632,7 +1708,7 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
     """
     global CONFIG_REVISION
     if env_path is None:
-        env_path = os.path.join(BASE_DIR, ".env")
+        env_path = ENV_FILE_PATH
 
     with _ENV_WRITE_LOCK:
         lines = []
@@ -1947,6 +2023,22 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
             "AGENT_CHECKPOINT_BACKEND=postgres 需要显式配置 AGENT_CHECKPOINT_DATABASE_URL，"
             "否则会静默创建本地空库"
         )
+
+    # 本地台账域（存储收敛）：显式 postgres 必须给出可达目标；空值跟随
+    # CONTROL_PLANE_*，由 resolve_domain_backend 在运行时解析。
+    for domain_prefix in ("PROJECT_STORE", "PIPELINE_DOCUMENT", "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE"):
+        domain_backend = _value(f"{domain_prefix}_BACKEND").lower()
+        if domain_backend and domain_backend not in {"sqlite", "postgres"}:
+            raise ValueError(
+                f"{domain_prefix}_BACKEND 必须是 sqlite 或 postgres，当前值: {domain_backend!r}"
+            )
+        if domain_backend == "postgres" and not (
+            _value(f"{domain_prefix}_DATABASE_URL") or _value("CONTROL_PLANE_DATABASE_URL")
+        ):
+            raise ValueError(
+                f"{domain_prefix}_BACKEND=postgres 需要 {domain_prefix}_DATABASE_URL"
+                " 或 CONTROL_PLANE_DATABASE_URL"
+            )
 
     authoring_backend = _value("DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND").lower() or "sqlite"
     if authoring_backend not in {"sqlite", "memory", "postgres"}:

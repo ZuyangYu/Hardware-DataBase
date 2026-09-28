@@ -6,7 +6,6 @@
 import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
-import UserMenu from '@/components/UserMenu';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { cn } from '@/lib/utils';
@@ -33,8 +32,6 @@ const CONSENT_REVOKE_REASON = '用户在会话页撤销';
 type Props = {
   title: string;
   kbName: string;
-  userName: string;
-  onLogout: () => void;
   onExtractMemory?: () => void;
   extractDisabled?: boolean;
   memorySummary?: SessionMemorySummary | null;
@@ -94,8 +91,6 @@ function HeaderToggle({
 export default function ChatHeader({
   title,
   kbName,
-  userName,
-  onLogout,
   onExtractMemory,
   extractDisabled = false,
   memorySummary = null,
@@ -239,7 +234,6 @@ export default function ChatHeader({
             重新提炼
           </button>
         )}
-        <UserMenu userName={userName} onLogout={onLogout} />
       </div>
       <Dialog
         open={consentsOpen}

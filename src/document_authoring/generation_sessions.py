@@ -170,11 +170,17 @@ class GenerationSession(BaseModel):
 class GenerationSessionStore:
     """SQLite store that can safely share DocumentAuthoringStore's database."""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._init_db()
+    def __init__(self, db_path: str | None = None):
+        from src.document_authoring import pg_support
+
+        if pg_support.configure(self, db_path):
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.document_authoring import pg_support
+
+            return pg_support.connect(self)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")

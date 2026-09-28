@@ -169,14 +169,54 @@ class AppLogService:
     # 一个实例（ragflow_backend._audit），靠这个标记让全进程只初始化一次。
     _initialized_paths: set[str] = set()
 
+    @staticmethod
+    def _auth_domain_classes() -> tuple[type, ...]:
+        from src.storage.auth_domain import domain_classes
+
+        return domain_classes()
+
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or src.settings.AUTH_DB_PATH
+        from src.storage import domain_pg
+
+        self._backend, self._dsn, resolved = domain_pg.resolve_store_backend(
+            explicit_db_path=db_path,
+            prefix="AUTH_STORE",
+            default_db_path=src.settings.AUTH_DB_PATH,
+        )
+        if self._backend == "postgres":
+            domain_pg.ensure_domain_group_ready(
+                dsn=self._dsn,
+                store_classes=AppLogService._auth_domain_classes(),
+                sqlite_db_path=os.path.join(src.settings.STORAGE_DIR, "auth.db"),
+                primary_table="audit_events",
+                migration_command=(
+                    "uv run python scripts/production_hardening/rebuild_auth_domain.py"
+                    " --dsn $CONTROL_PLANE_DATABASE_URL"
+                ),
+            )
+            domain_pg.assert_mechanical_shape(
+                self._dsn,
+                "audit_events",
+                {"created_at": "text"},
+                hint=(
+                    "认证域的表需要先重建为机械形状（早期按控制面语义建过）：\n"
+                    "  uv run python scripts/production_hardening/rebuild_auth_domain.py"
+                    " --dsn $CONTROL_PLANE_DATABASE_URL"
+                ),
+            )
+            self.db_path = None
+            return
+        self.db_path = resolved or src.settings.AUTH_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         if self.db_path not in AppLogService._initialized_paths:
             self._init_db()
             AppLogService._initialized_paths.add(self.db_path)
 
     def _connect(self):
+        if getattr(self, "_backend", "sqlite") == "postgres":
+            from src.storage.domain_pg import open_pg_connection
+
+            return open_pg_connection(self._dsn)
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -598,10 +638,10 @@ class AppLogService:
         keyword: str | None = None,
     ) -> int:
         where, params = _audit_where(viewer, action, kb_name, success, keyword)
-        sql = f"SELECT COUNT(*) FROM audit_events WHERE {' AND '.join(where)}"
+        sql = f"SELECT COUNT(*) AS total FROM audit_events WHERE {' AND '.join(where)}"
         with closing(self._connect()) as conn:
             row = conn.execute(sql, params).fetchone()
-        return int(row[0]) if row else 0
+        return int(row["total"]) if row else 0
 
     def audit_breakdown(
         self,
@@ -613,15 +653,15 @@ class AppLogService:
     ) -> dict[str, int]:
         """当前筛选下按 success 分组：{"success": n, "failed": n}。"""
         where, params = _audit_where(viewer, action, kb_name, success, keyword)
-        sql = f"SELECT success, COUNT(*) FROM audit_events WHERE {' AND '.join(where)} GROUP BY success"
+        sql = f"SELECT success, COUNT(*) AS cnt FROM audit_events WHERE {' AND '.join(where)} GROUP BY success"
         with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
         result = {"success": 0, "failed": 0}
         for row in rows:
-            if int(row[0]) == 1:
-                result["success"] = int(row[1])
+            if int(row["success"]) == 1:
+                result["success"] = int(row["cnt"])
             else:
-                result["failed"] += int(row[1])
+                result["failed"] += int(row["cnt"])
         return result
 
     def audit_action_breakdown(
@@ -636,29 +676,31 @@ class AppLogService:
         where, params = _audit_where(viewer, None, kb_name, success, keyword)
         params.append(max(1, min(limit, 200)))
         sql = (
-            f"SELECT action, COUNT(*) FROM audit_events "
+            f"SELECT action, COUNT(*) AS cnt FROM audit_events "
             f"WHERE {' AND '.join(where)} GROUP BY action ORDER BY COUNT(*) DESC, action ASC LIMIT ?"
         )
         with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [(row[0], int(row[1])) for row in rows if row[0]]
+        return [(row["action"], int(row["cnt"])) for row in rows if row["action"]]
 
     def audit_recent_daily(self, viewer: AuthUser, days: int = 7) -> list[tuple[str, int]]:
-        """近 N 日每日审计事件计数（按本地日期分组），员工只看本部门。
+        """近 N 日每日审计事件计数（按 UTC 日期分组），员工只看本部门。
 
-        created_at 存的是 UTC ISO 串；用 SQLite 的 substr 取日期前 10 位即可按日聚合。
+        created_at 存的是 UTC ISO 串；取前 10 位即按日聚合。日期下界在 Python 里
+        算好再作为参数传入：SQLite 的 datetime('now', ...) 在 PostgreSQL 上不存在。
         """
         where, params = scoped_where(viewer)
-        params.append(days)
+        cutoff = (datetime.fromisoformat(utc_now()) - timedelta(days=days)).isoformat()
+        params.append(cutoff)
         sql = (
-            f"SELECT substr(created_at, 1, 10) AS day, COUNT(*) "
+            f"SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS cnt "
             f"FROM audit_events WHERE {' AND '.join(where)} "
-            f"AND created_at >= datetime('now', '-' || ? || ' days') "
+            f"AND created_at >= ? "
             f"GROUP BY day ORDER BY day ASC"
         )
         with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [(row[0], int(row[1])) for row in rows]
+        return [(row["day"], int(row["cnt"])) for row in rows]
 
     def count_query_traces(
         self,
@@ -668,10 +710,10 @@ class AppLogService:
         keyword: str | None = None,
     ) -> int:
         where, params = _query_where(viewer, kb_name, status, keyword)
-        sql = f"SELECT COUNT(*) FROM query_traces WHERE {' AND '.join(where)}"
+        sql = f"SELECT COUNT(*) AS total FROM query_traces WHERE {' AND '.join(where)}"
         with closing(self._connect()) as conn:
             row = conn.execute(sql, params).fetchone()
-        return int(row[0]) if row else 0
+        return int(row["total"]) if row else 0
 
     def query_status_breakdown(
         self,
@@ -682,13 +724,13 @@ class AppLogService:
     ) -> dict[str, int]:
         """当前筛选下按 status 分组：success/failed/partial/no_evidence。"""
         where, params = _query_where(viewer, kb_name, status, keyword)
-        sql = f"SELECT status, COUNT(*) FROM query_traces WHERE {' AND '.join(where)} GROUP BY status"
+        sql = f"SELECT status, COUNT(*) AS cnt FROM query_traces WHERE {' AND '.join(where)} GROUP BY status"
         with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
         result = {"success": 0, "failed": 0, "partial": 0, "no_evidence": 0}
         for row in rows:
-            key = row[0] if row[0] in result else "failed"
-            result[key] = int(row[1])
+            key = row["status"] if row["status"] in result else "failed"
+            result[key] = int(row["cnt"])
         return result
 
     def query_failure_top(
