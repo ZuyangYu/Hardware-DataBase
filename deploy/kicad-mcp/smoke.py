@@ -68,10 +68,13 @@ def register_server(
     ]
     payload = {
         "slug": args.slug,
-        "name": "内网 KiCad（参考服务）",
+        "name": "KiCad 格式示例生成器（参考服务）",
         "transport": "streamable_http",
         "url": args.mcp_url,
-        "description": "deploy/kicad-mcp 参考服务：只读分析 + 候选产物生成",
+        "description": (
+            "MCP 参考实现：只按参数返回示例摘要并生成简单 KiCad 格式候选文件；"
+            "不读取或分析真实原理图，不调用 KiCad，也不运行 ERC。"
+        ),
         "department_scope": "departments" if department_ids else "all",
         "department_ids": department_ids,
         "tags": ["EDA", "kicad"],

@@ -3,7 +3,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 
 import type { McpListFlags, McpServerView, McpToolView } from '../../api/types';
-import { PluginsView, ServerFormFields } from './PluginsPage';
+import { AdminExtensionsView, PluginsView, ServerFormFields } from './PluginsPage';
 
 const flags: McpListFlags = {
   enabled: true,
@@ -14,7 +14,7 @@ const flags: McpListFlags = {
 
 const server: McpServerView = {
   slug: 'kicad',
-  name: '内网 KiCad',
+  name: 'KiCad 格式示例生成器（参考服务）',
   description: '原理图工具',
   transport: 'streamable_http',
   url: 'https://mcp.internal/kicad',
@@ -62,38 +62,34 @@ const tools: McpToolView[] = [
 
 function view(overrides: Partial<Parameters<typeof PluginsView>[0]> = {}) {
   return renderToStaticMarkup(
-    <MemoryRouter>
-      <PluginsView
-        flags={flags}
-        servers={[server]}
-        loaded
-        busySlug={null}
-        toolsFor="kicad"
-        tools={tools}
-        toolsLoading={false}
-        userName="admin"
-        onLogout={() => undefined}
-        onRefresh={() => undefined}
-        onCreate={() => undefined}
-        onEdit={() => undefined}
-        onDelete={() => undefined}
-        onTest={() => undefined}
-        onToggleEnabled={() => undefined}
-        onOpenTools={() => undefined}
-        onCloseTools={() => undefined}
-        onRefreshTools={() => undefined}
-        onToggleTool={() => undefined}
-        onToggleWriteTool={() => undefined}
-        {...overrides}
-      />
-    </MemoryRouter>,
+    <PluginsView
+      flags={flags}
+      servers={[server]}
+      loaded
+      busySlug={null}
+      toolsFor="kicad"
+      tools={tools}
+      toolsLoading={false}
+      onRefresh={() => undefined}
+      onCreate={() => undefined}
+      onEdit={() => undefined}
+      onDelete={() => undefined}
+      onTest={() => undefined}
+      onToggleEnabled={() => undefined}
+      onOpenTools={() => undefined}
+      onCloseTools={() => undefined}
+      onRefreshTools={() => undefined}
+      onToggleTool={() => undefined}
+      onToggleWriteTool={() => undefined}
+      {...overrides}
+    />,
   );
 }
 
 describe('PluginsView', () => {
   it('renders the registry, masked credentials and tool governance', () => {
     const markup = view();
-    expect(markup).toContain('内网 KiCad');
+    expect(markup).toContain('KiCad 格式示例生成器（参考服务）');
     expect(markup).toContain('kicad');
     expect(markup).toContain('已配置凭据');
     expect(markup).toContain('启用中');
@@ -128,6 +124,35 @@ describe('PluginsView', () => {
     const markup = view({ servers: [], toolsFor: null });
     expect(markup).toContain('暂无登记的服务');
     expect(markup).not.toContain('data-mcp-tools-panel');
+  });
+});
+
+describe('AdminExtensionsView', () => {
+  function renderSection(activeSection: 'mcp' | 'skills') {
+    return renderToStaticMarkup(
+      <MemoryRouter>
+        <AdminExtensionsView
+          activeSection={activeSection}
+          onSectionChange={() => undefined}
+          mcpContent={<div data-mcp-content>远程服务目录</div>}
+          skillContent={<div data-skill-content>Skill 审核目录</div>}
+        />
+      </MemoryRouter>,
+    );
+  }
+
+  it('shows MCP and Skill as peer navigation choices, with only the selected page visible', () => {
+    const mcp = renderSection('mcp');
+    expect(mcp).toContain('MCP 登记服务');
+    expect(mcp).toContain('Skill 上传与审核');
+    expect(mcp).toContain('data-mcp-content');
+    expect(mcp).not.toContain('data-skill-content');
+    expect(mcp).toContain('id="admin-extensions-mcp-tab" type="button" aria-controls="admin-extensions-mcp-panel" aria-pressed="true"');
+
+    const skills = renderSection('skills');
+    expect(skills).toContain('data-skill-content');
+    expect(skills).not.toContain('data-mcp-content');
+    expect(skills).toContain('id="admin-extensions-skills-tab" type="button" aria-controls="admin-extensions-skills-panel" aria-pressed="true"');
   });
 });
 

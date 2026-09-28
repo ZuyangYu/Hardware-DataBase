@@ -4,7 +4,7 @@ This is the deployable example from the MCP integration plan §4.12: a thin,
 reviewable wrapper that exposes exactly two governed tools and never accepts
 shell text, arbitrary commands or host paths from the caller.
 
-- ``kicad_analyze_schematic``  read-only analysis (``readOnlyHint=True``);
+- ``kicad_analyze_schematic``  parameter-based example summary (``readOnlyHint=True``);
 - ``kicad_create_schematic``   candidate-artifact generator (write channel).
 
 The write tool returns the candidate-artifact contract expected by HDB
@@ -71,10 +71,10 @@ def _schematic_text(title: str, symbol_count: int) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def kicad_analyze_schematic(title: str, symbol_count: int = 8) -> str:
-    """Analyze a schematic draft and return a bounded text summary.
+    """Return a bounded example summary based only on the provided parameters.
 
-    Read-only: it derives everything from the arguments and never touches
-    external files.
+    This reference implementation does not read or analyze schematic files,
+    invoke KiCad, or run ERC.
     """
 
     count = max(0, min(int(symbol_count), 64))

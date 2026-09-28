@@ -38,6 +38,10 @@ from src.api.schemas import (
     SandboxSkillListResponse,
     SandboxSkillRegisterRequest,
     SandboxSkillPackageUploadRequest,
+    SandboxTextSkillPackageUploadRequest,
+    SandboxPersonalTextSkillUploadRequest,
+    SandboxPersonalExecutableSkillUploadRequest,
+    SandboxPersonalSkillShareRequest,
     SandboxSkillBuildRequest,
     SandboxSkillPipSourceRequest,
     SandboxSkillExecutionBindingRequest,
@@ -91,7 +95,10 @@ from src.sandbox.skills import (
     SkillNotFound,
     SkillStateConflict,
 )
-from src.sandbox.skill_packages import SkillPackageError, SkillPackageStore, validate_skill_package
+from src.sandbox.skill_packages import (
+    SkillPackageError, SkillPackageStore, validate_skill_package, validate_text_skill_package,
+)
+from src.sandbox.schema import SchemaValidationError, normalize_schema
 from src.sandbox.pip_sources import SkillPipSourceStore, SkillPipSourceError
 from src.sandbox.task_store import (
     IdempotencyConflict,
@@ -346,6 +353,191 @@ def upload_skill_package(
     )
 
 
+@router.post("/skills/text-packages", response_model=SandboxSkillResponse)
+def upload_text_skill_package(
+    body: SandboxTextSkillPackageUploadRequest,
+    actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+    packages: SkillPackageStore = Depends(get_skill_package_store),
+):
+    """Register a reviewable text draft from SKILL.md and bundled Markdown."""
+    try:
+        raw = base64.b64decode(body.package_base64, validate=True)
+        package = validate_text_skill_package(raw)
+        storage_ref = packages.save(package.skill_ref, package, raw)
+        skill = catalog.register(
+            skill_ref=package.skill_ref, version=package.version,
+            content=package.content, department_id=body.department_id,
+            actor=actor.username,
+            metadata={"skill_name": package.skill_ref.removeprefix("skill/"),
+                      "summary": package.description[:500]},
+            text_storage_ref=storage_ref, text_archive_digest=package.archive_digest,
+            text_files=package.files,
+        )
+    except (ValueError, binascii.Error, SkillPackageError, SkillCatalogError) as exc:
+        _audit(actor, action="sandbox.text_skill_package_upload", target_type="sandbox_skill",
+               success=False, error=str(exc))
+        raise HTTPException(status_code=400, detail="text Skill package is invalid or conflicts with an enabled Skill") from exc
+    _audit(actor, action="sandbox.text_skill_package_upload", task_id=skill.skill_ref,
+           target_type="sandbox_skill", metadata={"archive_digest": package.archive_digest,
+                                                   "file_count": len(package.files)})
+    return SandboxSkillResponse(skill=skill.to_dict())
+
+
+def _personal_skill_view(skill) -> dict[str, Any]:
+    return {
+        "skill_ref": skill.skill_ref, "version": skill.version,
+        "approval_state": skill.approval_state, "share_scope": skill.share_scope,
+        "kind": "executable" if skill.package_archive_digest else "text",
+        "package_build_state": skill.package_build_state,
+        "summary": str(skill.metadata.get("summary") or ""),
+        "department_id": skill.department_id,
+        "created_at": skill.created_at,
+    }
+
+
+@router.post("/skills/personal/text-packages", status_code=status.HTTP_201_CREATED)
+def upload_personal_text_skill(
+    body: SandboxPersonalTextSkillUploadRequest,
+    user: AuthUser = Depends(require_employee),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+    packages: SkillPackageStore = Depends(get_skill_package_store),
+):
+    """Create a private draft; only an admin can review, enable or read the source."""
+    if not user.department_id:
+        raise HTTPException(status_code=403, detail="employee department is required")
+    try:
+        raw = base64.b64decode(body.package_base64, validate=True)
+        package = validate_text_skill_package(raw)
+    except (ValueError, binascii.Error, SkillPackageError) as exc:
+        _audit(user, action="sandbox.personal_skill_upload", target_type="sandbox_skill",
+               success=False, error=str(exc))
+        raise HTTPException(status_code=400, detail="text Skill ZIP is invalid") from exc
+    skill_ref = f"skill/personal/{user.id}/{package.skill_ref.removeprefix('skill/')}"
+    if catalog.get(skill_ref) is not None:
+        raise HTTPException(status_code=409, detail="personal Skill name already exists")
+    try:
+        storage_ref = packages.save(skill_ref, package, raw)
+        skill = catalog.register(
+            skill_ref=skill_ref, version=package.version, content=package.content,
+            catalog_source="employee", owner_id=user.id, department_id=user.department_id,
+            actor=user.username, metadata={"skill_name": package.skill_ref.removeprefix("skill/"),
+                                          "summary": package.description[:500]},
+            text_storage_ref=storage_ref, text_archive_digest=package.archive_digest,
+            text_files=package.files, allow_overwrite=False,
+        )
+    except SkillStateConflict as exc:
+        raise HTTPException(status_code=409, detail="personal Skill name already exists") from exc
+    except (SkillCatalogError, SkillPackageError) as exc:
+        _audit(user, action="sandbox.personal_skill_upload", task_id=skill_ref,
+               target_type="sandbox_skill", success=False, error=str(exc))
+        raise HTTPException(status_code=400, detail="text Skill ZIP is invalid") from exc
+    _audit(user, action="sandbox.personal_skill_upload", task_id=skill_ref,
+           target_type="sandbox_skill", metadata={"archive_digest": package.archive_digest})
+    return {"skill": _personal_skill_view(skill)}
+
+
+@router.post("/skills/personal/packages", status_code=status.HTTP_201_CREATED)
+def upload_personal_executable_skill(
+    body: SandboxPersonalExecutableSkillUploadRequest,
+    user: AuthUser = Depends(require_employee),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+    packages: SkillPackageStore = Depends(get_skill_package_store),
+):
+    """Store employee code as a private draft; never build on employee request."""
+    if not user.department_id:
+        raise HTTPException(status_code=403, detail="employee department is required")
+    try:
+        raw = base64.b64decode(body.package_base64, validate=True)
+        package = validate_skill_package(raw)
+        input_schema = normalize_schema(body.input_schema, field_name="input_schema")
+        output_schema = normalize_schema(body.output_schema, field_name="output_schema")
+        if input_schema.get("type") != "object" or input_schema.get("additionalProperties") is not False:
+            raise SkillPackageError("employee Skill input schema must be a closed object")
+    except (ValueError, binascii.Error, SkillPackageError, SchemaValidationError) as exc:
+        _audit(user, action="sandbox.personal_skill_package_upload", target_type="sandbox_skill",
+               success=False, error=str(exc))
+        raise HTTPException(status_code=400, detail="executable Skill ZIP or schema is invalid") from exc
+    skill_ref = f"skill/personal/{user.id}/{body.skill_name}"
+    if catalog.get(skill_ref) is not None:
+        raise HTTPException(status_code=409, detail="personal Skill name already exists")
+    try:
+        storage_ref = packages.save(skill_ref, package, raw)
+        summary = next((line.lstrip("# ").strip() for line in package.skill_markdown.splitlines() if line.strip()), "")
+        skill = catalog.register(
+            skill_ref=skill_ref, version=body.version, content=package.skill_markdown,
+            catalog_source="employee", owner_id=user.id, department_id=user.department_id,
+            actor=user.username, metadata={"skill_name": body.skill_name, "summary": summary[:500],
+                                          "submitted_input_schema": input_schema,
+                                          "submitted_output_schema": output_schema},
+            package_storage_ref=storage_ref, package_archive_digest=package.archive_digest,
+            package_files=package.files, package_review_flags=package.review_flags,
+            package_build_state="uploaded", allow_overwrite=False,
+        )
+    except SkillStateConflict as exc:
+        raise HTTPException(status_code=409, detail="personal Skill name already exists") from exc
+    except (SkillCatalogError, SkillPackageError) as exc:
+        _audit(user, action="sandbox.personal_skill_package_upload", task_id=skill_ref,
+               target_type="sandbox_skill", success=False, error=str(exc))
+        raise HTTPException(status_code=400, detail="executable Skill ZIP or schema is invalid") from exc
+    _audit(user, action="sandbox.personal_skill_package_upload", task_id=skill_ref,
+           target_type="sandbox_skill", metadata={"archive_digest": package.archive_digest})
+    return {"skill": _personal_skill_view(skill)}
+
+
+@router.get("/skills/mine")
+def list_personal_skills(
+    user: AuthUser = Depends(require_employee),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    return {"items": [_personal_skill_view(skill) for skill in catalog.list_owned(user.id)]}
+
+
+@router.post("/skills/personal/{skill_ref:path}/share")
+def share_personal_skill(
+    skill_ref: str,
+    body: SandboxPersonalSkillShareRequest,
+    user: AuthUser = Depends(require_employee),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    try:
+        skill = catalog.set_department_share(
+            skill_ref, principal_id=user.id, department_id=user.department_id or "",
+            share=body.share_to_department,
+        )
+    except (SkillNotFound, SkillNotAuthorized) as exc:
+        raise HTTPException(status_code=404, detail="personal Skill is not available") from exc
+    except SkillStateConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)[:300]) from exc
+    _audit(user, action="sandbox.personal_skill_share", task_id=skill_ref,
+           target_type="sandbox_skill", metadata={"share_scope": skill.share_scope})
+    return {"skill": _personal_skill_view(skill)}
+
+
+@router.post("/skills/{skill_ref:path}/approve-source", response_model=SandboxSkillResponse)
+def approve_personal_skill_source(
+    skill_ref: str,
+    actor: AuthUser = Depends(require_system_admin),
+    skills: SkillCatalog = Depends(get_skill_catalog),
+    packages: SkillPackageStore = Depends(get_skill_package_store),
+):
+    """Administrator confirms source review before the Runner may build it."""
+    try:
+        skill = skills.require(skill_ref)
+        package = validate_skill_package(packages.read(skill.package_storage_ref))
+        if package.archive_digest != skill.package_archive_digest:
+            raise SkillStateConflict("Skill source changed before review")
+        skill = skills.approve_source_for_build(skill_ref, archive_digest=package.archive_digest,
+                                                actor=actor.username)
+    except (SkillCatalogError, SkillPackageError) as exc:
+        _audit(actor, action="sandbox.skill_source_approve", task_id=skill_ref,
+               target_type="sandbox_skill", success=False, error=str(exc))
+        raise HTTPException(status_code=409, detail="employee Skill source is not eligible for build") from exc
+    _audit(actor, action="sandbox.skill_source_approve", task_id=skill_ref,
+           target_type="sandbox_skill", metadata={"archive_digest": skill.package_archive_digest})
+    return SandboxSkillResponse(skill=skill.to_dict())
+
+
 @router.post("/skills/{skill_ref:path}/build", response_model=SandboxSkillResponse)
 def build_skill_package(
     skill_ref: str,
@@ -362,6 +554,8 @@ def build_skill_package(
         skill = skills.require(skill_ref)
         if skill.approval_state != "draft" or not skill.package_storage_ref:
             raise SkillStateConflict("Skill package must be an uploaded draft")
+        if skill.catalog_source == "employee" and skill.package_build_state != "source_reviewed":
+            raise SkillStateConflict("employee Skill source must be approved before build")
         package = validate_skill_package(packages.read(skill.package_storage_ref))
         if package.archive_digest != skill.package_archive_digest:
             raise SkillStateConflict("Skill package digest changed")
@@ -370,12 +564,16 @@ def build_skill_package(
         dependency_index_url = pip_sources.get() if package.requirements_declared else ""
         if package.requirements_declared and not dependency_index_url:
             raise SkillPipSourceError("administrator must configure a reviewed pip index first")
+        runtime_policy_ref = body.runtime_policy_ref or body.profile_ref
+        runtime_policy_digest = body.runtime_policy_digest or str(
+            getattr(settings, "SANDBOX_RUNTIME_PROFILE_DIGEST", "")
+        )
         result = client.skill_build(
             skill_ref=skill.skill_ref, package_digest=package.archive_digest,
             package_bytes=packages.read(skill.package_storage_ref),
             base_bundle_ref=body.base_bundle_ref, profile_ref=body.profile_ref,
-            runtime_policy_ref=body.runtime_policy_ref,
-            runtime_policy_digest=body.runtime_policy_digest,
+            runtime_policy_ref=runtime_policy_ref,
+            runtime_policy_digest=runtime_policy_digest,
             input_schema=body.input_schema, output_schema=body.output_schema,
             required_capabilities=body.required_capabilities,
             dependency_index_url=dependency_index_url,
@@ -393,8 +591,8 @@ def build_skill_package(
             bundle_digest=str(result.get("bundle_digest") or ""),
             profile_ref=body.profile_ref, required_capabilities=body.required_capabilities,
             input_schema=body.input_schema, output_schema=body.output_schema,
-            runtime_policy_ref=body.runtime_policy_ref,
-            runtime_policy_digest=body.runtime_policy_digest,
+            runtime_policy_ref=runtime_policy_ref,
+            runtime_policy_digest=runtime_policy_digest,
             actor=actor.username, metadata={"skill_ref": skill.skill_ref, "package_digest": package.archive_digest,
                                             "image_digest": image_digest},
         )
@@ -453,8 +651,10 @@ def download_skill_source(
 ):
     try:
         skill = skills.require(skill_ref)
-        raw = packages.read(skill.package_storage_ref)
-        if hashlib.sha256(raw).hexdigest() != skill.package_archive_digest:
+        storage_ref = skill.text_storage_ref or skill.package_storage_ref
+        archive_digest = skill.text_archive_digest or skill.package_archive_digest
+        raw = packages.read(storage_ref)
+        if hashlib.sha256(raw).hexdigest() != archive_digest:
             raise SkillPackageError("Skill source changed")
     except (SkillCatalogError, SkillPackageError) as exc:
         raise HTTPException(status_code=404, detail="Skill source is unavailable") from exc
@@ -474,11 +674,29 @@ def available_skills(
         return {"items": []}
     try:
         require_execution_enabled(operation="Skill bundle listing")
+        executable_available = True
     except SandboxPolicyError:
-        return {"items": []}
-    effective = _context_capabilities(user, auth, authorization)
+        executable_available = False
+    effective: set[str] | None = None
     items: list[dict[str, Any]] = []
     for skill in skills.list(enabled_only=True):
+        if not skill.execution_bundle_ref:
+            if not skills._department_allowed(skill, user.department_id or ""):
+                continue
+            if not skills._principal_allowed(skill, user.id, user.department_id or ""):
+                continue
+            items.append({
+                "skill_ref": skill.skill_ref, "version": skill.version, "bundle_ref": "",
+                "input_schema": {}, "subscribed": skills.is_subscribed(skill.skill_ref, user.id),
+                "description": skills.content(skill.skill_ref)[:2000], "kind": "text",
+                "is_owner": skill.owner_id == str(user.id) and skill.catalog_source == "employee",
+                "share_scope": skill.share_scope if skill.catalog_source == "employee" else "",
+            })
+            continue
+        if not executable_available:
+            continue
+        if effective is None:
+            effective = _context_capabilities(user, auth, authorization)
         try:
             bundle = skills.execution_bundle(
                 skill.skill_ref, principal_id=user.id, department_id=user.department_id or "",
@@ -494,6 +712,7 @@ def available_skills(
             "input_schema": dict(bundle.input_schema),
             "subscribed": skills.is_subscribed(skill.skill_ref, user.id),
             "description": skills.content(skill.skill_ref)[:2000],
+            "kind": "executable",
         })
     return {"items": items}
 
@@ -578,6 +797,24 @@ def revoke_skill(
     catalog: SkillCatalog = Depends(get_skill_catalog),
 ):
     return _skill_state_action(skill_ref, "revoked", actor, catalog)
+
+
+@router.delete("/skills/{skill_ref:path}")
+def delete_skill(
+    skill_ref: str,
+    actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    try:
+        item = catalog.delete_revoked(skill_ref)
+    except SkillNotFound as exc:
+        raise HTTPException(status_code=404, detail="Skill not found") from exc
+    except SkillStateConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)[:300]) from exc
+    _audit(actor, action="sandbox.skill_delete", task_id=skill_ref, target_type="sandbox_skill",
+           metadata={"version": item.version, "content_digest": item.content_digest,
+                     "archive_digest": item.package_archive_digest or item.text_archive_digest})
+    return {"deleted": True}
 
 
 @router.post("/skills/{skill_ref:path}/bind-execution", response_model=SandboxSkillResponse)

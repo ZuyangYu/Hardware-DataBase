@@ -20,7 +20,7 @@ from src.sandbox.agent_tools import make_skill_tools
 from src.sandbox import agent_tools
 from src.sandbox.authorization import SandboxAuthorizationStore
 from src.sandbox.catalog import SandboxCatalog
-from src.sandbox.skills import SkillCatalog, SkillStateConflict
+from src.sandbox.skills import SkillCatalog, SkillNotAuthorized, SkillNotFound, SkillStateConflict
 from src.sandbox.service import SandboxExecutionAdapter, SandboxExecutionError
 from src.sandbox.task_store import SandboxTaskStore
 
@@ -137,17 +137,22 @@ def test_skill_run_fences_scope_capabilities_revocation_and_idempotency(setup, m
     assert no_capability.value.status_code == 403
     authorized.add("sandbox.write_artifact")
     skills.revoke("skill/report")
+    bundles.revoke(bundle.bundle_ref)
+    with pytest.raises(SkillStateConflict, match="unfinished"):
+        skills.delete_revoked("skill/report")
     with pytest.raises(HTTPException) as revoked:
         run(key="retry-3")
     assert revoked.value.status_code == 403
     assert len(store.list()) == 1
-    with pytest.raises(SandboxExecutionError, match="no longer approved"):
+    with pytest.raises(SandboxExecutionError, match="subscription was removed"):
         SandboxExecutionAdapter(store=store, catalog=bundles, broker=broker, client=object()).submit(task["task_id"])
     assert store.require(task["task_id"]).status == "admitted"
     report = SandboxExecutionAdapter(store=store, catalog=bundles, broker=broker, client=object()).dispatch_once()
     assert report.failed == 1
     assert store.require(task["task_id"]).status == "rejected"
     assert store.require(task["task_id"]).error_code == "skill_not_authorized"
+    skills.delete_revoked("skill/report")
+    assert store.require(task["task_id"]).skill_ref == "skill/report"
 
 
 def test_available_skills_is_narrowed_by_scope_and_capabilities(setup, monkeypatch):
@@ -199,6 +204,117 @@ def test_skill_subscription_requires_new_consent_after_version_change(setup):
     skills.mark_tested("skill/report")
     skills.enable("skill/report")
     assert not skills.is_subscribed("skill/report", "user-1")
+
+
+def test_text_skill_requires_department_consent_and_is_removed_on_delete(setup):
+    _, _, skills, _, _ = setup
+    skills.register(skill_ref="skill/checklist", version="v1", content="Check missing ratings",
+                    department_id="dept-1")
+    skills.review("skill/checklist")
+    skills.mark_tested("skill/checklist")
+    skills.enable("skill/checklist")
+    listed = routes.available_skills(
+        user=SimpleNamespace(id="user-1", department_id="dept-1"),
+        auth=None, skills=skills, authorization=None,
+    )["items"]
+    assert any(item["skill_ref"] == "skill/checklist" and item["kind"] == "text" for item in listed)
+    assert routes.available_skills(
+        user=SimpleNamespace(id="user-2", department_id="dept-2"),
+        auth=None, skills=skills, authorization=None,
+    )["items"] == []
+    with pytest.raises(SkillNotAuthorized):
+        skills.subscribe("skill/checklist", principal_id="user-2", department_id="dept-2")
+    skills.subscribe("skill/checklist", principal_id="user-1", department_id="dept-1")
+    assert [item.skill_ref for item in skills.subscribed_text(principal_id="user-1", department_id="dept-1")] == ["skill/checklist"]
+    assert skills.subscribed_text(principal_id="user-1", department_id="dept-2") == []
+    with pytest.raises(SkillStateConflict, match="revoked"):
+        skills.delete_revoked("skill/checklist")
+    skills.revoke("skill/checklist")
+    assert not skills.is_subscribed("skill/checklist", "user-1")
+    assert skills.subscribed_text(principal_id="user-1", department_id="dept-1") == []
+    deleted = skills.delete_revoked("skill/checklist")
+    assert deleted.skill_ref == "skill/checklist" and not skills.is_subscribed("skill/checklist", "user-1")
+    with pytest.raises(SkillNotFound):
+        skills.delete_revoked("skill/checklist")
+    skills.register(skill_ref="skill/checklist", version="v1", content="Check missing ratings", department_id="dept-1")
+    skills.review("skill/checklist")
+    skills.mark_tested("skill/checklist")
+    skills.enable("skill/checklist")
+    assert not skills.is_subscribed("skill/checklist", "user-1")
+
+
+def test_admin_published_all_department_skills_require_employee_department_and_subscription(setup, monkeypatch):
+    _, _, skills, _, bundle = setup
+    for ref in ("skill/global-text", "skill/global-run"):
+        skills.register(skill_ref=ref, version="v1", content="Demo for all departments", department_id="*")
+    skills.bind_execution("skill/global-run", bundle_ref=bundle.bundle_ref,
+                          bundle_digest=bundle.bundle_digest, profile_ref=bundle.profile_ref)
+    for ref in ("skill/global-text", "skill/global-run"):
+        skills.review(ref)
+        skills.mark_tested(ref)
+        skills.enable(ref)
+
+    monkeypatch.setattr(routes, "_context_capabilities", lambda *args: {"sandbox.execute", "sandbox.write_artifact"})
+    for department in ("47", "79136"):
+        user = SimpleNamespace(id=f"employee-{department}", department_id=department, role="employee")
+        available = routes.available_skills(user=user, auth=None, skills=skills, authorization=None)["items"]
+        assert {item["skill_ref"] for item in available} == {"skill/global-text", "skill/global-run"}
+        for ref in ("skill/global-text", "skill/global-run"):
+            skills.subscribe(ref, principal_id=user.id, department_id=department)
+            assert skills.is_subscribed(ref, user.id)
+        assert [item.skill_ref for item in skills.subscribed_text(
+            principal_id=user.id, department_id=department,
+        )] == ["skill/global-text"]
+        assert "Demo for all" in skills.prompt_block(
+            "skill/global-text", principal_id=user.id, department_id=department,
+        )
+    blank_user = SimpleNamespace(id="employee-none", department_id=None, role="employee")
+    assert routes.available_skills(user=blank_user, auth=None, skills=skills, authorization=None)["items"] == []
+    with pytest.raises(SkillNotAuthorized):
+        skills.subscribe("skill/global-text", principal_id="employee-none", department_id="")
+    with pytest.raises(SkillNotAuthorized):
+        skills.subscribe("skill/global-run", principal_id="employee-none", department_id="")
+
+
+def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeypatch):
+    from src.agents.runner import MultiSourceAgentRunner
+    import src.core.auth as auth_module
+
+    _, _, skills, _, _ = setup
+    monkeypatch.setattr(settings, "SANDBOX_TASK_DB_PATH", skills.db_path)
+    monkeypatch.setattr(auth_module, "AuthService", lambda: SimpleNamespace(
+        get_user_by_username=lambda username: SimpleNamespace(
+            id=42, role="employee", is_active=True, department_id="dept-1",
+        ) if username == "tester" else None,
+    ))
+    skills.register(skill_ref="skill/checklist", version="v1", content="Verify component voltage",
+                    department_id="dept-1")
+    skills.review("skill/checklist")
+    skills.mark_tested("skill/checklist")
+    skills.enable("skill/checklist")
+    context = SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-1"},
+                              is_system_admin=lambda: False)
+    load = MultiSourceAgentRunner._load_skill_prompt_context
+    assert load(context) == ""
+    skills.subscribe("skill/checklist", principal_id=42, department_id="dept-1")
+    assert "Verify component voltage" in load(context)
+    assert load(SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-2"},
+                                is_system_admin=lambda: False)) == ""
+    skills.unsubscribe("skill/checklist", principal_id=42)
+    assert load(context) == ""
+
+
+def test_revoked_executable_skill_delete_requires_revoked_bundle_and_finished_task(setup):
+    _, bundles, skills, _, bundle = setup
+    _reviewed_skill(skills, bundle)
+    skills.subscribe("skill/report", principal_id="user-1", department_id="dept-1")
+    skills.revoke("skill/report")
+    with pytest.raises(SkillStateConflict, match="bundle"):
+        skills.delete_revoked("skill/report")
+    bundles.revoke(bundle.bundle_ref)
+    skills.delete_revoked("skill/report")
+    assert not skills.is_subscribed("skill/report", "user-1")
+    assert bundles.require(bundle.bundle_ref).approval_state == "revoked"
 
 
 def test_agent_sees_only_subscribed_reviewed_skills_and_rechecks_at_call(setup, monkeypatch):

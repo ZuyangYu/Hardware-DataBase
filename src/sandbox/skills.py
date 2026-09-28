@@ -45,6 +45,7 @@ _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MAX_CONTENT_BYTES = 128 * 1024
+ALL_DEPARTMENTS = "*"
 SKILL_STATES = frozenset({"draft", "reviewed", "tested", "enabled", "revoked"})
 _STATE_TRANSITIONS = {
     "draft": frozenset({"reviewed", "revoked"}),
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS sandbox_skills (
     review_flags_json TEXT NOT NULL DEFAULT '[]',
     owner_id TEXT NOT NULL DEFAULT '',
     department_id TEXT NOT NULL DEFAULT '',
+    share_scope TEXT NOT NULL DEFAULT 'private',
     created_by TEXT NOT NULL DEFAULT '',
     updated_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -89,7 +91,10 @@ CREATE TABLE IF NOT EXISTS sandbox_skills (
     package_archive_digest TEXT NOT NULL DEFAULT '',
     package_files_json TEXT NOT NULL DEFAULT '[]',
     package_review_flags_json TEXT NOT NULL DEFAULT '[]',
-    package_build_state TEXT NOT NULL DEFAULT ''
+    package_build_state TEXT NOT NULL DEFAULT '',
+    text_storage_ref TEXT NOT NULL DEFAULT '',
+    text_archive_digest TEXT NOT NULL DEFAULT '',
+    text_files_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_sandbox_skills_state
     ON sandbox_skills(approval_state, updated_at);
@@ -205,6 +210,7 @@ class SkillRecord:
     review_flags: tuple[str, ...] = ()
     owner_id: str = ""
     department_id: str = ""
+    share_scope: str = "private"
     created_by: str = ""
     updated_by: str = ""
     created_at: str = ""
@@ -218,6 +224,9 @@ class SkillRecord:
     package_files: tuple[str, ...] = ()
     package_review_flags: tuple[str, ...] = ()
     package_build_state: str = ""
+    text_storage_ref: str = ""
+    text_archive_digest: str = ""
+    text_files: tuple[str, ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -241,6 +250,7 @@ class SkillRecord:
             "review_flags": list(self.review_flags),
             "owner_id": self.owner_id,
             "department_id": self.department_id,
+            "share_scope": self.share_scope,
             "created_by": self.created_by,
             "updated_by": self.updated_by,
             "created_at": self.created_at,
@@ -258,6 +268,8 @@ class SkillRecord:
             "package_files": list(self.package_files),
             "package_review_flags": list(self.package_review_flags),
             "package_build_state": self.package_build_state,
+            "text_archive_digest": self.text_archive_digest,
+            "text_files": list(self.text_files),
         }
 
 
@@ -282,6 +294,10 @@ class SkillCatalog:
                 ("package_files_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("package_review_flags_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("package_build_state", "TEXT NOT NULL DEFAULT ''"),
+                ("text_storage_ref", "TEXT NOT NULL DEFAULT ''"),
+                ("text_archive_digest", "TEXT NOT NULL DEFAULT ''"),
+                ("text_files_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("share_scope", "TEXT NOT NULL DEFAULT 'private'"),
             ):
                 if column not in columns:
                     conn.execute(f"ALTER TABLE sandbox_skills ADD COLUMN {column} {ddl}")
@@ -324,6 +340,7 @@ class SkillCatalog:
             review_flags=flags,
             owner_id=str(row["owner_id"] or ""),
             department_id=str(row["department_id"] or ""),
+            share_scope=str(row["share_scope"] or "private"),
             created_by=str(row["created_by"] or ""),
             updated_by=str(row["updated_by"] or ""),
             created_at=str(row["created_at"]),
@@ -337,6 +354,9 @@ class SkillCatalog:
             package_files=_tuple_json("package_files_json"),
             package_review_flags=_tuple_json("package_review_flags_json"),
             package_build_state=str(row["package_build_state"] or ""),
+            text_storage_ref=str(row["text_storage_ref"] or ""),
+            text_archive_digest=str(row["text_archive_digest"] or ""),
+            text_files=_tuple_json("text_files_json"),
         )
 
     def _row(self, skill_ref: str) -> sqlite3.Row | None:
@@ -364,6 +384,14 @@ class SkillCatalog:
             rows = conn.execute(f"SELECT * FROM sandbox_skills{where} ORDER BY updated_at DESC").fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def list_owned(self, principal_id: str | int) -> list[SkillRecord]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM sandbox_skills WHERE catalog_source = 'employee' AND owner_id = ? "
+                "ORDER BY created_at DESC", (str(principal_id),),
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     def is_subscribed(self, skill_ref: str, principal_id: str | int) -> bool:
         item = self.get(skill_ref)
         if item is None:
@@ -376,15 +404,48 @@ class SkillCatalog:
             ).fetchone()
         return row is not None
 
+    def subscribed_text(self, *, principal_id: str | int, department_id: str | int) -> list[SkillRecord]:
+        """Return enabled, version-matched text Skills in this employee's department."""
+        if not bool(getattr(settings, "SKILLS_ENABLED", False)) or not department_id:
+            return []
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT s.* FROM sandbox_skills s JOIN sandbox_skill_subscriptions sub "
+                "ON s.skill_ref = sub.skill_ref WHERE sub.principal_id = ? "
+                "AND s.approval_state = 'enabled' AND s.execution_bundle_ref = '' "
+                "AND s.department_id IN (?, ?) ORDER BY s.skill_ref LIMIT 32",
+                (str(principal_id), str(department_id), ALL_DEPARTMENTS),
+            ).fetchall()
+        return [item for row in rows if self._principal_allowed(item := self._row_to_record(row), principal_id, department_id)
+                and self.is_subscribed(item.skill_ref, principal_id)]
+
     @staticmethod
     def _subscription_identity(item: SkillRecord) -> str:
         fields = (item.version, item.content_digest, item.package_archive_digest,
                   item.execution_bundle_ref, item.execution_bundle_digest)
+        if item.text_archive_digest:
+            fields += (item.text_archive_digest,)
         return hashlib.sha256(_json(fields).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _department_allowed(item: SkillRecord, department_id: str | int) -> bool:
+        department = str(department_id or "")
+        return bool(department) and item.department_id in {department, ALL_DEPARTMENTS}
+
+    @classmethod
+    def _principal_allowed(cls, item: SkillRecord, principal_id: str | int, department_id: str | int) -> bool:
+        return cls._department_allowed(item, department_id) and (
+            not item.owner_id or item.owner_id == str(principal_id)
+            or (item.catalog_source == "employee" and item.share_scope == "department")
+        )
+
     def subscribe(self, skill_ref: str, *, principal_id: str | int, department_id: str | int) -> None:
-        self.execution_bundle(skill_ref, principal_id=principal_id, department_id=department_id)
         item = self.require(skill_ref)
+        if item.execution_bundle_ref:
+            self.execution_bundle(skill_ref, principal_id=principal_id, department_id=department_id)
+        elif (not bool(getattr(settings, "SKILLS_ENABLED", False)) or not item.enabled
+               or not self._principal_allowed(item, principal_id, department_id)):
+            raise SkillNotAuthorized("text Skill is not available in this department")
         with closing(self._connect()) as conn:
             conn.execute(
                 "INSERT INTO sandbox_skill_subscriptions(skill_ref, principal_id, skill_identity, subscribed_at) "
@@ -430,6 +491,11 @@ class SkillCatalog:
         package_files: tuple[str, ...] = (),
         package_review_flags: tuple[str, ...] = (),
         package_build_state: str = "",
+        text_storage_ref: str = "",
+        text_archive_digest: str = "",
+        text_files: tuple[str, ...] = (),
+        share_scope: str = "private",
+        allow_overwrite: bool = True,
     ) -> SkillRecord:
         ref = _ref(skill_ref, "skill_ref")
         version_value = _ref(version, "version", version=True)
@@ -440,12 +506,16 @@ class SkillCatalog:
         if declared_source and len(declared_source) > 512:
             raise SkillCatalogError("source_ref is too long")
         safe_metadata = _safe_metadata(metadata)
+        if share_scope not in {"private", "department"} or (share_scope == "department" and not owner_id):
+            raise SkillCatalogError("invalid Skill sharing scope")
         now = _now()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 old = conn.execute("SELECT * FROM sandbox_skills WHERE skill_ref = ?", (ref,)).fetchone()
                 old_item = self._row_to_record(old) if old is not None else None
+                if old_item is not None and not allow_overwrite:
+                    raise SkillStateConflict("Skill reference already exists")
                 changed = bool(
                     old_item
                     and (
@@ -455,7 +525,9 @@ class SkillCatalog:
                         or old_item.catalog_source != str(catalog_source or "curated")[:50]
                         or old_item.owner_id != str(owner_id or "")[:128]
                         or old_item.department_id != str(department_id or "")[:128]
+                        or old_item.share_scope != share_scope
                         or old_item.package_archive_digest != str(package_archive_digest or "")[:128]
+                        or old_item.text_archive_digest != str(text_archive_digest or "")[:128]
                         or _json(dict(old_item.metadata)) != _json(safe_metadata)
                     )
                 )
@@ -467,12 +539,13 @@ class SkillCatalog:
                     INSERT INTO sandbox_skills(
                         skill_ref, version, content_digest, source_ref, catalog_source,
                         approval_state, content, content_bytes, review_flags_json,
-                        owner_id, department_id, created_by, updated_by, created_at,
+                        owner_id, department_id, share_scope, created_by, updated_by, created_at,
                         updated_at, metadata_json, execution_bundle_ref,
                         execution_bundle_digest, execution_profile_ref,
                         package_storage_ref, package_archive_digest, package_files_json,
-                        package_review_flags_json, package_build_state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        package_review_flags_json, package_build_state,
+                        text_storage_ref, text_archive_digest, text_files_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(skill_ref) DO UPDATE SET
                         version = excluded.version,
                         content_digest = excluded.content_digest,
@@ -484,6 +557,7 @@ class SkillCatalog:
                         review_flags_json = excluded.review_flags_json,
                         owner_id = excluded.owner_id,
                         department_id = excluded.department_id,
+                        share_scope = excluded.share_scope,
                         updated_by = excluded.updated_by,
                         updated_at = excluded.updated_at,
                         metadata_json = excluded.metadata_json,
@@ -495,6 +569,9 @@ class SkillCatalog:
                         , package_files_json = excluded.package_files_json
                         , package_review_flags_json = excluded.package_review_flags_json
                         , package_build_state = excluded.package_build_state
+                        , text_storage_ref = excluded.text_storage_ref
+                        , text_archive_digest = excluded.text_archive_digest
+                        , text_files_json = excluded.text_files_json
                     """,
                     (
                         ref,
@@ -508,6 +585,7 @@ class SkillCatalog:
                         _json(list(flags)),
                         str(owner_id or "")[:128],
                         str(department_id or "")[:128],
+                        share_scope,
                         str(actor or "")[:128],
                         str(actor or "")[:128],
                         now,
@@ -521,6 +599,9 @@ class SkillCatalog:
                         _json(list(package_files)) if not (old_item and not changed) else _json(list(old_item.package_files)),
                         _json(list(package_review_flags)) if not (old_item and not changed) else _json(list(old_item.package_review_flags)),
                         str(package_build_state or "")[:40] if not (old_item and not changed) else old_item.package_build_state,
+                        text_storage_ref[:512] if not (old_item and not changed) else old_item.text_storage_ref,
+                        text_archive_digest[:128] if not (old_item and not changed) else old_item.text_archive_digest,
+                        _json(list(text_files)) if not (old_item and not changed) else _json(list(old_item.text_files)),
                     ),
                 )
                 row = conn.execute("SELECT * FROM sandbox_skills WHERE skill_ref = ?", (ref,)).fetchone()
@@ -529,6 +610,41 @@ class SkillCatalog:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+
+    def set_department_share(
+        self, skill_ref: str, *, principal_id: str | int, department_id: str | int, share: bool,
+    ) -> SkillRecord:
+        """Only the uploader can share an enabled, reviewed Skill within its department."""
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT * FROM sandbox_skills WHERE skill_ref = ?", (skill_ref,)).fetchone()
+                if row is None:
+                    raise SkillNotFound(skill_ref)
+                item = self._row_to_record(row)
+                if (item.catalog_source != "employee" or item.owner_id != str(principal_id)
+                        or not self._department_allowed(item, department_id)):
+                    raise SkillNotAuthorized("Skill is not owned by this employee in this department")
+                if not item.enabled:
+                    raise SkillStateConflict("only enabled personal Skills can be shared")
+                if item.execution_bundle_ref:
+                    self._checked_execution_bundle(item)
+                scope = "department" if share else "private"
+                if item.share_scope != scope:
+                    conn.execute(
+                        "UPDATE sandbox_skills SET share_scope = ?, updated_by = ?, updated_at = ? WHERE skill_ref = ?",
+                        (scope, str(principal_id), _now(), skill_ref),
+                    )
+                    if not share:
+                        conn.execute(
+                            "DELETE FROM sandbox_skill_subscriptions WHERE skill_ref = ? AND principal_id <> ?",
+                            (skill_ref, str(principal_id)),
+                        )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return self.require(skill_ref)
 
     def bind_execution(
         self, skill_ref: str, *, bundle_ref: str, bundle_digest: str,
@@ -564,6 +680,10 @@ class SkillCatalog:
                 item = self._row_to_record(row)
                 if item.approval_state != "draft":
                     raise SkillStateConflict("Skill must be a draft to bind an execution bundle")
+                if item.catalog_source == "employee" and (
+                    not item.package_archive_digest or item.package_build_state != "built"
+                ):
+                    raise SkillStateConflict("employee Skill requires an approved, built source package")
                 if not item.department_id:
                     raise SkillStateConflict("executable Skill requires an explicit department scope")
                 conn.execute(
@@ -577,15 +697,31 @@ class SkillCatalog:
                 raise
         return self.require(ref)
 
+    def approve_source_for_build(self, skill_ref: str, *, archive_digest: str, actor: str = "") -> SkillRecord:
+        """Explicit administrator gate before building an employee-submitted script."""
+        with closing(self._connect()) as conn:
+            result = conn.execute(
+                "UPDATE sandbox_skills SET package_build_state = 'source_reviewed', updated_by = ?, updated_at = ? "
+                "WHERE skill_ref = ? AND catalog_source = 'employee' AND approval_state = 'draft' "
+                "AND package_build_state = 'uploaded' AND package_archive_digest <> '' "
+                "AND package_storage_ref <> '' AND package_archive_digest = ?",
+                (str(actor or "")[:128], _now(), skill_ref, archive_digest),
+            )
+            if result.rowcount != 1:
+                raise SkillStateConflict("employee source must be an uploaded draft before build approval")
+        return self.require(skill_ref)
+
     def mark_package_built(self, skill_ref: str, *, archive_digest: str, actor: str = "") -> SkillRecord:
         item = self.require(skill_ref)
         if (item.approval_state != "draft" or item.package_archive_digest != archive_digest
-                or not item.package_storage_ref):
+                or not item.package_storage_ref
+                or (item.catalog_source == "employee" and item.package_build_state != "source_reviewed")):
             raise SkillStateConflict("Skill source changed before build completed")
         with closing(self._connect()) as conn:
             result = conn.execute(
                 "UPDATE sandbox_skills SET package_build_state = 'built', updated_by = ?, updated_at = ? "
-                "WHERE skill_ref = ? AND package_archive_digest = ? AND approval_state = 'draft'",
+                "WHERE skill_ref = ? AND package_archive_digest = ? AND approval_state = 'draft' "
+                "AND (catalog_source <> 'employee' OR package_build_state = 'source_reviewed')",
                 (str(actor or "")[:128], _now(), item.skill_ref, archive_digest),
             )
             if result.rowcount != 1:
@@ -651,7 +787,44 @@ class SkillCatalog:
         return self._set_state(skill_ref, "enabled", actor=actor)
 
     def revoke(self, skill_ref: str, *, actor: str = "") -> SkillRecord:
-        return self._set_state(skill_ref, "revoked", actor=actor)
+        item = self._set_state(skill_ref, "revoked", actor=actor)
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM sandbox_skill_subscriptions WHERE skill_ref = ?", (item.skill_ref,))
+        return item
+
+    def delete_revoked(self, skill_ref: str) -> SkillRecord:
+        """Remove a revoked declaration and subscriptions; retain tasks and audit history.
+
+        A built image must be revoked separately. In-flight tasks retain their
+        declaration until they have reached a final state.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT * FROM sandbox_skills WHERE skill_ref = ?", (skill_ref,)).fetchone()
+                if row is None:
+                    raise SkillNotFound(skill_ref)
+                item = self._row_to_record(row)
+                if item.approval_state != "revoked":
+                    raise SkillStateConflict("only a revoked Skill can be deleted")
+                if item.execution_bundle_ref:
+                    bundle = conn.execute("SELECT approval_state FROM sandbox_execution_bundles WHERE bundle_ref = ?",
+                                          (item.execution_bundle_ref,)).fetchone()
+                    if bundle is not None and bundle["approval_state"] != "revoked":
+                        raise SkillStateConflict("revoke the linked bundle before deleting the Skill")
+                tasks_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sandbox_tasks'").fetchone()
+                if tasks_table and conn.execute(
+                    "SELECT 1 FROM sandbox_tasks WHERE skill_ref = ? AND status NOT IN "
+                    "('succeeded','failed','cancelled','expired','rejected','timed_out') LIMIT 1", (skill_ref,),
+                ).fetchone():
+                    raise SkillStateConflict("Skill has unfinished tasks")
+                conn.execute("DELETE FROM sandbox_skill_subscriptions WHERE skill_ref = ?", (skill_ref,))
+                conn.execute("DELETE FROM sandbox_skills WHERE skill_ref = ?", (skill_ref,))
+                conn.execute("COMMIT")
+                return item
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def prompt_block(
         self,
@@ -665,9 +838,9 @@ class SkillCatalog:
 
         item = self.require(skill_ref)
         if not is_admin:
-            if item.owner_id and str(item.owner_id) != str(principal_id or ""):
+            if item.owner_id and not self._principal_allowed(item, principal_id, department_id):
                 raise SkillNotAuthorized("Skill is outside the principal scope")
-            if item.department_id and str(item.department_id) != str(department_id or ""):
+            if item.department_id and not self._department_allowed(item, department_id):
                 raise SkillNotAuthorized("Skill is outside the department scope")
         value = self.content(skill_ref, require_enabled=True)
         safe = value.replace("</untrusted_skill>", "[/untrusted_skill]")

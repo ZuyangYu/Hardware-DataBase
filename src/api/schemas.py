@@ -1652,6 +1652,41 @@ class SandboxSkillPackageUploadRequest(BaseModel):
     output_schema: dict[str, Any] = Field(default_factory=dict)
 
 
+class SandboxTextSkillPackageUploadRequest(BaseModel):
+    """Text-only ZIP: name/version come from SKILL.md, department from admin."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    department_id: str = Field(min_length=1, max_length=128)
+    package_base64: str = Field(min_length=1, max_length=12_000_000)
+
+
+class SandboxPersonalTextSkillUploadRequest(BaseModel):
+    """Employee upload: scope, owner and Skill ref are assigned by the server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    package_base64: str = Field(min_length=1, max_length=12_000_000)
+
+
+class SandboxPersonalExecutableSkillUploadRequest(BaseModel):
+    """Employee source submission; building and approval remain admin-only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skill_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    version: str = Field(default="1.0.0", min_length=1, max_length=64)
+    package_base64: str = Field(min_length=1, max_length=12_000_000)
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxPersonalSkillShareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    share_to_department: bool
+
+
 class SandboxSkillBuildRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

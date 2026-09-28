@@ -8,6 +8,7 @@ Hardware DataBase 是一个面向硬件设计资料、项目文档、结构化�
 - **多源 pipeline**：普通文档进入 RAGFlow 检索链路；Excel 进入结构化表格索引；EDF 网表进入电路结构化索引；外部对话记录单独索引；均由 agent 统一调度。
 - **RAGFlow 后端固定化**：文档上传、解析任务、检索、删除和知识库治理都通过 RAGFlow 后端适配层完成。
 - **权限与治理**：支持部门、用户、知识库权限、审计日志、查询 trace 和文件处理状态。
+- **外部扩展**：受治理的远程 MCP 工具、文本 Skill 与审核后沙箱 Skill；默认关闭并按部门和订阅授权。见[操作指南](docs/mcp-plugins.md)与[技术 Wiki](wiki/22-external-extensions.md)。
 - **统一模型配置**：答案生成、工具决策和后台模型任务统一走 `src.core.model_factory` profile，并由 chat runtime 负责调用归一化与观测，支持 Ollama 或 OpenAI-compatible API。提示词 `SYSTEM_PROMPT` / `NO_CONTEXT_PROMPT` 可在系统配置中覆盖。
 - **结果 Artifact 导出**：已完成的对话/知识库检索结果先固化为不可变 ResultSnapshot，再由独立 export worker 生成 Markdown、Excel、Word、PDF 或 PowerPoint Artifact；聊天消息和全局任务中心提供带权限校验的后台任务状态、重试和下载入口。导出任务不依赖浏览器 SSE，切换会话、页面或刷新页面不会丢失。
 

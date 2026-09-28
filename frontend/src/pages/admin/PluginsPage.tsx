@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 
 import { api } from '../../api/client';
 import type {
@@ -31,7 +31,61 @@ import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import SkillsPanel from './SkillsPanel';
 
-type Props = { auth: AuthSession; onLogout: () => void };
+type Props = { auth: AuthSession };
+type ExtensionSection = 'mcp' | 'skills';
+
+type AdminExtensionsViewProps = {
+  activeSection: ExtensionSection;
+  onSectionChange: (section: ExtensionSection) => void;
+  mcpContent: ReactNode;
+  skillContent: ReactNode;
+};
+
+/** One admin page with two peer management sections, only one visible at a time. */
+export function AdminExtensionsView({ activeSection, onSectionChange,
+  mcpContent, skillContent }: AdminExtensionsViewProps) {
+  return (
+    <>
+      <div className="px-[48px] pt-[32px] max-[900px]:px-[16px]">
+        <AppHeader
+          title="扩展插件"
+          description="分别管理远程 MCP 服务与可执行 Skill；员工按授权选择添加。"
+        />
+        <nav aria-label="扩展插件管理" className="mt-[20px] flex gap-[20px] border-b border-[#eceef3]">
+          {([
+            { id: 'mcp', label: 'MCP 登记服务' },
+            { id: 'skills', label: 'Skill 上传与审核' },
+          ] as const).map(({ id, label }) => (
+            <button
+              key={id}
+              id={`admin-extensions-${id}-tab`}
+              type="button"
+              aria-controls={`admin-extensions-${id}-panel`}
+              aria-pressed={activeSection === id}
+              onClick={() => onSectionChange(id)}
+              className={`border-b-2 px-[4px] py-[10px] text-[13px] font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1d4ed8] ${
+                activeSection === id
+                  ? 'border-[#1d4ed8] text-[#1d4ed8]'
+                  : 'border-transparent text-[#858b9c] hover:text-[#464c5e]'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+      </div>
+      {activeSection === 'mcp' ? (
+        <div id="admin-extensions-mcp-panel" role="region" aria-labelledby="admin-extensions-mcp-tab">
+          {mcpContent}
+        </div>
+      ) : (
+        <div id="admin-extensions-skills-panel" role="region" aria-labelledby="admin-extensions-skills-tab">
+          {skillContent}
+        </div>
+      )}
+    </>
+  );
+}
 
 const EMPTY_FLAGS: McpListFlags = {
   enabled: false,
@@ -60,8 +114,6 @@ export type PluginsViewProps = {
   toolsFor: string | null;
   tools: McpToolView[];
   toolsLoading: boolean;
-  userName: string;
-  onLogout: () => void;
   onRefresh: () => void;
   onCreate: () => void;
   onEdit: (server: McpServerView) => void;
@@ -84,8 +136,6 @@ export function PluginsView({
   toolsFor,
   tools,
   toolsLoading,
-  userName,
-  onLogout,
   onRefresh,
   onCreate,
   onEdit,
@@ -219,13 +269,11 @@ export function PluginsView({
   const active = servers.find((server) => server.slug === toolsFor) ?? null;
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
-      <AppHeader
-        title="扩展插件"
-        description="登记远程 MCP 服务；默认停用，测试连接通过后方可启用。外部结果不进入知识库证据链。"
-        userName={userName}
-        onLogout={onLogout}
-      />
+    <div className="min-h-full px-[48px] pt-[16px] pb-[43px] max-[900px]:px-[16px]">
+      <h2 className="text-[16px] font-semibold text-[#18181a]">MCP 登记服务</h2>
+      <p className="mt-[6px] text-[12px] text-[#858b9c]">
+        登记远程 MCP 服务；默认停用，测试连接通过后方可启用。外部结果不进入知识库证据链。
+      </p>
 
       {!flags.enabled && (
         <div data-mcp-switch-off className="mt-[20px] text-[13px] text-[#7a5a12]">
@@ -567,7 +615,8 @@ export function ServerFormFields({
   );
 }
 
-export default function PluginsPage({ auth, onLogout }: Props) {
+export default function PluginsPage({ auth }: Props) {
+  const [activeSection, setActiveSection] = useState<ExtensionSection>('mcp');
   const [flags, setFlags] = useState<McpListFlags>(EMPTY_FLAGS);
   const [servers, setServers] = useState<McpServerView[]>([]);
   const [departments, setDepartments] = useState<DepartmentView[]>([]);
@@ -614,9 +663,10 @@ export default function PluginsPage({ auth, onLogout }: Props) {
   }, []);
 
   useEffect(() => {
+    if (activeSection !== 'mcp') return;
     const cancel = load();
     return cancel;
-  }, [load]);
+  }, [activeSection, load]);
 
   const path = (slug: string) => `/api/v1/plugins/mcp/${encodeURIComponent(slug)}`;
 
@@ -658,9 +708,8 @@ export default function PluginsPage({ auth, onLogout }: Props) {
       .finally(() => setSubmitting(false));
   }
 
-  return (
-    <>
-      <PluginsView
+  const mcpContent = (
+    <PluginsView
         flags={flags}
         servers={servers}
         loaded={loaded}
@@ -668,8 +717,6 @@ export default function PluginsPage({ auth, onLogout }: Props) {
         toolsFor={toolsFor}
         tools={tools}
         toolsLoading={toolsLoading}
-        userName={auth.user.username}
-        onLogout={onLogout}
         onRefresh={() => void load()}
         onCreate={() => {
           setEditing(null);
@@ -749,9 +796,17 @@ export default function PluginsPage({ auth, onLogout }: Props) {
             ),
           );
         }}
-      />
+    />
+  );
 
-      <SkillsPanel />
+  return (
+    <>
+      <AdminExtensionsView
+        activeSection={activeSection}
+        onSectionChange={setActiveSection}
+        mcpContent={mcpContent}
+        skillContent={<SkillsPanel departments={departments} />}
+      />
 
       <Dialog
         open={formOpen}

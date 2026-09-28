@@ -1,4 +1,4 @@
-"""Validation and persistence for administrator-uploaded executable Skills.
+"""Validation and persistence for reviewable Skill source packages.
 
 The HDB process stores and validates the source package, but never imports or
 executes it.  The package is later sent to the independent Runner, which uses
@@ -15,6 +15,8 @@ import secrets
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 import src.settings as settings
 
@@ -65,6 +67,107 @@ class SkillPackage:
     files: tuple[str, ...]
     review_flags: tuple[str, ...]
     requirements_declared: bool = False
+
+
+@dataclass(frozen=True)
+class TextSkillPackage:
+    archive_digest: str
+    skill_ref: str
+    version: str
+    description: str
+    content: str
+    files: tuple[str, ...]
+
+
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SKILL_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+_FRONTMATTER_RE = re.compile(r"\A---\n(.{1,4096}?)\n---(?:\n|\Z)", re.DOTALL)
+
+
+def validate_text_skill_package(data: bytes) -> TextSkillPackage:
+    """Load a text-only Skill ZIP; Markdown resources become bounded prompt data.
+
+    HDB has no on-demand file-reader tool for text Skills, so every Markdown
+    reference is included with its path and reviewed as one immutable version.
+    Other assets and executable files are rejected rather than silently lost.
+    """
+    if not isinstance(data, (bytes, bytearray)) or not 0 < len(data) <= _MAX_ARCHIVE_BYTES:
+        raise SkillPackageError("text Skill ZIP exceeds the 8 MiB limit")
+    raw = bytes(data)
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise SkillPackageError("text Skill must be a valid ZIP archive") from exc
+    files: dict[str, str] = {}
+    total = 0
+    try:
+        for info in archive.infolist():
+            name = _safe_name(info.filename.rstrip("/"))
+            if info.is_dir():
+                continue
+            if name in files or len(files) >= _MAX_FILES:
+                raise SkillPackageError("text Skill contains duplicate or too many files")
+            if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                raise SkillPackageError("text Skill symlinks are not allowed")
+            if info.file_size > _MAX_FILE_BYTES or total + info.file_size > _MAX_UNPACKED_BYTES:
+                raise SkillPackageError("text Skill contains an oversized file")
+            if not (name.endswith(".md") or name.split("/")[-1] in {"LICENSE.txt", "NOTICE.txt"}):
+                raise SkillPackageError("text Skill accepts only Markdown and license text; use executable upload for code")
+            content = archive.read(info)
+            total += len(content)
+            if total > _MAX_UNPACKED_BYTES:
+                raise SkillPackageError("text Skill is too large after unpacking")
+            try:
+                files[name] = content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise SkillPackageError(f"text Skill file is not UTF-8: {name}") from exc
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise SkillPackageError("text Skill ZIP cannot be read") from exc
+    finally:
+        archive.close()
+
+    roots = [name for name in files if name == "SKILL.md" or name.endswith("/SKILL.md")]
+    if len(roots) != 1:
+        raise SkillPackageError("text Skill ZIP must contain exactly one SKILL.md")
+    root = roots[0]
+    prefix = root.removesuffix("SKILL.md")
+    if prefix and (prefix.count("/") != 1 or any(not name.startswith(prefix) for name in files)):
+        raise SkillPackageError("text Skill ZIP must contain just one Skill folder")
+    markdown = files[root].replace("\r\n", "\n").replace("\r", "\n")
+    frontmatter = _FRONTMATTER_RE.match(markdown)
+    if not frontmatter:
+        raise SkillPackageError("SKILL.md must start with YAML name and description")
+    try:
+        metadata = yaml.safe_load(frontmatter.group(1))
+    except yaml.YAMLError as exc:
+        raise SkillPackageError("SKILL.md frontmatter is invalid YAML") from exc
+    if not isinstance(metadata, dict):
+        raise SkillPackageError("SKILL.md frontmatter must be a mapping")
+    name, description = metadata.get("name"), metadata.get("description")
+    if not isinstance(name, str) or len(name) > 64 or not _SKILL_NAME_RE.fullmatch(name):
+        raise SkillPackageError("SKILL.md name must use lowercase letters, digits and hyphens")
+    if prefix and prefix[:-1] != name:
+        raise SkillPackageError("Skill folder name must match SKILL.md name")
+    if not isinstance(description, str) or not 1 <= len(description.strip()) <= 1024:
+        raise SkillPackageError("SKILL.md description must be 1-1024 characters")
+    declared = metadata.get("metadata") or {}
+    if not isinstance(declared, dict):
+        raise SkillPackageError("SKILL.md metadata must be a mapping")
+    version = declared.get("version", "1.0.0")
+    if not isinstance(version, str) or not _SKILL_VERSION_RE.fullmatch(version) or ".." in version:
+        raise SkillPackageError("SKILL.md metadata.version is invalid")
+
+    names = sorted(name for name in files if name.endswith(".md") and name != root)
+    combined = markdown + "".join(
+        f"\n\n---\n### 随附资料：{name.removeprefix(prefix)}\n\n{files[name]}" for name in names
+    )
+    if len(combined.encode("utf-8")) > 16 * 1024:
+        raise SkillPackageError("text Skill Markdown exceeds the 16 KiB conversation limit")
+    return TextSkillPackage(
+        archive_digest=hashlib.sha256(raw).hexdigest(), skill_ref=f"skill/{name}",
+        version=version, description=description.strip(), content=combined,
+        files=tuple(sorted(name.removeprefix(prefix) for name in files)),
+    )
 
 
 def _safe_name(name: str) -> str:
@@ -165,7 +268,7 @@ class SkillPackageStore:
     def _ref_part(value: str) -> str:
         return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or ""))[:100] or "skill"
 
-    def save(self, skill_ref: str, package: SkillPackage, data: bytes) -> str:
+    def save(self, skill_ref: str, package: SkillPackage | TextSkillPackage, data: bytes) -> str:
         directory = os.path.join(self.root, self._ref_part(skill_ref))
         os.makedirs(directory, mode=0o700, exist_ok=True)
         path = os.path.join(directory, f"{package.archive_digest}.zip")
@@ -191,4 +294,4 @@ class SkillPackageStore:
         return data
 
 
-__all__ = ["SkillPackage", "SkillPackageError", "SkillPackageStore", "validate_skill_package", "validate_requirements_lock"]
+__all__ = ["SkillPackage", "TextSkillPackage", "SkillPackageError", "SkillPackageStore", "validate_skill_package", "validate_text_skill_package", "validate_requirements_lock"]

@@ -209,7 +209,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               path="/extensions"
               element={
                 <KbContentRoute auth={auth}>
-                  <ExtensionsPage auth={auth} onLogout={onLogout} />
+                  <ExtensionsPage auth={auth} />
                 </KbContentRoute>
               }
             />
@@ -297,7 +297,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               path="/admin/plugins"
               element={
                 <AdminRoute auth={auth} requireSysAdmin>
-                  <PluginsPage auth={auth} onLogout={onLogout} />
+                  <PluginsPage auth={auth} />
                 </AdminRoute>
               }
             />

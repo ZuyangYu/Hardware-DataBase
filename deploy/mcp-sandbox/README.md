@@ -4,6 +4,13 @@ This directory documents the deployment boundary introduced by the HDB
 control-plane code. It is **not** a claim that the current development host
 has a production-safe sandbox runtime.
 
+![Hardware DataBase external extensions and secure runtime architecture](../../assets/external-extensions-runtime.svg)
+
+Related documentation: [administrator and employee operations](../../docs/mcp-plugins.md),
+[extension architecture](../../wiki/22-external-extensions.md),
+[Runner deployment](../sandbox-runner/README.md), and
+[Gateway deployment](../mcp-gateway/README.md).
+
 ## Current P0 status (2026-09-23)
 
 This host has only rootful Docker. A separately deployed dev-l1 Runner and
@@ -128,46 +135,23 @@ host for the **HDB-owned fixed-digest** first phase only:
 - text-only Skill catalog enabled (`SKILLS_ENABLED=true`): reviewed skills load
   as bounded untrusted prompt data and never change tools/capabilities.
 
-### Administrator-uploaded Skill packages (dev-l1 reference)
+### Skill execution boundary (dev-l1 reference)
 
-Only system administrators can upload and review a Skill ZIP. At the ZIP root,
-`SKILL.md` describes the Skill and `entrypoint.py` reads
-`/work/in/parameters.json` and writes artifacts into `/work/out`. Optional
-Python/text helper files are included in the image; optional `requirements.lock`
-lists pinned wheel versions and SHA-256 hashes. The administrator configures an
-HTTPS pip index from operator-allowed hosts. The independent Runner verifies
-the host again and installs the locked wheels **once at image build**, never
-inside a per-call task container. Dockerfiles, unpinned dependencies, arbitrary
-install recipes and container commands are refused. HDB keeps the
-original archive in private persistent storage and never runs its code. On
-upload it requests a fixed-template build from the independent Runner; a failure
-leaves a retriable draft and the source remains available to the administrator.
-The Runner uses its verified local Python base image and fixed Dockerfile
-template, records the image ID/source label and persists a bundle manifest.
+Employees may submit private Skill drafts, but an upload never builds or runs
+code. An administrator must review an employee executable source package and
+explicitly approve it before the independent Runner can build it; the resulting
+bundle and Skill are reviewed and enabled separately. Personal submissions are
+scoped to the uploader's department, and sharing does not subscribe other users.
 
-The administrator downloads the source package and reviews the generated
-bundle's digest and image ID, then reviews, marks tested, and enables the bundle
-and Skill separately. Ordinary users can list only enabled in-scope Skills;
-they add/subscribe before invoking and may later remove them. Subscriptions do
-not grant sandbox capabilities. Execution remains a temporary no-network
-container with the existing Artifact Broker path; source and image are retained
-after task cleanup. In unified conversation mode the Agent sees only the
-employee's subscribed/authorized Skill tools. A call emits task timeline events
-and returns verified artifact metadata and bounded text previews to the Agent;
-longer tasks return a task ID and can be checked via the status tool. The HTTP
-API sequence is:
-
-```text
-POST /api/v1/sandbox/skills/packages                # administrator; base64 ZIP, department_id, input_schema
-PUT  /api/v1/sandbox/skill-dependencies              # administrator; approved HTTPS pip index
-GET  /api/v1/sandbox/skills/{skill_ref}/source       # administrator source review
-POST /api/v1/sandbox/skills/{skill_ref}/build        # administrator retry on build failure
-POST /api/v1/sandbox/bundles/{bundle_ref}/review|tested|enable
-POST /api/v1/sandbox/skills/{skill_ref}/review|tested|enable
-POST /api/v1/sandbox/skills/{skill_ref}/subscribe    # employee
-POST /api/v1/sandbox/skills/{skill_ref}/run          # employee with sandbox capabilities
-DELETE /api/v1/sandbox/skills/{skill_ref}/subscribe  # employee
-```
+An executable package uses the fixed `SKILL.md` / `entrypoint.py` format and
+Runner-owned build template. Optional dependencies must be version-pinned and
+SHA-256 locked, fetched only from an operator-approved HTTPS index, and installed
+at image-build time. Arbitrary Dockerfiles, commands, dynamic task-time installs
+and task-container network access are not supported. HDB stores and reviews the
+source but never executes it. Invocation requires an enabled, in-scope Skill,
+employee subscription, the bundle's required capabilities and the Artifact
+Broker path. See the [operation guide](../../docs/mcp-plugins.md) for the review,
+sharing and employee workflow.
 
 This dev-l1 profile is limited to trusted single-tenant administrators and
 reviewed Python scripts with pinned wheel dependencies. Third-party untrusted scripts and
@@ -175,39 +159,14 @@ sensitive multi-tenant execution remain NO-GO pending the L2/L3 acceptance gates
 
 ### Fixed-bundle Skill invocation (legacy curated path)
 
-An administrator may bind a **draft** text Skill to an independently deployed,
-enabled, curated bundle with a fixed `bundle_ref`, SHA-256 digest and profile.
-Executable Skills must have an explicit department scope; globally visible
-text-only Skills cannot be bound to a task.
-The bundle must declare `sandbox.execute` and may additionally declare
-`sandbox.write_artifact`; this path refuses network and input artifacts. The
-Skill must then pass the existing review → tested → enable lifecycle. Changing
-its text, scope, version or binding requires review again. Admin UI:
-**Admin → Plugins → Skill 上传与审核**. Equivalent API:
-
-```text
-POST /api/v1/sandbox/skills                         # register text and optional department_id
-POST /api/v1/sandbox/skills/{skill_ref}/bind-execution
-     {"bundle_ref":"bundle/report","bundle_digest":"<reviewed sha256>","profile_ref":"profile/dev-l1"}
-POST /api/v1/sandbox/skills/{skill_ref}/review
-POST /api/v1/sandbox/skills/{skill_ref}/tested
-POST /api/v1/sandbox/skills/{skill_ref}/enable
-```
-
-Employees with the bundle's deployment-authorized capabilities can see it on
-the Extensions page or call `GET /api/v1/sandbox/skills/available`, subscribe, then submit
-`POST /api/v1/sandbox/skills/{skill_ref}/run` with an idempotency key and
-structured `parameters` matching the reviewed bundle schema. The normal task
-ledger, dispatcher, Runner and Artifact Broker handle observation and output
-downloads. The task records the Skill digest and the dispatcher checks its
-current enablement, owner/department scope and bundle binding before starting;
-revocation denies **new** runs; a dispatcher that observes a revoked Skill
-before submission marks the queued task rejected. Running
-tasks still follow the task cancellation endpoint.
-
-This legacy registration API accepts no executable source. Uploaded script
-packages use the separate administrator-only route above; neither route accepts
-hooks, arbitrary images or dynamic dependencies.
+An administrator may bind a draft Skill to an independently deployed curated
+bundle with a fixed reference, digest and profile. The bundle must declare
+`sandbox.execute`; the Skill must pass its own review lifecycle, and the
+caller's department, subscription and capability grant are checked at
+invocation. The dispatcher rechecks the binding and current enablement before
+starting; revocation denies new work. The HDB API and employee workflows are
+documented in the [operation guide](../../docs/mcp-plugins.md) and
+[extension architecture page](../../wiki/22-external-extensions.md).
 
 Evidence: `deploy/sandbox-runner/smoke.py` 17/17, `deploy/mcp-gateway/smoke.py`
 10/10, `deploy/sandbox-runner/hdb_e2e.py` 10/10 (HDB control plane against the

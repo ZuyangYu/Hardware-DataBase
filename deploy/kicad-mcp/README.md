@@ -1,12 +1,16 @@
-# 内网 KiCad MCP 参考服务
+# KiCad 格式示例生成器（MCP 参考服务）
 
 MCP 集成方案 §4.12 的可部署示例：一个独立的远程 MCP 服务，只暴露两个受治理工具，
 不接收 shell 文本、任意命令或宿主路径；写工具只返回候选产物引用，永不修改原件。
 
+> **功能边界：** 这是演示 MCP 调用与候选产物流程的参考实现，不是 KiCad 集成。只根据输入参数
+> 返回示例摘要并生成简单的 `.kicad_sch` 候选文件；不读取或分析真实原理图，不调用 KiCad，
+> 也不运行 ERC。生产环境需另行实现并验收真实的 KiCad 文件解析、生成或校验能力。
+
 | 工具 | 注解 | 用途 |
 |---|---|---|
-| `kicad_analyze_schematic` | `readOnlyHint=True` | 只读分析，返回文本摘要 |
-| `kicad_create_schematic` | `readOnlyHint=False` | 生成候选 `.kicad_sch`，返回产物引用 |
+| `kicad_analyze_schematic` | `readOnlyHint=True` | 仅按参数返回示例摘要，不读取或分析文件 |
+| `kicad_create_schematic` | `readOnlyHint=False` | 生成简单的 `.kicad_sch` 候选示例，返回产物引用 |
 
 写工具返回契约（HDB 侧逐项校验）：
 
@@ -63,7 +67,8 @@ MCP_WRITE_ENABLED=true            # 仅当要使用写工具
 
 管理页「系统配置 → 扩展插件」：
 
-1. 登记：slug `kicad`、传输 `streamable_http`、URL `http://10.0.0.8:8080/mcp`、
+1. 登记：名称「KiCad 格式示例生成器（参考服务）」、slug `kicad`、传输 `streamable_http`、
+   URL `http://10.0.0.8:8080/mcp`、描述填写上述功能边界、
    部门范围按需（`all` 或指定部门）。
 2. 测试连接 → 启用。
 3. 「工具」面板把 `kicad_create_schematic` 加入 `write_tools` 白名单。

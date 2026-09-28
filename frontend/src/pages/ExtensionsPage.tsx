@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { Blocks, Check, Code2, Download, FileText, Play, PlugZap, RefreshCw, Search, ShieldCheck, Upload } from 'lucide-react';
 
 import { api, apiDownload } from '../api/client';
 import type {
@@ -13,9 +14,10 @@ import AppHeader from '@/components/AppHeader';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, Input, Label } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
 
-type Props = { auth: AuthSession; onLogout: () => void };
+type Props = { auth: AuthSession };
 
 type ExecutableSkill = {
   skill_ref: string;
@@ -24,9 +26,29 @@ type ExecutableSkill = {
   input_schema: Record<string, unknown>;
   subscribed?: boolean;
   description?: string;
+  kind?: 'text' | 'executable';
+  is_owner?: boolean;
+  share_scope?: string;
 };
 type SkillTask = { task_id: string; status: string; error_code?: string };
 type SkillArtifact = { artifact_id: string; filename: string; state: string };
+type PersonalSkill = {
+  skill_ref: string;
+  version: string;
+  approval_state: string;
+  share_scope: string;
+  summary: string;
+  kind: 'text' | 'executable';
+  package_build_state: string;
+  department_id: string;
+  created_at: string;
+};
+type PersonalUploadOptions = { kind: 'text' | 'executable'; name: string; version: string; inputSchema: string };
+
+const PERSONAL_STATUS: Record<string, string> = {
+  draft: '待管理员审核', reviewed: '已审核 · 待测试', tested: '待启用',
+  enabled: '已启用', revoked: '已撤销',
+};
 
 const EMPTY_FLAGS: McpListFlags = {
   enabled: false,
@@ -39,9 +61,9 @@ export type ExtensionsViewProps = {
   flags: McpListFlags;
   items: McpCatalogItem[];
   loaded: boolean;
+  skillsLoaded?: boolean;
   busySlug: string | null;
-  userName: string;
-  onLogout: () => void;
+  userDepartmentId?: string;
   onRefresh: () => void;
   onSubscribe: (item: McpCatalogItem) => void;
   onUnsubscribe: (item: McpCatalogItem) => void;
@@ -52,6 +74,12 @@ export type ExtensionsViewProps = {
   onRejectProposal?: (proposal: McpWriteProposal) => void;
   onDownloadProposal?: (proposal: McpWriteProposal) => void;
   skills?: ExecutableSkill[];
+  personalSkills?: PersonalSkill[];
+  personalLoaded?: boolean;
+  personalBusy?: boolean;
+  sharingRef?: string | null;
+  onUploadPersonal?: (file: File, options: PersonalUploadOptions) => Promise<boolean>;
+  onSharePersonal?: (skill: PersonalSkill, share: boolean) => void;
   skillParameters?: Record<string, string>;
   skillBusy?: string | null;
   skillTask?: SkillTask | null;
@@ -63,14 +91,25 @@ export type ExtensionsViewProps = {
   onDownloadSkillArtifact?: (artifact: SkillArtifact) => void;
 };
 
+type ExtensionSection = 'skills' | 'mcp';
+
+function skillDisplay(skill: ExecutableSkill) {
+  const content = (skill.description || '').replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, '');
+  const title = content.match(/^#\s+(.+)$/m)?.[1]?.trim() || skill.skill_ref.replace(/^skill\//, '');
+  const summary = skill.description?.match(/^description:\s*(.+)$/m)?.[1]?.trim()
+    || content.split('\n').map((line) => line.trim()).find((line) => line && !line.startsWith('#') && !line.startsWith('---'))
+    || '管理员审核的扩展能力，添加后即可按授权使用。';
+  return { title, summary };
+}
+
 /** Pure view: employee catalog with subscription and write-consent controls. */
 export function ExtensionsView({
   flags,
   items,
   loaded,
+  skillsLoaded = true,
   busySlug,
-  userName,
-  onLogout,
+  userDepartmentId = '',
   onRefresh,
   onSubscribe,
   onUnsubscribe,
@@ -81,6 +120,12 @@ export function ExtensionsView({
   onRejectProposal,
   onDownloadProposal,
   skills = [],
+  personalSkills = [],
+  personalLoaded = true,
+  personalBusy = false,
+  sharingRef = null,
+  onUploadPersonal,
+  onSharePersonal,
   skillParameters = {},
   skillBusy = null,
   skillTask = null,
@@ -91,261 +136,346 @@ export function ExtensionsView({
   onRefreshSkillTask,
   onDownloadSkillArtifact,
 }: ExtensionsViewProps) {
+  const [activeSection, setActiveSection] = useState<ExtensionSection>('skills');
+  const [skillQuery, setSkillQuery] = useState('');
+  const [mcpQuery, setMcpQuery] = useState('');
+  const [onlyAdded, setOnlyAdded] = useState(false);
+  const [testingSkill, setTestingSkill] = useState<string | null>(null);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [personalFile, setPersonalFile] = useState<File | null>(null);
+  const [personalKind, setPersonalKind] = useState<'text' | 'executable'>('text');
+  const [personalName, setPersonalName] = useState('');
+  const [personalVersion, setPersonalVersion] = useState('1.0.0');
+  const [personalSchema, setPersonalSchema] = useState('{\n  "type": "object",\n  "properties": {},\n  "additionalProperties": false\n}');
+  const addedSkills = skills.filter((skill) => skill.subscribed).length;
+  const subscribedServices = items.filter((item) => item.subscribed).length;
+  const visibleSkills = skills.filter((skill) => {
+    const display = skillDisplay(skill);
+    return (!onlyAdded || skill.subscribed) &&
+      `${skill.skill_ref} ${display.title} ${display.summary}`.toLocaleLowerCase().includes(skillQuery.trim().toLocaleLowerCase());
+  }).sort((a, b) => Number(Boolean(b.subscribed)) - Number(Boolean(a.subscribed)));
+  const visibleServices = items.filter((item) =>
+    (!onlyAdded || item.subscribed) &&
+    `${item.name} ${item.slug} ${item.description || ''} ${item.tags.join(' ')}`.toLocaleLowerCase().includes(mcpQuery.trim().toLocaleLowerCase()),
+  ).sort((a, b) => Number(Boolean(b.subscribed)) - Number(Boolean(a.subscribed)));
+
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <div className="mx-auto min-h-full max-w-[1380px] px-[48px] pb-[56px] pt-[32px] max-[900px]:px-[16px]">
       <AppHeader
         title="扩展"
-        description="管理员登记的外部服务；订阅后才能在对话中使用。"
-        userName={userName}
-        onLogout={onLogout}
+        description="发现已审核的能力，按需添加到你的对话中。"
       />
 
-      <div
-        data-mcp-egress-notice
-        className="mt-[20px] rounded-[14px] border border-[#f0d8a8] bg-[#fffaf0] p-[16px] text-[13px] leading-[1.7] text-[#7a5a12]"
-      >
-        <div className="font-semibold">数据外发说明</div>
-        <div className="mt-[4px]">
-          调用外部服务时，你发送的查询内容会离开本系统并交给管理员登记的外部服务提供方；
-          外部返回内容属于不可信数据，不会进入知识库证据链，也不会获得引用编号。
+      <div className="mt-[26px] grid gap-[12px] sm:grid-cols-2">
+        <div className="flex items-center gap-[14px] rounded-[18px] border border-[#dce7fb] bg-gradient-to-r from-[#eef4ff] to-white px-[20px] py-[17px]">
+          <div className="flex size-[42px] shrink-0 items-center justify-center rounded-[12px] bg-white text-[#2862c4] shadow-sm"><Blocks className="size-[20px]" /></div>
+          <div className="min-w-0">
+            <p className="text-[12px] text-[#60708c]">我的 Skill</p>
+            <p className="mt-[2px] text-[19px] font-semibold leading-tight text-[#1c3156]">{skillsLoaded ? addedSkills : '—'}<span className="ml-[5px] text-[12px] font-normal text-[#73819a]">/ {skillsLoaded ? skills.length : '—'} 已添加</span></p>
+          </div>
+        </div>
+        <div className="flex items-center gap-[14px] rounded-[18px] border border-[#e7eaf0] bg-white px-[20px] py-[17px]">
+          <div className="flex size-[42px] shrink-0 items-center justify-center rounded-[12px] bg-[#f2f5f9] text-[#55657d]"><PlugZap className="size-[20px]" /></div>
+          <div className="min-w-0">
+            <p className="text-[12px] text-[#60708c]">我的 MCP 服务</p>
+            <p className="mt-[2px] text-[19px] font-semibold leading-tight text-[#1c3156]">{loaded ? subscribedServices : '—'}<span className="ml-[5px] text-[12px] font-normal text-[#73819a]">/ {loaded ? items.length : '—'} 已订阅</span></p>
+          </div>
         </div>
       </div>
 
-      {!flags.enabled && (
-        <div data-mcp-disabled className="mt-[16px] text-[13px] text-[#858b9c]">
-          扩展能力未启用（MCP_ENABLED=false），当前没有可订阅的服务。
-        </div>
-      )}
-      {flags.enabled && !flags.prerequisites_met && (
-        <div data-mcp-prerequisite className="mt-[16px] text-[13px] text-[#d20b0b]">
-          扩展已开启但前置条件未满足：{flags.prerequisites_reason || '未知原因'}
-        </div>
-      )}
-
-      <div className="mt-[16px] flex items-center gap-[10px]">
-        <Button variant="outline" onClick={onRefresh} disabled={!loaded}>
-          刷新
-        </Button>
-        <span className="text-[13px] text-[#858b9c]">
-          共 {items.length} 个服务，已订阅 {items.filter((item) => item.subscribed).length} 个
-        </span>
-      </div>
-
-      {!loaded ? (
-        <div className="mt-[16px] grid gap-[12px] md:grid-cols-2">
-          <Skeleton className="h-[140px] rounded-[16px]" />
-          <Skeleton className="h-[140px] rounded-[16px]" />
-        </div>
-      ) : items.length === 0 ? (
-        <div
-          data-mcp-empty
-          className="mt-[16px] rounded-[16px] bg-white p-[24px] text-[13px] text-[#858b9c] shadow-[0_2px_10px_rgba(0,0,0,0.05)]"
-        >
-          暂无可订阅的扩展服务。管理员登记并启用服务后会出现在这里。
-        </div>
-      ) : (
-        <div className="mt-[16px] grid gap-[12px] md:grid-cols-2">
-          {items.map((item) => (
-            <div
-              key={item.slug}
-              data-mcp-catalog-item={item.slug}
-              className="flex flex-col rounded-[16px] bg-white p-[18px] shadow-[0_2px_10px_rgba(0,0,0,0.05)]"
-            >
-              <div className="flex items-start justify-between gap-[12px]">
-                <div className="min-w-0">
-                  <div className="truncate text-[15px] font-semibold text-[#18181a]">
-                    {item.icon ? `${item.icon} ` : ''}
-                    {item.name}
-                  </div>
-                  <div className="mt-[2px] truncate text-[12px] text-[#858b9c]">{item.slug}</div>
-                </div>
-                {item.subscribed && <Badge data-mcp-subscribed={item.slug}>已订阅</Badge>}
-              </div>
-
-              {item.description && (
-                <p className="mt-[10px] text-[13px] leading-[1.6] text-[#464c5e]">
-                  {item.description}
-                </p>
-              )}
-
-              <div className="mt-[10px] text-[12px] text-[#858b9c]">
-                工具 {item.tool_count} 个 · 只读 {item.read_only_tool_count} 个
-              </div>
-              {item.tags.length > 0 && (
-                <div className="mt-[8px] flex flex-wrap gap-[6px]">
-                  {item.tags.map((tag) => (
-                    <span
-                      key={tag}
-                      className="rounded-full bg-[#f2f3f7] px-[8px] py-[2px] text-[11px] text-[#464c5e]"
-                    >
-                      {tag}
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              <div className="mt-[14px] flex flex-wrap items-center gap-[10px]">
-                {item.subscribed ? (
-                  <Button
-                    variant="outline"
-                    disabled={busySlug === item.slug}
-                    onClick={() => onUnsubscribe(item)}
-                  >
-                    退订
-                  </Button>
-                ) : (
-                  <Button
-                    disabled={busySlug === item.slug || !flags.enabled}
-                    onClick={() => onSubscribe(item)}
-                  >
-                    订阅
-                  </Button>
-                )}
-                {item.subscribed && item.writable && !flags.write_enabled && (
-                  <span className="text-[12px] text-[#858b9c]">
-                    该服务包含写工具，写通道当前未启用。
-                  </span>
-                )}
-                {item.subscribed && item.writable && flags.write_enabled && (
-                  <label className="flex cursor-pointer items-center gap-[6px] text-[13px] text-[#464c5e]">
-                    <input
-                      type="checkbox"
-                      data-mcp-write-consent={item.slug}
-                      checked={item.allow_write}
-                      onChange={(event) => onToggleWrite(item, event.target.checked)}
-                    />
-                    允许写操作（需管理员白名单）
-                  </label>
-                )}
-              </div>
-            </div>
+      <div className="mt-[28px] flex flex-wrap items-end justify-between gap-[12px] border-b border-[#e6eaf1]">
+        <div role="tablist" aria-label="扩展类型" className="flex gap-[22px]">
+          {([
+            { id: 'skills', label: 'Skill 库', count: skills.length, icon: Blocks },
+            { id: 'mcp', label: 'MCP 服务', count: items.length, icon: PlugZap },
+          ] as const).map(({ id, label, count, icon: Icon }) => (
+            <button key={id} id={`extensions-${id}-tab`} type="button" role="tab"
+              aria-selected={activeSection === id} aria-controls={`extensions-${id}-panel`}
+              tabIndex={activeSection === id ? 0 : -1}
+              onClick={() => { setActiveSection(id); setOnlyAdded(false); }}
+              onKeyDown={(event) => {
+                if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') return;
+                event.preventDefault();
+                const next: ExtensionSection = event.key === 'Home' ? 'skills' : event.key === 'End' ? 'mcp' : id === 'skills' ? 'mcp' : 'skills';
+                setActiveSection(next);
+                setOnlyAdded(false);
+                document.getElementById(`extensions-${next}-tab`)?.focus();
+              }}
+              className={`-mb-px flex items-center gap-[7px] border-b-2 px-[2px] pb-[13px] text-[13px] font-medium transition-colors focus-visible:rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1d4ed8] ${activeSection === id ? 'border-[#2563eb] text-[#1d4ed8]' : 'border-transparent text-[#7c879a] hover:text-[#34445d]'}`}>
+              <Icon className="size-[16px]" />{label}<span className={`rounded-full px-[7px] py-[1px] text-[11px] ${activeSection === id ? 'bg-[#e8f0ff] text-[#1d4ed8]' : 'bg-[#f1f3f6] text-[#798499]'}`}>{count}</span>
+            </button>
           ))}
         </div>
-      )}
+        <Button variant="outline" size="sm" className="mb-[9px]" onClick={onRefresh} disabled={!loaded || !skillsLoaded || !personalLoaded}>
+          <RefreshCw className="size-[14px]" />刷新
+        </Button>
+      </div>
 
-      <section
-        data-mcp-write-proposals
-        className="mt-[20px] rounded-[16px] bg-white p-[18px] shadow-[0_2px_10px_rgba(0,0,0,0.05)]"
-      >
-        <div className="flex items-center justify-between gap-[12px]">
+      <section id="extensions-skills-panel" role="tabpanel" aria-labelledby="extensions-skills-tab" hidden={activeSection !== 'skills'} data-sandbox-skills className="pt-[24px]">
+        <div className="flex flex-wrap items-end justify-between gap-[16px]">
           <div>
-            <h2 className="text-[15px] font-semibold text-[#18181a]">写入提案</h2>
-            <p className="mt-[4px] text-[12px] text-[#858b9c]">
-              候选产物必须先确认；确认前不会调用外部写工具，也不会修改原件。
-            </p>
+            <h2 className="text-[18px] font-semibold text-[#1d2a40]">已审核的 Skill</h2>
+            <p className="mt-[5px] text-[13px] text-[#758098]">文本参考会在对话中使用；执行型 Skill 可在独立沙箱中测试。</p>
           </div>
-          <Badge>{proposals.length} 条</Badge>
+          <Button variant="outline" onClick={() => setUploadOpen(true)} disabled={!onUploadPersonal || !userDepartmentId}><Upload className="size-[15px]" />上传个人 Skill</Button>
         </div>
-        {proposals.length === 0 ? (
-          <div className="mt-[12px] text-[13px] text-[#858b9c]">暂无待处理或已完成的写入提案。</div>
-        ) : (
-          <div className="mt-[12px] grid gap-[10px]">
-            {proposals.map((proposal) => {
-              const busy = proposalBusyId === proposal.proposal_id;
-              return (
-                <div
-                  key={proposal.proposal_id}
-                  data-mcp-write-proposal={proposal.proposal_id}
-                  className="rounded-[12px] border border-[#eceef3] p-[12px]"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-[8px]">
-                    <div className="text-[13px] font-medium text-[#18181a]">
-                      {proposal.slug} / {proposal.tool_name}
-                    </div>
-                    <Badge>{proposal.status}</Badge>
+        {personalLoaded && personalSkills.length > 0 && (
+          <div className="mt-[18px] rounded-[16px] border border-[#dce7fb] bg-[#f7faff] p-[16px]">
+            <div className="flex flex-wrap items-center justify-between gap-[6px]">
+              <h3 className="text-[13px] font-semibold text-[#274470]">我上传的 Skill</h3>
+              <span className="text-[11px] text-[#73819a]">审核启用后可添加；共享后同部门员工可自行订阅</span>
+            </div>
+            <div className="mt-[10px] grid gap-[8px]">
+              {personalSkills.map((skill) => (
+                <div key={skill.skill_ref} data-personal-skill={skill.skill_ref} className="flex flex-wrap items-center gap-[10px] rounded-[10px] border border-[#e2eafa] bg-white px-[13px] py-[10px]">
+                  <div className="min-w-0 flex-1">
+                    <p className="break-all text-[12px] font-medium text-[#273a59]">{skill.skill_ref} <span className="text-[11px] font-normal text-[#8995a9]">v{skill.version} · {skill.kind === 'executable' ? '执行型' : '文本型'}</span></p>
+                    {skill.summary && <p className="mt-[3px] line-clamp-1 text-[11px] text-[#758098]">{skill.summary}</p>}
+                    {skill.kind === 'executable' && skill.approval_state === 'draft' && <p className="mt-[3px] text-[11px] text-[#758098]">{skill.package_build_state === 'source_reviewed' ? '源包已审核，等待构建' : skill.package_build_state === 'built' ? '镜像已构建，等待审核' : '等待管理员审查源包'}</p>}
                   </div>
-                  <div className="mt-[6px] text-[12px] text-[#858b9c]">
-                    产物提示：{proposal.artifact_hint || '未声明'} · 参数摘要：{proposal.arguments_digest.slice(0, 12)}…
-                  </div>
-                  {proposal.error_code && (
-                    <div className="mt-[6px] text-[12px] text-[#d20b0b]">错误：{proposal.error_code}</div>
+                  <Badge variant={skill.approval_state === 'enabled' ? 'secondary' : 'outline'}>{PERSONAL_STATUS[skill.approval_state] ?? skill.approval_state}</Badge>
+                  {skill.approval_state === 'enabled' && skill.department_id === userDepartmentId && (
+                    <Button variant="outline" size="sm" disabled={sharingRef !== null || !onSharePersonal}
+                      onClick={() => onSharePersonal?.(skill, skill.share_scope !== 'department')}>
+                      {skill.share_scope === 'department' ? '停止部门共享' : '共享到部门'}
+                    </Button>
                   )}
-                  <div className="mt-[10px] flex flex-wrap gap-[8px]">
-                    {proposal.status === 'proposed' && onConfirmProposal && (
-                      <Button disabled={busy || !flags.write_enabled} onClick={() => onConfirmProposal(proposal)}>
-                        确认生成
-                      </Button>
-                    )}
-                    {proposal.status === 'proposed' && onRejectProposal && (
-                      <Button variant="outline" disabled={busy} onClick={() => onRejectProposal(proposal)}>
-                        拒绝
-                      </Button>
-                    )}
-                    {proposal.status === 'completed' && proposal.artifact_filename && onDownloadProposal && (
-                      <Button variant="outline" disabled={busy} onClick={() => onDownloadProposal(proposal)}>
-                        下载候选产物
-                      </Button>
-                    )}
-                  </div>
                 </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="mt-[20px] flex flex-wrap items-center justify-between gap-[10px]">
+          <p className="text-[12px] text-[#7c879a]">可用目录 · {skills.length} 项</p>
+          <div className="flex flex-wrap items-center gap-[10px]">
+            <label className="relative block max-[500px]:w-full">
+              <Search className="pointer-events-none absolute left-[11px] top-1/2 size-[15px] -translate-y-1/2 text-[#97a2b4]" />
+              <span className="sr-only">搜索 Skill</span>
+              <input type="search" value={skillQuery} onChange={(event) => setSkillQuery(event.target.value)} placeholder="搜索 Skill"
+                className="h-[36px] w-[210px] rounded-[9px] border border-[#e0e5ee] bg-white pl-[34px] pr-[10px] text-[13px] text-[#34445d] outline-none placeholder:text-[#9ba5b5] focus:border-[#6b9ae8] focus:ring-2 focus:ring-[#e5efff] max-[500px]:w-full" />
+            </label>
+            <Button variant={onlyAdded ? 'secondary' : 'outline'} size="sm" onClick={() => setOnlyAdded((value) => !value)} aria-pressed={onlyAdded}>仅看已添加</Button>
+          </div>
+        </div>
+        {!skillsLoaded ? (
+          <div className="mt-[20px] grid gap-[14px] lg:grid-cols-2"><Skeleton className="h-[198px] rounded-[16px]" /><Skeleton className="h-[198px] rounded-[16px]" /></div>
+        ) : visibleSkills.length === 0 ? (
+          <div className="mt-[20px] rounded-[16px] border border-dashed border-[#dce2eb] bg-white px-[24px] py-[48px] text-center text-[13px] text-[#858b9c]">
+            {skills.length === 0 ? '暂无可用的 Skill，管理员审核启用后会显示在这里。' : '没有找到符合条件的 Skill，试试其他关键词或取消筛选。'}
+          </div>
+        ) : (
+          <div className="mt-[20px] grid items-start gap-[14px] lg:grid-cols-2">
+            {visibleSkills.map((skill) => {
+              const isText = skill.kind === 'text';
+              const { title, summary } = skillDisplay(skill);
+              const isTesting = testingSkill === skill.skill_ref;
+              return (
+                <article key={skill.skill_ref} data-skill-catalog-item={skill.skill_ref} className="min-w-0 rounded-[16px] border border-[#e6eaf1] bg-white p-[20px] shadow-[0_3px_16px_rgba(28,45,75,0.04)]">
+                  <div className="flex items-start gap-[12px]">
+                    <div className={`flex size-[40px] shrink-0 items-center justify-center rounded-[11px] ${isText ? 'bg-[#ecf4ff] text-[#2864c7]' : 'bg-[#eef8f4] text-[#228666]'}`}>
+                      {isText ? <FileText className="size-[19px]" /> : <Code2 className="size-[19px]" />}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-start justify-between gap-[6px]">
+                        <h3 className="min-w-0 break-words text-[15px] font-semibold leading-[1.5] text-[#1d2a40]">{title}</h3>
+                        {skill.subscribed && <Badge variant="secondary" className="bg-[#eaf6ef] text-[#237a51]"><Check className="size-[12px]" />已添加</Badge>}
+                      </div>
+                      <p className="mt-[2px] break-all font-mono text-[11px] text-[#919bad]">{skill.skill_ref} · {skill.version}</p>
+                    </div>
+                  </div>
+                  <p className="mt-[14px] line-clamp-2 min-h-[42px] break-words text-[13px] leading-[1.65] text-[#536077]">{summary}</p>
+                  <div className="mt-[12px] flex flex-wrap items-center gap-[7px] text-[11px]">
+                    <span className={`rounded-full px-[9px] py-[4px] ${isText ? 'bg-[#f0f5ff] text-[#3768ae]' : 'bg-[#edf8f3] text-[#287a60]'}`}>{isText ? '文本参考' : '沙箱执行'}</span>
+                    <span className="text-[#858fa2]">{isText ? '添加后用于对话' : '添加后可在对话中调用或在此测试'}</span>
+                    {skill.is_owner && <span className="rounded-full bg-[#eef2fb] px-[9px] py-[4px] text-[#476a9f]">我的上传</span>}
+                    {skill.share_scope === 'department' && <span className="rounded-full bg-[#eef2fb] px-[9px] py-[4px] text-[#476a9f]">部门共享</span>}
+                  </div>
+                  {!isText && <p className="mt-[7px] truncate font-mono text-[11px] text-[#919bad]" title={skill.bundle_ref}>固定任务：{skill.bundle_ref}</p>}
+                  <div className="mt-[16px] flex flex-wrap items-center gap-[8px] border-t border-[#eef0f4] pt-[15px]">
+                    <Button variant={skill.subscribed ? 'outline' : 'default'} disabled={skillBusy !== null || !onToggleSkill} onClick={() => onToggleSkill?.(skill)}>
+                      {skill.subscribed ? '移除 Skill' : '添加 Skill'}
+                    </Button>
+                    {!isText && skill.subscribed && (
+                      <Button variant="outline" aria-expanded={isTesting} onClick={() => setTestingSkill(isTesting ? null : skill.skill_ref)}>
+                        <Play className="size-[14px]" />{isTesting ? '收起测试' : '测试 Skill'}
+                      </Button>
+                    )}
+                    {skill.description && <details className="w-full text-[12px] text-[#536077]"><summary className="w-fit cursor-pointer py-[3px] text-[#476a9f] hover:text-[#1d4ed8]">查看完整说明</summary><pre className="mt-[6px] max-h-[200px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-[#f7f9fc] p-[12px] font-sans leading-[1.6]">{skill.description}</pre></details>}
+                  </div>
+                  {!isText && skill.subscribed && isTesting && (
+                    <div className="mt-[14px] rounded-[12px] border border-[#e3e9f2] bg-[#f8faff] p-[14px]">
+                      <p className="text-[12px] text-[#64718a]">固定任务：<span className="break-all font-mono text-[#34445d]">{skill.bundle_ref}</span></p>
+                      <details className="mt-[10px] text-[12px] text-[#536077]"><summary className="w-fit cursor-pointer text-[#476a9f]">查看参数格式</summary><pre className="mt-[7px] max-h-[180px] overflow-auto whitespace-pre-wrap break-all rounded-[8px] bg-white p-[10px] font-mono">{JSON.stringify(skill.input_schema, null, 2)}</pre></details>
+                      <label className="mt-[12px] block text-[12px] font-medium text-[#464c5e]">JSON 参数
+                        <textarea data-skill-parameters={skill.skill_ref} spellCheck={false} value={skillParameters[skill.skill_ref] ?? '{}'} onChange={(event) => onSkillParametersChange?.(skill.skill_ref, event.target.value)}
+                          className="mt-[6px] block min-h-[90px] w-full rounded-[8px] border border-[#dfe5ef] bg-white p-[10px] font-mono text-[12px] outline-none focus:border-[#6b9ae8] focus:ring-2 focus:ring-[#e5efff]" />
+                      </label>
+                      <Button className="mt-[10px]" disabled={skillBusy !== null || !onRunSkill} onClick={() => onRunSkill?.(skill)}><Play className="size-[14px]" />在沙箱中运行</Button>
+                    </div>
+                  )}
+                </article>
               );
             })}
           </div>
         )}
+        {skillTask && (
+          <div className="mt-[18px] rounded-[16px] border border-[#dce6f7] bg-[#f6f9ff] p-[18px]" aria-live="polite">
+            <div className="text-[13px] font-medium text-[#243e68]">最近任务 · {skillTask.status}</div>
+            <div className="mt-[4px] break-all font-mono text-[11px] text-[#687894]">{skillTask.task_id}{skillTask.error_code ? ` · ${skillTask.error_code}` : ''}</div>
+            <div className="mt-[12px] flex flex-wrap gap-[8px]">
+              <Button variant="outline" size="sm" onClick={onRefreshSkillTask}><RefreshCw className="size-[13px]" />刷新状态</Button>
+              {skillArtifacts.filter((item) => item.state === 'committed').map((item) => (
+                <Button key={item.artifact_id} variant="outline" size="sm" onClick={() => onDownloadSkillArtifact?.(item)}><Download className="size-[13px]" />下载 {item.filename}</Button>
+              ))}
+            </div>
+          </div>
+        )}
       </section>
 
-      <section data-sandbox-skills className="mt-[20px] rounded-[16px] bg-white p-[18px] shadow-[0_2px_10px_rgba(0,0,0,0.05)]">
-        <h2 className="text-[15px] font-semibold text-[#18181a]">已审核的执行 Skill</h2>
-        <p className="mt-[4px] text-[12px] text-[#858b9c]">
-          添加审核通过的 Skill 后，可在临时沙箱中运行其构建镜像。
-        </p>
-        {skills.length === 0 ? (
-          <p className="mt-[12px] text-[13px] text-[#858b9c]">暂无可用的执行 Skill。</p>
+      <section id="extensions-mcp-panel" role="tabpanel" aria-labelledby="extensions-mcp-tab" hidden={activeSection !== 'mcp'} className="pt-[24px]">
+        <div className="flex flex-wrap items-end justify-between gap-[16px]">
+          <div>
+            <h2 className="text-[18px] font-semibold text-[#1d2a40]">MCP 服务</h2>
+            <p className="mt-[5px] text-[13px] text-[#758098]">订阅管理员登记的外部工具，按授权在对话中使用。</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-[10px]">
+            <label className="relative block max-[500px]:w-full"><Search className="pointer-events-none absolute left-[11px] top-1/2 size-[15px] -translate-y-1/2 text-[#97a2b4]" /><span className="sr-only">搜索 MCP 服务</span>
+              <input type="search" value={mcpQuery} onChange={(event) => setMcpQuery(event.target.value)} placeholder="搜索服务"
+                className="h-[36px] w-[210px] rounded-[9px] border border-[#e0e5ee] bg-white pl-[34px] pr-[10px] text-[13px] text-[#34445d] outline-none placeholder:text-[#9ba5b5] focus:border-[#6b9ae8] focus:ring-2 focus:ring-[#e5efff] max-[500px]:w-full" />
+            </label>
+            <Button variant={onlyAdded ? 'secondary' : 'outline'} size="sm" onClick={() => setOnlyAdded((value) => !value)} aria-pressed={onlyAdded}>仅看已订阅</Button>
+          </div>
+        </div>
+        <div data-mcp-egress-notice className="mt-[18px] flex gap-[12px] rounded-[12px] border border-[#f0dfb8] bg-[#fffbf2] px-[15px] py-[12px] text-[12px] leading-[1.6] text-[#785e2b]">
+          <ShieldCheck className="mt-[2px] size-[17px] shrink-0" />
+          <p><span className="font-semibold">数据外发说明：</span>调用外部服务时，查询内容会离开本系统并交给管理员登记的服务提供方；返回内容是不可信数据，不会进入知识库证据链，也不会获得引用编号。</p>
+        </div>
+        {!flags.enabled && <div data-mcp-disabled className="mt-[14px] rounded-[10px] bg-[#f3f5f9] px-[14px] py-[11px] text-[12px] text-[#64718a]">MCP 服务未启用（MCP_ENABLED=false），当前没有可订阅的 MCP 服务。</div>}
+        {flags.enabled && !flags.prerequisites_met && <div data-mcp-prerequisite className="mt-[14px] rounded-[10px] bg-[#fff4f2] px-[14px] py-[11px] text-[12px] text-[#b5352d]">扩展已开启但前置条件未满足：{flags.prerequisites_reason || '未知原因'}</div>}
+
+        {!loaded ? (
+          <div className="mt-[20px] grid gap-[14px] lg:grid-cols-2"><Skeleton className="h-[190px] rounded-[16px]" /><Skeleton className="h-[190px] rounded-[16px]" /></div>
+        ) : visibleServices.length === 0 ? (
+          <div data-mcp-empty className="mt-[20px] rounded-[16px] border border-dashed border-[#dce2eb] bg-white px-[24px] py-[48px] text-center text-[13px] text-[#858b9c]">
+            {items.length === 0 ? '暂无可订阅的扩展服务。管理员登记并启用服务后会出现在这里。' : '没有找到符合条件的服务，试试其他关键词或取消筛选。'}
+          </div>
         ) : (
-          <div className="mt-[12px] grid gap-[12px]">
-            {skills.map((skill) => (
-              <div key={skill.skill_ref} className="rounded-[12px] border border-[#eceef3] p-[12px]">
-                <div className="text-[13px] font-medium">{skill.skill_ref} · {skill.version}</div>
-                {skill.description && <p className="mt-[6px] whitespace-pre-wrap break-words text-[12px] text-[#464c5e]">{skill.description}</p>}
-                <div className="mt-[3px] text-[12px] text-[#858b9c]">固定任务：{skill.bundle_ref}</div>
-                <Button variant="outline" className="mt-[8px]" onClick={() => onToggleSkill?.(skill)}>
-                  {skill.subscribed ? '移除 Skill' : '添加 Skill'}
-                </Button>
-                {skill.subscribed && <Badge className="ml-[8px]">已添加</Badge>}
-                <details className="mt-[8px] text-[12px] text-[#464c5e]">
-                  <summary>查看参数格式</summary>
-                  <pre className="mt-[6px] max-h-[180px] overflow-auto whitespace-pre-wrap break-all">{JSON.stringify(skill.input_schema, null, 2)}</pre>
-                </details>
-                <label className="mt-[8px] block text-[12px] text-[#464c5e]">
-                  JSON 参数
-                  <textarea
-                    data-skill-parameters={skill.skill_ref}
-                    className="mt-[4px] block min-h-[64px] w-full rounded-[8px] border border-[#eceef3] p-[8px] font-mono"
-                    value={skillParameters[skill.skill_ref] ?? '{}'}
-                    onChange={(event) => onSkillParametersChange?.(skill.skill_ref, event.target.value)}
-                  />
-                </label>
-                <Button className="mt-[8px]" disabled={skillBusy !== null || !skill.subscribed || !onRunSkill} onClick={() => onRunSkill?.(skill)}>
-                  在沙箱中运行
-                </Button>
-              </div>
+          <div className="mt-[20px] grid items-start gap-[14px] lg:grid-cols-2">
+            {visibleServices.map((item) => (
+              <article key={item.slug} data-mcp-catalog-item={item.slug} className="min-w-0 rounded-[16px] border border-[#e6eaf1] bg-white p-[20px] shadow-[0_3px_16px_rgba(28,45,75,0.04)]">
+                <div className="flex items-start gap-[12px]">
+                  <div className="flex size-[40px] shrink-0 items-center justify-center rounded-[11px] bg-[#eef3fa] text-[#51729d]">{item.icon ? <span className="text-[19px]">{item.icon}</span> : <PlugZap className="size-[19px]" />}</div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-start justify-between gap-[6px]">
+                      <h3 className="min-w-0 break-words text-[15px] font-semibold leading-[1.5] text-[#1d2a40]">{item.name}</h3>
+                      {item.subscribed && <Badge data-mcp-subscribed={item.slug} variant="secondary" className="bg-[#eaf6ef] text-[#237a51]"><Check className="size-[12px]" />已订阅</Badge>}
+                    </div>
+                    <p className="mt-[2px] break-all font-mono text-[11px] text-[#919bad]">{item.slug}</p>
+                  </div>
+                </div>
+                {item.description && <p className="mt-[14px] line-clamp-3 break-words text-[13px] leading-[1.65] text-[#536077]">{item.description}</p>}
+                <div className="mt-[13px] flex flex-wrap items-center gap-[7px] text-[11px] text-[#798499]">
+                  <span className="rounded-full bg-[#f2f5f9] px-[9px] py-[4px]">工具 {item.tool_count} 个 · 只读 {item.read_only_tool_count} 个</span>
+                  {item.tags.map((tag) => <span key={tag} className="rounded-full bg-[#f2f5f9] px-[9px] py-[4px] text-[#536077]">{tag}</span>)}
+                </div>
+                <div className="mt-[16px] flex flex-wrap items-center gap-[12px] border-t border-[#eef0f4] pt-[15px]">
+                  {item.subscribed ? (
+                    <Button variant="outline" disabled={busySlug === item.slug} onClick={() => onUnsubscribe(item)}>退订</Button>
+                  ) : (
+                    <Button disabled={busySlug === item.slug || !flags.enabled} onClick={() => onSubscribe(item)}>订阅</Button>
+                  )}
+                  {item.subscribed && item.writable && !flags.write_enabled && <span className="text-[12px] text-[#858b9c]">该服务包含写工具，写通道当前未启用。</span>}
+                  {item.subscribed && item.writable && flags.write_enabled && (
+                    <label className="flex cursor-pointer items-center gap-[7px] text-[12px] text-[#464c5e]">
+                      <input type="checkbox" data-mcp-write-consent={item.slug} checked={item.allow_write} disabled={busySlug === item.slug} onChange={(event) => onToggleWrite(item, event.target.checked)} className="accent-[#2563eb]" />允许写操作（需管理员白名单）
+                    </label>
+                  )}
+                  {item.description && item.description.length > 140 && (
+                    <details className="w-full text-[12px] text-[#536077]"><summary className="w-fit cursor-pointer py-[3px] text-[#476a9f] hover:text-[#1d4ed8]">查看完整说明</summary><p className="mt-[6px] whitespace-pre-wrap break-words rounded-[9px] bg-[#f7f9fc] p-[12px] leading-[1.6]">{item.description}</p></details>
+                  )}
+                </div>
+              </article>
             ))}
           </div>
         )}
-        {skillTask && (
-          <div className="mt-[12px] rounded-[12px] border border-[#eceef3] p-[12px] text-[12px]">
-            <div>任务 {skillTask.task_id} · {skillTask.status}{skillTask.error_code ? ` · ${skillTask.error_code}` : ''}</div>
-            <Button variant="outline" className="mt-[8px]" onClick={onRefreshSkillTask}>刷新状态</Button>
-            {skillArtifacts.filter((item) => item.state === 'committed').map((item) => (
-              <Button key={item.artifact_id} variant="outline" className="ml-[8px] mt-[8px]" onClick={() => onDownloadSkillArtifact?.(item)}>
-                下载 {item.filename}
-              </Button>
-            ))}
-          </div>
+
+        {proposals.length > 0 && (
+          <section data-mcp-write-proposals className="mt-[24px] rounded-[16px] border border-[#e6eaf1] bg-white p-[20px]">
+            <div className="flex flex-wrap items-center justify-between gap-[10px]"><div><h3 className="text-[15px] font-semibold text-[#1d2a40]">写入提案</h3><p className="mt-[4px] text-[12px] text-[#858b9c]">候选产物必须先确认；确认前不会调用外部写工具，也不会修改原件。</p></div><Badge variant="secondary">{proposals.length} 条</Badge></div>
+            <div className="mt-[14px] grid gap-[10px]">
+              {proposals.map((proposal) => {
+                const busy = proposalBusyId === proposal.proposal_id;
+                return (
+                  <div key={proposal.proposal_id} data-mcp-write-proposal={proposal.proposal_id} className="rounded-[12px] border border-[#e7eaf1] p-[14px]">
+                    <div className="flex flex-wrap items-center justify-between gap-[8px]"><div className="break-all text-[13px] font-medium text-[#1d2a40]">{proposal.slug} / {proposal.tool_name}</div><Badge variant="outline">{proposal.status}</Badge></div>
+                    <div className="mt-[7px] break-all text-[12px] text-[#858b9c]">产物提示：{proposal.artifact_hint || '未声明'} · 参数摘要：{proposal.arguments_digest.slice(0, 12)}…</div>
+                    {proposal.error_code && <div className="mt-[6px] text-[12px] text-[#b5352d]">错误：{proposal.error_code}</div>}
+                    <div className="mt-[11px] flex flex-wrap gap-[8px]">
+                      {proposal.status === 'proposed' && onConfirmProposal && <Button disabled={busy || !flags.write_enabled} onClick={() => onConfirmProposal(proposal)}>确认生成</Button>}
+                      {proposal.status === 'proposed' && onRejectProposal && <Button variant="outline" disabled={busy} onClick={() => onRejectProposal(proposal)}>拒绝</Button>}
+                      {proposal.status === 'completed' && proposal.artifact_filename && onDownloadProposal && <Button variant="outline" disabled={busy} onClick={() => onDownloadProposal(proposal)}><Download className="size-[14px]" />下载候选产物</Button>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
         )}
       </section>
+
+      <Dialog open={uploadOpen} onOpenChange={(open) => { if (!open && !personalBusy) { setUploadOpen(false); setPersonalFile(null); } }}>
+        <DialogContent className="max-h-[86vh] max-w-[510px] overflow-y-auto p-[22px]">
+          <DialogHeader><DialogTitle>上传个人 Skill</DialogTitle></DialogHeader>
+          <p className="text-[13px] leading-[1.7] text-[#64718a]">上传后先由管理员审核；启用后你可以添加到对话，也可以共享给所属部门。</p>
+          <div className="mt-[12px] flex gap-[8px]" role="group" aria-label="Skill 类型">
+            <Button variant={personalKind === 'text' ? 'secondary' : 'outline'} aria-pressed={personalKind === 'text'} disabled={personalBusy} onClick={() => { setPersonalKind('text'); setPersonalFile(null); }}>文本型</Button>
+            <Button variant={personalKind === 'executable' ? 'secondary' : 'outline'} aria-pressed={personalKind === 'executable'} disabled={personalBusy} onClick={() => { setPersonalKind('executable'); setPersonalFile(null); }}>执行型</Button>
+          </div>
+          {personalKind === 'executable' && (
+            <div className="mt-[14px] space-y-[12px]">
+              <div className="grid gap-[10px] sm:grid-cols-2">
+                <div><Label htmlFor="personal-skill-name">Skill 名称</Label><Input id="personal-skill-name" className="mt-[6px]" value={personalName} onChange={(event) => setPersonalName(event.target.value)} placeholder="my-calculator" /><p className="mt-[4px] text-[11px] text-[#858b9c]">英文小写、数字及连字符</p></div>
+                <div><Label htmlFor="personal-skill-version">版本</Label><Input id="personal-skill-version" className="mt-[6px]" value={personalVersion} onChange={(event) => setPersonalVersion(event.target.value)} placeholder="1.0.0" /></div>
+              </div>
+              <div><Label htmlFor="personal-skill-schema">输入参数 JSON Schema</Label><textarea id="personal-skill-schema" value={personalSchema} onChange={(event) => setPersonalSchema(event.target.value)} rows={5} spellCheck={false} className="mt-[6px] w-full rounded-[8px] border border-[#e0e5ee] bg-white p-[9px] font-mono text-[12px] focus:border-[#6b9ae8] focus:outline-none" /></div>
+              <p className="text-[11px] leading-[1.6] text-[#73819a]">代码不会在上传时构建或运行；管理员审查源包后，才可交由独立 Runner 构建并继续审核镜像。</p>
+            </div>
+          )}
+          <div className="mt-[14px] rounded-[12px] border border-dashed border-[#cbd8ed] bg-[#f8faff] p-[16px]">
+            <Label htmlFor="personal-skill-zip">{personalKind === 'text' ? '文本 Skill ZIP' : '执行型 Skill ZIP'} · 不超过 8 MiB</Label>
+            <Input key={personalKind} id="personal-skill-zip" className="mt-[9px] bg-white" type="file" accept=".zip,application/zip"
+              onChange={(event) => setPersonalFile(event.target.files?.[0] ?? null)} />
+            <p className="mt-[8px] text-[11px] leading-[1.6] text-[#73819a]">{personalKind === 'text' ? '包含 SKILL.md（YAML name / description）和可选 Markdown 参考资料。' : '根目录包含 SKILL.md 与 entrypoint.py；可选 requirements.lock 须固定版本和 wheel SHA-256。'}同名 Skill 不能重复上传。</p>
+          </div>
+          <div className="mt-[20px] flex justify-end gap-[8px]">
+            <Button variant="outline" disabled={personalBusy} onClick={() => { setUploadOpen(false); setPersonalFile(null); }}>取消</Button>
+            <Button disabled={personalBusy || !personalFile || !onUploadPersonal} onClick={() => {
+              if (personalFile && onUploadPersonal) void onUploadPersonal(personalFile, {
+                kind: personalKind, name: personalName.trim(), version: personalVersion.trim(), inputSchema: personalSchema,
+              }).then((success) => {
+                if (success) { setUploadOpen(false); setPersonalFile(null); }
+              });
+            }}>{personalBusy ? '正在上传…' : '提交审核'}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-export default function ExtensionsPage({ auth, onLogout }: Props) {
+export default function ExtensionsPage({ auth }: Props) {
   const [flags, setFlags] = useState<McpListFlags>(EMPTY_FLAGS);
   const [items, setItems] = useState<McpCatalogItem[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [skillsLoaded, setSkillsLoaded] = useState(false);
   const [busySlug, setBusySlug] = useState<string | null>(null);
   const [proposals, setProposals] = useState<McpWriteProposal[]>([]);
   const [proposalBusyId, setProposalBusyId] = useState<string | null>(null);
   const [skills, setSkills] = useState<ExecutableSkill[]>([]);
+  const [personalSkills, setPersonalSkills] = useState<PersonalSkill[]>([]);
+  const [personalLoaded, setPersonalLoaded] = useState(false);
+  const [personalBusy, setPersonalBusy] = useState(false);
+  const [sharingRef, setSharingRef] = useState<string | null>(null);
   const [skillParameters, setSkillParameters] = useState<Record<string, string>>({});
   const [skillBusy, setSkillBusy] = useState<string | null>(null);
   const [skillTask, setSkillTask] = useState<SkillTask | null>(null);
@@ -354,6 +484,8 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
   const load = useCallback(() => {
     let cancelled = false;
     setLoaded(false);
+    setSkillsLoaded(false);
+    setPersonalLoaded(false);
     api
       .get<McpCatalogResponse>('/api/v1/plugins/mcp')
       .then((payload) => {
@@ -382,7 +514,14 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
       });
     api.get<{ items: ExecutableSkill[] }>('/api/v1/sandbox/skills/available')
       .then((payload) => { if (!cancelled) setSkills(payload.items); })
-      .catch(() => { if (!cancelled) setSkills([]); });
+      .catch((error) => {
+        if (!cancelled) notify.error(error instanceof Error ? error.message : '加载 Skill 失败');
+      })
+      .finally(() => { if (!cancelled) setSkillsLoaded(true); });
+    api.get<{ items: PersonalSkill[] }>('/api/v1/sandbox/skills/mine')
+      .then((payload) => { if (!cancelled) setPersonalSkills(payload.items); })
+      .catch((error) => { if (!cancelled) notify.error(error instanceof Error ? error.message : '加载个人 Skill 失败'); })
+      .finally(() => { if (!cancelled) setPersonalLoaded(true); });
     return () => {
       cancelled = true;
     };
@@ -439,9 +578,10 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
       flags={flags}
       items={items}
       loaded={loaded}
+      skillsLoaded={skillsLoaded}
+      personalLoaded={personalLoaded}
       busySlug={busySlug}
-      userName={auth.user.username}
-      onLogout={onLogout}
+      userDepartmentId={String(auth.user.department_id ?? '')}
       onRefresh={() => void load()}
       onSubscribe={(item) => run(item.slug, () => api.post(path(item.slug) + '/subscribe', {}), '已订阅')}
       onUnsubscribe={(item) => run(item.slug, () => api.delete(path(item.slug) + '/subscribe'), '已退订')}
@@ -479,6 +619,50 @@ export default function ExtensionsPage({ auth, onLogout }: Props) {
         )
       }
       skills={skills}
+      personalSkills={personalSkills}
+      personalBusy={personalBusy}
+      sharingRef={sharingRef}
+      onUploadPersonal={async (file, options) => {
+        if (file.size > 8 * 1024 * 1024) { notify.error('Skill ZIP 超过 8 MiB'); return false; }
+        let inputSchema: Record<string, unknown> = {};
+        if (options.kind === 'executable') {
+          if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(options.name) || !options.version) {
+            notify.error('请输入有效的 Skill 名称与版本'); return false;
+          }
+          try {
+            const parsed: unknown = JSON.parse(options.inputSchema);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('参数 Schema 必须是 JSON 对象');
+            inputSchema = parsed as Record<string, unknown>;
+          } catch (error) { notify.error(error instanceof Error ? error.message : '参数 Schema 不是有效 JSON'); return false; }
+        }
+        setPersonalBusy(true);
+        try {
+          const encoded = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result ?? '').split(',')[1] ?? '');
+            reader.onerror = () => reject(new Error('无法读取 Skill ZIP'));
+            reader.readAsDataURL(file);
+          });
+          await api.post(options.kind === 'text' ? '/api/v1/sandbox/skills/personal/text-packages' : '/api/v1/sandbox/skills/personal/packages',
+            options.kind === 'text' ? { package_base64: encoded } : {
+              package_base64: encoded, skill_name: options.name, version: options.version, input_schema: inputSchema,
+            });
+          notify.success('个人 Skill 已提交，等待管理员审核');
+          load();
+          return true;
+        } catch (error) {
+          notify.error(error instanceof Error ? error.message : '上传失败');
+          return false;
+        } finally { setPersonalBusy(false); }
+      }}
+      onSharePersonal={(skill, share) => {
+        setSharingRef(skill.skill_ref);
+        void api.post(`/api/v1/sandbox/skills/personal/${encodeURIComponent(skill.skill_ref)}/share`, {
+          share_to_department: share,
+        }).then(() => { notify.success(share ? '已共享给部门，成员可自行添加' : '已停止共享'); load(); })
+          .catch((error) => notify.error(error instanceof Error ? error.message : '共享设置失败'))
+          .finally(() => setSharingRef(null));
+      }}
       skillParameters={skillParameters}
       skillBusy={skillBusy}
       skillTask={skillTask}
