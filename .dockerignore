@@ -46,3 +46,15 @@ frontend/.env.*.local
 /docs
 /tests
 /benchmarks
+
+# --- 本地业务数据与备份（含真实机密数据，绝不进镜像）---
+# 与 .gitignore 对齐：这些目录只在本地磁盘上，不会进 Git 仓库，但 Docker 构建
+# 看的是磁盘而不是 Git，所以必须在这里显式排除，否则 `COPY . .` 会把真实硬件
+# 设计资料（AAA/）和数据库备份（backups/）一起写进镜像层。
+# 写成根级锚定（/AAA），避免误伤 src/ 下的同名目录。
+/AAA
+/backups
+# 备份产物：PostgreSQL dump 与离线镜像包。/backups 只挡目录，挡不住散落在根目录
+# 的导出文件；本条同时覆盖第 6 行的 deploy/docker/*.tar.gz。
+*.tar.gz
+*.dump
