@@ -5,10 +5,27 @@
 启动：
 
 ```bash
+export GRAFANA_ADMIN_PASSWORD='replace-with-a-strong-password'
+export PHOENIX_DB_PASSWORD='replace-with-a-different-strong-password'
 docker compose -f deploy/observability/docker-compose.yml up -d
 ```
 
-应用端将 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 `http://otel-collector:4317`（应用也在容器网络）或 `http://127.0.0.1:4317`（应用作为宿主机进程运行）。宿主机进程不能使用容器内的 `otel-collector` 域名。
+单机 Docker 生产部署（`deploy/docker`）默认用覆盖文件，一条命令同网络起全套：
+
+```bash
+cd deploy/docker
+docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+# 或：bash deploy/docker/quickstart.sh
+```
+
+本目录的独立 compose 适合观测栈单独部署、或放在另一台机器上。
+
+应用端将 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 `http://otel-collector:4317`（应用也接在同一容器网络）
+或 `http://127.0.0.1:4317`（应用作为宿主机进程运行）。宿主机进程不能使用容器内的 `otel-collector` 域名。
+
+`deploy/docker` 的生产编排通过覆盖文件把应用与观测栈放进同一个 Compose 网络，应用侧使用
+`http://otel-collector:4317`。资源受限环境可以显式使用
+`quickstart.sh --without-observability`，此时 API 不导出 OTLP。
 
 ```dotenv
 OBS_ENABLED=true
@@ -31,4 +48,4 @@ sudo bash deploy/observability/bypass-flclash-ports.sh --persist
 
 脚本只为 `3000` 和 `6006` 的新连接设置主路由标记，并保存当前 iptables 规则。执行后重新测试 `http://<服务器IP>:3000` 和 `http://<服务器IP>:6006`。
 
-默认不采集问题、回答、prompt、completion 或证据正文。需要在 Phoenix 查看完整内容时，将上述四个 `OBS_CAPTURE_*` 开关按需设为 `true`；`OBS_CONTENT_MAX_CHARS` 控制单个内容字段的最大长度。采集内容可能包含用户问题、模型上下文和知识库正文，启用前必须完成脱敏、访问控制和保留周期评审。Grafana 初始密码仅用于本地开发，请通过环境变量覆盖默认值。
+默认不采集问题、回答、prompt、completion 或证据正文。需要在 Phoenix 查看完整内容时，将上述四个 `OBS_CAPTURE_*` 开关按需设为 `true`；`OBS_CONTENT_MAX_CHARS` 控制单个内容字段的最大长度。采集内容可能包含用户问题、模型上下文和知识库正文，启用前必须完成脱敏、访问控制和保留周期评审。启动独立观测栈前必须设置 `GRAFANA_ADMIN_PASSWORD` 与 `PHOENIX_DB_PASSWORD`；编排不再提供默认口令。

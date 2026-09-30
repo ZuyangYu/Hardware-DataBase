@@ -22,7 +22,7 @@ from src.observability.metrics import (
     record_worker,
     set_queue_state,
 )
-from src.observability.worker_registry import heartbeat, register, unregister
+from src.observability.worker_registry import WorkerHeartbeat, heartbeat
 
 
 VALID_WORKER_ROLES = ("all", "chat", "authoring", "parse")
@@ -89,7 +89,6 @@ class HardwareWorker:
         self.role = resolve_worker_role(role)
         self.running = True
         self.worker_id = f"worker-{uuid.uuid4().hex}"
-        register(self.worker_id)
         self.auth = AuthService()
         self.conversations = ConversationService()
         self.pipeline = AppPipeline()
@@ -751,7 +750,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, worker.stop)
     signal.signal(signal.SIGINT, worker.stop)
     try:
-        worker.run_forever()
+        with WorkerHeartbeat(worker.worker_id, worker.role):
+            worker.run_forever()
     finally:
         try:
             from src.agents.tools.retrieval_executor import reset_retrieval_executor
@@ -769,7 +769,6 @@ def main() -> None:
             reset_mcp_runtime()
         except Exception:
             pass
-        unregister(worker.worker_id)
         shutdown_observability()
 
 

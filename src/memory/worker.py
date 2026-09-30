@@ -1074,7 +1074,10 @@ def main() -> None:
     signal.signal(signal.SIGTERM, worker.stop)
     signal.signal(signal.SIGINT, worker.stop)
     try:
-        worker.run_forever()
+        from src.observability.worker_registry import WorkerHeartbeat
+
+        with WorkerHeartbeat(worker.worker_id, "memory"):
+            worker.run_forever()
     finally:
         worker.stop()
         worker.close()

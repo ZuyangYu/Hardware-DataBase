@@ -159,12 +159,14 @@ LLM_BATCH_MAX_CONCURRENCY = int(os.getenv("LLM_BATCH_MAX_CONCURRENCY", "1"))
 LLM_QUEUE_TIMEOUT_SECONDS = int(os.getenv("LLM_QUEUE_TIMEOUT_SECONDS", "180"))
 LLM_QUEUE_WARN_SECONDS = int(os.getenv("LLM_QUEUE_WARN_SECONDS", "10"))
 LLM_STREAM_IDLE_TIMEOUT_SECONDS = int(os.getenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0"))
-# Agentic document authoring is default-off until the integration/migration
-# gates are approved.  The execution flag is separate from the chat-tool flag
-# so enabling a document schema does not accidentally expose it through the
-# conversation agent.
+# Agentic document authoring is built in and on by default.  Only documents
+# whose execution mode is explicitly ``external_agent`` use the deepagents
+# harness; everything else keeps ``internal_harness``/``deterministic_only``.
+# The harness degrades per field instead of failing when infrastructure is
+# unavailable.  The chat-tool flag stays separate so a document schema is not
+# implicitly exposed through the conversation agent.
 DOCUMENT_AUTHORING_AGENT_MODE_ENABLED = os.getenv(
-    "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "false"
+    "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 AGENT_DOCUMENT_TOOLS_ENABLED = os.getenv(
     "AGENT_DOCUMENT_TOOLS_ENABLED", "true"
@@ -202,8 +204,11 @@ CONVERSATION_ACTION_PLAN_MODE = os.getenv(
 ).strip().lower()
 if CONVERSATION_ACTION_PLAN_MODE not in {"off", "shadow", "enabled"}:
     CONVERSATION_ACTION_PLAN_MODE = "off"
+# Platform plumbing, not a product switch: the governed unified tool surface
+# is the default path.  Legacy assembly only remains for internal callers that
+# have no RequestContext.
 CONVERSATION_UNIFIED_TOOLS_ENABLED = _env_bool(
-    "CONVERSATION_UNIFIED_TOOLS_ENABLED", False
+    "CONVERSATION_UNIFIED_TOOLS_ENABLED", True
 )
 # Phase 0 planning is observational only.  Keep the shadow compiler and the
 # later execution path independently gated so a rollout can be measured and
@@ -404,11 +409,20 @@ RESOURCE_EXPORT_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_EXPORT_RESERVED_I
 RESOURCE_MEMORY_MAX_CONCURRENT = int(os.getenv("RESOURCE_MEMORY_MAX_CONCURRENT", "1"))
 RESOURCE_MEMORY_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MEMORY_RESERVED_INTERACTIVE", "0"))
 
-# MCP external plugins (外部插件): remote-only tool federation, default off.
-# Every key here is hot-reloadable at worker turn boundaries except the
-# credentials key, which is environment-only and never enters the config
-# write whitelist.
-MCP_ENABLED = _env_bool("MCP_ENABLED", False)
+# MCP external plugins (外部插件): remote-only tool federation.  The switch is
+# an emergency kill switch and defaults on: without a registered+enabled
+# server nothing connects, and visibility still requires department scope,
+# subscription and the external_tool.invoke capability.  Every key here is
+# hot-reloadable at worker turn boundaries except the credentials key, which
+# is environment-only and never enters the config write whitelist.
+MCP_ENABLED = _env_bool("MCP_ENABLED", True)
+# These are platform plumbing rather than product switches. An old .env may
+# still contain false values from the multi-switch rollout; once MCP is part
+# of the built-in production path, repair those values in memory so startup
+# and ordinary settings changes do not get trapped behind hidden prerequisites.
+if MCP_ENABLED:
+    CONVERSATION_UNIFIED_TOOLS_ENABLED = True
+    RESOURCE_GOVERNOR_ENABLED = True
 MCP_ALLOW_INSECURE_HTTP = _env_bool("MCP_ALLOW_INSECURE_HTTP", False)
 MCP_ALLOW_PRIVATE_HOSTS = _env_bool("MCP_ALLOW_PRIVATE_HOSTS", False)
 MCP_CONNECT_TIMEOUT_SECONDS = int(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
@@ -489,9 +503,10 @@ SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
     "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS", "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro"
 )
 # Text Skills are a separate, prompt-data-only catalog.  They have no runtime
-# capability and stay disabled until an operator explicitly enables reviewed
-# content; this switch does not enable sandbox execution.
-SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", False)
+# capability, so the catalog is on by default; nothing reaches a conversation
+# until an admin enables reviewed content and an employee subscribes.  Sandbox
+# execution still requires SANDBOX_ENABLED plus a validated Runner.
+SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
 
 # P0b shared retrieval executor: one bounded pool per process for document
 # batch retrieval; per-request fan-out and the RAG governor are separate.
@@ -576,6 +591,10 @@ WAITING_TURN_TIMEOUT_SCAN_SECONDS = float(os.getenv("WAITING_TURN_TIMEOUT_SCAN_S
 DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = os.getenv("DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES", "false").lower() == "true"
 DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS = os.getenv("DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS", "false").lower() == "true"
 DOCUMENT_AUTO_PUBLISH_VERIFIED = os.getenv("DOCUMENT_AUTO_PUBLISH_VERIFIED", "false").lower() == "true"
+# Upload endpoints pass bytes to parsers, so bound both the request read and the
+# downstream parser's maximum working set.
+DOCUMENT_TEMPLATE_MAX_BYTES = int(os.getenv("DOCUMENT_TEMPLATE_MAX_BYTES", str(50 * 1024 * 1024)))
+EVALUATION_DATASET_MAX_BYTES = int(os.getenv("EVALUATION_DATASET_MAX_BYTES", str(100 * 1024 * 1024)))
 
 # Chat attachments (会话附件): session-private, temporary, locally parsed data
 # sources. See docs/superpowers/specs/2026-09-03-local-chat-attachment-routing-design.md.
@@ -640,7 +659,10 @@ CHAT_ATTACHMENT_JOB_MAX_ATTEMPTS = int(os.getenv("CHAT_ATTACHMENT_JOB_MAX_ATTEMP
 # API, worker, Streamlit process and evaluation threads cannot drift apart.
 OBS_ENABLED = os.getenv("OBS_ENABLED", "true").lower() == "true"
 OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "hardware-database-api")
-OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+# Host processes use the published local Collector port.  Docker production
+# overrides this with the same-network service name in
+# docker-compose.observability.yml.
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
 OBS_ENVIRONMENT = os.getenv("OBS_ENVIRONMENT", "development")
 OBS_SERVICE_VERSION = os.getenv("OBS_SERVICE_VERSION", "0.1.0")
 OBS_TRACE_SAMPLE_RATIO = float(os.getenv("OBS_TRACE_SAMPLE_RATIO", "1.0"))
@@ -783,7 +805,7 @@ DEFAULT_VALUES = {
     "LLM_QUEUE_TIMEOUT_SECONDS": "180",
     "LLM_QUEUE_WARN_SECONDS": "10",
     "LLM_STREAM_IDLE_TIMEOUT_SECONDS": "0",
-    "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED": "false",
+    "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED": "true",
     "AGENT_DOCUMENT_TOOLS_ENABLED": "true",
     "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND": "sqlite",
     "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL": "",
@@ -796,7 +818,7 @@ DEFAULT_VALUES = {
     "DOCUMENT_TASK_ASSOCIATION_REQUIRED": "false",
     "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED": "false",
     "CONVERSATION_ACTION_PLAN_MODE": "off",
-    "CONVERSATION_UNIFIED_TOOLS_ENABLED": "false",
+    "CONVERSATION_UNIFIED_TOOLS_ENABLED": "true",
     "DOCUMENT_PLANNING_SHADOW_ENABLED": "false",
     "DOCUMENT_PLANNING_V2_ENABLED": "false",
     "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED": "false",
@@ -910,7 +932,7 @@ DEFAULT_VALUES = {
     "RESOURCE_EXPORT_RESERVED_INTERACTIVE": "0",
     "RESOURCE_MEMORY_MAX_CONCURRENT": "1",
     "RESOURCE_MEMORY_RESERVED_INTERACTIVE": "0",
-    "MCP_ENABLED": "false",
+    "MCP_ENABLED": "true",
     "MCP_ALLOW_INSECURE_HTTP": "false",
     "MCP_ALLOW_PRIVATE_HOSTS": "false",
     "MCP_CONNECT_TIMEOUT_SECONDS": "15",
@@ -941,7 +963,7 @@ DEFAULT_VALUES = {
     "SANDBOX_TASK_LEASE_SECONDS": "60",
     "SANDBOX_MAX_OUTPUT_BYTES": str(50 * 1024 * 1024),
     "SANDBOX_MAX_INPUT_BYTES": str(50 * 1024 * 1024),
-    "SKILLS_ENABLED": "false",
+    "SKILLS_ENABLED": "true",
     # Deployment-only sandbox identity/endpoints are intentionally excluded
     # from the ordinary config API; these defaults document the closed state.
     "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "false",
@@ -993,6 +1015,8 @@ DEFAULT_VALUES = {
     "CHAT_TURN_LEASE_RENEW_SECONDS": "15",
     "WAITING_TURN_MAX_SECONDS": "600",
     "WAITING_TURN_TIMEOUT_SCAN_SECONDS": "5",
+    "DOCUMENT_TEMPLATE_MAX_BYTES": str(50 * 1024 * 1024),
+    "EVALUATION_DATASET_MAX_BYTES": str(100 * 1024 * 1024),
     "CHAT_ATTACHMENTS_ENABLED": "true",
     "CHAT_ATTACHMENT_STORAGE_DIR": os.path.join(STORAGE_DIR, "chat_attachments"),
     "CHAT_ATTACHMENT_INDEX_DB_PATH": os.path.join(STORAGE_DIR, "chat_attachments.db"),
@@ -1035,7 +1059,7 @@ DEFAULT_VALUES = {
     "CHAT_ATTACHMENT_JOB_MAX_ATTEMPTS": "3",
     "OBS_ENABLED": "true",
     "OTEL_SERVICE_NAME": "hardware-database-api",
-    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector:4317",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4317",
     "OBS_ENVIRONMENT": "development",
     "OBS_SERVICE_VERSION": "0.1.0",
     "OBS_TRACE_SAMPLE_RATIO": "1.0",
@@ -1181,6 +1205,7 @@ def reload_settings():
     global CHAT_TURN_HEARTBEAT_TTL_SECONDS, CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS
     global CONVERSATION_SERIALIZE_SAME_THREAD, CHAT_TURN_LEASE_SECONDS, CHAT_TURN_LEASE_RENEW_SECONDS
     global WAITING_TURN_MAX_SECONDS, WAITING_TURN_TIMEOUT_SCAN_SECONDS
+    global DOCUMENT_TEMPLATE_MAX_BYTES, EVALUATION_DATASET_MAX_BYTES
     global CHAT_ATTACHMENTS_ENABLED, CHAT_ATTACHMENT_STORAGE_DIR, CHAT_ATTACHMENT_INDEX_DB_PATH
     global CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MAX_FILES_PER_SESSION
     global CHAT_ATTACHMENT_MAX_SESSION_BYTES, CHAT_ATTACHMENT_MAX_TENANT_BYTES, CHAT_ATTACHMENT_MAX_PAGES
@@ -1271,7 +1296,7 @@ def reload_settings():
     AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS = float(os.getenv("AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS", "1"))
     AGENT_RATE_LIMIT_MAX_DELAY_SECONDS = float(os.getenv("AGENT_RATE_LIMIT_MAX_DELAY_SECONDS", "16"))
     DOCUMENT_AUTHORING_AGENT_MODE_ENABLED = os.getenv(
-        "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "false"
+        "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "true"
     ).strip().lower() in {"1", "true", "yes", "on"}
     AGENT_DOCUMENT_TOOLS_ENABLED = os.getenv(
         "AGENT_DOCUMENT_TOOLS_ENABLED", "true"
@@ -1299,7 +1324,7 @@ def reload_settings():
     if CONVERSATION_ACTION_PLAN_MODE not in {"off", "shadow", "enabled"}:
         CONVERSATION_ACTION_PLAN_MODE = "off"
     CONVERSATION_UNIFIED_TOOLS_ENABLED = _env_bool(
-        "CONVERSATION_UNIFIED_TOOLS_ENABLED", False
+        "CONVERSATION_UNIFIED_TOOLS_ENABLED", True
     )
     DOCUMENT_PLANNING_SHADOW_ENABLED = _env_bool("DOCUMENT_PLANNING_SHADOW_ENABLED", False)
     DOCUMENT_PLANNING_V2_ENABLED = _env_bool("DOCUMENT_PLANNING_V2_ENABLED", False)
@@ -1401,7 +1426,12 @@ def reload_settings():
     RESOURCE_EXPORT_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_EXPORT_RESERVED_INTERACTIVE", "0"))
     RESOURCE_MEMORY_MAX_CONCURRENT = int(os.getenv("RESOURCE_MEMORY_MAX_CONCURRENT", "1"))
     RESOURCE_MEMORY_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MEMORY_RESERVED_INTERACTIVE", "0"))
-    MCP_ENABLED = _env_bool("MCP_ENABLED", False)
+    MCP_ENABLED = _env_bool("MCP_ENABLED", True)
+    if MCP_ENABLED:
+        # Keep the platform prerequisites automatic for both fresh and legacy
+        # environments. The public emergency kill switch remains authoritative.
+        CONVERSATION_UNIFIED_TOOLS_ENABLED = True
+        RESOURCE_GOVERNOR_ENABLED = True
     MCP_ALLOW_INSECURE_HTTP = _env_bool("MCP_ALLOW_INSECURE_HTTP", False)
     MCP_ALLOW_PRIVATE_HOSTS = _env_bool("MCP_ALLOW_PRIVATE_HOSTS", False)
     MCP_CONNECT_TIMEOUT_SECONDS = int(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
@@ -1467,7 +1497,7 @@ def reload_settings():
         "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS",
         "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro",
     )
-    SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", False)
+    SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
     SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
     RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
     RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
@@ -1535,6 +1565,8 @@ def reload_settings():
     CHAT_TURN_LEASE_RENEW_SECONDS = int(os.getenv("CHAT_TURN_LEASE_RENEW_SECONDS", "15"))
     WAITING_TURN_MAX_SECONDS = int(os.getenv("WAITING_TURN_MAX_SECONDS", "600"))
     WAITING_TURN_TIMEOUT_SCAN_SECONDS = float(os.getenv("WAITING_TURN_TIMEOUT_SCAN_SECONDS", "5"))
+    DOCUMENT_TEMPLATE_MAX_BYTES = int(os.getenv("DOCUMENT_TEMPLATE_MAX_BYTES", str(50 * 1024 * 1024)))
+    EVALUATION_DATASET_MAX_BYTES = int(os.getenv("EVALUATION_DATASET_MAX_BYTES", str(100 * 1024 * 1024)))
     CHAT_ATTACHMENTS_ENABLED = os.getenv("CHAT_ATTACHMENTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     CHAT_ATTACHMENT_STORAGE_DIR = _resolve_storage_path(
         os.getenv("CHAT_ATTACHMENT_STORAGE_DIR"), "chat_attachments"
@@ -1636,7 +1668,7 @@ def reload_settings():
     MEMORY_RETENTION_DAYS = os.getenv("MEMORY_RETENTION_DAYS", "")
     OBS_ENABLED = os.getenv("OBS_ENABLED", "true").lower() == "true"
     OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "hardware-database-api")
-    OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+    OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
     OBS_ENVIRONMENT = os.getenv("OBS_ENVIRONMENT", "development")
     OBS_SERVICE_VERSION = os.getenv("OBS_SERVICE_VERSION", "0.1.0")
     OBS_TRACE_SAMPLE_RATIO = float(os.getenv("OBS_TRACE_SAMPLE_RATIO", "1.0"))
@@ -1814,6 +1846,8 @@ _INT_SETTING_KEYS = frozenset({
     "CHAT_TURN_LEASE_SECONDS",
     "CHAT_TURN_LEASE_RENEW_SECONDS",
     "WAITING_TURN_MAX_SECONDS",
+    "DOCUMENT_TEMPLATE_MAX_BYTES",
+    "EVALUATION_DATASET_MAX_BYTES",
     "RESOURCE_QUEUE_MAX_DEPTH",
     "RESOURCE_PERMIT_LEASE_SECONDS",
     "CHAT_QUEUE_DEADLINE_SECONDS",
@@ -2151,28 +2185,7 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
     if _value("SANDBOX_ALLOW_DYNAMIC_INSTALL").lower() in {"1", "true", "yes", "on"}:
         raise ValueError("SANDBOX_ALLOW_DYNAMIC_INSTALL 当前阶段必须保持 false")
 
-    if _value("MCP_ENABLED").lower() in {"1", "true", "yes", "on"}:
-        # The MCP channel only exists on the unified tool path and relies on
-        # the resource governor for its independent mcp quota.  Refuse a
-        # configuration that would enable MCP but leave it unreachable or
-        # ungoverned, instead of failing silently at runtime.
-        if _value("CONVERSATION_UNIFIED_TOOLS_ENABLED").lower() not in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            raise ValueError(
-                "MCP_ENABLED=true 需要 CONVERSATION_UNIFIED_TOOLS_ENABLED=true，"
-                "否则外部插件不会出现在任何对话路径"
-            )
-        if _value("RESOURCE_GOVERNOR_ENABLED").lower() not in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            raise ValueError(
-                "MCP_ENABLED=true 需要 RESOURCE_GOVERNOR_ENABLED=true，"
-                "否则 MCP 调用没有独立配额"
-            )
+    # MCP's unified-tool and governor dependencies are enforced by the
+    # effective settings loader above. They are intentionally not validated
+    # as user-facing fields: legacy false values are repaired automatically
+    # and MCP_ENABLED remains the public emergency kill switch.

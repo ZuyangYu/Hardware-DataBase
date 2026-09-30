@@ -17,6 +17,12 @@ from src.core.concurrency.admission import reset_admission_controller
 
 
 @pytest.fixture(autouse=True)
+def _isolate_worker_readiness(monkeypatch):
+    # Unit API clients do not start real consumers. Deployment tests opt in.
+    monkeypatch.setenv("HDB_REQUIRED_WORKER_ROLES", "")
+
+
+@pytest.fixture(autouse=True)
 def _disable_admission_by_default():
     original = src.settings.ADMISSION_CONTROL_ENABLED
     src.settings.ADMISSION_CONTROL_ENABLED = False

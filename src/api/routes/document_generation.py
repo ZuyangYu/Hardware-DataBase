@@ -49,6 +49,23 @@ from src.document_authoring.template_analysis import TemplateMappingCorrection
 
 router = APIRouter(tags=["document-generation"])
 
+
+def _read_upload_limited(file: UploadFile, limit: int) -> bytes:
+    """Read a parser-bound upload in chunks and reject oversized bodies early."""
+    if limit <= 0:
+        raise HTTPException(status_code=413, detail="template upload is disabled")
+    total = 0
+    parts: list[bytes] = []
+    while True:
+        chunk = file.file.read(min(1024 * 1024, limit + 1 - total))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail=f"template file exceeds {limit} bytes")
+        parts.append(chunk)
+    return b"".join(parts)
+
 _DOCUMENT_DOWNLOAD_MEDIA_TYPES = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -153,7 +170,7 @@ def analyze_template(
     auth: AuthService = Depends(get_auth_service),
 ):
     ctx = _write_ctx(user, auth, kb)
-    content = file.file.read()
+    content = _read_upload_limited(file, int(src.settings.DOCUMENT_TEMPLATE_MAX_BYTES))
     try:
         analysis = pipeline.analyze_document_template(
             ctx, filename=file.filename or "template", content=content, template_name=template_name,

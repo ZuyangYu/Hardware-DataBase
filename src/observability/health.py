@@ -136,6 +136,8 @@ def _compute_ready() -> dict[str, Any]:
         "storage": _check_storage(),
         "sandbox": _check_sandbox(),
     }
+    if required_worker_roles():
+        dependencies["worker"] = _check_workers()
     if bool(getattr(settings, "REDIS_REQUIRED", True)):
         # Redis 是硬依赖：不可用即 not_ready（由编排/负载均衡摘流量）。
         dependencies["redis"] = _check_redis()
@@ -162,6 +164,25 @@ def _compute_ready() -> dict[str, Any]:
     }
 
 
+def required_worker_roles() -> set[str]:
+    value = os.getenv("HDB_REQUIRED_WORKER_ROLES", "chat,authoring,parse,export")
+    return {role.strip() for role in value.split(",") if role.strip()}
+
+
+def _check_workers() -> dict[str, Any]:
+    workers = list_workers()
+    available = {str(row.get("worker_type", "")) for row in workers}
+    if "all" in available or "hardware-worker" in available:
+        available.update({"chat", "authoring", "parse"})
+    missing = sorted(required_worker_roles() - available)
+    return {
+        "status": "degraded" if missing or not workers else "up",
+        "count": len(workers),
+        "missing_roles": missing,
+        "instances": workers,
+    }
+
+
 def _config_revision() -> str:
     try:
         return str(settings.CONFIG_REVISION or "")
@@ -170,11 +191,12 @@ def _config_revision() -> str:
 
 
 def _check_mcp() -> dict[str, Any]:
-    """Three-state MCP component for the System Status page.
+    """MCP component for the System Status page.
 
-    ``not_configured`` when the global switch is off; ``degraded`` when the
-    feature is on but unusable (prerequisites missing, store error, broken
-    credentials on an enabled server, or no enabled server); ``up`` otherwise.
+    ``not_configured`` when the emergency kill switch is off; ``idle`` when
+    the switch is on but no server is enabled yet; ``degraded`` when an
+    enabled server is unusable (prerequisites missing, store error, broken
+    credentials); ``up`` otherwise.
     """
 
     if not bool(getattr(settings, "MCP_ENABLED", False)):
@@ -204,8 +226,11 @@ def _check_mcp() -> dict[str, Any]:
             "write_enabled": bool(getattr(settings, "MCP_WRITE_ENABLED", False)),
         }
         if not enabled:
-            payload["status"] = "degraded"
-            payload["error"] = "no_enabled_server"
+            # Built in but idle: no enabled server means nothing connects, so
+            # this is not a degradation.  The master switch remains available
+            # as an emergency kill switch (that state reports not_configured).
+            payload["status"] = "idle"
+            payload["error"] = ""
             return payload
         payload["status"] = "up"
         return payload
@@ -257,8 +282,6 @@ def _check_sandbox() -> dict[str, Any]:
 
 
 def check_dependencies() -> dict[str, Any]:
-    workers = list_workers()
-    worker_status = "up" if workers else "degraded"
     ragflow_headers = {"Authorization": f"Bearer {settings.RAGFLOW_API_KEY}"} if settings.RAGFLOW_API_KEY else {}
     if settings.RAGFLOW_BASE_URL:
         ragflow = _probe_http(
@@ -280,7 +303,7 @@ def check_dependencies() -> dict[str, Any]:
         "database": _check_sqlite(),
         "control_plane": check_control_plane(),
         "storage": _check_storage(),
-        "worker": {"status": worker_status, "count": len(workers), "instances": workers},
+        "worker": _check_workers(),
         "redis": _check_redis(),
         "ragflow": ragflow,
         "llm": llm,

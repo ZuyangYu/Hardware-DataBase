@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import datetime, timezone
 
@@ -102,3 +103,43 @@ def list_workers(*, stale_after_seconds: int | None = None, db_path: str | None 
         return [dict(row) for row in rows]
     except Exception:
         return []
+
+
+class WorkerHeartbeat:
+    """Process liveness independent of task duration, including idle workers."""
+
+    def __init__(self, worker_id: str, role: str, *, db_path: str | None = None):
+        self.worker_id = worker_id
+        self.role = role
+        self.db_path = db_path
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self):
+        register(self.worker_id, worker_type=self.role, db_path=self.db_path)
+        self._thread = threading.Thread(target=self._run, name="worker-heartbeat", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        interval = max(1, min(10, int(settings.OBS_WORKER_STALE_SECONDS) / 3))
+        while not self._stop.wait(interval):
+            heartbeat(self.worker_id, db_path=self.db_path)
+
+    def __exit__(self, *_args):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        unregister(self.worker_id, db_path=self.db_path)
+
+
+def main() -> None:
+    """Container healthcheck: require a fresh heartbeat from this container."""
+    import sys
+
+    hostname = socket.gethostname()
+    sys.exit(0 if any(row["hostname"] == hostname for row in list_workers()) else 1)
+
+
+if __name__ == "__main__":
+    main()

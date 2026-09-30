@@ -460,6 +460,10 @@ def record_rag_zero_hit() -> None:
     counter("hdb.rag.zero_hit", description="RAG retrieval calls that returned no chunks")
 
 
+def record_rag_call() -> None:
+    counter("hdb.rag.calls", description="RAG retrieval calls")
+
+
 def record_job_phase(*, kind: str, phase: str, seconds: float) -> None:
     name = "hdb.job.wait_time" if phase == "wait" else "hdb.job.execution_time"
     histogram(
