@@ -11,8 +11,6 @@
 
 操作步骤见[外部扩展操作指南](../docs/mcp-plugins.md)。
 
-![外部扩展与安全运行框架](../assets/external-extensions-runtime.svg)
-
 ---
 
 ## 1. 概念与扩展类型

@@ -4,8 +4,6 @@ This directory documents the deployment boundary introduced by the HDB
 control-plane code. It is **not** a claim that the current development host
 has a production-safe sandbox runtime.
 
-![Hardware DataBase external extensions and secure runtime architecture](../../assets/external-extensions-runtime.svg)
-
 Related documentation: [administrator and employee operations](../../docs/mcp-plugins.md),
 [extension architecture](../../wiki/22-external-extensions.md),
 [Runner deployment](../sandbox-runner/README.md), and
