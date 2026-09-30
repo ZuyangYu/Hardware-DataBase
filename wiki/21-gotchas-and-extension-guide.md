@@ -291,7 +291,7 @@
 6. 测试：纯模型/组件的 renderToStaticMarkup 单测（无 jsdom）
 ```
 
-### 3.9 外部 MCP / Sandbox / Skill（默认关闭）
+### 3.9 外部 MCP / Sandbox / Skill（执行默认关闭；MCP 与文本 Skill 目录默认开启）
 
 外部扩展的控制面入口是 HDB API，但 HDB/API/Worker 不拥有 OCI/Docker
 控制权，也不启动第三方进程。`src/sandbox/client.py` 只调用部署级配置的

@@ -19,14 +19,27 @@ def _now() -> str:
 
 
 class TaskGraphStore:
-    def __init__(self, db_path: str | os.PathLike[str]):
-        self.db_path = str(db_path)
+    def __init__(self, db_path: str | os.PathLike[str] | None):
+        if db_path is None:
+            # PostgreSQL-backed authoring domains have no SQLite file.  Keep the
+            # store uninitialized and fail closed on first use instead of
+            # creating a file literally named "None" in the process CWD.
+            self.db_path: str | None = None
+            return
+        if not isinstance(db_path, (str, os.PathLike)):
+            raise TypeError("TaskGraphStore requires a path-like db_path")
+        self.db_path = os.fspath(db_path)
         parent = os.path.dirname(os.path.abspath(self.db_path))
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if not self.db_path:
+            raise RuntimeError(
+                "compiled task graphs require an explicit SQLite path; the "
+                "PostgreSQL authoring backend does not persist them yet"
+            )
         connection = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")

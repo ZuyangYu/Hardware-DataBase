@@ -4,7 +4,6 @@ import base64
 import hashlib
 import importlib.util
 import io
-import json
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -554,6 +553,87 @@ def test_revoked_skill_delete_endpoint_checks_role_state_and_clears_catalog(tmp_
         path = "/sandbox/skills/skill%2Fexample"
         assert client.delete(path).status_code == 409
         assert client.post(path + "/revoke").status_code == 200
-        assert client.delete(path).json() == {"deleted": True}
+        deleted = client.delete(path).json()
+        assert deleted["deleted"] is True
+        assert deleted["sources_purged"] == 0
         assert catalog.get("skill/example") is None
         assert client.delete(path).status_code == 404
+
+
+def test_skill_package_store_delete_is_path_safe(tmp_path):
+    store = SkillPackageStore(str(tmp_path / "source"))
+    raw = archive({"SKILL.md": "# Report", "entrypoint.py": "print('ok')\n"})
+    package = validate_skill_package(raw)
+    ref = store.save("skill/x", package, raw)
+    target = Path(store.root) / ref
+    assert target.exists()
+    assert store.delete(ref) is True
+    assert not target.exists()
+    assert store.delete("") is False
+    assert store.delete("../../etc/passwd") is False
+
+
+def test_delete_skill_purges_source_and_generated_bundle(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "SKILLS_ENABLED", True)
+    monkeypatch.setattr(routes, "_audit", lambda *a, **kw: None)
+    catalog = SkillCatalog(str(tmp_path / "tasks.db"))
+    packages = SkillPackageStore(str(tmp_path / "source"))
+    raw = archive({"SKILL.md": "---\nname: purge-me\ndescription: purge me\n---\n# guide\n"})
+    package = validate_text_skill_package(raw)
+    storage_ref = packages.save("skill/purge-me", package, raw)
+    purged: list[str] = []
+
+    class FakeClient:
+        def purge_generated_bundle(self, bundle_ref, *, envelope=None):
+            purged.append(bundle_ref)
+            return {"purged": True, "cleanup_pending": False}
+
+    item = SimpleNamespace(
+        text_storage_ref=storage_ref, package_storage_ref="",
+        execution_bundle_ref="bundle/skill-purge-me", version="v1",
+        content_digest="digest", package_archive_digest="", text_archive_digest="a" * 64,
+    )
+    monkeypatch.setattr(catalog, "delete_revoked", lambda ref: item)
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[current_user] = lambda: SimpleNamespace(
+        id=1, role="system_admin", username="admin", department_id=None,
+    )
+    app.dependency_overrides[routes.get_skill_catalog] = lambda: catalog
+    app.dependency_overrides[routes.get_skill_package_store] = lambda: packages
+    app.dependency_overrides[routes.get_sandbox_service_client] = lambda: FakeClient()
+    with TestClient(app) as client:
+        response = client.delete("/sandbox/skills/skill%2Fpurge-me")
+        assert response.status_code == 200, response.text
+        body = response.json()
+    assert body["sources_purged"] == 1
+    assert body["bundle_purged"] is True
+    assert body["cleanup_pending"] is False
+    assert purged == ["bundle/skill-purge-me"]
+    assert not (Path(packages.root) / storage_ref).exists()
+
+
+def test_failed_personal_upload_removes_orphan_package(tmp_path, monkeypatch):
+    monkeypatch.setattr(routes, "_audit", lambda *a, **kw: None)
+    catalog = SkillCatalog(str(tmp_path / "tasks.db"))
+    packages = SkillPackageStore(str(tmp_path / "source"))
+
+    def _conflict(**kwargs):
+        raise SkillStateConflict("race")
+
+    monkeypatch.setattr(catalog, "register", _conflict)
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[current_user] = lambda: SimpleNamespace(
+        id=2, role="employee", username="employee", department_id="17",
+    )
+    app.dependency_overrides[routes.get_skill_catalog] = lambda: catalog
+    app.dependency_overrides[routes.get_skill_package_store] = lambda: packages
+    raw = archive({"SKILL.md": "---\nname: race\ndescription: race\n---\n# x\n"})
+    with TestClient(app) as client:
+        response = client.post(
+            "/sandbox/skills/personal/text-packages",
+            json={"package_base64": base64.b64encode(raw).decode("ascii")},
+        )
+    assert response.status_code == 409, response.text
+    assert list(Path(packages.root).rglob("*.zip")) == []

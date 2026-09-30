@@ -30,13 +30,13 @@ type Props = {
   onLogout: () => void;
 };
 
-// 分组(对齐 settings.DEFAULT_VALUES)。值是 [key, 标签]。
-type FieldDef = [string, string];
-type Group = { title: string; fields: FieldDef[]; textarea?: boolean; hint?: string };
+// 分组(对齐 settings.DEFAULT_VALUES)。值是 [key, 标签, 可选渲染选项]。
+export type FieldDef = [string, string, { textarea?: boolean }?];
+export type Group = { title: string; fields: FieldDef[]; textarea?: boolean; hint?: string };
 
 export const GROUPS: Group[] = [
   {
-    title: 'RAGFlow 检索',
+    title: '检索',
     fields: [
       ['RAGFLOW_BASE_URL', 'Base URL'],
       ['RAGFLOW_API_KEY', 'API Key'],
@@ -45,10 +45,12 @@ export const GROUPS: Group[] = [
       ['RAGFLOW_TIMEOUT_SECONDS', '超时(秒)'],
       ['RAGFLOW_SIMILARITY_THRESHOLD', '相似度阈值'],
       ['RAGFLOW_VECTOR_WEIGHT', '向量权重'],
+      ['FINAL_TOP_K', 'Final Top K'],
+      ['AGENT_MAX_RETRIEVAL_ROUNDS', '最大检索轮数'],
     ],
   },
   {
-    title: '认证与会话',
+    title: '账号与会话',
     fields: [
       ['AUTH_DB_PATH', 'Auth DB 路径'],
       ['AUTH_DEFAULT_ADMIN_USERNAME', '默认管理员'],
@@ -57,7 +59,7 @@ export const GROUPS: Group[] = [
     ],
   },
   {
-    title: 'Agent 模型',
+    title: '模型与提示词',
     fields: [
       ['AGENT_LLM_PROVIDER', 'Provider (ollama/custom)'],
       ['AGENT_OLLAMA_BASE_URL', 'Ollama Base URL'],
@@ -78,33 +80,14 @@ export const GROUPS: Group[] = [
       ['LLM_QUEUE_WARN_SECONDS', '排队告警阈值(秒)'],
       ['LLM_STREAM_IDLE_TIMEOUT_SECONDS', '流空闲超时(秒, 0=关闭)'],
       ['WORKER_TURN_CONCURRENCY', 'Worker 轮次并发'],
+      ['SYSTEM_PROMPT', 'System Prompt', { textarea: true }],
+      ['NO_CONTEXT_PROMPT', 'No-Context Prompt', { textarea: true }],
     ],
   },
   {
-    title: 'Agent 检索',
+    title: '扩展（MCP，受管控）',
+    hint: '远程 MCP 默认开启；没有启用的服务时不发起任何连接，本开关仅作应急停用。平台前置自动开启，无需手动配置；凭据密钥 MCP_CREDENTIALS_KEY 只能写在 .env，配置接口不会返回或写入。',
     fields: [
-      ['FINAL_TOP_K', 'Final Top K'],
-      ['AGENT_MAX_RETRIEVAL_ROUNDS', '最大检索轮数'],
-    ],
-  },
-  {
-    title: '文档 Agent（受控灰度）',
-    fields: [
-      ['DOCUMENT_AUTHORING_AGENT_MODE_ENABLED', '启用 external_agent'],
-      ['AGENT_DOCUMENT_TOOLS_ENABLED', '启用聊天文档工具'],
-      ['DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND', 'Checkpointer 后端'],
-      ['DOCUMENT_AUTHORING_CHECKPOINTER_PATH', 'Checkpointer 路径'],
-      ['DOCUMENT_AUTHORING_JOB_LEASE_SECONDS', '文档任务租约(秒)'],
-      ['DOCUMENT_AUTHORING_JOB_BATCH_SIZE', '文档任务批量数'],
-      ['DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS', '文档任务时间预算(秒)'],
-    ],
-  },
-  {
-    title: '外部 MCP 扩展（受管控）',
-    hint: '启用 MCP_ENABLED 需同时开启统一工具路径与资源 governor；凭据密钥 MCP_CREDENTIALS_KEY 只能写在 .env，配置接口不会返回或写入。保存后热加载生效。',
-    fields: [
-      ['CONVERSATION_UNIFIED_TOOLS_ENABLED', 'MCP 前置：统一工具路径'],
-      ['RESOURCE_GOVERNOR_ENABLED', 'MCP 前置：资源 governor'],
       ['MCP_ENABLED', '启用外部 MCP 扩展'],
       ['MCP_WRITE_ENABLED', '启用写入通道（候选产物）'],
       ['MCP_ALLOW_INSECURE_HTTP', '允许 http://（非 https）'],
@@ -127,53 +110,58 @@ export const GROUPS: Group[] = [
       ['RESOURCE_MCP_RESERVED_INTERACTIVE', 'MCP 交互保留并发'],
     ],
   },
-  {
-    title: '可观测性',
-    fields: [
-      ['OBS_ENABLED', '启用观测'],
-      ['OTEL_SERVICE_NAME', '服务名'],
-      ['OTEL_EXPORTER_OTLP_ENDPOINT', 'OTLP Endpoint'],
-      ['OBS_ENVIRONMENT', '环境'],
-      ['OBS_SERVICE_VERSION', '服务版本'],
-      ['OBS_TRACE_SAMPLE_RATIO', 'Trace 采样率'],
-      ['OBS_CAPTURE_CONTENT', '允许采集内容'],
-      ['OBS_CAPTURE_QUERY', '允许采集问题'],
-      ['OBS_CAPTURE_EVIDENCE', '允许采集证据'],
-      ['OBS_CAPTURE_LLM_CONTENT', '允许采集 LLM 内容'],
-      ['OBS_CONTENT_MAX_CHARS', '内容最大长度'],
-      ['OBS_LOG_FORMAT', '日志格式'],
-      ['OBS_METRICS_ENABLED', '启用 Metrics'],
-      ['OBS_TRACES_ENABLED', '启用 Traces'],
-      ['OBS_LOGS_ENABLED', '启用 Logs'],
-      ['OBS_PHOENIX_PROJECT', 'Phoenix 项目'],
-      ['OBS_GRAFANA_BASE_URL', 'Grafana 地址'],
-      ['OBS_PHOENIX_BASE_URL', 'Phoenix 地址'],
-      ['OBS_WORKER_HEARTBEAT_INTERVAL_SECONDS', 'Worker 心跳间隔(秒)'],
-      ['OBS_WORKER_STALE_SECONDS', 'Worker 过期阈值(秒)'],
-      ['OBS_DEPENDENCY_TIMEOUT_SECONDS', '依赖探测超时(秒)'],
-    ],
-  },
-  {
-    title: '系统提示词',
-    textarea: true,
-    fields: [
-      ['SYSTEM_PROMPT', 'System Prompt'],
-      ['NO_CONTEXT_PROMPT', 'No-Context Prompt'],
-    ],
-  },
 ];
 
 const SECRET_KEYS = new Set(['RAGFLOW_API_KEY', 'AGENT_CUSTOM_API_KEY', 'AUTH_DEFAULT_ADMIN_PASSWORD']);
 
 /** 受控布尔开关:渲染 true/false 下拉,避免手输字符串。 */
 export const BOOLEAN_KEYS = new Set([
-  'CONVERSATION_UNIFIED_TOOLS_ENABLED',
-  'RESOURCE_GOVERNOR_ENABLED',
   'MCP_ENABLED',
   'MCP_WRITE_ENABLED',
   'MCP_ALLOW_INSECURE_HTTP',
   'MCP_ALLOW_PRIVATE_HOSTS',
 ]);
+
+/** 调参项：默认隐藏，避免把"永远用默认值"的旋钮摊在主视图。 */
+export const ADVANCED_KEYS = new Set([
+  'RAGFLOW_TIMEOUT_SECONDS',
+  'RAGFLOW_SIMILARITY_THRESHOLD',
+  'RAGFLOW_VECTOR_WEIGHT',
+  'AUTH_DB_PATH',
+  'AGENT_CUSTOM_MAX_TOKENS',
+  'AGENT_MODEL_MAX_INPUT_TOKENS',
+  'AGENT_TEMPERATURE',
+  'AGENT_TIMEOUT_SECONDS',
+  'AGENT_RATE_LIMIT_MAX_RETRIES',
+  'AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS',
+  'AGENT_RATE_LIMIT_MAX_DELAY_SECONDS',
+  'LLM_MAX_CONCURRENCY',
+  'LLM_BATCH_MAX_CONCURRENCY',
+  'LLM_QUEUE_TIMEOUT_SECONDS',
+  'LLM_QUEUE_WARN_SECONDS',
+  'LLM_STREAM_IDLE_TIMEOUT_SECONDS',
+  'WORKER_TURN_CONCURRENCY',
+  'AGENT_MAX_RETRIEVAL_ROUNDS',
+  'MCP_CONNECT_TIMEOUT_SECONDS',
+  'MCP_CALL_TIMEOUT_SECONDS',
+  'MCP_SSE_READ_TIMEOUT_SECONDS',
+  'MCP_MAX_RESULT_CHARS',
+  'MCP_MAX_RESULT_BYTES',
+  'MCP_MAX_ARGUMENT_CHARS',
+  'MCP_MAX_TOOLS_PER_SERVER',
+  'MCP_MAX_SERVERS_PER_RUN',
+  'MCP_CALLS_PER_TURN',
+  'MCP_FAILURE_COOLDOWN_SECONDS',
+  'MCP_WRITE_CONFIRM_TTL_SECONDS',
+  'MCP_MAX_ARTIFACT_BYTES',
+  'MCP_ARTIFACT_ALLOWED_EXTENSIONS',
+  'MCP_WRITE_MAX_ATTEMPTS',
+  'RESOURCE_MCP_MAX_CONCURRENT',
+  'RESOURCE_MCP_RESERVED_INTERACTIVE',
+]);
+
+/** 保存后需重启进程才生效的键（与后端 RESTART_REQUIRED_SETTINGS 子集对齐）。 */
+export const RESTART_REQUIRED_KEYS = new Set(['AUTH_DB_PATH']);
 
 const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
 
@@ -226,9 +214,164 @@ export const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: n
   RESOURCE_MCP_RESERVED_INTERACTIVE: { min: 0, max: 64, integer: true },
 };
 
+/** 分类内是否有未保存改动；掩码后的密钥视为未改动。 */
+export function groupDirty(
+  group: Group,
+  draft: Record<string, string>,
+  snapshot: Record<string, string>,
+): boolean {
+  return group.fields.some(([key]) => {
+    const value = draft[key] ?? '';
+    if (SECRET_KEYS.has(key) && value === '***') return false;
+    return value !== (snapshot[key] ?? '');
+  });
+}
+
+type ConfigGroupsPanelProps = {
+  groups: Group[];
+  activeGroup: string;
+  draft: Record<string, string>;
+  snapshot: Record<string, string>;
+  showAdvanced: boolean;
+  onSelectGroup: (title: string) => void;
+  onFieldChange: (key: string, value: string) => void;
+};
+
+/** 分类导航 + 单类面板；所有字段仍属于同一草稿，保存语义不变。 */
+export function ConfigGroupsPanel({
+  groups,
+  activeGroup,
+  draft,
+  snapshot,
+  showAdvanced,
+  onSelectGroup,
+  onFieldChange,
+}: ConfigGroupsPanelProps) {
+  return (
+    <div className="flex flex-col">
+      <nav
+        aria-label="配置分类"
+        className="flex gap-[2px] overflow-x-auto border-b border-[#eceef3]"
+      >
+        {groups.map((group, index) => {
+          const selected = group.title === activeGroup;
+          return (
+            <button
+              key={group.title}
+              id={`config-group-${index}-tab`}
+              type="button"
+              aria-controls={`config-group-${index}-panel`}
+              aria-pressed={selected}
+              onClick={() => onSelectGroup(group.title)}
+              className={cn(
+                'relative shrink-0 whitespace-nowrap border-b-2 px-[12px] py-[9px] text-[13px] font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1d4ed8]',
+                selected
+                  ? 'border-[#1d4ed8] text-[#1d4ed8]'
+                  : 'border-transparent text-[#858b9c] hover:text-[#464c5e]',
+              )}
+            >
+              {group.title}
+              {groupDirty(group, draft, snapshot) && (
+                <span
+                  aria-label="有未保存修改"
+                  title="有未保存修改"
+                  className="absolute right-[3px] top-[5px] size-[6px] rounded-full bg-[#e0871a]"
+                />
+              )}
+            </button>
+          );
+        })}
+      </nav>
+      {groups.map((group, index) => {
+        if (group.title !== activeGroup) return null;
+        return (
+          <div
+            key={group.title}
+            id={`config-group-${index}-panel`}
+            role="region"
+            aria-labelledby={`config-group-${index}-tab`}
+            className="flex min-w-0 flex-col gap-[12px] pt-[16px]"
+          >
+            {group.hint && <p className="text-[12px] text-[#858b9c]">{group.hint}</p>}
+            <div className="grid grid-cols-1 gap-[12px] sm:grid-cols-2 xl:grid-cols-3">
+              {group.fields
+                .filter(([key]) => showAdvanced || !ADVANCED_KEYS.has(key))
+                .map(([key, label, fieldOptions]) => (
+                <div
+                  key={key}
+                  className={cn('grid gap-[4px]', (group.textarea || fieldOptions?.textarea) && 'sm:col-span-2 xl:col-span-3')}
+                >
+                  <Label className="flex items-center gap-[6px] text-[11px] text-[#858b9c]">
+                    <span>
+                      {label} <span className="text-[#b3b8c4]">({key})</span>
+                    </span>
+                    {RESTART_REQUIRED_KEYS.has(key) && (
+                      <span className="rounded-[4px] bg-[#fdf3e3] px-[5px] py-[1px] text-[10px] text-[#a9701b]">
+                        重启生效
+                      </span>
+                    )}
+                  </Label>
+                  {BOOLEAN_KEYS.has(key) ? (
+                    <Select
+                      value={booleanDraftValue(draft[key])}
+                      onValueChange={(value) => onFieldChange(key, value)}
+                    >
+                      <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="true">true（启用）</SelectItem>
+                        <SelectItem value="false">false（关闭）</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  ) : key === 'AGENT_LLM_PROVIDER' ? (
+                    <Select value={String(draft[key] ?? 'ollama')} onValueChange={(value) => onFieldChange(key, value)}>
+                      <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="ollama">ollama</SelectItem>
+                        <SelectItem value="custom">custom</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  ) : group.textarea || fieldOptions?.textarea ? (
+                    <Textarea
+                      value={draft[key] ?? ''}
+                      onChange={(e) => onFieldChange(key, e.target.value)}
+                      className="min-h-[100px] rounded-[10px] border-[#e3e7f1] bg-white text-[13px]"
+                    />
+                  ) : (
+                    <Input
+                      type={NUMBER_FIELDS[key] ? 'number' : 'text'}
+                      min={NUMBER_FIELDS[key]?.min}
+                      max={NUMBER_FIELDS[key]?.max}
+                      step={NUMBER_FIELDS[key]?.step ?? (NUMBER_FIELDS[key]?.integer ? 1 : undefined)}
+                      value={draft[key] ?? ''}
+                      onChange={(e) => onFieldChange(key, e.target.value)}
+                      className="h-[36px] rounded-[10px] border-[#e3e7f1] bg-white text-[13px]"
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function ConfigPage({ auth, onLogout }: Props) {
   const [snapshot, setSnapshot] = useState<Record<string, string>>({});
   const [draft, setDraft] = useState<Record<string, string>>({});
+  const [activeGroup, setActiveGroup] = useState<string>(GROUPS[0]?.title ?? '');
+  const [showAdvanced, setShowAdvanced] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('hdb.config.showAdvanced') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [ragflowHealth, setRagflowHealth] = useState<RagflowHealthResponse | null>(null);
@@ -270,10 +413,23 @@ export default function ConfigPage({ auth, onLogout }: Props) {
     setDraft((prev) => ({ ...prev, [key]: value }));
   }
 
+  function toggleAdvanced() {
+    setShowAdvanced((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem('hdb.config.showAdvanced', String(next));
+      } catch {
+        // 隐私模式下 localStorage 不可用时忽略，仅影响记忆偏好。
+      }
+      return next;
+    });
+  }
+
   function visibleGroups(): Group[] {
     const provider = String(draft.AGENT_LLM_PROVIDER || 'ollama');
     return GROUPS.map((group) => {
-      if (group.title !== 'Agent 模型') return group;
+      // 按字段定位模型分组，避免与展示标题耦合。
+      if (!group.fields.some(([key]) => key === 'AGENT_LLM_PROVIDER')) return group;
       return {
         ...group,
         fields: group.fields.filter(([key]) => {
@@ -286,41 +442,48 @@ export default function ConfigPage({ auth, onLogout }: Props) {
     });
   }
 
-  function validateDraft(changes: Record<string, string>): string[] {
+  function validateDraft(changes: Record<string, string>): { key: string; message: string }[] {
     const view = { ...snapshot, ...draft, ...changes };
-    const errors: string[] = [];
+    const errors: { key: string; message: string }[] = [];
     const provider = String(view.AGENT_LLM_PROVIDER || 'ollama');
-    if (!['ollama', 'custom'].includes(provider)) errors.push('AGENT_LLM_PROVIDER 必须为 ollama 或 custom');
-    if (provider === 'ollama') {
-      if (!String(view.AGENT_OLLAMA_BASE_URL || '').trim()) errors.push('Agent Ollama Base URL 不能为空');
-      if (!String(view.AGENT_OLLAMA_MODEL || '').trim()) errors.push('Agent Ollama 模型不能为空');
-    } else {
-      if (!String(view.AGENT_CUSTOM_API_KEY || '').trim()) errors.push('Agent API Key 不能为空');
-      if (!String(view.AGENT_CUSTOM_BASE_URL || '').trim()) errors.push('Agent Base URL 不能为空');
-      if (!String(view.AGENT_CUSTOM_MODEL || '').trim()) errors.push('Agent LLM 模型不能为空');
+    if (!['ollama', 'custom'].includes(provider)) {
+      errors.push({ key: 'AGENT_LLM_PROVIDER', message: 'AGENT_LLM_PROVIDER 必须为 ollama 或 custom' });
     }
-    if (!String(view.RAGFLOW_BASE_URL || '').trim()) errors.push('RAGFlow Base URL 不能为空');
-    if (!String(view.RAGFLOW_API_KEY || '').trim()) errors.push('RAGFlow API Key 不能为空');
+    if (provider === 'ollama') {
+      if (!String(view.AGENT_OLLAMA_BASE_URL || '').trim()) {
+        errors.push({ key: 'AGENT_OLLAMA_BASE_URL', message: 'Agent Ollama Base URL 不能为空' });
+      }
+      if (!String(view.AGENT_OLLAMA_MODEL || '').trim()) {
+        errors.push({ key: 'AGENT_OLLAMA_MODEL', message: 'Agent Ollama 模型不能为空' });
+      }
+    } else {
+      if (!String(view.AGENT_CUSTOM_API_KEY || '').trim()) {
+        errors.push({ key: 'AGENT_CUSTOM_API_KEY', message: 'Agent API Key 不能为空' });
+      }
+      if (!String(view.AGENT_CUSTOM_BASE_URL || '').trim()) {
+        errors.push({ key: 'AGENT_CUSTOM_BASE_URL', message: 'Agent Base URL 不能为空' });
+      }
+      if (!String(view.AGENT_CUSTOM_MODEL || '').trim()) {
+        errors.push({ key: 'AGENT_CUSTOM_MODEL', message: 'Agent LLM 模型不能为空' });
+      }
+    }
+    if (!String(view.RAGFLOW_BASE_URL || '').trim()) {
+      errors.push({ key: 'RAGFLOW_BASE_URL', message: 'RAGFlow Base URL 不能为空' });
+    }
+    if (!String(view.RAGFLOW_API_KEY || '').trim()) {
+      errors.push({ key: 'RAGFLOW_API_KEY', message: 'RAGFlow API Key 不能为空' });
+    }
     for (const [key, rule] of Object.entries(NUMBER_FIELDS)) {
       const raw = String(view[key] ?? '').trim();
       if (raw === '') continue;
       const value = Number(raw);
       if (!Number.isFinite(value)) {
-        errors.push(`${key} 不是有效数字`);
+        errors.push({ key, message: `${key} 不是有效数字` });
         continue;
       }
-      if (rule.integer && !Number.isInteger(value)) errors.push(`${key} 必须为整数`);
-      if (value < rule.min) errors.push(`${key} 不能小于 ${rule.min}`);
-      if (rule.max != null && value > rule.max) errors.push(`${key} 不能大于 ${rule.max}`);
-    }
-    // 与后端 validate_provider_configuration 一致:MCP 依赖统一工具路径与 governor。
-    if (booleanDraftValue(view.MCP_ENABLED) === 'true') {
-      if (booleanDraftValue(view.CONVERSATION_UNIFIED_TOOLS_ENABLED) !== 'true') {
-        errors.push('MCP_ENABLED=true 需要 CONVERSATION_UNIFIED_TOOLS_ENABLED=true');
-      }
-      if (booleanDraftValue(view.RESOURCE_GOVERNOR_ENABLED) !== 'true') {
-        errors.push('MCP_ENABLED=true 需要 RESOURCE_GOVERNOR_ENABLED=true');
-      }
+      if (rule.integer && !Number.isInteger(value)) errors.push({ key, message: `${key} 必须为整数` });
+      if (value < rule.min) errors.push({ key, message: `${key} 不能小于 ${rule.min}` });
+      if (rule.max != null && value > rule.max) errors.push({ key, message: `${key} 不能大于 ${rule.max}` });
     }
     return errors;
   }
@@ -337,6 +500,9 @@ export default function ConfigPage({ auth, onLogout }: Props) {
   }
 
   async function handleSave() {
+    // The backend owns the hidden MCP platform prerequisites. Keep them out of
+    // the request entirely; the ordinary config API deliberately rejects
+    // those internal keys.
     const changes = changedKeys();
     if (Object.keys(changes).length === 0) {
       notify.info('没有改动');
@@ -344,7 +510,11 @@ export default function ConfigPage({ auth, onLogout }: Props) {
     }
     const errors = validateDraft(changes);
     if (errors.length > 0) {
-      notify.error(errors[0]);
+      const first = errors[0];
+      // 校验错误可能落在其他分类:自动切换到对应分类，避免看不到出错的字段。
+      const target = visibleGroups().find((group) => group.fields.some(([key]) => key === first.key));
+      if (target) setActiveGroup(target.title);
+      notify.error(first.message);
       return;
     }
     setSaving(true);
@@ -391,12 +561,13 @@ export default function ConfigPage({ auth, onLogout }: Props) {
   }
 
   const dirty = Object.keys(changedKeys()).length > 0;
+  const groups = visibleGroups();
 
   return (
     <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
       <AppHeader
         title="系统配置"
-        description="编辑运行时配置(写入 .env 并热加载)。仅白名单键可修改。"
+        description="编辑运行时配置(写入 .env 并热加载)；标有「重启生效」的项需重启进程。仅白名单键可修改，调参项可点「显示高级设置」。"
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap items-center justify-between gap-[12px]">
@@ -408,6 +579,18 @@ export default function ConfigPage({ auth, onLogout }: Props) {
           <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')} onClick={probeLlm} disabled={probing === 'llm'}>
             <AppIcon name="refresh" size={13} />
             探测 LLM
+          </Button>
+          <Button
+            variant="outline"
+            aria-pressed={showAdvanced}
+            className={cn(
+              OUTLINE_ACTION_BUTTON_CLASS,
+              'h-[34px]',
+              showAdvanced && 'border-[#1d4ed8] text-[#1d4ed8] hover:text-[#1d4ed8]',
+            )}
+            onClick={toggleAdvanced}
+          >
+            {showAdvanced ? '隐藏高级设置' : '显示高级设置'}
           </Button>
         </div>
         <div className="flex items-center gap-[8px]">
@@ -462,62 +645,16 @@ export default function ConfigPage({ auth, onLogout }: Props) {
           ))}
         </div>
       ) : (
-        <div className="flex flex-col gap-[20px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
-          {visibleGroups().map((group) => (
-            <div key={group.title} className="flex flex-col gap-[12px]">
-              <h3 className="text-[14px] font-semibold text-[#18181a]">{group.title}</h3>
-              {group.hint && <p className="-mt-[6px] text-[12px] text-[#858b9c]">{group.hint}</p>}
-              <div className={cn('grid gap-[12px]', group.textarea ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-2')}>
-                {group.fields.map(([key, label]) => (
-                  <div key={key} className="grid gap-[4px]">
-                    <Label className="text-[11px] text-[#858b9c]">
-                      {label} <span className="text-[#b3b8c4]">({key})</span>
-                    </Label>
-                    {BOOLEAN_KEYS.has(key) ? (
-                      <Select
-                        value={booleanDraftValue(draft[key])}
-                        onValueChange={(value) => setField(key, value)}
-                      >
-                        <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="true">true（启用）</SelectItem>
-                          <SelectItem value="false">false（关闭）</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    ) : key === 'AGENT_LLM_PROVIDER' ? (
-                      <Select value={String(draft[key] ?? 'ollama')} onValueChange={(value) => setField(key, value)}>
-                        <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="ollama">ollama</SelectItem>
-                          <SelectItem value="custom">custom</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    ) : group.textarea ? (
-                      <Textarea
-                        value={draft[key] ?? ''}
-                        onChange={(e) => setField(key, e.target.value)}
-                        className="min-h-[100px] rounded-[10px] border-[#e3e7f1] bg-white text-[13px]"
-                      />
-                    ) : (
-                      <Input
-                        type={NUMBER_FIELDS[key] ? 'number' : 'text'}
-                        min={NUMBER_FIELDS[key]?.min}
-                        max={NUMBER_FIELDS[key]?.max}
-                        step={NUMBER_FIELDS[key]?.step ?? (NUMBER_FIELDS[key]?.integer ? 1 : undefined)}
-                        value={draft[key] ?? ''}
-                        onChange={(e) => setField(key, e.target.value)}
-                        className="h-[36px] rounded-[10px] border-[#e3e7f1] bg-white text-[13px]"
-                      />
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
+        <div className="rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
+          <ConfigGroupsPanel
+            groups={groups}
+            activeGroup={activeGroup}
+            draft={draft}
+            snapshot={snapshot}
+            showAdvanced={showAdvanced}
+            onSelectGroup={setActiveGroup}
+            onFieldChange={setField}
+          />
         </div>
       )}
       <ConfirmDialog

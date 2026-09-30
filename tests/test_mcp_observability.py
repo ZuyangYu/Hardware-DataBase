@@ -215,7 +215,7 @@ class McpHealthTests(_McpTestBase):
         self.assertEqual(component["status"], "degraded")
         self.assertEqual(component["error"], "governor_disabled")
 
-    def test_degraded_when_no_enabled_server(self):
+    def test_idle_when_no_enabled_server(self):
         self.store.create(
             slug="idle",
             name="未启用",
@@ -224,8 +224,10 @@ class McpHealthTests(_McpTestBase):
             created_by="admin",
         )
         component = _check_mcp()
-        self.assertEqual(component["status"], "degraded")
-        self.assertEqual(component["error"], "no_enabled_server")
+        # Built-in feature: the switch is on but nothing is enabled yet, which
+        # is idle rather than degraded.
+        self.assertEqual(component["status"], "idle")
+        self.assertEqual(component["error"], "")
         self.assertEqual(component["servers"], 1)
         self.assertEqual(component["enabled"], 0)
 

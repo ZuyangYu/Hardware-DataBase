@@ -67,8 +67,8 @@ describe('SkillsPanelView', () => {
     expect(markup).toContain('data-skill-detail');
     expect(markup).toContain('skill/report');
     expect(markup).toContain('aria-pressed="true"');
-    expect(markup).toContain('上传 Skill');
-    expect(markup).toContain('文本 Skill');
+    expect(markup).toContain('上传执行型 Skill');
+    expect(markup).toContain('导入文本 Skill');
     expect(markup).not.toContain('id="skill-package"');
     expect(markup).not.toContain('id="text-skill-content"');
     expect(markup).toContain('bundle/report');
@@ -116,6 +116,8 @@ describe('SkillsPanelView', () => {
     expect(markup).toContain('审核构建镜像');
     expect(markup).toContain('审核 Skill');
     expect(markup).toContain('管理员人工标记');
+    expect(markup).toContain('data-skill-next-action');
+    expect(markup).toContain('data-skill-more-actions');
   });
 
   it('offers deletion only on revoked Skills', () => {

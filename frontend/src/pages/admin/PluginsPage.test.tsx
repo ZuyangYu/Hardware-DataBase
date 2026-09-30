@@ -167,7 +167,7 @@ describe('ServerFormFields', () => {
         onCancel={() => undefined}
       />,
     );
-    expect(markup).toContain('留空即保留已保存凭据');
+    expect(markup).toContain('编辑时留空会保留已保存凭据');
     expect(markup).toContain('data-mcp-clear-headers');
     // The credential value is never echoed back into the form.
     expect(markup).not.toContain('secret-value');
@@ -187,5 +187,26 @@ describe('ServerFormFields', () => {
     );
     expect(markup).toContain('登记');
     expect(markup).not.toContain('data-mcp-clear-headers');
+    expect(markup).toContain('data-mcp-advanced');
+    expect(markup).toContain('data-mcp-form-scroll');
+    expect(markup).toContain('data-mcp-form-footer');
+    expect(markup).toContain('服务名称');
+    expect(markup).toContain('服务地址');
+    expect(markup).toContain('访问凭据');
+    expect(markup).not.toContain('SSE（旧服务兼容，已弃用）');
+  });
+
+  it('only offers deprecated SSE as an existing-service compatibility option', () => {
+    const markup = renderToStaticMarkup(
+      <ServerFormFields
+        initial={{ ...server, transport: 'sse' }}
+        departments={[]}
+        submitting={false}
+        onSubmit={() => undefined}
+        onCancel={() => undefined}
+      />,
+    );
+    expect(markup).toContain('SSE（旧服务兼容，已弃用）');
+    expect(markup).toContain('data-mcp-advanced');
   });
 });

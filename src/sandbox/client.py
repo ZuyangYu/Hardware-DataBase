@@ -323,6 +323,23 @@ class SandboxServiceClient:
             },
         )
 
+    def purge_generated_bundle(
+        self, bundle_ref: str, *, envelope: RequestEnvelope | None = None
+    ) -> dict[str, Any]:
+        """Ask the Runner to remove one generated Skill bundle and its image."""
+        ref = _path_part(bundle_ref)
+        if not ref.startswith("bundle/skill-"):
+            raise SandboxProtocolError(
+                "only generated Skill bundles can be purged", code="invalid_reference"
+            )
+        return self._request(
+            "runner",
+            "POST",
+            f"/generated-bundles/{ref}/purge",
+            envelope=envelope,
+            payload={"bundle_ref": ref},
+        )
+
     def reconcile(self, task_id: str = "", *, envelope: RequestEnvelope | None = None) -> dict[str, Any]:
         suffix = f"/{_path_part(task_id)}" if task_id else ""
         return self._request("runner", "POST", f"/reconcile{suffix}", envelope=envelope)

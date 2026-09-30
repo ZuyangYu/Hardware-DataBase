@@ -97,6 +97,7 @@ HDB only calls these authenticated JSON endpoints (prefix `/v1` by default):
 | POST | `/v1/tasks/{task_id}/cancel` | request cancellation |
 | POST | `/v1/tasks/{task_id}/collect` | collect output manifest/bytes |
 | POST | `/v1/reconcile[/{task_id}]` | reconcile unknown executions |
+| POST | `/v1/generated-bundles/{bundle_ref}/purge` | remove a generated Skill bundle + image (only when no unfinished task references it) |
 | GET | `/v1/gateway/health` | gateway health |
 | POST | `/v1/gateway/attach` | attach a reviewed deployment/profile |
 | POST | `/v1/gateway/{deployment_ref}/invoke` | invoke an allowlisted tool |

@@ -4,7 +4,8 @@
 `src/api/routes/sandbox.py`、`src/observability/metrics.py`；独立服务位于
 `deploy/mcp-gateway/` 与 `deploy/sandbox-runner/`。
 
-> 新环境默认关闭 MCP、Skill 与 Sandbox 执行。仓库包含已做真实运行时验证的 dev-l1
+> 新环境沙箱执行默认关闭；MCP 与文本 Skill 目录默认开启（无已登记服务时不发起任何连接，
+> 写入等风险项仍默认关闭）。仓库包含已做真实运行时验证的 dev-l1
 > 参考部署，但这不等于生产多租户或不可信代码的安全验收。配置和风险边界以
 > [`deploy/mcp-sandbox/README.md`](../deploy/mcp-sandbox/README.md) 为准。
 
@@ -29,6 +30,9 @@
 远程 MCP 与 Sandbox MCP 要区分：前者由 HDB 的 MCP 客户端直接连远程 HTTP 服务；后者的
 MCP transport/session 由独立 Gateway 承载，服务进程容器由独立 Runner 管理。HDB API、Worker
 和 Agent Runner 都不启动第三方进程，也不接触 OCI/Docker socket。
+
+> `transport=sse` 属于旧版 HTTP+SSE 传输，已被 Streamable HTTP 取代并在后续 MCP 规范修订中
+> 标记为 Deprecated；新登记请使用 `streamable_http`，已有 SSE 服务仅作兼容保留。
 
 ## 2. 组件职责与信任边界
 
@@ -158,13 +162,17 @@ Broker 校验 manifest、哈希、路径/归档安全、task/owner/department AC
 后的产物可预览或下载；任务只在结果校验通过后标为 `succeeded`。内置 `scanner://builtin/basic-v1`
 是结构检查，不等同杀毒或生产级内容扫描器。
 
+生命周期尾端：删除已撤销的 Skill 时，HDB 清理原始上传包，并调用 Runner 的
+`POST /v1/generated-bundles/{ref}/purge` 回收生成 bundle 与固定镜像（有未完成任务时 Runner 拒绝；
+回收未确认时标记 `cleanup_pending`）。历史任务与审计记录保留。
+
 ## 6. 开关与部署状态
 
 | 功能 | 关键开关 | 默认值 | 说明 |
 |---|---|---|---|
-| 远程 MCP | `MCP_ENABLED` | `false` | 还要求统一工具路径、资源 governor 等前置条件 |
+| 远程 MCP | `MCP_ENABLED` | `true` | 应急停用；无已启用服务时 `idle`、不连接；平台前置已由默认配置满足 |
 | MCP 写工具 | `MCP_WRITE_ENABLED` | `false` | 另需工具白名单、员工同意和 `external_tool.write` |
-| Skill catalog | `SKILLS_ENABLED` | `false` | 控制文本 Skill 与 Skill 发现/提示注入 |
+| Skill catalog | `SKILLS_ENABLED` | `true` | 目录与文本 Skill 提示注入默认开启；审核+订阅后才生效，不承载执行能力 |
 | Sandbox task | `SANDBOX_ENABLED` | `false` | 执行型 Skill；必须配置 `SANDBOX_BACKEND=runner_api` 和独立 Runner |
 | Sandbox MCP Gateway | `SANDBOX_GATEWAY_ENABLED` | `false` | 必须配置独立 Gateway/Runner、身份和策略 attestation |
 
@@ -206,3 +214,19 @@ Artifact Scanner 引用。HDB 只接受运维控制的这些配置；策略校�
 
 扩展整个仓库时还应遵守 [21 · 已知陷阱与扩展指南](21-gotchas-and-extension-guide.md) 中的权限、审计、
 幂等、fail-closed 和测试要求。
+
+---
+
+## 9. 设计决策记录（本阶段）
+
+- **控制面归属**：HDB API/Worker/Agent Runner/Gateway 均不接触 OCI 控制面，Sandbox Runner 是唯一
+  运行时控制面；登记、授权、审计留在 HDB，运行实例的创建/取消/回收只发生在 Runner（见 §2）。
+- **存储**：sandbox 控制面（task/skill/bundle/授权/artifact）保持 SQLite 单写者 + 受控 `storage/`，
+  本阶段不随控制面 PostgreSQL 收敛迁移；多实例/HA 前必须重新评审并单独记录。
+- **服务身份**：dev-l1 使用 0600 长期服务令牌 + audience 校验（fail-closed）；mTLS 或短时工作负载
+  身份列入 L2/L3 生产门禁。
+- **构建依赖**：仅接受版本 + SHA-256 锁定的 wheel，Runner 独立复核索引主机；构建容器有内存/CPU
+  上限，任务容器默认无网。构建阶段的出网范围属于已记录的残余风险，L2/L3 缺口以
+  [`deploy/mcp-sandbox/README.md`](../deploy/mcp-sandbox/README.md) 为准。
+- **员工执行型 Skill**：员工上传只保存源码，不构建不执行；管理员逐包审核后由 Runner 构建，bundle
+  与 Skill 分别审核启用；L1 档位下第三方代码的生产使用仍为 NO-GO（见 §6）。
