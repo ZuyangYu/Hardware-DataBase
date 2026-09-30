@@ -684,16 +684,18 @@ class AppLogService:
         return [(row["action"], int(row["cnt"])) for row in rows if row["action"]]
 
     def audit_recent_daily(self, viewer: AuthUser, days: int = 7) -> list[tuple[str, int]]:
-        """近 N 日每日审计事件计数（按本地日期分组），员工只看本部门。
+        """近 N 日每日审计事件计数（按 UTC 日期分组），员工只看本部门。
 
-        created_at 存的是 UTC ISO 串；用 SQLite 的 substr 取日期前 10 位即可按日聚合。
+        created_at 存的是 UTC ISO 串；取前 10 位即按日聚合。日期下界在 Python 里
+        算好再作为参数传入：SQLite 的 datetime('now', ...) 在 PostgreSQL 上不存在。
         """
         where, params = scoped_where(viewer)
-        params.append(days)
+        cutoff = (datetime.fromisoformat(utc_now()) - timedelta(days=days)).isoformat()
+        params.append(cutoff)
         sql = (
             f"SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS cnt "
             f"FROM audit_events WHERE {' AND '.join(where)} "
-            f"AND created_at >= datetime('now', '-' || ? || ' days') "
+            f"AND created_at >= ? "
             f"GROUP BY day ORDER BY day ASC"
         )
         with closing(self._connect()) as conn:

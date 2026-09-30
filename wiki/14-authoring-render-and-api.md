@@ -401,8 +401,8 @@ run 租约 claim/心跳/栅栏/重试排队、`resolve_harness_human_decision` �
 
 | 标志 | 默认 | 作用 |
 |---|---|---|
-| `DOCUMENT_AUTHORING_AGENT_MODE_ENABLED` | false | external_agent 特性门（第 3 道门） |
-| `AGENT_DOCUMENT_TOOLS_ENABLED` | false | chat 内文档工具 |
+| `DOCUMENT_AUTHORING_AGENT_MODE_ENABLED` | true | external_agent 特性门（第 3 道门，逐字段可降级） |
+| `AGENT_DOCUMENT_TOOLS_ENABLED` | true | chat 内文档工具 |
 | `DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND/_PATH/_DATABASE_URL` | sqlite / `storage/document_authoring_checkpoints.sqlite` / `""` | 生成侧 checkpointer |
 | `DOCUMENT_TASK_WRITE_ENABLED` / `_READ_ENABLED` / `_STREAM_ENABLED` / `_ASSOCIATION_REQUIRED` | true/true/true/false | 任务投影写/读/SSE |
 | `DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED` | false | 预检中的需求解析快照 |

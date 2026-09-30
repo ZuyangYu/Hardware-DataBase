@@ -64,3 +64,15 @@ def test_graph_store_validates_persisted_identity_and_creates_schema(tmp_path: P
 
     with pytest.raises(ValueError, match="hash"):
         store.get(graph.graph_id, graph.version, graph.graph_hash, tenant_id="tenant-a", user_id="user-a")
+
+
+def test_graph_store_without_a_path_never_creates_a_file(tmp_path: Path, monkeypatch) -> None:
+    """PG-backed authoring passes None; no file literally named "None" may appear."""
+    monkeypatch.chdir(tmp_path)
+    store = TaskGraphStore(None)
+    assert store.db_path is None
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(RuntimeError, match="explicit SQLite path"):
+        store.put(_graph(), tenant_id="tenant-a", user_id="user-a")
+    with pytest.raises(TypeError):
+        TaskGraphStore(object())  # type: ignore[arg-type]

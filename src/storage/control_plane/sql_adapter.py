@@ -118,6 +118,23 @@ class PgSqlAdapterConnection:
     def _sql(sql: str) -> str:
         text = str(sql).replace("BEGIN IMMEDIATE", "BEGIN")
         text = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", text, flags=re.I)
+        # SQLite 的 datetime(...) 在 PostgreSQL 上不存在，按三种实际用法翻译：
+        #   datetime('now', X)   -> (now() + CAST(X AS interval))   例如 '-7 days' / '-' || ? || ' days'
+        #   datetime('now')      -> now()
+        #   datetime(<列名>)      -> CAST(<列名> AS timestamptz)      text 列(ISO 串)与 timestamptz 列都适用
+        text = re.sub(
+            r"datetime\(\s*'now'\s*,\s*([^()]+?)\s*\)",
+            r"(now() + CAST(\1 AS interval))",
+            text,
+            flags=re.I,
+        )
+        text = re.sub(r"datetime\(\s*'now'\s*\)", "now()", text, flags=re.I)
+        text = re.sub(
+            r"datetime\(\s*([A-Za-z_][\w.]*)\s*\)",
+            r"CAST(\1 AS timestamptz)",
+            text,
+            flags=re.I,
+        )
         # All INSERT OR IGNORE statements in the ported repositories have no
         # RETURNING clause; append the equivalent PostgreSQL conflict action.
         if (

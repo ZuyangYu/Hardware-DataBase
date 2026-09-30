@@ -345,7 +345,7 @@ class AuthService:
     def _ensure_default_admin(self):
         username = src.settings.AUTH_DEFAULT_ADMIN_USERNAME
         password = src.settings.AUTH_DEFAULT_ADMIN_PASSWORD
-        if not password or password == "admin123":
+        if not password or password == "admin123" or len(password) < 8:
             raise RuntimeError("AUTH_DEFAULT_ADMIN_PASSWORD must be set to a non-default strong password.")
         with closing(self._connect()) as conn:
             dept = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchone()
@@ -441,6 +441,8 @@ class AuthService:
             raise ValueError("用户名不能为空")
         if not password:
             raise ValueError("密码不能为空")
+        if len(password) < 8:
+            raise ValueError("密码长度不能少于 8 位")
         if role not in VALID_ROLES:
             raise ValueError("角色必须为 system_admin 或 employee")
 

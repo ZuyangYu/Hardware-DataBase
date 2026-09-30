@@ -60,6 +60,12 @@ _CAPABILITY_KINDS = {
     "document.release.request": "release",
     "document.scope.resolve": "document",
     "result.export": "export",
+    # External MCP plugins: tools that leave the local evidence boundary and
+    # therefore get their own capability kind.  ``external_tool.write`` is the
+    # phase-2 candidate-artifact channel and is deployed only when the write
+    # switch is on.
+    "external_tool.invoke": "external",
+    "external_tool.write": "external",
 }
 
 _ACTION_ALIASES = {
@@ -206,6 +212,17 @@ def deployed_capabilities_from_settings() -> set[str]:
                 "document.rebase",
                 "document.release.request",
             })
+    # MCP only exists on the unified tool path and relies on the resource
+    # governor for its independent quota; a half-enabled deployment must not
+    # advertise a capability that cannot execute.
+    if (
+        bool(getattr(settings, "MCP_ENABLED", False))
+        and bool(getattr(settings, "CONVERSATION_UNIFIED_TOOLS_ENABLED", False))
+        and bool(getattr(settings, "RESOURCE_GOVERNOR_ENABLED", False))
+    ):
+        deployed.add("external_tool.invoke")
+        if bool(getattr(settings, "MCP_WRITE_ENABLED", False)):
+            deployed.add("external_tool.write")
     return deployed
 
 
@@ -218,6 +235,8 @@ def authorized_capabilities_for_conversation(
     has_task: bool,
     has_candidate_artifact: bool = False,
     allow_document_write: bool = True,
+    has_mcp_access: bool = False,
+    has_mcp_write_access: bool = False,
 ) -> set[str]:
     """Derive capability grants from already authenticated turn facts.
 
@@ -271,6 +290,15 @@ def authorized_capabilities_for_conversation(
             "document.revise",
             "document.release.request",
         })
+    # The caller resolves the server snapshot (role/department/subscription)
+    # before capability computation, so this only mirrors an already
+    # authenticated turn fact; it cannot widen visibility by itself.
+    if has_mcp_access:
+        authorized.add("external_tool.invoke")
+    # Write access additionally requires the user's per-server consent (the
+    # caller derives it from the resolved snapshot, never from the model).
+    if has_mcp_access and has_mcp_write_access:
+        authorized.add("external_tool.write")
     return authorized
 
 

@@ -68,6 +68,8 @@ class DependencyAggregationTests(unittest.TestCase):
             mock.patch.object(health, "_check_storage", return_value={"status": "up"}),
             mock.patch.object(health, "check_control_plane", return_value={"status": "up"}),
             mock.patch.object(health, "_probe_http", return_value={"status": "up"}),
+            # MCP 由独立开关控制，本套件不依赖本机 .env 是否启用该特性。
+            mock.patch.object(health, "_check_mcp", return_value={"status": "not_configured"}),
         )
         for patcher in patchers:
             patcher.start()

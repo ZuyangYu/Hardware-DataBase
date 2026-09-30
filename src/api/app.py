@@ -7,11 +7,10 @@ modules. The Streamlit app and any later frontend become HTTP clients of it.
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.errors import install_error_handlers
@@ -34,9 +33,11 @@ from src.api.routes import (
     memories,
     notifications,
     parse_tasks,
+    plugins,
     query,
     exports,
     status,
+    sandbox,
     structured,
     upload,
     users,
@@ -44,6 +45,7 @@ from src.api.routes import (
 )
 from src.observability import init_observability, instrument_fastapi, shutdown_observability
 from src.observability.health import check_dependencies, check_live, check_ready
+from src.api.worker_supervisor import WorkerSupervisor
 
 
 def _should_spawn_worker() -> bool:
@@ -136,75 +138,83 @@ async def lifespan(app: FastAPI):
     _harden_storage_permissions()
     _prune_query_traces_once()
 
-    worker_proc: subprocess.Popen | None = None
-    export_worker_proc: subprocess.Popen | None = None
-    memory_worker_proc: subprocess.Popen | None = None
-    worker_log_file = None
-    export_log_file = None
-    memory_log_file = None
+    modules = []
     if _should_spawn_worker():
-        log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "worker.log")
-        worker_log_file = open(log_path, "ab", buffering=0)
-        worker_proc = subprocess.Popen(
-            [sys.executable, "-m", "src.workers.main"],
-            cwd=src.settings.BASE_DIR,
-            stdout=worker_log_file,
-            stderr=worker_log_file,
-        )
-        print(f"[hardware-database] spawned parse worker pid={worker_proc.pid} log={log_path}")
+        modules.append("src.workers.main")
     if os.getenv("HDB_API_SPAWN_EXPORT_WORKER", "1").lower() not in {"0", "false", "no", "off"}:
-        log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        export_log_path = os.path.join(log_dir, "export-worker.log")
-        export_log_file = open(export_log_path, "ab", buffering=0)
-        export_worker_proc = subprocess.Popen(
-            [sys.executable, "-m", "src.result_exports.worker"],
-            cwd=src.settings.BASE_DIR,
-            stdout=export_log_file,
-            stderr=export_log_file,
-        )
-        print(f"[hardware-database] spawned export worker pid={export_worker_proc.pid} log={export_log_path}")
+        modules.append("src.result_exports.worker")
     if _should_spawn_memory_worker():
-        log_dir = os.path.join(src.settings.STORAGE_DIR, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        memory_log_path = os.path.join(log_dir, "memory-worker.log")
-        memory_log_file = open(memory_log_path, "ab", buffering=0)
-        memory_worker_proc = subprocess.Popen(
-            [sys.executable, "-m", "src.memory.worker"],
-            cwd=src.settings.BASE_DIR,
-            stdout=memory_log_file,
-            stderr=memory_log_file,
-        )
-        print(f"[hardware-database] spawned memory worker pid={memory_worker_proc.pid} log={memory_log_path}")
+        modules.append("src.memory.worker")
+    supervisor = WorkerSupervisor(modules, src.settings.BASE_DIR)
+    sandbox_dispatcher = None
+    sandbox_reconciler = None
+    sandbox_client = None
+    if bool(getattr(src.settings, "SANDBOX_ENABLED", False)) or bool(
+        getattr(src.settings, "SANDBOX_GATEWAY_ENABLED", False)
+    ):
+        # Constructing this dependency never opens a remote connection.  It
+        # only succeeds when deployment injected an authenticated identity
+        # provider; otherwise the optional loops stay stopped and health can
+        # report the closed/degraded state without weakening the API boundary.
+        try:
+            from src.sandbox.dependencies import get_service_client
+
+            sandbox_client = get_service_client()
+            if sandbox_client is not None and bool(getattr(src.settings, "SANDBOX_ENABLED", False)):
+                from src.sandbox.artifact_broker import ArtifactBroker
+                from src.sandbox.artifacts import build_registered_scanner
+                from src.sandbox.catalog import SandboxCatalog
+                from src.sandbox.reconciler import SandboxReconciler, SandboxReconcilerLoop
+                from src.sandbox.service import SandboxDispatcherLoop, SandboxExecutionAdapter
+                from src.sandbox.task_store import SandboxTaskStore
+
+                sandbox_store = SandboxTaskStore()
+                sandbox_catalog = SandboxCatalog(sandbox_store.db_path)
+                sandbox_broker = ArtifactBroker(scanner=build_registered_scanner())
+                sandbox_adapter = SandboxExecutionAdapter(
+                    store=sandbox_store,
+                    catalog=sandbox_catalog,
+                    broker=sandbox_broker,
+                    client=sandbox_client,
+                )
+                sandbox_dispatcher = SandboxDispatcherLoop(
+                    sandbox_adapter,
+                    interval_seconds=float(
+                        getattr(src.settings, "SANDBOX_DISPATCH_INTERVAL_SECONDS", 2.0)
+                    ),
+                )
+                sandbox_reconciler = SandboxReconcilerLoop(
+                    SandboxReconciler(
+                        store=sandbox_store,
+                        client=sandbox_client,
+                        broker=sandbox_broker,
+                    ),
+                    interval_seconds=float(
+                        getattr(src.settings, "SANDBOX_RECONCILE_INTERVAL_SECONDS", 30.0)
+                    ),
+                )
+                sandbox_dispatcher.start()
+                sandbox_reconciler.start()
+                print("[hardware-database] sandbox dispatcher/reconciler started")
+            elif bool(getattr(src.settings, "SANDBOX_ENABLED", False)):
+                print("[hardware-database] sandbox loops not started: authenticated client is unavailable")
+        except Exception as exc:  # pragma: no cover - startup remains fail-closed
+            print(f"[hardware-database] sandbox loops not started: {exc}")
     try:
+        supervisor.start()
         yield
     finally:
-        if worker_proc is not None and worker_proc.poll() is None:
-            worker_proc.terminate()
-            try:
-                worker_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                worker_proc.kill()
-        if export_worker_proc is not None and export_worker_proc.poll() is None:
-            export_worker_proc.terminate()
-            try:
-                export_worker_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                export_worker_proc.kill()
-        if memory_worker_proc is not None and memory_worker_proc.poll() is None:
-            memory_worker_proc.terminate()
-            try:
-                memory_worker_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                memory_worker_proc.kill()
-        if worker_log_file is not None:
-            worker_log_file.close()
-        if memory_log_file is not None:
-            memory_log_file.close()
-        if export_log_file is not None:
-            export_log_file.close()
+        supervisor.stop()
+        if sandbox_dispatcher is not None:
+            sandbox_dispatcher.stop()
+        if sandbox_reconciler is not None:
+            sandbox_reconciler.stop()
+        try:
+            from src.sandbox.dependencies import close_service_client
+
+            close_service_client()
+        except Exception:  # pragma: no cover - teardown is best-effort
+            pass
         try:
             from src.agents.tools.retrieval_executor import reset_retrieval_executor
 
@@ -213,6 +223,12 @@ async def lifespan(app: FastAPI):
                     getattr(src.settings, "RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS", 10)
                 )
             )
+        except Exception:  # pragma: no cover - teardown is best-effort
+            pass
+        try:
+            from src.agents.mcp.client import reset_mcp_runtime
+
+            reset_mcp_runtime()
         except Exception:  # pragma: no cover - teardown is best-effort
             pass
         shutdown_observability()
@@ -279,7 +295,9 @@ def create_app() -> FastAPI:
     app.include_router(logs.router, prefix=api_v1)
     app.include_router(memories.router, prefix=api_v1)
     app.include_router(notifications.router, prefix=api_v1)
+    app.include_router(plugins.router, prefix=api_v1)
     app.include_router(status.router, prefix=api_v1)
+    app.include_router(sandbox.router, prefix=api_v1)
     app.include_router(evaluation.router, prefix=api_v1)
     app.include_router(structured.router, prefix=api_v1)
 
@@ -292,8 +310,18 @@ def create_app() -> FastAPI:
         return check_live()
 
     @app.get("/health/ready", tags=["health"])
-    def health_ready() -> dict:
-        return check_ready()
+    def health_ready() -> JSONResponse:
+        result = check_ready()
+        # Detailed errors, roles and filesystem paths belong to /system/status.
+        public = {
+            "status": result["status"],
+            "config_revision": result.get("config_revision", ""),
+            "dependencies": {
+                name: {"status": item["status"]}
+                for name, item in result.get("dependencies", {}).items()
+            },
+        }
+        return JSONResponse(public, status_code=200 if result["status"] == "ready" else 503)
 
     @app.get("/health/dependencies", tags=["health"])
     def health_dependencies(_viewer=Depends(require_system_admin)) -> dict:
@@ -311,4 +339,8 @@ def main() -> None:
 
     host = os.getenv("HDB_API_HOST", "127.0.0.1")
     port = int(os.getenv("HDB_API_PORT", "8001"))
-    uvicorn.run("src.api.app:app", host=host, port=port)
+    uvicorn.run(
+        "src.api.app:app", host=host, port=port,
+        proxy_headers=True,
+        forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1"),
+    )

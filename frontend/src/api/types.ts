@@ -1514,3 +1514,123 @@ export type IcdScopeReview = {
   exceptions?: IcdScopeException[];
   [k: string]: unknown;
 } | null;
+
+// ---------------------------------------------------------------------------
+// 外部 MCP 扩展（受治理的外部工具联邦）
+
+export type McpServerView = {
+  slug: string;
+  name: string;
+  description: string;
+  transport: string;
+  url: string;
+  headers: Record<string, string>;
+  has_credentials: boolean;
+  timeout_s: number | null;
+  sse_read_timeout_s: number | null;
+  enabled: boolean;
+  department_scope: string;
+  department_ids: number[];
+  disabled_tools: string[];
+  write_tools: string[];
+  tags: string[];
+  icon: string;
+  connection_fingerprint: string;
+  last_test_fingerprint: string;
+  last_test_ok_at: string;
+  last_test_error: string;
+  credentials_error: string;
+  test_passed_for_current_config: boolean;
+  created_by: string;
+  updated_by: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type McpCatalogItem = {
+  slug: string;
+  name: string;
+  description: string;
+  icon: string;
+  tags: string[];
+  tool_count: number;
+  read_only_tool_count: number;
+  subscribed: boolean;
+  allow_write: boolean;
+  writable: boolean;
+};
+
+export type McpListFlags = {
+  enabled: boolean;
+  write_enabled: boolean;
+  prerequisites_met: boolean;
+  prerequisites_reason: string;
+};
+
+export type McpAdminListResponse = McpListFlags & { items: McpServerView[] };
+export type McpCatalogResponse = McpListFlags & { items: McpCatalogItem[] };
+
+export type McpWriteProposal = {
+  proposal_id: string;
+  slug: string;
+  tool_name: string;
+  arguments_digest: string;
+  artifact_hint: string;
+  status: 'proposed' | 'confirmed' | 'rejected' | 'expired' | 'running' | 'completed' | 'failed' | string;
+  artifact_ref: string;
+  artifact_sha256: string;
+  artifact_filename: string;
+  error_code: string;
+  attempts: number;
+  created_at: string;
+  expires_at: string;
+  updated_at: string;
+};
+
+export type McpWriteProposalListResponse = { items: McpWriteProposal[] };
+export type McpWriteProposalResponse = { proposal: McpWriteProposal };
+
+export type McpToolView = {
+  name: string;
+  description: string;
+  read_only: boolean;
+  disabled: boolean;
+  write_allowed: boolean;
+  blocked_reason: string;
+};
+
+export type McpToolsResponse = { items: McpToolView[] };
+export type McpServerResponse = { server: McpServerView };
+export type McpTestResponse = {
+  ok: boolean;
+  tool_count: number;
+  read_only_tool_count: number;
+  blocked_count: number;
+  latency_ms: number;
+  message: string;
+};
+
+export type McpSubscriptionView = {
+  slug: string;
+  allow_write: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type McpSubscriptionListResponse = { items: McpSubscriptionView[] };
+export type McpSubscriptionResponse = { subscription: McpSubscriptionView };
+
+export type McpCreatePayload = {
+  slug: string;
+  name: string;
+  transport: string;
+  url: string;
+  description?: string;
+  headers?: Record<string, string>;
+  timeout_s?: number | null;
+  sse_read_timeout_s?: number | null;
+  department_scope: string;
+  department_ids: number[];
+  tags: string[];
+  icon?: string;
+};

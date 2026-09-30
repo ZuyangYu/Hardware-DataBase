@@ -17,6 +17,8 @@ import type {
   MemoryConsentListResponse,
   MemoryConsentView,
   MemoryOperationResponse,
+  McpWriteProposal,
+  McpWriteProposalListResponse,
   MessageView,
   OkResponse,
   QueryDonePayload,
@@ -179,6 +181,41 @@ export function mergeDocumentCardsFromSseEvent(
   return card ? mergeDocumentCards(prev, card) : prev;
 }
 
+export type McpWriteProposalCard = {
+  kind: 'mcp_write_proposal';
+  proposal_id: string;
+  server: string;
+  server_name: string;
+  tool: string;
+  arguments_digest: string;
+  artifact_hint: string;
+  status: string;
+  expires_at: string;
+  artifact_ref?: string;
+  artifact_filename?: string;
+  artifact_sha256?: string;
+  error_code?: string;
+};
+
+export function mergeMcpWriteProposalFromSseEvent(
+  previous: McpWriteProposalCard[],
+  eventType: string,
+  data: string,
+): McpWriteProposalCard[] {
+  if (eventType !== 'mcp_write_proposal') return previous;
+  try {
+    const parsed = JSON.parse(data) as { card?: Partial<McpWriteProposalCard> };
+    const card = parsed.card;
+    if (!card?.proposal_id || card.kind !== 'mcp_write_proposal') return previous;
+    const normalized = card as McpWriteProposalCard;
+    const index = previous.findIndex((item) => item.proposal_id === normalized.proposal_id);
+    if (index < 0) return [...previous, normalized];
+    return previous.map((item, itemIndex) => (itemIndex === index ? { ...item, ...normalized } : item));
+  } catch {
+    return previous;
+  }
+}
+
 /**
  * Build the persistent-turn request without embedding document metadata in
  * the user query. Keeping the property absent for null context preserves the
@@ -274,6 +311,7 @@ const TOOL_LABELS: Record<string, string> = {
 };
 
 function toolLabel(name: string): string {
+  if (name.startsWith('skill__') || name === 'skill_task_status') return '沙箱 Skill';
   return TOOL_LABELS[name] || name;
 }
 
@@ -304,10 +342,20 @@ function traceStepFromToolEvent(etype: string, raw: string): QueryTraceStep | nu
   }
   if (etype === 'tool_started') {
     const name = String(parsed.tool_name ?? '');
+    if (parsed.tool_kind === 'sandbox') return {
+      key: name, label: `运行 Skill · ${String(parsed.skill_ref ?? '')}`,
+      status: 'running', detail: `任务 ${String(parsed.task_id ?? '')}`,
+    };
     return { key: name, label: toolLabel(name), status: 'running', detail: String(parsed.query ?? '') };
   }
   if (etype === 'tool_result') {
     const name = String(parsed.tool_name ?? '');
+    if (parsed.tool_kind === 'sandbox') return {
+      key: name, label: `Skill · ${String(parsed.skill_ref ?? '')}`,
+      status: parsed.status === 'succeeded' ? 'done'
+        : ['failed', 'rejected', 'cancelled', 'expired', 'timed_out'].includes(String(parsed.status)) ? 'error' : 'running',
+      detail: `任务 ${String(parsed.task_id ?? '')} · ${String(parsed.status ?? '')}`,
+    };
     const status: QueryTraceStatus = parsed.status === 'failed' ? 'error' : 'done';
     const hits = Number(parsed.hit_count ?? 0);
     const latency = Number(parsed.latency_ms ?? NaN);
@@ -373,6 +421,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const [traceSteps, setTraceSteps] = useState<QueryTraceStep[]>([]);
   const [degradedNotes, setDegradedNotes] = useState<Array<{ stage: string; reason: string }>>([]);
   const [documentCards, setDocumentCards] = useState<DocumentCardData[]>([]);
+  const [mcpWriteCards, setMcpWriteCards] = useState<McpWriteProposalCard[]>([]);
   const [documentCardRefreshingId, setDocumentCardRefreshingId] = useState<string | null>(null);
   const [documentCardAnsweringId, setDocumentCardAnsweringId] = useState<string | null>(null);
   const [documentCardReleaseRequestingId, setDocumentCardReleaseRequestingId] = useState<string | null>(null);
@@ -804,6 +853,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   // 切换会话时清空上一会话的文档卡片,避免跨会话串显。
   useEffect(() => {
     setDocumentCards([]);
+    setMcpWriteCards([]);
     setDocumentCardRefreshingId(null);
     setDocumentCardAnsweringId(null);
   }, [activeSessionId]);
@@ -934,6 +984,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           } else if (evt.event === 'degraded') {
             const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
             setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
+          } else if (evt.event === 'mcp_write_proposal') {
+            setMcpWriteCards((prev) => mergeMcpWriteProposalFromSseEvent(prev, evt.event, evt.data));
           } else if (
             evt.event === 'document_card'
             || evt.event === 'document_clarification_question'
@@ -1363,7 +1415,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           } catch {
             // 忽略坏帧
           }
-        } else if (
+          } else if (evt.event === 'mcp_write_proposal') {
+            setMcpWriteCards((prev) => mergeMcpWriteProposalFromSseEvent(prev, evt.event, evt.data));
+          } else if (
           evt.event === 'document_card'
           || evt.event === 'document_clarification_question'
           || evt.event === 'document_clarification_ready'
@@ -1473,6 +1527,40 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     [sessions, activeSessionId],
   );
 
+  const updateMcpWriteCard = useCallback((proposal: McpWriteProposal) => {
+    setMcpWriteCards((previous) => previous.map((card) => (
+      card.proposal_id === proposal.proposal_id
+        ? {
+            ...card,
+            status: proposal.status,
+            artifact_ref: proposal.artifact_ref,
+            artifact_filename: proposal.artifact_filename,
+            artifact_sha256: proposal.artifact_sha256,
+            error_code: proposal.error_code,
+          }
+        : card
+    )));
+  }, []);
+
+  const refreshMcpWriteCards = useCallback(async () => {
+    if (mcpWriteCards.length === 0) return;
+    const payload = await api.get<McpWriteProposalListResponse>('/api/v1/plugins/mcp/write-proposals');
+    const byId = new Map(payload.items.map((proposal) => [proposal.proposal_id, proposal]));
+    setMcpWriteCards((previous) => previous.map((card) => {
+      const proposal = byId.get(card.proposal_id);
+      return proposal
+        ? {
+            ...card,
+            status: proposal.status,
+            artifact_ref: proposal.artifact_ref,
+            artifact_filename: proposal.artifact_filename,
+            artifact_sha256: proposal.artifact_sha256,
+            error_code: proposal.error_code,
+          }
+        : card;
+    }));
+  }, [mcpWriteCards.length]);
+
   return {
     kbName,
     // 会话
@@ -1508,6 +1596,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     traceByMessageId,
     degradedNotes,
     documentCards,
+    mcpWriteCards,
+    updateMcpWriteCard,
+    refreshMcpWriteCards,
     turnQueueNotice,
     documentCardRefreshingId,
     documentCardAnsweringId,

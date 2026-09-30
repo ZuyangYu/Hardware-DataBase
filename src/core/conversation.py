@@ -1170,12 +1170,21 @@ class ConversationService:
                     for ordinal, ref in enumerate(attachment_refs):
                         conn.execute(
                             """
-                            INSERT OR REPLACE INTO turn_attachments (
+                            INSERT INTO turn_attachments (
                                 turn_id, attachment_id, ordinal, filename_snapshot,
                                 media_type_snapshot, usage_hint_snapshot,
                                 content_hash_snapshot, parser_version_snapshot,
                                 asset_id, parse_status_snapshot
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(turn_id, attachment_id) DO UPDATE SET
+                                ordinal = excluded.ordinal,
+                                filename_snapshot = excluded.filename_snapshot,
+                                media_type_snapshot = excluded.media_type_snapshot,
+                                usage_hint_snapshot = excluded.usage_hint_snapshot,
+                                content_hash_snapshot = excluded.content_hash_snapshot,
+                                parser_version_snapshot = excluded.parser_version_snapshot,
+                                asset_id = excluded.asset_id,
+                                parse_status_snapshot = excluded.parse_status_snapshot
                             """,
                             (
                                 turn_id,

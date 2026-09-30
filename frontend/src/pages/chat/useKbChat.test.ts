@@ -6,8 +6,38 @@ import {
   isPlanConfirmationStale,
   latestDocumentChatTasks,
   mergeDocumentCardsFromSseEvent,
+  mergeMcpWriteProposalFromSseEvent,
   planConfirmationStaleKey,
 } from './useKbChat';
+
+describe('MCP write proposal card lifecycle', () => {
+  it('parses and updates the inline proposal card without treating it as evidence', () => {
+    const first = mergeMcpWriteProposalFromSseEvent([], 'mcp_write_proposal', JSON.stringify({
+      card: {
+        kind: 'mcp_write_proposal',
+        proposal_id: 'proposal-1',
+        server: 'kicad',
+        server_name: 'KiCad',
+        tool: 'create_schematic',
+        arguments_digest: 'abc123',
+        artifact_hint: 'kicad_sch',
+        status: 'proposed',
+        expires_at: '2030-01-01T00:00:00Z',
+      },
+    }));
+    expect(first).toHaveLength(1);
+    const completed = mergeMcpWriteProposalFromSseEvent(first, 'mcp_write_proposal', JSON.stringify({
+      card: {
+        kind: 'mcp_write_proposal',
+        proposal_id: 'proposal-1',
+        status: 'completed',
+        artifact_filename: 'board.kicad_sch',
+      },
+    }));
+    expect(completed[0]).toMatchObject({ status: 'completed', artifact_filename: 'board.kicad_sch' });
+    expect(mergeMcpWriteProposalFromSseEvent(completed, 'tool_result', '{}')).toEqual(completed);
+  });
+});
 
 describe('document task polling lifecycle', () => {
   it('keeps polling an empty active session so a task created after confirmation is discovered', () => {

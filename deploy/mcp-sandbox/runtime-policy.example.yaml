@@ -1,0 +1,24 @@
+# Illustrative review checklist, not a runnable runtime configuration.
+# A deployment must translate and validate this policy in the selected Runner.
+profile: reviewed-demo
+bundle_digest: sha256:REPLACE_WITH_REVIEWED_DIGEST
+network:
+  mode: none
+filesystem:
+  rootfs_read_only: true
+  host_paths: []
+  artifact_only: true
+identity:
+  run_as_non_root: true
+  workload_identity_ref: REPLACE_OUTSIDE_HDB_CONFIG
+  attestation_ref: REPLACE_WITH_RECORDED_RUNTIME_ATTESTATION
+  profile_digest: sha256:REPLACE_WITH_FIXED_PROFILE_DIGEST
+limits:
+  wall_clock_seconds: 300
+  max_output_bytes: 52428800
+  pids: 128
+dynamic_install: false
+scanner:
+  artifact_scanner_ref: REPLACE_WITH_DEPLOYED_SCANNER
+  fail_closed_when_unavailable: true
+on_policy_failure: reject

@@ -34,7 +34,7 @@ groups:
           summary: "Hardware DataBase worker failures are occurring"
 
       - alert: HdbRetrievalEmptyRateHigh
-        expr: sum(rate(hdb_retrieval_empty_total[10m])) / clamp_min(sum(rate(hdb_retrieval_calls_total[10m])), 1) > 0.30
+        expr: sum(rate(hdb_rag_zero_hit_total[10m])) / clamp_min(sum(rate(hdb_rag_calls_total[10m])), 1) > 0.30
         for: 15m
         labels:
           severity: warning

@@ -667,9 +667,10 @@ class RAGFlowClient:
         # P0b: each real retrieval call acquires the shared RAG budget, so
         # fallback retries are re-admitted rather than inheriting a slot.
         from src.core.concurrency import governor_acquire
-        from src.observability.metrics import incr_active, record_rag_zero_hit
+        from src.observability.metrics import incr_active, record_rag_call, record_rag_zero_hit
 
         with governor_acquire("rag", interactive=True):
+            record_rag_call()
             incr_active("hdb.rag.active_requests", "Concurrent RAG retrieval calls", 1)
             try:
                 if should_cancel is None:

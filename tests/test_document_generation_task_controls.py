@@ -174,7 +174,7 @@ def test_running_work_order_cannot_be_deleted(tmp_path):
         store.delete_terminal_work_order(order.work_order_id, actor_id="writer", reason="删除")
 
 
-def test_harness_progress_mirrors_checkpoint_into_run(monkeypatch):
+def test_harness_progress_mirrors_checkpoint_into_run(monkeypatch, tmp_path):
     """Status API reads harness_runs, so progress callbacks must update it too."""
     running = SimpleNamespace(
         harness_run_id="run-1",
@@ -183,6 +183,9 @@ def test_harness_progress_mirrors_checkpoint_into_run(monkeypatch):
         status="running",
     )
     store = Mock()
+    # The runtime derives a TaskGraphStore from store.db_path; a bare Mock here
+    # used to create a junk SQLite file named after the Mock in the CWD.
+    store.db_path = str(tmp_path / "authoring.db")
     store.claim_harness_run.return_value = running
     store.update_harness_run_owned.return_value = running
     store.heartbeat_harness_run.return_value = running

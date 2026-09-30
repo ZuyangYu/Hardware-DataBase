@@ -43,7 +43,7 @@ type StatusPayload = {
   };
 };
 
-const statusText: Record<string, string> = { up: '正常', ready: '就绪', degraded: '降级', down: '故障', not_ready: '未就绪' };
+const statusText: Record<string, string> = { up: '正常', ready: '就绪', degraded: '降级', down: '故障', not_ready: '未就绪', not_configured: '未启用', idle: '空闲' };
 
 export default function SystemStatusPage({ auth, onLogout }: Props) {
   const [payload, setPayload] = useState<StatusPayload | null>(null);

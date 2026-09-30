@@ -51,6 +51,9 @@ dependencies = [
     "langgraph-checkpoint-postgres==3.1.2",
     "psycopg[binary]==3.3.5",
     "redis",
+    "langchain-mcp-adapters>=0.3.2",
+    "mcp>=1.30.0",
+    "cryptography>=50.0.0",
 ]
 
 [project.scripts]
@@ -98,7 +101,7 @@ eval = [
 ]
 
 [tool.pytest.ini_options]
-norecursedirs = ["build", "src/circuit/vendor/spydrnet"]
+norecursedirs = ["build", "src/circuit/vendor/spydrnet", "deploy"]
 
 [tool.ruff]
 # vendored SpyDrNet (含 sch_parse / spydrnet_extension 等 upstream 风格代码) 不属于本应用源码,不纳入 lint。

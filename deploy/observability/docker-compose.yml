@@ -9,9 +9,9 @@ services:
     volumes:
       - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - "4317:4317"
-      - "4318:4318"
-      - "9464:9464"
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_OTLP_GRPC_PORT:-4317}:4317"
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_OTLP_HTTP_PORT:-4318}:4318"
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_METRICS_PORT:-9464}:9464"
     depends_on:
       - tempo
       - loki
@@ -28,9 +28,19 @@ services:
       - ./prometheus/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     ports:
-      - "9090:9090"
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_PROMETHEUS_PORT:-9090}:9090"
     depends_on:
       - otel-collector
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_ALERTMANAGER_PORT:-9093}:9093"
 
   tempo:
     image: grafana/tempo:2.8.2
@@ -55,14 +65,14 @@ services:
     image: grafana/grafana:12.0.2
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_GRAFANA_PORT:-3000}:3000"
     depends_on:
       - prometheus
       - tempo
@@ -72,7 +82,7 @@ services:
     image: postgres:16.10-alpine
     environment:
       POSTGRES_USER: ${PHOENIX_DB_USER:-phoenix}
-      POSTGRES_PASSWORD: ${PHOENIX_DB_PASSWORD:-change-me}
+      POSTGRES_PASSWORD: ${PHOENIX_DB_PASSWORD:?PHOENIX_DB_PASSWORD must be set}
       POSTGRES_DB: ${PHOENIX_DB_NAME:-phoenix}
     volumes:
       - phoenix-db-data:/var/lib/postgresql/data
@@ -80,10 +90,10 @@ services:
   phoenix:
     image: arizephoenix/phoenix:19.13.0
     environment:
-      PHOENIX_SQL_DATABASE_URL: postgresql://${PHOENIX_DB_USER:-phoenix}:${PHOENIX_DB_PASSWORD:-change-me}@phoenix-db:5432/${PHOENIX_DB_NAME:-phoenix}
+      PHOENIX_SQL_DATABASE_URL: postgresql://${PHOENIX_DB_USER:-phoenix}:${PHOENIX_DB_PASSWORD:?PHOENIX_DB_PASSWORD must be set}@phoenix-db:5432/${PHOENIX_DB_NAME:-phoenix}
       PHOENIX_PROJECT_NAME: ${OBS_PHOENIX_PROJECT:-hardware-database}
     ports:
-      - "6006:6006"
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_PHOENIX_PORT:-6006}:6006"
     depends_on:
       - phoenix-db
 
@@ -93,3 +103,4 @@ volumes:
   loki-data:
   grafana-data:
   phoenix-db-data:
+  alertmanager-data:

@@ -291,6 +291,34 @@
 6. 测试：纯模型/组件的 renderToStaticMarkup 单测（无 jsdom）
 ```
 
+### 3.9 外部 MCP / Sandbox / Skill（执行默认关闭；MCP 与文本 Skill 目录默认开启）
+
+外部扩展的控制面入口是 HDB API，但 HDB/API/Worker 不拥有 OCI/Docker
+控制权，也不启动第三方进程。`src/sandbox/client.py` 只调用部署级配置的
+独立 Runner/Gateway API；实际 runtime 生命周期只能由 Sandbox Runner 负责。
+
+提交 sandbox task 前必须同时满足：
+
+- `SANDBOX_ENABLED=true`、`SANDBOX_BACKEND=runner_api`、Runner endpoint 和
+  外部 workload identity 均已配置；否则本地拒绝并审计，不 fallback 到本地进程；
+- bundle/profile 已经 `draft → reviewed → tested → enabled`，digest 和
+  `policy_snapshot_hash` 与登记快照一致；撤销后即使下游健康也拒绝提交；
+- 参数只能是审核 bundle 声明的结构化数据；不接受 shell、command、任意 env、
+  volume、宿主路径或动态安装；输入输出只能用 Artifact Broker 的 opaque ID；
+- task 状态更新使用 SQLite ledger 的 revision/CAS、lease、fencing token 和
+  幂等键。`unknown`、`cleanup_pending`、`reconcile_required` 不能被猜测为成功；
+- Artifact 必须经过 `stage → scan → commit`，哈希、扩展名、归档 traversal、ACL
+  和 retention 检查通过后才可读取。
+
+文本 Skill 使用 `src/sandbox/skills.py` 的独立 catalog：固定版本和 digest、
+管理员审核后才能加载；即使启用也只有 `<untrusted_skill>` 提示数据，没有任何
+`sandbox.execute`/工具/网络能力。含 hooks/bin/command 或 prompt-injection
+模式的内容只生成审核标记，不会被解释或执行。当前有 HDB 自有/管理员审核固定负载的 dev-l1
+参考部署；第三方或模型生成代码、敏感多租户生产使用仍未通过安全验收。Skill 类型、个人提交与共享、
+权限矩阵、任务/产物流和观测方式见 [22 · 外部扩展](22-external-extensions.md)；部署限制见
+[`deploy/mcp-sandbox/README.md`](../deploy/mcp-sandbox/README.md)，员工和管理员操作见
+[`docs/mcp-plugins.md`](../docs/mcp-plugins.md)。
+
 ---
 
 ## 4. 技术债与改进建议（按收益排序）

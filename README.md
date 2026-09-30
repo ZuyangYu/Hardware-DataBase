@@ -15,7 +15,7 @@
 ![Redis](https://img.shields.io/badge/Redis-required-DC382D?logo=redis&logoColor=white)
 ![Frontend](https://img.shields.io/badge/Frontend-React%20%2B%20TypeScript-61DAFB?logo=react&logoColor=black)
 ![Eval](https://img.shields.io/badge/Eval-RAGAS-8A2BE2)
-![Tests](https://img.shields.io/badge/tests-2848%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-pytest-informational)
 
 </div>
 
@@ -27,6 +27,7 @@
 | 🗂 | **多源 Pipeline** | 普通文档进 RAGFlow 检索链路；Excel 进结构化表格索引；EDF 网表进电路结构化索引；外部对话记录单独索引——全部由 agent 统一调度 |
 | 🔌 | **RAGFlow 固定后端** | 文档上传、解析任务、检索、删除、知识库治理统一走 RAGFlow 适配层，项目内不维护本地向量索引 |
 | 🛡 | **权限与治理** | 部门、用户、知识库权限、审计日志、查询 trace、文件处理状态 |
+| 🧩 | **受治理扩展** | 远程 MCP、文本 Skill 与审核后的沙箱 Skill；目录可用不代表能力已启用，MCP 写入与沙箱执行默认关闭，见[操作指南](docs/mcp-plugins.md) |
 | ⚙️ | **统一模型配置** | 答案生成、工具决策与后台模型任务统一走 `src.core.model_factory` profile，由 chat runtime 负责调用归一化与观测；支持 Ollama 与任意 OpenAI-compatible API |
 | 📤 | **结果导出** | 对话/检索结果先固化为不可变 ResultSnapshot，再由独立 export worker 生成 Markdown / Excel / Word / PDF / PowerPoint；后台任务带权限校验，切页面、刷新、断线都不丢 |
 | 🧠 | **长期记忆** | LangMem 驱动的 User / Project Memory：默认 opt-out、显式 consent、有界注入为不可信线索，正式证据始终优先 |
@@ -35,9 +36,9 @@
 
 ## 🖼 界面预览
 
-| 知识库问答 | 知识资产治理 |
+| 平台入口 | 知识库问答 |
 |---|---|
-| <img src="assets/chat_example.png" alt="知识库问答"> | <img src="assets/kap_example.png" alt="知识资产治理"> |
+| <img src="assets/front1.png" alt="平台入口"> | <img src="assets/front2.png" alt="知识库问答"> |
 
 ## 🚀 快速开始
 
@@ -50,9 +51,11 @@
 | LLM | Ollama（默认）或任意 OpenAI-compatible API | ✅ |
 | PostgreSQL | pgvector 实例（生产账本库）；Docker 编排内自带 | ✅（生产） |
 | Redis | 实时平面（取消快路径 + 跨进程 SSE）；Docker 编排内自带 | ✅ |
-| Docker | 20+ / compose v2（方式一） | 方式一 |
-| Node.js | >= 18（前端开发与构建） | 前端 |
+| Docker | Engine 20+ / Compose v2（方式一） | 方式一 |
+| Node.js | >= 20.19（推荐 22 LTS；前端开发与构建） | 前端 |
 
+> RAGFlow 与 LLM 不在本仓库的 Docker 编排内，需要单独部署或接入已有服务；两者的地址与密钥可在首次登录后通过「系统配置」填写。
+>
 > PostgreSQL 与 Redis 均为**必需组件**，不做降级：Redis 默认 `REDIS_REQUIRED=true`，启动时校验连通性，不可用即拒绝启动。
 
 ### 方式一：Docker（推荐，一条命令起全套）
@@ -62,11 +65,13 @@
 bash deploy/docker/quickstart.sh
 ```
 
-脚本会：生成 PostgreSQL 密码与管理员口令（打印在终端）→ 构建镜像 → 按
-`postgres → migrate → api → web` 顺序启动。访问 `http://<主机IP>:8080`，
-用 `admin` + 终端打印的口令登录。
+脚本会：生成 PostgreSQL、观测栈与管理员口令（打印在终端）→ 构建镜像 → 启动
+`postgres/redis → migrate → api + 独立 chat/authoring/parse/export/memory worker → web`，
+并默认启动观测栈。访问 `http://<主机IP>:8080`，用 `admin` + 终端打印的口令登录。
 
 - 只准备文件不启动：`bash deploy/docker/quickstart.sh --no-start`
+- 资源受限时跳过观测栈：`bash deploy/docker/quickstart.sh --without-observability`
+- 默认端口被占用时，在 `deploy/docker/.env` 配置 `HDB_HTTP_PORT`、`HDB_API_PORT` 与 `OBS_*_PORT`
 - 镜像源加速、内网离线分发、指向已有 PostgreSQL、备份恢复：见 [`deploy/docker/README.md`](deploy/docker/README.md)
 
 ### 方式二：uv（源码开发，推荐）
@@ -120,13 +125,15 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
 | 进程 | 命令 | 作用 |
 |---|---|---|
-| API | `hardware-database-server` | FastAPI 唯一后端入口（单机默认内含 worker） |
-| Worker | `hardware-database-worker` | 解析任务与对话 turn 消费 |
+| API | `hardware-database-server` | FastAPI 唯一后端入口（源码单机默认自启统一 Worker 与 Export Worker） |
+| Worker | `hardware-database-worker` | 解析任务与对话 turn 消费（支持 `--role chat/authoring/parse` 拆分） |
 | Export worker | `hardware-database-export-worker` | Markdown / Excel / Word / PDF / PPTX 产物生成 |
 | Memory worker | `hardware-database-memory-worker` | LangMem 低优先级记忆提炼 |
 | Maintenance | `hardware-database-maintenance` | 运维 CLI |
 | Eval | `hardware-database-eval` | RAGAS 评估 CLI |
 | E2E | `hardware-database-e2e` | 端到端回归 |
+
+> Docker 生产编排以独立容器运行各 Worker（chat / authoring / parse / export / memory），API 不内嵌 Worker；使用 `bash scripts/hdb.sh start` 管理宿主机进程时会关闭 API 自启，并为各角色各启动一次。
 
 ## 📖 文档导航
 
@@ -134,6 +141,9 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 |---|---|
 | [`wiki/README.md`](wiki/README.md) | 系统技术 Wiki：总览、架构、API 与鉴权、对话 turn、Agent 运行时、工具与证据、模型与资源、ingestion |
 | [`deploy/docker/README.md`](deploy/docker/README.md) | Docker 部署、镜像源加速、内网离线分发、外部 PostgreSQL、备份恢复 |
+| [`docs/mcp-plugins.md`](docs/mcp-plugins.md) | MCP 插件与文本/执行型 Skill 的管理员、员工操作和排障 |
+| [`deploy/mcp-sandbox/README.md`](deploy/mcp-sandbox/README.md) | Sandbox Gateway/Runner 部署边界、运行档位与安全门禁 |
+| [`wiki/22-external-extensions.md`](wiki/22-external-extensions.md) | MCP、Skill 与 Sandbox 的架构、授权和生命周期 |
 | [`deploy/postgres/README.md`](deploy/postgres/README.md) | 自管 pgvector 实例与账本库迁移预演 |
 | [`evaluation/README.md`](evaluation/README.md) | RAGAS 数据集格式与扩展方式 |
 | [`.env.example`](.env.example) | 全量配置项与默认值 |
@@ -150,17 +160,20 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
                       ├─ 动态工具调用：文档检索 / 表格检索 / 电路检索 / 外部对话检索
                       ├─ Catalog-first 记忆检索（仅作为不可信历史线索）
                       └─ 每步 tool_started / tool_result 事件驱动前端实时轨迹
-       └─ 统一模型封装 (src.core.model_factory) → Ollama / OpenAI 兼容
+       ├─ 统一模型封装 (src.core.model_factory) → Ollama / OpenAI 兼容
+       └─ 持久化任务队列 → chat / authoring / parse / export / memory worker
 ```
 
 **存储平面**
 
 | 平面 | 组件 | 内容 |
 |---|---|---|
-| 账本 / 控制面 | PostgreSQL（pgvector） | 项目、知识库、会话、记忆投影、检查点、配额、审计 |
+| 控制面与任务账本 | PostgreSQL（生产推荐） | 会话、任务、记忆、检查点、配额、审计等生产状态 |
 | 实时平面 | Redis | 取消快路径、跨进程 SSE 事件流 |
-| 文档检索 | RAGFlow | 上传、解析、检索、知识库治理 |
-| 归档 | `storage/` | pipeline 归档、索引、日志 |
+| 文档检索 | RAGFlow | 上传、解析、检索、知识库治理（外部依赖） |
+| 本地文件与投影 | `storage/` | 附件、归档、导出、日志与部分本地业务数据 |
+
+> 各业务域支持独立的后端选择，详见 [`wiki/20-config-and-storage.md`](wiki/20-config-and-storage.md)；备份需覆盖 PostgreSQL 与 `storage/`，RAGFlow 的数据集与索引需按其自身方案备份或重建。
 
 **目录结构**
 
@@ -300,12 +313,19 @@ A：可适当调大 `AGENT_TIMEOUT_SECONDS`；`AGENT_MAX_RETRIEVAL_ROUNDS` 直�
 **Q：首次启动后无法使用问答？**
 A：请先以系统管理员进入「系统配置」，补全 RAGFlow 与 Agent 模型配置，保存后生效。
 
+**Q：Docker 启动后 `/health/ready` 返回 503？**
+A：说明依赖尚未就绪（Redis、Worker 心跳或存储检查未通过），此时不会接收业务流量；查看 `docker compose logs api` 与对应 worker 日志，就绪后自动返回 200。
+
+**Q：手动执行 compose 报缺少观测栈口令？**
+A：观测栈强制要求口令，请在 `deploy/docker/.env` 设置 `GRAFANA_ADMIN_PASSWORD` 与 `PHOENIX_DB_PASSWORD`（quickstart 会自动生成）；端口冲突可用 `OBS_*_PORT` 调整。
+
 ## 🗺️ Roadmap
 
 - [x] 多源检索（文档 / 表格 / 电路 / 外部对话）统一 Agent 调度
 - [x] PostgreSQL 单库收敛 + Redis 实时平面
 - [x] 结果导出（Markdown / Excel / Word / PDF / PPTX）与后台任务中心
 - [x] RAGAS 评估子系统与阈值门禁
+- [x] 受治理的外部扩展（远程 MCP / 文本与执行型 Skill / Sandbox 边界）
 - [ ] 嵌入文档（聊天附件）的结构化解析与路由统一
 - [ ] 拒答 / 置信度机制与文档版本时效治理
 - [ ] 模型升级放权流程与多副本部署形态完善

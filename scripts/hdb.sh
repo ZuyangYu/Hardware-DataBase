@@ -13,7 +13,7 @@ if [ -f "$APP_ROOT/.env" ]; then
     case "$key" in
       HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT|HDB_WORKER_ROLES) export "$key=$value" ;;
     esac
-  done < <(grep -E '^(HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT)=' "$APP_ROOT/.env" 2>/dev/null || true)
+  done < <(grep -E '^(HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT|HDB_WORKER_ROLES)=' "$APP_ROOT/.env" 2>/dev/null || true)
 fi
 
 API_HOST="${HDB_API_HOST:-127.0.0.1}"
@@ -216,7 +216,8 @@ start_front() {
 
 do_start() {
   mkdir -p "$LOG_DIR" "$PID_DIR"
-  # hdb.sh 自己管理 worker 生命周期：阻止 API 进程再 spawn 一份 export/memory worker
+  # hdb.sh 自己管理各类 worker；API 内仍管理 Sandbox dispatcher/reconciler。
+  export HDB_API_SPAWN_WORKER=0
   export HDB_API_SPAWN_EXPORT_WORKER=0
   export HDB_API_SPAWN_MEMORY_WORKER=0
   # 先清理历史残留的未纳管 worker,避免旧代码实例继续消费队列。
@@ -265,23 +266,8 @@ do_start() {
     start_front
   fi
 
-  # 对话 turns 执行器：没有它，前端对话会一直停留或报错。
-  if managed_pid "$WORKER_PID_FILE" "$APP_ROOT" >/dev/null; then
-    echo "[worker] 已在运行 (pid $(cat "$WORKER_PID_FILE"))"
-  else
-    echo "[worker] 启动中..."
-    start_process worker "$APP_ROOT" "$WORKER_PID_FILE" \
-      uv run hardware-database-worker
-  fi
-
-  # 长期记忆提炼器：没有它，"创建个人记忆/自动提炼"会永远停在 pending。
-  if managed_pid "$MEMORY_WORKER_PID_FILE" "$APP_ROOT" >/dev/null; then
-    echo "[memory] 已在运行 (pid $(cat "$MEMORY_WORKER_PID_FILE"))"
-  else
-    echo "[memory] 启动中..."
-    start_process memory-worker "$APP_ROOT" "$MEMORY_WORKER_PID_FILE" \
-      uv run hardware-database-memory-worker
-  fi
+  # chat/authoring/parse、memory、export 各启动一次，避免与 API 自启或
+  # 本脚本的 legacy all worker 重复消费同一队列。
   start_worker_processes
   do_status
 }
@@ -301,7 +287,7 @@ do_stop() {
 }
 
 do_status() {
-  local rc=0
+  local rc=0 unmanaged=0
   if api_ok; then
     echo "✅ [api]    http://$API_HOST:$API_PORT"
   else
@@ -331,10 +317,17 @@ do_status() {
     if [ -n "$pid" ] && pid_alive "$pid"; then
       echo "✅ [${name}]  pid ${pid}"
     else
-      echo "⚠️  [${name}]  未纳管/未启动 -> bash scripts/hdb.sh start"
+      echo "⚠️  [${name}]  未由 hdb.sh 纳管（手动启动时请检查 API 日志或进程）"
+      unmanaged=1
     fi
   done
-  [ "$rc" = 0 ] && echo "—— 全部就绪（API 子进程按本副本配置管理）——" || echo "—— 有缺失,执行: bash scripts/hdb.sh start ——"
+  if [ "$rc" = 0 ] && [ "$unmanaged" = 0 ]; then
+    echo "—— API、前端和脚本纳管的 Worker 均已就绪 ——"
+  elif [ "$rc" = 0 ]; then
+    echo "—— API/前端可达；Worker 未纳管，需按所选启动模式核实 ——"
+  else
+    echo "—— API/前端有缺失，检查当前启动模式 ——"
+  fi
   return "$rc"
 }
 

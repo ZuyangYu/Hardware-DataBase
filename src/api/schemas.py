@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from src.document_authoring.chat_context import (
     DocumentAuthoringContext,
@@ -1376,3 +1376,362 @@ class CompleteDocumentRevisionRequest(BaseModel):
     child_artifact_id: str = Field(min_length=1, max_length=200)
     revalidation_status: Literal["passed", "failed", "requires_human"]
     revalidation_result: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# External MCP plugins (governed external tool federation)
+
+
+class McpServerCreateRequest(BaseModel):
+    slug: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    transport: str = "streamable_http"
+    url: str = Field(min_length=1, max_length=2048)
+    description: str = Field(default="", max_length=1000)
+    headers: dict[str, str] | None = None
+    timeout_s: int | None = None
+    sse_read_timeout_s: int | None = None
+    department_scope: str = "none"
+    department_ids: list[int] = Field(default_factory=list)
+    disabled_tools: list[str] = Field(default_factory=list)
+    write_tools: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    icon: str = Field(default="", max_length=16)
+
+
+class McpServerUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    transport: str | None = None
+    url: str | None = Field(default=None, max_length=2048)
+    headers: dict[str, str] | None = None
+    clear_headers: bool = False
+    timeout_s: int | None = None
+    sse_read_timeout_s: int | None = None
+    department_scope: str | None = None
+    department_ids: list[int] | None = None
+    disabled_tools: list[str] | None = None
+    write_tools: list[str] | None = None
+    tags: list[str] | None = None
+    icon: str | None = Field(default=None, max_length=16)
+
+
+class McpServerStatusRequest(BaseModel):
+    enabled: bool
+
+
+class McpSubscribeRequest(BaseModel):
+    allow_write: bool = False
+
+
+class McpWriteConsentRequest(BaseModel):
+    allow_write: bool
+
+
+class McpWriteToolsRequest(BaseModel):
+    write_tools: list[str] = Field(default_factory=list)
+
+
+class McpListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    enabled: bool = False
+    write_enabled: bool = False
+    prerequisites_met: bool = False
+    prerequisites_reason: str = ""
+
+
+class McpServerResponse(BaseModel):
+    server: dict[str, Any]
+
+
+class McpTestResponse(BaseModel):
+    ok: bool
+    tool_count: int = 0
+    read_only_tool_count: int = 0
+    blocked_count: int = 0
+    latency_ms: int = 0
+    message: str = ""
+
+
+class McpToolsResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class McpSubscriptionResponse(BaseModel):
+    subscription: dict[str, Any]
+
+
+class McpSubscriptionListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class McpWriteProposalListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class McpWriteProposalResponse(BaseModel):
+    proposal: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Governed sandbox task admission
+# ---------------------------------------------------------------------------
+
+
+class SandboxTaskCreateRequest(BaseModel):
+    """Declaration-only task input; runtime-control fields are forbidden."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    bundle_ref: str = Field(min_length=1, max_length=256)
+    bundle_digest: str = Field(min_length=64, max_length=71)
+    profile_ref: str = Field(min_length=1, max_length=256)
+    # The server derives the immutable snapshot from the enabled catalog entry.
+    # A caller may echo it for optimistic concurrency, but cannot invent a
+    # policy hash that widens the bundle's authorization.
+    policy_snapshot_hash: str = Field(default="", max_length=256)
+    kind: Literal["task", "session"] = "task"
+    network_policy_ref: str = Field(default="", max_length=256)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=32)
+    input_artifact_ids: list[str] = Field(default_factory=list, max_length=128)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    deadline_at: str = Field(default="", max_length=80)
+
+
+class SandboxCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(default="", max_length=300)
+
+
+class SandboxTaskResponse(BaseModel):
+    task: dict[str, Any]
+
+
+class SandboxTaskListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SandboxTaskEventsResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SandboxRunnerResponse(BaseModel):
+    response: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxBundleRegisterRequest(BaseModel):
+    """Declaration-only bundle metadata; executable recipes are out of band."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bundle_ref: str = Field(min_length=1, max_length=256)
+    bundle_digest: str = Field(min_length=64, max_length=71)
+    profile_ref: str = Field(min_length=1, max_length=256)
+    required_capabilities: list[str] = Field(default_factory=lambda: ["sandbox.execute"], max_length=32)
+    network_policy_ref: str = Field(default="", max_length=256)
+    sbom_ref: str = Field(default="", max_length=256)
+    signature_ref: str = Field(default="", max_length=256)
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    tool_allowlist: list[str] = Field(default_factory=list, max_length=256)
+    runtime_policy_ref: str = Field(default="", max_length=256)
+    runtime_policy_digest: str = Field(default="", min_length=0, max_length=71)
+    catalog_source: str = Field(default="curated", max_length=50)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxBundleResponse(BaseModel):
+    bundle: dict[str, Any]
+
+
+class SandboxBundleListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SandboxGatewayRegisterRequest(BaseModel):
+    """Declaration-only Gateway metadata; no stdio recipe is accepted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_ref: str = Field(min_length=1, max_length=256)
+    profile_ref: str = Field(min_length=1, max_length=256)
+    endpoint: str = Field(min_length=1, max_length=2048)
+    digest: str = Field(min_length=64, max_length=71)
+    network_policy_ref: str = Field(default="", max_length=256)
+    capabilities: list[str] = Field(default_factory=list, max_length=32)
+    sbom_ref: str = Field(default="", max_length=256)
+    # Mapping is declaration-only: each key is a reviewed tool name and each
+    # value is a bounded input schema.  No endpoint/command recipe is accepted.
+    tool_allowlist: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxGatewayResponse(BaseModel):
+    gateway: dict[str, Any]
+
+
+class SandboxGatewayListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SandboxGatewayInvokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str = Field(min_length=1, max_length=200)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxGatewaySubscriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allow_write: bool = False
+
+
+class SandboxGatewaySubscriptionResponse(BaseModel):
+    subscription: dict[str, Any]
+
+
+class SandboxCapabilityGrantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    principal_type: Literal["user", "department"]
+    principal_id: str = Field(min_length=1, max_length=128)
+    capabilities: list[str] = Field(default_factory=list, max_length=16)
+
+
+class SandboxCapabilityGrantResponse(BaseModel):
+    principal_type: str
+    principal_id: str
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class SandboxArtifactStageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(min_length=1, max_length=128)
+    filename: str = Field(min_length=1, max_length=120)
+    content_base64: str = Field(min_length=1, max_length=75_000_000)
+    sha256: str = Field(min_length=64, max_length=71)
+    media_type: str = Field(default="", max_length=120)
+    role: Literal["input", "output", "log"] = "input"
+    execution_id: str = Field(default="", max_length=256)
+    expires_at: str = Field(default="", max_length=80)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxArtifactResponse(BaseModel):
+    artifact: dict[str, Any]
+
+
+class SandboxArtifactListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SandboxSkillRegisterRequest(BaseModel):
+    """Text-only Skill declaration; executable extension fields are forbidden."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skill_ref: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=64)
+    content: str = Field(min_length=1, max_length=131_072)
+    source_ref: str = Field(default="", max_length=512)
+    catalog_source: str = Field(default="curated", max_length=50)
+    department_id: str = Field(default="", max_length=128)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxSkillPackageUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_ref: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=64)
+    department_id: str = Field(min_length=1, max_length=128)
+    source_ref: str = Field(default="", max_length=512)
+    catalog_source: str = Field(default="curated", max_length=50)
+    package_base64: str = Field(min_length=1, max_length=12_000_000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxTextSkillPackageUploadRequest(BaseModel):
+    """Text-only ZIP: name/version come from SKILL.md, department from admin."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    department_id: str = Field(min_length=1, max_length=128)
+    package_base64: str = Field(min_length=1, max_length=12_000_000)
+
+
+class SandboxPersonalTextSkillUploadRequest(BaseModel):
+    """Employee upload: scope, owner and Skill ref are assigned by the server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    package_base64: str = Field(min_length=1, max_length=12_000_000)
+
+
+class SandboxPersonalExecutableSkillUploadRequest(BaseModel):
+    """Employee source submission; building and approval remain admin-only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skill_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    version: str = Field(default="1.0.0", min_length=1, max_length=64)
+    package_base64: str = Field(min_length=1, max_length=12_000_000)
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxPersonalSkillShareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    share_to_department: bool
+
+
+class SandboxSkillBuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_bundle_ref: str = Field(default="bundle/report", min_length=1, max_length=256)
+    profile_ref: str = Field(min_length=1, max_length=256)
+    runtime_policy_ref: str = Field(default="", max_length=256)
+    runtime_policy_digest: str = Field(default="", max_length=71)
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    required_capabilities: list[str] = Field(
+        default_factory=lambda: ["sandbox.execute", "sandbox.write_artifact"], max_length=8
+    )
+
+
+class SandboxSkillPipSourceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index_url: str = Field(default="", max_length=512)
+
+
+class SandboxSkillExecutionBindingRequest(BaseModel):
+    """References to an operator-deployed bundle, never a script upload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bundle_ref: str = Field(min_length=1, max_length=256)
+    bundle_digest: str = Field(min_length=64, max_length=71)
+    profile_ref: str = Field(min_length=1, max_length=256)
+
+
+class SandboxSkillRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=100)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class SandboxSkillResponse(BaseModel):
+    skill: dict[str, Any]
+
+
+class SandboxSkillListResponse(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
