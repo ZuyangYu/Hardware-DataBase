@@ -94,7 +94,8 @@ docker save -o hdb-images.tar \
   hardware-database-app:latest hardware-database-web:latest \
   pgvector/pgvector:pg17 redis:8-alpine \
   otel/opentelemetry-collector-contrib:0.128.0 \
-  prom/prometheus:v3.5.0 grafana/tempo:2.8.2 grafana/loki:3.5.1 \
+  prom/prometheus:v3.5.0 prom/alertmanager:v0.28.1 \
+  grafana/tempo:2.8.2 grafana/loki:3.5.1 \
   grafana/grafana:12.0.2 arizephoenix/phoenix:19.13.0 postgres:16.10-alpine
 tar -czf hdb-docker.tar.gz hdb-images.tar deploy/docker
 
@@ -109,15 +110,22 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
 
 访问 `http://<目标机IP>:8080`，用 `admin` + quickstart 打印的口令登录。
 
+> **一键部署**：把本目录的 `offline-install.sh` 与镜像包 `hdb-images.tar.gz`（含 `.sha256`）放在
+> 同一离线包根目录，执行 `bash offline-install.sh` 即可自动完成「校验并导入镜像 → 生成配置 →
+> 启动（默认含观测栈）→ 就绪检查 → 打印访问口令」，支持 `--port <端口>` 与
+> `--without-observability`；重复执行安全，升级时替换镜像包重跑即可。
+> 用 `git archive` 打 tag 时该脚本随 `deploy/docker/` 一起进入离线包。
+
 > **默认生产部署还需 save 观测镜像**：app、web、pgvector、redis、OTel Collector、
-> Prometheus、Tempo、Loki、Grafana、Phoenix、Phoenix PostgreSQL。完整示例：
+> Prometheus、Alertmanager、Tempo、Loki、Grafana、Phoenix、Phoenix PostgreSQL。完整示例：
 >
 > ```bash
 > docker save -o hdb-images.tar \
 >   hardware-database-app:latest hardware-database-web:latest \
 >   pgvector/pgvector:pg17 redis:8-alpine \
 >   otel/opentelemetry-collector-contrib:0.128.0 \
->   prom/prometheus:v3.5.0 grafana/tempo:2.8.2 grafana/loki:3.5.1 \
+>   prom/prometheus:v3.5.0 prom/alertmanager:v0.28.1 \
+>   grafana/tempo:2.8.2 grafana/loki:3.5.1 \
 >   grafana/grafana:12.0.2 arizephoenix/phoenix:19.13.0 postgres:16.10-alpine
 > ```
 > `quickstart.sh` 在离线机务必带 `--no-start`——否则它会尝试构建（需要外网）。
