@@ -4,9 +4,10 @@
 - ``PUT /config`` — write whitelisted keys to ``.env`` and hot-reload
 - ``GET /health/ragflow`` — probe the configured RAGFlow instance
 
-Only keys present in ``src.settings.DEFAULT_VALUES`` may be written — this
-is the same whitelist the Streamlit settings panel uses, and it prevents
-arbitrary environment variables from being injected via the API.
+Only ordinary application settings may be read or written.  Deployment-owned
+observability settings stay in ``.env``/Compose and are deliberately excluded
+from this API, so hiding them in the React page is backed by a server-side
+boundary rather than presentation alone.
 """
 from __future__ import annotations
 
@@ -29,6 +30,28 @@ from src.api.schemas import (
 router = APIRouter(tags=["config"])
 
 
+# Observability is a deployment concern.  The Docker production profile wires
+# it to the same-network Collector; exposing these keys through the ordinary
+# settings API would let a UI edit a process-level integration that may need a
+# restart or coordinated Compose change.
+_DEPLOYMENT_ONLY_PREFIXES = ("OBS_", "OTEL_")
+_INTERNAL_PLATFORM_KEYS = frozenset(
+    {
+        "CONVERSATION_UNIFIED_TOOLS_ENABLED",
+        "RESOURCE_GOVERNOR_ENABLED",
+    }
+)
+
+
+def _config_surface_keys() -> tuple[str, ...]:
+    return tuple(
+        key
+        for key in settings.DEFAULT_VALUES
+        if not key.startswith(_DEPLOYMENT_ONLY_PREFIXES)
+        and key not in _INTERNAL_PLATFORM_KEYS
+    )
+
+
 # Keys whose values must not be returned in plaintext.
 _SECRET_KEYS = {
     "RAGFLOW_API_KEY",
@@ -49,9 +72,9 @@ def _redact(key: str, value: object) -> object:
 
 
 def _current_config() -> dict[str, object]:
-    """Snapshot of the effective settings, using DEFAULT_VALUES as the key set."""
+    """Snapshot of the effective user-facing settings."""
     snapshot: dict[str, object] = {}
-    for key in settings.DEFAULT_VALUES:
+    for key in _config_surface_keys():
         # Read the live attribute rather than os.getenv so we reflect
         # runtime state after apply_settings + reload_settings.
         value = getattr(settings, key, settings.DEFAULT_VALUES.get(key, ""))
@@ -75,7 +98,7 @@ def update_config(
     pipeline: AppPipeline = Depends(get_pipeline),
 ):
     """Persist whitelisted keys to ``.env`` and hot-reload the runtime."""
-    allowed = set(settings.DEFAULT_VALUES.keys())
+    allowed = set(_config_surface_keys())
     unknown = [k for k in body.settings if k not in allowed]
     if unknown:
         raise HTTPException(

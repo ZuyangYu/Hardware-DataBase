@@ -5,8 +5,7 @@
 #
 # 拓扑（默认全在一个 compose 里，新机器一条命令起全套）：
 #   migrate(一次性) ──> api(8001) ──> web(8080->80)
-#        │                └ api 内部按 lifespan 拉起 chat/authoring/parse
-#        │                  worker + export worker + memory worker
+#        │                └ 独立 chat/authoring/parse/export/memory workers
 #        └ postgres(pgvector, 内部网络)   redis(内部网络，必需)
 #   外部依赖（不在本编排内）：RAGFlow、LLM（Ollama 或 OpenAI 兼容 API）
 #
@@ -28,6 +27,9 @@ x-app-env: &app-env
   HDB_API_HOST: 0.0.0.0
   HDB_API_PORT: "8001"
   TZ: ${TZ:-Asia/Shanghai}
+  HDB_API_SPAWN_WORKER: "0"
+  HDB_API_SPAWN_EXPORT_WORKER: "0"
+  HDB_API_SPAWN_MEMORY_WORKER: "0"
 
 # 账本：5 组后端全部指向 compose 内的 PG（外部 PG 见 README「指向已有 PostgreSQL」）
 # 密码只在运行期需要：这里用空默认值，保证 `docker compose build` / `config` 不被阻塞。
@@ -49,6 +51,13 @@ x-pg-env: &pg-env
 x-app: &app
   image: ${HDB_APP_IMAGE:-hardware-database-app:latest}
   restart: unless-stopped
+  user: "${HDB_UID:-10001}:${HDB_GID:-10001}"
+  init: true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
   environment:
     <<: [*app-env, *pg-env]
   volumes:
@@ -58,6 +67,20 @@ x-app: &app
   extra_hosts:
     - "host.docker.internal:host-gateway"
   stop_grace_period: 30s
+
+x-worker: &worker
+  <<: *app
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "python", "-m", "src.observability.worker_registry"]
+    interval: 15s
+    timeout: 5s
+    start_period: 180s
+    retries: 3
 
 services:
   # 一次性初始化/校验：建控制面 schema + 逐域建表 + 认证域形状校验。
@@ -74,12 +97,12 @@ services:
     <<: *app
     environment:
       <<: [*app-env, *pg-env]
-      # API 单进程内含 worker 时，worker 由 API 拉起（单机部署的默认形态）。
-      # 若要多角色拆分/多副本，把下面三个开关设为 0 并单独起 worker 容器。
-      HDB_API_SPAWN_WORKER: "1"
-      HDB_API_SPAWN_EXPORT_WORKER: "1"
-      HDB_API_SPAWN_MEMORY_WORKER: "1"
-      WORKER_ROLE: all
+      HDB_REQUIRED_WORKER_ROLES: chat,authoring,parse,export,memory
+      # Only the dedicated nginx network may supply forwarded client IPs.
+      FORWARDED_ALLOW_IPS: ${HDB_PROXY_SUBNET:-172.30.91.0/24}
+    networks:
+      - default
+      - proxy
     ports:
       # 只绑回环：对外统一走 web(nginx)；同机 CLI/MCP 仍可直连 8001。
       - "127.0.0.1:${HDB_API_PORT:-8001}:8001"
@@ -92,11 +115,29 @@ services:
   web:
     image: ${HDB_WEB_IMAGE:-hardware-database-web:latest}
     restart: unless-stopped
+    networks:
+      - proxy
     ports:
       - "${HDB_HTTP_PORT:-8080}:80"
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
+
+  worker-chat:
+    <<: *worker
+    command: ["hardware-database-worker", "--role", "chat"]
+  worker-authoring:
+    <<: *worker
+    command: ["hardware-database-worker", "--role", "authoring"]
+  worker-parse:
+    <<: *worker
+    command: ["hardware-database-worker", "--role", "parse"]
+  worker-export:
+    <<: *worker
+    command: ["hardware-database-export-worker"]
+  worker-memory:
+    <<: *worker
+    command: ["hardware-database-memory-worker"]
 
   # 账本库（pgvector 镜像：记忆投影的语义索引需要 vector 扩展）。
   postgres:
@@ -162,3 +203,9 @@ volumes:
     # 同样不能复用 deploy/redis 自管实例的卷名（hardware-database-redis-data）：
     # 两个 Redis 进程追加同一个 AOF 会损坏它。
     name: hardware-database-app-redis-data
+
+networks:
+  proxy:
+    ipam:
+      config:
+        - subnet: ${HDB_PROXY_SUBNET:-172.30.91.0/24}

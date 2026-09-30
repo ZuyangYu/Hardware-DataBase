@@ -1925,7 +1925,11 @@ class MultiSourceAgentRunner:
         )
 
     @staticmethod
-    def _load_skill_prompt_context(ctx: RequestContext | None) -> str:
+    def _load_skill_prompt_context(
+        ctx: RequestContext | None,
+        *,
+        on_error: Callable[[BaseException], None] | None = None,
+    ) -> str:
         """Load reviewed Skills as bounded untrusted prompt data only.
 
         Skill references come from the server-owned request context metadata;
@@ -1966,7 +1970,12 @@ class MultiSourceAgentRunner:
                 is_admin=bool(ctx.is_system_admin()),
                 limit=8,
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - fail closed and surface a bounded event
+            if on_error is not None:
+                try:
+                    on_error(exc)
+                except Exception:
+                    pass
             return ""
         if not blocks:
             return ""
@@ -2664,7 +2673,20 @@ class MultiSourceAgentRunner:
         )
         if attachment_context:
             system_prompt = f"{system_prompt}\n\n{attachment_context}"
-        skill_context = self._load_skill_prompt_context(ctx)
+        skill_context = self._load_skill_prompt_context(
+            ctx,
+            on_error=lambda exc: emit_event(
+                {
+                    "type": "degraded",
+                    "payload": {
+                        "stage": "skill_context",
+                        "component": "skill",
+                        "failure_type": type(exc).__name__,
+                        "capability": "unavailable",
+                    },
+                }
+            ),
+        )
         if skill_context:
             system_prompt = f"{system_prompt}\n\n{skill_context}"
 

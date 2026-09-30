@@ -392,15 +392,16 @@ class McpPluginsApiTests(unittest.TestCase):
             )
 
     def test_system_status_reports_mcp_three_states(self):
-        token = self._token("user1")
-        headers = self._auth(token)
+        # /api/v1/system/status is system-admin only, so the three-state
+        # assertions must use the administrator token.
+        headers = self._auth(self.sysadmin_token)
 
-        # Enabled but nothing is enabled yet -> degraded with a stable reason.
+        # Built-in and on, but no server is enabled yet -> idle, not degraded.
         component = self.client.get("/api/v1/system/status", headers=headers).json()[
             "dependencies"
         ]["dependencies"]["mcp"]
-        self.assertEqual(component["status"], "degraded")
-        self.assertEqual(component["error"], "no_enabled_server")
+        self.assertEqual(component["status"], "idle")
+        self.assertEqual(component["error"], "")
 
         # A passing test + enable flips the component to up.
         with McpStubServer() as stub:

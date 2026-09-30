@@ -1,0 +1,152 @@
+# 观测栈：作为生产部署的默认覆盖文件；资源受限环境才显式不加载。
+#
+#   cd deploy/docker
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#   或一键：bash quickstart.sh
+#
+# 与主编排同一 compose 网络：应用侧直接用 otel-collector:4317，不需要
+# host.docker.internal，也不需要单独维护两套 compose。
+#
+# 包含：OTel Collector（4317/4318/9464）+ Prometheus（9090）+ Tempo + Loki
+#      + Grafana（3000）+ Phoenix（6006）+ Phoenix PostgreSQL（内部）。
+# 配置复用 deploy/observability/ 下同一套 Collector/Prometheus/Grafana 文件。
+#
+# quickstart 会在 deploy/docker/.env 生成 Grafana/Phoenix 随机口令；手动启动时
+# 必须显式提供 GRAFANA_ADMIN_PASSWORD 与 PHOENIX_DB_PASSWORD。
+
+services:
+  worker-chat: &observed-worker
+    environment: &obs-env
+      OBS_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    depends_on:
+      otel-collector:
+        condition: service_started
+  worker-authoring: *observed-worker
+  worker-parse: *observed-worker
+  worker-export: *observed-worker
+  worker-memory: *observed-worker
+  api:
+    depends_on:
+      otel-collector:
+        condition: service_started
+    environment:
+      # 生产部署默认启用观测；此覆盖文件是观测栈的唯一连接入口。
+      OBS_ENABLED: "true"
+      # 同网络，collector 服务名可直连；覆盖 config/.env 的空/默认值。
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      # 仅用于前端跳转链接；远端浏览器访问时改为宿主机 IP：
+      #   OBS_GRAFANA_BASE_URL=http://<主机IP>:3000
+      OBS_GRAFANA_BASE_URL: ${OBS_GRAFANA_BASE_URL:-http://localhost:3000}
+      OBS_PHOENIX_BASE_URL: ${OBS_PHOENIX_BASE_URL:-http://localhost:6006}
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      OBS_PHOENIX_PROJECT: ${OBS_PHOENIX_PROJECT:-hardware-database}
+    volumes:
+      - ../observability/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_OTLP_GRPC_PORT:-4317}:4317"
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_OTLP_HTTP_PORT:-4318}:4318"
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_METRICS_PORT:-9464}:9464"
+    depends_on:
+      - tempo
+      - loki
+      - phoenix
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ../observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - otel-collector
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    volumes:
+      - ${ALERTMANAGER_CONFIG:-../observability/alertmanager/alertmanager.yml}:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_ALERTMANAGER_PORT:-9093}:9093"
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ../observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    expose:
+      - "3200"
+      - "4317"
+
+  loki:
+    image: grafana/loki:3.5.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ../observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    expose:
+      - "3100"
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+  phoenix-db:
+    image: postgres:16.10-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PHOENIX_DB_USER:-phoenix}
+      POSTGRES_PASSWORD: ${PHOENIX_DB_PASSWORD:?PHOENIX_DB_PASSWORD must be set}
+      POSTGRES_DB: ${PHOENIX_DB_NAME:-phoenix}
+    volumes:
+      - phoenix-db-data:/var/lib/postgresql/data
+
+  phoenix:
+    image: arizephoenix/phoenix:19.13.0
+    restart: unless-stopped
+    environment:
+      PHOENIX_SQL_DATABASE_URL: postgresql://${PHOENIX_DB_USER:-phoenix}:${PHOENIX_DB_PASSWORD:?PHOENIX_DB_PASSWORD must be set}@phoenix-db:5432/${PHOENIX_DB_NAME:-phoenix}
+      PHOENIX_PROJECT_NAME: ${OBS_PHOENIX_PROJECT:-hardware-database}
+    ports:
+      - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_PHOENIX_PORT:-6006}:6006"
+    depends_on:
+      - phoenix-db
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:
+  phoenix-db-data:
+  alertmanager-data:

@@ -299,10 +299,22 @@ class ResultExportWorker:
 
 
 def main() -> None:
+    from src.observability import init_observability, shutdown_observability
+    from src.observability.worker_registry import WorkerHeartbeat
+
+    init_observability(
+        "hardware-database-export-worker",
+        service_version=src.settings.OBS_SERVICE_VERSION,
+        environment=src.settings.OBS_ENVIRONMENT,
+    )
     worker = ResultExportWorker()
     signal.signal(signal.SIGTERM, worker.stop)
     signal.signal(signal.SIGINT, worker.stop)
-    worker.run_forever()
+    try:
+        with WorkerHeartbeat(worker.worker_id, "export"):
+            worker.run_forever()
+    finally:
+        shutdown_observability()
 
 
 if __name__ == "__main__":

@@ -39,6 +39,30 @@ def test_export_flags_have_compatible_defaults():
     assert result.returncode == 0, result.stderr or result.stdout
 
 
+def test_production_observability_defaults_are_enabled_and_local():
+    env = os.environ.copy()
+    env.pop("OBS_ENABLED", None)
+    env.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+    env["HDB_ENV_PATH"] = "/tmp/hdb-test-settings-no-env/does-not-exist"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import src.settings as s; "
+                "assert s.OBS_ENABLED is True; "
+                "assert s.OTEL_EXPORTER_OTLP_ENDPOINT == "
+                "'http://127.0.0.1:4317'"
+            ),
+        ],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def test_reload_settings_parses_global_and_per_format_export_flags():
     import src.settings as settings
 

@@ -318,6 +318,7 @@ def upload_skill_package(
     bundles: SandboxCatalog = Depends(get_sandbox_catalog),
     client: SandboxServiceClient | None = Depends(get_sandbox_service_client),
 ):
+    storage_ref = ""
     try:
         raw = base64.b64decode(body.package_base64, validate=True)
         package = validate_skill_package(raw)
@@ -332,6 +333,8 @@ def upload_skill_package(
             package_build_state="uploaded",
         )
     except (ValueError, binascii.Error, SkillPackageError, SkillCatalogError) as exc:
+        if storage_ref:
+            packages.delete(storage_ref)
         _audit(actor, action="sandbox.skill_package_upload", task_id=body.skill_ref,
                target_type="sandbox_skill", success=False, error=str(exc))
         raise HTTPException(status_code=400, detail="Skill package is invalid") from exc
@@ -361,6 +364,7 @@ def upload_text_skill_package(
     packages: SkillPackageStore = Depends(get_skill_package_store),
 ):
     """Register a reviewable text draft from SKILL.md and bundled Markdown."""
+    storage_ref = ""
     try:
         raw = base64.b64decode(body.package_base64, validate=True)
         package = validate_text_skill_package(raw)
@@ -375,6 +379,8 @@ def upload_text_skill_package(
             text_files=package.files,
         )
     except (ValueError, binascii.Error, SkillPackageError, SkillCatalogError) as exc:
+        if storage_ref:
+            packages.delete(storage_ref)
         _audit(actor, action="sandbox.text_skill_package_upload", target_type="sandbox_skill",
                success=False, error=str(exc))
         raise HTTPException(status_code=400, detail="text Skill package is invalid or conflicts with an enabled Skill") from exc
@@ -416,6 +422,7 @@ def upload_personal_text_skill(
     skill_ref = f"skill/personal/{user.id}/{package.skill_ref.removeprefix('skill/')}"
     if catalog.get(skill_ref) is not None:
         raise HTTPException(status_code=409, detail="personal Skill name already exists")
+    storage_ref = ""
     try:
         storage_ref = packages.save(skill_ref, package, raw)
         skill = catalog.register(
@@ -427,8 +434,12 @@ def upload_personal_text_skill(
             text_files=package.files, allow_overwrite=False,
         )
     except SkillStateConflict as exc:
+        if storage_ref:
+            packages.delete(storage_ref)
         raise HTTPException(status_code=409, detail="personal Skill name already exists") from exc
     except (SkillCatalogError, SkillPackageError) as exc:
+        if storage_ref:
+            packages.delete(storage_ref)
         _audit(user, action="sandbox.personal_skill_upload", task_id=skill_ref,
                target_type="sandbox_skill", success=False, error=str(exc))
         raise HTTPException(status_code=400, detail="text Skill ZIP is invalid") from exc
@@ -461,6 +472,7 @@ def upload_personal_executable_skill(
     skill_ref = f"skill/personal/{user.id}/{body.skill_name}"
     if catalog.get(skill_ref) is not None:
         raise HTTPException(status_code=409, detail="personal Skill name already exists")
+    storage_ref = ""
     try:
         storage_ref = packages.save(skill_ref, package, raw)
         summary = next((line.lstrip("# ").strip() for line in package.skill_markdown.splitlines() if line.strip()), "")
@@ -475,8 +487,12 @@ def upload_personal_executable_skill(
             package_build_state="uploaded", allow_overwrite=False,
         )
     except SkillStateConflict as exc:
+        if storage_ref:
+            packages.delete(storage_ref)
         raise HTTPException(status_code=409, detail="personal Skill name already exists") from exc
     except (SkillCatalogError, SkillPackageError) as exc:
+        if storage_ref:
+            packages.delete(storage_ref)
         _audit(user, action="sandbox.personal_skill_package_upload", task_id=skill_ref,
                target_type="sandbox_skill", success=False, error=str(exc))
         raise HTTPException(status_code=400, detail="executable Skill ZIP or schema is invalid") from exc
@@ -804,6 +820,8 @@ def delete_skill(
     skill_ref: str,
     actor: AuthUser = Depends(require_system_admin),
     catalog: SkillCatalog = Depends(get_skill_catalog),
+    packages: SkillPackageStore = Depends(get_skill_package_store),
+    client: SandboxServiceClient | None = Depends(get_sandbox_service_client),
 ):
     try:
         item = catalog.delete_revoked(skill_ref)
@@ -811,10 +829,36 @@ def delete_skill(
         raise HTTPException(status_code=404, detail="Skill not found") from exc
     except SkillStateConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)[:300]) from exc
+    # Retention cleanup: catalog history stays, but the uploaded source bytes
+    # and any Runner-generated bundle/image for this deleted Skill are removed.
+    sources_purged = 0
+    for storage_ref in (item.text_storage_ref, item.package_storage_ref):
+        if storage_ref and packages.delete(storage_ref):
+            sources_purged += 1
+    bundle_purged = False
+    cleanup_pending = False
+    bundle_ref = str(item.execution_bundle_ref or "")
+    if bundle_ref.startswith("bundle/skill-"):
+        if client is None:
+            cleanup_pending = True
+        else:
+            try:
+                result = client.purge_generated_bundle(
+                    bundle_ref, envelope=_runner_envelope(actor),
+                )
+                bundle_purged = bool(result.get("purged"))
+                cleanup_pending = bool(result.get("cleanup_pending"))
+            except Exception as exc:  # noqa: BLE001 - cleanup must not block deletion
+                cleanup_pending = True
+                _audit(actor, action="sandbox.skill_purge", task_id=skill_ref,
+                       target_type="sandbox_skill", success=False, error=str(exc))
     _audit(actor, action="sandbox.skill_delete", task_id=skill_ref, target_type="sandbox_skill",
            metadata={"version": item.version, "content_digest": item.content_digest,
-                     "archive_digest": item.package_archive_digest or item.text_archive_digest})
-    return {"deleted": True}
+                     "archive_digest": item.package_archive_digest or item.text_archive_digest,
+                     "sources_purged": sources_purged, "bundle_purged": bundle_purged,
+                     "cleanup_pending": cleanup_pending})
+    return {"deleted": True, "sources_purged": sources_purged,
+            "bundle_purged": bundle_purged, "cleanup_pending": cleanup_pending}
 
 
 @router.post("/skills/{skill_ref:path}/bind-execution", response_model=SandboxSkillResponse)

@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # Hardware DataBase 应用镜像：FastAPI API + 全部后台 worker 共用一个镜像，
-# 通过容器 CMD/环境变量选择角色（默认 API，会按 src/api/app.py 的 lifespan
-# 自动拉起 chat/authoring/parse worker 与 export worker）。
+# 通过容器 CMD/环境变量选择角色。Docker 生产编排默认以独立容器运行各 Worker；
+# 宿主机单进程模式仍可由 API lifespan 管理 Worker 子进程。
 #
 # 构建（在仓库根目录）：
 #   docker build -f deploy/docker/Dockerfile -t hardware-database-app:latest .
@@ -78,6 +78,9 @@ RUN if [ "$HDB_INSTALL_EVAL" = "1" ]; then \
 
 # 应用运行期目录：storage 由卷挂载，config 挂载存放可写 .env。
 RUN mkdir -p /app/storage /app/config && chmod +x /app/deploy/docker/entrypoint.sh
+RUN groupadd --gid 10001 hdb && useradd --uid 10001 --gid hdb --home-dir /app/storage hdb \
+    && chown -R hdb:hdb /app/storage /app/config
+USER hdb
 
 # 管理页「系统配置」保存时需要原子替换 .env，镜像层与单文件 bind mount 都不允许
 # rename，因此把可写配置指向挂载目录（宿主机 ./config/.env）。
@@ -88,7 +91,7 @@ ENV HDB_ENV_PATH=/app/config/.env \
 EXPOSE 8001
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=5 \
-  CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health/live', timeout=4).status == 200 else 1)"
+  CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health/ready', timeout=4).status == 200 else 1)"
 
 ENTRYPOINT ["/app/deploy/docker/entrypoint.sh"]
 # 默认角色：API。worker 角色示例：

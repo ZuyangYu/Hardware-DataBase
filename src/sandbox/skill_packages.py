@@ -293,5 +293,29 @@ class SkillPackageStore:
             raise SkillPackageError("Skill package source exceeds the archive size limit")
         return data
 
+    def delete(self, storage_ref: str) -> bool:
+        """Best-effort removal of one stored source archive.
+
+        Used when a revoked Skill is deleted or an upload fails before the
+        catalog row exists.  Audit rows and task history are unaffected.
+        """
+        value = str(storage_ref or "")
+        if not value:
+            return False
+        path = os.path.abspath(os.path.join(self.root, value))
+        if not path.startswith(self.root + os.sep) or not os.path.isfile(path):
+            return False
+        try:
+            os.remove(path)
+        except OSError:
+            return False
+        parent = os.path.dirname(path)
+        try:
+            if parent != self.root and os.path.isdir(parent) and not os.listdir(parent):
+                os.rmdir(parent)
+        except OSError:
+            pass
+        return True
+
 
 __all__ = ["SkillPackage", "TextSkillPackage", "SkillPackageError", "SkillPackageStore", "validate_skill_package", "validate_text_skill_package", "validate_requirements_lock"]

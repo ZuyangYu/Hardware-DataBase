@@ -424,38 +424,50 @@ export function ExtensionsView({
       </section>
 
       <Dialog open={uploadOpen} onOpenChange={(open) => { if (!open && !personalBusy) { setUploadOpen(false); setPersonalFile(null); } }}>
-        <DialogContent className="max-h-[86vh] max-w-[510px] overflow-y-auto p-[22px]">
-          <DialogHeader><DialogTitle>上传个人 Skill</DialogTitle></DialogHeader>
-          <p className="text-[13px] leading-[1.7] text-[#64718a]">上传后先由管理员审核；启用后你可以添加到对话，也可以共享给所属部门。</p>
-          <div className="mt-[12px] flex gap-[8px]" role="group" aria-label="Skill 类型">
-            <Button variant={personalKind === 'text' ? 'secondary' : 'outline'} aria-pressed={personalKind === 'text'} disabled={personalBusy} onClick={() => { setPersonalKind('text'); setPersonalFile(null); }}>文本型</Button>
-            <Button variant={personalKind === 'executable' ? 'secondary' : 'outline'} aria-pressed={personalKind === 'executable'} disabled={personalBusy} onClick={() => { setPersonalKind('executable'); setPersonalFile(null); }}>执行型</Button>
-          </div>
-          {personalKind === 'executable' && (
-            <div className="mt-[14px] space-y-[12px]">
-              <div className="grid gap-[10px] sm:grid-cols-2">
-                <div><Label htmlFor="personal-skill-name">Skill 名称</Label><Input id="personal-skill-name" className="mt-[6px]" value={personalName} onChange={(event) => setPersonalName(event.target.value)} placeholder="my-calculator" /><p className="mt-[4px] text-[11px] text-[#858b9c]">英文小写、数字及连字符</p></div>
-                <div><Label htmlFor="personal-skill-version">版本</Label><Input id="personal-skill-version" className="mt-[6px]" value={personalVersion} onChange={(event) => setPersonalVersion(event.target.value)} placeholder="1.0.0" /></div>
+        <DialogContent className="flex max-h-[88dvh] w-[min(560px,calc(100vw-32px))] max-w-none flex-col gap-0 overflow-hidden rounded-[18px] p-0 sm:max-w-none">
+          <DialogHeader className="shrink-0 border-b border-[#e8ebf2] px-[24px] py-[18px] pr-[56px]">
+            <DialogTitle className="text-[16px] font-semibold text-[#18181a]">上传个人 Skill</DialogTitle>
+            <p className="text-[12px] leading-[1.6] text-[#758098]">提交后先由管理员审核；启用后可添加到对话，也可以共享给所属部门。</p>
+          </DialogHeader>
+          <div data-personal-upload className="min-h-0 overflow-y-auto px-[24px] py-[20px]">
+            <div className="rounded-[12px] border border-[#e5eaf3] bg-[#f8faff] p-[12px]">
+              <div className="text-[11px] font-medium text-[#476a9f]">第一步 · 选择类型</div>
+              <div className="mt-[9px] grid gap-[8px] sm:grid-cols-2" role="group" aria-label="Skill 类型">
+                <Button variant={personalKind === 'text' ? 'secondary' : 'outline'} className="justify-start" aria-pressed={personalKind === 'text'} disabled={personalBusy} onClick={() => { setPersonalKind('text'); setPersonalFile(null); }}>文本型<span className="ml-auto text-[11px] font-normal opacity-70">Markdown 参考</span></Button>
+                <Button variant={personalKind === 'executable' ? 'secondary' : 'outline'} className="justify-start" aria-pressed={personalKind === 'executable'} disabled={personalBusy} onClick={() => { setPersonalKind('executable'); setPersonalFile(null); }}>执行型<span className="ml-auto text-[11px] font-normal opacity-70">独立沙箱</span></Button>
               </div>
-              <div><Label htmlFor="personal-skill-schema">输入参数 JSON Schema</Label><textarea id="personal-skill-schema" value={personalSchema} onChange={(event) => setPersonalSchema(event.target.value)} rows={5} spellCheck={false} className="mt-[6px] w-full rounded-[8px] border border-[#e0e5ee] bg-white p-[9px] font-mono text-[12px] focus:border-[#6b9ae8] focus:outline-none" /></div>
-              <p className="text-[11px] leading-[1.6] text-[#73819a]">代码不会在上传时构建或运行；管理员审查源包后，才可交由独立 Runner 构建并继续审核镜像。</p>
             </div>
-          )}
-          <div className="mt-[14px] rounded-[12px] border border-dashed border-[#cbd8ed] bg-[#f8faff] p-[16px]">
-            <Label htmlFor="personal-skill-zip">{personalKind === 'text' ? '文本 Skill ZIP' : '执行型 Skill ZIP'} · 不超过 8 MiB</Label>
-            <Input key={personalKind} id="personal-skill-zip" className="mt-[9px] bg-white" type="file" accept=".zip,application/zip"
-              onChange={(event) => setPersonalFile(event.target.files?.[0] ?? null)} />
-            <p className="mt-[8px] text-[11px] leading-[1.6] text-[#73819a]">{personalKind === 'text' ? '包含 SKILL.md（YAML name / description）和可选 Markdown 参考资料。' : '根目录包含 SKILL.md 与 entrypoint.py；可选 requirements.lock 须固定版本和 wheel SHA-256。'}同名 Skill 不能重复上传。</p>
-          </div>
-          <div className="mt-[20px] flex justify-end gap-[8px]">
-            <Button variant="outline" disabled={personalBusy} onClick={() => { setUploadOpen(false); setPersonalFile(null); }}>取消</Button>
-            <Button disabled={personalBusy || !personalFile || !onUploadPersonal} onClick={() => {
-              if (personalFile && onUploadPersonal) void onUploadPersonal(personalFile, {
-                kind: personalKind, name: personalName.trim(), version: personalVersion.trim(), inputSchema: personalSchema,
-              }).then((success) => {
-                if (success) { setUploadOpen(false); setPersonalFile(null); }
-              });
-            }}>{personalBusy ? '正在上传…' : '提交审核'}</Button>
+            {personalKind === 'executable' && (
+              <div className="mt-[16px] space-y-[12px]">
+                <div className="grid gap-[10px] sm:grid-cols-2">
+                  <div><Label htmlFor="personal-skill-name">Skill 名称</Label><Input id="personal-skill-name" className="mt-[6px]" value={personalName} onChange={(event) => setPersonalName(event.target.value)} placeholder="my-calculator" /><p className="mt-[4px] text-[11px] text-[#858b9c]">英文小写、数字及连字符</p></div>
+                  <div><Label htmlFor="personal-skill-version">版本</Label><Input id="personal-skill-version" className="mt-[6px]" value={personalVersion} onChange={(event) => setPersonalVersion(event.target.value)} placeholder="1.0.0" /></div>
+                </div>
+                <details data-personal-schema className="rounded-[10px] border border-[#e8ebf2] px-[12px] py-[10px]">
+                  <summary className="cursor-pointer text-[12px] font-medium text-[#596174]">高级：输入参数 JSON Schema</summary>
+                  <p className="mt-[9px] text-[11px] leading-[1.6] text-[#73819a]">不填写业务参数时可保留默认对象 Schema；执行时会将参数写入 /work/in/parameters.json。</p>
+                  <textarea id="personal-skill-schema" value={personalSchema} onChange={(event) => setPersonalSchema(event.target.value)} rows={6} spellCheck={false} className="mt-[8px] w-full rounded-[8px] border border-[#e0e5ee] bg-white p-[9px] font-mono text-[12px] focus:border-[#6b9ae8] focus:outline-none" />
+                </details>
+              </div>
+            )}
+            <div className="mt-[16px] rounded-[12px] border border-dashed border-[#cbd8ed] bg-[#f8faff] p-[16px]">
+              <div className="text-[11px] font-medium text-[#476a9f]">第二步 · 上传源包</div>
+              <Label htmlFor="personal-skill-zip" className="mt-[9px] block">{personalKind === 'text' ? '文本 Skill ZIP' : '执行型 Skill ZIP'} · 不超过 8 MiB</Label>
+              <Input key={personalKind} id="personal-skill-zip" className="mt-[9px] bg-white" type="file" accept=".zip,application/zip"
+                onChange={(event) => setPersonalFile(event.target.files?.[0] ?? null)} />
+              <p className="mt-[8px] text-[11px] leading-[1.6] text-[#73819a]">{personalKind === 'text' ? '包含 SKILL.md（YAML name / description）和可选 Markdown 参考资料。' : '根目录包含 SKILL.md 与 entrypoint.py；可选 requirements.lock 须固定版本和 wheel SHA-256。'}同名 Skill 不能重复上传。</p>
+            </div>
+            {personalKind === 'executable' && <p className="mt-[12px] rounded-[9px] bg-[#fff9ed] px-[11px] py-[9px] text-[11px] leading-[1.6] text-[#785e2b]">代码不会在上传时构建或运行；管理员审查源包后，才可交由独立 Runner 构建并继续审核镜像。</p>}
+            <div className="sticky bottom-0 z-10 mt-[20px] flex justify-end gap-[8px] border-t border-[#edf0f4] bg-white/95 pt-[14px] backdrop-blur-sm">
+              <Button variant="outline" disabled={personalBusy} onClick={() => { setUploadOpen(false); setPersonalFile(null); }}>取消</Button>
+              <Button disabled={personalBusy || !personalFile || !onUploadPersonal} onClick={() => {
+                if (personalFile && onUploadPersonal) void onUploadPersonal(personalFile, {
+                  kind: personalKind, name: personalName.trim(), version: personalVersion.trim(), inputSchema: personalSchema,
+                }).then((success) => {
+                  if (success) { setUploadOpen(false); setPersonalFile(null); }
+                });
+              }}>{personalBusy ? '正在上传…' : '提交审核'}</Button>
+            </div>
           </div>
         </DialogContent>
       </Dialog>

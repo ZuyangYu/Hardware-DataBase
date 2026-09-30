@@ -721,23 +721,31 @@ sandbox.write_artifact 生成候选 artifact
 
 ### 8.3 观测和审计
 
-低基数指标建议包括：
+以下为**代码现状**（2026-09-29 对齐，新增指标/审计前先确认消费方，不为了清单而补）：
 
-- `hdb.sandbox.task_count{status,backend,kind}`；
-- `hdb.sandbox.task_duration_seconds{backend,kind}`；
-- `hdb.sandbox.rejected_total{reason}`；
-- `hdb.sandbox.resource_limit_total{resource}`；
-- `hdb.sandbox.artifact_total{status}`；
-- `hdb.mcp.gateway_health{status}`。
+低基数指标：
 
-审计事件至少包括：
+- Sandbox：`hdb.sandbox.task_count`、`hdb.sandbox.task_duration_seconds`、
+  `hdb.sandbox.state_count`、`hdb.sandbox.artifact_count`；
+- MCP：`hdb.mcp.call_count`、`hdb.mcp.call_duration_seconds`、`hdb.mcp.discovery_count`、
+  `hdb.mcp.tools.discovered`、`hdb.mcp.truncated_total`、`hdb.mcp.skipped_total{reason}`、
+  `hdb.mcp.write_count`、`hdb.mcp.artifact_rejected_total`。
+
+> 早期草案里的 `hdb.sandbox.rejected_total`、`resource_limit_total`、`artifact_total`、
+> `hdb.mcp.gateway_health` 尚未实现；需要时先明确看板/告警消费方再补。
+
+审计事件（实现名，非草案名）：
 
 ```text
-plugins.mcp.gateway_attach|detach|revoke
-sandbox.bundle_publish|review|revoke
-sandbox.task_submit|start|cancel|timeout|complete|reject
-sandbox.task_unknown|cleanup_pending|reconcile
-sandbox.artifact_received|download|confirm
+plugins.mcp.create|update|delete|enable|disable|test|refresh|tool_toggle|write_tools
+plugins.mcp.user_subscribe|user_unsubscribe|write_consent|write_confirm|write_reject
+plugins.mcp.gateway_publish|gateway_review|gateway_enable|gateway_disable|gateway_revoke|gateway_test|gateway_invoke
+sandbox.skill_publish|bind|subscribe|unsubscribe|run|package_upload|package_build|dependency_source|source_approve|source_read
+sandbox.skill_review|tested|enable|revoke|delete
+sandbox.bundle_publish|review|enable|revoke
+sandbox.authorization_grant|authorization_revoke
+sandbox.task_submit|start|cancel|reject|timeout|complete|reconcile
+sandbox.artifact_received|scan|confirm|download
 ```
 
 不得记录 secret、命令正文、原始脚本、完整工具参数、完整外部响应或文件内容。为保证故障排查和不可抵赖性，可以记录脱敏后的参数摘要、schema/version、artifact digest、policy snapshot hash、execution ID、状态迁移和操作者，但不能通过这些字段重建 secret 或可执行命令。

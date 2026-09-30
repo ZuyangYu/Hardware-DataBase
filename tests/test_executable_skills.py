@@ -304,6 +304,33 @@ def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeyp
     assert load(context) == ""
 
 
+def test_skill_prompt_context_failure_reports_bounded_error(setup, monkeypatch):
+    from src.agents.runner import MultiSourceAgentRunner
+    from src.sandbox import skills as skills_module
+    import src.core.auth as auth_module
+
+    _, _, skills, _, _ = setup
+    monkeypatch.setattr(settings, "SANDBOX_TASK_DB_PATH", skills.db_path)
+    monkeypatch.setattr(auth_module, "AuthService", lambda: SimpleNamespace(
+        get_user_by_username=lambda username: SimpleNamespace(
+            id=42, role="employee", is_active=True, department_id="dept-1",
+        ) if username == "tester" else None,
+    ))
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(skills_module.SkillCatalog, "prompt_blocks", explode)
+    context = SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-1"},
+                              is_system_admin=lambda: False)
+    seen: list[str] = []
+    text = MultiSourceAgentRunner._load_skill_prompt_context(
+        context, on_error=lambda exc: seen.append(type(exc).__name__),
+    )
+    assert text == ""
+    assert seen == ["RuntimeError"]
+
+
 def test_revoked_executable_skill_delete_requires_revoked_bundle_and_finished_task(setup):
     _, bundles, skills, _, bundle = setup
     _reviewed_skill(skills, bundle)

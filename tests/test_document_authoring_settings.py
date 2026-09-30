@@ -22,8 +22,9 @@ class DocumentAuthoringSettingsTests(unittest.TestCase):
                 "-c",
                 (
                     "import src.settings as s; "
-                    # Agent 文档模式仍是灰度开关(默认关); 文档工具已默认开启。
-                    "assert s.DOCUMENT_AUTHORING_AGENT_MODE_ENABLED is False; "
+                    # Agent 文档模式已内置默认开启(external_agent 可逐字段降级);
+                    # 聊天文档工具同样默认开启。
+                    "assert s.DOCUMENT_AUTHORING_AGENT_MODE_ENABLED is True; "
                     "assert s.AGENT_DOCUMENT_TOOLS_ENABLED is True"
                 ),
             ],

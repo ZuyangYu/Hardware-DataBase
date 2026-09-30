@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import importlib.util
 import json
@@ -201,6 +202,107 @@ def test_runner_executes_pinned_id_without_registry_pull(runner, monkeypatch):
     assert argv[-2:] == [image, "/opt/bundle/report/entrypoint.py"]
     assert argv[argv.index("--pull") + 1] == "never"
     assert argv[argv.index("--network") + 1] == "none"
+
+
+def test_runner_build_applies_resource_limits(runner, monkeypatch, tmp_path):
+    module, image, _ = runner
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, stdout: str = "", returncode: int = 0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    def fake_run(argv, **kwargs):
+        calls.append([str(item) for item in argv])
+        if argv[:2] == ["docker", "build"]:
+            return Result()
+        if argv[:3] == ["docker", "image", "inspect"]:
+            if argv[3] == "hdb-sandbox-bundle:1.0":
+                return Result(image)
+            return Result("sha256:" + "b" * 64)
+        return Result()
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module, "GENERATED_BUNDLE_ROOT", str(tmp_path / "generated"))
+    monkeypatch.setattr(module, "WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    monkeypatch.setattr(module, "_skill_build_base_allowed", lambda digest: None)
+    monkeypatch.setattr(
+        module, "_load_bundle",
+        lambda ref: {"image_digest": image, "profile_ref": "profile/dev-l1"},
+    )
+    monkeypatch.setattr(
+        module, "_validate_skill_archive",
+        lambda raw, digest: ({"entrypoint.py": b"print('ok')\n", "SKILL.md": b"# ok\n"}, digest),
+    )
+    module._build_skill_bundle({
+        "skill_ref": "skill/report",
+        "package_digest": "c" * 64,
+        "base_bundle_ref": "bundle/report",
+        "profile_ref": "profile/dev-l1",
+        "package_base64": base64.b64encode(b"zip-bytes").decode("ascii"),
+        "input_schema": {},
+        "required_capabilities": ["sandbox.execute"],
+    })
+    build = next(call for call in calls if call[:2] == ["docker", "build"])
+    assert build[build.index("--resource") + 1] == "memory=1g"
+    assert "cpu-quota=100000" in build
+
+
+def test_runner_purges_generated_bundle_only_when_idle(runner, monkeypatch, tmp_path):
+    module, image, _ = runner
+    generated = tmp_path / "generated"
+    bundle_dir = generated / "skill-purge-abc"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "bundle.json").write_text(
+        json.dumps({"bundle_ref": "bundle/skill-purge-abc", "image_digest": image}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "GENERATED_BUNDLE_ROOT", str(generated))
+    monkeypatch.setattr(module, "_reconcile_tasks", lambda: {"reconciled": True})
+    calls: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+
+    def fake_run(argv, **kwargs):
+        calls.append([str(item) for item in argv])
+        return Result()
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    path = "/v1/generated-bundles/bundle/skill-purge-abc/purge"
+    hdb = {"Authorization": "Bearer hdb-secret", "X-Audience": "sandbox-runner"}
+    gateway = {"Authorization": "Bearer gateway-secret", "X-Audience": "sandbox-runner"}
+    with TestClient(module.app) as client:
+        assert client.post(path, headers=gateway).status_code == 401
+        assert client.post(path, headers={**hdb, "X-Audience": "sandbox-gateway"}).status_code == 403
+        conn = module._connect()
+        try:
+            conn.execute(
+                "INSERT INTO runner_tasks(task_id, bundle_ref, bundle_digest, profile_ref, status, created_at, updated_at) "
+                "VALUES(?, ?, ?, 'profile/dev-l1', 'running', 'now', 'now')",
+                ("task-" + "1" * 24, "bundle/skill-purge-abc", image),
+            )
+        finally:
+            conn.close()
+        blocked = client.post(path, headers=hdb)
+        assert blocked.status_code == 409, blocked.text
+        conn = module._connect()
+        try:
+            conn.execute(
+                "UPDATE runner_tasks SET status = 'succeeded' WHERE bundle_ref = ?",
+                ("bundle/skill-purge-abc",),
+            )
+        finally:
+            conn.close()
+        ok = client.post(path, headers=hdb)
+        assert ok.status_code == 200, ok.text
+        body = ok.json()
+    assert body["purged"] is True
+    assert body["image_removed"] is True
+    assert not bundle_dir.exists()
+    assert ["docker", "rmi", image] in calls
 
 
 def test_runner_rejects_unsafe_or_colliding_task_identifiers(runner):

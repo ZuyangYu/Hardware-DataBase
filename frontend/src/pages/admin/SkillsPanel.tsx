@@ -179,7 +179,7 @@ function SkillBundleCard({ bundle, busy, onBundleState }: {
       </details>
       {next && onBundleState && (
         <div className="mt-[14px] flex justify-end">
-          <Button variant={next.action === 'revoke' ? 'outline' : 'default'} size="sm"
+          <Button variant={next.action === 'revoke' ? 'destructive' : 'default'} size="sm"
             disabled={busy} onClick={() => onBundleState(bundle, next.action)}>
             {next.label}
           </Button>
@@ -200,7 +200,7 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
   const [filter, setFilter] = useState<SkillFilter>('all');
   const [search, setSearch] = useState('');
   const [selectedRef, setSelectedRef] = useState<string | null>(null);
-  const [dialog, setDialog] = useState<'upload' | 'text' | 'settings' | null>(null);
+  const [dialog, setDialog] = useState<'upload' | 'text' | 'text-manual' | 'settings' | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Skill | null>(null);
   const selectableDepartments = departments.filter((department) => department.name !== 'system');
   const departmentExists = (value: string) => value === '*' || selectableDepartments.some((department) => String(department.id) === value);
@@ -234,10 +234,29 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
     tested: { action: 'enable', label: '启用 Skill' },
   };
   const next = selectedSkill && nextSkillAction[selectedSkill.approval_state];
+  const nextActionBlocked = Boolean(
+    selectedSkill && (
+      busy
+      || (selectedIsPackage && selectedSkill.approval_state === 'draft'
+        && (selectedSkill.package_build_state !== 'built' || !selectedSkill.execution_bundle_ref))
+      || (selectedSkill.approval_state === 'tested'
+        && !!selectedSkill.execution_bundle_ref
+        && selectedBundle?.approval_state !== 'enabled')
+    ),
+  );
+  const nextActionHint = selectedSkill?.approval_state === 'draft' && selectedIsPackage
+    && (selectedSkill.package_build_state !== 'built' || !selectedSkill.execution_bundle_ref)
+    ? '请先完成源包审核并构建镜像。'
+    : selectedSkill?.approval_state === 'tested' && !!selectedSkill.execution_bundle_ref
+      && selectedBundle?.approval_state !== 'enabled'
+      ? '请先启用关联的构建镜像。'
+      : selectedSkill?.approval_state === 'tested'
+        ? '管理员确认测试结果后即可启用。'
+        : '确认内容与适用范围后推进审核状态。';
 
   async function submitAndClose(action?: () => Promise<boolean> | void) {
     if (action && await action()) {
-      if (dialog === 'upload' || dialog === 'text') {
+      if (dialog === 'upload' || dialog === 'text' || dialog === 'text-manual') {
         setSelectedRef(dialog === 'upload' ? skillRef.trim() : textSkillRef.trim());
         setFilter('all');
         setSearch('');
@@ -264,13 +283,13 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
         </div>
         <div className="flex flex-wrap items-center gap-[8px]">
           <Button variant="outline" size="sm" onClick={() => setDialog('settings')}><Settings2 />依赖源</Button>
-          <Button variant="outline" size="sm" onClick={() => setDialog('text')}><Plus />文本 Skill</Button>
-          <Button size="sm" onClick={() => setDialog('upload')}><Upload />上传 Skill</Button>
+          <Button variant="outline" size="sm" onClick={() => setDialog('text')}><Plus />导入文本 Skill</Button>
+          <Button size="sm" onClick={() => setDialog('upload')}><Upload />上传执行型 Skill</Button>
         </div>
       </header>
 
-      <div className="mt-[20px] grid items-start gap-[18px] lg:grid-cols-[minmax(260px,340px)_minmax(0,1fr)]">
-      <section data-skill-inventory className="min-w-0 rounded-[14px] border border-[#e8ebf2] bg-white shadow-[0_2px_10px_rgba(0,0,0,0.04)]">
+      <div className="mt-[20px] grid items-stretch gap-[18px] lg:h-[min(68dvh,680px)] lg:grid-cols-[minmax(280px,320px)_minmax(0,1fr)]">
+      <section data-skill-inventory className="flex min-h-0 min-w-0 flex-col rounded-[14px] border border-[#e8ebf2] bg-white shadow-[0_2px_10px_rgba(0,0,0,0.04)] lg:h-full">
         <div className="border-b border-[#edf0f4] px-[16px] py-[14px]">
           <div className="flex items-center justify-between gap-[8px]">
             <h3 className="text-[14px] font-semibold text-[#18181a]">Skill 目录</h3>
@@ -286,9 +305,9 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
           </select>
         </div>
         {filteredSkills.length === 0 ? (
-          <p className="px-[16px] py-[32px] text-center text-[12px] text-[#858b9c]">{skills.length ? '没有匹配的 Skill' : '还没有登记 Skill'}</p>
-        ) : (
-          <div className="max-h-[300px] overflow-y-auto py-[6px] lg:max-h-[min(65vh,660px)]" aria-label="Skill 列表">
+           <p className="px-[16px] py-[32px] text-center text-[12px] text-[#858b9c] lg:flex lg:min-h-0 lg:flex-1 lg:items-center lg:justify-center">{skills.length ? '没有匹配的 Skill' : '还没有登记 Skill'}</p>
+         ) : (
+           <div className="min-h-0 max-h-[300px] overflow-y-auto py-[6px] lg:flex-1 lg:max-h-none" aria-label="Skill 列表">
             {filteredSkills.map((skill) => (
               <button key={skill.skill_ref} type="button" data-skill-item={skill.skill_ref}
                 aria-controls="skill-review-detail"
@@ -309,7 +328,7 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
           </div>
         )}
       </section>
-      <section id="skill-review-detail" data-skill-detail className="min-w-0 rounded-[14px] border border-[#e8ebf2] bg-white p-[20px] shadow-[0_2px_10px_rgba(0,0,0,0.04)] max-[600px]:p-[16px]">
+       <section id="skill-review-detail" data-skill-detail className="min-h-0 min-w-0 overflow-y-auto rounded-[14px] border border-[#e8ebf2] bg-white p-[20px] shadow-[0_2px_10px_rgba(0,0,0,0.04)] max-[600px]:p-[16px] lg:h-full">
         {selectedSkill ? (
           <>
             <div className="flex flex-wrap items-start justify-between gap-[12px]">
@@ -326,6 +345,15 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
               <div><div className="text-[11px] text-[#858b9c]">可见范围</div><div className="mt-[3px] text-[13px] text-[#464c5e]">{selectedSkill.catalog_source === 'employee' ? selectedSkill.share_scope === 'department' ? `部门 ID ${selectedSkill.department_id}（上传者已共享）` : '仅上传者（审核通过后可共享部门）' : selectedSkill.department_id === '*' ? '全部员工（所有部门）' : selectedSkill.department_id ? `部门 ID ${selectedSkill.department_id}` : '未限定部门'}</div></div>
               <div><div className="text-[11px] text-[#858b9c]">构建状态</div><div className="mt-[3px] text-[13px] text-[#464c5e]">{selectedIsPackage ? BUILD_LABELS[selectedSkill.package_build_state ?? ''] ?? selectedSkill.package_build_state : '不适用'}</div></div>
             </div>
+
+            <section data-skill-next-action className="mt-[18px] flex flex-wrap items-center justify-between gap-[12px] rounded-[12px] border border-[#dce7fb] bg-[#f7faff] px-[14px] py-[13px]">
+              <div className="min-w-0">
+                <div className="text-[11px] font-medium text-[#476a9f]">当前下一步</div>
+                <p className="mt-[3px] text-[13px] font-medium text-[#243e68]">{next ? next.label : selectedSkill.approval_state === 'revoked' ? 'Skill 已撤销' : '当前状态无需操作'}</p>
+                <p className="mt-[3px] text-[11px] leading-[1.5] text-[#687894]">{nextActionHint}“测试通过”由管理员人工标记，不表示系统自动完成了功能测试。</p>
+              </div>
+              {next && <Button size="sm" disabled={nextActionBlocked} onClick={() => onState(selectedSkill, next.action)}>{next.label}</Button>}
+            </section>
 
             {selectedIsPackage && (
               <div data-skill-source-review={selectedSkill.skill_ref} className="border-b border-[#edf0f4] py-[20px]">
@@ -405,18 +433,16 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
 
             {selectedBundle && <div className="mt-[18px]"><SkillBundleCard bundle={selectedBundle} busy={busy} onBundleState={onBundleState} /></div>}
 
-            <div className="mt-[18px] border-t border-[#edf0f4] pt-[18px]">
-              <h4 className="text-[14px] font-semibold text-[#18181a]">Skill 审核</h4>
-              <p className="mt-[5px] text-[12px] leading-[1.6] text-[#697084]">{selectedIsPackage ? '源包和构建结果需分别审核。' : '确认内容与适用范围后推进状态。'}“测试通过”由管理员人工标记，不表示系统自动完成了功能测试。</p>
-              {selectedSkill.approval_state === 'tested' && selectedSkill.execution_bundle_ref && selectedBundle?.approval_state !== 'enabled' && (
-                <p className="mt-[8px] text-[12px] text-[#a15c00]">请先启用关联的构建镜像，再启用 Skill。</p>
-              )}
-              <div className="mt-[14px] flex flex-wrap gap-[8px]">
-                {next && <Button size="sm" disabled={busy || (selectedIsPackage && selectedSkill.approval_state === 'draft' && (selectedSkill.package_build_state !== 'built' || !selectedSkill.execution_bundle_ref)) || (selectedSkill.approval_state === 'tested' && !!selectedSkill.execution_bundle_ref && selectedBundle?.approval_state !== 'enabled')} onClick={() => onState(selectedSkill, next.action)}>{next.label}</Button>}
-                {selectedSkill.approval_state !== 'revoked' && <Button variant="outline" size="sm" disabled={busy} onClick={() => onState(selectedSkill, 'revoke')}>撤销 Skill</Button>}
-                {selectedSkill.approval_state === 'revoked' && onDelete && <Button variant="outline" size="sm" disabled={busy} onClick={() => setDeleteTarget(selectedSkill)}>删除 Skill</Button>}
+            <details className="mt-[18px] border-t border-[#edf0f4] pt-[16px]" data-skill-more-actions>
+              <summary className="cursor-pointer text-[12px] font-medium text-[#596174]">更多审核操作</summary>
+              <div className="mt-[10px] rounded-[10px] bg-[#fafbfc] p-[12px]">
+                <p className="text-[11px] leading-[1.6] text-[#697084]">{selectedIsPackage ? '源包和构建结果需分别审核。' : '确认内容与适用范围后推进状态。'}撤销或删除属于高影响操作，请确认后再执行。</p>
+                <div className="mt-[10px] flex flex-wrap gap-[8px]">
+                  {selectedSkill.approval_state !== 'revoked' && <Button variant="destructive" size="sm" disabled={busy} onClick={() => onState(selectedSkill, 'revoke')}>撤销 Skill</Button>}
+                  {selectedSkill.approval_state === 'revoked' && onDelete && <Button variant="destructive" size="sm" disabled={busy} onClick={() => setDeleteTarget(selectedSkill)}>删除 Skill</Button>}
+                </div>
               </div>
-            </div>
+            </details>
           </>
         ) : (
           <div className="flex min-h-[280px] flex-col items-center justify-center text-center">
@@ -424,21 +450,26 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
             <p className="mt-[5px] text-[12px] text-[#858b9c]">{skills.length ? '调整左侧搜索或筛选条件。' : '创建后在这里查看审核状态与构建结果。'}</p>
           </div>
         )}
-      </section>
-      </div>
-      {unlinkedBundles.length > 0 && (
-        <details className="mt-[18px] rounded-[12px] border border-[#e8ebf2] bg-white px-[18px] py-[14px]">
-          <summary className="cursor-pointer text-[12px] font-medium text-[#596174]">未关联 Skill 的构建镜像（{unlinkedBundles.length}）</summary>
-          <div className="mt-[14px] grid gap-[18px]">
-            {unlinkedBundles.map((bundle) => <SkillBundleCard key={bundle.bundle_ref} bundle={bundle} busy={busy} onBundleState={onBundleState} />)}
-          </div>
-        </details>
-      )}
+         {unlinkedBundles.length > 0 && (
+           <details className="mt-[18px] rounded-[12px] border border-[#e8ebf2] bg-[#fbfcfe] px-[14px] py-[12px]">
+             <summary className="cursor-pointer text-[12px] font-medium text-[#596174]">未关联 Skill 的构建镜像（{unlinkedBundles.length}）</summary>
+             <div className="mt-[14px] grid gap-[18px]">
+               {unlinkedBundles.map((bundle) => <SkillBundleCard key={bundle.bundle_ref} bundle={bundle} busy={busy} onBundleState={onBundleState} />)}
+             </div>
+           </details>
+         )}
+       </section>
+       </div>
       <Dialog open={dialog !== null} onOpenChange={(open) => { if (!open) setDialog(null); }}>
-        <DialogContent className="max-h-[86vh] max-w-[600px] overflow-y-auto p-[22px]">
-          <DialogHeader>
-             <DialogTitle>{dialog === 'upload' ? '上传执行型 Skill' : dialog === 'text' ? '导入文本 Skill' : '构建依赖源'}</DialogTitle>
+        <DialogContent className="flex max-h-[88dvh] w-[min(680px,calc(100vw-32px))] max-w-none flex-col gap-0 overflow-hidden rounded-[18px] p-0 sm:max-w-none">
+          <DialogHeader className="shrink-0 border-b border-[#e8ebf2] px-[24px] py-[18px] pr-[56px]">
+            <DialogTitle className="text-[16px] font-semibold text-[#18181a]">{dialog === 'upload' ? '上传执行型 Skill' : dialog === 'text' ? '导入文本 Skill' : dialog === 'text-manual' ? '快速创建文本 Skill' : '构建依赖源'}</DialogTitle>
+            <p className="text-[12px] leading-[1.6] text-[#758098]">
+              {dialog === 'upload' ? '上传源包后进入构建与审核流程。' : dialog === 'text' ? '导入 Markdown 内容，生成待审核文本 Skill。' : dialog === 'text-manual' ? '快速登记一段文本说明，内容不会作为脚本执行。' : '配置构建时使用的依赖源。'}
+            </p>
           </DialogHeader>
+
+          <div className="min-h-0 overflow-y-auto px-[24px] py-[20px]">
 
           {dialog === 'upload' && (
             <div data-skill-upload className="space-y-[16px]">
@@ -459,7 +490,7 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
                 <Label htmlFor="skill-schema" className="mt-[10px]">参数 JSON Schema</Label>
                 <Textarea id="skill-schema" rows={6} className="mt-[6px] font-mono text-[12px]" value={inputSchema ?? ''} onChange={(event) => onInputSchema?.(event.target.value)} />
               </details>
-              <div className="flex justify-end gap-[8px] border-t border-[#edf0f4] pt-[14px]">
+              <div className="sticky bottom-0 z-10 flex justify-end gap-[8px] border-t border-[#edf0f4] bg-white/95 pt-[14px] backdrop-blur-sm">
                 <Button variant="outline" disabled={busy} onClick={() => setDialog(null)}>取消</Button>
                 <Button disabled={busy || !packageFile || !skillRef.trim() || !departmentExists(departmentId) || !version.trim()} onClick={() => void submitAndClose(onUploadPackage)}>上传并构建</Button>
               </div>
@@ -476,21 +507,32 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
                 <p className="mt-[7px] break-all text-[11px] text-[#697084]">{textPackageFile ? `已选择：${textPackageFile.name}` : 'SKILL.md 需包含 YAML name / description；可直接打包内容或打包单个同名文件夹。仅接收 Markdown 和许可文本。'}</p>
               </div>
               <p className="text-[11px] text-[#858b9c]">随附 Markdown 会按文件路径合并为审核文本，最多 16 KiB；脚本、其他资产及工具权限声明不会被导入。</p>
-              <div className="flex justify-end gap-[8px]">
+              <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-[8px] border-t border-[#edf0f4] bg-white/95 pt-[14px] backdrop-blur-sm">
+                <Button variant="ghost" disabled={busy} onClick={() => setDialog('text-manual')}>没有 ZIP？快速创建</Button>
+                <div className="flex gap-[8px]">
                 <Button variant="outline" disabled={busy} onClick={() => setDialog(null)}>取消</Button>
                 <Button disabled={busy || !textPackageFile || !departmentExists(textDepartmentId)} onClick={() => void uploadTextAndClose()}>上传并创建草稿</Button>
-              </div>
-              <details className="border-t border-[#edf0f4] pt-[14px]">
-                <summary className="cursor-pointer text-[12px] font-medium text-[#596174]">没有 ZIP？手动粘贴单段文本</summary>
-                <div className="mt-[14px] space-y-[12px]">
-                  <div className="grid gap-[12px] sm:grid-cols-2">
-                    <div><Label htmlFor="text-skill-ref">Skill 引用</Label><Input id="text-skill-ref" className="mt-[6px]" value={textSkillRef} onChange={(event) => onTextSkillRef(event.target.value)} placeholder="skill/demo-bom-review" /><p className="mt-[5px] text-[11px] text-[#858b9c]">内部唯一标识，建议 skill/英文短名。</p></div>
-                    <div><Label htmlFor="text-skill-version">版本</Label><Input id="text-skill-version" className="mt-[6px]" value={textVersion} onChange={(event) => onTextVersion(event.target.value)} placeholder="1.0.0" /></div>
-                  </div>
-                  <div><Label htmlFor="text-skill-content">提示内容</Label><Textarea id="text-skill-content" className="mt-[6px]" rows={6} value={textContent} onChange={(event) => onTextContent(event.target.value)} placeholder="写明用途、适用场景与建议步骤。" /></div>
-                  <div className="flex justify-end"><Button variant="outline" disabled={busy || !textSkillRef.trim() || !textVersion.trim() || !textContent.trim() || !departmentExists(textDepartmentId)} onClick={() => void submitAndClose(onRegister)}>登记文本草稿</Button></div>
                 </div>
-              </details>
+              </div>
+            </div>
+          )}
+
+          {dialog === 'text-manual' && (
+            <div data-skill-text-manual className="space-y-[16px]">
+              <p className="text-[12px] leading-[1.6] text-[#697084]">适合快速登记一段文本说明。内容会进入待审核草稿，不会作为脚本执行。</p>
+              <SkillDepartmentSelect id="text-manual-department" value={textDepartmentId} departments={departments} onChange={onTextDepartmentId} />
+              <div className="grid gap-[12px] sm:grid-cols-2">
+                <div><Label htmlFor="text-skill-ref">Skill 引用</Label><Input id="text-skill-ref" className="mt-[6px]" value={textSkillRef} onChange={(event) => onTextSkillRef(event.target.value)} placeholder="skill/demo-bom-review" /><p className="mt-[5px] text-[11px] text-[#858b9c]">内部唯一标识，建议 skill/英文短名。</p></div>
+                <div><Label htmlFor="text-skill-version">版本</Label><Input id="text-skill-version" className="mt-[6px]" value={textVersion} onChange={(event) => onTextVersion(event.target.value)} placeholder="1.0.0" /></div>
+              </div>
+              <div><Label htmlFor="text-skill-content">提示内容</Label><Textarea id="text-skill-content" className="mt-[6px]" rows={8} value={textContent} onChange={(event) => onTextContent(event.target.value)} placeholder="写明用途、适用场景与建议步骤。" /></div>
+              <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-[8px] border-t border-[#edf0f4] bg-white/95 pt-[14px] backdrop-blur-sm">
+                <Button variant="ghost" disabled={busy} onClick={() => setDialog('text')}>返回 ZIP 导入</Button>
+                <div className="flex gap-[8px]">
+                  <Button variant="outline" disabled={busy} onClick={() => setDialog(null)}>取消</Button>
+                  <Button disabled={busy || !textSkillRef.trim() || !textVersion.trim() || !textContent.trim() || !departmentExists(textDepartmentId)} onClick={() => void submitAndClose(onRegister)}>登记文本草稿</Button>
+                </div>
+              </div>
             </div>
           )}
 
@@ -499,12 +541,13 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
               <p className="text-[12px] leading-[1.6] text-[#697084]">仅从运维批准的 HTTPS 主机获取固定版本与哈希的依赖；依赖在镜像构建时安装。</p>
               <div><Label htmlFor="skill-pip-index">pip 镜像源</Label><Input id="skill-pip-index" className="mt-[6px]" value={pipIndex ?? ''} onChange={(event) => onPipIndex?.(event.target.value)} placeholder="https://pypi.org/simple/" /></div>
               <p className="break-all text-[11px] text-[#858b9c]">允许的主机：{pipAllowedHosts || '未配置'}</p>
-              <div className="flex justify-end gap-[8px] border-t border-[#edf0f4] pt-[14px]">
+              <div className="sticky bottom-0 z-10 flex justify-end gap-[8px] border-t border-[#edf0f4] bg-white/95 pt-[14px] backdrop-blur-sm">
                 <Button variant="outline" disabled={busy} onClick={() => setDialog(null)}>取消</Button>
                 <Button disabled={busy || !onSavePipIndex} onClick={() => void submitAndClose(onSavePipIndex)}>保存依赖源</Button>
               </div>
             </div>
           )}
+          </div>
         </DialogContent>
       </Dialog>
       <ConfirmDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}

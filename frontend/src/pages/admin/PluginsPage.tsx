@@ -416,6 +416,24 @@ function parseHeaders(text: string): Record<string, string> | null {
   return Object.keys(headers).length > 0 ? headers : null;
 }
 
+function slugFromName(value: string): string {
+  const ascii = value
+    .normalize('NFKD')
+    .replace(/[^\x00-\x7F]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^[^a-z0-9]+|[-_]+$/g, '')
+    .slice(0, 50);
+  if (ascii.length >= 2) return ascii;
+  const codePoints = Array.from(value.trim())
+    .map((character) => character.codePointAt(0)?.toString(16) ?? '')
+    .filter(Boolean)
+    .join('-')
+    .slice(0, 44)
+    .replace(/[-_]+$/g, '');
+  return `mcp-${codePoints || 'service'}`.slice(0, 50);
+}
+
 /** Pure create/edit form fields; the credential is never echoed back. */
 export function ServerFormFields({
   initial,
@@ -426,6 +444,7 @@ export function ServerFormFields({
 }: ServerFormFieldsProps) {
   const editing = initial != null;
   const [slug, setSlug] = useState(initial?.slug ?? '');
+  const [slugEdited, setSlugEdited] = useState(initial != null);
   const [name, setName] = useState(initial?.name ?? '');
   const [transport, setTransport] = useState(initial?.transport ?? 'streamable_http');
   const [url, setUrl] = useState(initial?.url ?? '');
@@ -467,147 +486,225 @@ export function ServerFormFields({
   }
 
   return (
-    <div className="flex flex-col gap-[12px]">
-      <div className="grid gap-[12px] md:grid-cols-2">
-        <div>
-          <Label htmlFor="mcp-slug">标识（slug）</Label>
+    <div className="flex min-h-0 flex-col">
+      <div data-mcp-form-scroll className="max-h-[calc(88dvh-164px)] space-y-[16px] overflow-y-auto px-[24px] py-[20px]">
+        <section className="rounded-[14px] border border-[#e8ebf2] bg-white p-[16px]">
+          <div className="mb-[12px]">
+            <h3 className="text-[13px] font-semibold text-[#252b37]">基本信息</h3>
+            <p className="mt-[3px] text-[11px] text-[#858b9c]">名称用于在服务目录中展示；标识会根据名称自动生成。</p>
+          </div>
+          <Label htmlFor="mcp-name">服务名称</Label>
           <Input
-            id="mcp-slug"
-            value={slug}
-            disabled={editing}
-            onChange={(event) => setSlug(event.target.value)}
-            placeholder="kicad-local"
+            id="mcp-name"
+            className="mt-[6px]"
+            value={name}
+            onChange={(event) => {
+              const nextName = event.target.value;
+              setName(nextName);
+              if (!slugEdited) setSlug(slugFromName(nextName));
+            }}
+            placeholder="例如：KiCad 原理图工具"
           />
-        </div>
-        <div>
-          <Label htmlFor="mcp-name">名称</Label>
-          <Input id="mcp-name" value={name} onChange={(event) => setName(event.target.value)} />
-        </div>
-      </div>
+          <p className="mt-[6px] text-[11px] text-[#858b9c]">
+            服务标识：<span className="font-mono text-[#596174]">{slug || '填写名称后自动生成'}</span>
+          </p>
+        </section>
 
-      <div className="grid gap-[12px] md:grid-cols-2">
-        <div>
-          <Label htmlFor="mcp-transport">传输</Label>
-          <select
-            id="mcp-transport"
-            className="h-[36px] w-full rounded-[10px] border border-[#e1e5ee] bg-white px-[10px] text-[13px]"
-            value={transport}
-            onChange={(event) => setTransport(event.target.value)}
-          >
-            <option value="streamable_http">streamable_http</option>
-            <option value="sse">sse</option>
-          </select>
-        </div>
-        <div>
-          <Label htmlFor="mcp-timeout">超时（秒，可空）</Label>
-          <Input
-            id="mcp-timeout"
-            value={timeoutS}
-            onChange={(event) => setTimeoutS(event.target.value)}
-            placeholder="15"
-          />
-        </div>
-      </div>
-
-      <div>
-        <Label htmlFor="mcp-url">服务地址</Label>
-        <Input
-          id="mcp-url"
-          value={url}
-          onChange={(event) => setUrl(event.target.value)}
-          placeholder="https://mcp.example.com/mcp"
-        />
-      </div>
-
-      <div>
-        <Label htmlFor="mcp-description">说明</Label>
-        <Textarea
-          id="mcp-description"
-          value={description}
-          onChange={(event) => setDescription(event.target.value)}
-          rows={2}
-        />
-      </div>
-
-      <div>
-        <Label htmlFor="mcp-headers">
-          请求头（每行 Key: Value{editing ? '；留空即保留已保存凭据' : ''}）
-        </Label>
-        <Textarea
-          id="mcp-headers"
-          value={headersText}
-          onChange={(event) => setHeadersText(event.target.value)}
-          rows={2}
-          placeholder={editing && initial?.has_credentials ? '已保存凭据，留空即保留' : 'Authorization: Bearer …'}
-        />
-        {editing && (
-          <label className="mt-[6px] flex cursor-pointer items-center gap-[6px] text-[12px] text-[#464c5e]">
-            <input
-              type="checkbox"
-              data-mcp-clear-headers
-              checked={clearHeaders}
-              onChange={(event) => setClearHeaders(event.target.checked)}
-            />
-            清除已保存凭据
-          </label>
-        )}
-      </div>
-
-      <div className="grid gap-[12px] md:grid-cols-2">
-        <div>
-          <Label htmlFor="mcp-scope">部门范围</Label>
-          <select
-            id="mcp-scope"
-            className="h-[36px] w-full rounded-[10px] border border-[#e1e5ee] bg-white px-[10px] text-[13px]"
-            value={scope}
-            onChange={(event) => setScope(event.target.value)}
-          >
-            <option value="none">不可见</option>
-            <option value="departments">指定部门</option>
-            <option value="all">全部员工</option>
-          </select>
-          {scope === 'departments' && (
-            <div className="mt-[8px] flex flex-col gap-[6px]" data-mcp-department-picker>
-              {departments.length === 0 && (
-                <span className="text-[12px] text-[#858b9c]">暂无部门</span>
-              )}
-              {departments.map((department) => (
-                <label
-                  key={department.id}
-                  className="flex cursor-pointer items-center gap-[6px] text-[12px] text-[#464c5e]"
-                >
+        <section className="rounded-[14px] border border-[#e8ebf2] bg-white p-[16px]">
+          <div className="mb-[12px]">
+            <h3 className="text-[13px] font-semibold text-[#252b37]">连接信息</h3>
+            <p className="mt-[3px] text-[11px] text-[#858b9c]">凭据加密保存，不会在编辑时回显。</p>
+          </div>
+          <div className="space-y-[12px]">
+            <div>
+              <Label htmlFor="mcp-url">服务地址</Label>
+              <Input
+                id="mcp-url"
+                className="mt-[6px]"
+                value={url}
+                onChange={(event) => setUrl(event.target.value)}
+                placeholder="https://mcp.example.com/mcp"
+              />
+            </div>
+            <div>
+              <Label htmlFor="mcp-headers">访问凭据</Label>
+              <Textarea
+                id="mcp-headers"
+                className="mt-[6px] font-mono text-[12px]"
+                value={headersText}
+                onChange={(event) => setHeadersText(event.target.value)}
+                rows={2}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={editing && initial?.has_credentials ? '已保存凭据，留空即保留' : 'Authorization: Bearer …'}
+              />
+              <p className="mt-[5px] text-[11px] text-[#858b9c]">
+                每行一个请求头，格式为 Key: Value{editing ? '；编辑时留空会保留已保存凭据' : ''}。
+              </p>
+              {editing && (
+                <label className="mt-[9px] flex cursor-pointer items-center gap-[7px] text-[12px] text-[#464c5e]">
                   <input
                     type="checkbox"
-                    data-mcp-department={department.id}
-                    checked={departmentIds.includes(department.id)}
-                    onChange={() => toggleDepartment(department.id)}
+                    data-mcp-clear-headers
+                    checked={clearHeaders}
+                    onChange={(event) => setClearHeaders(event.target.checked)}
                   />
-                  {department.name}
+                  清除已保存凭据
                 </label>
-              ))}
+              )}
             </div>
-          )}
-        </div>
-        <div>
-          <Label htmlFor="mcp-tags">标签（逗号分隔）</Label>
-          <Input
-            id="mcp-tags"
-            value={tagsText}
-            onChange={(event) => setTagsText(event.target.value)}
-            placeholder="设计, EDA"
-          />
-          <Label htmlFor="mcp-icon" className="mt-[8px]">
-            图标（1 个字符，可空）
-          </Label>
-          <Input id="mcp-icon" value={icon} onChange={(event) => setIcon(event.target.value)} />
-        </div>
+          </div>
+        </section>
+
+        <details className="rounded-[14px] border border-[#e8ebf2] bg-[#fbfcfe] p-[16px]" data-mcp-advanced>
+          <summary className="cursor-pointer list-none text-[13px] font-semibold text-[#3f4a5d] marker:hidden">
+            <span className="flex flex-col items-start gap-[3px] sm:flex-row sm:items-center sm:justify-between sm:gap-[12px]">
+              <span className="min-w-0">授权与高级设置</span>
+              <span className="min-w-0 text-[11px] font-normal text-[#858b9c]">说明、传输协议、超时、部门范围与标签</span>
+            </span>
+          </summary>
+          <div className="mt-[16px] space-y-[16px]">
+            <section className="rounded-[12px] border border-[#e8ebf2] bg-white p-[14px]">
+              <h4 className="mb-[12px] text-[12px] font-semibold text-[#596174]">连接选项</h4>
+              {!editing && (
+                <div className="mb-[12px]">
+                  <Label htmlFor="mcp-slug">服务标识（可修改）</Label>
+                  <Input
+                    id="mcp-slug"
+                    className="mt-[6px] font-mono"
+                    value={slug}
+                    onChange={(event) => {
+                      setSlugEdited(true);
+                      setSlug(event.target.value);
+                    }}
+                    placeholder="kicad-local"
+                  />
+                  <p className="mt-[5px] text-[11px] text-[#858b9c]">只能用小写字母、数字、连字符和下划线；保存后不可修改。</p>
+                </div>
+              )}
+              {editing && (
+                <div className="mb-[12px]">
+                  <Label htmlFor="mcp-slug">服务标识</Label>
+                  <Input id="mcp-slug" className="mt-[6px] font-mono" value={slug} disabled />
+                </div>
+              )}
+              <div className="grid gap-[12px] sm:grid-cols-2">
+                <div>
+                  <Label htmlFor="mcp-transport">传输协议</Label>
+                  <select
+                    id="mcp-transport"
+                    className="mt-[6px] h-[36px] w-full rounded-[10px] border border-[#e1e5ee] bg-white px-[10px] text-[13px]"
+                    value={transport}
+                    onChange={(event) => setTransport(event.target.value)}
+                  >
+                    <option value="streamable_http">Streamable HTTP（推荐）</option>
+                    {editing && initial?.transport === 'sse' && (
+                      <option value="sse">SSE（旧服务兼容，已弃用）</option>
+                    )}
+                  </select>
+                </div>
+                <div>
+                  <Label htmlFor="mcp-timeout">连接超时（秒）</Label>
+                  <Input
+                    id="mcp-timeout"
+                    className="mt-[6px]"
+                    type="number"
+                    min={1}
+                    max={300}
+                    value={timeoutS}
+                    onChange={(event) => setTimeoutS(event.target.value)}
+                    placeholder="15"
+                  />
+                </div>
+              </div>
+              <div className="mt-[12px]">
+                <Label htmlFor="mcp-description">服务说明（可选）</Label>
+                <Textarea
+                  id="mcp-description"
+                  className="mt-[6px]"
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                  rows={2}
+                  placeholder="描述服务用途和适用场景"
+                />
+              </div>
+            </section>
+
+            <section className="rounded-[12px] border border-[#e8ebf2] bg-white p-[14px]">
+              <h4 className="mb-[12px] text-[12px] font-semibold text-[#596174]">可见范围</h4>
+              <div className="grid gap-[12px] sm:grid-cols-2">
+                <div>
+                  <Label htmlFor="mcp-scope">员工可见范围</Label>
+                  <select
+                    id="mcp-scope"
+                    className="mt-[6px] h-[36px] w-full rounded-[10px] border border-[#e1e5ee] bg-white px-[10px] text-[13px]"
+                    value={scope}
+                    onChange={(event) => setScope(event.target.value)}
+                  >
+                    <option value="none">暂不对员工开放</option>
+                    <option value="departments">指定部门</option>
+                    <option value="all">全部员工</option>
+                  </select>
+                  <p className="mt-[5px] text-[11px] text-[#858b9c]">服务启用后，符合范围的员工仍需自行订阅。</p>
+                  {scope === 'departments' && (
+                    <div className="mt-[10px] max-h-[150px] overflow-y-auto rounded-[9px] border border-[#edf0f4] p-[9px]" data-mcp-department-picker>
+                      {departments.length === 0 ? (
+                        <span className="text-[12px] text-[#858b9c]">暂无部门</span>
+                      ) : (
+                        <div className="flex flex-col gap-[8px]">
+                          {departments.map((department) => (
+                            <label
+                              key={department.id}
+                              className="flex cursor-pointer items-center gap-[7px] text-[12px] text-[#464c5e]"
+                            >
+                              <input
+                                type="checkbox"
+                                data-mcp-department={department.id}
+                                checked={departmentIds.includes(department.id)}
+                                onChange={() => toggleDepartment(department.id)}
+                              />
+                              {department.name}
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <div className="space-y-[12px]">
+                  <div>
+                    <Label htmlFor="mcp-tags">目录标签（可选）</Label>
+                    <Input
+                      id="mcp-tags"
+                      className="mt-[6px]"
+                      value={tagsText}
+                      onChange={(event) => setTagsText(event.target.value)}
+                      placeholder="设计, EDA"
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="mcp-icon">目录图标（可选）</Label>
+                    <Input
+                      id="mcp-icon"
+                      className="mt-[6px]"
+                      value={icon}
+                      onChange={(event) => setIcon(event.target.value)}
+                      maxLength={1}
+                      placeholder="🔌"
+                    />
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </details>
       </div>
 
-      <div className="mt-[4px] flex justify-end gap-[8px]">
-        <Button variant="outline" onClick={onCancel}>
+      <div data-mcp-form-footer className="flex shrink-0 justify-end gap-[8px] border-t border-[#e8ebf2] bg-white px-[24px] py-[14px]">
+        <Button type="button" variant="outline" onClick={onCancel}>
           取消
         </Button>
-        <Button disabled={submitting || !slug.trim() || !name.trim() || !url.trim()} onClick={submit}>
+        <Button type="button" disabled={submitting || !slug.trim() || !name.trim() || !url.trim()} onClick={submit}>
           {editing ? '保存' : '登记'}
         </Button>
       </div>
@@ -815,9 +912,14 @@ export default function PluginsPage({ auth }: Props) {
           if (!open) setEditing(null);
         }}
       >
-        <DialogContent className="max-h-[86vh] max-w-[640px] overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>{editing ? `编辑 ${editing.name}` : '登记 MCP 服务'}</DialogTitle>
+        <DialogContent className="flex max-h-[88dvh] w-[min(720px,calc(100vw-32px))] max-w-none flex-col gap-0 overflow-hidden rounded-[18px] p-0 sm:max-w-none">
+          <DialogHeader className="shrink-0 border-b border-[#e8ebf2] px-[24px] py-[18px] pr-[56px]">
+            <DialogTitle className="text-[16px] font-semibold text-[#18181a]">
+              {editing ? `编辑 ${editing.name}` : '登记 MCP 服务'}
+            </DialogTitle>
+            <p className="text-[12px] leading-[1.6] text-[#758098]">
+              填写服务名称、连接地址和访问凭据；授权范围等选项可稍后设置。
+            </p>
           </DialogHeader>
           <ServerFormFields
             initial={editing}

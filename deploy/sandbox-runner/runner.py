@@ -467,8 +467,12 @@ def _build_skill_bundle(body: Mapping[str, Any]) -> dict[str, Any]:
         with open(os.path.join(build_dir, "Dockerfile"), "w", encoding="utf-8") as handle:
             handle.write(dockerfile)
         tag = f"hdb-skill-build:{directory}-{package_digest[:12]}"
+        # Build containers get the same class of CPU/memory bounds as task
+        # containers; the build daemon is shared, so an oversized wheel set
+        # must not be able to exhaust the host.
         built = subprocess.run(
             ["docker", "build", "--pull=false", "--network", "default" if dependency_index else "none",
+             "--resource", "memory=1g", "--resource", "cpu-quota=100000",
              "--tag", tag, build_dir],
             capture_output=True, text=True, timeout=600 if dependency_index else 300,
         )
@@ -1351,6 +1355,65 @@ async def build_skill(
         return await asyncio.to_thread(_serialized_skill_build, body)
     except (binascii.Error, ValueError) as exc:
         raise _safe_error("package_invalid", "Skill build request is invalid") from exc
+
+
+@app.post("/v1/generated-bundles/{bundle_ref:path}/purge")
+def purge_generated_bundle(
+    bundle_ref: str,
+    authorization: str = Header(default=""),
+    x_audience: str = Header(default=""),
+) -> dict[str, Any]:
+    """Remove one generated Skill bundle directory and its fixed image.
+
+    Only bundles produced by the Skill build template (``bundle/skill-*``) can
+    be purged, and never while an unfinished task still references them.
+    """
+
+    _authenticate(authorization, x_audience)
+    ref = _require_ref(bundle_ref, "bundle_ref")
+    if not ref.startswith("bundle/skill-"):
+        raise _safe_error(
+            "invalid_reference", "only generated Skill bundles can be purged", status=400
+        )
+    root = os.path.abspath(GENERATED_BUNDLE_ROOT)
+    directory = _SAFE_NAME_RE.sub("_", ref.rsplit("/", 1)[-1])[:64]
+    candidate = os.path.abspath(os.path.join(root, directory))
+    if not candidate.startswith(root + os.sep) or not os.path.isdir(candidate):
+        raise _safe_error("bundle_unknown", "generated bundle is not registered", status=404)
+    with closing(_connect()) as conn:
+        active = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM runner_tasks WHERE bundle_ref = ? AND status NOT IN "
+                "('succeeded','failed','cancelled','timed_out')",
+                (ref,),
+            ).fetchone()[0]
+        )
+    if active:
+        raise _safe_error("bundle_in_use", "bundle is referenced by unfinished tasks", status=409)
+    try:
+        with open(os.path.join(candidate, "bundle.json"), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        image_digest = _reviewed_digest(manifest.get("image_digest"), "image_digest")
+    except (OSError, ValueError) as exc:
+        raise _safe_error("bundle_invalid", "bundle manifest is not readable", status=500) from exc
+    image_removed = False
+    if image_digest:
+        result = subprocess.run(
+            ["docker", "rmi", image_digest], capture_output=True, timeout=60
+        )
+        image_removed = result.returncode == 0
+    try:
+        shutil.rmtree(candidate)
+    except OSError as exc:
+        raise _safe_error(
+            "cleanup_pending", "bundle directory could not be removed", status=503
+        ) from exc
+    return {
+        "purged": True,
+        "bundle_ref": ref,
+        "image_removed": image_removed,
+        "cleanup_pending": False,
+    }
 
 
 @app.get("/v1/tasks/{task_id}")

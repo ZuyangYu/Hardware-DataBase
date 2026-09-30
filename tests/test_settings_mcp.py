@@ -61,7 +61,9 @@ class McpSettingsTests(unittest.TestCase):
             if key == "MCP_CREDENTIALS_KEY":
                 continue
             self.assertIn(key, settings.DEFAULT_VALUES, key)
-        self.assertEqual(settings.DEFAULT_VALUES["MCP_ENABLED"], "false")
+        # Built-in feature: the master switch defaults on and acts as an
+        # emergency kill switch; risk gates (write/insecure/private) stay off.
+        self.assertEqual(settings.DEFAULT_VALUES["MCP_ENABLED"], "true")
         self.assertEqual(settings.DEFAULT_VALUES["MCP_WRITE_ENABLED"], "false")
         self.assertEqual(settings.DEFAULT_VALUES["OBS_CAPTURE_MCP_CONTENT"], "false")
         # The credentials key must stay environment-only: returning it through
@@ -100,6 +102,17 @@ class McpSettingsTests(unittest.TestCase):
         self.assertEqual(settings.RESOURCE_MCP_MAX_CONCURRENT, 6)
         self.assertEqual(settings.RESOURCE_MCP_RESERVED_INTERACTIVE, 2)
 
+    def test_observability_is_not_part_of_the_user_config_api_surface(self):
+        from src.api.routes.config import _config_surface_keys
+
+        keys = _config_surface_keys()
+        self.assertNotIn("OBS_ENABLED", keys)
+        self.assertNotIn("OBS_TRACE_SAMPLE_RATIO", keys)
+        self.assertNotIn("OTEL_EXPORTER_OTLP_ENDPOINT", keys)
+        self.assertNotIn("CONVERSATION_UNIFIED_TOOLS_ENABLED", keys)
+        self.assertNotIn("RESOURCE_GOVERNOR_ENABLED", keys)
+        self.assertIn("MCP_ENABLED", keys)
+
     def test_integer_mcp_keys_are_validated_before_persisting(self):
         for key in ("MCP_CALL_TIMEOUT_SECONDS", "MCP_MAX_ARTIFACT_BYTES", "RESOURCE_MCP_MAX_CONCURRENT"):
             self.assertIn(key, settings._INT_SETTING_KEYS, key)
@@ -108,33 +121,17 @@ class McpSettingsTests(unittest.TestCase):
         self.assertIn("MCP_CALL_TIMEOUT_SECONDS", str(ctx.exception))
         settings.validate_settings_values({"MCP_CALL_TIMEOUT_SECONDS": "30"})
 
-    def test_enabling_mcp_requires_unified_tools_and_governor(self):
-        # 守卫看的是"当前生效配置"，必须先把本机 .env 可能打开的前置开关关掉，
-        # 否则 override 会命中已满足的全局值而放行。
+    def test_mcp_repairs_legacy_platform_prerequisites(self):
         self._reload(
             {
-                "MCP_ENABLED": "false",
+                "MCP_ENABLED": "true",
                 "CONVERSATION_UNIFIED_TOOLS_ENABLED": "false",
                 "RESOURCE_GOVERNOR_ENABLED": "false",
             }
         )
-        with self.assertRaises(ValueError) as ctx:
-            settings.validate_provider_configuration({"MCP_ENABLED": "true"})
-        self.assertIn("CONVERSATION_UNIFIED_TOOLS_ENABLED", str(ctx.exception))
-
-        with self.assertRaises(ValueError) as ctx:
-            settings.validate_provider_configuration(
-                {"MCP_ENABLED": "true", "CONVERSATION_UNIFIED_TOOLS_ENABLED": "true"}
-            )
-        self.assertIn("RESOURCE_GOVERNOR_ENABLED", str(ctx.exception))
-
-        settings.validate_provider_configuration(
-            {
-                "MCP_ENABLED": "true",
-                "CONVERSATION_UNIFIED_TOOLS_ENABLED": "true",
-                "RESOURCE_GOVERNOR_ENABLED": "true",
-            }
-        )
+        self.assertTrue(settings.CONVERSATION_UNIFIED_TOOLS_ENABLED)
+        self.assertTrue(settings.RESOURCE_GOVERNOR_ENABLED)
+        settings.validate_provider_configuration({"MCP_ENABLED": "true"})
 
     def test_config_route_maps_mcp_validation_to_400(self):
         """PUT /config surfaces the prerequisite error instead of a generic 500."""

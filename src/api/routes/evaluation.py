@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import uuid
 from dataclasses import dataclass
 
 from pathlib import Path
@@ -865,18 +866,37 @@ async def upload_dataset(
     filename = Path(file.filename or "dataset.jsonl").name
     if Path(filename).suffix.lower() != ".jsonl":
         raise HTTPException(status_code=400, detail="dataset file must be a .jsonl file")
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="dataset file is empty")
-
     upload_dir = Path(output_root) / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     target = upload_dir / filename
-    target.write_bytes(content)
-    errors = validate_dataset(target)
+    partial = upload_dir / f".{filename}.{uuid.uuid4().hex}.uploading"
+    total = 0
+    try:
+        with partial.open("wb") as handle:
+            while True:
+                chunk = await file.read(min(1024 * 1024, int(src.settings.EVALUATION_DATASET_MAX_BYTES) + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > int(src.settings.EVALUATION_DATASET_MAX_BYTES):
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"dataset file exceeds {src.settings.EVALUATION_DATASET_MAX_BYTES} bytes",
+                    )
+                handle.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="dataset file is empty")
+        errors = validate_dataset(partial)
+    except HTTPException:
+        partial.unlink(missing_ok=True)
+        raise
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
     if errors:
-        target.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="; ".join(errors))
+    partial.replace(target)
     return {
         "dataset_path": str(target),
         "file_name": filename,

@@ -75,6 +75,7 @@ uv run python deploy/sandbox-runner/skill_api_smoke.py # 需要管理员账号�
 | GET | `/health` | 健康检查 |
 | POST | `/tasks` | 提交固定 bundle（校验 bundle digest/profile/参数 schema） |
 | POST | `/skill-build` | HDB 管理员上传源包后调用；使用固定模板构建（锁定依赖时可按批准的 HTTPS 源联网），返回镜像 ID、源码 digest 和 bundle 引用 |
+| POST | `/generated-bundles/{ref}/purge` | 删除已撤销 Skill 的生成 bundle 目录与固定镜像；仅接受 `bundle/skill-*`，仍有未完成任务时返回 409 |
 | GET | `/tasks/{id}` | 观察状态/执行身份/产物清单 |
 | POST | `/tasks/{id}/cancel` | 请求取消；容器与工作区清理确认后终结为 cancelled |
 | POST | `/tasks/{id}/collect` | 返回内联产物清单（base64 + sha256 + execution_id） |

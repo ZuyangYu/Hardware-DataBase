@@ -30,6 +30,11 @@ __pycache__
 
 # --- 运行期数据（由卷挂载提供）---
 /storage
+/storage.pre-restore-*
+deploy/docker/storage
+deploy/sandbox-runner/secrets
+deploy/sandbox-runner/state
+deploy/mcp-gateway/secrets
 /logs
 
 # --- 前端：web 镜像在构建阶段自行 npm ci + build ---

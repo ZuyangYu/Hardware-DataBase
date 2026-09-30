@@ -1,359 +1,251 @@
 <div align="center">
 
-# Hardware DataBase
+## 项目介绍
 
-**面向硬件设计资料的多源智能问答与文档生成基座**
+硬件研发知识分散在规格书、接口表、网表、原理图和历史讨论中。一次工程查询往往需要同时查阅多种资料，再把结论整理进设计说明或评审文档。
 
-把散落在技术文档、结构化表格、电路设计（EDF 网表 / 原理图）与历史对话中的硬件知识，
-收敛为一个**可检索、可追溯、可治理、可导出**的统一数据基座。
+Hardware DataBase 为这些资料提供统一入口：文档由 RAGFlow 处理，表格和电路采用结构化索引，Agent 按问题调用检索工具，再将来源与结果展示给工程师。
 
-![License](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Retrieval](https://img.shields.io/badge/Retrieval-RAGFlow-1F6FEB)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)
-![Redis](https://img.shields.io/badge/Redis-required-DC382D?logo=redis&logoColor=white)
-![Frontend](https://img.shields.io/badge/Frontend-React%20%2B%20TypeScript-61DAFB?logo=react&logoColor=black)
-![Eval](https://img.shields.io/badge/Eval-RAGAS-8A2BE2)
-![Tests](https://img.shields.io/badge/tests-2848%20passed-brightgreen)
+```text
+工程资料 → 多源解析与检索 → 带来源的回答 / 文档初稿 → 人工审核 → 导出与归档
+```
 
-</div>
+适合希望自托管工程知识库、复用历史设计资料、探索技术文档自动化的硬件团队与开发者。
 
-## ✨ 核心特性
+**当前状态：持续开发中的预览版本。** 默认部署面向单机与小规模内部使用；多主机高可用和完整灾备验收仍需进一步完善。
 
-| | 能力 | 说明 |
-|---|---|---|
-| 🧠 | **Agentic 查询** | 基于 `deepagents` 的自主工具调用循环：模型按问题动态选择多源检索工具、决定检索跳数与顺序，最终给出 grounded answer，不再有写死的「拆解 → 规划 → 补检」固定流程 |
-| 🗂 | **多源 Pipeline** | 普通文档进 RAGFlow 检索链路；Excel 进结构化表格索引；EDF 网表进电路结构化索引；外部对话记录单独索引——全部由 agent 统一调度 |
-| 🔌 | **RAGFlow 固定后端** | 文档上传、解析任务、检索、删除、知识库治理统一走 RAGFlow 适配层，项目内不维护本地向量索引 |
-| 🛡 | **权限与治理** | 部门、用户、知识库权限、审计日志、查询 trace、文件处理状态 |
-| 🧩 | **外部扩展** | 受治理的远程 MCP 工具、文本 Skill 与审核后沙箱 Skill；默认关闭并按部门和订阅授权，见[操作指南](docs/mcp-plugins.md)与[技术 Wiki](wiki/22-external-extensions.md) |
-| ⚙️ | **统一模型配置** | 答案生成、工具决策与后台模型任务统一走 `src.core.model_factory` profile，由 chat runtime 负责调用归一化与观测；支持 Ollama 与任意 OpenAI-compatible API |
-| 📤 | **结果导出** | 对话/检索结果先固化为不可变 ResultSnapshot，再由独立 export worker 生成 Markdown / Excel / Word / PDF / PowerPoint；后台任务带权限校验，切页面、刷新、断线都不丢 |
-| 🧠 | **长期记忆** | LangMem 驱动的 User / Project Memory：默认 opt-out、显式 consent、有界注入为不可信线索，正式证据始终优先 |
-| 🚦 | **资源治理** | LLM 并发闸门 + 排队 + OCR / 工具 / 重任务配额；`deployment` 作用域下多进程、多副本共享 |
-| 📊 | **RAGAS 评估** | 在线跑真实问答管线，或对保存的回答快照离线重评；支持阈值门禁与历史对比 |
+## 核心能力
 
-## 🖼 界面预览
+| 能力                   | 说明                                                                                    |
+| ---------------------- | --------------------------------------------------------------------------------------- |
+| **多源检索**     | PDF/Word 等文档接入 RAGFlow；Excel、EDF 网表与历史对话使用各自的索引和检索工具          |
+| **Agent 查询**   | 基于 deepagents / LangGraph，在有界工具循环中选择检索来源、组织回答，并展示执行轨迹     |
+| **工程文档生成** | 分析模板、制定文档计划、检索填充依据，支持 ICD 等文档的审核、修订与生成                 |
+| **权限与审计**   | 部门、员工、知识库授权及操作审计；系统管理员负责治理，与业务内容访问分离                |
+| **持久化任务**   | 对话、解析、文档生成和导出通过后台任务执行，具备状态记录、租约与恢复机制                |
+| **多格式导出**   | 将结果固化为快照，由后台 Worker 生成 Markdown、Excel、Word、PDF、PowerPoint             |
+| **可控扩展**     | 远程 MCP、文本 Skill 与执行型 Skill；按审核、授权和订阅生效，MCP 写入与沙箱执行默认关闭 |
+| **记忆与评估**   | 经用户授权的记忆提炼、项目记忆检索，以及 RAGAS 在线评估、回答快照重评和历史对比         |
+| **资源与观测**   | 模型和工具并发配额；支持 OpenTelemetry、Prometheus、Grafana、Phoenix 等观测组件         |
+
+## 界面预览
 
 | 知识库问答 | 知识资产治理 |
-|---|---|
-| <img src="assets/front1.png" alt="知识库问答"> | <img src="assets/front2.png" alt="知识资产治理"> |
+| ---------- | ------------ |
+|            |              |
 
-## 🚀 快速开始
+## 快速开始
 
-### 环境要求
+以下命令在下载或克隆仓库后的**仓库根目录**执行。
 
-| 组件 | 要求 | 必需 |
-|---|---|---|
-| Python | >= 3.12 | ✅ |
-| RAGFlow | 可访问的实例 + API Key（文档检索后端） | ✅ |
-| LLM | Ollama（默认）或任意 OpenAI-compatible API | ✅ |
-| PostgreSQL | pgvector 实例（生产账本库）；Docker 编排内自带 | ✅（生产） |
-| Redis | 实时平面（取消快路径 + 跨进程 SSE）；Docker 编排内自带 | ✅ |
-| Docker | 20+ / compose v2（方式一） | 方式一 |
-| Node.js | >= 18（前端开发与构建） | 前端 |
+### 依赖说明
 
-> PostgreSQL 与 Redis 均为**必需组件**，不做降级：Redis 默认 `REDIS_REQUIRED=true`，启动时校验连通性，不可用即拒绝启动。
+| 组件                                 | 用途与准备方式                                                          |
+| ------------------------------------ | ----------------------------------------------------------------------- |
+| **Docker Engine + Compose v2** | 推荐部署方式；需要能够访问 Docker daemon                                |
+| **RAGFlow 实例与 API Key**     | 文档上传、解析与检索，需单独部署或接入已有实例                          |
+| **模型服务**                   | Ollama 或 OpenAI-compatible API，需单独准备；Agent 需要模型支持工具调用 |
+| **PostgreSQL / pgvector**      | Docker 编排自带，用于生产控制面、记忆、检查点等状态                     |
+| **Redis**                      | Docker 编排自带，用于取消与跨进程事件；默认是硬依赖                     |
+| **Python ≥ 3.12、uv**         | 仅源码开发需要；Docker 镜像内已安装                                     |
+| **Node.js ≥ 22.12、npm**      | 源码前端开发推荐环境；Docker 构建无需宿主机安装                         |
 
-### 方式一：Docker（推荐，一条命令起全套）
+**Docker 启动项目自身的业务与观测栈，不包含 RAGFlow 和模型服务。** 两者可在首次登录后配置，但资料解析与问答需要它们可用。
+
+### Docker 部署（推荐）
 
 ```bash
-# 在仓库根目录执行
 bash deploy/docker/quickstart.sh
 ```
 
-脚本会：生成 PostgreSQL 密码与管理员口令（打印在终端）→ 构建镜像 → 按
-`postgres → migrate → api → web` 顺序启动。访问 `http://<主机IP>:8080`，
-用 `admin` + 终端打印的口令登录。
+脚本生成数据库、观测栈和管理员口令，构建 API/Web 镜像，并启动 PostgreSQL、Redis、迁移服务、API、独立 Worker、Web 和观测栈。
 
-- 只准备文件不启动：`bash deploy/docker/quickstart.sh --no-start`
-- 镜像源加速、内网离线分发、指向已有 PostgreSQL、备份恢复：见 [`deploy/docker/README.md`](deploy/docker/README.md)
+- Web：`http://<主机IP>:8080`；首次生成的管理员口令会打印到终端。
+- 只准备配置：`bash deploy/docker/quickstart.sh --no-start`。
+- 资源受限时跳过观测：`bash deploy/docker/quickstart.sh --without-observability`。
+- 应用配置在 `deploy/docker/config/.env`；Compose 密码、镜像和端口在 `deploy/docker/.env`，不依赖根目录 `.env`。
+- 默认 API 和观测端口绑定宿主回环地址；远程访问观测页面可使用 SSH 端口转发。
+- 默认端口已被占用时，配置 `HDB_HTTP_PORT`、`HDB_API_PORT` 和对应 `OBS_*_PORT`。
 
-### 方式二：uv（源码开发，推荐）
+镜像加速、离线分发、目录权限、升级与备份恢复见 [Docker 部署指南](deploy/docker/README.md)。
+
+### 源码开发
+
+先安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，然后准备配置与依赖：
 
 ```bash
-# 安装 uv（已安装可跳过）
-curl -LsSf https://astral.sh/uv/install.sh | sh      # macOS / Linux
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
-
 uv sync --all-groups
-uv run hardware-database-server      # FastAPI 后端，默认 127.0.0.1:8001（HDB_API_HOST/PORT 可改）
+cp .env.example .env
 ```
 
-前端另开一个终端：
+编辑 `.env`，至少设置：
+
+- `AUTH_DEFAULT_ADMIN_PASSWORD`：自行设置至少 8 位的非默认口令；源码方式不会自动生成口令。
+- `REDIS_URL`：可用的 Redis 地址；默认 `REDIS_REQUIRED=true`，未配置或不可达会阻止 API 启动。
+- `RAGFLOW_BASE_URL` / `RAGFLOW_API_KEY`：文档后端。
+- `AGENT_LLM_PROVIDER` 与对应的 `AGENT_OLLAMA_*` 或 `AGENT_CUSTOM_*`：模型配置，也可登录后填写。
+
+没有 Redis 实例时，可在 Linux 上使用仓库脚本启动，它会将连接配置写入根目录 `.env`：
+
+```bash
+bash scripts/redis.sh up
+uv run hardware-database-server
+```
+
+已有 Redis 时，填好 `REDIS_URL` 后直接运行 `uv run hardware-database-server`。API 默认监听 `127.0.0.1:8001`。
+
+另开终端启动前端：
 
 ```bash
 cd frontend
 npm ci
-npm run dev                          # Vite dev server，默认 127.0.0.1:5176，/api 反代到后端
+npm run dev
 ```
 
-启用可执行 Skill 时，还需按 `deploy/sandbox-runner/README.md` 一次性准备受核验的基础镜像和服务令牌，
-然后在启动 API **之前**单独启动独立 Runner：
+访问 `http://127.0.0.1:5176`，前端默认代理到本机 API。源码单机模式支持 SQLite；需要 PostgreSQL 时按 [数据库迁移指南](deploy/postgres/README.md) 配置。仓库的 Bash 部署脚本面向 Linux，其他环境需自行准备基础服务。
 
-```bash
-uv run python deploy/sandbox-runner/runner.py  # 默认 127.0.0.1:8780；需要 Docker daemon
-```
+## 首次使用
 
-若开启本机沙箱 MCP Gateway（`SANDBOX_GATEWAY_ENABLED=true`），参照
-`deploy/mcp-gateway/README.md` 配置独立令牌，并另开终端运行
-`uv run python deploy/mcp-gateway/gateway.py`（默认 `127.0.0.1:8781`）。
+### 配置与账号
 
-单机直接运行 `hardware-database-server` 时，API 默认自动拉起对话/解析 Worker 和导出 Worker；
-沙箱任务的调度/对账循环也在 API 进程内自动启动，**无需另起沙箱 Worker**。记忆 Worker 默认不自动启动，
-如需记忆提炼，可另行运行 `uv run hardware-database-memory-worker`。若采用
-`bash scripts/hdb.sh start` 管理 API、前端和所有 Worker，它会关闭 API 的 Worker 自动拉起并
-各自启动一次；不要和上述手动启动方式同时使用。Runner（以及按需使用的 MCP Gateway）
-始终是单独的服务，不在 `hdb.sh` 中启动。
+1. 使用 `admin` 登录：Docker 使用首次生成的口令，源码方式使用 `.env` 中设置的口令。
+2. 在「系统配置」填写 RAGFlow 地址/API Key 和模型端点。
+3. 由系统管理员创建业务部门、注册员工账号。
+4. **切换为员工账号**，创建知识库、上传资料并进行问答。系统管理员的治理权限不包含知识库内容访问权限。
 
-生产部署用 `npm run build` 产出 `frontend/dist/` 静态文件。
+### 验证第一个业务闭环
 
-自管数据库（可选但推荐）：
+准备一份可以用于演示的规格书或接口 Excel 表，然后：
 
-```bash
-bash scripts/redis.sh up                          # Redis，127.0.0.1:6380
-bash scripts/postgres.sh up                       # pgvector，127.0.0.1:55433
-bash scripts/postgres.sh write-env                # 把会话/记忆/检查点/配额等后端切到 PG
-```
+1. 创建知识库并上传文件，等待解析完成。
+2. 提问资料中有明确依据的问题，例如：“接口 J1 的电压范围和终端匹配要求是什么？”
+3. 对照原文件检查答案的引用与检索轨迹；资料没有该信息时，检查回答是否明确说明证据不足。
+4. 从已完成的回答提交 Word/PDF/Excel 等导出任务，在任务中心查看状态并下载。
+5. 需要生成工程文档时，进入文档生成流程，上传模板、确认计划并审核结果。
 
-首次切换先按 [`deploy/postgres/README.md`](deploy/postgres/README.md) 跑预演；不切换则仍用内嵌 SQLite。
+更多数据源和工作流见 [技术 Wiki](wiki/README.md)。
 
-### 方式三：pip
-
-```bash
-python -m venv venv
-source venv/bin/activate             # Windows: venv\Scripts\activate
-
-pip install -r requirements.txt
-uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
-```
-
-### 首次配置
-
-1. 用 `admin` + 安装时打印的口令登录
-2. 进入 **「系统配置」** 页面，填 **RAGFlow**（地址 / API Key / 数据集）与 **模型端点**（Ollama 或 OpenAI 兼容），保存即生效
-3. 建知识库 → 上传文件 → 提问验证
-
-### 进程一览
-
-| 进程 | 命令 | 作用 |
-|---|---|---|
-| API | `hardware-database-server` | FastAPI 唯一后端入口（单机默认内含 worker） |
-| Worker | `hardware-database-worker` | 解析任务与对话 turn 消费 |
-| Export worker | `hardware-database-export-worker` | Markdown / Excel / Word / PDF / PPTX 产物生成 |
-| Memory worker | `hardware-database-memory-worker` | LangMem 低优先级记忆提炼 |
-| Maintenance | `hardware-database-maintenance` | 运维 CLI |
-| Eval | `hardware-database-eval` | RAGAS 评估 CLI |
-| E2E | `hardware-database-e2e` | 端到端回归 |
-
-## 📖 文档导航
-
-| 文档 | 内容 |
-|---|---|
-| [`wiki/README.md`](wiki/README.md) | 系统技术 Wiki：总览、架构、API 与鉴权、对话 turn、Agent 运行时、工具与证据、模型与资源、ingestion |
-| [`deploy/docker/README.md`](deploy/docker/README.md) | Docker 部署、镜像源加速、内网离线分发、外部 PostgreSQL、备份恢复 |
-| [`docs/mcp-plugins.md`](docs/mcp-plugins.md) | MCP 插件与文本/执行型 Skill 的管理员、员工操作和排障 |
-| [`deploy/mcp-sandbox/README.md`](deploy/mcp-sandbox/README.md) | Sandbox Gateway/Runner 部署边界、运行档位与安全门禁 |
-| [`wiki/22-external-extensions.md`](wiki/22-external-extensions.md) | MCP、Skill 与 Sandbox 的架构、授权和生命周期 |
-| [`deploy/postgres/README.md`](deploy/postgres/README.md) | 自管 pgvector 实例与账本库迁移预演 |
-| [`evaluation/README.md`](evaluation/README.md) | RAGAS 数据集格式与扩展方式 |
-| [`.env.example`](.env.example) | 全量配置项与默认值 |
-| [`CLAUDE.md`](CLAUDE.md) | 开发约定与仓库结构（面向贡献者与 AI 编码助手） |
-
-## 🏗️ 架构
+## 架构概览
 
 ```text
-前端 (React + TypeScript)
-  └─ FastAPI (/api/v1)            SSE 持久化 turn 事件
-       └─ AppPipeline
-            └─ MultiSourceAgentRunner
-                 └─ deepagents agent loop (create_deep_agent)
-                      ├─ 动态工具调用：文档检索 / 表格检索 / 电路检索 / 外部对话检索
-                      ├─ Catalog-first 记忆检索（仅作为不可信历史线索）
-                      └─ 每步 tool_started / tool_result 事件驱动前端实时轨迹
-       └─ 统一模型封装 (src.core.model_factory) → Ollama / OpenAI 兼容
+React + TypeScript
+        │ HTTP / SSE
+        ▼
+FastAPI ── 鉴权、配置、任务 API、审计
+        │
+        ├── AppPipeline / Agent / 文档生成服务
+        │       ├── RAGFlow：文档解析与检索
+        │       ├── 表格、电路、历史对话检索工具
+        │       ├── Ollama / OpenAI-compatible 模型
+        │       └── 经授权的 MCP / Skill / Sandbox
+        │
+        └── 持久化任务 → Chat / Authoring / Parse / Export / Memory Workers
+
+状态与数据：PostgreSQL · Redis · 本地 storage / SQLite
+遥测：OpenTelemetry → Collector → Prometheus / Grafana / Tempo / Loki / Phoenix
 ```
 
-**存储平面**
+| 数据面                | 职责                                                       |
+| --------------------- | ---------------------------------------------------------- |
+| PostgreSQL            | 按域配置的控制面、会话与任务、记忆、检查点、配额等生产状态 |
+| Redis                 | 取消信号、跨进程 SSE 和短期实时状态                        |
+| RAGFlow               | 文档数据集、解析与检索，属于外部依赖                       |
+| `storage/` / SQLite | 附件、原件归档、导出文件、索引与仍采用本地后端的业务数据   |
 
-| 平面 | 组件 | 内容 |
-|---|---|---|
-| 账本 / 控制面 | PostgreSQL（pgvector） | 项目、知识库、会话、记忆投影、检查点、配额、审计 |
-| 实时平面 | Redis | 取消快路径、跨进程 SSE 事件流 |
-| 文档检索 | RAGFlow | 上传、解析、检索、知识库治理 |
-| 归档 | `storage/` | pipeline 归档、索引、日志 |
+不同业务域支持独立的后端选择，详见 [配置与存储](wiki/20-config-and-storage.md)。备份需覆盖 PostgreSQL 与本地文件，RAGFlow 数据需要另行备份或重建。
 
-**目录结构**
+**Worker 运行模式：** Docker 使用独立的 Chat、Authoring、Parse、Export、Memory 容器；直接运行源码 API 时默认自启统一 Worker 与 Export Worker，Memory Worker 需另行启动。`scripts/hdb.sh` 会管理各角色并关闭 API 自启，避免重复启动。完整职责见 [对话与任务](wiki/04-conversation-turns.md) 和 [部署指南](deploy/docker/README.md)。
 
-```text
-Hardware-DataBase/
-├── src/
-│   ├── settings.py          # 全局配置与 .env 加载（单一事实来源）
-│   ├── api/                 # FastAPI 后端（唯一后端入口，路由见 api/routes/）
-│   ├── agents/              # deepagents 查询编排（runner + tools/）
-│   ├── core/                # AppPipeline、鉴权、model_factory、会话、source group 路由
-│   ├── pipelines/           # 多源 pipeline（document_rag / spreadsheet / registry / runtime）
-│   ├── circuit/             # 电路网表 / 原理图解析与结构化检索
-│   ├── document_authoring/  # 文档生成与模板
-│   ├── result_exports/      # 结果导出（Markdown / Excel / Word / PDF / PPTX）
-│   ├── memory/              # LangMem 长期记忆
-│   ├── evaluation/          # RAGAS 评估子系统（CLI / service / metrics / gates）
-│   ├── ingestion/           # source group 分类、KB 路径、解析任务
-│   ├── services/            # 文档治理、路由、归档、KB scope、资产清理
-│   ├── storage/             # 存储适配层（控制面 / 各业务域后端）
-│   └── workers/             # 后台 worker
-├── frontend/                # React + TypeScript 前端
-├── deploy/                  # 自管基础设施：docker/、postgres/、redis/、observability/
-├── evaluation/              # RAGAS 评估数据集与说明
-├── wiki/                    # 系统技术 Wiki（已纳入 git）
-├── scripts/                 # hdb.sh 进程管理 + redis.sh / postgres.sh + production_hardening/
-├── tests/                   # 单元与集成测试（pytest，unittest.TestCase 风格）
-├── storage/                 # (自动生成) 归档、索引、日志与鉴权库
-└── pyproject.toml
-```
+## 扩展能力
 
-## ⚙️ 配置
+<details>
+<summary><strong>结果导出与长期记忆</strong></summary>
 
-支持两种方式：**管理页面配置**（推荐，保存即热生效）与 **`.env` 文件配置**。
+- 导出先创建不可变结果快照，再由 Export Worker 渲染各格式。任务具有权限校验、状态记录、保留期和下载审计。
+- User Memory 默认不启用提炼，需要用户开启并针对消息授权；Project Memory 在工程范围内检索。
+- 记忆作为有界的不可信历史线索注入，正式文档证据优先。源码模式可运行 `uv run hardware-database-memory-worker`。
 
-> ⚠️ `.env` 已被 `.gitignore` 忽略，**不要**提交进仓库。请以 [`.env.example`](.env.example) 为模板创建本地 `.env`。
-> Docker 部署时，`deploy/docker/config/.env`（容器内 `/app/config/.env`）是权威配置源，改完执行 `docker compose up -d --force-recreate api`。
+详见 [结果导出](wiki/16-exports-and-external-conversations.md) 与 [长期记忆](wiki/11-memory.md)。
 
-常用配置项：
+</details>
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `RAGFLOW_BASE_URL` / `RAGFLOW_API_KEY` | — | RAGFlow 后端地址与密钥 |
-| `RAGFLOW_GOVERNANCE_DATASET_NAME` / `RAGFLOW_DESIGN_DATASET_NAME` | `department_governance` / `project_design_assets` | 治理库 / 设计资产库数据集 |
-| `AGENT_LLM_PROVIDER` | `ollama` | `ollama` \| `custom` |
-| `AGENT_OLLAMA_BASE_URL` / `AGENT_OLLAMA_MODEL` | `http://localhost:11434` / `qwen2.5:32b` | Ollama 端点与模型 |
-| `AGENT_CUSTOM_BASE_URL` / `AGENT_CUSTOM_MODEL` / `AGENT_CUSTOM_API_KEY` | — | OpenAI-compatible 端点 |
-| `AGENT_TIMEOUT_SECONDS` | `120` | 模型调用超时 |
-| `FINAL_TOP_K` | `5` | 送入答案的检索条数 |
-| `AGENT_MAX_RETRIEVAL_ROUNDS` | `3` | agent 检索轮数（同时决定 `recursion_limit` 预算） |
-| `LLM_MAX_CONCURRENCY` | `4` | LLM 总并发闸门（交互 + 批量共用） |
-| `LLM_BATCH_MAX_CONCURRENCY` | `1` | 批量任务并发上限（必须小于总闸门） |
-| `REDIS_REQUIRED` | `true` | Redis 缺失即拒绝启动 |
-| `RESOURCE_GOVERNOR_ENABLED` | `true` | 资源治理与配额 |
-| `RESULT_EXPORT_ENABLED` | `true` | 结果导出总开关 |
-| `MEMORY_ENABLED` | `true` | 长期记忆 |
-| `CHAT_ATTACHMENT_OCR_ENABLED` | `true` | 聊天附件 OCR |
+<details>
+<summary><strong>MCP、Skill 与沙箱</strong></summary>
 
-完整列表与注释见 [`.env.example`](.env.example)。
+MCP 与文本 Skill 目录默认可用；远程服务需登记、启用并授权，无服务时不会发起连接。MCP 写入和沙箱执行默认关闭。
 
-## 📤 结果导出
+执行型 Skill 需要独立 Runner；MCP Gateway 按需部署。它们不是打开一个开关就自动具备的能力，需要完成服务身份、运行环境和审核配置。
 
-已完成助手消息的「导出结果」菜单支持 Markdown、Excel、Word、PDF、PowerPoint，同一回答可分别提交多个格式，**单个格式失败不影响其他任务**。
+详见 [扩展操作指南](docs/mcp-plugins.md)、[扩展架构](wiki/22-external-extensions.md)、[Runner 部署](deploy/sandbox-runner/README.md) 与 [Gateway 部署](deploy/mcp-gateway/README.md)。
 
-- 对话中明确说「导出 / 输出 / 生成为 Excel、PDF」时，服务端在 turn 完成事务内登记后台任务，浏览器只负责订阅与展示；普通提到文件格式的检索问题不会误触发
-- 相关接口：`POST /api/v1/exports`、`GET /api/v1/exports/{export_job_id}`、`GET /api/v1/artifacts/{artifact_id}/preview|download`
-- Word / PDF 使用后端受控渲染器；PowerPoint 支持 light / dark / blue 主题与从真实数值表生成的柱状图
-- **安全边界**：生成过程不执行用户脚本、不访问用户本地路径或外部网络
-- 灰度与配额：`RESULT_EXPORT_ENABLED`、`RESULT_EXPORT_{MD,XLSX,DOCX,PDF,PPTX}_ENABLED`、`RESULT_EXPORT_MAX_RUNNING_JOBS`
-- 保留期由 `RESULT_EXPORT_RETENTION_DAYS` 控制：过期文件由 export worker 清理二进制，但保留 Artifact 历史元数据、任务历史与下载审计
+</details>
 
-多实例部署可设置 `HDB_API_SPAWN_EXPORT_WORKER=false` 并单独运行：
+<details>
+<summary><strong>RAGAS 评估</strong></summary>
 
-```bash
-uv run hardware-database-export-worker
-```
-
-## 🧠 长期记忆
-
-长期记忆由 `hardware-database-memory-worker` 独立低优先级消费。Conversation 原始消息仍保留在会话库；记忆 Catalog、来源、consent、revision 与 Outbox 位于账本库，LangGraph `SqliteStore` 只保存可重建的 Candidate / Verified 投影。
-
-```bash
-uv run hardware-database-memory-worker
-```
-
-- 默认 User Memory 为 **opt-out**：只有用户在 API/前端明确开启、并针对具体消息创建 consent event 后才会提炼
-- 选定知识库的 Agent 查询会在模型创建前自动预取当前用户可见的 User / Project Memory，并以有界的 `<untrusted_memory>` 上下文注入；`memory_search` 仍保留为按需补查工具
-- 单机部署可设 `HDB_API_SPAWN_MEMORY_WORKER=true` 由 API 自动拉起；多实例部署应只运行一个独立 Worker，Phase 1 保持 `MEMORY_SINGLE_WRITER=true`
-- 未配置 embedding 时 Candidate 检索会安全跳过；**正式知识库证据与 Datasheet 始终优先于记忆线索**
-
-## 📊 RAGAS 评估
-
-项目提供独立的 RAGAS 评估子系统，可在线调用真实问答管线，也可对保存的回答快照离线重评。内置数据集 `evaluation/datasets/hardware_qa_v1.jsonl` 覆盖电路、文档、联合检索、多跳、缺失证据、冲突、权限与直答用例。
+支持在线调用问答管线、保存回答快照、离线换裁判重评，以及阈值门禁和历史对比。测试通过数量与实际问答质量是不同指标。
 
 ```bash
 uv sync --group eval
-
-# 校验数据集
 uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
-
-# 端到端评估
-uv run hardware-database-eval run --dataset evaluation/datasets/hardware_qa_v1.jsonl --output storage/evaluations
-
-# 对已有快照换裁判模型重评
-uv run hardware-database-eval score --dataset evaluation/datasets/hardware_qa_v1.jsonl \
-  --snapshot storage/evaluations/<run_id>/snapshot.jsonl --output storage/evaluations
 ```
 
-- 默认生成 JSON、CSV、HTML 报告；CI 中可用 `--fail-on-threshold` 启用阈值门禁
-- 支持 `--tag`、`--sample-id`、`--metric`、`--threshold faithfulness=0.8` 过滤或覆盖评分设置
-- 裁判 LLM 默认复用 `AGENT_*`；Embedding 必须通过 `EVAL_EMBEDDING_BASE_URL`、`EVAL_EMBEDDING_API_KEY`、`EVAL_EMBEDDING_MODEL` 显式配置
-- 前端「RAGAS 评估」页面仅系统管理员可见，创建评估时按稳定 `kb_id` 绑定知识库并执行预检
-- 运行产物在 `storage/evaluations/<run_id>/`：`run_state.json` 记录阶段，`snapshot.jsonl` 保存回答与检索上下文，只有完成评分才会生成 `summary.json` / `results.jsonl` / `summary.csv` / `report.html`
-- 单题或单指标失败不会终止整批；`not_applicable` 不计入指标均值
+完整评估需准备模型和 Embedding 配置；数据集、运行和评分命令见 [评估指南](evaluation/README.md)。
 
-## 🧪 测试
+</details>
+
+## 常见问题与当前边界
+
+- **启动失败：** 先检查管理员口令、Redis 连通性、目录权限和端口；Docker 查看 `docker compose logs`。
+- **登录后不能问答：** 管理员先配置外部服务并创建员工账号；使用有知识库权限的员工账号操作。
+- **文档搜不到：** 检查 RAGFlow API Key、数据集和解析状态；Excel 与电路采用独立管线，应同时检查对应任务。
+- **任务迟迟不完成：** 检查相关 Worker、模型端点和资源配额；Docker 就绪探针未通过时返回 HTTP 503。
+- **改配置后未生效：** 部分配置热更新，监听地址、存储后端等需要重启。Docker 重建相关 API/Worker 时沿用业务与观测两个 Compose 文件，详见部署指南。
+- **多节点与灾备：** 本地文件、部分 SQLite 状态及外部 RAGFlow 仍需专门规划；当前默认方案不提供多主机自动故障转移。Alertmanager 已接入，通知接收渠道需自行配置。
+
+## 文档导航
+
+| 文档                                                                 | 内容                                         |
+| -------------------------------------------------------------------- | -------------------------------------------- |
+| [技术 Wiki](wiki/README.md)                                           | 模块职责、API、鉴权、Agent、检索、任务与前端 |
+| [架构说明](wiki/02-architecture.md)                                   | 业务链路、数据权威性与存储边界               |
+| [Docker 部署](deploy/docker/README.md)                                | 配置、镜像、离线部署、升级与备份恢复         |
+| [配置与存储](wiki/20-config-and-storage.md) / [配置模板](.env.example) | 配置项、热更新与后端选择                     |
+| [文档生成](wiki/13-document-authoring.md)                             | 模板、计划、审核与生成工作流                 |
+| [外部扩展](wiki/22-external-extensions.md)                            | MCP、Skill、Sandbox 授权与生命周期           |
+| [评估指南](evaluation/README.md)                                      | 数据集、问答采集、评分与历史比较             |
+| [可观测性与运维](wiki/18-observability-and-ops.md)                    | 遥测、状态检查与部署边界                     |
+| [开发约定](CLAUDE.md)                                                 | 项目结构、命令与代码约定                     |
+
+## 开发与贡献
+
+欢迎提交 Bug、使用反馈、文档修正与 Pull Request。先阅读 [开发约定](CLAUDE.md) 和相关 Wiki。
 
 ```bash
-uv run python -m pytest                                # 全量（tests/ 为 unittest.TestCase 风格）
-uv run python -m pytest tests/test_kb_scope.py          # 单文件
-cd frontend && npm test                                 # 前端 vitest
+# 仓库根目录：后端测试与静态检查
+uv sync --all-groups
+uv run pytest
+uv run ruff check .
+git diff --check
+
+# 前端：测试、类型检查与构建
+cd frontend
+npm ci
+npm test
+npm run build
 ```
 
-## ❓ 常见问题
+部分集成测试需要显式配置外部服务，具体条件见测试文件。请在反馈中说明版本、运行方式、复现步骤和日志；示例文件与日志请脱敏。改变配置或模块行为时，同步更新对应文档。
 
-**Q：`uv sync` 提示 lock file is not up to date？**
-A：通常发生在手动修改 `pyproject.toml` 之后。运行 `uv lock` 更新锁定文件，再执行 `uv sync`。
+## 后续方向
 
-**Q：启动时提示 `ModuleNotFoundError`？**
-A：使用 uv 时必须用 `uv run` 启动命令，或先 `source .venv/bin/activate`；使用 pip 时请确认已激活虚拟环境并安装依赖。
+- 打磨真实工程资料的检索、引用和文档生成闭环。
+- 完善证据不足、冲突处理与版本时效治理。
+- 补齐清洁部署、备份恢复和外部依赖故障演练。
+- 在共享存储和状态边界明确后，完善多副本部署。
 
-**Q：上传文件后在问答中搜不到内容？**
-A：检索后端为 RAGFlow，按顺序排查：1）RAGFlow 是否可达、`RAGFLOW_API_KEY` 是否正确；2）`RAGFLOW_GOVERNANCE_DATASET_NAME` / `RAGFLOW_DESIGN_DATASET_NAME` 对应 dataset 是否存在；3）在「日志中心」或知识库文件页确认 RAGFlow 解析任务是否完成。
+## License 与致谢
 
-**Q：Agent 响应很慢或超时？**
-A：可适当调大 `AGENT_TIMEOUT_SECONDS`；`AGENT_MAX_RETRIEVAL_ROUNDS` 直接决定 agent 循环的 `recursion_limit` 预算——调大检索更充分但更慢，调小更快但可能检索不足。同时确认 LLM 端点（Ollama 或 custom API）的响应速度。
+[MIT](LICENSE) © 2025 Luke Yu。第三方依赖及 vendored 代码保留各自的许可证。
 
-**Q：首次启动后无法使用问答？**
-A：请先以系统管理员进入「系统配置」，补全 RAGFlow 与 Agent 模型配置，保存后生效。
-
-## 🗺️ Roadmap
-
-- [x] 多源检索（文档 / 表格 / 电路 / 外部对话）统一 Agent 调度
-- [x] PostgreSQL 单库收敛 + Redis 实时平面
-- [x] 结果导出（Markdown / Excel / Word / PDF / PPTX）与后台任务中心
-- [x] RAGAS 评估子系统与阈值门禁
-- [ ] 嵌入文档（聊天附件）的结构化解析与路由统一
-- [ ] 拒答 / 置信度机制与文档版本时效治理
-- [ ] 模型升级放权流程与多副本部署形态完善
-
-## 🤝 贡献
-
-欢迎提交 Issue 与 Pull Request。
-
-1. 先读 [`wiki/README.md`](wiki/README.md)（架构与模块职责）与 [`CLAUDE.md`](CLAUDE.md)（开发约定）
-2. 提交前确保 `uv run python -m pytest` 全绿
-3. 保持 `tests/test_<topic>.py` 的扁平组织方式与现有代码风格（ruff）
-
-## 📄 License
-
-[MIT](LICENSE) © 2025 Luke Yu
-
-## 🙏 致谢
-
-感谢这些开源项目让本项目成为可能：
-
-[RAGFlow](https://github.com/infiniflow/ragflow) ·
-[deepagents](https://github.com/langchain-ai/deepagents) ·
-[LangGraph](https://github.com/langchain-ai/langgraph) ·
-[LangMem](https://github.com/langchain-ai/langmem) ·
-[pgvector](https://github.com/pgvector/pgvector) ·
-[Redis](https://redis.io/) ·
-[RAGAS](https://github.com/explodinggradients/ragas) ·
-[React](https://react.dev/) · [Vite](https://vite.dev/) ·
-[Tesseract OCR](https://github.com/tesseract-ocr/tesseract)
+感谢 [RAGFlow](https://github.com/infiniflow/ragflow)、[deepagents](https://github.com/langchain-ai/deepagents)、[LangGraph](https://github.com/langchain-ai/langgraph)、[LangMem](https://github.com/langchain-ai/langmem)、[pgvector](https://github.com/pgvector/pgvector)、[Redis](https://redis.io/)、[RAGAS](https://github.com/explodinggradients/ragas)、[React](https://react.dev/)、[Vite](https://vite.dev/) 与 [Tesseract OCR](https://github.com/tesseract-ocr/tesseract)。

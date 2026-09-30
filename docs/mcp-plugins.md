@@ -1,7 +1,7 @@
 # 外部扩展操作指南：MCP 插件与 Skill
 
 本指南面向系统管理员、运维和员工，说明远程 MCP 插件、文本 Skill 与沙箱执行 Skill 的启用和使用。
-外部扩展默认关闭；MCP 总开关关闭时不会连接服务或向 Agent 装配 MCP 工具。
+远程 MCP 与文本 Skill 目录默认开启（无已启用服务时零连接；审核+订阅后才生效）；沙箱执行与写入通道默认关闭；MCP 总开关关闭时不连接服务、不向 Agent 装配工具。
 
 技术架构、授权与数据流见 [外部扩展技术 Wiki](../wiki/22-external-extensions.md)。
 Sandbox Runner/Gateway 的部署要求见 [`deploy/mcp-sandbox/README.md`](../deploy/mcp-sandbox/README.md)、
@@ -9,8 +9,9 @@ Sandbox Runner/Gateway 的部署要求见 [`deploy/mcp-sandbox/README.md`](../de
 
 ## 适用范围与边界
 
-- **远程 MCP 插件**：HDB 使用 `streamable_http` / `sse` 连接管理员登记的远程服务；HDB
-  不启动 stdio 或任何本地第三方进程。工具结果是不可信外部数据。
+- **远程 MCP 插件**：HDB 使用 `streamable_http`（推荐；`sse` 已被 MCP 规范标记为已弃用，仅保留
+  既有服务兼容）连接管理员登记的远程服务；HDB 不启动 stdio 或任何本地第三方进程。工具结果是
+  不可信外部数据。
 - **Sandbox MCP / 执行型 Skill**：由独立部署的 Gateway/Runner 承载；HDB API/Worker
   只调用认证 API，不持有 Docker/OCI 控制权。新环境默认关闭。仓库内有 dev-l1 参考部署，
   只用于 HDB 自有或管理员审核的固定工作负载，不代表第三方代码或多租户生产安全验收。
@@ -125,14 +126,14 @@ curl -OJ $BASE/write-proposals/<proposal_id>/artifact -H "Authorization: Bearer 
 
 ## 管理员操作（系统配置 → 扩展插件）
 
-1. 在 `.env` 打开总开关（需要重启/热加载后生效）：
-   `MCP_ENABLED=true`，并配置 `MCP_CREDENTIALS_KEY=<Fernet key>`。
+1. 确认 MCP 可用（默认开启；`MCP_ENABLED` 仅作应急停用）：如需鉴权服务，
+   在 `.env` 配置 `MCP_CREDENTIALS_KEY=<Fernet key>`。
 2. 在「扩展插件」页登记服务：slug、名称、传输、URL、凭据（请求头）、部门范围、
    超时、标签。凭据编辑时“留空即保留”，勾选“清除已保存凭据”才会删除。
-   总开关关闭时仍可登记、编辑、删除，但不能启用，也不会发起外部连接：连接测试与工具
-   发现都会返回 409，除非显式打开独立的 break-glass 诊断开关
-   `SANDBOX_DIAGNOSTIC_TEST_ENABLED=true`。启用前需把 `MCP_ENABLED` 设为 true
-   （「系统配置 → 外部 MCP 扩展」，或 `.env`）。
+   总开关被应急停用时仍可登记、编辑、删除，但不能启用，也不会发起外部连接：连接测试与
+   工具发现都会返回 409，除非显式打开独立的 break-glass 诊断开关
+   `SANDBOX_DIAGNOSTIC_TEST_ENABLED=true`。启用服务前需保持 `MCP_ENABLED` 开启
+   （默认开启；仅在应急时于「系统配置 → 外部 MCP 扩展」或 `.env` 停用）。
    `MCP_CREDENTIALS_KEY` 不出现在配置页，只能写在 `.env`。
 3. 点击「测试连接」：真实连接并发现工具，成功后记录当前配置指纹；
    **修改连接字段会自动停用并作废测试结果**，必须重新测试才能启用。
@@ -203,13 +204,14 @@ curl -OJ $BASE/write-proposals/<proposal_id>/artifact -H "Authorization: Bearer 
 - 管理员撤销 Skill 后，系统会清除订阅并拒绝新的提示注入或任务提交；正在运行的任务仍按任务取消与
   对账流程处理。
 - 目录删除只允许对已撤销 Skill 执行；若关联 bundle 尚未撤销或仍有未完成任务，删除会被拒绝。
-  删除目录项不清除历史任务、审计记录或原始上传包。
+  删除会保留历史任务与审计记录，同时清理原始上传包和 Runner 生成的 bundle/镜像；若 Runner
+  回收未确认，响应与审计会标记 `cleanup_pending`，可稍后由运维清理。
 
 ### Skill 配置和排障
 
 | 现象 | 检查项 |
 |---|---|
-| Skill 库为空 | `SKILLS_ENABLED=true`、管理员已启用、员工部门范围匹配；员工个人 Skill 尚未启用时仅本人和管理员可见 |
+| Skill 库为空 | `SKILLS_ENABLED`（默认 true）、管理员已启用、员工部门范围匹配；员工个人 Skill 尚未启用时仅本人和管理员可见 |
 | 文本 Skill 没有出现在对话中 | 确认 Skill 已启用、员工已添加、用户仍在原部门且对话上下文允许加载 Skill |
 | 执行型 Skill 不可见或无法运行 | 检查 `SANDBOX_ENABLED`、`SANDBOX_BACKEND=runner_api`、Runner 健康/认证、profile digest/attestation、bundle 状态与所需能力 |
 | 个人执行 Skill 停留在待构建 | 管理员先下载审查源码并批准源包；带依赖时还需配置获准的 HTTPS pip 源 |
@@ -225,8 +227,8 @@ curl -OJ $BASE/write-proposals/<proposal_id>/artifact -H "Authorization: Bearer 
 - 指标：`hdb.mcp.call_count` / `hdb.mcp.call_duration_seconds` / `hdb.mcp.discovery_count` /
   `hdb.mcp.tools.discovered` / `hdb.mcp.truncated_total`，标签只含
   transport/status/kind 等有界枚举，不含 slug/工具名。
-- 系统状态：`/api/v1/system/status` 的 `mcp` 组件三态
-  `not_configured`（总开关关闭）/ `degraded`（前置条件缺失、无启用服务或凭据不可用）/ `up`。
+- 系统状态：`/api/v1/system/status` 的 `mcp` 组件四态
+  `not_configured`（应急停用）/ `idle`（无已启用服务）/ `degraded`（前置条件缺失或凭据不可用）/ `up`。
 - 写入指标：`hdb.mcp.write_count{status}`、`hdb.mcp.artifact_rejected_total{reason}`；写入审计
   action 为 `plugins.mcp.write_proposal|write_confirm|write_reject|artifact_received`。
 
@@ -234,7 +236,7 @@ curl -OJ $BASE/write-proposals/<proposal_id>/artifact -H "Authorization: Bearer 
 
 | 现象 | 原因与处理 |
 |---|---|
-| 目录为空 | `MCP_ENABLED=false`、无启用服务、部门范围不匹配 |
+| 目录为空 | `MCP_ENABLED` 被应急停用、无启用服务、部门范围不匹配 |
 | 无法启用 | 未通过当前配置的连接测试，或凭据不可解密 |
 | 工具消失 | 管理员停用/移出部门/删除服务，或本人退订；调用时也会二次校验 |
 | 调用返回 `code=timeout` | 超过 `MCP_CALL_TIMEOUT_SECONDS` 或服务端超时；检查服务与超时配置 |
@@ -271,13 +273,13 @@ profile digest、runtime attestation 和 Artifact Broker 扫描器引用；启�
 
 见 `.env.example` 的「外部 MCP 扩展」与「Sandbox/Skill」段。按功能分别配置：
 
-- **远程 MCP 只读调用**：`MCP_ENABLED=true`、统一 Agent 工具路径和资源 governor 前置条件；
-  如需鉴权，再配置仅从环境读取的 `MCP_CREDENTIALS_KEY`。
+- **远程 MCP 只读调用**：默认开启（`MCP_ENABLED=true`，仅作应急停用）；平台前置自动满足，
+  无需手动配置。如需鉴权，再配置仅从环境读取的 `MCP_CREDENTIALS_KEY`。
 - **远程 MCP 写入**：再打开 `MCP_WRITE_ENABLED=true`，并完成工具白名单、员工同意和
   `external_tool.write` 能力授权。
-- **文本 Skill**：`SKILLS_ENABLED=true`；只启用文本 Skill 不要求启用 Runner，但仍要审核、
-  配置部门范围并由员工订阅。
-- **Sandbox 执行型 Skill**：`SKILLS_ENABLED=true`、`SANDBOX_ENABLED=true`、
+- **文本 Skill**：默认开启（`SKILLS_ENABLED=true`，仅目录与文本注入）；不要求启用 Runner，
+  但仍要审核、配置部门范围并由员工订阅。
+- **Sandbox 执行型 Skill**：需保持 `SKILLS_ENABLED`（默认 true），再配 `SANDBOX_ENABLED=true`、
   `SANDBOX_BACKEND=runner_api`，以及认证 Runner URL、runtime attestation/profile digest 和
   Artifact Scanner 引用。若使用 Sandbox MCP 服务，再设置 `SANDBOX_GATEWAY_ENABLED=true` 与
   Gateway URL/身份。
