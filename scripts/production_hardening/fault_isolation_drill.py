@@ -175,7 +175,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _seed_user(args.username, args.password)
-    storage_env = {"AUTH_DB_PATH": str(REPO_ROOT / "storage" / "auth.db")}
+    import src.settings as settings
+
+    storage_env = {"AUTH_DB_PATH": settings.AUTH_DB_PATH}
 
     api = _start_api(args.port, storage_env)
     chat_worker = _start_worker("chat", storage_env)

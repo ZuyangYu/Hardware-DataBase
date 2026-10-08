@@ -179,6 +179,27 @@ class ConversationService:
             with _INIT_LOCK:
                 _INITIALIZED_DB_PATHS.add(self.db_path)
 
+    def list_waiting_turn_ids(self, attachment_ids: list[str] | None = None, *, limit: int = 100) -> list[str]:
+        bounded_limit = max(1, min(int(limit), 1000))
+        with closing(self._connect()) as conn:
+            if attachment_ids is not None:
+                if not attachment_ids:
+                    return []
+                placeholders = ",".join("?" for _ in attachment_ids)
+                rows = conn.execute(
+                    f"""SELECT DISTINCT t.id, t.created_at FROM chat_turns t
+                        JOIN turn_attachments ta ON ta.turn_id = t.id
+                        WHERE t.status = 'waiting_for_attachments'
+                        AND ta.attachment_id IN ({placeholders}) ORDER BY t.created_at, t.id LIMIT ?""",
+                    (*attachment_ids, bounded_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id FROM chat_turns WHERE status = 'waiting_for_attachments' ORDER BY created_at, id LIMIT ?",
+                    (bounded_limit,),
+                ).fetchall()
+        return [str(row["id"]) for row in rows]
+
     def _init_db_with_retry(self) -> None:
         """Bounded busy retry for concurrent first-use schema initialization."""
         deadline = time.monotonic() + 10.0

@@ -24,6 +24,61 @@ from __future__ import annotations
 import sys
 
 
+def _auxiliary_control_plane(conn) -> None:
+    """Provision memory and export ledgers with the migration type rules.
+
+    The SQLite repository owns the non-core shape. Generate from an empty
+    temporary template, just as the migration loader does; runtime stores do
+    not create or mutate the PostgreSQL authority schema.
+    """
+    import os
+    import sqlite3
+    import tempfile
+    from contextlib import closing
+
+    from src.result_exports.store import ResultExportStore
+    from src.core.conversation import ConversationService
+    from src.storage.control_plane.loader import (
+        _add_constraint_if_missing,
+        _generated_foreign_key_ddl,
+        _generated_index_ddl,
+        _sqlite_columns,
+        _sqlite_table_names,
+    )
+    from src.storage.control_plane.schema import generated_table_ddl, is_core_table
+
+    with tempfile.TemporaryDirectory(prefix="hdb-control-schema-") as tmp:
+        # Avoid the runtime backend factory: only the SQLite schema builder is
+        # needed, and all bytes belong to this disposable template.
+        db_path = os.path.join(tmp, "control.db")
+        conversation = object.__new__(ConversationService)
+        conversation.db_path = db_path
+        conversation._init_db()
+        template = object.__new__(ResultExportStore)
+        template.db_path = db_path
+        template._init_db()
+        with closing(sqlite3.connect(template.db_path)) as source:
+            source.row_factory = sqlite3.Row
+            tables = _sqlite_table_names(source)
+            for table in tables:
+                if not is_core_table(table):
+                    conn.execute(generated_table_ddl(table, _sqlite_columns(source, table)))
+            for table in tables:
+                if is_core_table(table):
+                    continue
+                indexes, notes = _generated_index_ddl(source, table)
+                constraints, fk_notes = _generated_foreign_key_ddl(source, table, set(tables))
+                if notes or fk_notes:
+                    raise RuntimeError(f"control-plane schema cannot be fully provisioned: {notes + fk_notes}")
+                for ddl in indexes:
+                    conn.execute(ddl)
+                for name, ddl in constraints:
+                    violations: list[str] = []
+                    _add_constraint_if_missing(conn, table, name, ddl, notes=violations)
+                    if violations:
+                        raise RuntimeError("; ".join(violations))
+
+
 def _control_plane(dsn: str) -> str:
     """返回一句人类可读的结果描述；失败时抛异常。"""
     import psycopg
@@ -33,6 +88,7 @@ def _control_plane(dsn: str) -> str:
         CORE_FOREIGN_KEYS,
         SCHEMA_TABLE,
         apply_schema,
+        create_core_indexes,
     )
     from src.storage.control_plane.schema_version import (
         assert_schema_compatible,
@@ -44,10 +100,13 @@ def _control_plane(dsn: str) -> str:
             "SELECT to_regclass(%s) IS NOT NULL", (f"public.{SCHEMA_TABLE}",)
         ).fetchone()[0]
         if not exists:
-            apply_schema(conn)
+            apply_schema(conn, include_indexes=True)
+            _auxiliary_control_plane(conn)
             record_schema_version(conn)
             return "控制面 schema 已创建（版本已记录）"
         version = assert_schema_compatible(conn)
+        create_core_indexes(conn)
+        _auxiliary_control_plane(conn)
         # 控制面外键（如 chat_sessions → users）在数据迁移路径上补挂；
         # 全新库由 apply_schema 内联建好，这里只在缺失时补齐。
         for name, table, constraint_sql in CORE_FOREIGN_KEYS:

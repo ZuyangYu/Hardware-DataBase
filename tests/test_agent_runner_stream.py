@@ -144,6 +144,39 @@ def test_attachment_sessions_get_a_larger_evidence_budget():
     assert with_attachment > base
 
 
+def test_attempt_checkpoint_thread_preserves_live_attachment_acl(monkeypatch, tmp_path):
+    import io
+    from src.agents import runner as runner_mod
+    from src.attachments.service import AttachmentService
+    from src.attachments.store import AttachmentStore
+
+    monkeypatch.setattr(runner_mod.settings, "CHAT_ATTACHMENTS_ENABLED", True)
+    monkeypatch.setattr(runner_mod.settings, "CHAT_ATTACHMENT_INDEX_DB_PATH", str(tmp_path / "attachments.db"))
+    monkeypatch.setattr(runner_mod.settings, "CHAT_ATTACHMENT_STORAGE_DIR", str(tmp_path / "files"))
+    store = AttachmentStore()
+    service = AttachmentService(store=store)
+    record = service.upload(session_id=42, user_id=7, filename="owned.md", stream=io.BytesIO(b"owned attachment"))
+    store.update_asset_status(record.asset_id, parse_status="ready")
+    record = store.get_attachment(attachment_id=record.attachment_id, session_id=42, user_id=7)
+    captured = []
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter([(AIMessage(content="ok"), {"langgraph_node": "model"})])
+
+    def build_agent(**kwargs):
+        attachment_list = next(tool for tool in kwargs["tools"]
+                               if getattr(tool, "name", getattr(tool, "__name__", "")) == "attachment_list")
+        captured.append(attachment_list.invoke({}) if hasattr(attachment_list, "invoke") else attachment_list())
+        return fake_agent
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", build_agent)
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend())
+    list(runner.stream(query="读取附件", kb_name="kb_hw", history=[], thread_id="42::attempt:opaque",
+                       conversation_session_id=42, attachment_user_id=7,
+                       attachments=service.build_refs([record]), source_scope="attachment_only"))
+    assert "owned.md" in str(captured[0])
+
+
 def test_graph_recursion_error_completes_with_actionable_notice(monkeypatch):
     """步数上限是执行预算，不是系统故障：轮次必须完成并给出可操作提示。"""
     from langgraph.errors import GraphRecursionError

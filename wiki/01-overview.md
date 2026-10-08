@@ -70,7 +70,7 @@ markdown 渲染库、图表库、i18n 库——全部手写实现（见 [19-fron
 | RAGFlow                      | 文档解析与检索的唯一后端                        | 文档问答不可用；`RAGFLOW_API_KEY` 为空时客户端构造即抛错 |
 | LLM（Ollama 或 OpenAI 兼容） | Agent、写作、记忆、评估裁判                     | 查询失败但 turn 会被正常收敛为失败态                       |
 | PostgreSQL                   | 控制面/记忆投影/checkpoint/配额（可选）         | 默认全 SQLite 单机                                         |
-| Redis                        | 取消快路径、跨进程 SSE、分布式准入（可选）      | 自动降级为进程内 + DB 轮询                                 |
+| Redis                        | 取消快路径、跨进程 SSE、分布式准入（默认必需） | `REDIS_REQUIRED=true` 时缺失拒绝启动且 not_ready；测试可显式关闭 |
 | ChromaDB                     | 电路/外部对话语义向量（**未声明为依赖**） | 语义索引显式 no-op                                         |
 
 ---

@@ -34,6 +34,13 @@ class PostgresConversationService:
     def close(self) -> None:
         self._store.close()
 
+    @property
+    def closed(self) -> bool:
+        return self._store._pool.closed
+
+    def list_waiting_turn_ids(self, attachment_ids: list[str] | None = None, *, limit: int = 100) -> list[str]:
+        return self._store.list_waiting_turn_ids(attachment_ids, limit=limit)
+
     # -- sessions -----------------------------------------------------------
 
     def create_session(

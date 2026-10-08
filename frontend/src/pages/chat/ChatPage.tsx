@@ -310,7 +310,7 @@ export default function ChatPage({
     }
   };
 
-  const chat = useKbChat(mountedKbName, { documentContextEnabled: documentAuthoringEnabled });
+  const chat = useKbChat(mountedKbName, { username: auth.user.username, documentContextEnabled: documentAuthoringEnabled });
   const {
     sessions,
     sessionsLoaded,

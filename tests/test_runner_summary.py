@@ -3,6 +3,7 @@ import unittest
 from src.agents.runner import (
     MultiSourceAgentRunner,
     _build_claim_coverage,
+    _build_citation_verification,
     _build_evidence_quality,
 )
 from src.agents.schemas import Evidence
@@ -43,13 +44,30 @@ class ClaimCoverageTests(unittest.TestCase):
         self.assertEqual(len(cov), 2)
         ids = {c["evidence_ids"][0] for c in cov}
         self.assertEqual(ids, {"e0", "e2"})
-        self.assertTrue(all(c["status"] == "supported" for c in cov))
+        self.assertTrue(all(c["status"] == "citation_valid" for c in cov))
 
     def test_ignores_unknown_citation(self):
         self.assertEqual(_build_claim_coverage("见[9]", _ev([1])), [])
 
     def test_empty_answer_no_citations(self):
         self.assertEqual(_build_claim_coverage("", _ev([1])), [])
+
+    def test_citations_do_not_prove_semantic_support(self):
+        result = _build_citation_verification("电压 500V [1][1][9]\n\n没有引用的段落", _ev([1, 2]))
+        self.assertIsNone(result["grounded"])
+        self.assertIsNone(result["conflicts"])
+        self.assertIsNone(result["unsupported_claims"])
+        self.assertEqual(result["semantic_verification_status"], "not_evaluated")
+        self.assertEqual(result["invalid_citations"], [9])
+        self.assertEqual(result["uncited_paragraphs"], [2])
+        self.assertEqual(result["citation_coverage"], 0.5)
+        self.assertEqual(len(_build_claim_coverage("[1][1]", _ev([1]))), 1)
+
+    def test_evidence_without_citations_is_not_verified(self):
+        result = _build_citation_verification("事实陈述", _ev([1]))
+        self.assertIsNone(result["grounded"])
+        self.assertEqual(result["citation_coverage"], 0)
+        self.assertEqual(result["uncited_paragraphs"], [1])
 
 
 class EvidenceQualityTests(unittest.TestCase):
@@ -96,7 +114,7 @@ class RetrievalSummaryTests(unittest.TestCase):
         self.assertEqual(summary["error_message"], "boom")
         # Honest fields, not the old hardcoded constants.
         self.assertEqual(summary["retrieval_rounds"], 1)
-        self.assertEqual(summary["sufficiency_status"], "sufficient")
+        self.assertEqual(summary["sufficiency_status"], "not_evaluated")
         self.assertEqual(summary["retrieval_ledger"], [{"tool_name": "document_search", "query": "q1"}])
         self.assertEqual(summary["evidence_quality"][0]["evidence_id"], "e0")
         self.assertEqual(summary["evidence_quality"][0]["score"], 0.9)

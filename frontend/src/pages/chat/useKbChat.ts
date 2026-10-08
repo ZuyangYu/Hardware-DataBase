@@ -401,6 +401,8 @@ function localAssistantMessage(sessionId: number, content: string): MessageView 
 export type UseKbChat = ReturnType<typeof useKbChat>;
 
 export type UseKbChatOptions = {
+  /** Keep tab-local conversation selection isolated across authenticated users. */
+  username?: string;
   /** Feature gate for the optional document_context wire field. */
   documentContextEnabled?: boolean;
   /** Called only for a newly completed turn, never for recovered history. */
@@ -409,6 +411,8 @@ export type UseKbChatOptions = {
 
 export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const scopeKbName = kbName || GENERAL_CHAT_KB_NAME;
+  const selectedSessionKey = `hdb_chat_session:${encodeURIComponent(options.username ?? 'anonymous')}:${encodeURIComponent(scopeKbName)}`;
+  const loadedSessionKey = useRef<string | null>(null);
   const documentContextEnabled = options.documentContextEnabled ?? false;
   const [sessions, setSessions] = useState<SessionView[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
@@ -463,6 +467,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   // 卡片刷新的在飞标记(ref 而非 state 闭包):两次快速点击只允许发起一次 REST 请求。
   const documentCardRefreshInFlightRef = useRef(false);
   const activeSessionRef = useRef<number | null>(null);
+  // A login “新对话” click and the first message send can race two session
+  // creations; share one in-flight request so only one durable session and
+  // one selection exist.
+  const pendingCreateRef = useRef<{ scope: string; promise: Promise<SessionView> } | null>(null);
   // opencode 风格轨迹:同一工具的多次调用各自占一行。
   // toolCallSeqRef 生成单调序号;toolActiveKeyRef 记录"工具名 -> 最近一次 running 的 step key",
   // 使 tool_result 能挂回正确的调用条目(流式恢复场景下退化为按工具名合并)。
@@ -552,6 +560,12 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   // ---- 会话列表 ----
   useEffect(() => {
     let cancelled = false;
+    loadedSessionKey.current = null;
+    let savedSessionId: number | null = null;
+    try {
+      const value = Number(window.sessionStorage.getItem(selectedSessionKey));
+      savedSessionId = Number.isSafeInteger(value) && value > 0 ? value : null;
+    } catch { /* Storage restrictions must not block loading server conversations. */ }
     setSessionsLoaded(false);
     setForbidden(null);
     setActiveSessionId(null);
@@ -562,9 +576,21 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       .get<SessionView[]>(`/api/v1/conversations?kb_name=${encodeURIComponent(scopeKbName)}`)
       .then((rows) => {
         if (cancelled) return;
-        setSessions(rows);
+        loadedSessionKey.current = selectedSessionKey;
+        // A session created while this fetch was in flight is not in ``rows``.
+        // Keep the new conversation in the list (and selected) instead of
+        // dropping it and falling back to an unrelated session.
+        setSessions((prev) => {
+          const ids = new Set(rows.map((row) => row.id));
+          const localSelection = prev.filter(
+            (session) => session.id === activeSessionRef.current && !ids.has(session.id),
+          );
+          return localSelection.length ? [...localSelection, ...rows] : rows;
+        });
         setActiveSessionId((current) => {
-          const next = rows.some((session) => session.id === current) ? current : rows[0]?.id ?? null;
+          if (current != null) return current;
+          const preferred = savedSessionId;
+          const next = rows.some((session) => session.id === preferred) ? preferred : rows[0]?.id ?? null;
           const restoredContext = rows.find((session) => session.id === next)?.document_context;
           if (restoredContext) {
             // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
@@ -587,7 +613,17 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     return () => {
       cancelled = true;
     };
-  }, [scopeKbName]);
+  }, [scopeKbName, selectedSessionKey]);
+
+  useEffect(() => {
+    if (loadedSessionKey.current !== selectedSessionKey || !sessionsLoaded || (activeSessionId !== null && !sessions.some(
+      (session) => session.id === activeSessionId && session.kb_name === scopeKbName,
+    ))) return;
+    try {
+      if (activeSessionId === null) window.sessionStorage.removeItem(selectedSessionKey);
+      else window.sessionStorage.setItem(selectedSessionKey, String(activeSessionId));
+    } catch { /* Refresh still falls back to the most recent authorized session. */ }
+  }, [activeSessionId, selectedSessionKey, sessionsLoaded, sessions, scopeKbName]);
 
   // ---- 选中会话的消息 ----
   useEffect(() => {
@@ -1050,22 +1086,45 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
 
   const createSession = useCallback(
     async (title: string, expectedStreamToken?: number): Promise<SessionView> => {
-      const session = await api.post<SessionView>('/api/v1/conversations', {
-        kb_name: scopeKbName,
-        title: title || '新对话',
-      });
-      // A navigation/KB switch may happen while the POST is in flight.  Keep
-      // the durable session, but do not let a stale request select it in the
-      // newly visible scope.
-      if (expectedStreamToken !== undefined && streamTokenRef.current !== expectedStreamToken) {
+      // Manual calls capture the current stream token too, so a session created
+      // by the login “新对话” click cannot steal the selection from a message
+      // send that started after it.
+      const expected = expectedStreamToken ?? streamTokenRef.current;
+      let pending = pendingCreateRef.current;
+      if (pending !== null && pending.scope !== scopeKbName) pending = null;
+      if (pending === null) {
+        const entry = {
+          scope: scopeKbName,
+          promise: api.post<SessionView>('/api/v1/conversations', {
+            kb_name: scopeKbName,
+            title: title || '新对话',
+          }),
+        };
+        pending = entry;
+        pendingCreateRef.current = entry;
+        void entry.promise
+          .finally(() => {
+            if (pendingCreateRef.current === entry) pendingCreateRef.current = null;
+          })
+          .catch(() => undefined);
+      }
+      const session = await pending.promise;
+      // A navigation/KB switch (or a newer send) may happen while the POST is
+      // in flight. Keep the durable session, but do not let a stale request
+      // select it in the newly visible scope.
+      if (streamTokenRef.current !== expected) {
         return session;
       }
-      setSessions((prev) => [session, ...prev]);
+      setSessions((prev) => (prev.some((item) => item.id === session.id) ? prev : [session, ...prev]));
       activeSessionRef.current = session.id;
       setActiveSessionId(session.id);
-      setMessages([]);
-      // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
-      setDocumentContextState(null);
+      if (expectedStreamToken === undefined) {
+        // 只有显式“新对话”才清空上一条会话的消息。发送路径的首轮
+        // createSession 必须保留刚上屏的乐观消息，供后续对账替换。
+        setMessages([]);
+        // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
+        setDocumentContextState(null);
+      }
       return session;
     },
     [scopeKbName],

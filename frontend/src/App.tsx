@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type CSSProperties } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useState, type CSSProperties } from 'react';
 import {
   BrowserRouter,
   Navigate,
@@ -26,22 +26,22 @@ import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { notify } from '@/components/ui/app-toast';
 import LoginPage from './pages/LoginPage';
-import KbListPage from './pages/KbListPage';
-import ChatPage from './pages/chat/ChatPage';
-import KbFilesPage from './pages/KbFilesPage';
-import DocumentAssetsPage from './pages/DocumentAssetsPage';
-import WikiPage from './pages/WikiPage';
-import UsersPage from './pages/admin/UsersPage';
-import DepartmentsPage from './pages/admin/DepartmentsPage';
-import KbMountPage from './pages/admin/KbMountPage';
-import GovernancePage from './pages/admin/GovernancePage';
-import LogsPage from './pages/admin/LogsPage';
-import ConfigPage from './pages/admin/ConfigPage';
-import EvaluationPage from './pages/admin/EvaluationPage';
-import SystemStatusPage from './pages/admin/SystemStatusPage';
-import PluginsPage from './pages/admin/PluginsPage';
-import ExtensionsPage from './pages/ExtensionsPage';
-import MemoryPage from './pages/MemoryPage';
+const KbListPage = lazy(() => import('./pages/KbListPage'));
+const ChatPage = lazy(() => import('./pages/chat/ChatPage'));
+const KbFilesPage = lazy(() => import('./pages/KbFilesPage'));
+const DocumentAssetsPage = lazy(() => import('./pages/DocumentAssetsPage'));
+const WikiPage = lazy(() => import('./pages/WikiPage'));
+const UsersPage = lazy(() => import('./pages/admin/UsersPage'));
+const DepartmentsPage = lazy(() => import('./pages/admin/DepartmentsPage'));
+const KbMountPage = lazy(() => import('./pages/admin/KbMountPage'));
+const GovernancePage = lazy(() => import('./pages/admin/GovernancePage'));
+const LogsPage = lazy(() => import('./pages/admin/LogsPage'));
+const ConfigPage = lazy(() => import('./pages/admin/ConfigPage'));
+const EvaluationPage = lazy(() => import('./pages/admin/EvaluationPage'));
+const SystemStatusPage = lazy(() => import('./pages/admin/SystemStatusPage'));
+const PluginsPage = lazy(() => import('./pages/admin/PluginsPage'));
+const ExtensionsPage = lazy(() => import('./pages/ExtensionsPage'));
+const MemoryPage = lazy(() => import('./pages/MemoryPage'));
 
 const SIDEBAR_STORAGE_KEY = 'hdb_sidebar_expanded';
 
@@ -161,6 +161,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
       <AppSidebar auth={auth} onLogout={onLogout} />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div className="content flex-1">
+          <Suspense fallback={<div role="status" className="p-6 text-muted-foreground">正在加载页面…</div>}>
           <Routes>
             <Route path="/" element={<HomeRedirect auth={auth} />} />
             <Route
@@ -303,6 +304,7 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
             />
             <Route path="*" element={<HomeRedirect auth={auth} />} />
           </Routes>
+          </Suspense>
         </div>
       </div>
     </SidebarProvider>

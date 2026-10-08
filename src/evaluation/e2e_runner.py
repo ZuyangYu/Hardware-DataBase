@@ -15,13 +15,14 @@ import argparse
 import io
 import json
 import os
-import sqlite3
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .http_events import iter_sse_events
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8001"
 DEFAULT_DATASET = Path(__file__).resolve().parents[2] / "evaluation/datasets/attachment_editing_v1.jsonl"
@@ -412,6 +413,14 @@ class E2EClient:
         disposition = str(response.headers.get("content-disposition") or "")
         return disposition, response.content
 
+    def turn_events(self, token: str, turn_id: str) -> list[dict[str, Any]]:
+        with self.requests.get(
+            f"{self.base_url}/api/v1/turns/{turn_id}/events",
+            headers=self.headers(token), params={"after": 0}, stream=True, timeout=self.timeout,
+        ) as response:
+            response.raise_for_status()
+            return list(iter_sse_events(response.iter_lines(decode_unicode=True)))
+
     def request_release(self, token: str, session_id: int, revision_id: str, comment: str) -> dict:
         response = self.requests.post(
             f"{self.base_url}/api/v1/conversations/{session_id}/attachments/revisions/{revision_id}/release-request",
@@ -435,26 +444,6 @@ class E2EClient:
         return response.json()
 
 
-def _turn_events(db_path: str, turn_id: str) -> list[dict[str, Any]]:
-    connection = sqlite3.connect(db_path)
-    try:
-        rows = connection.execute(
-            "SELECT seq, event_type, payload_json FROM chat_turn_events "
-            "WHERE turn_id = ? ORDER BY seq",
-            (turn_id,),
-        ).fetchall()
-    finally:
-        connection.close()
-    events = []
-    for seq, event_type, payload in rows:
-        try:
-            parsed = json.loads(payload or "{}")
-        except ValueError:
-            parsed = {}
-        events.append({"seq": seq, "event": event_type, "payload": parsed})
-    return events
-
-
 @dataclass
 class CaseResult:
     case_id: str
@@ -473,6 +462,9 @@ class CaseResult:
             "session_id": self.session_id,
             "turn_status": self.observation.get("turn_status"),
             "revision_id": (self.observation.get("revision") or {}).get("revision_id"),
+            "answer": self.observation.get("turn_answer", ""),
+            "tools_called": self.observation.get("tool_names", []),
+            "parse_status": self.observation.get("parse_status", ""),
         }
 
 
@@ -480,18 +472,6 @@ def _passes_gate(passed: int, total: int, min_pass_rate: float) -> bool:
     if total <= 0:
         return False
     return (passed / total) >= float(min_pass_rate)
-
-
-def _resolve_auth_db() -> str:
-    override = os.getenv("HDB_E2E_AUTH_DB", "").strip()
-    if override:
-        return override
-    from src import settings
-
-    path = settings.AUTH_DB_PATH
-    if os.path.isabs(path):
-        return path
-    return os.path.join(settings.BASE_DIR, path)
 
 
 def _tool_names_from_events(events: list[dict[str, Any]]) -> set[str]:
@@ -515,7 +495,6 @@ def run_case(
     owner_token: str,
     reviewer_token: str,
     kb_name: str,
-    db_path: str,
 ) -> CaseResult:
     """Execute one case and evaluate the final file + audit chain."""
 
@@ -542,7 +521,7 @@ def run_case(
                 turn_attachments or [attachment_id],
                 source_scope=case.source_scope,
             )
-            events = _turn_events(db_path, str(turn.get("id") or ""))
+            events = client.turn_events(owner_token, str(turn.get("id") or ""))
             all_events.extend(events)
             for event in events:
                 if event.get("event") != "attachment_revision":
@@ -618,6 +597,7 @@ def run_case(
                     released_texts = _texts_from_bytes(filename, released_bytes)
 
         observation = {
+            "parse_status": parse_status,
             "turn_status": str(turn.get("status") or ""),
             "turn_answer": str(turn.get("answer") or ""),
             "tool_names": sorted(_tool_names_from_events(all_events)),
@@ -695,26 +675,30 @@ def _cleanup(
     owner_id: int,
     reviewer_id: int,
     session_ids: list[int],
-) -> None:
+) -> list[str]:
+    failures: list[str] = []
     for session_id in session_ids:
         try:
-            client.requests.delete(
+            response = client.requests.delete(
                 f"{client.base_url}/api/v1/conversations/{session_id}",
                 headers=client.headers(owner_token),
                 timeout=client.timeout,
             )
-        except Exception:  # noqa: BLE001
-            pass
+            response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001 - record cleanup failures in the gate
+            failures.append(f"session {session_id}: {type(exc).__name__}")
     for user_id, token in ((owner_id, admin_token), (reviewer_id, admin_token)):
         try:
-            client.requests.put(
+            response = client.requests.put(
                 f"{client.base_url}/api/v1/users/{user_id}/active",
                 headers=client.headers(token),
                 json={"is_active": False},
                 timeout=client.timeout,
             )
-        except Exception:  # noqa: BLE001
-            pass
+            response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001 - record cleanup failures in the gate
+            failures.append(f"user {user_id}: {type(exc).__name__}")
+    return failures
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -763,13 +747,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     client = E2EClient(args.base_url)
-    db_path = _resolve_auth_db()
     admin_token, reviewer_token, owner_token, owner_id, reviewer_id = _create_identities(
         client, department_id=args.department_id
     )
 
     results: list[CaseResult] = []
     session_ids: list[int] = []
+    cleanup_failures: list[str] = []
     try:
         for case in cases:
             result = run_case(
@@ -778,7 +762,6 @@ def main(argv: list[str] | None = None) -> int:
                 owner_token=owner_token,
                 reviewer_token=reviewer_token,
                 kb_name=args.kb,
-                db_path=db_path,
             )
             results.append(result)
             if result.session_id:
@@ -791,7 +774,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"        ! {result.error}")
     finally:
         if not args.keep:
-            _cleanup(
+            cleanup_failures = _cleanup(
                 client,
                 admin_token=admin_token,
                 reviewer_token=reviewer_token,
@@ -813,6 +796,7 @@ def main(argv: list[str] | None = None) -> int:
         "min_pass_rate": float(args.min_pass_rate),
         "gate_passed": gate_ok,
         "cases": [result.to_dict() for result in results],
+        "cleanup_failures": cleanup_failures,
     }
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -824,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
         f"(rate={summary['pass_rate']:.2%}, gate≥{args.min_pass_rate:.0%}) · "
         f"summary: {summary_path}"
     )
-    return 0 if (passed == len(results) and gate_ok) else 1
+    return 0 if (passed == len(results) and gate_ok and not cleanup_failures) else 1
 
 
 __all__ = [

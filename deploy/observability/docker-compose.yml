@@ -37,7 +37,7 @@ services:
     restart: unless-stopped
     command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
     volumes:
-      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ${ALERTMANAGER_CONFIG:-./alertmanager/alertmanager.yml}:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager-data:/alertmanager
     ports:
       - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_ALERTMANAGER_PORT:-9093}:9093"

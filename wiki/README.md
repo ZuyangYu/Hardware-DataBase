@@ -81,6 +81,8 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 20 | [config-and-storage](20-config-and-storage.md) | 全量配置项分类表、SQLite/PG 表清单、磁盘布局、迁移、备份与恢复 |
 | 21 | [gotchas-and-extension-guide](21-gotchas-and-extension-guide.md) | 已知失效配置/死代码、易踩的坑、扩展新数据源/新工具/新渲染器的步骤 |
 | 22 | [external-extensions](22-external-extensions.md) | MCP、文本/执行型 Skill、Sandbox Gateway/Runner 的权限边界、生命周期、产物与可观测性 |
+| 23 | [reliability-improvement-plan](23-reliability-improvement-plan.md) | 可靠性修复计划、验收标准、执行记录与真实部署验证入口 |
+| 24 | [mainstream-frontier-gap-analysis](24-mainstream-frontier-gap-analysis.md) | 主流/前沿对标、可复现评测缺陷、质量闭环与生产验证完善建议 |
 
 ---
 

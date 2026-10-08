@@ -94,6 +94,21 @@ class StorageBootstrapTests(unittest.TestCase):
         # 控制面核心表 + 版本表
         self.assertIn("control_plane_schema", tables)
         self.assertIn("chat_turns", tables)
+        self.assertIn("memory_consent_events", tables)
+        self.assertIn("memory_sources", tables)
+        self.assertTrue({"result_snapshots", "result_export_jobs", "result_export_outbox", "result_artifacts"} <= tables)
+        from src.result_exports.store import ResultExportStore
+
+        exports = ResultExportStore(storage_dir=os.path.join(self.tmp.name, "exports"))
+        self.assertEqual(exports.list_pending(), [])
+        from src.result_exports.models import ResultEnvelope
+
+        payload = dict(owner_user_id=7, tenant_id="default", session_id=3, turn_id="fresh-export",
+                       envelope=ResultEnvelope(answer="stable answer", metadata={"z": "last", "a": "first"}))
+        snapshot = exports.create_snapshot(**payload)
+        self.assertEqual(exports.create_snapshot(**payload).snapshot_id, snapshot.snapshot_id)
+        with self.assertRaisesRegex(ValueError, "immutable"):
+            exports.create_snapshot(**{**payload, "envelope": ResultEnvelope(answer="changed answer")})
         # 各域的代表表（机械映射建出来的）
         self.assertIn("users", tables)
         self.assertIn("wiki_pages", tables)
@@ -105,6 +120,21 @@ class StorageBootstrapTests(unittest.TestCase):
         # 幂等：再跑一次仍然成功
         self.assertEqual(bootstrap.main(), 0, "重复执行必须幂等")
         self.assertEqual(tables, self._table_names())
+
+    def test_existing_core_only_database_gains_export_ledger(self) -> None:
+        from src.storage.control_plane.schema import apply_schema
+        from src.storage.control_plane.schema_version import record_schema_version
+
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            apply_schema(conn)
+            record_schema_version(conn)
+        self.assertEqual(bootstrap.main(), 0)
+        self.assertIn("result_export_jobs", self._table_names())
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            unique = conn.execute(
+                "SELECT indisunique FROM pg_index WHERE indexrelid = 'idx_result_export_jobs_idempotency'::regclass"
+            ).fetchone()[0]
+        self.assertTrue(unique)
 
     def test_version_mismatch_fails_closed(self) -> None:
         self.assertEqual(bootstrap.main(), 0)

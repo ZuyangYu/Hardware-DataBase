@@ -886,7 +886,7 @@ class RagasAdapter:
         selected_claim_ids: list[str] = []
         candidate_ids: list[str] = []
         for coverage in (snapshot.retrieval_summary or {}).get("claim_coverage") or []:
-            if coverage.get("status") not in {"supported", "partial", "conflicting"}:
+            if coverage.get("status") not in {"citation_valid", "supported", "partial", "conflicting"}:
                 continue
             candidates = [
                 str(evidence_id)

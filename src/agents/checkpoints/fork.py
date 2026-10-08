@@ -2,12 +2,14 @@
 
 Verified behavior (P0-002b):
 
-- ``BaseCheckpointSaver.put`` copies one checkpoint into a new thread/namespace
-  and assigns a fresh ``checkpoint_id``;
+- ``BaseCheckpointSaver.put`` copies a checkpoint into a new thread/namespace
+  while preserving its id and wiring the target parent chain;
 - pending writes are stored separately from the checkpoint and are NOT copied
   by ``put`` — take-over must copy them explicitly or they are lost;
 - resuming a copied namespace with new input continues the copied conversation
   history instead of starting empty.
+- delta channels require ancestor checkpoints and writes through their nearest
+  snapshots (or the chain root), including on successful-turn commits.
 
 These helpers intentionally operate on the official saver API and never
 reimplement the checkpoint protocol.
@@ -52,26 +54,47 @@ def copy_checkpoint_namespace(
     source_tuple = saver.get_tuple(source_config)
     if source_tuple is None:
         return None
-    checkpoint = source_tuple.checkpoint
-    new_versions = checkpoint.get("channel_versions", {}) if isinstance(checkpoint, dict) else {}
+    # DeepAgents uses DeltaChannel for messages/files. A head checkpoint may
+    # contain no value at all: its state lives in ancestor pending writes.
+    # Copy the on-path chain through every required snapshot (or the root),
+    # using the official saver API so no reducer/storage format is guessed.
+    chain = [source_tuple]
+    remaining = set((source_tuple.metadata or {}).get("counters_since_delta_snapshot", {}))
+    remaining.difference_update(source_tuple.checkpoint.get("channel_values", {}))
+    cursor = source_tuple
+    seen: set[str] = set()
+    while remaining and cursor.parent_config is not None:
+        parent_key = repr(cursor.parent_config.get("configurable", {}))
+        if parent_key in seen:
+            raise RuntimeError("cyclic delta checkpoint ancestry")
+        seen.add(parent_key)
+        parent = saver.get_tuple(cursor.parent_config)
+        if parent is None:
+            raise RuntimeError("missing delta checkpoint ancestor")
+        chain.append(parent)
+        remaining.difference_update(parent.checkpoint.get("channel_values", {}))
+        cursor = parent
+
     target_config: RunnableConfig = {
         "configurable": {
             "thread_id": str(target_thread_id),
             "checkpoint_ns": str(target_checkpoint_ns or ""),
         }
     }
-    saved = saver.put(target_config, checkpoint, source_tuple.metadata, new_versions)
-    if copy_pending_writes:
-        grouped: dict[str, list[tuple[str, Any]]] = {}
-        order: list[str] = []
-        for write in source_tuple.pending_writes or []:
-            task_id, channel, value = pending_write_parts(write)
-            if task_id not in grouped:
-                order.append(task_id)
-                grouped[task_id] = []
-            grouped[task_id].append((channel, value))
-        for task_id in order:
-            saver.put_writes(saved, grouped[task_id], task_id=task_id)
+    for checkpoint_tuple in reversed(chain):
+        checkpoint = checkpoint_tuple.checkpoint
+        new_versions = checkpoint.get("channel_versions", {})
+        saved = saver.put(target_config, checkpoint, checkpoint_tuple.metadata, new_versions)
+        # Ancestor writes are committed history, even when the caller asks not
+        # to replay the head's still-pending writes.
+        if copy_pending_writes or checkpoint_tuple is not source_tuple:
+            grouped: dict[str, list[tuple[str, Any]]] = {}
+            for write in checkpoint_tuple.pending_writes or []:
+                task_id, channel, value = pending_write_parts(write)
+                grouped.setdefault(task_id, []).append((channel, value))
+            for task_id, writes in grouped.items():
+                saver.put_writes(saved, writes, task_id=task_id)
+        target_config = saved
     return saved
 
 
@@ -84,10 +107,10 @@ def copy_latest_checkpoint(
 ) -> RunnableConfig | None:
     """Copy the latest root-namespace checkpoint of a conversation thread.
 
-    Only the single checkpoint needed to continue the conversation is copied;
-    older revisions and non-root namespaces are not cloned into the target
-    attempt.  History/time-travel inside a superseded attempt namespace stays
-    isolated and is cleaned up by the retention task.
+    Ordinary channels need only the head. Delta channels also need on-path
+    ancestors through their nearest snapshots; non-root namespaces are not
+    cloned. Superseded attempts remain isolated and can be safely purged once
+    the target owns its independent reconstruction chain.
     """
     source_config: RunnableConfig = {"configurable": {"thread_id": str(source_thread_id), "checkpoint_ns": ""}}
     return copy_checkpoint_namespace(

@@ -544,6 +544,7 @@ class AppPipeline:
         source_scope: str = "auto",
         propagate_errors: bool = False,
         attachment_user_id: int | None = None,
+        conversation_session_id: int | None = None,
         action_scope: Any | None = None,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
@@ -569,6 +570,7 @@ class AppPipeline:
                 attachments=attachments,
                 source_scope=source_scope,
                 attachment_user_id=attachment_user_id,
+                conversation_session_id=conversation_session_id,
                 action_scope=action_scope,
             )
         except QueryCancelled:

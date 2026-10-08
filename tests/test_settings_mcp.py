@@ -71,6 +71,7 @@ class McpSettingsTests(unittest.TestCase):
         self.assertNotIn("MCP_CREDENTIALS_KEY", settings.DEFAULT_VALUES)
 
     def test_reload_reads_mcp_settings_from_env(self):
+        startup_credentials_key = settings.MCP_CREDENTIALS_KEY
         self._reload(
             {
                 "MCP_ENABLED": "true",
@@ -98,7 +99,9 @@ class McpSettingsTests(unittest.TestCase):
         self.assertEqual(settings.MCP_WRITE_CONFIRM_TTL_SECONDS, 60)
         self.assertEqual(settings.MCP_MAX_ARTIFACT_BYTES, 1024)
         self.assertEqual(settings.MCP_ARTIFACT_ALLOWED_EXTENSIONS, "kicad_sch,zip")
-        self.assertEqual(settings.MCP_CREDENTIALS_KEY, "test-key-material")
+        # Credential rotation is construction-time wiring: hot settings reload
+        # must keep the key used by existing encrypted stores and clients.
+        self.assertEqual(settings.MCP_CREDENTIALS_KEY, startup_credentials_key)
         self.assertEqual(settings.RESOURCE_MCP_MAX_CONCURRENT, 6)
         self.assertEqual(settings.RESOURCE_MCP_RESERVED_INTERACTIVE, 2)
 

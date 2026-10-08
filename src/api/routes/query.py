@@ -439,6 +439,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     # thread; the visible thread only moves through the guarded commit below.
     visible_thread = str(turn.session_id)
     runner_thread = visible_thread
+    checkpoint_initialization_failed = False
     checkpoint_observer = None
 
     def _register_checkpoint_ref(saved: dict) -> None:
@@ -491,8 +492,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 resume_ref=resume_ref,
             )
         except Exception:
-            # Fail open to the visible thread rather than losing the turn.
-            runner_thread = visible_thread
+            # Fenced execution must never bypass attempt isolation. Let the
+            # normal guarded failure path publish a durable terminal event.
+            checkpoint_initialization_failed = True
         if ownership_token and runner_thread != visible_thread:
             try:
                 from src.agents.checkpoints.observer import install_checkpoint_observer
@@ -746,6 +748,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     summary: dict = {}
     footer = ""
     try:
+        if checkpoint_initialization_failed:
+            _fail_owned("检查点初始化失败，请稍后重试")
+            return
         try:
             history = conv.history_before_turn(user.id, turn_id)
         except Exception:
@@ -790,6 +795,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             source_scope=str(getattr(turn, "source_scope", "") or "auto"),
             propagate_errors=True,
             attachment_user_id=int(user.id),
+            conversation_session_id=int(turn.session_id),
             action_scope=action_scope,
         )
         try:
@@ -1448,6 +1454,7 @@ def _query_generator(
     source_scope="auto",
     propagate_errors=False,
     attachment_user_id=None,
+    conversation_session_id=None,
     action_scope=None,
 ):
     params = inspect.signature(pipeline.query).parameters
@@ -1476,6 +1483,8 @@ def _query_generator(
             kwargs["propagate_errors"] = propagate_errors
         if "attachment_user_id" in params:
             kwargs["attachment_user_id"] = attachment_user_id
+        if "conversation_session_id" in params:
+            kwargs["conversation_session_id"] = conversation_session_id
         if action_scope is not None and "action_scope" in params:
             kwargs["action_scope"] = action_scope
         return pipeline.query(
@@ -1506,6 +1515,8 @@ def _query_generator(
         kwargs["propagate_errors"] = propagate_errors
     if "attachment_user_id" in params:
         kwargs["attachment_user_id"] = attachment_user_id
+    if "conversation_session_id" in params:
+        kwargs["conversation_session_id"] = conversation_session_id
     if action_scope is not None and "action_scope" in params:
         kwargs["action_scope"] = action_scope
     return pipeline.query(query, kb_name, history, ctx, **kwargs)

@@ -255,14 +255,21 @@ attempt_thread_id(visible, token, attempt_id="")
 4. 记录 `hdb_checkpoint_attempts(visible_thread, attempt_thread, fencing_token, created_at)`；
 5. 指标 `hdb.checkpoint.fork_latency{reason=...}`。
 
-指针表（`CheckpointAttemptStore`，SQLite）：
+DeepAgents 的 `messages/files` 使用 `DeltaChannel`：最新 checkpoint 可能不包含消息正文，
+需要沿 parent chain 复制各 delta 通道到最近 snapshot（或根节点）的祖先与 writes。
+`fork.py` 在 fork 和成功提交时都复制这条重建链；祖先缺失时直接失败，避免静默丢上下文。
+SQLite/PG 回归覆盖 snapshot 间隔 1/3/1000，以及删除旧 attempt 后再打开 provider 续接。
+附件 ACL 和文档任务使用显式的 `conversation_session_id`，与 opaque attempt thread 分离。
+
+指针表（SQLite `CheckpointAttemptStore` / PG `PostgresCheckpointAttemptStore`）：
 
 ```sql
 hdb_checkpoint_attempts(visible_thread, attempt_thread, fencing_token, created_at, PK(visible,attempt))
 hdb_checkpoint_pointers(visible_thread PK, attempt_thread, checkpoint_id, fencing_token, updated_at)
 ```
 
-- `cas_pointer` 拒绝回退（`BEGIN IMMEDIATE`）——防止旧 worker 覆盖新进度；
+- `cas_pointer` 用带 token 条件的原子 UPSERT 拒绝回退；规范复制与 CAS 在同一跨进程锁内执行。
+  SQLite 以独立 `.commit-lock` 数据库的写事务互斥，PG 用 thread 维度 advisory transaction lock；
 - `commit_attempt(...)`：attempt → visible 克隆 + 指针 CAS，若更新 token 已提交则抛 `StaleAttemptCommit`，
   随后 `purge_superseded_attempts` 清理旧 attempt；
 - `forget_thread_state` 删除全部 attempt + 指针 + 规范 thread（会话清空/删除时调用，
@@ -278,8 +285,8 @@ hdb_checkpoint_pointers(visible_thread PK, attempt_thread, checkpoint_id, fencin
 记录 `hdb.checkpoint.write_latency`；回调异常被吞；`uninstall()` 恢复原实现。
 API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`。
 
-> 已知限制：attempt/pointer 表目前只在 SQLite 后端实现；PG 多实例 rollout 前需要补齐
-> （模块 docstring 已注明）。
+> 两个后端均有共享指针、pending writes、旧 attempt 拒绝及跨进程复制/CAS 回归。
+> attempt 初始化失败时 turn 以失败事件结束，禁止直接在可见 thread 执行。
 
 ---
 
@@ -291,7 +298,9 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | `retrieval_summary` | 机器可读摘要：`status`、`evidence`、`tables`、`agent_status`、`tool_diagnostics`、`retrieval_rounds`、`claim_coverage`、`memory_context` |
 | `diagnostics` | 每工具调用：`tool_name/status/hit_count/top_k/scoped/duration` |
 | `token usage` | `get_last_token_usage_summary()`（来自 model gateway 账本） |
-| `claim_coverage` | `_build_claim_coverage`：按回答里的 `[n]` 引用标记（正则 `\[(\d+)\]`）与证据 `metadata["citation_number"]` 对齐，产出 `[{claim_id:"cite-N", status:"supported", evidence_ids:[...]}]`——**这是词法近似，不是 LLM 断言抽取**，文档里必须如实说明 |
+| `claim_coverage` | `_build_claim_coverage`：按回答里的 `[n]` 与证据 `citation_number` 对齐去重，状态为 `citation_valid`，仅表示编号有效 |
+| `verification` | 记录无效引用与未引用段落；`semantic_verification_status=not_evaluated`，有证据时 `grounded=null`，`conflicts/unsupported_claims/weak_claims=null`；证据引用覆盖率为 distinct cited evidence / available evidence |
+| `sufficiency_status` | 无证据为 `insufficient`；有证据为 `not_evaluated`，实际语义支持与冲突由固定数据集评测验证 |
 
 降级事件（`degraded`）的 stage：
 
@@ -362,7 +371,7 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 1. 构造 `ActionExecutionScope`（dict 形式：`tenant_id/session_generation/turn_id/plan_version`），
    失败则禁用收据（`receipt_store=None`）；
 2. `claim_turn_result` → 装饰 turn（token/generation/attempt）；
-3. checkpoint attempt：`prepare_attempt` + 观察器登记引用；异常 fallback 到可见 thread；
+3. checkpoint attempt：`prepare_attempt` + 观察器登记引用；初始化失败结束 turn，不执行可见 thread；
 4. 心跳线程（`CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS=10`）续租 + 写心跳；
 5. 逐事件转发到 SSE（`_turn_event_payload`），把 assistant 文本增量写 `delta`；
 6. 结束时 `complete_turn_result`（回答归一化后）+ 按回答文本与 summary 推导 trace 状态落审计；
@@ -404,5 +413,5 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | 回答空/无证据 | 工具是否被 capability 过滤；RAGFlow 是否有 completed 记录；`degraded` 事件里的 reason |
 | 工具没被调用 | 提示词是否被自定义 `SYSTEM_PROMPT` 破坏；工具是否登记在 `TOOL_CAPABILITIES` |
 | 递归上限触发 | 回答里出现「单轮工具调用步数已达上限」+ 建议；调大 `AGENT_MAX_RETRIEVAL_ROUNDS` |
-| 多轮上下文丢失 | thread 是否持久化（`persist_thread`）；checkpoint 是否被 `forget_thread` 清过 |
-| 状态错乱/重复回答 | 检查 attempt 指针表与 `conversation_execution_state`；PG 后端下 attempt 表尚未实现 |
+| 多轮上下文丢失 | thread 是否持久化（`persist_thread`）；检查 DeltaChannel 的祖先 checkpoint/writes 链，不能只复制最新快照 |
+| 状态错乱/重复回答 | 检查 SQLite/PG attempt 指针表与 `conversation_execution_state`；旧 owner 的 fencing token 是否被拒绝 |

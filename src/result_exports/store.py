@@ -312,7 +312,7 @@ class ResultExportStore:
             (owner, turn),
         ).fetchone()
         if existing is not None:
-            if str(existing["envelope_json"]) != envelope_json:
+            if _json(_load(existing["envelope_json"], None)) != envelope_json:
                 raise ValueError("result snapshot is immutable")
             return _row_to_snapshot(existing)
         snapshot_id = f"snapshot-{uuid.uuid4().hex}"

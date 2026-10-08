@@ -2,7 +2,7 @@ groups:
   - name: hardware-database-slo
     rules:
       - alert: HdbChatErrorRateHigh
-        expr: sum(rate(hdb_chat_turns_total{status!="completed"}[5m])) / clamp_min(sum(rate(hdb_chat_turns_total[5m])), 1) > 0.10
+        expr: sum(rate(hdb_chat_turns_total{status="failed"}[5m])) / sum(rate(hdb_chat_turns_total{status=~"completed|failed"}[5m])) > 0.10
         for: 10m
         labels:
           severity: warning
@@ -34,7 +34,7 @@ groups:
           summary: "Hardware DataBase worker failures are occurring"
 
       - alert: HdbRetrievalEmptyRateHigh
-        expr: sum(rate(hdb_rag_zero_hit_total[10m])) / clamp_min(sum(rate(hdb_rag_calls_total[10m])), 1) > 0.30
+        expr: sum(rate(hdb_rag_zero_hit_total[10m])) / sum(rate(hdb_rag_calls_total[10m])) > 0.30
         for: 15m
         labels:
           severity: warning

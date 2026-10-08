@@ -1,0 +1,78 @@
+rule_files:
+  - ../rules/hardware-database.yml
+evaluation_interval: 1m
+tests:
+  - name: one failed request per minute still alerts
+    interval: 1m
+    input_series:
+      - series: hdb_chat_turns_total{status="failed"}
+        values: 0+1x40
+      - series: hdb_chat_turns_total{status="completed"}
+        values: 0+0x40
+      - series: hdb_rag_zero_hit_total
+        values: 0+1x40
+      - series: hdb_rag_calls_total
+        values: 0+1x40
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: HdbChatErrorRateHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Hardware DataBase chat error rate is above 10%
+      - eval_time: 26m
+        alertname: HdbRetrievalEmptyRateHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Retrieval empty-result rate is above 30%
+
+  - name: no traffic is not an error
+    interval: 1m
+    input_series:
+      - series: hdb_chat_turns_total{status="failed"}
+        values: 0+0x40
+      - series: hdb_chat_turns_total{status="completed"}
+        values: 0+0x40
+      - series: hdb_rag_zero_hit_total
+        values: 0+0x40
+      - series: hdb_rag_calls_total
+        values: 0+0x40
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: HdbChatErrorRateHigh
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: HdbRetrievalEmptyRateHigh
+        exp_alerts: []
+
+  - name: user cancellation is excluded from server errors
+    interval: 1m
+    input_series:
+      - series: hdb_chat_turns_total{status="cancelled"}
+        values: 0+60x40
+      - series: hdb_chat_turns_total{status="completed"}
+        values: 0+1x40
+      - series: hdb_chat_turns_total{status="failed"}
+        values: 0+0x40
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: HdbChatErrorRateHigh
+        exp_alerts: []
+
+  - name: cancellations do not dilute actual failures
+    interval: 1m
+    input_series:
+      - series: hdb_chat_turns_total{status="cancelled"}
+        values: 0+60x40
+      - series: hdb_chat_turns_total{status="completed"}
+        values: 0+1x40
+      - series: hdb_chat_turns_total{status="failed"}
+        values: 0+1x40
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: HdbChatErrorRateHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Hardware DataBase chat error rate is above 10%

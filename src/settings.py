@@ -47,7 +47,7 @@ _ENV_WRITE_LOCK = threading.RLock()
 
 load_dotenv(dotenv_path=ENV_FILE_PATH, encoding=ENV_FILE_ENCODING)
 CONFIG_REVISION = _config_revision()
-STORAGE_DIR = os.path.join(BASE_DIR, "storage")
+STORAGE_DIR = os.getenv("STORAGE_DIR") or os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
@@ -747,12 +747,27 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "RESOURCE_GOVERNOR_SCOPE",
         "AGENT_CHECKPOINT_BACKEND",
         "AGENT_CHECKPOINT_DATABASE_URL",
+        "AGENT_CHECKPOINT_DB_PATH",
+        "AGENT_CHECKPOINT_POOL_SIZE",
+        "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND",
+        "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL",
+        "DOCUMENT_AUTHORING_CHECKPOINTER_PATH",
         "MEMORY_STORE_BACKEND",
         "MEMORY_DATABASE_URL",
         "MEMORY_SQLITE_PATH",
         "WORKER_ROLE",
         "HDB_API_HOST",
         "HDB_API_PORT",
+        "OBS_ENABLED",
+        "OTEL_SERVICE_NAME",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OBS_ENVIRONMENT",
+        "OBS_SERVICE_VERSION",
+        "OBS_TRACE_SAMPLE_RATIO",
+        "OBS_METRICS_ENABLED",
+        "OBS_TRACES_ENABLED",
+        "OBS_LOGS_ENABLED",
+        "OBS_PHOENIX_PROJECT",
         # Environment-only MCP credential key: rotation requires a restart and
         # must never be writable through the config API.
         "MCP_CREDENTIALS_KEY",
@@ -1089,7 +1104,23 @@ DEFAULT_VALUES = {
 
 
 def reload_settings():
-    """Reload .env-backed settings after Streamlit writes configuration changes."""
+    """Reload hot settings, retaining construction-time settings until restart."""
+    with _ENV_WRITE_LOCK:
+        runtime = {key: globals()[key] for key in RESTART_REQUIRED_SETTINGS if key in globals()}
+        environment = {key: os.environ.get(key) for key in RESTART_REQUIRED_SETTINGS}
+        try:
+            _reload_settings()
+        finally:
+            globals().update(runtime)
+            for key, value in environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def _reload_settings():
+    """Parse the reloadable configuration under the settings lock."""
     global RAGFLOW_BASE_URL, RAGFLOW_API_KEY
     global RAGFLOW_GOVERNANCE_DATASET_NAME, RAGFLOW_DESIGN_DATASET_NAME
     global RAGFLOW_TIMEOUT_SECONDS, RAGFLOW_SIMILARITY_THRESHOLD, RAGFLOW_VECTOR_WEIGHT
@@ -1251,8 +1282,10 @@ def reload_settings():
     global MEMORY_EMBEDDING_INDEX_KIND
     global MEMORY_ALLOW_GENERAL_CHAT_EXTRACTION, MEMORY_USER_MEMORY_OPT_IN
     global MEMORY_USER_MEMORY_REQUIRE_PER_EVENT_CONSENT, MEMORY_RETENTION_DAYS
+    global CONFIG_REVISION
 
     load_dotenv(dotenv_path=ENV_FILE_PATH, override=True, encoding=ENV_FILE_ENCODING)
+    CONFIG_REVISION = _config_revision(ENV_FILE_PATH)
     # Invalidate cached chat models built from the previous env generation
     # (lazy import avoids a settings -> model_factory import cycle).
     from src.core.model_factory import notify_settings_reloaded

@@ -6,6 +6,7 @@ import os
 import logging
 import socket
 import threading
+import copy
 from typing import Any
 
 from opentelemetry import metrics, trace
@@ -16,16 +17,62 @@ from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
-from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics import Histogram, MeterProvider
+from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import Event, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
-from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
+from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+from opentelemetry.trace import Link, Status
 
 from .config import get_config
+from .logging import RedactingLoggingHandler
+from .privacy import safe_span_attributes, redact_text
+
+
+def _export_attributes(attrs):
+    values = dict(attrs or {})
+    safe = safe_span_attributes(values)
+    for key, default_kind in (("input.value", "query"), ("output.value", "llm")):
+        if key in values:
+            # Application content is tagged at capture time; automatic LLM
+            # spans use the stricter LLM gate for both input and output.
+            kind = values.get(f"hdb.content.{key}.kind") or (
+                "llm" if values.get("openinference.span.kind") == "LLM" else default_kind
+            )
+            safe.update(safe_span_attributes({key: values[key]}, content_kind=kind))
+    return safe
+
+
+class RedactingSpanExporter(SpanExporter):
+    """Apply the policy to auto-instrumentation as well as application spans."""
+
+    def __init__(self, exporter: SpanExporter) -> None:
+        self.exporter = exporter
+
+    def export(self, spans):
+        sanitized = []
+        for span in spans:
+            safe_span = copy.copy(span)
+            safe_span._attributes = _export_attributes(span.attributes)
+            safe_span._status = Status(span.status.status_code, redact_text(span.status.description) or None)
+            safe_span._links = tuple(Link(link.context, _export_attributes(link.attributes)) for link in span.links)
+            safe_span._events = tuple(
+                Event(redact_text(event.name), _export_attributes(event.attributes), event.timestamp)
+                for event in span.events
+            )
+            safe_span._name = redact_text(span.name)
+            sanitized.append(safe_span)
+        return self.exporter.export(sanitized)
+
+    def shutdown(self) -> None:
+        self.exporter.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self.exporter.force_flush(timeout_millis)
 
 
 _LOCK = threading.RLock()
@@ -36,6 +83,19 @@ _METER_PROVIDER: MeterProvider | None = None
 _LOG_PROVIDER: LoggerProvider | None = None
 _LOG_HANDLER: logging.Handler | None = None
 _INSTRUMENTED_CLIENTS = False
+
+# Seconds, rather than the SDK's default millisecond-like boundaries.
+LATENCY_BUCKETS_SECONDS = (
+    0, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 15, 20, 30, 60, 120, 300, 600,
+)
+
+
+def latency_views() -> list[View]:
+    return [View(
+        instrument_type=Histogram,
+        instrument_unit="s",
+        aggregation=ExplicitBucketHistogramAggregation(boundaries=LATENCY_BUCKETS_SECONDS),
+    )]
 
 
 def _endpoint_args(endpoint: str) -> dict[str, Any]:
@@ -80,7 +140,7 @@ def init_observability(
         )
         tracer_provider = TracerProvider(
             resource=resource,
-            sampler=TraceIdRatioBased(config.sample_ratio),
+            sampler=ParentBased(TraceIdRatioBased(config.sample_ratio)),
         )
         if config.traces_enabled:
             exporter = span_exporter
@@ -90,7 +150,7 @@ def init_observability(
                 except Exception:
                     exporter = None
             if exporter is not None:
-                tracer_provider.add_span_processor(BatchSpanProcessor(exporter))
+                tracer_provider.add_span_processor(BatchSpanProcessor(RedactingSpanExporter(exporter)))
         try:
             trace.set_tracer_provider(tracer_provider)
         except Exception:
@@ -107,7 +167,7 @@ def init_observability(
                 except Exception:
                     exporter = None
             readers = [PeriodicExportingMetricReader(exporter)] if exporter is not None else []
-            meter_provider = MeterProvider(resource=resource, metric_readers=readers)
+            meter_provider = MeterProvider(resource=resource, metric_readers=readers, views=latency_views())
             try:
                 metrics.set_meter_provider(meter_provider)
             except Exception:
@@ -120,7 +180,7 @@ def init_observability(
                 log_provider = LoggerProvider(resource=resource)
                 log_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
                 set_logger_provider(log_provider)
-                log_handler = LoggingHandler(level=logging.NOTSET, logger_provider=log_provider)
+                log_handler = RedactingLoggingHandler(level=logging.NOTSET, logger_provider=log_provider)
                 logging.getLogger("RAG").addHandler(log_handler)
                 _LOG_PROVIDER = log_provider
                 _LOG_HANDLER = log_handler

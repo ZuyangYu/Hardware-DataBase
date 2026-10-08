@@ -385,6 +385,19 @@ class StoreTests(AttachmentDomainTestBase):
         pending = self.store.list_pending_cleanups()
         self.assertEqual(len(pending), 1)
 
+    def test_session_cleanup_removes_revision_fk_edges_before_attachment_rows(self):
+        from src.core.session_cleanup import SessionCleanupCoordinator
+
+        parent = self._upload("revision.txt", b"old value\n")
+        revision = self.service.create_attachment_revision(parent_attachment_id=parent.attachment_id,
+            session_id=self.session.id, user_id=self.user_id, before="old value", after="new value")
+        self.store.enqueue_session_cleanup(session_id=self.session.id, user_id=self.user_id)
+        coordinator = SessionCleanupCoordinator(store=self.store, worker_id="revision-cleanup")
+        self.assertTrue(coordinator.run_once())
+        self.assertEqual(self.store.list_pending_cleanups(), [])
+        self.assertIsNone(self.store.get_attachment_revision(revision.revision_id, session_id=self.session.id, user_id=self.user_id))
+        self.assertIsNone(self.store.get_attachment(attachment_id=parent.attachment_id, session_id=self.session.id, user_id=self.user_id, include_deleted=True))
+
     def test_session_cleanup_coordinator_reclaims_result_exports(self):
         from src.core.session_cleanup import SessionCleanupCoordinator
         from src.result_exports.models import ResultEnvelope

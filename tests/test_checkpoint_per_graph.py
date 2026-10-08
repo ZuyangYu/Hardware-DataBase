@@ -12,6 +12,7 @@ import os
 import tempfile
 import threading
 import unittest
+import uuid
 
 from langgraph.checkpoint.base import empty_checkpoint
 
@@ -81,11 +82,15 @@ class PostgresPerGraphTests(_BackendSettingsMixin, unittest.TestCase):
         results: list[str] = []
         errors: list[str] = []
 
+        barrier = threading.Barrier(4)
+
         def worker(index: int) -> None:
-            saver = create_checkpointer()
-            thread_id = f"hdb-per-graph-{os.getpid()}-{index}"
+            saver = None
+            thread_id = f"hdb-per-graph-{os.getpid()}-{index}-{uuid.uuid4().hex}"
             config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
             try:
+                barrier.wait(timeout=10)
+                saver = create_checkpointer()
                 saver.put(config, empty_checkpoint(), {"step": 1, "source": "input"}, {})
                 if saver.get_tuple(config) is None:
                     errors.append(f"missing checkpoint for {thread_id}")
@@ -95,7 +100,8 @@ class PostgresPerGraphTests(_BackendSettingsMixin, unittest.TestCase):
                 errors.append(f"{type(exc).__name__}: {exc}")
             finally:
                 try:
-                    saver.delete_thread(thread_id)
+                    if saver is not None:
+                        saver.delete_thread(thread_id)
                 except Exception:
                     pass
 
@@ -106,6 +112,7 @@ class PostgresPerGraphTests(_BackendSettingsMixin, unittest.TestCase):
             thread.start()
         for thread in threads:
             thread.join(timeout=30)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         self.assertEqual(len(results), 4)
 

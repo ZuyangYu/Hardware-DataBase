@@ -63,8 +63,15 @@ class ControlPlaneFactoryTests(unittest.TestCase):
         service = build_conversation_service(settings)
         try:
             self.assertIsInstance(service, PostgresConversationService)
+            self.assertIs(build_conversation_service(settings), service)
         finally:
             service.close()
+        replacement = build_conversation_service(settings)
+        try:
+            self.assertIsNot(replacement, service)
+            self.assertFalse(replacement.closed)
+        finally:
+            replacement.close()
 
     @unittest.skipUnless(DSN, "HDB_TEST_POSTGRES_DSN is not configured")
     def test_postgres_backend_builds_from_settings(self):

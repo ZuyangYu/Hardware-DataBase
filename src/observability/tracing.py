@@ -8,7 +8,7 @@ from typing import Any
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
-from .privacy import redact_text, safe_span_attributes
+from .privacy import exception_attributes, redact_text, safe_span_attributes
 from .semantic import OPENINFERENCE_SPAN_KIND, SpanKind
 
 
@@ -97,6 +97,8 @@ class Observation:
             )
             for attr_key, attr_value in attrs.items():
                 self.span.set_attribute(attr_key, attr_value)
+            if attrs:
+                self.span.set_attribute(f"hdb.content.{key}.kind", content_kind)
         except Exception:
             pass
 
@@ -136,7 +138,7 @@ class Observation:
             return
         self._error_recorded = True
         try:
-            self.span.record_exception(exc)
+            self.span.add_event("exception", exception_attributes(exc))
             self.span.set_status(Status(StatusCode.ERROR, redact_text(str(exc))[:500]))
             self._status_recorded = True
             self.span.set_attribute("error.type", type(exc).__name__)

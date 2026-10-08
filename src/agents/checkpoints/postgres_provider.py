@@ -15,6 +15,7 @@ provider.
 from __future__ import annotations
 
 from typing import Any
+import threading
 
 import src.settings as settings
 
@@ -27,8 +28,9 @@ class PostgresCheckpointerProvider:
         self.setup = bool(setup)
         self._connection: Any | None = None
         self._pool: Any | None = None
-        # Per-graph savers share this provider; schema setup runs once.
-        self._setup_done = False
+        # Pool construction and schema setup must not race across first-use
+        # graph builds. Runtime checkpoint I/O keeps per-graph saver locks.
+        self._create_lock = threading.RLock()
 
     def _pool_size(self) -> int:
         try:
@@ -37,6 +39,10 @@ class PostgresCheckpointerProvider:
             return 4
 
     def create(self) -> Any:
+        with self._create_lock:
+            return self._create()
+
+    def _create(self) -> Any:
         if not self.database_url:
             raise ValueError("AGENT_CHECKPOINT_DATABASE_URL is required for the postgres backend")
         try:
@@ -68,15 +74,20 @@ class PostgresCheckpointerProvider:
             if self._connection is None:
                 self._connection = psycopg.connect(self.database_url, autocommit=True)
             saver = PostgresSaver(self._connection)
+        saver._hdb_backend = self.backend
+        saver._hdb_database_url = self.database_url
         # ``setup`` is idempotent.  Re-run it for each saver so a maintenance
         # rehearsal or test that recreates the target schema cannot leave a
         # process-level provider pointing at missing checkpoint tables.
         if self.setup:
             saver.setup()
-            self._setup_done = True
         return saver
 
     def close(self) -> None:
+        with self._create_lock:
+            self._close()
+
+    def _close(self) -> None:
         if self._pool is not None:
             try:
                 self._pool.close()

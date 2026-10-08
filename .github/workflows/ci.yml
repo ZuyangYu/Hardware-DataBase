@@ -1,0 +1,95 @@
+name: Reliability CI
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: hdbtest
+          POSTGRES_PASSWORD: isolated-ci-password
+          POSTGRES_DB: hdbtest
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U hdbtest -d hdbtest"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports: [6379:6379]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      HDB_TEST_POSTGRES_DSN: postgresql://hdbtest:isolated-ci-password@127.0.0.1:5432/hdbtest
+      HDB_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      UV_PYTHON_INSTALL_MIRROR: https://github.com/astral-sh/python-build-standalone/releases/download
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: '3.12'
+      - run: uv lock --check
+      - run: uv sync --locked --group dev --group eval
+      - run: uv run --no-sync ruff check .
+      - run: bash -n scripts/backup.sh
+      - run: uv run --no-sync hardware-database-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
+        env:
+          HDB_ENV_PATH: /dev/null
+          OBS_ENABLED: 'false'
+      - run: uv run --no-sync python -m pytest -q --disable-warnings -ra --junitxml=backend-tests.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-test-results
+          path: backend-tests.xml
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:e2e -- --list
+      - run: npm run build
+
+  alert-rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate rules
+        run: >-
+          docker run --rm --entrypoint /bin/promtool
+          -v "$PWD/deploy/observability/prometheus:/work:ro" -w /work
+          prom/prometheus:v3.5.0 check rules rules/hardware-database.yml
+      - name: Test low traffic, idle and cancellation scenarios
+        run: >-
+          docker run --rm --entrypoint /bin/promtool
+          -v "$PWD/deploy/observability/prometheus:/work:ro" -w /work
+          prom/prometheus:v3.5.0 test rules tests/rules.test.yml
+      - name: Validate Alertmanager config
+        run: >-
+          docker run --rm --entrypoint /bin/amtool
+          -v "$PWD/deploy/observability/alertmanager:/work:ro"
+          prom/alertmanager:v0.28.1 check-config /work/alertmanager.yml /work/alertmanager.webhook.yml

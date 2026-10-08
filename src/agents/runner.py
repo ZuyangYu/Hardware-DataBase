@@ -362,7 +362,7 @@ def _build_evidence_quality(evidence: list[Evidence]) -> list[dict]:
 def _build_claim_coverage(answer_text: str, evidence: list[Evidence]) -> list[dict]:
     """Map ``[n]`` citation markers in the answer to the evidence actually cited.
 
-    Returns one entry per distinct cited index with status ``"supported"`` and
+    Returns one entry per distinct cited index with status ``"citation_valid"`` and
     the matching evidence id. This is a lexical proxy for claim grounding (no
     LLM claim extraction) and feeds RAGAS' claim-aware context selection.
     """
@@ -376,7 +376,7 @@ def _build_claim_coverage(answer_text: str, evidence: list[Evidence]) -> list[di
         if num is not None and num not in by_citation:
             by_citation[num] = item.id
     coverage: list[dict] = []
-    for match in _CITATION_RE.findall(answer_text or ""):
+    for match in dict.fromkeys(_CITATION_RE.findall(answer_text or "")):
         num = int(match)
         evidence_id = by_citation.get(num)
         if evidence_id is None:
@@ -384,11 +384,32 @@ def _build_claim_coverage(answer_text: str, evidence: list[Evidence]) -> list[di
         coverage.append(
             {
                 "claim_id": f"cite-{num}",
-                "status": "supported",
+                "status": "citation_valid",
                 "evidence_ids": [evidence_id],
             }
         )
     return coverage
+
+
+def _build_citation_verification(answer_text: str, evidence: list[Evidence]) -> dict:
+    """Lexical diagnostics; semantic support and sufficiency remain unevaluated."""
+    coverage = _build_claim_coverage(answer_text, evidence)
+    cited_ids = {item["evidence_ids"][0] for item in coverage}
+    valid_numbers = {int(item["claim_id"].split("-", 1)[1]) for item in coverage}
+    all_numbers = {int(item) for item in _CITATION_RE.findall(answer_text or "")}
+    paragraphs = [text.strip() for text in re.split(r"\n\s*\n", answer_text or "") if text.strip()]
+    return {
+        "grounded": False if not evidence else None,
+        "grounding_method": "citation_presence",
+        "semantic_verification_status": "not_evaluated",
+        "unsupported_claims": None,
+        "weak_claims": None,
+        "conflicts": None,
+        "invalid_citations": sorted(all_numbers - valid_numbers),
+        "uncited_paragraphs": [index for index, text in enumerate(paragraphs, 1) if not _CITATION_RE.search(text)],
+        "citation_coverage": len(cited_ids) / len(evidence) if evidence else 0.0,
+        "citation_coverage_basis": "distinct_cited_evidence/available_evidence",
+    }
 
 
 @dataclass
@@ -2014,6 +2035,7 @@ class MultiSourceAgentRunner:
         attachments: list[Any] | None = None,
         source_scope: str = "auto",
         attachment_user_id: int | None = None,
+        conversation_session_id: int | None = None,
         action_scope: Any | None = None,
     ) -> Generator[str, None, None]:
         """Observability wrapper: one agent span + metrics per run."""
@@ -2046,6 +2068,7 @@ class MultiSourceAgentRunner:
                     attachments=attachments,
                     source_scope=source_scope,
                     attachment_user_id=attachment_user_id,
+                    conversation_session_id=conversation_session_id,
                     action_scope=action_scope,
                 )
             except QueryCancelled:
@@ -2119,6 +2142,7 @@ class MultiSourceAgentRunner:
         attachments: list[Any] | None = None,
         source_scope: str = "auto",
         attachment_user_id: int | None = None,
+        conversation_session_id: int | None = None,
         action_scope: Any | None = None,
     ) -> Generator[str, None, None]:
         """Run the deep agent and stream answer deltas live.
@@ -2156,6 +2180,14 @@ class MultiSourceAgentRunner:
             requested_attachment_refs if scope_allows_attachments(scope) else []
         )
         has_attachments = bool(attachment_refs)
+        # The checkpoint thread is attempt-scoped and may be opaque. File ACLs
+        # and document-task recovery use the durable conversation identity.
+        logical_session_id = (
+            self._numeric_identity(conversation_session_id)
+            or self._numeric_identity(getattr(ctx, "session_id", None))
+            or self._numeric_identity(thread_id)
+        )
+        logical_session = str(logical_session_id or thread_id or getattr(ctx, "session_id", "") or "")
         effective_scope = scope
         action_plan_mode = self._action_plan_mode()
         # ``enabled`` is the replacement route.  The separate tool flag can
@@ -2249,7 +2281,7 @@ class MultiSourceAgentRunner:
             and (not is_general or has_attachments)
             and bool(getattr(settings, "AGENT_DOCUMENT_TOOLS_ENABLED", False))
         ):
-            conversation_id = str(thread_id or getattr(ctx, "session_id", "") or "")
+            conversation_id = logical_session
             # First recover a current task for revision/control follow-ups,
             # including the case where the client sent a valid v2 context
             # without task_id.  If that is not applicable, preserve the older
@@ -2320,7 +2352,7 @@ class MultiSourceAgentRunner:
             kb_name=scope_kb,
             ctx=ctx,
             document_context=document_context,
-            chat_session_id=str(thread_id or getattr(ctx, "session_id", "")),
+            chat_session_id=logical_session,
             top_k=8 if query_mode == "deep" else 5,
             query_mode=query_mode,
             question=query,
@@ -2332,9 +2364,7 @@ class MultiSourceAgentRunner:
             # RequestContext.user_id is the username by design; the durable
             # turn worker passes AuthUser.id explicitly for attachment ACLs.
             attachment_user_id=numeric_user_id,
-            attachment_session_id=self._numeric_identity(
-                thread_id or getattr(ctx, "session_id", None)
-            ),
+            attachment_session_id=logical_session_id,
 
             attachment_edit_enabled=allow_document_write,
         )
@@ -2937,7 +2967,7 @@ class MultiSourceAgentRunner:
                 latest = self.document_authoring_pipeline.get_current_chat_document_task_projection(
                     ctx,
                     knowledge_base_name=scope_kb,
-                    conversation_id=str(thread_id),
+                    conversation_id=logical_session,
                 )
             except (PermissionError, KeyError, ValueError):
                 latest = None
@@ -3038,7 +3068,7 @@ class MultiSourceAgentRunner:
                     self.document_authoring_pipeline.get_current_chat_document_task_projection(
                         ctx,
                         knowledge_base_name=scope_kb or None,
-                        conversation_id=str(thread_id),
+                        conversation_id=logical_session,
                     )
                 )
             except (PermissionError, KeyError, ValueError):
@@ -3148,7 +3178,7 @@ class MultiSourceAgentRunner:
                     self.document_authoring_pipeline.get_current_chat_document_task_projection(
                         ctx,
                         knowledge_base_name=scope_kb or None,
-                        conversation_id=str(thread_id),
+                        conversation_id=logical_session,
                     )
                 )
             except (PermissionError, KeyError, ValueError):
@@ -3189,7 +3219,7 @@ class MultiSourceAgentRunner:
                     self.document_authoring_pipeline.get_current_chat_document_task_projection(
                         ctx,
                         knowledge_base_name=scope_kb or None,
-                        conversation_id=str(thread_id),
+                        conversation_id=logical_session,
                     )
                 )
             except (PermissionError, KeyError, ValueError):
@@ -3242,7 +3272,7 @@ class MultiSourceAgentRunner:
                             self.document_authoring_pipeline.get_current_chat_document_task_projection(
                                 ctx,
                                 knowledge_base_name=scope_kb or None,
-                                conversation_id=str(thread_id),
+                                conversation_id=logical_session,
                             )
                         )
                         after_state = (
@@ -3668,16 +3698,7 @@ class MultiSourceAgentRunner:
         record.token_usage_summary = usage
         rt.finalize_evidence()
         answer_text = _current_run().answer
-        claim_coverage = _build_claim_coverage(answer_text, rt.evidence)
-        cited_ids = {c["evidence_ids"][0] for c in claim_coverage if c.get("evidence_ids")}
-        verification = {
-            "grounded": bool(rt.evidence),
-            "grounding_method": "citation_presence",
-            "unsupported_claims": [],
-            "weak_claims": [],
-            "conflicts": [],
-            "citation_coverage": (len(cited_ids) / len(rt.evidence)) if rt.evidence else 0.0,
-        }
+        verification = _build_citation_verification(answer_text, rt.evidence)
         record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
         record.retrieval_summary["intent_plan"] = intent_plan.to_dict()
         record.retrieval_summary["conversation_plan"] = conversation_plan.to_dict()
@@ -3777,7 +3798,7 @@ class MultiSourceAgentRunner:
             "memory_context": list(rt.memory_context),
             "missing": [],
             "retrieval_rounds": len(rt.diagnostics),
-            "sufficiency_status": "insufficient" if not rt.evidence else "sufficient",
+            "sufficiency_status": "insufficient" if not rt.evidence else "not_evaluated",
             "trace": timeline,
             "tool_diagnostics": list(rt.diagnostics),
             "claim_coverage": _build_claim_coverage(answer_text, rt.evidence),
@@ -3822,8 +3843,8 @@ class MultiSourceAgentRunner:
             sections.append("- 无")
         sections.append("\n**Grounding**")
         sections.append(
-            "- grounded={grounded} · 引用覆盖率={cov:.0%} · 校验方式=仅核对回答中的 [n] 引用是否落在证据上（未做逐句归因）".format(
-                grounded=verification.get("grounded"),
+            "- 语义支持=未评估 · 证据引用覆盖率={cov:.0%} · 无效引用={invalid} · 校验方式=仅核对 [n] 编号（未做逐句归因或冲突校验）".format(
+                invalid=verification.get("invalid_citations", []),
                 cov=float(verification.get("citation_coverage") or 0.0),
             )
         )

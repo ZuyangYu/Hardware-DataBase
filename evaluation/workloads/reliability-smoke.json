@@ -1,0 +1,10 @@
+{
+  "weights": {"chat": 1, "parse": 1, "export": 1},
+  "chat_query": "请用不超过100字解释欧姆定律，给出公式和各变量单位。",
+  "export_format": "docx",
+  "fixtures": [
+    {"kind": "md", "content": "# 接口说明\n控制器使用3.3V电源，通信接口为CAN。\n"},
+    {"kind": "docx", "content": "接口说明\n控制器使用3.3V电源，通信接口为CAN。\n"},
+    {"kind": "xlsx", "content": "信号\t电压\nVCC\t3.3V\nCAN_H\t2.5V"}
+  ]
+}

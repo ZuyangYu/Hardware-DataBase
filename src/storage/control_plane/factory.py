@@ -8,6 +8,24 @@ the ``ConversationService`` facade will call once the switch is enabled.
 from __future__ import annotations
 
 from typing import Any
+import atexit
+import os
+import threading
+
+_CONVERSATION_SERVICES: dict[tuple[int, str, int], Any] = {}
+_SERVICES_LOCK = threading.Lock()
+
+
+def close_conversation_services() -> None:
+    """Release the process-owned pools at shutdown."""
+    with _SERVICES_LOCK:
+        services = [service for key, service in _CONVERSATION_SERVICES.items() if key[0] == os.getpid()]
+        _CONVERSATION_SERVICES.clear()
+    for service in services:
+        service.close()
+
+
+atexit.register(close_conversation_services)
 
 
 def build_conversation_service(settings_module: Any | None = None):
@@ -35,10 +53,14 @@ def build_conversation_service(settings_module: Any | None = None):
             )
         from .conversation_service import PostgresConversationService
 
-        return PostgresConversationService(
-            dsn,
-            pool_size=int(getattr(settings_module, "CONTROL_PLANE_POOL_SIZE", 8) or 8),
-        )
+        pool_size = int(getattr(settings_module, "CONTROL_PLANE_POOL_SIZE", 8) or 8)
+        key = (os.getpid(), dsn, pool_size)
+        with _SERVICES_LOCK:
+            service = _CONVERSATION_SERVICES.get(key)
+            if service is None or service.closed:
+                service = PostgresConversationService(dsn, pool_size=pool_size)
+                _CONVERSATION_SERVICES[key] = service
+        return service
     if backend != "sqlite":
         raise RuntimeError(f"unsupported CONTROL_PLANE_BACKEND: {backend!r}")
     from src.core.conversation import ConversationService

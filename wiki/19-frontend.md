@@ -135,6 +135,15 @@ i18n 库、ESLint/Prettier/Biome（无 lint 配置）。
 文档任务流：`GET /document-generation/chat-tasks/events?session_id=`（SSE，可重放，
 `document_task` 事件）；仅在 SSE 预算耗尽后退化为 10s REST 轮询。
 
+当前会话选择保存在标签页级 `sessionStorage`，key 按用户名与知识库隔离。
+刷新时先检查保存的 ID 是否仍在服务端授权列表中，再恢复；被删除或不再可见时回到最新授权会话。
+其他标签页新建会话不会改变当前标签页的刷新目标。跨标签页登出仍由 `hdb_auth_session` 的 storage 事件传播。
+
+真实浏览器回归入口为 `HDB_E2E=1 npm run test:e2e`（Chromium）；
+`HDB_BROWSER_API_URL` 配置 Vite 代理，`HDB_BROWSER_USERNAME/PASSWORD` 配置验收账户。
+用例覆盖断网/刷新、并发创建其他会话后的选择恢复、重复提交、SSE 游标续传、取消与跨 tab 退出。
+`vitest.config.ts` 将浏览器用例从单测收集中排除。
+
 ### 3.3 轮询节拍
 
 | 功能 | 节拍 | 位置 |

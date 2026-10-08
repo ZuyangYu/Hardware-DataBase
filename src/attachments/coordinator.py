@@ -99,37 +99,14 @@ class AttachmentTurnCoordinator:
         return [row["attachment_id"] for row in rows]
 
     def _waiting_turn_ids(self, attachment_ids: list[str]) -> list[str]:
-        conv = self._conv()
-        placeholders = ",".join("?" for _ in attachment_ids)
-        with closing(conv._connect()) as conn:
-            rows = conn.execute(
-                f"""
-                SELECT DISTINCT ta.turn_id
-                FROM turn_attachments ta
-                JOIN chat_turns t ON t.id = ta.turn_id
-                WHERE ta.attachment_id IN ({placeholders}) AND t.status = 'waiting_for_attachments'
-                """,
-                attachment_ids,
-            ).fetchall()
-        return [row["turn_id"] for row in rows]
+        return self._conv().list_waiting_turn_ids(attachment_ids, limit=1000)
 
     def _all_waiting_turn_ids(self, *, limit: int) -> list[str]:
         try:
             bounded_limit = max(1, min(int(limit), 1000))
         except (TypeError, ValueError):
             bounded_limit = 100
-        conv = self._conv()
-        with closing(conv._connect()) as conn:
-            rows = conn.execute(
-                """
-                SELECT id FROM chat_turns
-                WHERE status = 'waiting_for_attachments'
-                ORDER BY created_at, id
-                LIMIT ?
-                """,
-                (bounded_limit,),
-            ).fetchall()
-        return [row["id"] for row in rows]
+        return self._conv().list_waiting_turn_ids(limit=bounded_limit)
 
     def _resolve_turn(self, turn_id: str) -> bool:
         conv = self._conv()

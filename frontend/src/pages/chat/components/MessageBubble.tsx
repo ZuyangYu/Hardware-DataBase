@@ -396,7 +396,7 @@ function MessageBubble({
   if (streaming) {
     const generating = !!streamingText;
     return (
-      <div className={CHAT_MESSAGE_ITEM_CLASS}>
+      <div className={CHAT_MESSAGE_ITEM_CLASS} data-message-role="assistant" data-streaming="true">
         <div className={chatRowClass('assistant')}>
           <div className={chatBubbleClass('assistant')}>
             <div className="grid gap-[12px]">
@@ -418,7 +418,7 @@ function MessageBubble({
 
   const isError = msg.content.startsWith('⚠️');
   return (
-    <div className={CHAT_MESSAGE_ITEM_CLASS}>
+    <div className={CHAT_MESSAGE_ITEM_CLASS} data-message-id={msg.id} data-message-role={msg.role}>
       <div className={chatRowClass(msg.role)}>
         <div className={chatBubbleClass(msg.role, isError)}>
           {msg.role === 'assistant' ? (
