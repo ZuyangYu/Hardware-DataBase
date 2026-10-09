@@ -27,6 +27,14 @@ export function RefreshingBadge({ label = '正在更新' }: { label?: string }) 
   );
 }
 
+/** Errors are not empty results; preserve existing data and offer a read-only retry. */
+export function ErrorState({ message, onRetry }: { message: string; onRetry?: () => void }) {
+  return <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 break-words">
+    {message}
+    {onRetry && <button type="button" className="ml-2 underline" onClick={onRetry}>重试读取</button>}
+  </div>;
+}
+
 /** 确实无数据:空状态(与"未知/无数据" `—` 语义区分,不显示成 0)。 */
 export function EmptyState({
   title,

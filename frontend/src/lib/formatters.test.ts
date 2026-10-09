@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { formatAbsoluteTime, formatRelativeTime, formatUnknown } from './formatters';
+import {
+  formatAbsoluteTime,
+  formatMultiCurrencyAmount,
+  formatPercent,
+  formatRelativeTime,
+  formatUnknown,
+  statusTone,
+} from './formatters';
 
 describe('formatRelativeTime', () => {
   const now = new Date('2026-10-09T12:00:00Z');
@@ -24,12 +31,27 @@ describe('formatRelativeTime', () => {
     expect(formatRelativeTime(undefined, now)).toBe('—');
     expect(formatRelativeTime('not-a-date', now)).toBe('—');
   });
+
+  it('未来时间不会误标为过去', () => {
+    expect(formatRelativeTime('2026-10-09T12:30:00Z', now)).toBe('30 分钟后');
+  });
 });
 
 describe('formatAbsoluteTime', () => {
   it('空值/非法值显示 —', () => {
     expect(formatAbsoluteTime(null)).toBe('—');
     expect(formatAbsoluteTime('bad')).toBe('—');
+  });
+});
+
+describe('管理工作台共享格式化', () => {
+  it('金额、百分比和状态色调保持未知值语义', () => {
+    expect(formatMultiCurrencyAmount({ USD: '1.00', CNY: '2.00' })).toBe('USD 1.00 · CNY 2.00');
+    expect(formatMultiCurrencyAmount({})).toBe('无已知金额');
+    expect(formatPercent(null)).toBe('—');
+    expect(formatPercent(0)).toBe('0.0%');
+    expect(statusTone('error')).toBe('danger');
+    expect(statusTone('unmapped')).toBe('neutral');
   });
 });
 

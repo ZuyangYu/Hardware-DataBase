@@ -6,11 +6,12 @@ import type { QualityCase } from '@/api/types';
 
 /** SSR 渲染不执行 useEffect,api.get 不会被调用:reports 保持初值空数组。 */
 describe('QualityReports', () => {
-  it('空报告时显示空状态而不是空白区块', () => {
+  it('首屏未取得报告前显示加载状态，不提前显示暂无报告', () => {
     const markup = renderToStaticMarkup(<QualityReports />);
     expect(markup).toContain('质量与费用分析报告');
     expect(markup).toContain('生成统计报告');
-    expect(markup).toContain('暂无统计报告');
+    expect(markup).toContain('正在读取统计报告');
+    expect(markup).not.toContain('暂无统计报告');
   });
 });
 

@@ -1,49 +1,30 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@/api/client';
 import { createClientRequestId } from '@/api/documentAuthoring';
 import type { QualityCase } from '@/api/types';
+import type { QualityReport } from '@/api/workbenchTypes';
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { AdminSection } from '@/components/admin/AdminPageShell';
-import { EmptyState } from '@/components/admin/StateBlock';
+import { EmptyState, ErrorState, LoadingState, RefreshingBadge } from '@/components/admin/StateBlock';
 import { StatusBadge } from '@/components/admin/StatusBadge';
 import { CopyableTechnicalValue } from '@/components/admin/CopyableTechnicalValue';
 import { formatAbsoluteTime } from '@/lib/formatters';
-
-type Report = { report_id: string; created_at: string; input_manifest_sha256: string; verified_statistics: { case_count: number; costs: { calls: number; unknown_cost_calls: number } }; recommendations: { recommendation_id: string; hypothesis: string; experiment_plan: string; status: string }[] };
-
-const ROOT_CAUSE_FIXES: Record<string, { label: string; action: string }> = {
-  retrieval: { label: '检索', action: '检查召回范围、证据排序和无关材料过滤，修复后用同一固定问题重新检索验证。' },
-  parsing: { label: '解析', action: '检查文件解析、表格/原理图索引和字段映射，修复解析结果后重新生成证据。' },
-  missing_source: { label: '资料缺失', action: '补充或更新授权知识库资料，记录资料版本，再用同一问题重新回答。' },
-  prompt: { label: 'Prompt', action: '调整回答约束、格式要求或缺失信息披露规则，再运行固定数据集对比。' },
-  model: { label: '模型', action: '调整模型或参数，并用相同冻结输入执行基线/候选配对评测。' },
-  tool: { label: '工具', action: '检查工具调用参数、错误处理和返回内容，修复后重新执行受影响任务。' },
-  permission: { label: '权限', action: '检查知识库、部门和共享授权，确认修复后不会扩大数据访问范围。' },
-  presentation: { label: '前端呈现', action: '检查回答格式、引用展示、字段完整性和前端渲染规则，再用同一回答标准回归。' },
-  unknown: { label: '待确定', action: '先由原用户或同部门授权员工查看固定提问、回答和证据，补充复核结论后再确定修复方向。' },
-};
-const WORKFLOW_STAGES: Record<string, { label: string; next: string }> = {
-  new: { label: '待复核', next: '由原用户共享选定材料，安排同部门员工完成问题判断和根因复核。' },
-  needs_information: { label: '待补充材料', next: '联系原用户补充提问、回答或证据授权，然后重新提交复核。' },
-  reviewed: { label: '已确认问题', next: '原回答 owner 冻结案例，实施修复并运行基线/候选配对评测。' },
-  regression_verified: { label: '回归已验证', next: '确认发布 revision 和部署时间，在线上版本执行同一问题回访。' },
-  closed: { label: '已上线验证', next: '闭环完成；继续通过统计报告观察同类反馈和费用影响。' },
-  rejected: { label: '复核未发现问题', next: '保留复核依据；如用户仍有异议，由原用户补充新的反馈材料。' },
-};
+import { QUALITY_RECOMMENDATION_LABELS, ROOT_CAUSE_FIXES, WORKFLOW_STAGES } from '@/lib/qualityLabels';
+import { workbenchErrorMessage } from '@/lib/workbenchErrors';
 
 export function AdminRemediationGuide({ detail }: { detail: QualityCase }) {
   const review = detail.reviews.filter((item) => !detail.reviews.some((next) => next.supersedes === item.review_id)).slice(-1)[0];
   const fix = ROOT_CAUSE_FIXES[review?.root_cause ?? 'unknown'] ?? ROOT_CAUSE_FIXES.unknown;
   const stage = WORKFLOW_STAGES[detail.status] ?? { label: detail.status, next: '刷新案例并联系原回答 owner 确认当前处理阶段。' };
-  return <section className="grid gap-3 rounded-md border border-blue-200 bg-blue-50/60 p-3 dark:border-blue-900 dark:bg-blue-950/20">
+  return <section className="grid gap-3 rounded-md border border-blue-200 bg-blue-50/60 p-3">
     <h3 className="font-semibold">管理员修复管理</h3>
     <div className="grid gap-1 text-sm">
       <p><span className="font-medium">当前阶段：</span>{stage.label}</p>
       <p><span className="font-medium">下一步：</span>{stage.next}</p>
       <p><span className="font-medium">根因对应动作：</span>{fix.label}：{fix.action}</p>
     </div>
-    <div className="grid gap-1 border-t border-blue-200 pt-3 text-sm dark:border-blue-900">
+    <div className="grid gap-1 border-t border-blue-200 pt-3 text-sm">
       <p className="font-medium">完成标准</p>
       <ol className="list-decimal space-y-1 pl-5">
         <li>原回答 owner 或同部门授权员工确认参考答案、评分要点和固定证据。</li>
@@ -57,27 +38,62 @@ export function AdminRemediationGuide({ detail }: { detail: QualityCase }) {
 }
 
 export function QualityReports() {
-  const [reports, setReports] = useState<Report[]>([]);
+  const [reports, setReports] = useState<QualityReport[]>([]);
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  async function load() {
-    try { setReports(await api.get('/api/v1/quality/reports')); }
-    catch (error) { notify.error(error instanceof Error ? error.message : '读取报告失败'); }
-  }
-  useEffect(() => { void load(); }, []);
+  const [error, setError] = useState('');
+  const sequence = useRef(0);
+  const generationKey = useRef<string | null>(null);
+  const load = useCallback(async () => {
+    const request = ++sequence.current;
+    setLoading(true);
+    setError('');
+    try {
+      const result = await api.get<QualityReport[]>('/api/v1/quality/reports');
+      if (request === sequence.current) setReports(result);
+    } catch (failure) {
+      if (request === sequence.current) setError(workbenchErrorMessage(failure, '读取报告失败'));
+    } finally {
+      if (request === sequence.current) setLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    void load();
+    return () => { sequence.current += 1; };
+  }, [load]);
   async function generate() {
     setBusy(true);
-    try { await api.post('/api/v1/quality/analysis-runs', { client_request_id: createClientRequestId() }); await load(); }
-    catch (error) { notify.error(error instanceof Error ? error.message : '生成报告失败'); }
+    setError('');
+    try {
+      generationKey.current ??= createClientRequestId();
+      await api.post('/api/v1/quality/analysis-runs', { client_request_id: generationKey.current });
+      generationKey.current = null;
+      await load();
+    }
+    catch (failure) { setError(workbenchErrorMessage(failure, '生成报告失败')); }
     finally { setBusy(false); }
   }
   return <AdminSection
     title="质量与费用分析报告"
     description="首版由代码冻结当前权限范围内的全部历史统计；诊断建议待实验验证。报告未读取 Phoenix，也未调用 LLM 生成说明。"
-    actions={<Button variant="outline" disabled={busy} onClick={() => void generate()}>{busy ? '生成中…' : '生成统计报告'}</Button>}
+    actions={<><Button variant="outline" disabled={busy || loading} onClick={() => void load()}>刷新报告</Button><Button variant="outline" disabled={busy || loading} onClick={() => void generate()}>{busy ? '生成中…' : '生成统计报告'}</Button></>}
     bodyClassName="gap-3"
   >
-    {reports.map((r, index) => <details key={r.report_id} open={index === 0} className="rounded-lg border p-3"><summary className="cursor-pointer text-sm">{formatAbsoluteTime(r.created_at)} · {r.verified_statistics.case_count} 案例 · {r.verified_statistics.costs.calls} 调用 · {r.verified_statistics.costs.unknown_cost_calls} 未知费用</summary><div className="my-2 grid gap-2"><div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">输入版本<CopyableTechnicalValue value={r.input_manifest_sha256} /></div>{r.recommendations.map((item) => <div className="my-1 grid gap-1 text-sm" key={item.recommendation_id}><p>{item.hypothesis} <StatusBadge tone={({ verified: 'success', in_progress: 'warning', rejected: 'danger' } as const)[item.status] ?? 'neutral'}>{item.status}</StatusBadge></p><p className="text-xs text-muted-foreground">验证：{item.experiment_plan}</p></div>)}{!r.recommendations.length && <EmptyState title="本报告无诊断建议">冻结统计数据不含待验证假设时为空</EmptyState>}</div></details>)}
-    {!reports.length && !busy && <EmptyState title="暂无统计报告">点击"生成统计报告"创建首份报告</EmptyState>}
+    {error && <ErrorState message={error} onRetry={() => void load()} />}
+    {busy && <RefreshingBadge label="正在生成冻结统计报告" />}
+    {loading && (!reports.length ? <LoadingState label="正在读取统计报告…" /> : <RefreshingBadge label="正在更新报告，保留上次结果" />)}
+    {reports.map((r, index) => <details key={r.report_id} open={index === 0} className="min-w-0 rounded-lg border p-3">
+      <summary className="cursor-pointer text-sm">{formatAbsoluteTime(r.created_at)} · {r.verified_statistics.case_count} 案例 · {r.verified_statistics.costs.calls} 调用 · {r.verified_statistics.costs.unknown_cost_calls} 未知费用 <StatusBadge tone="info">已生成（冻结统计）</StatusBadge></summary>
+      <div className="my-2 grid min-w-0 gap-2">
+        <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">输入版本<CopyableTechnicalValue value={r.input_manifest_sha256} /></div>
+        {r.recommendations.map((item) => <div className="my-1 grid gap-1 text-sm break-words" key={item.recommendation_id}>
+          <p>{item.hypothesis} <StatusBadge tone={item.status === 'verified' ? 'success' : item.status === 'rejected' ? 'danger' : 'warning'}>{QUALITY_RECOMMENDATION_LABELS[item.status] ?? item.status}</StatusBadge></p>
+          <p className="text-xs text-muted-foreground">验证：{item.experiment_plan}</p>
+        </div>)}
+        {!r.recommendations.length && <EmptyState title="本报告无诊断建议">冻结统计数据不含待验证假设时为空</EmptyState>}
+      </div>
+    </details>)}
+    {!reports.length && !busy && !loading && !error && <EmptyState title="暂无统计报告">点击"生成统计报告"创建首份报告</EmptyState>}
   </AdminSection>;
 }
 

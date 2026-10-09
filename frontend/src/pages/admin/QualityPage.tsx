@@ -13,19 +13,13 @@ import { StatusBadge } from '@/components/admin/StatusBadge';
 import { LoadingState, RefreshingBadge, TableEmptyRow } from '@/components/admin/StateBlock';
 import { CopyIconButton, CopyableTechnicalValue } from '@/components/admin/CopyableTechnicalValue';
 import { formatAbsoluteTime, formatRelativeTime } from '@/lib/formatters';
-import { QUALITY_REASONS, QUALITY_STATUS } from '../chat/components/FeedbackActions';
+import {
+  QUALITY_REASONS, QUALITY_STATUS, QUALITY_STATUS_TONE,
+  QUALITY_JUDGMENTS, QUALITY_ROOT_CAUSES, QUALITY_CORRECTNESS,
+  QUALITY_TRIGGER_LABELS, QUALITY_FEEDBACK_RATING_LABELS, QUALITY_FEEDBACK_RATING_TONE,
+  QUALITY_CONTENT_ACCESS_LABELS, QUALITY_CONTENT_ACCESS_TONE, QUALITY_PROJECTION_LABELS,
+} from '@/lib/qualityLabels';
 import { AdminRemediationGuide, CaseWorkflow, QualityReports } from './QualityWorkflowPanel';
-
-const QUALITY_JUDGMENTS: Record<string, string> = {
-  confirmed: '确认问题', not_an_error: '未发现错误', needs_information: '需要补充材料',
-};
-const QUALITY_ROOT_CAUSES: Record<string, string> = {
-  unknown: '待确定', retrieval: '检索', parsing: '解析', missing_source: '资料缺失',
-  prompt: 'Prompt', model: '模型', tool: '工具', permission: '权限', presentation: '前端呈现',
-};
-const QUALITY_CORRECTNESS: Record<string, string> = {
-  correct: '已确认事实正确', incorrect: '已确认事实错误', not_evaluated: '尚未判定',
-};
 
 export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () => void }) {
   const [params, setParams] = useSearchParams();
@@ -86,7 +80,7 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
           detailVersion.current = value.row_version;
           setDetail(value);
         }
-      }).catch((error) => { if (!cancelled && requestSequence === sequence) { setDetail(null); notify.error(error instanceof Error ? error.message : '加载案例失败'); } });
+      }).catch((error) => { if (!cancelled && requestSequence === sequence) { if (!draftDirty.current) setDetail(null); notify.error(error instanceof Error ? error.message : '加载案例失败'); } });
     };
     void refresh();
     const interval = window.setInterval(() => void refresh(), 15000);
@@ -137,16 +131,17 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
          {loading && rows.length > 0 && <RefreshingBadge label="正在更新列表" />}<Button variant="outline" disabled={loading} onClick={() => void load()}>{loading ? '刷新中…' : '刷新'}</Button></div>
        </div>
       <p className="text-sm text-muted-foreground">反馈与随机抽样分别记录。复核正文仅对原会话用户或被明确授权的员工开放。</p>
-       <div className="overflow-x-auto rounded-lg border"><table className="min-w-[800px] w-full text-left text-sm">
-        <thead className="bg-muted"><tr>{['案例', '触发来源', '用户反馈', '状态', '内容访问', '更新时间'].map((title) => <th className="p-3" key={title}>{title}</th>)}</tr></thead>
-         <tbody>{loading && !rows.length ? <tr><td className="p-0" colSpan={6}><LoadingState label="正在加载质量案例…" /></td></tr> : rows.map((r) => <tr className="border-t transition-colors hover:bg-muted/40" key={r.case_id}>
-          <td className="group p-3"><button className="font-mono text-xs text-blue-700 hover:underline" title={r.case_id} onClick={() => setParams({ case: r.case_id })}>{r.case_id.slice(0, 17)}…</button><CopyIconButton value={r.case_id} label="案例 ID" /></td>
-          <td className="p-3">{r.triggers.map((t) => ({ feedback: '用户反馈', random_sample: '随机抽样', diagnostic: '诊断事件' })[t] ?? t).join('、')}{r.sampling.probability != null && <div className="text-xs text-muted-foreground">入样概率 {r.sampling.probability * 100}%</div>}</td>
-          <td className="p-3">{r.feedback ? <StatusBadge tone={({ helpful: 'success', unhelpful: 'danger', withdrawn: 'neutral' } as const)[r.feedback.rating] ?? 'neutral'}>{{ helpful: '有帮助', unhelpful: '没帮助', withdrawn: '已撤销' }[r.feedback.rating] ?? r.feedback.rating}</StatusBadge> : '—'}<div className="mt-1 text-xs text-muted-foreground">{r.feedback?.reason_codes.map((c) => QUALITY_REASONS[c]).join('、')}</div></td>
-          <td className="p-3"><StatusBadge tone={({ new: 'warning', triaged: 'info', reviewed: 'info', needs_information: 'warning', rejected: 'neutral', dataset_ready: 'info', regression_verified: 'success', closed: 'success' } as const)[r.status] ?? 'neutral'}>{QUALITY_STATUS[r.status] ?? r.status}</StatusBadge></td>
-          <td className="p-3"><StatusBadge tone={({ owner: 'success', shared: 'info', hidden: 'readonly' } as const)[r.content_access] ?? 'neutral'}>{{ owner: '本人材料', shared: '授权副本', hidden: '仅元数据' }[r.content_access] ?? r.content_access}</StatusBadge></td>
+        <div className="overflow-x-auto rounded-lg border"><table className="min-w-[900px] w-full text-left text-sm">
+         <thead className="bg-muted"><tr>{['案例', ...(auth.user.role === 'system_admin' ? ['部门'] : []), '触发来源', '用户反馈', '状态', '内容访问', '更新时间'].map((title) => <th className="p-3" key={title}>{title}</th>)}</tr></thead>
+         <tbody>{loading && !rows.length ? <tr><td className="p-0" colSpan={auth.user.role === 'system_admin' ? 7 : 6}><LoadingState label="正在加载质量案例…" /></td></tr> : rows.map((r) => <tr className="border-t transition-colors hover:bg-muted/40" key={r.case_id}>
+           <td className="group p-3"><button className="font-mono text-xs text-blue-700 hover:underline" title={r.case_id} onClick={() => setParams({ case: r.case_id })}>{r.case_id.slice(0, 17)}…</button><CopyIconButton value={r.case_id} label="案例 ID" /></td>
+           {auth.user.role === 'system_admin' && <td className="p-3 whitespace-nowrap">{r.department_id == null ? '全局' : `部门 ${r.department_id}`}</td>}
+          <td className="p-3">{r.triggers.map((t) => QUALITY_TRIGGER_LABELS[t] ?? t).join('、')}{r.sampling.probability != null && <div className="text-xs text-muted-foreground">入样概率 {r.sampling.probability * 100}%</div>}</td>
+          <td className="p-3">{r.feedback ? <StatusBadge tone={QUALITY_FEEDBACK_RATING_TONE[r.feedback.rating] ?? 'neutral'}>{QUALITY_FEEDBACK_RATING_LABELS[r.feedback.rating] ?? r.feedback.rating}</StatusBadge> : '—'}<div className="mt-1 text-xs text-muted-foreground">{r.feedback?.reason_codes.map((c) => QUALITY_REASONS[c]).join('、')}</div></td>
+          <td className="p-3"><StatusBadge tone={QUALITY_STATUS_TONE[r.status] ?? 'neutral'}>{QUALITY_STATUS[r.status] ?? r.status}</StatusBadge></td>
+          <td className="p-3"><StatusBadge tone={QUALITY_CONTENT_ACCESS_TONE[r.content_access] ?? 'neutral'}>{QUALITY_CONTENT_ACCESS_LABELS[r.content_access] ?? r.content_access}</StatusBadge></td>
           <td className="p-3 whitespace-nowrap" title={formatAbsoluteTime(r.updated_at)}>{formatRelativeTime(r.updated_at)}</td>
-        </tr>)}{!rows.length && !loading && <TableEmptyRow colSpan={6} title="当前范围暂无案例">调整状态筛选或稍后刷新</TableEmptyRow>}</tbody>
+        </tr>)}{!rows.length && !loading && <TableEmptyRow colSpan={auth.user.role === 'system_admin' ? 7 : 6} title="当前范围暂无案例">调整状态筛选或稍后刷新</TableEmptyRow>}</tbody>
       </table></div>
         <p className="mt-1 text-xs text-muted-foreground md:hidden">左右滑动查看全部列</p>
        <div className="flex flex-wrap items-center gap-3"><Button variant="outline" disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - 50))}>上一页</Button><span className="text-sm text-muted-foreground">第 {offset / 50 + 1} 页 · 当前页 {rows.length} 条</span><Button variant="outline" disabled={rows.length < 50 || loading} onClick={() => setOffset(offset + 50)}>下一页</Button></div>
@@ -163,19 +158,19 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
           <div className="flex min-w-0 gap-2"><span className="w-16 shrink-0">Trace</span><CopyableTechnicalValue value={String(detail.manifest.trace_id || '无采样 trace')} /></div>
         </div></details>
         <div>状态：{QUALITY_STATUS[detail.status] ?? detail.status} · 版本 {detail.row_version}</div>
-        {detail.projection_status && <p className="text-xs text-muted-foreground">Phoenix 标注：{detail.projection_status.map((s) => `${({ completed: '已同步', pending: '待投递', running: '投递中', failed: '投递失败', disabled: '同步未开启', no_span: '无采样 span' })[s.status] ?? s.status} ${s.count}`).join(' · ') || '暂无标注'}</p>}
+        {detail.projection_status && <p className="text-xs text-muted-foreground">Phoenix 标注：{detail.projection_status.map((s) => `${QUALITY_PROJECTION_LABELS[s.status] ?? s.status} ${s.count}`).join(' · ') || '暂无标注'}</p>}
          {detail.content_access === 'hidden' && <p className="rounded-md bg-muted p-3">当前仅有元数据访问权限，正文与证据未共享或共享已失效。</p>}
          {auth.user.role === 'system_admin' && <AdminRemediationGuide detail={detail} />}
-         <section className="rounded-md border border-amber-200 bg-amber-50/60 p-3 dark:border-amber-900 dark:bg-amber-950/20">
+         <section className="rounded-md border border-amber-200 bg-amber-50/60 p-3">
            <h3 className="font-semibold">问题概览（管理员可见）</h3>
            {detail.feedback ? <div className="mt-2 grid gap-1">
-             <p><span className="font-medium">用户反馈：</span>{({ helpful: '有帮助', unhelpful: '没帮助', withdrawn: '已撤销' })[detail.feedback.rating] ?? detail.feedback.rating}</p>
+             <p><span className="font-medium">用户反馈：</span>{QUALITY_FEEDBACK_RATING_LABELS[detail.feedback.rating] ?? detail.feedback.rating}</p>
              <p><span className="font-medium">反馈指出：</span>{detail.feedback.reason_codes.length ? detail.feedback.reason_codes.map((code) => QUALITY_REASONS[code]).join('、') : '未选择分类'}</p>
-             <p className="text-xs text-muted-foreground">反馈时间：{new Date(detail.feedback.created_at).toLocaleString()}</p>
+              <p className="text-xs text-muted-foreground">反馈时间：{formatAbsoluteTime(detail.feedback.created_at)}</p>
              {detail.content_access === 'hidden' && <p className="text-xs text-muted-foreground">补充说明原文仅对原用户或明确授权的员工开放。</p>}
-           </div> : <p className="mt-2">本案例由{detail.triggers.map((trigger) => ({ random_sample: '随机抽样', diagnostic: '诊断事件', feedback: '用户反馈' })[trigger] ?? trigger).join('、')}触发，尚无用户反馈。</p>}
-           {(detail.feedback_history?.length ?? 0) > 1 && <div className="mt-3 border-t border-amber-200 pt-3 dark:border-amber-900"><p className="font-medium">反馈历史（仅元数据）</p><div className="mt-1 grid gap-1">{detail.feedback_history?.map((event) => <p className="text-xs" key={event.event_id}>第 {event.sequence} 次：{({ helpful: '有帮助', unhelpful: '没帮助', withdrawn: '已撤销' })[event.rating] ?? event.rating} · {event.reason_codes.length ? event.reason_codes.map((code) => QUALITY_REASONS[code]).join('、') : '未选择分类'} · {new Date(event.created_at).toLocaleString()}</p>)}</div></div>}
-           {detail.reviews.length > 0 && <div className="mt-3 border-t border-amber-200 pt-3 dark:border-amber-900">
+           </div> : <p className="mt-2">本案例由{detail.triggers.map((trigger) => QUALITY_TRIGGER_LABELS[trigger] ?? trigger).join('、')}触发，尚无用户反馈。</p>}
+           {(detail.feedback_history?.length ?? 0) > 1 && <div className="mt-3 border-t border-amber-200 pt-3"><p className="font-medium">反馈历史（仅元数据）</p><div className="mt-1 grid gap-1">{detail.feedback_history?.map((event) => <p className="text-xs" key={event.event_id}>第 {event.sequence} 次：{QUALITY_FEEDBACK_RATING_LABELS[event.rating] ?? event.rating} · {event.reason_codes.length ? event.reason_codes.map((code) => QUALITY_REASONS[code]).join('、') : '未选择分类'} · {formatAbsoluteTime(event.created_at)}</p>)}</div></div>}
+           {detail.reviews.length > 0 && <div className="mt-3 border-t border-amber-200 pt-3">
              <p className="font-medium">当前复核结论</p>
              {detail.reviews.slice(-1).map((review) => <div className="mt-1 grid gap-1" key={review.review_id}>
                <p>判断：{QUALITY_JUDGMENTS[review.judgment] ?? review.judgment} · 根因：{QUALITY_ROOT_CAUSES[review.root_cause] ?? review.root_cause}</p>
@@ -192,9 +187,9 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
         {detail.reviews.map((r) => <section className="rounded-md border p-3" key={r.review_id}><h3 className="font-semibold">复核：{QUALITY_JUDGMENTS[r.judgment] ?? r.judgment} · {QUALITY_ROOT_CAUSES[r.root_cause] ?? r.root_cause}</h3><p className="whitespace-pre-wrap">{r.content.notes}</p><p className="whitespace-pre-wrap">{r.content.reference_answer}</p><span className="text-xs text-muted-foreground" title={formatAbsoluteTime(r.created_at)}>{formatRelativeTime(r.created_at)}</span></section>)}
         {detail.source_valid && detail.content.answer != null && auth.user.role === 'employee' && <fieldset disabled={busy} className="grid gap-3 border-t pt-4"><legend className="font-semibold">提交复核结论</legend>
           {staleDetail && <p className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">案例数据已更新（可能有新的复核被提交），你正在编辑的草稿未被覆盖。<button className="ml-1 underline" onClick={() => void reloadLatestVersion()}>载入最新版本</button>（将替换未保存草稿）</p>}
-          <label>判断 <select className="rounded border p-2" value={judgment} onChange={(e) => { draftDirty.current = true; setJudgment(e.target.value); setReviewKey(createClientRequestId()); }}><option value="confirmed">确认问题</option><option value="not_an_error">未发现错误</option><option value="needs_information">需要补充材料</option></select></label>
-          <label>事实正确性 <select className="rounded border p-2" value={correctness} onChange={(e) => { draftDirty.current = true; setCorrectness(e.target.value); setReviewKey(createClientRequestId()); }}><option value="not_evaluated">尚未判定</option><option value="incorrect">已确认事实错误</option><option value="correct">已确认事实正确</option></select></label>
-          <label>根因 <select className="rounded border p-2" value={rootCause} onChange={(e) => { draftDirty.current = true; setRootCause(e.target.value); setReviewKey(createClientRequestId()); }}>{Object.entries({ unknown: '待确定', retrieval: '检索', parsing: '解析', missing_source: '资料缺失', prompt: 'Prompt', model: '模型', tool: '工具', permission: '权限', presentation: '前端呈现' }).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>判断 <select className="rounded border p-2" value={judgment} onChange={(e) => { draftDirty.current = true; setJudgment(e.target.value); setReviewKey(createClientRequestId()); }}>{Object.entries(QUALITY_JUDGMENTS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>事实正确性 <select className="rounded border p-2" value={correctness} onChange={(e) => { draftDirty.current = true; setCorrectness(e.target.value); setReviewKey(createClientRequestId()); }}>{Object.entries(QUALITY_CORRECTNESS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>根因 <select className="rounded border p-2" value={rootCause} onChange={(e) => { draftDirty.current = true; setRootCause(e.target.value); setReviewKey(createClientRequestId()); }}>{Object.entries(QUALITY_ROOT_CAUSES).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
           <label className="grid gap-1">参考答案（经确认后填写）<textarea className="rounded border p-2" maxLength={20000} value={referenceAnswer} onChange={(e) => { draftDirty.current = true; setReferenceAnswer(e.target.value); setReviewKey(createClientRequestId()); }} /></label>
           <label className="grid gap-1">评分要点 / rubric<textarea className="rounded border p-2" maxLength={4000} value={rubric} onChange={(e) => { draftDirty.current = true; setRubric(e.target.value); setReviewKey(createClientRequestId()); }} /></label>
           <label className="grid gap-1">复核说明<textarea className="rounded border p-2" maxLength={4000} value={notes} onChange={(e) => { draftDirty.current = true; setNotes(e.target.value); setReviewKey(createClientRequestId()); }} /></label>
