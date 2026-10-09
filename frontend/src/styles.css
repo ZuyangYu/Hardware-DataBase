@@ -67,7 +67,7 @@
   --primary-foreground: #ffffff;
   --secondary: #eeece4;
   --secondary-foreground: #20201d;
-  --muted-foreground: #6d726e;
+  --muted-foreground: #5f655e;
   --destructive: #dc2626;
   --input: #ded7cc;
   --ring: #0f766e;
@@ -98,8 +98,10 @@
   --border: #e5e7eb;
   --border-strong: #d4d4d8;
   --line: #eceef1;
-  --muted: #6b7280;
-  --muted-soft: #9ca3af;
+  /* --muted 恢复浅色表面语义(与 --surface-muted 一致):此前第二 :root 把它覆盖成
+     中灰 #6b7280,导致 bg-muted 表头/卡片底变成灰底深字(实测约 3.9:1),不满足
+     WCAG AA 4.5:1。文字色由独立的 --muted-foreground 承担,不再互相覆盖。 */
+  --muted: #f3f4f6;
   --accent: #111111;
   --accent-soft: #f2f3f5;
   --accent-foreground: #ffffff;
@@ -194,6 +196,30 @@ body {
 
   * {
     @apply border-border outline-ring/50;
+  }
+}
+
+/* A3 统一键盘焦点:裸 input/select/textarea/button/a/summary 获得统一 focus ring。
+   写在 @layer base,Tailwind utilities 层的 outline-none(共享 UI 组件)优先,
+   因此 Input/Textarea/Select/Button 仍用自带的 ring,不叠加双环。
+   原生 datetime-local/分页按钮等无自定义 ring 的控件由本规则兜底。 */
+@layer base {
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  button:focus-visible,
+  a:focus-visible,
+  summary:focus-visible,
+  [role="button"]:focus-visible,
+  [role="tab"]:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  input[aria-invalid="true"]:focus-visible,
+  select[aria-invalid="true"]:focus-visible,
+  textarea[aria-invalid="true"]:focus-visible {
+    outline-color: var(--destructive);
   }
 }
 
