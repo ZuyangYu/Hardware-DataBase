@@ -8,6 +8,7 @@ import AppHeader from '@/components/AppHeader';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { notify } from '@/components/ui/app-toast';
+import { AdminPageShell } from '@/components/admin/AdminPageShell';
 import { QUALITY_REASONS, QUALITY_STATUS } from '../chat/components/FeedbackActions';
 import { AdminRemediationGuide, CaseWorkflow, QualityReports } from './QualityWorkflowPanel';
 
@@ -123,8 +124,8 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
   }
   return <div className="flex min-h-0 flex-1 flex-col">
     <AppHeader title="质量工作台" />
-    <main className="grid gap-5 p-6">
-       <div className="flex flex-wrap items-center gap-3"><div className="min-w-0"><h1 className="text-xl font-semibold">生产案例复核</h1><p className="mt-1 text-xs text-muted-foreground">按状态定位积压案例，打开案例查看问题概览和修复门禁。</p></div>
+    <AdminPageShell>
+       <div className="flex flex-wrap items-center gap-3"><div className="min-w-0"><h2 className="text-lg font-semibold">案例队列</h2><p className="mt-1 text-xs text-muted-foreground">按状态定位积压案例，打开案例查看问题概览和修复门禁。</p></div>
          <div className="ml-auto flex flex-wrap items-center gap-2"><label className="flex items-center gap-2 text-sm">状态<select aria-label="案例状态" className="rounded-md border bg-white p-2 text-sm" value={status} onChange={(e) => { setStatus(e.target.value); setOffset(0); }}><option value="">全部状态</option>{Object.entries(QUALITY_STATUS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
          <Button variant="outline" disabled={loading} onClick={() => void load()}>{loading ? '刷新中…' : '刷新'}</Button></div>
        </div>
@@ -140,9 +141,10 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
           <td className="p-3">{new Date(r.updated_at).toLocaleString()}</td>
         </tr>)}{!rows.length && <tr><td className="p-8 text-center text-muted-foreground" colSpan={6}>当前范围暂无案例</td></tr>}</tbody>
       </table></div>
+        <p className="mt-1 text-xs text-muted-foreground md:hidden">左右滑动查看全部列</p>
        <div className="flex flex-wrap items-center gap-3"><Button variant="outline" disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - 50))}>上一页</Button><span className="text-sm text-muted-foreground">第 {offset / 50 + 1} 页 · 当前页 {rows.length} 条</span><Button variant="outline" disabled={rows.length < 50 || loading} onClick={() => setOffset(offset + 50)}>下一页</Button></div>
       <QualityReports />
-    </main>
+    </AdminPageShell>
     <Dialog open={Boolean(caseId)} onOpenChange={(open) => { if (!open) setParams({}); }}><DialogContent className="flex h-[min(900px,calc(100dvh-32px))] max-h-[calc(100dvh-32px)] w-[min(960px,calc(100vw-32px))] max-w-none flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-none">
       <DialogHeader className="shrink-0 border-b border-[#edf0f4] px-[24px] py-[18px] pr-[56px]"><DialogTitle>固定案例与复核</DialogTitle></DialogHeader>
       {!detail ? <p className="p-[24px]">正在读取授权材料…</p> : <div className="min-h-0 flex-1 overflow-y-auto px-[24px] py-[20px]"><div className="grid gap-4 text-sm">

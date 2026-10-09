@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 import {
@@ -17,11 +17,17 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import {
+  Sheet,
+  SheetContent,
+  SheetTitle,
+} from '@/components/ui/sheet';
 import { cn } from '@/lib/utils';
 import AccountSettingsDialog from '@/components/AccountSettingsDialog';
 import AppIcon from '@/components/AppIcon';
-import { hasDashboardAccess, isSystemAdmin, ROLE_LABELS, type AuthSession } from '../auth';
 import BrandLogo from './BrandLogo';
+import { useIsMobile } from '@/hooks/use-mobile';
+import { hasDashboardAccess, isSystemAdmin, ROLE_LABELS, type AuthSession } from '../auth';
 
 type Props = {
   auth: AuthSession;
@@ -102,18 +108,36 @@ function GroupLabel({ children }: { children: string }) {
 export default function AppSidebar({ auth, onLogout }: Props) {
   const navigate = useNavigate();
   const location = useLocation();
-  const { toggleSidebar, state } = useSidebar();
+  const { toggleSidebar, state, isMobile, openMobile, setOpenMobile } = useSidebar();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const sysAdmin = isSystemAdmin(auth.user);
   const anyAdmin = hasDashboardAccess(auth.user);
   const initial = auth.user.username.slice(0, 1).toUpperCase();
-  const collapsed = state === 'collapsed';
+  const collapsed = !isMobile && state === 'collapsed';
+  /** 抽屉内导航:跳转后自动收起,避免遮挡目标页面。 */
+  const navigateAndClose = (to: string) => {
+    navigate(to);
+    if (isMobile) setOpenMobile(false);
+  };
+  /* 移动抽屉的 Escape 关闭。Radix 的 onEscapeKeyDown 链在本项目 radix-ui
+     统一包的版本上未稳定触发,这里在 document capture 阶段自行兜底:
+     先 preventDefault 再关闭,避免双重处理冲突。 */
+  useEffect(() => {
+    if (!isMobile || !openMobile) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setOpenMobile(false);
+    };
+    document.addEventListener('keydown', onKeyDown, { capture: true });
+    return () => document.removeEventListener('keydown', onKeyDown, { capture: true });
+  }, [isMobile, openMobile]);
 
-  return (
-    <Sidebar collapsible="icon" className={SIDEBAR_SHELL_CLASS}>
-      <div className="flex h-full w-full shrink-0 flex-col">
-        {/* 头部:品牌 + 收起/展开按钮。收起态点 mark 展开回边栏。 */}
-        <SidebarHeader className={cn('pt-[18px]', collapsed ? 'px-[12px] pb-[22px]' : 'px-[20px] pb-[26px]')}>
+  const navBody = (
+    <div className="flex h-full w-full shrink-0 flex-col">
+      {/* 头部:品牌 + 收起/展开按钮。收起态点 mark 展开回边栏。抽屉自带头部,不重复渲染。 */}
+      {!isMobile && (
+      <SidebarHeader className={cn('pt-[18px]', collapsed ? 'px-[12px] pb-[22px]' : 'px-[20px] pb-[26px]')}>
           <div className={cn('flex items-center', collapsed ? 'justify-center' : 'justify-between')}>
             <button
               type="button"
@@ -137,6 +161,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
             )}
           </div>
         </SidebarHeader>
+        )}
 
         {/* 导航:铺平,无分组卡片。内容管理是 KB 下钻,不作为侧边栏常驻模块。 */}
         <SidebarContent className={cn(collapsed ? 'items-center justify-center px-0 py-[14px]' : 'px-[16px] pt-[14px]')}>
@@ -147,7 +172,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 iconName="grid"
                 active={location.pathname === '/assets'}
                 collapsed={collapsed}
-                onClick={() => navigate('/assets')}
+                onClick={() => navigateAndClose('/assets')}
                 tooltip="资产中心"
               />
               <PrimaryNavButton
@@ -155,7 +180,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 iconName="database"
                 active={location.pathname === '/kbs' || location.pathname.startsWith('/kbs/')}
                 collapsed={collapsed}
-                onClick={() => navigate('/kbs')}
+                onClick={() => navigateAndClose('/kbs')}
                 tooltip="全部知识库"
               />
               <PrimaryNavButton
@@ -163,7 +188,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 iconName="send"
                 active={location.pathname === '/chat'}
                 collapsed={collapsed}
-                onClick={() => navigate('/chat')}
+                onClick={() => navigateAndClose('/chat')}
                 tooltip="对话"
               />
               <PrimaryNavButton
@@ -171,7 +196,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 iconName="history"
                 active={location.pathname === '/memory'}
                 collapsed={collapsed}
-                onClick={() => navigate('/memory')}
+                onClick={() => navigateAndClose('/memory')}
                 tooltip="长期记忆"
               />
               <PrimaryNavButton
@@ -179,7 +204,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 iconName="tool"
                 active={location.pathname === '/extensions'}
                 collapsed={collapsed}
-                onClick={() => navigate('/extensions')}
+                onClick={() => navigateAndClose('/extensions')}
                 tooltip="外部扩展"
               />
             </SidebarMenu>
@@ -207,7 +232,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                     iconName="user"
                     active={location.pathname === '/admin/users'}
                     collapsed={collapsed}
-                    onClick={() => navigate('/admin/users')}
+                    onClick={() => navigateAndClose('/admin/users')}
                     tooltip="员工管理"
                   />
                 )}
@@ -217,7 +242,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                     iconName="folder"
                     active={location.pathname === '/admin/departments'}
                     collapsed={collapsed}
-                    onClick={() => navigate('/admin/departments')}
+                    onClick={() => navigateAndClose('/admin/departments')}
                     tooltip="部门管理"
                   />
                 )}
@@ -227,7 +252,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                     iconName="lock"
                     active={location.pathname === '/admin/kb-mount'}
                     collapsed={collapsed}
-                    onClick={() => navigate('/admin/kb-mount')}
+                    onClick={() => navigateAndClose('/admin/kb-mount')}
                     tooltip="知识库挂载"
                   />
                 )}
@@ -236,7 +261,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   iconName="grid"
                   active={location.pathname === '/admin/governance'}
                   collapsed={collapsed}
-                  onClick={() => navigate('/admin/governance')}
+                  onClick={() => navigateAndClose('/admin/governance')}
                   tooltip="知识库治理"
                 />
                 <PrimaryNavButton
@@ -244,16 +269,25 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   iconName="history"
                   active={location.pathname === '/admin/logs'}
                   collapsed={collapsed}
-                  onClick={() => navigate('/admin/logs')}
+                  onClick={() => navigateAndClose('/admin/logs')}
                   tooltip="日志中心"
                 />
+                <PrimaryNavButton
+                  label="质量工作台"
+                  iconName="grid"
+                  active={location.pathname === '/admin/quality'}
+                  collapsed={collapsed}
+                  onClick={() => navigateAndClose('/admin/quality')}
+                  tooltip="生产反馈与案例复核"
+                />
+                <PrimaryNavButton label="成本与用量" iconName="grid" active={location.pathname === '/admin/costs'} collapsed={collapsed} onClick={() => navigateAndClose('/admin/costs')} tooltip="调用费用与覆盖率" />
                 {sysAdmin && (
                   <PrimaryNavButton
                     label="系统状态"
                     iconName="refresh"
                     active={location.pathname === '/admin/status'}
                     collapsed={collapsed}
-                    onClick={() => navigate('/admin/status')}
+                    onClick={() => navigateAndClose('/admin/status')}
                     tooltip="系统状态"
                   />
                 )}
@@ -263,7 +297,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                     iconName="tool"
                     active={location.pathname === '/admin/plugins'}
                     collapsed={collapsed}
-                    onClick={() => navigate('/admin/plugins')}
+                    onClick={() => navigateAndClose('/admin/plugins')}
                     tooltip="外部 MCP 扩展"
                   />
                 )}
@@ -273,7 +307,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                     iconName="tool"
                     active={location.pathname === '/admin/config'}
                     collapsed={collapsed}
-                    onClick={() => navigate('/admin/config')}
+                    onClick={() => navigateAndClose('/admin/config')}
                     tooltip="系统配置"
                   />
                 )}
@@ -283,7 +317,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                     iconName="grid"
                     active={location.pathname === '/admin/evaluation'}
                     collapsed={collapsed}
-                    onClick={() => navigate('/admin/evaluation')}
+                    onClick={() => navigateAndClose('/admin/evaluation')}
                     tooltip="RAGAS 评估"
                   />
                 )}
@@ -347,13 +381,44 @@ export default function AppSidebar({ auth, onLogout }: Props) {
           )}
         </SidebarFooter>
       </div>
+  );
 
+  return (
+    <>
       <AccountSettingsDialog
         open={settingsOpen}
         onOpenChange={setSettingsOpen}
         auth={auth}
         onLogout={onLogout}
       />
-    </Sidebar>
+
+      {isMobile ? (
+        /* 移动端:侧栏收纳为左抽屉。遮罩、Escape 关闭、焦点返回由 Radix Dialog 提供;
+           打开时默认锁定背景滚动。trigger 在 AppHeader(共享页头)内。 */
+        <Sheet open={openMobile} onOpenChange={setOpenMobile}>
+          <SheetContent
+            side="left"
+            className="w-[280px] max-w-[85vw] gap-0 p-0"
+            onEscapeKeyDown={() => setOpenMobile(false)}
+            onCloseAutoFocus={(event) => {
+              // 程序化打开(trigger 在 AppHeader,非 SheetTrigger 后代)时 Radix 无从
+              // 返回焦点,手动聚焦导航按钮,保持键盘路径连续。
+              const trigger = document.getElementById('admin-nav-trigger');
+              if (trigger) { event.preventDefault(); trigger.focus(); }
+            }}
+          >
+            <div className="flex h-full min-h-0 flex-col">
+              <div className="flex items-center gap-2 border-b border-sidebar-border px-4 py-3">
+                <BrandLogo />
+                <SheetTitle className="text-sm font-semibold">导航</SheetTitle>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto">{navBody}</div>
+            </div>
+          </SheetContent>
+        </Sheet>
+      ) : (
+        <Sidebar collapsible="icon" className={SIDEBAR_SHELL_CLASS}>{navBody}</Sidebar>
+      )}
+    </>
   );
 }

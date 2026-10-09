@@ -1,6 +1,10 @@
-import type { ReactNode } from 'react';
+import { useContext, type ReactNode } from 'react';
+
+import { Menu } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
+import { SidebarContext } from '@/components/ui/sidebar';
+import { Button } from '@/components/ui/button';
 
 import NotificationBell from './NotificationBell';
 
@@ -37,7 +41,7 @@ export default function AppHeader({
     (title !== undefined || description !== undefined) ? (
       <div className="flex min-h-[40px] flex-col justify-center gap-[4px]">
         {title !== undefined && (
-          <p className="text-[16px] font-medium leading-[normal] text-[#464c5e]">{title}</p>
+          <h1 className="text-[16px] font-medium leading-[normal] text-[#464c5e]">{title}</h1>
         )}
         {description !== undefined && (
           <p className="text-[14px] leading-[normal] text-[#757f9c]">{description}</p>
@@ -46,8 +50,27 @@ export default function AppHeader({
     ) : null
   );
 
+  // 移动端导航入口:窄屏(<768px)管理侧栏收纳为抽屉,由本按钮打开。
+  // context 为 null 时(登录页等无侧栏场景)不渲染,不影响 provider 外使用。
+  const sidebar = useContext(SidebarContext);
+  const showNavTrigger = sidebar?.isMobile === true;
+
   return (
     <header className={cn('flex w-full items-start gap-[16px]', className)}>
+      {showNavTrigger && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          id="admin-nav-trigger"
+          aria-label="打开导航"
+          title="打开导航"
+          className="mt-0.5 size-9 shrink-0 md:hidden"
+          onClick={() => sidebar.setOpenMobile(true)}
+        >
+          <Menu className="size-5" aria-hidden />
+        </Button>
+      )}
       <div className="min-w-0 flex-1">{leftContent}</div>
       <div className="flex h-[32px] shrink-0 items-center gap-[8px]">
         {right !== undefined ? right : <NotificationBell />}

@@ -33,7 +33,11 @@ type SidebarContextProps = {
   toggleSidebar: () => void
 }
 
-const SidebarContext = React.createContext<SidebarContextProps | null>(null)
+/**
+ * 导出 context 本体:provider 外(如登录页共用的 AppHeader)用
+ * useContext(SidebarContext) 做 null 安全读取,避免 useSidebar() 抛错。
+ */
+export const SidebarContext = React.createContext<SidebarContextProps | null>(null)
 
 function useSidebar() {
   const context = React.useContext(SidebarContext)
