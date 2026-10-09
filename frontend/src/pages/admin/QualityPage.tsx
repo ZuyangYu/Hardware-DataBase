@@ -9,6 +9,10 @@ import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { notify } from '@/components/ui/app-toast';
 import { AdminPageShell } from '@/components/admin/AdminPageShell';
+import { StatusBadge } from '@/components/admin/StatusBadge';
+import { LoadingState, RefreshingBadge, TableEmptyRow } from '@/components/admin/StateBlock';
+import { CopyIconButton, CopyableTechnicalValue } from '@/components/admin/CopyableTechnicalValue';
+import { formatAbsoluteTime, formatRelativeTime } from '@/lib/formatters';
 import { QUALITY_REASONS, QUALITY_STATUS } from '../chat/components/FeedbackActions';
 import { AdminRemediationGuide, CaseWorkflow, QualityReports } from './QualityWorkflowPanel';
 
@@ -43,6 +47,7 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
   // 草稿保护:轮询刷新只用服务器值回填未编辑过的字段;用户已动过的表单不被覆盖,
   // 改为提示案例有新版本,由用户保存或主动刷新后载入。保存成功或切换案例时解锁。
   const draftDirty = useRef(false);
+  const detailVersion = useRef<number | null>(null);
   const [staleDetail, setStaleDetail] = useState(false);
   const load = useCallback(async () => {
     setLoading(true);
@@ -57,6 +62,7 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
     setReviewKey(createClientRequestId());
     setReferenceAnswer(''); setRubric(''); setNotes('');
     draftDirty.current = false;
+    detailVersion.current = null;
     setStaleDetail(false);
     if (!caseId) return;
     let sequence = 0;
@@ -65,8 +71,8 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
       return api.get<QualityCase>(`/api/v1/quality/cases/${caseId}`).then((value) => {
         if (!cancelled && requestSequence === sequence) {
           if (draftDirty.current) {
-            // 用户正在编辑:仅更新详情,不回填表单,提示有新版本可载入。
-            setStaleDetail(true);
+            // 用户正在编辑:仅更新详情,不回填表单;仅当案例版本真的变化时提示。
+            if (detailVersion.current !== null && value.row_version !== detailVersion.current) setStaleDetail(true);
           } else {
             const latest = value.reviews.filter((review) => !value.reviews.some((next) => next.supersedes === review.review_id)).slice(-1)[0];
             setReferenceAnswer(latest?.content.reference_answer ?? '');
@@ -77,6 +83,7 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
             setRootCause(latest?.root_cause ?? 'unknown');
             setStaleDetail(false);
           }
+          detailVersion.current = value.row_version;
           setDetail(value);
         }
       }).catch((error) => { if (!cancelled && requestSequence === sequence) { setDetail(null); notify.error(error instanceof Error ? error.message : '加载案例失败'); } });
@@ -127,19 +134,19 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
     <AdminPageShell>
        <div className="flex flex-wrap items-center gap-3"><div className="min-w-0"><h2 className="text-lg font-semibold">案例队列</h2><p className="mt-1 text-xs text-muted-foreground">按状态定位积压案例，打开案例查看问题概览和修复门禁。</p></div>
          <div className="ml-auto flex flex-wrap items-center gap-2"><label className="flex items-center gap-2 text-sm">状态<select aria-label="案例状态" className="rounded-md border bg-white p-2 text-sm" value={status} onChange={(e) => { setStatus(e.target.value); setOffset(0); }}><option value="">全部状态</option>{Object.entries(QUALITY_STATUS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-         <Button variant="outline" disabled={loading} onClick={() => void load()}>{loading ? '刷新中…' : '刷新'}</Button></div>
+         {loading && rows.length > 0 && <RefreshingBadge label="正在更新列表" />}<Button variant="outline" disabled={loading} onClick={() => void load()}>{loading ? '刷新中…' : '刷新'}</Button></div>
        </div>
       <p className="text-sm text-muted-foreground">反馈与随机抽样分别记录。复核正文仅对原会话用户或被明确授权的员工开放。</p>
        <div className="overflow-x-auto rounded-lg border"><table className="min-w-[800px] w-full text-left text-sm">
         <thead className="bg-muted"><tr>{['案例', '触发来源', '用户反馈', '状态', '内容访问', '更新时间'].map((title) => <th className="p-3" key={title}>{title}</th>)}</tr></thead>
-         <tbody>{loading && !rows.length ? <tr><td className="p-8 text-center text-muted-foreground" colSpan={6}>正在加载案例…</td></tr> : rows.map((r) => <tr className="border-t transition-colors hover:bg-muted/40" key={r.case_id}>
-          <td className="p-3"><button className="text-blue-700 hover:underline" onClick={() => setParams({ case: r.case_id })}>{r.case_id.slice(0, 17)}…</button></td>
+         <tbody>{loading && !rows.length ? <tr><td className="p-0" colSpan={6}><LoadingState label="正在加载质量案例…" /></td></tr> : rows.map((r) => <tr className="border-t transition-colors hover:bg-muted/40" key={r.case_id}>
+          <td className="group p-3"><button className="font-mono text-xs text-blue-700 hover:underline" title={r.case_id} onClick={() => setParams({ case: r.case_id })}>{r.case_id.slice(0, 17)}…</button><CopyIconButton value={r.case_id} label="案例 ID" /></td>
           <td className="p-3">{r.triggers.map((t) => ({ feedback: '用户反馈', random_sample: '随机抽样', diagnostic: '诊断事件' })[t] ?? t).join('、')}{r.sampling.probability != null && <div className="text-xs text-muted-foreground">入样概率 {r.sampling.probability * 100}%</div>}</td>
-          <td className="p-3">{r.feedback ? ({ helpful: '有帮助', unhelpful: '没帮助', withdrawn: '已撤销' })[r.feedback.rating] : '—'}<div className="text-xs text-muted-foreground">{r.feedback?.reason_codes.map((c) => QUALITY_REASONS[c]).join('、')}</div></td>
-          <td className="p-3">{QUALITY_STATUS[r.status] ?? r.status}</td>
-          <td className="p-3">{{ owner: '本人材料', shared: '授权副本', hidden: '仅元数据' }[r.content_access]}</td>
-          <td className="p-3">{new Date(r.updated_at).toLocaleString()}</td>
-        </tr>)}{!rows.length && <tr><td className="p-8 text-center text-muted-foreground" colSpan={6}>当前范围暂无案例</td></tr>}</tbody>
+          <td className="p-3">{r.feedback ? <StatusBadge tone={({ helpful: 'success', unhelpful: 'danger', withdrawn: 'neutral' } as const)[r.feedback.rating] ?? 'neutral'}>{{ helpful: '有帮助', unhelpful: '没帮助', withdrawn: '已撤销' }[r.feedback.rating] ?? r.feedback.rating}</StatusBadge> : '—'}<div className="mt-1 text-xs text-muted-foreground">{r.feedback?.reason_codes.map((c) => QUALITY_REASONS[c]).join('、')}</div></td>
+          <td className="p-3"><StatusBadge tone={({ new: 'warning', triaged: 'info', reviewed: 'info', needs_information: 'warning', rejected: 'neutral', dataset_ready: 'info', regression_verified: 'success', closed: 'success' } as const)[r.status] ?? 'neutral'}>{QUALITY_STATUS[r.status] ?? r.status}</StatusBadge></td>
+          <td className="p-3"><StatusBadge tone={({ owner: 'success', shared: 'info', hidden: 'readonly' } as const)[r.content_access] ?? 'neutral'}>{{ owner: '本人材料', shared: '授权副本', hidden: '仅元数据' }[r.content_access] ?? r.content_access}</StatusBadge></td>
+          <td className="p-3 whitespace-nowrap" title={formatAbsoluteTime(r.updated_at)}>{formatRelativeTime(r.updated_at)}</td>
+        </tr>)}{!rows.length && !loading && <TableEmptyRow colSpan={6} title="当前范围暂无案例">调整状态筛选或稍后刷新</TableEmptyRow>}</tbody>
       </table></div>
         <p className="mt-1 text-xs text-muted-foreground md:hidden">左右滑动查看全部列</p>
        <div className="flex flex-wrap items-center gap-3"><Button variant="outline" disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - 50))}>上一页</Button><span className="text-sm text-muted-foreground">第 {offset / 50 + 1} 页 · 当前页 {rows.length} 条</span><Button variant="outline" disabled={rows.length < 50 || loading} onClick={() => setOffset(offset + 50)}>下一页</Button></div>
@@ -148,11 +155,17 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
     <Dialog open={Boolean(caseId)} onOpenChange={(open) => { if (!open) setParams({}); }}><DialogContent className="flex h-[min(900px,calc(100dvh-32px))] max-h-[calc(100dvh-32px)] w-[min(960px,calc(100vw-32px))] max-w-none flex-col gap-0 overflow-hidden rounded-[16px] p-0 sm:max-w-none">
       <DialogHeader className="shrink-0 border-b border-[#edf0f4] px-[24px] py-[18px] pr-[56px]"><DialogTitle>固定案例与复核</DialogTitle></DialogHeader>
       {!detail ? <p className="p-[24px]">正在读取授权材料…</p> : <div className="min-h-0 flex-1 overflow-y-auto px-[24px] py-[20px]"><div className="grid gap-4 text-sm">
-        <div className="grid gap-1 break-all text-xs text-muted-foreground"><span>案例：{detail.case_id}</span><span>快照：{detail.snapshot_id}</span><span>回答版本：{detail.answer_revision}</span><span>执行 attempt：{String(detail.manifest.execution_attempt_id || '历史记录未保存')}</span><span>Trace：{String(detail.manifest.trace_id || '无采样 trace')}</span></div>
+        <details className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground"><summary className="cursor-pointer font-medium">技术信息(默认折叠,可复制)</summary><div className="mt-2 grid gap-1">
+          <div className="flex min-w-0 gap-2"><span className="w-16 shrink-0">案例</span><CopyableTechnicalValue value={detail.case_id} /></div>
+          <div className="flex min-w-0 gap-2"><span className="w-16 shrink-0">快照</span><CopyableTechnicalValue value={detail.snapshot_id} /></div>
+          <div className="flex min-w-0 gap-2"><span className="w-16 shrink-0">回答版本</span><CopyableTechnicalValue value={detail.answer_revision} /></div>
+          <div className="flex min-w-0 gap-2"><span className="w-16 shrink-0">执行 attempt</span><CopyableTechnicalValue value={String(detail.manifest.execution_attempt_id || '历史记录未保存')} /></div>
+          <div className="flex min-w-0 gap-2"><span className="w-16 shrink-0">Trace</span><CopyableTechnicalValue value={String(detail.manifest.trace_id || '无采样 trace')} /></div>
+        </div></details>
         <div>状态：{QUALITY_STATUS[detail.status] ?? detail.status} · 版本 {detail.row_version}</div>
         {detail.projection_status && <p className="text-xs text-muted-foreground">Phoenix 标注：{detail.projection_status.map((s) => `${({ completed: '已同步', pending: '待投递', running: '投递中', failed: '投递失败', disabled: '同步未开启', no_span: '无采样 span' })[s.status] ?? s.status} ${s.count}`).join(' · ') || '暂无标注'}</p>}
          {detail.content_access === 'hidden' && <p className="rounded-md bg-muted p-3">当前仅有元数据访问权限，正文与证据未共享或共享已失效。</p>}
-         {detail.content_access === 'hidden' && auth.user.role === 'system_admin' && <AdminRemediationGuide detail={detail} />}
+         {auth.user.role === 'system_admin' && <AdminRemediationGuide detail={detail} />}
          <section className="rounded-md border border-amber-200 bg-amber-50/60 p-3 dark:border-amber-900 dark:bg-amber-950/20">
            <h3 className="font-semibold">问题概览（管理员可见）</h3>
            {detail.feedback ? <div className="mt-2 grid gap-1">
@@ -176,7 +189,7 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
         {detail.content.answer != null && <section><h3 className="font-semibold">固定回答</h3><p className="whitespace-pre-wrap break-words">{detail.content.answer}</p></section>}
         {detail.feedback?.comment && <section><h3 className="font-semibold">补充说明</h3><p className="whitespace-pre-wrap">{detail.feedback.comment}</p></section>}
         {detail.content.evidence?.map((e, i) => <section className="rounded-md border p-3" key={i}><h3 className="font-semibold">复核证据 {i + 1}：{String(e.file_name ?? e.title ?? '')}</h3><p className="whitespace-pre-wrap break-words">{String(e.text ?? e.text_preview ?? '')}</p></section>)}
-        {detail.reviews.map((r) => <section className="rounded-md border p-3" key={r.review_id}><h3 className="font-semibold">复核：{r.judgment} · {r.root_cause}</h3><p className="whitespace-pre-wrap">{r.content.notes}</p><p className="whitespace-pre-wrap">{r.content.reference_answer}</p><span className="text-xs text-muted-foreground">{r.created_at}</span></section>)}
+        {detail.reviews.map((r) => <section className="rounded-md border p-3" key={r.review_id}><h3 className="font-semibold">复核：{QUALITY_JUDGMENTS[r.judgment] ?? r.judgment} · {QUALITY_ROOT_CAUSES[r.root_cause] ?? r.root_cause}</h3><p className="whitespace-pre-wrap">{r.content.notes}</p><p className="whitespace-pre-wrap">{r.content.reference_answer}</p><span className="text-xs text-muted-foreground" title={formatAbsoluteTime(r.created_at)}>{formatRelativeTime(r.created_at)}</span></section>)}
         {detail.source_valid && detail.content.answer != null && auth.user.role === 'employee' && <fieldset disabled={busy} className="grid gap-3 border-t pt-4"><legend className="font-semibold">提交复核结论</legend>
           {staleDetail && <p className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">案例数据已更新（可能有新的复核被提交），你正在编辑的草稿未被覆盖。<button className="ml-1 underline" onClick={() => void reloadLatestVersion()}>载入最新版本</button>（将替换未保存草稿）</p>}
           <label>判断 <select className="rounded border p-2" value={judgment} onChange={(e) => { draftDirty.current = true; setJudgment(e.target.value); setReviewKey(createClientRequestId()); }}><option value="confirmed">确认问题</option><option value="not_an_error">未发现错误</option><option value="needs_information">需要补充材料</option></select></label>
