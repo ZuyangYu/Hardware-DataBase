@@ -23,7 +23,7 @@ test.beforeEach(async ({ page }) => {
     if (path === '/api/v1/quality/reports') return route.fulfill({ json: [] });
     if (path === '/api/v1/quality/analysis-runs') return route.fulfill({ json: { report_id: 'r' } });
     if (path === '/api/v1/costs/summary') return route.fulfill({ json: { calls: 0, known_amounts: {}, unknown_cost_calls: 0, usage_coverage: null, price_coverage: null, logical_only_calls: 0, unfinished_calls: 0, unattributed_calls: 0, updated_at: null, scope: 'test', by_purpose: {} } });
-    if (path === '/api/v1/costs/calls') return route.fulfill({ json: [] });
+    if (path === '/api/v1/costs/invocations') return route.fulfill({ json: [] });
     if (path === '/api/v1/costs/trends') return route.fulfill({ json: { buckets: [], rankings_by_currency: {} } });
     if (path === '/api/v1/costs/budgets') return route.fulfill({ json: [] });
     if (path === '/api/v1/notifications') return route.fulfill({ json: { items: [], unread_count: 0 } });
