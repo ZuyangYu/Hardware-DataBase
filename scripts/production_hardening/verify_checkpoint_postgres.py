@@ -43,13 +43,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dsn", required=True, help="PostgreSQL connection URL")
     parser.add_argument("--report", default="")
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="演练库尚未建检查点表时执行 DDL（运行期应用从不建表）",
+    )
     args = parser.parse_args(argv)
 
     run_id = uuid.uuid4().hex[:8]
     thread = f"verify-{run_id}"
     fork_thread = f"verify-{run_id}::attempt-2"
     report: dict[str, object] = {"dsn": args.dsn, "thread": thread, "checks": {}}
-    provider = PostgresCheckpointerProvider(args.dsn)
+    provider = PostgresCheckpointerProvider(args.dsn, setup=args.setup)
     try:
         saver = provider.create()
         app = _build_app(saver)

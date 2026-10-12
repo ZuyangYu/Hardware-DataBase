@@ -223,11 +223,18 @@ class IngestionOrchestrator:
         files: list[str],
         scope: IngestionScope,
         default_dataset_kind: str,
-        default_dataset_id: str,
+        default_dataset_id: str | Callable[[], str],
         progress_callback: Callable[[int, str], None] | None = None,
     ) -> IngestResult:
         if not files:
             return IngestResult(success_count=0, total_count=0, messages=["No files selected"], backend=self.backend_name)
+
+        def dataset_id_for(route: PipelineRoute) -> str:
+            """只有 RAGFlow 路由需要解析数据集 id；表格/电路/外部对话是本地管线，
+            不能因为 RAGFlow 未配置就挡住上传（id 用可调用对象延迟到真正需要时解析）。"""
+            if not (route.spec and route.spec.processor_kind == PROCESSOR_KIND_RAGFLOW):
+                return ""
+            return default_dataset_id() if callable(default_dataset_id) else default_dataset_id
 
         messages: list[str] = []
         success_count = 0
@@ -321,7 +328,7 @@ class IngestionOrchestrator:
                         scope,
                         archived,
                         default_dataset_kind,
-                        default_dataset_id,
+                        dataset_id_for(route),
                         progress_callback=progress_callback,
                     )
                     if route.spec and route.spec.processor_kind == PROCESSOR_KIND_SPREADSHEET:
@@ -478,7 +485,7 @@ class IngestionOrchestrator:
         parent_name: str,
         scope: IngestionScope,
         default_dataset_kind: str,
-        default_dataset_id: str,
+        default_dataset_id: str | Callable[[], str],
     ) -> list[str]:
         """Extract OOXML payloads from a container and index them as children.
 

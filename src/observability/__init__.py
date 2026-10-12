@@ -6,7 +6,12 @@ backend.  The package is intentionally safe to import before bootstrap: the
 OpenTelemetry API returns no-op providers until a process opts in.
 """
 
-from .bootstrap import init_observability, instrument_fastapi, shutdown_observability
+from .bootstrap import (
+    attach_log_handler,
+    init_observability,
+    instrument_fastapi,
+    shutdown_observability,
+)
 from .context import (
     current_span_id,
     current_trace_id,
@@ -21,6 +26,7 @@ from .context import (
 from .tracing import observe
 
 __all__ = [
+    "attach_log_handler",
     "current_span_id",
     "current_trace_id",
     "current_trace_identity",

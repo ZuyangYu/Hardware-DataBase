@@ -393,9 +393,11 @@ def create_postgres_checkpointer(
     database_url: str | None = None,
     *,
     fencing_token_provider: FencingTokenProvider | None = None,
-    setup: bool = True,
+    setup: bool = False,
 ) -> FencedCheckpointer:
     """Create the multi-instance saver over the official PostgreSQL provider.
+
+    ``setup`` 默认关闭：schema 由 migrate 建好，运行期只校验版本。
 
     The fencing wrapper is preserved; the underlying connection is kept alive
     through the returned checkpointer and closed via ``close()``.

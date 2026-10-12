@@ -126,6 +126,9 @@ class PostgresCheckpointerIntegrationTests(unittest.TestCase):
 
     @unittest.skipUnless(dsn, "HDB_TEST_POSTGRES_DSN is not configured")
     def test_postgres_saver_round_trip(self):
+        from src.agents.checkpoints.postgres_provider import ensure_checkpoint_schema
+
+        ensure_checkpoint_schema(self.dsn)  # 与生产一致：schema 先由 migrate 建好
         provider = PostgresCheckpointerProvider(self.dsn)
         saver = provider.create()
         try:
