@@ -1,6 +1,6 @@
 ---
 name: git-commit-skill
-description: 分析当前分支改动，智能推断 Gitmoji，分阶段确认改动点、敏感信息安全检查及 commit message 后辅助提交代码。用户要求提交代码、生成 commit message 或写提交信息时使用。
+description: 分析当前分支改动，智能推断提交类型（feat/fix/chore 等，不使用表情符号），分阶段确认改动点、敏感信息安全检查及 commit message 后辅助提交代码。用户要求提交代码、生成 commit message 或写提交信息时使用。
 version: 1.0.0
 ---
 
@@ -12,7 +12,7 @@ version: 1.0.0
 
 用户输入：`/git-commit`
 
-Skill 会**自动分析**当前分支的改动内容，智能推断并选择最合适的 Gitmoji 类型。
+Skill 会**自动分析**当前分支的改动内容，智能推断并选择最合适的提交类型（feat / fix / chore / docs / refactor / perf / test / style / ci / revert，不使用表情符号）。
 
 ---
 
@@ -64,7 +64,7 @@ git checkout -b <分支名> develop
 
 - **分支检查必须执行**：阶段 0 必须检查当前分支，`main`/`develop` 禁止直接提交，必须从 `develop` 创建新功能分支
 
-### 阶段 1：分析改动并自动推断 Gitmoji
+### 阶段 1：分析改动并自动推断提交类型
 
 执行命令分析当前工作状态：
 
@@ -93,7 +93,7 @@ git diff --cached
 1. 新增用户管理模块（UserService、UserController）
 2. 补充用户管理模块单元测试（UserServiceTest）
 
-【推断的提交类型】:sparkles: 新功能
+【推断的提交类型】feat - 新功能
 ```
 
 **归类原则**：
@@ -104,7 +104,7 @@ git diff --cached
 **等待用户确认**：
 - 询问用户改动点是否准确
 - 用户可以要求修改改动点
-- 如自动推断的 Gitmoji 不合适，用户可以指定其他类型
+- 如自动推断的提交类型不合适，用户可以指定其他类型
 - 用户确认无误后，进入下一阶段
 
 ---
@@ -178,20 +178,22 @@ git diff --cached
 
 ### 阶段 2：生成 commit message 并确认
 
-根据确认后的改动点和自动推断的 Gitmoji 生成 commit message：
+根据确认后的改动点和自动推断的提交类型生成 commit message：
 
 **格式**：
 ```
-:emoji-name: <改动点总结>
+类型: <改动点总结>
 
 1. <改动点 1>
 2. <改动点 2>
 3. <改动点 3>
 ```
 
+> 类型取值：feat / fix / chore / docs / refactor / perf / test / style / ci / revert；**禁止任何表情符号或 `:shortcode:` 短代码**。
+
 **示例**（新功能）：
 ```
-:sparkles: 新增用户管理模块
+feat: 新增用户管理模块
 
 1. 新增 UserService 处理用户业务逻辑（注册、登录、权限校验）
 2. 新增 UserController 提供 REST API 接口
@@ -201,7 +203,7 @@ git diff --cached
 
 **示例**（Bug 修复）：
 ```
-:bug: 修复用户登录验证问题
+fix: 修复用户登录验证问题
 
 1. 修复 Token 过期导致的登录失败
 2. 添加登录失败次数限制
@@ -209,13 +211,13 @@ git diff --cached
 
 **示例**（综合改动）：
 ```
-:sparkles: 新增数据导出功能并优化性能
+feat: 新增数据导出功能并优化性能
 
 1. 新增 ExportService 支持 Excel/CSV 格式导出
 2. 优化大数据量查询使用游标分页
 3. 添加导出任务异步处理机制
-4. :arrow_up: 升级 easyexcel 到 3.3.0
-5. :white_check_mark: 补充导出功能单元测试
+4. 升级 easyexcel 到 3.3.0
+5. 补充导出功能单元测试
 ```
 
 **展示 commit message 并等待用户确认**：
@@ -224,7 +226,7 @@ git diff --cached
 
 ```
 【生成的 commit message】
-:sparkles: 新增用户管理模块
+feat: 新增用户管理模块
 
 1. 新增 UserService 处理用户业务逻辑
 2. 新增 UserController 提供 REST API 接口
@@ -301,40 +303,40 @@ git push -u origin <current-branch>
 
 ---
 
-## Gitmoji 自动映射规则
+## 提交类型映射规则（不使用表情符号）
 
-根据改动特征自动选择最合适的 Gitmoji：
+根据改动特征自动选择最合适的文本前缀：
 
-| 改动特征 | Shortcode | 说明 |
+| 改动特征 | 类型前缀 | 说明 |
 |----------|-----------|------|
-| 新增功能、模块、接口 | `:sparkles:` | 新功能 |
-| 修复 bug、错误 | `:bug:` | Bug 修复 |
-| 紧急线上修复 | `:ambulance:` | 紧急热修复 |
-| 文档、README、注释 | `:memo:` | 文档 |
-| 代码重构、逻辑优化 | `:recycle:` | 重构 |
-| 删除代码/文件 | `:fire:` | 删除 |
-| UI、样式文件 | `:lipstick:` | UI 样式 |
-| 部署、上线 | `:rocket:` | 部署 |
-| 测试用例 | `:white_check_mark:` | 测试 |
-| 安全漏洞修复 | `:lock:` | 安全 |
-| 编译器/linter 警告 | `:rotating_light:` | 警告 |
-| CI/CD 配置 | `:construction_worker:` | CI 系统 |
-| CI 构建修复 | `:green_heart:` | CI 修复 |
-| 依赖升级 | `:arrow_up:` | 升级 |
-| 依赖降级 | `:arrow_down:` | 降级 |
-| 新增依赖 | `:heavy_plus_sign:` | 添加依赖 |
-| 移除依赖 | `:heavy_minus_sign:` | 删除依赖 |
-| 配置文件 | `:wrench:` | 配置 |
-| 脚本文件 | `:hammer:` | 脚本 |
-| 编译文件/包 | `:package:` | 包 |
-| 代码格式/结构 | `:art:` | 代码结构 |
-| 性能优化 | `:zap:` | 性能 |
-| 破坏性变更 | `:boom:` | 破坏性变更 |
-| 回滚 | `:rewind:` | 回滚 |
-| 国际化 | `:globe_with_meridians:` | i18n |
-| 无法明确判断 | `:sparkles:` | 默认新功能 |
+| 新增功能、模块、接口 | `feat` | 新功能 |
+| 修复 bug、错误 | `fix` | Bug 修复 |
+| 紧急线上修复 | `fix` | 紧急热修复（描述中注明） |
+| 文档、README、注释 | `docs` | 文档 |
+| 代码重构、逻辑优化 | `refactor` | 重构 |
+| 删除代码/文件 | `chore` | 删除清理 |
+| UI、样式文件 | `style` | UI 样式 |
+| 部署、上线 | `chore` | 部署 |
+| 测试用例 | `test` | 测试 |
+| 安全漏洞修复 | `fix` | 安全修复（描述中注明） |
+| 编译器/linter 警告 | `style` | 警告清理 |
+| CI/CD 配置 | `ci` | CI 系统 |
+| CI 构建修复 | `ci` | CI 修复 |
+| 依赖升级 | `chore` | 升级 |
+| 依赖降级 | `chore` | 降级 |
+| 新增依赖 | `chore` | 添加依赖 |
+| 移除依赖 | `chore` | 删除依赖 |
+| 配置文件 | `chore` | 配置 |
+| 脚本文件 | `chore` | 脚本 |
+| 编译文件/包 | `build` | 包 |
+| 代码格式/结构 | `style` | 代码结构 |
+| 性能优化 | `perf` | 性能 |
+| 破坏性变更 | `feat!` / `fix!` | 类型后附加 `!` |
+| 回滚 | `revert` | 回滚 |
+| 国际化 | `feat` | i18n |
+| 无法明确判断 | `chore` | 默认 |
 
-> **完整 Gitmoji 参考**：见 [`references/gitmojis.md`](references/gitmojis.md)
+> 类型一律使用纯文本前缀（feat / fix / chore / docs / refactor / perf / test / style / ci / build / revert），**禁止任何 emoji 或 `:shortcode:` 形式的图标**。
 
 ---
 
@@ -344,4 +346,4 @@ git push -u origin <current-branch>
 - **安全检查必须执行**：阶段 1.5 必须检查敏感文件和敏感代码模式
 - **无改动处理**：如工作目录干净，告知用户没有待提交的改动
 - **灵活调整**：用户可以在任何阶段要求修改或取消
-- **Gitmoji 格式**：使用 `:name:` 格式（如 `:sparkles:`），在 GitHub/GitLab 会自动渲染为 emoji
+- **禁止表情符号**：commit message 中不得出现任何 emoji 或 `:shortcode:` 形式的图标（如 `:sparkles:`）；类型统一使用文本前缀（feat / fix / chore 等）
