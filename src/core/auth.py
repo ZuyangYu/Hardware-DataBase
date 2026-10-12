@@ -163,6 +163,10 @@ class AuthService:
         """
         if getattr(self, "_backend", "sqlite") == "postgres":
             return
+        # 只镜像权威库：bootstrap 生成表结构时在临时模板库上实例化的 AuthService
+        # 不得把模板里的行写进控制面。
+        if os.path.abspath(str(self.db_path)) != os.path.abspath(str(src.settings.AUTH_DB_PATH)):
+            return
         try:
             from src.storage.auth_mirror import mirror_auth_row
 
@@ -368,13 +372,19 @@ class AuthService:
                 self._mirror_control_plane_row("users", row["id"])
                 return
             now = utc_now()
-            conn.execute(
-                """
-                INSERT INTO users (username, password_hash, role, department_id, is_active, managed_by_env, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 1, 1, ?, ?)
-                """,
-                (username, hash_password(password), ROLE_SYSTEM_ADMIN, department_id, now, now),
-            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO users (username, password_hash, role, department_id, is_active, managed_by_env, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 1, 1, ?, ?)
+                    """,
+                    (username, hash_password(password), ROLE_SYSTEM_ADMIN, department_id, now, now),
+                )
+            except sqlite3.IntegrityError:
+                # API 与各 worker 同时首次启动时，另一进程可能刚插入了同名管理员；
+                # 以唯一约束为准。其它完整性错误照常抛出。
+                if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone() is None:
+                    raise
             admin_row = conn.execute(
                 "SELECT id FROM users WHERE username = ?", (username,)
             ).fetchone()

@@ -25,7 +25,11 @@ class FakeService:
             run_id="run-1",
             gate=GateResult(passed=False, exit_code=2 if failed else 0),
         )
-        return summary, [], FakePaths()
+        # 真实服务把报告写在 output 目录下；假路径也必须落在 output 里，
+        # 否则 CLI 会把 run_state.json 写到运行测试的当前目录（仓库根）。
+        paths = FakePaths()
+        paths.report_html = Path(output) / "run-1" / "report.html"
+        return summary, [], paths
 
 
 class CliTests(unittest.TestCase):

@@ -746,6 +746,9 @@ def main() -> None:
         service_version=src.settings.OBS_SERVICE_VERSION,
         environment=src.settings.OBS_ENVIRONMENT,
     )
+    from src.agents.checkpoints.postgres_provider import verify_configured_checkpoint_schemas
+
+    verify_configured_checkpoint_schemas()
     worker = HardwareWorker(role=resolve_worker_role(args.role))
     signal.signal(signal.SIGTERM, worker.stop)
     signal.signal(signal.SIGINT, worker.stop)

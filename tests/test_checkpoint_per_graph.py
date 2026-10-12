@@ -63,6 +63,10 @@ class SqlitePerGraphTests(_BackendSettingsMixin, unittest.TestCase):
 @unittest.skipUnless(DSN, "HDB_TEST_POSTGRES_DSN is not configured")
 class PostgresPerGraphTests(_BackendSettingsMixin, unittest.TestCase):
     def setUp(self):
+        # 生产中检查点表由 migrate 串行建好；运行期并发 setup() 只在表缺失时才会竞态。
+        from src.agents.checkpoints.postgres_provider import ensure_checkpoint_schema
+
+        ensure_checkpoint_schema(DSN)
         self._configure(
             AGENT_CHECKPOINT_BACKEND="postgres",
             AGENT_CHECKPOINT_DATABASE_URL=DSN,

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 import socket
+import sys
 import threading
 from typing import Any
 
@@ -36,6 +37,47 @@ _METER_PROVIDER: MeterProvider | None = None
 _LOG_PROVIDER: LoggerProvider | None = None
 _LOG_HANDLER: logging.Handler | None = None
 _INSTRUMENTED_CLIENTS = False
+
+
+# 需要接入 OTel 日志导出的 logger：
+#   "RAG"            业务日志（src/core/logger.py，propagate=False）；
+#   "uvicorn" 等     API 进程由 uvicorn 写出的启动/错误/访问日志。
+# 不挂 root：避免会向上传播的 logger 把同一条记录导出两次。
+_LOG_HANDLER_LOGGERS: tuple[str, ...] = (
+    "RAG",
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+)
+
+
+def _attach_log_handler(handler: logging.Handler) -> None:
+    """把 OTel 日志 handler 挂到所有业务 logger 上（幂等，可重复调用）。
+
+    uvicorn 的 ``dictConfig`` 会**重建它配置的 logger 的 handler 列表**，而
+    ``create_app()`` 在模块导入时就已初始化观测（早于 ``uvicorn.run`` 的日志配置），
+    所以 API 进程必须在 lifespan 启动后再挂一次，否则 uvicorn 的访问/错误日志
+    到不了 Loki。
+    """
+    for logger_name in _LOG_HANDLER_LOGGERS:
+        target = logging.getLogger(logger_name)
+        if handler in target.handlers:
+            continue
+        target.addHandler(handler)
+        # uvicorn 可能先把 logger disable 掉后再由 dictConfig 重建
+        target.disabled = False
+        # uvicorn.access/uvicorn.error 是 uvicorn 的子 logger：同一条记录会先经自己
+        # 的 handler，再向上传播给父 logger 上同一个 handler，造成重复导出。
+        target.propagate = False
+
+
+def attach_log_handler() -> bool:
+    """（重新）挂载已初始化的日志 handler；未初始化日志导出时返回 False。"""
+    with _LOCK:
+        if _LOG_HANDLER is None:
+            return False
+        _attach_log_handler(_LOG_HANDLER)
+        return True
 
 
 def _endpoint_args(endpoint: str) -> dict[str, Any]:
@@ -121,12 +163,30 @@ def init_observability(
                 log_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
                 set_logger_provider(log_provider)
                 log_handler = LoggingHandler(level=logging.NOTSET, logger_provider=log_provider)
-                logging.getLogger("RAG").addHandler(log_handler)
+                # 只挂 "RAG" 会让 API 进程的日志全丢：uvicorn 自己的 logger 拿不到
+                # handler，而应用日志与 worker 共用的 "RAG" logger 又是 propagate=False。
+                # 因此把 handler 挂到所有产生业务日志的 logger 上（不挂 root，避免
+                # 会向上传播的 logger 重复导出同一条记录）。
+                _attach_log_handler(log_handler)
                 _LOG_PROVIDER = log_provider
                 _LOG_HANDLER = log_handler
-            except Exception:
-                # Log export is strictly best-effort; the JSON console/file
-                # handlers remain the local source of truth.
+                if os.getenv("HDB_OBS_DEBUG"):
+                    print(
+                        "[observability] DEBUG log handler attached: "
+                        + str(
+                            [
+                                (name, [type(h).__name__ for h in logging.getLogger(name).handlers])
+                                for name in _LOG_HANDLER_LOGGERS
+                            ]
+                        ),
+                        file=sys.stderr,
+                    )
+            except Exception as exc:  # noqa: BLE001 - 见下方说明：best-effort
+                # 静默吞掉会让"日志没进 Loki"无从排查，这里必须留痕。
+                print(
+                    f"[observability] 日志导出初始化失败: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
                 _LOG_PROVIDER = None
                 _LOG_HANDLER = None
 
@@ -183,6 +243,7 @@ def shutdown_observability() -> None:
             if _LOG_PROVIDER is not None:
                 _LOG_PROVIDER.force_flush(timeout_millis=2000)
             if _LOG_HANDLER is not None:
-                logging.getLogger("RAG").removeHandler(_LOG_HANDLER)
+                for logger_name in _LOG_HANDLER_LOGGERS:
+                    logging.getLogger(logger_name).removeHandler(_LOG_HANDLER)
         except Exception:
             pass
