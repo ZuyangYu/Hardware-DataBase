@@ -83,54 +83,28 @@ docker compose -f deploy/docker/docker-compose.yml \
 
 ## 2. 内网离线分发（打 tar）
 
-在联网构建机上构建完成后，把镜像存成 tar，连同**整个 `deploy/docker/` 目录**
-（compose、initdb、环境模板、quickstart）拷到内网：
+在联网构建机（需 docker 权限；国内源加速见 §1）上打包：
 
 ```bash
-# 构建机（需 docker 权限；国内源加速见 §1）
-docker compose -f deploy/docker/docker-compose.yml \
-               -f deploy/docker/docker-compose.build.yml build
-docker save -o hdb-images.tar \
-  hardware-database-app:latest hardware-database-web:latest \
-  pgvector/pgvector:pg17 redis:8-alpine \
-  otel/opentelemetry-collector-contrib:0.128.0 \
-  prom/prometheus:v3.5.0 prom/alertmanager:v0.28.1 \
-  grafana/tempo:2.8.2 grafana/loki:3.5.1 \
-  grafana/grafana:12.0.2 arizephoenix/phoenix:19.13.0 postgres:16.10-alpine
-tar -czf hdb-docker.tar.gz hdb-images.tar deploy/docker
-
-# 内网目标机（无需外网、无需重新构建）
-tar -xzf hdb-docker.tar.gz && cd deploy/docker
-docker load -i ../../hdb-images.tar
-bash quickstart.sh --no-start      # 生成 PG 密码 + 管理员口令（打印在终端）+ config/.env
-vi config/.env                     # 填 RAGFLOW_BASE_URL/API_KEY、模型端点（内网地址）
-docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
-                                   # 生产业务栈 + 观测栈
+bash deploy/docker/make-offline-bundle.sh ~/hdb-offline
 ```
 
-访问 `http://<目标机IP>:8080`，用 `admin` + quickstart 打印的口令登录。
+产物目录：`offline-install.sh`、`INSTALL.md`、`VERSION`、`hdb-images.tar.gz(+.sha256)`、
+`docker/`、`observability/`。包里不含 `config/.env` 与 `storage/`。
+镜像已在本地时加 `--no-build`；只验证包结构用 `--skip-images`；指定版本号用 `--tag <版本>`。
 
-> **一键部署**：把本目录的 `offline-install.sh` 与镜像包 `hdb-images.tar.gz`（含 `.sha256`）放在
-> 同一离线包根目录，执行 `bash offline-install.sh` 即可自动完成「校验并导入镜像 → 生成配置 →
-> 启动（默认含观测栈）→ 就绪检查 → 打印访问口令」，支持 `--port <端口>` 与
-> `--without-observability`；重复执行安全，升级时替换镜像包重跑即可。
-> 用 `git archive` 打 tag 时该脚本随 `deploy/docker/` 一起进入离线包。
+> `docker/` 与 `observability/` 必须保持同级——否则观测栈的 bind mount 找不到配置，
+> Docker 会自动建空目录占位，容器反复重启。脚本会校验这点，缺失即报错退出。
 
-> **默认生产部署还需 save 观测镜像**：app、web、pgvector、redis、OTel Collector、
-> Prometheus、Alertmanager、Tempo、Loki、Grafana、Phoenix、Phoenix PostgreSQL。完整示例：
->
-> ```bash
-> docker save -o hdb-images.tar \
->   hardware-database-app:latest hardware-database-web:latest \
->   pgvector/pgvector:pg17 redis:8-alpine \
->   otel/opentelemetry-collector-contrib:0.128.0 \
->   prom/prometheus:v3.5.0 prom/alertmanager:v0.28.1 \
->   grafana/tempo:2.8.2 grafana/loki:3.5.1 \
->   grafana/grafana:12.0.2 arizephoenix/phoenix:19.13.0 postgres:16.10-alpine
-> ```
-> `quickstart.sh` 在离线机务必带 `--no-start`——否则它会尝试构建（需要外网）。
-> 配置里指向宿主机上的 RAGFlow / Ollama 时用 `host.docker.internal`（compose 已加
-> `extra_hosts: host-gateway`，Linux 同样可用）；指向内网其他机器直接写 IP。
+内网目标机（无需外网、无需重新构建）：
+
+```bash
+tar -xzf hdb-offline.tar.gz && cd hdb-offline
+bash offline-install.sh --port 8080    # 校验镜像 → 导入 → 生成配置 → 启动 → 打印口令
+```
+
+访问 `http://<目标机IP>:8080`，用 `admin` + 终端打印的口令登录，之后在「系统配置」填
+RAGFlow 与模型端点。包内 `INSTALL.md` 有同样说明。
 
 ## 3. 配置
 
@@ -203,9 +177,8 @@ bash scripts/backup.sh create --deployment docker --dir deploy/docker/backups
 # 恢复：校验同批次 sha256，先停所有写入者，再恢复 PG 与 storage
 bash scripts/backup.sh restore deploy/docker/backups/storage-YYYYMMDD-HHMMSS.tar.gz --deployment docker --yes
 
-# 升级：构建机出新的 app/web 镜像 tar -> 内网 load -> 重建
-docker load -i hdb-images-new.tar && \
-  docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+# 升级：用新离线包执行（会自动 pg_dump 备份 → 导入镜像 → 重建）
+bash offline-install.sh --upgrade --target <旧部署目录>
 ```
 
 健康检查：`curl http://127.0.0.1:8001/health/live`（API 只绑宿主回环）、

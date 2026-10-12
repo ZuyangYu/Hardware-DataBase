@@ -82,6 +82,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh      # macOS / Linux
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
 
 uv sync --all-groups
+uv run python -m src.storage.bootstrap   # 建表（幂等），首次启动或升级后执行；使用 bash scripts/hdb.sh start 时自动执行
 uv run hardware-database-server      # FastAPI 后端，默认 127.0.0.1:8001（HDB_API_HOST/PORT 可改）
 ```
 
@@ -112,6 +113,7 @@ python -m venv venv
 source venv/bin/activate             # Windows: venv\Scripts\activate
 
 pip install -r requirements.txt
+python -m src.storage.bootstrap      # 建表（幂等），启动前执行
 uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
