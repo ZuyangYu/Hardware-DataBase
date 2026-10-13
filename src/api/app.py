@@ -46,7 +46,12 @@ from src.api.routes import (
     users,
     wiki,
 )
-from src.observability import init_observability, instrument_fastapi, shutdown_observability
+from src.observability import (
+    attach_log_handler,
+    init_observability,
+    instrument_fastapi,
+    shutdown_observability,
+)
 from src.observability.health import check_dependencies, check_live, check_ready
 from src.api.worker_supervisor import WorkerSupervisor
 
@@ -140,6 +145,20 @@ async def lifespan(app: FastAPI):
     from src.core.redis_client import assert_redis_ready
 
     assert_redis_ready(purpose="API 启动")
+    # uvicorn 的 dictConfig 会重建它配置的 logger 的 handler，把导入期挂上的 OTel
+    # 日志 handler 冲掉；lifespan 运行时再挂一次，API 的日志才进得了 Loki。
+    attach_log_handler()
+    # 检查点表只由 migrate 建好；缺失或版本不符时拒绝启动（fail-closed，不并发建表）。
+    from src.agents.checkpoints.postgres_provider import (
+        CheckpointSchemaNotReady,
+        verify_configured_checkpoint_schemas,
+    )
+
+    try:
+        verify_configured_checkpoint_schemas()
+    except CheckpointSchemaNotReady:
+        # 异常文本自带修复命令：traceback 第一行就是可执行的指引。
+        raise
     # P0-006: deployment-scope quota maintenance (reap/escalate uncertain).
     try:
         from src.core.concurrency import start_governor_maintenance

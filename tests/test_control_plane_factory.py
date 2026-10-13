@@ -13,6 +13,7 @@ from src.storage.control_plane.conversation_service import PostgresConversationS
 from src.storage.control_plane.factory import (
     build_conversation_service,
     build_execution_store,
+    close_conversation_services,
 )
 from src.storage.control_plane.postgres import PostgresExecutionStore
 from src.storage.control_plane.sqlite import SqliteExecutionStore
@@ -71,7 +72,7 @@ class ControlPlaneFactoryTests(unittest.TestCase):
             self.assertIsNot(replacement, service)
             self.assertFalse(replacement.closed)
         finally:
-            replacement.close()
+            close_conversation_services()
 
     @unittest.skipUnless(DSN, "HDB_TEST_POSTGRES_DSN is not configured")
     def test_postgres_backend_builds_from_settings(self):

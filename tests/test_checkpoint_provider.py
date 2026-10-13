@@ -63,6 +63,18 @@ class CheckpointerProviderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             provider.create()
 
+    def test_closed_postgres_provider_revalidates_schema_before_reopening(self):
+        from unittest.mock import patch
+        from src.agents.checkpoints.postgres_provider import CheckpointSchemaNotReady
+
+        provider = PostgresCheckpointerProvider("postgresql://unused/database")
+        provider._verified = True
+        provider.close()
+        with patch("src.agents.checkpoints.postgres_provider.verify_checkpoint_schema",
+                   side_effect=CheckpointSchemaNotReady("schema removed after close")):
+            with self.assertRaisesRegex(CheckpointSchemaNotReady, "schema removed"):
+                provider.create()
+
     def test_settings_validation_rejects_unknown_backend(self):
         with self.assertRaises(ValueError):
             src.settings.validate_settings_values({"AGENT_CHECKPOINT_BACKEND": "mysql"})
@@ -126,6 +138,9 @@ class PostgresCheckpointerIntegrationTests(unittest.TestCase):
 
     @unittest.skipUnless(dsn, "HDB_TEST_POSTGRES_DSN is not configured")
     def test_postgres_saver_round_trip(self):
+        from src.agents.checkpoints.postgres_provider import ensure_checkpoint_schema
+
+        ensure_checkpoint_schema(self.dsn)  # 与生产一致：schema 先由 migrate 建好
         provider = PostgresCheckpointerProvider(self.dsn)
         saver = provider.create()
         try:

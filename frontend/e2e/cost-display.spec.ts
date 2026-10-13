@@ -108,3 +108,34 @@ test('用途筛选保留 memory API 值但显示业务文案', async ({ page }) 
   await expect(page.locator('span').filter({ hasText: '记忆提取/整理' }).last()).toBeVisible();
   await expect(page.getByText(/本页只统计已捕获的模型\/Embedding provider 调用；记忆读写等非模型操作不计入/)).toBeVisible();
 });
+
+test('缺少用量的记忆调用默认隐藏,展开诊断记录后可查看', async ({ page }) => {
+  await page.route('**/api/v1/costs/invocations*', (route) => route.fulfill({ json: [
+    {
+      invocation_id: 'call-known-usage', task_type: 'chat', task_id: 'chat-known', purpose: 'chat',
+      started_at: '2026-10-10T05:24:30Z', requested_model: 'registered-model', response_model: '',
+      endpoint_alias: 'registered-endpoint', model_alias: 'registered-model', status: 'success',
+      input_tokens: 100, output_tokens: 200, cached_input_tokens: 0, reasoning_tokens: 0,
+      usage_status: 'reported', cost_status: 'priced', cost_amount: '0.01', currency: 'USD',
+      attempt_visibility: 'logical_only', price_version: 'test-v1',
+    },
+    {
+      invocation_id: 'call-missing-memory', task_type: 'memory', task_id: 'memory-job', purpose: 'memory',
+      started_at: '2026-10-10T05:24:33Z', requested_model: 'unregistered', response_model: '',
+      endpoint_alias: 'unregistered', model_alias: 'unregistered', status: 'error',
+      input_tokens: null, output_tokens: null, cached_input_tokens: null, reasoning_tokens: null,
+      usage_status: 'missing', cost_status: 'unknown_usage', cost_amount: null, currency: null,
+      attempt_visibility: 'logical_only', price_version: null,
+    },
+  ] }));
+  await page.goto('/admin/costs');
+  await expect(page.getByRole('button', { name: 'chat-known', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'memory-job', exact: true })).toHaveCount(0);
+  await page.getByRole('checkbox', { name: /显示诊断记录/ }).check();
+  const memoryRow = page.getByRole('row').filter({ has: page.getByRole('button', { name: 'memory-job', exact: true }) });
+  await expect(memoryRow).toBeVisible();
+  await expect(memoryRow.getByText('记忆提取/整理', { exact: true })).toBeVisible();
+  await expect(memoryRow.getByText('失败', { exact: true })).toBeVisible();
+  await expect(memoryRow.getByText('未登记模型', { exact: true })).toBeVisible();
+  await expect(memoryRow.getByText('未登记端点', { exact: true })).toBeVisible();
+});

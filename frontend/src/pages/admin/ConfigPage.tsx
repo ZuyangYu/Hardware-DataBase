@@ -85,6 +85,39 @@ export const GROUPS: Group[] = [
     ],
   },
   {
+    title: '长期记忆',
+    hint: '记忆默认开启，模型留空时复用上面的 Agent 模型；语义检索（Embedding）留空则关闭，走目录/关键词检索。',
+    fields: [
+      ['MEMORY_ENABLED', '启用长期记忆'],
+      ['MEMORY_MODEL_PROVIDER', '记忆模型 Provider（留空=复用 Agent）'],
+      ['MEMORY_MODEL', '记忆模型'],
+      ['MEMORY_MODEL_BASE_URL', '记忆模型 Base URL'],
+      ['MEMORY_MODEL_API_KEY', '记忆模型 API Key'],
+      ['MEMORY_EMBEDDING_PROVIDER', 'Embedding Provider（留空=关闭语义检索）'],
+      ['MEMORY_EMBEDDING_MODEL', 'Embedding 模型'],
+      ['MEMORY_EMBEDDING_BASE_URL', 'Embedding Base URL'],
+      ['MEMORY_EMBEDDING_API_KEY', 'Embedding API Key'],
+      ['MEMORY_EMBEDDING_DIMS', 'Embedding 维度'],
+    ],
+  },
+  {
+    title: '附件解析与理解',
+    hint: '附件默认开启：词法检索 + OCR（本地 tesseract，不外发）。稠密检索与图像理解需填写对应模型端点后才生效。',
+    fields: [
+      ['CHAT_ATTACHMENT_OCR_ENABLED', 'OCR 识别'],
+      ['CHAT_ATTACHMENT_DENSE_ENABLED', '稠密（语义）检索'],
+      ['CHAT_ATTACHMENT_EMBEDDING_PROVIDER', 'Embedding Provider'],
+      ['CHAT_ATTACHMENT_EMBEDDING_BASE_URL', 'Embedding Base URL'],
+      ['CHAT_ATTACHMENT_EMBEDDING_MODEL', 'Embedding 模型'],
+      ['CHAT_ATTACHMENT_EMBEDDING_API_KEY', 'Embedding API Key'],
+      ['CHAT_ATTACHMENT_VISUAL_ENABLED', '图像理解（视觉模型）'],
+      ['CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED', '允许远程推理（图像/OCR 外发）'],
+      ['CHAT_ATTACHMENT_VISUAL_PROVIDER', '视觉模型 Provider'],
+      ['CHAT_ATTACHMENT_VISUAL_BASE_URL', '视觉模型 Base URL'],
+      ['CHAT_ATTACHMENT_VISUAL_MODEL', '视觉模型'],
+    ],
+  },
+  {
     title: '扩展（MCP，受管控）',
     hint: '远程 MCP 默认开启；没有启用的服务时不发起任何连接，本开关仅作应急停用。平台前置自动开启，无需手动配置；凭据密钥 MCP_CREDENTIALS_KEY 只能写在 .env，配置接口不会返回或写入。',
     fields: [
@@ -112,7 +145,16 @@ export const GROUPS: Group[] = [
   },
 ];
 
-const SECRET_KEYS = new Set(['RAGFLOW_API_KEY', 'AGENT_CUSTOM_API_KEY', 'AUTH_DEFAULT_ADMIN_PASSWORD']);
+const SECRET_KEYS = new Set([
+  'RAGFLOW_API_KEY',
+  'AGENT_CUSTOM_API_KEY',
+  'AUTH_DEFAULT_ADMIN_PASSWORD',
+  // 与后端 _SECRET_KEYS 对齐：不在这个名单里的 "***" 会被当成真实值写回 .env。
+  'MEMORY_MODEL_API_KEY',
+  'MEMORY_EMBEDDING_API_KEY',
+  'CHAT_ATTACHMENT_EMBEDDING_API_KEY',
+  'ARK_API_KEY',
+]);
 
 /** 受控布尔开关:渲染 true/false 下拉,避免手输字符串。 */
 export const BOOLEAN_KEYS = new Set([
@@ -120,6 +162,11 @@ export const BOOLEAN_KEYS = new Set([
   'MCP_WRITE_ENABLED',
   'MCP_ALLOW_INSECURE_HTTP',
   'MCP_ALLOW_PRIVATE_HOSTS',
+  'MEMORY_ENABLED',
+  'CHAT_ATTACHMENT_OCR_ENABLED',
+  'CHAT_ATTACHMENT_DENSE_ENABLED',
+  'CHAT_ATTACHMENT_VISUAL_ENABLED',
+  'CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED',
 ]);
 
 /** 调参项：默认隐藏，避免把"永远用默认值"的旋钮摊在主视图。 */
@@ -212,6 +259,7 @@ export const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: n
   MCP_WRITE_MAX_ATTEMPTS: { min: 1, max: 10, integer: true },
   RESOURCE_MCP_MAX_CONCURRENT: { min: 1, max: 64, integer: true },
   RESOURCE_MCP_RESERVED_INTERACTIVE: { min: 0, max: 64, integer: true },
+  MEMORY_EMBEDDING_DIMS: { min: 0, max: 8192, integer: true },
 };
 
 /** 分类内是否有未保存改动；掩码后的密钥视为未改动。 */

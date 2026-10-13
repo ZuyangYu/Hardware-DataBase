@@ -942,7 +942,6 @@ class RAGFlowBackend(RAGBackend):
         self._check_kb_access(kb_name, ctx, "write")
         scope = _scope_for_kb(kb_name, ctx).require_department("upload to")
         dataset_kind = self._dataset_kind_for_group(source_group)
-        dataset_id = self._dataset_id_for_kind(dataset_kind)
         ingestion_scope = IngestionScope(
             kb_name=scope.kb_name,
             department_id=scope.department_id,
@@ -951,11 +950,13 @@ class RAGFlowBackend(RAGBackend):
             source_group=source_group,
             ctx=ctx,
         )
+        # 数据集 id 延迟解析：只有真的要走 RAGFlow 管线时才连它。表格（xlsx）与
+        # 电路（edf）是本地解析，不应因为 RAGFlow 未配置而无法上传。
         return self.ingestion.upload_files(
             files,
             ingestion_scope,
             default_dataset_kind=dataset_kind,
-            default_dataset_id=dataset_id,
+            default_dataset_id=lambda: self._dataset_id_for_kind(dataset_kind),
             progress_callback=progress_callback,
         )
 

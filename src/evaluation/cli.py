@@ -209,6 +209,7 @@ def _write_run_state(
         updated_at=summary.created_at,
         report_path=report_path,
     )
+    (run_dir / "run_state.json").parent.mkdir(parents=True, exist_ok=True)
     (run_dir / "run_state.json").write_text(
         state.model_dump_json(indent=2) + "\n", encoding="utf-8"
     )

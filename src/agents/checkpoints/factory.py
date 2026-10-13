@@ -19,7 +19,7 @@ def build_checkpointer_provider(
     backend: str | None = None,
     sqlite_path: str | None = None,
     database_url: str | None = None,
-    setup: bool = True,
+    setup: bool = False,
 ) -> CheckpointerProvider:
     import src.settings as settings
 

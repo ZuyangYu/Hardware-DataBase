@@ -27,7 +27,10 @@ import src.settings as app_settings
 from src.core.auth import ROLE_EMPLOYEE, AuthService
 from src.core.conversation import ConversationService
 from src.storage.control_plane import apply_schema, load_sqlite_snapshot
-from src.storage.control_plane.factory import build_conversation_service
+from src.storage.control_plane.factory import (
+    build_conversation_service,
+    close_conversation_services,
+)
 
 DSN = os.environ.get("HDB_TEST_POSTGRES_DSN", "")
 
@@ -52,6 +55,7 @@ class PostgresAuthMirrorTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        close_conversation_services()
         admin = psycopg.connect(_dsn_with_database(DSN, "postgres"), autocommit=True)
         try:
             admin.execute(f'DROP DATABASE IF EXISTS "{cls.database}" WITH (FORCE)')
@@ -111,11 +115,7 @@ class PostgresAuthMirrorTests(unittest.TestCase):
         app_settings.CONTROL_PLANE_DATABASE_URL = self.dsn
 
     def _pg_service(self):
-        service = build_conversation_service()
-        close = getattr(service, "close", None)
-        if close is not None:
-            self.addCleanup(close)
-        return service
+        return build_conversation_service()
 
     def _admin(self):
         return self.auth.get_user_by_username(

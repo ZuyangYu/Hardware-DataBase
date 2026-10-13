@@ -214,6 +214,20 @@ start_front() {
   fi
 }
 
+run_migrate() {
+  # 与容器编排一致：api / worker 启动前先串行建表（含 LangGraph 检查点表），
+  # 避免运行期并发 setup() 在表缺失时撞唯一约束。
+  mkdir -p "$LOG_DIR"
+  echo "[migrate] 初始化存储（幂等，失败则中止启动）..."
+  if (cd "$APP_ROOT" && uv run python -m src.storage.bootstrap > "$LOG_DIR/migrate.log" 2>&1); then
+    echo "[migrate] 完成"
+    return 0
+  fi
+  echo "[migrate] 失败，完整日志: $LOG_DIR/migrate.log"
+  tail -n 15 "$LOG_DIR/migrate.log" 2>/dev/null
+  return 1
+}
+
 do_start() {
   mkdir -p "$LOG_DIR" "$PID_DIR"
   # hdb.sh 自己管理各类 worker；API 内仍管理 Sandbox dispatcher/reconciler。
@@ -222,6 +236,7 @@ do_start() {
   export HDB_API_SPAWN_MEMORY_WORKER=0
   # 先清理历史残留的未纳管 worker,避免旧代码实例继续消费队列。
   cleanup_stale_workers
+  run_migrate || return 1
   if api_ok; then
     if managed_pid "$API_PID_FILE" "$APP_ROOT" >/dev/null; then
       echo "[api]    已在运行 (:$API_PORT, pid $(cat "$API_PID_FILE"))"
