@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '@/api/client';
+import { api, ApiError } from '@/api/client';
 import { createClientRequestId } from '@/api/documentAuthoring';
 import type { QualityCase } from '@/api/types';
 import type { QualityReport } from '@/api/workbenchTypes';
@@ -13,10 +13,37 @@ import { formatAbsoluteTime } from '@/lib/formatters';
 import { QUALITY_RECOMMENDATION_LABELS, ROOT_CAUSE_FIXES, WORKFLOW_STAGES } from '@/lib/qualityLabels';
 import { workbenchErrorMessage } from '@/lib/workbenchErrors';
 
+export { default as ReviewRequestApproval } from '@/components/quality/ReviewRequestApproval';
+
 export function AdminRemediationGuide({ detail }: { detail: QualityCase }) {
   const review = detail.reviews.filter((item) => !detail.reviews.some((next) => next.supersedes === item.review_id)).slice(-1)[0];
   const fix = ROOT_CAUSE_FIXES[review?.root_cause ?? 'unknown'] ?? ROOT_CAUSE_FIXES.unknown;
   const stage = WORKFLOW_STAGES[detail.status] ?? { label: detail.status, next: '刷新案例并联系原回答 owner 确认当前处理阶段。' };
+  const pendingRequest = detail.review_requests?.find((item) => item.status === 'pending');
+  const [requesting, setRequesting] = useState(false);
+  const [requested, setRequested] = useState<{ caseId: string; requestId: string } | null>(null);
+  const requestBody = useRef<{ row_version: number; client_request_id: string; message: string } | null>(null);
+  const waiting = pendingRequest || (requested?.caseId === detail.case_id && !detail.review_requests?.some((item) => item.request_id === requested.requestId));
+  const lastRequest = detail.review_requests?.[0];
+  async function requestReview() {
+    if (requesting) return;
+    setRequesting(true);
+    try {
+      requestBody.current ??= {
+        row_version: detail.row_version,
+        client_request_id: createClientRequestId(),
+        message: '请确认是否共享固定提问、回答和必要证据，安排同部门员工完成复核。',
+      };
+      const result = await api.post<{ request_id: string }>(`/api/v1/quality/cases/${detail.case_id}/review-requests`, requestBody.current);
+      requestBody.current = null;
+      setRequested({ caseId: detail.case_id, requestId: result.request_id });
+      notify.success('已向原回答用户发起复核请求');
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) requestBody.current = null;
+      notify.error(error instanceof Error ? error.message : '发起复核请求失败');
+    }
+    finally { setRequesting(false); }
+  }
   return <section className="grid gap-3 rounded-md border border-blue-200 bg-blue-50/60 p-3">
     <h3 className="font-semibold">管理员修复管理</h3>
     <div className="grid gap-1 text-sm">
@@ -33,6 +60,14 @@ export function AdminRemediationGuide({ detail }: { detail: QualityCase }) {
         <li>线上回访确认正确后，案例才会进入“已上线验证”。</li>
       </ol>
     </div>
+    {detail.content_access === 'hidden' && <div className="grid gap-2 border-t border-blue-200 pt-3 text-sm">
+      <p className="font-medium">授权复核</p>
+      {lastRequest?.status === 'approved' && <p>上次请求已批准，授权员工可复核；管理员仍只看元数据。</p>}
+      {lastRequest?.status === 'rejected' && <p>上次请求已关闭，未新增材料授权。</p>}
+      {waiting
+        ? <p className="text-blue-800">复核请求已发出，等待原回答用户确认共享范围。</p>
+        : <Button variant="outline" disabled={requesting || !detail.source_valid || detail.manifest.content_available === false} onClick={() => void requestReview()}>{requesting ? '发起中…' : '向原回答用户发起复核请求'}</Button>}
+    </div>}
     <p className="text-xs text-muted-foreground">管理员负责查看队列、协调负责人、监督门禁和报告；由于正文权限限制，管理员不能直接修改知识库、提交复核或代替 owner 发起正文评测。</p>
   </section>;
 }

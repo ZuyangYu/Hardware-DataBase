@@ -58,8 +58,8 @@ export function CostBudgetPanel({ canRegister }: { canRegister: boolean }) {
   }
   return <AdminSection
     className="mb-5"
-    title="版本化费用预算"
-    description="预算只用于观测和告警，不会自动停用模型或中断请求。每个策略固定统计时间范围；已知金额为已记录调用的下界。未知费用和队列丢失时不能断言预算内，币种不换算。"
+    title="内部观测预算"
+    description="预算只用于系统内部观测和告警，不是供应商账户余额，也不会自动停用模型或中断请求。已知金额是已记录调用的下界，未知费用和队列丢失时不能断言预算内。"
     actions={<Button variant="outline" disabled={busy} onClick={() => void load()}>刷新预算</Button>}
   >
     {error && <ErrorState message={error} onRetry={() => void load()} />}
@@ -69,16 +69,16 @@ export function CostBudgetPanel({ canRegister }: { canRegister: boolean }) {
       const utilization = decimalRatio(b.known_utilization);
       const utilizationLabel = utilization == null ? '—' : formatPercent(utilization);
       const barTone = utilization == null ? 'bg-muted' : utilization >= 0.9 ? 'bg-red-500' : utilization >= 0.7 ? 'bg-amber-500' : 'bg-emerald-500';
-      return <div className="grid gap-1 rounded-lg border p-3 text-sm" key={b.policy.budget_version}>
-        <div className="flex flex-wrap items-center gap-2">
-          <h3 className="font-medium">{b.policy.budget_version}</h3>
-          <StatusBadge tone={STATUS_TONE[b.status] ?? 'neutral'}>{statusLabels[b.status] ?? b.status}</StatusBadge>
-          <StatusBadge tone={period.tone}>{period.label}</StatusBadge>
-          <CopyableTechnicalValue className="ml-auto" value={b.policy.budget_version} label="版本号" />
-        </div>
-        <p>{b.policy.currency} {b.known_amount} / {b.policy.amount_limit} · 已知金额利用率 {utilizationLabel} · {b.summary.calls} 调用 · 未知费用 {b.summary.unknown_cost_calls}</p>
-        <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="已知金额利用率" aria-valuemin={0} aria-valuemax={100} aria-valuenow={utilization == null ? undefined : utilization * 100}><div className={cnBar(barTone)} style={{ width: `${Math.max(0, Math.min(utilization ?? 0, 1)) * 100}%` }} /></div>
-        <p className="text-xs text-muted-foreground">利用率为"已知金额/限额"的下界口径,未知费用补齐前可能低估 · {b.policy.department_id == null ? '全局' : `部门 ${b.policy.department_id}`} · {b.policy.purpose ?? '全部用途'} · 模型：{b.policy.model_alias ?? '全部模型'} · <span title={formatAbsoluteTime(b.policy.effective_from)}>{formatRelativeTime(b.policy.effective_from)}</span> — {formatAbsoluteTime(b.policy.effective_to)}</p>
+       return <div className="grid gap-1 rounded-lg border p-3 text-sm" key={b.policy.budget_version}>
+         <div className="flex flex-wrap items-center gap-2">
+           <h3 className="font-medium">{b.policy.budget_version}</h3>
+           <StatusBadge tone={STATUS_TONE[b.status] ?? 'neutral'}>{statusLabels[b.status] ?? b.status}</StatusBadge>
+           <StatusBadge tone={period.tone}>{period.label}</StatusBadge>
+           <CopyableTechnicalValue className="ml-auto" value={b.policy.budget_version} label="版本号" />
+         </div>
+         <p>{b.policy.currency} {b.known_amount} / {b.policy.amount_limit} · 已知金额利用率 {utilizationLabel} · {b.summary.calls} 次调用 · 未知费用 {b.summary.unknown_cost_calls} 次</p>
+         <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="已知金额利用率" aria-valuemin={0} aria-valuemax={100} aria-valuenow={utilization == null ? undefined : utilization * 100}><div className={cnBar(barTone)} style={{ width: `${Math.max(0, Math.min(utilization ?? 0, 1)) * 100}%` }} /></div>
+         <p className="text-xs text-muted-foreground">利用率为“已知金额 / 限额”的下界口径，未知费用补齐前可能低估 · {b.policy.department_id == null ? '全局' : `部门 ${b.policy.department_id}`} · {b.policy.purpose ?? '全部用途'} · 模型：{b.policy.model_alias ?? '全部模型'} · <span title={formatAbsoluteTime(b.policy.effective_from)}>{formatRelativeTime(b.policy.effective_from)}</span> — {formatAbsoluteTime(b.policy.effective_to)}</p>
       </div>;
     })}
     {canRegister && <details><summary className="cursor-pointer font-medium">注册预算版本（管理员）</summary><form className="mt-3 grid gap-3 rounded-lg border bg-muted/20 p-4" onSubmit={(event) => { event.preventDefault(); void register(); }}>
@@ -92,7 +92,7 @@ export function CostBudgetPanel({ canRegister }: { canRegister: boolean }) {
         <label className="grid gap-1 text-sm">预算开始<input required type="datetime-local" className="min-w-0 rounded border p-2 text-sm" value={start} onChange={(e) => setStart(e.target.value)} /></label>
         <label className="grid gap-1 text-sm">预算结束<input required type="datetime-local" className="min-w-0 rounded border p-2 text-sm" value={end} onChange={(e) => setEnd(e.target.value)} /></label>
       </div>
-      <p className="text-xs text-muted-foreground">预算维度为"部门 + 用途 + 模型别名 + 币种";空值表示全部。注册后不可变:更新请注册新版本。</p>
+       <p className="text-xs text-muted-foreground">预算维度为“部门 + 用途 + 模型别名 + 币种”；空值表示全部。注册后不可变，更新请注册新版本。</p>
       <div><Button disabled={busy} type="submit">{busy ? '注册中…' : '注册不可变预算'}</Button></div>
     </form></details>}
   </AdminSection>;

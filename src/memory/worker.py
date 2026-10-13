@@ -647,7 +647,9 @@ class MemoryWorker:
                 attributes={"job_kind": job.job_kind},
                 unit="{tokens}",
             )
-            future = executor.submit(self.adapter.extract, messages, scope=scope, user=user)
+            from src.observability import submit_with_current_context
+
+            future = submit_with_current_context(executor, self.adapter.extract, messages, scope=scope, user=user)
             future.add_done_callback(lambda _future: self._reflection_in_flight.clear())
             try:
                 return future.result(timeout=timeout_seconds)
@@ -928,7 +930,12 @@ class MemoryWorker:
                     # being prepared.  Re-check immediately before any new
                     # output is generated and persisted.
                     self.jobs.validate_consent_for_job(job)
-                self._output_for_run(job, run, messages, scope=self._scope_from_session(session, job, user=user), user=user)
+                from src.costs.context import call_context, numeric_identity
+
+                with call_context(task_type="memory", task_id=job.job_id, purpose="memory",
+                                  owner_user_id=numeric_identity(session.get("user_id")), department_id=numeric_identity(session.get("department_id")),
+                                  execution_attempt_id=str(job.lease_token or "")):
+                    self._output_for_run(job, run, messages, scope=self._scope_from_session(session, job, user=user), user=user)
                 with closing(self.jobs._connect()) as conn:
                     run = conn.execute("SELECT * FROM memory_reflection_runs WHERE run_id = ?", (run["run_id"],)).fetchone()
             else:

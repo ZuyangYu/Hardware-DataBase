@@ -17,6 +17,17 @@ export const QUALITY_STATUS: Record<string, string> = {
   rejected: '复核未发现问题', dataset_ready: '已入回归集', regression_verified: '回归已验证', closed: '已上线验证',
 };
 
+/** 当前后端可筛选的质量案例状态。triaged/dataset_ready 仍保留在显示字典中，
+ * 以便兼容历史或未来投影，但当前后端不会写入它们，不能向用户提供永远为空的筛选项。 */
+export const QUALITY_CASE_FILTER_STATUS: Record<string, string> = {
+  new: QUALITY_STATUS.new,
+  reviewed: QUALITY_STATUS.reviewed,
+  needs_information: QUALITY_STATUS.needs_information,
+  rejected: QUALITY_STATUS.rejected,
+  regression_verified: QUALITY_STATUS.regression_verified,
+  closed: QUALITY_STATUS.closed,
+};
+
 /** 状态徽章色调:颜色仅辅助,中文文案始终存在。 */
 export const QUALITY_STATUS_TONE: Record<string, StatusTone> = {
   new: 'warning', triaged: 'info', reviewed: 'info', needs_information: 'warning',

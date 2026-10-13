@@ -17,6 +17,8 @@ import pytest
 def _isolate_worker_readiness(monkeypatch):
     # Unit API clients do not start real consumers. Deployment tests opt in.
     monkeypatch.setenv("HDB_REQUIRED_WORKER_ROLES", "")
+    monkeypatch.setenv("HDB_API_SPAWN_QUALITY_WORKER", "0")
+    monkeypatch.setattr(src.settings, "COST_LEDGER_ENABLED", False)
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +41,8 @@ _BACKEND_SETTINGS = (
     "REDIS_URL",
     "CONTROL_PLANE_BACKEND",
     "CONTROL_PLANE_DATABASE_URL",
+    "EVALUATION_STORE_BACKEND",
+    "EVALUATION_STORE_DATABASE_URL",
     "MEMORY_STORE_BACKEND",
     "MEMORY_DATABASE_URL",
     "AGENT_CHECKPOINT_BACKEND",
@@ -66,6 +70,8 @@ _SQLITE_BACKENDS = {
     "REDIS_URL": "",
     "CONTROL_PLANE_BACKEND": "sqlite",
     "CONTROL_PLANE_DATABASE_URL": "",
+    "EVALUATION_STORE_BACKEND": "sqlite",
+    "EVALUATION_STORE_DATABASE_URL": "",
     "MEMORY_STORE_BACKEND": "sqlite",
     "MEMORY_DATABASE_URL": "",
     "AGENT_CHECKPOINT_BACKEND": "sqlite",

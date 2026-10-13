@@ -1,6 +1,5 @@
 import os
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -174,7 +173,7 @@ class RunStateStoreTests(unittest.TestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(store.load().status, "queued")
 
-    def test_load_acquires_the_state_lock(self):
+    def test_load_is_read_only_and_does_not_take_write_lock(self):
         class TrackingLock:
             def __init__(self):
                 self.entered = 0
@@ -193,7 +192,7 @@ class RunStateStoreTests(unittest.TestCase):
         state = store.load()
 
         self.assertEqual(state.status, "queued")
-        self.assertEqual(lock.entered, 1)
+        self.assertEqual(lock.entered, 0)
 
     def test_orphan_transition_leaves_terminal_states_unchanged(self):
         for status in ("paused", "cancelled", "completed", "failed"):
@@ -340,7 +339,9 @@ class EvaluationRunControllerTests(unittest.TestCase):
         Mirrors the product workflow: execute stops at ``collected`` with a
         persisted QC report; scoring starts only after an explicit request.
         """
-        final = self.controller.execute(run_id)
+        final = self.controller.load_for_display(run_id)
+        if final.status != "collected":
+            final = self.controller.execute(run_id)
         if final.status == "collected":
             store = self.controller._store(run_id)
             store.mutate(
@@ -841,7 +842,7 @@ class EvaluationRunControllerTests(unittest.TestCase):
         ):
             self.assertFalse((self.root / state.run_id / name).exists())
 
-    def test_unowned_running_state_is_recovered_as_paused(self):
+    def test_display_is_read_only_and_recovery_is_explicit(self):
         state = self.controller.create_online_run(
             self.dataset, self.root, self.samples
         )
@@ -850,8 +851,9 @@ class EvaluationRunControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            self.controller.load_for_display(state.run_id).status, "paused"
+            self.controller.load_for_display(state.run_id).status, "running"
         )
+        self.assertEqual(self.controller.recover_orphan(state.run_id).status, "paused")
 
     def test_orphaned_scoring_run_without_checkpoint_does_not_fabricate_report(self):
         state = self.controller.create_online_run(
@@ -861,7 +863,7 @@ class EvaluationRunControllerTests(unittest.TestCase):
             stage="scoring"
         )
 
-        recovered = self.controller.load_for_display(state.run_id)
+        recovered = self.controller.recover_orphan(state.run_id)
 
         self.assertEqual(recovered.status, "paused")
         self.assertFalse((self.root / state.run_id / "summary.json").exists())
@@ -893,51 +895,12 @@ class EvaluationRunControllerTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.controller.load_for_display("no-such-run")
 
-    def test_display_recovery_does_not_pause_a_concurrently_registered_worker(self):
-        class StartAfterReleaseLock:
-            def __init__(self, controller, run_id):
-                self._lock = threading.RLock()
-                self._controller = controller
-                self._run_id = run_id
-                self._started = threading.Event()
-                self._armed = True
-
-            def __enter__(self):
-                self._lock.acquire()
-                return self
-
-            def __exit__(self, *_args):
-                self._lock.release()
-                if self._armed:
-                    self._armed = False
-
-                    def start():
-                        self._controller.start(self._run_id)
-                        self._started.set()
-
-                    threading.Thread(target=start).start()
-                    self._started.wait()
-
-        state = self.controller.create_online_run(
-            self.dataset, self.root, self.samples
-        )
-        observed_worker_liveness = []
-        original_mark_orphaned = RunStateStore.mark_orphaned_as_paused
-
-        def mark_orphaned(store):
-            worker = self.controller._threads.get(state.run_id)
-            observed_worker_liveness.append(worker is not None and worker.is_alive())
-            return original_mark_orphaned(store)
-
-        self.controller._threads_lock = StartAfterReleaseLock(
-            self.controller, state.run_id
-        )
-        with patch.object(RunStateStore, "mark_orphaned_as_paused", new=mark_orphaned):
-            self.controller.load_for_display(state.run_id)
-
-        worker = self.controller._threads[state.run_id]
-        worker.join()
-        self.assertEqual(observed_worker_liveness, [False])
+    def test_display_never_runs_orphan_repair(self):
+        state = self.controller.create_online_run(self.dataset, self.root, self.samples)
+        with patch.object(RunStateStore, "mark_orphaned_as_paused") as repair:
+            displayed = self.controller.load_for_display(state.run_id)
+        self.assertEqual(displayed.status, "queued")
+        repair.assert_not_called()
 
     def test_sample_transition_does_not_overwrite_interleaved_control_request(self):
         for control, expected_status in (("pause", "paused"), ("cancel", "cancelled")):

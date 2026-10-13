@@ -61,7 +61,8 @@ class GateTests(unittest.TestCase):
             fail_on_threshold=True,
         )
         self.assertFalse(gate.passed)
-        self.assertEqual(gate.exit_code, 2)
+        self.assertEqual(gate.exit_code, 3)
+        self.assertEqual(gate.verdict, "insufficient_evaluation")
         self.assertIn("evaluation failed", " ".join(gate.failures))
 
     def test_non_retrieval_samples_do_not_contribute_ragas_metrics(self):
@@ -93,44 +94,76 @@ class GateTests(unittest.TestCase):
         self.assertIn("fixed_content_overwrite_rate", " ".join(gate.failures))
 
 
+    def test_unusable_scores_never_pass_release_gate(self):
+        cases = [
+            [_result("failed", status="failed")],
+            [SampleResult(sample_id="missing")],
+            [_result("bad", score=float("nan"))],
+            [_result("bad", score=float("inf"))],
+            [_result("bad", score=-0.1)],
+            [_result("bad", score=1.1)],
+            [],
+        ]
+        for results in cases:
+            with self.subTest(results=results):
+                gate = evaluate_gate(results, {"evidence_consistency": 0.75}, fail_on_threshold=True)
+                self.assertFalse(gate.passed)
+                self.assertEqual(gate.verdict, "insufficient_evaluation")
+                self.assertEqual(gate.exit_code, 3)
+
+    def test_low_coverage_uses_applicable_denominator(self):
+        results = [_result(str(i), 0.9 if i == 0 else None, status="success" if i == 0 else "failed") for i in range(10)]
+        gate = evaluate_gate(results, {"evidence_consistency": 0.75}, fail_on_threshold=True)
+        self.assertFalse(gate.passed)
+        self.assertEqual(gate.metric_expected_counts["evidence_consistency"], 10)
+        self.assertEqual(gate.metric_coverage["evidence_consistency"], 0.1)
+
+    def test_declared_applicable_na_is_not_valid_coverage(self):
+        gate = evaluate_gate(
+            [_result("x", status="not_applicable")], {"evidence_consistency": 0.75},
+            expected_metrics={"x": ["evidence_consistency"]}, fail_on_threshold=True,
+        )
+        self.assertEqual(gate.verdict, "insufficient_evaluation")
+
+    def test_critical_missing_metric_cannot_hide_in_high_coverage(self):
+        results = [_result(str(i), 0.9) for i in range(20)] + [SampleResult(sample_id="critical", critical=True)]
+        gate = evaluate_gate(results, {"evidence_consistency": 0.75}, min_coverage=0.95, fail_on_threshold=True)
+        self.assertEqual(gate.verdict, "insufficient_evaluation")
+
+    def test_incomplete_report_cannot_pass(self):
+        gate = evaluate_gate([_result("x", 0.9)], {"evidence_consistency": 0.75}, complete=False, fail_on_threshold=True)
+        self.assertEqual(gate.verdict, "insufficient_evaluation")
+
+    def test_duplicate_cells_cannot_inflate_coverage(self):
+        result = _result("x", 0.9)
+        result.metrics *= 3
+        gate = evaluate_gate([result], {"evidence_consistency": 0.75}, fail_on_threshold=True)
+        self.assertFalse(gate.passed)
+        self.assertNotIn("evidence_consistency", gate.metric_counts)
+
+    def test_required_metrics_without_threshold_still_need_coverage(self):
+        gate = evaluate_gate(
+            [SampleResult(sample_id="x")], {},
+            expected_metrics={"x": ["faithfulness"]}, fail_on_threshold=True,
+        )
+        self.assertEqual(gate.verdict, "insufficient_evaluation")
+        self.assertEqual(gate.metric_expected_counts, {"faithfulness": 1})
+
+    def test_missing_applicability_contract_is_not_an_empty_cohort(self):
+        gate = evaluate_gate(
+            [_result("x", 0.9)], {"evidence_consistency": 0.75},
+            expected_metrics={}, fail_on_threshold=True,
+        )
+        self.assertEqual(gate.verdict, "insufficient_evaluation")
+
+    def test_denied_access_cannot_pass_with_a_permission_leak(self):
+        gate = evaluate_gate(
+            [SampleResult(sample_id="permission", access_check={"expected": "denied", "observed": "allowed"})],
+            {}, fail_on_threshold=True,
+        )
+        self.assertEqual(gate.verdict, "fail")
+        self.assertEqual(gate.exit_code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
-
-    def test_low_coverage_metric_skips_threshold_check(self):
-        """1/25 样本有效的 context_recall=1.0 不应触发门禁阈值。"""
-
-        results = [
-            SampleResult(
-                sample_id=f"s{i}",
-                metrics=[
-                    MetricResult(sample_id=f"s{i}", metric_name="completeness", score=0.9)
-                    for _ in range(0)
-                ] or [MetricResult(sample_id=f"s{i}", metric_name="completeness", score=0.9)],
-            )
-            for i in range(25)
-        ]
-        results[0].metrics.append(
-            MetricResult(sample_id="s0", metric_name="context_recall", score=1.0)
-        )
-
-        gate = evaluate_gate(results)
-
-        self.assertTrue(gate.passed)
-        self.assertEqual(gate.metric_counts.get("context_recall"), 1)
-
-    def test_high_coverage_metric_below_threshold_fails(self):
-        results = [
-            SampleResult(
-                sample_id=f"s{i}",
-                metrics=[
-                    MetricResult(sample_id=f"s{i}", metric_name="completeness", score=0.9),
-                    MetricResult(sample_id=f"s{i}", metric_name="context_recall", score=0.5),
-                ],
-            )
-            for i in range(25)
-        ]
-
-        gate = evaluate_gate(results)
-
-        self.assertFalse(gate.passed)
-        self.assertIn("context_recall", " ".join(gate.failures))

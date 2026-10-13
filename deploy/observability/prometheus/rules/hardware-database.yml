@@ -1,6 +1,92 @@
 groups:
+  - name: hardware-database-telemetry-accounting
+    rules:
+      - alert: HdbCollectorDown
+        expr: absent(up{job="otel-collector-self"}) or max(up{job="otel-collector-self"}) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Collector self-metrics scrape is unavailable"
+      - alert: HdbCollectorQueuePressure
+        expr: max by (exporter, data_type) (otelcol_exporter_queue_size / otelcol_exporter_queue_capacity) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collector persistent sending queue exceeds 80% capacity"
+      - alert: HdbCollectorSendFailures
+        expr: sum by (exporter) (rate(otelcol_exporter_send_failed_spans_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collector trace exports are failing; inspect retry queues"
+      - alert: HdbCollectorEnqueueLoss
+        expr: sum(increase(otelcol_exporter_enqueue_failed_spans_total[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Collector spans failed to enter persistent queues; receiver ACK does not imply delivery"
+      - alert: HdbRequiredWorkerRoleMissing
+        expr: max(hdb_worker_required_roles_missing) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A configured required worker role has no fresh durable heartbeat"
+      - alert: HdbQualityWorkerMetricsAbsent
+        expr: absent_over_time(hdb_worker_required_roles_missing[5m])
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Quality worker operational gauges are absent; check process and telemetry delivery"
+      - alert: HdbCostBudgetKnownAmountExceeded
+        expr: max(hdb_cost_budget_exceeded) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A versioned active cost budget is exceeded by recorded known amounts"
+      - alert: HdbCostBudgetCoverageInsufficient
+        expr: max(hdb_cost_budget_unknown) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An active cost budget contains unknown costs; spend completeness is not proven"
+      - alert: HdbCostAccountingLoss
+        expr: sum(increase(hdb_cost_sink_events_total{status=~"dropped|corrupt"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Cost accounting events were dropped or quarantined; coverage is incomplete"
+      - alert: HdbCostAccountingWritesFailing
+        expr: sum(rate(hdb_cost_sink_events_total{status="write_failures"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cost accounting DB/spool writes are failing"
   - name: hardware-database-slo
     rules:
+      - alert: HdbChatSloFastBurn
+        expr: (max by (workload) (hdb_slo_burn_rate{window="1h"}) > 14.4) and (max by (workload) (hdb_slo_burn_rate{window="5m"}) > 14.4) and (max by (workload) (hdb_slo_eligible{window="5m"}) >= max by (workload) (hdb_slo_minimum_events{window="5m"}))
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Durable chat SLO error budget is burning above 14.4x in both 1h and 5m"
+      - alert: HdbChatSloSlowBurn
+        expr: (max by (workload) (hdb_slo_burn_rate{window="6h"}) > 6) and (max by (workload) (hdb_slo_burn_rate{window="30m"}) > 6) and (max by (workload) (hdb_slo_eligible{window="30m"}) >= max by (workload) (hdb_slo_minimum_events{window="30m"}))
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable chat SLO error budget is burning above 6x in both 6h and 30m"
       - alert: HdbChatErrorRateHigh
         expr: sum(rate(hdb_chat_turns_total{status="failed"}[5m])) / sum(rate(hdb_chat_turns_total{status=~"completed|failed"}[5m])) > 0.10
         for: 10m

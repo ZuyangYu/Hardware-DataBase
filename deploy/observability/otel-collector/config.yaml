@@ -1,3 +1,9 @@
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol-storage
+    create_directory: true
+    timeout: 2s
+
 receivers:
   otlp:
     protocols:
@@ -19,12 +25,39 @@ exporters:
     endpoint: tempo:4317
     tls:
       insecure: true
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0s
   prometheus:
     endpoint: 0.0.0.0:9464
   otlphttp/loki:
     endpoint: http://loki:3100/otlp
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0s
   otlphttp/phoenix:
     endpoint: http://phoenix:6006
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0s
     headers:
       # Phoenix uses this HTTP header to route Collector-exported traces to a
       # named project.  The application also sets the OpenInference resource
@@ -32,6 +65,16 @@ exporters:
       x-project-name: ${env:OBS_PHOENIX_PROJECT}
 
 service:
+  extensions: [file_storage]
+  telemetry:
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
   pipelines:
     traces:
       receivers: [otlp]

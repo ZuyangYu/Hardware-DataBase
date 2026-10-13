@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 
 import { api } from '../../api/client';
 import type { KbSummaryView } from '../../api/types';
@@ -14,6 +14,8 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
+import { navigationGroups } from '@/lib/navigation';
 
 type Props = {
   auth: AuthSession;
@@ -23,6 +25,7 @@ type Props = {
 export default function GovernancePage({ auth, onLogout }: Props) {
   const sysAdmin = isSystemAdmin(auth.user);
   const navigate = useNavigate();
+  const governanceItems = navigationGroups(auth.user).find((group) => group.id === 'governance')?.items ?? [];
   const [rows, setRows] = useState<KbSummaryView[]>([]);
   const [loaded, setLoaded] = useState(false);
 
@@ -173,13 +176,13 @@ export default function GovernancePage({ auth, onLogout }: Props) {
   );
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <AdminPageFrame>
       <AppHeader
-        title="知识库治理"
+        title="治理总览"
         description={
           sysAdmin
-            ? '全局知识库治理视图:文件统计、解析异常、挂载与归属问题。'
-            : '本部门知识库治理视图:文件统计与解析异常。'
+            ? '全局治理视图:知识库文件统计、解析异常、挂载与归属问题。'
+            : '本部门治理视图:知识库文件统计与解析异常。'
         }
       />
 
@@ -189,6 +192,33 @@ export default function GovernancePage({ auth, onLogout }: Props) {
           刷新
         </Button>
       </div>
+
+      <section
+        aria-labelledby="governance-quick-links"
+        className="mb-[16px] rounded-[16px] border border-[#e7eaf1] bg-[#f8f9fc] p-[16px]"
+      >
+        <div className="mb-[12px]">
+          <h2 id="governance-quick-links" className="text-[14px] font-semibold text-[#18181a]">运营入口</h2>
+          <p className="mt-[4px] text-[12px] text-[#757f9c]">从治理总览进入质量、成本、日志和评估工作台。</p>
+        </div>
+        <div className="grid gap-[10px] sm:grid-cols-2 xl:grid-cols-4">
+          {governanceItems.map((item) => (
+            <Link
+              key={item.path}
+              to={item.path}
+              className="group flex min-w-0 items-start gap-[10px] rounded-[12px] border border-[#e3e7f1] bg-white p-[12px] transition-colors hover:border-[#c9d2e4] hover:bg-[#fcfdff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8797c5]"
+            >
+              <span className="grid size-[30px] shrink-0 place-items-center rounded-[9px] bg-[#eef1fb] text-[#6378bc]">
+                <AppIcon name={item.icon} size={16} />
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate text-[13px] font-medium text-[#18181a] group-hover:text-[#41558f]">{item.label}</span>
+                <span className="mt-[3px] block truncate text-[11px] text-[#858b9c]">{item.description}</span>
+              </span>
+            </Link>
+          ))}
+        </div>
+      </section>
 
       <div className="flex flex-col gap-[24px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
         <div className="flex flex-wrap items-stretch gap-[20px]">
@@ -216,6 +246,6 @@ export default function GovernancePage({ auth, onLogout }: Props) {
           />
         )}
       </div>
-    </div>
+    </AdminPageFrame>
   );
 }

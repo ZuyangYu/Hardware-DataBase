@@ -407,6 +407,9 @@ class ConversationService:
                 " ON chat_turns(session_id, status, turn_sequence)"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_turns_status_created ON chat_turns(status, created_at)")
+            from src.quality.store import initialize_schema as initialize_quality_schema
+
+            initialize_quality_schema(conn)
             has_users = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
             ).fetchone()
@@ -853,6 +856,10 @@ class ConversationService:
                     int(message_id),
                     reason=reason or ("message_redacted" if redact else "message_edited"),
                 )
+                if redact:
+                    from src.quality.store import redact_message_in_connection
+
+                    redact_message_in_connection(conn, int(message_id))
                 conn.execute(
                     """
                     INSERT INTO chat_message_edits
@@ -2474,6 +2481,8 @@ class ConversationService:
                 ).fetchone()
                 if row is None:
                     raise KeyError("turn not found")
+                if row["status"] in ("completed", "cancelled"):
+                    raise StaleTurnOwner(f"turn {turn_id} is already terminal")
                 if fencing_token is not None:
                     if not self._verify_turn_owner(conn, turn_id, worker_id, fencing_token):
                         raise StaleTurnOwner(f"turn {turn_id} is owned by a newer attempt")
@@ -2578,6 +2587,9 @@ class ConversationService:
                     # the terminal transaction (v3 §5.3): any failure rolls the
                     # answer, status and terminal events back together.
                     domain_writer(conn, completed_turn)
+                from src.quality.store import capture_completed_turn
+
+                capture_completed_turn(conn, completed_turn, user_id)
                 conn.execute("COMMIT")
                 return TurnCompletion(turn=completed_turn, terminal_events=terminal_events)
             except StaleTurnOwner:

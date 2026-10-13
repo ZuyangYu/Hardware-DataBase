@@ -21,10 +21,11 @@ test.beforeEach(async ({ page }) => {
     if (path === '/api/v1/whoami') return route.fulfill({ json: admin });
     if (path === '/api/v1/quality/cases') return route.fulfill({ json: [] });
     if (path === '/api/v1/quality/reports') return route.fulfill({ json: [] });
+    if (path === '/api/v1/governance/kb-summaries') return route.fulfill({ json: [] });
     if (path === '/api/v1/quality/analysis-runs') return route.fulfill({ json: { report_id: 'r' } });
-    if (path === '/api/v1/costs/summary') return route.fulfill({ json: { calls: 0, known_amounts: {}, unknown_cost_calls: 0, usage_coverage: null, price_coverage: null, logical_only_calls: 0, unfinished_calls: 0, unattributed_calls: 0, updated_at: null, scope: 'test', by_purpose: {} } });
+    if (path === '/api/v1/costs/summary') return route.fulfill({ json: { calls: 0, known_amounts: {}, tokens: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, reasoning_tokens: 0 }, unknown_cost_calls: 0, usage_coverage: null, price_coverage: null, logical_only_calls: 0, unfinished_calls: 0, unattributed_calls: 0, updated_at: null, scope: 'test', by_purpose: {} } });
     if (path === '/api/v1/costs/invocations') return route.fulfill({ json: [] });
-    if (path === '/api/v1/costs/trends') return route.fulfill({ json: { buckets: [], rankings_by_currency: {} } });
+    if (path === '/api/v1/costs/trends') return route.fulfill({ json: { bucket: 'day', timezone: 'UTC', summary: { calls: 0, known_amounts: {}, tokens: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, reasoning_tokens: 0 }, unknown_cost_calls: 0, usage_coverage: null, price_coverage: null, logical_only_calls: 0, unfinished_calls: 0, unattributed_calls: 0, updated_at: null, scope: 'test', by_purpose: {} }, buckets: [], rankings_by_currency: {} } });
     if (path === '/api/v1/costs/budgets') return route.fulfill({ json: [] });
     if (path === '/api/v1/notifications') return route.fulfill({ json: { items: [], unread_count: 0 } });
     return route.fulfill({ status: 404, json: { detail: 'unexpected regression API request' } });
@@ -54,7 +55,8 @@ test('窄屏显示"打开导航"触发器,桌面隐藏且固定侧栏可用', as
   await expect(page.getByRole('button', { name: '打开导航' })).toBeVisible();
   await page.setViewportSize({ width: 1440, height: 900 });
   // 桌面固定侧栏先出现(说明 isMobile 已切换),再断言抽屉触发器消失
-  await expect(page.getByRole('button', { name: '质量工作台' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '治理与运营' })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: '页面二级导航' }).getByRole('link', { name: '质量工作台', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '打开导航' })).toBeHidden();
 });
 
@@ -66,26 +68,29 @@ test('移动抽屉: 打开、 Escape 关闭、焦点返回触发按钮', async (
   const drawer = page.getByRole('dialog');
   await expect(drawer).toBeVisible();
   await expect(drawer.getByRole('heading', { name: '导航' })).toBeVisible();
-  await expect(drawer.getByRole('button', { name: /质量工作台/ })).toBeVisible();
-  await expect(drawer.getByRole('button', { name: /成本与用量/ })).toBeVisible();
+  await expect(drawer.getByRole('button', { name: '治理与运营', exact: true })).toBeVisible();
+  await expect(drawer.getByRole('button', { name: '管理', exact: true })).toBeVisible();
+  await expect(drawer.getByRole('button', { name: /质量工作台/ })).toHaveCount(0);
   // 打开时背景滚动锁定(Radix Dialog 默认行为)
   await page.keyboard.press('Escape');
   await expect(drawer).toBeHidden();
   await expect(page.locator('#admin-nav-trigger')).toBeFocused();
   await trigger.click();
   await expect(drawer).toBeVisible();
-  // 点击导航项后抽屉自动收起
-  await drawer.getByRole('button', { name: /成本与用量/ }).click();
+  // 点击一级导航项后抽屉自动收起
+  await drawer.getByRole('button', { name: '治理与运营', exact: true }).click();
   await expect(drawer).toBeHidden();
+  await expect(page.getByRole('heading', { name: '治理总览' })).toBeVisible();
 });
 
 test('抽屉内导航跳转到成本页后,宽表在窄屏内部滚动且出现滑动提示', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/admin/quality');
   await page.getByRole('button', { name: '打开导航' }).click();
-  await page.getByRole('dialog').getByRole('button', { name: /成本与用量/ }).click();
-  await expect(page.getByRole('heading', { name: '筛选调用账本' })).toBeVisible();
-  await expect(page.getByText('左右滑动查看全部列').first()).toBeVisible();
+  await page.getByRole('dialog').getByRole('button', { name: '治理与运营', exact: true }).click();
+  await page.getByRole('navigation', { name: '页面二级导航' }).getByRole('link', { name: '成本与用量', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '调用明细' })).toBeVisible();
+  await expect(page.getByText('明细只包含账本字段，不包含提示词、回答正文、服务端点或 API Key。移动端可横向滑动查看全部字段。', { exact: true })).toBeVisible();
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
   expect(overflow).toBe(true);
 });

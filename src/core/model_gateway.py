@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextlib import asynccontextmanager
+from contextvars import copy_context
 from collections import defaultdict
 from typing import Any
 
@@ -27,10 +29,12 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 import src.settings as settings
+from src.costs.capture import leaf_call
 from src.core.llm_governor import (
     PRIORITY_BATCH,
     PRIORITY_INTERACTIVE,
     get_llm_governor,
+    CURRENT_LLM_PRIORITY,
 )
 
 
@@ -223,7 +227,10 @@ def _iter_with_idle_timeout(iterator: Any, timeout_seconds: float) -> Any:
                 except _queue.Full:
                     pass
 
-    _threading.Thread(target=pump, daemon=True, name="llm-stream-pump").start()
+    from contextvars import copy_context
+
+    context = copy_context()
+    _threading.Thread(target=lambda: context.run(pump), daemon=True, name="llm-stream-pump").start()
     try:
         while True:
             try:
@@ -332,6 +339,34 @@ def _estimated_call_tokens(model: Any, args: tuple[Any, ...], kwargs: dict[str, 
         return 0
 
 
+@asynccontextmanager
+async def _async_slot(cm, priority):
+    """Enter/exit the sync governor in the same Context, off the event loop.
+
+    Cancellation during acquisition still drains the in-flight acquisition and
+    releases its permit. Two to_thread calls otherwise get distinct contexts,
+    making ContextVar.reset fail and leaking the governance scope.
+    """
+    context = copy_context()
+    acquisition = asyncio.create_task(asyncio.to_thread(context.run, cm.__enter__))
+    try:
+        await asyncio.shield(acquisition)
+    except BaseException:
+        try:
+            await asyncio.shield(acquisition)
+        except Exception:
+            pass
+        else:
+            await asyncio.shield(asyncio.to_thread(context.run, cm.__exit__, None, None, None))
+        raise
+    token = CURRENT_LLM_PRIORITY.set(priority)
+    try:
+        yield
+    finally:
+        CURRENT_LLM_PRIORITY.reset(token)
+        await asyncio.shield(asyncio.to_thread(context.run, cm.__exit__, None, None, None))
+
+
 class _GovernedChatOpenAI(ChatOpenAI):
     hdb_priority: str = PRIORITY_INTERACTIVE
     hdb_provider: str = "openai-compatible"
@@ -344,7 +379,11 @@ class _GovernedChatOpenAI(ChatOpenAI):
             model=self.hdb_model,
             estimated_tokens=_estimated_call_tokens(self, args, kwargs),
         ):
-            return super()._generate(*args, **kwargs)
+            with leaf_call(self) as call:
+                result = super()._generate(*args, **kwargs)
+                if call:
+                    call.response = result
+                return result
 
     def _stream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
         with get_llm_governor().slot(
@@ -354,7 +393,11 @@ class _GovernedChatOpenAI(ChatOpenAI):
             estimated_tokens=_estimated_call_tokens(self, args, kwargs),
         ):
             timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
-            yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
+            with leaf_call(self) as call:
+                for chunk in _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout):
+                    if call:
+                        call.chunk(chunk)
+                    yield chunk
 
     async def _agenerate(self, *args: Any, **kwargs: Any):  # noqa: ANN401
         cm = get_llm_governor().slot(
@@ -363,11 +406,12 @@ class _GovernedChatOpenAI(ChatOpenAI):
             model=self.hdb_model,
             estimated_tokens=_estimated_call_tokens(self, args, kwargs),
         )
-        await asyncio.to_thread(cm.__enter__)
-        try:
-            return await super()._agenerate(*args, **kwargs)
-        finally:
-            await asyncio.to_thread(cm.__exit__, None, None, None)
+        async with _async_slot(cm, self.hdb_priority):
+            with leaf_call(self) as call:
+                result = await super()._agenerate(*args, **kwargs)
+                if call:
+                    call.response = result
+                return result
 
     async def _astream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
         cm = get_llm_governor().slot(
@@ -376,12 +420,12 @@ class _GovernedChatOpenAI(ChatOpenAI):
             model=self.hdb_model,
             estimated_tokens=_estimated_call_tokens(self, args, kwargs),
         )
-        await asyncio.to_thread(cm.__enter__)
-        try:
-            async for chunk in super()._astream(*args, **kwargs):
-                yield chunk
-        finally:
-            await asyncio.to_thread(cm.__exit__, None, None, None)
+        async with _async_slot(cm, self.hdb_priority):
+            with leaf_call(self) as call:
+                async for chunk in super()._astream(*args, **kwargs):
+                    if call:
+                        call.chunk(chunk)
+                    yield chunk
 
 
 class _GovernedChatOllama(ChatOllama):
@@ -396,7 +440,11 @@ class _GovernedChatOllama(ChatOllama):
             model=self.hdb_model,
             estimated_tokens=_estimated_call_tokens(self, args, kwargs),
         ):
-            return super()._generate(*args, **kwargs)
+            with leaf_call(self) as call:
+                result = super()._generate(*args, **kwargs)
+                if call:
+                    call.response = result
+                return result
 
     def _stream(self, *args: Any, **kwargs: Any):  # noqa: ANN401
         with get_llm_governor().slot(
@@ -406,7 +454,31 @@ class _GovernedChatOllama(ChatOllama):
             estimated_tokens=_estimated_call_tokens(self, args, kwargs),
         ):
             timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
-            yield from _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout)
+            with leaf_call(self) as call:
+                for chunk in _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout):
+                    if call:
+                        call.chunk(chunk)
+                    yield chunk
+
+    async def _agenerate(self, *args: Any, **kwargs: Any):
+        cm = get_llm_governor().slot(self.hdb_priority, provider=self.hdb_provider, model=self.hdb_model,
+                                     estimated_tokens=_estimated_call_tokens(self, args, kwargs))
+        async with _async_slot(cm, self.hdb_priority):
+            with leaf_call(self) as call:
+                result = await super()._agenerate(*args, **kwargs)
+                if call:
+                    call.response = result
+                return result
+
+    async def _astream(self, *args: Any, **kwargs: Any):
+        cm = get_llm_governor().slot(self.hdb_priority, provider=self.hdb_provider, model=self.hdb_model,
+                                     estimated_tokens=_estimated_call_tokens(self, args, kwargs))
+        async with _async_slot(cm, self.hdb_priority):
+            with leaf_call(self) as call:
+                async for chunk in super()._astream(*args, **kwargs):
+                    if call:
+                        call.chunk(chunk)
+                    yield chunk
 
 
 def build_governed_model(
@@ -594,7 +666,7 @@ def govern_ragas_llm(llm: Any) -> Any:
                 continue
             if asyncio.iscoroutinefunction(original):
                 async def wrapped_async(*args: Any, _orig=original, **kwargs: Any) -> Any:
-                    with get_llm_governor().slot(PRIORITY_BATCH):
+                    async with _async_slot(get_llm_governor().slot(PRIORITY_BATCH), PRIORITY_BATCH):
                         result = await _orig(*args, **kwargs)
                     _record_ragas_usage(result)
                     return result

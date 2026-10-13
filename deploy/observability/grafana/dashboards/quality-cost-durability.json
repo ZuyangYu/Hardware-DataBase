@@ -1,0 +1,21 @@
+{
+  "uid": "hdb-quality-cost-durability",
+  "title": "Hardware DataBase - Quality, Cost Durability and Pilot SLO",
+  "schemaVersion": 40,
+  "version": 1,
+  "editable": true,
+  "tags": ["hardware-database", "production-feedback"],
+  "timezone": "browser",
+  "time": {"from": "now-6h", "to": "now"},
+  "refresh": "30s",
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Collector WAL sending queue utilization", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []}, "targets": [{"refId": "A", "expr": "max by (exporter,data_type) (otelcol_exporter_queue_size / otelcol_exporter_queue_capacity)", "legendFormat": "{{exporter}} / {{data_type}}"}]},
+    {"id": 2, "type": "timeseries", "title": "Collector enqueue losses and retry failures", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "targets": [{"refId": "A", "expr": "sum by (exporter) (increase(otelcol_exporter_enqueue_failed_spans_total[5m]))", "legendFormat": "enqueue lost {{exporter}}"}, {"refId": "B", "expr": "sum by (exporter) (increase(otelcol_exporter_send_failed_spans_total[5m]))", "legendFormat": "retry failures {{exporter}}"}]},
+    {"id": 3, "type": "timeseries", "title": "Cost accounting events (failures do not imply zero cost)", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "targets": [{"refId": "A", "expr": "sum by (status) (increase(hdb_cost_sink_events_total[5m]))", "legendFormat": "{{status}}"}]},
+    {"id": 4, "type": "timeseries", "title": "Quality collection / Phoenix projection backlog", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "targets": [{"refId": "A", "expr": "max by (queue) (hdb_queue_depth{queue=~\"quality_collect|quality_phoenix\"})", "legendFormat": "{{queue}}"}]},
+    {"id": 5, "type": "timeseries", "title": "DB-derived chat SLO burn rates (explicit policy required)", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}, "targets": [{"refId": "A", "expr": "max by (workload,window) (hdb_slo_burn_rate)", "legendFormat": "{{workload}} / {{window}}"}]},
+    {"id": 6, "type": "timeseries", "title": "Chat eligible / pending tasks and first-token violations", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}, "targets": [{"refId": "A", "expr": "max by (workload) (hdb_slo_eligible{window=\"5m\"})", "legendFormat": "eligible {{workload}}"}, {"refId": "B", "expr": "max by (workload) (hdb_slo_pending{window=\"5m\"})", "legendFormat": "pending {{workload}}"}, {"refId": "C", "expr": "max by (workload) (hdb_slo_first_bad{window=\"5m\"})", "legendFormat": "first-token bad {{workload}}"}]},
+    {"id": 7, "type": "stat", "title": "Missing required worker roles", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 5, "w": 12, "x": 0, "y": 24}, "targets": [{"refId": "A", "expr": "max(hdb_worker_required_roles_missing)", "instant": true}]},
+    {"id": 8, "type": "stat", "title": "Collector self-metrics scrape up", "datasource": {"type": "prometheus", "uid": "hdb-prometheus"}, "gridPos": {"h": 5, "w": 12, "x": 12, "y": 24}, "targets": [{"refId": "A", "expr": "max(up{job=\"otel-collector-self\"})", "instant": true}]}
+  ]
+}

@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import Lock
 
 from .schemas import AnswerSnapshot
+from .execution import execution_write_guard
 
 
 class SnapshotStore:
@@ -32,7 +33,7 @@ class SnapshotStore:
         return {sample_id for sample_id, snapshot in latest.items() if snapshot.status == "success"}
 
     def append(self, snapshot: AnswerSnapshot) -> None:
-        with self._lock:
+        with self._lock, execution_write_guard():
             snapshots = self.load_all()
             snapshots.append(snapshot)
             self.path.parent.mkdir(parents=True, exist_ok=True)

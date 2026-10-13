@@ -1245,6 +1245,9 @@ class _NativeRagasBackend:
             timeout=self.config.timeout_seconds,
             default_headers=opencode_extra_headers(use_base) or None,
         )
+        from src.costs.sdk import instrument_async_openai
+
+        instrument_async_openai(llm_client)
         llm = llm_factory(
             use_model,
             client=llm_client,
@@ -1295,6 +1298,9 @@ class _NativeRagasBackend:
             timeout=config.timeout_seconds,
             default_headers=opencode_extra_headers(config.embedding_base_url) or None,
         )
+        from src.costs.sdk import instrument_async_openai
+
+        instrument_async_openai(client)
 
         class ConfiguredEmbeddings(ModernOpenAIEmbeddings):
             async def aembed_text(self, text: str, **kwargs: Any) -> list[float]:
@@ -1412,11 +1418,16 @@ class _NativeRagasBackend:
             return {"user_input", "reference", "retrieved_contexts"}
 
         async def run_job(record_index: int, metric_name: str, metric: Any, record: dict[str, Any]):
+            from src.costs.context import call_context
             # 每个裁判调用发出前轮询取消标志：取消后未发出的调用即刻跳过，
             # 已在途的请求由 wait_for 强制超时（代理环境下 socket 级读超时
             # 可能永不触发，必须用协程级超时兜底）。
             self._raise_if_stopped()
             kwargs = {key: record[key] for key in fields_for(metric_name) if key in record}
+            with call_context(sample_id=str(record.get("sample_id", "")), operation=metric_name):
+                return await run_metric(record_index, metric_name, metric, kwargs)
+
+        async def run_metric(record_index, metric_name, metric, kwargs):
             async with semaphore:
                 try:
                     result = await asyncio.wait_for(

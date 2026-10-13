@@ -34,6 +34,7 @@ export default function ChatSessionSidebar({
 }: Props) {
   const [deleteTarget, setDeleteTarget] = useState<SessionView | null>(null);
   const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
   const [width, setWidth] = useState(240);
   const dragRef = useRef<{ startX: number; startW: number } | null>(null);
 
@@ -55,12 +56,39 @@ export default function ChatSessionSidebar({
     };
   }, []);
 
+  const mobileLauncher = !mobileOpen && (
+    <button
+      type="button"
+      onClick={() => {
+        setCollapsed(false);
+        setMobileOpen(true);
+      }}
+      aria-label="打开会话列表"
+      title="打开会话列表"
+      className="fixed right-[12px] top-[68px] z-30 hidden size-[32px] place-items-center rounded-[9px] border border-[#e3e7f1] bg-white text-[#757f9c] shadow-[0_4px_14px_rgba(24,24,26,0.12)] hover:text-[#18181a] max-[700px]:inline-grid"
+    >
+      <AppIcon name="arrow" size={15} style={{ transform: 'rotate(180deg)' }} />
+    </button>
+  );
+  const mobileScrim = mobileOpen && (
+    <button
+      type="button"
+      aria-label="关闭会话列表"
+      onClick={() => setMobileOpen(false)}
+      className="fixed inset-0 z-40 hidden bg-black/15 max-[700px]:block"
+    />
+  );
+
   if (collapsed) {
-    return (
-      <aside className="flex w-[44px] shrink-0 flex-col items-center border-l border-[#f4f4f4] bg-white py-[12px]">
+    return <>
+      {mobileLauncher}
+      <aside className="flex w-[44px] shrink-0 flex-col items-center border-l border-[#f4f4f4] bg-white py-[12px] max-[700px]:hidden">
         <button
           type="button"
-          onClick={() => setCollapsed(false)}
+          onClick={() => {
+            setCollapsed(false);
+            setMobileOpen(true);
+          }}
           aria-label="展开会话侧栏"
           title="展开会话侧栏"
           className="inline-grid size-[28px] place-items-center rounded-[8px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
@@ -68,10 +96,16 @@ export default function ChatSessionSidebar({
           <AppIcon name="arrow" size={16} style={{ transform: 'rotate(180deg)' }} />
         </button>
       </aside>
-    );
+    </>;
   }
   return (
-    <aside className="group relative flex shrink-0 flex-col border-l border-[#f4f4f4] bg-white" style={{ width }}>
+    <>
+      {mobileLauncher}
+      {mobileScrim}
+      <aside className={cn(
+        'group relative flex shrink-0 flex-col border-l border-[#f4f4f4] bg-white',
+        mobileOpen ? 'max-[700px]:fixed max-[700px]:right-0 max-[700px]:top-0 max-[700px]:z-50 max-[700px]:h-full max-[700px]:!w-[min(320px,calc(100vw-24px))]' : 'max-[700px]:hidden',
+      )} style={{ width }}>
       <div
         onMouseDown={(e) => {
           dragRef.current = { startX: e.clientX, startW: width };
@@ -88,7 +122,10 @@ export default function ChatSessionSidebar({
           <div className="flex shrink-0 items-center gap-[4px]">
             <button
               type="button"
-              onClick={() => setCollapsed(true)}
+              onClick={() => {
+                setCollapsed(true);
+                setMobileOpen(false);
+              }}
               aria-label="收起会话侧栏"
               title="收起会话侧栏"
               className="inline-grid size-[24px] shrink-0 place-items-center rounded-[6px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
@@ -162,6 +199,7 @@ export default function ChatSessionSidebar({
           setDeleteTarget(null);
         }}
       />
-    </aside>
+      </aside>
+    </>
   );
 }

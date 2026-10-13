@@ -1373,6 +1373,11 @@ class PostgresExecutionStore:
                 int(message_id),
                 reason=reason or ("message_redacted" if redact else "message_edited"),
             )
+            if redact:
+                from src.quality.store import redact_message_in_connection
+                from .sql_adapter import PgSqlAdapterConnection
+
+                redact_message_in_connection(PgSqlAdapterConnection(conn), int(message_id))
             conn.execute(
                 """
                 INSERT INTO chat_message_edits
@@ -1881,6 +1886,10 @@ class PostgresExecutionStore:
                 )
             if domain_writer is not None:
                 domain_writer(conn, completed_turn)
+            from src.quality.store import capture_completed_turn
+            from .sql_adapter import PgSqlAdapterConnection
+
+            capture_completed_turn(PgSqlAdapterConnection(conn), completed_turn, user_id)
             return TurnCompletion(turn=completed_turn, terminal_events=terminal_events)
 
     def fail_turn(

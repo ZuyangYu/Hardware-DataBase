@@ -179,10 +179,11 @@ class AnalyzeFromAttachmentTests(unittest.TestCase):
 
     def test_conversion_forwards_attachment_provenance_after_kb_write_grant(self):
         token = self._token()
+        office_content = _valid_office_stub()
         upload = self.client.post(
             f"/api/v1/conversations/{self.session.id}/attachments",
             headers={"Authorization": f"Bearer {token}"},
-            files={"file": ("t.docx", io.BytesIO(_valid_office_stub()), "application/octet-stream")},
+            files={"file": ("t.docx", io.BytesIO(office_content), "application/octet-stream")},
         )
         self.assertEqual(upload.status_code, 201, upload.text)
         attachment = upload.json()
@@ -200,7 +201,7 @@ class AnalyzeFromAttachmentTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.captured["filename"], "t.docx")
-        self.assertEqual(self.captured["content"], _valid_office_stub())
+        self.assertEqual(self.captured["content"], office_content)
         self.assertEqual(self.captured["template_name"], "评审表")
         self.assertEqual(self.captured["origin_source_type"], "chat_attachment")
         self.assertEqual(

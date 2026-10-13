@@ -60,6 +60,9 @@ def _auxiliary_control_plane(conn) -> None:
         with closing(sqlite3.connect(template.db_path)) as source:
             source.row_factory = sqlite3.Row
             tables = _sqlite_table_names(source)
+            # Quality owns an explicit versioned schema with TEXT payloads on
+            # both backends; do not pass it through the legacy semantic mapper.
+            tables = [table for table in tables if not table.startswith("quality_")]
             for table in tables:
                 if not is_core_table(table):
                     conn.execute(generated_table_ddl(table, _sqlite_columns(source, table)))
@@ -103,10 +106,12 @@ def _control_plane(dsn: str) -> str:
             apply_schema(conn, include_indexes=True)
             _auxiliary_control_plane(conn)
             record_schema_version(conn)
-            return "控制面 schema 已创建（版本已记录）"
-        version = assert_schema_compatible(conn)
-        create_core_indexes(conn)
-        _auxiliary_control_plane(conn)
+            result = "控制面 schema 已创建（版本已记录）"
+        else:
+            version = assert_schema_compatible(conn)
+            create_core_indexes(conn)
+            _auxiliary_control_plane(conn)
+            result = f"控制面 schema 已存在（版本 {version}）"
         # 控制面外键（如 chat_sessions → users）在数据迁移路径上补挂；
         # 全新库由 apply_schema 内联建好，这里只在缺失时补齐。
         for name, table, constraint_sql in CORE_FOREIGN_KEYS:
@@ -119,7 +124,7 @@ def _control_plane(dsn: str) -> str:
             ).fetchone()[0]
             if ready:
                 _add_constraint_if_missing(conn, table, name, constraint_sql)
-        return f"控制面 schema 已存在（版本 {version}）"
+        return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -138,6 +143,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[bootstrap] {_control_plane(dsn)}")
         except Exception as exc:  # noqa: BLE001 - 一次性门槛：失败必须可见
             print(f"[bootstrap] 控制面初始化失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 3
+        try:
+            from src.quality.store import QualityStore
+
+            QualityStore(initialize=True)
+            from src.costs.store import CostStore
+
+            CostStore(initialize=True)
+            from src.quality.workflow import WorkflowStore
+
+            WorkflowStore(initialize=True)
+            from src.observability.slo import ChatSloStore
+
+            ChatSloStore(initialize=True)
+            print("[bootstrap] quality: 事务反馈 schema 已就绪（版本 1）")
+        except Exception as exc:
+            print(f"[bootstrap] quality: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 3
 
     groups: list[tuple[str, tuple[type, ...]]] = []
@@ -170,6 +192,14 @@ def main(argv: list[str] | None = None) -> int:
             failed += 1
 
     # 认证域形状校验：早期按控制面语义建过的库必须显式重建
+    if backend == "postgres":
+        # Fresh auth tables become available only after the domain groups.
+        # Attach the remaining authority FKs on the very first bootstrap, too.
+        try:
+            _control_plane(dsn)
+        except Exception as exc:
+            print(f"[bootstrap] 控制面外键校验失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+            failed += 1
     auth_backend, auth_dsn = domain_pg.resolve_domain_backend("AUTH_STORE")
     if auth_backend == "postgres":
         from src.storage.auth_domain import assert_shape
@@ -180,6 +210,17 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"[bootstrap] auth: {exc}", file=sys.stderr)
             failed += 1
+
+    try:
+        from pathlib import Path
+        from src.evaluation.execution import EvaluationExecutionLedger
+
+        evaluation_root = Path(settings.STORAGE_DIR) / "evaluations"
+        EvaluationExecutionLedger(evaluation_root, initialize=True)
+        print("[bootstrap] evaluation: 共享执行 schema 已就绪（版本 1）")
+    except Exception as exc:
+        print(f"[bootstrap] evaluation: {type(exc).__name__}: {exc}", file=sys.stderr)
+        failed += 1
 
     if failed:
         print(f"[bootstrap] 完成但有 {failed} 项失败", file=sys.stderr)
