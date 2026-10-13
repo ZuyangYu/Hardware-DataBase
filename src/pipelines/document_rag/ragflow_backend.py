@@ -578,10 +578,52 @@ class RAGFlowClient:
             raise request_error
         return outcome["data"]  # type: ignore[return-value]
 
+    # RAGFlow pages the dataset listing at 30 items by default, so a single
+    # unfiltered request hides every dataset beyond page 1 (health checks then
+    # report existing datasets as missing).  Page through the full listing here.
+    _DATASET_PAGE_SIZE = 100
+    _DATASET_MAX_PAGES = 200
+
     def list_datasets(self, name: str | None = None) -> list[dict]:
-        params = {"name": name} if name else {}
-        data = self.request("GET", "/api/v1/datasets", params=params)
-        return data.get("data", [])
+        if name:
+            try:
+                data = self.request("GET", "/api/v1/datasets", params={"name": name})
+            except RAGFlowAPIError as exc:
+                # RAGFlow answers a name it cannot resolve with a misleading
+                # "lacks permission for dataset '<name>'" payload (HTTP 200,
+                # code != 0) instead of an empty list.  Treat it as no match.
+                if self._is_dataset_not_found(exc):
+                    return []
+                raise
+            return data.get("data", [])
+
+        results: list[dict] = []
+        for page in range(1, self._DATASET_MAX_PAGES + 1):
+            data = self.request(
+                "GET",
+                "/api/v1/datasets",
+                params={"page": page, "page_size": self._DATASET_PAGE_SIZE},
+            )
+            batch = data.get("data") or []
+            if not isinstance(batch, list) or not batch:
+                break
+            results.extend(batch)
+            try:
+                total = int(data.get("total")) if data.get("total") is not None else None
+            except (TypeError, ValueError):
+                total = None
+            if total is not None:
+                if len(results) >= total:
+                    break
+            elif len(batch) < self._DATASET_PAGE_SIZE:
+                break
+        return results
+
+    @staticmethod
+    def _is_dataset_not_found(exc: RAGFlowAPIError) -> bool:
+        payload = exc.args[0] if exc.args else None
+        message = payload.get("message") if isinstance(payload, dict) else str(exc)
+        return "lacks permission for dataset" in str(message or "")
 
     def create_dataset(self, name: str) -> str:
         data = self.request("POST", "/api/v1/datasets", json={"name": name})
