@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# pre-push 钩子：禁止直接推送到受保护分支（main / develop）
+#
+# 规则来源：.claude/skills/git-commit-skill/SKILL.md 阶段 0
+#
+# 启用方式（每个克隆各执行一次）：
+#   git config core.hooksPath hooks
+#
+# 临时绕过（确需时，谨慎使用）：
+#   git push --no-verify
+#
+
+set -u
+
+PROTECTED_BRANCHES="main develop"
+blocked=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # 仅校验被推送的分支引用；tag 等其它引用放行
+  case "$remote_ref" in
+    refs/heads/*) branch="${remote_ref#refs/heads/}" ;;
+    *) continue ;;
+  esac
+
+  for protected in $PROTECTED_BRANCHES; do
+    [ "$branch" = "$protected" ] || continue
+    blocked=1
+    echo "" >&2
+    echo "⛔ 禁止向受保护分支 $branch 直接推送/删除/强推！" >&2
+    echo "" >&2
+    echo "请走功能分支 + Pull Request 流程：" >&2
+    echo "  git switch -c feature/<描述> $branch" >&2
+    echo "  git push -u origin feature/<描述>   # 然后在 GitHub 上开 PR" >&2
+    echo "" >&2
+    echo "（确需绕过：git push --no-verify）" >&2
+  done
+done
+
+exit $blocked
