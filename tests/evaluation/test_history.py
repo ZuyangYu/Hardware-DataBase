@@ -164,12 +164,14 @@ class EvaluationHistoryTests(unittest.TestCase):
                     "kb_name": "shared",
                     "department_id": 47,
                     "cohort_fingerprint": fingerprint,
+                    "execution_dataset_sha256": "same-execution-content",
                     "metric_scores": {"faithfulness": 0.8},
                     "llm_model": "judge-a",
                     "embedding_model": "embed-a",
-                    "evaluation_config": {"llm_model": "judge-a", "embedding_model": "embed-a"},
+                    "evaluation_config": {"llm_model": "judge-a", "embedding_model": "embed-a", "scoring_rules_sha256": "rules-v1"},
                     "snapshot_sha256": f"snapshot-{name}",
                     "snapshot_ownership_verified": True,
+                    "metadata": {"run_outcome": {"kind": "completed"}},
                 }
                 summary.update(updates)
                 (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -192,6 +194,27 @@ class EvaluationHistoryTests(unittest.TestCase):
             model_result = compatibility_report(selected, different_model)
             self.assertFalse(model_result["compatible"])
             self.assertFalse(model_result["compatibility"]["model_config"]["match"])
+
+            changed_content = write("changed-content", execution_dataset_sha256="changed-answer")
+            content_result = compatibility_report(selected, changed_content)
+            self.assertFalse(content_result["compatible"])
+            self.assertFalse(content_result["compatibility"]["dataset_content"]["match"])
+
+            no_hash = write("no-hash", execution_dataset_sha256="")
+            self.assertFalse(compatibility_report(selected, no_hash)["compatible"])
+            changed_rules = write("changed-rules", evaluation_config={"llm_model": "judge-a", "embedding_model": "embed-a", "scoring_rules_sha256": "rules-v2"})
+            self.assertFalse(compatibility_report(selected, changed_rules)["compatible"])
+            old_one = write("old-one", execution_dataset_sha256="", evaluation_config={}, metadata={})
+            old_two = write("old-two", execution_dataset_sha256="", evaluation_config={}, metadata={})
+            legacy_result = compatibility_report(old_one, old_two)
+            self.assertFalse(legacy_result["compatible"])
+            self.assertFalse(legacy_result["compatibility"]["dataset_content"]["match"])
+            self.assertFalse(legacy_result["compatibility"]["scoring_rules"]["match"])
+            self.assertFalse(legacy_result["compatibility"]["completion"]["match"])
+
+            reordered = write("reordered", execution_content_sha256="canonical-same", execution_dataset_sha256="different-order")
+            canonical = write("canonical", execution_content_sha256="canonical-same")
+            self.assertTrue(compatibility_report(canonical, reordered)["compatible"])
 
     def test_unverified_snapshot_cannot_be_a_strict_baseline(self):
         with tempfile.TemporaryDirectory() as temp_dir:

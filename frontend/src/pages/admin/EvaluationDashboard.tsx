@@ -57,7 +57,7 @@ function GatePill({ summary, isFinal }: { summary: EvaluationSummary; isFinal: b
   if (!summary.gate) return <span className="rounded-full bg-[#f3f4f6] px-[8px] py-[2px] text-[11px] text-[#464c5e]">未执行 Gate</span>;
   return (
     <span className={cn('rounded-full px-[8px] py-[2px] text-[11px]', summary.gate.passed ? 'bg-[#e6f6ec] text-[#138a55]' : 'bg-[#fce7e7] text-[#d20b0b]')}>
-      Gate {summary.gate.passed ? '通过' : '未通过'}
+      Gate {summary.gate.verdict === 'insufficient_evaluation' ? '评分不足，无法判定' : summary.gate.passed ? '通过' : '未通过'}
     </span>
   );
 }
@@ -118,9 +118,22 @@ function CurrentMetricChart({ summary, isInProgress }: { summary: EvaluationSumm
 
 function MetricTableAndGate({ summary, isFinal }: { summary: EvaluationSummary; isFinal: boolean }) {
   const rows = metricRows(summary);
+  const expectedCounts = Object.entries(summary.gate?.metric_expected_counts ?? {});
   return (
     <section className="rounded-[12px] border border-[#edf0f4] p-[14px]">
       <h4 className="mb-[10px] text-[14px] font-semibold text-[#18181a]">指标与门禁</h4>
+      {expectedCounts.length > 0 && (
+        <div className="mb-[12px] grid gap-[4px] text-[12px] text-[#464c5e]">
+          <p className="font-medium">有效评分 / 应评样本 · 覆盖率</p>
+          {expectedCounts.map(([metric, expected]) => (
+            <p key={metric}>
+              {rows.find((row) => row.metric === metric)?.label ?? metric}：
+              {summary.gate?.metric_counts[metric] ?? 0} / {expected} ·
+              {' '}{((summary.gate?.metric_coverage?.[metric] ?? 0) * 100).toFixed(1)}%
+            </p>
+          ))}
+        </div>
+      )}
       {rows.length > 0 && (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[560px] text-left text-[12px]">

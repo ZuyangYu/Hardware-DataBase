@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
-import { AdminRemediationGuide, QualityReports } from './QualityWorkflowPanel';
+import { AdminRemediationGuide, QualityReports, ReviewRequestApproval } from './QualityWorkflowPanel';
 import type { QualityCase } from '@/api/types';
 
 /** SSR 渲染不执行 useEffect,api.get 不会被调用:reports 保持初值空数组。 */
@@ -34,5 +34,19 @@ describe('AdminRemediationGuide', () => {
     const noCause = { ...detail, reviews: [{ ...detail.reviews[0], root_cause: 'mystery' }] } as unknown as QualityCase;
     const markup = renderToStaticMarkup(<AdminRemediationGuide detail={noCause} />);
     expect(markup).toContain('待确定');
+  });
+});
+
+describe('ReviewRequestApproval', () => {
+  it('为 owner 展示待处理请求和材料范围选择', () => {
+    const detail = {
+      case_id: 'case-owner', row_version: 2, content_access: 'owner',
+      content: { query: 'q', answer: 'a', evidence: [] },
+      review_requests: [{ request_id: 'request-1', status: 'pending', message: '请协助复核', created_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z', decided_at: null }],
+    } as unknown as QualityCase;
+    const markup = renderToStaticMarkup(<ReviewRequestApproval detail={detail} onRefresh={async () => undefined} />);
+    expect(markup).toContain('待处理的复核请求');
+    expect(markup).toContain('批准并共享复核材料');
+    expect(markup).toContain('固定回答');
   });
 });

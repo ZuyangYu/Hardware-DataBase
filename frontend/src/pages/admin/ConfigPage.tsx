@@ -85,6 +85,46 @@ export const GROUPS: Group[] = [
     ],
   },
   {
+    title: '长期记忆',
+    hint: '记忆默认开启，模型留空时复用上面的 Agent 模型；语义检索（Embedding）留空则关闭，走目录/关键词检索。',
+    fields: [
+      ['MEMORY_ENABLED', '启用长期记忆'],
+      ['MEMORY_MODEL_PROVIDER', '记忆模型 Provider（留空=复用 Agent）'],
+      ['MEMORY_MODEL', '记忆模型'],
+      ['MEMORY_MODEL_BASE_URL', '记忆模型 Base URL'],
+      ['MEMORY_MODEL_API_KEY', '记忆模型 API Key'],
+      ['MEMORY_EMBEDDING_PROVIDER', 'Embedding Provider（留空=关闭语义检索）'],
+      ['MEMORY_EMBEDDING_MODEL', 'Embedding 模型'],
+      ['MEMORY_EMBEDDING_BASE_URL', 'Embedding Base URL'],
+      ['MEMORY_EMBEDDING_API_KEY', 'Embedding API Key'],
+      ['MEMORY_EMBEDDING_DIMS', 'Embedding 维度'],
+    ],
+  },
+  {
+    title: '附件解析与理解',
+    hint: '附件默认开启：词法检索 + OCR（本地 tesseract，不外发）。先选择检索或视觉开关，再配置对应模型；远程推理仍需单独允许。',
+    fields: [
+      ['CHAT_ATTACHMENTS_ENABLED', '启用会话附件'],
+      ['CHAT_ATTACHMENT_MAX_BYTES', '单文件大小上限(字节)'],
+      ['CHAT_ATTACHMENT_MAX_FILES_PER_SESSION', '单会话文件数上限'],
+      ['CHAT_ATTACHMENT_OCR_ENABLED', 'OCR 识别'],
+      ['CHAT_ATTACHMENT_RETRIEVAL_MODE', '检索模式'],
+      ['CHAT_ATTACHMENT_EMBEDDING_PROVIDER', 'Embedding Provider'],
+      ['CHAT_ATTACHMENT_EMBEDDING_BASE_URL', 'Embedding Base URL'],
+      ['CHAT_ATTACHMENT_EMBEDDING_MODEL', 'Embedding 模型'],
+      ['CHAT_ATTACHMENT_EMBEDDING_API_KEY', 'Embedding API Key'],
+      ['CHAT_ATTACHMENT_VISUAL_ENABLED', '图像理解（视觉模型）'],
+      ['CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED', '允许远程推理（图像/OCR 外发）'],
+      ['CHAT_ATTACHMENT_VISUAL_PROVIDER', '视觉模型 Provider'],
+      ['CHAT_ATTACHMENT_VISUAL_BASE_URL', '视觉模型 Base URL'],
+      ['CHAT_ATTACHMENT_VISUAL_MODEL', '视觉模型'],
+      ['ARK_API_KEY', '视觉模型 API Key'],
+      ['CHAT_ATTACHMENT_VISUAL_MAX_PAGES_PER_TURN', '视觉模型每轮最大页数'],
+      ['CHAT_ATTACHMENT_VISUAL_MAX_IMAGE_BYTES', '单张图片大小上限(字节)'],
+      ['CHAT_ATTACHMENT_VISUAL_TIMEOUT_SECONDS', '视觉模型超时(秒)'],
+    ],
+  },
+  {
     title: '扩展（MCP，受管控）',
     hint: '远程 MCP 默认开启；没有启用的服务时不发起任何连接，本开关仅作应急停用。平台前置自动开启，无需手动配置；凭据密钥 MCP_CREDENTIALS_KEY 只能写在 .env，配置接口不会返回或写入。',
     fields: [
@@ -112,7 +152,16 @@ export const GROUPS: Group[] = [
   },
 ];
 
-const SECRET_KEYS = new Set(['RAGFLOW_API_KEY', 'AGENT_CUSTOM_API_KEY', 'AUTH_DEFAULT_ADMIN_PASSWORD']);
+const SECRET_KEYS = new Set([
+  'RAGFLOW_API_KEY',
+  'AGENT_CUSTOM_API_KEY',
+  'AUTH_DEFAULT_ADMIN_PASSWORD',
+  // 与后端 _SECRET_KEYS 对齐：不在这个名单里的 "***" 会被当成真实值写回 .env。
+  'MEMORY_MODEL_API_KEY',
+  'MEMORY_EMBEDDING_API_KEY',
+  'CHAT_ATTACHMENT_EMBEDDING_API_KEY',
+  'ARK_API_KEY',
+]);
 
 /** 受控布尔开关:渲染 true/false 下拉,避免手输字符串。 */
 export const BOOLEAN_KEYS = new Set([
@@ -120,6 +169,12 @@ export const BOOLEAN_KEYS = new Set([
   'MCP_WRITE_ENABLED',
   'MCP_ALLOW_INSECURE_HTTP',
   'MCP_ALLOW_PRIVATE_HOSTS',
+  'MEMORY_ENABLED',
+  'CHAT_ATTACHMENTS_ENABLED',
+  'CHAT_ATTACHMENT_OCR_ENABLED',
+  'CHAT_ATTACHMENT_DENSE_ENABLED',
+  'CHAT_ATTACHMENT_VISUAL_ENABLED',
+  'CHAT_ATTACHMENT_REMOTE_INFERENCE_ALLOWED',
 ]);
 
 /** 调参项：默认隐藏，避免把"永远用默认值"的旋钮摊在主视图。 */
@@ -158,6 +213,10 @@ export const ADVANCED_KEYS = new Set([
   'MCP_WRITE_MAX_ATTEMPTS',
   'RESOURCE_MCP_MAX_CONCURRENT',
   'RESOURCE_MCP_RESERVED_INTERACTIVE',
+  'CHAT_ATTACHMENT_MAX_FILES_PER_SESSION',
+  'CHAT_ATTACHMENT_VISUAL_MAX_PAGES_PER_TURN',
+  'CHAT_ATTACHMENT_VISUAL_MAX_IMAGE_BYTES',
+  'CHAT_ATTACHMENT_VISUAL_TIMEOUT_SECONDS',
 ]);
 
 /** 保存后需重启进程才生效的键（与后端 RESTART_REQUIRED_SETTINGS 子集对齐）。 */
@@ -212,6 +271,12 @@ export const NUMBER_FIELDS: Record<string, { min: number; max?: number; step?: n
   MCP_WRITE_MAX_ATTEMPTS: { min: 1, max: 10, integer: true },
   RESOURCE_MCP_MAX_CONCURRENT: { min: 1, max: 64, integer: true },
   RESOURCE_MCP_RESERVED_INTERACTIVE: { min: 0, max: 64, integer: true },
+  MEMORY_EMBEDDING_DIMS: { min: 0, max: 8192, integer: true },
+  CHAT_ATTACHMENT_MAX_BYTES: { min: 1, max: 1073741824, integer: true },
+  CHAT_ATTACHMENT_MAX_FILES_PER_SESSION: { min: 1, max: 100, integer: true },
+  CHAT_ATTACHMENT_VISUAL_MAX_PAGES_PER_TURN: { min: 1, max: 20, integer: true },
+  CHAT_ATTACHMENT_VISUAL_MAX_IMAGE_BYTES: { min: 1024, max: 67108864, integer: true },
+  CHAT_ATTACHMENT_VISUAL_TIMEOUT_SECONDS: { min: 1, max: 600, integer: true },
 };
 
 /** 分类内是否有未保存改动；掩码后的密钥视为未改动。 */
@@ -247,6 +312,31 @@ export function ConfigGroupsPanel({
   onSelectGroup,
   onFieldChange,
 }: ConfigGroupsPanelProps) {
+  const enabled = (key: string) => booleanDraftValue(draft[key]) === 'true';
+  const isVisibleField = (key: string) => {
+    if (!showAdvanced && ADVANCED_KEYS.has(key)) return false;
+    if (key.startsWith('MEMORY_') && key !== 'MEMORY_ENABLED' && !enabled('MEMORY_ENABLED')) return false;
+    const denseFields = new Set([
+      'CHAT_ATTACHMENT_EMBEDDING_PROVIDER',
+      'CHAT_ATTACHMENT_EMBEDDING_BASE_URL',
+      'CHAT_ATTACHMENT_EMBEDDING_MODEL',
+      'CHAT_ATTACHMENT_EMBEDDING_API_KEY',
+    ]);
+    if (denseFields.has(key) && String(draft.CHAT_ATTACHMENT_RETRIEVAL_MODE ?? 'lexical').trim().toLowerCase() !== 'hybrid') {
+      return false;
+    }
+    const visualFields = new Set([
+      'CHAT_ATTACHMENT_VISUAL_PROVIDER',
+      'CHAT_ATTACHMENT_VISUAL_BASE_URL',
+      'CHAT_ATTACHMENT_VISUAL_MODEL',
+      'ARK_API_KEY',
+      'CHAT_ATTACHMENT_VISUAL_MAX_PAGES_PER_TURN',
+      'CHAT_ATTACHMENT_VISUAL_MAX_IMAGE_BYTES',
+      'CHAT_ATTACHMENT_VISUAL_TIMEOUT_SECONDS',
+    ]);
+    if (visualFields.has(key) && !enabled('CHAT_ATTACHMENT_VISUAL_ENABLED')) return false;
+    return true;
+  };
   return (
     <div className="flex flex-col">
       <nav
@@ -295,7 +385,7 @@ export function ConfigGroupsPanel({
             {group.hint && <p className="text-[12px] text-[#858b9c]">{group.hint}</p>}
             <div className="grid grid-cols-1 gap-[12px] sm:grid-cols-2 xl:grid-cols-3">
               {group.fields
-                .filter(([key]) => showAdvanced || !ADVANCED_KEYS.has(key))
+                .filter(([key]) => isVisibleField(key))
                 .map(([key, label, fieldOptions]) => (
                 <div
                   key={key}
@@ -334,6 +424,24 @@ export function ConfigGroupsPanel({
                         <SelectItem value="custom">custom</SelectItem>
                       </SelectContent>
                     </Select>
+                  ) : key === 'CHAT_ATTACHMENT_RETRIEVAL_MODE' ? (
+                    <Select
+                      value={String(draft[key] ?? 'lexical').toLowerCase() === 'hybrid' ? 'hybrid' : 'lexical'}
+                      onValueChange={(value) => {
+                        onFieldChange(key, value);
+                        // Keep the legacy backend flag synchronized while the
+                        // visible mode remains the single user-facing switch.
+                        onFieldChange('CHAT_ATTACHMENT_DENSE_ENABLED', value === 'hybrid' ? 'true' : 'false');
+                      }}
+                    >
+                      <SelectTrigger className="h-[36px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="lexical">lexical（关键词）</SelectItem>
+                        <SelectItem value="hybrid">hybrid（关键词+语义）</SelectItem>
+                      </SelectContent>
+                    </Select>
                   ) : group.textarea || fieldOptions?.textarea ? (
                     <Textarea
                       value={draft[key] ?? ''}
@@ -342,7 +450,7 @@ export function ConfigGroupsPanel({
                     />
                   ) : (
                     <Input
-                      type={NUMBER_FIELDS[key] ? 'number' : 'text'}
+                      type={NUMBER_FIELDS[key] ? 'number' : SECRET_KEYS.has(key) ? 'password' : 'text'}
                       min={NUMBER_FIELDS[key]?.min}
                       max={NUMBER_FIELDS[key]?.max}
                       step={NUMBER_FIELDS[key]?.step ?? (NUMBER_FIELDS[key]?.integer ? 1 : undefined)}

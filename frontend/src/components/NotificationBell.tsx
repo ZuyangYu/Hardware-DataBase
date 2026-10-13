@@ -197,6 +197,11 @@ export default function NotificationBell() {
           void markRead(item);
           if (item.target_type === 'attachment_revision') {
             navigate('/chat');
+          } else if (item.target_type === 'quality_case') {
+            navigate(item.kind === 'quality_review_request'
+              ? `/chat?quality_case=${encodeURIComponent(item.target_id)}`
+              : `/admin/quality?case=${encodeURIComponent(item.target_id)}`);
+            setOpen(false);
           }
         }}
       />

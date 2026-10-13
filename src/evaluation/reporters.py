@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .schemas import EvaluationSummary, SampleResult
+from .execution import execution_write_guard
 
 
 @dataclass(frozen=True)
@@ -43,9 +44,29 @@ def write_reports(
     *,
     metadata: dict[str, Any] | None = None,
 ) -> ReportPaths:
+    with execution_write_guard():
+        return _write_reports(run_dir, summary, results, metadata=metadata)
+
+
+def _write_reports(
+    run_dir: str | Path,
+    summary: EvaluationSummary,
+    results: list[SampleResult],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> ReportPaths:
     run_dir = Path(run_dir)
     if metadata:
         summary = summary.model_copy(update={"metadata": {**summary.metadata, **metadata}})
+    outcome = summary.metadata.get("run_outcome", {}).get("kind", "completed")
+    if outcome != "completed" and summary.gate is not None and summary.gate.passed:
+        reasons = [*summary.gate.insufficient_reasons, f"report outcome is {outcome}"]
+        summary = summary.model_copy(update={"gate": summary.gate.model_copy(update={
+            "passed": False, "verdict": "insufficient_evaluation",
+            "exit_code": 3 if summary.gate.enforced else 0,
+            "insufficient_reasons": reasons,
+            "failures": [*summary.gate.failures, f"report outcome is {outcome}"],
+        })})
     summary_json = run_dir / "summary.json"
     results_jsonl = run_dir / "results.jsonl"
     summary_csv = run_dir / "summary.csv"

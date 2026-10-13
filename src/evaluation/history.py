@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .schemas import EvaluationSummary, SampleResult
+from .reproducibility import public_evaluator_config
 
 
 def _canonical_sample_ids(sample_ids: Iterable[str]) -> list[str]:
@@ -271,7 +272,7 @@ def _summary_metric_names(history: EvaluationHistoryRun) -> list[str]:
 def _model_config(history: EvaluationHistoryRun) -> dict[str, Any]:
     """Return only the public evaluator configuration used for comparison."""
 
-    config = dict(history.summary.evaluation_config or {})
+    config = public_evaluator_config(history.summary.evaluation_config or {})
     if history.summary.llm_model:
         config["llm_model"] = history.summary.llm_model
     if history.summary.embedding_model:
@@ -281,7 +282,7 @@ def _model_config(history: EvaluationHistoryRun) -> dict[str, Any]:
 
 def _comparison_item(current: Any, baseline: Any, *, reason: str = "") -> dict[str, Any]:
     return {
-        "match": current == baseline,
+        "match": current == baseline and not reason,
         "current": current,
         "baseline": baseline,
         "reason": reason,
@@ -309,13 +310,26 @@ def compatibility_report(
     baseline_cohort = baseline_summary.cohort_fingerprint
     cohort_match = bool(current_cohort and baseline_cohort and current_cohort == baseline_cohort)
 
+    # New reports hash normalized content; legacy reports can only compare
+    # identical execution files.  Source-file hashes may include unused rows.
+    canonical = bool(current_summary.execution_content_sha256 and baseline_summary.execution_content_sha256)
+    current_content = current_summary.execution_content_sha256 if canonical else current_summary.execution_dataset_sha256
+    baseline_content = baseline_summary.execution_content_sha256 if canonical else baseline_summary.execution_dataset_sha256
+    content_match = bool(current_content and baseline_content and current_content == baseline_content)
+
     current_metrics = _summary_metric_names(selected)
     baseline_metrics = _summary_metric_names(baseline)
-    metrics_match = current_metrics == baseline_metrics
+    metrics_match = bool(current_metrics and baseline_metrics) and current_metrics == baseline_metrics
 
     current_config = _model_config(selected)
     baseline_config = _model_config(baseline)
     model_match = bool(current_config and baseline_config) and current_config == baseline_config
+    current_rules = current_config.get("scoring_rules_sha256", "")
+    baseline_rules = baseline_config.get("scoring_rules_sha256", "")
+    rules_match = bool(current_rules and baseline_rules and current_rules == baseline_rules)
+    current_outcome = current_summary.metadata.get("run_outcome", {}).get("kind", "")
+    baseline_outcome = baseline_summary.metadata.get("run_outcome", {}).get("kind", "")
+    completion_match = current_outcome == baseline_outcome == "completed"
 
     current_snapshot_verified = bool(current_summary.snapshot_ownership_verified)
     baseline_snapshot_verified = bool(baseline_summary.snapshot_ownership_verified)
@@ -341,6 +355,16 @@ def compatibility_report(
     )
 
     compatibility = {
+        "completion": _comparison_item(
+            current_outcome,
+            baseline_outcome,
+            reason="严格基线必须来自完整完成的评测" if not completion_match else "",
+        ),
+        "dataset_content": _comparison_item(
+            current_content,
+            baseline_content,
+            reason="执行样本内容哈希缺失或不一致" if not content_match else "",
+        ),
         "kb_id": _comparison_item(
             current_kb,
             baseline_kb,
@@ -361,6 +385,11 @@ def compatibility_report(
             baseline_config,
             reason="评估模型配置缺失或不一致" if not model_match else "",
         ),
+        "scoring_rules": _comparison_item(
+            current_rules,
+            baseline_rules,
+            reason="裁判/评分规则指纹缺失或不一致" if not rules_match else "",
+        ),
         "snapshot_ownership": _comparison_item(
             current_ownership,
             baseline_ownership,
@@ -377,9 +406,12 @@ def compatibility_report(
             compatibility[key]["match"]
             for key in (
                 "kb_id",
+                "completion",
                 "cohort_fingerprint",
+                "dataset_content",
                 "metrics",
                 "model_config",
+                "scoring_rules",
                 "snapshot_ownership",
             )
         ),

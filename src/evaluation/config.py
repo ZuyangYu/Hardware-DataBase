@@ -148,11 +148,15 @@ class EvaluationConfig:
         )
 
     def public_metadata(self) -> dict[str, str | int | float | None]:
+        from .reproducibility import scoring_rules_hash
+
         return {
+            "scoring_rules_sha256": scoring_rules_hash(),
             "llm_provider": self.llm_provider,
             "llm_base_url": self.llm_base_url,
             "llm_model": self.llm_model,
             "llm_fallback_model": self.llm_fallback_model,
+            "llm_fallback_base_url": self.llm_fallback_base_url,
             "embedding_base_url": self.embedding_base_url,
             "embedding_model": self.embedding_model,
             "embedding_dims": self.embedding_dims,

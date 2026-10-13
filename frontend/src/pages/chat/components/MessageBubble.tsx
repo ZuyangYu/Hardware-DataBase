@@ -18,6 +18,7 @@ import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { MarkdownMessage, citationDisplayTitle } from '../chatHelpers';
 import ExportMenu, { exportJobStatusLabel } from './ExportMenu';
+import FeedbackActions from './FeedbackActions';
 import { exportFormatLabel } from '../exportResultModel';
 import {
   CHAT_CITATION_HEADING_CLASS,
@@ -425,6 +426,7 @@ function MessageBubble({
             <div className="grid gap-[12px]" data-i18n-ignore>
               {showDiagnostics && traceSteps.length > 0 && <StepGroup steps={traceSteps} />}
               <MarkdownMessage content={msg.content} />
+              <FeedbackActions msg={msg} />
               {msg.memory_context && msg.memory_context.length > 0 && (
                 <MemoryContextBlock memories={msg.memory_context} />
               )}

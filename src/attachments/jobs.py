@@ -360,4 +360,8 @@ def _current_parser_version(processor) -> str:
 def run_job(job: AttachmentJob, executor: AttachmentParseExecutor | None = None) -> dict:
     """Execute one claimed parse job (worker-facing entry point)."""
     executor = executor or AttachmentParseExecutor()
-    return executor.process_asset(job.asset_id)
+    from src.costs.context import call_context, numeric_identity
+
+    with call_context(task_type="attachment", task_id=job.job_id, purpose="ingestion", owner_user_id=job.user_id,
+                      department_id=numeric_identity(job.payload.get("department_id")), execution_attempt_id=str(job.attempt)):
+        return executor.process_asset(job.asset_id)

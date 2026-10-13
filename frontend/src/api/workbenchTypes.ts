@@ -28,6 +28,14 @@ export type CostInvocation = {
 export type CostSummary = {
   calls: number;
   known_amounts: Record<string, string>;
+  tokens: {
+    input_tokens: number;
+    output_tokens: number;
+    cached_input_tokens: number;
+    reasoning_tokens: number;
+  };
+  reported_usage_calls?: number;
+  priced_calls?: number;
   unknown_cost_calls: number;
   usage_coverage: number | null;
   price_coverage: number | null;
@@ -36,6 +44,8 @@ export type CostSummary = {
   unattributed_calls: number;
   updated_at: string | null;
   scope: string;
+  amount_kind?: 'application_token_estimate' | string;
+  settlement_status?: 'not_reconciled' | string;
   by_purpose: Record<string, { calls: number; known_amounts: Record<string, string> }>;
 };
 
@@ -44,6 +54,12 @@ export type CostTrends = {
   timezone: 'UTC';
   summary: CostSummary;
   buckets: (CostSummary & { bucket_start: string })[];
+  models?: (CostSummary & {
+    endpoint_alias: string;
+    model_alias: string;
+    requested_model: string;
+    response_model: string;
+  })[];
   rankings_by_currency: Record<string, {
     endpoint_alias: string;
     model_alias: string;
@@ -94,4 +110,13 @@ export type QualityReport = {
     experiment_plan: string;
     status: string;
   }[];
+};
+
+export type QualityReviewRequest = {
+  request_id: string;
+  status: 'pending' | 'approved' | 'rejected';
+  message: string;
+  created_at: string;
+  updated_at: string;
+  decided_at: string | null;
 };

@@ -23,6 +23,7 @@ from langchain_core.runnables import Runnable
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.observability import observe
+from src.costs.context import runtime_scope
 from src.observability.metrics import record_llm, record_llm_timeout, record_llm_tokens
 
 
@@ -392,14 +393,14 @@ def stream_text(
     first_delta_at: float | None = None
     usage = _empty_usage_accumulator()
     status = "success"
-    observation = observe.llm(
+    observation = observe.chain(
         "hdb.llm.runtime", provider=provider, model=model_id,
         stage=operation, profile=profile, streaming=True,
     )
     try:
         # The permit is held until the stream is exhausted or closed, matching
         # the real downstream lifetime rather than the caller's future.
-        with _llm_governor(), observation:
+        with _llm_governor(), observation, runtime_scope(operation=operation, profile=profile):
             try:
                 stream = model.stream(messages, **kwargs)
                 for chunk in stream:
@@ -551,12 +552,12 @@ def _observed_invoke(
     model_id = model_name(identity)
     started = time.monotonic()
     status = "success"
-    observation = observe.llm(
+    observation = observe.chain(
         "hdb.llm.runtime", provider=provider, model=model_id,
         stage=operation, profile=profile, streaming=streaming,
     )
     try:
-        with observation:
+        with observation, runtime_scope(operation=operation, profile=profile):
             try:
                 response = runnable.invoke(messages, **kwargs)
                 usage = normalize_usage(response)

@@ -21,12 +21,15 @@ import {
   type AuthSession,
 } from './auth';
 import AppSidebar from './components/AppSidebar';
+import { NavigationSectionContext } from './components/NavigationSectionContext';
+import { activePrimaryNavigationItem } from '@/lib/navigation';
 import { SidebarProvider } from '@/components/ui/sidebar';
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { notify } from '@/components/ui/app-toast';
 import LoginPage from './pages/LoginPage';
 const KbListPage = lazy(() => import('./pages/KbListPage'));
+const HelpPage = lazy(() => import('./pages/HelpPage'));
 const ChatPage = lazy(() => import('./pages/chat/ChatPage'));
 const KbFilesPage = lazy(() => import('./pages/KbFilesPage'));
 const DocumentAssetsPage = lazy(() => import('./pages/DocumentAssetsPage'));
@@ -36,6 +39,8 @@ const DepartmentsPage = lazy(() => import('./pages/admin/DepartmentsPage'));
 const KbMountPage = lazy(() => import('./pages/admin/KbMountPage'));
 const GovernancePage = lazy(() => import('./pages/admin/GovernancePage'));
 const LogsPage = lazy(() => import('./pages/admin/LogsPage'));
+const QualityPage = lazy(() => import('./pages/admin/QualityPage'));
+const CostsPage = lazy(() => import('./pages/admin/CostsPage'));
 const ConfigPage = lazy(() => import('./pages/admin/ConfigPage'));
 const EvaluationPage = lazy(() => import('./pages/admin/EvaluationPage'));
 const SystemStatusPage = lazy(() => import('./pages/admin/SystemStatusPage'));
@@ -109,6 +114,7 @@ function AdminRoute({
 
 function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) {
   const location = useLocation();
+  const primaryNavigation = activePrimaryNavigationItem(auth.user, location.pathname);
   const [kbs, setKbs] = useState<KbView[]>([]);
   const [kbsLoaded, setKbsLoaded] = useState(false);
   const sysAdmin = isSystemAdmin(auth.user);
@@ -161,9 +167,24 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
       <AppSidebar auth={auth} onLogout={onLogout} />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div className="content flex-1">
+          <NavigationSectionContext.Provider
+            value={{
+              primary: primaryNavigation,
+              subnav: primaryNavigation?.items,
+              sectionLabel: primaryNavigation?.id === 'governance'
+                ? '治理与运营'
+                : primaryNavigation?.id === 'management'
+                  ? '组织与平台管理'
+                  : primaryNavigation?.id === 'extensions'
+                    ? '个人能力'
+                    : undefined,
+            }}
+          >
           <Suspense fallback={<div role="status" className="p-6 text-muted-foreground">正在加载页面…</div>}>
           <Routes>
             <Route path="/" element={<HomeRedirect auth={auth} />} />
+            <Route path="/admin/quality" element={<AdminRoute auth={auth}><QualityPage auth={auth} onLogout={onLogout} /></AdminRoute>} />
+            <Route path="/admin/costs" element={<AdminRoute auth={auth}><CostsPage auth={auth} onLogout={onLogout} /></AdminRoute>} />
             <Route
               path="/assets"
               element={
@@ -204,7 +225,11 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
             />
             <Route
               path="/memory"
-              element={<MemoryPage auth={auth} onLogout={onLogout} kbs={kbs} />}
+              element={
+                <KbContentRoute auth={auth}>
+                  <MemoryPage auth={auth} onLogout={onLogout} kbs={kbs} />
+                </KbContentRoute>
+              }
             />
             <Route
               path="/extensions"
@@ -305,15 +330,19 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
             <Route path="*" element={<HomeRedirect auth={auth} />} />
           </Routes>
           </Suspense>
+          </NavigationSectionContext.Provider>
         </div>
       </div>
     </SidebarProvider>
   );
 }
 
-/** 已登录应用统一走 Shell;聊天作为一级业务页挂在全局侧边栏内。 */
+/** 业务页使用应用壳；使用帮助在登录校验后提供独立手册布局。 */
 function AuthedApp({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) {
   const location = useLocation();
+  if (/^\/help\/?$/.test(location.pathname)) {
+    return <Suspense fallback={<div role="status" className="p-8 text-muted-foreground">正在加载使用手册…</div>}><HelpPage /></Suspense>;
+  }
   if ((location.pathname === '/chat' || /^\/kbs\/[^/]+\/chat(?:\/.*)?$/.test(location.pathname)) && isSystemAdmin(auth.user)) {
     return <Navigate to="/admin/governance" replace />;
   }

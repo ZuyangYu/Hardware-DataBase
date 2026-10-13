@@ -20,6 +20,7 @@ from src.api.routes import (
     attachments,
     auth,
     config,
+    costs,
     conversations,
     departments,
     doc_assets,
@@ -35,6 +36,8 @@ from src.api.routes import (
     parse_tasks,
     plugins,
     query,
+    quality,
+    quality_workflow,
     exports,
     status,
     sandbox,
@@ -115,6 +118,23 @@ async def lifespan(app: FastAPI):
     # P0-008: fail fast on provider selections that cannot run; never fall back
     # to a silently created local database.
     src.settings.validate_provider_configuration()
+    from pathlib import Path
+    from src.evaluation.execution import EvaluationExecutionLedger
+
+    EvaluationExecutionLedger(Path(src.settings.STORAGE_DIR) / "evaluations")
+    from src.quality.store import QualityStore
+
+    if src.settings.CONTROL_PLANE_BACKEND == "sqlite":
+        from src.core.conversation import ConversationService
+
+        ConversationService()
+    QualityStore()
+    from src.costs.store import CostStore
+
+    CostStore()
+    from src.quality.workflow import WorkflowStore
+
+    WorkflowStore()
     # Redis 是硬依赖（REDIS_REQUIRED=true，默认）：未配置或不可达时拒绝启动，
     # 不提供"降级成 DB 轮询"的运行形态。
     from src.core.redis_client import assert_redis_ready
@@ -145,6 +165,8 @@ async def lifespan(app: FastAPI):
         modules.append("src.result_exports.worker")
     if _should_spawn_memory_worker():
         modules.append("src.memory.worker")
+    if os.getenv("HDB_API_SPAWN_QUALITY_WORKER", "1").lower() not in {"0", "false", "no", "off"}:
+        modules.append("src.quality.worker")
     supervisor = WorkerSupervisor(modules, src.settings.BASE_DIR)
     sandbox_dispatcher = None
     sandbox_reconciler = None
@@ -205,6 +227,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         supervisor.stop()
+        from src.costs.sink import shutdown_sinks
+
+        shutdown_sinks()
         if sandbox_dispatcher is not None:
             sandbox_dispatcher.stop()
         if sandbox_reconciler is not None:
@@ -284,6 +309,9 @@ def create_app() -> FastAPI:
     app.include_router(files.router, prefix=api_v1)
     app.include_router(parse_tasks.router, prefix=api_v1)
     app.include_router(query.router, prefix=api_v1)
+    app.include_router(quality.router, prefix=api_v1)
+    app.include_router(costs.router, prefix=api_v1)
+    app.include_router(quality_workflow.router, prefix=api_v1)
     app.include_router(exports.router, prefix=api_v1)
     app.include_router(upload.router, prefix=api_v1)
     app.include_router(users.router, prefix=api_v1)

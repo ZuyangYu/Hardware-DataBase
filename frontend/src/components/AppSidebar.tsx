@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
+import { BookOpen } from 'lucide-react';
 
 import {
   Sidebar,
@@ -26,8 +27,8 @@ import { cn } from '@/lib/utils';
 import AccountSettingsDialog from '@/components/AccountSettingsDialog';
 import AppIcon from '@/components/AppIcon';
 import BrandLogo from './BrandLogo';
-import { useIsMobile } from '@/hooks/use-mobile';
-import { hasDashboardAccess, isSystemAdmin, ROLE_LABELS, type AuthSession } from '../auth';
+import { isEmployee, ROLE_LABELS, type AuthSession } from '../auth';
+import { isPrimaryNavItemActive, primaryNavigationItems } from '@/lib/navigation';
 
 type Props = {
   auth: AuthSession;
@@ -47,6 +48,7 @@ function PrimaryNavButton({
   disabled,
   onClick,
   tooltip,
+  className,
 }: {
   label: string;
   iconName: Parameters<typeof AppIcon>[0]['name'];
@@ -55,9 +57,10 @@ function PrimaryNavButton({
   disabled?: boolean;
   onClick: () => void;
   tooltip?: string;
+  className?: string;
 }) {
   return (
-    <SidebarMenuItem className={cn('relative', collapsed ? 'flex w-full justify-center' : 'w-full')}>
+    <SidebarMenuItem className={cn('relative', collapsed ? 'flex w-full justify-center' : 'w-full', className)}>
       {active && !collapsed && (
         <span
           className={cn(
@@ -75,33 +78,25 @@ function PrimaryNavButton({
       <SidebarMenuButton
         tooltip={tooltip ?? label}
         isActive={active}
+        aria-current={active ? 'page' : undefined}
         disabled={disabled}
         onClick={onClick}
         className={cn(
-          'text-[14px] text-sidebar-foreground',
+          'text-[14px] text-sidebar-foreground md:text-[15px]',
           collapsed
             ? 'mx-auto flex h-[46px]! w-[46px]! flex-none items-center justify-center rounded-[13px]! p-0!'
             : 'h-[46px] gap-[12px] rounded-[14px] px-[16px] py-[10px]',
           'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
           active && 'bg-[#eceff4] text-[#18181a] shadow-[inset_0_0_0_1px_#e1e5ee]',
-          'data-active:bg-[#eceff4] data-active:text-[#18181a] data-active:font-semibold',
+          'data-[active=true]:bg-[#eceff4] data-[active=true]:text-[#18181a] data-[active=true]:font-semibold',
         )}
       >
         <AppIcon name={iconName} size={collapsed ? 21 : 20} className={cn('shrink-0', active && 'text-[#18181a]')} />
         {!collapsed && (
-          <span className={cn('text-[14px]', active && 'font-semibold text-[#18181a]')}>{label}</span>
+          <span className={cn('text-[14px] md:text-[15px]', active && 'font-semibold text-[#18181a]')}>{label}</span>
         )}
       </SidebarMenuButton>
     </SidebarMenuItem>
-  );
-}
-
-/** 分组标签:照搬 GroupLabel。 */
-function GroupLabel({ children }: { children: string }) {
-  return (
-    <span className="px-[8px] pt-[8px] pb-[3px] text-[11px] leading-none text-[#464c5e]">
-      {children}
-    </span>
   );
 }
 
@@ -110,8 +105,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
   const location = useLocation();
   const { toggleSidebar, state, isMobile, openMobile, setOpenMobile } = useSidebar();
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const sysAdmin = isSystemAdmin(auth.user);
-  const anyAdmin = hasDashboardAccess(auth.user);
+  const primaryItems = primaryNavigationItems(auth.user);
   const initial = auth.user.username.slice(0, 1).toUpperCase();
   const collapsed = !isMobile && state === 'collapsed';
   /** 抽屉内导航:跳转后自动收起,避免遮挡目标页面。 */
@@ -163,202 +157,73 @@ export default function AppSidebar({ auth, onLogout }: Props) {
         </SidebarHeader>
         )}
 
-        {/* 导航:铺平,无分组卡片。内容管理是 KB 下钻,不作为侧边栏常驻模块。 */}
+        {/* 只保留一级工作区;具体页面在 AppHeader 下的二级导航中切换。 */}
         <SidebarContent className={cn(collapsed ? 'items-center justify-center px-0 py-[14px]' : 'px-[16px] pt-[14px]')}>
-          {!sysAdmin && (
-            <SidebarMenu className={cn(collapsed ? 'items-center gap-[12px]' : 'gap-[8px]')}>
-              <PrimaryNavButton
-                label="资产中心"
-                iconName="grid"
-                active={location.pathname === '/assets'}
-                collapsed={collapsed}
-                onClick={() => navigateAndClose('/assets')}
-                tooltip="资产中心"
-              />
-              <PrimaryNavButton
-                label="全部知识库"
-                iconName="database"
-                active={location.pathname === '/kbs' || location.pathname.startsWith('/kbs/')}
-                collapsed={collapsed}
-                onClick={() => navigateAndClose('/kbs')}
-                tooltip="全部知识库"
-              />
-              <PrimaryNavButton
-                label="对话"
-                iconName="send"
-                active={location.pathname === '/chat'}
-                collapsed={collapsed}
-                onClick={() => navigateAndClose('/chat')}
-                tooltip="对话"
-              />
-              <PrimaryNavButton
-                label="长期记忆"
-                iconName="history"
-                active={location.pathname === '/memory'}
-                collapsed={collapsed}
-                onClick={() => navigateAndClose('/memory')}
-                tooltip="长期记忆"
-              />
-              <PrimaryNavButton
-                label="扩展"
-                iconName="tool"
-                active={location.pathname === '/extensions'}
-                collapsed={collapsed}
-                onClick={() => navigateAndClose('/extensions')}
-                tooltip="外部扩展"
-              />
-            </SidebarMenu>
-          )}
-
-          {anyAdmin && (
-            <>
-              <div
-                className={cn(
-                  'h-px bg-sidebar-border',
-                  collapsed ? 'mx-auto my-[20px] w-[30px]' : 'w-full',
-                  !collapsed && !sysAdmin ? 'my-[22px]' : !collapsed && 'my-[18px]',
-                )}
-              />
-              <SidebarMenu
-                className={cn(
-                  collapsed ? 'items-center gap-[12px]' : 'gap-[8px]',
-                  !collapsed && !sysAdmin && 'mt-[2px]',
-                  !collapsed && sysAdmin && 'mt-[6px]',
-                )}
-              >
-                {sysAdmin && (
-                  <PrimaryNavButton
-                    label="员工管理"
-                    iconName="user"
-                    active={location.pathname === '/admin/users'}
-                    collapsed={collapsed}
-                    onClick={() => navigateAndClose('/admin/users')}
-                    tooltip="员工管理"
-                  />
-                )}
-                {sysAdmin && (
-                  <PrimaryNavButton
-                    label="部门管理"
-                    iconName="folder"
-                    active={location.pathname === '/admin/departments'}
-                    collapsed={collapsed}
-                    onClick={() => navigateAndClose('/admin/departments')}
-                    tooltip="部门管理"
-                  />
-                )}
-                {sysAdmin && (
-                  <PrimaryNavButton
-                    label="知识库挂载"
-                    iconName="lock"
-                    active={location.pathname === '/admin/kb-mount'}
-                    collapsed={collapsed}
-                    onClick={() => navigateAndClose('/admin/kb-mount')}
-                    tooltip="知识库挂载"
-                  />
-                )}
+          <SidebarMenu className={cn(collapsed ? 'items-center gap-[12px]' : 'gap-[8px]')}>
+            {primaryItems.map((item, itemIndex) => {
+              const active = isPrimaryNavItemActive(item, location.pathname);
+              const separated = itemIndex > 0 && (item.id === 'governance' || item.id === 'management');
+              return (
                 <PrimaryNavButton
-                  label="治理面板"
-                  iconName="grid"
-                  active={location.pathname === '/admin/governance'}
+                  key={item.id}
+                  label={item.label}
+                  iconName={item.icon}
+                  active={active}
                   collapsed={collapsed}
-                  onClick={() => navigateAndClose('/admin/governance')}
-                  tooltip="知识库治理"
+                  onClick={() => navigateAndClose(item.path)}
+                  tooltip={`${item.label}：${item.description}`}
+                  className={cn(
+                    separated && !collapsed && 'mt-[12px] border-t border-sidebar-border pt-[16px]',
+                    separated && collapsed && 'mt-[10px] border-t border-sidebar-border pt-[12px]',
+                  )}
                 />
-                <PrimaryNavButton
-                  label="日志中心"
-                  iconName="history"
-                  active={location.pathname === '/admin/logs'}
-                  collapsed={collapsed}
-                  onClick={() => navigateAndClose('/admin/logs')}
-                  tooltip="日志中心"
-                />
-                <PrimaryNavButton
-                  label="质量工作台"
-                  iconName="grid"
-                  active={location.pathname === '/admin/quality'}
-                  collapsed={collapsed}
-                  onClick={() => navigateAndClose('/admin/quality')}
-                  tooltip="生产反馈与案例复核"
-                />
-                <PrimaryNavButton label="成本与用量" iconName="grid" active={location.pathname === '/admin/costs'} collapsed={collapsed} onClick={() => navigateAndClose('/admin/costs')} tooltip="调用费用与覆盖率" />
-                {sysAdmin && (
-                  <PrimaryNavButton
-                    label="系统状态"
-                    iconName="refresh"
-                    active={location.pathname === '/admin/status'}
-                    collapsed={collapsed}
-                    onClick={() => navigateAndClose('/admin/status')}
-                    tooltip="系统状态"
-                  />
-                )}
-                {sysAdmin && (
-                  <PrimaryNavButton
-                    label="扩展插件"
-                    iconName="tool"
-                    active={location.pathname === '/admin/plugins'}
-                    collapsed={collapsed}
-                    onClick={() => navigateAndClose('/admin/plugins')}
-                    tooltip="外部 MCP 扩展"
-                  />
-                )}
-                {sysAdmin && (
-                  <PrimaryNavButton
-                    label="系统配置"
-                    iconName="tool"
-                    active={location.pathname === '/admin/config'}
-                    collapsed={collapsed}
-                    onClick={() => navigateAndClose('/admin/config')}
-                    tooltip="系统配置"
-                  />
-                )}
-                {sysAdmin && (
-                  <PrimaryNavButton
-                    label="RAGAS 评估"
-                    iconName="grid"
-                    active={location.pathname === '/admin/evaluation'}
-                    collapsed={collapsed}
-                    onClick={() => navigateAndClose('/admin/evaluation')}
-                    tooltip="RAGAS 评估"
-                  />
-                )}
-              </SidebarMenu>
-            </>
-          )}
+              );
+            })}
+          </SidebarMenu>
         </SidebarContent>
 
         {/* 底部:用户菜单(保留退出;AppHeader 也有,这里冗余但常见) */}
         <SidebarFooter className="px-[20px] pb-[20px] group-data-[collapsible=icon]:px-[12px]">
-          {collapsed ? (
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              title="个人设置"
-              aria-label="个人设置"
-              className="flex w-full items-center justify-center rounded-[14px] px-0 py-[8px] text-left transition-colors hover:bg-sidebar-accent"
-            >
-              <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] text-[13px] font-bold text-[#7e96dc]">
-                {initial}
-              </span>
-            </button>
-          ) : (
-            <DropdownMenu>
+          <SidebarMenu className="mb-2">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                asChild
+                tooltip="使用帮助（在新标签页打开）"
+                className={cn(
+                  'h-[40px] rounded-[12px] text-[14px] text-[#5b6478]',
+                  collapsed ? 'mx-auto flex h-[46px]! w-[46px]! justify-center p-0!' : 'gap-[10px] px-[8px]',
+                )}
+              >
+                <a href="/help" target="_blank" rel="noopener noreferrer" aria-label="使用帮助" title="使用帮助（在新标签页打开）">
+                  <BookOpen className="size-[20px] shrink-0" aria-hidden="true" />
+                  {!collapsed && <span>使用帮助</span>}
+                  <span className="sr-only">在新标签页打开</span>
+                </a>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </SidebarMenu>
+          <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  className="flex w-full items-center gap-[10px] rounded-[14px] px-[8px] py-[8px] text-left transition-colors hover:bg-sidebar-accent"
+                  aria-label="打开个人菜单"
+                  className={cn(
+                    'flex w-full items-center rounded-[14px] py-[8px] text-left transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring',
+                    collapsed ? 'justify-center px-0' : 'gap-[10px] px-[8px]',
+                  )}
                 >
                   <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] text-[13px] font-bold text-[#7e96dc]">
                     {initial}
                   </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[13px] font-semibold text-foreground">
+                  {!collapsed && <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[13px] font-semibold text-foreground md:text-[14px]">
                       {auth.user.username}
                     </span>
-                    <span className="block truncate text-[11px] text-muted-foreground">
+                    <span className="block truncate text-[11px] text-muted-foreground md:text-[12px]">
                       {ROLE_LABELS[auth.user.role]}
                       {auth.user.department_name ? ` · ${auth.user.department_name}` : ''}
                     </span>
-                  </span>
+                  </span>}
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent side="top" align="start" className="w-[200px] rounded-[14px] border-0 bg-white p-[6px] shadow-[0px_16px_15px_rgba(0,0,0,0.1)] ring-0 [--accent:#F6F6F6] [--accent-foreground:#18181A]">
@@ -369,6 +234,15 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                   <AppIcon name="user" size={16} />
                   个人设置
                 </DropdownMenuItem>
+                {isEmployee(auth.user) && (
+                  <DropdownMenuItem
+                    onSelect={() => navigateAndClose('/memory')}
+                    className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
+                  >
+                    <AppIcon name="history" size={16} />
+                    长期记忆
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem
                   onSelect={onLogout}
                   className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
@@ -378,7 +252,6 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-          )}
         </SidebarFooter>
       </div>
   );

@@ -49,6 +49,8 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 改导出 / 外部对话 / 评估 | [16-exports-and-external-conversations.md](16-exports-and-external-conversations.md) / [17-evaluation.md](17-evaluation.md) |
 | 改前端 | [19-frontend.md](19-frontend.md) |
 | 改模型/并发/限流 | [07-model-and-resources.md](07-model-and-resources.md) |
+| 改生产反馈/授权复核 | [25-production-quality-feedback.md](25-production-quality-feedback.md) |
+| 改固定实验/费用账本 | [26-quality-experiments-cost-ledger.md](26-quality-experiments-cost-ledger.md) |
 | 接入/维护 MCP、Skill 或 Sandbox 扩展 | [22-external-extensions.md](22-external-extensions.md) + [操作指南](../docs/mcp-plugins.md) |
 | 上生产/扩容/排障 | [18-observability-and-ops.md](18-observability-and-ops.md) + [20-config-and-storage.md](20-config-and-storage.md) |
 | 踩坑预警 | [21-gotchas-and-extension-guide.md](21-gotchas-and-extension-guide.md) |
@@ -83,6 +85,9 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 22 | [external-extensions](22-external-extensions.md) | MCP、文本/执行型 Skill、Sandbox Gateway/Runner 的权限边界、生命周期、产物与可观测性 |
 | 23 | [reliability-improvement-plan](23-reliability-improvement-plan.md) | 可靠性修复计划、验收标准、执行记录与真实部署验证入口 |
 | 24 | [mainstream-frontier-gap-analysis](24-mainstream-frontier-gap-analysis.md) | 主流/前沿对标、可复现评测缺陷、质量闭环与生产验证完善建议 |
+| 25 | [production-quality-feedback](25-production-quality-feedback.md) | 固定回答/证据、反馈幂等、指定员工共享/撤销、复核队列、事务 outbox 与 Phoenix 标量投影 |
+| 26 | [quality-experiments-cost-ledger](26-quality-experiments-cost-ledger.md) | 授权数据集、固定证据回答实验、发布/回访、调用费用、spool、确定性报告与聊天 SLO |
+| 27 | [production-feedback-cost-observability-plan](../docs/superpowers/plans/2026-10-8-production-feedback-cost-observability-plan.md) / [实施记录](../docs/superpowers/plans/2026-10-8-production-feedback-cost-observability-implementation.md) | 生产反馈闭环、调用级成本归因、Phoenix 分析报告与优化工作台、Collector/SLO 与分阶段验收 |
 
 ---
 

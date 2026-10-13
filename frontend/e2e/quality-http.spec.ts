@@ -30,6 +30,8 @@ test('administrator workbench loads and creates a report without randomUUID', as
   expect(await page.evaluate(() => typeof crypto.randomUUID)).toBe('undefined');
   await expect(page.getByRole('heading', { name: '案例队列' })).toBeVisible();
   await expect(page.getByText('当前范围暂无案例')).toBeVisible();
+  await expect(page.getByLabel('案例状态').locator('option[value="triaged"]')).toHaveCount(0);
+  await expect(page.getByLabel('案例状态').locator('option[value="dataset_ready"]')).toHaveCount(0);
   await page.getByRole('button', { name: '生成统计报告', exact: true }).click();
   await expect(page.locator('summary').filter({ hasText: '0 案例 · 0 调用 · 0 未知费用' })).toBeVisible();
   expect(requestIds).toHaveLength(1);
@@ -76,4 +78,76 @@ test('administrator case detail explains the issue from safe metadata', async ({
   await expect(page.getByText(/候选必须通过质量门禁/)).toBeVisible();
   await expect(page.getByText(/Private|原始问答内容/)).toHaveCount(0);
   await expect(page.getByText('补充说明原文仅对原用户或明确授权的员工开放。', { exact: true })).toBeVisible();
+});
+
+test('administrator can request owner review without receiving private content', async ({ page }) => {
+  const user = { username: 'http-admin', role: 'system_admin', department_id: null, department_name: null };
+  const detail = {
+    case_id: 'case-request', snapshot_id: 'snapshot-request', turn_id: 'turn-request', assistant_message_id: 12,
+    answer_revision: 'b'.repeat(64), department_id: 47, status: 'new', row_version: 1,
+    triggers: ['feedback'], sampling: {}, manifest: {}, content: {}, content_access: 'hidden', source_valid: true,
+    share: { active: false }, feedback: null, feedback_history: [], reviews: [], review_requests: [],
+    created_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z', projection_status: [],
+  };
+  let requestBody: Record<string, unknown> | null = null;
+  await page.addInitScript((sessionUser) => {
+    localStorage.setItem('hdb_auth_session', JSON.stringify({ token: 'request-regression-only', user: sessionUser }));
+  }, user);
+  await page.route('**/api/v1/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/v1/whoami') return route.fulfill({ json: user });
+    if (path === '/api/v1/quality/cases') return route.fulfill({ json: [] });
+    if (path === '/api/v1/quality/cases/case-request') return route.fulfill({ json: detail });
+    if (path === '/api/v1/quality/reports') return route.fulfill({ json: [] });
+    if (path === '/api/v1/notifications') return route.fulfill({ json: { items: [], unread_count: 0 } });
+    if (path === '/api/v1/quality/cases/case-request/review-requests' && route.request().method() === 'POST') {
+      requestBody = route.request().postDataJSON();
+      return route.fulfill({ json: { request_id: 'request-1', status: 'pending', created: true } });
+    }
+    return route.fulfill({ status: 404, json: { detail: 'unexpected review request API request' } });
+  });
+  await page.goto('/admin/quality?case=case-request');
+  await page.getByRole('button', { name: '向原回答用户发起复核请求', exact: true }).click();
+  await expect(page.getByText('复核请求已发出，等待原回答用户确认共享范围。', { exact: true })).toBeVisible();
+  expect(requestBody).toMatchObject({ row_version: 1, message: expect.any(String) });
+});
+
+test('owner can choose reviewers and approve a review request', async ({ page }) => {
+  const user = { username: 'http-owner', role: 'employee', department_id: 47, department_name: 'ADAS' };
+  const pendingDetail = {
+    case_id: 'case-owner-request', snapshot_id: 'snapshot-owner-request', turn_id: 'turn-owner-request', assistant_message_id: 13,
+    answer_revision: 'c'.repeat(64), department_id: 47, status: 'new', row_version: 2,
+    triggers: ['feedback'], sampling: {}, manifest: {}, content: { query: 'q', answer: 'a', evidence: [] }, content_access: 'owner', source_valid: true,
+    share: { active: false }, feedback: null, feedback_history: [], reviews: [],
+    review_requests: [{ request_id: 'request-owner-1', status: 'pending', message: '请协助复核', created_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z', decided_at: null }],
+    created_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z', projection_status: [],
+  };
+  let approved = false;
+  let approvalBody: Record<string, unknown> | null = null;
+  await page.addInitScript((sessionUser) => {
+    localStorage.setItem('hdb_auth_session', JSON.stringify({ token: 'owner-request-regression-only', user: sessionUser }));
+  }, user);
+  await page.route('**/api/v1/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/v1/whoami') return route.fulfill({ json: user });
+    if (path === '/api/v1/quality/cases') return route.fulfill({ json: [pendingDetail] });
+    if (path === '/api/v1/quality/cases/case-owner-request') {
+      return route.fulfill({ json: approved ? { ...pendingDetail, row_version: 3, review_requests: [{ ...pendingDetail.review_requests[0], status: 'approved', decided_at: '2026-10-09T00:01:00Z' }], share: { active: true, reviewer_user_ids: [2] } } : pendingDetail });
+    }
+    if (path === '/api/v1/quality/reviewers') return route.fulfill({ json: [{ id: 2, username: 'reviewer' }] });
+    if (path === '/api/v1/quality/reports') return route.fulfill({ json: [] });
+    if (path === '/api/v1/notifications') return route.fulfill({ json: { items: [], unread_count: 0 } });
+    if (path === '/api/v1/quality/cases/case-owner-request/review-requests/request-owner-1/approve' && route.request().method() === 'POST') {
+      approvalBody = route.request().postDataJSON();
+      approved = true;
+      return route.fulfill({ json: { ...pendingDetail, row_version: 3, review_requests: [{ ...pendingDetail.review_requests[0], status: 'approved' }], share: { active: true, reviewer_user_ids: [2] } } });
+    }
+    return route.fulfill({ status: 404, json: { detail: 'unexpected owner review API request' } });
+  });
+  await page.goto('/admin/quality?case=case-owner-request');
+  await expect(page.getByRole('heading', { name: '待处理的复核请求', exact: true })).toBeVisible();
+  await page.getByLabel('reviewer', { exact: true }).check();
+  await page.getByRole('button', { name: '批准并共享复核材料', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '待处理的复核请求', exact: true })).toBeHidden();
+  expect(approvalBody).toMatchObject({ row_version: 2, reviewer_user_ids: [2], fields: ['query', 'answer'], retention_days: 7 });
 });

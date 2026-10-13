@@ -289,19 +289,24 @@ class HardwareWorker:
                     record_worker(status="success", duration_s=time.monotonic() - started)
                     continue
                 if job.operation == "generate_work_order":
-                    result = self.pipeline.continue_knowledge_base_document_generation(
-                        ctx, work_order_id, should_cancel=document_job_cancelled,
-                    )
+                    from src.costs.context import call_context
+
+                    with call_context(task_type="authoring", task_id=job.job_id, owner_user_id=getattr(user, "id", None),
+                                      department_id=getattr(user, "department_id", None), purpose="authoring", execution_attempt_id=str(job.lease_token)):
+                        result = self.pipeline.continue_knowledge_base_document_generation(
+                            ctx, work_order_id, should_cancel=document_job_cancelled,
+                        )
                 else:
                     harness_run_id = str(payload.get("harness_run_id") or "").strip()
                     if not harness_run_id:
                         raise ValueError("resume document authoring job payload is incomplete")
-                    result = self.pipeline.resume_knowledge_base_document_generation_run(
-                        ctx,
-                        work_order_id,
-                        harness_run_id,
-                        should_cancel=document_job_cancelled,
-                    )
+                    from src.costs.context import call_context
+
+                    with call_context(task_type="authoring", task_id=job.job_id, owner_user_id=getattr(user, "id", None),
+                                      department_id=getattr(user, "department_id", None), purpose="authoring", execution_attempt_id=str(job.lease_token)):
+                        result = self.pipeline.resume_knowledge_base_document_generation_run(
+                            ctx, work_order_id, harness_run_id, should_cancel=document_job_cancelled,
+                        )
                 artifact_id = getattr(result, "artifact_id", None)
                 conversion_job_id = None
                 requested_output_format = str(payload.get("requested_output_format") or "native").strip().lower()

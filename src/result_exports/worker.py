@@ -193,11 +193,14 @@ class ResultExportWorker:
                     raise KeyError("result snapshot not found")
                 render_envelope = _render_envelope(snapshot, job)
                 if _should_organize(job):
-                    render_envelope = organize_envelope(
-                        render_envelope,
-                        formats=[job.format],
-                        include_citations=job.options.get("include_citations") is not False,
-                    )
+                    from src.costs.context import call_context, numeric_identity
+
+                    with call_context(task_type="export", task_id=job.export_job_id, purpose="authoring",
+                                      owner_user_id=numeric_identity(job.owner_user_id), department_id=numeric_identity(job.department_id),
+                                      execution_attempt_id=str(job.lease_token)):
+                        render_envelope = organize_envelope(
+                            render_envelope, formats=[job.format], include_citations=job.options.get("include_citations") is not False,
+                        )
                 render_started_at = time.monotonic()
                 rendered = render_result(
                     render_envelope,

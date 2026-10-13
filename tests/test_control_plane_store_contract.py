@@ -16,6 +16,7 @@ from contextlib import closing
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.rows import dict_row
 
 import src.settings
 from src.core.conversation import StaleTurnOwner
@@ -333,11 +334,15 @@ class PostgresStoreContractTests(_StoreContractScenarios, unittest.TestCase):
         )
         src.settings.CONVERSATION_SERIALIZE_SAME_THREAD = True
         with psycopg.connect(
-            self.dsn, autocommit=True, options="-c TimeZone=UTC"
+            self.dsn, autocommit=True, options="-c TimeZone=UTC", row_factory=dict_row
         ) as conn:
             conn.execute("DROP SCHEMA public CASCADE")
             conn.execute("CREATE SCHEMA public")
             apply_schema(conn, include_indexes=True)
+            from src.quality.store import initialize_schema
+            from src.storage.control_plane.sql_adapter import PgSqlAdapterConnection
+
+            initialize_schema(PgSqlAdapterConnection(conn))
         self._store = PostgresExecutionStore(self.dsn)
         self.addCleanup(self._store.close)
 

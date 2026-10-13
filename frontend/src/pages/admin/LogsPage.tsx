@@ -33,6 +33,7 @@ import {
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
 
 type Props = {
   auth: AuthSession;
@@ -55,7 +56,7 @@ export default function LogsPage({ auth, onLogout }: Props) {
   const [tab, setTab] = useState<Tab>('audit');
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <AdminPageFrame>
       <AppHeader
         title="日志中心"
         description={sysAdmin ? '全局审计日志与查询日志。' : '本部门审计日志与查询日志。'}
@@ -71,7 +72,7 @@ export default function LogsPage({ auth, onLogout }: Props) {
       </div>
 
       {tab === 'audit' ? <AuditPanel /> : <QueryPanel />}
-    </div>
+    </AdminPageFrame>
   );
 }
 

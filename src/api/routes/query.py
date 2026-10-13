@@ -18,6 +18,7 @@ from src.agents.runner import strip_narration_segments
 from src.core.app_logs import AppLogService, query_trace_status
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
+from src.costs.context import attributed, update_context
 from src.core.conversation import (
     GENERAL_CHAT_KB_NAME,
     ChatMessage,
@@ -394,6 +395,7 @@ def _bind_document_task_trace(ctx: Any, turn: ChatTurn) -> None:
     })
 
 
+@attributed("chat", "chat", "turn_id")
 def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None) -> None:
     """Own a turn independently of any one SSE subscriber.
 
@@ -405,6 +407,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     turn = conv.claim_turn(user.id, turn_id, worker_id)
     if turn is None:
         return
+    update_context(execution_attempt_id=str(getattr(turn, "attempt_id", "") or ""))
     # Execution ownership: a positive token means serialized mode and enables
     # stale-owner rejection for every later authoritative write of this turn.
     fencing_token = int(getattr(turn, "fencing_token", 0) or 0)
@@ -738,6 +741,8 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "queue_ms": queue_ms,
             "first_token_ms": first_token_ms,
             "total_ms": int((time.monotonic() - start) * 1000),
+            "accepted_to_first_token_ms": queue_ms + first_token_ms if first_token_ms is not None else None,
+            "accepted_to_terminal_ms": queue_ms + int((time.monotonic() - start) * 1000),
             "stage_durations_ms": stage_durations_ms,
             "tool_calls": tool_latencies,
             "short_term_memory": dict(short_term_memory),
@@ -888,13 +893,22 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             ]
 
         try:
+            from opentelemetry.trace import TraceFlags
+
+            context = turn_observation.span.get_span_context()
+            terminal_metrics = metrics(summary=summary)
+            terminal_metrics["quality_trace_identity"] = {
+                "trace_id": f"{context.trace_id:032x}" if context.is_valid else "",
+                "span_id": f"{context.span_id:016x}" if context.is_valid else "",
+                "sampling_status": "sampled" if context.is_valid and context.trace_flags & TraceFlags.SAMPLED else "not_sampled",
+            }
             completion = conv.complete_turn_result(
                 user.id,
                 turn_id,
                 answer,
                 summary,
                 footer,
-                metrics=metrics(summary=summary),
+                metrics=terminal_metrics,
                 worker_id=worker_id,
                 fencing_token=ownership_token,
                 expected_generation=session_generation if ownership_token else None,

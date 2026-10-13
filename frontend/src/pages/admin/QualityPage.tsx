@@ -14,12 +14,12 @@ import { LoadingState, RefreshingBadge, TableEmptyRow } from '@/components/admin
 import { CopyIconButton, CopyableTechnicalValue } from '@/components/admin/CopyableTechnicalValue';
 import { formatAbsoluteTime, formatRelativeTime } from '@/lib/formatters';
 import {
-  QUALITY_REASONS, QUALITY_STATUS, QUALITY_STATUS_TONE,
+  QUALITY_CASE_FILTER_STATUS, QUALITY_REASONS, QUALITY_STATUS, QUALITY_STATUS_TONE,
   QUALITY_JUDGMENTS, QUALITY_ROOT_CAUSES, QUALITY_CORRECTNESS,
   QUALITY_TRIGGER_LABELS, QUALITY_FEEDBACK_RATING_LABELS, QUALITY_FEEDBACK_RATING_TONE,
   QUALITY_CONTENT_ACCESS_LABELS, QUALITY_CONTENT_ACCESS_TONE, QUALITY_PROJECTION_LABELS,
 } from '@/lib/qualityLabels';
-import { AdminRemediationGuide, CaseWorkflow, QualityReports } from './QualityWorkflowPanel';
+import { AdminRemediationGuide, CaseWorkflow, QualityReports, ReviewRequestApproval } from './QualityWorkflowPanel';
 
 export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () => void }) {
   const [params, setParams] = useSearchParams();
@@ -127,7 +127,7 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
     <AppHeader title="质量工作台" />
     <AdminPageShell>
        <div className="flex flex-wrap items-center gap-3"><div className="min-w-0"><h2 className="text-lg font-semibold">案例队列</h2><p className="mt-1 text-xs text-muted-foreground">按状态定位积压案例，打开案例查看问题概览和修复门禁。</p></div>
-         <div className="ml-auto flex flex-wrap items-center gap-2"><label className="flex items-center gap-2 text-sm">状态<select aria-label="案例状态" className="rounded-md border bg-white p-2 text-sm" value={status} onChange={(e) => { setStatus(e.target.value); setOffset(0); }}><option value="">全部状态</option>{Object.entries(QUALITY_STATUS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+         <div className="ml-auto flex flex-wrap items-center gap-2"><label className="flex items-center gap-2 text-sm">状态<select aria-label="案例状态" className="rounded-md border bg-white p-2 text-sm" value={status} onChange={(e) => { setStatus(e.target.value); setOffset(0); }}><option value="">全部状态</option>{Object.entries(QUALITY_CASE_FILTER_STATUS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
          {loading && rows.length > 0 && <RefreshingBadge label="正在更新列表" />}<Button variant="outline" disabled={loading} onClick={() => void load()}>{loading ? '刷新中…' : '刷新'}</Button></div>
        </div>
       <p className="text-sm text-muted-foreground">反馈与随机抽样分别记录。复核正文仅对原会话用户或被明确授权的员工开放。</p>
@@ -160,8 +160,9 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
         <div>状态：{QUALITY_STATUS[detail.status] ?? detail.status} · 版本 {detail.row_version}</div>
         {detail.projection_status && <p className="text-xs text-muted-foreground">Phoenix 标注：{detail.projection_status.map((s) => `${QUALITY_PROJECTION_LABELS[s.status] ?? s.status} ${s.count}`).join(' · ') || '暂无标注'}</p>}
          {detail.content_access === 'hidden' && <p className="rounded-md bg-muted p-3">当前仅有元数据访问权限，正文与证据未共享或共享已失效。</p>}
-         {auth.user.role === 'system_admin' && <AdminRemediationGuide detail={detail} />}
-         <section className="rounded-md border border-amber-200 bg-amber-50/60 p-3">
+          {auth.user.role === 'system_admin' && <AdminRemediationGuide key={detail.case_id} detail={detail} />}
+          {auth.user.role === 'employee' && detail.content_access === 'owner' && <ReviewRequestApproval key={`${detail.case_id}:${detail.review_requests?.find((item) => item.status === 'pending')?.request_id ?? ''}`} detail={detail} onRefresh={async () => { setDetail(await api.get<QualityCase>(`/api/v1/quality/cases/${detail.case_id}`)); await load(); }} />}
+          <section className="rounded-md border border-amber-200 bg-amber-50/60 p-3">
            <h3 className="font-semibold">问题概览（管理员可见）</h3>
            {detail.feedback ? <div className="mt-2 grid gap-1">
              <p><span className="font-medium">用户反馈：</span>{QUALITY_FEEDBACK_RATING_LABELS[detail.feedback.rating] ?? detail.feedback.rating}</p>

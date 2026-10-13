@@ -1,4 +1,5 @@
 import os
+import json
 import stat
 import threading
 import hashlib
@@ -348,6 +349,20 @@ RESOURCE_GOVERNOR_DEPLOYMENT_ID = os.getenv("RESOURCE_GOVERNOR_DEPLOYMENT_ID", "
 CONTROL_PLANE_BACKEND = os.getenv("CONTROL_PLANE_BACKEND", "sqlite").strip().lower()
 CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
 CONTROL_PLANE_POOL_SIZE = int(os.getenv("CONTROL_PLANE_POOL_SIZE", "8"))
+EVALUATION_STORE_BACKEND = os.getenv("EVALUATION_STORE_BACKEND", "").strip().lower()
+EVALUATION_STORE_DATABASE_URL = os.getenv("EVALUATION_STORE_DATABASE_URL", "").strip()
+EVAL_EXECUTION_MODE = os.getenv("EVAL_EXECUTION_MODE", "inline").strip().lower()
+# Quality must use the control-plane database for terminal atomicity.
+QUALITY_ENABLED = os.getenv("QUALITY_ENABLED", "true").lower() == "true"
+QUALITY_CAPTURE_CONTENT = os.getenv("QUALITY_CAPTURE_CONTENT", "true").lower() == "true"
+QUALITY_SAMPLE_RATE = float(os.getenv("QUALITY_SAMPLE_RATE", "0.01"))
+QUALITY_SAMPLE_DAILY_LIMIT = int(os.getenv("QUALITY_SAMPLE_DAILY_LIMIT", "100"))
+QUALITY_PHOENIX_SYNC_ENABLED = os.getenv("QUALITY_PHOENIX_SYNC_ENABLED", "false").lower() == "true"
+QUALITY_PHOENIX_ENDPOINT = os.getenv("QUALITY_PHOENIX_ENDPOINT", "").strip()
+QUALITY_PHOENIX_API_KEY = os.getenv("QUALITY_PHOENIX_API_KEY", "").strip()
+QUALITY_PHOENIX_MAX_ATTEMPTS = int(os.getenv("QUALITY_PHOENIX_MAX_ATTEMPTS", "20"))
+COST_LEDGER_ENABLED = os.getenv("COST_LEDGER_ENABLED", "true").lower() == "true"
+COST_MODEL_REGISTRY = json.loads(os.getenv("COST_MODEL_REGISTRY", "{}"))
 # 本地台账域（projects / pipeline_documents）的存储后端。空值 = 跟随
 # CONTROL_PLANE_BACKEND（存储收敛的终态）；显式 sqlite 可以在迁移完成前
 # 让单个域先留在本地文件。DATABASE_URL 空 = CONTROL_PLANE_DATABASE_URL。
@@ -731,6 +746,9 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "CONTROL_PLANE_BACKEND",
         "CONTROL_PLANE_DATABASE_URL",
         "CONTROL_PLANE_POOL_SIZE",
+        "EVALUATION_STORE_BACKEND",
+        "EVALUATION_STORE_DATABASE_URL",
+        "EVAL_EXECUTION_MODE",
         "PROJECT_STORE_BACKEND",
         "PROJECT_STORE_DATABASE_URL",
         "PIPELINE_DOCUMENT_STORE_BACKEND",
@@ -910,6 +928,19 @@ DEFAULT_VALUES = {
     "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED": "false",
     "CONTROL_PLANE_BACKEND": "sqlite",
     "CONTROL_PLANE_DATABASE_URL": "",
+    "EVALUATION_STORE_BACKEND": "",
+    "EVALUATION_STORE_DATABASE_URL": "",
+    "EVAL_EXECUTION_MODE": "inline",
+    "QUALITY_ENABLED": "true",
+    "QUALITY_CAPTURE_CONTENT": "true",
+    "QUALITY_SAMPLE_RATE": "0.01",
+    "QUALITY_SAMPLE_DAILY_LIMIT": "100",
+    "QUALITY_PHOENIX_SYNC_ENABLED": "false",
+    "QUALITY_PHOENIX_ENDPOINT": "",
+    "QUALITY_PHOENIX_API_KEY": "",
+    "QUALITY_PHOENIX_MAX_ATTEMPTS": "20",
+    "COST_LEDGER_ENABLED": "true",
+    "COST_MODEL_REGISTRY": "{}",
     "PROJECT_STORE_BACKEND": "",
     "PROJECT_STORE_DATABASE_URL": "",
     "PIPELINE_DOCUMENT_STORE_BACKEND": "",
@@ -1171,6 +1202,11 @@ def _reload_settings():
     global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
     global RESOURCE_GOVERNOR_DEPLOYMENT_ID, RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED
     global CONTROL_PLANE_BACKEND, CONTROL_PLANE_DATABASE_URL, CONTROL_PLANE_POOL_SIZE
+    global EVALUATION_STORE_BACKEND, EVALUATION_STORE_DATABASE_URL
+    global EVAL_EXECUTION_MODE
+    global QUALITY_ENABLED, QUALITY_CAPTURE_CONTENT, QUALITY_SAMPLE_RATE, QUALITY_SAMPLE_DAILY_LIMIT
+    global QUALITY_PHOENIX_SYNC_ENABLED, QUALITY_PHOENIX_ENDPOINT, QUALITY_PHOENIX_API_KEY, QUALITY_PHOENIX_MAX_ATTEMPTS
+    global COST_LEDGER_ENABLED, COST_MODEL_REGISTRY
     global PROJECT_STORE_BACKEND, PROJECT_STORE_DATABASE_URL
     global PIPELINE_DOCUMENT_STORE_BACKEND, PIPELINE_DOCUMENT_DATABASE_URL
     global AUTHORING_STORE_BACKEND, AUTHORING_STORE_DATABASE_URL
@@ -1418,6 +1454,19 @@ def _reload_settings():
     CONTROL_PLANE_BACKEND = os.getenv("CONTROL_PLANE_BACKEND", "sqlite").strip().lower()
     CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
     CONTROL_PLANE_POOL_SIZE = int(os.getenv("CONTROL_PLANE_POOL_SIZE", "8"))
+    EVALUATION_STORE_BACKEND = os.getenv("EVALUATION_STORE_BACKEND", "").strip().lower()
+    EVALUATION_STORE_DATABASE_URL = os.getenv("EVALUATION_STORE_DATABASE_URL", "").strip()
+    EVAL_EXECUTION_MODE = os.getenv("EVAL_EXECUTION_MODE", "inline").strip().lower()
+    QUALITY_ENABLED = os.getenv("QUALITY_ENABLED", "true").lower() == "true"
+    QUALITY_CAPTURE_CONTENT = os.getenv("QUALITY_CAPTURE_CONTENT", "true").lower() == "true"
+    QUALITY_SAMPLE_RATE = float(os.getenv("QUALITY_SAMPLE_RATE", "0.01"))
+    QUALITY_SAMPLE_DAILY_LIMIT = int(os.getenv("QUALITY_SAMPLE_DAILY_LIMIT", "100"))
+    QUALITY_PHOENIX_SYNC_ENABLED = os.getenv("QUALITY_PHOENIX_SYNC_ENABLED", "false").lower() == "true"
+    QUALITY_PHOENIX_ENDPOINT = os.getenv("QUALITY_PHOENIX_ENDPOINT", "").strip()
+    QUALITY_PHOENIX_API_KEY = os.getenv("QUALITY_PHOENIX_API_KEY", "").strip()
+    QUALITY_PHOENIX_MAX_ATTEMPTS = int(os.getenv("QUALITY_PHOENIX_MAX_ATTEMPTS", "20"))
+    COST_LEDGER_ENABLED = os.getenv("COST_LEDGER_ENABLED", "true").lower() == "true"
+    COST_MODEL_REGISTRY = json.loads(os.getenv("COST_MODEL_REGISTRY", "{}"))
     PROJECT_STORE_BACKEND = os.getenv("PROJECT_STORE_BACKEND", "").strip().lower()
     PROJECT_STORE_DATABASE_URL = os.getenv("PROJECT_STORE_DATABASE_URL", "").strip()
     PIPELINE_DOCUMENT_STORE_BACKEND = os.getenv(
@@ -2093,7 +2142,7 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
 
     # 本地台账域（存储收敛）：显式 postgres 必须给出可达目标；空值跟随
     # CONTROL_PLANE_*，由 resolve_domain_backend 在运行时解析。
-    for domain_prefix in ("PROJECT_STORE", "PIPELINE_DOCUMENT", "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE"):
+    for domain_prefix in ("PROJECT_STORE", "PIPELINE_DOCUMENT", "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE", "EVALUATION_STORE"):
         domain_backend = _value(f"{domain_prefix}_BACKEND").lower()
         if domain_backend and domain_backend not in {"sqlite", "postgres"}:
             raise ValueError(
@@ -2145,6 +2194,15 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
             )
 
     control_backend = _value("CONTROL_PLANE_BACKEND").lower() or "sqlite"
+    if _value("EVAL_EXECUTION_MODE").lower() not in {"inline", "worker"}:
+        raise ValueError("EVAL_EXECUTION_MODE 必须是 inline 或 worker")
+    import math
+
+    quality_rate = float(_value("QUALITY_SAMPLE_RATE"))
+    if not math.isfinite(quality_rate) or not 0 <= quality_rate <= 1:
+        raise ValueError("QUALITY_SAMPLE_RATE 必须是 0 到 1 之间的有限数值")
+    if int(_value("QUALITY_SAMPLE_DAILY_LIMIT")) < 0 or int(_value("QUALITY_PHOENIX_MAX_ATTEMPTS")) < 1:
+        raise ValueError("质量抽样日上限不能为负，Phoenix 最大投递次数必须至少为 1")
     if control_backend not in {"sqlite", "postgres"}:
         raise ValueError(
             f"CONTROL_PLANE_BACKEND 必须是 sqlite 或 postgres，当前值: {control_backend!r}"

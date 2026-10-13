@@ -3,6 +3,9 @@
 日期：2026-10-08。评审对象：`Hardware-DataBase-observability` 当前工作区，
 `develop` / `62a85a7`，**包含已有未提交的可靠性改造**。
 
+实施跟进：随后从 `a2396d6` 开始落地 P0（G01–G03），本页保留原始复现证据；
+当前代码契约和验收状态见 [实施记录](../docs/superpowers/plans/2026-10-8-production-feedback-cost-observability-implementation.md)。
+
 对应代码：`src/observability/`、`src/evaluation/`、`src/agents/`、
 `src/core/chat_model_runtime.py`、`src/pipelines/document_rag/ragflow_backend.py`、
 `deploy/observability/`、`.github/workflows/ci.yml`、`frontend/e2e/`。

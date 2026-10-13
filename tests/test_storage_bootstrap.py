@@ -65,6 +65,8 @@ class StorageBootstrapTests(unittest.TestCase):
             ("PIPELINE_DOCUMENT_STORE_BACKEND", app_settings.PIPELINE_DOCUMENT_STORE_BACKEND),
             ("AUTHORING_STORE_BACKEND", app_settings.AUTHORING_STORE_BACKEND),
             ("COMPATIBILITY_STORE_BACKEND", app_settings.COMPATIBILITY_STORE_BACKEND),
+            ("EVALUATION_STORE_BACKEND", app_settings.EVALUATION_STORE_BACKEND),
+            ("EVALUATION_STORE_DATABASE_URL", app_settings.EVALUATION_STORE_DATABASE_URL),
         ):
             self.addCleanup(setattr, app_settings, name, value)
         app_settings.CONTROL_PLANE_BACKEND = "postgres"
@@ -78,6 +80,8 @@ class StorageBootstrapTests(unittest.TestCase):
         app_settings.PIPELINE_DOCUMENT_STORE_BACKEND = ""
         app_settings.AUTHORING_STORE_BACKEND = ""
         app_settings.COMPATIBILITY_STORE_BACKEND = ""
+        app_settings.EVALUATION_STORE_BACKEND = ""
+        app_settings.EVALUATION_STORE_DATABASE_URL = ""
 
     def _table_names(self) -> set[str]:
         with psycopg.connect(self.dsn, autocommit=True) as conn:
@@ -116,6 +120,12 @@ class StorageBootstrapTests(unittest.TestCase):
         self.assertIn("pipeline_documents", tables)
         self.assertIn("template_versions", tables)
         self.assertIn("document_authoring_compatibility_events", tables)
+        self.assertIn("evaluation_execution_schema", tables)
+        self.assertIn("evaluation_execution_owners", tables)
+        self.assertTrue({"quality_schema", "quality_snapshots", "quality_cases", "quality_feedback_events", "quality_reviews", "quality_outbox"} <= tables)
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            constraints = {row[0] for row in conn.execute("SELECT conname FROM pg_constraint WHERE conname IN ('fk_chat_sessions_user', 'fk_chat_messages_session', 'fk_chat_turns_session')").fetchall()}
+        self.assertEqual(constraints, {"fk_chat_sessions_user", "fk_chat_messages_session", "fk_chat_turns_session"}, "first bootstrap must establish deletion cascades")
 
         # 幂等：再跑一次仍然成功
         self.assertEqual(bootstrap.main(), 0, "重复执行必须幂等")
@@ -151,6 +161,7 @@ class StorageBootstrapTests(unittest.TestCase):
         app_settings.AUTHORING_STORE_BACKEND = "sqlite"
         app_settings.AUTH_STORE_BACKEND = "sqlite"
         app_settings.COMPATIBILITY_STORE_BACKEND = "sqlite"
+        app_settings.EVALUATION_STORE_BACKEND = "sqlite"
         self.assertEqual(bootstrap.main(), 0, "纯 SQLite 部署下应直接通过")
         self.assertEqual(self._table_names(), set(), "不该往 PG 建任何表")
 

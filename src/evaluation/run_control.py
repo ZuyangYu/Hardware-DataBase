@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import threading
@@ -9,13 +10,21 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 import logging
+from contextlib import contextmanager
+import contextvars
 from pathlib import Path
 
 from .collection_qc import run_collection_qc
 from .cohorts import evaluation_cohort
 from .dataset_loader import load_dataset
+from .execution import (
+    EvaluationExecutionLedger, EvaluationLeaseLost, execution_context, execution_write_guard,
+)
 from .history import cohort_fingerprint
 from .reporters import write_reports
+from .reproducibility import (
+    EvaluationReproducibilityError, execution_content_hash, public_evaluator_config, scoring_rules_hash,
+)
 from .schemas import (
     AnswerSnapshot,
     EvaluationRunState,
@@ -24,7 +33,7 @@ from .schemas import (
     MetricResult,
     SampleResult,
 )
-from .service import DEFAULT_STANDARD_METRICS, new_run_id
+from .service import DEFAULT_STANDARD_METRICS, EvaluationService, new_run_id
 from .snapshot_manifest import write_snapshot_manifest
 from .snapshot_store import SnapshotStore
 from src.observability import observe, thread_with_current_context
@@ -42,6 +51,61 @@ _REPORT_ARTIFACT_NAMES = (
 )
 _DELETABLE_RUN_STATUSES = frozenset({"failed", "cancelled", "completed", "collected"})
 _EXECUTION_DATASET_NAME = "execution_dataset.jsonl"
+_LOCKED_PATHS = contextvars.ContextVar("evaluation_locked_paths", default=frozenset())
+
+try:
+    import fcntl
+except ImportError:  # Windows uses a byte-range lock.
+    fcntl = None
+
+
+class _RunFileLock:
+    """Serialize JSON state transitions across processes sharing the run root."""
+    def __init__(self, path):
+        self.path = Path(path)
+        self._local = threading.local()
+
+    @contextmanager
+    def hold(self):
+        with _STATE_LOCK:
+            key = (os.getpid(), threading.get_ident(), str(self.path.resolve()))
+            if key in _LOCKED_PATHS.get():
+                yield
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.with_suffix(".lock").open("a+b") as handle:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                else:
+                    import msvcrt
+
+                    if handle.seek(0, os.SEEK_END) == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                token = _LOCKED_PATHS.set(_LOCKED_PATHS.get() | {key})
+                try:
+                    with execution_write_guard():
+                        yield
+                finally:
+                    _LOCKED_PATHS.reset(token)
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    else:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+    def __enter__(self):
+        context = self.hold()
+        result = context.__enter__()
+        if not hasattr(self._local, "contexts"):
+            self._local.contexts = []
+        self._local.contexts.append(context)
+        return result
+
+    def __exit__(self, *args):
+        return self._local.contexts.pop().__exit__(*args)
 
 
 def _now() -> str:
@@ -63,7 +127,7 @@ def _freeze_execution_dataset(
     dataset_path: str | Path,
     run_dir: str | Path,
     samples: list[EvaluationSample],
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str]:
     """Write the normalized sample list used by a run and return its hashes."""
 
     run_path = Path(run_dir)
@@ -77,24 +141,23 @@ def _freeze_execution_dataset(
         str(execution_path),
         _sha256_file(dataset_path),
         _sha256_file(execution_path),
+        execution_content_hash(samples),
     )
 
 
 class RunStateStore:
-    _lock = _STATE_LOCK
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self._lock = _RunFileLock(self.path)
 
     def create(self, state: EvaluationRunState) -> EvaluationRunState:
         with self._lock:
             return self._write(state)
 
     def load(self) -> EvaluationRunState:
-        with self._lock:
-            return EvaluationRunState.model_validate_json(
-                self.path.read_text(encoding="utf-8")
-            )
+        # Atomic replacement makes reads safe and keeps display side-effect free.
+        return EvaluationRunState.model_validate_json(self.path.read_text(encoding="utf-8"))
 
     def mutate(
         self, mutator: Callable[[EvaluationRunState], EvaluationRunState]
@@ -417,6 +480,7 @@ class EvaluationRunController:
         self.state_root = Path(state_root)
         self._threads: dict[str, threading.Thread] = {}
         self._threads_lock = threading.RLock()
+        self.ownership = EvaluationExecutionLedger(self.state_root)
 
     def create_online_run(
         self,
@@ -437,16 +501,18 @@ class EvaluationRunController:
         validation_warnings: list[str] | None = None,
         snapshot_ownership_verified: bool = False,
         evaluation_config: dict[str, object] | None = None,
+        quality_binding: dict[str, object] | None = None,
     ) -> EvaluationRunState:
         run_id = new_run_id()
         run_dir = self.state_root / run_id
-        execution_path, source_digest, execution_digest = _freeze_execution_dataset(
+        execution_path, source_digest, execution_digest, content_digest = _freeze_execution_dataset(
             dataset_path,
             run_dir,
             samples,
         )
         denied_count = sum(sample.expected_access == "denied" for sample in samples)
         metadata = {
+            "quality_binding": dict(quality_binding or {}),
             "kb_id": kb_id,
             "kb_name": kb_name,
             "department_id": department_id,
@@ -454,6 +520,7 @@ class EvaluationRunController:
             "source_dataset_path": str(dataset_path),
             "dataset_sha256": source_digest,
             "execution_dataset_sha256": execution_digest,
+            "execution_content_sha256": content_digest,
             "dataset_total_count": dataset_total_count
             if dataset_total_count is not None
             else len(samples),
@@ -501,10 +568,11 @@ class EvaluationRunController:
         validation_warnings: list[str] | None = None,
         snapshot_ownership_verified: bool = False,
         evaluation_config: dict[str, object] | None = None,
+        quality_binding: dict[str, object] | None = None,
     ) -> EvaluationRunState:
         run_id = new_run_id()
         run_dir = self.state_root / run_id
-        execution_path, source_digest, execution_digest = _freeze_execution_dataset(
+        execution_path, source_digest, execution_digest, content_digest = _freeze_execution_dataset(
             dataset_path,
             run_dir,
             samples,
@@ -522,6 +590,7 @@ class EvaluationRunController:
             source_dataset_path=str(dataset_path),
             dataset_sha256=source_digest,
             execution_dataset_sha256=execution_digest,
+            execution_content_sha256=content_digest,
             dataset_total_count=dataset_total_count
             if dataset_total_count is not None
             else len(samples),
@@ -537,6 +606,7 @@ class EvaluationRunController:
             snapshot_ownership_verified=snapshot_ownership_verified,
             validation_warnings=list(validation_warnings or []),
             evaluation_config=dict(evaluation_config or {}),
+            quality_binding=dict(quality_binding or {}),
             total_samples=len(samples),
             sample_ids=sorted(sample_ids or []),
             tags=sorted(tags or []),
@@ -547,22 +617,34 @@ class EvaluationRunController:
             stored = self._store(run_id).load()
         return stored
 
-    def start(self, run_id: str) -> threading.Thread:
+    def start(self, run_id: str) -> threading.Thread | None:
         with self._threads_lock:
             existing = self._threads.get(run_id)
             if existing is not None and existing.is_alive():
                 raise RuntimeError(f"evaluation run {run_id!r} is already running")
-            thread = thread_with_current_context(
-                self.execute,
-                run_id,
-                daemon=True,
-                name=f"evaluation-{run_id[:16]}",
-            )
+            store = self._store(run_id)
+            with store._lock:
+                if store.load().status not in {"queued", "running", "pause_requested", "cancel_requested"}:
+                    raise ValueError("evaluation run is not executable")
+                if os.getenv("EVAL_EXECUTION_MODE", "inline") == "worker":
+                    self.ownership.enqueue(run_id)
+                    return None
+                claim = self.ownership.claim(run_id)
+            thread = thread_with_current_context(self._execute_claimed, claim, daemon=True,
+                                                 name=f"evaluation-{run_id[:16]}")
             self._threads[run_id] = thread
-            thread.start()
+            try:
+                thread.start()
+            except BaseException:
+                self.ownership.release(claim)
+                raise
             return thread
 
     def _record_snapshot_manifest(self, store: RunStateStore) -> EvaluationRunState:
+        with store._lock:
+            return self._write_snapshot_manifest(store)
+
+    def _write_snapshot_manifest(self, store: RunStateStore) -> EvaluationRunState:
         state = store.load()
         if state.kb_id is None or not Path(state.snapshot_path).is_file():
             return state
@@ -605,8 +687,7 @@ class EvaluationRunController:
     ) -> EvaluationRunState:
         state = store.load()
         public = self._service_public_metadata(service)
-        if not public:
-            return state
+        public["scoring_rules_sha256"] = scoring_rules_hash()
         evaluation_config = {**state.evaluation_config, **public}
         return store.mutate(
             lambda current: RunStateStore._with_update(
@@ -632,6 +713,7 @@ class EvaluationRunController:
             "source_dataset_path",
             "dataset_sha256",
             "execution_dataset_sha256",
+            "execution_content_sha256",
             "dataset_total_count",
             "dataset_sample_count",
             "matched_sample_count",
@@ -645,6 +727,7 @@ class EvaluationRunController:
             "llm_model",
             "embedding_model",
             "evaluation_config",
+            "quality_binding",
         )
         updates = {field: getattr(state, field) for field in fields}
         metadata = {
@@ -659,6 +742,44 @@ class EvaluationRunController:
         return summary.model_copy(update=updates)
 
     def execute(self, run_id: str) -> EvaluationRunState:
+        store = self._store(run_id)
+        with store._lock:
+            if store.load().status not in {"queued", "running", "pause_requested", "cancel_requested"}:
+                raise ValueError("evaluation run is not executable")
+            claim = self.ownership.claim(run_id)
+        return self._execute_claimed(claim)
+
+    def _execute_claimed(self, claim) -> EvaluationRunState:
+        stop = threading.Event()
+
+        def heartbeat():
+            while not stop.wait(max(0.1, self.ownership.lease_seconds / 3)):
+                try:
+                    if not self.ownership.heartbeat(claim):
+                        return
+                except Exception:
+                    logging.getLogger(__name__).exception("evaluation heartbeat failed")
+                    return
+
+        worker = threading.Thread(target=heartbeat, daemon=True, name="evaluation-heartbeat")
+        worker.start()
+        try:
+            from src.costs.context import call_context
+
+            state = self._store(claim.run_id).load()
+            with execution_context(self.ownership, claim), call_context(
+                task_type="evaluation", task_id=claim.run_id, evaluation_run_id=claim.run_id,
+                department_id=state.department_id, purpose="evaluation_judge",
+                owner_user_id=state.quality_binding.get("actor_user_id"),
+                execution_attempt_id=f"{claim.owner_id}:{claim.fencing_token}",
+            ):
+                return self._execute_observed(claim.run_id)
+        finally:
+            stop.set()
+            worker.join(timeout=2)
+            self.ownership.release(claim)
+
+    def _execute_observed(self, run_id: str) -> EvaluationRunState:
         try:
             initial_state = self._store(run_id).load()
             mode = initial_state.mode
@@ -686,6 +807,7 @@ class EvaluationRunController:
         latest_checkpoint: tuple[object, object] | None = None
         try:
             state = self._refresh_progress(store)
+            self._validate_quality_binding(state)
             if state.status == "queued":
                 store.mark_running(stage="collecting")
             elif state.status not in {"running", "pause_requested", "cancel_requested"}:
@@ -694,9 +816,13 @@ class EvaluationRunController:
             samples = self._load_samples(store.load())
             state = store.load()
             service = self.service_factory()
+            if state.quality_binding and state.mode == "online":
+                from src.quality.evaluation_bridge import FixedEvidenceRunner
+
+                service.answer_runner = FixedEvidenceRunner(state.quality_binding)
             state = self._record_service_metadata(store, service)
             if state.mode == "online":
-                errors = service.preflight_online(samples)
+                errors = [] if state.quality_binding else service.preflight_online(samples)
                 if errors:
                     return store.mark_failed(
                         f"evaluation preflight failed: {'; '.join(errors)}"
@@ -713,9 +839,12 @@ class EvaluationRunController:
                     ),
                 )
             else:
+                if state.snapshot_sha256 and _sha256_file(state.snapshot_path) != state.snapshot_sha256:
+                    raise EvaluationReproducibilityError("离线快照内容已变化，请创建新的评测运行")
                 snapshots = SnapshotStore(state.snapshot_path).load_all()
 
             self._record_snapshot_manifest(store)
+            self._validate_quality_binding(store.load())
 
             if not self._checkpoint(store):
                 return store.load()
@@ -731,23 +860,30 @@ class EvaluationRunController:
             ):
                 qc = run_collection_qc(samples, snapshots)
                 qc_path = store.path.parent / "collection_qc.json"
-                qc_path.write_text(
-                    json.dumps(qc, ensure_ascii=False, indent=1) + "\n",
-                    encoding="utf-8",
-                )
-                return store.mark_collected(str(qc.get("verdict", "")))
+                with store._lock:
+                    if not self._checkpoint(store):
+                        return store.load()
+                    qc_path.write_text(json.dumps(qc, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+                    return store.mark_collected(str(qc.get("verdict", "")))
 
             # Scoring prerequisites are checked only when this execution is
             # actually entering the scoring phase.  Online runs reach this
             # point only after the explicit post-collection start_scoring()
             # action; collection itself must not contact the judge LLM or
             # embedding endpoint.
+            if isinstance(service, EvaluationService) and service.config is None and service.ragas_adapter is None:
+                from .config import EvaluationConfig
+
+                # Freeze the same native config for preflight, checkpoints and
+                # score() rather than reading the environment at each stage.
+                service.config = EvaluationConfig.from_environment()
             scoring_preflight = getattr(service, "preflight_scoring", None)
             errors = scoring_preflight() if callable(scoring_preflight) else []
             if errors:
                 return store.mark_failed(
                     f"evaluation scoring preflight failed: {'; '.join(errors)}"
                 )
+            state = self._record_service_metadata(store, service)
 
             # 进入评分前先落定进度总数：检索样本数 × 指标数。这样前端在
             # 点击「开始评分」后立刻渲染 0/N 进度条，不必等第一组结果。
@@ -770,6 +906,7 @@ class EvaluationRunController:
             )
 
             def checkpoint(summary, results, completed_groups, total_groups):
+                self._validate_quality_binding(store.load())
                 nonlocal latest_checkpoint
                 latest_checkpoint = (summary, results)
                 store.update_scoring_progress(completed_groups, total_groups)
@@ -788,6 +925,7 @@ class EvaluationRunController:
             item_report_every = 5
 
             def item_checkpoint(summary, results, completed_items, total_items):
+                self._validate_quality_binding(store.load())
                 nonlocal last_item_report_at
                 nonlocal latest_checkpoint
                 latest_checkpoint = (summary, results)
@@ -813,12 +951,10 @@ class EvaluationRunController:
                     )
                     last_item_report_at = now
 
-            scoring_service = (
-                service if state.mode == "online" else self.service_factory()
-            )
+            scoring_service = service
             resume_mode = (store.load().evaluation_config or {}).get("scoring_resume")
             seeded_metrics = (
-                self._load_checkpoint_metrics(store.path.parent)
+                self._validated_checkpoint_metrics(store.path.parent, store.load())
                 if resume_mode == "continue"
                 else None
             )
@@ -836,83 +972,22 @@ class EvaluationRunController:
             # Persist that config after scoring as well as before collection so
             # completed reports can be compared reproducibly.
             state = self._record_service_metadata(store, scoring_service)
-            if state.status in {"pause_requested", "cancel_requested"}:
-                outcome_kind = (
-                    "partial_paused"
-                    if state.status == "pause_requested"
-                    else "partial_cancelled"
-                )
-                paths = write_reports(
-                    store.path.parent,
-                    self._decorate_summary(summary, state),
-                    results,
-                    metadata={
-                        "run_outcome": {
-                            "kind": outcome_kind,
-                            "completed_groups": state.scoring_completed_groups,
-                            "total_groups": state.scoring_total_groups,
-                        }
-                    },
-                )
-                return store.publish_partial_report(report_path=str(paths.report_html))
-            store.mutate(
-                lambda current: RunStateStore._with_update(current, stage="reporting")
-            )
-            paths = write_reports(
-                store.path.parent,
-                self._decorate_summary(summary, store.load()),
-                results,
-                metadata={
-                    "run_outcome": {
-                        "kind": "completed",
-                        "completed_groups": store.load().scoring_completed_groups,
-                        "total_groups": store.load().scoring_total_groups,
-                    }
-                },
-            )
-            state = store.load()
-            if state.status in {"pause_requested", "cancel_requested"}:
-                outcome_kind = (
-                    "partial_paused"
-                    if state.status == "pause_requested"
-                    else "partial_cancelled"
-                )
-                paths = write_reports(
-                    store.path.parent,
-                    self._decorate_summary(summary, state),
-                    results,
-                    metadata={
-                        "run_outcome": {
-                            "kind": outcome_kind,
-                            "completed_groups": state.scoring_completed_groups,
-                            "total_groups": state.scoring_total_groups,
-                        }
-                    },
-                )
-                return store.publish_partial_report(report_path=str(paths.report_html))
-            return store.complete_report_or_handle_control(
-                report_path=str(paths.report_html)
-            )
+            return self._publish_report(store, summary, results)
+        except EvaluationLeaseLost:
+            # An old worker must not publish a failure or remove its successor's files.
+            raise
+        except EvaluationReproducibilityError as exc:
+            if store.load().quality_binding:
+                from src.quality.evaluation_bridge import purge_run_material
+
+                purge_run_material(store.path.parent, store.load())
+            return store.mark_failed(str(exc))
         except Exception:
             logging.getLogger(__name__).exception("evaluation worker failed")
             if latest_checkpoint is not None:
                 summary, results = latest_checkpoint
                 try:
-                    paths = write_reports(
-                        store.path.parent,
-                        self._decorate_summary(summary, store.load()),
-                        results,
-                        metadata={
-                            "run_outcome": {
-                                "kind": "partial_failed",
-                                "completed_groups": store.load().scoring_completed_groups,
-                                "total_groups": store.load().scoring_total_groups,
-                            }
-                        },
-                    )
-                    return store.publish_partial_report(
-                        report_path=str(paths.report_html)
-                    )
+                    return self._publish_report(store, summary, results, failed=True)
                 except Exception:
                     logging.getLogger(__name__).exception(
                         "failed to publish partial evaluation report"
@@ -930,8 +1005,46 @@ class EvaluationRunController:
             except Exception:
                 return store.load()
 
+    def _publish_report(self, store, summary, results, *, failed=False):
+        # One fenced critical section covers artifacts and terminal state.
+        # A competing owner cannot publish between those two operations.
+        with store._lock:
+            state = store.load()
+            self._validate_quality_binding(state)
+
+            def publish(current):
+                kind = {
+                    "pause_requested": "partial_paused",
+                    "cancel_requested": "partial_cancelled",
+                }.get(current.status, "partial_failed" if failed else "completed")
+                return write_reports(
+                    store.path.parent, self._decorate_summary(summary, current), results,
+                    metadata={"run_outcome": {
+                        "kind": kind,
+                        "completed_groups": current.scoring_completed_groups,
+                        "total_groups": current.scoring_total_groups,
+                    }},
+                )
+
+            if state.status in {"queued", "running"}:
+                store.mutate(lambda current: RunStateStore._with_update(current, stage="reporting"))
+            paths = publish(state)
+            latest = store.load()
+            if latest.status in {"pause_requested", "cancel_requested"} or failed:
+                if latest.status != state.status:
+                    paths = publish(latest)
+                return store.publish_partial_report(report_path=str(paths.report_html))
+            return store.complete_report_or_handle_control(report_path=str(paths.report_html))
+
     def pause(self, run_id: str) -> EvaluationRunState:
         return self._store(run_id).request_pause()
+
+    @staticmethod
+    def _validate_quality_binding(state):
+        if state.quality_binding:
+            from src.quality.evaluation_bridge import validate_binding
+
+            validate_binding(state)
 
     def cancel(self, run_id: str) -> EvaluationRunState:
         return self._store(run_id).request_cancel()
@@ -952,13 +1065,14 @@ class EvaluationRunController:
             if not run_dir.is_dir() or not state_path.is_file():
                 raise FileNotFoundError(f"evaluation run {run_id!r} was not found")
 
-            state = RunStateStore(state_path).load()
-            if state.status not in _DELETABLE_RUN_STATUSES:
-                raise ValueError(
-                    f"evaluation run {run_id!r} can only be deleted from a failed, cancelled, or completed state"
-                )
-
-            shutil.rmtree(run_dir)
+            store = RunStateStore(state_path)
+            with store._lock, self.ownership.idle_guard(run_id):
+                state = store.load()
+                if state.status not in _DELETABLE_RUN_STATUSES:
+                    raise ValueError(
+                        f"evaluation run {run_id!r} can only be deleted from a failed, cancelled, or completed state"
+                    )
+                shutil.rmtree(run_dir)
             self._threads.pop(run_id, None)
             return state
 
@@ -991,8 +1105,29 @@ class EvaluationRunController:
             )
 
         store = self._store(run_id)
-        store.mutate(queue)
-        return self._refresh_progress(store)
+        with store._lock, self.ownership.idle_guard(run_id):
+            store.mutate(queue)
+            return self._refresh_progress(store)
+
+    @staticmethod
+    def _validated_checkpoint_metrics(run_dir: Path, state: EvaluationRunState):
+        summary_path = run_dir / ".checkpoint" / "summary.json"
+        if not summary_path.is_file():
+            return None
+        try:
+            summary = EvaluationSummary.model_validate_json(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise EvaluationReproducibilityError("评分断点损坏，请选择重新开始评分") from None
+        if not summary.execution_content_sha256 or not summary.snapshot_sha256:
+            # Legacy checkpoints are viewable but cannot safely seed a run.
+            return None
+        if (
+            summary.execution_content_sha256 != state.execution_content_sha256
+            or summary.snapshot_sha256 != state.snapshot_sha256
+            or public_evaluator_config(summary.evaluation_config) != public_evaluator_config(state.evaluation_config)
+        ):
+            raise EvaluationReproducibilityError("评分输入或裁判配置已变化，请选择重新开始评分")
+        return EvaluationRunController._load_checkpoint_metrics(run_dir)
 
     @staticmethod
     def _load_checkpoint_metrics(
@@ -1030,7 +1165,10 @@ class EvaluationRunController:
             except ValueError:
                 continue
             for item in result.metrics:
-                if item.status != "success":
+                if (
+                    item.status != "success" or item.sample_id != result.sample_id
+                    or item.score is None or not math.isfinite(item.score) or not 0 <= item.score <= 1
+                ):
                     continue
                 name = aliases.get(item.metric_name, item.metric_name)
                 seeded.setdefault(result.sample_id, {})[name] = MetricResult(
@@ -1052,7 +1190,7 @@ class EvaluationRunController:
         shutil.rmtree(Path(run_dir) / ".checkpoint", ignore_errors=True)
 
     def load_collection_qc(self, run_id: str) -> dict[str, object] | None:
-        """Return the persisted collection QC report, recomputing if absent."""
+        """Read QC, deriving missing legacy QC without changing artifacts."""
 
         qc_path = self.state_root / run_id / "collection_qc.json"
         if qc_path.is_file():
@@ -1066,16 +1204,16 @@ class EvaluationRunController:
         samples = self._load_samples(state)
         snapshots = SnapshotStore(state.snapshot_path).load_all()
         qc = run_collection_qc(samples, snapshots)
-        try:
-            qc_path.write_text(
-                json.dumps(qc, ensure_ascii=False, indent=1) + "\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
         return qc
 
     def start_scoring(self, run_id: str, *, force: bool = False) -> EvaluationRunState:
+        store = self._store(run_id)
+        with store._lock, self.ownership.idle_guard(run_id):
+            self._queue_scoring(run_id, force=force)
+        self.start(run_id)
+        return store.load()
+
+    def _queue_scoring(self, run_id: str, *, force: bool = False) -> EvaluationRunState:
         """Enter the scoring phase from the collected QC-gate state.
 
         允许从 ``failed`` 恢复：仅当采集已全部完成（样本齐全且有成功快照）
@@ -1117,19 +1255,16 @@ class EvaluationRunController:
             )
         )
         store.request_scoring()
-        self.start(run_id)
         return store.load()
 
     def load_for_display(self, run_id: str) -> EvaluationRunState:
-        with self._threads_lock:
-            thread = self._threads.get(run_id)
-            if thread is not None and thread.is_alive():
-                return self._store(run_id).load()
-            store = self._store(run_id)
-            if not store.path.is_file():
-                # Legacy run (pre-run_state): no run_state.json, only report
-                # artifacts. Synthesise a completed state so it can be opened.
-                return self._legacy_state(run_id)
+        store = self._store(run_id)
+        return store.load() if store.path.is_file() else self._legacy_state(run_id)
+
+    def recover_orphan(self, run_id: str) -> EvaluationRunState:
+        """Explicit coordination action; status GETs never mutate a run."""
+        store = self._store(run_id)
+        with store._lock, self.ownership.idle_guard(run_id):
             return store.mark_orphaned_as_paused()
 
     def _legacy_state(self, run_id: str) -> EvaluationRunState:
@@ -1161,6 +1296,8 @@ class EvaluationRunController:
         )
 
     def _store(self, run_id: str) -> RunStateStore:
+        if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
+            raise ValueError("invalid evaluation run id")
         return RunStateStore(self.state_root / run_id / "run_state.json")
 
     @staticmethod
@@ -1175,6 +1312,7 @@ class EvaluationRunController:
         return True
 
     def _before_sample(self, store: RunStateStore, sample: EvaluationSample) -> bool:
+        self._validate_quality_binding(store.load())
         return store.begin_sample(sample).status == "running"
 
     def _after_sample(
@@ -1212,6 +1350,8 @@ class EvaluationRunController:
 
     @staticmethod
     def _load_samples(state: EvaluationRunState) -> list[EvaluationSample]:
+        if state.execution_dataset_sha256 and _sha256_file(state.dataset_path) != state.execution_dataset_sha256:
+            raise EvaluationReproducibilityError("冻结执行数据集内容已变化，请创建新的评测运行")
         samples = load_dataset(state.dataset_path)
         if state.sample_ids:
             sample_ids = set(state.sample_ids)
@@ -1219,4 +1359,6 @@ class EvaluationRunController:
         if state.tags:
             tags = set(state.tags)
             samples = [sample for sample in samples if tags.intersection(sample.tags)]
+        if state.execution_content_sha256 and execution_content_hash(samples) != state.execution_content_sha256:
+            raise EvaluationReproducibilityError("执行样本内容与冻结指纹不一致，请创建新的评测运行")
         return samples

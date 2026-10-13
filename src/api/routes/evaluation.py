@@ -134,6 +134,16 @@ def _run_dir(output_root: str, run_id: str) -> Path:
     path = (Path(output_root) / run_id).resolve()
     if path.parent != Path(output_root).resolve():
         raise HTTPException(status_code=400, detail="invalid evaluation run id")
+    for filename in ("run_state.json", "summary.json"):
+        file = path / filename
+        if not file.is_file():
+            continue
+        try:
+            binding = json.loads(file.read_text()).get("quality_binding")
+        except (ValueError, AttributeError):
+            continue  # Legacy invalid artifacts remain deletable.
+        if binding:
+            raise HTTPException(403, "production dataset material requires its authorized quality evaluation endpoint")
     return path
 
 
@@ -469,11 +479,8 @@ def _validate_stored_run_before_start(
                 raise HTTPException(status_code=409, detail="；".join(manifest_errors))
 
 
-# Process-wide controller cache keyed by output_root. EvaluationRunController
-# keeps an in-memory _threads registry to prevent concurrent workers on the same
-# run; if we built a fresh controller per request that guard would be defeated
-# (a double-click on /start would spawn two workers). Mirror get_pipeline's
-# singleton pattern so start/pause/cancel share one thread registry.
+# Controllers cache local thread handles; ownership is enforced by the shared
+# execution ledger across API replicas and independent evaluation workers.
 _controller_lock = threading.Lock()
 _controllers: dict[str, EvaluationRunController] = {}
 
@@ -510,6 +517,7 @@ _SUMMARY_METADATA_FIELDS = (
     "source_dataset_path",
     "dataset_sha256",
     "execution_dataset_sha256",
+    "execution_content_sha256",
     "dataset_total_count",
     "dataset_sample_count",
     "matched_sample_count",
@@ -530,6 +538,8 @@ def _summary_dict(summary: EvaluationSummary) -> dict[str, Any]:
     """Serialize legacy summaries without fabricating new metadata fields."""
 
     result = summary.model_dump()
+    if not summary.quality_binding:
+        result.pop("quality_binding", None)
     if summary.kb_id is None and not summary.cohort_fingerprint and not summary.source_dataset_path:
         for field in _SUMMARY_METADATA_FIELDS:
             result.pop(field, None)
@@ -942,6 +952,22 @@ def pause_run(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return _state_dict(state)
+
+
+@router.post("/evaluation/runs/{run_id}/recover")
+def recover_run(
+    run_id: str,
+    output_root: str = Query(default=str(DEFAULT_OUTPUT_ROOT)),
+    _actor: AuthUser = Depends(require_system_admin),
+) -> dict[str, Any]:
+    output_root = _check_output_root(output_root)
+    _run_dir(output_root, run_id)
+    try:
+        return _state_dict(_controller(output_root).recover_orphan(run_id))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/evaluation/runs/{run_id}/resume")

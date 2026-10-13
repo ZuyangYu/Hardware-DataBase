@@ -35,10 +35,33 @@ describe('ConfigPage category navigation', () => {
       '检索',
       '账号与会话',
       '模型与提示词',
+      '长期记忆',
+      '附件解析与理解',
       '扩展（MCP，受管控）',
     ]);
     const keys = GROUPS.flatMap((group) => group.fields.map(([key]) => key));
     expect(keys.some((key) => key.startsWith('OBS_') || key.startsWith('OTEL_'))).toBe(false);
+  });
+
+  it('marks every credential field as secret so "***" is never saved back', () => {
+    // 后端 _SECRET_KEYS 返回 "***"；前端名单缺一个，保存时就会把掩码写成真实值。
+    const backendSecretKeys = [
+      'RAGFLOW_API_KEY',
+      'AGENT_CUSTOM_API_KEY',
+      'MEMORY_MODEL_API_KEY',
+      'MEMORY_EMBEDDING_API_KEY',
+      'CHAT_ATTACHMENT_EMBEDDING_API_KEY',
+      'ARK_API_KEY',
+      'AUTH_DEFAULT_ADMIN_PASSWORD',
+    ];
+    const keys = new Set(GROUPS.flatMap((group) => group.fields.map(([key]) => key)));
+    const rendered = backendSecretKeys.filter((key) => keys.has(key));
+    expect(rendered.length).toBeGreaterThan(0);
+    // 渲染出来的凭证字段必须都在 SECRET_KEYS 里（用行为验证：填 "***" 不算改动）。
+    const group = GROUPS.find((item) => item.fields.some(([key]) => key === rendered[0]))!;
+    const draft = Object.fromEntries(rendered.map((key) => [key, '***']));
+    const snapshot = Object.fromEntries(rendered.map((key) => [key, '***']));
+    expect(groupDirty(group, { ...snapshot, ...draft }, snapshot)).toBe(false);
   });
 
   it('hides advanced tuning fields until the toggle is on', () => {
@@ -47,6 +70,33 @@ describe('ConfigPage category navigation', () => {
     expect(hidden).toContain('MCP_ENABLED');
     const shown = renderPanel('扩展（MCP，受管控）', { showAdvanced: true });
     expect(shown).toContain('MCP_CALL_TIMEOUT_SECONDS');
+  });
+
+  it('exposes attachment safety controls and keeps retrieval mode explicit', () => {
+    const keys = new Set(GROUPS.flatMap((group) => group.fields.map(([key]) => key)));
+    expect(keys.has('CHAT_ATTACHMENTS_ENABLED')).toBe(true);
+    expect(keys.has('CHAT_ATTACHMENT_MAX_BYTES')).toBe(true);
+    expect(keys.has('CHAT_ATTACHMENT_RETRIEVAL_MODE')).toBe(true);
+    expect(keys.has('ARK_API_KEY')).toBe(true);
+
+    const markup = renderPanel('附件解析与理解', {
+      showAdvanced: true,
+      draft: {
+        CHAT_ATTACHMENT_DENSE_ENABLED: 'true',
+        CHAT_ATTACHMENT_VISUAL_ENABLED: 'true',
+      },
+    });
+    expect(markup).toContain('CHAT_ATTACHMENTS_ENABLED');
+    expect(markup).toContain('CHAT_ATTACHMENT_RETRIEVAL_MODE');
+    expect(markup).toContain('ARK_API_KEY');
+  });
+
+  it('uses retrieval mode as the single dense-retrieval control', () => {
+    const attachment = GROUPS.find((group) => group.title === '附件解析与理解');
+    expect(attachment).toBeDefined();
+    expect(attachment?.fields.some(([key]) => key === 'CHAT_ATTACHMENT_DENSE_ENABLED')).toBe(false);
+    const markup = renderPanel('附件解析与理解');
+    expect(markup).toContain('CHAT_ATTACHMENT_RETRIEVAL_MODE');
   });
 
   it('renders prompt fields as full-width textareas', () => {

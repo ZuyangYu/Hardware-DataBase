@@ -377,7 +377,7 @@ def create_core_indexes(conn) -> None:
 
 def pg_type_for(table: str, column: str, declared: str = "") -> str:
     """Explicit SQLite→PostgreSQL type mapping (no guessing)."""
-    if str(table).lower() in AUTH_DOMAIN_TABLES:
+    if str(table).lower() in AUTH_DOMAIN_TABLES or str(table).lower().startswith("quality_"):
         # 认证域：机械映射（TEXT 保真），见 AUTH_DOMAIN_TABLES 注释。
         value = str(declared or "").upper()
         if "BLOB" in value:

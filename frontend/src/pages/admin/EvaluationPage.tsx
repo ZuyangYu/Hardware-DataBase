@@ -448,7 +448,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   }
 
   async function controlRun(
-    action: 'start' | 'pause' | 'resume' | 'cancel',
+    action: 'start' | 'pause' | 'resume' | 'cancel' | 'recover',
     resumeMode?: 'continue' | 'restart',
   ) {
     if (!selectedRunId) return;
@@ -466,7 +466,9 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
               ? resumeMode === 'restart'
                 ? '评分将重新开始'
                 : '评估已从断点继续'
-              : '已请求取消',
+              : action === 'recover'
+                ? '已恢复失联评估，可从断点继续'
+                : '已请求取消',
       );
       await Promise.all([loadRuns(), loadDetail(selectedRunId)]);
     } catch (error) {
@@ -882,7 +884,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
             )}
           </div>
         ) : (
-          <p className="text-[12px] text-[#858b9c]">选择一个已完成的运行作为基线。严格对比校验知识库、样本集、指标和模型配置；仅查看对比会保留差异警告。</p>
+          <p className="text-[12px] text-[#858b9c]">选择一个已完成的运行作为基线。严格对比校验知识库、样本内容、评分规则、指标、模型配置与快照归属；仅查看对比会保留差异警告。</p>
         )}
       </section>
 
@@ -903,6 +905,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
           onResume={() => void controlRun('resume', 'continue')}
           onRestartScoring={() => void controlRun('resume', 'restart')}
           onCancel={() => void controlRun('cancel')}
+          onRecover={() => void controlRun('recover')}
           onScore={(force) => void startScoring(force)}
         />
       </section>
@@ -966,6 +969,7 @@ function RunDetailPanel({
   onResume,
   onRestartScoring,
   onCancel,
+  onRecover,
   onScore,
 }: {
   run: EvaluationRunDetail | null;
@@ -983,6 +987,7 @@ function RunDetailPanel({
   onResume: () => void;
   onRestartScoring: () => void;
   onCancel: () => void;
+  onRecover: () => void;
   onScore: (force: boolean) => void;
 }) {
   if (!loaded) {
@@ -1041,6 +1046,16 @@ function RunDetailPanel({
           <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')} onClick={onPause} disabled={!canPause}>
             暂停
           </Button>
+          {['running', 'pause_requested', 'cancel_requested'].includes(run.status) && (
+            <Button
+              variant="outline"
+              className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')}
+              onClick={onRecover}
+              title="仅在执行租约已过期时恢复为暂停；活跃 worker 会被服务端拒绝"
+            >
+              恢复失联运行
+            </Button>
+          )}
           <Button
             variant="outline"
             className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[12px]')}

@@ -1,5 +1,7 @@
 /** 后端 /api/v1 的 DTO 镜像(对齐 src/api/schemas.py) */
 
+import type { QualityReviewRequest } from './workbenchTypes';
+
 export type Role = 'system_admin' | 'employee';
 
 export interface UserInfo {
@@ -1047,10 +1049,15 @@ export interface EvaluationPreflightResponse {
 
 export interface EvaluationGateResult {
   passed: boolean;
+  verdict?: 'pass' | 'fail' | 'insufficient_evaluation';
+  enforced?: boolean;
   exit_code: number;
   metric_scores: Record<string, number>;
   metric_counts: Record<string, number>;
   failures: string[];
+  metric_expected_counts?: Record<string, number>;
+  metric_coverage?: Record<string, number>;
+  insufficient_reasons?: string[];
 }
 
 export interface EvaluationSummary {
@@ -1073,6 +1080,7 @@ export interface EvaluationSummary {
   source_dataset_path: string;
   dataset_sha256: string;
   execution_dataset_sha256: string;
+  execution_content_sha256?: string;
   dataset_total_count: number;
   dataset_sample_count: number;
   matched_sample_count: number;
@@ -1634,3 +1642,50 @@ export type McpCreatePayload = {
   tags: string[];
   icon?: string;
 };
+export type QualityRating = 'helpful' | 'unhelpful' | 'withdrawn';
+export type QualityReason = 'factual_error' | 'unsupported_evidence' | 'not_found' | 'version_conflict' | 'incomplete_task' | 'format_mismatch';
+export interface QualityShare {
+  active?: boolean;
+  reviewer_user_ids?: number[];
+  fields?: string[];
+  evidence_indices?: number[];
+  expires_at?: string;
+}
+export interface QualityFeedbackState {
+  assistant_message_id: number;
+  answer_revision: string;
+  case_id: string | null;
+  status: string | null;
+  row_version: number | null;
+  rating: QualityRating | null;
+  reason_codes: QualityReason[];
+  comment: string;
+  evidence_count: number;
+  content_available: boolean;
+  share: QualityShare;
+  review_requests?: QualityReviewRequest[];
+}
+export interface QualityCase {
+  projection_status?: { status: string; count: number }[];
+  case_id: string;
+  snapshot_id: string;
+  turn_id: string;
+  assistant_message_id: number;
+  answer_revision: string;
+  department_id: number | null;
+  status: string;
+  row_version: number;
+  triggers: string[];
+  sampling: { policy?: string; probability?: number; cohort?: string };
+  manifest: Record<string, unknown>;
+  content: { query?: string; answer?: string; evidence?: Record<string, unknown>[] };
+  content_access: 'owner' | 'shared' | 'hidden';
+  source_valid: boolean;
+  share: QualityShare;
+  feedback: { event_id: string; rating: QualityRating; reason_codes: QualityReason[]; comment: string; created_at: string } | null;
+  feedback_history?: { event_id: string; sequence: number; rating: QualityRating; reason_codes: QualityReason[]; created_at: string }[];
+  reviews: { review_id: string; judgment: string; root_cause: string; correctness?: string | null; supersedes: string | null; created_at: string; content: { reference_answer?: string; rubric?: string; notes?: string } }[];
+  review_requests?: QualityReviewRequest[];
+  created_at: string;
+  updated_at: string;
+}

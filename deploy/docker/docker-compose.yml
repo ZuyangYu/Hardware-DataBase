@@ -30,6 +30,8 @@ x-app-env: &app-env
   HDB_API_SPAWN_WORKER: "0"
   HDB_API_SPAWN_EXPORT_WORKER: "0"
   HDB_API_SPAWN_MEMORY_WORKER: "0"
+  HDB_API_SPAWN_QUALITY_WORKER: "0"
+  EVAL_EXECUTION_MODE: worker
 
 # 账本：5 组后端全部指向 compose 内的 PG（外部 PG 见 README「指向已有 PostgreSQL」）
 # 密码只在运行期需要：这里用空默认值，保证 `docker compose build` / `config` 不被阻塞。
@@ -97,7 +99,7 @@ services:
     <<: *app
     environment:
       <<: [*app-env, *pg-env]
-      HDB_REQUIRED_WORKER_ROLES: chat,authoring,parse,export,memory
+      HDB_REQUIRED_WORKER_ROLES: chat,authoring,parse,export,memory,evaluation,quality
       # Only the dedicated nginx network may supply forwarded client IPs.
       FORWARDED_ALLOW_IPS: ${HDB_PROXY_SUBNET:-172.30.91.0/24}
     networks:
@@ -138,6 +140,12 @@ services:
   worker-memory:
     <<: *worker
     command: ["hardware-database-memory-worker"]
+  worker-evaluation:
+    <<: *worker
+    command: ["python", "-m", "src.evaluation.worker", "--root", "/app/storage/evaluations"]
+  worker-quality:
+    <<: *worker
+    command: ["python", "-m", "src.quality.worker"]
 
   # 账本库（pgvector 镜像：记忆投影的语义索引需要 vector 扩展）。
   postgres:
