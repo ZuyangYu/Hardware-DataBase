@@ -82,6 +82,15 @@ RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
 RAGFLOW_STATUS_REFRESH_MIN_SECONDS = int(os.getenv("RAGFLOW_STATUS_REFRESH_MIN_SECONDS", "60"))
 RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
 RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
+# RAGFlow <0.21 会静默忽略检索的 metadata_condition（定制老版本可能直接报错）。
+# 开启后，检索把本地台账翻译成 document_ids 预过滤下发（0.19 起支持），
+# 隔离与召回不再依赖远端元数据能力；关闭则退回旧行为。
+RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED = os.getenv("RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# document_ids 预过滤的规模上限：超过则回退旧行为（共享数据集上的 top_k 召回可能变差）。
+RAGFLOW_RETRIEVAL_DOC_IDS_MAX = int(os.getenv("RAGFLOW_RETRIEVAL_DOC_IDS_MAX", "2000") or 2000)
+# 文档元数据（meta_fields）写入失败时是否降级继续：老版本/定制构建可能拒绝
+# meta_fields；检索隔离由 document_ids 保证，元数据不是上传的硬前提。
+RAGFLOW_METADATA_WRITE_BEST_EFFORT = os.getenv("RAGFLOW_METADATA_WRITE_BEST_EFFORT", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 # Task 7 gray rollout: role/structure read models can be disabled per
 # deployment; exact refdes/net queries always stay available.
@@ -769,6 +778,9 @@ DEFAULT_VALUES = {
     "RAGFLOW_STATUS_REFRESH_MIN_SECONDS": "60",
     "RAGFLOW_SIMILARITY_THRESHOLD": "0.25",
     "RAGFLOW_VECTOR_WEIGHT": "0.4",
+    "RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED": "true",
+    "RAGFLOW_RETRIEVAL_DOC_IDS_MAX": "2000",
+    "RAGFLOW_METADATA_WRITE_BEST_EFFORT": "true",
     "PIPELINE_ARCHIVE_ROOT": os.path.join(STORAGE_DIR, "pipeline_archives"),
     "RAGFLOW_FILE_ROOT": os.path.join(STORAGE_DIR, "pipeline_archives"),
     "RESULT_EXPORT_STORAGE_DIR": os.path.join(STORAGE_DIR, "exports"),
@@ -1094,6 +1106,8 @@ def reload_settings():
     global RAGFLOW_GOVERNANCE_DATASET_NAME, RAGFLOW_DESIGN_DATASET_NAME
     global RAGFLOW_TIMEOUT_SECONDS, RAGFLOW_SIMILARITY_THRESHOLD, RAGFLOW_VECTOR_WEIGHT
     global RAGFLOW_STATUS_REFRESH_MIN_SECONDS
+    global RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED, RAGFLOW_RETRIEVAL_DOC_IDS_MAX
+    global RAGFLOW_METADATA_WRITE_BEST_EFFORT
     global AUTH_DB_PATH, AUTH_DEFAULT_ADMIN_USERNAME, AUTH_DEFAULT_ADMIN_PASSWORD, AUTH_SESSION_TTL_HOURS
     global AGENT_CHECKPOINT_DB_PATH, AGENT_CHECKPOINT_BACKEND, AGENT_CHECKPOINT_DATABASE_URL
     global AGENT_CHECKPOINT_POOL_SIZE
@@ -1266,6 +1280,9 @@ def reload_settings():
     RAGFLOW_STATUS_REFRESH_MIN_SECONDS = int(os.getenv("RAGFLOW_STATUS_REFRESH_MIN_SECONDS", "60"))
     RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
     RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
+    RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED = os.getenv("RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    RAGFLOW_RETRIEVAL_DOC_IDS_MAX = int(os.getenv("RAGFLOW_RETRIEVAL_DOC_IDS_MAX", "2000") or 2000)
+    RAGFLOW_METADATA_WRITE_BEST_EFFORT = os.getenv("RAGFLOW_METADATA_WRITE_BEST_EFFORT", "true").strip().lower() in {"1", "true", "yes", "on"}
     PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
     RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
 
@@ -1817,6 +1834,7 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
 _INT_SETTING_KEYS = frozenset({
     "RAGFLOW_TIMEOUT_SECONDS",
     "RAGFLOW_STATUS_REFRESH_MIN_SECONDS",
+    "RAGFLOW_RETRIEVAL_DOC_IDS_MAX",
     "AUTH_SESSION_TTL_HOURS",
     "AGENT_CUSTOM_MAX_TOKENS",
     "AGENT_MODEL_MAX_INPUT_TOKENS",

@@ -22,7 +22,7 @@ class _Client:
         self.responses = list(responses)
         self.calls: list[tuple[str, list[str], int, dict | None]] = []
 
-    def retrieve(self, question: str, dataset_ids: list[str], top_k: int, metadata_condition=None):
+    def retrieve(self, question: str, dataset_ids: list[str], top_k: int, metadata_condition=None, document_ids=None):
         self.calls.append((question, dataset_ids, top_k, metadata_condition))
         return self.responses.pop(0)
 

@@ -28,7 +28,7 @@ class _Client:
         self.responses = list(responses)
         self.calls = []
 
-    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None, should_cancel=None):
+    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None, document_ids=None, should_cancel=None):
         self.calls.append((question, dataset_ids, top_k, metadata_condition))
         if self.responses:
             return self.responses.pop(0)

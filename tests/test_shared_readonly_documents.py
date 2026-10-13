@@ -171,7 +171,7 @@ class SharedReadOnlyDocumentTests(unittest.TestCase):
         record = _record()
         client = SimpleNamespace(retrieve_calls=[])
 
-        def retrieve(question, dataset_ids, top_k, metadata_condition=None):
+        def retrieve(question, dataset_ids, top_k, metadata_condition=None, document_ids=None):
             client.retrieve_calls.append((question, dataset_ids, top_k, metadata_condition))
             return []
 
