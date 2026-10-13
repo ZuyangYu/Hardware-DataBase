@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
+import src.settings as settings
 from src.pipelines.ingestion import ArchivedFile, IngestionScope, RAGFlowDocumentHandler
 from src.pipelines.document_rag.ragflow_backend import RAGFlowAPIError, RAGFlowBackend
 from src.pipelines.registry import PIPELINE_REGISTRY, PROCESSOR_KIND_RAGFLOW
@@ -38,6 +40,31 @@ class _NotOwnerStatusClient:
 
     def wait_document_ready(self, dataset_id, document_id):
         raise RAGFlowAPIError({"code": 102, "message": "You don't own the document remote-1."})
+
+    def parse_documents(self, dataset_id, document_ids):
+        self.parsed.append((dataset_id, list(document_ids)))
+
+    def delete_documents(self, dataset_id, document_ids):
+        self.deleted.append((dataset_id, list(document_ids)))
+
+
+class _MetadataRejectingClient:
+    """模拟老版本/定制 RAGFlow 拒绝 meta_fields（如 0.19.0.h4 返回 code 100）。"""
+
+    def __init__(self):
+        self.parsed = []
+        self.deleted = []
+
+    def upload_document(self, dataset_id, archived_path):
+        return "remote-1"
+
+    def update_document_metadata(self, dataset_id, document_id, metadata):
+        raise RAGFlowAPIError(
+            {"code": 100, "message": "Internal server error: no such column: meta_fields"}
+        )
+
+    def wait_document_ready(self, dataset_id, document_id):
+        return {"name": "source.pdf"}
 
     def parse_documents(self, dataset_id, document_ids):
         self.parsed.append((dataset_id, list(document_ids)))
@@ -92,6 +119,47 @@ class RAGFlowHandlerSubmitRollbackTests(unittest.TestCase):
         self.assertEqual(result.document_id, "remote-1")
         self.assertEqual(client.parsed, [("dataset-1", ["remote-1"])])
         self.assertEqual(client.deleted, [])
+
+
+class RAGFlowMetadataWriteFallbackTests(unittest.TestCase):
+    def _backend(self, client):
+        backend = object.__new__(RAGFlowBackend)
+        backend._client_instance = client
+        backend._metadata = lambda *args, **kwargs: {}
+        return backend
+
+    def test_submit_tolerates_metadata_write_failure_by_default(self):
+        client = _MetadataRejectingClient()
+        backend = self._backend(client)
+
+        result = backend._submit_archived_document(
+            "dataset-1",
+            "kb",
+            "source.pdf",
+            "archive.pdf",
+            "docs",
+        )
+
+        self.assertEqual(result.document_id, "remote-1")
+        self.assertEqual(client.parsed, [("dataset-1", ["remote-1"])])
+        self.assertEqual(client.deleted, [])
+
+    def test_submit_fails_on_metadata_write_failure_in_strict_mode(self):
+        client = _MetadataRejectingClient()
+        backend = self._backend(client)
+
+        with mock.patch.object(settings, "RAGFLOW_METADATA_WRITE_BEST_EFFORT", False):
+            with self.assertRaises(RuntimeError):
+                backend._submit_archived_document(
+                    "dataset-1",
+                    "kb",
+                    "source.pdf",
+                    "archive.pdf",
+                    "docs",
+                )
+
+        self.assertEqual(client.parsed, [])
+        self.assertEqual(client.deleted, [("dataset-1", ["remote-1"])])
 
 
 if __name__ == "__main__":

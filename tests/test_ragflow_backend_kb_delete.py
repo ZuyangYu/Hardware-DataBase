@@ -21,7 +21,7 @@ class _RetrieveClient:
         self.chunks = chunks
         self.retrieve_calls = []
 
-    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None):
+    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None, document_ids=None):
         self.retrieve_calls.append((question, dataset_ids, top_k, metadata_condition))
         return self.chunks
 
@@ -31,7 +31,7 @@ class _SequentialRetrieveClient:
         self.responses = list(responses)
         self.retrieve_calls = []
 
-    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None):
+    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None, document_ids=None):
         self.retrieve_calls.append((question, dataset_ids, top_k, metadata_condition))
         return self.responses.pop(0) if self.responses else []
 
