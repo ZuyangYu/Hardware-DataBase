@@ -162,6 +162,15 @@ def _is_ragflow_not_found_error(exc: Exception) -> bool:
     return False
 
 
+def _is_ragflow_document_scope_rejection(exc: Exception) -> bool:
+    """识别 RAGFlow 拒绝本次 document_ids 的错误（台账与远端漂移）。
+
+    远端报错形如 "The datasets don't own the document <id>"；命中后调用方
+    去掉预过滤重试一次，结果仍由本地记录过滤兜底。
+    """
+    return "own the document" in str(exc).lower()
+
+
 def _ragflow_status_unavailable_message(document_name: str) -> str:
     return f"{document_name}: RAGFlow parse submitted; realtime progress is not readable by the current API key."
 
@@ -578,10 +587,52 @@ class RAGFlowClient:
             raise request_error
         return outcome["data"]  # type: ignore[return-value]
 
+    # RAGFlow pages the dataset listing at 30 items by default, so a single
+    # unfiltered request hides every dataset beyond page 1 (health checks then
+    # report existing datasets as missing).  Page through the full listing here.
+    _DATASET_PAGE_SIZE = 100
+    _DATASET_MAX_PAGES = 200
+
     def list_datasets(self, name: str | None = None) -> list[dict]:
-        params = {"name": name} if name else {}
-        data = self.request("GET", "/api/v1/datasets", params=params)
-        return data.get("data", [])
+        if name:
+            try:
+                data = self.request("GET", "/api/v1/datasets", params={"name": name})
+            except RAGFlowAPIError as exc:
+                # RAGFlow answers a name it cannot resolve with a misleading
+                # "lacks permission for dataset '<name>'" payload (HTTP 200,
+                # code != 0) instead of an empty list.  Treat it as no match.
+                if self._is_dataset_not_found(exc):
+                    return []
+                raise
+            return data.get("data", [])
+
+        results: list[dict] = []
+        for page in range(1, self._DATASET_MAX_PAGES + 1):
+            data = self.request(
+                "GET",
+                "/api/v1/datasets",
+                params={"page": page, "page_size": self._DATASET_PAGE_SIZE},
+            )
+            batch = data.get("data") or []
+            if not isinstance(batch, list) or not batch:
+                break
+            results.extend(batch)
+            try:
+                total = int(data.get("total")) if data.get("total") is not None else None
+            except (TypeError, ValueError):
+                total = None
+            if total is not None:
+                if len(results) >= total:
+                    break
+            elif len(batch) < self._DATASET_PAGE_SIZE:
+                break
+        return results
+
+    @staticmethod
+    def _is_dataset_not_found(exc: RAGFlowAPIError) -> bool:
+        payload = exc.args[0] if exc.args else None
+        message = payload.get("message") if isinstance(payload, dict) else str(exc)
+        return "lacks permission for dataset" in str(message or "")
 
     def create_dataset(self, name: str) -> str:
         data = self.request("POST", "/api/v1/datasets", json={"name": name})
@@ -651,8 +702,12 @@ class RAGFlowClient:
         dataset_ids: list[str],
         top_k: int,
         metadata_condition: dict | None = None,
+        document_ids: list[str] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict]:
+        # document_ids 预过滤：RAGFlow 0.19 起支持，作用与 0.21+ 的
+        # metadata_condition 等价（新版本源码本身也是先转成 doc_ids 再检索），
+        # 用于在忽略元数据过滤的老版本上把检索范围收敛到本库文档。
         payload = {
             "question": question,
             "dataset_ids": dataset_ids,
@@ -664,6 +719,8 @@ class RAGFlowClient:
         }
         if metadata_condition:
             payload["metadata_condition"] = metadata_condition
+        if document_ids:
+            payload["document_ids"] = document_ids
         # P0b: each real retrieval call acquires the shared RAG budget, so
         # fallback retries are re-admitted rather than inheriting a slot.
         from src.core.concurrency import governor_acquire
@@ -942,7 +999,6 @@ class RAGFlowBackend(RAGBackend):
         self._check_kb_access(kb_name, ctx, "write")
         scope = _scope_for_kb(kb_name, ctx).require_department("upload to")
         dataset_kind = self._dataset_kind_for_group(source_group)
-        dataset_id = self._dataset_id_for_kind(dataset_kind)
         ingestion_scope = IngestionScope(
             kb_name=scope.kb_name,
             department_id=scope.department_id,
@@ -951,11 +1007,13 @@ class RAGFlowBackend(RAGBackend):
             source_group=source_group,
             ctx=ctx,
         )
+        # 数据集 id 延迟解析：只有真的要走 RAGFlow 管线时才连它。表格（xlsx）与
+        # 电路（edf）是本地解析，不应因为 RAGFlow 未配置而无法上传。
         return self.ingestion.upload_files(
             files,
             ingestion_scope,
             default_dataset_kind=dataset_kind,
-            default_dataset_id=dataset_id,
+            default_dataset_id=lambda: self._dataset_id_for_kind(dataset_kind),
             progress_callback=progress_callback,
         )
 
@@ -981,7 +1039,16 @@ class RAGFlowBackend(RAGBackend):
             try:
                 client.update_document_metadata(dataset_id, document_id, metadata)
             except Exception as exc:
-                raise _ragflow_submission_error(file_name, "update metadata", exc) from exc
+                if not getattr(src.settings, "RAGFLOW_METADATA_WRITE_BEST_EFFORT", True):
+                    raise _ragflow_submission_error(file_name, "update metadata", exc) from exc
+                # 老版本/定制 RAGFlow 可能拒绝 meta_fields；检索隔离由
+                # document_ids 预过滤保证，元数据不再是上传的硬前提。
+                log(
+                    f"RAGFlow metadata write failed but was tolerated "
+                    f"({file_name}, {dataset_id}/{document_id}): {exc}"
+                )
+                if progress_callback:
+                    progress_callback(5, f"{file_name}: 元数据未写入（RAGFlow 不支持），已继续")
 
             try:
                 client.wait_document_ready(dataset_id, document_id)
@@ -1241,8 +1308,54 @@ class RAGFlowBackend(RAGBackend):
             else [dataset_ids]
         )
         metadata_condition = _metadata_condition(kb_name, ctx, routed_source_groups, filters=filters)
+        source_names = _source_name_filters(filters)
 
-        def retrieve_chunks(condition: dict | None) -> list[dict]:
+        # RAGFlow <0.21 不支持检索端元数据过滤（metadata_condition 会被静默忽略），
+        # 服务端只能在整张共享数据集上排 top_k，容易把本库结果挤出召回。这里把
+        # 同等作用域翻译成本地台账的 document_ids 预过滤（0.19 起支持），隔离与
+        # 召回不再依赖远端元数据能力；关闭开关或超限时退回旧行为。
+        doc_scope_enabled = bool(getattr(src.settings, "RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED", True))
+        doc_ids_max = int(getattr(src.settings, "RAGFLOW_RETRIEVAL_DOC_IDS_MAX", 2000) or 0)
+
+        def _scope_records(narrowed: bool) -> list | None:
+            if not doc_scope_enabled:
+                return None
+            records = list(records_by_remote_id.values())
+            if narrowed:
+                if routed_source_groups:
+                    records = [
+                        record
+                        for record in records
+                        if _normalize_chunk_source_group(record.source_group) in routed_source_groups
+                    ]
+                if source_names:
+                    records = [
+                        record
+                        for record in records
+                        if str(record.original_file_name or record.document_name or "") in source_names
+                    ]
+            if not records:
+                return None
+            if doc_ids_max and len(records) > doc_ids_max:
+                log(
+                    "RAGFlow document-scope fallback: "
+                    f"{len(records)} scoped documents exceed RAGFLOW_RETRIEVAL_DOC_IDS_MAX={doc_ids_max}."
+                )
+                return None
+            return records
+
+        def _document_scope_ids(scope_records: list | None, dataset_ids: list[str]) -> list[str] | None:
+            if scope_records is None:
+                return None
+            allowed = set(dataset_ids)
+            ids = [
+                str(record.document_id)
+                for record in scope_records
+                if record.document_id and record.dataset_id in allowed
+            ]
+            return ids or None
+
+        def retrieve_chunks(condition: dict | None, scope_records: list | None = None) -> list[dict]:
             chunks: list[dict] = []
             for retrieval_dataset_ids in retrieval_dataset_groups:
                 retrieve_kwargs = {
@@ -1250,9 +1363,21 @@ class RAGFlowBackend(RAGBackend):
                     "top_k": top_k,
                     "metadata_condition": condition,
                 }
+                call_doc_ids = _document_scope_ids(scope_records, retrieval_dataset_ids)
+                if call_doc_ids:
+                    retrieve_kwargs["document_ids"] = call_doc_ids
                 if should_cancel is not None:
                     retrieve_kwargs["should_cancel"] = should_cancel
-                chunks.extend(self._client().retrieve(query, **retrieve_kwargs))
+                try:
+                    chunks.extend(self._client().retrieve(query, **retrieve_kwargs))
+                except RAGFlowAPIError as exc:
+                    if not retrieve_kwargs.get("document_ids") or not _is_ragflow_document_scope_rejection(exc):
+                        raise
+                    # 台账与远端漂移（如远端手工删过文档）时不允许把查询打死：
+                    # 去掉预过滤重试一次，结果仍由本地记录过滤兜底。
+                    log(f"RAGFlow document-scope rejected by remote; retrying without document_ids: {exc}")
+                    retrieve_kwargs.pop("document_ids", None)
+                    chunks.extend(self._client().retrieve(query, **retrieve_kwargs))
             if len(retrieval_dataset_groups) > 1:
                 def _chunk_score(chunk: dict) -> float:
                     value = chunk.get("similarity") or chunk.get("score") or chunk.get("vector_similarity") or 0.0
@@ -1264,8 +1389,9 @@ class RAGFlowBackend(RAGBackend):
                 chunks.sort(key=_chunk_score, reverse=True)
             return chunks
 
-        chunks = retrieve_chunks(metadata_condition)
-        source_names = _source_name_filters(filters)
+        scoped_doc_records = _scope_records(narrowed=True)
+        base_doc_records = _scope_records(narrowed=False)
+        chunks = retrieve_chunks(metadata_condition, scoped_doc_records)
         if strict_allowed:
             # The strict linked-record path never widens: no unconditioned
             # retry, no filename fallback, no route-based group widening.
@@ -1280,7 +1406,7 @@ class RAGFlowBackend(RAGBackend):
             source_name_fallback = False
             metadata_condition_fallback = False
             if not chunks:
-                chunks = retrieve_chunks(None)
+                chunks = retrieve_chunks(None, base_doc_records)
                 metadata_condition_fallback = True
                 source_name_fallback = bool(source_names)
                 log(
@@ -1371,7 +1497,7 @@ class RAGFlowBackend(RAGBackend):
 
         evidences, skipped_counts = _filter_chunks()
         if not evidences and source_names and not source_name_fallback and skipped_counts["source_name"]:
-            chunks = retrieve_chunks(None)
+            chunks = retrieve_chunks(None, base_doc_records)
             source_name_fallback = True
             metadata_condition_fallback = True
             evidences, skipped_counts = _filter_chunks()

@@ -705,7 +705,7 @@ class AppPipeline:
         if not base_url or not api_key:
             return False, "请先填写 RAGFlow Base URL 和 API Key", []
         try:
-            from src.pipelines.document_rag.ragflow_backend import RAGFlowClient
+            from src.pipelines.document_rag.ragflow_backend import RAGFlowAPIError, RAGFlowClient
 
             client = RAGFlowClient(
                 base_url=base_url.rstrip("/"),
@@ -714,7 +714,22 @@ class AppPipeline:
             )
             datasets = client.list_datasets()
             existing_names = {item.get("name") for item in datasets if isinstance(item, dict)}
-            missing = [name for name in dataset_names if name and name not in existing_names]
+            missing: List[str] = []
+            seen: set[str] = set()
+            for name in dataset_names:
+                if not name or name in seen or name in existing_names:
+                    continue
+                seen.add(name)
+                # Some RAGFlow deployments hide shared datasets from the
+                # unfiltered listing; probe the exact name before reporting it
+                # missing (mirrors what operators verify by hand with the API).
+                try:
+                    hits = client.list_datasets(name=name)
+                except RAGFlowAPIError:
+                    hits = []
+                if any(isinstance(item, dict) and item.get("name") == name for item in hits):
+                    continue
+                missing.append(name)
             if missing:
                 return True, f"RAGFlow 可连接，但以下 Dataset 暂未找到: {', '.join(missing)}", missing
             return True, f"RAGFlow 连接正常，已找到 {len(dataset_names)} 个配置 Dataset", []

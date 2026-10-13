@@ -27,7 +27,6 @@ def close_conversation_services() -> None:
 
 atexit.register(close_conversation_services)
 
-
 def build_conversation_service(settings_module: Any | None = None):
     """Return the configured conversation service (SQLite default).
 

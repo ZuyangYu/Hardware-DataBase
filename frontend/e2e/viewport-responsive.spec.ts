@@ -83,14 +83,30 @@ test('移动抽屉: 打开、 Escape 关闭、焦点返回触发按钮', async (
   await expect(page.getByRole('heading', { name: '治理总览' })).toBeVisible();
 });
 
-test('抽屉内导航跳转到成本页后,宽表在窄屏内部滚动且出现滑动提示', async ({ page }) => {
+test('抽屉导航跳转到成本页后，宽表可在窄屏内部横向滚动', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/admin/quality');
   await page.getByRole('button', { name: '打开导航' }).click();
   await page.getByRole('dialog').getByRole('button', { name: '治理与运营', exact: true }).click();
   await page.getByRole('navigation', { name: '页面二级导航' }).getByRole('link', { name: '成本与用量', exact: true }).click();
   await expect(page.getByRole('heading', { name: '调用明细' })).toBeVisible();
-  await expect(page.getByText('明细只包含账本字段，不包含提示词、回答正文、服务端点或 API Key。移动端可横向滑动查看全部字段。', { exact: true })).toBeVisible();
+  const table = page.getByRole('table').filter({
+    has: page.getByRole('columnheader', { name: 'Token 用量', exact: true }),
+  });
+  const scroller = table.locator('..');
+  await expect(scroller).toBeVisible();
+  const scroll = await scroller.evaluate((element) => {
+    element.scrollLeft = element.scrollWidth;
+    return {
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth,
+      scrollLeft: element.scrollLeft,
+      overflowX: getComputedStyle(element).overflowX,
+    };
+  });
+  expect(scroll.scrollWidth).toBeGreaterThan(scroll.clientWidth);
+  expect(scroll.scrollLeft).toBeGreaterThan(0);
+  expect(scroll.overflowX).toMatch(/^(auto|scroll)$/);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
   expect(overflow).toBe(true);
 });

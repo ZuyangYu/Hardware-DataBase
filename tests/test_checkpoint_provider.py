@@ -104,8 +104,11 @@ class AuthoringCheckpointerProviderTests(unittest.TestCase):
         os.environ.get("HDB_TEST_POSTGRES_DSN", ""), "HDB_TEST_POSTGRES_DSN is not configured"
     )
     def test_postgres_postgres_backend_smoke(self):
+        from src.agents.checkpoints.postgres_provider import ensure_checkpoint_schema
         from src.document_authoring.harness.checkpointer import build_checkpointer
 
+        # Runtime only verifies: prepare the schema just as migrate does.
+        ensure_checkpoint_schema(os.environ["HDB_TEST_POSTGRES_DSN"])
         checkpointer = build_checkpointer(
             "postgres",
             database_url=os.environ["HDB_TEST_POSTGRES_DSN"],
@@ -126,6 +129,9 @@ class PostgresCheckpointerIntegrationTests(unittest.TestCase):
 
     @unittest.skipUnless(dsn, "HDB_TEST_POSTGRES_DSN is not configured")
     def test_postgres_saver_round_trip(self):
+        from src.agents.checkpoints.postgres_provider import ensure_checkpoint_schema
+
+        ensure_checkpoint_schema(self.dsn)  # 与生产一致：schema 先由 migrate 建好
         provider = PostgresCheckpointerProvider(self.dsn)
         saver = provider.create()
         try:

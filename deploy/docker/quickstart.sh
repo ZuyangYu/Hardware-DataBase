@@ -124,6 +124,12 @@ if [ ! -f config/.env ]; then
   cp hdb.env.example config/.env
   log "已从模板生成 config/.env"
 fi
+# 旧模板写死的 RESOURCE_GOVERNOR_SCOPE=process 与本编排（后端 postgres）冲突：
+# 保存「系统配置」时以本文件为准覆盖环境变量，会直接校验失败。就地纠正。
+if grep -qE '^RESOURCE_GOVERNOR_SCOPE=process$' config/.env; then
+  sed -i 's/^RESOURCE_GOVERNOR_SCOPE=process$/RESOURCE_GOVERNOR_SCOPE=deployment/' config/.env
+  log "已纠正 config/.env: RESOURCE_GOVERNOR_SCOPE=deployment（容器部署要求）"
+fi
 if ! grep -qE '^AUTH_DEFAULT_ADMIN_PASSWORD=.+' config/.env; then
   ADMIN_PW="$(gen_secret)"
   awk -v v="$ADMIN_PW" '

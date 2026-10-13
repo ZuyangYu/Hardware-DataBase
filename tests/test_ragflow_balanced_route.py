@@ -37,7 +37,7 @@ class _Client:
         self.responses = list(responses)
         self.calls: list[tuple[str, list[str], int, dict | None]] = []
 
-    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None):
+    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None, document_ids=None):
         self.calls.append((question, dataset_ids, top_k, metadata_condition))
         return self.responses.pop(0)
 
@@ -58,7 +58,7 @@ class _RoutingClient:
         self.balanced_chunks = balanced_chunks
         self.calls: list[tuple[str, list[str], int, dict | None]] = []
 
-    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None):
+    def retrieve(self, question, dataset_ids, top_k, metadata_condition=None, document_ids=None):
         self.calls.append((question, dataset_ids, top_k, metadata_condition))
         if _has_source_group_condition(metadata_condition):
             return list(self.group_chunks)
