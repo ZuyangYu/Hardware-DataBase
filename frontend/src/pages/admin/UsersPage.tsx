@@ -269,7 +269,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
           <StatCard label="停用" value={users.length - activeCount} />
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-[10px]">
+        <div className="flex flex-wrap items-center gap-[10px]">
           <label htmlFor="user-directory-search" className="sr-only">
             查找用户
           </label>
@@ -277,7 +277,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
             <AppIcon
               name="search"
               size={15}
-              className="pointer-events-none absolute left-[10px] top-1/2 -translate-y-1/2 text-[#858b9c]"
+              className="pointer-events-none absolute left-[11px] top-1/2 -translate-y-1/2 text-[#858b9c]"
             />
             <Input
               id="user-directory-search"
@@ -285,7 +285,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.target.value)}
               placeholder="查找用户名、部门或角色"
-              className="h-[36px] rounded-[10px] border-[#e3e7f1] pl-[32px] text-[13px]"
+              className="h-[36px] rounded-[10px] border-[#e3e7f1] pl-[35px] text-[13px]"
             />
           </div>
           {searchQuery.trim() && loaded && (

@@ -33,6 +33,13 @@ test('department names expand to show their members', async ({ page }) => {
   await expect(departmentRow).toContainText('alice');
   await expect(departmentRow).toContainText('bob');
   await expect(departmentRow).not.toContainText('carol');
+  // 成员行三列对齐:角色列起点一致,且与名字列保持间距(不再挤成一团)
+  const memberRows = departmentRow.locator('[id^="department-members-"] > div');
+  await expect(memberRows).toHaveCount(2);
+  const nameBox = await memberRows.nth(0).locator('span').nth(0).boundingBox();
+  const roleBoxes = await Promise.all([0, 1].map((i) => memberRows.nth(i).locator('span').nth(1).boundingBox()));
+  expect(Math.round(roleBoxes[0]!.x)).toBe(Math.round(roleBoxes[1]!.x));
+  expect(Math.round(roleBoxes[0]!.x - (nameBox!.x + nameBox!.width))).toBeGreaterThanOrEqual(10);
 });
 
 test('user management filters users by username and department', async ({ page }) => {
@@ -43,6 +50,12 @@ test('user management filters users by username and department', async ({ page }
   await search.fill('alice');
   await expect(page.getByRole('row').filter({ hasText: 'alice' })).toBeVisible();
   await expect(page.getByRole('row').filter({ hasText: 'bob' })).toHaveCount(0);
+  // 计数提示应紧跟搜索框(不再被推到行尾)
+  const hint = page.getByText('找到 1 个用户', { exact: true });
+  await expect(hint).toBeVisible();
+  const inputBox = await search.boundingBox();
+  const hintBox = await hint.boundingBox();
+  expect(Math.round(hintBox!.x - (inputBox!.x + inputBox!.width))).toBeLessThanOrEqual(24);
   await search.fill('研发部');
   await expect(page.getByRole('row').filter({ hasText: 'alice' })).toBeVisible();
   await expect(page.getByRole('row').filter({ hasText: 'bob' })).toBeVisible();
