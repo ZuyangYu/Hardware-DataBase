@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { notify } from '@/components/ui/app-toast';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 
 type Props = {
@@ -123,7 +124,7 @@ export default function KbMountPage({ auth, onLogout }: Props) {
   }
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <AdminPageFrame>
       <AppHeader
         title="知识库挂载"
         description="把知识库归属到部门并指定部门员工为所有者；知识库默认私有，由所有者决定是否部门共享，共享后部门其他成员拥有完整 admin 权限。"
@@ -207,6 +208,6 @@ export default function KbMountPage({ auth, onLogout }: Props) {
           </div>
         </div>
       )}
-    </div>
+    </AdminPageFrame>
   );
 }

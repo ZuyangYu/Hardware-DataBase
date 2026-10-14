@@ -22,6 +22,7 @@ import {
 } from '@/components/ui/select';
 import { notify } from '@/components/ui/app-toast';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 
@@ -672,7 +673,7 @@ export default function ConfigPage({ auth, onLogout }: Props) {
   const groups = visibleGroups();
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <AdminPageFrame>
       <AppHeader
         title="系统配置"
         description="编辑运行时配置(写入 .env 并热加载)；标有「重启生效」的项需重启进程。仅白名单键可修改，调参项可点「显示高级设置」。"
@@ -776,6 +777,6 @@ export default function ConfigPage({ auth, onLogout }: Props) {
           load();
         }}
       />
-    </div>
+    </AdminPageFrame>
   );
 }

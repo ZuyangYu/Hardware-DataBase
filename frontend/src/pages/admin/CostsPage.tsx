@@ -290,8 +290,8 @@ export default function CostsPage(props: { auth: AuthSession; onLogout: () => vo
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <AppHeader title="成本与用量" description="共享模型调用账本 · 应用侧 Token 估算 · 按币种分别统计" />
       <AdminPageShell>
+        <AppHeader title="成本与用量" description="共享模型调用账本 · 应用侧 Token 估算 · 按币种分别统计" />
         <section className="grid min-w-0 gap-4 rounded-xl border bg-white p-4 shadow-sm">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0">

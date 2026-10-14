@@ -275,10 +275,10 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
   }
 
   return (
-    <section data-admin-skills className="mx-[48px] mt-[16px] mb-[32px] max-[900px]:mx-[16px]">
+    <section data-admin-skills>
       <header className="flex flex-wrap items-center justify-between gap-[16px] border-b border-[#e8ebf2] pb-[20px]">
         <div>
-          <h2 className="text-[20px] font-semibold tracking-[-0.02em] text-[#18181a]">Skill 上传与审核</h2>
+          <h2 className="text-[16px] font-semibold tracking-[-0.02em] text-[#18181a]">Skill 上传与审核</h2>
           <p className="mt-[4px] text-[12px] text-[#697084]">管理上传、构建和审核。选择一项查看详情与下一步操作。</p>
         </div>
         <div className="flex flex-wrap items-center gap-[8px]">
