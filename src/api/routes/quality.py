@@ -1,6 +1,7 @@
 """Production feedback, scoped queue and explicitly shared review copies."""
 from __future__ import annotations
 
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import src.settings as settings
@@ -48,8 +49,17 @@ def feedback_state(turn_id: str, user: AuthUser = Depends(require_employee), sto
 
 
 @router.post("/chat/turns/{turn_id}/feedback")
-def submit_feedback(turn_id: str, body: FeedbackRequest, user: AuthUser = Depends(require_employee), store: QualityStore = Depends(_store)):
-    return _call(store.submit_feedback, user, turn_id, body)
+def submit_feedback(turn_id: str, body: FeedbackRequest, user: AuthUser = Depends(require_employee), store: QualityStore = Depends(_store), auth: AuthService = Depends(get_auth_service)):
+    result = _call(store.submit_feedback, user, turn_id, body)
+    if result.get("ticket_created"):
+        from src.api.routes.quality_tickets import notify_ticket_created
+
+        try:
+            notify_ticket_created(result["ticket_id"], auth.list_users())
+        except Exception as exc:
+            # Notification delivery must never undo a committed support request.
+            logging.getLogger(__name__).warning("Ticket intake notification unavailable: ticket=%s error=%s", result["ticket_id"], type(exc).__name__)
+    return result
 
 
 @router.get("/quality/reviewers")

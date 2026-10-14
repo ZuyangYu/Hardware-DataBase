@@ -1,6 +1,5 @@
 /** 后端 /api/v1 的 DTO 镜像(对齐 src/api/schemas.py) */
 
-import type { QualityReviewRequest } from './workbenchTypes';
 
 export type Role = 'system_admin' | 'employee';
 
@@ -1644,14 +1643,10 @@ export type McpCreatePayload = {
 };
 export type QualityRating = 'helpful' | 'unhelpful' | 'withdrawn';
 export type QualityReason = 'factual_error' | 'unsupported_evidence' | 'not_found' | 'version_conflict' | 'incomplete_task' | 'format_mismatch';
-export interface QualityShare {
-  active?: boolean;
-  reviewer_user_ids?: number[];
-  fields?: string[];
-  evidence_indices?: number[];
-  expires_at?: string;
-}
 export interface QualityFeedbackState {
+  ticket_id?: string | null;
+  ticket_status?: TicketStatus | null;
+  support_contact?: string;
   assistant_message_id: number;
   answer_revision: string;
   case_id: string | null;
@@ -1662,30 +1657,31 @@ export interface QualityFeedbackState {
   comment: string;
   evidence_count: number;
   content_available: boolean;
-  share: QualityShare;
-  review_requests?: QualityReviewRequest[];
 }
-export interface QualityCase {
-  projection_status?: { status: string; count: number }[];
+export type TicketStatus = 'open' | 'in_progress' | 'waiting' | 'resolved' | 'closed';
+export type TicketAction = 'reply' | 'claim' | 'assign' | 'wait' | 'resolve' | 'reopen' | 'close';
+export interface FeedbackTicket {
+  ticket_id: string;
   case_id: string;
-  snapshot_id: string;
-  turn_id: string;
-  assistant_message_id: number;
-  answer_revision: string;
+  owner_user_id: number;
+  requester_username: string;
   department_id: number | null;
-  status: string;
+  department_name: string;
+  assignee_user_id: number | null;
+  assignee_username: string;
+  status: TicketStatus;
   row_version: number;
-  triggers: string[];
-  sampling: { policy?: string; probability?: number; cohort?: string };
-  manifest: Record<string, unknown>;
-  content: { query?: string; answer?: string; evidence?: Record<string, unknown>[] };
-  content_access: 'owner' | 'shared' | 'hidden';
-  source_valid: boolean;
-  share: QualityShare;
-  feedback: { event_id: string; rating: QualityRating; reason_codes: QualityReason[]; comment: string; created_at: string } | null;
-  feedback_history?: { event_id: string; sequence: number; rating: QualityRating; reason_codes: QualityReason[]; created_at: string }[];
-  reviews: { review_id: string; judgment: string; root_cause: string; correctness?: string | null; supersedes: string | null; created_at: string; content: { reference_answer?: string; rubric?: string; notes?: string } }[];
-  review_requests?: QualityReviewRequest[];
+  consent_active: boolean;
+  content_available: boolean;
+  summary: string;
+  reason_codes: QualityReason[];
   created_at: string;
   updated_at: string;
+}
+export interface FeedbackTicketDetail extends FeedbackTicket {
+  content: { query?: string; answer?: string };
+  comment: string;
+  contact: string;
+  resolution: string;
+  events: { event_id: string; actor_user_id: number; actor_username: string; actor_role: Role; kind: string; message: string; status: TicketStatus; created_at: string }[];
 }

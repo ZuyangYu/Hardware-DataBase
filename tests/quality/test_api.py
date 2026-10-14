@@ -18,6 +18,7 @@ def test_feedback_api_authorization_and_read_only_queries(quality):
     app.dependency_overrides[routes._store] = lambda: q.store
     viewer = [q.owner]
     app.dependency_overrides[current_user] = lambda: viewer[0]
+    app.dependency_overrides[get_auth_service] = lambda: SimpleNamespace(list_users=lambda: [q.owner, q.admin])
     with TestClient(app) as client:
         path = f"/api/v1/chat/turns/{q.turn.id}/feedback"
         state = client.get(path)

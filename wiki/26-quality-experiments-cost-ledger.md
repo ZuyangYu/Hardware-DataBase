@@ -3,14 +3,17 @@
 对应代码：`src/quality/{workflow,evaluation_bridge,experiments}.py`、`src/costs/`、
 `src/api/routes/{quality_workflow,costs}.py`、`src/observability/slo.py`。
 
-## 案例到回归、发布与回访
+## 内部案例、回归、发布与回访 API
 
-1. 在 `/admin/quality` 对当前有权访问的固定材料复核；confirmed 并提供参考答案。
-2. “冻结已确认案例版本”记录材料、所选证据、rubric、split 和 review ID 的不可变来源 manifest。
+高级质量前端已移除，以下功能仅保留为内部接口和历史记录。日常用户通过反馈工单提交问题，
+管理员联系处理并记录解决办法；工单关闭不依赖以下步骤。
+
+1. 通过质量案例与复核 API 对有权访问的固定材料复核；confirmed 并提供参考答案。
+2. 冻结接口记录材料、所选证据、rubric、split 和 review ID 的不可变来源 manifest。
    修订或撤销后重新读取时会拒绝使用失效材料；同一会话不能跨 repair/gold/holdout 分组。
-3. “评分固定生产回答”按该版本创建 offline run。原始 owner 可发起“固定证据生成候选回答”，
+3. 评分接口按该版本创建 offline run。原始 owner 可调用固定证据候选生成接口，
    只向业务模型提供问题与冻结检索证据；参考答案只交给 scorer，不提供给生成模型。
-4. run 沿用共享租约 evaluation worker；在线采集完成后显式“开始候选评分”。
+4. run 沿用共享租约 evaluation worker；在线采集完成后显式调用候选评分接口。
    授权详情：`GET /api/v1/quality/evaluation-runs/{run_id}`；原管理员评测入口不会开放正文。
 5. 关联修改引用和不同的 baseline/candidate run。服务端校验固定输入内容指纹、cohort、scorer 和候选门禁。
    数值配对由代码计算，评分不足、输入改变、未完成报告不能计作验证通过。

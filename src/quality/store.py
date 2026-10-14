@@ -16,6 +16,7 @@ from typing import Any
 
 import src.settings as settings
 from src.core.auth import ROLE_EMPLOYEE, ROLE_SYSTEM_ADMIN
+from src.quality.ticket_schema import DDL as TICKET_DDL, CHECKS as TICKET_CHECKS
 
 SCHEMA_VERSION = 1
 DDL = (
@@ -71,7 +72,7 @@ DDL = (
     "CREATE INDEX IF NOT EXISTS ix_quality_feedback_case ON quality_feedback_events(case_id, sequence)",
     "CREATE INDEX IF NOT EXISTS ix_quality_review_requests_owner ON quality_review_requests(owner_user_id, status, created_at)",
     "CREATE INDEX IF NOT EXISTS ix_quality_review_requests_case ON quality_review_requests(case_id, status, created_at)",
-)
+) + TICKET_DDL
 
 
 class QualityConflict(ValueError):
@@ -122,7 +123,7 @@ def assert_schema(conn) -> None:
             "SELECT review_id, case_id, reviewer_user_id, client_request_id, request_sha256, judgment, root_cause, content_json, supersedes, created_at FROM quality_reviews LIMIT 0",
             "SELECT request_id, case_id, requester_user_id, owner_user_id, department_id, client_request_id, request_sha256, message, status, decision_note, created_at, updated_at, decided_at FROM quality_review_requests LIMIT 0",
             "SELECT job_id, snapshot_id, kind, dedup_key, payload_json, status, owner, lease_until, fencing_token, attempts, available_at, last_error, created_at, updated_at FROM quality_outbox LIMIT 0",
-        ):
+        ) + TICKET_CHECKS:
             conn.execute(query)
         if not isinstance(conn, sqlite3.Connection):
             text_payloads = {
@@ -246,6 +247,9 @@ def purge_snapshot_content(conn, snapshot_id: str, reason: str) -> None:
     conn.execute("UPDATE quality_cases SET share_json = '{}', row_version = row_version + 1, updated_at = ? WHERE snapshot_id = ?", (now_iso(), snapshot_id))
     conn.execute("UPDATE quality_feedback_events SET comment = '' WHERE case_id IN (SELECT case_id FROM quality_cases WHERE snapshot_id = ?)", (snapshot_id,))
     conn.execute("UPDATE quality_reviews SET content_json = '{}' WHERE case_id IN (SELECT case_id FROM quality_cases WHERE snapshot_id = ?)", (snapshot_id,))
+    from src.quality.tickets import clear_ticket_material
+
+    clear_ticket_material(conn, snapshot_id)
     conn.execute(
         """UPDATE quality_review_requests
            SET status = 'rejected', decision_note = ?, decided_at = ?, updated_at = ?
@@ -444,8 +448,11 @@ class QualityStore:
         }
 
     def feedback_state(self, user_id: int, turn_id: str) -> dict:
+        from src.quality.tickets import active_ticket
+
         with closing(self.connect()) as conn:
             snapshot = self.target(conn, turn_id, user_id)
+            ticket = active_ticket(conn, snapshot["snapshot_id"])
             case = conn.execute("SELECT * FROM quality_cases WHERE snapshot_id = ?", (snapshot["snapshot_id"],)).fetchone()
             event = None if case is None else conn.execute("SELECT * FROM quality_feedback_events WHERE case_id = ? ORDER BY sequence DESC LIMIT 1", (case["case_id"],)).fetchone()
             review_requests = []
@@ -469,10 +476,20 @@ class QualityStore:
                 "comment": event["comment"] if event and self.source_valid(conn, snapshot) else "",
                 "share": json.loads(case["share_json"]) if case else {},
                 "review_requests": review_requests,
+                "ticket_id": ticket["ticket_id"] if ticket else None,
+                "ticket_status": ticket["status"] if ticket else None,
+                "support_contact": ticket["contact"] if ticket and ticket["consent_active"] and self.source_valid(conn, snapshot) else "",
             }
 
     def submit_feedback(self, viewer, turn_id: str, request) -> dict:
-        payload_hash = sha256([turn_id, request.model_dump()])
+        from src.quality.tickets import active_ticket, record_feedback_ticket
+
+        payload = request.model_dump()
+        if not request.share_with_support and not request.support_contact:
+            # Preserve hashes of requests persisted before support tickets existed.
+            payload.pop("share_with_support")
+            payload.pop("support_contact")
+        payload_hash = sha256([turn_id, payload])
         with self.transaction() as conn:
             self.request_lock(conn, "feedback", viewer.id, request.client_request_id)
             snapshot = self.target(conn, turn_id, viewer.id, lock=True)
@@ -486,7 +503,9 @@ class QualityStore:
             if prior:
                 if prior["request_sha256"] != payload_hash:
                     raise QualityConflict("client_request_id was already used for different feedback")
-                return {"event_id": prior["event_id"], "case_id": case["case_id"], "deduplicated": True}
+                ticket = active_ticket(conn, snapshot["snapshot_id"])
+                return {"event_id": prior["event_id"], "case_id": case["case_id"], "deduplicated": True,
+                        "ticket_id": ticket["ticket_id"] if ticket else None, "ticket_created": False}
             event_id = f"feedback-{uuid.uuid4().hex}"
             sequence = int(conn.execute("SELECT COALESCE(MAX(sequence), 0) FROM quality_feedback_events WHERE case_id = ?", (case["case_id"],)).fetchone()[0]) + 1
             conn.execute(
@@ -502,7 +521,9 @@ class QualityStore:
                 "label": request.rating, "score": 1 if request.rating == "helpful" else 0 if request.rating == "unhelpful" else None,
                 "metadata": {"case_id": case["case_id"], "event_id": event_id, "revision": snapshot["answer_revision"], "reason_codes": request.reason_codes},
             })
-            return {"event_id": event_id, "case_id": case["case_id"], "deduplicated": False}
+            ticket_id, ticket_created = record_feedback_ticket(self, conn, snapshot, case, viewer, request, event_id)
+            return {"event_id": event_id, "case_id": case["case_id"], "deduplicated": False,
+                    "ticket_id": ticket_id, "ticket_created": ticket_created}
 
     def create_review_request(self, viewer, case_id: str, request) -> dict:
         if viewer.role != ROLE_SYSTEM_ADMIN:

@@ -1,14 +1,15 @@
 import { expect, test, type Page } from '@playwright/test';
 
 // 管理后台页面骨架一致性回归:所有管理页的页头(h1 标题)必须落在同一位置、
-// 同一字号,页头整体高度一致 —— 防止再出现"质量工作台/治理总览标题不齐"。
+// 同一字号,页头整体高度一致 —— 防止再出现"反馈工单/治理总览标题不齐"。
 // 只 mock API,不触碰真实数据。
 
 const admin = { username: 'skeleton-admin', role: 'system_admin', department_id: null, department_name: null };
+const employee = { username: 'skeleton-employee', role: 'employee', department_id: 7, department_name: '研发部' };
 
 const PAGES: Array<{ path: string; name: string }> = [
   { path: '/admin/governance', name: '治理总览' },
-  { path: '/admin/quality', name: '质量工作台' },
+  { path: '/admin/quality', name: '反馈工单' },
   { path: '/admin/costs', name: '成本与用量' },
   { path: '/admin/logs', name: '日志中心' },
   { path: '/admin/evaluation', name: 'RAGAS 评估' },
@@ -26,17 +27,17 @@ const COST_SUMMARY = {
   tokens: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, reasoning_tokens: 0 },
 };
 
-async function installMocks(page: Page) {
+async function installMocks(page: Page, user: typeof admin | typeof employee = admin) {
   await page.addInitScript((user) => {
     localStorage.setItem('hdb_auth_session', JSON.stringify({ token: 'skeleton-regression-only', user }));
-  }, admin);
+  }, user);
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
-    if (path === '/api/v1/whoami') return route.fulfill({ json: admin });
+    if (path === '/api/v1/whoami') return route.fulfill({ json: user });
     if (path === '/api/v1/notifications') return route.fulfill({ json: { items: [], unread_count: 0 } });
     if (path === '/api/v1/governance/kb-summaries') return route.fulfill({ json: [] });
-    if (path === '/api/v1/quality/cases' || path === '/api/v1/quality/reports') return route.fulfill({ json: [] });
-    if (path === '/api/v1/quality/analysis-runs') return route.fulfill({ json: { report_id: 'r' } });
+    if (path === '/api/v1/quality/tickets') return route.fulfill({ json: { items: [], total: 0 } });
+    if (path === '/api/v1/quality/ticket-assignees') return route.fulfill({ json: [] });
     if (path === '/api/v1/costs/summary' || path === '/api/v1/costs/trends') {
       return route.fulfill({ json: path.endsWith('/trends')
         ? { bucket: 'day', timezone: 'UTC', summary: COST_SUMMARY, buckets: [], rankings_by_currency: {} }
@@ -90,6 +91,20 @@ test('所有管理页页头几何一致(位置/字号/高度)', async ({ page })
   for (const { name, geometry } of geometries) {
     expect(geometry, `${name} 的页头应与「${PAGES[0].name}」一致,实际 ${JSON.stringify(geometry)} 基准 ${JSON.stringify(reference)}`).toEqual(reference);
   }
+});
+
+test('员工我的反馈页沿用治理页面的布局并说明如何提交问题', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await installMocks(page, employee);
+  await page.goto('/admin/governance');
+  await expect(page.locator('header h1')).toHaveText('治理总览');
+  await page.evaluate(() => document.fonts.ready);
+  const reference = await readHeader(page);
+  await page.goto('/admin/quality');
+  await expect(page.locator('header h1')).toHaveText('我的反馈');
+  await expect(page.locator('header')).toContainText('回答有问题');
+  await page.evaluate(() => document.fonts.ready);
+  expect(await readHeader(page)).toEqual(reference);
 });
 
 test('所有管理页标题都有描述行,页头结构一致(避免块高忽高忽低)', async ({ page }) => {

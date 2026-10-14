@@ -39,7 +39,7 @@ const DepartmentsPage = lazy(() => import('./pages/admin/DepartmentsPage'));
 const KbMountPage = lazy(() => import('./pages/admin/KbMountPage'));
 const GovernancePage = lazy(() => import('./pages/admin/GovernancePage'));
 const LogsPage = lazy(() => import('./pages/admin/LogsPage'));
-const QualityPage = lazy(() => import('./pages/admin/QualityPage'));
+const FeedbackTicketsPage = lazy(() => import('./pages/admin/FeedbackTicketsPage'));
 const CostsPage = lazy(() => import('./pages/admin/CostsPage'));
 const ConfigPage = lazy(() => import('./pages/admin/ConfigPage'));
 const EvaluationPage = lazy(() => import('./pages/admin/EvaluationPage'));
@@ -183,7 +183,8 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
           <Suspense fallback={<div role="status" className="p-6 text-muted-foreground">正在加载页面…</div>}>
           <Routes>
             <Route path="/" element={<HomeRedirect auth={auth} />} />
-            <Route path="/admin/quality" element={<AdminRoute auth={auth}><QualityPage auth={auth} onLogout={onLogout} /></AdminRoute>} />
+            <Route path="/admin/quality" element={<AdminRoute auth={auth}><FeedbackTicketsPage auth={auth} onLogout={onLogout} /></AdminRoute>} />
+            <Route path="/admin/quality/advanced" element={<Navigate to="/admin/quality" replace />} />
             <Route path="/admin/costs" element={<AdminRoute auth={auth}><CostsPage auth={auth} onLogout={onLogout} /></AdminRoute>} />
             <Route
               path="/assets"

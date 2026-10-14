@@ -18,9 +18,15 @@ class FeedbackRequest(BaseModel):
     rating: Literal["helpful", "unhelpful", "withdrawn"]
     reason_codes: list[ReasonCode] = Field(default_factory=list, max_length=6)
     comment: str = Field(default="", max_length=4000)
+    share_with_support: bool = False
+    support_contact: str = Field(default="", max_length=200)
 
     @model_validator(mode="after")
     def valid_reasons(self):
+        if self.rating != "unhelpful" and (self.share_with_support or self.support_contact):
+            raise ValueError("support material requires unhelpful feedback")
+        if self.support_contact and not self.share_with_support:
+            raise ValueError("support contact requires ticket consent")
         if len(set(self.reason_codes)) != len(self.reason_codes):
             raise ValueError("reason_codes must be unique")
         if self.rating != "unhelpful" and self.reason_codes:

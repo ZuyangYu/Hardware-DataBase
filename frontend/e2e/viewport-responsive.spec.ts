@@ -19,10 +19,9 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === '/api/v1/whoami') return route.fulfill({ json: admin });
-    if (path === '/api/v1/quality/cases') return route.fulfill({ json: [] });
-    if (path === '/api/v1/quality/reports') return route.fulfill({ json: [] });
+    if (path === '/api/v1/quality/tickets') return route.fulfill({ json: { items: [], total: 0 } });
+    if (path === '/api/v1/quality/ticket-assignees' || path === '/api/v1/departments') return route.fulfill({ json: [] });
     if (path === '/api/v1/governance/kb-summaries') return route.fulfill({ json: [] });
-    if (path === '/api/v1/quality/analysis-runs') return route.fulfill({ json: { report_id: 'r' } });
     if (path === '/api/v1/costs/summary') return route.fulfill({ json: { calls: 0, known_amounts: {}, tokens: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, reasoning_tokens: 0 }, unknown_cost_calls: 0, usage_coverage: null, price_coverage: null, logical_only_calls: 0, unfinished_calls: 0, unattributed_calls: 0, updated_at: null, scope: 'test', by_purpose: {} } });
     if (path === '/api/v1/costs/invocations') return route.fulfill({ json: [] });
     if (path === '/api/v1/costs/trends') return route.fulfill({ json: { bucket: 'day', timezone: 'UTC', summary: { calls: 0, known_amounts: {}, tokens: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, reasoning_tokens: 0 }, unknown_cost_calls: 0, usage_coverage: null, price_coverage: null, logical_only_calls: 0, unfinished_calls: 0, unattributed_calls: 0, updated_at: null, scope: 'test', by_purpose: {} }, buckets: [], rankings_by_currency: {} } });
@@ -56,7 +55,7 @@ test('窄屏显示"打开导航"触发器,桌面隐藏且固定侧栏可用', as
   await page.setViewportSize({ width: 1440, height: 900 });
   // 桌面固定侧栏先出现(说明 isMobile 已切换),再断言抽屉触发器消失
   await expect(page.getByRole('button', { name: '治理与运营' })).toBeVisible();
-  await expect(page.getByRole('navigation', { name: '页面二级导航' }).getByRole('link', { name: '质量工作台', exact: true })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: '页面二级导航' }).getByRole('link', { name: '反馈工单', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '打开导航' })).toBeHidden();
 });
 
@@ -70,7 +69,7 @@ test('移动抽屉: 打开、 Escape 关闭、焦点返回触发按钮', async (
   await expect(drawer.getByRole('heading', { name: '导航' })).toBeVisible();
   await expect(drawer.getByRole('button', { name: '治理与运营', exact: true })).toBeVisible();
   await expect(drawer.getByRole('button', { name: '管理', exact: true })).toBeVisible();
-  await expect(drawer.getByRole('button', { name: /质量工作台/ })).toHaveCount(0);
+  await expect(drawer.getByRole('button', { name: /反馈工单/ })).toHaveCount(0);
   // 打开时背景滚动锁定(Radix Dialog 默认行为)
   await page.keyboard.press('Escape');
   await expect(drawer).toBeHidden();
