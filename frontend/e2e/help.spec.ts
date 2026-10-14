@@ -193,3 +193,37 @@ test('离开已定位位置后，重复提交相同搜索仍会定位', async ({
   await page.keyboard.press('Enter');
   await expect(heading).toBeInViewport();
 });
+
+test('章节目录默认展开所有小节，并可定位到小节', async ({ page }) => {
+  await authenticate(page);
+  await page.goto('/help');
+  const toc = page.getByRole('navigation', { name: '手册目录' });
+  await expect(toc.getByRole('link', { name: '修改密码', exact: true })).toBeVisible();
+  await expect(toc.getByRole('link', { name: '资产中心', exact: true })).toBeVisible();
+  const collapse = toc.getByRole('button', { name: '收起 3 登录与首次使用 小节', exact: true });
+  await collapse.click();
+  await expect(toc.getByRole('link', { name: '修改密码', exact: true })).toBeHidden();
+  await toc.getByRole('button', { name: '展开 3 登录与首次使用 小节', exact: true }).click();
+  await expect(toc.getByRole('link', { name: '修改密码', exact: true })).toBeVisible();
+  await toc.getByRole('link', { name: '修改密码', exact: true }).click();
+  await expect(page).toHaveURL(/#login--section-2$/);
+  await expect(page.getByRole('heading', { name: '修改密码', exact: true })).toBeInViewport();
+});
+
+test('移动端使用单栏布局并可折叠手册目录', async ({ page }) => {
+  await authenticate(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/help');
+  const widths = await page.evaluate(() => ({
+    documentWidth: document.documentElement.scrollWidth,
+    viewportWidth: document.documentElement.clientWidth,
+  }));
+  expect(widths.documentWidth).toBeLessThanOrEqual(widths.viewportWidth + 1);
+  const toggle = page.getByRole('button', { name: '展开手册目录', exact: true });
+  await expect(toggle).toBeVisible();
+  const toc = page.getByRole('navigation', { name: '手册目录' });
+  await expect(toc).toBeHidden();
+  await toggle.click();
+  await expect(toc).toBeVisible();
+  await expect(page.getByRole('button', { name: '收起手册目录', exact: true })).toBeVisible();
+});

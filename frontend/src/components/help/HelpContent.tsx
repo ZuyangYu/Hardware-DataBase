@@ -11,9 +11,9 @@ export default function HelpContent({ content, sections }: { content: string; se
         remarkPlugins={[remarkGfm]}
         skipHtml
         components={{
-          h3: ({ node, children }) => <h3 id={sections.find((section) => section.line === node?.position?.start.line)?.id} tabIndex={-1} className="scroll-mt-[116px] outline-none">{children}</h3>,
+          h3: ({ node, children }) => <h3 id={sections.find((section) => section.line === node?.position?.start.line)?.id} tabIndex={-1} className="scroll-mt-40 outline-none lg:scroll-mt-[116px]">{children}</h3>,
           img: ({ src, alt }) => src?.startsWith('/help-assets/') ? <HelpImagePreview src={src} alt={alt || '手册截图'} /> : null,
-          table: ({ children }) => <div className="my-4 max-w-full overflow-x-auto rounded-lg border border-border"><table className="w-full border-collapse text-left text-[14px] [&_td]:min-w-[120px] [&_td]:border-b [&_td]:border-border [&_td]:px-4 [&_td]:py-2 [&_th]:min-w-[120px] [&_th]:border-b [&_th]:border-border [&_th]:bg-muted [&_th]:px-4 [&_th]:py-2 [&_th]:font-medium [&_tr:last-child_td]:border-b-0">{children}</table></div>,
+          table: ({ children }) => <div className="my-4 max-w-full overflow-x-auto rounded-lg border border-border"><table className="min-w-[480px] w-full border-collapse text-left text-[14px] sm:min-w-0 [&_td]:min-w-[120px] [&_td]:border-b [&_td]:border-border [&_td]:px-4 [&_td]:py-2 [&_th]:min-w-[120px] [&_th]:border-b [&_th]:border-border [&_th]:bg-muted [&_th]:px-4 [&_th]:py-2 [&_th]:font-medium [&_tr:last-child_td]:border-b-0">{children}</table></div>,
           a: ({ href, children }) => <a href={href} {...(href?.startsWith('http') ? { target: '_blank', rel: 'noopener noreferrer' } : {})}>{children}</a>,
         }}
       >{content}</Markdown>
