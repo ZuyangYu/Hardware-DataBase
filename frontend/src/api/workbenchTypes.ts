@@ -1,4 +1,4 @@
-/** Display contracts from costs/store.py and quality/workflow.py.
+/** Display contracts from costs/store.py.
  * Amounts and utilization are decimal strings; never recompute billing in the UI.
  * Kept separate from types.ts so existing in-flight API type changes stay untouched.
  */
@@ -95,28 +95,4 @@ export type CostBudget = {
   status: string;
   period_status: 'future' | 'active' | 'ended';
   summary: CostSummary;
-};
-
-export type QualityReport = {
-  report_id: string;
-  created_at: string;
-  input_manifest_sha256: string;
-  reporter: string;
-  // The current endpoint only returns persisted, completed reports, not run status.
-  verified_statistics: { case_count: number; costs: { calls: number; unknown_cost_calls: number } };
-  recommendations: {
-    recommendation_id: string;
-    hypothesis: string;
-    experiment_plan: string;
-    status: string;
-  }[];
-};
-
-export type QualityReviewRequest = {
-  request_id: string;
-  status: 'pending' | 'approved' | 'rejected';
-  message: string;
-  created_at: string;
-  updated_at: string;
-  decided_at: string | null;
 };

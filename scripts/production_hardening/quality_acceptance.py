@@ -19,7 +19,7 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     with tempfile.TemporaryDirectory(prefix="hdb-quality-browser-", dir="/tmp/opencode" if Path("/tmp/opencode").exists() else None) as root:
         os.environ.update({"HDB_ENV_PATH": os.devnull, "STORAGE_DIR": root, "AUTH_DB_PATH": str(Path(root) / "auth.db"),
-                           "OBS_ENABLED": "false", "REDIS_REQUIRED": "false", "REDIS_URL": "", "MEMORY_ENABLED": "false",
+                           "OBS_ENABLED": "false", "REDIS_REQUIRED": "false", "REDIS_URL": "", "MEMORY_ENABLED": "false", "NOTIFY_WEBHOOK_URL": "",
                            "AUTH_DEFAULT_ADMIN_USERNAME": "quality_admin", "AUTH_DEFAULT_ADMIN_PASSWORD": "BrowserTestPassword123!", "QUALITY_SAMPLE_RATE": "0"})
         for prefix in ("CONTROL_PLANE", "EVALUATION_STORE", "MEMORY_STORE", "AGENT_CHECKPOINT", "DOCUMENT_AUTHORING_CHECKPOINTER", "RESOURCE_GOVERNOR", "PROJECT_STORE", "PIPELINE_DOCUMENT_STORE", "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE"):
             os.environ[f"{prefix}_BACKEND"] = "sqlite"

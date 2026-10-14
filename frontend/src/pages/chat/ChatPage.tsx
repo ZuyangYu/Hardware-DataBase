@@ -34,7 +34,6 @@ import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
 import Composer from './components/Composer';
 import ExportTaskCenter from '@/components/ExportTaskCenter';
-import ChatReviewRequest from '@/components/quality/ChatReviewRequest';
 import EditMessageDialog from './EditMessageDialog';
 import { notify } from '@/components/ui/app-toast';
 import {
@@ -952,7 +951,6 @@ export default function ChatPage({
 
   return (
     <div className="flex h-full min-h-0 bg-[#fcfcfc] text-[#18181a]" style={sidebarProviderStyle}>
-      <ChatReviewRequest />
       <main className={cn(CHAT_MAIN_CLASS, 'flex-1')}>
         <ChatHeader
           title={activeSession?.title || '新对话'}

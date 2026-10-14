@@ -48,7 +48,7 @@ const NAV_GROUPS: NavGroup[] = [
   {
     id: 'governance', label: '治理与运营', items: [
       { path: '/admin/governance', label: '治理总览', icon: 'grid', description: '知识库治理与运营入口', access: 'dashboard' },
-      { path: '/admin/quality', label: '质量工作台', icon: 'check-list', description: '生产反馈与案例复核', access: 'dashboard' },
+      { path: '/admin/quality', label: '反馈工单', icon: 'check-list', description: '员工反馈与问题处理', access: 'dashboard', matchChildren: true },
       { path: '/admin/costs', label: '成本与用量', icon: 'chart', description: '模型调用费用与覆盖率', access: 'dashboard' },
       { path: '/admin/logs', label: '日志中心', icon: 'logs', description: '审计记录与查询日志', access: 'dashboard' },
       { path: '/admin/evaluation', label: 'RAGAS 评估', icon: 'flask', description: '评估运行与质量门禁', access: 'system_admin' },
@@ -120,7 +120,7 @@ export function navigationGroups(user: UserInfo): NavGroup[] {
   return NAV_GROUPS.map((group) => ({
     ...group,
     items: group.items.filter((item) => item.access === 'workspace' ? !isSystemAdmin(user)
-      : item.access === 'system_admin' ? isSystemAdmin(user) : hasDashboardAccess(user)),
+      : item.access === 'system_admin' ? isSystemAdmin(user) : hasDashboardAccess(user)).map(item => item.path === '/admin/quality' && !isSystemAdmin(user) ? { ...item, label: '我的反馈' } : item),
   })).filter((group) => group.items.length > 0);
 }
 
@@ -132,7 +132,7 @@ function canSeeNavItem(item: NavItem, user: UserInfo): boolean {
 export function primaryNavigationItems(user: UserInfo): PrimaryNavItem[] {
   return PRIMARY_NAV_ITEMS.map((item) => ({
     ...item,
-    items: item.itemSource().filter((child) => canSeeNavItem(child, user)),
+    items: item.itemSource().filter((child) => canSeeNavItem(child, user)).map(child => child.path === '/admin/quality' && !isSystemAdmin(user) ? { ...child, label: '我的反馈' } : child),
   })).filter((item) => item.items.length > 0);
 }
 

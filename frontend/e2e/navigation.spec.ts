@@ -13,7 +13,8 @@ function installMocks(page: import('@playwright/test').Page, user: typeof admin 
     page.route('**/api/v1/**', async (route) => {
       const path = new URL(route.request().url()).pathname;
       if (path === '/api/v1/whoami') return route.fulfill({ json: user });
-      if (path === '/api/v1/quality/cases' || path === '/api/v1/quality/reports' || path === '/api/v1/kbs') {
+      if (path === '/api/v1/quality/tickets') return route.fulfill({ json: { items: [], total: 0 } });
+      if (['/api/v1/quality/ticket-assignees', '/api/v1/departments', '/api/v1/kbs'].includes(path)) {
         return route.fulfill({ json: [] });
       }
       if (path === '/api/v1/governance/kb-summaries') return route.fulfill({ json: [] });
@@ -45,8 +46,7 @@ function installMocks(page: import('@playwright/test').Page, user: typeof admin 
 test('system_admin sees only primary workspaces and admin secondary navigation', async ({ page }) => {
   await installMocks(page, admin);
   await page.setViewportSize({ width: 1440, height: 900 });
-  // 使用无业务含义的 query 验证深链接不会被侧栏重构吞掉；`case` query
-  // 会触发现有质量复核弹窗，不属于本导航回归范围。
+  // 使用无业务含义的 query 验证深链接不会被侧栏重构吞掉。
   await page.goto('/admin/quality?from=navigation-test');
   await expect(page).toHaveURL(/\/admin\/quality\?from=navigation-test$/);
 
@@ -55,7 +55,7 @@ test('system_admin sees only primary workspaces and admin secondary navigation',
   await expect(page.getByRole('button', { name: '员工管理' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '部门管理' })).toHaveCount(0);
   const secondary = page.getByRole('navigation', { name: '页面二级导航' });
-  await expect(secondary.getByRole('link', { name: '质量工作台', exact: true })).toHaveAttribute('aria-current', 'page');
+  await expect(secondary.getByRole('link', { name: '反馈工单', exact: true })).toHaveAttribute('aria-current', 'page');
   await expect(secondary.getByRole('link', { name: '日志中心', exact: true })).toBeVisible();
   await expect(secondary.getByRole('link', { name: '成本与用量', exact: true })).toBeVisible();
   await expect(secondary.getByRole('link', { name: 'RAGAS 评估', exact: true })).toBeVisible();
@@ -72,7 +72,7 @@ test('employee sees compact primary navigation and permitted secondary links', a
   await expect(page.getByRole('button', { name: '个人扩展' })).toBeVisible();
   await expect(page.getByRole('button', { name: '治理与运营' })).toBeVisible();
   const secondary = page.getByRole('navigation', { name: '页面二级导航' });
-  await expect(secondary.getByRole('link', { name: '质量工作台', exact: true })).toHaveAttribute('aria-current', 'page');
+  await expect(secondary.getByRole('link', { name: '我的反馈', exact: true })).toHaveAttribute('aria-current', 'page');
   await expect(secondary.getByRole('link', { name: '日志中心', exact: true })).toBeVisible();
   await expect(secondary.getByRole('link', { name: '成本与用量', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '员工管理' })).toHaveCount(0);
@@ -153,7 +153,7 @@ test('governance overview exposes only existing workbench links', async ({ page 
   await page.goto('/admin/governance');
 
   await expect(page.getByRole('heading', { name: '运营入口' })).toBeVisible();
-  await expect(page.getByRole('link', { name: '质量工作台', exact: true })).toHaveAttribute('href', '/admin/quality');
+  await expect(page.getByRole('link', { name: '我的反馈', exact: true })).toHaveAttribute('href', '/admin/quality');
   await expect(page.getByRole('link', { name: '成本与用量', exact: true })).toHaveAttribute('href', '/admin/costs');
   await expect(page.getByRole('link', { name: '日志中心', exact: true })).toHaveAttribute('href', '/admin/logs');
   await expect(page.getByRole('link', { name: /RAGAS 评估/ })).toHaveCount(0);
