@@ -340,10 +340,12 @@ class AuthKnowledgeBaseScopeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 auth.create_user_as(system_admin, "emp_sys", "password123", ROLE_EMPLOYEE, system_dept.id)
 
-            # 系统管理员账号由部署环境管理, 不能通过 API 自增殖
-            with self.assertRaises(ValueError):
-                auth.create_user_as(system_admin, "admin_2", "password123", ROLE_SYSTEM_ADMIN, None)
-            self.assertNotIn("admin_2", {u.username for u in auth.list_users()})
+            # 已有系统管理员可以创建管理员, 员工无法授予管理员角色。
+            admin_2 = auth.create_user_as(system_admin, "admin_2", "password123", ROLE_SYSTEM_ADMIN, None)
+            self.assertEqual(admin_2.department_id, system_dept.id)
+            with self.assertRaises(PermissionError):
+                auth.create_user_as(emp_a, "blocked_admin", "password123", ROLE_SYSTEM_ADMIN, None)
+            self.assertIsNone(auth.get_user_by_username("blocked_admin"))
 
             del auth
             gc.collect()

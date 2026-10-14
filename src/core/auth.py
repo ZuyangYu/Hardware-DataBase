@@ -402,21 +402,24 @@ class AuthService:
         role: str = ROLE_EMPLOYEE,
         department_id: int | None = None,
     ) -> AuthUser:
-        """Create an account. Only system administrators may register staff.
+        """Active administrators can create staff or additional administrators.
 
-        Accounts created here are always ``employee`` (bound to a business
-        department). System-administrator accounts are provisioned by the
-        deployment environment (``AUTH_DEFAULT_ADMIN_*``), not through this
-        API — governance is deliberately not self-expanding.
+        Employees belong to business departments; administrators belong to
+        the system department. The deployment account keeps its existing
+        environment-managed initialization.
         """
         scope = "system" if actor.role == ROLE_SYSTEM_ADMIN else "department"
         try:
-            if actor.role != ROLE_SYSTEM_ADMIN:
-                raise PermissionError("只有系统管理员可以注册账号。")
-            if role != ROLE_EMPLOYEE:
-                raise ValueError("只能注册员工账号; 系统管理员账号由部署环境管理")
+            if not actor.is_active or actor.role != ROLE_SYSTEM_ADMIN:
+                raise PermissionError("只有启用的系统管理员可以创建账号。")
+            if role not in VALID_ROLES:
+                raise ValueError("角色必须为 system_admin 或 employee")
             system_department_id = self._system_department_id()
-            if department_id is None or department_id == system_department_id:
+            if role == ROLE_SYSTEM_ADMIN:
+                if department_id is not None and department_id != system_department_id:
+                    raise ValueError("系统管理员不能归属业务部门")
+                department_id = system_department_id
+            elif department_id is None or department_id == system_department_id:
                 raise ValueError("员工必须归属到业务部门，不能归属 system 部门")
 
             created = self._create_user_record(username, password, role, department_id)
@@ -461,13 +464,16 @@ class AuthService:
             if department_id is None:
                 dept = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchone()
                 department_id = dept["id"] if dept else None
-            conn.execute(
+            inserted = conn.execute(
                 """
                 INSERT INTO users (username, password_hash, role, department_id, is_active, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(username) DO NOTHING RETURNING id
                 """,
                 (username, hash_password(password), role, department_id, now, now),
-            )
+            ).fetchone()
+            if inserted is None:
+                raise ValueError("用户名已存在")
             row = self._get_user_row(conn, username)
         self._mirror_control_plane_row("users", row["id"])
         return row_to_user(row)

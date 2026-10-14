@@ -898,7 +898,7 @@ class AuthUserView(BaseModel):
 class CreateUserRequest(BaseModel):
     username: str
     password: str
-    role: Literal["employee"] = "employee"
+    role: Literal["employee", "system_admin"] = "employee"
     department_id: int | None = None
 
 

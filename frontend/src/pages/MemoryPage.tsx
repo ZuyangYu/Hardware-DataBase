@@ -214,7 +214,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
           <select
             value={selectedKb}
             onChange={(event) => setSelectedKb(event.target.value)}
-            className="h-[32px] rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] outline-none"
+            className="h-[32px] rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e]"
             aria-label="选择知识库"
           >
             {kbs.length === 0 && <option value="">暂无可访问知识库</option>}
@@ -224,7 +224,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
         <select
           value={status}
           onChange={(event) => setStatus(event.target.value as ListStatus)}
-          className="h-[32px] rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] outline-none"
+          className="h-[32px] rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e]"
           aria-label="记忆状态"
         >
           {(Object.keys(STATUS_LABEL) as ListStatus[]).map((value) => <option key={value} value={value}>{STATUS_LABEL[value]}</option>)}
