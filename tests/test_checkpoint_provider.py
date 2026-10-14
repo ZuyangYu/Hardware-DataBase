@@ -63,6 +63,18 @@ class CheckpointerProviderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             provider.create()
 
+    def test_closed_postgres_provider_revalidates_schema_before_reopening(self):
+        from unittest.mock import patch
+        from src.agents.checkpoints.postgres_provider import CheckpointSchemaNotReady
+
+        provider = PostgresCheckpointerProvider("postgresql://unused/database")
+        provider._verified = True
+        provider.close()
+        with patch("src.agents.checkpoints.postgres_provider.verify_checkpoint_schema",
+                   side_effect=CheckpointSchemaNotReady("schema removed after close")):
+            with self.assertRaisesRegex(CheckpointSchemaNotReady, "schema removed"):
+                provider.create()
+
     def test_settings_validation_rejects_unknown_backend(self):
         with self.assertRaises(ValueError):
             src.settings.validate_settings_values({"AGENT_CHECKPOINT_BACKEND": "mysql"})

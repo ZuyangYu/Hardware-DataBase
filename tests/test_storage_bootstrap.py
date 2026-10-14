@@ -24,6 +24,12 @@ from src.storage import auth_mirror, bootstrap, domain_pg
 DSN = os.environ.get("HDB_TEST_POSTGRES_DSN", "")
 
 
+def test_storage_lock_covers_separate_evaluation_database(monkeypatch):
+    monkeypatch.setattr(app_settings, "EVALUATION_STORE_BACKEND", "postgres")
+    monkeypatch.setattr(app_settings, "EVALUATION_STORE_DATABASE_URL", "postgresql://localhost/evaluation-test")
+    assert bootstrap._postgres_dsns() == ["postgresql://localhost/evaluation-test"]
+
+
 def _dsn_with_database(dsn: str, name: str) -> str:
     values = conninfo_to_dict(dsn)
     values["dbname"] = name
