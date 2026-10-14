@@ -397,6 +397,11 @@ class ReadParityPostgresTests(unittest.TestCase):
             "UPDATE chat_turns SET status='waiting_for_attachments' WHERE id=%s",
             (pending_id,),
         )
+        self.assertEqual(service.list_waiting_turn_ids(), [pending_id])
+        self.assertEqual(store.list_waiting_turn_ids(), [pending_id])
+        self.assertEqual(store.list_waiting_turn_ids([]), [])
+        self.assertEqual(service.list_waiting_turn_ids(["missing"]), [])
+        self.assertEqual(store.list_waiting_turn_ids(["missing"]), [])
         self.assertTrue(service.transition_waiting_turn(pending_id, to_status="pending"))
         self.assertTrue(store.transition_waiting_turn(pending_id, to_status="pending"))
         self.assertEqual(

@@ -24,6 +24,12 @@ from src.storage import auth_mirror, bootstrap, domain_pg
 DSN = os.environ.get("HDB_TEST_POSTGRES_DSN", "")
 
 
+def test_storage_lock_covers_separate_evaluation_database(monkeypatch):
+    monkeypatch.setattr(app_settings, "EVALUATION_STORE_BACKEND", "postgres")
+    monkeypatch.setattr(app_settings, "EVALUATION_STORE_DATABASE_URL", "postgresql://localhost/evaluation-test")
+    assert bootstrap._postgres_dsns() == ["postgresql://localhost/evaluation-test"]
+
+
 def _dsn_with_database(dsn: str, name: str) -> str:
     values = conninfo_to_dict(dsn)
     values["dbname"] = name
@@ -65,6 +71,8 @@ class StorageBootstrapTests(unittest.TestCase):
             ("PIPELINE_DOCUMENT_STORE_BACKEND", app_settings.PIPELINE_DOCUMENT_STORE_BACKEND),
             ("AUTHORING_STORE_BACKEND", app_settings.AUTHORING_STORE_BACKEND),
             ("COMPATIBILITY_STORE_BACKEND", app_settings.COMPATIBILITY_STORE_BACKEND),
+            ("EVALUATION_STORE_BACKEND", app_settings.EVALUATION_STORE_BACKEND),
+            ("EVALUATION_STORE_DATABASE_URL", app_settings.EVALUATION_STORE_DATABASE_URL),
         ):
             self.addCleanup(setattr, app_settings, name, value)
         app_settings.CONTROL_PLANE_BACKEND = "postgres"
@@ -78,6 +86,8 @@ class StorageBootstrapTests(unittest.TestCase):
         app_settings.PIPELINE_DOCUMENT_STORE_BACKEND = ""
         app_settings.AUTHORING_STORE_BACKEND = ""
         app_settings.COMPATIBILITY_STORE_BACKEND = ""
+        app_settings.EVALUATION_STORE_BACKEND = ""
+        app_settings.EVALUATION_STORE_DATABASE_URL = ""
 
     def _table_names(self) -> set[str]:
         with psycopg.connect(self.dsn, autocommit=True) as conn:
@@ -94,6 +104,21 @@ class StorageBootstrapTests(unittest.TestCase):
         # 控制面核心表 + 版本表
         self.assertIn("control_plane_schema", tables)
         self.assertIn("chat_turns", tables)
+        self.assertIn("memory_consent_events", tables)
+        self.assertIn("memory_sources", tables)
+        self.assertTrue({"result_snapshots", "result_export_jobs", "result_export_outbox", "result_artifacts"} <= tables)
+        from src.result_exports.store import ResultExportStore
+
+        exports = ResultExportStore(storage_dir=os.path.join(self.tmp.name, "exports"))
+        self.assertEqual(exports.list_pending(), [])
+        from src.result_exports.models import ResultEnvelope
+
+        payload = dict(owner_user_id=7, tenant_id="default", session_id=3, turn_id="fresh-export",
+                       envelope=ResultEnvelope(answer="stable answer", metadata={"z": "last", "a": "first"}))
+        snapshot = exports.create_snapshot(**payload)
+        self.assertEqual(exports.create_snapshot(**payload).snapshot_id, snapshot.snapshot_id)
+        with self.assertRaisesRegex(ValueError, "immutable"):
+            exports.create_snapshot(**{**payload, "envelope": ResultEnvelope(answer="changed answer")})
         # 各域的代表表（机械映射建出来的）
         self.assertIn("users", tables)
         self.assertIn("wiki_pages", tables)
@@ -101,10 +126,31 @@ class StorageBootstrapTests(unittest.TestCase):
         self.assertIn("pipeline_documents", tables)
         self.assertIn("template_versions", tables)
         self.assertIn("document_authoring_compatibility_events", tables)
+        self.assertIn("evaluation_execution_schema", tables)
+        self.assertIn("evaluation_execution_owners", tables)
+        self.assertTrue({"quality_schema", "quality_snapshots", "quality_cases", "quality_feedback_events", "quality_reviews", "quality_outbox"} <= tables)
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            constraints = {row[0] for row in conn.execute("SELECT conname FROM pg_constraint WHERE conname IN ('fk_chat_sessions_user', 'fk_chat_messages_session', 'fk_chat_turns_session')").fetchall()}
+        self.assertEqual(constraints, {"fk_chat_sessions_user", "fk_chat_messages_session", "fk_chat_turns_session"}, "first bootstrap must establish deletion cascades")
 
         # 幂等：再跑一次仍然成功
         self.assertEqual(bootstrap.main(), 0, "重复执行必须幂等")
         self.assertEqual(tables, self._table_names())
+
+    def test_existing_core_only_database_gains_export_ledger(self) -> None:
+        from src.storage.control_plane.schema import apply_schema
+        from src.storage.control_plane.schema_version import record_schema_version
+
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            apply_schema(conn)
+            record_schema_version(conn)
+        self.assertEqual(bootstrap.main(), 0)
+        self.assertIn("result_export_jobs", self._table_names())
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            unique = conn.execute(
+                "SELECT indisunique FROM pg_index WHERE indexrelid = 'idx_result_export_jobs_idempotency'::regclass"
+            ).fetchone()[0]
+        self.assertTrue(unique)
 
     def test_hybrid_default_provisions_memory_export_and_auth_mirror(self) -> None:
         # 生产默认形态：认证域留在 SQLite，控制面在 PG。此时仍需要 PG 上的
@@ -292,6 +338,28 @@ class StorageBootstrapTests(unittest.TestCase):
             conn.execute("SELECT memory_id FROM memory_sources WHERE session_id = 1 AND source_valid")
         self.assertEqual(after, "boolean")
 
+    def test_checkpoint_provider_revalidates_after_close(self) -> None:
+        from src.agents.checkpoints.postgres_provider import (
+            CheckpointSchemaNotReady,
+            PostgresCheckpointerProvider,
+            ensure_checkpoint_schema,
+        )
+
+        ensure_checkpoint_schema(self.dsn)
+        provider = PostgresCheckpointerProvider(self.dsn)
+        try:
+            provider.create()
+            provider.close()
+            with psycopg.connect(self.dsn, autocommit=True) as conn:
+                conn.execute(
+                    "UPDATE checkpoint_migrations SET v = v + 1000 "
+                    "WHERE v = (SELECT max(v) FROM checkpoint_migrations)"
+                )
+            with self.assertRaises(CheckpointSchemaNotReady):
+                provider.create()
+        finally:
+            provider.close()
+
     def test_version_mismatch_fails_closed(self) -> None:
         self.assertEqual(bootstrap.main(), 0)
         with psycopg.connect(self.dsn, autocommit=True) as conn:
@@ -307,8 +375,25 @@ class StorageBootstrapTests(unittest.TestCase):
         app_settings.AUTHORING_STORE_BACKEND = "sqlite"
         app_settings.AUTH_STORE_BACKEND = "sqlite"
         app_settings.COMPATIBILITY_STORE_BACKEND = "sqlite"
+        app_settings.EVALUATION_STORE_BACKEND = "sqlite"
         self.assertEqual(bootstrap.main(), 0, "纯 SQLite 部署下应直接通过")
         self.assertEqual(self._table_names(), set(), "不该往 PG 建任何表")
+
+
+def test_bootstrap_collects_separate_evaluation_database_for_storage_lock(monkeypatch):
+    for prefix in (
+        "CONTROL_PLANE", "PROJECT_STORE", "PIPELINE_DOCUMENT",
+        "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE",
+        "AGENT_CHECKPOINT", "DOCUMENT_AUTHORING_CHECKPOINTER",
+    ):
+        monkeypatch.setattr(app_settings, f"{prefix}_BACKEND", "sqlite", raising=False)
+    monkeypatch.setattr(app_settings, "EVALUATION_STORE_BACKEND", "postgres")
+    monkeypatch.setattr(
+        app_settings, "EVALUATION_STORE_DATABASE_URL",
+        "postgresql://localhost/isolated-evaluation",
+    )
+
+    assert bootstrap._postgres_dsns() == ["postgresql://localhost/isolated-evaluation"]
 
 
 if __name__ == "__main__":

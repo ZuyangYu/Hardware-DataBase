@@ -201,10 +201,22 @@ class GateResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     passed: bool
+    verdict: Literal["pass", "fail", "insufficient_evaluation"] = "pass"
+    enforced: bool = False
     exit_code: int = 0
     metric_scores: dict[str, float] = Field(default_factory=dict)
     metric_counts: dict[str, int] = Field(default_factory=dict)
     failures: list[str] = Field(default_factory=list)
+    metric_expected_counts: dict[str, int] = Field(default_factory=dict)
+    metric_coverage: dict[str, float] = Field(default_factory=dict)
+    insufficient_reasons: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_verdict(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "verdict" not in value:
+            value = {**value, "verdict": "pass" if value.get("passed") else "fail"}
+        return value
 
 
 class EvaluationSummary(BaseModel):
@@ -229,6 +241,7 @@ class EvaluationSummary(BaseModel):
     source_dataset_path: str = ""
     dataset_sha256: str = ""
     execution_dataset_sha256: str = ""
+    execution_content_sha256: str = ""
     dataset_total_count: int = 0
     dataset_sample_count: int = 0
     matched_sample_count: int = 0
@@ -242,6 +255,7 @@ class EvaluationSummary(BaseModel):
     llm_model: str = ""
     embedding_model: str = ""
     evaluation_config: dict[str, Any] = Field(default_factory=dict)
+    quality_binding: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvaluationRunState(BaseModel):
@@ -259,6 +273,7 @@ class EvaluationRunState(BaseModel):
     source_dataset_path: str = ""
     dataset_sha256: str = ""
     execution_dataset_sha256: str = ""
+    execution_content_sha256: str = ""
     dataset_total_count: int = 0
     dataset_sample_count: int = 0
     matched_sample_count: int = 0
@@ -272,6 +287,7 @@ class EvaluationRunState(BaseModel):
     llm_model: str = ""
     embedding_model: str = ""
     evaluation_config: dict[str, Any] = Field(default_factory=dict)
+    quality_binding: dict[str, Any] = Field(default_factory=dict)
     sample_ids: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     status: RunStatus = "queued"

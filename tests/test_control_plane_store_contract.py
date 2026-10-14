@@ -16,6 +16,7 @@ from contextlib import closing
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.rows import dict_row
 
 import src.settings
 from src.core.conversation import StaleTurnOwner
@@ -333,11 +334,15 @@ class PostgresStoreContractTests(_StoreContractScenarios, unittest.TestCase):
         )
         src.settings.CONVERSATION_SERIALIZE_SAME_THREAD = True
         with psycopg.connect(
-            self.dsn, autocommit=True, options="-c TimeZone=UTC"
+            self.dsn, autocommit=True, options="-c TimeZone=UTC", row_factory=dict_row
         ) as conn:
             conn.execute("DROP SCHEMA public CASCADE")
             conn.execute("CREATE SCHEMA public")
             apply_schema(conn, include_indexes=True)
+            from src.quality.store import initialize_schema
+            from src.storage.control_plane.sql_adapter import PgSqlAdapterConnection
+
+            initialize_schema(PgSqlAdapterConnection(conn))
         self._store = PostgresExecutionStore(self.dsn)
         self.addCleanup(self._store.close)
 
@@ -378,6 +383,24 @@ class PostgresStoreContractTests(_StoreContractScenarios, unittest.TestCase):
         self._execute(
             "UPDATE chat_turns SET retry_count = %s WHERE id = %s", (int(value), turn_id)
         )
+
+    def test_recovery_uses_configured_heartbeat_ttl_and_explicit_override(self):
+        original = src.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS
+        self.addCleanup(setattr, src.settings, "CHAT_TURN_HEARTBEAT_TTL_SECONDS", original)
+        src.settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS = 30
+        store = self.store()
+        session = self.create_session()
+        turn = store.create_turn(self.user_id, session, "recover configured timeout")
+        first = store.claim_turn(turn.id, "old-worker")
+        self._execute("UPDATE chat_turns SET worker_heartbeat_at = now() - interval '45 seconds' WHERE id = %s", (turn.id,))
+        self.assertEqual(store.requeue_stale_turns(60).requeued, 0)
+        self.assertEqual(store.requeue_stale_turns().requeued, 1)
+        second = store.claim_turn(turn.id, "new-worker")
+        self.assertEqual(second.status, "claimed")
+        self.assertGreater(second.turn.fencing_token, first.turn.fencing_token)
+        with self.assertRaises(StaleTurnOwner):
+            store.append_turn_event(turn.id, "delta", {"text": "late"}, worker_id="old-worker",
+                                    attempt_id=first.turn.attempt_id, fencing_token=first.turn.fencing_token)
 
 
 if __name__ == "__main__":

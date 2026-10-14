@@ -166,6 +166,26 @@ class PostgresExecutionStore:
 
     # -- infrastructure -----------------------------------------------------
 
+    def list_waiting_turn_ids(self, attachment_ids: list[str] | None = None, *, limit: int = 100) -> list[str]:
+        bounded_limit = max(1, min(int(limit), 1000))
+        with self._tx() as conn:
+            if attachment_ids is not None:
+                if not attachment_ids:
+                    return []
+                rows = conn.execute(
+                    """SELECT DISTINCT t.id, t.created_at FROM chat_turns t
+                       JOIN turn_attachments ta ON ta.turn_id = t.id
+                       WHERE t.status = 'waiting_for_attachments' AND ta.attachment_id = ANY(%s)
+                       ORDER BY t.created_at, t.id LIMIT %s""",
+                    (attachment_ids, bounded_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id FROM chat_turns WHERE status = 'waiting_for_attachments' ORDER BY created_at, id LIMIT %s",
+                    (bounded_limit,),
+                ).fetchall()
+        return [str(row["id"]) for row in rows]
+
     @contextmanager
     def _tx(self) -> Iterator[Any]:
         with self._pool.connection() as conn:
@@ -1353,6 +1373,11 @@ class PostgresExecutionStore:
                 int(message_id),
                 reason=reason or ("message_redacted" if redact else "message_edited"),
             )
+            if redact:
+                from src.quality.store import redact_message_in_connection
+                from .sql_adapter import PgSqlAdapterConnection
+
+                redact_message_in_connection(PgSqlAdapterConnection(conn), int(message_id))
             conn.execute(
                 """
                 INSERT INTO chat_message_edits
@@ -1861,6 +1886,10 @@ class PostgresExecutionStore:
                 )
             if domain_writer is not None:
                 domain_writer(conn, completed_turn)
+            from src.quality.store import capture_completed_turn
+            from .sql_adapter import PgSqlAdapterConnection
+
+            capture_completed_turn(PgSqlAdapterConnection(conn), completed_turn, user_id)
             return TurnCompletion(turn=completed_turn, terminal_events=terminal_events)
 
     def fail_turn(
@@ -1922,7 +1951,9 @@ class PostgresExecutionStore:
             return TurnFinalization(turn=finalized_turn, terminal_events=terminal_events)
 
     def requeue_stale_turns(self, stale_after_seconds: int | None = None) -> RequeueSummary:
-        stale_after_seconds = max(30, int(stale_after_seconds or 90))
+        import src.settings as settings
+
+        stale_after_seconds = max(30, int(stale_after_seconds or settings.CHAT_TURN_HEARTBEAT_TTL_SECONDS))
         summary = RequeueSummary()
         with self._tx() as conn:
             rows = conn.execute(

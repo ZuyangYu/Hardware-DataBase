@@ -139,10 +139,10 @@
 | ------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | 控制面              | `CONTROL_PLANE_BACKEND=sqlite`（或 `bash scripts/postgres.sh up` + `write-env` 单机也走 PG） | `postgres` + `CONTROL_PLANE_DATABASE_URL`（池 `CONTROL_PLANE_POOL_SIZE=8`）                |
 | 会话 checkpoint     | `AGENT_CHECKPOINT_BACKEND=sqlite`                                                                | `postgres`                                                                                     |
-| 文档生成 checkpoint | `DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND=sqlite`                                                 | `postgres`（注意：attempt/pointer 表目前仅 SQLite，见 [21](21-gotchas-and-extension-guide.md)） |
+| 文档生成 checkpoint | `DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND=sqlite`                                                 | `postgres`；会话 attempt/pointer 同步使用 PG，共享 advisory lock |
 | 记忆投影            | `MEMORY_STORE_BACKEND=sqlite`                                                                    | `postgres`（pgvector）                                                                         |
 | 资源配额            | `RESOURCE_GOVERNOR_SCOPE=process`                                                                | `deployment` + `RESOURCE_GOVERNOR_BACKEND=postgres`                                          |
-| 实时平面            | 可选 Redis（`bash scripts/redis.sh up`，缺失按 fail-soft 退化）                                  | `REDIS_URL`：取消快路径 / 跨进程 SSE / 分布式准入                                              |
+| 实时平面            | 默认必需 Redis（`REDIS_REQUIRED=true`，缺失拒绝启动）                                           | `REDIS_URL`：取消快路径 / 跨进程 SSE / 分布式准入                                              |
 | 子进程              | `HDB_API_SPAWN_*` 默认                                                                           | 全部设 0，独立起 worker（含**唯一的** memory worker）                                      |
 | 文件                | 本地`storage/`                                                                                   | 所有实例共享同一`storage/`（附件、归档、导出、索引都是文件+SQLite）                            |
 
@@ -282,7 +282,8 @@ fail-closed 并提示命令。认证域切换前需要 `rebuild_auth_domain.py` 
 - **重启才能生效**的键（`settings.RESTART_REQUIRED_SETTINGS`，`/health/ready` 会返回）：
   `STORAGE_DIR`、`AUTH_DB_PATH`、`CONTROL_PLANE_*`、`REDIS_URL`、`RESOURCE_GOVERNOR_{BACKEND,DATABASE_URL,SCOPE}`、
   `AGENT_CHECKPOINT_{BACKEND,DATABASE_URL}`、`MEMORY_STORE_BACKEND/DATABASE_URL/SQLITE_PATH`、
-  `WORKER_ROLE`、`HDB_API_HOST/PORT`。
+   `WORKER_ROLE`、`HDB_API_HOST/PORT`，以及 OTel endpoint、启用开关、资源标识和采样配置。
+  重载保留这些键的运行时值与进程环境值；完整清单以 `RESTART_REQUIRED_SETTINGS` 为准。
 
 ---
 
@@ -311,7 +312,7 @@ docker compose -f deploy/observability/docker-compose.yml up -d
 ```
 
 内置 2 个 Grafana dashboard 与 15 条告警规则（6 条 SLO + 9 条 hardening）。
-**没有 Alertmanager**：告警止于 Prometheus 评估。
+包含 Alertmanager（9093）；默认 receiver 仅展示告警，通知接入见 [18 §4.3.2](18-observability-and-ops.md#432-通知接入)。
 
 ### 6.3 健康探针
 

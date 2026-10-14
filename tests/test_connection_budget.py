@@ -61,6 +61,13 @@ class ConnectionBudgetTests(unittest.TestCase):
         self.assertEqual(budget.entries["memory"], 1)
         self.assertEqual(budget.entries["migration/ops"], 2)
 
+    def test_postgres_checkpoint_pointer_connections_are_budgeted(self):
+        settings = SimpleNamespace(AGENT_CHECKPOINT_BACKEND="postgres", RESOURCE_CHAT_MAX_CONCURRENT=4)
+        budget = settings_connection_budget(settings, api_replicas=2, worker_replicas=3)
+        self.assertEqual(budget.entries["checkpoint-pointers"], 50)
+        fits, _ = budget_fits(budget, max_connections=100)
+        self.assertFalse(fits)
+
 
 if __name__ == "__main__":
     unittest.main()

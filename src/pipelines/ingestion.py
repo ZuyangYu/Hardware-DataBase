@@ -1036,7 +1036,9 @@ class ExternalConversationHandler(PipelineHandler):
                 with _EXTERNAL_CONVERSATION_LLM_LOCK:
                     _EXTERNAL_CONVERSATION_LLM_INFLIGHT.discard(conversation.conversation_id)
 
-        threading.Thread(target=_run, name="ext-conv-postprocess", daemon=True).start()
+        from src.observability import thread_with_current_context
+
+        thread_with_current_context(_run, name="ext-conv-postprocess", daemon=True).start()
 
     def existing_record_dataset_kind(self, default_dataset_kind: str) -> str:
         return self.spec.dataset_kind or DATASET_CONVERSATION

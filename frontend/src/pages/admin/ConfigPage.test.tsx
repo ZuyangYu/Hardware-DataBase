@@ -72,6 +72,33 @@ describe('ConfigPage category navigation', () => {
     expect(shown).toContain('MCP_CALL_TIMEOUT_SECONDS');
   });
 
+  it('exposes attachment safety controls and keeps retrieval mode explicit', () => {
+    const keys = new Set(GROUPS.flatMap((group) => group.fields.map(([key]) => key)));
+    expect(keys.has('CHAT_ATTACHMENTS_ENABLED')).toBe(true);
+    expect(keys.has('CHAT_ATTACHMENT_MAX_BYTES')).toBe(true);
+    expect(keys.has('CHAT_ATTACHMENT_RETRIEVAL_MODE')).toBe(true);
+    expect(keys.has('ARK_API_KEY')).toBe(true);
+
+    const markup = renderPanel('附件解析与理解', {
+      showAdvanced: true,
+      draft: {
+        CHAT_ATTACHMENT_DENSE_ENABLED: 'true',
+        CHAT_ATTACHMENT_VISUAL_ENABLED: 'true',
+      },
+    });
+    expect(markup).toContain('CHAT_ATTACHMENTS_ENABLED');
+    expect(markup).toContain('CHAT_ATTACHMENT_RETRIEVAL_MODE');
+    expect(markup).toContain('ARK_API_KEY');
+  });
+
+  it('uses retrieval mode as the single dense-retrieval control', () => {
+    const attachment = GROUPS.find((group) => group.title === '附件解析与理解');
+    expect(attachment).toBeDefined();
+    expect(attachment?.fields.some(([key]) => key === 'CHAT_ATTACHMENT_DENSE_ENABLED')).toBe(false);
+    const markup = renderPanel('附件解析与理解');
+    expect(markup).toContain('CHAT_ATTACHMENT_RETRIEVAL_MODE');
+  });
+
   it('renders prompt fields as full-width textareas', () => {
     const markup = renderPanel('模型与提示词', { showAdvanced: true });
     expect(markup).toContain('SYSTEM_PROMPT');

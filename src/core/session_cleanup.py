@@ -10,6 +10,7 @@ safe to re-run after partial failure.
 from __future__ import annotations
 
 import json
+from contextlib import closing
 
 from src.attachments import storage
 from src.attachments.store import AttachmentStore
@@ -81,21 +82,29 @@ class SessionCleanupCoordinator:
         self.store.cancel_session_jobs(session_id=session_id)
         # 2. Collect assets belonging to the session and purge each one.
         asset_ids: list[str] = []
-        with self.store._connect() as conn:
-            rows = conn.execute(
-                "SELECT asset_id, storage_key FROM chat_attachment_assets WHERE session_id = ?",
-                (session_id,),
-            ).fetchall()
-            asset_ids = [row["asset_id"] for row in rows]
-            for asset_id in asset_ids:
-                conn.execute("DELETE FROM chat_attachment_parts WHERE asset_id = ?", (asset_id,))
-                conn.execute("DELETE FROM chat_attachment_embeddings WHERE asset_id = ?", (asset_id,))
-                conn.execute("DELETE FROM chat_attachment_visual_cache WHERE asset_id = ?", (asset_id,))
-                conn.execute("DELETE FROM chat_attachment_jobs WHERE asset_id = ?", (asset_id,))
-                conn.execute("DELETE FROM chat_attachment_assets WHERE asset_id = ?", (asset_id,))
-            conn.execute(
-                "DELETE FROM chat_attachments WHERE session_id = ?", (session_id,)
-            )
+        with closing(self.store._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    "SELECT asset_id, storage_key FROM chat_attachment_assets WHERE session_id = ?",
+                    (session_id,),
+                ).fetchall()
+                asset_ids = [row["asset_id"] for row in rows]
+                # Revision FK edges reference both parent and candidate records.
+                # Remove their session-scoped raw text before either endpoint.
+                conn.execute("DELETE FROM chat_attachment_edit_proposals WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM chat_attachment_revisions WHERE session_id = ?", (session_id,))
+                for asset_id in asset_ids:
+                    conn.execute("DELETE FROM chat_attachment_parts WHERE asset_id = ?", (asset_id,))
+                    conn.execute("DELETE FROM chat_attachment_embeddings WHERE asset_id = ?", (asset_id,))
+                    conn.execute("DELETE FROM chat_attachment_visual_cache WHERE asset_id = ?", (asset_id,))
+                    conn.execute("DELETE FROM chat_attachment_jobs WHERE asset_id = ?", (asset_id,))
+                    conn.execute("DELETE FROM chat_attachment_assets WHERE asset_id = ?", (asset_id,))
+                conn.execute("DELETE FROM chat_attachments WHERE session_id = ?", (session_id,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         # 3. Remove FTS rows and physical storage.
         try:
             from src.attachments.index import AttachmentIndex

@@ -13,16 +13,19 @@
   - 路径默认是仓库根 `.env`；容器部署用环境变量 `HDB_ENV_PATH` 指向挂载目录中的可写文件
     （`save_settings_to_env` 用 `mkstemp + os.replace` 原子替换，镜像层与单文件 bind mount
     不允许 rename（EBUSY），故 `.env` 必须落在挂载目录里；见 `deploy/docker/README.md`）；
-- 路径类配置若为相对路径，统一相对 `STORAGE_DIR = <repo>/storage` 解析（`_resolve_storage_path`）；
+- 路径类配置若为相对路径，统一相对 `STORAGE_DIR` 解析（默认 `<repo>/storage`，可由 env 配置）；
 - 布尔值接受 `1/true/yes/on`；CSV 用 `_env_csv`（casefold 集合）；
 - `DEFAULT_VALUES` 镜像全部键，供系统配置页与校验回退；
 - `CONFIG_REVISION = sha256(.env)[:16]`（每次保存更新，`/health/ready` 返回）；
 - 热重载：`PUT /api/v1/config` → `validate_settings_values` → `validate_provider_configuration`
   → `save_settings_to_env`（原子替换）→ `reload_settings()` → 清模型缓存；
+  重启项保持当前运行时和进程环境值，避免 `.env` 覆盖 Docker 注入项或让单例与配置漂移；
 - **重启生效清单**（`RESTART_REQUIRED_SETTINGS`）：
   `STORAGE_DIR, AUTH_DB_PATH, CONTROL_PLANE_{BACKEND,DATABASE_URL,POOL_SIZE}, REDIS_URL,`
   `RESOURCE_GOVERNOR_{BACKEND,DATABASE_URL,SCOPE}, AGENT_CHECKPOINT_{BACKEND,DATABASE_URL},`
-  `MEMORY_STORE_BACKEND, MEMORY_DATABASE_URL, MEMORY_SQLITE_PATH, WORKER_ROLE, HDB_API_HOST, HDB_API_PORT`；
+   `MEMORY_STORE_BACKEND, MEMORY_DATABASE_URL, MEMORY_SQLITE_PATH, WORKER_ROLE, HDB_API_HOST, HDB_API_PORT`；
+  还包含 checkpoint 路径/池、authoring checkpoint 和 OTel bootstrap 参数；完整清单以代码为准。
+  内容采集策略、探针 timeout 等继续支持热重载；
 - **provider 交叉校验**（fail-closed，启动与保存时都跑）：选 postgres 必须给显式 DSN
   （`AGENT_CHECKPOINT_*`、`DOCUMENT_AUTHORING_CHECKPOINTER_*`、`MEMORY_*`、
   `RESOURCE_GOVERNOR_*` 且 `SCOPE=deployment`、`CONTROL_PLANE_*`），**绝不静默回落本地**。
@@ -35,7 +38,7 @@
 
 | 变量 | 默认 |
 |---|---|
-| `STORAGE_DIR`（非 env，派生） | `<repo>/storage` |
+| `STORAGE_DIR` | `<repo>/storage`（支持 env 覆盖，重启生效） |
 | `PIPELINE_ARCHIVE_ROOT` / `RAGFLOW_FILE_ROOT` | `storage/pipeline_archives` / 同左 |
 | `LOG_DIR`（派生） | `storage/logs` |
 | `AUTH_DB_PATH` | `storage/auth.db` |

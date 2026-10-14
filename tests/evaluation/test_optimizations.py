@@ -144,10 +144,11 @@ class GateCoverageTests(unittest.TestCase):
             results.append(SampleResult(sample_id=f"s{i}", metrics=metrics))
         return results
 
-    def test_single_sample_metric_never_fails_gate(self):
+    def test_single_sample_metric_is_insufficient_for_release(self):
         results = self._results(extra=[MetricResult(sample_id="s0", metric_name="context_recall", score=1.0)])
         gate = evaluate_gate(results, DEFAULT_THRESHOLDS)
-        self.assertTrue(gate.passed)
+        self.assertFalse(gate.passed)
+        self.assertEqual(gate.verdict, "insufficient_evaluation")
         self.assertEqual(gate.metric_counts["context_recall"], 1)
 
     def test_full_coverage_metric_below_threshold_fails(self):

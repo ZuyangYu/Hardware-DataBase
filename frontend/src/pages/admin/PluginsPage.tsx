@@ -48,10 +48,10 @@ export function AdminExtensionsView({ activeSection, onSectionChange,
     <>
       <div className="px-[48px] pt-[32px] max-[900px]:px-[16px]">
         <AppHeader
-          title="扩展插件"
-          description="分别管理远程 MCP 服务与可执行 Skill；员工按授权选择添加。"
+          title="平台扩展"
+          description="登记、审核和配置远程 MCP 服务与可执行 Skill；员工按授权选择添加。"
         />
-        <nav aria-label="扩展插件管理" className="mt-[20px] flex gap-[20px] border-b border-[#eceef3]">
+        <nav aria-label="平台扩展管理" className="mt-[20px] flex gap-[20px] border-b border-[#eceef3]">
           {([
             { id: 'mcp', label: 'MCP 登记服务' },
             { id: 'skills', label: 'Skill 上传与审核' },

@@ -110,6 +110,11 @@ def settings_connection_budget(
         == "postgres"
     )
     memory_pg = str(getattr(settings, "MEMORY_STORE_BACKEND", "sqlite")).lower() == "postgres"
+    checkpoint_pg = str(getattr(settings, "AGENT_CHECKPOINT_BACKEND", "sqlite")).lower() == "postgres"
+    # Pointer schema setup/commit hold an advisory-lock connection while their
+    # bookkeeping transaction uses another connection. Include these transient
+    # peaks separately from the official saver pool, plus maintenance callers.
+    pointer_peak = 2 * max(1, int(getattr(settings, "RESOURCE_CHAT_MAX_CONCURRENT", 4))) + 2
     return connection_budget(
         api_replicas=api_replicas,
         api_control_pool=control_pool,
@@ -122,6 +127,10 @@ def settings_connection_budget(
         extra_processes={
             "memory": 1 if memory_pg else 0,
             "migration/ops": 2,
+            "checkpoint-pointers": (
+                (max(0, int(api_replicas)) + max(0, int(worker_replicas))) * pointer_peak
+                if checkpoint_pg else 0
+            ),
         },
         reserve=reserve,
     )

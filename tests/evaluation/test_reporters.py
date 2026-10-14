@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from src.evaluation.reporters import write_reports
-from src.evaluation.schemas import EvaluationSummary, MetricResult, SampleResult
+from src.evaluation.schemas import EvaluationSummary, GateResult, MetricResult, SampleResult
 
 
 class ReporterTests(unittest.TestCase):
@@ -104,6 +104,17 @@ class ReporterTests(unittest.TestCase):
         loaded = json.loads(paths.summary_json.read_text(encoding="utf-8"))
         self.assertEqual(loaded["metadata"]["run_outcome"]["kind"], "partial_cancelled")
         self.assertIn("partial_cancelled", paths.report_html.read_text(encoding="utf-8"))
+
+    def test_cancel_after_successful_scoring_cannot_publish_a_passing_gate(self):
+        summary = EvaluationSummary(run_id="run-1", gate=GateResult(passed=True, enforced=True))
+        paths = write_reports(
+            self.run_dir, summary, [],
+            metadata={"run_outcome": {"kind": "partial_cancelled"}},
+        )
+        loaded = EvaluationSummary.model_validate_json(paths.summary_json.read_text())
+        self.assertFalse(loaded.gate.passed)
+        self.assertEqual(loaded.gate.verdict, "insufficient_evaluation")
+        self.assertEqual(loaded.gate.exit_code, 3)
 
 
 if __name__ == "__main__":

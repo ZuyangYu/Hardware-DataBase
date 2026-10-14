@@ -30,10 +30,19 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 
-def _control_plane(dsn: str) -> str:
+def _auxiliary_control_plane(conn) -> None:
+    """Provision memory/export tables once with the migration type rules.
+
+    Quality, cost and workflow ledgers keep their own versioned schemas and
+    must not pass through the legacy SQLite semantic mapper.
+    """
+    _provision_semantic("", (_MemoryCatalogTemplate, _ResultExportTemplate), connection=conn)
+
+
+def _control_plane(dsn: str, *, provision_auxiliary: bool = True) -> str:
     """返回一句人类可读的结果描述；失败时抛异常。"""
     import psycopg
 
@@ -42,6 +51,7 @@ def _control_plane(dsn: str) -> str:
         CORE_FOREIGN_KEYS,
         SCHEMA_TABLE,
         apply_schema,
+        create_core_indexes,
     )
     from src.storage.control_plane.schema_version import (
         assert_schema_compatible,
@@ -53,10 +63,17 @@ def _control_plane(dsn: str) -> str:
             "SELECT to_regclass(%s) IS NOT NULL", (f"public.{SCHEMA_TABLE}",)
         ).fetchone()[0]
         if not exists:
-            apply_schema(conn)
+            apply_schema(conn, include_indexes=True)
+            if provision_auxiliary:
+                _auxiliary_control_plane(conn)
             record_schema_version(conn)
-            return "控制面 schema 已创建（版本已记录）"
-        version = assert_schema_compatible(conn)
+            result = "控制面 schema 已创建（版本已记录）"
+        else:
+            version = assert_schema_compatible(conn)
+            create_core_indexes(conn)
+            if provision_auxiliary:
+                _auxiliary_control_plane(conn)
+            result = f"控制面 schema 已存在（版本 {version}）"
         # 控制面外键（如 chat_sessions → users）在数据迁移路径上补挂；
         # 全新库由 apply_schema 内联建好，这里只在缺失时补齐。
         for name, table, constraint_sql in CORE_FOREIGN_KEYS:
@@ -69,7 +86,7 @@ def _control_plane(dsn: str) -> str:
             ).fetchone()[0]
             if ready:
                 _add_constraint_if_missing(conn, table, name, constraint_sql)
-        return f"控制面 schema 已存在（版本 {version}）"
+        return result
 
 
 # 所有 bootstrap 进程共用的 advisory lock key（会话级，连接断开自动释放）。
@@ -90,6 +107,7 @@ def _postgres_dsns() -> list[str]:
         "AUTHORING_STORE",
         "AUTH_STORE",
         "COMPATIBILITY_STORE",
+        "EVALUATION_STORE",
     ):
         try:
             backend_for_domain, domain_dsn = domain_pg.resolve_domain_backend(prefix)
@@ -168,6 +186,23 @@ def _bootstrap() -> int:
         except Exception as exc:  # noqa: BLE001 - 一次性门槛：失败必须可见
             print(f"[bootstrap] 控制面初始化失败: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 3
+        try:
+            from src.quality.store import QualityStore
+
+            QualityStore(initialize=True)
+            from src.costs.store import CostStore
+
+            CostStore(initialize=True)
+            from src.quality.workflow import WorkflowStore
+
+            WorkflowStore(initialize=True)
+            from src.observability.slo import ChatSloStore
+
+            ChatSloStore(initialize=True)
+            print("[bootstrap] quality: 事务反馈 schema 已就绪（版本 1）")
+        except Exception as exc:
+            print(f"[bootstrap] quality: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 3
 
     groups: list[tuple[str, tuple[type, ...]]] = []
     from src.document_authoring.pg_support import compat_classes, store_classes
@@ -205,20 +240,7 @@ def _bootstrap() -> int:
         from src.storage.auth_mirror import MIRROR_TABLES
 
         auth_backend, _ = domain_pg.resolve_domain_backend("AUTH_STORE")
-        extras = (
-            ("memory", (_MemoryCatalogTemplate,), None),
-            ("result_exports", (_ResultExportTemplate,), None),
-        )
-        for name, classes, only in extras:
-            try:
-                # 语义映射（与 loader 的迁移形状一致）：memory / result_exports 的表由
-                # 控制面事务直接读写，SQL 用的是 PG 布尔/时间戳语法；机械映射（TEXT/BIGINT）
-                # 会让 `AND source_valid`、`= TRUE` 这类查询直接报类型错误。
-                tables = _provision_semantic(dsn, classes, tables=only)
-                print(f"[bootstrap] {name}: 已就绪 {len(tables)} 张表")
-            except Exception as exc:  # noqa: BLE001 - 门槛失败要可见
-                print(f"[bootstrap] {name}: 建表失败 {type(exc).__name__}: {exc}", file=sys.stderr)
-                failed += 1
+        # Memory/export authority tables were provisioned with the core above.
         if auth_backend != "postgres":
             from src.storage.auth_domain import domain_classes as auth_classes
 
@@ -263,6 +285,14 @@ def _bootstrap() -> int:
             failed += 1
 
     # 认证域形状校验：早期按控制面语义建过的库必须显式重建
+    if backend == "postgres":
+        # Fresh auth tables become available only after the domain groups.
+        # Attach the remaining authority FKs on the very first bootstrap, too.
+        try:
+            _control_plane(dsn, provision_auxiliary=False)
+        except Exception as exc:
+            print(f"[bootstrap] 控制面外键校验失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+            failed += 1
     auth_backend, auth_dsn = domain_pg.resolve_domain_backend("AUTH_STORE")
     if auth_backend == "postgres":
         from src.storage.auth_domain import assert_shape
@@ -273,6 +303,17 @@ def _bootstrap() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"[bootstrap] auth: {exc}", file=sys.stderr)
             failed += 1
+
+    try:
+        from pathlib import Path
+        from src.evaluation.execution import EvaluationExecutionLedger
+
+        evaluation_root = Path(settings.STORAGE_DIR) / "evaluations"
+        EvaluationExecutionLedger(evaluation_root, initialize=True)
+        print("[bootstrap] evaluation: 共享执行 schema 已就绪（版本 1）")
+    except Exception as exc:
+        print(f"[bootstrap] evaluation: {type(exc).__name__}: {exc}", file=sys.stderr)
+        failed += 1
 
     if failed:
         print(f"[bootstrap] 完成但有 {failed} 项失败", file=sys.stderr)
@@ -295,7 +336,7 @@ _PG_TYPE_TO_INFO = {
 }
 
 
-def _provision_semantic(dsn: str, store_classes, tables=None) -> list[str]:
+def _provision_semantic(dsn: str, store_classes, tables=None, *, connection=None) -> list[str]:
     """按控制面语义映射建表（BOOLEAN / TIMESTAMPTZ / JSONB），与 loader 的迁移形状一致。
 
     memory / result_exports 的表由控制面事务直接读写，SQL 使用 PG 原生布尔与时间戳
@@ -308,6 +349,7 @@ def _provision_semantic(dsn: str, store_classes, tables=None) -> list[str]:
     from src.storage import domain_pg
     from src.storage.control_plane.loader import _add_constraint_if_missing
     from src.storage.control_plane.schema import (
+        CORE_TABLES,
         PARTIAL_INDEX_OVERRIDES,
         generated_table_ddl,
         pg_ident,
@@ -324,7 +366,8 @@ def _provision_semantic(dsn: str, store_classes, tables=None) -> list[str]:
         semantic = pg_type_for(table, str(column["name"]), str(column["type"] or ""))
         return _PG_TYPE_TO_INFO.get(semantic, "text")
 
-    with psycopg.connect(dsn, autocommit=True, options="-c TimeZone=UTC") as conn:
+    context = nullcontext(connection) if connection is not None else psycopg.connect(dsn, autocommit=True, options="-c TimeZone=UTC")
+    with context as conn:
         for table in wanted:
             columns = metadata["columns"][table]
             rows = conn.execute(
@@ -369,7 +412,7 @@ def _provision_semantic(dsn: str, store_classes, tables=None) -> list[str]:
         for table in wanted:
             for name, constraint_sql in metadata["foreign_keys"].get(table, []):
                 reference = constraint_sql.split("REFERENCES")[1].split("(")[0].strip().strip('"')
-                if reference not in loaded:
+                if reference not in loaded and reference not in CORE_TABLES:
                     continue
                 _add_constraint_if_missing(conn, table, name, constraint_sql)
     return wanted

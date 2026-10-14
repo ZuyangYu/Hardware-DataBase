@@ -12,9 +12,8 @@ Design (verified by ``tests/test_checkpoint_fork_restore.py``):
   its own orphan namespace and can never move the canonical pointer backwards.
 
 The visible ``thread_id`` never changes for users; the runner receives the
-internal attempt thread.  Only the SQLite backend is supported here; the
-PostgreSQL backend requires the same pointer table on PostgreSQL (documented
-as remaining work before multi-instance checkpoint rollout).
+internal attempt thread. Bookkeeping uses the same backend as the saver.
+Canonical copies and pointer CAS are serialized across processes.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -87,7 +86,7 @@ class CheckpointAttemptStore:
                 CREATE TABLE IF NOT EXISTS hdb_checkpoint_attempts (
                     visible_thread TEXT NOT NULL,
                     attempt_thread TEXT NOT NULL,
-                    fencing_token INTEGER NOT NULL,
+                    fencing_token BIGINT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (visible_thread, attempt_thread)
                 )
@@ -99,7 +98,7 @@ class CheckpointAttemptStore:
                     visible_thread TEXT PRIMARY KEY,
                     attempt_thread TEXT NOT NULL,
                     checkpoint_id TEXT NOT NULL DEFAULT '',
-                    fencing_token INTEGER NOT NULL DEFAULT 0,
+                    fencing_token BIGINT NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -116,9 +115,12 @@ class CheckpointAttemptStore:
         with closing(self._connect()) as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO hdb_checkpoint_attempts
+                INSERT INTO hdb_checkpoint_attempts
                     (visible_thread, attempt_thread, fencing_token, created_at)
                 VALUES (?, ?, ?, ?)
+                ON CONFLICT(visible_thread, attempt_thread) DO UPDATE SET
+                    fencing_token = excluded.fencing_token,
+                    created_at = excluded.created_at
                 """,
                 (visible_thread, attempt_thread, int(token), datetime.now(timezone.utc).isoformat()),
             )
@@ -143,13 +145,6 @@ class CheckpointAttemptStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT fencing_token FROM hdb_checkpoint_pointers WHERE visible_thread = ?",
-                    (visible_thread,),
-                ).fetchone()
-                if row is not None and int(row["fencing_token"] or 0) >= int(token):
-                    conn.execute("COMMIT")
-                    return False
-                conn.execute(
                     """
                     INSERT INTO hdb_checkpoint_pointers
                         (visible_thread, attempt_thread, checkpoint_id, fencing_token, updated_at)
@@ -159,11 +154,13 @@ class CheckpointAttemptStore:
                         checkpoint_id = excluded.checkpoint_id,
                         fencing_token = excluded.fencing_token,
                         updated_at = excluded.updated_at
+                    WHERE hdb_checkpoint_pointers.fencing_token < excluded.fencing_token
+                    RETURNING visible_thread
                     """,
                     (visible_thread, attempt_thread, checkpoint_id, int(token), now),
-                )
+                ).fetchone()
                 conn.execute("COMMIT")
-                return True
+                return row is not None
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
@@ -198,12 +195,61 @@ class CheckpointAttemptStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    @contextmanager
+    def commit_lock(self, visible_thread: str):
+        # A separate SQLite file avoids blocking saver writes in the main DB.
+        # SQLite transaction locks are process-safe and released on crash.
+        with closing(sqlite3.connect(self.path + ".commit-lock", timeout=30, isolation_level=None)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            finally:
+                conn.execute("ROLLBACK")
+
+
+class PostgresCheckpointAttemptStore(CheckpointAttemptStore):
+    """Shared pointers plus per-thread advisory locks for multi-replica commits."""
+
+    def __init__(self, database_url: str) -> None:
+        self.path = database_url
+        with self.commit_lock("__schema__"):
+            super().__init__(database_url)
+
+    def _connect(self):
+        import psycopg
+        from psycopg.rows import dict_row
+        from src.storage.control_plane.sql_adapter import PgSqlAdapterConnection
+
+        return PgSqlAdapterConnection(psycopg.connect(
+            self.path, autocommit=True, row_factory=dict_row, connect_timeout=5,
+        ))
+
+    @contextmanager
+    def commit_lock(self, visible_thread: str):
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            try:
+                conn.execute("SET LOCAL lock_timeout = '30s'")
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                    (f"hdb-checkpoint-commit:{visible_thread}",),
+                )
+                yield
+            finally:
+                conn.execute("ROLLBACK")
+
 
 def _store_for(saver: Any, pointer_path: str | None) -> CheckpointAttemptStore:
     if pointer_path:
         return CheckpointAttemptStore(pointer_path)
     import src.settings as settings
 
+    backend = getattr(saver, "_hdb_backend", None) or settings.AGENT_CHECKPOINT_BACKEND
+    if backend == "postgres":
+        url = getattr(saver, "_hdb_database_url", None) or settings.AGENT_CHECKPOINT_DATABASE_URL
+        if not url:
+            raise ValueError("AGENT_CHECKPOINT_DATABASE_URL is required for checkpoint pointers")
+        return PostgresCheckpointAttemptStore(str(url))
     return CheckpointAttemptStore(str(getattr(settings, "AGENT_CHECKPOINT_DB_PATH", "storage/agent_checkpoints.db")))
 
 
@@ -219,8 +265,8 @@ def prepare_attempt(
     """Fork the canonical state into a fresh attempt namespace.
 
     Returns the thread the runner must use.  Legacy token 0 returns the visible
-    thread unchanged.  Fork failures are surfaced so the caller can decide
-    whether to fall back to the visible thread.
+    thread unchanged. Fork failures are surfaced; fenced workers must stop
+    rather than writing directly to the canonical thread.
 
     ``resume_ref`` is the authoritative ``recoverable_checkpoint_ref`` of the
     previous attempt: take-over forks from that exact durable checkpoint
@@ -292,7 +338,9 @@ def attempt_checkpoint_ref(
     authority transaction, never here.
     """
     reference: dict[str, Any] = {
-        "backend": "sqlite",
+        "backend": getattr(saver, "_hdb_backend", None) or (
+            "postgres" if type(saver).__module__.startswith("langgraph.checkpoint.postgres") else "sqlite"
+        ),
         "thread_id": str(attempt_thread or ""),
         "checkpoint_ns": "",
         "checkpoint_id": "",
@@ -333,7 +381,7 @@ def commit_attempt(
     if token <= 0 or not visible or attempt_thread == visible:
         return False
     store = _store_for(saver, pointer_path)
-    with _STORE_LOCK:
+    with _STORE_LOCK, store.commit_lock(visible):
         pointer = store.pointer(visible)
         if pointer is not None and int(pointer["fencing_token"] or 0) >= token:
             raise StaleAttemptCommit(visible, token)

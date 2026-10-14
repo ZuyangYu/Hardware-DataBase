@@ -1,4 +1,5 @@
 import os
+import json
 import stat
 import threading
 import hashlib
@@ -47,7 +48,7 @@ _ENV_WRITE_LOCK = threading.RLock()
 
 load_dotenv(dotenv_path=ENV_FILE_PATH, encoding=ENV_FILE_ENCODING)
 CONFIG_REVISION = _config_revision()
-STORAGE_DIR = os.path.join(BASE_DIR, "storage")
+STORAGE_DIR = os.getenv("STORAGE_DIR") or os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
@@ -357,6 +358,20 @@ RESOURCE_GOVERNOR_DEPLOYMENT_ID = os.getenv("RESOURCE_GOVERNOR_DEPLOYMENT_ID", "
 CONTROL_PLANE_BACKEND = os.getenv("CONTROL_PLANE_BACKEND", "sqlite").strip().lower()
 CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
 CONTROL_PLANE_POOL_SIZE = int(os.getenv("CONTROL_PLANE_POOL_SIZE", "8"))
+EVALUATION_STORE_BACKEND = os.getenv("EVALUATION_STORE_BACKEND", "").strip().lower()
+EVALUATION_STORE_DATABASE_URL = os.getenv("EVALUATION_STORE_DATABASE_URL", "").strip()
+EVAL_EXECUTION_MODE = os.getenv("EVAL_EXECUTION_MODE", "inline").strip().lower()
+# Quality must use the control-plane database for terminal atomicity.
+QUALITY_ENABLED = os.getenv("QUALITY_ENABLED", "true").lower() == "true"
+QUALITY_CAPTURE_CONTENT = os.getenv("QUALITY_CAPTURE_CONTENT", "true").lower() == "true"
+QUALITY_SAMPLE_RATE = float(os.getenv("QUALITY_SAMPLE_RATE", "0.01"))
+QUALITY_SAMPLE_DAILY_LIMIT = int(os.getenv("QUALITY_SAMPLE_DAILY_LIMIT", "100"))
+QUALITY_PHOENIX_SYNC_ENABLED = os.getenv("QUALITY_PHOENIX_SYNC_ENABLED", "false").lower() == "true"
+QUALITY_PHOENIX_ENDPOINT = os.getenv("QUALITY_PHOENIX_ENDPOINT", "").strip()
+QUALITY_PHOENIX_API_KEY = os.getenv("QUALITY_PHOENIX_API_KEY", "").strip()
+QUALITY_PHOENIX_MAX_ATTEMPTS = int(os.getenv("QUALITY_PHOENIX_MAX_ATTEMPTS", "20"))
+COST_LEDGER_ENABLED = os.getenv("COST_LEDGER_ENABLED", "true").lower() == "true"
+COST_MODEL_REGISTRY = json.loads(os.getenv("COST_MODEL_REGISTRY", "{}"))
 # 本地台账域（projects / pipeline_documents）的存储后端。空值 = 跟随
 # CONTROL_PLANE_BACKEND（存储收敛的终态）；显式 sqlite 可以在迁移完成前
 # 让单个域先留在本地文件。DATABASE_URL 空 = CONTROL_PLANE_DATABASE_URL。
@@ -740,6 +755,9 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "CONTROL_PLANE_BACKEND",
         "CONTROL_PLANE_DATABASE_URL",
         "CONTROL_PLANE_POOL_SIZE",
+        "EVALUATION_STORE_BACKEND",
+        "EVALUATION_STORE_DATABASE_URL",
+        "EVAL_EXECUTION_MODE",
         "PROJECT_STORE_BACKEND",
         "PROJECT_STORE_DATABASE_URL",
         "PIPELINE_DOCUMENT_STORE_BACKEND",
@@ -756,12 +774,27 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "RESOURCE_GOVERNOR_SCOPE",
         "AGENT_CHECKPOINT_BACKEND",
         "AGENT_CHECKPOINT_DATABASE_URL",
+        "AGENT_CHECKPOINT_DB_PATH",
+        "AGENT_CHECKPOINT_POOL_SIZE",
+        "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND",
+        "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL",
+        "DOCUMENT_AUTHORING_CHECKPOINTER_PATH",
         "MEMORY_STORE_BACKEND",
         "MEMORY_DATABASE_URL",
         "MEMORY_SQLITE_PATH",
         "WORKER_ROLE",
         "HDB_API_HOST",
         "HDB_API_PORT",
+        "OBS_ENABLED",
+        "OTEL_SERVICE_NAME",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OBS_ENVIRONMENT",
+        "OBS_SERVICE_VERSION",
+        "OBS_TRACE_SAMPLE_RATIO",
+        "OBS_METRICS_ENABLED",
+        "OBS_TRACES_ENABLED",
+        "OBS_LOGS_ENABLED",
+        "OBS_PHOENIX_PROJECT",
         # Environment-only MCP credential key: rotation requires a restart and
         # must never be writable through the config API.
         "MCP_CREDENTIALS_KEY",
@@ -907,6 +940,19 @@ DEFAULT_VALUES = {
     "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED": "false",
     "CONTROL_PLANE_BACKEND": "sqlite",
     "CONTROL_PLANE_DATABASE_URL": "",
+    "EVALUATION_STORE_BACKEND": "",
+    "EVALUATION_STORE_DATABASE_URL": "",
+    "EVAL_EXECUTION_MODE": "inline",
+    "QUALITY_ENABLED": "true",
+    "QUALITY_CAPTURE_CONTENT": "true",
+    "QUALITY_SAMPLE_RATE": "0.01",
+    "QUALITY_SAMPLE_DAILY_LIMIT": "100",
+    "QUALITY_PHOENIX_SYNC_ENABLED": "false",
+    "QUALITY_PHOENIX_ENDPOINT": "",
+    "QUALITY_PHOENIX_API_KEY": "",
+    "QUALITY_PHOENIX_MAX_ATTEMPTS": "20",
+    "COST_LEDGER_ENABLED": "true",
+    "COST_MODEL_REGISTRY": "{}",
     "PROJECT_STORE_BACKEND": "",
     "PROJECT_STORE_DATABASE_URL": "",
     "PIPELINE_DOCUMENT_STORE_BACKEND": "",
@@ -1101,7 +1147,23 @@ DEFAULT_VALUES = {
 
 
 def reload_settings():
-    """Reload .env-backed settings after Streamlit writes configuration changes."""
+    """Reload hot settings, retaining construction-time settings until restart."""
+    with _ENV_WRITE_LOCK:
+        runtime = {key: globals()[key] for key in RESTART_REQUIRED_SETTINGS if key in globals()}
+        environment = {key: os.environ.get(key) for key in RESTART_REQUIRED_SETTINGS}
+        try:
+            _reload_settings()
+        finally:
+            globals().update(runtime)
+            for key, value in environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def _reload_settings():
+    """Parse the reloadable configuration under the settings lock."""
     global RAGFLOW_BASE_URL, RAGFLOW_API_KEY
     global RAGFLOW_GOVERNANCE_DATASET_NAME, RAGFLOW_DESIGN_DATASET_NAME
     global RAGFLOW_TIMEOUT_SECONDS, RAGFLOW_SIMILARITY_THRESHOLD, RAGFLOW_VECTOR_WEIGHT
@@ -1154,6 +1216,11 @@ def reload_settings():
     global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
     global RESOURCE_GOVERNOR_DEPLOYMENT_ID, RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED
     global CONTROL_PLANE_BACKEND, CONTROL_PLANE_DATABASE_URL, CONTROL_PLANE_POOL_SIZE
+    global EVALUATION_STORE_BACKEND, EVALUATION_STORE_DATABASE_URL
+    global EVAL_EXECUTION_MODE
+    global QUALITY_ENABLED, QUALITY_CAPTURE_CONTENT, QUALITY_SAMPLE_RATE, QUALITY_SAMPLE_DAILY_LIMIT
+    global QUALITY_PHOENIX_SYNC_ENABLED, QUALITY_PHOENIX_ENDPOINT, QUALITY_PHOENIX_API_KEY, QUALITY_PHOENIX_MAX_ATTEMPTS
+    global COST_LEDGER_ENABLED, COST_MODEL_REGISTRY
     global PROJECT_STORE_BACKEND, PROJECT_STORE_DATABASE_URL
     global PIPELINE_DOCUMENT_STORE_BACKEND, PIPELINE_DOCUMENT_DATABASE_URL
     global AUTHORING_STORE_BACKEND, AUTHORING_STORE_DATABASE_URL
@@ -1265,8 +1332,10 @@ def reload_settings():
     global MEMORY_EMBEDDING_INDEX_KIND
     global MEMORY_ALLOW_GENERAL_CHAT_EXTRACTION, MEMORY_USER_MEMORY_OPT_IN
     global MEMORY_USER_MEMORY_REQUIRE_PER_EVENT_CONSENT, MEMORY_RETENTION_DAYS
+    global CONFIG_REVISION
 
     load_dotenv(dotenv_path=ENV_FILE_PATH, override=True, encoding=ENV_FILE_ENCODING)
+    CONFIG_REVISION = _config_revision(ENV_FILE_PATH)
     # Invalidate cached chat models built from the previous env generation
     # (lazy import avoids a settings -> model_factory import cycle).
     from src.core.model_factory import notify_settings_reloaded
@@ -1402,6 +1471,19 @@ def reload_settings():
     CONTROL_PLANE_BACKEND = os.getenv("CONTROL_PLANE_BACKEND", "sqlite").strip().lower()
     CONTROL_PLANE_DATABASE_URL = os.getenv("CONTROL_PLANE_DATABASE_URL", "").strip()
     CONTROL_PLANE_POOL_SIZE = int(os.getenv("CONTROL_PLANE_POOL_SIZE", "8"))
+    EVALUATION_STORE_BACKEND = os.getenv("EVALUATION_STORE_BACKEND", "").strip().lower()
+    EVALUATION_STORE_DATABASE_URL = os.getenv("EVALUATION_STORE_DATABASE_URL", "").strip()
+    EVAL_EXECUTION_MODE = os.getenv("EVAL_EXECUTION_MODE", "inline").strip().lower()
+    QUALITY_ENABLED = os.getenv("QUALITY_ENABLED", "true").lower() == "true"
+    QUALITY_CAPTURE_CONTENT = os.getenv("QUALITY_CAPTURE_CONTENT", "true").lower() == "true"
+    QUALITY_SAMPLE_RATE = float(os.getenv("QUALITY_SAMPLE_RATE", "0.01"))
+    QUALITY_SAMPLE_DAILY_LIMIT = int(os.getenv("QUALITY_SAMPLE_DAILY_LIMIT", "100"))
+    QUALITY_PHOENIX_SYNC_ENABLED = os.getenv("QUALITY_PHOENIX_SYNC_ENABLED", "false").lower() == "true"
+    QUALITY_PHOENIX_ENDPOINT = os.getenv("QUALITY_PHOENIX_ENDPOINT", "").strip()
+    QUALITY_PHOENIX_API_KEY = os.getenv("QUALITY_PHOENIX_API_KEY", "").strip()
+    QUALITY_PHOENIX_MAX_ATTEMPTS = int(os.getenv("QUALITY_PHOENIX_MAX_ATTEMPTS", "20"))
+    COST_LEDGER_ENABLED = os.getenv("COST_LEDGER_ENABLED", "true").lower() == "true"
+    COST_MODEL_REGISTRY = json.loads(os.getenv("COST_MODEL_REGISTRY", "{}"))
     PROJECT_STORE_BACKEND = os.getenv("PROJECT_STORE_BACKEND", "").strip().lower()
     PROJECT_STORE_DATABASE_URL = os.getenv("PROJECT_STORE_DATABASE_URL", "").strip()
     PIPELINE_DOCUMENT_STORE_BACKEND = os.getenv(
@@ -2078,7 +2160,7 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
 
     # 本地台账域（存储收敛）：显式 postgres 必须给出可达目标；空值跟随
     # CONTROL_PLANE_*，由 resolve_domain_backend 在运行时解析。
-    for domain_prefix in ("PROJECT_STORE", "PIPELINE_DOCUMENT", "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE"):
+    for domain_prefix in ("PROJECT_STORE", "PIPELINE_DOCUMENT", "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE", "EVALUATION_STORE"):
         domain_backend = _value(f"{domain_prefix}_BACKEND").lower()
         if domain_backend and domain_backend not in {"sqlite", "postgres"}:
             raise ValueError(
@@ -2130,6 +2212,15 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
             )
 
     control_backend = _value("CONTROL_PLANE_BACKEND").lower() or "sqlite"
+    if _value("EVAL_EXECUTION_MODE").lower() not in {"inline", "worker"}:
+        raise ValueError("EVAL_EXECUTION_MODE 必须是 inline 或 worker")
+    import math
+
+    quality_rate = float(_value("QUALITY_SAMPLE_RATE"))
+    if not math.isfinite(quality_rate) or not 0 <= quality_rate <= 1:
+        raise ValueError("QUALITY_SAMPLE_RATE 必须是 0 到 1 之间的有限数值")
+    if int(_value("QUALITY_SAMPLE_DAILY_LIMIT")) < 0 or int(_value("QUALITY_PHOENIX_MAX_ATTEMPTS")) < 1:
+        raise ValueError("质量抽样日上限不能为负，Phoenix 最大投递次数必须至少为 1")
     if control_backend not in {"sqlite", "postgres"}:
         raise ValueError(
             f"CONTROL_PLANE_BACKEND 必须是 sqlite 或 postgres，当前值: {control_backend!r}"

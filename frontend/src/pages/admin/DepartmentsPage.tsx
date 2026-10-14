@@ -20,6 +20,7 @@ import {
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
 
 /** system 部门受保护,不可删(后端也会拒)。 */
 const PROTECTED_DEPARTMENT_NAMES = new Set(['system', '系统']);
@@ -117,7 +118,7 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
   );
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <AdminPageFrame>
       <AppHeader
         title="部门管理"
         description="创建、删除部门。部门下仍有用户或知识库时无法删除。"
@@ -177,7 +178,7 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
         destructive
         onConfirm={handleDelete}
       />
-    </div>
+    </AdminPageFrame>
   );
 }
 

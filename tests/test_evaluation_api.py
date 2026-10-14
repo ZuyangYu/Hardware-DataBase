@@ -8,6 +8,29 @@ from src.core.auth import AuthUser, KnowledgeBaseSummary
 from src.evaluation.run_control import EvaluationRunController
 from src.evaluation.schemas import EvaluationRunState, EvaluationSample
 from src.evaluation.history import cohort_fingerprint
+from src.evaluation.run_control import RunStateStore
+
+
+def test_recovery_route_rejects_live_owner_and_display_does_not_repair(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+
+    controller = EvaluationRunController(lambda: None, tmp_path)
+    store = RunStateStore(tmp_path / "run-1" / "run_state.json")
+    store.create(EvaluationRunState.new_online(
+        run_id="run-1", dataset_path="dataset.jsonl", snapshot_path="", total_samples=1,
+    ))
+    store.mark_running()
+    claim = controller.ownership.claim("run-1")
+    monkeypatch.setattr(evaluation, "_check_output_root", lambda _: str(tmp_path))
+    monkeypatch.setattr(evaluation, "_controller", lambda _: controller)
+    before = store.path.read_bytes()
+    assert evaluation.get_run("run-1", output_root=str(tmp_path))["status"] == "running"
+    assert store.path.read_bytes() == before
+    with pytest.raises(HTTPException) as error:
+        evaluation.recover_run("run-1", output_root=str(tmp_path))
+    assert error.value.status_code == 409
+    controller.ownership.release(claim)
+    assert evaluation.recover_run("run-1", output_root=str(tmp_path))["status"] == "paused"
 
 
 def test_load_sample_results_serializes_valid_results(tmp_path):

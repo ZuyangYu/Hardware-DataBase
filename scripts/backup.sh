@@ -45,6 +45,9 @@ DEPLOYMENT="${HDB_BACKUP_DEPLOYMENT:-auto}"
 STORAGE_PARENT="$APP_ROOT"
 RESUME_SERVICES=()
 RESUME_HOST=0
+RESTORE_PREVIOUS_STORAGE=""
+RESTORE_FILES_REPLACED=0
+RESTORE_COMMITTED=0
 
 # 永远不属于"要备份数据"的部分：日志、pid、便携 Node、嵌套备份、测试产物。
 ALWAYS_EXCLUDE=(storage/logs storage/run storage/nodeenv storage/backups storage/_test_output)
@@ -129,6 +132,27 @@ resume_writers() {
   if [ "$RESUME_HOST" -eq 1 ]; then
     bash "$APP_ROOT/scripts/hdb.sh" start || warn "请手动启动宿主机服务。"
   fi
+}
+
+finish_restore() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [ "$status" -ne 0 ] || [ "$RESTORE_COMMITTED" -ne 1 ]; then
+    if [ "$RESTORE_FILES_REPLACED" -eq 1 ] && [ "$RESTORE_COMMITTED" -eq 0 ]; then
+      rm -rf "$STORAGE_PARENT/storage"
+      if [ -n "$RESTORE_PREVIOUS_STORAGE" ] && [ -d "$RESTORE_PREVIOUS_STORAGE" ]; then
+        mv "$RESTORE_PREVIOUS_STORAGE" "$STORAGE_PARENT/storage" \
+          || warn "文件回滚失败，请从 $RESTORE_PREVIOUS_STORAGE 手动恢复。"
+      fi
+    fi
+    # A signal or lost pg_restore connection can leave the DB outcome unknown.
+    # Keep writers stopped even after a successful file rollback.
+    warn "恢复未成功，应用保持停止。请确认 PostgreSQL 与 storage 属于同一批次后再启动。"
+    [ "$status" -ne 0 ] || status=1
+  else
+    resume_writers
+  fi
+  exit "$status"
 }
 
 stop_writers() {
@@ -314,7 +338,9 @@ restore_backup() {
   fi
 
   log "停止应用服务（数据服务保留）..."
-  trap resume_writers EXIT
+  trap finish_restore EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   stop_writers
 
   # ---- 1) ./storage：先把当前数据挪走（可回滚），再解包 ----
@@ -322,11 +348,11 @@ restore_backup() {
   if [ -d "$STORAGE_PARENT/storage" ]; then
     log "现有 storage 挪到 $(basename "$pre_restore")（确认无误后可删除）"
     mv "$STORAGE_PARENT/storage" "$pre_restore"
+    RESTORE_PREVIOUS_STORAGE="$pre_restore"
   fi
+  RESTORE_FILES_REPLACED=1
   if ! tar -xzf "$tar_file" -C "$STORAGE_PARENT"; then
-    rm -rf "$STORAGE_PARENT/storage"
-    [ ! -d "$pre_restore" ] || mv "$pre_restore" "$STORAGE_PARENT/storage"
-    die "storage 解包失败（已还原原目录）。"
+    die "storage 解包失败。"
   fi
   mkdir -p "$STORAGE_PARENT/storage/logs" "$STORAGE_PARENT/storage/run"
 
@@ -347,12 +373,15 @@ restore_backup() {
       "${DOCKER_CMD[@]}" exec "$container" rm -f /tmp/hdb-restore.dump || true
       die "pg_restore 失败（确认没有活跃连接：应用已停？）。"
     fi
+    RESTORE_COMMITTED=1
     "${DOCKER_CMD[@]}" exec "$container" rm -f /tmp/hdb-restore.dump || true
   else
     warn "归档里没有 pg-*.dump，跳过 PostgreSQL 恢复。"
   fi
 
-  log "恢复完成。启动：bash scripts/hdb.sh start（或 docker compose up -d）"
+  RESTORE_COMMITTED=1
+
+  log "恢复完成，将恢复备份前运行的应用服务。"
   log "验收: curl http://127.0.0.1:${HDB_API_PORT:-8001}/health/ready"
 }
 

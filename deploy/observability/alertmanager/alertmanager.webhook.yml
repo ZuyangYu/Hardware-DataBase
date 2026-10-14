@@ -1,0 +1,17 @@
+global:
+  resolve_timeout: 5m
+route:
+  receiver: operators
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+receivers:
+  - name: operators
+    webhook_configs:
+      - url_file: /run/secrets/alert-webhook-url
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /run/secrets/alert-webhook-token

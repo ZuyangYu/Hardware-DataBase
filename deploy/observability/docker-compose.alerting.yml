@@ -1,0 +1,6 @@
+# Use absolute environment paths with either application or standalone stack.
+services:
+  alertmanager:
+    volumes:
+      - ${ALERTMANAGER_CONFIG:?Set an absolute Alertmanager config path}:/etc/alertmanager/alertmanager.yml:ro
+      - ${ALERTMANAGER_SECRETS_DIR:?Set an absolute secrets directory}:/run/secrets:ro

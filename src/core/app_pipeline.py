@@ -544,6 +544,7 @@ class AppPipeline:
         source_scope: str = "auto",
         propagate_errors: bool = False,
         attachment_user_id: int | None = None,
+        conversation_session_id: int | None = None,
         action_scope: Any | None = None,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
@@ -569,6 +570,7 @@ class AppPipeline:
                 attachments=attachments,
                 source_scope=source_scope,
                 attachment_user_id=attachment_user_id,
+                conversation_session_id=conversation_session_id,
                 action_scope=action_scope,
             )
         except QueryCancelled:
@@ -759,6 +761,8 @@ class AppPipeline:
             # instead of sniffing error prefixes out of the message string.
             delete_ok = bool(getattr(result, "ok", False))
             message = getattr(result, "message", str(result))
+            if delete_ok:
+                self._invalidate_quality_source(kb_name, ctx, filename=filename)
             self._audit(
                 "delete_document",
                 ctx,
@@ -848,6 +852,7 @@ class AppPipeline:
                 self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message=result.message)
                 return False, result.message
             scope = kb_scope_from_context(kb_name, ctx)
+            self._invalidate_quality_source(kb_name, ctx)
             AuthService().delete_knowledge_base_record(scope.kb_name, department_id=scope.department_id, kb_id=scope.kb_id)
             # Surface partial cleanup (some archive assets failed to delete) in
             # audit metadata so the governance log shows it wasn't fully clean.
@@ -867,6 +872,23 @@ class AppPipeline:
             error(f"删除知识库失败: {exc}")
             self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message=str(exc))
             return False, f"删除失败: {str(exc)}"
+
+    @staticmethod
+    def _invalidate_quality_source(kb_name: str, ctx: RequestContext | None, *, filename: str | None = None) -> None:
+        if ctx is None or not getattr(src.settings, "QUALITY_ENABLED", True):
+            return
+        scope = kb_scope_from_context(kb_name, ctx)
+        if scope.department_id is None:
+            return
+        from src.quality.store import QualityStore
+
+        # A source deletion also revokes review copies derived from it.
+        # Initialize local conversation tables when this is the first operation.
+        if src.settings.CONTROL_PLANE_BACKEND == "sqlite":
+            from src.core.conversation import ConversationService
+
+            ConversationService()
+        QualityStore().invalidate_source(kb_name=kb_name, department_id=scope.department_id, kb_id=scope.kb_id, filename=filename)
 
     def list_files(self, kb_name: str, ctx: RequestContext | None = None) -> List[str]:
         return self.documents.list_files(kb_name, ctx=ctx)

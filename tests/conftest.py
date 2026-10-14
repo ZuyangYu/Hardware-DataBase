@@ -9,17 +9,16 @@ tests; the admission suites enable it explicitly (and reset the controller).
 from __future__ import annotations
 
 import os
+import tempfile
 
 import pytest
-
-import src.settings
-from src.core.concurrency.admission import reset_admission_controller
-
 
 @pytest.fixture(autouse=True)
 def _isolate_worker_readiness(monkeypatch):
     # Unit API clients do not start real consumers. Deployment tests opt in.
     monkeypatch.setenv("HDB_REQUIRED_WORKER_ROLES", "")
+    monkeypatch.setenv("HDB_API_SPAWN_QUALITY_WORKER", "0")
+    monkeypatch.setattr(src.settings, "COST_LEDGER_ENABLED", False)
 
 
 @pytest.fixture(autouse=True)
@@ -39,8 +38,11 @@ def _disable_admission_by_default():
 # 强制回落 sqlite；需要 PG 的套件显式传 DSN（`HDB_TEST_POSTGRES_DSN`）并自行设置。
 _BACKEND_SETTINGS = (
     "REDIS_REQUIRED",
+    "REDIS_URL",
     "CONTROL_PLANE_BACKEND",
     "CONTROL_PLANE_DATABASE_URL",
+    "EVALUATION_STORE_BACKEND",
+    "EVALUATION_STORE_DATABASE_URL",
     "MEMORY_STORE_BACKEND",
     "MEMORY_DATABASE_URL",
     "AGENT_CHECKPOINT_BACKEND",
@@ -65,8 +67,11 @@ _BACKEND_SETTINGS = (
 
 _SQLITE_BACKENDS = {
     "REDIS_REQUIRED": "false",
+    "REDIS_URL": "",
     "CONTROL_PLANE_BACKEND": "sqlite",
     "CONTROL_PLANE_DATABASE_URL": "",
+    "EVALUATION_STORE_BACKEND": "sqlite",
+    "EVALUATION_STORE_DATABASE_URL": "",
     "MEMORY_STORE_BACKEND": "sqlite",
     "MEMORY_DATABASE_URL": "",
     "AGENT_CHECKPOINT_BACKEND": "sqlite",
@@ -98,6 +103,27 @@ _PATH_SETTINGS = {
     "DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH": "document_authoring_compatibility.sqlite",
 }
 
+# Apply isolation before collecting test modules: unittest.setUpClass and
+# module-level app factories run before function-scoped autouse fixtures.
+_TEST_STORAGE = tempfile.TemporaryDirectory(
+    prefix="hdb-tests-", dir="/tmp/opencode" if os.path.isdir("/tmp/opencode") else None,
+)
+os.environ.setdefault("HDB_TEST_REDIS_URL", "redis://127.0.0.1:1/15")
+os.environ.update(_SQLITE_BACKENDS)
+os.environ.update({
+    "HDB_ENV_PATH": os.devnull,
+    "STORAGE_DIR": _TEST_STORAGE.name,
+    "AUTH_DB_PATH": os.path.join(_TEST_STORAGE.name, "auth.db"),
+    "OBS_ENABLED": "false",
+    "HDB_REQUIRED_WORKER_ROLES": "",
+    "AUTH_DEFAULT_ADMIN_PASSWORD": "IsolatedTestPassword123!",
+})
+for _key, _filename in _PATH_SETTINGS.items():
+    os.environ[_key] = os.path.join(_TEST_STORAGE.name, _filename)
+
+import src.settings  # noqa: E402
+from src.core.concurrency.admission import reset_admission_controller  # noqa: E402
+
 
 @pytest.fixture(scope="session")
 def _shared_auth_db(tmp_path_factory) -> str:
@@ -107,7 +133,7 @@ def _shared_auth_db(tmp_path_factory) -> str:
     依赖类级或跨用例的共享状态，频繁换库会破坏原有语义。隔离的目标是别写生产
     `storage/auth.db`，不是让每个用例互不可见。
     """
-    return str(tmp_path_factory.mktemp("auth") / "auth.db")
+    return os.path.join(_TEST_STORAGE.name, "auth.db")
 
 
 @pytest.fixture(autouse=True)
@@ -121,7 +147,7 @@ def _isolate_production_backends(tmp_path, _shared_auth_db):
     saved_auth = getattr(src.settings, "AUTH_DB_PATH", None)
     saved_auth_env = os.environ.get("AUTH_DB_PATH")
     for key, value in _SQLITE_BACKENDS.items():
-        setattr(src.settings, key, value)
+        setattr(src.settings, key, value == "true" if key == "REDIS_REQUIRED" else value)
         os.environ[key] = value
     for key, filename in _PATH_SETTINGS.items():
         path = str(tmp_path / filename)

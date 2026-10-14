@@ -179,6 +179,27 @@ class ConversationService:
             with _INIT_LOCK:
                 _INITIALIZED_DB_PATHS.add(self.db_path)
 
+    def list_waiting_turn_ids(self, attachment_ids: list[str] | None = None, *, limit: int = 100) -> list[str]:
+        bounded_limit = max(1, min(int(limit), 1000))
+        with closing(self._connect()) as conn:
+            if attachment_ids is not None:
+                if not attachment_ids:
+                    return []
+                placeholders = ",".join("?" for _ in attachment_ids)
+                rows = conn.execute(
+                    f"""SELECT DISTINCT t.id, t.created_at FROM chat_turns t
+                        JOIN turn_attachments ta ON ta.turn_id = t.id
+                        WHERE t.status = 'waiting_for_attachments'
+                        AND ta.attachment_id IN ({placeholders}) ORDER BY t.created_at, t.id LIMIT ?""",
+                    (*attachment_ids, bounded_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id FROM chat_turns WHERE status = 'waiting_for_attachments' ORDER BY created_at, id LIMIT ?",
+                    (bounded_limit,),
+                ).fetchall()
+        return [str(row["id"]) for row in rows]
+
     def _init_db_with_retry(self) -> None:
         """Bounded busy retry for concurrent first-use schema initialization."""
         deadline = time.monotonic() + 10.0
@@ -386,6 +407,9 @@ class ConversationService:
                 " ON chat_turns(session_id, status, turn_sequence)"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_turns_status_created ON chat_turns(status, created_at)")
+            from src.quality.store import initialize_schema as initialize_quality_schema
+
+            initialize_quality_schema(conn)
             has_users = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
             ).fetchone()
@@ -832,6 +856,10 @@ class ConversationService:
                     int(message_id),
                     reason=reason or ("message_redacted" if redact else "message_edited"),
                 )
+                if redact:
+                    from src.quality.store import redact_message_in_connection
+
+                    redact_message_in_connection(conn, int(message_id))
                 conn.execute(
                     """
                     INSERT INTO chat_message_edits
@@ -2453,6 +2481,8 @@ class ConversationService:
                 ).fetchone()
                 if row is None:
                     raise KeyError("turn not found")
+                if row["status"] in ("completed", "cancelled"):
+                    raise StaleTurnOwner(f"turn {turn_id} is already terminal")
                 if fencing_token is not None:
                     if not self._verify_turn_owner(conn, turn_id, worker_id, fencing_token):
                         raise StaleTurnOwner(f"turn {turn_id} is owned by a newer attempt")
@@ -2557,6 +2587,9 @@ class ConversationService:
                     # the terminal transaction (v3 §5.3): any failure rolls the
                     # answer, status and terminal events back together.
                     domain_writer(conn, completed_turn)
+                from src.quality.store import capture_completed_turn
+
+                capture_completed_turn(conn, completed_turn, user_id)
                 conn.execute("COMMIT")
                 return TurnCompletion(turn=completed_turn, terminal_events=terminal_events)
             except StaleTurnOwner:

@@ -35,6 +35,7 @@ import {
 import { notify } from '@/components/ui/app-toast';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
 
 type Props = {
   auth: AuthSession;
@@ -224,7 +225,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
   const activeCount = users.filter((u) => u.is_active).length;
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <AdminPageFrame>
       <AppHeader
         title="员工管理"
         description="注册员工到部门、创建系统管理员、停用/启用账号、重置密码。"
@@ -301,7 +302,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
         destructive
         onConfirm={handleDeactivateConfirm}
       />
-    </div>
+    </AdminPageFrame>
   );
 }
 

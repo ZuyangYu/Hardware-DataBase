@@ -162,8 +162,8 @@ export function ExtensionsView({
   return (
     <div className="mx-auto min-h-full max-w-[1380px] px-[48px] pb-[56px] pt-[32px] max-[900px]:px-[16px]">
       <AppHeader
-        title="扩展"
-        description="发现已审核的能力，按需添加到你的对话中。"
+        title="个人扩展"
+        description="订阅已审核的 Skill 与 MCP 服务，按需添加到你的对话中。"
       />
 
       <div className="mt-[26px] grid gap-[12px] sm:grid-cols-2">

@@ -10,6 +10,17 @@
 
 **不在编排内**（属于外部依赖）：RAGFlow、LLM（Ollama 或 OpenAI 兼容 API）。
 
+**使用帮助**：桌面侧栏的“使用帮助”在新标签页打开 `/help`。章节、截图和完整手册 PDF
+随 `hardware-database-web` 镜像发布，无需独立帮助容器或挂载宿主机的编辑目录。
+手册采用独立阅读布局，左侧为章节目录，页头提供本地关键词搜索、返回系统和 PDF 下载；
+沿用现有登录校验，阅读页不加载业务侧栏或知识库列表。搜索匹配章节、小节标题和正文，
+直接定位到对应小节，索引与 Markdown 同源生成，不需要额外搜索服务或外网连接。
+更新时同步 `frontend/src/content/manual/` 与 `frontend/public/help-assets/`，重新构建 web 镜像；
+手册资源使用版本目录，已发布路径不原地覆盖。内部 DOCX 不进入前端发布目录。
+文档维护者可在安装了中文 TTF 字体的制作环境运行
+`uv run python scripts/manual/build_pdf.py`，从网页同源章节和截图生成 PDF；目标部署机无需运行此脚本。
+构建后检查 `/help` 及章节锚点刷新、图片预览、PDF 下载、缺失资源 404，阅读资源不依赖外网。
+
 **组件分工**：PostgreSQL（账本，唯一真相）+ Redis（实时平面）+ `storage/`（文件类数据），
 三者都随编排启动，见第 3 节。
 
@@ -19,8 +30,8 @@
                                    └──> redis:6379（内部网络，不存独有数据）
 ```
 
-`api` 容器默认按 `src/api/app.py` 的 lifespan 自己拉起 chat/authoring/parse worker、
-export worker 和 memory worker，所以业务侧只需要 3 个核心容器；生产默认另起观测组件。
+生产 Compose 启动独立的 chat/authoring/parse/export/memory/evaluation/quality worker，
+API 的自动拉起开关在 Compose 中关闭；各进程通过持久账本协调。生产默认另起观测组件。
 
 ---
 
@@ -41,8 +52,8 @@ Collector/Prometheus/Tempo/Loki/Grafana/Phoenix）→ 打印管理员口令。
 ```bash
 # 准备两个文件（先做这步；构建本身不需要密码，但启动需要）
 printf 'HDB_PG_PASSWORD=%s\n' "$(openssl rand -hex 16)" > deploy/docker/.env
+mkdir -p deploy/docker/config deploy/docker/storage
 cp deploy/docker/hdb.env.example deploy/docker/config/.env   # 填管理员口令、RAGFlow、模型
-mkdir -p deploy/docker/storage
 
 # 构建镜像（首次 5~15 分钟）
 docker compose -f deploy/docker/docker-compose.yml \
@@ -58,6 +69,81 @@ docker compose -f deploy/docker/docker-compose.yml \
 启动顺序由编排保证：`postgres`（健康）→ `migrate`（一次性：建控制面 schema +
 逐域建表 + 认证域形状校验，失败会拦住 api）→ `api` → `web`。
 **migrate 是幂等的**，每次 `up -d` 都会跑一遍，升级时它就是你的"迁移门槛"。
+
+### 评测执行与恢复
+
+Compose 默认 `EVAL_EXECUTION_MODE=worker`：管理页的开始/评分请求写入共享评测执行账本，
+`worker-evaluation` 消费；创建运行本身不会自动执行。新表由 `migrate` 初始化，
+API 与 worker 在 PostgreSQL 上只校验已有 schema（版本 1）。
+
+所有 API/评测 worker 必须挂载同一 `storage/evaluations`，容器内使用相同的绝对路径
+`/app/storage/evaluations`。账本保存请求、owner、租约和递增 fencing token；
+JSON 状态/快照/报告继续保存在共享目录，写入有跨进程文件锁和 owner 校验。
+默认执行租约 60 秒，每 20 秒续租。失联 owner 过期后，独立 worker 自动重新认领已请求运行。
+
+本地开发默认 `EVAL_EXECUTION_MODE=inline`。宿主机独立执行模式可启动：
+
+```bash
+EVAL_EXECUTION_MODE=worker uv run python -m src.evaluation.worker --root storage/evaluations
+```
+
+状态 GET 不会修复运行。需要手动接管时，管理页使用“恢复失联运行”按钮，或调用
+`POST /api/v1/evaluation/runs/{run_id}/recover`：活跃租约返回 409，过期运行转为暂停，
+再从断点继续。暂停/取消保留部分报告；部分报告和评分不足不会获得通过门禁。
+CLI 使用 `--fail-on-threshold` 时，质量失败退出 2，评分不足退出 3。
+既有报告缺少内容/评分规则指纹时可浏览，但不能作为严格可复现基线。
+
+统一备份中的 PostgreSQL 全库与 `storage/` 同批次保留执行账本和评测文件。
+恢复应保持相同的绝对挂载路径；改变评测路径会产生新的执行 scope，旧运行需显式重新启动。
+
+### 生产反馈与质量复核
+
+升级前运行 `migrate`（`python -m src.storage.bootstrap`）。它创建 `quality_schema` 版本 1 及
+快照、案例、反馈、复核、outbox 表，并补齐全新控制面的级联外键。API 与 `worker-quality`
+启动时校验版本和关键表/索引；质量数据库固定跟随 `CONTROL_PLANE_*`，保证终态同事务提交。
+
+- `worker-quality` 独立消费采集和 Phoenix 投影队列，API readiness 要求 quality 角色心跳。
+- 本地 API 默认托管质量 worker；独立运行时设 `HDB_API_SPAWN_QUALITY_WORKER=0`。
+- `QUALITY_CAPTURE_CONTENT=false` 只保留元数据/哈希及反馈标量，不能共享未采集的固定材料。
+- `QUALITY_SAMPLE_RATE=0.01`、`QUALITY_SAMPLE_DAILY_LIMIT=100` 为初始抽样配置；设 rate=0 可停随机采样。
+- Phoenix 同步默认关闭。启用时在私密配置中设置 `QUALITY_PHOENIX_SYNC_ENABLED=true`、
+  `QUALITY_PHOENIX_ENDPOINT`（服务端可达的 REST 地址）、`QUALITY_PHOENIX_API_KEY` 和 `OBS_PHOENIX_PROJECT`。
+  独立宿主机观测 Compose 可使用 `http://host.docker.internal:6006`；跨机按实际网络/认证地址配置。
+- 同步只包含受控评分/标签及关联 ID；原始问答、评论、来源标题和参考答案保留在业务账本。
+  案例页会显示 completed/pending/failed/disabled/no_span 等投影状态。
+
+```bash
+# 明确补采旧终态；GET 不补采，也不会运行评分。
+uv run python -m src.quality.worker --once --backfill
+# Phoenix 配置恢复后，显式重投失败/未启用的标注，保留稳定 identifier。
+uv run python -m src.quality.worker --once --requeue-projections
+```
+
+聊天反馈绑定原始回答 revision；复核共享限定为同部门指定员工和所选材料，UI 默认 7 天。
+管理员默认只读取脱敏元数据。共享撤销/过期及消息脱敏阻止后续访问；会话删除清理派生质量数据。
+完整 PostgreSQL 备份包含质量材料、同步水位和执行租约；恢复后按数据库时间接管，旧 token 仍拒写。
+详见 [质量反馈 Wiki](../../wiki/25-production-quality-feedback.md)。
+
+## 固定实验、调用费用与预算
+
+当前升级还需由 `migrate` 初始化 `quality_workflow_*`、`llm_*`（包含预算版本）和 `business_slo_*`。
+API/worker 的 PG 运行路径仅校验；旧部署缺表时应先执行显式迁移。
+
+- `/admin/quality` 可冻结经确认案例、评分固定生产回答、执行固定检索证据上的回答级候选实验，
+  关联真实 baseline/candidate、发布 revision 与部署后回访。完整 RAG/Agent 来源隔离实验另配置。
+- `/admin/costs` 使用持久调用账本，展示未知费用/覆盖率、时间/用途/模型/部门/项目过滤、
+  趋势/分币种排行、版本化预算、任务所有尝试分页与 CSV。
+- 价格/预算由管理员注册不可变版本；需要真实响应 model/version 和批准价目，缺失保持 unknown。
+  预算状态仅使用已知金额下界，不自动停用模型，不宣称已与供应商结算对账。
+- cost spool 为共享 storage 中的 `cost-spool/<destination-hash>/<pid-uuid>/`；Linux 自动接管同目标孤儿目录。
+  模型路径不等待 DB/磁盘；内存队列中尚未落盘的数据仍可能在 SIGKILL 时丢失。
+- 通过覆盖文件启动 Collector 时，`otel-storage-init` 初始化 WAL 卷权限；quality/evaluation worker
+  与其他 workers 一同启用 OTLP。self-metrics 8888 为内部端口。
+- `HDB_CHAT_SLO_POLICY` 仅在业务明确 version、effective time、deadline/首 token 阈值/target 后启用。
+  生产通知接收端、供应商对账、复核案例及容量/24h 长稳态需使用相应实际部署窗口。
+
+详情：[固定实验与费用 Wiki](../../wiki/26-quality-experiments-cost-ledger.md)、
+[观测运行手册](../observability/README.md)。
 
 构建加速（构建机仍需能访问源）：
 

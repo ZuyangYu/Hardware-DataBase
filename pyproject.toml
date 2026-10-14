@@ -58,6 +58,7 @@ dependencies = [
 
 [project.scripts]
 hardware-database-eval = "src.evaluation.cli:main"
+hardware-database-evaluation-worker = "src.evaluation.worker:main"
 hardware-database-server = "src.api.app:main"
 hardware-database-worker = "src.workers.main:main"
 hardware-database-export-worker = "src.result_exports.worker:main"

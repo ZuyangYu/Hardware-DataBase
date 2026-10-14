@@ -17,17 +17,17 @@ Resource 属性：`service.name, service.version, deployment.environment.name,`
 `openinference.project.name=OBS_PHOENIX_PROJECT, service.instance.id="{hostname}-{pid}",`
 `host.name, process.pid`。
 
-- Traces：`TracerProvider(resource, sampler=TraceIdRatioBased(OBS_TRACE_SAMPLE_RATIO))`
-  + `BatchSpanProcessor(OTLPSpanExporter(endpoint, insecure=http://…))`；
+- Traces：`TracerProvider(resource, sampler=ParentBased(TraceIdRatioBased(OBS_TRACE_SAMPLE_RATIO)))`
+  + `BatchSpanProcessor(RedactingSpanExporter(OTLPSpanExporter(...)))`；
 - Metrics：`MeterProvider` + `PeriodicExportingMetricReader(OTLPMetricExporter)`；
 - Logs：`LoggerProvider` + `BatchLogRecordProcessor(OTLPLogExporter)`；
-  `LoggingHandler` 挂到 `RAG` logger（尽力而为；本地 JSON handler 仍是权威）；
+  `RedactingLoggingHandler` 在副本上脱敏 body、extras、异常事件后导出；挂到 `RAG` logger；
 - 客户端插桩：`HTTPXClientInstrumentor`、`RequestsInstrumentor`（各一次）；
 - `instrument_fastapi(app)` 幂等（`app.state.hdb_fastapi_instrumented`）；
 - `shutdown_observability()`：2s 超时强制 flush traces/metrics/logs 并摘除日志 handler；
 - **所有导出失败 fail-open/异步**——遥测永不阻塞业务。
 
-配置（`config.py`，每次读取新值 → 热重载）：`enabled, service_name, endpoint, environment,`
+配置（`config.py` 读取当前 settings；provider 初始化参数重启生效）：`enabled, service_name, endpoint, environment,`
 `service_version, sample_ratio(0..1), capture_content, capture_query, capture_evidence,`
 `capture_llm_content, content_max_chars(≥1000), log_format, metrics_enabled, traces_enabled,`
 `logs_enabled, phoenix_project`。
@@ -40,7 +40,7 @@ Resource 属性：`service.name, service.version, deployment.environment.name,`
   `.llm()` 自动映射 `model→llm.model_name`、`provider→llm.provider`；
 - `Observation` 上下文管理器：`.start()/.set(k,v)`（隐私过滤）`/.set_content/.set_input/.set_output`
   `/.outcome(status)`（success/completed/ok→OK；failed/error/cancelled→ERROR）`/.event/.error(exc)`
-  （record_exception + `error.type` + 脱敏 message）`/.tokens(...)`（`llm.token_count.*` + `gen_ai.usage.*`）
+  （脱敏 exception event/message/stacktrace + `error.type`）`/.tokens(...)`（`llm.token_count.*` + `gen_ai.usage.*`）
   `/.set_token_usage(summary)` `/.hit_count(n)` `/.score(s)`；
 - `QUERY_ATTRIBUTES = {hdb.query.mode, hdb.query.source, hdb.turn.id, hdb.session.id}`；
 - 所有失败都被吞掉——遥测不是业务依赖。
@@ -168,7 +168,7 @@ W3C `propagate.inject/extract`；`TraceIdentity(trace_id, span_id)`；`use_trace
 
 ---
 
-## 3. Redis（可选实时平面）
+## 3. Redis（默认必需的实时平面）
 
 **项目自管实例**：`bash scripts/redis.sh up` 起 `deploy/redis/docker-compose.yml`
 （`redis:8-alpine`，仅宿主 `127.0.0.1:6380`，必填随机密码，AOF everysec，
@@ -183,10 +183,9 @@ W3C `propagate.inject/extract`；`TraceIdentity(trace_id, span_id)`；`use_trace
 | 分布式准入 L2 | 计数器 + TTL 120（**失败 fail-closed**） | `DISTRIBUTED_ADMISSION_ENABLED` |
 | 提供商配额 | RPM/TPM 预算（0=关；开启后 Redis 不可用即拒绝） | `PROVIDER_RPM_LIMIT` / `PROVIDER_TPM_LIMIT` |
 
-**无 Redis 时的行为**：取消只能靠 DB 列 + worker 轮询；SSE 退化为进程内队列 + 0.4s DB 轮询
-（同进程 worker 场景完全可用；跨进程需要 Redis 才能实时）。实时面整体 fail-soft，
-`GET /health/dependencies` 的 `redis` 项区分 `up` / `degraded`（配置了连不上，不拖垮就绪）/
-`not_configured`（URL 为空），`/health/ready` 不依赖 Redis。
+`REDIS_REQUIRED=true`（默认）时未配置/不可达会拒绝启动并使 `/health/ready` 报 not_ready。
+仅当测试显式设为 false 时，取消可退回 DB 轮询、SSE 退回进程队列 + DB 重放。
+`/health/dependencies` 的 Redis 项仍报告 `up/degraded/not_configured` 供诊断。
 
 ---
 
@@ -243,7 +242,42 @@ docker compose -f deploy/observability/docker-compose.yml up -d
 告警：6 条 SLO（chat 错误率 >10%、p95 >8s、队列 >100、worker 失败、检索零命中 >30%、LLM p95 >20s）
 + 9 条 hardening（陈旧权威写入=critical、资源拒绝/队列/不确定/升级、附件等待超时、
 重任务队列饥饿 >600s、检索执行器 shedding、action 并行失败）。
-**没有 Alertmanager**：告警止于 Prometheus 评估。
+包含 `alertmanager`（9093）。默认 receiver 展示告警；真实通知需要配置收件端。
+错误率只计 `failed/(completed+failed)`，用户取消不算服务错误，也不稀释错误率；
+检索零命中率直接以检索调用数为分母。无流量时不触发比例告警。
+
+### 4.3.2 通知接入
+
+提供 `alertmanager/alertmanager.webhook.yml` 和 `docker-compose.alerting.yml`。
+收件端须接受 Alertmanager webhook 格式。部署前将通知系统提供的 URL/token 写入部署机
+专用目录中的 `alert-webhook-url`、`alert-webhook-token`（文件来自部署环境，勿写入仓库）。
+导出两个绝对路径环境变量：
+
+```bash
+export ALERTMANAGER_CONFIG="$PWD/deploy/observability/alertmanager/alertmanager.webhook.yml"
+export ALERTMANAGER_SECRETS_DIR="/etc/hdb/alertmanager-secrets"
+docker run --rm --entrypoint /bin/amtool \
+  -v "$ALERTMANAGER_CONFIG:/work/alertmanager.yml:ro" \
+  -v "$ALERTMANAGER_SECRETS_DIR:/run/secrets:ro" \
+  prom/alertmanager:v0.28.1 check-config /work/alertmanager.yml
+docker compose -f deploy/observability/docker-compose.yml \
+  -f deploy/observability/docker-compose.alerting.yml up -d alertmanager
+```
+
+应用一体化部署时把第一个 compose 文件替换为 `deploy/docker/docker-compose.yml`，
+并同时加载 `deploy/docker/docker-compose.observability.yml` 和上述 alerting 覆盖文件。
+用通知系统测试 URL 验证 firing 与 resolved 均送达；Alertmanager UI 同时检查 receiver。
+
+规则验证和低流量/取消回归（CI 自动执行）：
+
+```bash
+docker run --rm --entrypoint /bin/promtool \
+  -v "$PWD/deploy/observability/prometheus:/work:ro" -w /work \
+  prom/prometheus:v3.5.0 test rules tests/rules.test.yml
+```
+
+秒级直方图使用 10ms 至 600s 的专用桶。HTTP 依赖探针只把 2xx 视为成功，
+禁止跟随重定向；custom LLM `/models` 使用配置的 Bearer 鉴权。
 
 ### 4.4 维护命令
 
@@ -274,10 +308,12 @@ bash scripts/backup.sh restore backups/storage-20260922-120000.tar.gz   # 破坏
 bash scripts/backup.sh list
 ```
 
-- `create` 不需要停服：PG 用 `pg_dump -Fc` 一致性快照，storage tar 对"打包中文件变化"
-  按警告处理（退出码 1）；恢复才要求停应用（脚本会先 `hdb.sh stop`）。
+- `create` 先停止正在运行的应用写入服务，保持 PG/Redis 运行；PG dump 与 storage
+  在同一停写窗口生成，完成后恢复原运行服务；校验文件随备份生成。
 - `restore` 会把现有 `storage/` 挪到 `storage.pre-restore-<ts>`，并用
-  `pg_restore --clean --if-exists` 覆盖控制面库 —— 必须确认没有活跃连接。
+  `pg_restore --clean --if-exists --single-transaction --exit-on-error` 恢复控制面库。
+  解包、复制 dump 或 PG 恢复失败时回滚 storage 并保持应用停止；成功才恢复原服务。
+  连接中断时 PG 结果可能不确定，启动前须确认 PG 与 storage 属于同一批次。
 - 可重建数据（`table_indexes/`、`circuits/`、`agent_checkpoints.db` 等）`--lean`
   时不备份，恢复后随首次解析重建；`auth.db`/`pipeline_documents.db`/
   `chat_attachments.db`/`document_authoring.db`/`projects.db`/`exports` 永远是全量。
@@ -316,10 +352,13 @@ bash scripts/backup.sh list
 - `tests/` 共 **307 个 Python 测试模块**（281 个扁平 `test_*.py` + `tests/core/` 3 个 +
   `tests/evaluation/` 23 个）+ 1 个 shell 测试；扁平平铺、多为 `unittest.TestCase`，pytest 作为 runner；
 - `norecursedirs = ["build", "src/circuit/vendor/spydrnet"]`；
-- `tests/conftest.py` 自动关闭准入控制并重置单例（防止顺序相关的 429）；
+- `tests/conftest.py` 在模块收集之前使用临时 storage、SQLite 与空配置，保证类级 API
+  启动不触碰本地部署；测试级 fixture 自动关闭准入控制并重置单例；
   `document_gating_env.py` 固定治理类自动发布开关为安全默认；
 - 运行：`uv run python -m pytest`（全量）、单文件、`::Class::test` 单测；
   `uv run ruff check .` 静态检查（vendor 与 `.claude` 排除）。
+- `.github/workflows/ci.yml`：锁文件、ruff、全量后端（一次性 PG/Redis）、前端测试与构建、告警规则；
+  真实模型、浏览器和容量验收入口见 [23](23-reliability-improvement-plan.md)。
 
 ### 5.2 外部依赖的门控
 

@@ -18,6 +18,7 @@ from src.agents.runner import strip_narration_segments
 from src.core.app_logs import AppLogService, query_trace_status
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
+from src.costs.context import attributed, update_context
 from src.core.conversation import (
     GENERAL_CHAT_KB_NAME,
     ChatMessage,
@@ -394,6 +395,7 @@ def _bind_document_task_trace(ctx: Any, turn: ChatTurn) -> None:
     })
 
 
+@attributed("chat", "chat", "turn_id")
 def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None) -> None:
     """Own a turn independently of any one SSE subscriber.
 
@@ -405,6 +407,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     turn = conv.claim_turn(user.id, turn_id, worker_id)
     if turn is None:
         return
+    update_context(execution_attempt_id=str(getattr(turn, "attempt_id", "") or ""))
     # Execution ownership: a positive token means serialized mode and enables
     # stale-owner rejection for every later authoritative write of this turn.
     fencing_token = int(getattr(turn, "fencing_token", 0) or 0)
@@ -439,6 +442,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     # thread; the visible thread only moves through the guarded commit below.
     visible_thread = str(turn.session_id)
     runner_thread = visible_thread
+    checkpoint_initialization_failed = False
     checkpoint_observer = None
 
     def _register_checkpoint_ref(saved: dict) -> None:
@@ -491,8 +495,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 resume_ref=resume_ref,
             )
         except Exception:
-            # Fail open to the visible thread rather than losing the turn.
-            runner_thread = visible_thread
+            # Fenced execution must never bypass attempt isolation. Let the
+            # normal guarded failure path publish a durable terminal event.
+            checkpoint_initialization_failed = True
         if ownership_token and runner_thread != visible_thread:
             try:
                 from src.agents.checkpoints.observer import install_checkpoint_observer
@@ -736,6 +741,8 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "queue_ms": queue_ms,
             "first_token_ms": first_token_ms,
             "total_ms": int((time.monotonic() - start) * 1000),
+            "accepted_to_first_token_ms": queue_ms + first_token_ms if first_token_ms is not None else None,
+            "accepted_to_terminal_ms": queue_ms + int((time.monotonic() - start) * 1000),
             "stage_durations_ms": stage_durations_ms,
             "tool_calls": tool_latencies,
             "short_term_memory": dict(short_term_memory),
@@ -746,6 +753,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     summary: dict = {}
     footer = ""
     try:
+        if checkpoint_initialization_failed:
+            _fail_owned("检查点初始化失败，请稍后重试")
+            return
         try:
             history = conv.history_before_turn(user.id, turn_id)
         except Exception:
@@ -790,6 +800,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             source_scope=str(getattr(turn, "source_scope", "") or "auto"),
             propagate_errors=True,
             attachment_user_id=int(user.id),
+            conversation_session_id=int(turn.session_id),
             action_scope=action_scope,
         )
         try:
@@ -882,13 +893,22 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             ]
 
         try:
+            from opentelemetry.trace import TraceFlags
+
+            context = turn_observation.span.get_span_context()
+            terminal_metrics = metrics(summary=summary)
+            terminal_metrics["quality_trace_identity"] = {
+                "trace_id": f"{context.trace_id:032x}" if context.is_valid else "",
+                "span_id": f"{context.span_id:016x}" if context.is_valid else "",
+                "sampling_status": "sampled" if context.is_valid and context.trace_flags & TraceFlags.SAMPLED else "not_sampled",
+            }
             completion = conv.complete_turn_result(
                 user.id,
                 turn_id,
                 answer,
                 summary,
                 footer,
-                metrics=metrics(summary=summary),
+                metrics=terminal_metrics,
                 worker_id=worker_id,
                 fencing_token=ownership_token,
                 expected_generation=session_generation if ownership_token else None,
@@ -1448,6 +1468,7 @@ def _query_generator(
     source_scope="auto",
     propagate_errors=False,
     attachment_user_id=None,
+    conversation_session_id=None,
     action_scope=None,
 ):
     params = inspect.signature(pipeline.query).parameters
@@ -1476,6 +1497,8 @@ def _query_generator(
             kwargs["propagate_errors"] = propagate_errors
         if "attachment_user_id" in params:
             kwargs["attachment_user_id"] = attachment_user_id
+        if "conversation_session_id" in params:
+            kwargs["conversation_session_id"] = conversation_session_id
         if action_scope is not None and "action_scope" in params:
             kwargs["action_scope"] = action_scope
         return pipeline.query(
@@ -1506,6 +1529,8 @@ def _query_generator(
         kwargs["propagate_errors"] = propagate_errors
     if "attachment_user_id" in params:
         kwargs["attachment_user_id"] = attachment_user_id
+    if "conversation_session_id" in params:
+        kwargs["conversation_session_id"] = conversation_session_id
     if action_scope is not None and "action_scope" in params:
         kwargs["action_scope"] = action_scope
     return pipeline.query(query, kb_name, history, ctx, **kwargs)

@@ -69,7 +69,12 @@ class PipelineRuntime:
         handler = self.handlers.get(record.processor_kind)
         if handler is None:
             raise RuntimeError(f"No pipeline handler registered for {record.processor_kind}.")
-        result = handler.process_record(record, self.archive)
+        from src.costs.context import call_context, numeric_identity
+
+        with call_context(task_type="ingestion", task_id=str(record.id), purpose="ingestion", project_id=str(record.project_id),
+                          department_id=numeric_identity(record.department_id), owner_user_id=numeric_identity(record.uploaded_by),
+                          execution_attempt_id=str(record.retry_count)):
+            result = handler.process_record(record, self.archive)
         if not result.ok:
             raise RuntimeError(result.message)
         self.audit_callback(

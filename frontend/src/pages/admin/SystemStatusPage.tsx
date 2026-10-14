@@ -103,7 +103,7 @@ export default function SystemStatusPage({ auth, onLogout }: Props) {
           <StatCard label="累计完成" value={payload?.llm?.completed ?? 0} />
         </div>
         <div className="mt-[12px] flex flex-wrap gap-[12px]">
-          <StatCard label="模型调用数" value={payload?.llm?.usage?.calls ?? 0} />
+           <StatCard label="当前 API 进程调用数" value={payload?.llm?.usage?.calls ?? 0} />
           <StatCard
             label="交互 token"
             value={payload?.llm?.usage?.by_channel?.interactive?.total_tokens ?? 0}
@@ -114,6 +114,7 @@ export default function SystemStatusPage({ auth, onLogout }: Props) {
           />
           <StatCard label="总 token" value={payload?.llm?.usage?.total_tokens ?? 0} tone="green" />
         </div>
+        <p className="mt-3 text-xs text-muted-foreground">上方累计值为当前 API 进程；跨副本持久调用、费用及更新时间见 <a className="text-blue-700 hover:underline" href="/admin/costs">成本与用量</a>。</p>
       </div>
       <div className="mt-[16px] rounded-[16px] bg-white p-[18px] shadow-[0_2px_10px_rgba(0,0,0,0.05)]">
         <div className="mb-[12px] text-[14px] font-semibold text-[#18181a]">最近 24 小时任务</div>

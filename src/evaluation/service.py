@@ -206,13 +206,17 @@ class EvaluationService:
         return store.load_all()
 
     def _collect_sample(self, sample: EvaluationSample) -> AnswerSnapshot:
+        from src.costs.context import call_context
+
         started = datetime.now(timezone.utc).timestamp()
         status = "success"
         with observe.evaluator(
             "hdb.evaluation.sample",
             sample_id=sample.id,
             stage="collect",
-        ) as observation:
+        ) as observation, call_context(purpose="evaluation_collection", sample_id=sample.id,
+                                      owner_user_id=sample.request_context.get("user_id"),
+                                      department_id=sample.request_context.get("department_id")):
             try:
                 snapshot = self.answer_runner.collect(sample)
                 # 采集降级自愈：管线 fail-open 会把上游瞬时故障（限流/5xx/
@@ -278,6 +282,7 @@ class EvaluationService:
         metric_names = (
             DEFAULT_STANDARD_METRICS if metric_names is None else metric_names
         )
+        requested_metric_names = list(metric_names)
         resume_done_groups = completed_groups or set()
         seeded_metrics = seeded_metrics or {}
         seeded_cells: dict[str, set[str]] = {}
@@ -338,6 +343,29 @@ class EvaluationService:
             sample_results[sample.id].metadata["evaluation_cohort"] = sample_cohorts[
                 sample.id
             ]
+            if snapshot is not None:
+                if snapshot.duration_seconds > 0:
+                    sample_results[sample.id].metadata["latency_ms"] = snapshot.duration_seconds * 1000
+                if snapshot.metadata.get("dataset_version_id"):
+                    sample_results[sample.id].metadata["dataset_version_id"] = snapshot.metadata["dataset_version_id"]
+            sample_results[sample.id].metadata["expected_access"] = sample.expected_access
+            expected_metrics = []
+            if sample.expected_access == "allowed":
+                if sample_cohorts[sample.id] == "retrieval":
+                    expected_metrics.extend(requested_metric_names)
+                    if thresholds is not None:
+                        expected_metrics.extend(name for name in thresholds if is_ragas_metric(name))
+                if sample.rubric.forbidden_claims:
+                    expected_metrics.append("forbidden_claims")
+                if sample.required_evidence_types:
+                    expected_metrics.append("evidence_consistency")
+                if thresholds is not None:
+                    expected_metrics.extend(
+                        name for name in thresholds
+                        if not is_ragas_metric(name)
+                        and name not in {"forbidden_claims", "evidence_consistency"}
+                    )
+            sample_results[sample.id].metadata["expected_metrics"] = expected_metrics
             if snapshot is not None and snapshot.access_check is not None:
                 sample_results[sample.id].metadata["access_check"] = (
                     snapshot.access_check
@@ -678,9 +706,15 @@ class EvaluationService:
         sample_cohorts = {sample.id: evaluation_cohort(sample) for sample in samples}
         gate = evaluate_gate(
             ordered_results,
-            thresholds or DEFAULT_THRESHOLDS,
+            DEFAULT_THRESHOLDS if thresholds is None else thresholds,
             fail_on_threshold=fail_on_threshold,
             sample_cohorts=sample_cohorts,
+            expected_metrics={
+                result.sample_id: result.metadata["expected_metrics"]
+                for result in ordered_results
+                if "expected_metrics" in result.metadata
+            } if all("expected_metrics" in result.metadata for result in ordered_results) else None,
+            complete=outcome_kind in {None, "completed"},
         )
         metric_failures = Counter(
             metric.metric_name

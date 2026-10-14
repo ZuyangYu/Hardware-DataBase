@@ -13,9 +13,12 @@ import unittest
 from collections import Counter
 from types import SimpleNamespace
 
+from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+
 import src.observability.bootstrap as bootstrap
 from src.core.logger import logger as rag_logger
 from src.observability.bootstrap import init_observability, shutdown_observability
+from src.observability.logging import RedactingLoggingHandler
 
 _LOGGERS = ("RAG", "uvicorn", "uvicorn.error", "uvicorn.access")
 
@@ -27,7 +30,7 @@ class _FakeConfig(SimpleNamespace):
 class ObservabilityLogHandlerTests(unittest.TestCase):
     def setUp(self) -> None:
         # 其它测试可能已用真实配置初始化过观测（_INITIALIZED=True），这里先关停并复位，
-        # 保证本测试拿到的是假 handler。
+        # 使用真实脱敏 handler，只将外部 exporter 替换为内存 exporter。
         if bootstrap._INITIALIZED:
             shutdown_observability()
         self.saved_globals = (
@@ -40,7 +43,6 @@ class ObservabilityLogHandlerTests(unittest.TestCase):
         bootstrap._SHUTDOWN = False
         bootstrap._LOG_HANDLER = None
         bootstrap._LOG_PROVIDER = None
-        self.emitted: list[str] = []
         self.saved = {
             name: (
                 list(logging.getLogger(name).handlers),
@@ -50,19 +52,10 @@ class ObservabilityLogHandlerTests(unittest.TestCase):
             for name in _LOGGERS
         }
 
-        def _emit(record: logging.LogRecord) -> None:
-            self.emitted.append(record.getMessage())
-
-        class _Handler(logging.Handler):
-            def __init__(self, *args, **kwargs) -> None:
-                super().__init__()
-
-            def emit(self, record: logging.LogRecord) -> None:
-                _emit(record)
-
-        self._handler_cls = _Handler
-        self._original = bootstrap.LoggingHandler
-        bootstrap.LoggingHandler = _Handler  # type: ignore[assignment]
+        self._handler_cls = RedactingLoggingHandler
+        self.exporter = InMemoryLogRecordExporter()
+        self._original_exporter = bootstrap.OTLPLogExporter
+        bootstrap.OTLPLogExporter = lambda *a, **k: self.exporter
         self._original_get_config = bootstrap.get_config
         bootstrap.get_config = lambda *a, **k: _FakeConfig(  # type: ignore[assignment]
             enabled=True,
@@ -76,7 +69,7 @@ class ObservabilityLogHandlerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutdown_observability()
-        bootstrap.LoggingHandler = self._original  # type: ignore[assignment]
+        bootstrap.OTLPLogExporter = self._original_exporter
         bootstrap.get_config = self._original_get_config  # type: ignore[assignment]
         (
             bootstrap._INITIALIZED,
@@ -93,6 +86,10 @@ class ObservabilityLogHandlerTests(unittest.TestCase):
             target.propagate = propagate
             target.handlers = handlers
 
+    def _emitted_bodies(self) -> Counter:
+        bootstrap._LOG_PROVIDER.force_flush()
+        return Counter(str(record.log_record.body) for record in self.exporter.get_finished_logs())
+
     def test_handler_reaches_every_business_logger_exactly_once(self) -> None:
         init_observability("probe", service_version="0", environment="test")
 
@@ -107,7 +104,7 @@ class ObservabilityLogHandlerTests(unittest.TestCase):
         logging.getLogger("uvicorn.error").error("probe-uvicorn-error")
         logging.getLogger("uvicorn.access").error("probe-uvicorn-access")
 
-        counts = Counter(self.emitted)
+        counts = self._emitted_bodies()
         expected = {
             "probe-business": 1,
             "probe-uvicorn": 1,
@@ -156,9 +153,21 @@ class ObservabilityLogHandlerTests(unittest.TestCase):
 
         rag_logger.info("probe-after-reconfig")
         logging.getLogger("uvicorn.access").error("probe-access-after-reconfig")
-        counts = Counter(self.emitted)
+        counts = self._emitted_bodies()
         self.assertEqual(counts["probe-after-reconfig"], 1)
         self.assertEqual(counts["probe-access-after-reconfig"], 1)
+
+    def test_every_exported_logger_redacts_credentials(self) -> None:
+        init_observability("probe", service_version="0", environment="test")
+        secret = "MERGE_REVIEW_FAKE_CREDENTIAL"
+        for name in _LOGGERS:
+            logging.getLogger(name).error("api_key=%s", secret, extra={"password": secret})
+        bootstrap._LOG_PROVIDER.force_flush()
+        records = self.exporter.get_finished_logs()
+        self.assertEqual(len(records), len(_LOGGERS))
+        for record in records:
+            self.assertNotIn(secret, str(record.log_record.body))
+            self.assertNotIn(secret, str(record.log_record.attributes))
 
 
 if __name__ == "__main__":

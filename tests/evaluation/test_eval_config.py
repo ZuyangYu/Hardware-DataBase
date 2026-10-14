@@ -100,13 +100,16 @@ class EvaluationConfigTests(unittest.TestCase):
         self.assertEqual(config.scoring_context_shrink_factor, 0.5)
         self.assertEqual(config.timeout_seconds, 60)
         self.assertEqual(config.max_retries, 2)
+        public = config.public_metadata()
+        self.assertRegex(public.pop("scoring_rules_sha256"), r"^[a-f0-9]{64}$")
         self.assertEqual(
-            config.public_metadata(),
+            public,
             {
                 "llm_provider": "custom",
                 "llm_base_url": "https://judge.test/v1",
                 "llm_model": "judge",
                 "llm_fallback_model": "",
+                "llm_fallback_base_url": "",
                 "embedding_base_url": "https://embed.test/v1",
                 "embedding_model": "embed",
                 "embedding_dims": None,

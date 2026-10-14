@@ -27,7 +27,7 @@ class SettingsEnvLoadingTests(unittest.TestCase):
             settings = importlib.reload(settings)
             settings.reload_settings()
 
-        expected_path = os.path.join(settings.BASE_DIR, ".env")
+        expected_path = os.environ.get("HDB_ENV_PATH") or os.path.join(settings.BASE_DIR, ".env")
         expected_kwargs = {
             "dotenv_path": expected_path,
             "encoding": settings.ENV_FILE_ENCODING,

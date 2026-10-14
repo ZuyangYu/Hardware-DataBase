@@ -106,8 +106,9 @@
 37. 附件等待超时（600s）与排队超时（600s）都会把 turn 置 `failed`，事件分别是
     `attachment_wait_timeout` / `chat_queue_timeout`。
 38. 无 Redis 时跨进程 SSE 退化为 0.4s DB 轮询（同进程 worker 不受影响）。
-39. PG 后端下 attempt/pointer 表（`hdb_checkpoint_attempts/pointers`）**尚未实现**；
-    多实例 checkpoint 隔离还不完整（模块 docstring 已注明）。
+39. PG 后端 attempt/pointer 表与 checkpoint 同库；复制与 CAS 使用跨进程 advisory lock。
+    扩容时将短连接计入预算，并执行 `test_checkpoint_attempt_backends.py`。DeepAgents DeltaChannel
+    要复制祖先 checkpoint/writes 链；附件 ACL 不得从 attempt thread 推导会话 ID。
 
 ### 2.8 平台与安全
 
@@ -119,13 +120,13 @@
 43. 默认 CORS 放行本地开发 origin；生产必须显式设置 `HDB_API_CORS_ORIGINS`。
 44. Vite `allowedHosts` 硬编码 `.trycloudflare.com`（演示用），生产构建前应移除。
 45. Grafana/Phoenix DB 的默认密码是 `change-me`；`HDB_TOKEN` 可选。
-46. **没有 Alertmanager**：Prometheus 告警不会自动通知。
+46. Alertmanager 已部署，但默认 receiver 只展示告警；要送达通知需配置 webhook/email，见 [18](18-observability-and-ops.md)。
 47. `docs/` 与 `CLAUDE.md` 是本地文件（gitignored）；本 Wiki 已迁至仓库根 `wiki/` 并纳入版本管理——
     新增/修改文档请写 `wiki/`，不要写回 `docs/wiki/`（该路径已不存在）。
 48. `requirements.txt` 是 uv 生成的，**改依赖请改 `pyproject.toml`** 后 `uv lock`。
 49. `deploy/` 目前有可观测性栈、`redis/`（项目自管实时面）、`postgres/`（项目自管账本库）
     与 `docker/`（应用镜像 + compose + nginx，内网离线分发见 `deploy/docker/README.md`）；
-    仍**没有** systemd/k8s 与 CI workflow。
+    CI workflow 位于 `.github/workflows/ci.yml`；systemd/k8s 编排仍需按部署环境配置。
 50. `hardware-database-eval` CLI 不调用 `init_observability`（离线评估无外部遥测）。
 
 ### 2.9 PostgreSQL 控制面（单机也走 PG 之后）
@@ -325,7 +326,7 @@
 
 | 优先级 | 项 | 影响 |
 |---|---|---|
-| 高 | PG 后端补齐 checkpoint attempt/pointer 表 | 多实例下 attempt 隔离不完整，可能串扰 |
+| 高 | 目标部署多实例 checkpoint 故障验收 | PG 指针和跨进程锁已实现；发布前验证真实 Worker 接管与存储拓扑 |
 | 高 | 文档生成独立工作台页面（评审/纠错/修订/计划确认 UI） | 当前全部靠聊天文本，评审能力未释放 |
 | 高 | `TOOL_CAPABILITIES` 补全（wiki_search / release / revision_history） | 统一工具模式下这些工具会被静默过滤 |
 | 中 | `RESOURCE_GOVERNOR_ENABLED` 语义统一（去掉 `getattr(..., True)`） | 避免误判许可生效 |

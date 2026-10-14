@@ -122,6 +122,13 @@ class AuthDomainPostgresTests(unittest.TestCase):
             auth.get_knowledge_base_id("design", department_id=department.id)
         )
 
+    def test_auxiliary_sqlite_file_without_users_does_not_block_pg_auth(self) -> None:
+        with sqlite3.connect(app_settings.AUTH_DB_PATH) as conn:
+            conn.execute("CREATE TABLE auxiliary_log (message TEXT)")
+            conn.execute("INSERT INTO auxiliary_log VALUES ('worker started')")
+        auth = AuthService()
+        self.assertIsNotNone(auth.get_user_by_username("admin"))
+
     def test_audit_events_round_trip_on_postgres(self) -> None:
         logs = AppLogService()
         self.assertEqual(logs._backend, "postgres")

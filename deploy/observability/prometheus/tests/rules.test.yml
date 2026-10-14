@@ -1,0 +1,173 @@
+rule_files:
+  - ../rules/hardware-database.yml
+evaluation_interval: 1m
+tests:
+  - name: known budget exceedance and unknown spend coverage are independent alerts
+    interval: 1m
+    input_series:
+      - series: hdb_cost_budget_exceeded
+        values: 1+0x10
+      - series: hdb_cost_budget_unknown
+        values: 1+0x10
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HdbCostBudgetKnownAmountExceeded
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: A versioned active cost budget is exceeded by recorded known amounts
+      - eval_time: 6m
+        alertname: HdbCostBudgetCoverageInsufficient
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: An active cost budget contains unknown costs; spend completeness is not proven
+  - name: paired multiwindow burn requires sufficient events
+    interval: 1m
+    input_series:
+      - series: hdb_slo_burn_rate{workload="kb_chat",window="1h"}
+        values: 20+0x20
+      - series: hdb_slo_burn_rate{workload="kb_chat",window="5m"}
+        values: 20+0x20
+      - series: hdb_slo_eligible{workload="kb_chat",window="5m"}
+        values: 10+0x20
+      - series: hdb_slo_minimum_events{workload="kb_chat",window="5m"}
+        values: 5+0x20
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: HdbChatSloFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, workload: kb_chat}
+            exp_annotations:
+              summary: Durable chat SLO error budget is burning above 14.4x in both 1h and 5m
+  - name: a single low volume failure is not a burn-rate page
+    interval: 1m
+    input_series:
+      - series: hdb_slo_burn_rate{workload="kb_chat",window="1h"}
+        values: 200+0x20
+      - series: hdb_slo_burn_rate{workload="kb_chat",window="5m"}
+        values: 200+0x20
+      - series: hdb_slo_eligible{workload="kb_chat",window="5m"}
+        values: 1+0x20
+      - series: hdb_slo_minimum_events{workload="kb_chat",window="5m"}
+        values: 5+0x20
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: HdbChatSloFastBurn
+        exp_alerts: []
+  - name: collector down and persistent queue pressure are visible
+    interval: 1m
+    input_series:
+      - series: up{job="otel-collector-self"}
+        values: 0+0x20
+      - series: otelcol_exporter_queue_size{exporter="otlphttp/phoenix",data_type="traces"}
+        values: 90+0x20
+      - series: otelcol_exporter_queue_capacity{exporter="otlphttp/phoenix",data_type="traces"}
+        values: 100+0x20
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: HdbCollectorDown
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: Collector self-metrics scrape is unavailable
+      - eval_time: 8m
+        alertname: HdbCollectorQueuePressure
+        exp_alerts:
+          - exp_labels: {severity: warning, exporter: "otlphttp/phoenix", data_type: traces}
+            exp_annotations:
+              summary: Collector persistent sending queue exceeds 80% capacity
+  - name: lost cost records trigger coverage alert
+    interval: 1m
+    input_series:
+      - series: hdb_cost_sink_events_total{status="dropped"}
+        values: 0+1x10
+      - series: hdb_cost_sink_events_total{status="write_failures"}
+        values: 0+1x10
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: HdbCostAccountingLoss
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: Cost accounting events were dropped or quarantined; coverage is incomplete
+      - eval_time: 8m
+        alertname: HdbCostAccountingWritesFailing
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Cost accounting DB/spool writes are failing
+  - name: one failed request per minute still alerts
+    interval: 1m
+    input_series:
+      - series: hdb_chat_turns_total{status="failed"}
+        values: 0+1x40
+      - series: hdb_chat_turns_total{status="completed"}
+        values: 0+0x40
+      - series: hdb_rag_zero_hit_total
+        values: 0+1x40
+      - series: hdb_rag_calls_total
+        values: 0+1x40
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: HdbChatErrorRateHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Hardware DataBase chat error rate is above 10%
+      - eval_time: 26m
+        alertname: HdbRetrievalEmptyRateHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Retrieval empty-result rate is above 30%
+
+  - name: no traffic is not an error
+    interval: 1m
+    input_series:
+      - series: hdb_chat_turns_total{status="failed"}
+        values: 0+0x40
+      - series: hdb_chat_turns_total{status="completed"}
+        values: 0+0x40
+      - series: hdb_rag_zero_hit_total
+        values: 0+0x40
+      - series: hdb_rag_calls_total
+        values: 0+0x40
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: HdbChatErrorRateHigh
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: HdbRetrievalEmptyRateHigh
+        exp_alerts: []
+
+  - name: user cancellation is excluded from server errors
+    interval: 1m
+    input_series:
+      - series: hdb_chat_turns_total{status="cancelled"}
+        values: 0+60x40
+      - series: hdb_chat_turns_total{status="completed"}
+        values: 0+1x40
+      - series: hdb_chat_turns_total{status="failed"}
+        values: 0+0x40
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: HdbChatErrorRateHigh
+        exp_alerts: []
+
+  - name: cancellations do not dilute actual failures
+    interval: 1m
+    input_series:
+      - series: hdb_chat_turns_total{status="cancelled"}
+        values: 0+60x40
+      - series: hdb_chat_turns_total{status="completed"}
+        values: 0+1x40
+      - series: hdb_chat_turns_total{status="failed"}
+        values: 0+1x40
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: HdbChatErrorRateHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Hardware DataBase chat error rate is above 10%

@@ -27,23 +27,30 @@ export type StatCardProps = {
   tone?: StatCardTone;
   valueClassName?: string;
   className?: string;
+  /** 整卡悬浮说明(如统计口径),避免截断信息只能靠 tooltip。 */
+  title?: string;
 };
 
-/** 指标卡:圆角着色面 + 大数字 + 尾随标签。照搬自企业风 UI。 */
-export function StatCard({ value, label, tone = 'default', valueClassName, className }: StatCardProps) {
+/**
+ * 指标卡:圆角着色面 + 大数字 + 尾随标签。照搬自企业风 UI。
+ * 长金额/长标签不再截断:高度改为 min-h 允许内容增高,值与标签均可
+ * 收缩换行;固定短标签视觉与旧版一致。
+ */
+export function StatCard({ value, label, tone = 'default', valueClassName, className, title }: StatCardProps) {
   return (
     <div
+      title={title}
       className={cn(
-        'flex h-[70px] flex-1 basis-[180px] items-center rounded-[14px] px-[24px] py-[8px]',
+        'flex min-h-[70px] flex-1 basis-[180px] items-center rounded-[14px] px-[24px] py-[8px]',
         SURFACE_CLASS[tone],
         className,
       )}
     >
-      <div className="flex min-w-0 items-end gap-[6px]">
-        <span className={cn('shrink-0 text-[26px] font-semibold leading-none', VALUE_CLASS[tone], valueClassName)}>
+      <div className="flex min-w-0 flex-wrap items-end gap-[6px]">
+        <span className={cn('min-w-0 break-words text-[26px] font-semibold leading-tight', VALUE_CLASS[tone], valueClassName)}>
           {value}
         </span>
-        <span className={cn('truncate text-[14px] leading-none', LABEL_CLASS[tone])}>{label}</span>
+        <span className={cn('min-w-0 text-[14px] leading-snug', LABEL_CLASS[tone])}>{label}</span>
       </div>
     </div>
   );

@@ -1,0 +1,22 @@
+{
+  "title": "Hardware DataBase 图文用户使用手册",
+  "version": "V2.2",
+  "updatedAt": "2026-10-13",
+  "applicationBaseline": "develop/40a227b + 2026-10-13 工作区",
+  "pdf": "/help-assets/v2.2/downloads/Hardware_DataBase_observability_图文用户使用手册_V2.2.pdf",
+  "chapters": [
+    { "id": "preparation", "title": "1 使用前准备", "source": "chapters/01-preparation.md" },
+    { "id": "roles", "title": "2 角色、部门与知识库权限", "source": "chapters/02-roles.md" },
+    { "id": "login", "title": "3 登录与首次使用", "source": "chapters/03-login.md" },
+    { "id": "knowledge-bases", "title": "4 创建知识库与管理文件", "source": "chapters/04-knowledge-bases.md" },
+    { "id": "files", "title": "5 上传、解析与内容工作台", "source": "chapters/05-files.md" },
+    { "id": "retrieval", "title": "6 检索问答与证据复核", "source": "chapters/06-retrieval.md" },
+    { "id": "general-chat", "title": "7 通用对话与文档产物", "source": "chapters/07-general-chat.md" },
+    { "id": "documents", "title": "8 工程文档生成与人工审核", "source": "chapters/08-documents.md" },
+    { "id": "assets", "title": "9 资产中心、Wiki、长期记忆与扩展", "source": "chapters/09-assets.md" },
+    { "id": "administration", "title": "10 管理员配置与日常治理", "source": "chapters/10-administration.md" },
+    { "id": "evaluation", "title": "11 RAGAS 评估与运维排查", "source": "chapters/11-evaluation.md" },
+    { "id": "workflows", "title": "12 典型业务流程与验收清单", "source": "chapters/12-workflows.md" },
+    { "id": "appendix", "title": "附录 术语、版本和发布说明", "source": "chapters/13-appendix.md" }
+  ]
+}

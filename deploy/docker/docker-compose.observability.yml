@@ -26,6 +26,8 @@ services:
   worker-parse: *observed-worker
   worker-export: *observed-worker
   worker-memory: *observed-worker
+  worker-evaluation: *observed-worker
+  worker-quality: *observed-worker
   api:
     depends_on:
       otel-collector:
@@ -40,6 +42,12 @@ services:
       OBS_GRAFANA_BASE_URL: ${OBS_GRAFANA_BASE_URL:-http://localhost:3000}
       OBS_PHOENIX_BASE_URL: ${OBS_PHOENIX_BASE_URL:-http://localhost:6006}
 
+  otel-storage-init:
+    image: alpine:3.22
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:10001 /wal && chmod 0700 /wal"]
+    volumes:
+      - otel-collector-wal:/wal
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.128.0
     restart: unless-stopped
@@ -48,14 +56,22 @@ services:
       OBS_PHOENIX_PROJECT: ${OBS_PHOENIX_PROJECT:-hardware-database}
     volumes:
       - ../observability/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - otel-collector-wal:/var/lib/otelcol-storage
+    expose:
+      - "8888"
     ports:
       - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_OTLP_GRPC_PORT:-4317}:4317"
       - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_OTLP_HTTP_PORT:-4318}:4318"
       - "${OBS_BIND_HOST:-127.0.0.1}:${OBS_METRICS_PORT:-9464}:9464"
     depends_on:
-      - tempo
-      - loki
-      - phoenix
+      otel-storage-init:
+        condition: service_completed_successfully
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+      phoenix:
+        condition: service_started
 
   prometheus:
     image: prom/prometheus:v3.5.0
@@ -144,6 +160,7 @@ services:
       - phoenix-db
 
 volumes:
+  otel-collector-wal:
   prometheus-data:
   tempo-data:
   loki-data:

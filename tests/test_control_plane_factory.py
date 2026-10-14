@@ -64,7 +64,13 @@ class ControlPlaneFactoryTests(unittest.TestCase):
         service = build_conversation_service(settings)
         try:
             self.assertIsInstance(service, PostgresConversationService)
-            self.assertIs(service, build_conversation_service(settings))
+            self.assertIs(build_conversation_service(settings), service)
+        finally:
+            service.close()
+        replacement = build_conversation_service(settings)
+        try:
+            self.assertIsNot(replacement, service)
+            self.assertFalse(replacement.closed)
         finally:
             close_conversation_services()
 

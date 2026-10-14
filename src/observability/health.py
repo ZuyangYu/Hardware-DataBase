@@ -80,8 +80,9 @@ def _probe_http(name: str, url: str, *, headers: dict[str, str] | None = None) -
             url.rstrip("/"),
             headers=headers or {},
             timeout=settings.OBS_DEPENDENCY_TIMEOUT_SECONDS,
+            allow_redirects=False,
         )
-        if response.status_code < 500:
+        if 200 <= response.status_code < 300:
             return {"status": "up", "http_status": response.status_code}
         return {"status": "down", "http_status": response.status_code}
     except Exception as exc:
@@ -295,7 +296,8 @@ def check_dependencies() -> dict[str, Any]:
     if settings.AGENT_LLM_PROVIDER == settings.Provider.OLLAMA:
         llm = _probe_http("llm", f"{settings.AGENT_OLLAMA_BASE_URL.rstrip('/')}/api/tags")
     elif settings.AGENT_CUSTOM_BASE_URL:
-        llm = _probe_http("llm", f"{settings.AGENT_CUSTOM_BASE_URL.rstrip('/')}/models")
+        llm_headers = {"Authorization": f"Bearer {settings.AGENT_CUSTOM_API_KEY}"} if settings.AGENT_CUSTOM_API_KEY else {}
+        llm = _probe_http("llm", f"{settings.AGENT_CUSTOM_BASE_URL.rstrip('/')}/models", headers=llm_headers)
     else:
         llm = {"status": "not_configured"}
 

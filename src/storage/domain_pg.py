@@ -614,9 +614,14 @@ def ensure_domain_group_ready(
         sqlite_rows = 0
         if sqlite_db_path and os.path.exists(sqlite_db_path):
             with closing(sqlite3.connect(f"file:{sqlite_db_path}?mode=ro", uri=True)) as conn:
-                sqlite_rows = int(
-                    conn.execute(f"SELECT COUNT(*) FROM {primary_table}").fetchone()[0]
-                )
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (primary_table,),
+                ).fetchone()
+                if exists:
+                    sqlite_rows = int(
+                        conn.execute(f"SELECT COUNT(*) FROM {pg_ident(primary_table)}").fetchone()[0]
+                    )
         with closing(
             psycopg.connect(dsn, connect_timeout=5, options="-c TimeZone=UTC")
         ) as conn:

@@ -23,7 +23,14 @@ export type AppIconName =
   | 'tool'
   | 'trash'
   | 'user'
-  | 'warning';
+  | 'warning'
+  | 'check-list'
+  | 'chart'
+  | 'logs'
+  | 'flask'
+  | 'activity'
+  | 'settings'
+  | 'more';
 
 type AppIconProps = {
   name: AppIconName;
@@ -56,6 +63,13 @@ const iconPaths: Record<AppIconName, string[]> = {
   trash: ['M5 7h14', 'M9 7V5h6v2', 'M8 10v8', 'M12 10v8', 'M16 10v8', 'M7 7l1 13h8l1-13'],
   user: ['M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z', 'M4.5 20c1.2-4.1 13.8-4.1 15 0'],
   warning: ['M12 4 21 20H3L12 4Z', 'M12 9v5', 'M12 17h.1'],
+  'check-list': ['M10 6h10', 'M10 12h10', 'M10 18h10', 'M3 5l2 2 3-3', 'M3 11l2 2 3-3', 'M3 17l2 2 3-3'],
+  chart: ['M4 4v16h16', 'M8 16v-5', 'M12 16V7', 'M16 16v-8', 'M20 16V4'],
+  logs: ['M5 3h14v18H5V3Z', 'M8 7h8', 'M8 11h8', 'M8 15h5'],
+  flask: ['M9 3h6', 'M10 3v7l-6 9a1 1 0 0 0 1 2h14a1 1 0 0 0 1-2l-6-9V3', 'M8 15h8'],
+  activity: ['M3 12h4l3-8 4 16 3-8h4'],
+  settings: ['M9 3h6l1 4 4 2v6l-4 2-1 4H9l-1-4-4-2V9l4-2 1-4Z', 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z'],
+  more: ['M5 12h.1', 'M12 12h.1', 'M19 12h.1'],
 };
 
 /**
