@@ -6,6 +6,7 @@ import AppHeader from '@/components/AppHeader';
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
 import { StatCard } from '@/components/StatCard';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
 
 type Props = { auth: AuthSession; onLogout: () => void };
 type StatusPayload = {
@@ -68,7 +69,7 @@ export default function SystemStatusPage({ auth, onLogout }: Props) {
   };
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <AdminPageFrame>
       <AppHeader
         title="系统状态"
         description="查看 API、worker、RAGFlow、LLM 与持久化任务状态。"
@@ -123,6 +124,6 @@ export default function SystemStatusPage({ auth, onLogout }: Props) {
           {Object.entries(taskStatuses).map(([name, value]) => <StatCard key={name} label={name} value={value} />)}
         </div>
       </div>
-    </div>
+    </AdminPageFrame>
   );
 }

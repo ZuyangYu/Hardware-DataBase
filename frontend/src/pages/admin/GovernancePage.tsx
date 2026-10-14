@@ -198,7 +198,7 @@ export default function GovernancePage({ auth, onLogout }: Props) {
         className="mb-[16px] rounded-[16px] border border-[#e7eaf1] bg-[#f8f9fc] p-[16px]"
       >
         <div className="mb-[12px]">
-          <h2 id="governance-quick-links" className="text-[14px] font-semibold text-[#18181a]">运营入口</h2>
+          <h2 id="governance-quick-links" className="font-semibold text-[#18181a]">运营入口</h2>
           <p className="mt-[4px] text-[12px] text-[#757f9c]">从治理总览进入质量、成本、日志和评估工作台。</p>
         </div>
         <div className="grid gap-[10px] sm:grid-cols-2 xl:grid-cols-4">

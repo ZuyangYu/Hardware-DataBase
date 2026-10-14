@@ -31,6 +31,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { notify } from '@/components/ui/app-toast';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
 import { OUTLINE_ACTION_BUTTON_CLASS, formatDateTime } from '@/lib/enterprise-ui';
 import { cn } from '@/lib/utils';
 
@@ -636,7 +637,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
   }
 
   return (
-    <div className="min-h-full px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
+    <AdminPageFrame>
       <AppHeader
         title="RAGAS 评估"
         description="创建、控制和对比检索回答评估运行。仅系统管理员可访问。"
@@ -644,7 +645,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
 
       <section className="mt-[20px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
         <div className="mb-[14px] flex flex-wrap items-center justify-between gap-[12px]">
-          <h3 className="text-[14px] font-semibold text-[#18181a]">新建评估</h3>
+          <h3 className="text-[16px] font-semibold text-[#18181a]">新建评估</h3>
           <div className="flex flex-wrap gap-[8px]">
             <Button
               variant="outline"
@@ -813,7 +814,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
 
       <section className="mt-[16px] flex flex-col gap-[16px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
         <div className="flex flex-wrap items-center justify-between gap-[12px]">
-          <h3 className="text-[14px] font-semibold text-[#18181a]">评估运行</h3>
+          <h3 className="text-[16px] font-semibold text-[#18181a]">评估运行</h3>
           <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')} onClick={() => loadRuns()}>
             <AppIcon name="refresh" size={13} />
             刷新
@@ -922,7 +923,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
         destructive
         onConfirm={() => void handleDeleteRun()}
       />
-    </div>
+    </AdminPageFrame>
   );
 }
 

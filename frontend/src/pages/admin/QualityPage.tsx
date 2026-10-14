@@ -124,9 +124,9 @@ export default function QualityPage({ auth }: { auth: AuthSession; onLogout: () 
     } finally { setBusy(false); }
   }
   return <div className="flex min-h-0 flex-1 flex-col">
-    <AppHeader title="质量工作台" />
     <AdminPageShell>
-       <div className="flex flex-wrap items-center gap-3"><div className="min-w-0"><h2 className="text-lg font-semibold">案例队列</h2><p className="mt-1 text-xs text-muted-foreground">按状态定位积压案例，打开案例查看问题概览和修复门禁。</p></div>
+      <AppHeader title="质量工作台" description="生产反馈与案例复核:定位积压案例、提交复核结论并生成质量报告。" />
+       <div className="flex flex-wrap items-center gap-3"><div className="min-w-0"><h2 className="font-semibold">案例队列</h2><p className="mt-1 text-xs text-muted-foreground">按状态定位积压案例，打开案例查看问题概览和修复门禁。</p></div>
          <div className="ml-auto flex flex-wrap items-center gap-2"><label className="flex items-center gap-2 text-sm">状态<select aria-label="案例状态" className="rounded-md border bg-white p-2 text-sm" value={status} onChange={(e) => { setStatus(e.target.value); setOffset(0); }}><option value="">全部状态</option>{Object.entries(QUALITY_CASE_FILTER_STATUS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
          {loading && rows.length > 0 && <RefreshingBadge label="正在更新列表" />}<Button variant="outline" disabled={loading} onClick={() => void load()}>{loading ? '刷新中…' : '刷新'}</Button></div>
        </div>

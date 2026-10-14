@@ -28,6 +28,7 @@ import {
   Textarea,
 } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
+import { AdminPageFrame } from '@/components/admin/AdminPageShell';
 import { OUTLINE_ACTION_BUTTON_CLASS } from '@/lib/enterprise-ui';
 import SkillsPanel from './SkillsPanel';
 
@@ -45,12 +46,11 @@ type AdminExtensionsViewProps = {
 export function AdminExtensionsView({ activeSection, onSectionChange,
   mcpContent, skillContent }: AdminExtensionsViewProps) {
   return (
-    <>
-      <div className="px-[48px] pt-[32px] max-[900px]:px-[16px]">
-        <AppHeader
-          title="平台扩展"
-          description="登记、审核和配置远程 MCP 服务与可执行 Skill；员工按授权选择添加。"
-        />
+    <AdminPageFrame>
+      <AppHeader
+        title="平台扩展"
+        description="登记、审核和配置远程 MCP 服务与可执行 Skill；员工按授权选择添加。"
+      />
         <nav aria-label="平台扩展管理" className="mt-[20px] flex gap-[20px] border-b border-[#eceef3]">
           {([
             { id: 'mcp', label: 'MCP 登记服务' },
@@ -73,17 +73,16 @@ export function AdminExtensionsView({ activeSection, onSectionChange,
             </button>
           ))}
         </nav>
-      </div>
       {activeSection === 'mcp' ? (
-        <div id="admin-extensions-mcp-panel" role="region" aria-labelledby="admin-extensions-mcp-tab">
+        <div id="admin-extensions-mcp-panel" role="region" aria-labelledby="admin-extensions-mcp-tab" className="mt-[20px]">
           {mcpContent}
         </div>
       ) : (
-        <div id="admin-extensions-skills-panel" role="region" aria-labelledby="admin-extensions-skills-tab">
+        <div id="admin-extensions-skills-panel" role="region" aria-labelledby="admin-extensions-skills-tab" className="mt-[20px]">
           {skillContent}
         </div>
       )}
-    </>
+    </AdminPageFrame>
   );
 }
 
@@ -269,7 +268,7 @@ export function PluginsView({
   const active = servers.find((server) => server.slug === toolsFor) ?? null;
 
   return (
-    <div className="min-h-full px-[48px] pt-[16px] pb-[43px] max-[900px]:px-[16px]">
+    <div>
       <h2 className="text-[16px] font-semibold text-[#18181a]">MCP 登记服务</h2>
       <p className="mt-[6px] text-[12px] text-[#858b9c]">
         登记远程 MCP 服务；默认停用，测试连接通过后方可启用。外部结果不进入知识库证据链。
