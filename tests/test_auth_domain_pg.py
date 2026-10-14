@@ -27,7 +27,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 import src.settings as app_settings
 from src.core.app_logs import AppLogService
-from src.core.auth import ROLE_EMPLOYEE, AuthService
+from src.core.auth import ROLE_EMPLOYEE, ROLE_SYSTEM_ADMIN, AuthService
 from src.storage import domain_pg
 from src.storage.auth_domain import TABLES, domain_classes
 
@@ -90,6 +90,23 @@ class AuthDomainPostgresTests(unittest.TestCase):
             return int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
 
     # ------------------------------------------------------------------
+
+    def test_created_administrator_can_manage_accounts_on_postgres(self) -> None:
+        auth = AuthService()
+        administrator = auth.get_user_by_username("admin")
+        created = auth.create_user_as(administrator, "support-admin", ADMIN_PASSWORD, ROLE_SYSTEM_ADMIN)
+        self.assertEqual(created.role, ROLE_SYSTEM_ADMIN)
+        self.assertEqual(created.department_name, "system")
+        self.assertEqual(auth.get_kb_permissions_for_user(created), {})
+        session, reason = auth.authenticate("support-admin", ADMIN_PASSWORD)
+        self.assertIsNotNone(session, reason)
+        department = auth.create_department_as(created, "support-team")
+        employee = auth.create_user_as(created, "support-employee", ADMIN_PASSWORD, ROLE_EMPLOYEE, department.id)
+        self.assertEqual(employee.department_id, department.id)
+        with self.assertRaisesRegex(ValueError, "用户名已存在"):
+            auth.create_user_as(administrator, "support-admin", ADMIN_PASSWORD, ROLE_SYSTEM_ADMIN)
+        auth.set_user_active_as(administrator, created.id, False)
+        self.assertIsNone(auth.get_user_by_token(session.token))
 
     def test_auth_service_round_trip_on_postgres(self) -> None:
         auth = AuthService()

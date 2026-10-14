@@ -465,15 +465,16 @@ class SchemaValidationTests(unittest.TestCase):
     def _auth(self, token: str) -> dict:
         return {"Authorization": f"Bearer {token}"}
 
-    def test_system_admin_role_creation_rejected(self):
-        # 只允许注册员工; system_admin 账号由部署环境管理, API 直接 422。
+    def test_system_admin_can_create_another_administrator(self):
         admin_token = self._token(src.settings.AUTH_DEFAULT_ADMIN_USERNAME, "StrongTestPassword123!")
         r = self.client.post(
             "/api/v1/users",
             json={"username": "admin2", "password": "pw123456", "role": "system_admin"},
             headers=self._auth(admin_token),
         )
-        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["role"], "system_admin")
+        self.assertEqual(r.json()["department_name"], "system")
 
     def test_invalid_role_rejected(self):
         # 系统管理员调 POST /users, 非法 role -> 422 from pydantic Literal.

@@ -202,7 +202,8 @@ body {
 /* A3 统一键盘焦点:裸 input/select/textarea/button/a/summary 获得统一 focus ring。
    写在 @layer base,Tailwind utilities 层的 outline-none(共享 UI 组件)优先,
    因此 Input/Textarea/Select/Button 仍用自带的 ring,不叠加双环。
-   原生 datetime-local/分页按钮等无自定义 ring 的控件由本规则兜底。 */
+   原生 datetime-local/分页按钮等无自定义 ring 的控件由本规则兜底。
+   文本框与下拉框使用内描边,避免滚动容器裁切焦点高亮。 */
 @layer base {
   input:focus-visible,
   select:focus-visible,
@@ -214,6 +215,12 @@ body {
   [role="tab"]:focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 2px;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]):focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline-offset: -2px;
   }
 
   input[aria-invalid="true"]:focus-visible,

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { api } from '../../api/client';
-import type { DepartmentView, OkResponse } from '../../api/types';
+import type { DepartmentView, OkResponse, UserView } from '../../api/types';
+import { ROLE_LABELS } from '../../auth';
 import type { AuthSession } from '../../auth';
 import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
@@ -32,7 +33,12 @@ type Props = {
 
 export default function DepartmentsPage({ auth, onLogout }: Props) {
   const [departments, setDepartments] = useState<DepartmentView[]>([]);
+  const [users, setUsers] = useState<UserView[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [usersLoaded, setUsersLoaded] = useState(false);
+  const [expandedDepartments, setExpandedDepartments] = useState<Set<number>>(
+    () => new Set(),
+  );
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<DepartmentView | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -40,6 +46,7 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
   const load = useCallback(() => {
     let cancelled = false;
     setLoaded(false);
+    setUsersLoaded(false);
     api
       .get<DepartmentView[]>('/api/v1/departments')
       .then((rows) => {
@@ -51,6 +58,17 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
       .finally(() => {
         if (!cancelled) setLoaded(true);
       });
+    api
+      .get<UserView[]>('/api/v1/users')
+      .then((rows) => {
+        if (!cancelled) setUsers(rows);
+      })
+      .catch((error) => {
+        if (!cancelled) notify.error(error instanceof Error ? error.message : '加载员工失败');
+      })
+      .finally(() => {
+        if (!cancelled) setUsersLoaded(true);
+      });
     return () => {
       cancelled = true;
     };
@@ -60,6 +78,15 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
     const cancel = load();
     return cancel;
   }, [load]);
+
+  function toggleDepartment(departmentId: number) {
+    setExpandedDepartments((current) => {
+      const next = new Set(current);
+      if (next.has(departmentId)) next.delete(departmentId);
+      else next.add(departmentId);
+      return next;
+    });
+  }
 
   async function handleDelete() {
     if (!deleteTarget) return;
@@ -81,9 +108,56 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
       {
         key: 'name',
         title: '部门名称',
-        render: (d) => (
-          <span className="truncate font-medium text-[#18181a]">{d.name}</span>
-        ),
+        render: (d) => {
+          const expanded = expandedDepartments.has(d.id);
+          const members = users.filter((user) => user.department_id === d.id);
+          const membersId = `department-members-${d.id}`;
+          return (
+            <div className="min-w-0">
+              <button
+                type="button"
+                aria-expanded={expanded}
+                aria-controls={membersId}
+                onClick={() => toggleDepartment(d.id)}
+                className="inline-flex max-w-full items-center gap-[6px] rounded-[6px] text-left font-medium text-[#18181a] transition-colors hover:text-[#516bc4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#91a5ef] focus-visible:ring-offset-1"
+              >
+                <AppIcon
+                  name="arrow"
+                  size={13}
+                  className={expanded ? 'rotate-90 transition-transform' : 'transition-transform'}
+                />
+                <span className="truncate">{d.name}</span>
+              </button>
+              {expanded && (
+                <div
+                  id={membersId}
+                  className="mt-[8px] grid gap-[5px] rounded-[8px] bg-[#f8f9fc] px-[10px] py-[8px] text-[11px]"
+                >
+                  {!usersLoaded ? (
+                    <span className="text-[#858b9c]">加载员工中…</span>
+                  ) : members.length === 0 ? (
+                    <span className="text-[#858b9c]">暂无员工</span>
+                  ) : (
+                    members.map((member) => (
+                      <div
+                        key={member.id}
+                        className="flex min-w-0 flex-wrap items-center gap-x-[8px] gap-y-[2px]"
+                      >
+                        <span className="min-w-0 truncate font-medium text-[#464c5e]">
+                          {member.username}
+                        </span>
+                        <span className="text-[#858b9c]">{ROLE_LABELS[member.role]}</span>
+                        <span className={member.is_active ? 'text-[#138a55]' : 'text-[#858b9c]'}>
+                          {member.is_active ? '启用' : '停用'}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        },
       },
       {
         key: 'id',
@@ -114,7 +188,7 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
         },
       },
     ],
-    [],
+    [expandedDepartments, users, usersLoaded],
   );
 
   return (

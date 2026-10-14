@@ -174,7 +174,7 @@ export const CHAT_COMPOSER_STAGE_CLASS = 'relative mx-auto w-full max-w-[820px]'
 export const CHAT_COMPOSER_AVATAR_CLASS =
   'absolute bottom-full left-[16px] z-10 mb-[2px] size-[44px] shrink-0 overflow-hidden';
 export const CHAT_COMPOSER_FORM_CLASS =
-  'relative flex min-w-0 flex-1 flex-col gap-[10px] rounded-[14px] border-[0.5px] border-[#18181a] bg-white p-[12px] shadow-[0_6px_24px_rgba(24,24,26,0.08)] transition-colors';
+  'relative flex min-w-0 flex-1 flex-col gap-[10px] rounded-[14px] border-[0.5px] border-[#18181a] bg-white p-[12px] shadow-[0_6px_24px_rgba(24,24,26,0.08)] transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/50 focus-within:ring-inset';
 export const CHAT_COMPOSER_FORM_DRAG_CLASS = 'border-dashed border-[#0b6cf5] bg-[#f5f9ff]';
 export const CHAT_COMPOSER_DROP_HINT_CLASS =
   'pointer-events-none absolute inset-0 z-[2] grid place-items-center rounded-[14px] bg-white/85 text-[14px] font-medium text-[#18181a] backdrop-blur-sm';

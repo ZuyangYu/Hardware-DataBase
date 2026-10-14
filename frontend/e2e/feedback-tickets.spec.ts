@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { expectVisibleFormFocus } from './helpers/form-focus';
 
 async function tickets(page: Page, role: 'employee' | 'system_admin', status = 'open', legacyNotificationKind?: string) {
   const user = { username: role === 'employee' ? 'employee-a' : 'support-admin', role, department_id: role === 'employee' ? 7 : null, department_name: '硬件研发部' };
@@ -42,6 +43,25 @@ async function tickets(page: Page, role: 'employee' | 'system_admin', status = '
   });
   await page.goto('/admin/quality');
   return { row, actions, isDeleted: () => deleted };
+}
+
+for (const role of ['employee', 'system_admin'] as const) {
+  for (const width of [390, 1440]) {
+    test(`${role} ticket form focus stays visible on all edges at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await tickets(page, role);
+      await expectVisibleFormFocus(page.getByLabel('搜索工单', { exact: true }), 'mouse');
+      await expectVisibleFormFocus(page.getByLabel('工单状态', { exact: true }), 'keyboard');
+      if (role === 'system_admin') await expectVisibleFormFocus(page.getByLabel('反馈部门', { exact: true }), 'keyboard');
+      await page.getByRole('button', { name: '查看工单', exact: true }).click();
+      const dialog = page.getByRole('dialog', { name: '工单详情' });
+      const reply = dialog.getByLabel('回复或解决说明');
+      await expectVisibleFormFocus(reply, 'mouse');
+      if (role === 'system_admin') await page.screenshot({ path: test.info().outputPath('reply-focus.png') });
+      await expectVisibleFormFocus(reply, 'keyboard');
+      if (role === 'system_admin') await expectVisibleFormFocus(dialog.getByLabel('转派管理员'), 'keyboard');
+    });
+  }
 }
 
 test('administrator handles, closes and confirms deletion of a ticket without professional evaluation', async ({ page }) => {
@@ -142,9 +162,17 @@ test('chat problem submission explicitly shares only the submitted answer and cr
     return route.fulfill({ json: [] });
   });
   await page.goto('/chat');
+  const composer = page.getByPlaceholder('未挂载知识库,直接提问', { exact: true });
+  const composerFrame = page.locator('form').filter({ has: composer });
+  await expectVisibleFormFocus(composer, 'mouse', composerFrame);
+  await expectVisibleFormFocus(composer, 'keyboard', composerFrame);
   await page.getByRole('button', { name: '回答有问题', exact: true }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByText('提交后，处理管理员可查看本次提问、回答和补充说明，用于联系你解决问题。', { exact: true })).toBeVisible();
+  await expectVisibleFormFocus(dialog.getByLabel('补充说明（可选）'), 'mouse');
+  await expectVisibleFormFocus(dialog.getByLabel('补充说明（可选）'), 'keyboard');
+  await expectVisibleFormFocus(dialog.getByLabel('联系方式（可选）'), 'mouse');
+  await expectVisibleFormFocus(dialog.getByLabel('联系方式（可选）'), 'keyboard');
   await dialog.getByLabel('补充说明（可选）').fill('电流应为 2A');
   await dialog.getByLabel('联系方式（可选）').fill('企业微信：employee-a');
   await dialog.getByRole('button', { name: '提交工单', exact: true }).click();

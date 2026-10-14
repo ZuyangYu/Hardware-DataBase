@@ -5,6 +5,7 @@ import type {
   CreateUserPayload,
   DepartmentView,
   OkResponse,
+  Role,
   UserView,
 } from '../../api/types';
 import type { AuthSession } from '../../auth';
@@ -46,6 +47,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
   const [users, setUsers] = useState<UserView[]>([]);
   const [departments, setDepartments] = useState<DepartmentView[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const [createOpen, setCreateOpen] = useState(false);
   const [resetTarget, setResetTarget] = useState<UserView | null>(null);
@@ -223,6 +225,21 @@ export default function UsersPage({ auth, onLogout }: Props) {
   );
 
   const activeCount = users.filter((u) => u.is_active).length;
+  const filteredUsers = useMemo(() => {
+    const query = searchQuery.trim().toLocaleLowerCase();
+    if (!query) return users;
+    return users.filter((user) => {
+      const searchable = [
+        user.username,
+        user.department_name ?? '',
+        ROLE_LABELS[user.role],
+        user.role,
+        user.is_active ? '启用' : '停用',
+        user.is_active ? 'active' : 'inactive',
+      ];
+      return searchable.some((value) => value.toLocaleLowerCase().includes(query));
+    });
+  }, [searchQuery, users]);
 
   return (
     <AdminPageFrame>
@@ -241,7 +258,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
           className="h-[36px] gap-[6px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] text-white hover:bg-[#303030]"
         >
           <AppIcon name="plus" size={14} />
-          注册员工
+          创建账号
         </Button>
       </div>
 
@@ -250,6 +267,32 @@ export default function UsersPage({ auth, onLogout }: Props) {
           <StatCard label="用户总数" value={users.length} />
           <StatCard label="启用" value={activeCount} tone="green" />
           <StatCard label="停用" value={users.length - activeCount} />
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-[10px]">
+          <label htmlFor="user-directory-search" className="sr-only">
+            查找用户
+          </label>
+          <div className="relative w-full max-w-[360px]">
+            <AppIcon
+              name="search"
+              size={15}
+              className="pointer-events-none absolute left-[10px] top-1/2 -translate-y-1/2 text-[#858b9c]"
+            />
+            <Input
+              id="user-directory-search"
+              type="search"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="查找用户名、部门或角色"
+              className="h-[36px] rounded-[10px] border-[#e3e7f1] pl-[32px] text-[13px]"
+            />
+          </div>
+          {searchQuery.trim() && loaded && (
+            <span className="text-[12px] text-[#858b9c]">
+              找到 {filteredUsers.length} 个用户
+            </span>
+          )}
         </div>
 
         {!loaded ? (
@@ -261,7 +304,7 @@ export default function UsersPage({ auth, onLogout }: Props) {
         ) : (
           <DataTable
             columns={columns}
-            data={users}
+            data={filteredUsers}
             rowKey={(u) => u.id}
             size="compact"
             emptyText="暂无用户"
@@ -368,7 +411,7 @@ function ResetPasswordDialog({
   );
 }
 
-/** 注册员工对话框(仅系统管理员可用; 系统管理员账号由部署环境管理)。 */
+/** 创建员工或系统管理员,仅已登录的系统管理员可用。 */
 function CreateUserDialog({
   open,
   onOpenChange,
@@ -382,8 +425,17 @@ function CreateUserDialog({
 }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [role, setRole] = useState<Role>('employee');
   const [departmentId, setDepartmentId] = useState<string>('');
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setUsername('');
+    setPassword('');
+    setRole('employee');
+    setDepartmentId('');
+  }, [open]);
 
   const businessDepartments = useMemo(
     () => departments.filter((d) => d.name !== 'system'),
@@ -391,24 +443,29 @@ function CreateUserDialog({
   );
 
   async function submit() {
+    if (submitting) return;
     if (!username.trim() || !password) {
       notify.error('请输入用户名和密码');
       return;
     }
-    if (!departmentId) {
-      notify.error('请选择部门');
+    if (password.length < 8) {
+      notify.error('密码长度不能少于 8 位');
+      return;
+    }
+    if (role === 'employee' && !departmentId) {
+      notify.error('请选择业务部门');
       return;
     }
     const payload: CreateUserPayload = {
       username: username.trim(),
       password,
-      role: 'employee',
-      department_id: Number(departmentId),
+      role,
+      department_id: role === 'employee' ? Number(departmentId) : null,
     };
     setSubmitting(true);
     try {
       await api.post<UserView>('/api/v1/users', payload);
-      notify.success('员工已注册');
+      notify.success(role === 'system_admin' ? '系统管理员已创建' : '员工已注册');
       onOpenChange(false);
       setUsername('');
       setPassword('');
@@ -426,30 +483,45 @@ function CreateUserDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={value => { if (!submitting) onOpenChange(value); }}>
       <DialogContent className="flex w-[calc(100%-32px)] max-w-[440px] flex-col rounded-[16px] p-0">
         <DialogHeader className="px-[24px] pt-[20px]">
-          <DialogTitle className="text-[16px] font-semibold text-[#18181a]">注册员工</DialogTitle>
+          <DialogTitle className="text-[16px] font-semibold text-[#18181a]">创建账号</DialogTitle>
         </DialogHeader>
         <div className="grid gap-[14px] px-[24px] py-[16px]">
           <div className="grid gap-[6px]">
-            <Label className="text-[12px] text-[#464c5e]">用户名</Label>
-            <Input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="登录用户名" />
+            <Label htmlFor="create-user-role" className="text-[12px] text-[#464c5e]">账号角色</Label>
+            <Select value={role} disabled={submitting} onValueChange={value => { setRole(value as Role); setDepartmentId(''); }}>
+              <SelectTrigger id="create-user-role" className="w-full" aria-describedby={role === 'system_admin' ? 'create-user-role-description' : undefined}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="employee">员工</SelectItem>
+                <SelectItem value="system_admin">系统管理员</SelectItem>
+              </SelectContent>
+            </Select>
+            {role === 'system_admin' && <p id="create-user-role-description" className="text-xs leading-5 text-muted-foreground">系统管理员可管理组织、账号、配置及全局工单。此角色不授予知识库正文访问权限。</p>}
           </div>
           <div className="grid gap-[6px]">
-            <Label className="text-[12px] text-[#464c5e]">密码</Label>
+            <Label htmlFor="create-user-username" className="text-[12px] text-[#464c5e]">用户名</Label>
+            <Input id="create-user-username" name="new-account-username" autoComplete="off" spellCheck={false} disabled={submitting} value={username} onChange={(e) => setUsername(e.target.value)} placeholder="登录用户名" />
+          </div>
+          <div className="grid gap-[6px]">
+            <Label htmlFor="create-user-password" className="text-[12px] text-[#464c5e]">密码</Label>
             <PasswordInput
+              id="create-user-password"
               autoComplete="new-password"
-              name="employee-initial-password"
+              name="new-account-password"
+              disabled={submitting}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="初始密码"
             />
           </div>
-          <div className="grid gap-[6px]">
-            <Label className="text-[12px] text-[#464c5e]">部门</Label>
-            <Select value={departmentId} onValueChange={setDepartmentId}>
-              <SelectTrigger className="w-full">
+          {role === 'employee' && <div className="grid gap-[6px]">
+            <Label htmlFor="create-user-department" className="text-[12px] text-[#464c5e]">业务部门</Label>
+            <Select value={departmentId} disabled={submitting} onValueChange={setDepartmentId}>
+              <SelectTrigger id="create-user-department" className="w-full">
                 <SelectValue placeholder="选择业务部门" />
               </SelectTrigger>
               <SelectContent>
@@ -460,12 +532,13 @@ function CreateUserDialog({
                 ))}
               </SelectContent>
             </Select>
-          </div>
+          </div>}
         </div>
         <div className="flex items-center justify-end gap-[8px] px-[24px] pb-[20px]">
           <Button
             variant="outline"
             onClick={() => onOpenChange(false)}
+            disabled={submitting}
             className="h-[32px] min-w-[80px] rounded-[10px] border-[#e3e7f1] bg-white text-[14px] text-[#464c5e] hover:bg-[#f6f6f6]"
           >
             取消
