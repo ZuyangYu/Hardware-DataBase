@@ -160,6 +160,11 @@ class ToolRuntime:
     # tool factory consumes it.
     document_context: Any | None = None
     knowledge_scope: KnowledgeScopeSnapshot | None = None
+    # Multi-KB retrieval is injected by the authenticated execution boundary.
+    # Keeping both objects request-scoped prevents a tool from widening a
+    # persisted scope or creating an independent budget for each source.
+    multi_kb_retrieval: Any | None = None
+    retrieval_budget: Any | None = None
     chat_session_id: str = ""
     top_k: int = 6
     query_mode: str = "deep"
@@ -429,6 +434,14 @@ def timed_tool_call(
     except QueryCancelled:
         raise
     except Exception as exc:
+        # A live ACL revocation is a terminal execution condition for a
+        # multi-KB turn.  Do not turn it into an apparently empty result that
+        # lets the model continue with a partial, unauthorized scope.
+        from src.services.knowledge_scope import KnowledgeScopeDenied
+
+        if isinstance(exc, KnowledgeScopeDenied):
+            rt.mark_ended()
+            raise
         from src.core.error_friendly import friendly_error_message
 
         try:

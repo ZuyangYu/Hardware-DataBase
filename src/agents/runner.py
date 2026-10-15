@@ -89,6 +89,9 @@ from src.pipelines.document_rag.schemas import RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
 from src.memory.service import MemoryService
+from src.services.knowledge_scope import KnowledgeScopeResolver
+from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
+from src.services.multi_kb_retrieval import MultiKnowledgeRetrievalService, RetrievalBudget
 
 # M9: 收窄 deepagents 默认能力面。禁用框架自动装配的 general-purpose 子代理
 # (task 工具随之移除)，并剥离与 SYSTEM_PROMPT 声明不符的文件系统/命令执行工具，
@@ -1235,6 +1238,19 @@ def _build_messages(query: str, history: list[tuple[str, str]]) -> list[dict[str
     return messages
 
 
+def _scope_dependency_fields(scope: KnowledgeScopeSnapshot | None) -> dict[str, Any]:
+    if scope is None:
+        return {}
+    return {
+        "source_dependencies": {
+            "version": 1,
+            "kb_ids": sorted({int(source.kb_id) for source in scope.sources}),
+            "inherited_turn_ids": [],
+            "complete": True,
+        }
+    }
+
+
 def _extract_text_delta(chunk: Any) -> str:
     content = getattr(chunk, "content", None)
     if isinstance(content, str):
@@ -2037,6 +2053,8 @@ class MultiSourceAgentRunner:
         attachment_user_id: int | None = None,
         conversation_session_id: int | None = None,
         action_scope: Any | None = None,
+        knowledge_scope: KnowledgeScopeSnapshot | None = None,
+        knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
     ) -> Generator[str, None, None]:
         """Observability wrapper: one agent span + metrics per run."""
         started = time.monotonic()
@@ -2070,6 +2088,8 @@ class MultiSourceAgentRunner:
                     attachment_user_id=attachment_user_id,
                     conversation_session_id=conversation_session_id,
                     action_scope=action_scope,
+                    knowledge_scope=knowledge_scope,
+                    knowledge_scope_resolver=knowledge_scope_resolver,
                 )
             except QueryCancelled:
                 status = "cancelled"
@@ -2144,6 +2164,8 @@ class MultiSourceAgentRunner:
         attachment_user_id: int | None = None,
         conversation_session_id: int | None = None,
         action_scope: Any | None = None,
+        knowledge_scope: KnowledgeScopeSnapshot | None = None,
+        knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
     ) -> Generator[str, None, None]:
         """Run the deep agent and stream answer deltas live.
 
@@ -2157,6 +2179,15 @@ class MultiSourceAgentRunner:
         """
         record = _RunRecord()
         _RUN_RECORD.set(record)
+
+        if knowledge_scope is not None and not isinstance(knowledge_scope, KnowledgeScopeSnapshot):
+            knowledge_scope = KnowledgeScopeSnapshot.model_validate(knowledge_scope)
+        if knowledge_scope is not None and knowledge_scope_resolver is not None:
+            # This is the model-submission gate. Retrieval performs the same
+            # check again before and after every source call.
+            knowledge_scope_resolver.revalidate(
+                knowledge_scope.actor_user_id, knowledge_scope
+            )
 
         kb_label = str(kb_name or "").strip()
         is_general = (not kb_label) or kb_label == GENERAL_CHAT_KB_NAME
@@ -2219,6 +2250,15 @@ class MultiSourceAgentRunner:
             scope_kb = kb_label
             kb_scope_line = f"当前知识库为「{kb_label}」。"
             workflow = _DEEP_WORKFLOW if query_mode == "deep" else _FAST_WORKFLOW
+            if knowledge_scope is not None:
+                selected = "、".join(
+                    f"{source.kb_name}（{source.role}）"
+                    for source in knowledge_scope.sources
+                )
+                kb_scope_line = (
+                    f"当前受控知识库范围：{selected}。每条结论必须保留真实来源身份；"
+                    "未列入范围的知识库不得检索。"
+                )
         if has_attachments:
             names = "、".join(str(getattr(ref, "filename", "") or "附件") for ref in attachment_refs[:5])
             attachment_scope_line = (
@@ -2367,7 +2407,24 @@ class MultiSourceAgentRunner:
             attachment_session_id=logical_session_id,
 
             attachment_edit_enabled=allow_document_write,
+            knowledge_scope=knowledge_scope,
         )
+        if knowledge_scope is not None:
+            if knowledge_scope_resolver is None:
+                # Direct callers may inject a service in tests, but the
+                # authenticated worker always supplies the live resolver.
+                rt.multi_kb_retrieval = None
+            else:
+                rt.multi_kb_retrieval = MultiKnowledgeRetrievalService(
+                    knowledge_scope_resolver, self.rag_backend
+                )
+            rt.retrieval_budget = RetrievalBudget(
+                max_calls=int(getattr(settings, "MULTI_KB_MAX_CALLS_PER_TURN", 24)),
+                timeout_seconds=float(
+                    getattr(settings, "MULTI_KB_RETRIEVAL_DEADLINE_SECONDS", 30)
+                ),
+                should_cancel=should_cancel,
+            )
         if attachment_refs:
             from src.attachments.service import AttachmentService
 
@@ -2621,7 +2678,8 @@ class MultiSourceAgentRunner:
                 from src.agents.tools.attachment_tools import build_attachment_tools
 
                 tools.extend(build_attachment_tools(rt))
-            tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
+            if rt.knowledge_scope is None:
+                tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
             tools.extend(document_tools)
             tools = filter_tools_by_capability(
                 tools,
@@ -2636,7 +2694,7 @@ class MultiSourceAgentRunner:
                 "本轮按受控动作计划执行：只能调用当前可见的业务工具；"
                 "附件、知识库和文档产物均须通过这些工具访问，绝不可访问任意文件系统。"
             )
-            memory_context = self._prefetch_memory_context(
+            memory_context = "" if rt.knowledge_scope is not None else self._prefetch_memory_context(
                 query=query,
                 kb_name=scope_kb,
                 ctx=ctx,
@@ -2673,7 +2731,8 @@ class MultiSourceAgentRunner:
                 from src.agents.tools.attachment_tools import build_attachment_tools
 
                 tools.extend(build_attachment_tools(rt))
-            tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
+            if rt.knowledge_scope is None:
+                tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
             base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
             if not wiki_assist:
                 base_prompt = f"{base_prompt}\n\n本次未启用 Wiki 检索, 请不要调用 wiki_search。"
@@ -2684,7 +2743,7 @@ class MultiSourceAgentRunner:
             # explicit true that failed routing must not fall back to them.
             if document_flow is None:
                 tools.extend(document_tools)
-            memory_context = self._prefetch_memory_context(
+            memory_context = "" if rt.knowledge_scope is not None else self._prefetch_memory_context(
                 query=query,
                 kb_name=scope_kb,
                 ctx=ctx,
@@ -3440,6 +3499,7 @@ class MultiSourceAgentRunner:
                     action_plan_mode, action_plan, action_plan_issues, action_execution,
                 ),
             }
+            record.retrieval_summary.update(_scope_dependency_fields(knowledge_scope))
             yield direct_control_answer
             return
 
@@ -3557,6 +3617,7 @@ class MultiSourceAgentRunner:
                     action_plan_mode, action_plan, action_plan_issues, action_execution,
                 ),
             }
+            record.retrieval_summary.update(_scope_dependency_fields(knowledge_scope))
             emit_event(
                 {
                     "type": "stage",
@@ -3571,6 +3632,10 @@ class MultiSourceAgentRunner:
             yield direct_answer
             return
 
+        if knowledge_scope is not None and knowledge_scope_resolver is not None:
+            knowledge_scope_resolver.revalidate(
+                knowledge_scope.actor_user_id, knowledge_scope
+            )
         model = self._get_model()
         # 会话状态持久化：thread 模式挂 checkpointer，LangGraph 按
         # configurable.thread_id 自动恢复/续写该会话的完整消息历史；
@@ -3787,7 +3852,7 @@ class MultiSourceAgentRunner:
             status, error_stage, error_message = "no_evidence", "retrieval", "no evidence"
         else:
             status, error_stage, error_message = "success", "", ""
-        return {
+        result = {
             "status": status,
             "error_stage": error_stage,
             "error_message": error_message,
@@ -3806,6 +3871,8 @@ class MultiSourceAgentRunner:
             "evidence_quality": _build_evidence_quality(rt.evidence),
             "verification": verification,
         }
+        result.update(_scope_dependency_fields(rt.knowledge_scope))
+        return result
 
     def _format_footer(
         self,

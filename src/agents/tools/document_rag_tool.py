@@ -40,10 +40,53 @@ def _backend_filters(
     return backend_filters
 
 
+def _convert_scoped_evidence(item) -> Evidence:
+    """Convert adapter evidence while retaining its complete source identity."""
+    metadata = dict(getattr(item, "metadata", None) or {})
+    kb_id = metadata.get("kb_id")
+    # Remote chunk IDs are only unique inside a source. Prefixing the citation
+    # identity prevents equal chunk IDs from collapsing across KBs.
+    identity = str(getattr(item, "id", "") or "")
+    if kb_id not in (None, ""):
+        identity = f"{kb_id}:{identity}"
+    return Evidence(
+        id=f"document:{identity}",
+        content=str(getattr(item, "content", "") or ""),
+        source_name=str(getattr(item, "source_name", "") or ""),
+        content_kind=str(metadata.get("content_kind") or "document_text"),
+        processor_kind=str(metadata.get("processor_kind") or getattr(item, "backend", "") or "ragflow"),
+        score=float(getattr(item, "score", 0.0) or 0.0),
+        locator={
+            "document_id": metadata.get("remote_document_id") or getattr(item, "id", ""),
+            "chunk_id": metadata.get("chunk_or_structured_locator") or getattr(item, "id", ""),
+            "page": metadata.get("page") or metadata.get("page_number"),
+        },
+        metadata={
+            **metadata,
+            "retriever": getattr(item, "retriever", ""),
+            "backend": getattr(item, "backend", ""),
+            "tool": "document_search",
+        },
+    )
+
+
 def make_document_search(rt, rag_backend: RAGBackend, document_store: PipelineDocumentStore | None):
     """Return a ``document_search(query, top_k)`` tool closure."""
 
     def run(query: str, top_k: int) -> list[Evidence]:
+        if rt.knowledge_scope is not None:
+            service = getattr(rt, "multi_kb_retrieval", None)
+            budget = getattr(rt, "retrieval_budget", None)
+            if service is None or budget is None:
+                raise RuntimeError("multi_kb_retrieval_not_configured")
+            outcome = service.search(
+                snapshot=rt.knowledge_scope,
+                queries=[query],
+                retriever_kind="document",
+                per_source_top_k=max(1, min(int(top_k), 20)),
+                budget=budget,
+            )
+            return [_convert_scoped_evidence(item) for item in outcome.evidence]
         backend_filters = _backend_filters(rt.kb_name, rt.ctx, None, document_store)
         retrieve_kwargs: dict[str, Any] = {"top_k": top_k, "ctx": rt.ctx, "filters": backend_filters}
         raw = rag_backend.retrieve(rt.kb_name, query, **retrieve_kwargs)
@@ -132,6 +175,33 @@ def make_document_search_batch(
         if not normalized:
             return "（未提供有效的文档查询）"
         safe_top_k = max(1, min(int(top_k), 20))
+        if rt.knowledge_scope is not None:
+            # Calling ``document_search`` through the shared executor would
+            # submit work to the same pool from inside one of its workers.
+            # Expand all query × source items in one service call instead.
+            from src.agents.tools.runtime import format_tool_result, timed_tool_call
+
+            service = getattr(rt, "multi_kb_retrieval", None)
+            budget = getattr(rt, "retrieval_budget", None)
+            if service is None or budget is None:
+                return "（多知识库检索服务未配置）"
+
+            def run_multi() -> list[Evidence]:
+                outcome = service.search(
+                    snapshot=rt.knowledge_scope,
+                    queries=normalized,
+                    retriever_kind="document",
+                    per_source_top_k=safe_top_k,
+                    budget=budget,
+                )
+                for value in normalized:
+                    rt.log_query("document_search", value)
+                return [_convert_scoped_evidence(item) for item in outcome.evidence]
+
+            items, adds_nothing = timed_tool_call(
+                rt, "document_search_batch", " | ".join(normalized), None, run_multi
+            )
+            return format_tool_result(rt, adds_nothing, items)
         if not bool(getattr(settings, "SHARED_RETRIEVAL_EXECUTOR_ENABLED", True)):
             with ThreadPoolExecutor(
                 max_workers=len(normalized), thread_name_prefix="hdb-document-search"

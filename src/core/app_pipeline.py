@@ -546,6 +546,8 @@ class AppPipeline:
         attachment_user_id: int | None = None,
         conversation_session_id: int | None = None,
         action_scope: Any | None = None,
+        knowledge_scope: Any | None = None,
+        knowledge_scope_resolver: Any | None = None,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -572,6 +574,8 @@ class AppPipeline:
                 attachment_user_id=attachment_user_id,
                 conversation_session_id=conversation_session_id,
                 action_scope=action_scope,
+                knowledge_scope=knowledge_scope,
+                knowledge_scope_resolver=knowledge_scope_resolver,
             )
         except QueryCancelled:
             return

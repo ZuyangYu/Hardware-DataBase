@@ -5,7 +5,8 @@ import json
 import queue
 import inspect
 from src.services.knowledge_scope_access import resolve_session_scope, can_read_turn
-from src.services.knowledge_scope import KnowledgeScopeDenied, KnowledgeScopeInvalid, KnowledgeScopeChanged
+from src.services.knowledge_scope import KnowledgeScopeDenied, KnowledgeScopeInvalid, KnowledgeScopeChanged, KnowledgeScopeResolver
+from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
 from src.services.knowledge_scope_persistence import IdempotencyConflict
 from src.agents.tools.retrieval_executor import MultiKnowledgeRetrievalUnavailable
 import threading
@@ -470,6 +471,18 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     runner_thread = visible_thread
     checkpoint_initialization_failed = False
     checkpoint_observer = None
+    knowledge_scope = None
+    knowledge_scope_resolver = None
+    knowledge_scope_error = None
+    if getattr(turn, "knowledge_scope", None):
+        try:
+            knowledge_scope = KnowledgeScopeSnapshot.model_validate(turn.knowledge_scope)
+            knowledge_scope_resolver = KnowledgeScopeResolver(AuthService())
+            knowledge_scope_resolver.revalidate(user.id, knowledge_scope)
+        except Exception as exc:
+            # A persisted snapshot records what was authorized at creation;
+            # it never grants access after a revoke or department change.
+            knowledge_scope_error = exc
 
     def _register_checkpoint_ref(saved: dict) -> None:
         """Report one durable graph-state write to the authority transaction."""
@@ -779,6 +792,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     summary: dict = {}
     footer = ""
     try:
+        if knowledge_scope_error is not None:
+            _fail_owned("知识库来源权限已变化，请重新创建会话")
+            outcome_status = "failed"
+            return
         if checkpoint_initialization_failed:
             _fail_owned("检查点初始化失败，请稍后重试")
             return
@@ -828,6 +845,8 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             attachment_user_id=int(user.id),
             conversation_session_id=int(turn.session_id),
             action_scope=action_scope,
+            knowledge_scope=knowledge_scope,
+            knowledge_scope_resolver=knowledge_scope_resolver,
         )
         try:
             for chunk in gen:
@@ -1545,6 +1564,8 @@ def _query_generator(
     attachment_user_id=None,
     conversation_session_id=None,
     action_scope=None,
+    knowledge_scope=None,
+    knowledge_scope_resolver=None,
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -1576,6 +1597,10 @@ def _query_generator(
             kwargs["conversation_session_id"] = conversation_session_id
         if action_scope is not None and "action_scope" in params:
             kwargs["action_scope"] = action_scope
+        if "knowledge_scope" in params:
+            kwargs["knowledge_scope"] = knowledge_scope
+        if "knowledge_scope_resolver" in params:
+            kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
         return pipeline.query(
             query,
             kb_name,
@@ -1608,6 +1633,10 @@ def _query_generator(
         kwargs["conversation_session_id"] = conversation_session_id
     if action_scope is not None and "action_scope" in params:
         kwargs["action_scope"] = action_scope
+    if "knowledge_scope" in params:
+        kwargs["knowledge_scope"] = knowledge_scope
+    if "knowledge_scope_resolver" in params:
+        kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 
