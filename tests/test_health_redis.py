@@ -60,6 +60,8 @@ class RedisProbeTests(unittest.TestCase):
 
 class DependencyAggregationTests(unittest.TestCase):
     def setUp(self) -> None:
+        health.reset_readiness_cache()
+        self.addCleanup(health.reset_readiness_cache)
         self._url = src.settings.REDIS_URL
         self.addCleanup(setattr, src.settings, "REDIS_URL", self._url)
         patchers = (

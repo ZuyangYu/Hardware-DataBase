@@ -753,6 +753,12 @@ class AppPipeline:
             from src.core.model_factory import invalidate_chat_model_cache
 
             invalidate_chat_model_cache()
+            from src.agents.tools.retrieval_executor import initialize_retrieval_executor
+
+            try:
+                initialize_retrieval_executor()
+            except Exception as exc:
+                error(f"Retrieval executor unavailable after settings reload: {type(exc).__name__}")
 
     def delete_document(self, filename: str, kb_name: str, ctx: RequestContext | None = None) -> str:
         try:

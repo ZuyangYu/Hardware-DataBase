@@ -26,6 +26,10 @@ class RetrievalSaturated(RuntimeError):
     """Raised/recorded when the bounded retrieval queue cannot admit work."""
 
 
+class MultiKnowledgeRetrievalUnavailable(RuntimeError):
+    """The multi-KB switch is off or process-owned pool initialization failed."""
+
+
 @dataclass
 class RetrievalCallResult:
     index: int
@@ -59,6 +63,10 @@ class RetrievalExecutor:
 
     # -- lifecycle ----------------------------------------------------------
 
+    def start(self) -> None:
+        """Initialize the process-owned pool before accepting multi-KB work."""
+        self._ensure_executor()
+
     def _ensure_executor(self) -> ThreadPoolExecutor:
         with self._executor_lock:
             if self._closed:
@@ -84,10 +92,13 @@ class RetrievalExecutor:
             self._executor = None
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+        with self._condition:
+            futures = list(self._futures)
+            self._condition.notify_all()
         if deadline_seconds <= 0:
-            return len(self._futures)
+            return sum(not future.done() for future in futures)
         done, not_done = wait(
-            list(self._futures), timeout=max(0.0, float(deadline_seconds))
+            futures, timeout=max(0.0, float(deadline_seconds))
         )
         unconfirmed = len(not_done)
         for future in done:
@@ -245,6 +256,31 @@ class RetrievalExecutor:
 
 _EXECUTOR: RetrievalExecutor | None = None
 _EXECUTOR_LOCK = threading.Lock()
+
+
+def initialize_retrieval_executor() -> RetrievalExecutor | None:
+    """API/Worker startup (and live enable) owns the existing singleton.
+
+    The legacy batch flag only selects that tool's execution path. Multi-KB
+    independently requires this pool; it never flips the legacy flag.
+    """
+    import src.settings as settings
+
+    if not (settings.SHARED_RETRIEVAL_EXECUTOR_ENABLED or settings.MULTI_KB_CHAT_ENABLED):
+        return None
+    executor = get_retrieval_executor()
+    executor.start()
+    return executor
+
+
+def get_multi_kb_retrieval_executor() -> RetrievalExecutor:
+    """Fail closed without lazily resurrecting a failed or shutdown pool."""
+    import src.settings as settings
+
+    with _EXECUTOR_LOCK:
+        if not settings.MULTI_KB_CHAT_ENABLED or _EXECUTOR is None or not _EXECUTOR.stats()["alive"]:
+            raise MultiKnowledgeRetrievalUnavailable("feature_unavailable")
+        return _EXECUTOR
 
 
 def get_retrieval_executor() -> RetrievalExecutor:

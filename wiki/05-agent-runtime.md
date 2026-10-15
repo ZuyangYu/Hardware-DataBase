@@ -401,7 +401,14 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | `REVIEWER_AGENT_ENABLED` / `RESEARCH_AGENT_ENABLED` | `false` / `false` | 子代理（未接线） |
 | `AGENT_CHECKPOINT_BACKEND` / `_DB_PATH` / `_DATABASE_URL` / `_POOL_SIZE` | `sqlite` / `storage/agent_checkpoints.db` / `""` / `4` | checkpoint |
 | `SHARED_RETRIEVAL_EXECUTOR_ENABLED` + `RETRIEVAL_*` | `false` + 8/256/4/30/10 | 共享检索池 |
+| `MULTI_KB_CHAT_ENABLED` / `MULTI_KB_MAX_SOURCES` | `false` / `4` | 多库独立开关与选库上限；目前完成池生命周期，多库问答入口待接通 |
 | `HDB_WIKI_SEARCH_EXPAND` | 未设置 | 环境变量级覆盖 `wiki_search` 的 `include_linked` |
+
+API 与 Worker 在启动和运行时启用时初始化同一个进程级检索池。多库开关不改变
+旧 `document_search_batch` 的共享池/本地池分支。多库启用但池未初始化成功时，
+就绪探针返回 `multi_kb_retrieval=down`，服务层以 `feature_unavailable` 拒绝使用；
+停止进程按 `RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS` 回收，运行中的 Python 调用不会
+被强制终止。关闭多库开关立即阻止新多库调用，已运行调用仍按取消/截止边界结束。
 
 ---
 

@@ -137,6 +137,9 @@ class HardwareWorker:
             from src.core.model_factory import invalidate_chat_model_cache
 
             invalidate_chat_model_cache()
+            from src.agents.tools.retrieval_executor import initialize_retrieval_executor
+
+            initialize_retrieval_executor()
             self._env_mtime_ns = current_mtime_ns
             # v3 §11.3: record the reloaded content revision so config drift
             # across API/worker processes is traceable in logs.
@@ -754,10 +757,16 @@ def main() -> None:
     from src.agents.checkpoints.postgres_provider import verify_configured_checkpoint_schemas
 
     verify_configured_checkpoint_schemas()
-    worker = HardwareWorker(role=resolve_worker_role(args.role))
-    signal.signal(signal.SIGTERM, worker.stop)
-    signal.signal(signal.SIGINT, worker.stop)
     try:
+        from src.agents.tools.retrieval_executor import initialize_retrieval_executor
+
+        try:
+            initialize_retrieval_executor()
+        except Exception as exc:
+            error(f"Worker retrieval executor unavailable: {type(exc).__name__}")
+        worker = HardwareWorker(role=resolve_worker_role(args.role))
+        signal.signal(signal.SIGTERM, worker.stop)
+        signal.signal(signal.SIGINT, worker.stop)
         with WorkerHeartbeat(worker.worker_id, worker.role):
             worker.run_forever()
     finally:

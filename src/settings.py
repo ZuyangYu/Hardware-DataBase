@@ -536,6 +536,9 @@ SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
 # batch retrieval; per-request fan-out and the RAG governor are separate.
 # Rollout flag: off until stage acceptance opens it (plan §10.1).
 SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
+# R3: independent rollout switch; scope/API acceptance is still required.
+MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
+MULTI_KB_MAX_SOURCES = int(os.getenv("MULTI_KB_MAX_SOURCES", "4"))
 RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
 RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
 RETRIEVAL_PER_REQUEST_FANOUT = int(os.getenv("RETRIEVAL_PER_REQUEST_FANOUT", "4"))
@@ -1025,6 +1028,8 @@ DEFAULT_VALUES = {
     # Deployment-only sandbox identity/endpoints are intentionally excluded
     # from the ordinary config API; these defaults document the closed state.
     "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "false",
+    "MULTI_KB_CHAT_ENABLED": "false",
+    "MULTI_KB_MAX_SOURCES": "4",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS": "8",
     "RETRIEVAL_QUEUE_MAX_DEPTH": "256",
     "RETRIEVAL_PER_REQUEST_FANOUT": "4",
@@ -1265,6 +1270,8 @@ def _reload_settings():
     global SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS
     global SKILLS_ENABLED
     global SHARED_RETRIEVAL_EXECUTOR_ENABLED, RETRIEVAL_EXECUTOR_MAX_WORKERS
+    global MULTI_KB_CHAT_ENABLED
+    global MULTI_KB_MAX_SOURCES
     global RETRIEVAL_QUEUE_MAX_DEPTH, RETRIEVAL_PER_REQUEST_FANOUT, RETRIEVAL_QUEUE_MAX_WAIT_SECONDS
     global RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS
     global ACTION_DAG_PARALLEL_ENABLED, ACTION_EXECUTOR_MAX_PARALLEL
@@ -1598,6 +1605,8 @@ def _reload_settings():
     )
     SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
     SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
+    MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
+    MULTI_KB_MAX_SOURCES = int(os.getenv("MULTI_KB_MAX_SOURCES", "4"))
     RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
     RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
     RETRIEVAL_PER_REQUEST_FANOUT = int(os.getenv("RETRIEVAL_PER_REQUEST_FANOUT", "4"))
@@ -1998,6 +2007,7 @@ _INT_SETTING_KEYS = frozenset({
     "SANDBOX_MAX_OUTPUT_BYTES",
     "SANDBOX_MAX_INPUT_BYTES",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS",
+    "MULTI_KB_MAX_SOURCES",
     "RETRIEVAL_QUEUE_MAX_DEPTH",
     "RETRIEVAL_PER_REQUEST_FANOUT",
     "ACTION_EXECUTOR_MAX_PARALLEL",
@@ -2083,6 +2093,7 @@ def validate_settings_values(settings_dict: dict) -> None:
                 "SANDBOX_TASK_LEASE_SECONDS",
                 "SANDBOX_MAX_OUTPUT_BYTES",
                 "SANDBOX_MAX_INPUT_BYTES",
+                "MULTI_KB_MAX_SOURCES",
             } and parsed_int <= 0:
                 raise ValueError(f"{key} 必须大于 0，当前值: {text!r}")
         elif key in _FLOAT_SETTING_KEYS:
