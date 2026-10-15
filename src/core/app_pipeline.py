@@ -78,6 +78,8 @@ from src.attachments.models import (
     scope_allows_kb,
 )
 from src.attachments.retrieval import AttachmentRetrievalService
+from src.services.knowledge_scope import KnowledgeScopeResolver
+from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
 
 
 _ICD_PIN_TERMS = (
@@ -1954,14 +1956,57 @@ class AppPipeline:
         """Freeze currently readable source identities for a proposal."""
 
         kb = str(knowledge_base_name or "").strip()
-        if not kb or not ctx.has_kb_permission(kb, "read"):
+        raw_scope = (getattr(ctx, "metadata", {}) or {}).get("knowledge_scope_snapshot")
+        multi_scope = None
+        if raw_scope:
+            try:
+                multi_scope = raw_scope if isinstance(raw_scope, KnowledgeScopeSnapshot) else KnowledgeScopeSnapshot.model_validate(raw_scope)
+                KnowledgeScopeResolver(AuthService()).revalidate(
+                    multi_scope.actor_user_id, multi_scope
+                )
+            except Exception as exc:
+                raise PermissionError("knowledge scope is no longer authorized") from exc
+        if multi_scope is None and (not kb or not ctx.has_kb_permission(kb, "read")):
             raise PermissionError("knowledge base read permission is required")
         source_names: list[str] = []
-        for document in self.list_file_infos(kb, ctx):
-            name = document.get("name", "") if isinstance(document, dict) else getattr(document, "name", "")
-            normalized = str(name or "").strip()
-            if normalized and normalized not in source_names:
-                source_names.append(normalized)
+        frozen_sources: list[dict[str, Any]] = []
+        if multi_scope is None:
+            documents = self.list_file_infos(kb, ctx)
+            for document in documents:
+                name = document.get("name", "") if isinstance(document, dict) else getattr(document, "name", "")
+                normalized = str(name or "").strip()
+                if normalized and normalized not in source_names:
+                    source_names.append(normalized)
+        else:
+            # Freeze each selected source independently. The role is metadata
+            # for authoring policy; it never changes the read authorization.
+            auth = AuthService()
+            resolver = KnowledgeScopeResolver(auth)
+            for source in multi_scope.sources:
+                source_ctx = resolver.context_for_source(multi_scope.actor_user_id, source)
+                for document in self.list_file_infos(source.kb_name, source_ctx):
+                    name = document.get("name", "") if isinstance(document, dict) else getattr(document, "name", "")
+                    normalized = str(name or "").strip()
+                    if normalized and normalized not in source_names:
+                        source_names.append(normalized)
+                    if normalized:
+                        frozen_sources.append({
+                            "kb_id": int(source.kb_id),
+                            "kb_name": source.kb_name,
+                            "role": source.role,
+                            "source_name": normalized,
+                            "local_record_id": (
+                                document.get("id") if isinstance(document, dict) else getattr(document, "id", None)
+                            ),
+                            "source_content_hash": (
+                                document.get("content_hash", "") if isinstance(document, dict)
+                                else getattr(document, "content_hash", "")
+                            ),
+                            "index_revision": int(
+                                document.get("index_revision", 0) if isinstance(document, dict)
+                                else getattr(document, "index_revision", 0) or 0
+                            ),
+                        })
         attachment_ids = [
             str(item).strip()
             for item in (ctx.metadata.get("document_authoring_attachment_ids", []) or [])
@@ -1971,6 +2016,8 @@ class AppPipeline:
             ctx,
             kb,
             source_names,
+            source_snapshot_kind="multi_knowledge_v1" if multi_scope is not None else "legacy_knowledge_base",
+            sources=frozen_sources,
         )
         source_hash = content_hash({
             # KnowledgeBaseSourceSnapshot includes created_at and therefore
@@ -1978,10 +2025,12 @@ class AppPipeline:
             # retries need a semantic scope hash independent of that nonce.
             "knowledge_base_name": kb,
             "source_names": sorted(set(source_names)),
+            "sources": frozen_sources,
+            "selection_hash": multi_scope.selection_hash if multi_scope is not None else "",
             "attachment_ids": sorted(set(attachment_ids)),
         })
         return snapshot, {
-            "knowledge_base_count": 1,
+            "knowledge_base_count": len(multi_scope.sources) if multi_scope is not None else 1,
             "attachment_count": len(set(attachment_ids)),
             "source_count": len(source_names),
             "snapshot_bound": True,

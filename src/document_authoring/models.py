@@ -258,6 +258,11 @@ class KnowledgeBaseSourceSnapshot(BaseModel):
     created_by: str
     created_at: datetime = Field(default_factory=utc_now)
     content_hash: str = ""
+    # R3 multi-source authoring keeps the legacy fields for readers that only
+    # understand one KB, while these fields preserve the actual source set and
+    # per-source role/record freeze in the payload column.
+    source_snapshot_kind: Literal["legacy_knowledge_base", "multi_knowledge_v1"] = "legacy_knowledge_base"
+    sources: list[dict[str, Any]] = Field(default_factory=list)
 
     @classmethod
     def create(
@@ -267,6 +272,8 @@ class KnowledgeBaseSourceSnapshot(BaseModel):
         knowledge_base_name: str,
         source_names: list[str],
         created_by: str,
+        source_snapshot_kind: Literal["legacy_knowledge_base", "multi_knowledge_v1"] = "legacy_knowledge_base",
+        sources: list[dict[str, Any]] | None = None,
     ) -> KnowledgeBaseSourceSnapshot:
         return cls(
             source_set_snapshot_id=f"kb-source-set-{uuid.uuid4().hex}",
@@ -274,6 +281,8 @@ class KnowledgeBaseSourceSnapshot(BaseModel):
             knowledge_base_name=knowledge_base_name,
             source_names=source_names,
             created_by=created_by,
+            source_snapshot_kind=source_snapshot_kind,
+            sources=list(sources or []),
         )
 
     @model_validator(mode="after")

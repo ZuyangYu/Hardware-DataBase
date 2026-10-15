@@ -20,6 +20,7 @@ from src.attachments.evidence import evidence_from_chunk
 from src.attachments.models import SOURCE_SCOPES, scope_allows_attachments
 from src.attachments.retrieval import AttachmentRetrievalService
 from src.pipelines.document_rag.schemas import RequestContext
+from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
 
 
 class DocumentEvidenceProvider(Protocol):
@@ -122,6 +123,9 @@ class KnowledgeBaseEvidenceProvider:
         top_k: int = 8,
         source_names: Sequence[str] | None = None,
         extra_filters: Mapping[str, Any] | None = None,
+        multi_kb_service: Any | None = None,
+        knowledge_scope: KnowledgeScopeSnapshot | None = None,
+        retrieval_budget: Any | None = None,
     ):
         self.backend = backend
         self.top_k = max(1, int(top_k))
@@ -131,6 +135,9 @@ class KnowledgeBaseEvidenceProvider:
             else tuple(dict.fromkeys(str(name) for name in source_names if str(name)))
         )
         self.extra_filters = dict(extra_filters or {})
+        self.multi_kb_service = multi_kb_service
+        self.knowledge_scope = knowledge_scope
+        self.retrieval_budget = retrieval_budget
 
     def retrieve(
         self,
@@ -146,6 +153,40 @@ class KnowledgeBaseEvidenceProvider:
             return []
         if not kb_name:
             return []
+        if self.knowledge_scope is None:
+            raw_scope = (getattr(ctx, "metadata", {}) or {}).get("knowledge_scope_snapshot")
+            if raw_scope:
+                self.knowledge_scope = KnowledgeScopeSnapshot.model_validate(raw_scope)
+                from src.core.auth import AuthService
+                from src.services.knowledge_scope import KnowledgeScopeResolver
+                from src.services.multi_kb_retrieval import (
+                    MultiKnowledgeRetrievalService,
+                    RetrievalBudget,
+                )
+                resolver = KnowledgeScopeResolver(AuthService())
+                resolver.revalidate(self.knowledge_scope.actor_user_id, self.knowledge_scope)
+                self.multi_kb_service = MultiKnowledgeRetrievalService(resolver, self.backend)
+                self.retrieval_budget = RetrievalBudget(
+                    max_calls=24,
+                    timeout_seconds=30,
+                )
+        if self.knowledge_scope is not None:
+            if self.multi_kb_service is None or self.retrieval_budget is None:
+                raise RuntimeError("multi_kb_retrieval_not_configured")
+            outcome = self.multi_kb_service.search(
+                snapshot=self.knowledge_scope,
+                queries=[str(query or "")],
+                retriever_kind="document",
+                per_source_top_k=self.top_k,
+                budget=self.retrieval_budget,
+            )
+            return [
+                _knowledge_base_evidence(
+                    item,
+                    kb_name=str((item.metadata or {}).get("knowledge_source", {}).get("kb_name") or kb_name),
+                )
+                for item in outcome.evidence
+            ]
         # ``None`` means the standalone adapter has no source restriction;
         # an explicit empty sequence is a frozen empty source set and must
         # never be widened into an unrestricted backend query.

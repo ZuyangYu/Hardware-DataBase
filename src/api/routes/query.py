@@ -479,6 +479,12 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             knowledge_scope = KnowledgeScopeSnapshot.model_validate(turn.knowledge_scope)
             knowledge_scope_resolver = KnowledgeScopeResolver(AuthService())
             knowledge_scope_resolver.revalidate(user.id, knowledge_scope)
+            # Document authoring and its worker adapters receive the same
+            # server-owned snapshot; they must never reconstruct scope from
+            # the client query or the anchor-only RequestContext.
+            metadata = getattr(ctx, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata["knowledge_scope_snapshot"] = knowledge_scope.model_dump(mode="json")
         except Exception as exc:
             # A persisted snapshot records what was authorized at creation;
             # it never grants access after a revoke or department change.

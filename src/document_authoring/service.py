@@ -4409,12 +4409,21 @@ class DocumentGenerationService:
         ctx: RequestContext,
         knowledge_base_name: str,
         source_names: list[str],
+        *,
+        source_snapshot_kind: str = "legacy_knowledge_base",
+        sources: list[dict[str, Any]] | None = None,
     ) -> KnowledgeBaseSourceSnapshot:
         snapshot = KnowledgeBaseSourceSnapshot.create(
             tenant_id=ctx.tenant_id or "default",
             knowledge_base_name=knowledge_base_name,
             source_names=source_names,
             created_by=ctx.user_id,
+            source_snapshot_kind=(
+                "multi_knowledge_v1"
+                if source_snapshot_kind == "multi_knowledge_v1"
+                else "legacy_knowledge_base"
+            ),
+            sources=sources,
         )
         return self.store.create_knowledge_base_source_snapshot(snapshot)
 
