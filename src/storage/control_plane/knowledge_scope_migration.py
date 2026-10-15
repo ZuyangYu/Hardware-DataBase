@@ -38,6 +38,7 @@ def apply_sqlite(conn) -> dict:
 
 
 def inspect_postgres(conn) -> dict:
+    from .schema import SCHEMA_VERSION
     rows = conn.execute("SELECT table_name, column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = current_schema() AND table_name IN ('chat_sessions','chat_turns')").fetchall()
     columns = {(row[0], row[1]): (row[2], row[3]) for row in rows}
     missing, invalid = [], []
@@ -51,14 +52,17 @@ def inspect_postgres(conn) -> dict:
                 invalid.append(f"{table}.{name}")
     version_row = conn.execute("SELECT value FROM control_plane_schema WHERE key = 'schema_version'").fetchone()
     version = str(version_row[0]) if version_row else ""
-    return {"ready": not missing and not invalid and version == "2", "missing": missing, "invalid": invalid, "schema_version": version}
+    protocol = conn.execute("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'chat_turns'::regclass AND conname = 'chat_turns_status_check'").fetchone()
+    protocol_ready = protocol is not None and "multi_kb_pending" in protocol[0] and "multi_kb_streaming" in protocol[0]
+    return {"ready": not missing and not invalid and version == SCHEMA_VERSION and protocol_ready, "missing": missing, "invalid": invalid, "schema_version": version, "turn_protocol_ready": protocol_ready}
 
 
 def apply_postgres(conn) -> dict:
     from .schema_version import record_schema_version
+    from .schema import SCHEMA_VERSION, TURN_STATUSES
 
     report = inspect_postgres(conn)
-    if report["invalid"] or report["schema_version"] not in {"1", "2"}:
+    if report["invalid"] or report["schema_version"] not in {"1", "2", SCHEMA_VERSION}:
         raise RuntimeError("knowledge_scope_schema_incompatible")
     if report["ready"]:
         return {**report, "changed": False}
@@ -66,6 +70,9 @@ def apply_postgres(conn) -> dict:
         for name in columns:
             declaration = "JSONB NOT NULL DEFAULT '{}'::jsonb" if name.endswith("_json") else "TEXT NOT NULL DEFAULT ''"
             conn.execute(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{name}" {declaration}')
-    if report["schema_version"] != "2":
+    if not report["turn_protocol_ready"]:
+        conn.execute("ALTER TABLE chat_turns DROP CONSTRAINT IF EXISTS chat_turns_status_check")
+        conn.execute(f"ALTER TABLE chat_turns ADD CONSTRAINT chat_turns_status_check CHECK (status IN {tuple(TURN_STATUSES)})")
+    if report["schema_version"] != SCHEMA_VERSION:
         record_schema_version(conn)
     return {**inspect_postgres(conn), "changed": True}

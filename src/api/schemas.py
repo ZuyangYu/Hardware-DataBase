@@ -361,6 +361,7 @@ class SessionView(BaseModel):
     document_context: DocumentContextView | None = None
     knowledge_scope: KnowledgeScopeSnapshot | None = None
     knowledge_selection_hash: str = ""
+    source_access_restricted: bool = False
 
 
 class MemoryContextView(BaseModel):
@@ -412,6 +413,7 @@ class MessageView(BaseModel):
     cards: list[dict] = Field(default_factory=list)
     # 该 turn 持久化的执行轨迹（stage/tool 事件折叠；刷新后轨迹面板不消失）。
     trace_steps: list[dict] = Field(default_factory=list)
+    source_access_restricted: bool = False
 
 
 class AddMessageRequest(BaseModel):
@@ -494,6 +496,7 @@ class TurnView(BaseModel):
     wait_deadline: str | None = None
     knowledge_scope: KnowledgeScopeSnapshot | None = None
     knowledge_selection_hash: str = ""
+    source_access_restricted: bool = False
 
 
 class TurnStartResponse(BaseModel):

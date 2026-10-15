@@ -23,18 +23,16 @@ Type rules (explicit, no declaration-string guessing):
 from __future__ import annotations
 
 import json
+from src.core.conversation import TURN_STATUSES_NON_TERMINAL
 from typing import Any
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 SCHEMA_TABLE = "control_plane_schema"
 
 # Canonical turn statuses (conversation.py); the plan forbids inventing a
 # second enum in DDL.
 TURN_STATUSES: tuple[str, ...] = (
-    "pending",
-    "streaming",
-    "cancelling",
-    "waiting_for_attachments",
+    *TURN_STATUSES_NON_TERMINAL,
     "completed",
     "failed",
     "cancelled",
@@ -213,9 +211,9 @@ CORE_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_action_receipts_job_ref ON action_receipts(job_ref)",
     "CREATE INDEX IF NOT EXISTS idx_turn_attachments_asset ON turn_attachments(asset_id)",
     "CREATE INDEX IF NOT EXISTS ix_chat_turn_pending ON chat_turns(created_at)"
-    " WHERE status = 'pending' AND cancel_requested = FALSE",
+    " WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = FALSE",
     "CREATE INDEX IF NOT EXISTS ix_chat_turn_lease ON chat_turns(status, created_at)"
-    " WHERE status IN ('streaming', 'cancelling')",
+    " WHERE status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')",
 )
 
 # Partial/expression indexes the generic generator cannot translate.  Keyed by

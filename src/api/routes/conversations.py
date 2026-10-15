@@ -6,6 +6,9 @@ from src.core.auth import AuthService, AuthUser
 from src.core.conversation import GENERAL_CHAT_KB_NAME, ConversationService
 
 from src.api.context import build_context_for_user
+from src.services.knowledge_scope_access import can_read_turn, resolve_session_scope
+from src.services.knowledge_scope import KnowledgeScopeDenied, KnowledgeScopeInvalid
+from src.agents.tools.retrieval_executor import MultiKnowledgeRetrievalUnavailable
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
 from src.api.schemas import (
     AddMessageRequest,
@@ -25,7 +28,13 @@ def _conv_service() -> ConversationService:
     return ConversationService()
 
 
-def _session_view(s) -> SessionView:
+def _session_view(s, *, user=None, auth=None, scope=None) -> SessionView:
+    restricted = False
+    if scope is None and getattr(s, "knowledge_selection", None) and user is not None:
+        try:
+            scope = resolve_session_scope(auth, user, s, execute=False)
+        except (KnowledgeScopeDenied, KnowledgeScopeInvalid):
+            restricted = True
     return SessionView(
         id=s.id,
         user_id=s.user_id,
@@ -33,7 +42,10 @@ def _session_view(s) -> SessionView:
         title=s.title,
         created_at=s.created_at,
         updated_at=s.updated_at,
-        document_context=getattr(s, "document_context", None),
+        document_context=None if restricted else getattr(s, "document_context", None),
+        knowledge_scope=scope,
+        knowledge_selection_hash=getattr(s, "knowledge_selection_hash", ""),
+        source_access_restricted=restricted,
     )
 
 
@@ -180,7 +192,7 @@ def list_sessions(
     conv: ConversationService = Depends(_conv_service),
 ):
     _ensure_history_access(user, auth)
-    return [_session_view(s) for s in conv.list_sessions(user.id, kb_name)]
+    return [_session_view(s, user=user, auth=auth) for s in conv.list_sessions(user.id, kb_name)]
 
 
 @router.post("/conversations", response_model=SessionView)
@@ -190,6 +202,17 @@ def create_session(
     auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
 ):
+    scope = None
+    if body.knowledge_scope is not None:
+        from types import SimpleNamespace
+        try:
+            scope = resolve_session_scope(auth, user, SimpleNamespace(kb_name=body.kb_name, knowledge_selection=None), body.knowledge_scope)
+        except KnowledgeScopeDenied as exc:
+            raise HTTPException(status_code=403, detail="knowledge_scope_denied") from exc
+        except KnowledgeScopeInvalid as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except MultiKnowledgeRetrievalUnavailable as exc:
+            raise HTTPException(status_code=409, detail="feature_unavailable") from exc
     _ensure_kb_read(user, body.kb_name, auth)
     ctx = build_context_for_user(user, body.kb_name, auth=auth)
     s = conv.create_session(
@@ -198,8 +221,9 @@ def create_session(
         body.title,
         department_id=ctx.metadata.get("resource_department_id") or ctx.metadata.get("department_id"),
         kb_id=ctx.metadata.get("kb_id"),
+        **({"knowledge_selection": body.knowledge_scope} if scope is not None else {}),
     )
-    return _session_view(s)
+    return _session_view(s, scope=scope)
 
 
 @router.get("/conversations/{session_id}", response_model=SessionView)
@@ -213,7 +237,7 @@ def get_session(
     if s is None:
         raise HTTPException(status_code=404, detail="session not found")
     _ensure_history_access(user, auth)
-    return _session_view(s)
+    return _session_view(s, user=user, auth=auth)
 
 
 @router.delete("/conversations/{session_id}", response_model=OkResponse)
@@ -267,6 +291,13 @@ def list_messages(
             trace_by_turn[turn_id] = []
     views: list[MessageView] = []
     for m in messages:
+        if m.turn_id:
+            owning_turn = conv.get_turn(user.id, str(m.turn_id))
+            if owning_turn is not None and not can_read_turn(auth, user, owning_turn):
+                views.append(MessageView(id=m.id, session_id=m.session_id, turn_id=m.turn_id,
+                    role=m.role, content="来源权限已变化", footer="", created_at=m.created_at,
+                    redacted=True, source_access_restricted=True))
+                continue
         turn_id = str(getattr(m, "turn_id", "") or "")
         cards: list[dict] = []
         if turn_id and (m.role == "assistant" or turn_id not in assistant_turns):

@@ -41,11 +41,13 @@ from src.core.conversation import (
     TurnFinalization,
     row_to_message,
     row_to_session,
+    canonical_turn_status,
+    TURN_STATUSES_NON_TERMINAL,
 )
 
 from .base import RequeueSummary
 
-_NON_TERMINAL = ("pending", "streaming", "cancelling", "waiting_for_attachments")
+_NON_TERMINAL = TURN_STATUSES_NON_TERMINAL
 _LEASE_SECONDS = 120
 
 
@@ -76,7 +78,7 @@ def _turn_from_row(row: dict) -> ChatTurn:
         query=str(row["query"]),
         query_mode=str(row.get("query_mode") or "fast"),
         wiki_assist=bool(row.get("wiki_assist")),
-        status=str(row["status"]),
+        status=canonical_turn_status(str(row["status"])),
         client_request_id=row.get("client_request_id"),
         cancel_requested=bool(row.get("cancel_requested")),
         last_event_seq=int(row.get("last_event_seq") or 0),
@@ -178,13 +180,13 @@ class PostgresExecutionStore:
                 rows = conn.execute(
                     """SELECT DISTINCT t.id, t.created_at FROM chat_turns t
                        JOIN turn_attachments ta ON ta.turn_id = t.id
-                       WHERE t.status = 'waiting_for_attachments' AND ta.attachment_id = ANY(%s)
+                       WHERE t.status IN ('waiting_for_attachments', 'multi_kb_waiting_for_attachments') AND ta.attachment_id = ANY(%s)
                        ORDER BY t.created_at, t.id LIMIT %s""",
                     (attachment_ids, bounded_limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT id FROM chat_turns WHERE status = 'waiting_for_attachments' ORDER BY created_at, id LIMIT %s",
+                    "SELECT id FROM chat_turns WHERE status IN ('waiting_for_attachments', 'multi_kb_waiting_for_attachments') ORDER BY created_at, id LIMIT %s",
                     (bounded_limit,),
                 ).fetchall()
         return [str(row["id"]) for row in rows]
@@ -274,7 +276,7 @@ class PostgresExecutionStore:
             SET status = 'cancelled',
                 error_message = COALESCE(NULLIF(error_message, ''), '已停止生成'),
                 finished_at = clock_timestamp(), worker_id = '', worker_heartbeat_at = NULL
-            WHERE id = %s AND status IN ('pending', 'streaming', 'cancelling')
+            WHERE id = %s AND status IN ('pending', 'streaming', 'cancelling', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'waiting_for_attachments', 'multi_kb_waiting_for_attachments')
             """,
             (turn_id,),
         )
@@ -397,6 +399,7 @@ class PostgresExecutionStore:
             has_history = conn.execute("SELECT 1 FROM chat_messages WHERE session_id = %s LIMIT 1", (int(session_id),)).fetchone() is not None
             require_scope_binding(session_row["knowledge_selection_hash"], scope, has_history=has_history)
             if scope:
+                initial_status = f"multi_kb_{initial_status}"
                 selection = {"version": scope["version"], "purpose": scope["purpose"], "sources": [{"kb_id": s["kb_id"], "role": s["role"]} for s in scope["sources"]]}
                 conn.execute("UPDATE chat_sessions SET knowledge_selection_json = %s, knowledge_selection_hash = %s WHERE id = %s", (Jsonb(selection), scope["selection_hash"], int(session_id)))
             turn_sequence = self._allocate_sequence_locked(conn, session_id)
@@ -616,7 +619,7 @@ class PostgresExecutionStore:
                 SELECT t.* FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 WHERE t.session_id = %s AND s.user_id = %s
-                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 ORDER BY t.created_at
                 """,
                 (int(session_id), int(user_id)),
@@ -672,7 +675,7 @@ class PostgresExecutionStore:
                 """
                 SELECT COUNT(*) AS depth, MIN(created_at) AS oldest_at,
                        EXTRACT(EPOCH FROM (now() - MIN(created_at))) AS oldest_age
-                FROM chat_turns WHERE status = 'pending' AND cancel_requested = FALSE
+                FROM chat_turns WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = FALSE
                 """
             ).fetchone()
         depth = int(row["depth"] or 0)
@@ -688,7 +691,7 @@ class PostgresExecutionStore:
               AND NOT EXISTS (
                   SELECT 1 FROM chat_turns prior
                   WHERE prior.session_id = t.session_id
-                    AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                    AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                     AND prior.turn_sequence < t.turn_sequence
               )
             """
@@ -701,7 +704,7 @@ class PostgresExecutionStore:
                 SELECT t.*, s.user_id FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 JOIN users u ON u.id = s.user_id
-                WHERE t.status = 'pending' AND t.cancel_requested = FALSE
+                WHERE t.status IN ('pending', 'multi_kb_pending') AND t.cancel_requested = FALSE
                   AND u.is_active = 1
                   {head_filter}
                 ORDER BY t.created_at, t.id
@@ -723,7 +726,7 @@ class PostgresExecutionStore:
             SET status = %s, error_message = %s,
                 finished_at = CASE WHEN %s = 'failed' THEN clock_timestamp()
                                    ELSE finished_at END
-            WHERE id = %s AND status = 'waiting_for_attachments'
+            WHERE id = %s AND status IN ('waiting_for_attachments', 'multi_kb_waiting_for_attachments')
             """,
             (
                 to_status,
@@ -776,7 +779,7 @@ class PostgresExecutionStore:
             rows = conn.execute(
                 """
                 SELECT id FROM chat_turns
-                WHERE status = 'waiting_for_attachments'
+                WHERE status IN ('waiting_for_attachments', 'multi_kb_waiting_for_attachments')
                   AND created_at < now() - make_interval(secs => %s)
                 ORDER BY created_at, id
                 LIMIT %s
@@ -1004,7 +1007,7 @@ class PostgresExecutionStore:
                 SELECT COUNT(*) AS total FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 WHERE s.user_id = %s {scope}
-                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 """,
                 params,
             ).fetchone()
@@ -1107,7 +1110,7 @@ class PostgresExecutionStore:
                     """
                     UPDATE chat_turns SET worker_heartbeat_at = clock_timestamp()
                     WHERE id = %s AND worker_id = %s
-                      AND status IN ('streaming', 'cancelling')
+                      AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                     """,
                     (str(turn_id), str(worker_id)),
                 )
@@ -1160,7 +1163,7 @@ class PostgresExecutionStore:
                 SELECT 1 FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 WHERE t.id = %s AND s.user_id = %s
-                  AND t.status IN ('streaming', 'cancelling')
+                  AND t.status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                   AND t.worker_heartbeat_at IS NOT NULL
                   AND t.worker_heartbeat_at < now() - make_interval(secs => %s)
                 """,
@@ -1215,7 +1218,7 @@ class PostgresExecutionStore:
             rows = conn.execute(
                 """
                 SELECT id FROM chat_turns
-                WHERE status = 'pending' AND cancel_requested = FALSE
+                WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = FALSE
                   AND created_at < now() - make_interval(secs => %s)
                 ORDER BY created_at, id
                 LIMIT %s
@@ -1230,7 +1233,7 @@ class PostgresExecutionStore:
                     UPDATE chat_turns
                     SET status = 'failed', error_message = %s,
                         finished_at = clock_timestamp()
-                    WHERE id = %s AND status = 'pending'
+                    WHERE id = %s AND status IN ('pending', 'multi_kb_pending')
                     """,
                     (message, turn_id),
                 )
@@ -1274,14 +1277,14 @@ class PostgresExecutionStore:
                 """
                 SELECT prior.id, prior.status FROM chat_turns prior
                 WHERE prior.session_id = %s AND prior.turn_sequence < %s
-                  AND prior.status IN ('pending', 'streaming', 'cancelling',
-                                       'waiting_for_attachments')
+                  AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments',
+                                       'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 ORDER BY prior.turn_sequence DESC
                 LIMIT 1
                 """,
                 (int(turn["session_id"]), int(turn["turn_sequence"] or 0)),
             ).fetchone()
-        if str(turn["status"]) == "waiting_for_attachments":
+        if canonical_turn_status(str(turn["status"])) == "waiting_for_attachments":
             context["queue_reason"] = "waiting_for_attachments"
             created = turn["created_at"]
             if not isinstance(created, datetime):
@@ -1298,7 +1301,7 @@ class PostgresExecutionStore:
             context["blocked_by_turn_id"] = str(blocker["id"])
             context["queue_reason"] = (
                 "waiting_for_attachments"
-                if str(blocker["status"]) == "waiting_for_attachments"
+                if canonical_turn_status(str(blocker["status"])) == "waiting_for_attachments"
                 else "queued_behind_previous_turn"
             )
         return context
@@ -1568,7 +1571,7 @@ class PostgresExecutionStore:
             ).fetchone()
             if (
                 current is not None
-                and str(current["status"]) in {"streaming", "cancelling"}
+                and str(current["status"]) in {"streaming", "cancelling", "multi_kb_streaming", "multi_kb_cancelling"}
                 and str(state.get("active_turn_id") or "") == str(turn_id)
             ):
                 # Reclaim this turn's expired claim so a takeover does not have
@@ -1583,9 +1586,9 @@ class PostgresExecutionStore:
                     )
                 if not lease_valid:
                     conn.execute(
-                        "UPDATE chat_turns SET status = 'pending', worker_id = '',"
+                        "UPDATE chat_turns SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END, worker_id = '',"
                         " worker_heartbeat_at = NULL"
-                        " WHERE id = %s AND status IN ('streaming', 'cancelling')",
+                        " WHERE id = %s AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')",
                         (str(turn_id),),
                     )
                     current = conn.execute(
@@ -1593,7 +1596,7 @@ class PostgresExecutionStore:
                         " assistant_message_id FROM chat_turns WHERE id = %s FOR UPDATE",
                         (str(turn_id),),
                     ).fetchone()
-            if current is None or str(current["status"]) != "pending":
+            if current is None or str(current["status"]) not in {"pending", "multi_kb_pending"}:
                 if (
                     current is not None
                     and bool(current["cancel_requested"])
@@ -1611,7 +1614,7 @@ class PostgresExecutionStore:
                     """
                     SELECT id FROM chat_turns
                     WHERE session_id = %s AND id <> %s
-                      AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                      AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                       AND turn_sequence < %s
                     ORDER BY turn_sequence LIMIT 1
                     """,
@@ -1649,7 +1652,7 @@ class PostgresExecutionStore:
                     SET status = 'failed', finished_at = clock_timestamp(),
                         error_message = 'Exceeded maximum chat retries',
                         worker_id = '', worker_heartbeat_at = NULL
-                    WHERE id = %s AND status = 'pending'
+                    WHERE id = %s AND status IN ('pending', 'multi_kb_pending')
                     """,
                     (str(turn_id),),
                 )
@@ -1671,9 +1674,10 @@ class PostgresExecutionStore:
             cursor = conn.execute(
                 """
                 UPDATE chat_turns
-                SET status = 'streaming', worker_id = %s, started_at = clock_timestamp(),
+                SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_streaming' ELSE 'streaming' END,
+                    worker_id = %s, started_at = clock_timestamp(),
                     worker_heartbeat_at = clock_timestamp(), retry_count = retry_count + 1
-                WHERE id = %s AND status = 'pending' AND cancel_requested = FALSE
+                WHERE id = %s AND status IN ('pending', 'multi_kb_pending') AND cancel_requested = FALSE
                 """,
                 (str(worker_id), str(turn_id)),
             )
@@ -1806,7 +1810,7 @@ class PostgresExecutionStore:
             status = str(current["status"])
             if status in {"completed", "failed", "cancelled"}:
                 return self.get_turn(turn_id)
-            if status == "streaming":
+            if status in {"streaming", "multi_kb_streaming"}:
                 conn.execute(
                     "UPDATE conversation_execution_state"
                     " SET generation = generation + 1, revision = revision + 1,"
@@ -1814,11 +1818,12 @@ class PostgresExecutionStore:
                     (session_id,),
                 )
                 conn.execute(
-                    "UPDATE chat_turns SET cancel_requested = TRUE, status = 'cancelling'"
-                    " WHERE id = %s AND status = 'streaming'",
+                    "UPDATE chat_turns SET cancel_requested = TRUE,"
+                    " status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_cancelling' ELSE 'cancelling' END"
+                    " WHERE id = %s AND status IN ('streaming', 'multi_kb_streaming')",
                     (str(turn_id),),
                 )
-            elif status in {"pending", "waiting_for_attachments"}:
+            elif status in {"pending", "multi_kb_pending", "waiting_for_attachments", "multi_kb_waiting_for_attachments"}:
                 self._converge_cancelled_locked(
                     conn,
                     str(turn_id),
@@ -1988,7 +1993,7 @@ class PostgresExecutionStore:
                 """
                 SELECT id, session_id, cancel_requested, retry_count, assistant_message_id
                 FROM chat_turns
-                WHERE status IN ('streaming', 'cancelling')
+                WHERE status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                   AND worker_heartbeat_at IS NOT NULL
                   AND worker_heartbeat_at < clock_timestamp() - make_interval(secs => %s)
                 """,
@@ -2005,7 +2010,7 @@ class PostgresExecutionStore:
                     " FROM chat_turns WHERE id = %s FOR UPDATE",
                     (turn_id,),
                 ).fetchone()
-                if current is None or str(current["status"]) not in {"streaming", "cancelling"}:
+                if current is None or str(current["status"]) not in {"streaming", "cancelling", "multi_kb_streaming", "multi_kb_cancelling"}:
                     continue
                 if bool(current["cancel_requested"]):
                     self._converge_cancelled_locked(
@@ -2020,7 +2025,7 @@ class PostgresExecutionStore:
                         SET status = 'failed', finished_at = clock_timestamp(),
                             error_message = '任务执行器失去心跳，超过最大重试次数',
                             worker_id = '', worker_heartbeat_at = NULL
-                        WHERE id = %s AND status IN ('streaming', 'cancelling')
+                        WHERE id = %s AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                         """,
                         (turn_id,),
                     )
@@ -2037,8 +2042,9 @@ class PostgresExecutionStore:
                 cursor = conn.execute(
                     """
                     UPDATE chat_turns
-                    SET status = 'pending', worker_id = '', worker_heartbeat_at = NULL
-                    WHERE id = %s AND status IN ('streaming', 'cancelling')
+                    SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
+                        worker_id = '', worker_heartbeat_at = NULL
+                    WHERE id = %s AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                     """,
                     (turn_id,),
                 )
