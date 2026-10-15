@@ -301,6 +301,7 @@ class DocAssetServiceTests(unittest.TestCase):
 
     def test_parse_completion_hook_creates_shadow_asset_once(self) -> None:
         from src.pipelines.document_store_sqlite import PipelineDocumentStore
+        from src.core.doc_assets import ensure_shadow_asset_for_record
 
         parse_db = os.path.join(self._tmp.name, "pipeline_documents.db")
         store = PipelineDocumentStore(db_path=parse_db)
@@ -322,25 +323,83 @@ class DocAssetServiceTests(unittest.TestCase):
         record = store.get_document("KB-A", "ADAS_HWDebug.xlsx", department_id=self.department.id)
         self.assertIsNotNone(record)
         record_id = record.id
-        from src.core.doc_assets import ensure_shadow_asset_for_record
 
         old_db = src.settings.AUTH_DB_PATH
+        old_storage = src.settings.STORAGE_DIR
+        old_backend = src.settings.CONTROL_PLANE_BACKEND
         src.settings.AUTH_DB_PATH = self.db_path
+        # 钩子内部用默认 store；指到同一临时目录，保证读写同一个解析库。
+        src.settings.STORAGE_DIR = self._tmp.name
+        src.settings.CONTROL_PLANE_BACKEND = "sqlite"
         try:
+            # 解析未完成时钩子是 no-op。
             self.assertFalse(ensure_shadow_asset_for_record(record_id, store=store))
-            store.update_document_status_by_id(record_id, "completed")
-            self.assertTrue(ensure_shadow_asset_for_record(record_id, store=store))
+            # 真实链路写入的终态是 "parsed"（不是字面 "completed"）——写入完成状态
+            # 即应自动立影子档，不依赖调用方手动触发（回归：钩子曾只认 "completed"）。
+            store.update_document_status_by_id(record_id, "parsed")
         finally:
             src.settings.AUTH_DB_PATH = old_db
+            src.settings.STORAGE_DIR = old_storage
+            src.settings.CONTROL_PLANE_BACKEND = old_backend
         rows = self.service.list_assets(kb_id=self.kb_a, department_id=self.dept_id)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["title"], "ADAS_HWDebug")
         self.assertEqual(rows[0]["lifecycle_status"], "effective")
         detail = self.service.get_asset(asset_id=rows[0]["id"], kb_id=self.kb_a, department_id=self.dept_id)
         self.assertEqual(detail["versions"][0]["file_id"], str(record_id))
-        store.update_document_status_by_id(record_id, "completed")
+
+        # 重复到达完成态（如每次状态刷新）不重复建档。
+        src.settings.AUTH_DB_PATH = self.db_path
+        src.settings.STORAGE_DIR = self._tmp.name
+        src.settings.CONTROL_PLANE_BACKEND = "sqlite"
+        try:
+            store.update_document_status_by_id(record_id, "parsed")
+        finally:
+            src.settings.AUTH_DB_PATH = old_db
+            src.settings.STORAGE_DIR = old_storage
+            src.settings.CONTROL_PLANE_BACKEND = old_backend
         rows = self.service.list_assets(kb_id=self.kb_a, department_id=self.dept_id)
         self.assertEqual(len(rows), 1)
+
+    def test_spreadsheet_worker_completion_hook_creates_shadow_asset(self) -> None:
+        from src.pipelines.document_store_sqlite import PipelineDocumentStore
+
+        parse_db = os.path.join(self._tmp.name, "pipeline_documents.db")
+        store = PipelineDocumentStore(db_path=parse_db)
+        store.upsert_document(
+            kb_name="KB-A",
+            document_name="ADAS_ICD.xlsx",
+            dataset_kind="table",
+            dataset_id="ds-2",
+            document_id="remote-2",
+            source_group="测试数据",
+            department_id=str(self.department.id),
+            uploaded_by="hw_admin",
+            kb_id=self.kb_a,
+            status="processing",
+            original_file_name="ADAS_ICD.xlsx",
+            content_hash="hash-2",
+            processor_kind="spreadsheet_table",
+        )
+        record = store.get_document("KB-A", "ADAS_ICD.xlsx", department_id=self.department.id)
+        self.assertIsNotNone(record)
+
+        old_db = src.settings.AUTH_DB_PATH
+        old_storage = src.settings.STORAGE_DIR
+        old_backend = src.settings.CONTROL_PLANE_BACKEND
+        src.settings.AUTH_DB_PATH = self.db_path
+        src.settings.STORAGE_DIR = self._tmp.name
+        src.settings.CONTROL_PLANE_BACKEND = "sqlite"
+        try:
+            # 表格 worker 走的进度更新路径，终态原始值是 "indexed"。
+            store.update_document_progress_by_id(record.id, 100, "解析完成", status="indexed")
+        finally:
+            src.settings.AUTH_DB_PATH = old_db
+            src.settings.STORAGE_DIR = old_storage
+            src.settings.CONTROL_PLANE_BACKEND = old_backend
+        rows = self.service.list_assets(kb_id=self.kb_a, department_id=self.dept_id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["title"], "ADAS_ICD")
 
 
 if __name__ == "__main__":

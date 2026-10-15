@@ -888,7 +888,9 @@ class PipelineDocumentStore:
                 (status, status, error_message, error_message, dataset_id, document_id),
             )
             self._write_profile_event(conn, record_id, "parse_status", {"status": status})
-        if status == TASK_STATUS_COMPLETED and (prev is None or prev["status"] != TASK_STATUS_COMPLETED):
+        if normalize_parse_status(status) == TASK_STATUS_COMPLETED and (
+            prev is None or normalize_parse_status(prev["status"]) != TASK_STATUS_COMPLETED
+        ):
             _fire_shadow_asset_hook(record_id)
 
     def update_document_status_by_id(self, record_id: int, status: str, error_message: str = ""):
@@ -912,7 +914,9 @@ class PipelineDocumentStore:
                 (status, status, error_message, error_message, record_id),
             )
             self._write_profile_event(conn, record_id, "parse_status", {"status": status})
-        if status == TASK_STATUS_COMPLETED and (prev is None or prev["status"] != TASK_STATUS_COMPLETED):
+        if normalize_parse_status(status) == TASK_STATUS_COMPLETED and (
+            prev is None or normalize_parse_status(prev["status"]) != TASK_STATUS_COMPLETED
+        ):
             _fire_shadow_asset_hook(record_id)
 
     def update_document_progress_by_id(
@@ -955,8 +959,8 @@ class PipelineDocumentStore:
                 """,
                 params,
             )
-        if status == TASK_STATUS_COMPLETED and normalize_parse_status(
-            (prev["status"] if prev is not None else ""), PROCESSOR_KIND_SPREADSHEET
+        if status is not None and normalize_parse_status(status) == TASK_STATUS_COMPLETED and normalize_parse_status(
+            (prev["status"] if prev is not None else "")
         ) != TASK_STATUS_COMPLETED:
             _fire_shadow_asset_hook(record_id)
 
