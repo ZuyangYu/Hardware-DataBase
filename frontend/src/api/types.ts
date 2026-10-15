@@ -32,6 +32,35 @@ export interface KbView {
   is_owner: boolean;
 }
 
+export type KnowledgePurpose = 'answer' | 'compare' | 'compose';
+export type KnowledgeRole = 'primary' | 'peer' | 'reference' | 'standard';
+
+export interface KnowledgeSourceInput {
+  kb_id: number;
+  role: KnowledgeRole;
+}
+
+export interface KnowledgeSelectionInput {
+  version: 1;
+  purpose: KnowledgePurpose;
+  sources: KnowledgeSourceInput[];
+}
+
+export interface AuthorizedKnowledgeSource extends KnowledgeSourceInput {
+  kb_name: string;
+  department_id: string;
+}
+
+export interface KnowledgeScopeSnapshot extends KnowledgeSelectionInput {
+  snapshot_id: string;
+  tenant_key: string;
+  actor_user_id: number;
+  anchor_kb_id: number;
+  selection_hash: string;
+  sources: AuthorizedKnowledgeSource[];
+  authorized_at: string;
+}
+
 export interface FileView {
   id: string;
   name: string;
@@ -340,6 +369,15 @@ export interface SessionView {
   updated_at: string;
   /** Optional until the conversation API exposes persisted document context. */
   document_context?: DocumentContext | null;
+  knowledge_scope?: KnowledgeScopeSnapshot | null;
+  knowledge_selection_hash?: string;
+  source_access_restricted?: boolean;
+}
+
+export interface CreateSessionRequest {
+  kb_name: string;
+  title?: string;
+  knowledge_scope?: KnowledgeSelectionInput | null;
 }
 
 export interface MemoryContextItem {
@@ -421,6 +459,9 @@ export interface TurnView {
   blocked_by_turn_id?: string | null;
   queue_reason?: 'waiting_for_attachments' | 'queued_behind_previous_turn' | '';
   wait_deadline?: string | null;
+  knowledge_scope?: KnowledgeScopeSnapshot | null;
+  knowledge_selection_hash?: string;
+  source_access_restricted?: boolean;
 }
 
 /** Chat attachment lifecycle DTO (aligned with src/api/routes/attachments.py). */
@@ -457,6 +498,7 @@ export interface CreateTurnRequest {
   source_scope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
   /** Wiki 辅助开关: true 时注册 wiki_search 检索知识 Wiki 蒸馏页。 */
   wiki_assist?: boolean;
+  knowledge_scope?: KnowledgeSelectionInput | null;
 }
 
 export interface TurnStartResponse {

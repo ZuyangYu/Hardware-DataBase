@@ -16,7 +16,7 @@ import {
   retryAttachment,
   uploadAttachment,
 } from '@/api/chatAttachments';
-import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, McpWriteProposal, MessageView } from '@/api/types';
+import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, KnowledgePurpose, KnowledgeSelectionInput, McpWriteProposal, MessageView } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -218,6 +218,8 @@ export default function ChatPage({
 }: Props) {
   const navigate = useNavigate();
   const [mountedKbName, setMountedKbName] = useState(kbName);
+  const [knowledgePurpose, setKnowledgePurpose] = useState<KnowledgePurpose>('answer');
+  const [selectedKnowledgeBaseIds, setSelectedKnowledgeBaseIds] = useState<number[]>([]);
   const [documentContextLabel, setDocumentContextLabel] = useState<string | null>(null);
   const [documentUploadPending, setDocumentUploadPending] = useState(false);
   const [exportJobsByMessageId, setExportJobsByMessageId] = useState<Record<number, ExportJobView[]>>({});
@@ -244,6 +246,44 @@ export default function ChatPage({
       ...rows,
     ];
   }, [availableKbs, mountedKbName]);
+
+  const anchorKnowledgeBaseId = useMemo(
+    () => visibleKbs.find((item) => item.name === mountedKbName)?.kb_id ?? null,
+    [visibleKbs, mountedKbName],
+  );
+  useEffect(() => {
+    if (anchorKnowledgeBaseId == null) {
+      setSelectedKnowledgeBaseIds([]);
+      return;
+    }
+    setSelectedKnowledgeBaseIds((previous) => {
+      const allowed = new Set(
+        visibleKbs.map((item) => item.kb_id).filter((value): value is number => value != null),
+      );
+      const retained = previous.filter((value) => allowed.has(value));
+      return retained.includes(anchorKnowledgeBaseId) ? retained : [anchorKnowledgeBaseId, ...retained];
+    });
+  }, [anchorKnowledgeBaseId, visibleKbs]);
+
+  const knowledgeScope = useMemo<KnowledgeSelectionInput | null>(() => {
+    if (anchorKnowledgeBaseId == null || selectedKnowledgeBaseIds.length < 2) return null;
+    const ids = [...new Set(selectedKnowledgeBaseIds)];
+    if (knowledgePurpose === 'compare') {
+      return {
+        version: 1,
+        purpose: 'compare',
+        sources: ids.map((kb_id) => ({ kb_id, role: 'peer' as const })),
+      };
+    }
+    return {
+      version: 1,
+      purpose: knowledgePurpose,
+      sources: ids.map((kb_id) => ({
+        kb_id,
+        role: kb_id === anchorKnowledgeBaseId ? 'primary' as const : 'reference' as const,
+      })),
+    };
+  }, [anchorKnowledgeBaseId, knowledgePurpose, selectedKnowledgeBaseIds]);
 
   useEffect(() => {
     setMountedKbName(kbName);
@@ -310,7 +350,11 @@ export default function ChatPage({
     }
   };
 
-  const chat = useKbChat(mountedKbName, { username: auth.user.username, documentContextEnabled: documentAuthoringEnabled });
+  const chat = useKbChat(mountedKbName, {
+    username: auth.user.username,
+    documentContextEnabled: documentAuthoringEnabled,
+    knowledgeScope,
+  });
   const {
     sessions,
     sessionsLoaded,
@@ -353,6 +397,12 @@ export default function ChatPage({
     updateMcpWriteCard,
     refreshMcpWriteCards,
   } = chat;
+
+  const handleKnowledgeScopeChange = (purpose: KnowledgePurpose, kbIds: number[]) => {
+    if (streaming || anchorKnowledgeBaseId == null) return;
+    setKnowledgePurpose(purpose);
+    setSelectedKnowledgeBaseIds([...new Set([anchorKnowledgeBaseId, ...kbIds])]);
+  };
 
   useEffect(() => {
     if (!mcpWriteCards.some((card) => card.status === 'confirmed' || card.status === 'running')) {
@@ -964,6 +1014,11 @@ export default function ChatPage({
           wikiAssist={mountedKbName ? wikiAssist : undefined}
           onWikiAssistChange={mountedKbName ? updateWikiAssist : undefined}
           wikiAvailable={mountedKbName ? wikiAvailable : undefined}
+          availableKbs={visibleKbs}
+          knowledgePurpose={knowledgePurpose}
+          selectedKnowledgeBaseIds={selectedKnowledgeBaseIds}
+          onKnowledgeScopeChange={handleKnowledgeScopeChange}
+          knowledgeScopeDisabled={streaming}
           /* 导出任务中心嵌入页头,避免悬浮按钮遮挡右侧会话侧栏的新建按钮 */
           actions={<ExportTaskCenter variant="embedded" />}
         />

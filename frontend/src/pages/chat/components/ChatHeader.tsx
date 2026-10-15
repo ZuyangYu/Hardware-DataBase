@@ -10,7 +10,7 @@ import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/enterprise-ui';
-import type { MemoryConsentView, SessionMemorySummary } from '@/api/types';
+import type { KbView, KnowledgePurpose, MemoryConsentView, SessionMemorySummary } from '@/api/types';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -48,6 +48,12 @@ type Props = {
   wikiAvailable?: boolean | null;
   /** 页面级附加操作(如嵌入的导出任务中心),渲染在用户菜单之前。 */
   actions?: ReactNode;
+  /** Optional multi-KB selector; the selected set is fixed when a session starts. */
+  availableKbs?: KbView[];
+  knowledgePurpose?: KnowledgePurpose;
+  selectedKnowledgeBaseIds?: number[];
+  onKnowledgeScopeChange?: (purpose: KnowledgePurpose, kbIds: number[]) => void;
+  knowledgeScopeDisabled?: boolean;
 };
 
 function HeaderToggle({
@@ -101,6 +107,11 @@ export default function ChatHeader({
   onWikiAssistChange,
   wikiAvailable,
   actions = null,
+  availableKbs = [],
+  knowledgePurpose = 'answer',
+  selectedKnowledgeBaseIds = [],
+  onKnowledgeScopeChange,
+  knowledgeScopeDisabled = false,
 }: Props) {
   const [toggling, setToggling] = useState(false);
   const [consentsOpen, setConsentsOpen] = useState(false);
@@ -142,6 +153,59 @@ export default function ChatHeader({
         <span className={CHAT_HEADER_TITLE_META_CLASS}>{kbName}</span>
       </div>
       <div className="flex items-center gap-[8px]">
+        {onKnowledgeScopeChange && availableKbs.filter((kb) => kb.permission && kb.kb_id != null).length > 1 && (
+          <details className="relative">
+            <summary className="cursor-pointer list-none rounded-[8px] px-[8px] py-[4px] text-[11px] text-[#68728a] hover:bg-[#f6f7fa]">
+              多库范围
+            </summary>
+            <div className="absolute right-0 top-[30px] z-30 w-[250px] rounded-[10px] border border-[#e5e8f0] bg-white p-[10px] shadow-lg">
+              <label className="mb-[8px] flex items-center justify-between gap-[8px] text-[11px] text-[#464c5e]">
+                用途
+                <select
+                  aria-label="知识库用途"
+                  value={knowledgePurpose}
+                  disabled={knowledgeScopeDisabled}
+                  onChange={(event) => onKnowledgeScopeChange(
+                    event.target.value as KnowledgePurpose,
+                    selectedKnowledgeBaseIds,
+                  )}
+                  className="rounded border border-[#e5e8f0] px-[5px] py-[3px] text-[11px]"
+                >
+                  <option value="answer">问答</option>
+                  <option value="compare">对比</option>
+                  <option value="compose">编写文档</option>
+                </select>
+              </label>
+              <div className="space-y-[4px]">
+                {availableKbs.filter((kb) => kb.permission && kb.kb_id != null).map((kb) => {
+                  const id = Number(kb.kb_id);
+                  const checked = selectedKnowledgeBaseIds.includes(id);
+                  const anchor = kb.name === kbName;
+                  return (
+                    <label key={id} className="flex items-center gap-[7px] text-[11px] text-[#464c5e]">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={knowledgeScopeDisabled || anchor}
+                        onChange={(event) => {
+                          const next = event.target.checked
+                            ? [...selectedKnowledgeBaseIds, id]
+                            : selectedKnowledgeBaseIds.filter((value) => value !== id);
+                          onKnowledgeScopeChange(knowledgePurpose, next);
+                        }}
+                      />
+                      <span className="truncate">{kb.name}</span>
+                      {anchor && <span className="ml-auto text-[10px] text-[#8a92a5]">主库</span>}
+                    </label>
+                  );
+                })}
+              </div>
+              <p className="mt-[8px] text-[10px] leading-4 text-[#8a92a5]">
+                选库集合会绑定到新会话；范围变化时请新建会话。
+              </p>
+            </div>
+          </details>
+        )}
         {kbName && onWikiAssistChange && (
           <label
             className={cn(

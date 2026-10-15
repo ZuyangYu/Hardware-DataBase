@@ -28,6 +28,7 @@ import type {
   SessionView,
   TurnStartResponse,
   TurnView,
+  KnowledgeSelectionInput,
 } from '@/api/types';
 import { notify } from '@/components/ui/app-toast';
 import {
@@ -232,6 +233,7 @@ export function buildTurnRequest(
   documentContext?: DocumentContext | null,
   documentFlow?: boolean,
   attachments?: { attachmentIds: string[]; sourceScope?: CreateTurnRequest['source_scope'] } | null,
+  knowledgeScope?: KnowledgeSelectionInput | null,
 ): CreateTurnRequest {
   const request: CreateTurnRequest = {
     query,
@@ -282,6 +284,13 @@ export function buildTurnRequest(
     if (attachments.sourceScope && attachments.sourceScope !== 'auto') {
       request.source_scope = attachments.sourceScope;
     }
+  }
+  if (knowledgeScope) {
+    request.knowledge_scope = {
+      version: 1,
+      purpose: knowledgeScope.purpose,
+      sources: knowledgeScope.sources.map((source) => ({ ...source })),
+    };
   }
   return request;
 }
@@ -407,11 +416,23 @@ export type UseKbChatOptions = {
   documentContextEnabled?: boolean;
   /** Called only for a newly completed turn, never for recovered history. */
   onTurnCompleted?: (message: MessageView, query: string) => void | Promise<void>;
+  /** Explicit multi-KB selection for new sessions and turns. */
+  knowledgeScope?: KnowledgeSelectionInput | null;
 };
 
 export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const scopeKbName = kbName || GENERAL_CHAT_KB_NAME;
-  const selectedSessionKey = `hdb_chat_session:${encodeURIComponent(options.username ?? 'anonymous')}:${encodeURIComponent(scopeKbName)}`;
+  const knowledgeScope = options.knowledgeScope ?? null;
+  const knowledgeScopeKey = knowledgeScope
+    ? JSON.stringify({
+      version: 1,
+      purpose: knowledgeScope.purpose,
+      sources: knowledgeScope.sources
+        .map((source) => [source.kb_id, source.role])
+        .sort((a, b) => Number(a[0]) - Number(b[0])),
+    })
+    : '';
+  const selectedSessionKey = `hdb_chat_session:${encodeURIComponent(options.username ?? 'anonymous')}:${encodeURIComponent(scopeKbName)}:${encodeURIComponent(knowledgeScopeKey)}`;
   const loadedSessionKey = useRef<string | null>(null);
   const documentContextEnabled = options.documentContextEnabled ?? false;
   const [sessions, setSessions] = useState<SessionView[]>([]);
@@ -576,22 +597,37 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       .get<SessionView[]>(`/api/v1/conversations?kb_name=${encodeURIComponent(scopeKbName)}`)
       .then((rows) => {
         if (cancelled) return;
+        const scopedRows = knowledgeScope
+          ? rows.filter((session) => {
+            const stored = session.knowledge_scope;
+            if (!stored || stored.purpose !== knowledgeScope.purpose) return false;
+            const expected = knowledgeScope.sources
+              .map((source) => `${source.kb_id}:${source.role}`)
+              .sort()
+              .join('|');
+            const actual = stored.sources
+              .map((source) => `${source.kb_id}:${source.role}`)
+              .sort()
+              .join('|');
+            return expected === actual;
+          })
+          : rows;
         loadedSessionKey.current = selectedSessionKey;
         // A session created while this fetch was in flight is not in ``rows``.
         // Keep the new conversation in the list (and selected) instead of
         // dropping it and falling back to an unrelated session.
         setSessions((prev) => {
-          const ids = new Set(rows.map((row) => row.id));
+          const ids = new Set(scopedRows.map((row) => row.id));
           const localSelection = prev.filter(
             (session) => session.id === activeSessionRef.current && !ids.has(session.id),
           );
-          return localSelection.length ? [...localSelection, ...rows] : rows;
+          return localSelection.length ? [...localSelection, ...scopedRows] : scopedRows;
         });
         setActiveSessionId((current) => {
           if (current != null) return current;
           const preferred = savedSessionId;
-          const next = rows.some((session) => session.id === preferred) ? preferred : rows[0]?.id ?? null;
-          const restoredContext = rows.find((session) => session.id === next)?.document_context;
+          const next = scopedRows.some((session) => session.id === preferred) ? preferred : scopedRows[0]?.id ?? null;
+          const restoredContext = scopedRows.find((session) => session.id === next)?.document_context;
           if (restoredContext) {
             // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
             setDocumentContextState(restoredContext);
@@ -613,7 +649,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     return () => {
       cancelled = true;
     };
-  }, [scopeKbName, selectedSessionKey]);
+  }, [knowledgeScope, scopeKbName, selectedSessionKey]);
 
   useEffect(() => {
     if (loadedSessionKey.current !== selectedSessionKey || !sessionsLoaded || (activeSessionId !== null && !sessions.some(
@@ -1091,13 +1127,15 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       // send that started after it.
       const expected = expectedStreamToken ?? streamTokenRef.current;
       let pending = pendingCreateRef.current;
-      if (pending !== null && pending.scope !== scopeKbName) pending = null;
+      const createScopeKey = `${scopeKbName}:${knowledgeScopeKey}`;
+      if (pending !== null && pending.scope !== createScopeKey) pending = null;
       if (pending === null) {
         const entry = {
-          scope: scopeKbName,
+          scope: createScopeKey,
           promise: api.post<SessionView>('/api/v1/conversations', {
             kb_name: scopeKbName,
             title: title || '新对话',
+            ...(knowledgeScope ? { knowledge_scope: knowledgeScope } : {}),
           }),
         };
         pending = entry;
@@ -1127,7 +1165,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       }
       return session;
     },
-    [scopeKbName],
+    [knowledgeScope, scopeKbName],
   );
 
   const newConversation = useCallback(async () => {
@@ -1413,6 +1451,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           : null,
         undefined,
         attachments ?? null,
+        knowledgeScope,
       );
       turnRequest.wiki_assist = attachments?.wikiAssist ?? false;
       const created = await api.post<TurnStartResponse>(
@@ -1579,7 +1618,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         setTurnQueueNotice(null);
       }
     }
-  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice]);
+  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice, knowledgeScope]);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
