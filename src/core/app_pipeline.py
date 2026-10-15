@@ -31,6 +31,7 @@ from src.document_authoring.evidence import (
     CompositeDocumentEvidenceProvider,
     KnowledgeBaseEvidenceProvider,
 )
+from src.document_authoring.knowledge_sources import build_frozen_source_entry
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
 from src.document_authoring.icd_scope_decision import (
@@ -1985,28 +1986,17 @@ class AppPipeline:
             for source in multi_scope.sources:
                 source_ctx = resolver.context_for_source(multi_scope.actor_user_id, source)
                 for document in self.list_file_infos(source.kb_name, source_ctx):
-                    name = document.get("name", "") if isinstance(document, dict) else getattr(document, "name", "")
-                    normalized = str(name or "").strip()
+                    entry = build_frozen_source_entry(
+                        tenant_key=multi_scope.tenant_key,
+                        source=source,
+                        document=document,
+                        strict=True,
+                    )
+                    normalized = str(entry["source_name"] or "").strip()
                     if normalized and normalized not in source_names:
                         source_names.append(normalized)
                     if normalized:
-                        frozen_sources.append({
-                            "kb_id": int(source.kb_id),
-                            "kb_name": source.kb_name,
-                            "role": source.role,
-                            "source_name": normalized,
-                            "local_record_id": (
-                                document.get("id") if isinstance(document, dict) else getattr(document, "id", None)
-                            ),
-                            "source_content_hash": (
-                                document.get("content_hash", "") if isinstance(document, dict)
-                                else getattr(document, "content_hash", "")
-                            ),
-                            "index_revision": int(
-                                document.get("index_revision", 0) if isinstance(document, dict)
-                                else getattr(document, "index_revision", 0) or 0
-                            ),
-                        })
+                        frozen_sources.append(entry)
         attachment_ids = [
             str(item).strip()
             for item in (ctx.metadata.get("document_authoring_attachment_ids", []) or [])
@@ -3925,6 +3915,9 @@ class AppPipeline:
             for ref in frozen_attachment_refs
         ]
         attachment_ids = list(dict.fromkeys(item for item in attachment_ids if item))
+        multi_kb_authoring = (getattr(ctx, "metadata", {}) or {}).get(
+            "knowledge_scope_snapshot"
+        ) is not None
         kb_provider = KnowledgeBaseEvidenceProvider(
             self.backend,
             top_k=src.settings.FINAL_TOP_K,
@@ -3943,10 +3936,14 @@ class AppPipeline:
         if attachment_provider is not None:
             evidence_providers.append(attachment_provider)
         composite_provider = CompositeDocumentEvidenceProvider(evidence_providers)
-        frozen_pin_evidence = self._frozen_icd_pin_evidence(
-            kb_name,
-            frozen_source_names,
-            icd_scope_review,
+        frozen_pin_evidence = (
+            []
+            if multi_kb_authoring
+            else self._frozen_icd_pin_evidence(
+                kb_name,
+                frozen_source_names,
+                icd_scope_review,
+            )
         )
 
         # Spreadsheet structured index (xlsx TableIndexStore). Instantiated
@@ -3957,7 +3954,7 @@ class AppPipeline:
         # re-checks as a second guard.
         spreadsheet_tool = (
             SpreadsheetSemanticTool(self.spreadsheet_service)
-            if self.spreadsheet_service is not None
+            if self.spreadsheet_service is not None and not multi_kb_authoring
             else None
         )
 
@@ -3971,7 +3968,7 @@ class AppPipeline:
         circuit_service = getattr(self, "circuit_service", None)
         circuit_tool = (
             CircuitQueryTool(circuit_service)
-            if circuit_service is not None
+            if circuit_service is not None and not multi_kb_authoring
             else None
         )
 

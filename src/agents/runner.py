@@ -2657,21 +2657,26 @@ class MultiSourceAgentRunner:
             from src.attachments.models import scope_allows_kb
 
             if not is_general and scope_allows_kb(effective_scope):
-                tools.extend([
-                    make_catalog_tool(
-                        rt,
-                        document_store=self.document_store,
-                        spreadsheet_service=self.spreadsheet_service,
-                        circuit_service=self.circuit_service,
-                        rag_backend=self.rag_backend,
-                    ),
+                kb_tools = [
                     make_document_search(rt, self.rag_backend, self.document_store),
                     make_document_search_batch(rt, self.rag_backend, self.document_store),
-                    make_circuit_search(rt, self.circuit_service),
-                    *make_spreadsheet_tools(rt, self.spreadsheet_service),
-                    *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
-                    make_conversation_search(rt, self.conversation_service),
-                ])
+                ]
+                if rt.knowledge_scope is None:
+                    kb_tools = [
+                        make_catalog_tool(
+                            rt,
+                            document_store=self.document_store,
+                            spreadsheet_service=self.spreadsheet_service,
+                            circuit_service=self.circuit_service,
+                            rag_backend=self.rag_backend,
+                        ),
+                        *kb_tools,
+                        make_circuit_search(rt, self.circuit_service),
+                        *make_spreadsheet_tools(rt, self.spreadsheet_service),
+                        *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
+                        make_conversation_search(rt, self.conversation_service),
+                    ]
+                tools.extend(kb_tools)
                 if wiki_assist:
                     tools.append(make_wiki_search(rt, self.wiki_service))
             if attachment_refs:
@@ -2711,20 +2716,24 @@ class MultiSourceAgentRunner:
 
             if not is_general and scope_allows_kb(effective_scope):
                 tools = [
-                    make_catalog_tool(
-                        rt,
-                        document_store=self.document_store,
-                        spreadsheet_service=self.spreadsheet_service,
-                        circuit_service=self.circuit_service,
-                        rag_backend=self.rag_backend,
-                    ),
                     make_document_search(rt, self.rag_backend, self.document_store),
                     make_document_search_batch(rt, self.rag_backend, self.document_store),
-                    make_circuit_search(rt, self.circuit_service),
-                    *make_spreadsheet_tools(rt, self.spreadsheet_service),
-                    *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
-                    make_conversation_search(rt, self.conversation_service),
                 ]
+                if rt.knowledge_scope is None:
+                    tools = [
+                        make_catalog_tool(
+                            rt,
+                            document_store=self.document_store,
+                            spreadsheet_service=self.spreadsheet_service,
+                            circuit_service=self.circuit_service,
+                            rag_backend=self.rag_backend,
+                        ),
+                        *tools,
+                        make_circuit_search(rt, self.circuit_service),
+                        *make_spreadsheet_tools(rt, self.spreadsheet_service),
+                        *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
+                        make_conversation_search(rt, self.conversation_service),
+                    ]
                 if wiki_assist:
                     tools.append(make_wiki_search(rt, self.wiki_service))
             if attachment_refs:

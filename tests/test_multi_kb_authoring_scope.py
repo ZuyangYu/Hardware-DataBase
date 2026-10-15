@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 from src.agents.schemas import Evidence
+from src.agents.claim_evidence import InformationRequirement
+from src.core.app_pipeline import AppPipeline
+from src.pipelines.document_rag.schemas import RequestContext
 from src.document_authoring.evidence import KnowledgeBaseEvidenceProvider
 from src.document_authoring.models import KnowledgeBaseSourceSnapshot
+from src.services.knowledge_scope_models import AuthorizedKnowledgeSource
 from tests.test_multi_kb_store_contract import snapshot
 
 
@@ -64,3 +71,110 @@ def test_authoring_kb_provider_delegates_to_scoped_multi_service():
     )
     assert calls and calls[0]["snapshot"] is scope
     assert rows[0].metadata["knowledge_base_name"] == "KB205"
+
+
+def test_multi_kb_authoring_does_not_mount_anchor_only_structured_retrievers(monkeypatch):
+    pipeline = object.__new__(AppPipeline)
+    pipeline.backend = Mock()
+    pipeline.spreadsheet_service = Mock()
+    pipeline.circuit_service = Mock()
+    pipeline.document_generation = Mock()
+    pipeline.document_generation.build_knowledge_base_retrieval_outcome.return_value = SimpleNamespace(
+        status="success_empty"
+    )
+    ctx = RequestContext(
+        user_id="alice",
+        metadata={
+            "department_id": "7",
+            "knowledge_scope_snapshot": {"version": 1, "sources": [{"kb_id": 101}]},
+        },
+        kb_permissions={"7:KB101": "read"},
+    )
+    monkeypatch.setattr(
+        "src.core.app_pipeline.KnowledgeBaseEvidenceProvider.retrieve",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "src.core.app_pipeline.SpreadsheetSemanticTool",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("multi-KB authoring must not use anchor-only spreadsheet retrieval")
+        ),
+    )
+    monkeypatch.setattr(
+        "src.core.app_pipeline.CircuitQueryTool",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("multi-KB authoring must not use anchor-only circuit retrieval")
+        ),
+    )
+
+    retrieve = pipeline._knowledge_base_retriever(ctx, "KB101", ["spec.pdf"])
+    result = retrieve(
+        InformationRequirement(
+            requirement_id="r1",
+            semantic_unit_id="u1",
+            claim_type="attribute",
+            subject="voltage",
+            required_capabilities=["tabular_lookup", "relationship_lookup"],
+        ),
+        0,
+    )
+
+    assert result.status == "success_empty"
+
+
+def test_frozen_source_entry_keeps_record_identity_and_processing_stamps():
+    from src.document_authoring.knowledge_sources import build_frozen_source_entry
+
+    source = AuthorizedKnowledgeSource(
+        kb_id=205,
+        kb_name="KB205",
+        department_id="7",
+        role="standard",
+    )
+    document = SimpleNamespace(
+        id="pipeline:9",
+        name="standard.xlsx",
+        processor_kind="spreadsheet_table",
+        metadata={
+            "store_id": 9,
+            "dataset_id": "dataset-205",
+            "table_document_id": "table-9",
+            "content_hash": "b" * 64,
+            "source_version_id": "source-v3",
+            "revision": "r7",
+            "approval_status": "approved",
+            "processing_artifact_id": "artifact-2",
+            "processor_version": "xlsx-parser-4",
+            "index_revision": 12,
+            "source_group": "requirements",
+            "locator": {"sheet_name": "BOM", "row_index": 8},
+        },
+    )
+
+    entry = build_frozen_source_entry(
+        tenant_key="default",
+        source=source,
+        document=document,
+    )
+
+    assert entry == {
+        "tenant_key": "default",
+        "department_id": "7",
+        "kb_id": 205,
+        "kb_name_snapshot": "KB205",
+        "role": "standard",
+        "local_record_id": 9,
+        "processor_kind": "spreadsheet_table",
+        "source_group": "requirements",
+        "source_name": "standard.xlsx",
+        "source_content_hash": "b" * 64,
+        "source_version_id": "source-v3",
+        "revision": "r7",
+        "approval_status": "approved",
+        "processing_artifact_id": "artifact-2",
+        "processor_version": "xlsx-parser-4",
+        "index_revision": 12,
+        "dataset_id": "dataset-205",
+        "remote_document_id": "table-9",
+        "locator": {"sheet_name": "BOM", "row_index": 8},
+    }

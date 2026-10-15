@@ -110,6 +110,12 @@ def test_multi_kb_runner_does_not_mount_or_prefetch_long_term_memory(monkeypatch
         for tool in captured["tools"]
     }
     assert "memory_search" not in names
+    assert "circuit_search" not in names
+    assert "spreadsheet_row_search" not in names
+    assert "spreadsheet_cell_lookup" not in names
+    assert "spreadsheet_schema_lookup" not in names
+    assert "spreadsheet_sql_query" not in names
+    assert "conversation_search" not in names
     assert not memory_factory_called
     assert runner.get_last_retrieval_summary()["source_dependencies"]["kb_ids"] == [101, 205]
 
