@@ -18,6 +18,7 @@ from typing import Any, Callable
 from src.agents.schemas import Evidence
 from src.core.cancellation import QueryCancelled
 from src.pipelines.document_rag.schemas import RequestContext
+from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
 
 MAX_EVIDENCE_CONTENT_CHARS = 1200
 
@@ -158,6 +159,7 @@ class ToolRuntime:
     # opaque to ordinary retrieval tools; only the explicitly gated document
     # tool factory consumes it.
     document_context: Any | None = None
+    knowledge_scope: KnowledgeScopeSnapshot | None = None
     chat_session_id: str = ""
     top_k: int = 6
     query_mode: str = "deep"
@@ -280,7 +282,21 @@ class ToolRuntime:
                 if self.evidence_budget > 0
                 else len(fresh)
             )
-            if len(fresh) > room:
+            if self.knowledge_scope is not None:
+                fresh.sort(key=lambda position: int(items[position].metadata.get("fusion_rank") or position + 1))
+                required = {source.kb_id for source in self.knowledge_scope.sources} if self.source_scope != "attachment_only" else set()
+                covered = {item.metadata.get("kb_id") for item in self.evidence}
+                kept = set()
+                for position in fresh:
+                    if len(kept) >= room:
+                        break
+                    kb_id = items[position].metadata.get("kb_id")
+                    missing_after = required - covered - {kb_id}
+                    if room - len(kept) - 1 < len(missing_after):
+                        continue
+                    kept.add(position)
+                    covered.add(kb_id)
+            elif len(fresh) > room:
                 question_tokens = _evidence_tokens(self.question)
                 # 检索器相似度优先(RAGFlow score 为真实语义分), 词法分仅作次键;
                 # 纯词法排序会错杀"问题文本中不出现的要素"(如"谁编制"问题里的人名)。
@@ -320,6 +336,8 @@ class ToolRuntime:
         """按问题相关性重排证据堆;citation_number 在 metadata 里,编号不变。"""
 
         with self._lock:
+            if self.knowledge_scope is not None:
+                return
             if len(self.evidence) < 2:
                 return
             question_tokens = _evidence_tokens(self.question)
@@ -509,7 +527,10 @@ def format_evidence_for_llm(items: list[Evidence]) -> str:
         content = _LEADING_CITATION_RE.sub(r"`\1`", content)
         locator = item.locator or {}
         locator_text = ", ".join(f"{k}={v}" for k, v in locator.items() if v not in (None, ""))
-        header = f"[{number}] 来源：{item.source_name} | 类型：{item.content_kind}"
+        from src.services.evidence_fusion import source_label
+
+        label = source_label(item.source_name, item.metadata)
+        header = f"[{number}] 来源：{label} | 类型：{item.content_kind}"
         if locator_text:
             header += f" | 位置：{locator_text}"
         blocks.append(
