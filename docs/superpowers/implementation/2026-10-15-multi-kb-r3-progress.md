@@ -6,7 +6,7 @@
 ## 任务状态
 
 - [x] T0：共享检索池生命周期与旧单库兼容。
-- [ ] T1：范围模型、稳定 KB ID 授权与独立上下文（实施中）。
+- [x] T1：范围模型、稳定 KB ID 授权与独立上下文。
 - [ ] T2：会话/轮次范围、SQLite/PG 持久化与增量迁移。
 - [ ] T3：API/Worker/Agent、历史依赖、记忆与撤权隔离。
 - [ ] T4：scoped outcome、检索调度、预算、真实截止与错误语义。
@@ -41,6 +41,22 @@ uv run python -m pytest -q \
 
 结果：**60 passed, 1 skipped**。跳过项为未配置 `HDB_TEST_POSTGRES_DSN` 的既有 PG 健康检查；不计为真实 PG 验收。
 
+## T1 交付与验证
+
+- 冻结的 Pydantic 来源/用途/选库快照模型：拒绝空列表、重复、非法 ID/角色、越限和客户端伪造身份字段；集合以 tuple 存储，以 JSON 数组输出。
+- `selection_hash` 绑定版本、租户、操作者、归属库、用途和排序后的 ID/角色，不包含展示名称、时间和随机快照 ID。
+- AuthService 提供按稳定 ID 查询真实库身份的公开接口；resolver 整体授权，拒绝未知、跨部门、私有他人库、停用用户、系统管理员及篡改/跨用户/跨租户快照。
+- resolve/revalidate/context 边界重新读取用户与权限。撤回共享或改为系统管理员后旧快照失效。
+- 每来源 context 只含该来源的权限，metadata/权限集合彼此独立；API helper 委托同一服务层，来源角色不赋权。
+- answer/compare/compose 的 1～4 库模型与授权行为已测试；这只表示底层契约支持，不表示对应业务入口已开放。
+
+```bash
+uv run python -m pytest -q tests/test_knowledge_scope.py tests/test_auth_kb_scope.py tests/test_kb_scope.py
+```
+
+连同上述 T0 套件的最终合并回归：**121 passed, 1 skipped**。新增 T1 用例 42 个。
+修改的 Python 文件通过 `ruff check`，补丁通过 `git diff --check`。
+
 ## 阶段边界
 
-T0 不等于多库问答可用。新入口保持关闭；当前未执行生产迁移、未修改运行环境 `.env`、未重启线上 API/Worker。M1/M2/M3/M4/M5 均未验收。
+T0/T1 不等于多库问答可用。新入口保持关闭；当前未执行生产迁移、未修改运行环境 `.env`、未重启线上 API/Worker。M1/M2/M3/M4/M5 均未验收。

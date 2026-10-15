@@ -401,7 +401,7 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | `REVIEWER_AGENT_ENABLED` / `RESEARCH_AGENT_ENABLED` | `false` / `false` | 子代理（未接线） |
 | `AGENT_CHECKPOINT_BACKEND` / `_DB_PATH` / `_DATABASE_URL` / `_POOL_SIZE` | `sqlite` / `storage/agent_checkpoints.db` / `""` / `4` | checkpoint |
 | `SHARED_RETRIEVAL_EXECUTOR_ENABLED` + `RETRIEVAL_*` | `false` + 8/256/4/30/10 | 共享检索池 |
-| `MULTI_KB_CHAT_ENABLED` / `MULTI_KB_MAX_SOURCES` | `false` / `4` | 多库独立开关与选库上限；目前完成池生命周期，多库问答入口待接通 |
+| `MULTI_KB_CHAT_ENABLED` / `MULTI_KB_MAX_SOURCES` | `false` / `4` | 多库独立开关与选库上限；目前完成池生命周期与授权基础，多库问答入口待接通 |
 | `HDB_WIKI_SEARCH_EXPAND` | 未设置 | 环境变量级覆盖 `wiki_search` 的 `include_linked` |
 
 API 与 Worker 在启动和运行时启用时初始化同一个进程级检索池。多库开关不改变
@@ -409,6 +409,13 @@ API 与 Worker 在启动和运行时启用时初始化同一个进程级检索�
 就绪探针返回 `multi_kb_retrieval=down`，服务层以 `feature_unavailable` 拒绝使用；
 停止进程按 `RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS` 回收，运行中的 Python 调用不会
 被强制终止。关闭多库开关立即阻止新多库调用，已运行调用仍按取消/截止边界结束。
+
+`services/knowledge_scope_models.py` 定义独立于附件 `source_scope` 的多库选择契约。
+`answer`/`compose` 有且仅有一个 `primary`，其余为 `reference`/`standard`；
+`compare` 至少两个来源且均为 `peer`。来源角色只表达使用方式。
+`KnowledgeScopeResolver` 按稳定 KB ID 读取真实身份、复核当前用户部门与内容权限，
+任一来源拒绝即整体拒绝；快照及 selection hash 不能代替实时授权。每库上下文只携带
+自己的权限，不复用另一个来源的可变 metadata。会话持久化、Agent 接线和前端仍需后续实施。
 
 ---
 
