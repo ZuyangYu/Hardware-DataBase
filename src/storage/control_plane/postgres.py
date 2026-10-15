@@ -103,6 +103,9 @@ def _turn_from_row(row: dict) -> ChatTurn:
             str(item)
             for item in (_json_value(row.get("required_attachment_ids"), []) or [])
         ],
+        knowledge_scope=_json_value(row.get("knowledge_scope_json"), {}) or None,
+        knowledge_selection_hash=str(row.get("knowledge_selection_hash") or ""),
+        knowledge_request_fingerprint=str(row.get("knowledge_request_fingerprint") or ""),
         turn_sequence=int(row.get("turn_sequence") or 0),
     )
 
@@ -301,6 +304,8 @@ class PostgresExecutionStore:
         document_context: dict | Any | None = None,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
+        *,
+        knowledge_scope=None,
     ) -> ChatTurn:
         query = str(query or "").strip()
         if not query:
@@ -375,13 +380,25 @@ class PostgresExecutionStore:
             ).fetchone()
             if session_row is None:
                 raise PermissionError("chat session does not belong to current user")
+            from src.services.knowledge_scope_persistence import (
+                turn_scope_payload, request_fingerprint, require_replay_fingerprint, require_scope_binding,
+            )
+
+            scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
+            fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, document_context=document, query_mode=query_mode, wiki_assist=wiki_assist)
             if request_id:
                 existing = conn.execute(
                     "SELECT * FROM chat_turns WHERE session_id = %s AND client_request_id = %s",
                     (int(session_id), request_id),
                 ).fetchone()
                 if existing is not None:
+                    require_replay_fingerprint(existing["knowledge_request_fingerprint"], fingerprint)
                     return _turn_from_row(existing)
+            has_history = conn.execute("SELECT 1 FROM chat_messages WHERE session_id = %s LIMIT 1", (int(session_id),)).fetchone() is not None
+            require_scope_binding(session_row["knowledge_selection_hash"], scope, has_history=has_history)
+            if scope:
+                selection = {"version": scope["version"], "purpose": scope["purpose"], "sources": [{"kb_id": s["kb_id"], "role": s["role"]} for s in scope["sources"]]}
+                conn.execute("UPDATE chat_sessions SET knowledge_selection_json = %s, knowledge_selection_hash = %s WHERE id = %s", (Jsonb(selection), scope["selection_hash"], int(session_id)))
             turn_sequence = self._allocate_sequence_locked(conn, session_id)
             user_message = conn.execute(
                 "INSERT INTO chat_messages (session_id, role, content, created_at)"
@@ -415,10 +432,10 @@ class PostgresExecutionStore:
                     department_id, kb_id, query, query_mode, status, client_request_id,
                     turn_sequence, trace_context_json, document_context_json,
                     export_plan_json, source_scope, required_attachment_ids, wiki_assist,
-                    created_at
+                    created_at, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, clock_timestamp()
+                    %s, %s, clock_timestamp(), %s, %s, %s
                 ) RETURNING *
                 """,
                 (
@@ -440,6 +457,9 @@ class PostgresExecutionStore:
                     effective_scope,
                     Jsonb(required_ids),
                     bool(wiki_assist),
+                    Jsonb(scope),
+                    scope.get("selection_hash", ""),
+                    fingerprint,
                 ),
             ).fetchone()
             for ordinal, ref in enumerate(attachment_refs):
@@ -871,7 +891,13 @@ class PostgresExecutionStore:
         title: str = "新对话",
         department_id: int | None = None,
         kb_id: int | None = None,
+        *,
+        knowledge_selection=None,
+        tenant_key: str = "default",
     ) -> ChatSession:
+        from src.services.knowledge_scope_persistence import selection_for_session
+
+        selection, scope_hash = selection_for_session(knowledge_selection, user_id=user_id, anchor_kb_id=kb_id, tenant_key=tenant_key)
         with self._tx() as conn:
             if department_id is None:
                 owner = conn.execute(
@@ -881,8 +907,8 @@ class PostgresExecutionStore:
             row = conn.execute(
                 """
                 INSERT INTO chat_sessions
-                    (user_id, kb_name, department_id, kb_id, title, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, clock_timestamp(), clock_timestamp())
+                    (user_id, kb_name, department_id, kb_id, title, created_at, updated_at, knowledge_selection_json, knowledge_selection_hash)
+                VALUES (%s, %s, %s, %s, %s, clock_timestamp(), clock_timestamp(), %s, %s)
                 RETURNING *
                 """,
                 (
@@ -891,6 +917,8 @@ class PostgresExecutionStore:
                     department_id,
                     kb_id,
                     str(title),
+                    Jsonb(selection),
+                    scope_hash,
                 ),
             ).fetchone()
         return _session_from_row(row)

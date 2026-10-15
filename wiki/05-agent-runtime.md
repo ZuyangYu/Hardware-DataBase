@@ -415,7 +415,10 @@ API 与 Worker 在启动和运行时启用时初始化同一个进程级检索�
 `compare` 至少两个来源且均为 `peer`。来源角色只表达使用方式。
 `KnowledgeScopeResolver` 按稳定 KB ID 读取真实身份、复核当前用户部门与内容权限，
 任一来源拒绝即整体拒绝；快照及 selection hash 不能代替实时授权。每库上下文只携带
-自己的权限，不复用另一个来源的可变 metadata。会话持久化、Agent 接线和前端仍需后续实施。
+自己的权限，不复用另一个来源的可变 metadata。会话/轮次已保存选择和授权快照，
+首轮范围绑定采用事务，后续修改范围需新会话；新协议幂等键与请求内容绑定。
+PG 控制面版本为 2，部署前使用 `scripts/production_hardening/migrate_multi_kb_scope.py`
+依次检查、应用、验证加法迁移；脚本默认只检查。API/Agent 接线和前端仍在实施。
 
 ---
 

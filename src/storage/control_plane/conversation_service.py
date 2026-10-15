@@ -50,8 +50,11 @@ class PostgresConversationService:
         title: str = "新对话",
         department_id: int | None = None,
         kb_id: int | None = None,
+        *,
+        knowledge_selection=None,
+        tenant_key: str = "default",
     ) -> ChatSession:
-        return self._store.create_session(user_id, kb_name, title, department_id, kb_id)
+        return self._store.create_session(user_id, kb_name, title, department_id, kb_id, knowledge_selection=knowledge_selection, tenant_key=tenant_key)
 
     def get_session(self, user_id: int, session_id: int) -> ChatSession | None:
         return self._store.get_session(user_id, session_id)
@@ -119,6 +122,8 @@ class PostgresConversationService:
         document_context: dict | Any | None = None,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
+        *,
+        knowledge_scope=None,
     ) -> ChatTurn:
         return self._store.create_turn(
             user_id,
@@ -131,6 +136,7 @@ class PostgresConversationService:
             document_context,
             attachment_ids,
             source_scope,
+            knowledge_scope=knowledge_scope,
         )
 
     def claim_turn(

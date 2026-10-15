@@ -17,6 +17,7 @@ from src.document_authoring.chat_context import (
     DocumentContextInput,
 )
 from src.result_exports.models import normalize_export_format
+from src.services.knowledge_scope_models import KnowledgeSelectionInput, KnowledgeScopeSnapshot
 
 
 DocumentContextRequest = DocumentContextInput | DocumentAuthoringContextInput
@@ -347,6 +348,7 @@ class WikiGraphView(BaseModel):
 class CreateSessionRequest(BaseModel):
     kb_name: str
     title: str = "新对话"
+    knowledge_scope: KnowledgeSelectionInput | None = None
 
 
 class SessionView(BaseModel):
@@ -357,6 +359,8 @@ class SessionView(BaseModel):
     created_at: str
     updated_at: str
     document_context: DocumentContextView | None = None
+    knowledge_scope: KnowledgeScopeSnapshot | None = None
+    knowledge_selection_hash: str = ""
 
 
 class MemoryContextView(BaseModel):
@@ -435,6 +439,7 @@ class SessionMemorySettingsUpdate(BaseModel):
 
 class CreateTurnRequest(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
+    knowledge_scope: KnowledgeSelectionInput | None = None
     client_request_id: str | None = Field(default=None, max_length=128)
     # Retained for wire compatibility; the route normalizes KB turns to deep
     # retrieval and general chat bypasses the knowledge-base agent entirely.
@@ -487,6 +492,8 @@ class TurnView(BaseModel):
     blocked_by_turn_id: str | None = None
     queue_reason: str = ""
     wait_deadline: str | None = None
+    knowledge_scope: KnowledgeScopeSnapshot | None = None
+    knowledge_selection_hash: str = ""
 
 
 class TurnStartResponse(BaseModel):

@@ -102,7 +102,7 @@ class ControlPlaneHealthPostgresTests(unittest.TestCase):
             record_schema_version(conn)
         result = check_control_plane(self._settings())
         self.assertEqual(result["status"], "up")
-        self.assertEqual(result["schema_version"], "1")
+        self.assertEqual(result["schema_version"], "2")
 
         with psycopg.connect(self.dsn, autocommit=True) as conn:
             conn.execute(

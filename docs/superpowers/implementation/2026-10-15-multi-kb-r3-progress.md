@@ -7,7 +7,7 @@
 
 - [x] T0：共享检索池生命周期与旧单库兼容。
 - [x] T1：范围模型、稳定 KB ID 授权与独立上下文。
-- [ ] T2：会话/轮次范围、SQLite/PG 持久化与增量迁移。
+- [x] T2：会话/轮次范围、SQLite/PG 持久化与增量迁移。
 - [ ] T3：API/Worker/Agent、历史依赖、记忆与撤权隔离。
 - [ ] T4：scoped outcome、检索调度、预算、真实截止与错误语义。
 - [ ] T5：证据复合身份、融合、覆盖与质量门槛。
@@ -59,4 +59,24 @@ uv run python -m pytest -q tests/test_knowledge_scope.py tests/test_auth_kb_scop
 
 ## 阶段边界
 
-T0/T1 不等于多库问答可用。新入口保持关闭；当前未执行生产迁移、未修改运行环境 `.env`、未重启线上 API/Worker。M1/M2/M3/M4/M5 均未验收。
+T0–T2 不等于多库问答可用。新入口保持关闭；当前未执行生产迁移、未修改运行环境 `.env`、未重启线上 API/Worker。M1/M2/M3/M4/M5 均未验收。
+
+## T2 交付与验证
+
+- 两后端保存会话选库 JSON/hash、轮次授权快照/hash 和请求 fingerprint；ChatSession/ChatTurn、列表、Worker claim 和 PG facade 保留字段，旧行默认无范围。
+- 首轮范围绑定与轮次/两条消息在同一事务；并发选择只有一组成功，已有旧单库历史不能原地附加多库范围。
+- 新协议幂等键绑定问题、范围、附件范围/ID、文档上下文、模式和 Wiki 开关；授权时间和随机快照 ID 不影响重试。旧单库重放行为兼容。
+- PG 控制面 schema 升至 2；JSON 后缀列自动沿用 loader 的 JSONB 适配，不批量伪造历史 KB 身份。
+- 迁移脚本 `migrate_multi_kb_scope.py` 提供互斥 `--check/--apply/--verify`，默认只检查。SQLite 迁移显式事务覆盖 DDL；PG 使用事务锁及版本检查，拒绝未来版本，重复应用不修改记录/迁移时间。
+- 一次性 PG 容器：`hdb-multikb-r3-test-20261015`，仅用于本次验收。所有数据库为随机命名临时库，测试完成后各自删除。
+
+回归结果：**130 passed，0 skipped**，包含真实 PG scope round-trip、重新连接、并发首轮、旧 schema 迁移、既有控制面 Store/facade/loader、记忆入队、附件范围和权限测试。
+
+```bash
+HDB_TEST_POSTGRES_DSN=<一次性PG> uv run python -m pytest -q \
+  tests/test_multi_kb_store_contract.py tests/test_control_plane_store_contract.py \
+  tests/test_control_plane_schema.py tests/test_control_plane_postgres.py \
+  tests/test_control_plane_health.py tests/test_control_plane_conversation_service_postgres.py \
+  tests/test_control_plane_memory_enqueue_postgres.py tests/test_chat_attachment_scopes.py \
+  tests/test_control_plane_factory.py tests/test_knowledge_scope.py tests/test_conversation_wiring.py
+```

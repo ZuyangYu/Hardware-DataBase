@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 SCHEMA_TABLE = "control_plane_schema"
 
 # Canonical turn statuses (conversation.py); the plan forbids inventing a
@@ -66,6 +66,8 @@ CORE_TABLE_DDL: dict[str, str] = {
             rolling_summary TEXT NOT NULL DEFAULT '',
             summary_covered_message_id BIGINT NOT NULL DEFAULT 0,
             document_context_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            knowledge_selection_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            knowledge_selection_hash TEXT NOT NULL DEFAULT '',
             next_turn_sequence BIGINT NOT NULL DEFAULT 0,
             active_turn_id TEXT NOT NULL DEFAULT '',
             lease_owner TEXT NOT NULL DEFAULT '',
@@ -114,6 +116,9 @@ CORE_TABLE_DDL: dict[str, str] = {
             trace_context_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             document_context_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             export_plan_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            knowledge_scope_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            knowledge_selection_hash TEXT NOT NULL DEFAULT '',
+            knowledge_request_fingerprint TEXT NOT NULL DEFAULT '',
             source_scope TEXT NOT NULL DEFAULT 'auto',
             required_attachment_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
             turn_sequence BIGINT NOT NULL,

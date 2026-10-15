@@ -28,6 +28,8 @@ class ChatSession:
     created_at: str
     updated_at: str
     document_context: dict | None = None
+    knowledge_selection: dict | None = None
+    knowledge_selection_hash: str = ""
 
 
 @dataclass
@@ -90,6 +92,9 @@ class ChatTurn:
     session_generation: int = 0
     # Server-generated identity of the execution attempt that owns this turn.
     attempt_id: str = ""
+    knowledge_scope: dict | None = None
+    knowledge_selection_hash: str = ""
+    knowledge_request_fingerprint: str = ""
 
 
 # A turn waits here while its required chat attachments are still parsing.
@@ -359,6 +364,9 @@ class ConversationService:
             self._ensure_column(conn, "chat_sessions", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "kb_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
+            from src.storage.control_plane.knowledge_scope_migration import apply_sqlite as migrate_scope
+
+            migrate_scope(conn)
             self._ensure_column(conn, "chat_turns", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "kb_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "worker_id", "TEXT NOT NULL DEFAULT ''")
@@ -637,7 +645,13 @@ class ConversationService:
         title: str = "新对话",
         department_id: int | None = None,
         kb_id: int | None = None,
+        *,
+        knowledge_selection=None,
+        tenant_key: str = "default",
     ) -> ChatSession:
+        from src.services.knowledge_scope_persistence import selection_for_session
+
+        selection, scope_hash = selection_for_session(knowledge_selection, user_id=user_id, anchor_kb_id=kb_id, tenant_key=tenant_key)
         now = utc_now()
         with closing(self._connect()) as conn:
             if department_id is None:
@@ -645,10 +659,11 @@ class ConversationService:
                 department_id = owner["department_id"] if owner else None
             cursor = conn.execute(
                 """
-                INSERT INTO chat_sessions (user_id, kb_name, department_id, kb_id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_sessions (user_id, kb_name, department_id, kb_id, title, created_at, updated_at,
+                    knowledge_selection_json, knowledge_selection_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, kb_name, department_id, kb_id, title, now, now),
+                (user_id, kb_name, department_id, kb_id, title, now, now, json.dumps(selection, ensure_ascii=False), scope_hash),
             )
             row = conn.execute("SELECT * FROM chat_sessions WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return row_to_session(row)
@@ -1022,6 +1037,8 @@ class ConversationService:
         document_context: dict | Any | None = None,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
+        *,
+        knowledge_scope=None,
     ) -> ChatTurn:
         """Persist one user request and its assistant placeholder atomically.
 
@@ -1108,14 +1125,26 @@ class ConversationService:
                 ).fetchone()
                 if session_row is None:
                     raise PermissionError("chat session does not belong to current user")
+                from src.services.knowledge_scope_persistence import (
+                    turn_scope_payload, request_fingerprint, require_replay_fingerprint, require_scope_binding,
+                )
+
+                scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
+                fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, document_context=document_context or {}, query_mode=query_mode, wiki_assist=wiki_assist)
                 if request_id:
                     existing = conn.execute(
                         "SELECT * FROM chat_turns WHERE session_id = ? AND client_request_id = ?",
                         (session_id, request_id),
                     ).fetchone()
                     if existing is not None:
+                        require_replay_fingerprint(existing["knowledge_request_fingerprint"], fingerprint)
                         conn.execute("COMMIT")
                         return row_to_turn(existing)
+                has_history = conn.execute("SELECT 1 FROM chat_messages WHERE session_id = ? LIMIT 1", (session_id,)).fetchone() is not None
+                require_scope_binding(session_row["knowledge_selection_hash"], scope, has_history=has_history)
+                if scope:
+                    selection = {"version": scope["version"], "purpose": scope["purpose"], "sources": [{"kb_id": s["kb_id"], "role": s["role"]} for s in scope["sources"]]}
+                    conn.execute("UPDATE chat_sessions SET knowledge_selection_json = ?, knowledge_selection_hash = ? WHERE id = ?", (json.dumps(selection, ensure_ascii=False), scope["selection_hash"], session_id))
                 keys = session_row.keys()
                 if "next_turn_sequence" in keys:
                     turn_sequence = int(session_row["next_turn_sequence"] or 0)
@@ -1169,8 +1198,8 @@ class ConversationService:
                         department_id, kb_id, status, client_request_id, turn_sequence,
                         trace_context_json, created_at,
                         document_context_json, export_plan_json, source_scope, required_attachment_ids,
-                        wiki_assist
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        wiki_assist, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -1192,6 +1221,9 @@ class ConversationService:
                         effective_scope,
                         json.dumps(required_ids, ensure_ascii=False),
                         1 if wiki_assist else 0,
+                        json.dumps(scope, ensure_ascii=False),
+                        scope.get("selection_hash", ""),
+                        fingerprint,
                     ),
                 )
                 if attachment_refs:
@@ -2874,6 +2906,8 @@ def row_to_session(row) -> ChatSession:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         document_context=context,
+        knowledge_selection=json.loads(row["knowledge_selection_json"] or "{}") or None if "knowledge_selection_json" in row.keys() else None,
+        knowledge_selection_hash=row["knowledge_selection_hash"] if "knowledge_selection_hash" in row.keys() else "",
     )
 
 
@@ -3007,6 +3041,9 @@ def row_to_turn(row) -> ChatTurn:
         export_plan=export_plan,
         source_scope=row["source_scope"] if "source_scope" in row.keys() else "auto",
         required_attachment_ids=required_ids,
+        knowledge_scope=json.loads(row["knowledge_scope_json"] or "{}") or None if "knowledge_scope_json" in row.keys() else None,
+        knowledge_selection_hash=row["knowledge_selection_hash"] if "knowledge_selection_hash" in row.keys() else "",
+        knowledge_request_fingerprint=row["knowledge_request_fingerprint"] if "knowledge_request_fingerprint" in row.keys() else "",
         turn_sequence=(
             int(row["turn_sequence"])
             if "turn_sequence" in row.keys() and row["turn_sequence"] is not None
