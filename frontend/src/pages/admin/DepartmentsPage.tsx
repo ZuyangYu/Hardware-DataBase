@@ -141,12 +141,12 @@ export default function DepartmentsPage({ auth, onLogout }: Props) {
                     members.map((member) => (
                       <div
                         key={member.id}
-                        className="flex min-w-0 flex-wrap items-center gap-x-[8px] gap-y-[2px]"
+                        className="grid min-w-0 grid-cols-[minmax(0,128px)_60px_auto] items-center gap-x-[12px]"
                       >
-                        <span className="min-w-0 truncate font-medium text-[#464c5e]">
+                        <span className="truncate font-medium text-[#464c5e]">
                           {member.username}
                         </span>
-                        <span className="text-[#858b9c]">{ROLE_LABELS[member.role]}</span>
+                        <span className="truncate text-[#858b9c]">{ROLE_LABELS[member.role]}</span>
                         <span className={member.is_active ? 'text-[#138a55]' : 'text-[#858b9c]'}>
                           {member.is_active ? '启用' : '停用'}
                         </span>
